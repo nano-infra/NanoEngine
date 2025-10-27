@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Tuple
 import ray
 
 from nanodeploy.config import Config
+from nanovllm.engine.sequence import Sequence
 from nanodeploy.worker.model_runner import ModelRunner
 
 
@@ -15,7 +16,7 @@ class RayExecutor:
 
         self.workers = []
         for global_rank in range(config.world_size):
-            self.workers.append(ModelRunner(config, global_rank, None))
+            self.workers.append(ModelRunner.remote(config, global_rank, None))
 
     def collective_rpc(
         self,
@@ -37,8 +38,8 @@ class RayExecutor:
             timeout=timeout,
         )
 
-    def step(self):
-        raise NotImplementedError
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        return self.collective_rpc("run", [seqs, is_prefill])
 
     def gather_free_mem(self):
         """Get free memory."""

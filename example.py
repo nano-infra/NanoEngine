@@ -15,7 +15,7 @@ def main():
         data_parallel_size=1
     )
 
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=16)
+    sampling_params = SamplingParams(temperature=0.1, max_tokens=256)
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100",

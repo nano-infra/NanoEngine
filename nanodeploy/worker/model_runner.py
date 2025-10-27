@@ -1,4 +1,5 @@
 import pickle
+import ray
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -21,6 +22,7 @@ from nanodeploy.config import Config
 from flash_mla import get_mla_metadata
 
 
+@ray.remote(num_gpus=1, num_cpus=10)
 class ModelRunner(NanoVLLMModelRunner):
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
@@ -159,14 +161,13 @@ class ModelRunner(NanoVLLMModelRunner):
             input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
 
         logits = self.run_model(input_ids, positions, is_prefill)
-
         if seqs:
             temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
             token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
             reset_context()
             return token_ids
         else:
-            return None
+            return []
 
     # def allocate_kv_cache(self):
     #     config = self.config

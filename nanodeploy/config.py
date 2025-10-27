@@ -16,12 +16,12 @@ class Config:
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
-    num_kvcache_blocks: int = -1
+    num_kvcache_blocks: int = 15000
 
     master_addr: str | None = None
     master_port: int | None = None
 
-    ray_address: str | None = None
+    ray_address: str | None = "10.102.207.84:6379"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
