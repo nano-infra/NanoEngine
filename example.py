@@ -11,11 +11,11 @@ def main():
         path,
         enforce_eager=True,
         tensor_parallel_size=1,
-        expert_parallel_size=8,
-        data_parallel_size=8
+        expert_parallel_size=1,
+        data_parallel_size=1
     )
 
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=256)
+    sampling_params = SamplingParams(temperature=0.1, max_tokens=16)
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100",

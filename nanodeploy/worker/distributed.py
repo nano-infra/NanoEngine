@@ -4,7 +4,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 
 @dataclass
-class ParallelContext:
+class DistContext:
     rank: int = 0
     world_size: int = 1
 
@@ -35,10 +35,6 @@ class ParallelContext:
         return self.cpu_world_mesh.get_group("world")
 
     def __post_init__(self):
-        if self.world_size == 1:
-            return
-        # initialize attn and ffn parallel group
-
         self.cpu_world_mesh = init_device_mesh(
             "cpu",
             [self.world_size],
@@ -57,17 +53,17 @@ class ParallelContext:
             mesh_dim_names=["ep", "tp"]
         )
 
-_PARALLEL_CONTEXT = ParallelContext()
+_DIST_CONTEXT = None
 
-def get_parallel_context():
-    return _PARALLEL_CONTEXT
+def get_dist_context():
+    return _DIST_CONTEXT
 
-def set_parallel_context(
+def set_dist_context(
     rank, world_size, dp=1, ep=1, pp=1, tp=1, sp=1):
-    global _PARALLEL_CONTEXT
-    _PARALLEL_CONTEXT = ParallelContext(rank=rank, world_size=world_size, dp=dp, ep=ep, pp=pp, tp=tp, sp=sp)
+    global _DIST_CONTEXT
+    _DIST_CONTEXT = DistContext(rank=rank, world_size=world_size, dp=dp, ep=ep, pp=pp, tp=tp, sp=sp)
 
-def reset_parallel_context():
+def reset_dist_context():
     global _CONTEXT
-    _CONTEXT = ParallelContext()
+    _CONTEXT = DistContext()
 
