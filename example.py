@@ -5,7 +5,7 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("/models/models--deepseek-ai--DeepSeek-V3/snapshots/4c1f24cc10a2a1894304c7ab52edd9710c047571/")
+    path = os.path.expanduser("/models/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(
         path,

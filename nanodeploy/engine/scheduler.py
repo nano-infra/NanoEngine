@@ -1,21 +1,9 @@
 from collections import deque
-from typing import List
 
+from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
-from nanodeploy.config import Config
-
-
-class SchedulerState:
-    def __init__(self, config: Config):
-        self.dp = config.data_parallel_size
-        self.waiting: deque[Sequence] = deque()
-        self.running: List[deque[Sequence]] = [deque() for _ in range(self.dp)]
-        self.block_manager: BlockManager = [
-            BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
-            for _ in range(self.dp)
-        ]
 
 class Scheduler:
 
@@ -23,20 +11,9 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-
-        self.state = SchedulerState(config)
-
-    @property
-    def waiting(self):
-        return self.state.waiting
-
-    @property
-    def running(self):
-        return self.state.running[0]
-
-    @property
-    def block_manager(self):
-        return self.state.block_manager[0]
+        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.waiting: deque[Sequence] = deque()
+        self.running: deque[Sequence] = deque()
 
     def is_finished(self):
         return not self.waiting and not self.running
