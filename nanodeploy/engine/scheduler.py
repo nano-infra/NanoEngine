@@ -84,7 +84,6 @@ class Scheduler:
             else:
                 break
         if scheduled_seqs:
-            print(f"{scheduled_seqs=}")
             return scheduled_seqs, True
 
         # decode

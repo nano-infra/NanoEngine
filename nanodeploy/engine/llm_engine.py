@@ -23,23 +23,22 @@ class LLMEngine(NanoVLLMLLMEngine):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
-        self.confing = config
+        self.config = config
         self.ps = []
         self.events = []
-        # ctx = mp.get_context("spawn")
-        # for i in range(1, config.tensor_parallel_size):
-        #     event = ctx.Event()
-        #     process = ctx.Process(target=ModelRunner, args=(config, i, event))
-        #     process.start()
-        #     self.ps.append(process)
-        #     self.events.append(event)
 
         self.executor = RayExecutor(config=config)
+        self.update_num_kvcache_blocks()
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
+
+    def update_num_kvcache_blocks(self):
+        num_kvcache_blocks = self.executor.num_kvcache_blocks()
+        self.config.num_kvcache_blocks = min(num_kvcache_blocks)
+        print(f"kvcache blocks number updated, {self.config.num_kvcache_blocks=}")
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
@@ -48,7 +47,7 @@ class LLMEngine(NanoVLLMLLMEngine):
         self.scheduler.add(seq)
 
     def step(self):
-        dp_stride = self.confing.tensor_parallel_size
+        dp_stride = self.config.tensor_parallel_size
         dp_seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.executor.run(dp_seqs, is_prefill)[::dp_stride]
         self.scheduler.postprocess(dp_seqs, token_ids)

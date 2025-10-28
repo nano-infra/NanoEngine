@@ -61,6 +61,9 @@ class ModelRunner(NanoVLLMModelRunner):
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+    def num_kvcache_blocks(self):
+        return self.config.num_kvcache_blocks
+
     @torch.inference_mode()
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool

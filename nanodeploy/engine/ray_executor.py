@@ -40,26 +40,6 @@ class RayExecutor:
             timeout=timeout,
         )
 
-    def collective_rpc(
-        self,
-        method: str,
-        args: Tuple[Any] = None,
-        kwargs: Dict[str, Any] = None,
-        timeout: float = None,
-    ):
-        """Collective rpc."""
-        if args is None:
-            args = list()
-        if kwargs is None:
-            kwargs = dict()
-        return ray.get(
-            [
-                getattr(worker, method).remote(*args, **kwargs)
-                for worker in self.workers
-            ],
-            timeout=timeout,
-        )
-
     def run(
         self, dp_seqs: List[List[Sequence]], is_prefill: bool, timeout: float = None
     ) -> list[int]:
@@ -72,6 +52,9 @@ class RayExecutor:
             ],
             timeout=timeout,
         )
+
+    def num_kvcache_blocks(self):
+        return self.collective_rpc("num_kvcache_blocks")
 
     def gather_free_mem(self):
         """Get free memory."""
