@@ -1,10 +1,10 @@
 import torch
-from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
+from torch import nn
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -23,7 +23,9 @@ class VocabParallelEmbedding(nn.Module):
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
-        self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
+        self.weight = nn.Parameter(
+            torch.empty(self.num_embeddings_per_partition, embedding_dim)
+        )
         self.weight.weight_loader = self.weight_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -62,7 +64,16 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            dist.gather(logits, all_logits, 0, group=get_dist_context().attn_tp_group)
+            all_logits = (
+                [torch.empty_like(logits) for _ in range(self.tp_size)]
+                if self.tp_rank == 0
+                else None
+            )
+            dist.gather(
+                logits,
+                all_logits,
+                dist.get_process_group_ranks(get_dist_context().attn_tp_group)[0],
+                group=get_dist_context().attn_tp_group,
+            )
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits
