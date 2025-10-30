@@ -83,12 +83,12 @@ class Scheduler:
                 break
             else:
                 break
-        if scheduled_seqs:
+        if any(scheduled_seqs):
             return scheduled_seqs, True
 
         # decode
         for selected_replica in range(self.num_replica):
-            while self.running(selected_replica) and num_seqs < self.max_num_seqs:
+            while self.running(selected_replica) and num_seqs[selected_replica] < self.max_num_seqs:
                 seq = self.running(selected_replica).popleft()
                 while not self.block_manager(selected_replica).can_append(seq):
                     if self.running(selected_replica):
@@ -99,7 +99,7 @@ class Scheduler:
                         self.preempt(selected_replica, seq)
                         break
                 else:
-                    num_seqs += 1
+                    num_seqs[selected_replica] += 1
                     self.block_manager(selected_replica).may_append(seq)
                     scheduled_seqs[selected_replica].append(seq)
             self.running(selected_replica).extendleft(
@@ -112,6 +112,7 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         self.block_manager(selected_replica).deallocate(seq)
         self.waiting.appendleft(seq)
+        seq.num_completion_tokens
 
     def postprocess(self, seqs: List[List[Sequence]], token_ids: List[List[int]]):
         for i in range(self.num_replica):

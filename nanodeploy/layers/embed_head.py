@@ -28,7 +28,9 @@ class VocabParallelEmbedding(nn.Module):
         )
         self.weight.weight_loader = self.weight_loader
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str = None
+    ):
         param_data = param.data
         shard_size = param_data.size(0)
         start_idx = self.tp_rank * shard_size

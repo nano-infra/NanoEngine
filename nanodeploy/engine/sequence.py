@@ -87,7 +87,8 @@ class Sequence:
             self.num_cached_tokens,
             self.block_table,
             self.temperature,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            self.token_ids,
+            self.last_token,
         )
 
     def __setstate__(self, state):
@@ -96,9 +97,7 @@ class Sequence:
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.block_table,
-            self.temperature
-        ) = state[:-1]
-        if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
-        else:
-            self.last_token = state[-1]
+            self.temperature,
+            self.token_ids,
+            self.last_token
+        ) = state
