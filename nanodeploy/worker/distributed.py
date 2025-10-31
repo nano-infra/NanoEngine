@@ -31,6 +31,10 @@ class DistContext:
         return self.ffn_device_mesh.get_group("ep")
 
     @property
+    def ffn_tp_group(self):
+        return self.ffn_device_mesh.get_group("tp")
+
+    @property
     def cpu_world_group(self):
         return self.cpu_world_mesh.get_group("world")
 

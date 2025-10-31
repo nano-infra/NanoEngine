@@ -1,3 +1,5 @@
+from typing import Dict
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -20,11 +22,14 @@ from nanodeploy.worker.distributed import get_dist_context
 from torch import nn
 from transformers import Qwen3MoeConfig
 
+from .quant_config import QuantizationConfig
+
 
 class Qwen3MoeAttention(nn.Module):
 
     def __init__(
         self,
+        layer_idx: int,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -34,8 +39,16 @@ class Qwen3MoeAttention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        config: Qwen3MoeConfig | None = None,
+        quantization_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
+
+        self.config = config
+        self.quantization_config = quantization_config
+
+        self.layer_idx = layer_idx
+
         tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -48,59 +61,22 @@ class Qwen3MoeAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_weight = nn.Parameter(
-            torch.empty(
-                (self.total_num_heads + 2 * self.total_num_kv_heads) * self.head_dim,
-                hidden_size,
-                dtype=torch.float8_e4m3fn,
-                device="cuda"
-            )
-        )
-
-        self.qkv_scale = nn.Parameter(
-            torch.empty(
-                (self.total_num_heads + 2 * self.total_num_kv_heads) * self.head_dim // 128,
-                hidden_size // 128,
-                dtype=torch.float32,
-                device="cuda"
-            )
-        )
-
-        self.o_weight = nn.Parameter(
-            torch.empty(
-                hidden_size,
-                self.total_num_heads * self.head_dim,
-                dtype=torch.float8_e4m3fn,
-                device="cuda"
-            )
-        )
-
-        self.o_scale = nn.Parameter(
-            torch.empty(
-                hidden_size // 128,
-                (self.total_num_heads * self.head_dim) // 128,
-                dtype=torch.float32,
-                device="cuda"
-            )
-        )
-
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
-            weight_tensor=self.qkv_weight,
-            scale_tensor=self.qkv_scale
+            quantization_config=quantization_config,
         )
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
-            weight_tensor=self.o_weight,
-            scale_tensor=self.o_scale,
-            block_size=128
+            quantization_config=quantization_config,
         )
+
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -108,12 +84,14 @@ class Qwen3MoeAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
         )
+
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -144,21 +122,31 @@ class Qwen3MoeMLP(nn.Module):
         down_proj_tenosr: torch.Tensor | None = None,
         gate_up_scale_inv_tensor: torch.Tensor | None = None,
         down_scale_inv_tensor: torch.Tensor | None = None,
+        config: Qwen3MoeConfig | None = None,
+        quantization_config: QuantizationConfig | None = None,
     ) -> None:
+        # by now, all FFN layers are SparseMLP
         super().__init__()
+
+        self.config = config
+        self.quantization_config = quantization_config
+
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             weight_tensor=gate_up_proj_tensor,
-            scale_tensor=gate_up_scale_inv_tensor
+            scale_tensor=gate_up_scale_inv_tensor,
+            quantization_config=quantization_config,
         )
+
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             weight_tensor=down_proj_tenosr,
             scale_tensor=down_scale_inv_tensor,
+            quantization_config=quantization_config,
         )
 
         assert hidden_act == "silu"
@@ -174,10 +162,13 @@ class Qwen3MoeMLP(nn.Module):
 class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def __init__(
-        self,
-        config: Qwen3MoeConfig,
+        self, config: Qwen3MoeConfig, quantization_config: QuantizationConfig
     ) -> None:
         super().__init__()
+
+        self.config = config
+        self.quantization_config = quantization_config
+
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.hidden_act = config.hidden_act
@@ -188,16 +179,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # gating
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
 
-        # quant block
-        self.block_size = 128
+        weight_dtype = quantization_config.dtype or config.dtype
+
+        self.tp_size = dist.get_world_size(group=get_dist_context().ffn_tp_group)
 
         # global parameter for DeepGEMM
         self.gate_up_proj_tensor = nn.Parameter(
             torch.ones(
                 self.num_experts_per_rank,
-                config.moe_intermediate_size * 2,
+                config.moe_intermediate_size * 2 // self.tp_size,
                 config.hidden_size,
-                dtype=torch.float8_e4m3fn,
+                dtype=weight_dtype,
                 device="cuda",
             ),
         )
@@ -205,9 +197,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.gate_up_proj_tensor_meta = nn.Parameter(
             torch.ones(
                 self.num_experts,
-                config.moe_intermediate_size * 2,
+                config.moe_intermediate_size * 2 // self.tp_size,
                 config.hidden_size,
-                dtype=torch.float8_e4m3fn,
+                dtype=weight_dtype,
                 device="meta",
             )
         )
@@ -216,8 +208,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             torch.ones(
                 self.num_experts_per_rank,
                 config.hidden_size,
-                config.moe_intermediate_size,
-                dtype=torch.float8_e4m3fn,
+                config.moe_intermediate_size // self.tp_size,
+                dtype=weight_dtype,
                 device="cuda",
             )
         )
@@ -226,51 +218,59 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             torch.ones(
                 self.num_experts,
                 config.hidden_size,
-                config.moe_intermediate_size,
-                dtype=torch.float8_e4m3fn,
+                config.moe_intermediate_size // self.tp_size,
+                dtype=weight_dtype,
                 device="meta",
             )
         )
+        if quantization_config.quant_method == "fp8":
+            self.gate_up_scale_inv = nn.Parameter(
+                torch.ones(
+                    self.num_experts_per_rank,
+                    config.moe_intermediate_size
+                    * 2
+                    // quantization_config.block_size[0] // self.tp_size,
+                    config.hidden_size // quantization_config.block_size[1],
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                * 8
+            )
 
-        self.gate_up_scale_inv = nn.Parameter(
-            torch.ones(
-                self.num_experts_per_rank,
-                config.moe_intermediate_size * 2 // self.block_size,
-                config.hidden_size // self.block_size,
-                dtype=torch.float32,
-                device="cuda",
-            ) * 8
-        )
+            self.gate_up_scale_inv_meta = nn.Parameter(
+                torch.ones(
+                    self.num_experts,
+                    config.moe_intermediate_size
+                    * 2
+                    // quantization_config.block_size[0] // self.tp_size,
+                    config.hidden_size // quantization_config.block_size[1],
+                    dtype=torch.float32,
+                    device="meta",
+                )
+                * 8
+            )
 
-        self.gate_up_scale_inv_meta = nn.Parameter(
-            torch.ones(
-                self.num_experts,
-                config.moe_intermediate_size * 2 // self.block_size,
-                config.hidden_size // self.block_size,
-                dtype=torch.float32,
-                device="cuda",
-            ) * 8
-        )
+            self.down_scale_inv = nn.Parameter(
+                torch.ones(
+                    self.num_experts_per_rank,
+                    config.hidden_size // quantization_config.block_size[0],
+                    config.moe_intermediate_size // quantization_config.block_size[1] // self.tp_size,
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                * 8
+            ) if quantization_config.quant_method == "fp8" else None
 
-        self.down_scale_inv = nn.Parameter(
-            torch.ones(
-                self.num_experts_per_rank,
-                config.hidden_size // self.block_size,
-                config.moe_intermediate_size // self.block_size,
-                dtype=torch.float32,
-                device="cuda",
-            ) * 8
-        )
-
-        self.down_scale_inv_meta = nn.Parameter(
-            torch.ones(
-                self.num_experts,
-                config.hidden_size // self.block_size,
-                config.moe_intermediate_size // self.block_size,
-                dtype=torch.float32,
-                device="meta",
-            ) * 8
-        )
+            self.down_scale_inv_meta = nn.Parameter(
+                torch.ones(
+                    self.num_experts,
+                    config.hidden_size // quantization_config.block_size[0],
+                    config.moe_intermediate_size // quantization_config.block_size[1] // self.tp_size,
+                    dtype=torch.float32,
+                    device="meta",
+                )
+                * 8
+            ) 
 
         expert_id_start = self.expert_list_this_rank[0]
 
@@ -290,16 +290,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                         if expert_id in self.expert_list_this_rank
                         else self.down_proj_tensor_meta[expert_id]
                     ),
-                    gate_up_scale_inv_tensor=(
+                    gate_up_scale_inv_tensor=None if quantization_config.quant_method != "fp8" else (
                         self.gate_up_scale_inv[expert_id - expert_id_start]
                         if expert_id in self.expert_list_this_rank
                         else self.gate_up_scale_inv_meta[expert_id]
                     ),
-                    down_scale_inv_tensor=(
+                    down_scale_inv_tensor=None if quantization_config.quant_method != "fp8" else (
                         self.down_scale_inv[expert_id - expert_id_start]
                         if expert_id in self.expert_list_this_rank
                         else self.down_scale_inv_meta[expert_id]
                     ),
+                    quantization_config=self.quantization_config,
                 )
                 for expert_id in range(self.num_experts)
             ]
@@ -307,19 +308,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.ep_group = get_dist_context().ffn_ep_group
         self.ep_size = dist.get_world_size(group=self.ep_group)
+        if self.ep_size > 1:
+            self.moe = build_deepep_moe(
+                low_latency_mode=True,
+                ep_size=self.ep_size,
+                ep_group=self.ep_group,
+                num_experts=self.num_experts,
+                hidden_dim=self.hidden_size,
+                block_size=self.quantization_config.block_size[0],
+                top_k=self.top_k,
+                out_dtype=torch.bfloat16,
+                layer_idx=0,
+                chunk_size=16 * 1024,
+            )
 
-        self.moe = build_deepep_moe(
-            low_latency_mode=True,
-            ep_size=self.ep_size,
-            ep_group=self.ep_group,
-            num_experts=self.num_experts,
-            hidden_dim=self.hidden_size,
-            block_size=self.block_size,
-            top_k=self.top_k,
-            out_dtype=torch.bfloat16,
-            layer_idx=0,
-            chunk_size=16 * 1024,
-        )
         self.act_fn = config.hidden_act
 
     def fusedmoe_build(self, low_latency_mode):
@@ -329,7 +331,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             ep_group=self.ep_group,
             num_experts=self.num_experts,
             hidden_dim=self.hidden_size,
-            block_size=self.block_size,
+            block_size=self.quantization_config.block_size[0],
             top_k=self.top_k,
             out_dtype=torch.bfloat16,
             layer_idx=0,
@@ -352,12 +354,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         return list(range(expert_id_begin, expert_id_end))
 
-    @property
-    def expert_list(self):
-        return list(range(self.num_experts))
-
     def forward(self, hidden_states: torch.Tensor):
         if self.ep_size > 1:
+            assert self.quantization_config.quant_method == "fp8", "Only FP8 EP is supported by now"
             context = get_context()
             moe = self.fusedmoe_build(not context.is_prefill)
             router_logits = self.gate(hidden_states)
@@ -426,10 +425,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3MoeConfig,
+        quantization_config: QuantizationConfig,
         layer_idx: int = -1,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3MoeAttention(
+            layer_idx=layer_idx,
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -439,17 +440,21 @@ class Qwen3MoeDecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            config=config,
+            quantization_config=quantization_config,
         )
         mlp_only_layers = getattr(config, "mlp_only_layers", [])
         if (layer_idx not in mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
-            self.mlp = Qwen3MoeSparseMoeBlock(config=config)
+            self.mlp = Qwen3MoeSparseMoeBlock(config=config, quantization_config=quantization_config)
         else:
             self.mlp = Qwen3MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
+                config=config,
+                quantization_config=quantization_config
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -477,8 +482,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 class Qwen3MoeModel(nn.Module):
 
     def __init__(
-        self,
-        config: Qwen3MoeConfig,
+        self, config: Qwen3MoeConfig, quantization_config: QuantizationConfig
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
@@ -486,7 +490,7 @@ class Qwen3MoeModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                Qwen3MoeDecoderLayer(config, layer_idx)
+                Qwen3MoeDecoderLayer(config, quantization_config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -513,12 +517,15 @@ class Qwen3MoeForCausalLM(nn.Module):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
         "gate_scale_inv": ("gate_up_scale_inv", 0),
-        "up_scale_inv": ("gate_up_scale_inv", 1)
+        "up_scale_inv": ("gate_up_scale_inv", 1),
     }
 
     def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
-        self.model = Qwen3MoeModel(config)
+        quantization_config = QuantizationConfig(
+            **getattr(config, "quantization_config", dict())
+        )
+        self.model = Qwen3MoeModel(config, quantization_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

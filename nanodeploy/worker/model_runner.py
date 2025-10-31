@@ -12,7 +12,6 @@ from nanodeploy.config import Config
 
 from nanodeploy.engine.sequence import Sequence
 
-from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 
@@ -22,7 +21,6 @@ from nanodeploy.worker.distributed import get_dist_context, set_dist_context
 from nanodeploy.worker.loader import load_model
 
 from nanovllm.engine.model_runner import ModelRunner as NanoVLLMModelRunner
-
 from nanovllm.layers.sampler import Sampler
 
 
@@ -61,7 +59,8 @@ class ModelRunner(NanoVLLMModelRunner):
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
 
-        self.model = architectures[hf_config.architectures[0]](hf_config)
+        model_architecture = hf_config.architectures[0]
+        self.model = architectures[model_architecture](hf_config)
 
         load_model(self.model, config.model)
         self.sampler = Sampler()
@@ -180,7 +179,6 @@ class ModelRunner(NanoVLLMModelRunner):
             None,
             block_tables,
         )
-        print(input_ids.shape)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):

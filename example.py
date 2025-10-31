@@ -1,6 +1,6 @@
 import os
 from nanodeploy import LLM
-from nanovllm import SamplingParams
+from nanodeploy import SamplingParams
 from transformers import AutoTokenizer
 
 
@@ -15,7 +15,7 @@ def main():
         data_parallel_size=8
     )
 
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=True)
+    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=False)
     prompts = [
         "你好",
         "how to bake a chocolate cake from scratch",

@@ -3,9 +3,11 @@ from typing import List
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from nanodeploy.kernels.block_gemm_fp8 import deep_gemm_fp8, quant_fp8_tma
 
+from nanodeploy.kernels.block_gemm_fp8 import deep_gemm_fp8, quant_fp8_tma
+from nanodeploy.models.quant_config import QuantizationConfig
 from nanodeploy.worker.distributed import get_dist_context
+
 from torch import nn
 
 
@@ -25,18 +27,22 @@ class LinearBase(nn.Module):
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
-        block_size: int | None = 128,
+        quantization_config: QuantizationConfig = None,
     ):
         super().__init__()
-        self.block_size = block_size
+
+        self.quantization_config = quantization_config or QuantizationConfig
+
         self.tp_dim = tp_dim
         self.tp_rank = dist.get_rank(group=get_dist_context().attn_tp_group)
         self.tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
 
+        weight_dtype = self.quantization_config.dtype or torch.get_default_dtype()
+
         self.weight = nn.Parameter(
             weight_tensor
             if weight_tensor is not None
-            else torch.empty(output_size, input_size)
+            else torch.empty(output_size, input_size, dtype=weight_dtype)
         )
 
         self.weight.weight_loader = self.weight_loader
@@ -50,10 +56,42 @@ class LinearBase(nn.Module):
 
         if scale_tensor is not None:
             self.weight_scale_inv = nn.Parameter(scale_tensor)
-            self.weight_scale_inv.weight_loader = self.weight_loader
+        elif quantization_config.quant_method == "fp8":
+            self.weight_scale_inv = nn.Parameter(
+                torch.empty(
+                    output_size // quantization_config.block_size[0],
+                    input_size // quantization_config.block_size[1],
+                    dtype=torch.float32,
+                )
+            )
+        else:
+            self.weight_scale_inv = nn.Parameter(
+                torch.empty(output_size, input_size, dtype=torch.float32, device="meta")
+            )
+        self.weight_scale_inv.weight_loader = self.weight_loader
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        if not self.quantization_config.quant_method:
+            return F.linear(x, self.weight, self.bias)
+        elif self.quantization_config.quant_method == "fp8":
+            input_quant, input_scale = quant_fp8_tma(
+                x, self.quantization_config.block_size[0], dtype=self.weight.dtype
+            )
+
+            out = deep_gemm_fp8(
+                input_quant,
+                input_scale,
+                self.weight,
+                self.weight_scale_inv,
+                out_dtype=x.dtype,
+            )
+            out = out[: x.size(0)]
+            if self.bias is not None:
+                out += self.bias
+
+            return out
+        else:
+            raise AttributeError(f"Unsupported Quant Method")
 
 
 class ReplicatedLinear(LinearBase):
@@ -66,7 +104,7 @@ class ReplicatedLinear(LinearBase):
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
-        block_size: int | None = 128,
+        quantization_config: QuantizationConfig = None,
     ):
         super().__init__(
             input_size,
@@ -75,7 +113,7 @@ class ReplicatedLinear(LinearBase):
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
-            block_size=block_size,
+            quantization_config=quantization_config,
         )
 
     def weight_loader(
@@ -84,8 +122,28 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        if not self.quantization_config.quant_method:
+            return F.linear(x, self.weight, self.bias)
+        elif self.quantization_config.quant_method == "fp8":
+            input_quant, input_scale = quant_fp8_tma(
+                x, self.quantization_config.block_size[0], dtype=self.weight.dtype
+            )
 
+            out = deep_gemm_fp8(
+                input_quant,
+                input_scale,
+                self.weight,
+                self.weight_scale_inv,
+                out_dtype=x.dtype,
+            )
+            out = out[: x.size(0)]
+            if self.bias is not None:
+                out += self.bias
+
+            return out
+        else:
+            raise AttributeError(f"Unsupported Quant Method")
+        
 
 class ColumnParallelLinear(LinearBase):
 
@@ -97,7 +155,7 @@ class ColumnParallelLinear(LinearBase):
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
-        block_size: int | None = 128,
+        quantization_config: QuantizationConfig = None,
     ):
         tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
         super().__init__(
@@ -108,9 +166,8 @@ class ColumnParallelLinear(LinearBase):
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
-            block_size=128,
+            quantization_config=quantization_config,
         )
-        self.block_size = block_size
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str = None
@@ -122,7 +179,27 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        if not self.quantization_config.quant_method:
+            return F.linear(x, self.weight, self.bias)
+        elif self.quantization_config.quant_method == "fp8":
+            input_quant, input_scale = quant_fp8_tma(
+                x, self.quantization_config.block_size[0], dtype=self.weight.dtype
+            )
+
+            out = deep_gemm_fp8(
+                input_quant,
+                input_scale,
+                self.weight,
+                self.weight_scale_inv,
+                out_dtype=x.dtype,
+            )
+            out = out[: x.size(0)]
+            if self.bias is not None:
+                out += self.bias
+
+            return out
+        else:
+            raise AttributeError(f"Unsupported Quant Method")
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -135,10 +212,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
-        block_size: int | None = 128,
+        quantization_config: QuantizationConfig = None,
     ):
-        self.output_sizes = output_sizes
-        self.block_size = block_size
         super().__init__(
             input_size,
             sum(output_sizes),
@@ -146,8 +221,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
-            block_size=block_size,
+            quantization_config=quantization_config,
         )
+        self.output_sizes = output_sizes
 
     def weight_loader(
         self,
@@ -158,7 +234,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         if "inv" in weight_name:
-            output_sizes = [out // self.block_size for out in self.output_sizes]
+            output_sizes = [
+                out // self.quantization_config.block_size[0]
+                for out in self.output_sizes
+            ]
             loaded_weight = loaded_weight.to(torch.float32)
         else:
             output_sizes = self.output_sizes
@@ -181,9 +260,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
-        block_size: int | None = 128,
+        quantization_config: QuantizationConfig = QuantizationConfig,
     ):
-        self.block_size = block_size
         tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
@@ -197,8 +275,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
+            quantization_config=quantization_config,
         )
-        self.block_size = 128
 
     def weight_loader(
         self,
@@ -222,35 +300,12 @@ class QKVParallelLinear(ColumnParallelLinear):
             )
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         if "inv" in weight_name:
-            shard_offset = shard_offset // self.block_size
-            shard_size = shard_size // self.block_size
+            shard_offset = shard_offset // self.quantization_config.block_size[0]
+            shard_size = shard_size // self.quantization_config.block_size[0]
             loaded_weight = loaded_weight.to(torch.float32)
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
 
         param_data.copy_(loaded_weight)
-
-    def forward(self, x):
-        """forward."""
-        x_shape = x.shape
-        x = x.flatten(0, -2)
-
-        input_quant, input_scale = quant_fp8_tma(
-            x, self.block_size, dtype=self.weight.dtype
-        )
-
-        out = deep_gemm_fp8(
-            input_quant,
-            input_scale,
-            self.weight,
-            self.weight_scale_inv,
-            out_dtype=x.dtype,
-        )
-        out = out[: x.size(0)]
-        if self.bias is not None:
-            out += self.bias
-
-        out = out.unflatten(0, x_shape[:-1])
-        return out
 
 
 class RowParallelLinear(LinearBase):
@@ -263,7 +318,7 @@ class RowParallelLinear(LinearBase):
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
-        block_size: int | None = None,
+        quantization_config: QuantizationConfig = None,
     ):
         tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
         super().__init__(
@@ -274,7 +329,7 @@ class RowParallelLinear(LinearBase):
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
-            block_size=block_size,
+            quantization_config=quantization_config,
         )
 
     def weight_loader(
@@ -287,12 +342,17 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if hasattr(self, "weight_scale_inv"):
+        if not self.quantization_config.quant_method:
+            y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+            if self.tp_size > 1:
+                dist.all_reduce(y, group=get_dist_context().attn_tp_group)
+            return y
+        elif self.quantization_config.quant_method == "fp8":
             x_shape = x.shape
             x = x.flatten(0, -2)
 
             input_quant, input_scale = quant_fp8_tma(
-                x, self.block_size, dtype=self.weight.dtype
+                x, self.quantization_config.block_size[0], dtype=self.weight.dtype
             )
 
             out = deep_gemm_fp8(
@@ -307,10 +367,7 @@ class RowParallelLinear(LinearBase):
                 out += self.bias
 
             out = out.unflatten(0, x_shape[:-1])
-            return out
-
-        else:
-            y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
             if self.tp_size > 1:
-                dist.all_reduce(y, group=get_dist_context().attn_tp_group)
-            return y
+                dist.all_reduce(out, group=get_dist_context().attn_tp_group)
+            return out
+            
