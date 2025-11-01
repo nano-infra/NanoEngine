@@ -24,6 +24,7 @@ class LinearBase(nn.Module):
         output_size: int,
         bias: bool = False,
         tp_dim: int | None = None,
+        meta: bool = False,
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
@@ -37,18 +38,22 @@ class LinearBase(nn.Module):
         self.tp_rank = dist.get_rank(group=get_dist_context().attn_tp_group)
         self.tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
 
-        weight_dtype = self.quantization_config.dtype or torch.get_default_dtype()
+        device = torch.get_default_device() if not meta else torch.device("meta")
+
+        weight_dtype = self.quantization_config.dtype
 
         self.weight = nn.Parameter(
             weight_tensor
             if weight_tensor is not None
-            else torch.empty(output_size, input_size, dtype=weight_dtype)
+            else torch.empty(output_size, input_size, dtype=weight_dtype, device=device)
         )
 
         self.weight.weight_loader = self.weight_loader
         if bias:
             self.bias = nn.Parameter(
-                bias_tensor if bias_tensor is not None else torch.empty(output_size)
+                bias_tensor
+                if bias_tensor is not None
+                else torch.empty(output_size, device=device)
             )
             self.bias.weight_loader = self.weight_loader
         else:
@@ -62,6 +67,7 @@ class LinearBase(nn.Module):
                     output_size // quantization_config.block_size[0],
                     input_size // quantization_config.block_size[1],
                     dtype=torch.float32,
+                    device=device,
                 )
             )
         else:
@@ -101,6 +107,7 @@ class ReplicatedLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        meta: bool = False,
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
@@ -110,6 +117,7 @@ class ReplicatedLinear(LinearBase):
             input_size,
             output_size,
             bias,
+            meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
@@ -143,7 +151,7 @@ class ReplicatedLinear(LinearBase):
             return out
         else:
             raise AttributeError(f"Unsupported Quant Method")
-        
+
 
 class ColumnParallelLinear(LinearBase):
 
@@ -152,6 +160,7 @@ class ColumnParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        meta: bool = False,
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
@@ -163,6 +172,7 @@ class ColumnParallelLinear(LinearBase):
             divide(output_size, tp_size),
             bias,
             0,
+            meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
@@ -209,6 +219,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         input_size: int,
         output_sizes: list[int],
         bias: bool = False,
+        meta: bool = False,
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
@@ -218,6 +229,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             input_size,
             sum(output_sizes),
             bias,
+            meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
@@ -257,6 +269,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
+        meta: bool = False,
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
@@ -272,6 +285,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             hidden_size,
             output_size,
             bias,
+            meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
@@ -315,6 +329,7 @@ class RowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        meta: bool = False,
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
@@ -326,6 +341,7 @@ class RowParallelLinear(LinearBase):
             output_size,
             bias,
             1,
+            meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
@@ -370,4 +386,4 @@ class RowParallelLinear(LinearBase):
             if self.tp_size > 1:
                 dist.all_reduce(out, group=get_dist_context().attn_tp_group)
             return out
-            
+

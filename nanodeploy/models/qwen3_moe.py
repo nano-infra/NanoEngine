@@ -122,6 +122,7 @@ class Qwen3MoeMLP(nn.Module):
         down_proj_tenosr: torch.Tensor | None = None,
         gate_up_scale_inv_tensor: torch.Tensor | None = None,
         down_scale_inv_tensor: torch.Tensor | None = None,
+        meta: bool = False,
         config: Qwen3MoeConfig | None = None,
         quantization_config: QuantizationConfig | None = None,
     ) -> None:
@@ -135,6 +136,7 @@ class Qwen3MoeMLP(nn.Module):
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
+            meta=meta,
             weight_tensor=gate_up_proj_tensor,
             scale_tensor=gate_up_scale_inv_tensor,
             quantization_config=quantization_config,
@@ -144,6 +146,7 @@ class Qwen3MoeMLP(nn.Module):
             intermediate_size,
             hidden_size,
             bias=False,
+            meta=meta,
             weight_tensor=down_proj_tenosr,
             scale_tensor=down_scale_inv_tensor,
             quantization_config=quantization_config,
@@ -184,7 +187,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.tp_size = dist.get_world_size(group=get_dist_context().ffn_tp_group)
 
         # global parameter for DeepGEMM
-        self.gate_up_proj_tensor = nn.Parameter(
+        self.gate_up_proj = nn.Parameter(
             torch.ones(
                 self.num_experts_per_rank,
                 config.moe_intermediate_size * 2 // self.tp_size,
@@ -194,17 +197,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             ),
         )
 
-        self.gate_up_proj_tensor_meta = nn.Parameter(
-            torch.ones(
-                self.num_experts,
-                config.moe_intermediate_size * 2 // self.tp_size,
-                config.hidden_size,
-                dtype=weight_dtype,
-                device="meta",
-            )
-        )
-
-        self.down_proj_tensor = nn.Parameter(
+        self.down_proj = nn.Parameter(
             torch.ones(
                 self.num_experts_per_rank,
                 config.hidden_size,
@@ -214,22 +207,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
         )
 
-        self.down_proj_tensor_meta = nn.Parameter(
-            torch.ones(
-                self.num_experts,
-                config.hidden_size,
-                config.moe_intermediate_size // self.tp_size,
-                dtype=weight_dtype,
-                device="meta",
-            )
-        )
         if quantization_config.quant_method == "fp8":
             self.gate_up_scale_inv = nn.Parameter(
                 torch.ones(
                     self.num_experts_per_rank,
                     config.moe_intermediate_size
                     * 2
-                    // quantization_config.block_size[0] // self.tp_size,
+                    // quantization_config.block_size[0]
+                    // self.tp_size,
                     config.hidden_size // quantization_config.block_size[1],
                     dtype=torch.float32,
                     device="cuda",
@@ -237,42 +222,28 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 * 8
             )
 
-            self.gate_up_scale_inv_meta = nn.Parameter(
-                torch.ones(
-                    self.num_experts,
-                    config.moe_intermediate_size
-                    * 2
-                    // quantization_config.block_size[0] // self.tp_size,
-                    config.hidden_size // quantization_config.block_size[1],
-                    dtype=torch.float32,
-                    device="meta",
+            self.down_scale_inv = (
+                nn.Parameter(
+                    torch.ones(
+                        self.num_experts_per_rank,
+                        config.hidden_size // quantization_config.block_size[0],
+                        config.moe_intermediate_size
+                        // quantization_config.block_size[1]
+                        // self.tp_size,
+                        dtype=torch.float32,
+                        device="cuda",
+                    )
+                    * 8
                 )
-                * 8
+                if quantization_config.quant_method == "fp8"
+                else None
             )
 
-            self.down_scale_inv = nn.Parameter(
-                torch.ones(
-                    self.num_experts_per_rank,
-                    config.hidden_size // quantization_config.block_size[0],
-                    config.moe_intermediate_size // quantization_config.block_size[1] // self.tp_size,
-                    dtype=torch.float32,
-                    device="cuda",
-                )
-                * 8
-            ) if quantization_config.quant_method == "fp8" else None
+        local_expert_id = lambda i: i - self.expert_list_this_rank[0]
+        is_local_expert = lambda i: i in self.expert_list_this_rank
 
-            self.down_scale_inv_meta = nn.Parameter(
-                torch.ones(
-                    self.num_experts,
-                    config.hidden_size // quantization_config.block_size[0],
-                    config.moe_intermediate_size // quantization_config.block_size[1] // self.tp_size,
-                    dtype=torch.float32,
-                    device="meta",
-                )
-                * 8
-            ) 
-
-        expert_id_start = self.expert_list_this_rank[0]
+        def _get_data_for_expert(i, t):
+            return t[local_expert_id(i)] if is_local_expert(i) else None
 
         self.experts = nn.ModuleList(
             [
@@ -280,29 +251,22 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                     hidden_size=config.hidden_size,
                     intermediate_size=config.moe_intermediate_size,
                     hidden_act=config.hidden_act,
-                    gate_up_proj_tensor=(
-                        self.gate_up_proj_tensor[expert_id - expert_id_start]
-                        if expert_id in self.expert_list_this_rank
-                        else self.gate_up_proj_tensor_meta[expert_id]
+                    meta=not is_local_expert(i),
+                    gate_up_proj_tensor=_get_data_for_expert(i, self.gate_up_proj),
+                    down_proj_tenosr=_get_data_for_expert(i, self.down_proj),
+                    gate_up_scale_inv_tensor=(
+                        None
+                        if quantization_config.quant_method != "fp8"
+                        else _get_data_for_expert(i, self.gate_up_scale_inv)
                     ),
-                    down_proj_tenosr=(
-                        self.down_proj_tensor[expert_id - expert_id_start]
-                        if expert_id in self.expert_list_this_rank
-                        else self.down_proj_tensor_meta[expert_id]
-                    ),
-                    gate_up_scale_inv_tensor=None if quantization_config.quant_method != "fp8" else (
-                        self.gate_up_scale_inv[expert_id - expert_id_start]
-                        if expert_id in self.expert_list_this_rank
-                        else self.gate_up_scale_inv_meta[expert_id]
-                    ),
-                    down_scale_inv_tensor=None if quantization_config.quant_method != "fp8" else (
-                        self.down_scale_inv[expert_id - expert_id_start]
-                        if expert_id in self.expert_list_this_rank
-                        else self.down_scale_inv_meta[expert_id]
+                    down_scale_inv_tensor=(
+                        None
+                        if quantization_config.quant_method != "fp8"
+                        else (_get_data_for_expert(i, self.down_scale_inv))
                     ),
                     quantization_config=self.quantization_config,
                 )
-                for expert_id in range(self.num_experts)
+                for i in range(self.num_experts)
             ]
         )
 
@@ -356,7 +320,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor):
         if self.ep_size > 1:
-            assert self.quantization_config.quant_method == "fp8", "Only FP8 EP is supported by now"
+            assert (
+                self.quantization_config.quant_method == "fp8"
+            ), "Only FP8 EP is supported by now"
             context = get_context()
             moe = self.fusedmoe_build(not context.is_prefill)
             router_logits = self.gate(hidden_states)
@@ -370,9 +336,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 routing_weights,
                 selected_experts,
-                self.gate_up_proj_tensor,
+                self.gate_up_proj,
                 self.gate_up_scale_inv,
-                self.down_proj_tensor,
+                self.down_proj,
                 self.down_scale_inv,
                 expert_list=self.expert_list_this_rank,
             )
@@ -447,14 +413,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if (layer_idx not in mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
-            self.mlp = Qwen3MoeSparseMoeBlock(config=config, quantization_config=quantization_config)
+            self.mlp = Qwen3MoeSparseMoeBlock(
+                config=config, quantization_config=quantization_config
+            )
         else:
             self.mlp = Qwen3MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 config=config,
-                quantization_config=quantization_config
+                quantization_config=quantization_config,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
