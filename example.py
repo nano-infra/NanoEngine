@@ -27,7 +27,6 @@ def main():
         "list 5 famous scientists and their contributions",
     ]
     prompts = [prompt for prompt in prompts]
-    prompts = prompts[0:512]
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],

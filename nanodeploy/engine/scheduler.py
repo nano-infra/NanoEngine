@@ -3,9 +3,8 @@ import enum
 from collections import deque
 from typing import List
 
-from nanovllm.engine.block_manager import BlockManager
-
 from nanodeploy.config import Config
+from nanodeploy.engine.block_manager import BlockManager
 from nanodeploy.engine.sequence import Sequence, SequenceStatus
 
 
@@ -65,13 +64,19 @@ class Scheduler:
         scheduled_seqs = [[] for _ in range(self.num_replica)]
         num_seqs = {replica_id: 0 for replica_id in range(self.num_replica)}
         num_batched_tokens = {replica_id: 0 for replica_id in range(self.num_replica)}
-        while self.waiting :
+        while self.waiting:
             seq = self.waiting[0]
             for i in range(self.num_replica):
                 selected_replica = self.rr_generator.__next__()
                 if num_seqs[selected_replica] >= self.max_num_seqs:
                     continue
-                if num_batched_tokens[selected_replica] + len(seq) > self.max_num_batched_tokens or not self.block_manager(selected_replica).can_allocate(seq):
+                if num_batched_tokens[selected_replica] + len(
+                    seq
+                ) > self.max_num_batched_tokens or not self.block_manager(
+                    selected_replica
+                ).can_allocate(
+                    seq
+                ):
                     continue
                 num_seqs[selected_replica] += 1
                 self.block_manager(selected_replica).allocate(seq)
@@ -88,7 +93,10 @@ class Scheduler:
 
         # decode
         for selected_replica in range(self.num_replica):
-            while self.running(selected_replica) and num_seqs[selected_replica] < self.max_num_seqs:
+            while (
+                self.running(selected_replica)
+                and num_seqs[selected_replica] < self.max_num_seqs
+            ):
                 seq = self.running(selected_replica).popleft()
                 while not self.block_manager(selected_replica).can_append(seq):
                     if self.running(selected_replica):
@@ -111,8 +119,8 @@ class Scheduler:
     def preempt(self, selected_replica: int, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager(selected_replica).deallocate(seq)
+        seq.num_prompt_tokens = len(seq.token_ids)
         self.waiting.appendleft(seq)
-        seq.num_completion_tokens
 
     def postprocess(self, seqs: List[List[Sequence]], token_ids: List[List[int]]):
         for i in range(self.num_replica):

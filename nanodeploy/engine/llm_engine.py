@@ -2,23 +2,17 @@ import atexit
 from dataclasses import fields
 from time import perf_counter
 
-import torch.multiprocessing as mp
-
-from nanovllm.engine.llm_engine import LLMEngine as NanoVLLMLLMEngine
-from nanovllm.sampling_params import SamplingParams
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from nanodeploy.config import Config
 from nanodeploy.engine.ray_executor import RayExecutor
-
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.sampling_params import SamplingParams
 
-from nanodeploy.worker.model_runner import ModelRunner
 
-
-class LLMEngine(NanoVLLMLLMEngine):
+class LLMEngine:
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
@@ -34,6 +28,9 @@ class LLMEngine(NanoVLLMLLMEngine):
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
+
+    def exit(self):
+        del self.executor
 
     def update_num_kvcache_blocks(self):
         num_kvcache_blocks = self.executor.num_kvcache_blocks()
@@ -63,3 +60,47 @@ class LLMEngine(NanoVLLMLLMEngine):
             )
             num_tokens += sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
+
+    def is_finished(self):
+        return self.scheduler.is_finished()
+
+    def generate(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool = True,
+    ) -> list[str]:
+        if use_tqdm:
+            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        for prompt, sp in zip(prompts, sampling_params):
+            self.add_request(prompt, sp)
+        outputs = {}
+        prefill_throughput = decode_throughput = 0.0
+        while not self.is_finished():
+            t = perf_counter()
+            output, num_tokens = self.step()
+            if use_tqdm:
+                if num_tokens > 0:
+                    prefill_throughput = num_tokens / (perf_counter() - t)
+                else:
+                    decode_throughput = -num_tokens / (perf_counter() - t)
+                pbar.set_postfix(
+                    {
+                        "Prefill": f"{int(prefill_throughput)}tok/s",
+                        "Decode": f"{int(decode_throughput)}tok/s",
+                    }
+                )
+            for seq_id, token_ids in output:
+                outputs[seq_id] = token_ids
+                if use_tqdm:
+                    pbar.update(1)
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        outputs = [
+            {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}
+            for token_ids in outputs
+        ]
+        if use_tqdm:
+            pbar.close()
+        return outputs

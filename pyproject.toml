@@ -17,6 +17,7 @@ dependencies = [
     "transformers>=4.51.0",
     "flash-attn",
     "xxhash",
+    "dlslime>=0.0.1.post9"
 ]
 
 [project.urls]

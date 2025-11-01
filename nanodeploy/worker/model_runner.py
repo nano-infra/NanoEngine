@@ -11,17 +11,12 @@ from flash_mla import get_mla_metadata
 from nanodeploy.config import Config
 
 from nanodeploy.engine.sequence import Sequence
-
+from nanodeploy.layers.sampler import Sampler
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
-
 from nanodeploy.worker.context import get_context, reset_context, set_context
 from nanodeploy.worker.distributed import get_dist_context, set_dist_context
-
 from nanodeploy.worker.loader import load_model
-
-from nanovllm.engine.model_runner import ModelRunner as NanoVLLMModelRunner
-from nanovllm.layers.sampler import Sampler
 
 
 architectures = {
@@ -31,7 +26,7 @@ architectures = {
 
 
 @ray.remote(num_gpus=1, num_cpus=10)
-class ModelRunner(NanoVLLMModelRunner):
+class ModelRunner:
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
@@ -74,37 +69,61 @@ class ModelRunner(NanoVLLMModelRunner):
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
 
-    @torch.inference_mode()
-    def run_model(
-        self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
-    ):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][
-                :bs, : context.block_tables.size(1)
-            ] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+    def exit(self):
+        if not self.enforce_eager:
+            del self.graphs, self.graph_pool
+        torch.cuda.synchronize()
+        dist.destroy_process_group()
 
-    def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = []
-        for seq in seqs:
-            temperatures.append(seq.temperature)
-        temperatures = torch.tensor(
-            temperatures, dtype=torch.float32, pin_memory=True
-        ).cuda(non_blocking=True)
-        return temperatures
+    def warmup_model(self):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        max_num_batched_tokens, max_model_len = (
+            self.config.max_num_batched_tokens,
+            self.config.max_model_len,
+        )
+        num_seqs = min(
+            max_num_batched_tokens // max_model_len, self.config.max_num_seqs
+        )
+        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        self.run(seqs, True)
+        torch.cuda.empty_cache()
+
+    def allocate_kv_cache(self):
+        config = self.config
+        hf_config = config.hf_config
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        num_kv_heads = hf_config.num_key_value_heads // config.tensor_parallel_size
+        block_bytes = (
+            2
+            * hf_config.num_hidden_layers
+            * self.block_size
+            * num_kv_heads
+            * hf_config.head_dim
+            * hf_config.torch_dtype.itemsize
+        )
+        config.num_kvcache_blocks = (
+            int(total * config.gpu_memory_utilization - used - peak + current)
+            // block_bytes
+        )
+        assert config.num_kvcache_blocks > 0
+        self.kv_cache = torch.empty(
+            2,
+            hf_config.num_hidden_layers,
+            config.num_kvcache_blocks,
+            self.block_size,
+            num_kv_heads,
+            hf_config.head_dim,
+        )
+        layer_id = 0
+        for module in self.model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = self.kv_cache[0, layer_id]
+                module.v_cache = self.kv_cache[1, layer_id]
+                layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -214,6 +233,38 @@ class ModelRunner(NanoVLLMModelRunner):
         )
         return input_ids, positions
 
+    def prepare_sample(self, seqs: list[Sequence]):
+        temperatures = []
+        for seq in seqs:
+            temperatures.append(seq.temperature)
+        temperatures = torch.tensor(
+            temperatures, dtype=torch.float32, pin_memory=True
+        ).cuda(non_blocking=True)
+        return temperatures
+
+    @torch.inference_mode()
+    def run_model(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
+    ):
+        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            return self.model.compute_logits(self.model(input_ids, positions))
+        else:
+            bs = input_ids.size(0)
+            context = get_context()
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph_vars = self.graph_vars
+            graph_vars["input_ids"][:bs] = input_ids
+            graph_vars["positions"][:bs] = positions
+            graph_vars["slot_mapping"].fill_(-1)
+            graph_vars["slot_mapping"][:bs] = context.slot_mapping
+            graph_vars["context_lens"].zero_()
+            graph_vars["context_lens"][:bs] = context.context_lens
+            graph_vars["block_tables"][
+                :bs, : context.block_tables.size(1)
+            ] = context.block_tables
+            graph.replay()
+            return self.model.compute_logits(graph_vars["outputs"][:bs])
+
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if not seqs:
             seq = Sequence([0])
@@ -234,20 +285,6 @@ class ModelRunner(NanoVLLMModelRunner):
             return token_ids
         else:
             return []
-
-    def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = (
-            self.config.max_num_batched_tokens,
-            self.config.max_model_len,
-        )
-        num_seqs = min(
-            max_num_batched_tokens // max_model_len, self.config.max_num_seqs
-        )
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        self.run(seqs, True)
-        torch.cuda.empty_cache()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
