@@ -386,4 +386,3 @@ class RowParallelLinear(LinearBase):
             if self.tp_size > 1:
                 dist.all_reduce(out, group=get_dist_context().attn_tp_group)
             return out
-

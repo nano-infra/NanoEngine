@@ -1,3 +1,4 @@
+import uuid
 from copy import copy
 from enum import auto, Enum
 from itertools import count
@@ -16,6 +17,8 @@ class SequenceStatus(Enum):
     RUNNING = auto()
     FINISHED = auto()
 
+    TO_BE_MIGRATED = auto()
+
 
 class Sequence:
     block_size = 256
@@ -25,7 +28,7 @@ class Sequence:
         self, token_ids: list[int], sampling_params: SamplingParams | None = None
     ):
         sampling_params = sampling_params or SamplingParams()
-        self.seq_id = next(Sequence.counter)
+        self.seq_id = str(uuid.uuid4())
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
@@ -36,6 +39,8 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+
+        self.token_ids_backup = None
 
     def __len__(self):
         return self.num_tokens

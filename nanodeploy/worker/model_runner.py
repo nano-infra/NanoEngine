@@ -44,9 +44,12 @@ class ModelRunner:
         set_dist_context(
             rank=rank,
             world_size=config.world_size,
-            dp=config.data_parallel_size,
-            tp=config.tensor_parallel_size,
-            ep=config.expert_parallel_size,
+            attention_dp=config.attention_dp,
+            attention_sp=config.attention_sp,
+            attention_tp=config.attention_tp,
+            ffn_dp=config.ffn_dp,
+            ffn_ep=config.ffn_ep,
+            ffn_tp=config.ffn_tp,
         )
 
         torch.cuda.set_device(0)
@@ -96,7 +99,7 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // config.tensor_parallel_size
+        num_kv_heads = hf_config.num_key_value_heads // config.attention_tp
         block_bytes = (
             2
             * hf_config.num_hidden_layers

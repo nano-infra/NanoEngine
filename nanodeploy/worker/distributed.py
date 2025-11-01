@@ -8,31 +8,39 @@ class DistContext:
     rank: int = 0
     world_size: int = 1
 
-    dp: int = 1
-    ep: int = 1
+    attention_dp: int = 1
+    attention_tp: int = 1
+    attention_sp: int = 1
+
+    ffn_dp: int = 1
+    ffn_ep: int = 1
+    ffn_tp: int = 1
+
     pp: int = 1
-    tp: int = 1
-    sp: int = 1
 
     @property
     def attn_dp_group(self):
-        return self.attn_device_mesh.get_group("dp")
+        return self.attn_device_mesh.get_group("attn_dp")
 
     @property
     def attn_sp_group(self):
-        return self.attn_device_mesh.get_group("sp")
+        return self.attn_device_mesh.get_group("attn_sp")
 
     @property
     def attn_tp_group(self):
-        return self.attn_device_mesh.get_group("tp")
+        return self.attn_device_mesh.get_group("attn_tp")
+
+    @property
+    def ffn_dp_group(self):
+        return self.ffn_device_mesh.get_group("ffn_dp")
 
     @property
     def ffn_ep_group(self):
-        return self.ffn_device_mesh.get_group("ep")
+        return self.ffn_device_mesh.get_group("ffn_ep")
 
     @property
     def ffn_tp_group(self):
-        return self.ffn_device_mesh.get_group("tp")
+        return self.ffn_device_mesh.get_group("ffn_tp")
 
     @property
     def cpu_world_group(self):
@@ -40,34 +48,54 @@ class DistContext:
 
     def __post_init__(self):
         self.cpu_world_mesh = init_device_mesh(
-            "cpu",
-            [self.world_size],
-            mesh_dim_names=["world"]
+            "cpu", [self.world_size], mesh_dim_names=["world"]
         )
 
         self.attn_device_mesh = init_device_mesh(
             "cuda",
-            [self.dp, self.sp, self.tp],
-            mesh_dim_names=["dp", "sp", "tp"]
+            [self.attention_dp, self.attention_sp, self.attention_tp],
+            mesh_dim_names=["attn_dp", "attn_sp", "attn_tp"],
         )
 
         self.ffn_device_mesh = init_device_mesh(
             "cuda",
-            [self.ep, self.tp],
-            mesh_dim_names=["ep", "tp"]
+            [self.ffn_dp, self.ffn_ep, self.ffn_tp],
+            mesh_dim_names=["ffn_dp", "ffn_ep", "ffn_tp"],
         )
 
+
 _DIST_CONTEXT = None
+
 
 def get_dist_context():
     return _DIST_CONTEXT
 
+
 def set_dist_context(
-    rank, world_size, dp=1, ep=1, pp=1, tp=1, sp=1):
+    rank,
+    world_size,
+    attention_dp=1,
+    attention_sp=1,
+    attention_tp=1,
+    ffn_dp=1,
+    ffn_ep=1,
+    ffn_tp=1,
+    pp=1,
+):
     global _DIST_CONTEXT
-    _DIST_CONTEXT = DistContext(rank=rank, world_size=world_size, dp=dp, ep=ep, pp=pp, tp=tp, sp=sp)
+    _DIST_CONTEXT = DistContext(
+        rank=rank,
+        world_size=world_size,
+        attention_dp=attention_dp,
+        attention_sp=attention_sp,
+        attention_tp=attention_tp,
+        ffn_dp=ffn_dp,
+        ffn_ep=ffn_ep,
+        ffn_tp=ffn_tp,
+        pp=pp,
+    )
+
 
 def reset_dist_context():
     global _CONTEXT
     _CONTEXT = DistContext()
-

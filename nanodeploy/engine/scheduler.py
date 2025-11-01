@@ -1,7 +1,5 @@
-import dataclasses
 import enum
 from collections import deque
-from typing import List
 
 from nanodeploy.config import Config
 from nanodeploy.engine.block_manager import BlockManager
@@ -17,9 +15,11 @@ class RoutingStrategy(enum.Enum):
 class WorkerState:
     def __init__(self, num_kv_cache_blocks: int, kvcache_block_size: int):
         self.running: deque[Sequence] = deque()
+        self.to_be_migrated: list[Sequence] = dict()
         self.block_manager = BlockManager(num_kv_cache_blocks, kvcache_block_size)
 
-    def is_finished(self):
+    @property
+    def is_empty(self):
         return not self.running
 
 
@@ -29,9 +29,11 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
+
+        self.waiting_migration: deque[Sequence] = deque()
         self.waiting: deque[Sequence] = deque()
 
-        self.num_replica = config.data_parallel_size
+        self.num_replica = config.attention_dp
         self.rounting_strategy = RoutingStrategy.RoundRobin
         self.worker_state = [
             WorkerState(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -41,7 +43,8 @@ class Scheduler:
         self.rr_generator = self.route_by_rr()
 
     def is_finished(self):
-        return not self.waiting and all(w.is_finished() for w in self.worker_state)
+        waiting = self.waiting
+        return not waiting and all(w.is_empty for w in self.worker_state)
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
@@ -56,17 +59,22 @@ class Scheduler:
     def running(self, selected_replica: int):
         return self.worker_state[selected_replica].running
 
+    def to_be_migrated(self, selected_replica: int):
+        return self.worker_state[selected_replica].to_be_migrated
+
     def block_manager(self, selected_replica: int):
         return self.worker_state[selected_replica].block_manager
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
-        # prefill
+    def _schedule_prefill(self) -> list[list[Sequence]]:
         scheduled_seqs = [[] for _ in range(self.num_replica)]
         num_seqs = {replica_id: 0 for replica_id in range(self.num_replica)}
         num_batched_tokens = {replica_id: 0 for replica_id in range(self.num_replica)}
-        while self.waiting:
-            seq = self.waiting[0]
-            for i in range(self.num_replica):
+
+        waiting = self.waiting
+
+        while waiting:
+            seq = waiting[0]
+            for _ in range(self.num_replica):
                 selected_replica = self.rr_generator.__next__()
                 if num_seqs[selected_replica] >= self.max_num_seqs:
                     continue
@@ -82,16 +90,17 @@ class Scheduler:
                 self.block_manager(selected_replica).allocate(seq)
                 num_batched_tokens[selected_replica] += len(seq) - seq.num_cached_tokens
                 seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
+                waiting.popleft()
                 self.running(selected_replica).append(seq)
                 scheduled_seqs[selected_replica].append(seq)
                 break
             else:
                 break
-        if any(scheduled_seqs):
-            return scheduled_seqs, True
+        return scheduled_seqs
 
-        # decode
+    def _schedule_decode(self) -> list[list[Sequence]]:
+        scheduled_seqs = [[] for _ in range(self.num_replica)]
+        num_seqs = {replica_id: 0 for replica_id in range(self.num_replica)}
         for selected_replica in range(self.num_replica):
             while (
                 self.running(selected_replica)
@@ -113,7 +122,20 @@ class Scheduler:
             self.running(selected_replica).extendleft(
                 reversed(scheduled_seqs[selected_replica])
             )
+        return scheduled_seqs
+
+    def schedule(self) -> tuple[list[Sequence], bool]:
+        # prefill
+        scheduled_seqs = self._schedule_prefill()
+
+        if any(scheduled_seqs):
+            return scheduled_seqs, True
+
+        # decode
+        scheduled_seqs = self._schedule_decode()
+
         assert any(scheduled_seqs)
+
         return scheduled_seqs, False
 
     def preempt(self, selected_replica: int, seq: Sequence):
@@ -122,7 +144,11 @@ class Scheduler:
         seq.num_prompt_tokens = len(seq.token_ids)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: List[List[Sequence]], token_ids: List[List[int]]):
+    def postprocess(
+        self,
+        seqs: list[list[Sequence]],
+        token_ids: list[list[int]]
+    ):
         for i in range(self.num_replica):
             for seq, token_id in zip(seqs[i], token_ids[i]):
                 seq.append_token(token_id)

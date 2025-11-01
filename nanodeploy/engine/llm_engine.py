@@ -1,6 +1,8 @@
 import atexit
+import uuid
 from dataclasses import fields
 from time import perf_counter
+from typing import Literal
 
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -9,14 +11,18 @@ from nanodeploy.config import Config
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
-from nanodeploy.sampling_params import SamplingParams
 
 
 class LLMEngine:
     def __init__(self, model, **kwargs):
+        self.engine_id = str(uuid.uuid4())
+
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+
+        assert config.mode == "hybrid"
+
         self.config = config
         self.ps = []
         self.events = []
@@ -37,16 +43,23 @@ class LLMEngine:
         self.config.num_kvcache_blocks = min(num_kvcache_blocks)
         print(f"kvcache blocks number updated, {self.config.num_kvcache_blocks=}")
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
-        self.scheduler.add(seq)
+    def add_request(self, seqs: Sequence | list[Sequence]):
+        if isinstance(seqs, Sequence):
+            seqs = [seqs]
+        for seq in seqs:
+            self.scheduler.add(seq)
+
+    def prefill(self) -> None:
+        tp_size = self.config.attention_tp
+        dp_seqs = self.scheduler._schedule_prefill()
+        token_ids = self.executor.run(dp_seqs, True)[::tp_size]
+        self.scheduler.postprocess(dp_seqs, token_ids)
+        return
 
     def step(self):
-        dp_stride = self.config.tensor_parallel_size
+        tp_size = self.config.attention_tp
         dp_seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.executor.run(dp_seqs, is_prefill)[::dp_stride]
+        token_ids = self.executor.run(dp_seqs, is_prefill)[::tp_size]
         self.scheduler.postprocess(dp_seqs, token_ids)
         outputs = []
         num_tokens = 0
@@ -66,18 +79,15 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
-        sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-    ) -> list[str]:
+    ) -> None:
+        num_reqs = len(self.scheduler.waiting)
         if use_tqdm:
-            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
-        if not isinstance(sampling_params, list):
-            sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+            pbar = tqdm(total=num_reqs, desc="Generating", dynamic_ncols=True)
+
         outputs = {}
         prefill_throughput = decode_throughput = 0.0
+
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
@@ -96,11 +106,6 @@ class LLMEngine:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [
-            {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}
-            for token_ids in outputs
-        ]
         if use_tqdm:
             pbar.close()
-        return outputs
+        return
