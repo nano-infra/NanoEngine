@@ -14,6 +14,7 @@ from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
+from nanodeploy.worker.cache import get_cache_context, set_cache_context
 from nanodeploy.worker.context import get_context, reset_context, set_context
 from nanodeploy.worker.distributed import get_dist_context, set_dist_context
 from nanodeploy.worker.loader import load_model
@@ -30,7 +31,6 @@ class ModelRunner:
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
-        self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.world_size
         self.rank = rank
@@ -95,37 +95,24 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // config.attention_tp
-        block_bytes = (
-            2
-            * hf_config.num_hidden_layers
-            * self.block_size
-            * num_kv_heads
-            * hf_config.head_dim
-            * hf_config.torch_dtype.itemsize
+
+        cache_context = set_cache_context(
+            num_kv_heads=hf_config.num_key_value_heads,
+            head_dim=hf_config.head_dim,
+            block_size=config.kvcache_block_size,
+            num_hidden_layers=hf_config.num_hidden_layers,
+            attention_tp=config.attention_tp,
+            gpu_memory_utilization=config.gpu_memory_utilization,
+            device=torch.get_default_device(),
+            dtype=torch.get_default_dtype(),
+            mode="gqa",
         )
-        config.num_kvcache_blocks = (
-            int(total * config.gpu_memory_utilization - used - peak + current)
-            // block_bytes
-        )
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(
-            2,
-            hf_config.num_hidden_layers,
-            config.num_kvcache_blocks,
-            self.block_size,
-            num_kv_heads,
-            hf_config.head_dim,
-        )
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
+                module.k_cache = cache_context.kv_cache[0, layer_id]
+                module.v_cache = cache_context.kv_cache[1, layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -168,9 +155,9 @@ class ModelRunner:
             if not seq.block_table:  # warmup
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
+                start = seq.block_table[i] * get_cache_context().block_size
                 if i != seq.num_blocks - 1:
-                    end = start + self.block_size
+                    end = start + get_cache_context().block_size
                 else:
                     end = start + seq.last_block_num_tokens
                 slot_mapping.extend(list(range(start, end)))
@@ -213,7 +200,9 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(
-                seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+                seq.block_table[-1] * get_cache_context().block_size
+                + seq.last_block_num_tokens
+                - 1
             )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
@@ -294,7 +283,8 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        block_size = get_cache_context().block_size
+        max_num_blocks = (config.max_model_len + block_size - 1) // block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
