@@ -1,7 +1,12 @@
 import dataclasses
 from typing import Literal
 
+import dlslime
+
 import torch
+import torch.distributed as dist
+
+from nanodeploy.engine.sequence import Sequence
 
 
 @dataclasses.dataclass
@@ -24,6 +29,9 @@ class CacheContext:
 
     num_kvcache_blocks = -1
     kv_cache: torch.Tensor = None
+
+    selected_nic: str
+    endpoints: dict[str, dict[int, dlslime.RDMAEndpoint]] = None
 
     @property
     def num_local_kv_heads(self):
@@ -63,6 +71,23 @@ class CacheContext:
             self.num_local_kv_heads,
             self.head_dim,
         )
+
+        available_nics = dlslime.available_nic()
+        self.selected_nic = available_nics[dist.get_rank() % len(available_nics)]
+
+        self.endpoints = {}
+
+    def init_endpoints(self, remote_engine_name: str, remote_world_size: int):
+        # init endpoint
+        # register memory region
+
+        raise NotImplementedError
+
+    def connect(self, remote_engine_name: str, endpoint_info: dict[int, dict]):
+        raise NotImplementedError
+
+    def migrate(self, seqs: list[Sequence]):
+        raise NotImplementedError
 
 
 _CACHE_CONTEXT = None
