@@ -31,11 +31,11 @@ repos:
         args: ["--skip=docs/imgs/*,csrc/json.hpp,csrc/python/pybind_json/pybind_json.hpp"]
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v18.1.6  # 可根据需要指定最新版本
+    rev: v18.1.6
     hooks:
       - id: clang-format
-        args: ["--style=file"]  # 关键：指定使用当前目录的 .clang-format 文件
-        files: \.(cpp|hpp|c|h|cu|cuh)$  # 匹配 C++ 和 CUDA 文件
+        args: ["--style=file"]
+        files: \.(cpp|hpp|c|h|cu|cuh)$
 
   # - repo: https://github.com/myint/docformatter
   #   rev: v1.4
