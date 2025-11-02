@@ -96,11 +96,3 @@ def set_cache_context(
         mode=mode,
     )
     return _CACHE_CONTEXT
-
-
-class EPBufferContext:
-    pass
-
-
-class SPBufferContext:
-    pass
