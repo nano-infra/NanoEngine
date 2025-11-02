@@ -1,6 +1,6 @@
 import os
-from typing import Literal
 from dataclasses import dataclass
+from typing import Literal
 
 from transformers import AutoConfig
 

@@ -36,15 +36,15 @@ def main():
 
     seqs = [
         Sequence(
-                llm.tokenizer.encode(
-                    llm.tokenizer.apply_chat_template(
-                        [{"role": "user", "content": prompt}],
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
+            llm.tokenizer.encode(
+                llm.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
                 )
             )
-            for prompt in prompts
+        )
+        for prompt in prompts
     ]
     llm.add_request(seqs)
     llm.generate()

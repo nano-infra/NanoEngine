@@ -6,7 +6,7 @@ class QuantizationConfig:
         self.quant_method = kwargs.get("quant_method", None)
         self.fmt = kwargs.get("fmt", None)
 
-        # configuration for block-wise quantization 
+        # configuration for block-wise quantization
         self.block_size = kwargs.get("weight_block_size", list())
 
     @property

@@ -144,11 +144,7 @@ class Scheduler:
         seq.num_prompt_tokens = len(seq.token_ids)
         self.waiting.appendleft(seq)
 
-    def postprocess(
-        self,
-        seqs: list[list[Sequence]],
-        token_ids: list[list[int]]
-    ):
+    def postprocess(self, seqs: list[list[Sequence]], token_ids: list[list[int]]):
         for i in range(self.num_replica):
             for seq, token_id in zip(seqs[i], token_ids[i]):
                 seq.append_token(token_id)

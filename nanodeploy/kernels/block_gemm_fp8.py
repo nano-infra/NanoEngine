@@ -100,7 +100,12 @@ def _quant_fp8_launcher(A: Tensor, group_size: int, out: Tensor, scales: Tensor)
     return out, scales
 
 
-def quant_fp8(A: Tensor, group_size: int, dtype: torch.dtype = torch.float8_e4m3fn, trans_scale: bool = False):
+def quant_fp8(
+    A: Tensor,
+    group_size: int,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+    trans_scale: bool = False,
+):
     """Quant fp8."""
     assert A.dim() == 2
     M, K = A.shape
@@ -117,6 +122,7 @@ def quant_fp8(A: Tensor, group_size: int, dtype: torch.dtype = torch.float8_e4m3
 def quant_fp8_tma(A: Tensor, group_size: int, dtype: torch.dtype = torch.float8_e4m3fn):
     """Quant fp8 tma."""
     from deep_gemm import ceil_div, get_m_alignment_for_contiguous_layout
+
     assert A.dim() == 2
     M, K = A.shape
     assert K % group_size == 0
@@ -127,17 +133,20 @@ def quant_fp8_tma(A: Tensor, group_size: int, dtype: torch.dtype = torch.float8_
     scales = A.new_empty(num_groups, aligned_M, dtype=torch.float32).T
     return _quant_fp8_launcher(A, group_size, out, scales)
 
-def deep_gemm_fp8(A: Tensor,
-                  A_scale: Tensor,
-                  B: Tensor,
-                  B_scale: torch.Tensor,
-                  out_dtype: torch.dtype = torch.bfloat16):
+
+def deep_gemm_fp8(
+    A: Tensor,
+    A_scale: Tensor,
+    B: Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+):
     """Deepgemm fp8."""
     from deep_gemm import gemm_fp8_fp8_bf16_nt
+
     M, _ = A.shape
     N, _ = B.shape
-    assert out_dtype == torch.bfloat16, 'DeepGemm requires bf16 output.'
+    assert out_dtype == torch.bfloat16, "DeepGemm requires bf16 output."
     C = A.new_empty(M, N, dtype=out_dtype)
     gemm_fp8_fp8_bf16_nt((A, A_scale), (B, B_scale), C)
     return C
-
