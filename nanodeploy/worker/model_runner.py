@@ -1,4 +1,4 @@
-import pickle
+import os
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
 
@@ -32,18 +32,18 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.world_size
+        self.world_size = config.attn_world_size
         self.rank = rank
         self.event = event
 
         # set context
         dist.init_process_group(
-            "nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank
+            "cpu:gloo,cuda:nccl", "tcp://10.102.207.84:2333", world_size=self.world_size, rank=rank
         )
 
         set_dist_context(
             rank=rank,
-            world_size=config.world_size,
+            world_size=config.attn_world_size,
             attention_dp=config.attention_dp,
             attention_sp=config.attention_sp,
             attention_tp=config.attention_tp,
@@ -71,6 +71,14 @@ class ModelRunner:
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
+
+    def p2p_init(self, remote_engine_id, remote_engine_world_size):
+        return get_cache_context().p2p_init(remote_engine_id, remote_engine_world_size)
+
+    def p2p_connect(
+        self, remote_engine_id: str, endpoints_info_list: list[dict[int, dict]]
+    ):
+        return get_cache_context().p2p_connect(remote_engine_id, endpoints_info_list)
 
     def exit(self):
         if not self.enforce_eager:

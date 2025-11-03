@@ -17,7 +17,8 @@ class RayExecutor:
         ray.init(address=config.ray_address, ignore_reinit_error=True)
 
         self.workers = []
-        for global_rank in range(config.world_size):
+        assert config.attn_world_size == config.ffn_world_size
+        for global_rank in range(config.attn_world_size):
             self.workers.append(ModelRunner.remote(config, global_rank, None))
 
     def collective_rpc(
@@ -55,6 +56,9 @@ class RayExecutor:
 
     def num_kvcache_blocks(self):
         return self.collective_rpc("num_kvcache_blocks")
+
+    def p2p_init(self, remote_name: str, remote_world_size: int):
+        return self.collective_rpc("p2p_init", (remote_name, remote_world_size))
 
     def gather_free_mem(self):
         """Get free memory."""

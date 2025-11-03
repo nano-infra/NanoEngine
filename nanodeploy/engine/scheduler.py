@@ -15,7 +15,7 @@ class RoutingStrategy(enum.Enum):
 class WorkerState:
     def __init__(self, num_kv_cache_blocks: int, kvcache_block_size: int):
         self.running: deque[Sequence] = deque()
-        self.to_be_migrated: list[Sequence] = dict()
+        self.to_be_migrated: dict[str, Sequence] = dict()
         self.block_manager = BlockManager(num_kv_cache_blocks, kvcache_block_size)
 
     @property
@@ -40,6 +40,7 @@ class Scheduler:
             for _ in range(self.num_replica)
         ]
 
+        self.mode = config.mode
         self.rr_generator = self.route_by_rr()
 
     def is_finished(self):
@@ -47,7 +48,10 @@ class Scheduler:
         return not waiting and all(w.is_empty for w in self.worker_state)
 
     def add(self, seq: Sequence):
-        self.waiting.append(seq)
+        if self.mode == "decode":
+            self.waiting_migration.append(seq)
+        else:
+            self.waiting.append(seq)
 
     def route_by_rr(self):
         if not hasattr(self, "selected_replica"):
@@ -70,7 +74,7 @@ class Scheduler:
         num_seqs = {replica_id: 0 for replica_id in range(self.num_replica)}
         num_batched_tokens = {replica_id: 0 for replica_id in range(self.num_replica)}
 
-        waiting = self.waiting
+        waiting = self.waiting if self.mode != "decode" else self.waiting_migration
 
         while waiting:
             seq = waiting[0]
@@ -154,3 +158,7 @@ class Scheduler:
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager(i).deallocate(seq)
                     self.running(i).remove(seq)
+                elif self.mode == "prefill":
+                    seq.status = SequenceStatus.TO_BE_MIGRATED
+                    self.running(i).remove(seq)
+                    self.to_be_migrated(i)[seq.seq_id] = seq

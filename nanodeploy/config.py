@@ -8,10 +8,10 @@ from transformers import AutoConfig
 @dataclass
 class Config:
     model: str
-    max_num_batched_tokens: int = 16384
-    max_num_seqs: int = 512
-    max_model_len: int = 16384
-    gpu_memory_utilization: float = 0.9
+    max_num_batched_tokens: int = 8192
+    max_num_seqs: int = 128
+    max_model_len: int = 8192
+    gpu_memory_utilization: float = 0.6
     attention_tp: int = 1
     attention_sp: int = 1
     attention_dp: int = 1
@@ -42,5 +42,9 @@ class Config:
         assert self.max_num_batched_tokens >= self.max_model_len
 
     @property
-    def world_size(self):
-        return self.attention_tp * self.attention_dp
+    def attn_world_size(self):
+        return self.attention_dp * self.attention_sp * self.attention_tp
+
+    @property
+    def ffn_world_size(self):
+        return self.ffn_dp * self.ffn_ep * self.ffn_tp

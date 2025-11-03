@@ -30,7 +30,7 @@ class CacheContext:
     num_kvcache_blocks = -1
     kv_cache: torch.Tensor = None
 
-    selected_nic: str
+    selected_nic: str | None = None
     endpoints: dict[str, dict[int, dlslime.RDMAEndpoint]] = None
 
     @property
@@ -74,20 +74,39 @@ class CacheContext:
 
         available_nics = dlslime.available_nic()
         self.selected_nic = available_nics[dist.get_rank() % len(available_nics)]
+        assert self.selected_nic
 
         self.endpoints = {}
 
-    def init_endpoints(self, remote_engine_name: str, remote_world_size: int):
+    def p2p_init(
+        self, remote_engine_name: str, remote_world_size: int
+    ) -> dict[int, dict]:
         # init endpoint
         # register memory region
+        endpoints = self.endpoints[remote_engine_name] = {}
+        endpoints_info = {}
+        for i in range(remote_world_size):
+            endpoint = dlslime.RDMAEndpoint(self.selected_nic, qp_num=2)
+            endpoint.register_memory_region(
+                mr_key="kv",
+                addr=self.kv_cache.data_ptr(),
+                offset=self.kv_cache.storage_offset(),
+                length=self.kv_cache.numel() * self.kv_cache.itemsize,
+            )
+            endpoint_info = endpoint.endpoint_info
+            endpoints[i] = endpoint
+            endpoints_info[i] = endpoint_info
+        return endpoints_info
 
-        raise NotImplementedError
-
-    def connect(self, remote_engine_name: str, endpoint_info: dict[int, dict]):
-        raise NotImplementedError
+    def p2p_connect(
+        self, remote_engine_id: str, endpoints_info_list: list[dict[int, dict]]
+    ):
+        for i in endpoints_info_list:
+            endpoint_info = endpoints_info_list[i][dist.get_rank()]
+            self.endpoints[remote_engine_id][i].connect(endpoint_info)
 
     def migrate(self, seqs: list[Sequence]):
-        raise NotImplementedError
+        print("dummy migration")
 
 
 _CACHE_CONTEXT = None

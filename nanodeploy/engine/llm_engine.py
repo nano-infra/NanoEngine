@@ -77,6 +77,9 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
+    def p2p_init(self, remote_engine_name: str, remote_world_size):
+        return self.executor.p2p_init(remote_engine_name, remote_world_size)
+
     def generate(
         self,
         use_tqdm: bool = True,
