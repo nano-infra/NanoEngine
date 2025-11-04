@@ -52,6 +52,10 @@ class ModelRunner:
             ffn_tp=config.ffn_tp,
         )
 
+        if get_dist_context().ffn_ep_group.size() > 1:
+            import deep_ep
+            deep_ep.Buffer.num_sms = 16
+
         torch.cuda.set_device(0)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)

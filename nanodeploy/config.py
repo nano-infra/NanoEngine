@@ -9,7 +9,7 @@ from transformers import AutoConfig
 class Config:
     model: str
     max_num_batched_tokens: int = 8192
-    max_num_seqs: int = 128
+    max_num_seqs: int = 256
     max_model_len: int = 8192
     gpu_memory_utilization: float = 0.6
     attention_tp: int = 1

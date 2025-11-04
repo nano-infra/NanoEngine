@@ -22,7 +22,7 @@ def main():
         ffn_tp=1,
     )
 
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=False)
+    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=True)
     prompts = [
         "你好",
         "how to bake a chocolate cake from scratch",
@@ -32,15 +32,7 @@ def main():
         "how to bake a chocolate cake from scratch",
         "what are the benefits of meditation",
         "list 5 famous scientists and their contributions",
-        "你好",
-        "how to bake a chocolate cake from scratch",
-        "what are the benefits of meditation",
-        "list 5 famous scientists and their contributions",
-        "explain quantum computing in simple terms",
-        "how to bake a chocolate cake from scratch",
-        "what are the benefits of meditation",
-        "list 5 famous scientists and their contributions",
-    ]
+    ] * 256
 
     seqs = [
         Sequence(
@@ -61,8 +53,8 @@ def main():
     for prompt, seq in zip(prompts, seqs):
         token_ids = seq.completion_token_ids
         output = {"text": llm.tokenizer.decode(token_ids), "token_ids": token_ids}
-        print(f"Prompt: {prompt!r}")
-        print(f"Completion: {output['text']!r}")
+        # print(f"Prompt: {prompt!r}")
+        # print(f"Completion: {output['text']!r}")
 
 
 if __name__ == "__main__":
