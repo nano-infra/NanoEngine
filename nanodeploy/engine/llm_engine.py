@@ -61,8 +61,9 @@ class LLMEngine:
         dp_seqs, is_prefill = self.scheduler.schedule()
         if is_prefill and self.config.mode == "decode":
             self.executor.migrate(dp_seqs)
-        token_ids = self.executor.run(dp_seqs, is_prefill)[::tp_size]
-        self.scheduler.postprocess(dp_seqs, token_ids)
+        else:
+            token_ids = self.executor.run(dp_seqs, is_prefill)[::tp_size]
+            self.scheduler.postprocess(dp_seqs, token_ids)
         outputs = []
         num_tokens = 0
         for seqs in dp_seqs:
