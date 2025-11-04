@@ -167,7 +167,7 @@ class Scheduler:
                     seq.status = SequenceStatus.TO_BE_MIGRATED
                     seq.backup_block_table = seq.active_block_table
                     seq.active_block_table = []
-                    seq.current_checkpointed_tokens = len(seq.token_ids)
+                    seq.backup_engine_id = seq.active_engine_id
                     self.running(i).remove(seq)
                     self.to_be_migrated[seq.seq_id] = (seq, [i])
 

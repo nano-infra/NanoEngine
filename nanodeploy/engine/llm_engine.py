@@ -22,6 +22,7 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
 
         self.config = config
+        self.config.engine_id = self.engine_id
         self.ps = []
         self.events = []
 
@@ -44,6 +45,7 @@ class LLMEngine:
         if isinstance(seqs, Sequence):
             seqs = [seqs]
         for seq in seqs:
+            seq.set_engine_id(self.engine_id)
             self.scheduler.add(seq)
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):

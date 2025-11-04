@@ -17,7 +17,7 @@ def load_model(model: nn.Module, path: str):
 
     # 获取所有权重文件并初始化进度条（按文件数量）
     weight_files = glob(os.path.join(path, "*.safetensors"))
-    pbar = tqdm(weight_files, desc="Loading weights", unit="file")
+    pbar = tqdm(weight_files, desc="Loading weights", unit="files")
 
     try:
         for file in pbar:  # 直接迭代文件列表，进度条按文件计数

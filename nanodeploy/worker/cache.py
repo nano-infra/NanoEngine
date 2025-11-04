@@ -75,7 +75,13 @@ class CacheContext:
         self.num_remote_kvcache_blocks = {}
 
     def block_stride(self, block_idx: int):
-        return block_idx * self.block_size * self.num_kv_heads * self.head_dim
+        return (
+            block_idx
+            * self.block_size
+            * self.num_kv_heads
+            * self.head_dim
+            * self.dtype.itemsize
+        )
 
     def local_layer_stride(self, layer_idx: int, block_idx: int):
         return (
@@ -151,27 +157,30 @@ class CacheContext:
             for remote_block_idx, source_block_idx in zip(
                 seq.backup_block_table, seq.active_block_table
             ):
-                for layer_idx in range(self.num_hidden_layers):
-                    for kv_idx in range(self.kv_cache.size(0)):
-                        assigns[list(self.endpoints.keys())[0]][
+                for kv_idx in range(self.kv_cache.size(0)):
+                    for layer_idx in range(self.num_hidden_layers):
+                        assignment = Assignment(
+                            mr_key="kv",
+                            target_offset=self.remote_kv_stride(
+                                kv_idx,
+                                layer_idx,
+                                remote_block_idx,
+                                seq.backup_engine_id,
+                            ),
+                            source_offset=self.local_kv_stride(
+                                kv_idx, layer_idx, source_block_idx
+                            ),
+                            length=self.block_stride(1),
+                        )
+                        assigns[seq.backup_engine_id][
                             seq.backup_selected_replica
-                        ].append(
-                            Assignment(
-                                mr_key="kv",
-                                target_offset=self.remote_kv_stride(
-                                    kv_idx,
-                                    layer_idx,
-                                    remote_block_idx,
-                                    list(self.endpoints.keys())[0],
-                                ),
-                                source_offset=self.local_kv_stride(
-                                    kv_idx, layer_idx, source_block_idx
-                                ),
-                                length=self.block_stride(1),
-                            )
+                        ].append(assignment)
+                        print(
+                            f"{assignment=}, {kv_idx=}, {layer_idx=}, {remote_block_idx=}, {source_block_idx=}, {self.block_stride(1)=}"
                         )
 
             futures = []
+            print(f"{assigns=}")
             for endpoint_key, endpoint_assign_batch in assigns.items():
                 for replica_key, assign_batch in endpoint_assign_batch.items():
                     futures.append(

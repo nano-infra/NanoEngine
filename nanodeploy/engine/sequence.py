@@ -26,7 +26,10 @@ class Sequence:
     counter = count()
 
     def __init__(
-        self, token_ids: list[int], sampling_params: SamplingParams | None = None
+        self,
+        token_ids: list[int],
+        sampling_params: SamplingParams | None = None,
+        engine_id: str | None = None,
     ):
         sampling_params = sampling_params or SamplingParams()
         self.seq_id = str(uuid.uuid4())
@@ -42,12 +45,19 @@ class Sequence:
         self.active_selected_replica: int | None = None
         self.backup_selected_replica: int | None = None
 
+        self.active_engine_id: str | None = engine_id
+        self.backup_engine_id: str | None = engine_id
+
         self.backup_block_table = []
         self.active_block_table = []
 
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+
+    def set_engine_id(self, engine_id: str):
+        self.backup_engine_id = self.active_engine_id
+        self.active_engine_id = engine_id
 
     def __len__(self):
         return self.num_tokens
@@ -101,6 +111,8 @@ class Sequence:
             self.backup_block_table,
             self.active_selected_replica,
             self.backup_selected_replica,
+            self.active_engine_id,
+            self.backup_engine_id,
             self.temperature,
             (
                 self.token_ids
@@ -118,6 +130,8 @@ class Sequence:
             self.backup_block_table,
             self.active_selected_replica,
             self.backup_selected_replica,
+            self.active_engine_id,
+            self.backup_engine_id,
             self.temperature,
         ) = state[:-1]
         if self.num_generated_tokens_since_checkpoint == 0:
