@@ -41,6 +41,19 @@ class RayExecutor:
             timeout=timeout,
         )
 
+    def migrate(
+        self, dp_seqs: List[List[Sequence]], timeout: float | None = None
+    ) -> list[int]:
+        tp_size = self.config.attention_tp
+        dp_seqs = [num for num in dp_seqs for _ in range(tp_size)]
+        return ray.get(
+            [
+                getattr(worker, "migrate").remote(seqs)
+                for seqs, worker in zip(dp_seqs, self.workers)
+            ],
+            timeout=timeout,
+        )
+
     def run(
         self, dp_seqs: List[List[Sequence]], is_prefill: bool, timeout: float = None
     ) -> list[int]:
@@ -54,11 +67,18 @@ class RayExecutor:
             timeout=timeout,
         )
 
-    def num_kvcache_blocks(self):
-        return self.collective_rpc("num_kvcache_blocks")
+    def update_kvcache_blocks(self):
+        num_cache_blocks = min(self.collective_rpc("num_kvcache_blocks"))
+        self.collective_rpc("allocate_kvcache", (num_cache_blocks,))
+        return num_cache_blocks
 
-    def p2p_init(self, remote_name: str, remote_world_size: int):
-        return self.collective_rpc("p2p_init", (remote_name, remote_world_size))
+    def p2p_init(self, remote_name: str, num_kv_blocks: int, remote_world_size: int):
+        return self.collective_rpc(
+            "p2p_init", (remote_name, num_kv_blocks, remote_world_size)
+        )
+
+    def p2p_connect(self, remote_name: str, remote_endpoint_infos: list[list[dict]]):
+        return self.collective_rpc("p2p_connect", (remote_name, remote_endpoint_infos))
 
     def gather_free_mem(self):
         """Get free memory."""

@@ -37,8 +37,7 @@ class LLMEngine:
         del self.executor
 
     def update_num_kvcache_blocks(self):
-        num_kvcache_blocks = self.executor.num_kvcache_blocks()
-        self.config.num_kvcache_blocks = min(num_kvcache_blocks)
+        self.config.num_kvcache_blocks = self.executor.update_kvcache_blocks()
         print(f"kvcache blocks number updated, {self.config.num_kvcache_blocks=}")
 
     def add_request(self, seqs: Sequence | list[Sequence]):
@@ -60,6 +59,8 @@ class LLMEngine:
     def step(self):
         tp_size = self.config.attention_tp
         dp_seqs, is_prefill = self.scheduler.schedule()
+        if is_prefill and self.config.mode == "decode":
+            self.executor.migrate(dp_seqs)
         token_ids = self.executor.run(dp_seqs, is_prefill)[::tp_size]
         self.scheduler.postprocess(dp_seqs, token_ids)
         outputs = []
@@ -78,8 +79,17 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
-    def p2p_init(self, remote_engine_name: str, remote_world_size):
-        return self.executor.p2p_init(remote_engine_name, remote_world_size)
+    def p2p_init(
+        self, remote_engine_name: str, num_kv_blocks: int, remote_world_size: int
+    ):
+        return self.executor.p2p_init(
+            remote_engine_name, num_kv_blocks, remote_world_size
+        )
+
+    def p2p_connect(
+        self, remote_engine_name: str, remote_endpoint_infos: list[dict[int, dict]]
+    ):
+        return self.executor.p2p_connect(remote_engine_name, remote_endpoint_infos)
 
     def generate(
         self,

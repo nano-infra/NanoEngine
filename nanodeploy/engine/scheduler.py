@@ -94,6 +94,8 @@ class Scheduler:
                 ):
                     continue
                 num_seqs[selected_replica] += 1
+                seq.backup_selected_replica = seq.active_selected_replica
+                seq.active_selected_replica = selected_replica
                 self.block_manager(selected_replica).allocate(seq)
                 num_batched_tokens[selected_replica] += len(seq) - seq.num_cached_tokens
                 seq.status = SequenceStatus.RUNNING
@@ -131,7 +133,7 @@ class Scheduler:
             )
         return scheduled_seqs
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule(self) -> tuple[list[list[Sequence]], bool]:
         # prefill
         scheduled_seqs = self._schedule_prefill()
 
@@ -148,7 +150,7 @@ class Scheduler:
     def preempt(self, selected_replica: int, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager(selected_replica).deallocate(seq)
-        seq.current_active_tokens = len(seq.token_ids)
+        seq.current_checkpointed_tokens = len(seq.token_ids)
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[list[Sequence]], token_ids: list[list[int]]):
@@ -165,7 +167,7 @@ class Scheduler:
                     seq.status = SequenceStatus.TO_BE_MIGRATED
                     seq.backup_block_table = seq.active_block_table
                     seq.active_block_table = []
-                    seq.current_active_tokens = len(seq.token_ids)
+                    seq.current_checkpointed_tokens = len(seq.token_ids)
                     self.running(i).remove(seq)
                     self.to_be_migrated[seq.seq_id] = (seq, [i])
 

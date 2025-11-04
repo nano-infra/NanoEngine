@@ -27,7 +27,7 @@ class Config:
     mode: Literal["prefill", "decode", "hybrid"] = "hybrid"
 
     master_address: str | None = "127.0.0.1:6006"
-    ray_address: str | None = "10.102.207.84:6379"
+    ray_address: str | None = "10.102.207.84:7007"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

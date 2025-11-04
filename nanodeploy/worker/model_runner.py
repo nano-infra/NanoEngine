@@ -61,8 +61,8 @@ class ModelRunner:
             deep_ep.Buffer.num_sms = 16
 
         torch.cuda.set_device(0)
-        default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        self.default_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
 
         model_architecture = hf_config.architectures[0]
@@ -71,17 +71,30 @@ class ModelRunner:
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+        self.preallocate_kvcache()
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
 
-    def p2p_init(self, remote_engine_id, remote_engine_world_size):
-        return get_cache_context().p2p_init(remote_engine_id, remote_engine_world_size)
+    def allocate_kvcache(self, num_kvcache_blocks: int):
+        self.config.num_kvcache_blocks = num_kvcache_blocks
+        cache_context = get_cache_context()
+        cache_context.allocate_kvcache(num_kvcache_blocks)
+        layer_id = 0
+        for module in self.model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = cache_context.kv_cache[0, layer_id]
+                module.v_cache = cache_context.kv_cache[1, layer_id]
+                layer_id += 1
+        if not self.enforce_eager:
+            self.capture_cudagraph()
+        torch.set_default_device("cpu")
+        torch.set_default_dtype(self.default_dtype)
+
+    def p2p_init(self, remote_engine_id, num_kv_blocks, remote_engine_world_size):
+        return get_cache_context().p2p_init(
+            remote_engine_id, num_kv_blocks, remote_engine_world_size
+        )
 
     def p2p_connect(
         self, remote_engine_id: str, endpoints_info_list: list[dict[int, dict]]
@@ -108,7 +121,7 @@ class ModelRunner:
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
-    def allocate_kv_cache(self):
+    def preallocate_kvcache(self):
         config = self.config
         hf_config = config.hf_config
 
@@ -123,13 +136,7 @@ class ModelRunner:
             dtype=torch.get_default_dtype(),
             mode="gqa",
         )
-
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = cache_context.kv_cache[0, layer_id]
-                module.v_cache = cache_context.kv_cache[1, layer_id]
-                layer_id += 1
+        config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.active_block_table) for seq in seqs)
@@ -273,6 +280,9 @@ class ModelRunner:
             ] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+    def migrate(self, seqs: list[Sequence]) -> None:
+        get_cache_context().migrate(seqs=seqs)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if not seqs:

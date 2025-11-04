@@ -39,11 +39,19 @@ def main():
     )
 
     prefill_endpoints_info = prefill.p2p_init(
-        decode.engine_id, decode.config.attn_world_size
+        decode.engine_id,
+        decode.config.num_kvcache_blocks,
+        decode.config.attn_world_size,
     )
+
     decode_endpoints_info = decode.p2p_init(
-        prefill.engine_id, prefill.config.attn_world_size
+        prefill.engine_id,
+        prefill.config.num_kvcache_blocks,
+        prefill.config.attn_world_size,
     )
+
+    prefill.p2p_connect(decode.engine_id, decode_endpoints_info)
+    decode.p2p_connect(prefill.engine_id, prefill_endpoints_info)
 
     print(f"{prefill_endpoints_info}, {decode_endpoints_info}")
 
@@ -80,12 +88,6 @@ def main():
     decode.generate()
 
     prefill.free_to_be_migrated(seqs)
-
-    print([(seq.seq_id, seq.status) for seq in seqs])
-    print(
-        len(prefill.scheduler.block_manager(0).free_block_ids),
-        len(prefill.scheduler.block_manager(0).blocks),
-    )
 
     for prompt, seq in zip(prompts, seqs):
         token_ids = seq.completion_token_ids

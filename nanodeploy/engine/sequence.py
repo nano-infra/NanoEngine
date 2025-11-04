@@ -1,4 +1,5 @@
 import uuid
+from collections import deque
 from copy import copy
 from enum import auto, Enum
 from itertools import count
@@ -35,8 +36,11 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
 
         self.num_prompt_tokens = len(token_ids)
+        self.current_checkpointed_tokens = len(token_ids)
         self.num_cached_tokens = 0
-        self.current_active_tokens = len(token_ids)
+
+        self.active_selected_replica: int | None = None
+        self.backup_selected_replica: int | None = None
 
         self.backup_block_table = []
         self.active_block_table = []
@@ -57,7 +61,7 @@ class Sequence:
 
     @property
     def num_generated_tokens_since_checkpoint(self):
-        return self.num_tokens - self.current_active_tokens
+        return self.num_tokens - self.current_checkpointed_tokens
 
     @property
     def prompt_token_ids(self):
@@ -91,9 +95,12 @@ class Sequence:
     def __getstate__(self):
         return (
             self.num_tokens,
-            self.current_active_tokens,
+            self.current_checkpointed_tokens,
             self.num_cached_tokens,
             self.active_block_table,
+            self.backup_block_table,
+            self.active_selected_replica,
+            self.backup_selected_replica,
             self.temperature,
             (
                 self.token_ids
@@ -105,9 +112,12 @@ class Sequence:
     def __setstate__(self, state):
         (
             self.num_tokens,
-            self.current_active_tokens,
+            self.current_checkpointed_tokens,
             self.num_cached_tokens,
             self.active_block_table,
+            self.backup_block_table,
+            self.active_selected_replica,
+            self.backup_selected_replica,
             self.temperature,
         ) = state[:-1]
         if self.num_generated_tokens_since_checkpoint == 0:
