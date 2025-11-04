@@ -1,5 +1,6 @@
 import enum
 from collections import deque
+from typing import Literal
 
 from nanodeploy.config import Config
 from nanodeploy.engine.block_manager import BlockManager
@@ -15,7 +16,7 @@ class RoutingStrategy(enum.Enum):
 class WorkerState:
     def __init__(self, num_kv_cache_blocks: int, kvcache_block_size: int):
         self.running: deque[Sequence] = deque()
-        self.to_be_migrated: list[Sequence] = dict()
+        self.to_be_migrated: dict[str, Sequence] = dict()
         self.block_manager = BlockManager(num_kv_cache_blocks, kvcache_block_size)
 
     @property
@@ -35,19 +36,25 @@ class Scheduler:
 
         self.num_replica = config.attention_dp
         self.rounting_strategy = RoutingStrategy.RoundRobin
+
         self.worker_state = [
             WorkerState(config.num_kvcache_blocks, config.kvcache_block_size)
             for _ in range(self.num_replica)
         ]
+        self.to_be_migrated: dict[str, tuple[Sequence, list[int]]] = {}
 
+        self.mode: Literal["prefill", "decode", "hybrid"] = config.mode
         self.rr_generator = self.route_by_rr()
 
     def is_finished(self):
-        waiting = self.waiting
+        waiting = self.waiting if self.mode != "decode" else self.waiting_migration
         return not waiting and all(w.is_empty for w in self.worker_state)
 
     def add(self, seq: Sequence):
-        self.waiting.append(seq)
+        if self.mode == "decode":
+            self.waiting_migration.append(seq)
+        else:
+            self.waiting.append(seq)
 
     def route_by_rr(self):
         if not hasattr(self, "selected_replica"):
@@ -70,7 +77,7 @@ class Scheduler:
         num_seqs = {replica_id: 0 for replica_id in range(self.num_replica)}
         num_batched_tokens = {replica_id: 0 for replica_id in range(self.num_replica)}
 
-        waiting = self.waiting
+        waiting = self.waiting if self.mode != "decode" else self.waiting_migration
 
         while waiting:
             seq = waiting[0]
@@ -87,6 +94,8 @@ class Scheduler:
                 ):
                     continue
                 num_seqs[selected_replica] += 1
+                seq.backup_selected_replica = seq.active_selected_replica
+                seq.active_selected_replica = selected_replica
                 self.block_manager(selected_replica).allocate(seq)
                 num_batched_tokens[selected_replica] += len(seq) - seq.num_cached_tokens
                 seq.status = SequenceStatus.RUNNING
@@ -124,7 +133,7 @@ class Scheduler:
             )
         return scheduled_seqs
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule(self) -> tuple[list[list[Sequence]], bool]:
         # prefill
         scheduled_seqs = self._schedule_prefill()
 
@@ -141,7 +150,7 @@ class Scheduler:
     def preempt(self, selected_replica: int, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager(selected_replica).deallocate(seq)
-        seq.num_prompt_tokens = len(seq.token_ids)
+        seq.current_checkpointed_tokens = len(seq.token_ids)
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[list[Sequence]], token_ids: list[list[int]]):
@@ -150,7 +159,25 @@ class Scheduler:
                 seq.append_token(token_id)
                 if (
                     not seq.ignore_eos and token_id == self.eos
-                ) or seq.num_completion_tokens == seq.max_tokens:
+                ) or seq.num_generated_tokens_since_checkpoint == seq.max_tokens:
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager(i).deallocate(seq)
                     self.running(i).remove(seq)
+                elif self.mode == "prefill":
+                    seq.status = SequenceStatus.TO_BE_MIGRATED
+                    seq.backup_block_table = seq.active_block_table
+                    seq.active_block_table = []
+                    seq.backup_engine_id = seq.active_engine_id
+                    self.running(i).remove(seq)
+                    self.to_be_migrated[seq.seq_id] = (seq, [i])
+
+    def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
+        if isinstance(seqs, Sequence):
+            seqs = [seqs]
+        for seq in seqs:
+            seq, selected_replicas = self.to_be_migrated[seq.seq_id]
+            for selected in selected_replicas:
+                seq.active_block_table = seq.backup_block_table
+                seq.backup_block_table = []
+                self.block_manager(selected).deallocate(seq)
+            del self.to_be_migrated[seq.seq_id]

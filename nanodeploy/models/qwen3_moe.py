@@ -219,7 +219,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                     dtype=torch.float32,
                     device="cuda",
                 )
-                * 8
             )
 
             self.down_scale_inv = (
@@ -233,7 +232,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                         dtype=torch.float32,
                         device="cuda",
                     )
-                    * 8
                 )
                 if quantization_config.quant_method == "fp8"
                 else None

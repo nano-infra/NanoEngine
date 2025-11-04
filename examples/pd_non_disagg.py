@@ -13,16 +13,16 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(
         path,
-        enforce_eager=True,
-        attention_dp=2,
+        enforce_eager=False,
+        attention_dp=16,
         attention_sp=1,
-        attention_tp=4,
-        ffn_dp=2,
-        ffn_ep=1,
-        ffn_tp=4,
+        attention_tp=1,
+        ffn_dp=1,
+        ffn_ep=16,
+        ffn_tp=1,
     )
 
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=False)
+    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=True)
     prompts = [
         "你好",
         "how to bake a chocolate cake from scratch",
@@ -32,17 +32,18 @@ def main():
         "how to bake a chocolate cake from scratch",
         "what are the benefits of meditation",
         "list 5 famous scientists and their contributions",
-    ]
+    ] * 256
 
     seqs = [
         Sequence(
-            llm.tokenizer.encode(
-                llm.tokenizer.apply_chat_template(
+            tokenizer.encode(
+                tokenizer.apply_chat_template(
                     [{"role": "user", "content": prompt}],
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-            )
+            ),
+            sampling_params=sampling_params,
         )
         for prompt in prompts
     ]

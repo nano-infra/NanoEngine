@@ -1,4 +1,5 @@
 import uuid
+from collections import deque
 from copy import copy
 from enum import auto, Enum
 from itertools import count
@@ -25,7 +26,10 @@ class Sequence:
     counter = count()
 
     def __init__(
-        self, token_ids: list[int], sampling_params: SamplingParams | None = None
+        self,
+        token_ids: list[int],
+        sampling_params: SamplingParams | None = None,
+        engine_id: str | None = None,
     ):
         sampling_params = sampling_params or SamplingParams()
         self.seq_id = str(uuid.uuid4())
@@ -33,14 +37,27 @@ class Sequence:
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
+
         self.num_prompt_tokens = len(token_ids)
+        self.current_checkpointed_tokens = len(token_ids)
         self.num_cached_tokens = 0
-        self.block_table = []
+
+        self.active_selected_replica: int | None = None
+        self.backup_selected_replica: int | None = None
+
+        self.active_engine_id: str | None = engine_id
+        self.backup_engine_id: str | None = engine_id
+
+        self.backup_block_table = []
+        self.active_block_table = []
+
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
-        self.token_ids_backup = None
+    def set_engine_id(self, engine_id: str):
+        self.backup_engine_id = self.active_engine_id
+        self.active_engine_id = engine_id
 
     def __len__(self):
         return self.num_tokens
@@ -53,8 +70,8 @@ class Sequence:
         return self.status == SequenceStatus.FINISHED
 
     @property
-    def num_completion_tokens(self):
-        return self.num_tokens - self.num_prompt_tokens
+    def num_generated_tokens_since_checkpoint(self):
+        return self.num_tokens - self.current_checkpointed_tokens
 
     @property
     def prompt_token_ids(self):
@@ -88,22 +105,36 @@ class Sequence:
     def __getstate__(self):
         return (
             self.num_tokens,
-            self.num_prompt_tokens,
+            self.current_checkpointed_tokens,
             self.num_cached_tokens,
-            self.block_table,
+            self.active_block_table,
+            self.backup_block_table,
+            self.active_selected_replica,
+            self.backup_selected_replica,
+            self.active_engine_id,
+            self.backup_engine_id,
             self.temperature,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            (
+                self.token_ids
+                if self.num_generated_tokens_since_checkpoint == 0
+                else self.last_token
+            ),
         )
 
     def __setstate__(self, state):
         (
             self.num_tokens,
-            self.num_prompt_tokens,
+            self.current_checkpointed_tokens,
             self.num_cached_tokens,
-            self.block_table,
+            self.active_block_table,
+            self.backup_block_table,
+            self.active_selected_replica,
+            self.backup_selected_replica,
+            self.active_engine_id,
+            self.backup_engine_id,
             self.temperature,
         ) = state[:-1]
-        if self.num_completion_tokens == 0:
+        if self.num_generated_tokens_since_checkpoint == 0:
             self.token_ids = state[-1]
         else:
             self.last_token = state[-1]
