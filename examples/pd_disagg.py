@@ -22,7 +22,7 @@ def main():
         ffn_ep=8,
         ffn_tp=1,
         mode="decode",
-        master_address="127.0.0.1:6006"
+        master_address="127.0.0.1:6006",
     )
 
     prefill = LLM(
@@ -35,7 +35,7 @@ def main():
         ffn_ep=8,
         ffn_tp=1,
         mode="prefill",
-        master_address="127.0.0.1:6006"
+        master_address="127.0.0.1:6006",
     )
 
     prefill_endpoints_info = prefill.p2p_init(

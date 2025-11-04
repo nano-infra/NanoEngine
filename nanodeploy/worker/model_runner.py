@@ -38,7 +38,10 @@ class ModelRunner:
 
         # set context
         dist.init_process_group(
-            "cpu:gloo,cuda:nccl", f"tcp://{config.master_address}", world_size=self.world_size, rank=rank
+            "cpu:gloo,cuda:nccl",
+            f"tcp://{config.master_address}",
+            world_size=self.world_size,
+            rank=rank,
         )
 
         set_dist_context(
@@ -54,6 +57,7 @@ class ModelRunner:
 
         if get_dist_context().ffn_ep_group.size() > 1:
             import deep_ep
+
             deep_ep.Buffer.num_sms = 16
 
         torch.cuda.set_device(0)
