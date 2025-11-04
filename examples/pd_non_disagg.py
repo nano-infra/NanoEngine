@@ -53,8 +53,8 @@ def main():
     for prompt, seq in zip(prompts, seqs):
         token_ids = seq.completion_token_ids
         output = {"text": llm.tokenizer.decode(token_ids), "token_ids": token_ids}
-        # print(f"Prompt: {prompt!r}")
-        # print(f"Completion: {output['text']!r}")
+        print(f"Prompt: {prompt!r}")
+        print(f"Completion: {output['text']!r}")
 
 
 if __name__ == "__main__":

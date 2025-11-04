@@ -12,17 +12,6 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(path)
 
-    prefill = LLM(
-        path,
-        enforce_eager=False,
-        attention_dp=8,
-        attention_sp=1,
-        attention_tp=1,
-        ffn_dp=1,
-        ffn_ep=8,
-        ffn_tp=1,
-    )
-
     decode = LLM(
         path,
         enforce_eager=False,
@@ -32,6 +21,21 @@ def main():
         ffn_dp=1,
         ffn_ep=8,
         ffn_tp=1,
+        mode="decode",
+        master_address="127.0.0.1:6006"
+    )
+
+    prefill = LLM(
+        path,
+        enforce_eager=False,
+        attention_dp=8,
+        attention_sp=1,
+        attention_tp=1,
+        ffn_dp=1,
+        ffn_ep=8,
+        ffn_tp=1,
+        mode="prefill",
+        master_address="127.0.0.1:6006"
     )
 
     prefill_endpoints_info = prefill.p2p_init(
@@ -43,6 +47,17 @@ def main():
 
     print(f"{prefill_endpoints_info}, {decode_endpoints_info}")
 
+    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=True)
+    prompts = [
+        "你好",
+        "how to bake a chocolate cake from scratch",
+        "what are the benefits of meditation",
+        "list 5 famous scientists and their contributions",
+        "explain quantum computing in simple terms",
+        "how to bake a chocolate cake from scratch",
+        "what are the benefits of meditation",
+        "list 5 famous scientists and their contributions",
+    ]
 
     seqs = [
         Sequence(
@@ -57,12 +72,18 @@ def main():
         )
         for prompt in prompts
     ]
-    llm.add_request(seqs)
-    llm.generate()
+
+    prefill.add_request(seqs)
+    prefill.generate()
+
+    decode.add_request(seqs)
+    decode.generate()
+
+    print([(seq.seq_id, seq.status) for seq in seqs])
 
     for prompt, seq in zip(prompts, seqs):
         token_ids = seq.completion_token_ids
-        output = {"text": llm.tokenizer.decode(token_ids), "token_ids": token_ids}
+        output = {"text": tokenizer.decode(token_ids), "token_ids": token_ids}
         print(f"Prompt: {prompt!r}")
         print(f"Completion: {output['text']!r}")
 

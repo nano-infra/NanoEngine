@@ -1,5 +1,6 @@
 import enum
 from collections import deque
+from typing import Literal
 
 from nanodeploy.config import Config
 from nanodeploy.engine.block_manager import BlockManager
@@ -40,11 +41,11 @@ class Scheduler:
             for _ in range(self.num_replica)
         ]
 
-        self.mode = config.mode
+        self.mode: Literal["prefill", "decode", "hybrid"] = config.mode
         self.rr_generator = self.route_by_rr()
 
     def is_finished(self):
-        waiting = self.waiting
+        waiting = self.waiting if self.mode != "decode" else self.waiting_migration
         return not waiting and all(w.is_empty for w in self.worker_state)
 
     def add(self, seq: Sequence):
@@ -145,7 +146,7 @@ class Scheduler:
     def preempt(self, selected_replica: int, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager(selected_replica).deallocate(seq)
-        seq.num_prompt_tokens = len(seq.token_ids)
+        seq.current_active_tokens = len(seq.token_ids)
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[list[Sequence]], token_ids: list[list[int]]):
@@ -154,11 +155,14 @@ class Scheduler:
                 seq.append_token(token_id)
                 if (
                     not seq.ignore_eos and token_id == self.eos
-                ) or seq.num_completion_tokens == seq.max_tokens:
+                ) or seq.num_generated_tokens_since_checkpoint == seq.max_tokens:
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager(i).deallocate(seq)
                     self.running(i).remove(seq)
                 elif self.mode == "prefill":
                     seq.status = SequenceStatus.TO_BE_MIGRATED
+                    seq.block_table_backup = seq.block_table
+                    seq.block_table = []
+                    seq.current_active_tokens = len(seq.token_ids)
                     self.running(i).remove(seq)
                     self.to_be_migrated(i)[seq.seq_id] = seq

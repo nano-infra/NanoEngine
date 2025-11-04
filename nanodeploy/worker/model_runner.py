@@ -38,7 +38,7 @@ class ModelRunner:
 
         # set context
         dist.init_process_group(
-            "cpu:gloo,cuda:nccl", "tcp://10.102.207.84:2333", world_size=self.world_size, rank=rank
+            "cpu:gloo,cuda:nccl", f"tcp://{config.master_address}", world_size=self.world_size, rank=rank
         )
 
         set_dist_context(

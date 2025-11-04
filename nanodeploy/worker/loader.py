@@ -15,18 +15,12 @@ def default_weight_loader(param, tensor):
 def load_model(model: nn.Module, path: str):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
 
-    # 先收集所有需要加载的权重信息，用于进度条总长度
-    total_weights = 0
+    # 获取所有权重文件并初始化进度条（按文件数量）
     weight_files = glob(os.path.join(path, "*.safetensors"))
-    for file in weight_files:
-        with safe_open(file, "pt", "cpu") as f:
-            total_weights += len(f.keys())
-
-    # 初始化进度条
-    pbar = tqdm(total=total_weights, desc="Weight Loading", unit="weights")
+    pbar = tqdm(weight_files, desc="Loading weights", unit="file")
 
     try:
-        for file in weight_files:
+        for file in pbar:  # 直接迭代文件列表，进度条按文件计数
             with safe_open(file, "pt", "cpu") as f:
                 for weight_name in f.keys():
                     matched = False
@@ -49,9 +43,5 @@ def load_model(model: nn.Module, path: str):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, f.get_tensor(weight_name))
-
-                    # 更新进度条
-                    pbar.update(1)
     finally:
-        # 确保进度条在结束时关闭
         pbar.close()

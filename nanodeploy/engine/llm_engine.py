@@ -21,8 +21,6 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
 
-        assert config.mode == "hybrid"
-
         self.config = config
         self.ps = []
         self.events = []

@@ -33,14 +33,19 @@ class Sequence:
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
+
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
+        self.current_active_tokens = len(token_ids)
+        
+
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
-        self.token_ids_backup = None
+        self.block_table_backup = None
+        
 
     def __len__(self):
         return self.num_tokens
@@ -53,8 +58,8 @@ class Sequence:
         return self.status == SequenceStatus.FINISHED
 
     @property
-    def num_completion_tokens(self):
-        return self.num_tokens - self.num_prompt_tokens
+    def num_generated_tokens_since_checkpoint(self):
+        return self.num_tokens - self.current_active_tokens
 
     @property
     def prompt_token_ids(self):
@@ -88,22 +93,22 @@ class Sequence:
     def __getstate__(self):
         return (
             self.num_tokens,
-            self.num_prompt_tokens,
+            self.current_active_tokens,
             self.num_cached_tokens,
             self.block_table,
             self.temperature,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            self.token_ids if self.num_generated_tokens_since_checkpoint == 0 else self.last_token,
         )
 
     def __setstate__(self, state):
         (
             self.num_tokens,
-            self.num_prompt_tokens,
+            self.current_active_tokens,
             self.num_cached_tokens,
             self.block_table,
             self.temperature,
         ) = state[:-1]
-        if self.num_completion_tokens == 0:
+        if self.num_generated_tokens_since_checkpoint == 0:
             self.token_ids = state[-1]
         else:
             self.last_token = state[-1]
