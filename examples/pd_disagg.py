@@ -53,8 +53,6 @@ def main():
     prefill.p2p_connect(decode.engine_id, decode_endpoints_info)
     decode.p2p_connect(prefill.engine_id, prefill_endpoints_info)
 
-    print(f"{prefill_endpoints_info}, {decode_endpoints_info}")
-
     sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=True)
     prompts = [
         "你好",

@@ -149,7 +149,6 @@ class CacheContext:
             self.endpoints[remote_engine_id][i].connect(endpoint_info)
 
     def migrate(self, seqs: list[Sequence]):
-        print("dummy migration")
         assigns: dict[dict[int, list[Assignment]]] = defaultdict(
             lambda: defaultdict(list)
         )
@@ -175,12 +174,8 @@ class CacheContext:
                         assigns[seq.backup_engine_id][
                             seq.backup_selected_replica
                         ].append(assignment)
-                        print(
-                            f"{assignment=}, {kv_idx=}, {layer_idx=}, {remote_block_idx=}, {source_block_idx=}, {self.block_stride(1)=}"
-                        )
 
             futures = []
-            print(f"{assigns=}")
             for endpoint_key, endpoint_assign_batch in assigns.items():
                 for replica_key, assign_batch in endpoint_assign_batch.items():
                     futures.append(
@@ -190,10 +185,6 @@ class CacheContext:
                     )
 
             [future.wait() for future in futures]
-
-            print(
-                f"{self.kv_cache.shape}, {seq.backup_block_table=}, {seq.active_block_table=}, {seq.backup_selected_replica=}, {seq.active_selected_replica=}"
-            )
 
 
 _CACHE_CONTEXT = None

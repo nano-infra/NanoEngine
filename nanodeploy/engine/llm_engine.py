@@ -39,7 +39,6 @@ class LLMEngine:
 
     def update_num_kvcache_blocks(self):
         self.config.num_kvcache_blocks = self.executor.update_kvcache_blocks()
-        print(f"kvcache blocks number updated, {self.config.num_kvcache_blocks=}")
 
     def add_request(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):
