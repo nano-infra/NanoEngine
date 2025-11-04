@@ -79,7 +79,13 @@ def main():
     decode.add_request(seqs)
     decode.generate()
 
+    prefill.free_to_be_migrated(seqs)
+
     print([(seq.seq_id, seq.status) for seq in seqs])
+    print(
+        len(prefill.scheduler.block_manager(0).free_block_ids),
+        len(prefill.scheduler.block_manager(0).blocks),
+    )
 
     for prompt, seq in zip(prompts, seqs):
         token_ids = seq.completion_token_ids

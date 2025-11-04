@@ -132,9 +132,10 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
+        max_len = max(len(seq.active_block_table) for seq in seqs)
         block_tables = [
-            seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs
+            seq.active_block_table + [-1] * (max_len - len(seq.active_block_table))
+            for seq in seqs
         ]
         block_tables = torch.tensor(
             block_tables, dtype=torch.int32, pin_memory=True
@@ -143,7 +144,7 @@ class ModelRunner:
 
     def prepare_dummy(self, is_prefill: bool):
         seq = Sequence([0])
-        seq.block_table = [self.config.num_kvcache_blocks - 1]
+        seq.active_block_table = [self.config.num_kvcache_blocks - 1]
         if is_prefill:
             return self.prepare_prefill([seq])
         else:
@@ -168,10 +169,10 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:  # warmup
+            if not seq.active_block_table:  # warmup
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * get_cache_context().block_size
+                start = seq.active_block_table[i] * get_cache_context().block_size
                 if i != seq.num_blocks - 1:
                     end = start + get_cache_context().block_size
                 else:
@@ -216,7 +217,7 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(
-                seq.block_table[-1] * get_cache_context().block_size
+                seq.active_block_table[-1] * get_cache_context().block_size
                 + seq.last_block_num_tokens
                 - 1
             )
@@ -276,7 +277,7 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if not seqs:
             seq = Sequence([0])
-            seq.block_table = [0]
+            seq.active_block_table = [0]
             seqs = [seq]
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)

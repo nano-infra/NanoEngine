@@ -47,6 +47,9 @@ class LLMEngine:
         for seq in seqs:
             self.scheduler.add(seq)
 
+    def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
+        self.scheduler.free_to_be_migrated(seqs)
+
     def prefill(self) -> None:
         tp_size = self.config.attention_tp
         dp_seqs = self.scheduler._schedule_prefill()

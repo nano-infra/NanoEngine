@@ -36,10 +36,12 @@ class Scheduler:
 
         self.num_replica = config.attention_dp
         self.rounting_strategy = RoutingStrategy.RoundRobin
+
         self.worker_state = [
             WorkerState(config.num_kvcache_blocks, config.kvcache_block_size)
             for _ in range(self.num_replica)
         ]
+        self.to_be_migrated: dict[str, tuple[Sequence, list[int]]] = {}
 
         self.mode: Literal["prefill", "decode", "hybrid"] = config.mode
         self.rr_generator = self.route_by_rr()
@@ -161,8 +163,19 @@ class Scheduler:
                     self.running(i).remove(seq)
                 elif self.mode == "prefill":
                     seq.status = SequenceStatus.TO_BE_MIGRATED
-                    seq.block_table_backup = seq.block_table
-                    seq.block_table = []
+                    seq.backup_block_table = seq.active_block_table
+                    seq.active_block_table = []
                     seq.current_active_tokens = len(seq.token_ids)
                     self.running(i).remove(seq)
-                    self.to_be_migrated(i)[seq.seq_id] = seq
+                    self.to_be_migrated[seq.seq_id] = (seq, [i])
+
+    def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
+        if isinstance(seqs, Sequence):
+            seqs = [seqs]
+        for seq in seqs:
+            seq, selected_replicas = self.to_be_migrated[seq.seq_id]
+            for selected in selected_replicas:
+                seq.active_block_table = seq.backup_block_table
+                seq.backup_block_table = []
+                self.block_manager(selected).deallocate(seq)
+            del self.to_be_migrated[seq.seq_id]

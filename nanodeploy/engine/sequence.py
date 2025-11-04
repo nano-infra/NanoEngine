@@ -38,12 +38,12 @@ class Sequence:
         self.num_cached_tokens = 0
         self.current_active_tokens = len(token_ids)
 
-        self.block_table = []
+        self.backup_block_table = []
+        self.active_block_table = []
+
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
-
-        self.block_table_backup = None
 
     def __len__(self):
         return self.num_tokens
@@ -93,7 +93,7 @@ class Sequence:
             self.num_tokens,
             self.current_active_tokens,
             self.num_cached_tokens,
-            self.block_table,
+            self.active_block_table,
             self.temperature,
             (
                 self.token_ids
@@ -107,7 +107,7 @@ class Sequence:
             self.num_tokens,
             self.current_active_tokens,
             self.num_cached_tokens,
-            self.block_table,
+            self.active_block_table,
             self.temperature,
         ) = state[:-1]
         if self.num_generated_tokens_since_checkpoint == 0:
