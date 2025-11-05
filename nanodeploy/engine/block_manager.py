@@ -26,7 +26,8 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, engine_id: str, num_blocks: int, block_size: int):
+        self.engine_id = engine_id
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
@@ -58,7 +59,7 @@ class BlockManager:
         return len(self.free_block_ids) >= seq.num_blocks
 
     def allocate(self, seq: Sequence):
-        assert not seq.active_block_table
+        assert not seq.block_table(self.engine_id)
         h = -1
         cache_miss = False
         for i in range(seq.num_blocks):
@@ -84,22 +85,22 @@ class BlockManager:
             if h != -1:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
-            seq.active_block_table.append(block_id)
+            seq.block_table(self.engine_id).append(block_id)
 
     def deallocate(self, seq: Sequence):
-        for block_id in reversed(seq.active_block_table):
+        for block_id in reversed(seq.block_table(self.engine_id)):
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
-        seq.active_block_table.clear()
+        seq.block_table(self.engine_id).clear()
 
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
-        block_table = seq.active_block_table
+        block_table = seq.block_table(self.engine_id)
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
             assert last_block.hash != -1

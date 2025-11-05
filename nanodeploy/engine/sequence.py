@@ -1,5 +1,6 @@
+import dataclasses
 import uuid
-from collections import deque
+from collections import defaultdict
 from copy import copy
 from enum import auto, Enum
 from itertools import count
@@ -21,6 +22,13 @@ class SequenceStatus(Enum):
     TO_BE_MIGRATED = auto()
 
 
+@dataclasses.dataclass
+class BlockContext:
+    engine_id: str
+    selected_replica: int
+    block_table: list[int]
+
+
 class Sequence:
     block_size = 256
     counter = count()
@@ -39,25 +47,44 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
 
         self.num_prompt_tokens = len(token_ids)
+
+        # total tokens since preemption happens
         self.current_checkpointed_tokens = len(token_ids)
         self.num_cached_tokens = 0
 
-        self.active_selected_replica: int | None = None
-        self.backup_selected_replica: int | None = None
-
-        self.active_engine_id: str | None = engine_id
-        self.backup_engine_id: str | None = engine_id
-
-        self.backup_block_table = []
-        self.active_block_table = []
+        self.backup_engine_id = engine_id
+        self.active_engine_id = engine_id
+        self.block_ctx_map: dict[str, BlockContext] = {
+            engine_id: BlockContext(engine_id, -1, [])
+        }
 
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
+    def selected_replica(self, engine_id):
+        return self.block_ctx_map[engine_id].selected_replica
+
+    def block_table(self, engine_id):
+        return self.block_ctx_map[engine_id].block_table
+
+    @property
+    def active_block_table(self):
+        return self.block_ctx_map[self.active_engine_id].block_table
+
+    @active_block_table.setter
+    def active_block_table(self, value: list[int]):
+        self.block_ctx_map[self.active_engine_id].block_table = value
+
     def set_engine_id(self, engine_id: str):
-        self.backup_engine_id = self.active_engine_id
         self.active_engine_id = engine_id
+        if engine_id in self.block_ctx_map:
+            return
+        self.block_ctx_map[engine_id] = BlockContext(
+            engine_id=engine_id,
+            selected_replica=-1,
+            block_table=[],
+        )
 
     def __len__(self):
         return self.num_tokens
@@ -107,12 +134,9 @@ class Sequence:
             self.num_tokens,
             self.current_checkpointed_tokens,
             self.num_cached_tokens,
-            self.active_block_table,
-            self.backup_block_table,
-            self.active_selected_replica,
-            self.backup_selected_replica,
-            self.active_engine_id,
             self.backup_engine_id,
+            self.active_engine_id,
+            self.block_ctx_map,
             self.temperature,
             (
                 self.token_ids
@@ -126,12 +150,9 @@ class Sequence:
             self.num_tokens,
             self.current_checkpointed_tokens,
             self.num_cached_tokens,
-            self.active_block_table,
-            self.backup_block_table,
-            self.active_selected_replica,
-            self.backup_selected_replica,
-            self.active_engine_id,
             self.backup_engine_id,
+            self.active_engine_id,
+            self.block_ctx_map,
             self.temperature,
         ) = state[:-1]
         if self.num_generated_tokens_since_checkpoint == 0:
