@@ -14,10 +14,14 @@ class RoutingStrategy(enum.Enum):
 
 
 class WorkerState:
-    def __init__(self, num_kv_cache_blocks: int, kvcache_block_size: int):
+    def __init__(
+        self, engine_id: str, num_kv_cache_blocks: int, kvcache_block_size: int
+    ):
         self.running: deque[Sequence] = deque()
         self.to_be_migrated: dict[str, Sequence] = dict()
-        self.block_manager = BlockManager(num_kv_cache_blocks, kvcache_block_size)
+        self.block_manager = BlockManager(
+            engine_id, num_kv_cache_blocks, kvcache_block_size
+        )
 
     @property
     def is_empty(self):
@@ -27,6 +31,7 @@ class WorkerState:
 class Scheduler:
 
     def __init__(self, config: Config):
+        self.engine_id = config.engine_id
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
@@ -38,7 +43,9 @@ class Scheduler:
         self.rounting_strategy = RoutingStrategy.RoundRobin
 
         self.worker_state = [
-            WorkerState(config.num_kvcache_blocks, config.kvcache_block_size)
+            WorkerState(
+                config.engine_id, config.num_kvcache_blocks, config.kvcache_block_size
+            )
             for _ in range(self.num_replica)
         ]
         self.to_be_migrated: dict[str, tuple[Sequence, list[int]]] = {}
@@ -57,11 +64,11 @@ class Scheduler:
             self.waiting.append(seq)
 
     def route_by_rr(self):
-        if not hasattr(self, "selected_replica"):
-            setattr(self, "selected_replica", 0)
+        if not hasattr(self, "rr_selected"):
+            setattr(self, "rr_selected", 0)
         while True:
-            yield self.selected_replica
-            self.selected_replica = (self.selected_replica + 1) % self.num_replica
+            yield self.rr_selected
+            self.rr_selected = (self.rr_selected + 1) % self.num_replica
 
     def running(self, selected_replica: int):
         return self.worker_state[selected_replica].running
@@ -85,17 +92,17 @@ class Scheduler:
                 selected_replica = self.rr_generator.__next__()
                 if num_seqs[selected_replica] >= self.max_num_seqs:
                     continue
-                if num_batched_tokens[selected_replica] + len(
-                    seq
-                ) > self.max_num_batched_tokens or not self.block_manager(
-                    selected_replica
-                ).can_allocate(
-                    seq
-                ):
+                num_batched_tokens_satisfied = (
+                    num_batched_tokens[selected_replica] + len(seq)
+                    <= self.max_num_batched_tokens
+                )
+                can_allocate = self.block_manager(selected_replica).can_allocate(seq)
+                if not num_batched_tokens_satisfied or not can_allocate:
                     continue
+
                 num_seqs[selected_replica] += 1
-                seq.backup_selected_replica = seq.active_selected_replica
-                seq.active_selected_replica = selected_replica
+                seq.block_ctx_map[self.engine_id].master_replica = selected_replica
+
                 self.block_manager(selected_replica).allocate(seq)
                 num_batched_tokens[selected_replica] += len(seq) - seq.num_cached_tokens
                 seq.status = SequenceStatus.RUNNING
@@ -165,9 +172,8 @@ class Scheduler:
                     self.running(i).remove(seq)
                 elif self.mode == "prefill":
                     seq.status = SequenceStatus.TO_BE_MIGRATED
-                    seq.backup_block_table = seq.active_block_table
-                    seq.active_block_table = []
                     seq.backup_engine_id = seq.active_engine_id
+                    seq.active_engine_id = None
                     self.running(i).remove(seq)
                     self.to_be_migrated[seq.seq_id] = (seq, [i])
 
@@ -177,7 +183,5 @@ class Scheduler:
         for seq in seqs:
             seq, selected_replicas = self.to_be_migrated[seq.seq_id]
             for selected in selected_replicas:
-                seq.active_block_table = seq.backup_block_table
-                seq.backup_block_table = []
                 self.block_manager(selected).deallocate(seq)
             del self.to_be_migrated[seq.seq_id]

@@ -154,7 +154,8 @@ class CacheContext:
         )
         for seq in seqs:
             for remote_block_idx, source_block_idx in zip(
-                seq.backup_block_table, seq.active_block_table
+                seq.block_table(seq.backup_engine_id),
+                seq.block_table(seq.active_engine_id),
             ):
                 for kv_idx in range(self.kv_cache.size(0)):
                     for layer_idx in range(self.num_hidden_layers):
@@ -172,7 +173,7 @@ class CacheContext:
                             length=self.block_stride(1),
                         )
                         assigns[seq.backup_engine_id][
-                            seq.backup_selected_replica
+                            seq.selected_replica(seq.backup_engine_id)
                         ].append(assignment)
 
             futures = []

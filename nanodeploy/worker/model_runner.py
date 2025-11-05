@@ -2,11 +2,11 @@ import os
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
 
+import numpy as np
+
 import ray
 import torch
 import torch.distributed as dist
-
-from flash_mla import get_mla_metadata
 
 from nanodeploy.config import Config
 
@@ -30,6 +30,7 @@ architectures = {
 class ModelRunner:
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
+        self.engine_id = self.config.engine_id
         hf_config = config.hf_config
         self.enforce_eager = config.enforce_eager
         self.world_size = config.attn_world_size
@@ -117,7 +118,13 @@ class ModelRunner:
         num_seqs = min(
             max_num_batched_tokens // max_model_len, self.config.max_num_seqs
         )
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        seqs = [
+            Sequence(
+                list(np.random.randint(low=0, high=10000, size=max_model_len)),
+                engine_id=self.engine_id,
+            )
+            for _ in range(num_seqs)
+        ]
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
@@ -139,9 +146,10 @@ class ModelRunner:
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
     def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.active_block_table) for seq in seqs)
+        max_len = max(len(seq.block_table(self.engine_id)) for seq in seqs)
         block_tables = [
-            seq.active_block_table + [-1] * (max_len - len(seq.active_block_table))
+            seq.block_table(self.engine_id)
+            + [-1] * (max_len - len(seq.block_table(self.engine_id)))
             for seq in seqs
         ]
         block_tables = torch.tensor(
@@ -150,8 +158,10 @@ class ModelRunner:
         return block_tables
 
     def prepare_dummy(self, is_prefill: bool):
-        seq = Sequence([0])
-        seq.active_block_table = [self.config.num_kvcache_blocks - 1]
+        seq = Sequence([0], engine_id=self.engine_id)
+        seq.block_ctx_map[self.engine_id].block_table = [
+            self.config.num_kvcache_blocks - 1
+        ]
         if is_prefill:
             return self.prepare_prefill([seq])
         else:
@@ -176,10 +186,12 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.active_block_table:  # warmup
+            if not seq.block_table(self.engine_id):  # warmup
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.active_block_table[i] * get_cache_context().block_size
+                start = (
+                    seq.block_table(self.engine_id)[i] * get_cache_context().block_size
+                )
                 if i != seq.num_blocks - 1:
                     end = start + get_cache_context().block_size
                 else:
@@ -224,7 +236,8 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(
-                seq.active_block_table[-1] * get_cache_context().block_size
+                seq.block_table(seq.active_engine_id)[-1]
+                * get_cache_context().block_size
                 + seq.last_block_num_tokens
                 - 1
             )
@@ -286,8 +299,8 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if not seqs:
-            seq = Sequence([0])
-            seq.active_block_table = [0]
+            seq = Sequence([np.random.randint(8000)])
+            seq.block_ctx_map[self.engine_id].block_table = [0]
             seqs = [seq]
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
