@@ -25,7 +25,7 @@ class SequenceStatus(Enum):
 @dataclasses.dataclass
 class BlockContext:
     engine_id: str
-    selected_replica: int
+    master_replica: int
     block_table: list[int]
 
 
@@ -63,7 +63,7 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
 
     def selected_replica(self, engine_id):
-        return self.block_ctx_map[engine_id].selected_replica
+        return self.block_ctx_map[engine_id].master_replica
 
     def block_table(self, engine_id):
         return self.block_ctx_map[engine_id].block_table
@@ -82,7 +82,7 @@ class Sequence:
             return
         self.block_ctx_map[engine_id] = BlockContext(
             engine_id=engine_id,
-            selected_replica=-1,
+            master_replica=-1,
             block_table=[],
         )
 

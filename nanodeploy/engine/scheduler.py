@@ -64,11 +64,11 @@ class Scheduler:
             self.waiting.append(seq)
 
     def route_by_rr(self):
-        if not hasattr(self, "selected_replica"):
-            setattr(self, "selected_replica", 0)
+        if not hasattr(self, "rr_selected"):
+            setattr(self, "rr_selected", 0)
         while True:
-            yield self.selected_replica
-            self.selected_replica = (self.selected_replica + 1) % self.num_replica
+            yield self.rr_selected
+            self.rr_selected = (self.rr_selected + 1) % self.num_replica
 
     def running(self, selected_replica: int):
         return self.worker_state[selected_replica].running
@@ -92,16 +92,16 @@ class Scheduler:
                 selected_replica = self.rr_generator.__next__()
                 if num_seqs[selected_replica] >= self.max_num_seqs:
                     continue
-                if num_batched_tokens[selected_replica] + len(
-                    seq
-                ) > self.max_num_batched_tokens or not self.block_manager(
-                    selected_replica
-                ).can_allocate(
-                    seq
-                ):
+                num_batched_tokens_satisfied = (
+                    num_batched_tokens[selected_replica] + len(seq)
+                    <= self.max_num_batched_tokens
+                )
+                can_allocate = self.block_manager(selected_replica).can_allocate(seq)
+                if not num_batched_tokens_satisfied or not can_allocate:
                     continue
+
                 num_seqs[selected_replica] += 1
-                seq.block_ctx_map[self.engine_id].selected_replica = selected_replica
+                seq.block_ctx_map[self.engine_id].master_replica = selected_replica
 
                 self.block_manager(selected_replica).allocate(seq)
                 num_batched_tokens[selected_replica] += len(seq) - seq.num_cached_tokens
