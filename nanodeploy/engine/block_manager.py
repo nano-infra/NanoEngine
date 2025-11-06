@@ -86,9 +86,7 @@ class BlockManager:
             if h != -1:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
-            seq.block_ctx(self.engine_id).block_location.append(
-                (self.sp_idx, len(seq.block_table(sp_idx=self.sp_idx)))
-            )
+            seq.block_ctx(self.engine_id).block_location.append((self.sp_idx, block_id))
             seq.block_table(self.engine_id, self.sp_idx).append(block_id)
 
     def deallocate(self, seq: Sequence):
@@ -109,9 +107,7 @@ class BlockManager:
         if len(seq) % self.block_size == 1:
             assert last_block.hash != -1
             block_id = self.free_block_ids[0]
-            seq.block_ctx(self.engine_id).block_location.append(
-                (self.sp_idx, len(seq.block_table(self.engine_id, self.sp_idx)))
-            )
+            seq.block_ctx(self.engine_id).block_location.append((self.sp_idx, block_id))
             self._allocate_block(block_id)
             block_table.append(block_id)
         elif len(seq) % self.block_size == 0:

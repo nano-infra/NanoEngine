@@ -4,7 +4,10 @@ from dataclasses import fields
 from time import perf_counter
 from typing import Literal
 
+import numpy as np
+
 from tqdm.auto import tqdm
+
 from transformers import AutoTokenizer
 
 from nanodeploy.config import Config
@@ -44,7 +47,9 @@ class LLMEngine:
         if isinstance(seqs, Sequence):
             seqs = [seqs]
         for seq in seqs:
-            seq.set_engine_id(self.engine_id, self.config.attention_sp)
+            seq.set_engine_id(
+                self.engine_id, self.config.attention_dp, self.config.attention_sp
+            )
             self.scheduler.add(seq)
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
@@ -55,24 +60,31 @@ class LLMEngine:
         sp_size = self.config.attention_sp
         tp_size = self.config.attention_tp
         dp_seqs, is_prefill = self.scheduler.schedule()
+        dp_sp_seqs = [
+            [
+                seq
+                for seq in seqs
+                if seq.block_ctx(self.engine_id).master_sp_rank == sp_idx
+            ]
+            for seqs in dp_seqs
+            for sp_idx in range(self.config.attention_sp)
+        ]
+        dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
         if is_prefill and self.config.mode == "decode":
-            self.executor.migrate(dp_seqs)
-        else:
-            dp_sp_seqs = [
+            if not self.config.dummy_prefill:
+                self.executor.migrate(dp_sp_tp_seqs)
+            else:
                 [
-                    seq
+                    [seq.append_token(np.random.randint(0, 8000)) for seq in seqs]
                     for seqs in dp_seqs
-                    for seq in seqs
-                    if seq.block_ctx(self.engine).master_sp_rank == sp_idx
                 ]
-                for sp_idx in self.config.attention_sp
-            ]
-            token_ids = self.executor.run(dp_sp_seqs, is_prefill)[::tp_size]
+        else:
+            token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
             token_ids = [
-                token_ids[i * sp_size : (i + 1) + sp_size] for i in range(0, dp_size)
+                token_ids[i * sp_size : (i + 1) * sp_size] for i in range(0, dp_size)
             ]
             dp_sp_seqs = [
-                dp_sp_seqs[i * sp_size : (i + 1) + sp_size] for i in range(0, dp_size)
+                dp_sp_seqs[i * sp_size : (i + 1) * sp_size] for i in range(0, dp_size)
             ]
             self.scheduler.postprocess(dp_sp_seqs, token_ids)
         outputs = []

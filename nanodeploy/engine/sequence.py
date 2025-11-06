@@ -26,10 +26,12 @@ class SequenceStatus(Enum):
 class BlockContext:
     engine_id: str
 
-    selected_dp_idx: int
-    attention_sp: int
-
+    selected_dp_idx: int = 0
     master_sp_rank: int = 0
+
+    attention_sp: int = 1
+    attention_dp: int = 1
+
     block_location: list[tuple[int, int]] | None = None
     sp_block_table: dict[int, list[int]] | None = None
 
@@ -65,6 +67,7 @@ class Sequence:
                 engine_id=engine_id,
                 selected_dp_idx=-1,
                 attention_sp=1,
+                attention_dp=1,
                 master_sp_rank=master_sp_rank,
                 block_location=[],
                 sp_block_table=defaultdict(list),
@@ -84,18 +87,19 @@ class Sequence:
 
     def block_table(self, engine_id: int = None, sp_idx: int = 0):
         engine_id = engine_id or self.active_engine_id
-        return self.block_ctx(engine_id).sp_block_table.get(sp_idx, [])
+        return self.block_ctx(engine_id).sp_block_table[sp_idx]
 
-    def set_engine_id(self, engine_id: str, attention_sp: int = 1):
+    def set_engine_id(self, engine_id: str, attention_dp=1, attention_sp: int = 1):
         self.active_engine_id = engine_id
         if engine_id in self.block_ctx_map:
             return
         self.block_ctx_map[engine_id] = BlockContext(
             engine_id=engine_id,
-            attention_sp=attention_sp,
             selected_dp_idx=-1,
+            attention_sp=attention_sp,
+            attention_dp=attention_dp,
             block_location=[],
-            sp_block_table={i: [] for i in range(attention_sp)},
+            sp_block_table=defaultdict(list, {i: [] for i in range(attention_sp)}),
         )
 
     def context_len(self, sp_idx):

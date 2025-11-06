@@ -42,6 +42,7 @@ class SPBlockManager:
         return self.block_manager[self.attention_sp - 1].can_allocate(seq)
 
     def allocate(self, seq: Sequence):
+        seq.block_ctx().master_sp_rank = self.attention_sp - 1
         return self.block_manager[self.attention_sp - 1].allocate(seq)
 
     def deallocate(self, seq: Sequence):

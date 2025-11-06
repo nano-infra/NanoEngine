@@ -10,9 +10,9 @@ class Config:
     model: str
 
     # scheduler config
-    max_num_batched_tokens: int = 32768
+    max_num_batched_tokens: int = 16384
     max_num_seqs: int = 256
-    max_model_len: int = 32768
+    max_model_len: int = 16384
     gpu_memory_utilization: float = 0.5
 
     # parallel config
@@ -33,6 +33,8 @@ class Config:
     # deployment config
     engine_id: str | None = None
     mode: Literal["prefill", "decode", "hybrid"] = "hybrid"
+
+    dummy_prefill: bool | None = False
 
     # dist config
     master_address: str | None = "127.0.0.1:6006"

@@ -180,7 +180,11 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        sp_idx = get_dist_context().attn_sp_rank
         for seq in seqs:
+            assert (
+                seq.block_ctx(self.engine_id).master_sp_rank == sp_idx
+            ), f"{sp_idx=}, {seq.block_ctx(self.engine_id).master_sp_rank=}"
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens :])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
@@ -190,7 +194,6 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            sp_idx = get_dist_context().attn_sp_rank
             if not seq.block_table(self.engine_id, sp_idx):  # warmup
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
@@ -239,16 +242,16 @@ class ModelRunner:
         context_lens = []
         sp_idx = get_dist_context().attn_sp_rank
         for seq in seqs:
-            if seq.block_ctx().master_sp_rank == sp_idx:
-                input_ids.append(seq.last_token)
-                positions.append(len(seq) - 1)
-                context_lens.append(seq.context_len(sp_idx))
-                slot_mapping.append(
-                    seq.block_table(seq.active_engine_id, sp_idx)[-1]
-                    * get_cache_context().block_size
-                    + seq.last_block_num_tokens
-                    - 1
-                )
+            assert seq.block_ctx(self.engine_id).master_sp_rank == sp_idx
+            input_ids.append(seq.last_token)
+            positions.append(len(seq) - 1)
+            context_lens.append(seq.context_len(sp_idx))
+            slot_mapping.append(
+                seq.block_table(seq.active_engine_id, sp_idx)[-1]
+                * get_cache_context().block_size
+                + seq.last_block_num_tokens
+                - 1
+            )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
@@ -307,9 +310,13 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if not seqs:
-            seq = Sequence([np.random.randint(8000)])
+            seq = Sequence(
+                [np.random.randint(8000)],
+                engine_id=self.engine_id,
+                master_sp_rank=get_dist_context().attn_sp_rank,
+            )
             sp_idx = get_dist_context().attn_sp_rank
-            seq.block_ctx_map[self.engine_id].sp_block_table[sp_idx] = [0]
+            seq.block_ctx(self.engine_id).sp_block_table[sp_idx] = [0]
             seqs = [seq]
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
