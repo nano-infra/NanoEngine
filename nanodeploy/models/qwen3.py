@@ -11,9 +11,10 @@ from nanodeploy.layers.linear import (
     RowParallelLinear,
 )
 from nanodeploy.layers.rotary_embedding import get_rope
+from nanodeploy.worker.distributed import get_dist_context
 
-from nanodeploy.worker.distributed import get_dist_context, set_dist_context
 from torch import nn
+
 from transformers import Qwen3Config
 
 
@@ -32,7 +33,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
+        tp_size = get_dist_context().attn_tp_world_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

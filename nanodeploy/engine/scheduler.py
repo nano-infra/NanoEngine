@@ -33,16 +33,16 @@ class SPBlockManager:
         }
 
     def can_append(self, seq: Sequence):
-        return self.block_manager[0].can_append(seq)
+        return self.block_manager[self.attention_sp - 1].can_append(seq)
 
     def may_append(self, seq: Sequence):
-        return self.block_manager[0].may_append(seq)
+        return self.block_manager[self.attention_sp - 1].may_append(seq)
 
     def can_allocate(self, seq: Sequence):
-        return self.block_manager[0].can_allocate(seq)
+        return self.block_manager[self.attention_sp - 1].can_allocate(seq)
 
     def allocate(self, seq: Sequence):
-        return self.block_manager[0].allocate(seq)
+        return self.block_manager[self.attention_sp - 1].allocate(seq)
 
     def deallocate(self, seq: Sequence):
         for sp_idx in range(self.attention_sp):
@@ -205,23 +205,26 @@ class Scheduler:
         seq.current_checkpointed_tokens = len(seq.token_ids)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[list[Sequence]], token_ids: list[list[int]]):
-        for dp_idx in range(self.attention_dp):
-            for idx, (seq) in enumerate(seqs[dp_idx]):
-                token_id = token_ids[dp_idx][seq.block_ctx().master_sp_rank][idx]
-                seq.append_token(token_id)
-                if (
-                    not seq.ignore_eos and token_id == self.eos
-                ) or seq.num_generated_tokens_since_checkpoint == seq.max_tokens:
-                    seq.status = SequenceStatus.FINISHED
-                    self.block_manager(dp_idx).deallocate(seq)
-                    self.running(dp_idx).remove(seq)
-                elif self.mode == "prefill":
-                    seq.status = SequenceStatus.TO_BE_MIGRATED
-                    seq.backup_engine_id = seq.active_engine_id
-                    seq.active_engine_id = None
-                    self.running(dp_idx).remove(seq)
-                    self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
+    def postprocess(
+        self, dp_seqs: list[list[list[Sequence]]], dp_token_ids: list[list[list[int]]]
+    ):
+        for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
+            for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
+                for _, (seq, token_id) in enumerate(zip(seqs, token_ids)):
+                    assert sp_idx == seq.block_ctx(self.engine_id).master_sp_rank
+                    seq.append_token(token_id)
+                    if (
+                        not seq.ignore_eos and token_id == self.eos
+                    ) or seq.num_completed_tokens == seq.max_tokens:
+                        seq.status = SequenceStatus.FINISHED
+                        self.block_manager(dp_idx).deallocate(seq)
+                        self.running(dp_idx).remove(seq)
+                    elif self.mode == "prefill":
+                        seq.status = SequenceStatus.TO_BE_MIGRATED
+                        seq.backup_engine_id = seq.active_engine_id
+                        seq.active_engine_id = None
+                        self.running(dp_idx).remove(seq)
+                        self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):

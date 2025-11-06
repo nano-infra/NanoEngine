@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 
@@ -19,31 +20,108 @@ class DistContext:
     pp: int = 1
 
     @property
+    def attn_dp_rank(self):
+        """Get the current process rank in attention data parallel group"""
+        return dist.get_rank(self.attn_dp_group)
+
+    @property
+    def attn_dp_world_size(self):
+        """Get the total number of processes in attention data parallel group"""
+        return dist.get_world_size(self.attn_dp_group)
+
+    @property
     def attn_dp_group(self):
+        """Get the communication group for attention data parallelism"""
         return self.attn_device_mesh.get_group("attn_dp")
 
     @property
+    def attn_sp_rank(self):
+        """Get the current process rank in attention expert parallel group"""
+        return dist.get_rank(self.attn_sp_group)
+
+    @property
+    def attn_sp_world_size(self):
+        """Get the total number of processes in attention expert parallel group"""
+        return dist.get_world_size(self.attn_sp_group)
+
+    @property
     def attn_sp_group(self):
+        """Get the communication group for attention expert parallelism"""
         return self.attn_device_mesh.get_group("attn_sp")
 
     @property
+    def attn_tp_rank(self):
+        """Get the current process rank in attention tensor parallel group"""
+        return dist.get_rank(self.attn_tp_group)
+
+    @property
+    def attn_tp_world_size(self):
+        """Get the total number of processes in attention tensor parallel group"""
+        return dist.get_world_size(self.attn_tp_group)
+
+    @property
     def attn_tp_group(self):
+        """Get the communication group for attention tensor parallelism"""
         return self.attn_device_mesh.get_group("attn_tp")
 
     @property
+    def ffn_dp_rank(self):
+        """Get the current process rank in FFN data parallel group"""
+        return dist.get_rank(self.ffn_dp_group)
+
+    @property
+    def ffn_dp_world_size(self):
+        """Get the total number of processes in FFN data parallel group"""
+        return dist.get_world_size(self.ffn_dp_group)
+
+    @property
     def ffn_dp_group(self):
+        """Get the communication group for FFN data parallelism"""
         return self.ffn_device_mesh.get_group("ffn_dp")
 
     @property
+    def ffn_ep_rank(self):
+        """Get the current process rank in FFN expert parallel group"""
+        return dist.get_rank(self.ffn_ep_group)
+
+    @property
+    def ffn_ep_world_size(self):
+        """Get the total number of processes in FFN expert parallel group"""
+        return dist.get_world_size(self.ffn_ep_group)
+
+    @property
     def ffn_ep_group(self):
+        """Get the communication group for FFN expert parallelism"""
         return self.ffn_device_mesh.get_group("ffn_ep")
 
     @property
+    def ffn_tp_rank(self):
+        """Get the current process rank in FFN tensor parallel group"""
+        return dist.get_rank(self.ffn_tp_group)
+
+    @property
+    def ffn_tp_world_size(self):
+        """Get the total number of processes in FFN tensor parallel group"""
+        return dist.get_world_size(self.ffn_tp_group)
+
+    @property
     def ffn_tp_group(self):
+        """Get the communication group for FFN tensor parallelism"""
         return self.ffn_device_mesh.get_group("ffn_tp")
 
     @property
+    def cpu_world_rank(self):
+        """Get the current process rank in CPU global communication group"""
+        return dist.get_rank(self.cpu_world_group)
+
+    @property
+    def cpu_world_size(self):
+        """Get the total number of processes in CPU global communication group"""
+        return dist.get_world_size(self.cpu_world_group)
+
+    @property
     def cpu_world_group(self):
+        """Get the global communication group for CPU world"""
         return self.cpu_world_mesh.get_group("world")
 
     def __post_init__(self):

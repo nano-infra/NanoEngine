@@ -30,6 +30,7 @@ class BlockContext:
     attention_sp: int
 
     master_sp_rank: int = 0
+    block_location: list[tuple[int, int]] | None = None
     sp_block_table: dict[int, list[int]] | None = None
 
 
@@ -42,6 +43,7 @@ class Sequence:
         token_ids: list[int],
         sampling_params: SamplingParams | None = None,
         engine_id: str | None = None,
+        master_sp_rank: str | None = 0,
     ):
         sampling_params = sampling_params or SamplingParams()
         self.seq_id = str(uuid.uuid4())
@@ -63,7 +65,8 @@ class Sequence:
                 engine_id=engine_id,
                 selected_dp_idx=-1,
                 attention_sp=1,
-                master_sp_rank=-1,
+                master_sp_rank=master_sp_rank,
+                block_location=[],
                 sp_block_table=defaultdict(list),
             )
         }
@@ -81,7 +84,7 @@ class Sequence:
 
     def block_table(self, engine_id: int = None, sp_idx: int = 0):
         engine_id = engine_id or self.active_engine_id
-        return self.block_ctx_map[engine_id].sp_block_table.get(sp_idx, [])
+        return self.block_ctx(engine_id).sp_block_table.get(sp_idx, [])
 
     def set_engine_id(self, engine_id: str, attention_sp: int = 1):
         self.active_engine_id = engine_id
@@ -91,6 +94,7 @@ class Sequence:
             engine_id=engine_id,
             attention_sp=attention_sp,
             selected_dp_idx=-1,
+            block_location=[],
             sp_block_table={i: [] for i in range(attention_sp)},
         )
 
@@ -109,6 +113,10 @@ class Sequence:
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
+
+    @property
+    def num_completed_tokens(self):
+        return self.num_tokens - self.num_prompt_tokens
 
     @property
     def num_generated_tokens_since_checkpoint(self):

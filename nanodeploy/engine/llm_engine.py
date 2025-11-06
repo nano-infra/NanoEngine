@@ -58,11 +58,23 @@ class LLMEngine:
         if is_prefill and self.config.mode == "decode":
             self.executor.migrate(dp_seqs)
         else:
-            token_ids = self.executor.run(dp_seqs, is_prefill)[::tp_size]
-            token_ids = [
-                token_ids[i : i + sp_size] for i in range(0, dp_size * sp_size, sp_size)
+            dp_sp_seqs = [
+                [
+                    seq
+                    for seqs in dp_seqs
+                    for seq in seqs
+                    if seq.block_ctx(self.engine).master_sp_rank == sp_idx
+                ]
+                for sp_idx in self.config.attention_sp
             ]
-            self.scheduler.postprocess(dp_seqs, token_ids)
+            token_ids = self.executor.run(dp_sp_seqs, is_prefill)[::tp_size]
+            token_ids = [
+                token_ids[i * sp_size : (i + 1) + sp_size] for i in range(0, dp_size)
+            ]
+            dp_sp_seqs = [
+                dp_sp_seqs[i * sp_size : (i + 1) + sp_size] for i in range(0, dp_size)
+            ]
+            self.scheduler.postprocess(dp_sp_seqs, token_ids)
         outputs = []
         num_tokens = 0
         for seqs in dp_seqs:

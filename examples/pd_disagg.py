@@ -28,8 +28,8 @@ def main():
     prefill = LLM(
         path,
         enforce_eager=False,
-        attention_dp=8,
-        attention_sp=1,
+        attention_dp=4,
+        attention_sp=2,
         attention_tp=1,
         ffn_dp=1,
         ffn_ep=8,

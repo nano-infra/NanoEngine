@@ -153,30 +153,31 @@ class CacheContext:
         assigns: dict[dict[int, list[Assignment]]] = defaultdict(
             lambda: defaultdict(list)
         )
-        sp_idx = dist.get_rank(get_dist_context().attn_sp_group)
+        sp_idx = get_dist_context().attn_sp_rank
         for seq in seqs:
             for remote_block_idx, source_block_idx in zip(
-                seq.block_table(seq.backup_engine_id, sp_idx),
-                seq.block_table(seq.active_engine_id, sp_idx),
+                seq.block_ctx(seq.backup_engine_id).block_location,
+                seq.block_ctx(seq.active_engine_id).block_location,
             ):
                 for kv_idx in range(self.kv_cache.size(0)):
                     for layer_idx in range(self.num_hidden_layers):
-                        assignment = Assignment(
-                            mr_key="kv",
-                            target_offset=self.remote_kv_stride(
-                                kv_idx,
-                                layer_idx,
-                                remote_block_idx,
-                                seq.backup_engine_id,
-                            ),
-                            source_offset=self.local_kv_stride(
-                                kv_idx, layer_idx, source_block_idx
-                            ),
-                            length=self.block_stride(1),
-                        )
-                        assigns[seq.backup_engine_id][
-                            seq.selected_replica(seq.backup_engine_id)
-                        ].append(assignment)
+                        if source_block_idx[0] == sp_idx:
+                            assignment = Assignment(
+                                mr_key="kv",
+                                target_offset=self.remote_kv_stride(
+                                    kv_idx,
+                                    layer_idx,
+                                    remote_block_idx[1],
+                                    seq.backup_engine_id,
+                                ),
+                                source_offset=self.local_kv_stride(
+                                    kv_idx, layer_idx, source_block_idx[1]
+                                ),
+                                length=self.block_stride(1),
+                            )
+                            assigns[seq.backup_engine_id][
+                                seq.selected_replica(seq.backup_engine_id)
+                            ].append(assignment)
 
             futures = []
             for endpoint_key, endpoint_assign_batch in assigns.items():

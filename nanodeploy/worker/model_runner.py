@@ -56,7 +56,7 @@ class ModelRunner:
             ffn_tp=config.ffn_tp,
         )
 
-        if get_dist_context().ffn_ep_group.size() > 1:
+        if get_dist_context().ffn_ep_world_size > 1:
             import deep_ep
 
             deep_ep.Buffer.num_sms = 16
@@ -118,10 +118,12 @@ class ModelRunner:
         num_seqs = min(
             max_num_batched_tokens // max_model_len, self.config.max_num_seqs
         )
+        sp_rank = get_dist_context().attn_sp_rank
         seqs = [
             Sequence(
                 list(np.random.randint(low=0, high=10000, size=max_model_len)),
                 engine_id=self.engine_id,
+                master_sp_rank=sp_rank,
             )
             for _ in range(num_seqs)
         ]
@@ -146,7 +148,7 @@ class ModelRunner:
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
     def prepare_block_tables(self, seqs: list[Sequence]):
-        sp_group = dist.get_rank(get_dist_context().attn_sp_group)
+        sp_group = get_dist_context().attn_sp_rank
         max_len = max(len(seq.block_table(self.engine_id, sp_group)) for seq in seqs)
         block_tables = [
             seq.block_table(self.engine_id, sp_group)
@@ -159,8 +161,8 @@ class ModelRunner:
         return block_tables
 
     def prepare_dummy(self, is_prefill: bool):
-        seq = Sequence([0], engine_id=self.engine_id)
-        sp_idx = dist.get_rank(get_dist_context().attn_sp_group())
+        sp_idx = get_dist_context().attn_sp_rank
+        seq = Sequence([0], engine_id=self.engine_id, master_sp_rank=sp_idx)
         seq.block_ctx_map[self.engine_id].sp_block_table[sp_idx] = [
             self.config.num_kvcache_blocks - 1
         ]
@@ -179,7 +181,6 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            assert seq.block_ctx().attention_sp == 1
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens :])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
@@ -189,7 +190,7 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            sp_idx = dist.get_rank(get_dist_context().attn_sp_group)
+            sp_idx = get_dist_context().attn_sp_rank
             if not seq.block_table(self.engine_id, sp_idx):  # warmup
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
@@ -236,7 +237,7 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
-        sp_idx = dist.get_rank(get_dist_context().attn_sp_group)
+        sp_idx = get_dist_context().attn_sp_rank
         for seq in seqs:
             if seq.block_ctx().master_sp_rank == sp_idx:
                 input_ids.append(seq.last_token)
@@ -307,7 +308,7 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if not seqs:
             seq = Sequence([np.random.randint(8000)])
-            sp_idx = dist.get_rank(get_dist_context().attn_sp_group)
+            sp_idx = get_dist_context().attn_sp_rank
             seq.block_ctx_map[self.engine_id].sp_block_table[sp_idx] = [0]
             seqs = [seq]
         input_ids, positions = (
@@ -315,7 +316,7 @@ class ModelRunner:
         )
 
         logits = self.run_model(input_ids, positions, is_prefill)
-        tp_rank = dist.get_rank(group=get_dist_context().attn_tp_group)
+        tp_rank = get_dist_context().attn_tp_rank
         if seqs:
             temperatures = self.prepare_sample(seqs) if tp_rank == 0 else None
             token_ids = (

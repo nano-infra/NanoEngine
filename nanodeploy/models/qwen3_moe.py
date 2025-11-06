@@ -49,7 +49,7 @@ class Qwen3MoeAttention(nn.Module):
 
         self.layer_idx = layer_idx
 
-        tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
+        tp_size = get_dist_context().attn_tp_world_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -184,7 +184,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         weight_dtype = quantization_config.dtype or config.dtype
 
-        self.tp_size = dist.get_world_size(group=get_dist_context().ffn_tp_group)
+        self.tp_size = get_dist_context().ffn_tp_world_size
 
         # global parameter for DeepGEMM
         self.gate_up_proj = nn.Parameter(
@@ -269,7 +269,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         )
 
         self.ep_group = get_dist_context().ffn_ep_group
-        self.ep_size = dist.get_world_size(group=self.ep_group)
+        self.ep_size = get_dist_context().ffn_ep_world_size
         if self.ep_size > 1:
             self.moe = build_deepep_moe(
                 low_latency_mode=True,
@@ -302,8 +302,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     @property
     def num_experts_per_rank(self):
-        ep_group = get_dist_context().ffn_ep_group
-        ep_world_size = dist.get_world_size(group=ep_group)
+        ep_world_size = get_dist_context().ffn_ep_world_size
         return self.num_experts // ep_world_size
 
     @property
