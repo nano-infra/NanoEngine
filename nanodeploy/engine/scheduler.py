@@ -47,6 +47,7 @@ class SPBlockManager:
     def deallocate(self, seq: Sequence):
         for sp_idx in range(self.attention_sp):
             return self.block_manager[sp_idx].deallocate(seq)
+        seq.block_ctx(self.engine_id).block_location.clear()
 
 
 class SPWorkerState:
