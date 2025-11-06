@@ -58,7 +58,8 @@ class RayExecutor:
         self, dp_seqs: List[List[Sequence]], is_prefill: bool, timeout: float = None
     ) -> list[int]:
         tp_size = self.config.attention_tp
-        dp_seqs = [num for num in dp_seqs for _ in range(tp_size)]
+        sp_size = self.config.attention_sp
+        dp_seqs = [seq for seq in dp_seqs for _ in range(tp_size * sp_size)]
         return ray.get(
             [
                 getattr(worker, "run").remote(seqs, is_prefill)

@@ -25,8 +25,12 @@ class SequenceStatus(Enum):
 @dataclasses.dataclass
 class BlockContext:
     engine_id: str
-    master_replica: int
-    block_table: list[int]
+
+    selected_dp_idx: int
+    attention_sp: int
+
+    master_sp_rank: int = 0
+    sp_block_table: dict[int, list[int]] | None = None
 
 
 class Sequence:
@@ -55,7 +59,13 @@ class Sequence:
         self.backup_engine_id = engine_id
         self.active_engine_id = engine_id
         self.block_ctx_map: dict[str, BlockContext] = {
-            engine_id: BlockContext(engine_id, -1, [])
+            engine_id: BlockContext(
+                engine_id=engine_id,
+                selected_dp_idx=-1,
+                attention_sp=1,
+                master_sp_rank=-1,
+                sp_block_table=defaultdict(list),
+            )
         }
 
         self.temperature = sampling_params.temperature
@@ -63,28 +73,32 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
 
     def selected_replica(self, engine_id):
-        return self.block_ctx_map[engine_id].master_replica
+        return self.block_ctx_map[engine_id].selected_dp_idx
 
-    def block_table(self, engine_id):
-        return self.block_ctx_map[engine_id].block_table
+    def block_ctx(self, engine_id: str | None = None):
+        engine_id = engine_id or self.active_engine_id
+        return self.block_ctx_map[engine_id]
 
-    @property
-    def active_block_table(self):
-        return self.block_ctx_map[self.active_engine_id].block_table
+    def block_table(self, engine_id: int = None, sp_idx: int = 0):
+        engine_id = engine_id or self.active_engine_id
+        return self.block_ctx_map[engine_id].sp_block_table.get(sp_idx, [])
 
-    @active_block_table.setter
-    def active_block_table(self, value: list[int]):
-        self.block_ctx_map[self.active_engine_id].block_table = value
-
-    def set_engine_id(self, engine_id: str):
+    def set_engine_id(self, engine_id: str, attention_sp: int = 1):
         self.active_engine_id = engine_id
         if engine_id in self.block_ctx_map:
             return
         self.block_ctx_map[engine_id] = BlockContext(
             engine_id=engine_id,
-            master_replica=-1,
-            block_table=[],
+            attention_sp=attention_sp,
+            selected_dp_idx=-1,
+            sp_block_table={i: [] for i in range(attention_sp)},
         )
+
+    def context_len(self, sp_idx):
+        length = len(self.block_table(sp_idx=sp_idx)) * self.block_size
+        if sp_idx == self.block_ctx().master_sp_rank:
+            length -= self.block_size - (len(self) % self.block_size)
+        return length
 
     def __len__(self):
         return self.num_tokens

@@ -9,6 +9,7 @@ import torch.distributed as dist
 from dlslime.assignment import Assignment
 
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.worker.distributed import get_dist_context
 
 
 @dataclasses.dataclass
@@ -152,10 +153,11 @@ class CacheContext:
         assigns: dict[dict[int, list[Assignment]]] = defaultdict(
             lambda: defaultdict(list)
         )
+        sp_idx = dist.get_rank(get_dist_context().attn_sp_group)
         for seq in seqs:
             for remote_block_idx, source_block_idx in zip(
-                seq.block_table(seq.backup_engine_id),
-                seq.block_table(seq.active_engine_id),
+                seq.block_table(seq.backup_engine_id, sp_idx),
+                seq.block_table(seq.active_engine_id, sp_idx),
             ):
                 for kv_idx in range(self.kv_cache.size(0)):
                     for layer_idx in range(self.num_hidden_layers):

@@ -10,10 +10,10 @@ class Config:
     model: str
 
     # scheduler config
-    max_num_batched_tokens: int = 16384
+    max_num_batched_tokens: int = 32768
     max_num_seqs: int = 256
-    max_model_len: int = 8192
-    gpu_memory_utilization: float = 0.6
+    max_model_len: int = 32768
+    gpu_memory_utilization: float = 0.5
 
     # parallel config
     attention_tp: int = 1
