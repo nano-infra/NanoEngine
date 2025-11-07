@@ -13,14 +13,57 @@ class RoutingStrategy(enum.Enum):
     LeastCache = enum.auto()
 
 
-class WorkerState:
+class SPBlockManager:
     def __init__(
-        self, engine_id: str, num_kv_cache_blocks: int, kvcache_block_size: int
+        self,
+        engine_id: str,
+        attention_sp: str,
+        num_kvcache_blocks: int,
+        kvcache_block_size: int,
     ):
+        self.attention_sp = attention_sp
+        self.block_manager: dict[str, BlockManager] = {
+            i: BlockManager(
+                engine_id,
+                i,
+                num_kvcache_blocks,
+                kvcache_block_size,
+            )
+            for i in range(attention_sp)
+        }
+
+    def can_append(self, seq: Sequence):
+        return self.block_manager[self.attention_sp - 1].can_append(seq)
+
+    def may_append(self, seq: Sequence):
+        return self.block_manager[self.attention_sp - 1].may_append(seq)
+
+    def can_allocate(self, seq: Sequence):
+        return self.block_manager[self.attention_sp - 1].can_allocate(seq)
+
+    def allocate(self, seq: Sequence):
+        seq.block_ctx().master_sp_rank = self.attention_sp - 1
+        return self.block_manager[self.attention_sp - 1].allocate(seq)
+
+    def deallocate(self, seq: Sequence):
+        for sp_idx in range(self.attention_sp):
+            return self.block_manager[sp_idx].deallocate(seq)
+        seq.block_ctx(self.engine_id).block_location.clear()
+
+
+class SPWorkerState:
+    def __init__(
+        self,
+        engine_id: str,
+        attention_sp: int,
+        num_kv_cache_blocks: int,
+        kvcache_block_size: int,
+    ):
+        self.attention_sp = attention_sp
+
         self.running: deque[Sequence] = deque()
-        self.to_be_migrated: dict[str, Sequence] = dict()
-        self.block_manager = BlockManager(
-            engine_id, num_kv_cache_blocks, kvcache_block_size
+        self.sp_block_manager = SPBlockManager(
+            engine_id, attention_sp, num_kv_cache_blocks, kvcache_block_size
         )
 
     @property
@@ -39,14 +82,18 @@ class Scheduler:
         self.waiting_migration: deque[Sequence] = deque()
         self.waiting: deque[Sequence] = deque()
 
-        self.num_replica = config.attention_dp
+        self.attention_dp = config.attention_dp
+        self.attention_sp = config.attention_sp
         self.rounting_strategy = RoutingStrategy.RoundRobin
 
         self.worker_state = [
-            WorkerState(
-                config.engine_id, config.num_kvcache_blocks, config.kvcache_block_size
+            SPWorkerState(
+                config.engine_id,
+                self.attention_sp,
+                config.num_kvcache_blocks,
+                config.kvcache_block_size,
             )
-            for _ in range(self.num_replica)
+            for _ in range(self.attention_dp)
         ]
         self.to_be_migrated: dict[str, tuple[Sequence, list[int]]] = {}
 
@@ -68,7 +115,7 @@ class Scheduler:
             setattr(self, "rr_selected", 0)
         while True:
             yield self.rr_selected
-            self.rr_selected = (self.rr_selected + 1) % self.num_replica
+            self.rr_selected = (self.rr_selected + 1) % self.attention_dp
 
     def running(self, selected_replica: int):
         return self.worker_state[selected_replica].running
@@ -77,18 +124,18 @@ class Scheduler:
         return self.worker_state[selected_replica].to_be_migrated
 
     def block_manager(self, selected_replica: int):
-        return self.worker_state[selected_replica].block_manager
+        return self.worker_state[selected_replica].sp_block_manager
 
     def _schedule_prefill(self) -> list[list[Sequence]]:
-        scheduled_seqs = [[] for _ in range(self.num_replica)]
-        num_seqs = {replica_id: 0 for replica_id in range(self.num_replica)}
-        num_batched_tokens = {replica_id: 0 for replica_id in range(self.num_replica)}
+        scheduled_seqs = [[] for _ in range(self.attention_dp)]
+        num_seqs = {replica_id: 0 for replica_id in range(self.attention_dp)}
+        num_batched_tokens = {replica_id: 0 for replica_id in range(self.attention_dp)}
 
         waiting = self.waiting if self.mode != "decode" else self.waiting_migration
 
         while waiting:
             seq = waiting[0]
-            for _ in range(self.num_replica):
+            for _ in range(self.attention_dp):
                 selected_replica = self.rr_generator.__next__()
                 if num_seqs[selected_replica] >= self.max_num_seqs:
                     continue
@@ -101,7 +148,7 @@ class Scheduler:
                     continue
 
                 num_seqs[selected_replica] += 1
-                seq.block_ctx_map[self.engine_id].master_replica = selected_replica
+                seq.block_ctx_map[self.engine_id].selected_dp_idx = selected_replica
 
                 self.block_manager(selected_replica).allocate(seq)
                 num_batched_tokens[selected_replica] += len(seq) - seq.num_cached_tokens
@@ -115,9 +162,9 @@ class Scheduler:
         return scheduled_seqs
 
     def _schedule_decode(self) -> list[list[Sequence]]:
-        scheduled_seqs = [[] for _ in range(self.num_replica)]
-        num_seqs = {replica_id: 0 for replica_id in range(self.num_replica)}
-        for selected_replica in range(self.num_replica):
+        scheduled_seqs = [[] for _ in range(self.attention_dp)]
+        num_seqs = {replica_id: 0 for replica_id in range(self.attention_dp)}
+        for selected_replica in range(self.attention_dp):
             while (
                 self.running(selected_replica)
                 and num_seqs[selected_replica] < self.max_num_seqs
@@ -160,28 +207,31 @@ class Scheduler:
         seq.current_checkpointed_tokens = len(seq.token_ids)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[list[Sequence]], token_ids: list[list[int]]):
-        for i in range(self.num_replica):
-            for seq, token_id in zip(seqs[i], token_ids[i]):
-                seq.append_token(token_id)
-                if (
-                    not seq.ignore_eos and token_id == self.eos
-                ) or seq.num_generated_tokens_since_checkpoint == seq.max_tokens:
-                    seq.status = SequenceStatus.FINISHED
-                    self.block_manager(i).deallocate(seq)
-                    self.running(i).remove(seq)
-                elif self.mode == "prefill":
-                    seq.status = SequenceStatus.TO_BE_MIGRATED
-                    seq.backup_engine_id = seq.active_engine_id
-                    seq.active_engine_id = None
-                    self.running(i).remove(seq)
-                    self.to_be_migrated[seq.seq_id] = (seq, [i])
+    def postprocess(
+        self, dp_seqs: list[list[list[Sequence]]], dp_token_ids: list[list[list[int]]]
+    ):
+        for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
+            for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
+                for _, (seq, token_id) in enumerate(zip(seqs, token_ids)):
+                    assert sp_idx == seq.block_ctx(self.engine_id).master_sp_rank
+                    seq.append_token(token_id)
+                    if (
+                        not seq.ignore_eos and token_id == self.eos
+                    ) or seq.num_completed_tokens == seq.max_tokens:
+                        seq.status = SequenceStatus.FINISHED
+                        self.block_manager(dp_idx).deallocate(seq)
+                        self.running(dp_idx).remove(seq)
+                    elif self.mode == "prefill":
+                        seq.status = SequenceStatus.TO_BE_MIGRATED
+                        seq.backup_engine_id = seq.active_engine_id
+                        seq.active_engine_id = None
+                        self.running(dp_idx).remove(seq)
+                        self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):
             seqs = [seqs]
         for seq in seqs:
-            seq, selected_replicas = self.to_be_migrated[seq.seq_id]
-            for selected in selected_replicas:
-                self.block_manager(selected).deallocate(seq)
+            seq, selected_dp_idx = self.to_be_migrated[seq.seq_id]
+            self.block_manager(selected_dp_idx).deallocate(seq)
             del self.to_be_migrated[seq.seq_id]

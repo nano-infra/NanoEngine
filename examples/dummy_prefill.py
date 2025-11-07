@@ -15,8 +15,8 @@ def main():
     decode = LLM(
         path,
         enforce_eager=False,
-        attention_dp=4,
-        attention_sp=2,
+        attention_dp=8,
+        attention_sp=1,
         attention_tp=1,
         ffn_dp=1,
         ffn_ep=8,
@@ -25,34 +25,6 @@ def main():
         master_address="127.0.0.1:6006",
         dummy_prefill=True,
     )
-
-    prefill = LLM(
-        path,
-        enforce_eager=False,
-        attention_dp=8,
-        attention_sp=1,
-        attention_tp=1,
-        ffn_dp=1,
-        ffn_ep=8,
-        ffn_tp=1,
-        mode="prefill",
-        master_address="127.0.0.1:6006",
-    )
-
-    prefill_endpoints_info = prefill.p2p_init(
-        decode.engine_id,
-        decode.config.num_kvcache_blocks,
-        decode.config.attn_world_size,
-    )
-
-    decode_endpoints_info = decode.p2p_init(
-        prefill.engine_id,
-        prefill.config.num_kvcache_blocks,
-        prefill.config.attn_world_size,
-    )
-
-    prefill.p2p_connect(decode.engine_id, decode_endpoints_info)
-    decode.p2p_connect(prefill.engine_id, prefill_endpoints_info)
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=True)
     prompts = [
@@ -80,13 +52,8 @@ def main():
         for prompt in prompts
     ]
 
-    prefill.add_request(seqs)
-    prefill.generate()
-
     decode.add_request(seqs)
     decode.generate()
-
-    prefill.free_to_be_migrated(seqs)
 
     for prompt, seq in zip(prompts, seqs):
         token_ids = seq.completion_token_ids

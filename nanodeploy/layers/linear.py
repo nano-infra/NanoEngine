@@ -35,8 +35,8 @@ class LinearBase(nn.Module):
         self.quantization_config = quantization_config or QuantizationConfig
 
         self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank(group=get_dist_context().attn_tp_group)
-        self.tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
+        self.tp_rank = get_dist_context().attn_tp_rank
+        self.tp_size = get_dist_context().attn_tp_world_size
 
         device = torch.get_default_device() if not meta else torch.device("meta")
 
@@ -166,7 +166,7 @@ class ColumnParallelLinear(LinearBase):
         scale_tensor: torch.Tensor | None = None,
         quantization_config: QuantizationConfig = None,
     ):
-        tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
+        tp_size = get_dist_context().attn_tp_world_size
         super().__init__(
             input_size,
             divide(output_size, tp_size),
@@ -275,7 +275,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         scale_tensor: torch.Tensor | None = None,
         quantization_config: QuantizationConfig = QuantizationConfig,
     ):
-        tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
+        tp_size = get_dist_context().attn_tp_world_size
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
         self.num_heads = divide(total_num_heads, tp_size)
@@ -335,7 +335,7 @@ class RowParallelLinear(LinearBase):
         scale_tensor: torch.Tensor | None = None,
         quantization_config: QuantizationConfig = None,
     ):
-        tp_size = dist.get_world_size(group=get_dist_context().attn_tp_group)
+        tp_size = get_dist_context().attn_tp_world_size
         super().__init__(
             divide(input_size, tp_size),
             output_size,
