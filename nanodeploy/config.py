@@ -10,10 +10,11 @@ class Config:
     model: str
 
     # scheduler config
+    loop_count: int = 16
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 256
     max_model_len: int = 16384
-    gpu_memory_utilization: float = 0.5
+    gpu_memory_utilization: float = 0.9
 
     # parallel config
     attention_tp: int = 1
@@ -45,7 +46,10 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.attention_tp <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
-        self.max_model_len = min(
+        # self.max_model_len = min(
+        #     self.max_model_len, self.hf_config.max_position_embeddings
+        # )
+        self.hf_config.max_position_embeddings = max(
             self.max_model_len, self.hf_config.max_position_embeddings
         )
         assert self.max_num_batched_tokens >= self.max_model_len

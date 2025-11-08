@@ -1,4 +1,5 @@
 import atexit
+import time
 import uuid
 from dataclasses import fields
 from time import perf_counter
@@ -59,6 +60,7 @@ class LLMEngine:
         dp_size = self.config.attention_dp
         sp_size = self.config.attention_sp
         tp_size = self.config.attention_tp
+        sch_begin = time.time()
         dp_seqs, is_prefill = self.scheduler.schedule()
         dp_sp_seqs = [
             [
@@ -70,16 +72,17 @@ class LLMEngine:
             for sp_idx in range(self.config.attention_sp)
         ]
         dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
+        sch_end = time.time()
+        post_sch_begin = 0
+        post_sch_end = 0
         if is_prefill and self.config.mode == "decode":
             if not self.config.dummy_prefill:
                 self.executor.migrate(dp_sp_tp_seqs)
             else:
-                [
-                    [seq.append_token(np.random.randint(0, 8000)) for seq in seqs]
-                    for seqs in dp_seqs
-                ]
+                [[seq.append_token(0) for seq in seqs] for seqs in dp_seqs]
         else:
             token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
+            post_sch_begin = time.time()
             token_ids = [
                 token_ids[i * sp_size : (i + 1) * sp_size] for i in range(0, dp_size)
             ]
@@ -87,6 +90,7 @@ class LLMEngine:
                 dp_sp_seqs[i * sp_size : (i + 1) * sp_size] for i in range(0, dp_size)
             ]
             self.scheduler.postprocess(dp_sp_seqs, token_ids)
+            post_sch_end = time.time()
         outputs = []
         num_tokens = 0
         for seqs in dp_seqs:
@@ -97,8 +101,18 @@ class LLMEngine:
                     if seq.is_finished
                 ]
             )
-            num_tokens += sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        return outputs, num_tokens
+            num_tokens += (
+                sum(len(seq) for seq in seqs)
+                if is_prefill
+                else -len(seqs) * self.config.loop_count
+            )
+        return (
+            outputs,
+            num_tokens,
+            [len(seqs) for seqs in dp_seqs],
+            (sch_end - sch_begin) * 1000,
+            (post_sch_end - post_sch_begin) * 1000,
+        )
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -128,16 +142,21 @@ class LLMEngine:
 
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            output, num_tokens, bs, sch_latency, post_sch_latency = self.step()
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
                 else:
                     decode_throughput = -num_tokens / (perf_counter() - t)
+                itl = (perf_counter() - t) * 1000 / self.config.loop_count
                 pbar.set_postfix(
                     {
+                        "bs": f"{bs}",
                         "Prefill": f"{int(prefill_throughput)}tok/s",
                         "Decode": f"{int(decode_throughput)}tok/s",
+                        "sch_ovhd": f"{sch_latency:.2f}ms",
+                        "post_sch_ovhd": f"{post_sch_latency:.2f}ms",
+                        "itl": f"{itl:.2f}ms",
                     }
                 )
             for seq_id, token_ids in output:

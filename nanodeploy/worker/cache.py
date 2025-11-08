@@ -182,7 +182,7 @@ class CacheContext:
                                 length=self.block_stride(1),
                             )
                             assigns[seq.backup_engine_id][
-                                seq.selected_replica(seq.backup_engine_id)
+                                seq.dp_idx(seq.backup_engine_id)
                                 * seq.block_ctx(seq.backup_engine_id).attention_sp
                                 + remote_block_idx[0]
                             ].append(assignment)

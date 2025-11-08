@@ -1,6 +1,6 @@
 import torch
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 
 from nanodeploy.kernels.kvcache import store_kvcache
 from nanodeploy.worker.context import get_context
@@ -42,15 +42,15 @@ class Attention(nn.Module):
                 cu_seqlens_k=context.cu_seqlens_k,
                 softmax_scale=self.scale,
                 causal=True,
-                block_table=context.block_tables,
             )
         else:  # decode
+            # print(f"{q.shape=}, {k_cache.shape=}, {v_cache.shape=}, {context.context_lens=}, {context.block_tables.shape=}")
             o = flash_attn_with_kvcache(
                 q.unsqueeze(1),
                 k_cache,
                 v_cache,
                 cache_seqlens=context.context_lens,
-                block_table=context.block_tables,
+                page_table=context.block_tables,
                 softmax_scale=self.scale,
                 causal=True,
             )

@@ -162,6 +162,29 @@ class Qwen3MoeMLP(nn.Module):
         return x
 
 
+def compute_topk_ids(topk_ids, ranks, num_experts):
+    shape = topk_ids.shape
+    step = num_experts // ranks
+    topk_ids = (
+        (
+            torch.arange(
+                0, topk_ids.numel(), dtype=topk_ids.dtype, device=topk_ids.device
+            )
+            // ranks
+        )
+        % step
+        + (
+            torch.arange(
+                0, topk_ids.numel(), dtype=topk_ids.dtype, device=topk_ids.device
+            )
+            % ranks
+        )
+        * step
+    ) % num_experts
+    topk_ids = topk_ids.reshape(shape)
+    return topk_ids
+
+
 class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def __init__(
@@ -329,6 +352,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 routing_weights, self.top_k, dim=-1
             )
 
+            if True:
+                ep_size = get_dist_context().ffn_ep_world_size
+                selected_experts = compute_topk_ids(
+                    selected_experts, ep_size, self.num_experts
+                )
             final_hidden_states = moe.forward(
                 hidden_states,
                 routing_weights,

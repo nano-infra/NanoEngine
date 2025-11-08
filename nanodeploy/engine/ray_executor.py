@@ -18,8 +18,10 @@ class RayExecutor:
 
         self.workers = []
         assert config.attn_world_size == config.ffn_world_size
-        for global_rank in range(config.attn_world_size):
-            self.workers.append(ModelRunner.remote(config, global_rank, None))
+        self.workers = [
+            ModelRunner.remote(config, rank, None)
+            for rank in range(config.attn_world_size)
+        ]
 
     def collective_rpc(
         self,
@@ -65,6 +67,7 @@ class RayExecutor:
 
     def update_kvcache_blocks(self):
         num_cache_blocks = min(self.collective_rpc("num_kvcache_blocks"))
+        print(f"{num_cache_blocks=}")
         self.collective_rpc("allocate_kvcache", (num_cache_blocks,))
         return num_cache_blocks
 

@@ -26,7 +26,7 @@ class SequenceStatus(Enum):
 class BlockContext:
     engine_id: str
 
-    selected_dp_idx: int = 0
+    dp_idx: int = 0
     master_sp_rank: int = 0
 
     attention_sp: int = 1
@@ -65,7 +65,7 @@ class Sequence:
         self.block_ctx_map: dict[str, BlockContext] = {
             engine_id: BlockContext(
                 engine_id=engine_id,
-                selected_dp_idx=-1,
+                dp_idx=-1,
                 attention_sp=1,
                 attention_dp=1,
                 master_sp_rank=master_sp_rank,
@@ -78,8 +78,8 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
-    def selected_replica(self, engine_id):
-        return self.block_ctx_map[engine_id].selected_dp_idx
+    def dp_idx(self, engine_id):
+        return self.block_ctx_map[engine_id].dp_idx
 
     def block_ctx(self, engine_id: str | None = None):
         engine_id = engine_id or self.active_engine_id
@@ -95,7 +95,7 @@ class Sequence:
             return
         self.block_ctx_map[engine_id] = BlockContext(
             engine_id=engine_id,
-            selected_dp_idx=-1,
+            dp_idx=-1,
             attention_sp=attention_sp,
             attention_dp=attention_dp,
             block_location=[],

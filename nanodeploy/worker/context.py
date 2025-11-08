@@ -15,6 +15,21 @@ class Context:
     block_tables: torch.Tensor | None = None
     is_dummy: bool = False
 
+    def print(self):
+        """打印所有张量字段的形状，非张量字段打印值或类型"""
+        print("Context 字段信息：")
+        # 遍历所有字段
+        for field in self.__dataclass_fields__:
+            value = getattr(self, field)
+            if isinstance(value, torch.Tensor):
+                # 张量字段：打印名称和形状
+                print(
+                    f"  {field}: shape={value.shape}, dtype={value.dtype}, device={value.device}"
+                )
+            else:
+                # 非张量字段：打印名称和值（或None）
+                print(f"  {field}: {value}")
+
 
 _CONTEXT = Context()
 

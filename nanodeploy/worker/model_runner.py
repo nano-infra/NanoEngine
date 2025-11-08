@@ -8,6 +8,8 @@ import ray
 import torch
 import torch.distributed as dist
 
+import torch.profiler as profiler
+
 from nanodeploy.config import Config
 
 from nanodeploy.engine.sequence import Sequence
@@ -69,7 +71,31 @@ class ModelRunner:
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
 
-        load_model(self.model, config.model)
+        # 性能分析相关初始化
+        self.run_count = 0  # 记录 run_model 的调用次数
+        self.prof_start = 0  # 开始 profiling 的次数
+        self.prof_end = 100  # 结束 profiling 的次数
+        self.profiler = None  # 用于存储 profiler 实例
+
+        # 配置 profiler（包含 CUDA 时间线）
+        self.prof_kwargs = {
+            "activities": [
+                torch.profiler.ProfilerActivity.CPU,  # 记录 CPU 活动
+                torch.profiler.ProfilerActivity.CUDA,  # 记录 CUDA 活动（关键）
+            ],
+            "schedule": profiler.schedule(
+                wait=0, warmup=50, active=50
+            ),  # 每次启动只记录1步
+            "on_trace_ready": torch.profiler.tensorboard_trace_handler(
+                dir_name="/mnt/nvme1n1/ml_research/majinming/src/nano-deploy/",
+                worker_name=f"trace_rank_{dist.get_rank()}",
+            ),
+            "record_shapes": True,  # 记录张量形状
+            "profile_memory": True,  # 记录内存使用
+            "with_stack": True,  # 记录调用栈
+        }
+
+        # load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.preallocate_kvcache()
@@ -112,8 +138,8 @@ class ModelRunner:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = (
-            self.config.max_num_batched_tokens,
-            self.config.max_model_len,
+            min(self.config.max_num_batched_tokens, 16384),
+            min(self.config.max_model_len, 8192),
         )
         num_seqs = min(
             max_num_batched_tokens // max_model_len, self.config.max_num_seqs
@@ -309,6 +335,28 @@ class ModelRunner:
         get_cache_context().migrate(seqs=seqs)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # start_event = torch.cuda.Event(enable_timing=True)
+        # end_event = torch.cuda.Event(enable_timing=True)
+        # start_event.record()
+
+        # """封装 run_model 的调用，加入 profiler 控制"""
+
+        # # # 判断是否在目标范围内（50~100 次）
+        # in_prof_range = (self.run_count >= self.prof_start) and (
+        #     self.run_count <= self.prof_end
+        # )
+
+        # if self.run_count == self.prof_start and self.profiler is None:
+        #     # 进入范围时启动 profiler
+        #     self.profiler = profiler.profile(**self.prof_kwargs)
+        #     self.profiler.start()
+        #     print(f"开始 profiling（第 {self.run_count} 次）")
+
+        # self.run_count += 1  # 每次调用计数+1
+
+        # print(input_ids.shape, positions.shape)
+        # get_context().print()
+
         if not seqs:
             seq = Sequence(
                 [np.random.randint(8000)],
@@ -318,26 +366,58 @@ class ModelRunner:
             sp_idx = get_dist_context().attn_sp_rank
             seq.block_ctx(self.engine_id).sp_block_table[sp_idx] = [0]
             seqs = [seq]
-        input_ids, positions = (
-            self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        )
 
-        logits = self.run_model(input_ids, positions, is_prefill)
-        tp_rank = get_dist_context().attn_tp_rank
-        if seqs:
-            temperatures = self.prepare_sample(seqs) if tp_rank == 0 else None
-            token_ids = (
-                self.sampler(logits, temperatures).tolist() if tp_rank == 0 else None
+        loop_count = self.config.loop_count if not is_prefill else 1
+
+        loop_count_token_ids = [[] for _ in seqs]
+
+        for i in range(loop_count):
+            input_ids, positions = (
+                self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
             )
+            logits = self.run_model(input_ids, positions, is_prefill)
+            tp_rank = get_dist_context().attn_tp_rank
+            temperatures = (
+                self.prepare_sample(seqs) if tp_rank == 0 else [None] * len(seqs)
+            )
+            token_ids = (
+                self.sampler(logits, temperatures).tolist()
+                if tp_rank == 0
+                else [None] * len(seqs)
+            )
+            for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
+                loop_count_token_ids[i].append(token_id)
+                seq.num_tokens += 1
             reset_context()
-            return token_ids
-        else:
-            return []
+        # if in_prof_range and self.profiler is not None:
+        #     self.profiler.step()
+        #     # 在范围内时，每次调用结束后停止并记录（配合 schedule=active=1）
+        #     # self.profiler.stop()
+        #     print(f"记录第 {self.run_count} 次调用的性能数据")
+
+        # if self.run_count == self.prof_end and self.profiler is not None:
+        #     self.profiler.stop()
+        #     # 超出范围后关闭 profiler
+        #     self.profiler = None
+        #     print(f"结束 profiling（共记录 {self.prof_end - self.prof_start + 1} 次）")
+        # end_event.record()
+        # torch.cuda.synchronize()
+        # cuda_elapse_ms = start_event.elapsed_time(end_event)
+        # cuda_time = torch.tensor(cuda_elapse_ms)
+        # dist.all_reduce(cuda_time)
+        # if dist.get_rank() == 0:
+        #     print(
+        #         f"model run latency: {(float(cuda_time) / get_dist_context().attn_dp_world_size):.2f} ms\n"
+        #     )
+        return loop_count_token_ids
 
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
+        hf_config.max_position_embeddings = max(
+            config.max_model_len, hf_config.max_position_embeddings
+        )
         max_bs = min(self.config.max_num_seqs, 512)
         block_size = get_cache_context().block_size
         max_num_blocks = (config.max_model_len + block_size - 1) // block_size

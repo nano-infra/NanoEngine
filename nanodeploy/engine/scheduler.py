@@ -32,11 +32,11 @@ class SPBlockManager:
             for i in range(attention_sp)
         }
 
-    def can_append(self, seq: Sequence):
-        return self.block_manager[self.attention_sp - 1].can_append(seq)
+    def can_append(self, seq: Sequence, num_tokens: int = 1):
+        return self.block_manager[self.attention_sp - 1].can_append(seq, num_tokens)
 
-    def may_append(self, seq: Sequence):
-        return self.block_manager[self.attention_sp - 1].may_append(seq)
+    def may_append(self, seq: Sequence, num_tokens: int = 1):
+        return self.block_manager[self.attention_sp - 1].may_append(seq, num_tokens)
 
     def can_allocate(self, seq: Sequence):
         return self.block_manager[self.attention_sp - 1].can_allocate(seq)
@@ -75,6 +75,7 @@ class Scheduler:
 
     def __init__(self, config: Config):
         self.engine_id = config.engine_id
+        self.loop_count = config.loop_count
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
@@ -117,14 +118,14 @@ class Scheduler:
             yield self.rr_selected
             self.rr_selected = (self.rr_selected + 1) % self.attention_dp
 
-    def running(self, selected_replica: int):
-        return self.worker_state[selected_replica].running
+    def running(self, dp_idx: int):
+        return self.worker_state[dp_idx].running
 
-    def to_be_migrated(self, selected_replica: int):
-        return self.worker_state[selected_replica].to_be_migrated
+    def to_be_migrated(self, dp_idx: int):
+        return self.worker_state[dp_idx].to_be_migrated
 
-    def block_manager(self, selected_replica: int):
-        return self.worker_state[selected_replica].sp_block_manager
+    def block_manager(self, dp_idx: int):
+        return self.worker_state[dp_idx].sp_block_manager
 
     def _schedule_prefill(self) -> list[list[Sequence]]:
         scheduled_seqs = [[] for _ in range(self.attention_dp)]
@@ -135,55 +136,68 @@ class Scheduler:
 
         while waiting:
             seq = waiting[0]
-            for _ in range(self.attention_dp):
-                selected_replica = self.rr_generator.__next__()
-                if num_seqs[selected_replica] >= self.max_num_seqs:
-                    continue
-                num_batched_tokens_satisfied = (
-                    num_batched_tokens[selected_replica] + len(seq)
-                    <= self.max_num_batched_tokens
-                )
-                can_allocate = self.block_manager(selected_replica).can_allocate(seq)
-                if not num_batched_tokens_satisfied or not can_allocate:
-                    continue
+            if self.rounting_strategy == RoutingStrategy.RoundRobin:
+                for _ in range(self.attention_dp):
+                    selected_dp_idx = self.rr_generator.__next__()
+                    if num_seqs[selected_dp_idx] >= self.max_num_seqs:
+                        continue
+                    num_batched_tokens_satisfied = (
+                        num_batched_tokens[selected_dp_idx] + len(seq)
+                        <= self.max_num_batched_tokens
+                    )
+                    can_allocate = self.block_manager(selected_dp_idx).can_allocate(seq)
+                    if not num_batched_tokens_satisfied or not can_allocate:
+                        continue
 
-                num_seqs[selected_replica] += 1
-                seq.block_ctx_map[self.engine_id].selected_dp_idx = selected_replica
+                    num_seqs[selected_dp_idx] += 1
+                    seq.block_ctx_map[self.engine_id].dp_idx = selected_dp_idx
 
-                self.block_manager(selected_replica).allocate(seq)
-                num_batched_tokens[selected_replica] += len(seq) - seq.num_cached_tokens
-                seq.status = SequenceStatus.RUNNING
-                waiting.popleft()
-                self.running(selected_replica).append(seq)
-                scheduled_seqs[selected_replica].append(seq)
-                break
+                    self.block_manager(selected_dp_idx).allocate(seq)
+                    num_batched_tokens[selected_dp_idx] += (
+                        len(seq) - seq.num_cached_tokens
+                    )
+                    seq.status = SequenceStatus.RUNNING
+                    waiting.popleft()
+                    self.running(selected_dp_idx).append(seq)
+                    scheduled_seqs[selected_dp_idx].append(seq)
+                    break
+                else:
+                    break
+            elif self.rounting_strategy == RoutingStrategy.LeastToken:
+                pass
+            elif self.rounting_strategy == RoutingStrategy.LeastCache:
+                pass
             else:
-                break
+                raise AttributeError
         return scheduled_seqs
 
     def _schedule_decode(self) -> list[list[Sequence]]:
         scheduled_seqs = [[] for _ in range(self.attention_dp)]
         num_seqs = {replica_id: 0 for replica_id in range(self.attention_dp)}
-        for selected_replica in range(self.attention_dp):
+        for selected_dp_idx in range(self.attention_dp):
             while (
-                self.running(selected_replica)
-                and num_seqs[selected_replica] < self.max_num_seqs
+                self.running(selected_dp_idx)
+                and num_seqs[selected_dp_idx] < self.max_num_seqs
             ):
-                seq = self.running(selected_replica).popleft()
-                while not self.block_manager(selected_replica).can_append(seq):
-                    if self.running(selected_replica):
+                seq = self.running(selected_dp_idx).popleft()
+                while not self.block_manager(selected_dp_idx).can_append(
+                    seq, num_tokens=self.loop_count
+                ):
+                    if self.running(selected_dp_idx):
                         self.preempt(
-                            selected_replica, self.running(selected_replica).pop()
+                            selected_dp_idx, self.running(selected_dp_idx).pop()
                         )
                     else:
-                        self.preempt(selected_replica, seq)
+                        self.preempt(selected_dp_idx, seq)
                         break
                 else:
-                    num_seqs[selected_replica] += 1
-                    self.block_manager(selected_replica).may_append(seq)
-                    scheduled_seqs[selected_replica].append(seq)
-            self.running(selected_replica).extendleft(
-                reversed(scheduled_seqs[selected_replica])
+                    num_seqs[selected_dp_idx] += 1
+                    self.block_manager(selected_dp_idx).may_append(
+                        seq, num_tokens=self.loop_count
+                    )
+                    scheduled_seqs[selected_dp_idx].append(seq)
+            self.running(selected_dp_idx).extendleft(
+                reversed(scheduled_seqs[selected_dp_idx])
             )
         return scheduled_seqs
 
@@ -201,9 +215,10 @@ class Scheduler:
 
         return scheduled_seqs, False
 
-    def preempt(self, selected_replica: int, seq: Sequence):
+    def preempt(self, dp_idx: int, seq: Sequence):
+        print("preemption happens")
         seq.status = SequenceStatus.WAITING
-        self.block_manager(selected_replica).deallocate(seq)
+        self.block_manager(dp_idx).deallocate(seq)
         seq.current_checkpointed_tokens = len(seq.token_ids)
         self.waiting.appendleft(seq)
 
@@ -212,21 +227,24 @@ class Scheduler:
     ):
         for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
             for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
-                for _, (seq, token_id) in enumerate(zip(seqs, token_ids)):
-                    assert sp_idx == seq.block_ctx(self.engine_id).master_sp_rank
-                    seq.append_token(token_id)
-                    if (
-                        not seq.ignore_eos and token_id == self.eos
-                    ) or seq.num_completed_tokens == seq.max_tokens:
-                        seq.status = SequenceStatus.FINISHED
-                        self.block_manager(dp_idx).deallocate(seq)
-                        self.running(dp_idx).remove(seq)
-                    elif self.mode == "prefill":
-                        seq.status = SequenceStatus.TO_BE_MIGRATED
-                        seq.backup_engine_id = seq.active_engine_id
-                        seq.active_engine_id = None
-                        self.running(dp_idx).remove(seq)
-                        self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
+                for _, (seq, loop_count_token_id) in enumerate(zip(seqs, token_ids)):
+                    for token_id in loop_count_token_id:
+                        assert sp_idx == seq.block_ctx(self.engine_id).master_sp_rank
+                        seq.append_token(token_id)
+                        if (
+                            not seq.ignore_eos and token_id == self.eos
+                        ) or seq.num_completed_tokens == seq.max_tokens:
+                            seq.status = SequenceStatus.FINISHED
+                            self.block_manager(dp_idx).deallocate(seq)
+                            self.running(dp_idx).remove(seq)
+                            break
+                        elif self.mode == "prefill":
+                            seq.status = SequenceStatus.TO_BE_MIGRATED
+                            seq.backup_engine_id = seq.active_engine_id
+                            seq.active_engine_id = None
+                            self.running(dp_idx).remove(seq)
+                            self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
+                            break
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):
