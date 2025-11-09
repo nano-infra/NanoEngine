@@ -18,6 +18,7 @@ from nanodeploy.layers.linear import (
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
+from nanodeploy.worker.runner_config import get_runner_config
 
 from torch import nn
 from transformers import Qwen3MoeConfig
@@ -352,7 +353,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 routing_weights, self.top_k, dim=-1
             )
 
-            if True:
+            if get_runner_config().perfect_eplb:
                 ep_size = get_dist_context().ffn_ep_world_size
                 selected_experts = compute_topk_ids(
                     selected_experts, ep_size, self.num_experts

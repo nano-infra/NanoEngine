@@ -57,13 +57,14 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        return len(self.free_block_ids) >= seq.num_blocks(self.engine_id, self.sp_idx)
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table(self.engine_id, self.sp_idx)
         h = -1
         cache_miss = False
-        for i in range(seq.num_blocks):
+        num_blocks = seq.num_blocks(self.engine_id, self.sp_idx)
+        for i in range(num_blocks):
             token_ids = seq.block(i)
             h = (
                 self.compute_hash(token_ids, h)
@@ -121,7 +122,7 @@ class BlockManager:
                 block_table.append(block_id)
             elif (len(seq) + idx - 1) % self.block_size == 0:
                 # assert last_block.hash == -1
-                token_ids = seq.block(seq.num_blocks - 1)
+                token_ids = seq.block(seq.num_blocks(self.engine_id, self.sp_idx) - 1)
                 prefix = (
                     self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
                 )

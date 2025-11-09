@@ -20,6 +20,7 @@ from nanodeploy.worker.cache import get_cache_context, set_cache_context
 from nanodeploy.worker.context import get_context, reset_context, set_context
 from nanodeploy.worker.distributed import get_dist_context, set_dist_context
 from nanodeploy.worker.loader import load_model
+from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 
 
 architectures = {
@@ -39,7 +40,11 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        # set context
+        set_runner_config(
+            dummy_weight=config.dummy_weight,
+            perfect_eplb=config.perfect_eplb,
+        )
+
         dist.init_process_group(
             "cpu:gloo,cuda:nccl",
             f"tcp://{config.master_address}",
@@ -95,7 +100,9 @@ class ModelRunner:
             "with_stack": True,  # 记录调用栈
         }
 
-        # load_model(self.model, config.model)
+        if not get_runner_config().dummy_weight:
+            load_model(self.model, config.model)
+
         self.sampler = Sampler()
         self.warmup_model()
         self.preallocate_kvcache()
@@ -186,17 +193,6 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_dummy(self, is_prefill: bool):
-        sp_idx = get_dist_context().attn_sp_rank
-        seq = Sequence([0], engine_id=self.engine_id, master_sp_rank=sp_idx)
-        seq.block_ctx_map[self.engine_id].sp_block_table[sp_idx] = [
-            self.config.num_kvcache_blocks - 1
-        ]
-        if is_prefill:
-            return self.prepare_prefill([seq])
-        else:
-            return self.prepare_decode([seq])
-
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
@@ -222,15 +218,16 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table(self.engine_id, sp_idx):  # warmup
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
+            num_blocks = seq.num_blocks(self.engine_id, sp_idx)
+            for i in range(seq.num_cached_blocks, num_blocks):
                 start = (
                     seq.block_table(self.engine_id, sp_idx)[i]
                     * get_cache_context().block_size
                 )
-                if i != seq.num_blocks - 1:
+                if i != seq.num_blocks(self.engine_id, sp_idx) - 1:
                     end = start + get_cache_context().block_size
                 else:
-                    end = start + seq.last_block_num_tokens
+                    end = start + seq.last_block_num_tokens(self.engine_id, sp_idx)
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
             block_tables = self.prepare_block_tables(seqs)
@@ -271,11 +268,11 @@ class ModelRunner:
             assert seq.block_ctx(self.engine_id).master_sp_rank == sp_idx
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
-            context_lens.append(seq.context_len(sp_idx))
+            context_lens.append(seq.context_len(self.engine_id, sp_idx))
             slot_mapping.append(
                 seq.block_table(seq.active_engine_id, sp_idx)[-1]
                 * get_cache_context().block_size
-                + seq.last_block_num_tokens
+                + seq.last_block_num_tokens(self.engine_id, sp_idx)
                 - 1
             )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
@@ -355,7 +352,7 @@ class ModelRunner:
         # self.run_count += 1  # 每次调用计数+1
 
         # print(input_ids.shape, positions.shape)
-        # get_context().print()
+        sp_idx = get_dist_context().attn_sp_rank
 
         if not seqs:
             seq = Sequence(
@@ -363,7 +360,7 @@ class ModelRunner:
                 engine_id=self.engine_id,
                 master_sp_rank=get_dist_context().attn_sp_rank,
             )
-            sp_idx = get_dist_context().attn_sp_rank
+
             seq.block_ctx(self.engine_id).sp_block_table[sp_idx] = [0]
             seqs = [seq]
 
@@ -386,8 +383,11 @@ class ModelRunner:
                 else [None] * len(seqs)
             )
             for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
+                # handle seq block context
                 loop_count_token_ids[i].append(token_id)
                 seq.num_tokens += 1
+                seq.last_token = token_id
+                seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_idx] += 1
             reset_context()
         # if in_prof_range and self.profiler is not None:
         #     self.profiler.step()

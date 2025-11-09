@@ -21,6 +21,7 @@ class SPBlockManager:
         num_kvcache_blocks: int,
         kvcache_block_size: int,
     ):
+        self.engine_id = engine_id
         self.attention_sp = attention_sp
         self.block_manager: dict[str, BlockManager] = {
             i: BlockManager(
@@ -42,13 +43,17 @@ class SPBlockManager:
         return self.block_manager[self.attention_sp - 1].can_allocate(seq)
 
     def allocate(self, seq: Sequence):
-        seq.block_ctx().master_sp_rank = self.attention_sp - 1
+        master_sp_rank = self.attention_sp - 1
+        block_ctx = seq.block_ctx(self.engine_id)
+        block_ctx.master_sp_rank = master_sp_rank
+        block_ctx.num_dispatched_tokens[master_sp_rank] = seq.num_checkpointed_tokens
         return self.block_manager[self.attention_sp - 1].allocate(seq)
 
     def deallocate(self, seq: Sequence):
         for sp_idx in range(self.attention_sp):
             return self.block_manager[sp_idx].deallocate(seq)
         seq.block_ctx(self.engine_id).block_location.clear()
+        seq.block_ctx(self.engine_id).num_dispatched_tokens.clear()
 
 
 class SPWorkerState:
@@ -219,7 +224,7 @@ class Scheduler:
         print("preemption happens")
         seq.status = SequenceStatus.WAITING
         self.block_manager(dp_idx).deallocate(seq)
-        seq.current_checkpointed_tokens = len(seq.token_ids)
+        seq.num_checkpointed_tokens = len(seq.token_ids)
         self.waiting.appendleft(seq)
 
     def postprocess(

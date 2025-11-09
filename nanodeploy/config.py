@@ -36,10 +36,12 @@ class Config:
     mode: Literal["prefill", "decode", "hybrid"] = "hybrid"
 
     dummy_prefill: bool | None = False
+    dummy_weight: bool | None = False
+    perfect_eplb: bool | None = False
 
     # dist config
     master_address: str | None = "127.0.0.1:6006"
-    ray_address: str | None = "10.102.207.84:7007"
+    ray_address: str | None = "127.0.0.1:6379"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

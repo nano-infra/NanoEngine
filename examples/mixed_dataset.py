@@ -38,6 +38,8 @@ def main():
         max_num_seqs=128,
         max_model_len=524288,
         gpu_memory_utilization=0.95,
+        dummy_weight=True,
+        perfect_eplb=True,
     )
 
     base_sampling_params = SamplingParams(temperature=0.1, ignore_eos=True)
