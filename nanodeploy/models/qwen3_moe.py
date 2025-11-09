@@ -18,6 +18,7 @@ from nanodeploy.layers.linear import (
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
+from nanodeploy.worker.runner_config import get_runner_config
 
 from torch import nn
 from transformers import Qwen3MoeConfig
@@ -160,6 +161,29 @@ class Qwen3MoeMLP(nn.Module):
         x = self.act_fn(gate_up)
         x = self.down_proj(x)
         return x
+
+
+def compute_topk_ids(topk_ids, ranks, num_experts):
+    shape = topk_ids.shape
+    step = num_experts // ranks
+    topk_ids = (
+        (
+            torch.arange(
+                0, topk_ids.numel(), dtype=topk_ids.dtype, device=topk_ids.device
+            )
+            // ranks
+        )
+        % step
+        + (
+            torch.arange(
+                0, topk_ids.numel(), dtype=topk_ids.dtype, device=topk_ids.device
+            )
+            % ranks
+        )
+        * step
+    ) % num_experts
+    topk_ids = topk_ids.reshape(shape)
+    return topk_ids
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -329,6 +353,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 routing_weights, self.top_k, dim=-1
             )
 
+            if get_runner_config().perfect_eplb:
+                ep_size = get_dist_context().ffn_ep_world_size
+                selected_experts = compute_topk_ids(
+                    selected_experts, ep_size, self.num_experts
+                )
             final_hidden_states = moe.forward(
                 hidden_states,
                 routing_weights,

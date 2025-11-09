@@ -1,6 +1,12 @@
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
+
+from nanodeploy.logging import get_logger
+
+# Initialize logger with NANODEPLOY namespace
+logger = get_logger()
 
 
 @dataclass
@@ -13,26 +19,24 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
-    is_dummy: bool = False
 
 
 _CONTEXT = Context()
 
 
-def get_context():
+def get_context() -> Context:
     return _CONTEXT
 
 
 def set_context(
-    is_prefill,
-    cu_seqlens_q=None,
-    cu_seqlens_k=None,
-    max_seqlen_q=0,
-    max_seqlen_k=0,
-    slot_mapping=None,
-    context_lens=None,
-    block_tables=None,
-    is_dummy=False,
+    is_prefill: bool,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: int = 0,
+    max_seqlen_k: int = 0,
+    slot_mapping: Optional[torch.Tensor] = None,
+    context_lens: Optional[torch.Tensor] = None,
+    block_tables: Optional[torch.Tensor] = None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -44,7 +48,6 @@ def set_context(
         slot_mapping,
         context_lens,
         block_tables,
-        is_dummy=is_dummy,
     )
 
 

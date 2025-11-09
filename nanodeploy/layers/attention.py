@@ -1,6 +1,6 @@
 import torch
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 
 from nanodeploy.kernels.kvcache import store_kvcache
 from nanodeploy.worker.context import get_context
@@ -27,7 +27,7 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel() and (not context.is_dummy):
+        if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
             if context.block_tables is not None:  # prefix cache
@@ -42,15 +42,15 @@ class Attention(nn.Module):
                 cu_seqlens_k=context.cu_seqlens_k,
                 softmax_scale=self.scale,
                 causal=True,
-                block_table=context.block_tables,
             )
         else:  # decode
+            # print(f"{q.shape=}, {k_cache.shape=}, {v_cache.shape=}, {context.context_lens=}, {context.block_tables.shape=}")
             o = flash_attn_with_kvcache(
                 q.unsqueeze(1),
                 k_cache,
                 v_cache,
                 cache_seqlens=context.context_lens,
-                block_table=context.block_tables,
+                page_table=context.block_tables,
                 softmax_scale=self.scale,
                 causal=True,
             )

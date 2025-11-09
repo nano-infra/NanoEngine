@@ -14,12 +14,14 @@ def main():
     llm = LLM(
         path,
         enforce_eager=False,
-        attention_dp=16,
+        attention_dp=8,
         attention_sp=1,
         attention_tp=1,
         ffn_dp=1,
-        ffn_ep=16,
+        ffn_ep=8,
         ffn_tp=1,
+        ray_address="10.103.5.41:7077",
+        loop_count=16,
     )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=True)

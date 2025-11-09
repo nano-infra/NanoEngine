@@ -26,13 +26,15 @@ class SequenceStatus(Enum):
 class BlockContext:
     engine_id: str
 
-    selected_dp_idx: int = 0
+    dp_idx: int = 0
     master_sp_rank: int = 0
 
     attention_sp: int = 1
     attention_dp: int = 1
 
+    # For Sequence Parallelization
     block_location: list[tuple[int, int]] | None = None
+    num_dispatched_tokens: dict[int, list[int]] | None = None
     sp_block_table: dict[int, list[int]] | None = None
 
 
@@ -57,7 +59,7 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
 
         # total tokens since preemption happens
-        self.current_checkpointed_tokens = len(token_ids)
+        self.num_checkpointed_tokens = len(token_ids)
         self.num_cached_tokens = 0
 
         self.backup_engine_id = engine_id
@@ -65,12 +67,13 @@ class Sequence:
         self.block_ctx_map: dict[str, BlockContext] = {
             engine_id: BlockContext(
                 engine_id=engine_id,
-                selected_dp_idx=-1,
+                dp_idx=-1,
                 attention_sp=1,
                 attention_dp=1,
                 master_sp_rank=master_sp_rank,
                 block_location=[],
                 sp_block_table=defaultdict(list),
+                num_dispatched_tokens=defaultdict(int),
             )
         }
 
@@ -78,8 +81,8 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
-    def selected_replica(self, engine_id):
-        return self.block_ctx_map[engine_id].selected_dp_idx
+    def dp_idx(self, engine_id):
+        return self.block_ctx_map[engine_id].dp_idx
 
     def block_ctx(self, engine_id: str | None = None):
         engine_id = engine_id or self.active_engine_id
@@ -95,18 +98,17 @@ class Sequence:
             return
         self.block_ctx_map[engine_id] = BlockContext(
             engine_id=engine_id,
-            selected_dp_idx=-1,
+            dp_idx=-1,
             attention_sp=attention_sp,
             attention_dp=attention_dp,
             block_location=[],
             sp_block_table=defaultdict(list, {i: [] for i in range(attention_sp)}),
+            num_dispatched_tokens=defaultdict(int),
         )
 
-    def context_len(self, sp_idx):
-        length = len(self.block_table(sp_idx=sp_idx)) * self.block_size
-        if sp_idx == self.block_ctx().master_sp_rank:
-            length -= self.block_size - (len(self) % self.block_size)
-        return length
+    def context_len(self, engine_id: str | None = None, sp_idx: int | None = None):
+        sp_idx = sp_idx or self.block_ctx(engine_id).master_sp_rank
+        return self.block_ctx(engine_id).num_dispatched_tokens[sp_idx]
 
     def __len__(self):
         return self.num_tokens
@@ -124,7 +126,7 @@ class Sequence:
 
     @property
     def num_generated_tokens_since_checkpoint(self):
-        return self.num_tokens - self.current_checkpointed_tokens
+        return self.num_tokens - self.num_checkpointed_tokens
 
     @property
     def prompt_token_ids(self):
@@ -138,27 +140,36 @@ class Sequence:
     def num_cached_blocks(self):
         return self.num_cached_tokens // self.block_size
 
-    @property
-    def num_blocks(self):
+    def num_blocks(self, engine_id: str | None = None, sp_idx: str | None = None):
+        engine_id = engine_id or self.active_engine_id
+        sp_idx = sp_idx or self.block_ctx(engine_id).master_sp_rank
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
-    @property
-    def last_block_num_tokens(self):
-        return self.num_tokens - (self.num_blocks - 1) * self.block_size
+    def last_block_num_tokens(
+        self, engine_id: str | None = None, sp_idx: str | None = None
+    ):
+        return (
+            self.num_tokens - (self.num_blocks(engine_id, sp_idx) - 1) * self.block_size
+        )
 
     def block(self, i):
-        assert 0 <= i < self.num_blocks
+        assert 0 <= i < self.num_blocks()
         return self.token_ids[i * self.block_size : (i + 1) * self.block_size]
 
-    def append_token(self, token_id: int):
+    def append_token(
+        self, token_id: int, engine_id: str | None = None, sp_idx: int | None = None
+    ):
+        engine_id = engine_id or self.active_engine_id
+        sp_idx = sp_idx or self.block_ctx(engine_id).master_sp_rank
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+        self.block_ctx(engine_id).num_dispatched_tokens[sp_idx] += 1
 
     def __getstate__(self):
         return (
             self.num_tokens,
-            self.current_checkpointed_tokens,
+            self.num_checkpointed_tokens,
             self.num_cached_tokens,
             self.backup_engine_id,
             self.active_engine_id,
@@ -174,7 +185,7 @@ class Sequence:
     def __setstate__(self, state):
         (
             self.num_tokens,
-            self.current_checkpointed_tokens,
+            self.num_checkpointed_tokens,
             self.num_cached_tokens,
             self.backup_engine_id,
             self.active_engine_id,
