@@ -22,13 +22,16 @@ def main():
         ffn_ep=8,
         ffn_tp=1,
         mode="decode",
+        loop_count=1,
         master_address="127.0.0.1:6006",
-        dummy_prefill=True,
+        ray_address="10.103.5.41:7077",
+        dummy_prefill=False,
     )
 
     prefill = LLM(
         path,
         enforce_eager=False,
+        loop_count=1,
         attention_dp=8,
         attention_sp=1,
         attention_tp=1,
@@ -37,6 +40,7 @@ def main():
         ffn_tp=1,
         mode="prefill",
         master_address="127.0.0.1:6006",
+        ray_address="10.103.5.41:7077",
     )
 
     prefill_endpoints_info = prefill.p2p_init(

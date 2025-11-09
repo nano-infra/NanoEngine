@@ -15,6 +15,10 @@ from nanodeploy.config import Config
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.logging import get_logger
+
+
+logger = get_logger()
 
 
 class LLMEngine:
@@ -71,12 +75,23 @@ class LLMEngine:
             for seqs in dp_seqs
             for sp_idx in range(self.config.attention_sp)
         ]
-        dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
+        dp_sp_tp_seqs: list[list[Sequence]] = [
+            seqs for seqs in dp_sp_seqs for _ in range(tp_size)
+        ]
         sch_end = time.time()
         post_sch_begin = 0
         post_sch_end = 0
         if is_prefill and self.config.mode == "decode":
             if not self.config.dummy_prefill:
+                logger.info("perform migration")
+                for seqs in dp_sp_tp_seqs:
+                    for seq in seqs:
+                        logger.info(
+                            f"{seq.block_ctx(seq.backup_engine_id).block_location, seq.block_ctx(seq.active_engine_id).block_location}"
+                        )
+                        seq.block_ctx(seq.active_engine_id).num_dispatched_tokens[
+                            seq.block_ctx().master_sp_rank
+                        ] += 1
                 self.executor.migrate(dp_sp_tp_seqs)
             else:
                 [[seq.append_token(0) for seq in seqs] for seqs in dp_seqs]
