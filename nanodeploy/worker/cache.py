@@ -16,25 +16,16 @@ from nanodeploy.worker.distributed import get_dist_context
 class CacheContext:
     num_kv_heads: int
     head_dim: int
-
     block_size: int
-
     num_hidden_layers: int
-
     attention_tp: int
-
     gpu_memory_utilization: float
-
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
-
     mode: Literal["gqa", "mla"] = "gqa"
-
     num_local_kvcache_blocks = -1
     num_remote_kvcache_blocks: dict[str, int] = None
-
     kv_cache: torch.Tensor = None
-
     selected_nic: str | None = None
     endpoints: dict[str, dict[int, dlslime.RDMAEndpoint]] = None
 
@@ -49,8 +40,9 @@ class CacheContext:
 
         free, total = torch.cuda.mem_get_info()
         used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        memory_stats = torch.cuda.memory_stats()
+        peak = memory_stats["allocated_bytes.all.peak"]
+        current = memory_stats["allocated_bytes.all.current"]
 
         block_bytes = (
             2
@@ -69,7 +61,8 @@ class CacheContext:
         assert self.num_local_kvcache_blocks > 0
 
         available_nics = dlslime.available_nic()
-        self.selected_nic = available_nics[dist.get_rank() % len(available_nics)]
+        selected_nic_idx = dist.get_rank() % len(available_nics)
+        self.selected_nic = available_nics[selected_nic_idx]
         assert self.selected_nic
 
         self.endpoints = {}
@@ -161,12 +154,6 @@ class CacheContext:
             ):
                 for kv_idx in range(self.kv_cache.size(0)):
                     for layer_idx in range(self.num_hidden_layers):
-                        remote_offset = self.remote_kv_stride(
-                            kv_idx, layer_idx, remote_block_idx[1], seq.backup_engine_id
-                        )
-                        source_offset = self.local_kv_stride(
-                            kv_idx, layer_idx, source_block_idx[1]
-                        )
                         if source_block_idx[0] == sp_idx:
                             assignment = Assignment(
                                 mr_key="kv",

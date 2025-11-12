@@ -66,31 +66,37 @@ class LLMEngine:
         tp_size = self.config.attention_tp
         sch_begin = time.time()
         dp_seqs, is_prefill = self.scheduler.schedule()
-        dp_sp_seqs = [
+        # TODO (JimyMa): For loop
+        filtered_dp_sp_seqs = [
             [
                 seq
                 for seq in seqs
-                if seq.block_ctx(self.engine_id).master_sp_rank == sp_idx
+                if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
             ]
             for seqs in dp_seqs
             for sp_idx in range(self.config.attention_sp)
         ]
+
+        dp_sp_seqs = [
+            [seq for seq in seqs]
+            for seqs in dp_seqs
+            for _ in range(self.config.attention_sp)
+        ]
+
         dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
         sch_end = time.time()
         post_sch_begin = 0
         post_sch_end = 0
         if is_prefill and self.config.mode == "decode":
             if not self.config.dummy_prefill:
-                logger.info("perform migration")
-                for seqs in dp_sp_tp_seqs:
+                logger.debug("perform migration")
+                for seqs in filtered_dp_sp_seqs:
                     for seq in seqs:
-                        logger.info(
-                            f"{seq.block_ctx(seq.backup_engine_id).block_location, seq.block_ctx(seq.active_engine_id).block_location}"
+                        logger.debug(
+                            f"{seq.block_ctx(seq.backup_engine_id).block_location}, "
+                            f"{seq.block_ctx(seq.active_engine_id).block_location}"
                         )
-                        seq.block_ctx(seq.active_engine_id).num_dispatched_tokens[
-                            seq.block_ctx().master_sp_rank
-                        ] += 1
-                self.executor.migrate(dp_sp_tp_seqs)
+                self.executor.migrate(dp_sp_seqs)
             else:
                 [[seq.append_token(0) for seq in seqs] for seqs in dp_seqs]
         else:
@@ -99,10 +105,11 @@ class LLMEngine:
             token_ids = [
                 token_ids[i * sp_size : (i + 1) * sp_size] for i in range(0, dp_size)
             ]
-            dp_sp_seqs = [
-                dp_sp_seqs[i * sp_size : (i + 1) * sp_size] for i in range(0, dp_size)
+            filtered_dp_sp_seqs = [
+                filtered_dp_sp_seqs[i * sp_size : (i + 1) * sp_size]
+                for i in range(0, dp_size)
             ]
-            self.scheduler.postprocess(dp_sp_seqs, token_ids)
+            self.scheduler.postprocess(filtered_dp_sp_seqs, token_ids)
             post_sch_end = time.time()
         outputs = []
         num_tokens = 0

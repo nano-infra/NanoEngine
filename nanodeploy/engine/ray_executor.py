@@ -4,7 +4,11 @@ import ray
 
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.logging import get_logger
 from nanodeploy.worker.model_runner import ModelRunner
+
+
+logger = get_logger()
 
 
 class RayExecutor:
@@ -67,7 +71,7 @@ class RayExecutor:
 
     def update_kvcache_blocks(self):
         num_cache_blocks = min(self.collective_rpc("num_kvcache_blocks"))
-        print(f"{num_cache_blocks=}")
+        logger.info(f"Set {num_cache_blocks=}")
         self.collective_rpc("allocate_kvcache", (num_cache_blocks,))
         return num_cache_blocks
 

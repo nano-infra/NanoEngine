@@ -59,13 +59,18 @@ class BlockManager:
     def can_allocate(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= seq.num_blocks(self.engine_id, self.sp_idx)
 
-    def allocate(self, seq: Sequence):
+    def allocate(
+        self,
+        seq: Sequence,
+        token_idx_from: int = None,
+        token_idx_to: int = None,
+    ):
         assert not seq.block_table(self.engine_id, self.sp_idx)
         h = -1
         cache_miss = False
         num_blocks = seq.num_blocks(self.engine_id, self.sp_idx)
         for i in range(num_blocks):
-            token_ids = seq.block(i)
+            token_ids = seq.block(i, self.engine_id, self.sp_idx)
             h = (
                 self.compute_hash(token_ids, h)
                 if len(token_ids) == self.block_size
@@ -78,7 +83,7 @@ class BlockManager:
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
             else:
-                seq.num_cached_tokens += self.block_size
+                # seq.num_cached_tokens += self.block_size
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
                     block.ref_count += 1
@@ -100,9 +105,16 @@ class BlockManager:
         seq.block_table(self.engine_id, self.sp_idx).clear()
 
     def can_append(self, seq: Sequence, num_tokens: int = 1) -> bool:
-        total_tokens_needed_before = (len(seq) + self.block_size - 1) // self.block_size
+        total_tokens_needed_before = (
+            seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx]
+            + self.block_size
+            - 1
+        ) // self.block_size
         total_tokens_needed_after = (
-            len(seq) + num_tokens + self.block_size - 1
+            seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx]
+            + num_tokens
+            + self.block_size
+            - 1
         ) // self.block_size
         return len(self.free_block_ids) >= (
             total_tokens_needed_after - total_tokens_needed_before
@@ -112,7 +124,11 @@ class BlockManager:
         for idx in range(num_tokens):
             block_table = seq.block_table(self.engine_id, self.sp_idx)
             last_block = self.blocks[block_table[-1]]
-            if (len(seq) + idx - 1) % self.block_size == 1:
+            if (
+                seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx]
+                + idx
+                - 1
+            ) % self.block_size == 1:
                 # assert last_block.hash != -1
                 block_id = self.free_block_ids[0]
                 seq.block_ctx(self.engine_id).block_location.append(
@@ -120,14 +136,23 @@ class BlockManager:
                 )
                 self._allocate_block(block_id)
                 block_table.append(block_id)
-            elif (len(seq) + idx - 1) % self.block_size == 0:
+            elif (
+                seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx]
+                + idx
+                - 1
+            ) % self.block_size == 0:
                 # assert last_block.hash == -1
-                token_ids = seq.block(seq.num_blocks(self.engine_id, self.sp_idx) - 1)
+                token_ids = seq.block(
+                    seq.num_blocks(self.engine_id, self.sp_idx) - 1,
+                    self.engine_id,
+                    self.sp_idx,
+                )
                 prefix = (
                     self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
                 )
-                h = self.compute_hash(token_ids, prefix)
-                last_block.update(h, token_ids)
-                self.hash_to_block_id[h] = last_block.block_id
+                # h = self.compute_hash(token_ids, prefix)
+                # last_block.update(h, token_ids)
+                # self.hash_to_block_id[h] = last_block.block_id
             else:
+                continue
                 assert last_block.hash == -1

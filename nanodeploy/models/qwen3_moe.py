@@ -311,7 +311,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.act_fn = config.hidden_act
 
     def fusedmoe_build(self, low_latency_mode):
-        return build_deepep_moe(
+        fusedmoe = build_deepep_moe(
             low_latency_mode=low_latency_mode,
             ep_size=self.ep_size,
             ep_group=self.ep_group,
@@ -323,6 +323,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             layer_idx=0,
             chunk_size=16 * 1024,
         )
+        return fusedmoe
 
     @property
     def num_experts_per_rank(self):
@@ -467,7 +468,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        # all_gather
         hidden_states = self.self_attn(positions, hidden_states)
+        # all_to_all
+
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual

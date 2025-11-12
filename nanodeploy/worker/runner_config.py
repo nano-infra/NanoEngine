@@ -9,6 +9,7 @@ logger = get_logger()
 
 @dataclasses.dataclass
 class RunnerConfig:
+    max_num_seqs: int | None = None
     dummy_weight: bool = False
     perfect_eplb: bool = False
 
@@ -22,11 +23,14 @@ def get_runner_config() -> RunnerConfig:
 
 
 def set_runner_config(
+    max_num_seqs: int | None = None,
     dummy_weight: Optional[bool] = None,
     perfect_eplb: Optional[bool] = None,
 ):
     global _RUNNER_CONFIG
-    _RUNNER_CONFIG = RunnerConfig(dummy_weight=dummy_weight, perfect_eplb=perfect_eplb)
+    _RUNNER_CONFIG = RunnerConfig(
+        max_num_seqs=max_num_seqs, dummy_weight=dummy_weight, perfect_eplb=perfect_eplb
+    )
 
 
 def reset_runner_config():

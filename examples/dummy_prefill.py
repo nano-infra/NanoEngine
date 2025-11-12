@@ -15,14 +15,15 @@ def main():
     decode = LLM(
         path,
         enforce_eager=False,
-        attention_dp=8,
-        attention_sp=1,
+        attention_dp=4,
+        attention_sp=2,
         attention_tp=1,
         ffn_dp=1,
         ffn_ep=8,
         ffn_tp=1,
         mode="decode",
         master_address="127.0.0.1:6006",
+        ray_address="10.103.5.41:7077",
         dummy_prefill=True,
     )
 
