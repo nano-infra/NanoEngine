@@ -14,7 +14,7 @@ def main():
 
     decode = LLM(
         path,
-        enforce_eager=True,
+        enforce_eager=False,
         attention_dp=1,
         attention_sp=8,
         attention_tp=1,
@@ -26,7 +26,7 @@ def main():
         master_address="127.0.0.1:6006",
         ray_address="10.103.5.41:7077",
         dummy_prefill=False,
-        max_num_seqs=8,
+        max_num_seqs=2,
     )
 
     prefill = LLM(

@@ -21,6 +21,7 @@ class Context:
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
 
+    global_context_lens: torch.Tensor | None = None
     is_dummy: bool = False
 
 
@@ -41,6 +42,7 @@ def set_context(
     slot_mapping: Optional[torch.Tensor] = None,
     context_lens: dict[int, torch.Tensor] | torch.Tensor | None = None,
     block_tables: Optional[torch.Tensor] = None,
+    global_context_lens: Optional[torch.Tensor] = None,
     is_dummy: bool | None = False,
 ):
     global _CONTEXT
@@ -54,6 +56,7 @@ def set_context(
         slot_mapping,
         context_lens,
         block_tables,
+        global_context_lens,
         is_dummy=is_dummy,
     )
 

@@ -2,6 +2,8 @@ import enum
 from collections import deque
 from typing import Literal
 
+import numpy as np
+
 from nanodeploy.config import Config
 from nanodeploy.engine.block_manager import BlockManager
 from nanodeploy.engine.sequence import Sequence, SequenceStatus
@@ -32,6 +34,20 @@ class SPBlockManager:
             )
             for i in range(attention_sp)
         }
+
+        self.dummy_seqs = []
+
+        for sp_idx in range(attention_sp):
+            dummy_seq = Sequence(
+                token_ids=[np.random.randint(8000)],
+                sampling_params=None,
+                engine_id=self.engine_id,
+                master_sp_rank=sp_idx,
+            )
+
+            dummy_seq.append_token(np.random.randint(8000), self.engine_id, sp_idx)
+            self.block_manager[sp_idx].allocate(dummy_seq)
+            self.dummy_seqs.append(dummy_seq)
 
     def can_append(self, seq: Sequence, num_tokens: int = 1):
         return self.block_manager[
@@ -75,9 +91,6 @@ class SPBlockManager:
             self.block_manager[sp_idx].can_allocate(seq)
             for sp_idx in range(self.attention_sp)
         ):
-            print(
-                f"{block_ctx.sp_block_table=}, {block_ctx.num_dispatched_tokens=}, {block_ctx.block_location=}, {block_ctx.master_sp_idx=}"
-            )
             return True
         else:
             block_ctx.num_dispatched_tokens.clear()
@@ -242,6 +255,10 @@ class Scheduler:
             self.running(selected_dp_idx).extendleft(
                 reversed(scheduled_seqs[selected_dp_idx])
             )
+        for dp_idx, dp_seqs in enumerate(scheduled_seqs):
+            scheduled_seqs[dp_idx] += self.worker_state[
+                dp_idx
+            ].sp_block_manager.dummy_seqs
         return scheduled_seqs
 
     def schedule(self) -> tuple[list[list[Sequence]], bool]:
@@ -271,6 +288,8 @@ class Scheduler:
         for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
             for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
                 for _, (seq, loop_count_token_id) in enumerate(zip(seqs, token_ids)):
+                    if seq in self.worker_state[dp_idx].sp_block_manager.dummy_seqs:
+                        continue
                     for token_id in loop_count_token_id:
                         assert sp_idx == seq.block_ctx(self.engine_id).master_sp_idx
                         seq.append_token(

@@ -50,7 +50,7 @@ class SPContext:
         )
 
         self.res_lse_buffer = AllToAllIntraLLBuffer(
-            sp_world_size,
+            1,
             self.max_num_seqs,
             sp_rank,
             sp_world_size,

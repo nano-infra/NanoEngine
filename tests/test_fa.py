@@ -76,11 +76,6 @@ for seqlen in [2**i for i in range(10, 20)]:  # 2**10 到 2**19
 
     qv = None  # GQA不使用qv
 
-    # scheduler_metadata = get_scheduler_metadata(
-    #     batch_size, seqlen_q, , nheads_q, nheads_kv, headdim,
-    #     cache_seqlens, q.dtype, headdim_v=headdim_v, page_size=page_size, causal=True
-    # )
-
     fn0 = lambda: flash_attn_with_kvcache(
         q,
         k_cache,
@@ -90,7 +85,6 @@ for seqlen in [2**i for i in range(10, 20)]:  # 2**10 到 2**19
         qv=qv,
         page_table=page_table,
         causal=True,
-        scheduler_metadata=scheduler_metadata,
     )
 
     time.sleep(1)

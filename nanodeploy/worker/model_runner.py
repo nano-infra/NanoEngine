@@ -82,7 +82,7 @@ class ModelRunner:
         # 性能分析相关初始化
         self.run_count = 0  # 记录 run_model 的调用次数
         self.prof_start = 0  # 开始 profiling 的次数
-        self.prof_end = 100  # 结束 profiling 的次数
+        self.prof_end = 50  # 结束 profiling 的次数
         self.profiler = None  # 用于存储 profiler 实例
 
         # 配置 profiler（包含 CUDA 时间线）
@@ -92,7 +92,7 @@ class ModelRunner:
                 torch.profiler.ProfilerActivity.CUDA,  # 记录 CUDA 活动（关键）
             ],
             "schedule": profiler.schedule(
-                wait=0, warmup=50, active=50
+                wait=1, warmup=1, active=30
             ),  # 每次启动只记录1步
             "on_trace_ready": torch.profiler.tensorboard_trace_handler(
                 dir_name="/mnt/nvme1n1/ml_research/majinming/src/nano-deploy/",
@@ -203,31 +203,49 @@ class ModelRunner:
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
+    def prepare_block_tables(self, dp_seqs: list[Sequence]):
         sp_size = get_dist_context().attn_sp_world_size
+        sp_rank = get_dist_context().attn_sp_rank
+
+        dp_sp_seqs = [
+            [
+                seq
+                for seq in dp_seqs
+                if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
+            ]
+            for sp_idx in range(sp_size)
+        ]
+
         max_len = max(
-            max(
-                [
-                    len(seq.block_table(self.engine_id, sp_idx))
-                    for sp_idx in range(sp_size)
-                ]
-            )
-            for seq in seqs
+            [
+                max([len(seq.block_table(self.engine_id, sp_rank)) for seq in seqs])
+                for seqs in dp_sp_seqs
+            ]
         )
-        num_seqs = len(seqs)
+
+        sp_num_seqs = [len(seqs) for seqs in dp_sp_seqs]
+
         block_tables = [
             [
                 (
-                    seqs[seq_id].block_table(self.engine_id, sp_idx)
+                    dp_sp_seqs[sp_idx][seq_id].block_table(self.engine_id, sp_rank)
                     + [-1]
-                    * (max_len - len(seqs[seq_id].block_table(self.engine_id, sp_idx)))
-                    if seq_id < num_seqs
+                    * (
+                        max_len
+                        - len(
+                            dp_sp_seqs[sp_idx][seq_id].block_table(
+                                self.engine_id, sp_rank
+                            )
+                        )
+                    )
+                    if seq_id < sp_num_seqs[sp_idx]
                     else [-1] * max_len
                 )
                 for seq_id in range(self.config.max_num_seqs)
             ]
             for sp_idx in range(sp_size)
         ]
+        # logger.info(f"{sp_rank=}, {block_tables=}")
 
         block_tables = torch.tensor(
             block_tables, dtype=torch.int32, pin_memory=True
@@ -298,45 +316,64 @@ class ModelRunner:
             slot_mapping,
             None,
             block_tables,
+            None,
             is_dummy=is_dummy,
         )
         return input_ids, positions
 
-    def prepare_decode(self, seqs: list[Sequence], is_dummy: bool = False):
+    def prepare_decode(self, dp_seqs: list[Sequence], is_dummy: bool = False):
         input_ids = []
         positions = []
         slot_mapping = []
         context_lens = []
-        sp_idx = get_dist_context().attn_sp_rank
+        sp_rank = get_dist_context().attn_sp_rank
 
-        for seq in seqs:
-            if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx:
+        for seq in dp_seqs:
+            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank:
                 input_ids.append(seq.last_token)
                 positions.append(len(seq) - 1)
                 slot_mapping.append(
-                    seq.last_block_page_id(self.engine_id, sp_idx)
+                    seq.last_block_page_id(self.engine_id, sp_rank)
                     * get_cache_context().block_size
-                    + seq.last_block_num_tokens(self.engine_id, sp_idx)
+                    + seq.last_block_num_tokens(self.engine_id, sp_rank)
                     - 1
                 )
-                # if sp_idx == 2:
-                #     logger.info(f"{seq.last_block_page_id(self.engine_id, sp_idx)=}, {seq.last_block_num_tokens(self.engine_id, sp_idx)=}, {slot_mapping=}")
 
-        num_seqs = len(seqs)
         sp_size = get_dist_context().attn_sp_world_size
+        sp_seqs = [
+            [
+                seq
+                for seq in dp_seqs
+                if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
+            ]
+            for sp_idx in range(sp_size)
+        ]
+        sp_num_seqs = [len(seqs) for seqs in sp_seqs]
         context_lens = [
             [
                 (
-                    seqs[seq_id].context_len(self.engine_id, sp_idx)
-                    if seq_id < num_seqs
+                    sp_seqs[sp_idx][seq_id].context_len(self.engine_id, sp_rank)
+                    if seq_id < sp_num_seqs[sp_idx]
                     else 0
                 )
                 for seq_id in range(self.config.max_num_seqs)
             ]
             for sp_idx in range(sp_size)
         ]
-        # if sp_idx == 2:
-        #     logger.info(f"{context_lens=}")
+
+        global_context_lens = [
+            [
+                (
+                    sp_seqs[sp_rank][seq_id].context_len(self.engine_id, sp_idx)
+                    if seq_id < sp_num_seqs[sp_rank]
+                    else 0
+                )
+                for seq_id in range(self.config.max_num_seqs)
+            ]
+            for sp_idx in range(sp_size)
+        ]
+
+        # logger.info(f"{sp_rank=}, {context_lens=}")
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
@@ -350,15 +387,20 @@ class ModelRunner:
         context_lens = torch.tensor(
             context_lens, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        global_context_lens = torch.tensor(
+            global_context_lens, dtype=torch.int32, pin_memory=True
+        )
+        block_tables = self.prepare_block_tables(dp_seqs)
         set_context(
             False,
             self.config.max_num_seqs,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            global_context_lens=global_context_lens,
             is_dummy=is_dummy,
         )
+
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -385,6 +427,7 @@ class ModelRunner:
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -392,6 +435,8 @@ class ModelRunner:
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"].copy_(context.context_lens)
+            graph_vars["global_context_lens"].zero_()
+            graph_vars["global_context_lens"].copy_(context.global_context_lens)
             graph_vars["block_tables"][
                 :, :, : context.block_tables.size(2)
             ] = context.block_tables
@@ -418,8 +463,6 @@ class ModelRunner:
         #     self.profiler = profiler.profile(**self.prof_kwargs)
         #     self.profiler.start()
         #     print(f"开始 profiling（第 {self.run_count} 次）")
-
-        # self.run_count += 1  # 每次调用计数+1
 
         # print(input_ids.shape, positions.shape)
         sp_rank = get_dist_context().attn_sp_rank
@@ -468,6 +511,7 @@ class ModelRunner:
                     seq.num_tokens += 1
                     seq.last_token = token_id
                     seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_rank] += 1
+            self.run_count += 1  # 每次调用计数+1
             reset_context()
         # if in_prof_range and self.profiler is not None:
         #     self.profiler.step()
@@ -475,7 +519,7 @@ class ModelRunner:
         #     # self.profiler.stop()
         #     print(f"记录第 {self.run_count} 次调用的性能数据")
 
-        # if self.run_count == self.prof_end and self.profiler is not None:
+        # if self.run_count > self.prof_end and self.profiler is not None:
         #     self.profiler.stop()
         #     # 超出范围后关闭 profiler
         #     self.profiler = None
@@ -506,6 +550,7 @@ class ModelRunner:
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
+        global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         block_tables = torch.zeros(
             sp_world_size, max_bs, max_num_blocks, dtype=torch.int32
         )
@@ -522,6 +567,7 @@ class ModelRunner:
                 slot_mapping=slot_mapping[:bs],
                 context_lens=context_lens,
                 block_tables=block_tables,
+                global_context_lens=global_context_lens,
             )
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
@@ -539,5 +585,6 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            global_context_lens=global_context_lens,
             outputs=outputs,
         )

@@ -63,8 +63,8 @@ class Attention(nn.Module):
                 context_lens = context.context_lens.view(-1)
                 block_tables = context.block_tables.view(sp_size * max_num_seqs, -1)
             else:
-                context_lens = context.context_lens[sp_rank]
-                block_tables = context.block_tables[sp_rank]
+                context_lens = context.context_lens[sp_rank][:bs]
+                block_tables = context.block_tables[sp_rank][:bs]
 
             o, lse = flash_attn_with_kvcache(
                 q.unsqueeze(1),
@@ -83,15 +83,17 @@ class Attention(nn.Module):
                 gathered_o = o.view([sp_size, max_num_seqs, num_head, head_dim])
                 gathered_lse = lse.view([sp_size, max_num_seqs, num_head, 1])
 
-                all_ranks_output_combine = torch.cat([gathered_o, gathered_lse], dim=3)
+                all_ranks_output_combine_0 = torch.cat(
+                    [gathered_o, gathered_lse], dim=3
+                )
                 all_ranks_output_combine = res_lse_buffer.all_to_all_ll(
-                    all_ranks_output_combine.view(sp_size * max_num_seqs, -1),
+                    all_ranks_output_combine_0.view(sp_size * max_num_seqs, -1),
                     is_transpose=True,
                 ).view(sp_size, max_num_seqs, num_head, head_dim + 1)
 
                 o = inter_rank_gqa_fwd_batch_decode_combine_kv(
                     all_ranks_output_combine,
-                    context_lens,
+                    context.global_context_lens,
                     num_head,
                     head_dim,
                     get_sp_context().max_num_seqs,
