@@ -2,6 +2,8 @@ import enum
 from collections import deque
 from typing import Literal
 
+import numpy as np
+
 from nanodeploy.config import Config
 from nanodeploy.engine.block_manager import BlockManager
 from nanodeploy.engine.sequence import Sequence, SequenceStatus
@@ -33,21 +35,70 @@ class SPBlockManager:
             for i in range(attention_sp)
         }
 
+        self.dummy_seqs = []
+
+        for sp_idx in range(attention_sp):
+            dummy_seq = Sequence(
+                token_ids=[np.random.randint(8000)],
+                sampling_params=None,
+                engine_id=self.engine_id,
+                master_sp_rank=sp_idx,
+            )
+
+            dummy_seq.append_token(np.random.randint(8000), self.engine_id, sp_idx)
+            self.block_manager[sp_idx].allocate(dummy_seq)
+            self.dummy_seqs.append(dummy_seq)
+
     def can_append(self, seq: Sequence, num_tokens: int = 1):
-        return self.block_manager[self.attention_sp - 1].can_append(seq, num_tokens)
+        return self.block_manager[
+            seq.block_ctx(self.engine_id).master_sp_idx
+        ].can_append(seq, num_tokens)
 
     def may_append(self, seq: Sequence, num_tokens: int = 1):
-        return self.block_manager[self.attention_sp - 1].may_append(seq, num_tokens)
+        return self.block_manager[
+            seq.block_ctx(self.engine_id).master_sp_idx
+        ].may_append(seq, num_tokens)
 
     def can_allocate(self, seq: Sequence):
-        return self.block_manager[self.attention_sp - 1].can_allocate(seq)
+        master_sp_rank = 0
+        block_ctx = seq.block_ctx(self.engine_id)
+        block_ctx.master_sp_idx = master_sp_rank
+
+        # Step 1: sch to master to cal num_blocks and num_blocks_per_rank
+        block_ctx.num_dispatched_tokens[master_sp_rank] = seq.num_tokens
+        num_blocks = seq.num_blocks(self.engine_id, master_sp_rank)
+        num_blocks_per_rank = (num_blocks + self.attention_sp - 1) // self.attention_sp
+
+        # step 2: allocation
+        total_token_unalloc = seq.num_tokens
+        for sp_idx in range(self.attention_sp):
+            block_ctx.num_dispatched_tokens[sp_idx] = min(
+                total_token_unalloc, num_blocks_per_rank * seq.block_size
+            )
+            total_token_unalloc -= num_blocks_per_rank * seq.block_size
+            if total_token_unalloc <= 0:
+                block_ctx.master_sp_idx = sp_idx
+                assert block_ctx.master_sp_idx >= 0, (
+                    block_ctx.master_sp_idx,
+                    seq.num_tokens,
+                )
+                assert (
+                    block_ctx.master_sp_idx < self.attention_sp
+                ), block_ctx.master_sp_idx
+                break
+
+        if all(
+            self.block_manager[sp_idx].can_allocate(seq)
+            for sp_idx in range(self.attention_sp)
+        ):
+            return True
+        else:
+            block_ctx.num_dispatched_tokens.clear()
+            return False
 
     def allocate(self, seq: Sequence):
-        master_sp_rank = self.attention_sp - 1
-        block_ctx = seq.block_ctx(self.engine_id)
-        block_ctx.master_sp_rank = master_sp_rank
-        block_ctx.num_dispatched_tokens[master_sp_rank] = seq.num_checkpointed_tokens
-        return self.block_manager[self.attention_sp - 1].allocate(seq)
+        for sp_idx in range(self.attention_sp):
+            self.block_manager[sp_idx].allocate(seq)
 
     def deallocate(self, seq: Sequence):
         for sp_idx in range(self.attention_sp):
@@ -204,6 +255,10 @@ class Scheduler:
             self.running(selected_dp_idx).extendleft(
                 reversed(scheduled_seqs[selected_dp_idx])
             )
+        for dp_idx, dp_seqs in enumerate(scheduled_seqs):
+            scheduled_seqs[dp_idx] += self.worker_state[
+                dp_idx
+            ].sp_block_manager.dummy_seqs
         return scheduled_seqs
 
     def schedule(self) -> tuple[list[list[Sequence]], bool]:
@@ -233,9 +288,13 @@ class Scheduler:
         for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
             for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
                 for _, (seq, loop_count_token_id) in enumerate(zip(seqs, token_ids)):
+                    if seq in self.worker_state[dp_idx].sp_block_manager.dummy_seqs:
+                        continue
                     for token_id in loop_count_token_id:
-                        assert sp_idx == seq.block_ctx(self.engine_id).master_sp_rank
-                        seq.append_token(token_id)
+                        assert sp_idx == seq.block_ctx(self.engine_id).master_sp_idx
+                        seq.append_token(
+                            token_id, engine_id=self.engine_id, sp_idx=sp_idx
+                        )
                         if (
                             not seq.ignore_eos and token_id == self.eos
                         ) or seq.num_completed_tokens == seq.max_tokens:

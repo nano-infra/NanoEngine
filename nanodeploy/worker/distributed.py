@@ -124,9 +124,28 @@ class DistContext:
         """Get the global communication group for CPU world"""
         return self.cpu_world_mesh.get_group("world")
 
+    @property
+    def cuda_world_rank(self):
+        """Get the current process rank in CUDA global communication group"""
+        return dist.get_rank(self.cuda_world_group)
+
+    @property
+    def cuda_world_size(self):
+        """Get the total number of processes in CUDA global communication group"""
+        return dist.get_world_size(self.cuda_world_group)
+
+    @property
+    def cuda_world_group(self):
+        """Get the total number of processes in CUDA global communication group"""
+        return self.cuda_world_mesh.get_group("world")
+
     def __post_init__(self):
         self.cpu_world_mesh = init_device_mesh(
             "cpu", [self.world_size], mesh_dim_names=["world"]
+        )
+
+        self.cuda_world_mesh = init_device_mesh(
+            "cuda", [self.world_size], mesh_dim_names=["world"]
         )
 
         self.attn_device_mesh = init_device_mesh(

@@ -27,7 +27,7 @@ class BlockContext:
     engine_id: str
 
     dp_idx: int = 0
-    master_sp_rank: int = 0
+    master_sp_idx: int = 0
 
     attention_sp: int = 1
     attention_dp: int = 1
@@ -70,7 +70,7 @@ class Sequence:
                 dp_idx=-1,
                 attention_sp=1,
                 attention_dp=1,
-                master_sp_rank=master_sp_rank,
+                master_sp_idx=master_sp_rank,
                 block_location=[],
                 sp_block_table=defaultdict(list),
                 num_dispatched_tokens=defaultdict(int),
@@ -107,7 +107,9 @@ class Sequence:
         )
 
     def context_len(self, engine_id: str | None = None, sp_idx: int | None = None):
-        sp_idx = sp_idx or self.block_ctx(engine_id).master_sp_rank
+        sp_idx = (
+            sp_idx if sp_idx is not None else self.block_ctx(engine_id).master_sp_idx
+        )
         return self.block_ctx(engine_id).num_dispatched_tokens[sp_idx]
 
     def __len__(self):
@@ -140,27 +142,62 @@ class Sequence:
     def num_cached_blocks(self):
         return self.num_cached_tokens // self.block_size
 
-    def num_blocks(self, engine_id: str | None = None, sp_idx: str | None = None):
+    def num_blocks(
+        self,
+        engine_id: str | None = None,
+        sp_idx: str | None = None,
+    ):
         engine_id = engine_id or self.active_engine_id
-        sp_idx = sp_idx or self.block_ctx(engine_id).master_sp_rank
-        return (self.num_tokens + self.block_size - 1) // self.block_size
+        sp_idx = (
+            sp_idx if sp_idx is not None else self.block_ctx(engine_id).master_sp_idx
+        )
+        return (
+            self.block_ctx(engine_id).num_dispatched_tokens[sp_idx]
+            + self.block_size
+            - 1
+        ) // self.block_size
+
+    def last_block_page_id(
+        self,
+        engine_id: str | None = None,
+        sp_idx: str | None = None,
+    ):
+        engine_id = engine_id or self.active_engine_id
+        sp_idx = (
+            sp_idx if sp_idx is not None else self.block_ctx(engine_id).master_sp_idx
+        )
+        num_tokens = self.block_ctx(engine_id).num_dispatched_tokens[sp_idx]
+        last_block_idx = (num_tokens - 1) // self.block_size
+        return self.block_table(engine_id, sp_idx)[last_block_idx]
 
     def last_block_num_tokens(
-        self, engine_id: str | None = None, sp_idx: str | None = None
+        self,
+        engine_id: str | None = None,
+        sp_idx: str | None = None,
     ):
-        return (
-            self.num_tokens - (self.num_blocks(engine_id, sp_idx) - 1) * self.block_size
+        engine_id = engine_id or self.active_engine_id
+        sp_idx = (
+            sp_idx if sp_idx is not None else self.block_ctx(engine_id).master_sp_idx
         )
+        num_tokens = self.block_ctx(engine_id).num_dispatched_tokens[sp_idx]
+        return num_tokens - (self.num_blocks(engine_id, sp_idx) - 1) * self.block_size
 
-    def block(self, i):
-        assert 0 <= i < self.num_blocks()
+    def block(
+        self,
+        i,
+        engine_id: str | None = None,
+        sp_idx: str | None = None,
+    ):
+        assert 0 <= i < self.num_blocks(engine_id, sp_idx)
         return self.token_ids[i * self.block_size : (i + 1) * self.block_size]
 
     def append_token(
         self, token_id: int, engine_id: str | None = None, sp_idx: int | None = None
     ):
         engine_id = engine_id or self.active_engine_id
-        sp_idx = sp_idx or self.block_ctx(engine_id).master_sp_rank
+        sp_idx = (
+            sp_idx if sp_idx is not None else self.block_ctx(engine_id).master_sp_idx
+        )
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1

@@ -14,13 +14,18 @@ from nanodeploy.config import Config
 
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
+from nanodeploy.logging import get_logger
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
+from nanodeploy.worker.buffer import get_sp_context, set_sp_context
 from nanodeploy.worker.cache import get_cache_context, set_cache_context
 from nanodeploy.worker.context import get_context, reset_context, set_context
 from nanodeploy.worker.distributed import get_dist_context, set_dist_context
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
+
+
+logger = get_logger()
 
 
 architectures = {
@@ -40,7 +45,10 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
         set_runner_config(
+            max_num_seqs=config.max_num_seqs,
             dummy_weight=config.dummy_weight,
             perfect_eplb=config.perfect_eplb,
         )
@@ -63,11 +71,6 @@ class ModelRunner:
             ffn_tp=config.ffn_tp,
         )
 
-        if get_dist_context().ffn_ep_world_size > 1:
-            import deep_ep
-
-            deep_ep.Buffer.num_sms = 16
-
         torch.cuda.set_device(0)
         self.default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
@@ -79,7 +82,7 @@ class ModelRunner:
         # 性能分析相关初始化
         self.run_count = 0  # 记录 run_model 的调用次数
         self.prof_start = 0  # 开始 profiling 的次数
-        self.prof_end = 100  # 结束 profiling 的次数
+        self.prof_end = 50  # 结束 profiling 的次数
         self.profiler = None  # 用于存储 profiler 实例
 
         # 配置 profiler（包含 CUDA 时间线）
@@ -89,7 +92,7 @@ class ModelRunner:
                 torch.profiler.ProfilerActivity.CUDA,  # 记录 CUDA 活动（关键）
             ],
             "schedule": profiler.schedule(
-                wait=0, warmup=50, active=50
+                wait=1, warmup=1, active=30
             ),  # 每次启动只记录1步
             "on_trace_ready": torch.profiler.tensorboard_trace_handler(
                 dir_name="/mnt/nvme1n1/ml_research/majinming/src/nano-deploy/",
@@ -99,6 +102,26 @@ class ModelRunner:
             "profile_memory": True,  # 记录内存使用
             "with_stack": True,  # 记录调用栈
         }
+
+        sp_size = get_dist_context().attn_sp_world_size
+        ep_size = get_dist_context().ffn_ep_world_size
+
+        if ep_size > 1:
+            import deep_ep
+
+            deep_ep.Buffer.num_sms = 16
+            dist.barrier(group=get_dist_context().cuda_world_group)
+
+        if sp_size > 1:
+            sp_rank = get_dist_context().attn_sp_rank
+            set_sp_context(
+                config.max_num_seqs,
+                hf_config.head_dim,
+                hf_config.num_attention_heads,
+                torch.get_default_dtype(),
+                sp_size,
+                sp_rank,
+            )
 
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
@@ -180,20 +203,57 @@ class ModelRunner:
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
-        sp_group = get_dist_context().attn_sp_rank
-        max_len = max(len(seq.block_table(self.engine_id, sp_group)) for seq in seqs)
-        block_tables = [
-            seq.block_table(self.engine_id, sp_group)
-            + [-1] * (max_len - len(seq.block_table(self.engine_id, sp_group)))
-            for seq in seqs
+    def prepare_block_tables(self, dp_seqs: list[Sequence]):
+        sp_size = get_dist_context().attn_sp_world_size
+        sp_rank = get_dist_context().attn_sp_rank
+
+        dp_sp_seqs = [
+            [
+                seq
+                for seq in dp_seqs
+                if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
+            ]
+            for sp_idx in range(sp_size)
         ]
+
+        max_len = max(
+            [
+                max([len(seq.block_table(self.engine_id, sp_rank)) for seq in seqs])
+                for seqs in dp_sp_seqs
+            ]
+        )
+
+        sp_num_seqs = [len(seqs) for seqs in dp_sp_seqs]
+
+        block_tables = [
+            [
+                (
+                    dp_sp_seqs[sp_idx][seq_id].block_table(self.engine_id, sp_rank)
+                    + [-1]
+                    * (
+                        max_len
+                        - len(
+                            dp_sp_seqs[sp_idx][seq_id].block_table(
+                                self.engine_id, sp_rank
+                            )
+                        )
+                    )
+                    if seq_id < sp_num_seqs[sp_idx]
+                    else [-1] * max_len
+                )
+                for seq_id in range(self.config.max_num_seqs)
+            ]
+            for sp_idx in range(sp_size)
+        ]
+        # logger.info(f"{sp_rank=}, {block_tables=}")
+
         block_tables = torch.tensor(
             block_tables, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
+    def prepare_prefill(self, seqs: list[Sequence], is_dummy: bool = False):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -205,8 +265,8 @@ class ModelRunner:
         sp_idx = get_dist_context().attn_sp_rank
         for seq in seqs:
             assert (
-                seq.block_ctx(self.engine_id).master_sp_rank == sp_idx
-            ), f"{sp_idx=}, {seq.block_ctx(self.engine_id).master_sp_rank=}"
+                seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
+            ), f"{sp_idx=}, {seq.block_ctx(self.engine_id).master_sp_idx=}"
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens :])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
@@ -248,6 +308,7 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         set_context(
             True,
+            self.config.max_num_seqs,
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q,
@@ -255,26 +316,65 @@ class ModelRunner:
             slot_mapping,
             None,
             block_tables,
+            None,
+            is_dummy=is_dummy,
         )
         return input_ids, positions
 
-    def prepare_decode(self, seqs: list[Sequence]):
+    def prepare_decode(self, dp_seqs: list[Sequence], is_dummy: bool = False):
         input_ids = []
         positions = []
         slot_mapping = []
         context_lens = []
-        sp_idx = get_dist_context().attn_sp_rank
-        for seq in seqs:
-            assert seq.block_ctx(self.engine_id).master_sp_rank == sp_idx
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(seq.context_len(self.engine_id, sp_idx))
-            slot_mapping.append(
-                seq.block_table(seq.active_engine_id, sp_idx)[-1]
-                * get_cache_context().block_size
-                + seq.last_block_num_tokens(self.engine_id, sp_idx)
-                - 1
-            )
+        sp_rank = get_dist_context().attn_sp_rank
+
+        for seq in dp_seqs:
+            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank:
+                input_ids.append(seq.last_token)
+                positions.append(len(seq) - 1)
+                slot_mapping.append(
+                    seq.last_block_page_id(self.engine_id, sp_rank)
+                    * get_cache_context().block_size
+                    + seq.last_block_num_tokens(self.engine_id, sp_rank)
+                    - 1
+                )
+
+        sp_size = get_dist_context().attn_sp_world_size
+        sp_seqs = [
+            [
+                seq
+                for seq in dp_seqs
+                if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
+            ]
+            for sp_idx in range(sp_size)
+        ]
+        sp_num_seqs = [len(seqs) for seqs in sp_seqs]
+        context_lens = [
+            [
+                (
+                    sp_seqs[sp_idx][seq_id].context_len(self.engine_id, sp_rank)
+                    if seq_id < sp_num_seqs[sp_idx]
+                    else 0
+                )
+                for seq_id in range(self.config.max_num_seqs)
+            ]
+            for sp_idx in range(sp_size)
+        ]
+
+        global_context_lens = [
+            [
+                (
+                    sp_seqs[sp_rank][seq_id].context_len(self.engine_id, sp_idx)
+                    if seq_id < sp_num_seqs[sp_rank]
+                    else 0
+                )
+                for seq_id in range(self.config.max_num_seqs)
+            ]
+            for sp_idx in range(sp_size)
+        ]
+
+        # logger.info(f"{sp_rank=}, {context_lens=}")
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
@@ -287,19 +387,30 @@ class ModelRunner:
         context_lens = torch.tensor(
             context_lens, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        global_context_lens = torch.tensor(
+            global_context_lens, dtype=torch.int32, pin_memory=True
+        )
+        block_tables = self.prepare_block_tables(dp_seqs)
         set_context(
             False,
+            self.config.max_num_seqs,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            global_context_lens=global_context_lens,
+            is_dummy=is_dummy,
         )
+
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
         for seq in seqs:
-            temperatures.append(seq.temperature)
+            if (
+                seq.block_ctx(self.engine_id).master_sp_idx
+                == get_dist_context().attn_sp_rank
+            ):
+                temperatures.append(seq.temperature)
         temperatures = torch.tensor(
             temperatures, dtype=torch.float32, pin_memory=True
         ).cuda(non_blocking=True)
@@ -310,20 +421,24 @@ class ModelRunner:
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            context = get_context()
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
+            graph_vars["context_lens"].copy_(context.context_lens)
+            graph_vars["global_context_lens"].zero_()
+            graph_vars["global_context_lens"].copy_(context.global_context_lens)
             graph_vars["block_tables"][
-                :bs, : context.block_tables.size(1)
+                :, :, : context.block_tables.size(2)
             ] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -349,20 +464,25 @@ class ModelRunner:
         #     self.profiler.start()
         #     print(f"开始 profiling（第 {self.run_count} 次）")
 
-        # self.run_count += 1  # 每次调用计数+1
-
         # print(input_ids.shape, positions.shape)
-        sp_idx = get_dist_context().attn_sp_rank
+        sp_rank = get_dist_context().attn_sp_rank
 
-        if not seqs:
+        sp_seqs = [
+            seq
+            for seq in seqs
+            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank
+        ]
+        is_dummy = False
+        if not sp_seqs:
+            is_dummy = True
             seq = Sequence(
                 [np.random.randint(8000)],
                 engine_id=self.engine_id,
                 master_sp_rank=get_dist_context().attn_sp_rank,
             )
 
-            seq.block_ctx(self.engine_id).sp_block_table[sp_idx] = [0]
-            seqs = [seq]
+            seq.block_ctx(self.engine_id).sp_block_table[sp_rank] = [0]
+            seqs.append(seq)
 
         loop_count = self.config.loop_count if not is_prefill else 1
 
@@ -370,7 +490,9 @@ class ModelRunner:
 
         for i in range(loop_count):
             input_ids, positions = (
-                self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+                self.prepare_prefill(seqs, is_dummy)
+                if is_prefill
+                else self.prepare_decode(seqs, is_dummy)
             )
             logits = self.run_model(input_ids, positions, is_prefill)
             tp_rank = get_dist_context().attn_tp_rank
@@ -384,10 +506,12 @@ class ModelRunner:
             )
             for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
                 # handle seq block context
-                loop_count_token_ids[i].append(token_id)
-                seq.num_tokens += 1
-                seq.last_token = token_id
-                seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_idx] += 1
+                if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank:
+                    loop_count_token_ids[i].append(token_id)
+                    seq.num_tokens += 1
+                    seq.last_token = token_id
+                    seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_rank] += 1
+            self.run_count += 1  # 每次调用计数+1
             reset_context()
         # if in_prof_range and self.profiler is not None:
         #     self.profiler.step()
@@ -395,7 +519,7 @@ class ModelRunner:
         #     # self.profiler.stop()
         #     print(f"记录第 {self.run_count} 次调用的性能数据")
 
-        # if self.run_count == self.prof_end and self.profiler is not None:
+        # if self.run_count > self.prof_end and self.profiler is not None:
         #     self.profiler.stop()
         #     # 超出范围后关闭 profiler
         #     self.profiler = None
@@ -413,6 +537,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        sp_world_size = get_dist_context().attn_sp_world_size
         config = self.config
         hf_config = config.hf_config
         hf_config.max_position_embeddings = max(
@@ -424,8 +549,11 @@ class ModelRunner:
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
+        global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(
+            sp_world_size, max_bs, max_num_blocks, dtype=torch.int32
+        )
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
@@ -435,9 +563,11 @@ class ModelRunner:
             graph = torch.cuda.CUDAGraph()
             set_context(
                 False,
+                self.config.max_num_seqs,
                 slot_mapping=slot_mapping[:bs],
-                context_lens=context_lens[:bs],
-                block_tables=block_tables[:bs],
+                context_lens=context_lens,
+                block_tables=block_tables,
+                global_context_lens=global_context_lens,
             )
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
@@ -446,6 +576,7 @@ class ModelRunner:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
             torch.cuda.synchronize()
+            dist.barrier(group=get_dist_context().cuda_world_group)
             reset_context()
 
         self.graph_vars = dict(
@@ -454,5 +585,6 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            global_context_lens=global_context_lens,
             outputs=outputs,
         )

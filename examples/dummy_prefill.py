@@ -23,43 +23,42 @@ def main():
         ffn_tp=1,
         mode="decode",
         master_address="127.0.0.1:6006",
+        ray_address="10.103.5.41:7077",
         dummy_prefill=True,
+        dummy_weight=True,
+        perfect_eplb=True,
+        max_num_seqs=2,
+        max_model_len=524288,
+        max_num_batched_tokens=524288,
+        loop_count=16,
     )
 
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=True)
-    prompts = [
-        "你好",
-        "how to bake a chocolate cake from scratch",
-        "what are the benefits of meditation",
-        "list 5 famous scientists and their contributions",
-        "explain quantum computing in simple terms",
-        "how to bake a chocolate cake from scratch",
-        "what are the benefits of meditation",
-        "list 5 famous scientists and their contributions",
-    ]
+    sampling_params = SamplingParams(temperature=0.1, max_tokens=256, ignore_eos=True)
+    # prompts = [
+    #     "你好",
+    #     "how to bake a chocolate cake from scratch",
+    #     "what are the benefits of meditation",
+    #     "list 5 famous scientists and their contributions",
+    #     "explain quantum computing in simple terms",
+    #     "how to bake a chocolate cake from scratch",
+    #     "what are the benefits of meditation",
+    #     "list 5 famous scientists and their contributions",
+    # ]
 
     seqs = [
         Sequence(
-            tokenizer.encode(
-                tokenizer.apply_chat_template(
-                    [{"role": "user", "content": prompt}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            ),
+            [0] * 400000,
             sampling_params=sampling_params,
         )
-        for prompt in prompts
     ]
 
     decode.add_request(seqs)
     decode.generate()
 
-    for prompt, seq in zip(prompts, seqs):
+    for seq in seqs:
         token_ids = seq.completion_token_ids
         output = {"text": tokenizer.decode(token_ids), "token_ids": token_ids}
-        print(f"Prompt: {prompt!r}")
-        print(f"Completion: {output['text']!r}")
+        print(output)
 
 
 if __name__ == "__main__":

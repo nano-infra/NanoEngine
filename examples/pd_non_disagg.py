@@ -22,9 +22,11 @@ def main():
         ffn_tp=1,
         ray_address="10.103.5.41:7077",
         loop_count=16,
+        max_model_len=16384,
+        max_num_batched_tokens=16384,
     )
 
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=True)
+    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=False)
     prompts = [
         "你好",
         "how to bake a chocolate cake from scratch",
