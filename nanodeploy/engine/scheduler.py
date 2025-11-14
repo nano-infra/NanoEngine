@@ -317,6 +317,44 @@ class Scheduler:
                             self.running(dp_idx).remove(seq)
                             self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
                             break
+                        
+    def build_group_req_kv_map(self, dp_seqs: list[list[Sequence]]) -> list[list[list[int]]]:
+        """
+        构建 group_req_kv_map，记录每个请求的 KV cache 分布
+        
+        格式: group_req_kv_map[sp_rank][request_idx] = [kv_rank1, kv_rank2, ...]
+        
+        Args:
+            dp_seqs: DP 维度的序列列表，每个 DP 包含多个序列
+            
+        Returns:
+            group_req_kv_map: 三维列表
+                - 第1维: SP rank ID (0 到 attention_sp-1)
+                - 第2维: 该 rank 负责的请求索引
+                - 第3维: 该请求的 KV cache 分布的 rank 列表
+        """
+        # 初始化结果: [sp_rank][request_list][kv_ranks]
+        group_req_kv_map = [[] for _ in range(self.attention_sp)]
+        
+        # 遍历每个 DP 组（在单 DP 场景下只有一个）
+        for dp_idx, seqs in enumerate(dp_seqs):
+            # 按 master_sp_idx 分组序列
+            sp_seqs = [[] for _ in range(self.attention_sp)]
+            for seq in seqs:
+                # 跳过 dummy 序列
+                if seq in self.worker_state[dp_idx].sp_block_manager.dummy_seqs:
+                    continue
+                master_sp_idx = seq.block_ctx(self.engine_id).master_sp_idx
+                sp_seqs[master_sp_idx].append(seq)
+            
+            # 为每个 SP rank 构建其请求的 KV 分布信息
+            for sp_rank in range(self.attention_sp):
+                for seq in sp_seqs[sp_rank]:
+                    # 获取该序列的 KV cache 分布在哪些 rank 上
+                    kv_ranks = seq.get_kv_ranks(self.engine_id)
+                    group_req_kv_map[sp_rank].append(kv_ranks)
+        
+        return group_req_kv_map
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):

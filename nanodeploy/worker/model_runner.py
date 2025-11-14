@@ -26,6 +26,7 @@ from nanodeploy.worker.distributed import (
 )
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
+from  nanodeploy.worker.sp_utils import build_all_gather_q_mask, count_requests_to_cur_rank, build_all2all_res_mask, build_lse_mask, build_kv_lens_slice
 
 
 logger = get_logger()
@@ -345,12 +346,14 @@ class ModelRunner:
         )
         return input_ids, positions
 
-    def prepare_decode(self, dp_seqs: list[Sequence], is_dummy: bool = False):
+    def prepare_decode(self, dp_seqs: list[Sequence], is_dummy: bool = False, group_req_kv_map: list[list[list[int]]] | None = None):
         input_ids = []
         positions = []
         slot_mapping = []
         context_lens = []
         sp_rank = get_dist_context().attn_sp_rank
+        sp_size = get_dist_context().attn_sp_world_size
+        
 
         for seq in dp_seqs:
             if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank:
@@ -415,6 +418,23 @@ class ModelRunner:
             global_context_lens, dtype=torch.int32, pin_memory=True
         )
         block_tables = self.prepare_block_tables(dp_seqs)
+        
+        q_mask = None
+        if sp_size > 1 and group_req_kv_map is not None:
+            cur_rank_req_kv_map = group_req_kv_map[sp_rank]
+            
+            # Build q_mask for all-gather Q operation
+            q_mask = build_all_gather_q_mask(
+                cur_rank_req_kv_map=cur_rank_req_kv_map,
+                max_bs=self.config.max_num_seqs,
+                gpus_per_machine=sp_size,
+                cur_rank=sp_rank,
+                device="cuda"
+            )
+        elif sp_size > 1:
+            logger.warning(f"[{sp_rank}]sp_size > 1 but group_req_kv_map is none")
+        logger.info(f"[{sp_rank}] {q_mask=}")
+        
         set_context(
             False,
             self.config.max_num_seqs,
@@ -423,6 +443,7 @@ class ModelRunner:
             block_tables=block_tables,
             global_context_lens=global_context_lens,
             is_dummy=is_dummy,
+            q_mask=q_mask
         )
 
         return input_ids, positions
@@ -442,7 +463,8 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(
-        self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
+        self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool,
+        group_req_kv_map: list[list[list[int]]] | None = None
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             context = get_context()
@@ -450,15 +472,49 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            sp_size = get_dist_context().attn_sp_world_size
+            sp_rank = get_dist_context().attn_sp_rank
+            
+            if sp_size > 1 and group_req_kv_map is not None:
+                all_ranks_max_bs = max(len(group_req_kv_map[rank]) for rank in range(sp_size))
+            else:
+                all_ranks_max_bs = bs
+            
+            selected_bs = next(x for x in self.graph_bs if x >= all_ranks_max_bs)
+            graph = self.graphs[selected_bs]
+            # graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"].copy_(context.context_lens)
+            
+            if sp_size > 1 and group_req_kv_map is not None:
+                slice_to_get, slice_to_fill = build_kv_lens_slice(
+                    global_rank=self.rank,
+                    group_req_kv_map=group_req_kv_map,
+                    max_bs=selected_bs,
+                    sp_rank=sp_rank
+                )
+                graph_vars["context_lens"].zero_()
+                flattened_context_lens = context.context_lens.view(-1)
+                # slice_to_get_tensor = torch.tensor(slice_to_get, dtype=torch.long, device="cuda")
+                # slice_to_fill_tensor = torch.tensor(slice_to_fill, dtype=torch.long, device="cuda")
+                graph_vars["context_lens"].view(-1)[slice_to_fill] = flattened_context_lens[slice_to_get]
+                flattened_block_tables = context.block_tables.view(sp_size * self.config.max_num_seqs, -1)
+                graph_vars["block_tables"].view(sp_size * selected_bs, -1).zero_()
+                graph_vars["block_tables"].view(sp_size * selected_bs, -1)[slice_to_fill, :context.block_tables.size(2)] = \
+                    flattened_block_tables[slice_to_get, :context.block_tables.size(2)]
+                # logger.info(f"{type(context.q_mask[:bs])=}")
+                graph_vars["q_mask"].zero_()
+                graph_vars["q_mask"][:bs] = context.q_mask[:bs]
+            else:
+                if sp_size>1:
+                    logger.warning(f"SP>1, group_req_kv_map is none")
+                graph_vars["context_lens"].zero_()
+                graph_vars["context_lens"].copy_(context.context_lens)
+            
             graph_vars["global_context_lens"].zero_()
             graph_vars["global_context_lens"].copy_(context.global_context_lens)
             graph_vars["block_tables"][
@@ -470,7 +526,7 @@ class ModelRunner:
     def migrate(self, seqs: list[Sequence]) -> None:
         get_cache_context().migrate(seqs=seqs)
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool, group_req_kv_map: list[list[list[int]]] | None = None) -> list[int]:
         # start_event = torch.cuda.Event(enable_timing=True)
         # end_event = torch.cuda.Event(enable_timing=True)
         # start_event.record()
@@ -516,9 +572,9 @@ class ModelRunner:
             input_ids, positions = (
                 self.prepare_prefill(seqs, is_dummy)
                 if is_prefill
-                else self.prepare_decode(seqs, is_dummy)
+                else self.prepare_decode(seqs, is_dummy, group_req_kv_map)
             )
-            logits = self.run_model(input_ids, positions, is_prefill)
+            logits = self.run_model(input_ids, positions, is_prefill, group_req_kv_map)
             tp_rank = get_dist_context().attn_tp_rank
             temperatures = (
                 self.prepare_sample(seqs) if tp_rank == 0 else [None] * len(seqs)
@@ -582,6 +638,9 @@ class ModelRunner:
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
+        max_graph_bs = max(self.graph_bs)
+        q_mask = torch.zeros(max_graph_bs, sp_world_size, dtype=torch.int32)
+        
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
@@ -592,6 +651,7 @@ class ModelRunner:
                 context_lens=context_lens,
                 block_tables=block_tables,
                 global_context_lens=global_context_lens,
+                q_mask=q_mask[bs:] if sp_world_size > 1 else None,
             )
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
@@ -611,4 +671,7 @@ class ModelRunner:
             block_tables=block_tables,
             global_context_lens=global_context_lens,
             outputs=outputs,
+            q_mask=q_mask,
+            # res_mask=res_mask,
+            # lse_mask=lse_mask,
         )

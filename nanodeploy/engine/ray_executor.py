@@ -200,15 +200,37 @@ class RayExecutor:
         )
 
     def run(
-        self, dp_seqs: List[List[Sequence]], is_prefill: bool, timeout: float = None
+        self, dp_seqs: List[List[Sequence]], is_prefill: bool, 
+        group_req_kv_map: List[List[List[int]]] | None = None, timeout: float = None
     ) -> list[int]:
+        sp_size = self.config.attention_sp
+        dp_size = self.config.attention_dp
+        
+        if group_req_kv_map is not None and sp_size > 1:
+            # 为每个 DP 组复制 group_req_kv_map
+            # expanded_maps[dp_idx * sp_size + sp_idx] = group_req_kv_map (for that DP group)
+            expanded_maps = []
+            for dp_idx in range(dp_size):
+                for sp_idx in range(sp_size):
+                    # 每个 worker 都使用相同的 group_req_kv_map
+                    expanded_maps.append(group_req_kv_map)
+        else:
+            expanded_maps = [None] * len(dp_seqs)
+        
         return ray.get(
             [
-                getattr(worker, "run").remote(seqs, is_prefill)
-                for seqs, worker in zip(dp_seqs, self.workers)
+                getattr(worker, "run").remote(seqs, is_prefill, kv_map)
+                for seqs, worker, kv_map in zip(dp_seqs, self.workers, expanded_maps)
             ],
             timeout=timeout,
         )
+        # return ray.get(
+        #     [
+        #         getattr(worker, "run").remote(seqs, is_prefill)
+        #         for seqs, worker in zip(dp_seqs, self.workers)
+        #     ],
+        #     timeout=timeout,
+        # )
 
     def update_kvcache_blocks(self):
         num_cache_blocks = min(self.collective_rpc("num_kvcache_blocks"))

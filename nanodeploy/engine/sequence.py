@@ -169,6 +169,22 @@ class Sequence:
         num_tokens = self.block_ctx(engine_id).num_dispatched_tokens[sp_idx]
         last_block_idx = (num_tokens - 1) // self.block_size
         return self.block_table(engine_id, sp_idx)[last_block_idx]
+    
+    def get_kv_ranks(self, engine_id: str | None = None) -> list[int]:
+        """
+        获取该序列的 KV cache 分布在哪些 SP rank 上
+        Returns: List of SP rank IDs that store KV cache for this sequence
+        """
+        engine_id = engine_id or self.active_engine_id
+        block_ctx = self.block_ctx(engine_id)
+        
+        # 返回所有有 token 分布的 rank
+        kv_ranks = [
+            sp_idx 
+            for sp_idx, num_tokens in block_ctx.num_dispatched_tokens.items()
+            if num_tokens > 0
+        ]
+        return sorted(kv_ranks)
 
     def last_block_num_tokens(
         self,

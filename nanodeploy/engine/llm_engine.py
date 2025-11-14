@@ -101,7 +101,9 @@ class LLMEngine:
             else:
                 [[seq.append_token(0) for seq in seqs] for seqs in dp_seqs]
         else:
-            token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
+            group_req_kv_map = self.scheduler.build_group_req_kv_map(dp_seqs)
+            # token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
+            token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill, group_req_kv_map)[::tp_size]
             post_sch_begin = time.time()
             token_ids = [
                 token_ids[i * sp_size : (i + 1) * sp_size] for i in range(0, dp_size)

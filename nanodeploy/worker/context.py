@@ -23,6 +23,9 @@ class Context:
 
     global_context_lens: torch.Tensor | None = None
     is_dummy: bool = False
+    
+    q_mask: torch.Tensor | None = None
+    
 
 
 _CONTEXT = Context()
@@ -44,6 +47,7 @@ def set_context(
     block_tables: Optional[torch.Tensor] = None,
     global_context_lens: Optional[torch.Tensor] = None,
     is_dummy: bool | None = False,
+    q_mask: Optional[torch.Tensor] = None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -58,6 +62,7 @@ def set_context(
         block_tables,
         global_context_lens,
         is_dummy=is_dummy,
+        q_mask=q_mask,
     )
 
 
