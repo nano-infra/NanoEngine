@@ -35,7 +35,7 @@ class SPBlockManager:
             for i in range(attention_sp)
         }
 
-        self.dummy_seqs = []
+        self.dummy_seqs: list[Sequence] = []
 
         for sp_idx in range(attention_sp):
             dummy_seq = Sequence(
@@ -255,10 +255,18 @@ class Scheduler:
             self.running(selected_dp_idx).extendleft(
                 reversed(scheduled_seqs[selected_dp_idx])
             )
+
         for dp_idx, dp_seqs in enumerate(scheduled_seqs):
-            scheduled_seqs[dp_idx] += self.worker_state[
-                dp_idx
-            ].sp_block_manager.dummy_seqs
+            sp_lens = [0 for _ in range(self.attention_sp)]
+            for seq in dp_seqs:
+                sp_lens[seq.block_ctx(self.engine_id).master_sp_idx] += len(seq)
+
+            for sp_idx in range(self.attention_sp):
+                if sp_lens[sp_idx] == 0:
+                    scheduled_seqs[dp_idx].append(
+                        self.worker_state[dp_idx].sp_block_manager.dummy_seqs[sp_idx]
+                    )
+
         return scheduled_seqs
 
     def schedule(self) -> tuple[list[list[Sequence]], bool]:
