@@ -48,7 +48,7 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        logger.debug(f"init ModelRunner, rank: {rank}, local_ip：, {get_local_ip()}")
+        logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
         set_runner_config(
             max_num_seqs=config.max_num_seqs,
@@ -500,7 +500,7 @@ class ModelRunner:
         if not sp_seqs:
             is_dummy = True
             seq = Sequence(
-                [np.random.randint(self.config.hf_config.vacab_size - 1)],
+                [np.random.randint(self.config.hf_config.vocab_size - 1)],
                 engine_id=self.engine_id,
                 master_sp_rank=get_dist_context().attn_sp_rank,
             )
