@@ -1,7 +1,21 @@
+import socket
+
 from dataclasses import dataclass
 
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
+
+
+def get_local_ip():
+    try:
+        # 创建 UDP 套接字，连接到外部服务器（无需实际发送数据）
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except Exception as e:
+        return f"获取本地 IP 失败：{str(e)}"
 
 
 @dataclass
