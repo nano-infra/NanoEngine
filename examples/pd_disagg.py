@@ -23,7 +23,7 @@ def main():
         ffn_tp=1,
         mode="decode",
         loop_count=1,
-        master_address="127.0.0.1:6006",
+        master_address="10.103.5.41:6006",
         ray_address="10.103.5.41:7077",
         dummy_prefill=False,
         max_num_seqs=2,
@@ -40,7 +40,7 @@ def main():
         ffn_ep=8,
         ffn_tp=1,
         mode="prefill",
-        master_address="127.0.0.1:6006",
+        master_address="10.103.11.87:6006",
         ray_address="10.103.5.41:7077",
     )
 

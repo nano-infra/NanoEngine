@@ -1,5 +1,7 @@
 from typing import Any, Dict, List, Tuple
 
+from urllib.parse import urlparse
+
 import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 
@@ -12,20 +14,92 @@ from nanodeploy.worker.model_runner import ModelRunner
 logger = get_logger()
 
 
-def get_nodes_with_head_first():
+def _clean_and_parse_address(address: str) -> str:
     """
-    node list
+    清理并解析地址，正确处理 'ip:port' 格式。
     """
-    nodes = ray.nodes()
+    # 如果地址包含 ':' 且不以 'http://' 或 'https://' 开头，我们认为它是 'ip:port' 格式
+    if ":" in address and not address.startswith(("http://", "https://")):
+        # 为其添加一个默认的 'http://' 前缀，使其成为一个标准 URL
+        address = f"http://{address}"
 
-    # 自定义排序函数：头节点在前，其他节点按原顺序排列
+    parsed_url = urlparse(address)
+
+    # 如果解析后的 hostname 存在，则返回它
+    if parsed_url.hostname:
+        return parsed_url.hostname
+
+    # 如果解析失败（例如，输入是一个纯 IP 或主机名），则返回原始地址
+    return address
+
+
+def get_available_nodes_with_master_first(master_address: str):
+    """
+    Retrieves a list of Ray nodes, sorting them so that the specified master node comes first.
+    Excludes nodes that have any ALIVE Placement Groups.
+
+    Args:
+        master_address: The address of the master node.
+
+    Returns:
+        A list of available Ray node dictionaries, sorted with the master node first.
+    """
+    all_nodes = ray.nodes()
+    if not all_nodes:
+        logger.warning("No nodes found in the Ray cluster.")
+        return []
+
+    # --------------------------
+    # Step 1: Clean and resolve the master address
+    # --------------------------
+    cleaned_host = _clean_and_parse_address(master_address)
+    if cleaned_host in {"localhost", "127.0.0.1"}:
+        if not ray.is_initialized():
+            raise RuntimeError("Ray must be initialized to resolve 'localhost'")
+        resolved_master_ip = ray.util.get_node_ip_address()
+    else:
+        resolved_master_ip = cleaned_host
+
+    # --------------------------
+    # Step 2: Get ALIVE Placement Groups and their nodes
+    # --------------------------
+    existing_pgs = ray.util.placement_group_table()
+    nodes_with_alive_pg = set()
+
+    for pg_id, pg_info in existing_pgs.items():
+        pg_state = pg_info.get("state", "")
+        pg_name = pg_info.get("name", "Unnamed")
+
+        # Only consider ALIVE PGs
+        if pg_state == "ALIVE":
+            logger.info(f"Found ALIVE PG: {pg_name} (ID: {pg_id})")
+            # A PG's bundles are spread across nodes. We need all nodes hosting its bundles.
+            bundles_to_node_id = pg_info.get("bundles_to_node_id", {})
+            for bundle_idx, node_id in bundles_to_node_id.items():
+                if node_id:
+                    nodes_with_alive_pg.add(node_id)
+
+    logger.info(f"Node IDs with ALIVE PGs: {nodes_with_alive_pg}")
+
+    # --------------------------
+    # Step 3: Filter available nodes
+    # --------------------------
+    available_nodes = [
+        node for node in all_nodes if node["NodeID"] not in nodes_with_alive_pg
+    ]
+
+    # --------------------------
+    # Step 4: Sort
+    # --------------------------
     def sort_key(node):
-        # 头节点返回 0，其他节点返回 1，确保头节点排在前面
-        return 0 if "node:__internal_head__" in node.get("Resources", {}) else 1
+        node_ip = node.get("NodeManagerAddress")
+        logger.info(f"{node_ip=}, {resolved_master_ip=}")
+        return 0 if node_ip == resolved_master_ip else 1
 
-    # 排序节点列表
-    sorted_nodes = sorted(nodes, key=sort_key)
-    return sorted_nodes
+    sorted_available_nodes = sorted(available_nodes, key=sort_key)
+
+    logger.info(f"Found {len(sorted_available_nodes)} available nodes.")
+    return sorted_available_nodes
 
 
 class RayExecutor:
@@ -42,7 +116,7 @@ class RayExecutor:
         assert config.attn_world_size == config.ffn_world_size
 
         # 2. 获取所有节点的 NodeID
-        nodes = get_nodes_with_head_first()
+        nodes = get_available_nodes_with_master_first(config.master_address)
         node_ids = [node["NodeID"] for node in nodes]
         print(f"find nodes (NodeIDs): {node_ids}")
 
@@ -64,11 +138,9 @@ class RayExecutor:
             logger.info(f"--- scheduling node: {target_node_id} ---")
 
             pg = placement_group(
-                bundles=[
-                    {"CPU": 0.1, "GPU": 1.0} for _ in range(8)
-                ],  # <-- 修改这里：使用最小化资源请求
+                bundles=[{"CPU": 0.1, "GPU": 1.0} for _ in range(8)],
                 strategy="STRICT_PACK",
-                name=f"pg-node-{node_idx}",
+                name=f"pg-node-{node_ids[node_idx]}",
                 _soft_target_node_id=target_node_id,
             )
             logger.info(target_node_id)

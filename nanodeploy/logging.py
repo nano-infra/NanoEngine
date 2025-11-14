@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from typing import Optional
 
@@ -43,6 +44,32 @@ class ColoredFormatter(logging.Formatter):
         logging.CRITICAL: AnsiColors.RED,
     }
 
+    def __init__(self, use_relative_path: bool = True):
+        """
+        Initialize the formatter.
+
+        Args:
+            use_relative_path (bool): If True, use relative path instead of absolute path
+        """
+        self.use_relative_path = use_relative_path
+        self.project_root = self._find_project_root()
+        super().__init__()
+
+    def _find_project_root(self) -> Optional[str]:
+        """Find the project root directory (looking for common markers)."""
+        current_dir = os.getcwd()
+        for _ in range(10):  # Limit the number of parent directories to check
+            if any(
+                os.path.exists(os.path.join(current_dir, marker))
+                for marker in [".git", ".vscode", "pyproject.toml", "setup.py"]
+            ):
+                return current_dir
+            parent_dir = os.path.dirname(current_dir)
+            if parent_dir == current_dir:  # Reached the root directory
+                break
+            current_dir = parent_dir
+        return None
+
     def format(self, record: logging.LogRecord) -> str:
         """
         Format the specified log record as text with color and context.
@@ -56,17 +83,28 @@ class ColoredFormatter(logging.Formatter):
         # Get the color for the current log level
         color = self.LEVEL_COLORS.get(record.levelno, AnsiColors.WHITE)
 
+        # Get the file path
+        file_path = record.pathname
+        if self.use_relative_path and self.project_root:
+            try:
+                file_path = os.path.relpath(file_path, self.project_root)
+            except ValueError:
+                # If relative path can't be created, use absolute path
+                pass
+
         # Define the log format string. This includes:
         # - Timestamp (cyan)
         # - Logger name/namespace (magenta)
         # - Log level (color-coded)
-        # - Function name and line number (yellow)
+        # - File path and line number (yellow) - VS Code recognizable format
+        # - Function name (yellow)
         # - Log message
         log_format = (
             f"{AnsiColors.CYAN}[%(asctime)s]{AnsiColors.RESET} "
             f"{AnsiColors.MAGENTA}[%(name)s]{AnsiColors.RESET} "
             f"{color}[%(levelname)s]{AnsiColors.RESET} "
-            f"{AnsiColors.YELLOW}%(funcName)s:%(lineno)d{AnsiColors.RESET} - "
+            f"{AnsiColors.YELLOW}{file_path}:%(lineno)d{AnsiColors.RESET} "
+            f"{AnsiColors.BRIGHT_WHITE}%(funcName)s{AnsiColors.RESET} - "
             f"%(message)s"
         )
 
@@ -92,12 +130,15 @@ class LoggerManager:
     _logger: Optional[logging.Logger] = None
 
     @classmethod
-    def get_logger(cls, name: str = "NANODEPLOY") -> logging.Logger:
+    def get_logger(
+        cls, name: str = "NANODEPLOY", use_relative_path: bool = True
+    ) -> logging.Logger:
         """
         Retrieve the singleton logger instance. If it doesn't exist, create and configure it.
 
         Args:
             name (str, optional): The name/namespace of the logger. Defaults to "NANODEPLOY".
+            use_relative_path (bool, optional): If True, use relative paths in logs. Defaults to True.
 
         Returns:
             logging.Logger: The configured logger instance.
@@ -119,7 +160,7 @@ class LoggerManager:
             console_handler.setLevel(logging.DEBUG)
 
             # Apply our custom colored formatter to the console handler
-            formatter = ColoredFormatter()
+            formatter = ColoredFormatter(use_relative_path=use_relative_path)
             console_handler.setFormatter(formatter)
 
             # Add the handler to the logger
@@ -129,7 +170,7 @@ class LoggerManager:
             # file_handler = logging.FileHandler('nanodeploy.log', encoding='utf-8')
             # file_handler.setLevel(logging.INFO) # Log INFO and above to file
             # file_handler.setFormatter(logging.Formatter(
-            #     '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+            #     '%(asctime)s - %(name)s - %(levelname)s - %(pathname)s:%(lineno)d - %(funcName)s - %(message)s',
             #     datefmt='%Y-%m-%d %H:%M:%S'
             # ))
             # logger.addHandler(file_handler)
@@ -143,14 +184,19 @@ class LoggerManager:
 # Module Exports
 # =============================================================================
 # Export a simple function for easy access to the logger
-get_logger = LoggerManager.get_logger
+def get_logger(
+    name: str = "NANODEPLOY", use_relative_path: bool = True
+) -> logging.Logger:
+    return LoggerManager.get_logger(name, use_relative_path)
+
 
 # =============================================================================
 # Example Usage
 # =============================================================================
 if __name__ == "__main__":
     # Obtain the logger instance
-    logger = get_logger()
+    # Set use_relative_path=False to use absolute paths
+    logger = get_logger(use_relative_path=True)
 
     # Demonstrate different log levels
     logger.debug("This is a debug message, useful for development.")
@@ -163,3 +209,9 @@ if __name__ == "__main__":
         1 / 0
     except ZeroDivisionError:
         logger.exception("An unexpected exception occurred:")
+
+    # Test with a different function
+    def test_function():
+        logger.info("This message is from test_function")
+
+    test_function()
