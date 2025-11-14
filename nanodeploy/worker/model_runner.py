@@ -11,7 +11,6 @@ import torch.distributed as dist
 import torch.profiler as profiler
 
 from nanodeploy.config import Config
-
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
@@ -20,7 +19,11 @@ from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.buffer import get_sp_context, set_sp_context
 from nanodeploy.worker.cache import get_cache_context, set_cache_context
 from nanodeploy.worker.context import get_context, reset_context, set_context
-from nanodeploy.worker.distributed import get_dist_context, set_dist_context
+from nanodeploy.worker.distributed import (
+    get_dist_context,
+    get_local_ip,
+    set_dist_context,
+)
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 
@@ -34,7 +37,7 @@ architectures = {
 }
 
 
-@ray.remote(num_gpus=1, num_cpus=10)
+@ray.remote(num_cpus=0.1, num_gpus=1)
 class ModelRunner:
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
@@ -45,7 +48,7 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+        logger.debug(f"init ModelRunner, rank: {rank}, local_ip：, {get_local_ip()}")
 
         set_runner_config(
             max_num_seqs=config.max_num_seqs,
@@ -76,31 +79,50 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
 
+        sp_size = get_dist_context().attn_sp_world_size
+        ep_size = get_dist_context().ffn_ep_world_size
+
+        if ep_size > 1:
+            import deep_ep
+
+            deep_ep.Buffer.num_sms = 16
+            dist.barrier(group=get_dist_context().cuda_world_group)
+        import time
+
+        time.sleep(10)
+
+        if sp_size > 1:
+            sp_rank = get_dist_context().attn_sp_rank
+            set_sp_context(
+                config.max_num_seqs,
+                hf_config.head_dim,
+                hf_config.num_attention_heads,
+                torch.get_default_dtype(),
+                sp_size,
+                sp_rank,
+            )
+
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
 
-        # 性能分析相关初始化
-        self.run_count = 0  # 记录 run_model 的调用次数
-        self.prof_start = 0  # 开始 profiling 的次数
-        self.prof_end = 50  # 结束 profiling 的次数
-        self.profiler = None  # 用于存储 profiler 实例
+        self.run_count = 0
+        self.prof_start = 0
+        self.prof_end = 50
+        self.profiler = None
 
-        # 配置 profiler（包含 CUDA 时间线）
         self.prof_kwargs = {
             "activities": [
-                torch.profiler.ProfilerActivity.CPU,  # 记录 CPU 活动
-                torch.profiler.ProfilerActivity.CUDA,  # 记录 CUDA 活动（关键）
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
             ],
-            "schedule": profiler.schedule(
-                wait=1, warmup=1, active=30
-            ),  # 每次启动只记录1步
+            "schedule": profiler.schedule(wait=1, warmup=1, active=30),
             "on_trace_ready": torch.profiler.tensorboard_trace_handler(
                 dir_name="/mnt/nvme1n1/ml_research/majinming/src/nano-deploy/",
                 worker_name=f"trace_rank_{dist.get_rank()}",
             ),
-            "record_shapes": True,  # 记录张量形状
-            "profile_memory": True,  # 记录内存使用
-            "with_stack": True,  # 记录调用栈
+            "record_shapes": True,
+            "profile_memory": True,
+            "with_stack": True,
         }
 
         sp_size = get_dist_context().attn_sp_world_size
@@ -125,6 +147,8 @@ class ModelRunner:
 
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
+
+        dist.barrier()
 
         self.sampler = Sampler()
         self.warmup_model()
@@ -476,7 +500,7 @@ class ModelRunner:
         if not sp_seqs:
             is_dummy = True
             seq = Sequence(
-                [np.random.randint(8000)],
+                [np.random.randint(self.config.hf_config.vacab_size - 1)],
                 engine_id=self.engine_id,
                 master_sp_rank=get_dist_context().attn_sp_rank,
             )

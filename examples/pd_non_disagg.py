@@ -14,16 +14,18 @@ def main():
     llm = LLM(
         path,
         enforce_eager=False,
-        attention_dp=8,
+        attention_dp=32,
         attention_sp=1,
         attention_tp=1,
         ffn_dp=1,
-        ffn_ep=8,
+        ffn_ep=32,
         ffn_tp=1,
         ray_address="10.103.5.41:7077",
+        master_address="10.103.5.41:6006",
         loop_count=16,
-        max_model_len=16384,
-        max_num_batched_tokens=16384,
+        max_model_len=4096,
+        max_num_batched_tokens=4096,
+        gpu_memory_utilization=0.5,
     )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=False)
