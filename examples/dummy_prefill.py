@@ -15,8 +15,8 @@ def main():
     decode = LLM(
         path,
         enforce_eager=False,
-        attention_dp=8,
-        attention_sp=1,
+        attention_dp=1,
+        attention_sp=8,
         attention_tp=1,
         ffn_dp=1,
         ffn_ep=8,
@@ -27,7 +27,7 @@ def main():
         dummy_prefill=True,
         dummy_weight=True,
         perfect_eplb=True,
-        max_num_seqs=2,
+        max_num_seqs=64,
         max_model_len=524288,
         max_num_batched_tokens=524288,
         loop_count=16,
@@ -47,7 +47,7 @@ def main():
 
     seqs = [
         Sequence(
-            [0] * 262144,
+            [0] * 400000,
             sampling_params=sampling_params,
         )
     ]

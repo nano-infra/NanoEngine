@@ -414,6 +414,7 @@ class ModelRunner:
         global_context_lens = torch.tensor(
             global_context_lens, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+
         block_tables = self.prepare_block_tables(dp_seqs)
         set_context(
             False,
@@ -473,7 +474,6 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         # start_event = torch.cuda.Event(enable_timing=True)
         # end_event = torch.cuda.Event(enable_timing=True)
-        # start_event.record()
 
         # """封装 run_model 的调用，加入 profiler 控制"""
 
@@ -487,6 +487,7 @@ class ModelRunner:
         #     self.profiler = profiler.profile(**self.prof_kwargs)
         #     self.profiler.start()
         #     print(f"开始 profiling（第 {self.run_count} 次）")
+        # start_event.record()
 
         # print(input_ids.shape, positions.shape)
         sp_rank = get_dist_context().attn_sp_rank

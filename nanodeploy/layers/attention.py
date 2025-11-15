@@ -59,10 +59,7 @@ class Attention(nn.Module):
                 q_buffer = get_sp_context().q_buffer
                 q = q_buffer.all_to_all_ll(
                     q.view([bs, -1]),
-                    mask=(context.global_context_lens > 0)
-                    .T.to(torch.int32)
-                    .contiguous()
-                    .to(torch.int32),
+                    mask=context.global_context_lens,
                 ).view([sp_size * max_num_seqs, num_head, head_dim])
                 context_lens = context.context_lens.view(-1)
                 block_tables = context.block_tables.view(sp_size * max_num_seqs, -1)
@@ -77,7 +74,7 @@ class Attention(nn.Module):
                 cache_seqlens=context_lens,
                 page_table=block_tables,
                 softmax_scale=self.scale,
-                causal=True,
+                causal=False,
                 return_softmax_lse=True,
             )[:2]
 
@@ -92,7 +89,7 @@ class Attention(nn.Module):
                 )
                 all_ranks_output_combine = res_lse_buffer.all_to_all_ll(
                     all_ranks_output_combine_0.view(sp_size * max_num_seqs, -1),
-                    mask=(context.context_lens > 0).T.to(torch.int32).contiguous(),
+                    mask=context.context_lens,
                     is_transpose=True,
                 ).view(sp_size, max_num_seqs, num_head, head_dim + 1)
 
