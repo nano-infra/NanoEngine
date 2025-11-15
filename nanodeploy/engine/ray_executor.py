@@ -143,7 +143,6 @@ class RayExecutor:
                 name=f"pg-node-{node_ids[node_idx]}",
                 _soft_target_node_id=target_node_id,
             )
-            logger.info(target_node_id)
 
             ray.get(pg.ready())
             self.placement_groups.append(pg)
@@ -157,7 +156,7 @@ class RayExecutor:
                 )
                 self.workers.append(worker)
 
-        logger.info("\nAll workers scheduled successfully.")
+        logger.info("All workers scheduled successfully.")
 
     def __del__(self):
         if hasattr(self, "placement_groups") and self.placement_groups:

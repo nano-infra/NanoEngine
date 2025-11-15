@@ -125,9 +125,7 @@ class BlockManager:
             block_table = seq.block_table(self.engine_id, self.sp_idx)
             last_block = self.blocks[block_table[-1]]
             if (
-                seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx]
-                + idx
-                - 1
+                seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx] + idx
             ) % self.block_size == 1:
                 # assert last_block.hash != -1
                 block_id = self.free_block_ids[0]
