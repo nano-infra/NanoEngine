@@ -414,7 +414,6 @@ class ModelRunner:
         global_context_lens = torch.tensor(
             global_context_lens, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
-
         block_tables = self.prepare_block_tables(dp_seqs)
         set_context(
             False,
