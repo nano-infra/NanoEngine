@@ -47,7 +47,7 @@ def main():
 
     seqs = [
         Sequence(
-            [0] * 400000,
+            [0] * 262144,
             sampling_params=sampling_params,
         )
     ]

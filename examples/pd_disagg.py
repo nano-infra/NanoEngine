@@ -7,9 +7,7 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser(
-        "/models/models--Qwen--Qwen3-235B-A22B-Instruct-2507-FP8/snapshots/ba82a1060073fa0ecdc70d7b1922ec071f60cf3e"
-    )
+    path = os.path.expanduser("/models/model--Qwen--Qwen3-30B-A3B-FP8")
     tokenizer = AutoTokenizer.from_pretrained(path)
 
     decode = LLM(
@@ -22,11 +20,13 @@ def main():
         ffn_ep=8,
         ffn_tp=1,
         mode="decode",
-        loop_count=1,
+        loop_count=16,
         master_address="10.103.5.41:6006",
         ray_address="10.103.5.41:7077",
         dummy_prefill=False,
         max_num_seqs=2,
+        max_model_len=262144,
+        max_num_batched_tokens=262144,
     )
 
     prefill = LLM(
@@ -59,18 +59,18 @@ def main():
     prefill.p2p_connect(decode.engine_id, decode_endpoints_info)
     decode.p2p_connect(prefill.engine_id, prefill_endpoints_info)
 
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=False)
+    sampling_params = SamplingParams(temperature=0.1, max_tokens=512, ignore_eos=False)
+
     prompts = [
         """
-    雨夜的暖光​
-    傍晚时分，乌云像被打翻的墨汁，渐渐染黑了整片天空。风卷着枯叶在窗外打着旋，不一会儿，淅淅沥沥的雨声便敲起了节拍，由疏到密，最终织成一张灰蒙蒙的雨网，将整个小城笼罩其中。​
-    我趴在书桌前写作业，台灯的暖光在雨雾中晕开一圈柔和的光晕。客厅里传来妈妈择菜的沙沙声，夹杂着爸爸翻报纸的轻响，偶尔还有电视里新闻播报的声音，这些细碎的声响在雨声的衬托下，格外让人安心。忽然，台灯闪烁了两下，屋里瞬间陷入黑暗。“停电了？” 我下意识地喊了一声，手忙脚乱地摸索着手机。​
-    “别慌，我找蜡烛。” 爸爸的声音从黑暗中传来，带着沉稳的力量。打火机的火苗亮起，映出他熟悉的轮廓。妈妈拿着蜡烛走过来，烛光照亮了她眼角的细纹，也照亮了桌上刚切好的水果。“快把作业收一收，这么暗伤眼睛。” 她把蜡烛放在桌角，转身去厨房忙活，“正好炖了汤，咱们今晚就着烛光喝汤聊天。”​
-    烛光摇曳，将我们的影子投在墙上，忽明忽暗。雨点敲打着窗户，像是大自然的伴奏。爸爸说起他小时候停电的趣事，说那时候孩子们会围着蜡烛做游戏，妈妈则念叨着明天要记得买备用灯泡。我捧着温热的汤碗，听着家人的话语，鼻尖萦绕着汤的鲜香和蜡烛淡淡的蜡油味，心里暖洋洋的。​
-    平日里总觉得生活匆匆忙忙，忙着学习，忙着追赶时间，却很少有这样静下心来和家人相处的时刻。这场突如其来的停电，像是按下了生活的暂停键，让我感受到了平凡日子里最真切的温暖。原来幸福不必惊天动地，也许就是这样一个雨夜，一盏烛光，一碗热汤，和家人围坐在一起，聊着无关紧要的琐事。​
-    不知过了多久，灯光突然亮起，屋里恢复了明亮。雨还在下，但我的心里却充满了暖意。我看着窗外被雨水冲刷得格外清新的世界，忽然明白，生活中的美好，往往就藏在这些不期而遇的小插曲里。只要我们用心感受，就会发现，温暖一直都在。
-    给这篇作文打分。
-    """
+As evening fell, dark clouds spread across the sky like spilled ink, gradually blotting out the light. Wind swirled with withered leaves outside the window, and soon, the patter of rain began—a gentle rhythm that grew denser by the minute, weaving a gray, misty net that enshrouded the entire town.
+I leaned over my desk doing homework, the warm glow of the desk lamp diffusing a soft halo through the rain fog. From the living room came the rustle of Mom sorting vegetables, mixed with the faint sound of Dad flipping through the newspaper and occasional news broadcasts from the TV. These subtle noises, set against the rain, brought an overwhelming sense of peace. Suddenly, the desk lamp flickered twice, and the room was plunged into darkness. "Power outage?" I exclaimed instinctively, fumbling for my phone in a fluster.
+"Don’t panic—I’ll find candles," Dad’s voice came out of the dark, steady and reassuring. A lighter flame flared to life, casting light on his familiar silhouette. Mom approached holding candles, their glow illuminating the fine lines at the corners of her eyes and the freshly cut fruit on the table. "Put away your homework quickly; it’s too dark for your eyes," she said, placing a candle on the desk corner before turning to the kitchen. "I just made soup—tonight we’ll chat over candlelight while we eat."
+The candle flames danced, throwing our shadows onto the wall, now bright, now dim. Rain tapped against the windowpanes like nature’s accompaniment. Dad told stories of power outages from his childhood, how the kids would gather around candles to play games, while Mom chatted about remembering to buy backup lightbulbs tomorrow. I held the warm soup bowl in my hands, listening to my family’s voices, the aroma of the soup and the faint scent of candle wax lingering in my nose, filling my heart with warmth.
+On usual days, life felt so hurried—rushing through studies, chasing after time—that I rarely had moments like this to sit quietly with my family. This unexpected power outage was like pressing pause on life, letting me feel the most genuine warmth in ordinary days. It turned out happiness didn’t need to be earth-shaking; it might just be a rainy night like this, a candle’s glow, a bowl of hot soup, and sitting around with family, chatting about trivial matters.
+Before long, the lights suddenly came back on, flooding the room with brightness. The rain was still falling, but my heart was brimming with warmth. I looked out at the world, refreshed by the rain, and suddenly understood—life’s beauties are often hidden in these unplanned little interludes. As long as we pay attention, we’ll find that warmth is always there.
+Score this composition.
+"""
     ]
 
     seqs = [
