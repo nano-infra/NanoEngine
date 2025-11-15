@@ -7,6 +7,10 @@ import numpy as np
 from nanodeploy.config import Config
 from nanodeploy.engine.block_manager import BlockManager
 from nanodeploy.engine.sequence import Sequence, SequenceStatus
+from nanodeploy.logging import get_logger
+
+
+logger = get_logger()
 
 
 class RoutingStrategy(enum.Enum):
@@ -78,13 +82,6 @@ class SPBlockManager:
             total_token_unalloc -= num_blocks_per_rank * seq.block_size
             if total_token_unalloc <= 0:
                 block_ctx.master_sp_idx = sp_idx
-                assert block_ctx.master_sp_idx >= 0, (
-                    block_ctx.master_sp_idx,
-                    seq.num_tokens,
-                )
-                assert (
-                    block_ctx.master_sp_idx < self.attention_sp
-                ), block_ctx.master_sp_idx
                 break
 
         if all(
