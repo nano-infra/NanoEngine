@@ -43,7 +43,7 @@ def set_context(
     context_lens: dict[int, torch.Tensor] | torch.Tensor | None = None,
     block_tables: Optional[torch.Tensor] = None,
     global_context_lens: Optional[torch.Tensor] = None,
-    is_dummy: bool | None = Fals,
+    is_dummy: bool | None = False,
 ):
     global _CONTEXT
     _CONTEXT = Context(
