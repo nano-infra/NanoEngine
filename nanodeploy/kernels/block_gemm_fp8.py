@@ -1,9 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
 
+from nanodeploy.worker.buffer import get_sp_context
+from nanodeploy.worker.context import get_context
+from nanodeploy.worker.distributed import get_dist_context
 from .utils import get_device_props
 
 
@@ -119,7 +124,12 @@ def quant_fp8(
     return _quant_fp8_launcher(A, group_size, out, scales)
 
 
-def quant_fp8_tma(A: Tensor, group_size: int, dtype: torch.dtype = torch.float8_e4m3fn):
+def quant_fp8_tma(
+    A: Tensor,
+    group_size: int,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+    enable_zero_copy: Optional[bool] = False,
+):
     """Quant fp8 tma."""
     from deep_gemm import ceil_div, get_m_alignment_for_contiguous_layout
 
@@ -131,7 +141,12 @@ def quant_fp8_tma(A: Tensor, group_size: int, dtype: torch.dtype = torch.float8_
     aligned_M = ceil_div(M, alignment) * alignment
     out = A.new_empty(aligned_M, K, dtype=dtype)
     scales = A.new_empty(num_groups, aligned_M, dtype=torch.float32).T
-    return _quant_fp8_launcher(A, group_size, out, scales)
+
+    out, scales = _quant_fp8_launcher(A, group_size, out, scales)
+    if enable_zero_copy:
+        return out[:M, :K], scales[:M, :K]
+    else:
+        return out, scales
 
 
 def deep_gemm_fp8(
@@ -140,6 +155,7 @@ def deep_gemm_fp8(
     B: Tensor,
     B_scale: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
+    enable_zero_copy: Optional[bool] = False,
 ):
     """Deepgemm fp8."""
     from deep_gemm import gemm_fp8_fp8_bf16_nt
@@ -147,6 +163,35 @@ def deep_gemm_fp8(
     M, _ = A.shape
     N, _ = B.shape
     assert out_dtype == torch.bfloat16, "DeepGemm requires bf16 output."
-    C = A.new_empty(M, N, dtype=out_dtype)
-    gemm_fp8_fp8_bf16_nt((A, A_scale), (B, B_scale), C)
-    return C
+
+    sp_rank = get_dist_context().attn_sp_rank
+    sp_size = get_dist_context().attn_sp_world_size
+    if enable_zero_copy:
+        max_bs = get_context().max_bs
+        num_heads = get_sp_context().num_attention_heads
+        num_kv_heads = get_sp_context().num_kv_heads
+        head_size = get_sp_context().head_size
+
+        q_buffer = get_sp_context().q_buffer
+        msg_size = head_size * num_heads
+        q_local_buffer = q_buffer.get_local_buffer(
+            sp_size, max_bs + 2, msg_size, torch.bfloat16.itemsize, torch.bfloat16
+        )
+        res_buffer = q_local_buffer[
+            (max_bs)
+            * sp_rank
+            * num_heads
+            * head_size : (max_bs)
+            * sp_rank
+            * num_heads
+            * head_size
+            + (M) * (1) * (num_heads + num_kv_heads * 2) * head_size
+        ]
+
+        res_buffer = res_buffer.reshape(M, N)
+
+    else:
+        res_buffer = A.new_empty(M, N, dtype=out_dtype)
+
+    gemm_fp8_fp8_bf16_nt((A, A_scale), (B, B_scale), res_buffer)
+    return res_buffer

@@ -2,10 +2,8 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-
 from dlslime.buffer.intra.all_to_all_intra_ll_buffer import AllToAllIntraLLBuffer
 from nanodeploy.logging import get_logger
-
 from nanodeploy.worker.distributed import get_dist_context
 
 
@@ -18,6 +16,7 @@ class SPContext:
 
     head_size: int = None
     num_attention_heads: int = None
+    num_kv_heads: int = None
 
     dtype: torch.dtype = None
 
@@ -36,7 +35,7 @@ class SPContext:
 
         q_res_lse_buffer_size = AllToAllIntraLLBuffer.get_buffer_size_hint(
             sp_world_size,
-            self.max_num_seqs,
+            self.max_num_seqs + 2,
             self.msg_size,
             self.dtype.itemsize,
         )
@@ -72,13 +71,14 @@ def set_sp_context(
     max_num_seqs: int = None,
     head_size: int = None,
     num_attention_heads: int = None,
+    num_kv_heads: int = None,
     dtype: torch.dtype = None,
     rank: int = 0,
     sp_size: int = 1,
 ):
     global _SP_CONTEXT
     _SP_CONTEXT = SPContext(
-        max_num_seqs, head_size, num_attention_heads, dtype, rank, sp_size
+        max_num_seqs, head_size, num_attention_heads, num_kv_heads, dtype, rank, sp_size
     )
 
 

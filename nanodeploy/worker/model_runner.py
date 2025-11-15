@@ -3,13 +3,10 @@ from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
 
 import numpy as np
-
 import ray
 import torch
 import torch.distributed as dist
-
 import torch.profiler as profiler
-
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
@@ -97,6 +94,7 @@ class ModelRunner:
                 config.max_num_seqs,
                 hf_config.head_dim,
                 hf_config.num_attention_heads,
+                hf_config.num_key_value_heads,
                 torch.get_default_dtype(),
                 sp_size,
                 sp_rank,
@@ -140,6 +138,7 @@ class ModelRunner:
                 config.max_num_seqs,
                 hf_config.head_dim,
                 hf_config.num_attention_heads,
+                hf_config.num_key_value_heads,
                 torch.get_default_dtype(),
                 sp_size,
                 sp_rank,

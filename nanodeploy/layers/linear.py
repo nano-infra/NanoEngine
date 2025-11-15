@@ -1,13 +1,12 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
 from nanodeploy.kernels.block_gemm_fp8 import deep_gemm_fp8, quant_fp8_tma
 from nanodeploy.models.quant_config import QuantizationConfig
+from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
-
 from torch import nn
 
 
@@ -188,12 +187,17 @@ class ColumnParallelLinear(LinearBase):
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, enable_zero_copy: Optional[bool] = False
+    ) -> torch.Tensor:
         if not self.quantization_config.quant_method:
             return F.linear(x, self.weight, self.bias)
         elif self.quantization_config.quant_method == "fp8":
             input_quant, input_scale = quant_fp8_tma(
-                x, self.quantization_config.block_size[0], dtype=self.weight.dtype
+                x,
+                self.quantization_config.block_size[0],
+                dtype=self.weight.dtype,
+                enable_zero_copy=enable_zero_copy,
             )
 
             out = deep_gemm_fp8(
@@ -202,11 +206,11 @@ class ColumnParallelLinear(LinearBase):
                 self.weight,
                 self.weight_scale_inv,
                 out_dtype=x.dtype,
+                enable_zero_copy=enable_zero_copy,
             )
             out = out[: x.size(0)]
             if self.bias is not None:
                 out += self.bias
-
             return out
         else:
             raise AttributeError(f"Unsupported Quant Method")
@@ -236,6 +240,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             quantization_config=quantization_config,
         )
         self.output_sizes = output_sizes
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x, False)
 
     def weight_loader(
         self,
@@ -291,6 +298,15 @@ class QKVParallelLinear(ColumnParallelLinear):
             scale_tensor=scale_tensor,
             quantization_config=quantization_config,
         )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        is_prefill = get_context().is_prefill
+        sp_size = get_dist_context().attn_sp_world_size
+        if not is_prefill and get_context().enable_zero_copy and sp_size > 1:
+            enable_zero_copy = True
+        else:
+            enable_zero_copy = False
+        return super().forward(x, enable_zero_copy)
 
     def weight_loader(
         self,
