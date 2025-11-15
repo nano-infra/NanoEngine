@@ -1,3 +1,4 @@
+import threading
 from typing import Any, Dict, List, Tuple
 
 from urllib.parse import urlparse
@@ -107,9 +108,11 @@ class RayExecutor:
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        self.lock = threading.Lock()
 
         # 1. 初始化 Ray 连接
-        ray.init(address=config.ray_address, ignore_reinit_error=True)
+        with self.lock:
+            ray.init(address=config.ray_address, ignore_reinit_error=True)
 
         self.workers = []
         self.placement_groups = []

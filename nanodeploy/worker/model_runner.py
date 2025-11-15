@@ -240,7 +240,7 @@ class ModelRunner:
             for sp_idx in range(sp_size)
         ]
 
-        max_len = max(
+        max_num_blocks = max(
             [
                 max([len(seq.block_table(self.engine_id, sp_rank)) for seq in seqs])
                 for seqs in dp_sp_seqs
@@ -255,7 +255,7 @@ class ModelRunner:
                     dp_sp_seqs[sp_idx][seq_id].block_table(self.engine_id, sp_rank)
                     + [-1]
                     * (
-                        max_len
+                        max_num_blocks
                         - len(
                             dp_sp_seqs[sp_idx][seq_id].block_table(
                                 self.engine_id, sp_rank
@@ -263,7 +263,7 @@ class ModelRunner:
                         )
                     )
                     if seq_id < sp_num_seqs[sp_idx]
-                    else [-1] * max_len
+                    else [-1] * max_num_blocks
                 )
                 for seq_id in range(self.config.max_num_seqs)
             ]
@@ -397,7 +397,7 @@ class ModelRunner:
             for sp_idx in range(sp_size)
         ]
 
-        # logger.info(f"{sp_rank=}, {context_lens=}")
+        # logger.info(f"{sp_rank=},{context_lens=},{global_context_lens=}")
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
@@ -413,7 +413,7 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         global_context_lens = torch.tensor(
             global_context_lens, dtype=torch.int32, pin_memory=True
-        )
+        ).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(dp_seqs)
         set_context(
             False,

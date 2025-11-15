@@ -57,9 +57,13 @@ class Attention(nn.Module):
             if sp_size > 1:
                 max_num_seqs = get_sp_context().max_num_seqs
                 q_buffer = get_sp_context().q_buffer
-                q = q_buffer.all_to_all_ll(q.view([bs, -1])).view(
-                    [sp_size * max_num_seqs, num_head, head_dim]
-                )
+                q = q_buffer.all_to_all_ll(
+                    q.view([bs, -1]),
+                    mask=(context.global_context_lens > 0)
+                    .T.to(torch.int32)
+                    .contiguous()
+                    .to(torch.int32),
+                ).view([sp_size * max_num_seqs, num_head, head_dim])
                 context_lens = context.context_lens.view(-1)
                 block_tables = context.block_tables.view(sp_size * max_num_seqs, -1)
             else:
@@ -88,6 +92,7 @@ class Attention(nn.Module):
                 )
                 all_ranks_output_combine = res_lse_buffer.all_to_all_ll(
                     all_ranks_output_combine_0.view(sp_size * max_num_seqs, -1),
+                    mask=(context.context_lens > 0).T.to(torch.int32).contiguous(),
                     is_transpose=True,
                 ).view(sp_size, max_num_seqs, num_head, head_dim + 1)
 
