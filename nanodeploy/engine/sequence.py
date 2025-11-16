@@ -4,10 +4,14 @@ from collections import defaultdict
 from copy import copy
 from enum import auto, Enum
 from itertools import count
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
 from nanodeploy.sampling_params import SamplingParams
+
+if TYPE_CHECKING:
+    from nanodeploy.metrics import SequenceMetric
 
 
 class SequenceConfig(BaseModel):
@@ -80,6 +84,9 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        
+        # Metrics tracking
+        self.metric: "SequenceMetric | None" = None
 
     def dp_idx(self, engine_id):
         return self.block_ctx_map[engine_id].dp_idx

@@ -1,7 +1,7 @@
 import enum
 from collections import deque
 from itertools import count
-from typing import Literal
+from typing import Literal, TYPE_CHECKING
 
 import numpy as np
 
@@ -9,6 +9,9 @@ from nanodeploy.config import Config
 from nanodeploy.engine.block_manager import BlockManager
 from nanodeploy.engine.sequence import Sequence, SequenceStatus
 from nanodeploy.logging import get_logger
+
+if TYPE_CHECKING:
+    from nanodeploy.metrics import MetricsManager
 
 
 logger = get_logger()
@@ -288,6 +291,7 @@ class Scheduler:
         self,
         dp_seqs: list[list[list[Sequence]]],
         dp_token_ids: list[list[list[list[int]]]],
+        metrics_manager: "MetricsManager | None" = None,
     ):
         for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
             for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
@@ -295,11 +299,22 @@ class Scheduler:
                     if seq in self.worker_state[dp_idx].dummy_seqs:
                         continue
 
-                    for token_id in loop_count_token_id:
+                    for token_idx, token_id in enumerate(loop_count_token_id):
                         assert sp_idx == seq.block_ctx(self.engine_id).master_sp_idx
                         seq.append_token(
                             token_id, engine_id=self.engine_id, sp_idx=sp_idx
                         )
+                        
+                        # Record metrics for token generation
+                        if metrics_manager and seq.metric:
+                            if seq.num_completed_tokens == 1:
+                                # First token just generated
+                                seq.metric.record_first_token()
+                                seq.metric.num_generated_tokens = 1
+                            else:
+                                # Subsequent tokens - record ITL
+                                seq.metric.record_token()
+                        
                         if (
                             not seq.ignore_eos and token_id == self.eos
                         ) or seq.num_completed_tokens == seq.max_tokens:
