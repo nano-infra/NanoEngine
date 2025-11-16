@@ -10,7 +10,6 @@ def main():
     path = os.path.expanduser(
         "/models/models--Qwen--Qwen3-235B-A22B-Instruct-2507-FP8/snapshots/ba82a1060073fa0ecdc70d7b1922ec071f60cf3e"
     )
-    tokenizer = AutoTokenizer.from_pretrained(path)
 
     decode = LLM(
         path,
@@ -34,16 +33,6 @@ def main():
     )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=256, ignore_eos=True)
-    # prompts = [
-    #     "你好",
-    #     "how to bake a chocolate cake from scratch",
-    #     "what are the benefits of meditation",
-    #     "list 5 famous scientists and their contributions",
-    #     "explain quantum computing in simple terms",
-    #     "how to bake a chocolate cake from scratch",
-    #     "what are the benefits of meditation",
-    #     "list 5 famous scientists and their contributions",
-    # ]
 
     long_seqs = [
         Sequence(
@@ -53,8 +42,13 @@ def main():
     ]
 
     short_seqs = [
-        Sequence([0] * 1024, sampling_params=sampling_params) for _ in range(63)
+        Sequence(
+            [0] * 1024,
+            sampling_params=sampling_params,
+        )
+        for _ in range(511)
     ]
+
     seqs = long_seqs + short_seqs
 
     decode.add_request(seqs)

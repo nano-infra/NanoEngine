@@ -483,16 +483,15 @@ class ModelRunner:
         #     print(f"开始 profiling（第 {self.run_count} 次）")
         # start_event.record()
 
-        # print(input_ids.shape, positions.shape)
         sp_rank = get_dist_context().attn_sp_rank
 
-        sp_seqs = [
-            seq
+        num_sp_seqs = sum(
+            1
             for seq in dp_seqs
             if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank
-        ]
+        )
         is_dummy = False
-        if not sp_seqs:
+        if num_sp_seqs == 0:
             is_dummy = True
             seq = Sequence(
                 [np.random.randint(self.config.hf_config.vocab_size - 1)],
@@ -502,6 +501,12 @@ class ModelRunner:
 
             seq.block_ctx(self.engine_id).sp_block_table[sp_rank] = [0]
             dp_seqs.append(seq)
+
+        sp_seqs = [
+            seq
+            for seq in dp_seqs
+            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank
+        ]
 
         loop_count = self.config.loop_count if not is_prefill else 1
 
@@ -516,7 +521,7 @@ class ModelRunner:
             logits = self.run_model(input_ids, positions, is_prefill)
             tp_rank = get_dist_context().attn_tp_rank
             temperatures = (
-                self.prepare_sample(sp_seqs) if tp_rank == 0 else [None] * len(sp_seqs)
+                self.prepare_sample(dp_seqs) if tp_rank == 0 else [None] * len(sp_seqs)
             )
             token_ids = (
                 self.sampler(logits, temperatures).tolist()
