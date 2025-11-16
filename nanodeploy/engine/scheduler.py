@@ -1,5 +1,6 @@
 import enum
 from collections import deque
+from itertools import count
 from typing import Literal
 
 import numpy as np
@@ -38,6 +39,9 @@ class SPBlockManager:
             )
             for i in range(attention_sp)
         }
+
+        self.routing_startegy = RoutingStrategy.RoundRobin
+        self.sp_rr_counter = (idx % self.attention_sp for idx in count())
 
         self.dummy_seqs: list[Sequence] = []
         self._initialize_dummy_seqs()
@@ -158,7 +162,7 @@ class Scheduler:
         self.to_be_migrated: dict[str, tuple[Sequence, int]] = {}
 
         self.mode: Literal["prefill", "decode", "hybrid"] = config.mode
-        self.rr_generator = self.route_by_rr()
+        self.dp_rr_counter = (idx % self.attention_dp for idx in count())
 
     def is_finished(self):
         waiting = self.waiting if self.mode != "decode" else self.waiting_migration
@@ -169,13 +173,6 @@ class Scheduler:
             self.waiting_migration.append(seq)
         else:
             self.waiting.append(seq)
-
-    def route_by_rr(self):
-        if not hasattr(self, "rr_selected"):
-            setattr(self, "rr_selected", 0)
-        while True:
-            yield self.rr_selected
-            self.rr_selected = (self.rr_selected + 1) % self.attention_dp
 
     def running(self, dp_idx: int):
         return self.worker_state[dp_idx].running
@@ -194,7 +191,7 @@ class Scheduler:
             seq = waiting[0]
             if self.rounting_strategy == RoutingStrategy.RoundRobin:
                 for _ in range(self.attention_dp):
-                    selected_dp_idx = self.rr_generator.__next__()
+                    selected_dp_idx = next(self.dp_rr_counter)
                     if num_seqs[selected_dp_idx] >= self.max_num_seqs:
                         continue
                     num_batched_tokens_satisfied = (
