@@ -20,7 +20,7 @@ class RoutingStrategy(enum.Enum):
     LeastCache = enum.auto()
 
 
-class SPBlockManager:
+class SPStateManager:
     def __init__(
         self,
         engine_id: str | None,
@@ -40,11 +40,19 @@ class SPBlockManager:
             for i in range(attention_sp)
         }
 
+        self.block_manager[0].free_block_ids
+
+        self.running: deque[Sequence] = deque()
+
         self.routing_startegy = RoutingStrategy.RoundRobin
         self.sp_rr_counter = (idx % self.attention_sp for idx in count())
 
         self.dummy_seqs: list[Sequence] = []
         self._initialize_dummy_seqs()
+
+    @property
+    def is_empty(self):
+        return not self.running
 
     def _initialize_dummy_seqs(self):
         for sp_idx in range(self.attention_sp):
@@ -75,63 +83,52 @@ class SPBlockManager:
         ].may_append(seq, num_tokens)
 
     def can_allocate(self, seq: Sequence):
-        # Step 1: sch to master to cal num_blocks and num_blocks_per_rank
+        # Step 1: cal num_blocks and num_blocks_per_rank
         block_ctx = seq.block_ctx(self.engine_id)
+        block_ctx.num_dispatched_tokens.clear()
+
         num_blocks = (seq.num_tokens + seq.block_size - 1) // seq.block_size
         num_blocks_per_rank = (num_blocks + self.attention_sp - 1) // self.attention_sp
+        num_ranks = (num_blocks + num_blocks_per_rank - 1) // num_blocks_per_rank
+
+        master_rank = next(self.sp_rr_counter)
+        rank_free_count = [
+            (rank, len(block_manager.free_block_ids))
+            for rank, block_manager in self.block_manager.items()
+            if rank != master_rank
+        ]
+        rank_free_count_sorted = sorted(rank_free_count, key=lambda x: x[1])
+        top_least_free_ranks = [
+            item[0] for item in rank_free_count_sorted[: (num_ranks - 1)]
+        ] + [master_rank]
 
         # step 2: allocation
+        block_ctx.master_sp_idx = master_rank
         total_token_unalloc = seq.num_tokens
-        for sp_idx in range(self.attention_sp):
+        for sp_idx in top_least_free_ranks:
             block_ctx.num_dispatched_tokens[sp_idx] = min(
                 total_token_unalloc, num_blocks_per_rank * seq.block_size
             )
             total_token_unalloc -= num_blocks_per_rank * seq.block_size
-            if total_token_unalloc <= 0:
-                block_ctx.master_sp_idx = sp_idx
-                break
 
-        if all(
+        return all(
             self.block_manager[sp_idx].can_allocate(seq)
             for sp_idx in range(self.attention_sp)
-        ):
-            return True
-        else:
-            block_ctx.num_dispatched_tokens.clear()
-            return False
+        )
 
     def allocate(self, seq: Sequence):
+        block_ctx = seq.block_ctx(self.engine_id)
         for sp_idx in range(self.attention_sp):
-            self.block_manager[sp_idx].allocate(seq)
+            if sp_idx != block_ctx.master_sp_idx:
+                self.block_manager[sp_idx].allocate(seq)
+        self.block_manager[block_ctx.master_sp_idx].allocate(seq)
 
     def deallocate(self, seq: Sequence):
         for sp_idx in range(self.attention_sp):
             return self.block_manager[sp_idx].deallocate(seq)
+        seq.block_ctx(self.engine_id).sp_block_table.clear()
         seq.block_ctx(self.engine_id).block_location.clear()
         seq.block_ctx(self.engine_id).num_dispatched_tokens.clear()
-
-
-class DPWorkerState:
-    def __init__(
-        self,
-        engine_id: str | None,
-        attention_sp: int,
-        num_kv_cache_blocks: int,
-        kvcache_block_size: int,
-    ):
-        self.attention_sp = attention_sp
-
-        self.running: deque[Sequence] = deque()
-        self.sp_block_manager = SPBlockManager(
-            engine_id,
-            attention_sp,
-            num_kv_cache_blocks,
-            kvcache_block_size,
-        )
-
-    @property
-    def is_empty(self):
-        return not self.running
 
 
 class Scheduler:
@@ -151,7 +148,7 @@ class Scheduler:
         self.rounting_strategy = RoutingStrategy.RoundRobin
 
         self.worker_state = [
-            DPWorkerState(
+            SPStateManager(
                 config.engine_id,
                 self.attention_sp,
                 config.num_kvcache_blocks,
@@ -178,7 +175,7 @@ class Scheduler:
         return self.worker_state[dp_idx].running
 
     def block_manager(self, dp_idx: int):
-        return self.worker_state[dp_idx].sp_block_manager
+        return self.worker_state[dp_idx].block_manager
 
     def _schedule_prefill(self) -> list[list[Sequence]]:
         scheduled_seqs = [[] for _ in range(self.attention_dp)]
@@ -198,14 +195,14 @@ class Scheduler:
                         num_batched_tokens[selected_dp_idx] + len(seq)
                         <= self.max_num_batched_tokens
                     )
-                    can_allocate = self.block_manager(selected_dp_idx).can_allocate(seq)
+                    can_allocate = self.worker_state[selected_dp_idx].can_allocate(seq)
                     if not num_batched_tokens_satisfied or not can_allocate:
                         continue
 
                     num_seqs[selected_dp_idx] += 1
                     seq.block_ctx_map[self.engine_id].dp_idx = selected_dp_idx
 
-                    self.block_manager(selected_dp_idx).allocate(seq)
+                    self.worker_state[selected_dp_idx].allocate(seq)
                     num_batched_tokens[selected_dp_idx] += (
                         len(seq) - seq.num_cached_tokens
                     )
@@ -233,7 +230,7 @@ class Scheduler:
                 and num_seqs[selected_dp_idx] < self.max_num_seqs
             ):
                 seq = self.running(selected_dp_idx).popleft()
-                while not self.block_manager(selected_dp_idx).can_append(
+                while not self.worker_state[selected_dp_idx].can_append(
                     seq, num_tokens=self.loop_count
                 ):
                     if self.running(selected_dp_idx):
@@ -245,7 +242,7 @@ class Scheduler:
                         break
                 else:
                     num_seqs[selected_dp_idx] += 1
-                    self.block_manager(selected_dp_idx).may_append(
+                    self.worker_state[selected_dp_idx].may_append(
                         seq, num_tokens=self.loop_count
                     )
                     scheduled_seqs[selected_dp_idx].append(seq)
@@ -261,7 +258,7 @@ class Scheduler:
             for sp_idx in range(self.attention_sp):
                 if sp_lens[sp_idx] == 0:
                     scheduled_seqs[dp_idx].append(
-                        self.worker_state[dp_idx].sp_block_manager.dummy_seqs[sp_idx]
+                        self.worker_state[dp_idx].dummy_seqs[sp_idx]
                     )
 
         return scheduled_seqs
@@ -281,9 +278,9 @@ class Scheduler:
         return scheduled_seqs, False
 
     def preempt(self, dp_idx: int, seq: Sequence):
-        print("preemption happens")
+        logger.info("preemption happens")
         seq.status = SequenceStatus.WAITING
-        self.block_manager(dp_idx).deallocate(seq)
+        self.worker_state[dp_idx].deallocate(seq)
         seq.num_checkpointed_tokens = len(seq.token_ids)
         self.waiting.appendleft(seq)
 
@@ -295,8 +292,9 @@ class Scheduler:
         for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
             for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
                 for _, (seq, loop_count_token_id) in enumerate(zip(seqs, token_ids)):
-                    if seq in self.worker_state[dp_idx].sp_block_manager.dummy_seqs:
+                    if seq in self.worker_state[dp_idx].dummy_seqs:
                         continue
+
                     for token_id in loop_count_token_id:
                         assert sp_idx == seq.block_ctx(self.engine_id).master_sp_idx
                         seq.append_token(
@@ -305,8 +303,9 @@ class Scheduler:
                         if (
                             not seq.ignore_eos and token_id == self.eos
                         ) or seq.num_completed_tokens == seq.max_tokens:
+
                             seq.status = SequenceStatus.FINISHED
-                            self.block_manager(dp_idx).deallocate(seq)
+                            self.worker_state[dp_idx].deallocate(seq)
                             self.running(dp_idx).remove(seq)
                             break
                         elif self.mode == "prefill":
@@ -322,5 +321,5 @@ class Scheduler:
             seqs = [seqs]
         for seq in seqs:
             seq, selected_dp_idx = self.to_be_migrated[seq.seq_id]
-            self.block_manager(selected_dp_idx).deallocate(seq)
+            self.worker_state[selected_dp_idx].deallocate(seq)
             del self.to_be_migrated[seq.seq_id]
