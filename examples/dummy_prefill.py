@@ -22,7 +22,7 @@ def main():
         ffn_ep=8,
         ffn_tp=1,
         mode="decode",
-        master_address="127.0.0.1:6006",
+        master_address="10.103.5.41:6006",
         ray_address="10.103.5.41:7077",
         dummy_prefill=True,
         dummy_weight=True,
@@ -45,20 +45,20 @@ def main():
     #     "list 5 famous scientists and their contributions",
     # ]
 
-    seqs = [
+    long_seqs = [
         Sequence(
             [0] * 400000,
             sampling_params=sampling_params,
         )
     ]
 
+    short_seqs = [
+        Sequence([0] * 1024, sampling_params=sampling_params) for _ in range(63)
+    ]
+    seqs = long_seqs + short_seqs
+
     decode.add_request(seqs)
     decode.generate()
-
-    for seq in seqs:
-        token_ids = seq.completion_token_ids
-        output = {"text": tokenizer.decode(token_ids), "token_ids": token_ids}
-        print(output)
 
 
 if __name__ == "__main__":
