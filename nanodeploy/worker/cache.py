@@ -186,7 +186,7 @@ class CacheContext:
             [future.wait() for future in futures]
 
 
-_CACHE_CONTEXT = None
+_CACHE_CONTEXT: CacheContext
 
 
 def get_cache_context():
@@ -200,7 +200,7 @@ def set_cache_context(
     num_hidden_layers: int,
     attention_tp: int,
     gpu_memory_utilization: float,
-    device: str = "cuda",
+    device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     mode: Literal["gqa", "mla"] = "gqa",
 ):

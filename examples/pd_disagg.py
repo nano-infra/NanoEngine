@@ -63,7 +63,7 @@ def main():
     prefill.p2p_connect(decode.engine_id, decode_endpoints_info)
     decode.p2p_connect(prefill.engine_id, prefill_endpoints_info)
 
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=False)
+    sampling_params = SamplingParams(temperature=0.1, max_tokens=256, ignore_eos=False)
     prompts = [
         """
     雨夜的暖光​

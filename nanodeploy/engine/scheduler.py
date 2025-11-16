@@ -1,5 +1,6 @@
 import enum
 from collections import deque
+from itertools import count
 from typing import Literal
 
 import numpy as np
@@ -22,14 +23,14 @@ class RoutingStrategy(enum.Enum):
 class SPBlockManager:
     def __init__(
         self,
-        engine_id: str,
-        attention_sp: str,
+        engine_id: str | None,
+        attention_sp: int,
         num_kvcache_blocks: int,
         kvcache_block_size: int,
     ):
         self.engine_id = engine_id
         self.attention_sp = attention_sp
-        self.block_manager: dict[str, BlockManager] = {
+        self.block_manager: dict[int, BlockManager] = {
             i: BlockManager(
                 engine_id,
                 i,
@@ -39,9 +40,14 @@ class SPBlockManager:
             for i in range(attention_sp)
         }
 
-        self.dummy_seqs: list[Sequence] = []
+        self.routing_startegy = RoutingStrategy.RoundRobin
+        self.sp_rr_counter = (idx % self.attention_sp for idx in count())
 
-        for sp_idx in range(attention_sp):
+        self.dummy_seqs: list[Sequence] = []
+        self._initialize_dummy_seqs()
+
+    def _initialize_dummy_seqs(self):
+        for sp_idx in range(self.attention_sp):
             dummy_seq = Sequence(
                 token_ids=[np.random.randint(8000)],
                 sampling_params=None,
@@ -49,7 +55,12 @@ class SPBlockManager:
                 master_sp_rank=sp_idx,
             )
 
-            dummy_seq.append_token(np.random.randint(8000), self.engine_id, sp_idx)
+            dummy_seq.append_token(
+                np.random.randint(8000),
+                self.engine_id,
+                sp_idx,
+            )
+
             self.block_manager[sp_idx].allocate(dummy_seq)
             self.dummy_seqs.append(dummy_seq)
 
@@ -64,13 +75,9 @@ class SPBlockManager:
         ].may_append(seq, num_tokens)
 
     def can_allocate(self, seq: Sequence):
-        master_sp_rank = 0
-        block_ctx = seq.block_ctx(self.engine_id)
-        block_ctx.master_sp_idx = master_sp_rank
-
         # Step 1: sch to master to cal num_blocks and num_blocks_per_rank
-        block_ctx.num_dispatched_tokens[master_sp_rank] = seq.num_tokens
-        num_blocks = seq.num_blocks(self.engine_id, master_sp_rank)
+        block_ctx = seq.block_ctx(self.engine_id)
+        num_blocks = (seq.num_tokens + seq.block_size - 1) // seq.block_size
         num_blocks_per_rank = (num_blocks + self.attention_sp - 1) // self.attention_sp
 
         # step 2: allocation
@@ -104,10 +111,10 @@ class SPBlockManager:
         seq.block_ctx(self.engine_id).num_dispatched_tokens.clear()
 
 
-class SPWorkerState:
+class DPWorkerState:
     def __init__(
         self,
-        engine_id: str,
+        engine_id: str | None,
         attention_sp: int,
         num_kv_cache_blocks: int,
         kvcache_block_size: int,
@@ -116,7 +123,10 @@ class SPWorkerState:
 
         self.running: deque[Sequence] = deque()
         self.sp_block_manager = SPBlockManager(
-            engine_id, attention_sp, num_kv_cache_blocks, kvcache_block_size
+            engine_id,
+            attention_sp,
+            num_kv_cache_blocks,
+            kvcache_block_size,
         )
 
     @property
@@ -141,7 +151,7 @@ class Scheduler:
         self.rounting_strategy = RoutingStrategy.RoundRobin
 
         self.worker_state = [
-            SPWorkerState(
+            DPWorkerState(
                 config.engine_id,
                 self.attention_sp,
                 config.num_kvcache_blocks,
@@ -149,10 +159,10 @@ class Scheduler:
             )
             for _ in range(self.attention_dp)
         ]
-        self.to_be_migrated: dict[str, tuple[Sequence, list[int]]] = {}
+        self.to_be_migrated: dict[str, tuple[Sequence, int]] = {}
 
         self.mode: Literal["prefill", "decode", "hybrid"] = config.mode
-        self.rr_generator = self.route_by_rr()
+        self.dp_rr_counter = (idx % self.attention_dp for idx in count())
 
     def is_finished(self):
         waiting = self.waiting if self.mode != "decode" else self.waiting_migration
@@ -164,18 +174,8 @@ class Scheduler:
         else:
             self.waiting.append(seq)
 
-    def route_by_rr(self):
-        if not hasattr(self, "rr_selected"):
-            setattr(self, "rr_selected", 0)
-        while True:
-            yield self.rr_selected
-            self.rr_selected = (self.rr_selected + 1) % self.attention_dp
-
     def running(self, dp_idx: int):
         return self.worker_state[dp_idx].running
-
-    def to_be_migrated(self, dp_idx: int):
-        return self.worker_state[dp_idx].to_be_migrated
 
     def block_manager(self, dp_idx: int):
         return self.worker_state[dp_idx].sp_block_manager
@@ -191,7 +191,7 @@ class Scheduler:
             seq = waiting[0]
             if self.rounting_strategy == RoutingStrategy.RoundRobin:
                 for _ in range(self.attention_dp):
-                    selected_dp_idx = self.rr_generator.__next__()
+                    selected_dp_idx = next(self.dp_rr_counter)
                     if num_seqs[selected_dp_idx] >= self.max_num_seqs:
                         continue
                     num_batched_tokens_satisfied = (
@@ -288,7 +288,9 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def postprocess(
-        self, dp_seqs: list[list[list[Sequence]]], dp_token_ids: list[list[list[int]]]
+        self,
+        dp_seqs: list[list[list[Sequence]]],
+        dp_token_ids: list[list[list[list[int]]]],
     ):
         for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
             for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
