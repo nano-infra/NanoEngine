@@ -464,7 +464,7 @@ class ModelRunner:
     def migrate(self, seqs: list[Sequence]) -> None:
         get_cache_context().migrate(seqs=seqs)
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
+    def run(self, dp_seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
         # start_event = torch.cuda.Event(enable_timing=True)
         # end_event = torch.cuda.Event(enable_timing=True)
 
@@ -487,7 +487,7 @@ class ModelRunner:
 
         sp_seqs = [
             seq
-            for seq in seqs
+            for seq in dp_seqs
             if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank
         ]
         is_dummy = False
@@ -500,35 +500,33 @@ class ModelRunner:
             )
 
             seq.block_ctx(self.engine_id).sp_block_table[sp_rank] = [0]
-            seqs.append(seq)
+            dp_seqs.append(seq)
 
         loop_count = self.config.loop_count if not is_prefill else 1
 
-        loop_count_token_ids = [[] for _ in seqs]
+        loop_count_token_ids = [[] for _ in sp_seqs]
 
         for i in range(loop_count):
             input_ids, positions = (
-                self.prepare_prefill(seqs, is_dummy)
+                self.prepare_prefill(dp_seqs, is_dummy)
                 if is_prefill
-                else self.prepare_decode(seqs, is_dummy)
+                else self.prepare_decode(dp_seqs, is_dummy)
             )
             logits = self.run_model(input_ids, positions, is_prefill)
             tp_rank = get_dist_context().attn_tp_rank
             temperatures = (
-                self.prepare_sample(seqs) if tp_rank == 0 else [None] * len(seqs)
+                self.prepare_sample(sp_seqs) if tp_rank == 0 else [None] * len(sp_seqs)
             )
             token_ids = (
                 self.sampler(logits, temperatures).tolist()
                 if tp_rank == 0
-                else [None] * len(seqs)
+                else [None] * len(sp_seqs)
             )
-            for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
-                # handle seq block context
-                if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank:
-                    loop_count_token_ids[i].append(token_id)
-                    seq.num_tokens += 1
-                    seq.last_token = token_id
-                    seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_rank] += 1
+            for i, (seq, token_id) in enumerate(zip(sp_seqs, token_ids)):
+                loop_count_token_ids[i].append(token_id)
+                seq.num_tokens += 1
+                seq.last_token = token_id
+                seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_rank] += 1
             self.run_count += 1  # 每次调用计数+1
             reset_context()
         # if in_prof_range and self.profiler is not None:
