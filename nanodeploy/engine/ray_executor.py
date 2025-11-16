@@ -77,7 +77,6 @@ def get_available_nodes_with_master_first(master_address: str):
             for _, node_id in bundles_to_node_id.items():
                 if node_id:
                     nodes_with_alive_pg.add(node_id)
-            logger.info(f"{pg_info=}, {pg_state=}")
 
     logger.info(f"Node IDs with ALIVE PGs: {nodes_with_alive_pg}")
 
@@ -171,7 +170,6 @@ class RayExecutor:
             for worker in self.workers:
                 try:
                     ray.kill(worker)
-                    ray.get(worker.__ray_terminate__.remote())
                     logger.debug(f"Worker {worker} terminated successfully.")
                 except Exception as e:
                     logger.warning(f"Failed to terminate worker {worker}: {e}")
@@ -181,7 +179,6 @@ class RayExecutor:
             for pg in self.placement_groups:
                 try:
                     remove_placement_group(pg)
-                    ray.get(pg.ready())
                 except Exception as e:
                     logger.error(f"Warning: Failed to remove Placement Group: {e}")
 
