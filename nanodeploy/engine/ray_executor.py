@@ -67,18 +67,17 @@ def get_available_nodes_with_master_first(master_address: str):
     existing_pgs = ray.util.placement_group_table()
     nodes_with_alive_pg = set()
 
-    for pg_id, pg_info in existing_pgs.items():
+    for _, pg_info in existing_pgs.items():
         pg_state = pg_info.get("state", "")
-        pg_name = pg_info.get("name", "Unnamed")
 
         # Only consider ALIVE PGs
-        if pg_state == "ALIVE":
-            logger.info(f"Found ALIVE PG: {pg_name} (ID: {pg_id})")
+        if pg_state != "REMOVED":
             # A PG's bundles are spread across nodes. We need all nodes hosting its bundles.
             bundles_to_node_id = pg_info.get("bundles_to_node_id", {})
-            for bundle_idx, node_id in bundles_to_node_id.items():
+            for _, node_id in bundles_to_node_id.items():
                 if node_id:
                     nodes_with_alive_pg.add(node_id)
+            logger.info(f"{pg_info=}, {pg_state=}")
 
     logger.info(f"Node IDs with ALIVE PGs: {nodes_with_alive_pg}")
 
@@ -100,6 +99,12 @@ def get_available_nodes_with_master_first(master_address: str):
     sorted_available_nodes = sorted(available_nodes, key=sort_key)
 
     logger.info(f"Found {len(sorted_available_nodes)} available nodes.")
+
+    assert sorted_available_nodes, "No available node resources"
+    assert (
+        sorted_available_nodes[0].get("NodeManagerAddress") == cleaned_host
+    ), "master address is occupied"
+
     return sorted_available_nodes
 
 
@@ -148,37 +153,50 @@ class RayExecutor:
             )
 
             ray.get(pg.ready())
+
             self.placement_groups.append(pg)
 
             start_rank = node_idx * workers_per_node
             end_rank = min(start_rank + workers_per_node, config.attn_world_size)
 
             for rank in range(start_rank, end_rank):
-                worker = ModelRunner.options(placement_group=pg).remote(
-                    config, rank, None
-                )
+                worker = ModelRunner.options(placement_group=pg).remote(config, rank)
                 self.workers.append(worker)
 
         logger.info("All workers scheduled successfully.")
 
     def __del__(self):
+        if hasattr(self, "workers") and self.workers:
+            logger.info(f"Terminating {len(self.workers)} workers...")
+            for worker in self.workers:
+                try:
+                    ray.kill(worker)
+                    ray.get(worker.__ray_terminate__.remote())
+                    logger.debug(f"Worker {worker} terminated successfully.")
+                except Exception as e:
+                    logger.warning(f"Failed to terminate worker {worker}: {e}")
+            del self.workers
+
         if hasattr(self, "placement_groups") and self.placement_groups:
             for pg in self.placement_groups:
                 try:
                     remove_placement_group(pg)
+                    ray.get(pg.ready())
                 except Exception as e:
                     logger.error(f"Warning: Failed to remove Placement Group: {e}")
+
+        logger.debug("Ray Executor deconstructed")
 
     def collective_rpc(
         self,
         method: str,
-        args: Tuple[Any] = None,
-        kwargs: Dict[str, Any] = None,
-        timeout: float = None,
+        args: tuple | None = None,
+        kwargs: dict | None = None,
+        timeout: float | None = None,
     ):
         """Collective rpc."""
         if args is None:
-            args = list()
+            args = tuple()
         if kwargs is None:
             kwargs = dict()
 
@@ -202,8 +220,11 @@ class RayExecutor:
         )
 
     def run(
-        self, dp_seqs: List[List[Sequence]], is_prefill: bool, timeout: float = None
-    ) -> list[int]:
+        self,
+        dp_seqs: List[List[Sequence]],
+        is_prefill: bool,
+        timeout: float | None = None,
+    ) -> list[list[list[int]]]:
         return ray.get(
             [
                 getattr(worker, "run").remote(seqs, is_prefill)

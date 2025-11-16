@@ -146,9 +146,9 @@ class LLMEngine:
         )
 
     def p2p_connect(
-        self, remote_engine_name: str, remote_endpoint_infos: list[dict[int, dict]]
+        self, remote_engine_name: str, remote_endpoints_info: list[list[dict]]
     ):
-        return self.executor.p2p_connect(remote_engine_name, remote_endpoint_infos)
+        return self.executor.p2p_connect(remote_engine_name, remote_endpoints_info)
 
     def generate(
         self,

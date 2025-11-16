@@ -1,7 +1,3 @@
-import os
-from multiprocessing.shared_memory import SharedMemory
-from multiprocessing.synchronize import Event
-
 import numpy as np
 
 import ray
@@ -16,7 +12,7 @@ from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
-from nanodeploy.worker.buffer import get_sp_context, set_sp_context
+from nanodeploy.worker.buffer import set_sp_context
 from nanodeploy.worker.cache import get_cache_context, set_cache_context
 from nanodeploy.worker.context import get_context, reset_context, set_context
 from nanodeploy.worker.distributed import (
@@ -39,14 +35,13 @@ architectures = {
 
 @ray.remote(num_cpus=0.1, num_gpus=1)
 class ModelRunner:
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int):
         self.config = config
         self.engine_id = self.config.engine_id
         hf_config = config.hf_config
         self.enforce_eager = config.enforce_eager
         self.world_size = config.attn_world_size
         self.rank = rank
-        self.event = event
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -456,13 +451,13 @@ class ModelRunner:
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
+            graph_vars["slot_mapping"][:bs] = context.slot_mapping  # type: ignore
             graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"].copy_(context.context_lens)
+            graph_vars["context_lens"].copy_(context.context_lens)  # type: ignore
             graph_vars["global_context_lens"].zero_()
-            graph_vars["global_context_lens"].copy_(context.global_context_lens)
+            graph_vars["global_context_lens"].copy_(context.global_context_lens)  # type: ignore
             graph_vars["block_tables"][
-                :, :, : context.block_tables.size(2)
+                :, :, : context.block_tables.size(2)  # type: ignore
             ] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -470,7 +465,7 @@ class ModelRunner:
     def migrate(self, seqs: list[Sequence]) -> None:
         get_cache_context().migrate(seqs=seqs)
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
         # start_event = torch.cuda.Event(enable_timing=True)
         # end_event = torch.cuda.Event(enable_timing=True)
 
