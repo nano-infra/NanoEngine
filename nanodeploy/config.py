@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from transformers import AutoConfig
 
@@ -26,7 +26,7 @@ class Config:
 
     # runner config
     enforce_eager: bool = False
-    hf_config: AutoConfig | None = None
+    hf_config: Any = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = 15000
@@ -40,8 +40,8 @@ class Config:
     perfect_eplb: bool | None = False
 
     # dist config
-    master_address: str | None = "127.0.0.1:6006"
-    ray_address: str | None = "127.0.0.1:6379"
+    master_address: str = "127.0.0.1:6006"
+    ray_address: str = "127.0.0.1:6379"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

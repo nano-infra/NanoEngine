@@ -24,18 +24,18 @@ class SequenceStatus(Enum):
 
 @dataclasses.dataclass
 class BlockContext:
-    engine_id: str
+    engine_id: str | None
 
-    dp_idx: int = 0
-    master_sp_idx: int = 0
+    dp_idx: int
+    master_sp_idx: int
 
-    attention_sp: int = 1
-    attention_dp: int = 1
+    attention_sp: int
+    attention_dp: int
 
     # For Sequence Parallelization
-    block_location: list[tuple[int, int]] | None = None
-    num_dispatched_tokens: dict[int, list[int]] | None = None
-    sp_block_table: dict[int, list[int]] | None = None
+    block_location: list[tuple[int, int]]
+    num_dispatched_tokens: dict[int, int]
+    sp_block_table: dict[int, list[int]]
 
 
 class Sequence:
@@ -47,7 +47,7 @@ class Sequence:
         token_ids: list[int],
         sampling_params: SamplingParams | None = None,
         engine_id: str | None = None,
-        master_sp_rank: str | None = 0,
+        master_sp_rank: int = 0,
     ):
         sampling_params = sampling_params or SamplingParams()
         self.seq_id = str(uuid.uuid4())
@@ -62,9 +62,9 @@ class Sequence:
         self.num_checkpointed_tokens = len(token_ids)
         self.num_cached_tokens = 0
 
-        self.backup_engine_id = engine_id
-        self.active_engine_id = engine_id
-        self.block_ctx_map: dict[str, BlockContext] = {
+        self.backup_engine_id: str | None = engine_id
+        self.active_engine_id: str | None = engine_id
+        self.block_ctx_map: dict[str | None, BlockContext] = {
             engine_id: BlockContext(
                 engine_id=engine_id,
                 dp_idx=-1,
@@ -88,7 +88,7 @@ class Sequence:
         engine_id = engine_id or self.active_engine_id
         return self.block_ctx_map[engine_id]
 
-    def block_table(self, engine_id: int = None, sp_idx: int = 0):
+    def block_table(self, engine_id: str | None = None, sp_idx: int = 0):
         engine_id = engine_id or self.active_engine_id
         return self.block_ctx(engine_id).sp_block_table[sp_idx]
 
@@ -99,6 +99,7 @@ class Sequence:
         self.block_ctx_map[engine_id] = BlockContext(
             engine_id=engine_id,
             dp_idx=-1,
+            master_sp_idx=0,
             attention_sp=attention_sp,
             attention_dp=attention_dp,
             block_location=[],
@@ -142,52 +143,23 @@ class Sequence:
     def num_cached_blocks(self):
         return self.num_cached_tokens // self.block_size
 
-    def num_blocks(
-        self,
-        engine_id: str | None = None,
-        sp_idx: str | None = None,
-    ):
-        engine_id = engine_id or self.active_engine_id
-        sp_idx = (
-            sp_idx if sp_idx is not None else self.block_ctx(engine_id).master_sp_idx
-        )
+    def num_blocks(self, engine_id: str | None, sp_idx: int):
         return (
             self.block_ctx(engine_id).num_dispatched_tokens[sp_idx]
             + self.block_size
             - 1
         ) // self.block_size
 
-    def last_block_page_id(
-        self,
-        engine_id: str | None = None,
-        sp_idx: str | None = None,
-    ):
-        engine_id = engine_id or self.active_engine_id
-        sp_idx = (
-            sp_idx if sp_idx is not None else self.block_ctx(engine_id).master_sp_idx
-        )
+    def last_block_page_id(self, engine_id: str | None, sp_idx: int):
         num_tokens = self.block_ctx(engine_id).num_dispatched_tokens[sp_idx]
         last_block_idx = (num_tokens - 1) // self.block_size
         return self.block_table(engine_id, sp_idx)[last_block_idx]
 
-    def last_block_num_tokens(
-        self,
-        engine_id: str | None = None,
-        sp_idx: str | None = None,
-    ):
-        engine_id = engine_id or self.active_engine_id
-        sp_idx = (
-            sp_idx if sp_idx is not None else self.block_ctx(engine_id).master_sp_idx
-        )
+    def last_block_num_tokens(self, engine_id: str | None, sp_idx: int):
         num_tokens = self.block_ctx(engine_id).num_dispatched_tokens[sp_idx]
         return num_tokens - (self.num_blocks(engine_id, sp_idx) - 1) * self.block_size
 
-    def block(
-        self,
-        i,
-        engine_id: str | None = None,
-        sp_idx: str | None = None,
-    ):
+    def block(self, i, engine_id: str | None, sp_idx: int):
         assert 0 <= i < self.num_blocks(engine_id, sp_idx)
         return self.token_ids[i * self.block_size : (i + 1) * self.block_size]
 

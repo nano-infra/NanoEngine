@@ -8,14 +8,13 @@ from torch.distributed.device_mesh import init_device_mesh
 
 def get_local_ip():
     try:
-        # 创建 UDP 套接字，连接到外部服务器（无需实际发送数据）
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         local_ip = s.getsockname()[0]
         s.close()
         return local_ip
     except Exception as e:
-        return f"获取本地 IP 失败：{str(e)}"
+        return f"Fail to get local ip：{str(e)}"
 
 
 @dataclass
@@ -155,27 +154,27 @@ class DistContext:
 
     def __post_init__(self):
         self.cpu_world_mesh = init_device_mesh(
-            "cpu", [self.world_size], mesh_dim_names=["world"]
+            "cpu", (self.world_size,), mesh_dim_names=("world",)
         )
 
         self.cuda_world_mesh = init_device_mesh(
-            "cuda", [self.world_size], mesh_dim_names=["world"]
+            "cuda", (self.world_size,), mesh_dim_names=("world",)
         )
 
         self.attn_device_mesh = init_device_mesh(
             "cuda",
-            [self.attention_dp, self.attention_sp, self.attention_tp],
-            mesh_dim_names=["attn_dp", "attn_sp", "attn_tp"],
+            (self.attention_dp, self.attention_sp, self.attention_tp),
+            mesh_dim_names=("attn_dp", "attn_sp", "attn_tp"),
         )
 
         self.ffn_device_mesh = init_device_mesh(
             "cuda",
-            [self.ffn_dp, self.ffn_ep, self.ffn_tp],
-            mesh_dim_names=["ffn_dp", "ffn_ep", "ffn_tp"],
+            (self.ffn_dp, self.ffn_ep, self.ffn_tp),
+            mesh_dim_names=("ffn_dp", "ffn_ep", "ffn_tp"),
         )
 
 
-_DIST_CONTEXT = None
+_DIST_CONTEXT: DistContext
 
 
 def get_dist_context():

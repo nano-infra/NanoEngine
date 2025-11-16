@@ -26,7 +26,7 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, engine_id: str, sp_idx, num_blocks: int, block_size: int):
+    def __init__(self, engine_id: str | None, sp_idx, num_blocks: int, block_size: int):
         self.engine_id = engine_id
         self.sp_idx = sp_idx
         self.block_size = block_size
@@ -62,8 +62,8 @@ class BlockManager:
     def allocate(
         self,
         seq: Sequence,
-        token_idx_from: int = None,
-        token_idx_to: int = None,
+        token_idx_from: int = -1,
+        token_idx_to: int = -1,
     ):
         assert not seq.block_table(self.engine_id, self.sp_idx)
         h = -1
