@@ -27,9 +27,15 @@ class SPStateManager:
         attention_sp: int,
         num_kvcache_blocks: int,
         kvcache_block_size: int,
+        max_num_seqs: int,
+        max_num_batched_tokens: int,
     ):
         self.engine_id = engine_id
         self.attention_sp = attention_sp
+
+        self.max_num_seqs = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens
+
         self.block_manager: dict[int, BlockManager] = {
             i: BlockManager(
                 engine_id,
@@ -82,7 +88,12 @@ class SPStateManager:
             seq.block_ctx(self.engine_id).master_sp_idx
         ].may_append(seq, num_tokens)
 
-    def can_allocate(self, seq: Sequence):
+    def can_allocate(
+        self,
+        seq: Sequence,
+        num_seqs: dict[int, int],
+        num_batched_tokens: dict[int, int],
+    ):
         # Step 1: cal num_blocks and num_blocks_per_rank
         block_ctx = seq.block_ctx(self.engine_id)
         block_ctx.num_dispatched_tokens.clear()
@@ -92,6 +103,13 @@ class SPStateManager:
         num_ranks = (num_blocks + num_blocks_per_rank - 1) // num_blocks_per_rank
 
         master_rank = next(self.sp_rr_counter)
+
+        if num_seqs[master_rank] >= self.max_num_seqs:
+            return False
+
+        if num_batched_tokens[master_rank] + len(seq) >= self.max_num_batched_tokens:
+            return False
+
         rank_free_count = [
             (rank, len(block_manager.free_block_ids))
             for rank, block_manager in self.block_manager.items()
@@ -153,6 +171,8 @@ class Scheduler:
                 self.attention_sp,
                 config.num_kvcache_blocks,
                 config.kvcache_block_size,
+                config.max_num_seqs,
+                config.max_num_batched_tokens,
             )
             for _ in range(self.attention_dp)
         ]
@@ -179,8 +199,14 @@ class Scheduler:
 
     def _schedule_prefill(self) -> list[list[Sequence]]:
         scheduled_seqs = [[] for _ in range(self.attention_dp)]
-        num_seqs = {replica_id: 0 for replica_id in range(self.attention_dp)}
-        num_batched_tokens = {replica_id: 0 for replica_id in range(self.attention_dp)}
+        num_seqs: dict[int, dict[int, int]] = {
+            dp_id: {sp_id: 0 for sp_id in range(self.attention_sp)}
+            for dp_id in range(self.attention_dp)
+        }
+        num_batched_tokens: dict[int, dict[int, int]] = {
+            dp_id: {sp_id: 0 for sp_id in range(self.attention_sp)}
+            for dp_id in range(self.attention_dp)
+        }
 
         waiting = self.waiting if self.mode != "decode" else self.waiting_migration
 
@@ -189,21 +215,18 @@ class Scheduler:
             if self.rounting_strategy == RoutingStrategy.RoundRobin:
                 for _ in range(self.attention_dp):
                     selected_dp_idx = next(self.dp_rr_counter)
-                    if num_seqs[selected_dp_idx] >= self.max_num_seqs:
-                        continue
-                    num_batched_tokens_satisfied = (
-                        num_batched_tokens[selected_dp_idx] + len(seq)
-                        <= self.max_num_batched_tokens
-                    )
-                    can_allocate = self.worker_state[selected_dp_idx].can_allocate(seq)
-                    if not num_batched_tokens_satisfied or not can_allocate:
-                        continue
 
-                    num_seqs[selected_dp_idx] += 1
+                    can_allocate = self.worker_state[selected_dp_idx].can_allocate(
+                        seq, num_seqs[selected_dp_idx], num_seqs[selected_dp_idx]
+                    )
+                    if not can_allocate:
+                        continue
+                    block_ctx = seq.block_ctx(self.engine_id)
+                    num_seqs[selected_dp_idx][block_ctx.master_sp_idx] += 1
                     seq.block_ctx_map[self.engine_id].dp_idx = selected_dp_idx
 
                     self.worker_state[selected_dp_idx].allocate(seq)
-                    num_batched_tokens[selected_dp_idx] += (
+                    num_batched_tokens[selected_dp_idx][block_ctx.master_sp_idx] += (
                         len(seq) - seq.num_cached_tokens
                     )
                     seq.status = SequenceStatus.RUNNING
@@ -225,10 +248,7 @@ class Scheduler:
         scheduled_seqs = [[] for _ in range(self.attention_dp)]
         num_seqs = {replica_id: 0 for replica_id in range(self.attention_dp)}
         for selected_dp_idx in range(self.attention_dp):
-            while (
-                self.running(selected_dp_idx)
-                and num_seqs[selected_dp_idx] < self.max_num_seqs
-            ):
+            while self.running(selected_dp_idx):
                 seq = self.running(selected_dp_idx).popleft()
                 while not self.worker_state[selected_dp_idx].can_append(
                     seq, num_tokens=self.loop_count
@@ -294,7 +314,6 @@ class Scheduler:
                 for _, (seq, loop_count_token_id) in enumerate(zip(seqs, token_ids)):
                     if seq in self.worker_state[dp_idx].dummy_seqs:
                         continue
-
                     for token_id in loop_count_token_id:
                         assert sp_idx == seq.block_ctx(self.engine_id).master_sp_idx
                         seq.append_token(
@@ -303,7 +322,6 @@ class Scheduler:
                         if (
                             not seq.ignore_eos and token_id == self.eos
                         ) or seq.num_completed_tokens == seq.max_tokens:
-
                             seq.status = SequenceStatus.FINISHED
                             self.worker_state[dp_idx].deallocate(seq)
                             self.running(dp_idx).remove(seq)
