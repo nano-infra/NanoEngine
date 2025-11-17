@@ -37,7 +37,7 @@ class SPContext:
 
         q_res_lse_buffer_size = AllToAllIntraLLBuffer.get_buffer_size_hint(
             sp_world_size,
-            self.max_num_seqs + 2,
+            self.max_num_seqs * 2,
             self.msg_size,
             self.dtype.itemsize,
         )

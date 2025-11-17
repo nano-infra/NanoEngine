@@ -1,6 +1,9 @@
 import torch
-from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
-from nanodeploy.kernels.attention import inter_rank_gqa_fwd_batch_decode_combine_kv
+from flash_attn_interface import flash_attn_varlen_func
+from nanodeploy.kernels.attention import (
+    flash_attn_with_kvcache,
+    inter_rank_gqa_fwd_batch_decode_combine_kv,
+)
 from nanodeploy.kernels.kvcache import store_kvcache
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.buffer import get_sp_context
@@ -64,18 +67,56 @@ class Attention(nn.Module):
                 context_lens = context.context_lens[sp_rank][:bs]
                 block_tables = context.block_tables[sp_rank][:bs]
 
-            o, lse = flash_attn_with_kvcache(
-                q.unsqueeze(1),
-                k_cache,
-                v_cache,
-                cache_seqlens=context_lens,
-                page_table=block_tables,
-                softmax_scale=self.scale,
-                causal=False,
-                return_softmax_lse=True,
-            )[:2]
-
             if sp_size > 1:
+                if context.enable_zero_copy:
+                    max_bs = get_context().max_bs
+                    num_heads = get_sp_context().num_attention_heads
+                    head_size = get_sp_context().head_size
+                    res_buffer = get_sp_context().res_buffer
+                    msg_size = head_size * num_heads
+                    out_local_buffer = res_buffer.get_local_buffer(
+                        sp_size,
+                        max_bs * sp_size,
+                        msg_size,
+                        torch.bfloat16.itemsize,
+                        torch.bfloat16,
+                    )
+                    out_buffer_to_write = out_local_buffer[
+                        (max_bs)
+                        * sp_rank
+                        * num_heads
+                        * (head_size) : (max_bs)
+                        * sp_rank
+                        * num_heads
+                        * (head_size)
+                        + (max_bs * sp_size) * (1) * (num_heads) * (head_size)
+                    ]
+
+                    o, lse = flash_attn_with_kvcache(
+                        q.unsqueeze(1),
+                        k_cache,
+                        v_cache,
+                        cache_seqlens=context_lens,
+                        page_table=block_tables,
+                        softmax_scale=self.scale,
+                        causal=False,
+                        return_softmax_lse=True,
+                        out_buffer=out_buffer_to_write.view(
+                            [max_bs * sp_size, 1, num_head, head_dim]
+                        ),
+                    )[:2]
+                else:
+                    o, lse = flash_attn_with_kvcache(
+                        q.unsqueeze(1),
+                        k_cache,
+                        v_cache,
+                        cache_seqlens=context_lens,
+                        page_table=block_tables,
+                        softmax_scale=self.scale,
+                        causal=False,
+                        return_softmax_lse=True,
+                    )[:2]
+
                 res_buffer = get_sp_context().res_buffer
                 lse_buffer = get_sp_context().lse_buffer
                 lse = lse.to(torch.bfloat16)
