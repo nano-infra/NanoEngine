@@ -21,6 +21,8 @@ class RoutingStrategy(enum.Enum):
 
 
 class SPStateManager:
+    _segment_size = 1024
+
     def __init__(
         self,
         engine_id: str | None,
@@ -98,9 +100,11 @@ class SPStateManager:
         block_ctx = seq.block_ctx(self.engine_id)
         block_ctx.num_dispatched_tokens.clear()
 
-        num_blocks = (seq.num_tokens + seq.block_size - 1) // seq.block_size
-        num_blocks_per_rank = (num_blocks + self.attention_sp - 1) // self.attention_sp
-        num_ranks = (num_blocks + num_blocks_per_rank - 1) // num_blocks_per_rank
+        num_segments = (seq.num_tokens + self._segment_size - 1) // self._segment_size
+        num_segments_per_rank = (
+            num_segments + self.attention_sp - 1
+        ) // self.attention_sp
+        num_ranks = (num_segments + num_segments_per_rank - 1) // num_segments_per_rank
 
         master_rank = next(self.sp_rr_counter)
 
@@ -125,9 +129,9 @@ class SPStateManager:
         total_token_unalloc = seq.num_tokens
         for sp_idx in top_least_free_ranks:
             block_ctx.num_dispatched_tokens[sp_idx] = min(
-                total_token_unalloc, num_blocks_per_rank * seq.block_size
+                total_token_unalloc, num_segments_per_rank * self._segment_size
             )
-            total_token_unalloc -= num_blocks_per_rank * seq.block_size
+            total_token_unalloc -= num_segments_per_rank * self._segment_size
 
         return all(
             self.block_manager[sp_idx].can_allocate(seq)
