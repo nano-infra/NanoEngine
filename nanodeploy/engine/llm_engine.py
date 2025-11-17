@@ -212,9 +212,9 @@ class LLMEngine:
                         "bs": f"{bs}",
                         "Prefill": f"{int(prefill_throughput)}tok/s",
                         "Decode": f"{int(decode_throughput)}tok/s",
+                        "itl": f"{itl:.2f}ms",
                         "sch_ovhd": f"{sch_latency:.2f}ms",
                         "post_sch_ovhd": f"{post_sch_latency:.2f}ms",
-                        "itl": f"{itl:.2f}ms",
                     }
                 )
             for seq_id, token_ids in output:
