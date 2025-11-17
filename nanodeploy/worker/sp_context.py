@@ -1,11 +1,10 @@
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 
 from dlslime.buffer.intra.all_to_all_intra_ll_buffer import AllToAllIntraLLBuffer
-from nanodeploy.logging import get_logger
 
+from nanodeploy.logging import get_logger
 from nanodeploy.worker.distributed import get_dist_context
 
 
@@ -14,15 +13,15 @@ logger = get_logger()
 
 @dataclass
 class SPContext:
-    max_num_seqs: int = None
+    max_num_seqs: int
 
-    head_size: int = None
-    num_attention_heads: int = None
+    head_size: int
+    num_attention_heads: int
 
-    dtype: torch.dtype = None
+    dtype: torch.dtype
 
-    rank: int = 0
-    sp_size: int = 1
+    rank: int
+    sp_size: int
 
     q_buffer: AllToAllIntraLLBuffer | None = None
     res_lse_buffer: AllToAllIntraLLBuffer | None = None
@@ -61,7 +60,7 @@ class SPContext:
         self.res_lse_buffer.connect_full_mesh(get_dist_context().attn_sp_group)
 
 
-_SP_CONTEXT = None
+_SP_CONTEXT: SPContext
 
 
 def get_sp_context() -> SPContext:
@@ -69,12 +68,12 @@ def get_sp_context() -> SPContext:
 
 
 def set_sp_context(
-    max_num_seqs: int = None,
-    head_size: int = None,
-    num_attention_heads: int = None,
-    dtype: torch.dtype = None,
-    rank: int = 0,
-    sp_size: int = 1,
+    max_num_seqs: int,
+    head_size: int,
+    num_attention_heads: int,
+    dtype: torch.dtype,
+    rank: int,
+    sp_size: int,
 ):
     global _SP_CONTEXT
     _SP_CONTEXT = SPContext(
