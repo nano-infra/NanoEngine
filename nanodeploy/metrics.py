@@ -36,6 +36,7 @@ class SequenceMetric:
 
     seq_id: str
     arrival_time: Optional[float] = None
+    decode_first_scheduled_time: Optional[float] = None
     first_token_time: Optional[float] = None
     completion_time: Optional[float] = None
     num_prompt_tokens: int = 0
@@ -48,6 +49,11 @@ class SequenceMetric:
         """Record the arrival timestamp."""
         if self.arrival_time is None:
             self.arrival_time = time.time()
+
+    def record_first_scheduled(self):
+        """Record the timestamp of the first token scheduled."""
+        if self.decode_first_scheduled_time is None:
+            self.decode_first_scheduled_time = time.time()
 
     def record_first_token(self):
         """Record the timestamp of the first generated token."""
@@ -100,6 +106,15 @@ class SequenceMetric:
         return total_decode_time / self.num_generated_tokens
 
     @property
+    def avg_tpot_wo_queueing(self) -> Optional[float]:
+        if self.num_generated_tokens == 0 or self.completion_time is None:
+            return None
+        total_decode_time = (
+            self.completion_time - self.decode_first_scheduled_time
+        ) * 1000  # ms
+        return total_decode_time / self.num_generated_tokens
+
+    @property
     def avg_itl(self) -> Optional[float]:
         """
         Average inter-token latency in milliseconds. Not include queueing time.
@@ -144,7 +159,8 @@ class SequenceMetric:
             f"TTFT: {ttft_str}, "
             f"E2E: {e2e_str}, "
             f"Prompt Length: {self.num_prompt_tokens}, Output Length: {self.num_generated_tokens}, "
-            f"ITL (avg/p50/p99): {itl_str}; {len(self.itl_samples)=}, "
+            f"Queueing Time: {self.decode_first_scheduled_time - self.arrival_time:.5f}ms, "
+            f"ITL Wo Queue: {self.avg_tpot_wo_queueing:.2f}ms, "
             f"ITL With Queue: {self.avg_tpot_with_queueing:.2f}ms"
         )
 

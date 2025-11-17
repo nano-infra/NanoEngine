@@ -271,6 +271,7 @@ class Scheduler:
                         seq, num_tokens=self.loop_count
                     )
                     scheduled_seqs[selected_dp_idx].append(seq)
+                    seq.metric.record_first_scheduled()
             self.running(selected_dp_idx).extendleft(
                 reversed(scheduled_seqs[selected_dp_idx])
             )
@@ -320,6 +321,7 @@ class Scheduler:
                 for _, (seq, loop_count_token_id) in enumerate(zip(seqs, token_ids)):
                     if seq in self.worker_state[dp_idx].dummy_seqs:
                         continue
+
                     for token_id in loop_count_token_id:
                         assert sp_idx == seq.block_ctx(self.engine_id).master_sp_idx
                         seq.append_token(
