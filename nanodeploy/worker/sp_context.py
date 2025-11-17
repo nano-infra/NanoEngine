@@ -50,14 +50,6 @@ class SPContext:
             q_res_lse_buffer_size,
         )
 
-        # self.res_lse_buffer = AllToAllIntraLLBuffer(
-        #     1,
-        #     self.max_num_seqs,
-        #     sp_rank,
-        #     sp_world_size,
-        #     q_res_lse_buffer_size,
-        # )
-
         self.res_buffer = AllToAllIntraLLBuffer(
             1,
             self.max_num_seqs,

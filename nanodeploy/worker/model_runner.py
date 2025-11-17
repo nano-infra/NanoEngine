@@ -9,7 +9,6 @@ from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
-from nanodeploy.worker.buffer import set_sp_context
 from nanodeploy.worker.cache import get_cache_context, set_cache_context
 from nanodeploy.worker.context import get_context, reset_context, set_context
 from nanodeploy.worker.distributed import (
@@ -19,6 +18,7 @@ from nanodeploy.worker.distributed import (
 )
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
+from nanodeploy.worker.sp_context import set_sp_context
 
 
 logger = get_logger()

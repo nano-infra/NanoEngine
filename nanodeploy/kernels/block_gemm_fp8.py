@@ -6,9 +6,9 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from nanodeploy.worker.buffer import get_sp_context
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
+from nanodeploy.worker.sp_context import get_sp_context
 from .utils import get_device_props
 
 
@@ -174,9 +174,7 @@ def deep_gemm_fp8(
 
         q_buffer = get_sp_context().q_buffer
         msg_size = head_size * num_heads
-        q_local_buffer = q_buffer.get_local_buffer(
-            sp_size, max_bs + 2, msg_size, torch.bfloat16.itemsize, torch.bfloat16
-        )
+        q_local_buffer = q_buffer.get_local_buffer().view(torch.bfloat16)
         res_buffer = q_local_buffer[
             (max_bs)
             * sp_rank
