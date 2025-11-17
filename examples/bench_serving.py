@@ -2,7 +2,7 @@
 Serving Benchmark for NanoDeploy
 
 This script benchmarks the serving performance of NanoDeploy by simulating
-realistic request patterns with Poisson arrival times.
+realistic request patterns with configurable arrival time distributions.
 
 Key Adaptations from external benchmark:
 1. Uses NanoDeploy's LLM and SamplingParams instead of nanovllm
@@ -17,8 +17,24 @@ Metrics Collected:
 - E2E Latency: Total time from request submission to completion
 - Throughput: Total output tokens per second
 
+Burstiness Configuration:
+- Burstiness factor controls the variability of request arrival times
+- 1.0 (default): Poisson process with exponential inter-arrival times (CV=1)
+- <1.0: More regular/uniform arrivals (e.g., 0.5 for CV=0.5)
+- >1.0: More bursty arrivals (e.g., 2.0 for CV=2)
+- Uses Gamma distribution with shape parameter k = 1/(burstiness^2)
+
 Usage:
+    # Standard Poisson process
     python bench_serving.py --num-requests 256 --request-rate 8
+    
+    # More regular arrivals (less bursty)
+    python bench_serving.py --num-requests 256 --request-rate 8 --burstiness 0.5
+    
+    # More bursty arrivals
+    python bench_serving.py --num-requests 256 --request-rate 8 --burstiness 2.0
+    
+    # Custom model configuration
     python bench_serving.py --num-requests 100 --request-rate 4 --model-path /path/to/model
 """
 
@@ -83,6 +99,9 @@ def main():
     parser = argparse.ArgumentParser(description="Serving benchmark for NanoDeploy.")
     parser.add_argument("--num-requests", type=int, default=256, help="Number of requests to process.")
     parser.add_argument("--request-rate", type=int, default=8, help="Request rate (requests per second).")
+    parser.add_argument("--burstiness", type=float, default=1.0, 
+                        help="Burstiness factor for request arrivals. 1.0 = Poisson process (default), "
+                             "<1.0 = more regular, >1.0 = more bursty.")
     parser.add_argument("--model-path", type=str, default=MODEL_PATH, help="Path to the model.")
     parser.add_argument("--max-model-len", type=int, default=4096, help="Maximum model length.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization.")
@@ -91,8 +110,9 @@ def main():
 
     NUM_REQUESTS = args.num_requests
     REQUEST_RATE = args.request_rate
+    BURSTINESS = args.burstiness
 
-    print(f"\n--- Running benchmark with --num-requests {NUM_REQUESTS} --request-rate {REQUEST_RATE} ---")
+    print(f"\n--- Running benchmark with --num-requests {NUM_REQUESTS} --request-rate {REQUEST_RATE} --burstiness {BURSTINESS} ---")
     
     # Initialize LLM engine
     llm = LLM(
@@ -111,7 +131,19 @@ def main():
     ]
 
     # --- Generate request arrival times ---
-    request_intervals = np.random.poisson(1.0 / REQUEST_RATE, NUM_REQUESTS)
+    # BURSTINESS = 1.0 for Poisson (exponential inter-arrival times)
+    # BURSTINESS < 1.0 for more regular arrivals; > 1.0 for more bursty arrivals
+    if BURSTINESS == 1.0:
+        # Standard Poisson process (exponential inter-arrival times)
+        request_intervals = np.random.exponential(1.0 / REQUEST_RATE, NUM_REQUESTS)
+    else:
+        # Gamma distribution to control burstiness
+        # Shape parameter k controls CV: CV = 1/sqrt(k)
+        # For burstiness factor b: k = 1/(b^2)
+        shape = 1.0 / (BURSTINESS ** 2)
+        scale = BURSTINESS ** 2 / REQUEST_RATE
+        request_intervals = np.random.gamma(shape, scale, NUM_REQUESTS)
+    
     arrival_times = np.cumsum(request_intervals)
 
     # --- Benchmark loop ---
