@@ -23,9 +23,9 @@ def get_runner_config() -> RunnerConfig:
 
 
 def set_runner_config(
-    max_num_seqs: int | None = None,
-    dummy_weight: Optional[bool] = None,
-    perfect_eplb: Optional[bool] = None,
+    max_num_seqs: int,
+    dummy_weight: bool = False,
+    perfect_eplb: bool = False,
 ):
     global _RUNNER_CONFIG
     _RUNNER_CONFIG = RunnerConfig(

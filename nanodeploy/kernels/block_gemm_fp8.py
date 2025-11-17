@@ -1,9 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
 
+from nanodeploy.worker.context import get_context
+from nanodeploy.worker.distributed import get_dist_context
+from nanodeploy.worker.sp_context import get_sp_context
 from .utils import get_device_props
 
 
@@ -119,7 +124,12 @@ def quant_fp8(
     return _quant_fp8_launcher(A, group_size, out, scales)
 
 
-def quant_fp8_tma(A: Tensor, group_size: int, dtype: torch.dtype = torch.float8_e4m3fn):
+def quant_fp8_tma(
+    A: Tensor,
+    group_size: int,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+    out: Optional[torch.Tensor] = None,
+):
     """Quant fp8 tma."""
     from deep_gemm import ceil_div, get_m_alignment_for_contiguous_layout
 
@@ -129,9 +139,15 @@ def quant_fp8_tma(A: Tensor, group_size: int, dtype: torch.dtype = torch.float8_
     num_groups = K // group_size
     alignment = get_m_alignment_for_contiguous_layout()
     aligned_M = ceil_div(M, alignment) * alignment
-    out = A.new_empty(aligned_M, K, dtype=dtype)
+    if out is None:
+        out = A.new_empty(aligned_M, K, dtype=dtype)
+    else:
+        out = out.reshape([aligned_M, K])
+
     scales = A.new_empty(num_groups, aligned_M, dtype=torch.float32).T
-    return _quant_fp8_launcher(A, group_size, out, scales)
+    out, scales = _quant_fp8_launcher(A, group_size, out, scales)
+
+    return out, scales
 
 
 def deep_gemm_fp8(
@@ -140,6 +156,7 @@ def deep_gemm_fp8(
     B: Tensor,
     B_scale: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
 ):
     """Deepgemm fp8."""
     from deep_gemm import gemm_fp8_fp8_bf16_nt
@@ -147,6 +164,11 @@ def deep_gemm_fp8(
     M, _ = A.shape
     N, _ = B.shape
     assert out_dtype == torch.bfloat16, "DeepGemm requires bf16 output."
-    C = A.new_empty(M, N, dtype=out_dtype)
-    gemm_fp8_fp8_bf16_nt((A, A_scale), (B, B_scale), C)
-    return C
+
+    if out is None:
+        out = A.new_empty(M, N, dtype=out_dtype)
+    else:
+        out = out.view(out_dtype).reshape([M, N])
+
+    gemm_fp8_fp8_bf16_nt((A, A_scale), (B, B_scale), out)
+    return out

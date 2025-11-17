@@ -1,14 +1,14 @@
 import torch
-
-from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
-from nanodeploy.kernels.attention import inter_rank_gqa_fwd_batch_decode_combine_kv
-
+from flash_attn_interface import flash_attn_varlen_func
+from nanodeploy.kernels.attention import (
+    flash_attn_with_kvcache,
+    inter_rank_gqa_fwd_batch_decode_combine_kv,
+)
 from nanodeploy.kernels.kvcache import store_kvcache
 from nanodeploy.logging import get_logger
-from nanodeploy.worker.buffer import get_sp_context
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
-
+from nanodeploy.worker.sp_context import get_sp_context
 from torch import nn
 
 
@@ -59,13 +59,21 @@ class Attention(nn.Module):
                 q_buffer = get_sp_context().q_buffer
                 q = q_buffer.all_to_all_ll(
                     q.view([bs, -1]),
-                    mask=context.global_context_lens,
+                    mask=context.q_mask,
                 ).view([sp_size * max_num_seqs, num_head, head_dim])
                 context_lens = context.context_lens.view(-1)
                 block_tables = context.block_tables.view(sp_size * max_num_seqs, -1)
             else:
                 context_lens = context.context_lens[sp_rank][:bs]
                 block_tables = context.block_tables[sp_rank][:bs]
+
+            if sp_size == 1:
+                out_buffer = None
+            else:
+                res_buffer = get_sp_context().res_buffer
+                out_buffer = res_buffer.local_buffer.view(get_sp_context().dtype)[
+                    : max_num_seqs * sp_size * num_head * head_dim
+                ].view([max_num_seqs * sp_size, 1, num_head, head_dim])
 
             o, lse = flash_attn_with_kvcache(
                 q.unsqueeze(1),
@@ -76,32 +84,36 @@ class Attention(nn.Module):
                 softmax_scale=self.scale,
                 causal=False,
                 return_softmax_lse=True,
+                out_buffer=out_buffer,
             )[:2]
 
             if sp_size > 1:
-                res_lse_buffer = get_sp_context().res_lse_buffer
+                res_buffer = get_sp_context().res_buffer
+                lse_buffer = get_sp_context().lse_buffer
+
                 lse = lse.to(torch.bfloat16)
                 gathered_o = o.view([sp_size, max_num_seqs, num_head, head_dim])
                 gathered_lse = lse.view([sp_size, max_num_seqs, num_head, 1])
 
-                all_ranks_output_combine_0 = torch.cat(
-                    [gathered_o, gathered_lse], dim=3
-                )
-                all_ranks_output_combine = res_lse_buffer.all_to_all_ll(
-                    all_ranks_output_combine_0.view(sp_size * max_num_seqs, -1),
-                    mask=context.context_lens,
+                all_ranks_res_output_combine = res_buffer.all_to_all_ll(
+                    gathered_o.view(sp_size * max_num_seqs, -1),
+                    mask=context.res_lse_mask,
                     is_transpose=True,
-                ).view(sp_size, max_num_seqs, num_head, head_dim + 1)
+                ).view(sp_size, max_num_seqs, num_head, head_dim)
+                all_ranks_lse_output_combine = lse_buffer.all_to_all_ll(
+                    gathered_lse.view(sp_size * max_num_seqs, -1),
+                    mask=context.res_lse_mask,
+                    is_transpose=True,
+                ).view(sp_size, max_num_seqs, num_head, 1)
 
                 o = inter_rank_gqa_fwd_batch_decode_combine_kv(
-                    all_ranks_output_combine,
+                    all_ranks_res_output_combine,
+                    all_ranks_lse_output_combine,
                     context.global_context_lens,
                     num_head,
                     head_dim,
                     get_sp_context().max_num_seqs,
                     sp_size,
-                )
-
-                o = o.view([max_num_seqs, num_head, head_dim])[:bs]
+                ).view([max_num_seqs, num_head, head_dim])[:bs]
 
         return o
