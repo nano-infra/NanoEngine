@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-
 from nanodeploy.logging import get_logger
 
 # Initialize logger with NANODEPLOY namespace
@@ -23,6 +22,7 @@ class Context:
 
     global_context_lens: torch.Tensor | None = None
     is_dummy: bool = False
+    enable_zero_copy: bool = True
 
 
 _CONTEXT = Context()
@@ -44,6 +44,7 @@ def set_context(
     block_tables: Optional[torch.Tensor] = None,
     global_context_lens: Optional[torch.Tensor] = None,
     is_dummy: bool | None = False,
+    enable_zero_copy: bool = True,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -58,6 +59,7 @@ def set_context(
         block_tables,
         global_context_lens,
         is_dummy=is_dummy,
+        enable_zero_copy=enable_zero_copy,
     )
 
 
