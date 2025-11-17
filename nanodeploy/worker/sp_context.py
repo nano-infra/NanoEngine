@@ -13,31 +13,26 @@ logger = get_logger()
 class SPContext:
     max_num_seqs: int
 
-    head_size: int
+    head_dim: int
     num_attention_heads: int
     num_kv_heads: int
 
     dtype: torch.dtype
 
-    rank: int
-    sp_size: int
-
-    q_buffer: AllToAllIntraLLBuffer | None = None
-    res_buffer: AllToAllIntraLLBuffer | None = None
-    lse_buffer: AllToAllIntraLLBuffer | None = None
+    q_buffer: AllToAllIntraLLBuffer = None
+    res_buffer: AllToAllIntraLLBuffer = None
+    lse_buffer: AllToAllIntraLLBuffer = None
 
     def __post_init__(self):
-
-        self.msg_size = self.head_size * self.num_attention_heads
 
         sp_rank = get_dist_context().attn_sp_rank
         sp_world_size = get_dist_context().attn_sp_world_size
 
-        q_res_lse_buffer_size = AllToAllIntraLLBuffer.get_buffer_size_hint(
-            sp_world_size,
-            self.max_num_seqs * 2,
-            self.msg_size,
-            self.dtype.itemsize,
+        q_res_lse_buffer_size = (
+            (sp_world_size * self.max_num_seqs + 128)
+            * self.head_dim
+            * (self.num_attention_heads + self.num_kv_heads)
+            * self.dtype.itemsize
         )
 
         self.q_buffer = AllToAllIntraLLBuffer(
@@ -47,6 +42,8 @@ class SPContext:
             sp_world_size,
             q_res_lse_buffer_size,
         )
+
+        logger.info(f"{self.q_buffer.local_buffer.shape=}")
 
         self.res_buffer = AllToAllIntraLLBuffer(
             1,
@@ -78,16 +75,14 @@ def get_sp_context() -> SPContext:
 
 def set_sp_context(
     max_num_seqs: int,
-    head_size: int,
+    head_dim: int,
     num_attention_heads: int,
     num_kv_heads: int,
     dtype: torch.dtype,
-    rank: int,
-    sp_size: int,
 ):
     global _SP_CONTEXT
     _SP_CONTEXT = SPContext(
-        max_num_seqs, head_size, num_attention_heads, num_kv_heads, dtype, rank, sp_size
+        max_num_seqs, head_dim, num_attention_heads, num_kv_heads, dtype
     )
 
 

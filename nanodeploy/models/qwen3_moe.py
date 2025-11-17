@@ -19,6 +19,7 @@ from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
 from nanodeploy.worker.runner_config import get_runner_config
+from nanodeploy.worker.sp_context import get_sp_context
 
 from torch import nn
 from transformers import Qwen3MoeConfig
@@ -101,7 +102,34 @@ class Qwen3MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        sp_size = get_dist_context().attn_sp_world_size
+        sp_rank = get_dist_context().attn_sp_rank
+
+        if sp_size == 1 or get_context().is_prefill:
+            qkv = None
+        else:
+            q_buffer = get_sp_context().q_buffer
+            dtype = get_sp_context().dtype
+            max_num_seqs = get_sp_context().max_num_seqs
+            num_attn_heads = get_sp_context().num_attention_heads
+            num_kv_heads = get_sp_context().num_kv_heads
+            head_dim = get_sp_context().head_dim
+            idx_from = max_num_seqs * sp_rank * num_attn_heads * head_dim
+            M = max_num_seqs
+            if (
+                self.quantization_config
+                and self.quantization_config.quant_method == "fp8"
+            ):
+                block_size = self.quantization_config.block_size[0]
+                M = (max_num_seqs + block_size - 1) // block_size * block_size
+            length = M * (num_attn_heads + num_kv_heads * 2) * head_dim
+            q_buffer.local_buffer.to(dtype)
+            qkv = q_buffer.local_buffer.to(dtype)[idx_from : idx_from + length].reshape(
+                M, (num_attn_heads + num_kv_heads * 2) * head_dim
+            )
+
+        qkv = self.qkv_proj(hidden_states, qkv)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))

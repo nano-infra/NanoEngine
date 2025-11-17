@@ -84,16 +84,19 @@ class ModelRunner:
         time.sleep(10)
 
         if sp_size > 1:
-            sp_rank = get_dist_context().attn_sp_rank
             set_sp_context(
                 config.max_num_seqs,
                 hf_config.head_dim,
                 hf_config.num_attention_heads,
                 hf_config.num_key_value_heads,
                 torch.get_default_dtype(),
-                sp_size,
-                sp_rank,
             )
+
+        if ep_size > 1:
+            import deep_ep
+
+            deep_ep.Buffer.num_sms = 16
+            dist.barrier(group=get_dist_context().cuda_world_group)
 
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
@@ -120,24 +123,6 @@ class ModelRunner:
 
         sp_size = get_dist_context().attn_sp_world_size
         ep_size = get_dist_context().ffn_ep_world_size
-
-        if ep_size > 1:
-            import deep_ep
-
-            deep_ep.Buffer.num_sms = 16
-            dist.barrier(group=get_dist_context().cuda_world_group)
-
-        if sp_size > 1:
-            sp_rank = get_dist_context().attn_sp_rank
-            set_sp_context(
-                config.max_num_seqs,
-                hf_config.head_dim,
-                hf_config.num_attention_heads,
-                hf_config.num_key_value_heads,
-                torch.get_default_dtype(),
-                sp_size,
-                sp_rank,
-            )
 
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
@@ -391,6 +376,30 @@ class ModelRunner:
             for sp_idx in range(sp_size)
         ]
 
+        q_mask = [
+            [
+                (
+                    sp_seqs[sp_rank][seq_id].context_len(self.engine_id, sp_idx)
+                    if seq_id < sp_num_seqs[sp_rank] and sp_idx != sp_rank
+                    else 0
+                )
+                for seq_id in range(self.config.max_num_seqs)
+            ]
+            for sp_idx in range(sp_size)
+        ]
+
+        res_lse_mask = [
+            [
+                (
+                    sp_seqs[sp_idx][seq_id].context_len(self.engine_id, sp_rank)
+                    if seq_id < sp_num_seqs[sp_idx] and sp_idx != sp_rank
+                    else 0
+                )
+                for seq_id in range(self.config.max_num_seqs)
+            ]
+            for sp_idx in range(sp_size)
+        ]
+
         # logger.info(f"{sp_rank=},{context_lens=},{global_context_lens=}")
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
@@ -408,6 +417,12 @@ class ModelRunner:
         global_context_lens = torch.tensor(
             global_context_lens, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+        q_mask = torch.tensor(q_mask, dtype=torch.int32, pin_memory=True).cuda(
+            non_blocking=True
+        )
+        res_lse_mask = torch.tensor(
+            res_lse_mask, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(dp_seqs)
         set_context(
             False,
@@ -416,6 +431,8 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             global_context_lens=global_context_lens,
+            q_mask=q_mask,
+            res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
         )
 
@@ -455,6 +472,10 @@ class ModelRunner:
             graph_vars["context_lens"].copy_(context.context_lens)  # type: ignore
             graph_vars["global_context_lens"].zero_()
             graph_vars["global_context_lens"].copy_(context.global_context_lens)  # type: ignore
+            graph_vars["q_mask"].zero_()
+            graph_vars["q_mask"].copy_(context.q_mask)  # type: ignore
+            graph_vars["res_lse_mask"].zero_()
+            graph_vars["res_lse_mask"].copy_(context.res_lse_mask)  # type: ignore
             graph_vars["block_tables"][
                 :, :, : context.block_tables.size(2)  # type: ignore
             ] = context.block_tables
@@ -572,6 +593,8 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
+        q_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
+        res_lse_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         block_tables = torch.zeros(
             sp_world_size, max_bs, max_num_blocks, dtype=torch.int32
         )
@@ -607,5 +630,7 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             global_context_lens=global_context_lens,
+            q_mask=q_mask,
+            res_lse_mask=res_lse_mask,
             outputs=outputs,
         )

@@ -21,7 +21,7 @@ class RoutingStrategy(enum.Enum):
 
 
 class SPStateManager:
-    _segment_size = 1024
+    _segment_size = 256
 
     def __init__(
         self,
