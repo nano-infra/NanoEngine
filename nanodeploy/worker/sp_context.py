@@ -15,6 +15,7 @@ class SPContext:
 
     head_size: int
     num_attention_heads: int
+    num_kv_heads: int
 
     dtype: torch.dtype
 
