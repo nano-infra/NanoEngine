@@ -33,7 +33,7 @@ class SequenceMetric:
         itl_samples: List of inter-token latencies (ms)
     """
     seq_id: str
-    arrival_time: float = field(default_factory=time.time)
+    arrival_time: Optional[float]  = None
     first_token_time: Optional[float] = None
     completion_time: Optional[float] = None
     num_prompt_tokens: int = 0
@@ -41,6 +41,11 @@ class SequenceMetric:
     # without queueing time
     itl_samples: list[float] = field(default_factory=list)
     last_token_time: Optional[float] = None
+    
+    def record_arrival(self):
+        """Record the arrival timestamp."""
+        if self.arrival_time is None:
+            self.arrival_time = time.time()
     
     def record_first_token(self):
         """Record the timestamp of the first generated token."""
@@ -132,7 +137,7 @@ class SequenceMetric:
             f"TTFT: {ttft_str}, "
             f"E2E: {e2e_str}, "
             f"Tokens: {self.num_prompt_tokens}→{self.num_generated_tokens}, "
-            f"ITL (avg/p50/p99): {itl_str}"
+            f"ITL (avg/p50/p99): {itl_str}; {len(self.itl_samples)=}"
         )
 
 
