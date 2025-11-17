@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 from dlslime.buffer.intra.all_to_all_intra_ll_buffer import AllToAllIntraLLBuffer
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.distributed import get_dist_context
@@ -14,16 +13,15 @@ logger = get_logger()
 class SPContext:
     max_num_seqs: int
 
+    head_size: int
+    num_attention_heads: int
+
     dtype: torch.dtype
+
     rank: int
     sp_size: int
 
-    head_size: int = None
-    num_attention_heads: int = None
-    num_kv_heads: int = None
-
     q_buffer: AllToAllIntraLLBuffer | None = None
-    # res_lse_buffer: AllToAllIntraLLBuffer | None = None
     res_buffer: AllToAllIntraLLBuffer | None = None
     lse_buffer: AllToAllIntraLLBuffer | None = None
 
@@ -66,7 +64,6 @@ class SPContext:
         )
 
         self.q_buffer.connect_full_mesh(get_dist_context().attn_sp_group)
-        # self.res_lse_buffer.connect_full_mesh(get_dist_context().attn_sp_group)
         self.res_buffer.connect_full_mesh(get_dist_context().attn_sp_group)
         self.lse_buffer.connect_full_mesh(get_dist_context().attn_sp_group)
 
