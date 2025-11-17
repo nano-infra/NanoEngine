@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 from collections import defaultdict
+import numpy as np
 
 from nanodeploy.logging import get_logger
 
@@ -87,24 +88,21 @@ class SequenceMetric:
         """
         if not self.itl_samples:
             return None
-        return sum(self.itl_samples) / len(self.itl_samples)
+        return np.mean(self.itl_samples)
     
     @property
     def p50_itl(self) -> Optional[float]:
         """P50 (median) inter-token latency in milliseconds."""
         if not self.itl_samples:
             return None
-        sorted_samples = sorted(self.itl_samples)
-        return sorted_samples[len(sorted_samples) // 2]
+        return np.median(self.itl_samples)
     
     @property
     def p99_itl(self) -> Optional[float]:
         """P99 inter-token latency in milliseconds."""
         if not self.itl_samples:
             return None
-        sorted_samples = sorted(self.itl_samples)
-        idx = int(len(sorted_samples) * 0.99)
-        return sorted_samples[min(idx, len(sorted_samples) - 1)]
+        return np.percentile(self.itl_samples, 99)
     
     def log_metrics(self):
         """Log all metrics for this sequence."""
