@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
-from nanodeploy.metrics import SeqMetrics
 
 from nanodeploy.sampling_params import SamplingParams
 
@@ -82,8 +81,6 @@ class Sequence:
                 num_dispatched_tokens=defaultdict(int),
             )
         }
-
-        self.metrics = SeqMetrics()
 
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens

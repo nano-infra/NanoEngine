@@ -38,6 +38,7 @@ class SequenceMetric:
     completion_time: Optional[float] = None
     num_prompt_tokens: int = 0
     num_generated_tokens: int = 0
+    # without queueing time
     itl_samples: list[float] = field(default_factory=list)
     last_token_time: Optional[float] = None
     
@@ -63,7 +64,7 @@ class SequenceMetric:
     @property
     def ttft(self) -> Optional[float]:
         """
-        Time to first token (TTFT) in milliseconds.
+        Time to first token (TTFT) in milliseconds. Includes queueing time.
         Returns None if first token hasn't been generated yet.
         """
         if self.first_token_time is None:
@@ -81,9 +82,20 @@ class SequenceMetric:
         return (self.completion_time - self.arrival_time) * 1000
     
     @property
+    def avg_tpot_with_queueing(self) -> Optional[float]:
+        """
+        Time per output token (TPOT) in milliseconds. Includes queueing time.
+        Returns None if no tokens have been generated yet.
+        """
+        if self.num_generated_tokens == 0 or self.completion_time is None:
+            return None
+        total_decode_time = (self.completion_time - self.arrival_time) * 1000  # ms
+        return total_decode_time / self.num_generated_tokens
+    
+    @property
     def avg_itl(self) -> Optional[float]:
         """
-        Average inter-token latency in milliseconds.
+        Average inter-token latency in milliseconds. Not include queueing time.
         Returns None if no tokens have been generated yet.
         """
         if not self.itl_samples:

@@ -48,50 +48,13 @@ from nanodeploy import LLM, SamplingParams
 from nanodeploy.engine.sequence import Sequence
 
 # --- Constants ---
-MODEL_PATH = os.path.expanduser("~/Data/Qwen3-0.6B/")
+MODEL_PATH = os.path.expanduser("/models/models--Qwen--Qwen3-235B-A22B-Instruct-2507-FP8/snapshots/ba82a1060073fa0ecdc70d7b1922ec071f60cf3e")
 MAX_INPUT_LEN = 1024
 MAX_OUTPUT_LEN = 1024
 
 # --- Seed for reproducibility ---
 seed(0)
 np.random.seed(0)
-
-
-class RequestMetrics:
-    """Stores metrics for a single request."""
-    def __init__(self, request_id, input_len, max_output_len):
-        self.request_id = request_id
-        self.input_len = input_len
-        self.max_output_len = max_output_len
-        self.submission_time = -1
-        self.first_token_time = -1
-        self.completion_time = -1
-        self.output_len = -1
-
-    def record_submission(self):
-        self.submission_time = time.perf_counter()
-
-    def record_first_token(self):
-        if self.first_token_time == -1:
-            self.first_token_time = time.perf_counter()
-
-    def record_completion(self, output_ids):
-        self.completion_time = time.perf_counter()
-        self.output_len = len(output_ids)
-
-    @property
-    def ttft(self):
-        return self.first_token_time - self.submission_time
-
-    @property
-    def tpot(self):
-        if self.output_len > 1:
-            return (self.completion_time - self.first_token_time) / (self.output_len - 1)
-        return float('nan')
-
-    @property
-    def latency(self):
-        return self.completion_time - self.submission_time
 
 
 def main():
@@ -120,6 +83,18 @@ def main():
         enforce_eager=args.enforce_eager,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        master_address="10.102.207.84:26379",
+        ray_address="10.102.207.84:6398",
+        mode="decode",
+        dummy_prefill=True,
+        dummy_weight=True,
+        perfect_eplb=True,
+        attention_dp=1,
+        attention_sp=8,
+        attention_tp=1,
+        ffn_dp=1,
+        ffn_ep=8,
+        ffn_tp=1,
     )
     engine = llm
 
@@ -147,7 +122,7 @@ def main():
     arrival_times = np.cumsum(request_intervals)
 
     # --- Benchmark loop ---
-    metrics = {}
+    seq_map = {}  # Map seq_id to Sequence object
     requests_sent = 0
     start_time = time.perf_counter()
     completed_latencies = []
@@ -168,11 +143,8 @@ def main():
                 
                 engine.add_request(seq)
                 
-                # Track metrics for this request
-                seq_id = seq.seq_id
-                req_metrics = RequestMetrics(seq_id, len(prompt), sp.max_tokens)
-                req_metrics.record_submission()
-                metrics[seq_id] = req_metrics
+                # Store sequence reference for later metric access
+                seq_map[seq.seq_id] = seq
                 
                 requests_sent += 1
 
@@ -181,21 +153,14 @@ def main():
                 # Get outputs from step
                 outputs, num_tokens, bs, sch_latency, post_sch_latency = engine.step()
 
-                # Record first token time for all running sequences
-                for dp_idx in range(engine.config.attention_dp):
-                    for seq in engine.scheduler.running(dp_idx):
-                        if seq.seq_id in metrics and seq.num_completed_tokens > 0:
-                            metrics[seq.seq_id].record_first_token()
-
                 # Process completed sequences
                 for seq_id, output_ids in outputs:
-                    if seq_id in metrics:
-                        metrics[seq_id].record_first_token()  # Ensure first token time is recorded
-                        metrics[seq_id].record_completion(output_ids)
-                        
-                        completed_latencies.append(metrics[seq_id].latency)
-                        avg_latency = np.mean(completed_latencies)
-                        pbar.set_postfix({"Avg Latency": f"{avg_latency:.2f}s"})
+                    if seq_id in seq_map:
+                        seq = seq_map[seq_id]
+                        if seq.metric and seq.metric.e2e_latency is not None:
+                            completed_latencies.append(seq.metric.e2e_latency / 1000)  # Convert ms to s
+                            avg_latency = np.mean(completed_latencies)
+                            pbar.set_postfix({"Avg Latency": f"{avg_latency:.2f}s"})
                         pbar.update(1)
             else:
                 # If no requests are running or waiting, sleep briefly
@@ -205,26 +170,81 @@ def main():
     total_time = end_time - start_time
 
     # --- Calculate and print metrics ---
-    total_input_tokens = sum(m.input_len for m in metrics.values())
-    total_output_tokens = sum(m.output_len for m in metrics.values() if m.output_len != -1)
+    # Get completed sequences with metrics
+    completed_seqs = [seq for seq in seq_map.values() if seq.metric and seq.metric.completion_time is not None]
     
-    avg_ttft = np.mean([m.ttft for m in metrics.values() if m.first_token_time != -1])
-    avg_tpot = np.mean([m.tpot for m in metrics.values() if not np.isnan(m.tpot)])
-    avg_latency = np.mean([m.latency for m in metrics.values() if m.completion_time != -1])
+    total_input_tokens = sum(seq.metric.num_prompt_tokens for seq in completed_seqs)
+    total_output_tokens = sum(seq.metric.num_generated_tokens for seq in completed_seqs)
+    
+    # TTFT and E2E latency (convert from ms to s for display)
+    ttft_samples = [seq.metric.ttft / 1000 for seq in completed_seqs if seq.metric.ttft is not None]
+    avg_ttft = np.mean(ttft_samples) if ttft_samples else 0
+    
+    e2e_samples = [seq.metric.e2e_latency / 1000 for seq in completed_seqs if seq.metric.e2e_latency is not None]
+    avg_latency = np.mean(e2e_samples) if e2e_samples else 0
+    
     throughput = total_output_tokens / total_time
+    
+    # TPOT without queueing time statistics (ITL)
+    # avg_itl is already in ms, convert to seconds for TPOT
+    itl_samples = [seq.metric.avg_itl / 1000 for seq in completed_seqs if seq.metric.avg_itl is not None]
+    if itl_samples:
+        tpot_avg = np.mean(itl_samples)
+        tpot_p50 = np.median(itl_samples)
+        tpot_p90 = np.percentile(itl_samples, 90)
+        tpot_p99 = np.percentile(itl_samples, 99)
+    else:
+        tpot_avg = tpot_p50 = tpot_p90 = tpot_p99 = 0
+    
+    # TPOT with queueing time statistics
+    # avg_tpot_with_queueing is already in ms, convert to seconds
+    tpot_with_queueing_samples = [seq.metric.avg_tpot_with_queueing / 1000 for seq in completed_seqs 
+                                   if seq.metric.avg_tpot_with_queueing is not None]
+    if tpot_with_queueing_samples:
+        tpot_wq_avg = np.mean(tpot_with_queueing_samples)
+        tpot_wq_p50 = np.percentile(tpot_with_queueing_samples, 50)
+        tpot_wq_p90 = np.percentile(tpot_with_queueing_samples, 90)
+        tpot_wq_p95 = np.percentile(tpot_with_queueing_samples, 95)
+        tpot_wq_p99 = np.percentile(tpot_with_queueing_samples, 99)
+    else:
+        tpot_wq_avg = tpot_wq_p50 = tpot_wq_p90 = tpot_wq_p95 = tpot_wq_p99 = 0
+    
+    # Goodput calculation (SLO: avg_tpot_with_queueing < 100ms)
+    SLO_THRESHOLD_MS = 100
+    slo_success_count = sum(1 for seq in completed_seqs 
+                           if seq.metric.avg_tpot_with_queueing is not None and 
+                           seq.metric.avg_tpot_with_queueing < SLO_THRESHOLD_MS)
+    total_sequences = len(completed_seqs)
+    goodput = (slo_success_count / total_sequences * 100) if total_sequences > 0 else 0
 
     print("\n" + "="*60)
     print("--- Benchmark Results ---")
     print("="*60)
     print(f"Total time: {total_time:.2f}s")
     print(f"Requests sent: {requests_sent}")
-    print(f"Requests completed: {len([m for m in metrics.values() if m.completion_time != -1])}")
+    print(f"Requests completed: {total_sequences}")
     print(f"Total input tokens: {total_input_tokens}")
     print(f"Total output tokens: {total_output_tokens}")
     print(f"Throughput: {throughput:.2f} tokens/s")
     print(f"Average TTFT: {avg_ttft * 1000:.2f} ms")
-    print(f"Average TPOT: {avg_tpot * 1000:.2f} ms/token")
     print(f"Average latency: {avg_latency:.2f} s")
+    print()
+    print("--- TPOT without Queueing Time ---")
+    print(f"  Avg:  {tpot_avg * 1000:.2f} ms/token")
+    print(f"  P50:  {tpot_p50 * 1000:.2f} ms/token")
+    print(f"  P90:  {tpot_p90 * 1000:.2f} ms/token")
+    print(f"  P99:  {tpot_p99 * 1000:.2f} ms/token")
+    print()
+    print("--- TPOT with Queueing Time ---")
+    print(f"  Avg:  {tpot_wq_avg * 1000:.2f} ms/token")
+    print(f"  P50:  {tpot_wq_p50 * 1000:.2f} ms/token")
+    print(f"  P90:  {tpot_wq_p90 * 1000:.2f} ms/token")
+    print(f"  P95:  {tpot_wq_p95 * 1000:.2f} ms/token")
+    print(f"  P99:  {tpot_wq_p99 * 1000:.2f} ms/token")
+    print()
+    print("--- Goodput (SLO: TPOT with queueing < 100ms) ---")
+    print(f"  SLO Success: {slo_success_count}/{total_sequences}")
+    print(f"  Goodput: {goodput:.2f}%")
     print("="*60 + "\n")
 
 
