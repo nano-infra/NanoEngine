@@ -191,8 +191,10 @@ class Scheduler:
     def add(self, seq: Sequence):
         if self.mode == "decode":
             self.waiting_migration.append(seq)
+            seq.metric.record_arrival()
         else:
             self.waiting.append(seq)
+            seq.metric.record_arrival()
 
     def running(self, dp_idx: int):
         return self.worker_state[dp_idx].running
@@ -323,17 +325,17 @@ class Scheduler:
                         seq.append_token(
                             token_id, engine_id=self.engine_id, sp_idx=sp_idx
                         )
-                        
+
                         # Record metrics for token generation
                         if metrics_manager and seq.metric:
-                            if seq.num_completed_tokens == 1:
+                            if seq.metric.num_generated_tokens == 0:
                                 # First token just generated
                                 seq.metric.record_first_token()
                                 seq.metric.num_generated_tokens = 1
                             else:
                                 # Subsequent tokens - record ITL
                                 seq.metric.record_token()
-                        
+
                         if (
                             not seq.ignore_eos and token_id == self.eos
                         ) or seq.num_completed_tokens == seq.max_tokens:
