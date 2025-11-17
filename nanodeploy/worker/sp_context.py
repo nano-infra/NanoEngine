@@ -12,16 +12,16 @@ logger = get_logger()
 
 @dataclass
 class SPContext:
-    max_num_seqs: int = None
+    max_num_seqs: int
 
     head_size: int = None
     num_attention_heads: int = None
     num_kv_heads: int = None
 
-    dtype: torch.dtype = None
+    dtype: torch.dtype
 
-    rank: int = 0
-    sp_size: int = 1
+    rank: int
+    sp_size: int
 
     q_buffer: AllToAllIntraLLBuffer | None = None
     # res_lse_buffer: AllToAllIntraLLBuffer | None = None
@@ -72,7 +72,7 @@ class SPContext:
         self.lse_buffer.connect_full_mesh(get_dist_context().attn_sp_group)
 
 
-_SP_CONTEXT = None
+_SP_CONTEXT: SPContext
 
 
 def get_sp_context() -> SPContext:
@@ -80,13 +80,13 @@ def get_sp_context() -> SPContext:
 
 
 def set_sp_context(
-    max_num_seqs: int = None,
-    head_size: int = None,
-    num_attention_heads: int = None,
-    num_kv_heads: int = None,
-    dtype: torch.dtype = None,
-    rank: int = 0,
-    sp_size: int = 1,
+    max_num_seqs: int,
+    head_size: int,
+    num_attention_heads: int,
+    num_kv_heads: int,
+    dtype: torch.dtype,
+    rank: int,
+    sp_size: int,
 ):
     global _SP_CONTEXT
     _SP_CONTEXT = SPContext(
