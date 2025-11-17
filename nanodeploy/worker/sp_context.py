@@ -14,14 +14,13 @@ logger = get_logger()
 class SPContext:
     max_num_seqs: int
 
+    dtype: torch.dtype
+    rank: int
+    sp_size: int
+
     head_size: int = None
     num_attention_heads: int = None
     num_kv_heads: int = None
-
-    dtype: torch.dtype
-
-    rank: int
-    sp_size: int
 
     q_buffer: AllToAllIntraLLBuffer | None = None
     # res_lse_buffer: AllToAllIntraLLBuffer | None = None
