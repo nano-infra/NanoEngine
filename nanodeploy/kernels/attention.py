@@ -239,7 +239,7 @@ def flash_attn_with_kvcache(
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
 
-    out_buffer = maybe_contiguous(out_buffer) if out_buffer is not None else None
+    # out_buffer = maybe_contiguous(out_buffer) if out_buffer is not None else None
 
     out, softmax_lse, *rest = _flash_attn_forward(
         q,

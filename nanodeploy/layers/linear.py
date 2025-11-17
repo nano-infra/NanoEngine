@@ -75,7 +75,9 @@ class LinearBase(nn.Module):
             )
         self.weight_scale_inv.weight_loader = self.weight_loader
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if not self.quantization_config.quant_method:
             return F.linear(x, self.weight, self.bias)
         elif self.quantization_config.quant_method == "fp8":
@@ -128,7 +130,9 @@ class ReplicatedLinear(LinearBase):
     ):
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if not self.quantization_config.quant_method:
             return F.linear(x, self.weight, self.bias)
         elif self.quantization_config.quant_method == "fp8":
@@ -188,30 +192,28 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(
-        self, x: torch.Tensor, enable_zero_copy: Optional[bool] = False
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if not self.quantization_config.quant_method:
             return F.linear(x, self.weight, self.bias)
         elif self.quantization_config.quant_method == "fp8":
             input_quant, input_scale = quant_fp8_tma(
-                x,
-                self.quantization_config.block_size[0],
-                dtype=self.weight.dtype,
-                enable_zero_copy=enable_zero_copy,
+                x, self.quantization_config.block_size[0], dtype=self.weight.dtype
             )
-
             out = deep_gemm_fp8(
                 input_quant,
                 input_scale,
                 self.weight,
                 self.weight_scale_inv,
                 out_dtype=x.dtype,
-                enable_zero_copy=enable_zero_copy,
+                out=out,
             )
             out = out[: x.size(0)]
+
             if self.bias is not None:
                 out += self.bias
             return out
+
         else:
             raise AttributeError(f"Unsupported Quant Method")
 
@@ -240,9 +242,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             quantization_config=quantization_config,
         )
         self.output_sizes = output_sizes
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return super().forward(x, False)
 
     def weight_loader(
         self,
@@ -298,15 +297,6 @@ class QKVParallelLinear(ColumnParallelLinear):
             scale_tensor=scale_tensor,
             quantization_config=quantization_config,
         )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        is_prefill = get_context().is_prefill
-        sp_size = get_dist_context().attn_sp_world_size
-        if not is_prefill and get_context().enable_zero_copy and sp_size > 1:
-            enable_zero_copy = True
-        else:
-            enable_zero_copy = False
-        return super().forward(x, enable_zero_copy)
 
     def weight_loader(
         self,
