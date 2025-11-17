@@ -5,9 +5,9 @@ from nanodeploy.kernels.attention import inter_rank_gqa_fwd_batch_decode_combine
 
 from nanodeploy.kernels.kvcache import store_kvcache
 from nanodeploy.logging import get_logger
-from nanodeploy.worker.buffer import get_sp_context
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
+from nanodeploy.worker.sp_context import get_sp_context
 
 from torch import nn
 
