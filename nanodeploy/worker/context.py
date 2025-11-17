@@ -63,9 +63,9 @@ def set_context(
         slot_mapping,
         context_lens,
         block_tables,
-        global_context_lens,
-        q_mask,
-        res_lse_mask,
+        global_context_lens=global_context_lens,
+        q_mask=q_mask,
+        res_lse_mask=res_lse_mask,
         is_dummy=is_dummy,
         enable_zero_copy=enable_zero_copy,
     )

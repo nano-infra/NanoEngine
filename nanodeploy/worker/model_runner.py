@@ -103,7 +103,7 @@ class ModelRunner:
 
         self.run_count = 0
         self.prof_start = 0
-        self.prof_end = 50
+        self.prof_end = 32
         self.profiler = None
 
         self.prof_kwargs = {
@@ -111,7 +111,7 @@ class ModelRunner:
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            "schedule": profiler.schedule(wait=1, warmup=1, active=30),
+            "schedule": profiler.schedule(wait=1, warmup=1, active=16),
             "on_trace_ready": torch.profiler.tensorboard_trace_handler(
                 dir_name="/mnt/nvme1n1/ml_research/majinming/src/nano-deploy/",
                 worker_name=f"trace_rank_{dist.get_rank()}",
@@ -400,6 +400,9 @@ class ModelRunner:
             for sp_idx in range(sp_size)
         ]
 
+        # if sp_rank == 0:
+        #     logger.info(f"{q_mask=}, {res_lse_mask=}")
+
         # logger.info(f"{sp_rank=},{context_lens=},{global_context_lens=}")
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
@@ -612,6 +615,8 @@ class ModelRunner:
                 context_lens=context_lens,
                 block_tables=block_tables,
                 global_context_lens=global_context_lens,
+                q_mask=q_mask,
+                res_lse_mask=res_lse_mask,
             )
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):

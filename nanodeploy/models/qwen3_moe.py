@@ -123,12 +123,11 @@ class Qwen3MoeAttention(nn.Module):
                 block_size = self.quantization_config.block_size[0]
                 M = (max_num_seqs + block_size - 1) // block_size * block_size
             length = M * (num_attn_heads + num_kv_heads * 2) * head_dim
-            q_buffer.local_buffer.to(dtype)
-            qkv = q_buffer.local_buffer.to(dtype)[idx_from : idx_from + length].reshape(
-                M, (num_attn_heads + num_kv_heads * 2) * head_dim
-            )
+            qkv = q_buffer.local_buffer.view(dtype)[
+                idx_from : idx_from + length
+            ].reshape(M, (num_attn_heads + num_kv_heads * 2) * head_dim)
 
-        qkv = self.qkv_proj(hidden_states, qkv)
+        qkv = self.qkv_proj(hidden_states, qkv)[: positions.size(0)]
 
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))

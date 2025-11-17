@@ -29,7 +29,8 @@ class SPContext:
         sp_world_size = get_dist_context().attn_sp_world_size
 
         q_res_lse_buffer_size = (
-            (sp_world_size * self.max_num_seqs + 128)
+            2
+            * (sp_world_size * self.max_num_seqs + 128)
             * self.head_dim
             * (self.num_attention_heads + self.num_kv_heads)
             * self.dtype.itemsize

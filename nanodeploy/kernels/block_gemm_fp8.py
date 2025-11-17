@@ -142,7 +142,7 @@ def quant_fp8_tma(
     if out is None:
         out = A.new_empty(aligned_M, K, dtype=dtype)
     else:
-        out = out.to(dtype).reshape([aligned_M, K])
+        out = out.reshape([aligned_M, K])
 
     scales = A.new_empty(num_groups, aligned_M, dtype=torch.float32).T
     out, scales = _quant_fp8_launcher(A, group_size, out, scales)
@@ -168,7 +168,7 @@ def deep_gemm_fp8(
     if out is None:
         out = A.new_empty(M, N, dtype=out_dtype)
     else:
-        out = out.to(out_dtype).reshape([M, N])
+        out = out.view(out_dtype).reshape([M, N])
 
     gemm_fp8_fp8_bf16_nt((A, A_scale), (B, B_scale), out)
     return out
