@@ -1,13 +1,12 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
 from nanodeploy.kernels.block_gemm_fp8 import deep_gemm_fp8, quant_fp8_tma
 from nanodeploy.models.quant_config import QuantizationConfig
+from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
-
 from torch import nn
 
 
@@ -76,7 +75,9 @@ class LinearBase(nn.Module):
             )
         self.weight_scale_inv.weight_loader = self.weight_loader
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if not self.quantization_config.quant_method:
             return F.linear(x, self.weight, self.bias)
         elif self.quantization_config.quant_method == "fp8":
@@ -129,7 +130,9 @@ class ReplicatedLinear(LinearBase):
     ):
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if not self.quantization_config.quant_method:
             return F.linear(x, self.weight, self.bias)
         elif self.quantization_config.quant_method == "fp8":
@@ -188,26 +191,29 @@ class ColumnParallelLinear(LinearBase):
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if not self.quantization_config.quant_method:
             return F.linear(x, self.weight, self.bias)
         elif self.quantization_config.quant_method == "fp8":
             input_quant, input_scale = quant_fp8_tma(
                 x, self.quantization_config.block_size[0], dtype=self.weight.dtype
             )
-
             out = deep_gemm_fp8(
                 input_quant,
                 input_scale,
                 self.weight,
                 self.weight_scale_inv,
                 out_dtype=x.dtype,
+                out=out,
             )
             out = out[: x.size(0)]
+
             if self.bias is not None:
                 out += self.bias
-
             return out
+
         else:
             raise AttributeError(f"Unsupported Quant Method")
 

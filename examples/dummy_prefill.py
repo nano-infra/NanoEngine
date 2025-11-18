@@ -2,7 +2,6 @@ import os
 
 from nanodeploy import LLM, SamplingParams
 from nanodeploy.engine.sequence import Sequence
-
 from transformers import AutoTokenizer
 
 
@@ -14,8 +13,8 @@ def main():
     decode = LLM(
         path,
         enforce_eager=False,
-        attention_dp=4,
-        attention_sp=2,
+        attention_dp=1,
+        attention_sp=8,
         attention_tp=1,
         ffn_dp=1,
         ffn_ep=8,
@@ -40,13 +39,14 @@ def main():
             sampling_params=sampling_params,
         )
     ]
+    long_seqs = []
 
     short_seqs = [
         Sequence(
             [0] * 1024,
             sampling_params=sampling_params,
         )
-        for _ in range(511)
+        for _ in range(512)
     ]
 
     seqs = long_seqs + short_seqs
