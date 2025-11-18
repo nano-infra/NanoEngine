@@ -117,7 +117,7 @@ class BlockManager:
             - 1
         ) // self.block_size
         return len(self.free_block_ids) >= (
-            total_tokens_needed_after - total_tokens_needed_before
+            total_tokens_needed_after - total_tokens_needed_before + 2
         )
 
     def may_append(self, seq: Sequence, num_tokens: int = 1):

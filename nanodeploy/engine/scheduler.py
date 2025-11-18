@@ -24,7 +24,8 @@ class RoutingStrategy(enum.Enum):
 
 
 class SPStateManager:
-    _segment_size = 1024
+    _segment_size = 32768
+    # _segment_size = 65536
 
     def __init__(
         self,
@@ -122,7 +123,7 @@ class SPStateManager:
             for rank, block_manager in self.block_manager.items()
             if rank != master_rank
         ]
-        rank_free_count_sorted = sorted(rank_free_count, key=lambda x: x[1])
+        rank_free_count_sorted = sorted(rank_free_count, key=lambda x: x[1], reverse=True)
         top_least_free_ranks = [
             item[0] for item in rank_free_count_sorted[: (num_ranks - 1)]
         ] + [master_rank]
@@ -150,10 +151,11 @@ class SPStateManager:
 
     def deallocate(self, seq: Sequence):
         for sp_idx in range(self.attention_sp):
-            return self.block_manager[sp_idx].deallocate(seq)
+            self.block_manager[sp_idx].deallocate(seq)
         seq.block_ctx(self.engine_id).sp_block_table.clear()
         seq.block_ctx(self.engine_id).block_location.clear()
         seq.block_ctx(self.engine_id).num_dispatched_tokens.clear()
+        return
 
 
 class Scheduler:
@@ -312,7 +314,10 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         self.worker_state[dp_idx].deallocate(seq)
         seq.num_checkpointed_tokens = len(seq.token_ids)
-        self.waiting.appendleft(seq)
+        if self.mode != "decode":
+            self.waiting.appendleft(seq)
+        else:
+            self.waiting_migration.appendleft(seq)
 
     def postprocess(
         self,

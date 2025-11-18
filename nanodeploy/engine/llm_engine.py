@@ -78,10 +78,14 @@ class LLMEngine:
         
         # Update server metrics - running and waiting requests
         total_running = sum(len(seqs) for seqs in dp_seqs)
-        total_waiting = len(self.scheduler.waiting) + len(self.scheduler.waiting_migration)
+        total_waiting = len(self.scheduler.waiting) 
+        total_waiting_migration = len(self.scheduler.waiting_migration)
         self.metrics_manager.server_metric.update_running_requests(total_running)
         self.metrics_manager.server_metric.update_waiting_requests(total_waiting)
-        
+        self.metrics_manager.server_metric.update_waiting_migration_requests(total_waiting_migration)
+
+        if self.scheduler.waiting_migration:
+            logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
         # TODO (JimyMa): For loop
         filtered_dp_sp_seqs = [
             [
@@ -100,6 +104,24 @@ class LLMEngine:
         ]
 
         dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
+        
+        # Calculate batch sizes for logging
+        dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
+        sp_batch_sizes = [[len(filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx]) 
+                          for sp_idx in range(sp_size)] 
+                          for dp_idx in range(dp_size)]
+        
+        logger.info({
+            "dp_batch_sizes": dp_batch_sizes,
+            "sp_batch_sizes": sp_batch_sizes,
+            "free_blocks": [
+                [
+                    len(worker_state.block_manager[i].free_block_ids) 
+                    for i in range(self.scheduler.attention_sp)
+                ]
+                for worker_state in self.scheduler.worker_state
+            ]
+        })
 
         sch_end = time.time()
         post_sch_begin = 0

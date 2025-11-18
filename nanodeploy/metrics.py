@@ -188,6 +188,7 @@ class ServerMetric:
     total_generated_tokens: int = 0
     num_running_requests: int = 0
     num_waiting_requests: int = 0
+    num_waiting_migration_requests : int = 0
     num_completed_requests: int = 0
     prefill_throughput_samples: list[float] = field(default_factory=list)
     decode_throughput_samples: list[float] = field(default_factory=list)
@@ -201,6 +202,10 @@ class ServerMetric:
     def update_waiting_requests(self, count: int):
         """Update the number of waiting requests."""
         self.num_waiting_requests = count
+        
+    def update_waiting_migration_requests(self, count: int):
+        """Update the number of waiting requests."""
+        self.num_waiting_migration_requests = count
 
     def add_completed_request(self):
         """Increment the completed request counter."""
@@ -292,7 +297,7 @@ class ServerMetric:
 
         logger.info(
             f"ServerMetric - "
-            f"Running/Waiting: {self.num_running_requests}/{self.num_waiting_requests}, "
+            f"Running/Waiting/Waiting migration: {self.num_running_requests}/{self.num_waiting_requests}/{self.num_waiting_migration_requests}, "
             f"Completed: {self.num_completed_requests}, "
             f"Tokens: {self.total_tokens} (prompt: {self.total_prompt_tokens}, gen: {self.total_generated_tokens}), "
             f"Throughput: Prefill {prefill_tput:.0f} tok/s, "

@@ -456,7 +456,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(
-        self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
+        self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, update: bool
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             context = get_context()
@@ -471,17 +471,18 @@ class ModelRunner:
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping  # type: ignore
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"].copy_(context.context_lens)  # type: ignore
-            graph_vars["global_context_lens"].zero_()
-            graph_vars["global_context_lens"].copy_(context.global_context_lens)  # type: ignore
-            graph_vars["q_mask"].zero_()
-            graph_vars["q_mask"].copy_(context.q_mask)  # type: ignore
-            graph_vars["res_lse_mask"].zero_()
-            graph_vars["res_lse_mask"].copy_(context.res_lse_mask)  # type: ignore
-            graph_vars["block_tables"][
-                :, :, : context.block_tables.size(2)  # type: ignore
-            ] = context.block_tables
+            if not update:
+                graph_vars["context_lens"].zero_()
+                graph_vars["context_lens"].copy_(context.context_lens)  # type: ignore
+                graph_vars["global_context_lens"].zero_()
+                graph_vars["global_context_lens"].copy_(context.global_context_lens)  # type: ignore
+                graph_vars["q_mask"].zero_()
+                graph_vars["q_mask"].copy_(context.q_mask)  # type: ignore
+                graph_vars["res_lse_mask"].zero_()
+                graph_vars["res_lse_mask"].copy_(context.res_lse_mask)  # type: ignore
+                graph_vars["block_tables"][
+                    :, :, : context.block_tables.size(2)  # type: ignore
+                ] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -536,12 +537,13 @@ class ModelRunner:
         loop_count_token_ids = [[] for _ in sp_seqs]
 
         for i in range(loop_count):
-            input_ids, positions = (
-                self.prepare_prefill(dp_seqs, is_dummy)
-                if is_prefill
-                else self.prepare_decode(dp_seqs, is_dummy)
-            )
-            logits = self.run_model(input_ids, positions, is_prefill)
+            if i == 0:
+                input_ids, positions = (
+                    self.prepare_prefill(dp_seqs, is_dummy)
+                    if is_prefill
+                    else self.prepare_decode(dp_seqs, is_dummy)
+                )
+            logits = self.run_model(input_ids, positions, is_prefill,update=(i!=0))
             tp_rank = get_dist_context().attn_tp_rank
             temperatures = (
                 self.prepare_sample(dp_seqs) if tp_rank == 0 else [None] * len(sp_seqs)
@@ -557,7 +559,8 @@ class ModelRunner:
                 seq.last_token = token_id
                 seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_rank] += 1
             self.run_count += 1  # 每次调用计数+1
-            reset_context()
+            if i == loop_count - 1:
+                reset_context()
         # if in_prof_range and self.profiler is not None:
         #     self.profiler.step()
         #     # 在范围内时，每次调用结束后停止并记录（配合 schedule=active=1）
