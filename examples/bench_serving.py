@@ -36,7 +36,7 @@ Usage:
 
     # Custom model configuration
     python bench_serving.py --num-requests 100 --request-rate 4 --model-path /path/to/model
-    
+
     # Use CSV dataset
     python bench_serving.py --dataset csv --csv-path dataset.csv --num-requests 1000 --request-rate 8
 """
@@ -44,10 +44,10 @@ Usage:
 import argparse
 import os
 import time
-import pandas as pd
 from random import randint, seed
 
 import numpy as np
+import pandas as pd
 from nanodeploy import LLM, SamplingParams
 from nanodeploy.engine.sequence import Sequence
 from tqdm.auto import tqdm
@@ -67,19 +67,50 @@ np.random.seed(0)
 def main():
     """Main function to run the serving benchmark."""
     parser = argparse.ArgumentParser(description="Serving benchmark for NanoDeploy.")
-    parser.add_argument("--num-requests", type=int, default=256, help="Number of requests to process.")
-    parser.add_argument("--request-rate", type=int, default=8, help="Request rate (requests per second).")
-    parser.add_argument("--burstiness", type=float, default=1.0, 
-                        help="Burstiness factor for request arrivals. 1.0 = Poisson process (default), "
-                             "<1.0 = more regular, >1.0 = more bursty.")
-    parser.add_argument("--model-path", type=str, default=MODEL_PATH, help="Path to the model.")
-    parser.add_argument("--max-model-len", type=int, default=4096, help="Maximum model length.")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization.")
-    parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager mode.")
-    parser.add_argument("--dataset", type=str, default="random", choices=["random", "csv"], 
-                        help="Dataset type: 'random' for random generation, 'csv' to read from CSV file.")
-    parser.add_argument("--csv-path", type=str, default=None, 
-                        help="Path to CSV file (required when --dataset=csv). CSV should have 'prompt_len' and 'output_len' columns.")
+    parser.add_argument(
+        "--num-requests", type=int, default=256, help="Number of requests to process."
+    )
+    parser.add_argument(
+        "--request-rate",
+        type=int,
+        default=8,
+        help="Request rate (requests per second).",
+    )
+    parser.add_argument(
+        "--burstiness",
+        type=float,
+        default=1.0,
+        help="Burstiness factor for request arrivals. 1.0 = Poisson process (default), "
+        "<1.0 = more regular, >1.0 = more bursty.",
+    )
+    parser.add_argument(
+        "--model-path", type=str, default=MODEL_PATH, help="Path to the model."
+    )
+    parser.add_argument(
+        "--max-model-len", type=int, default=4096, help="Maximum model length."
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="GPU memory utilization.",
+    )
+    parser.add_argument(
+        "--enforce-eager", action="store_true", help="Enforce eager mode."
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="random",
+        choices=["random", "csv"],
+        help="Dataset type: 'random' for random generation, 'csv' to read from CSV file.",
+    )
+    parser.add_argument(
+        "--csv-path",
+        type=str,
+        default=None,
+        help="Path to CSV file (required when --dataset=csv). CSV should have 'prompt_len' and 'output_len' columns.",
+    )
     args = parser.parse_args()
 
     NUM_REQUESTS = args.num_requests
@@ -93,11 +124,13 @@ def main():
         if not os.path.exists(args.csv_path):
             parser.error(f"CSV file not found: {args.csv_path}")
 
-    print(f"\n--- Running benchmark with --num-requests {NUM_REQUESTS} --request-rate {REQUEST_RATE} --burstiness {BURSTINESS} ---")
+    print(
+        f"\n--- Running benchmark with --num-requests {NUM_REQUESTS} --request-rate {REQUEST_RATE} --burstiness {BURSTINESS} ---"
+    )
     print(f"Dataset type: {args.dataset}")
     if args.dataset == "csv":
         print(f"CSV path: {args.csv_path}")
-    
+
     # Initialize LLM engine
     llm = LLM(
         args.model_path,
@@ -117,51 +150,60 @@ def main():
         ffn_ep=8,
         ffn_tp=1,
         max_num_seqs=64,
+        routing_strategy="least_token",
     )
     engine = llm
 
     # --- Generate prompts ---
     if args.dataset == "random":
         # Generate prompts and sampling params with fixed lengths
-        print(f"Generating random dataset with fixed lengths (input: {MAX_INPUT_LEN}, output: {MAX_OUTPUT_LEN})...")
-        prompts = [[randint(0, 10000) for _ in range(MAX_INPUT_LEN)] for _ in range(NUM_REQUESTS)]
+        print(
+            f"Generating random dataset with fixed lengths (input: {MAX_INPUT_LEN}, output: {MAX_OUTPUT_LEN})..."
+        )
+        prompts = [
+            [randint(0, 10000) for _ in range(MAX_INPUT_LEN)]
+            for _ in range(NUM_REQUESTS)
+        ]
         sampling_params_list = [
-            SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=MAX_OUTPUT_LEN) 
+            SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=MAX_OUTPUT_LEN)
             for _ in range(NUM_REQUESTS)
         ]
     else:  # csv
         # Read prompts from CSV file
         print(f"Reading dataset from CSV: {args.csv_path}...")
         df = pd.read_csv(args.csv_path)
-        
+
         # Validate CSV columns
-        if 'prompt_len' not in df.columns or 'output_len' not in df.columns:
-            raise ValueError("CSV file must contain 'prompt_len' and 'output_len' columns")
-        
+        if "prompt_len" not in df.columns or "output_len" not in df.columns:
+            raise ValueError(
+                "CSV file must contain 'prompt_len' and 'output_len' columns"
+            )
+
         # Limit to NUM_REQUESTS
         if len(df) < NUM_REQUESTS:
-            print(f"Warning: CSV has only {len(df)} rows, but {NUM_REQUESTS} requests were requested. Using {len(df)} requests.")
+            print(
+                f"Warning: CSV has only {len(df)} rows, but {NUM_REQUESTS} requests were requested. Using {len(df)} requests."
+            )
             NUM_REQUESTS = len(df)
         else:
             df = df.head(NUM_REQUESTS)
-        
+
         # Generate prompts based on exact prompt_len and output_len from CSV
         prompts = []
         sampling_params_list = []
         for idx, row in df.iterrows():
-            prompt_len = int(row['prompt_len'])
-            output_len = int(row['output_len'])
-            
+            prompt_len = int(row["prompt_len"])
+            output_len = int(row["output_len"])
+
             # Generate prompt with exact specified length
             prompt = [randint(0, 10000) for _ in range(prompt_len)]
             prompts.append(prompt)
-            
+
             # Create sampling params with exact specified output length
             sp = SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=output_len)
             sampling_params_list.append(sp)
-        
-        print(f"Loaded {len(prompts)} requests from CSV")
 
+        print(f"Loaded {len(prompts)} requests from CSV")
 
     # --- Generate request arrival times ---
     # BURSTINESS = 1.0 for Poisson (exponential inter-arrival times)

@@ -15,6 +15,7 @@ class Config:
     max_num_seqs: int = 256
     max_model_len: int = 16384
     gpu_memory_utilization: float = 0.9
+    routing_strategy: str = "round_robin"
 
     # parallel config
     attention_tp: int = 1
