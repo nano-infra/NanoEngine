@@ -35,6 +35,7 @@ class SPStateManager:
         kvcache_block_size: int,
         max_num_seqs: int,
         max_num_batched_tokens: int,
+        routing_strategy: str = "round_robin",
     ):
         self.engine_id = engine_id
         self.attention_sp = attention_sp
@@ -56,8 +57,19 @@ class SPStateManager:
 
         self.running: deque[Sequence] = deque()
 
-        self.routing_startegy = RoutingStrategy.RoundRobin
-        self.sp_rr_counter = (idx % self.attention_sp for idx in count())
+        print(f"routing_strategy: {routing_strategy}", flush=True)
+
+        if routing_strategy == "round_robin":
+            self.routing_startegy = RoutingStrategy.RoundRobin
+            self.sp_rr_counter = (idx % self.attention_sp for idx in count())
+        elif routing_strategy == "least_token":
+            self.routing_startegy = RoutingStrategy.LeastToken
+            self.sp_rr_counter = (idx % self.attention_sp for idx in count())
+        elif routing_strategy == "least_cache":
+            self.routing_startegy = RoutingStrategy.LeastCache
+            self.sp_rr_counter = (idx % self.attention_sp for idx in count())
+        else:
+            raise ValueError(f"Unknown routing strategy: {routing_strategy}")
 
         self.dummy_seqs: list[Sequence] = []
         self._initialize_dummy_seqs()
@@ -182,6 +194,7 @@ class Scheduler:
                 config.kvcache_block_size,
                 config.max_num_seqs,
                 config.max_num_batched_tokens,
+                config.routing_strategy,
             )
             for _ in range(self.attention_dp)
         ]
@@ -248,9 +261,76 @@ class Scheduler:
                 else:
                     break
             elif self.rounting_strategy == RoutingStrategy.LeastToken:
-                pass
-            elif self.rounting_strategy == RoutingStrategy.LeastCache:
-                pass
+                # 计算每个dp_idx的当前序列数量
+                dp_seq_counts = []
+                for dp_idx in range(self.attention_dp):
+                    seq_count = len(self.running(dp_idx))
+                    dp_seq_counts.append((dp_idx, seq_count))
+
+                # 按序列数量排序，选择最小的
+                dp_seq_counts_sorted = sorted(dp_seq_counts, key=lambda x: x[1])
+
+                print(
+                    f"RoutingStrategy.LeastToken dp_seq_counts_sorted: {dp_seq_counts_sorted}",
+                    flush=True,
+                )
+
+                for selected_dp_idx, _ in dp_seq_counts_sorted:
+                    can_allocate = self.worker_state[selected_dp_idx].can_allocate(
+                        seq,
+                        num_seqs[selected_dp_idx],
+                        num_batched_tokens[selected_dp_idx],
+                    )
+                    if not can_allocate:
+                        break
+                    block_ctx = seq.block_ctx(self.engine_id)
+                    num_seqs[selected_dp_idx][block_ctx.master_sp_idx] += 1
+                    seq.block_ctx_map[self.engine_id].dp_idx = selected_dp_idx
+
+                    self.worker_state[selected_dp_idx].allocate(seq)
+                    num_batched_tokens[selected_dp_idx][block_ctx.master_sp_idx] += (
+                        len(seq) - seq.num_cached_tokens
+                    )
+                    seq.status = SequenceStatus.RUNNING
+                    waiting.popleft()
+                    self.running(selected_dp_idx).append(seq)
+                    scheduled_seqs[selected_dp_idx].append(seq)
+                    break
+                else:
+                    break
+            elif self.routing_strategy == RoutingStrategy.LeastCache:
+                # 计算每个dp_idx的当前token数量
+                dp_token_counts = []
+                for dp_idx in range(self.attention_dp):
+                    token_count = sum(len(seq) for seq in self.running(dp_idx))
+                    dp_token_counts.append((dp_idx, token_count))
+
+                # 按token数量排序，选择最小的
+                dp_token_counts_sorted = sorted(dp_token_counts, key=lambda x: x[1])
+
+                for selected_dp_idx, _ in dp_token_counts_sorted:
+                    can_allocate = self.worker_state[selected_dp_idx].can_allocate(
+                        seq,
+                        num_seqs[selected_dp_idx],
+                        num_batched_tokens[selected_dp_idx],
+                    )
+                    if not can_allocate:
+                        break
+                    block_ctx = seq.block_ctx(self.engine_id)
+                    num_seqs[selected_dp_idx][block_ctx.master_sp_idx] += 1
+                    seq.block_ctx_map[self.engine_id].dp_idx = selected_dp_idx
+
+                    self.worker_state[selected_dp_idx].allocate(seq)
+                    num_batched_tokens[selected_dp_idx][block_ctx.master_sp_idx] += (
+                        len(seq) - seq.num_cached_tokens
+                    )
+                    seq.status = SequenceStatus.RUNNING
+                    waiting.popleft()
+                    self.running(selected_dp_idx).append(seq)
+                    scheduled_seqs[selected_dp_idx].append(seq)
+                    break
+                else:
+                    break
             else:
                 raise AttributeError
         return scheduled_seqs
