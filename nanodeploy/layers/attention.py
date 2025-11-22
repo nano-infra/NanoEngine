@@ -56,10 +56,19 @@ class Attention(nn.Module):
             bs, num_head, head_dim = q.shape
             if sp_size > 1:
                 max_num_seqs = get_sp_context().max_num_seqs
+                q = q.view([bs, -1])
                 q_buffer = get_sp_context().q_buffer
+
+                get_sp_context().q_buffer.local_buffer.view(get_sp_context().dtype)[
+                    sp_rank
+                    * max_num_seqs
+                    * (num_head * head_dim) : (sp_rank * max_num_seqs + bs)
+                    * (num_head * head_dim)
+                ].copy_(q.flatten())
+
                 q = q_buffer.all_to_all_ll(
-                    q.view([bs, -1]),
-                    mask=context.global_context_lens,
+                    q,
+                    mask=context.q_mask,
                 ).view([sp_size * max_num_seqs, num_head, head_dim])
                 context_lens = context.context_lens.view(-1)
                 block_tables = context.block_tables.view(sp_size * max_num_seqs, -1)
@@ -79,29 +88,60 @@ class Attention(nn.Module):
             )[:2]
 
             if sp_size > 1:
-                res_lse_buffer = get_sp_context().res_lse_buffer
+                res_buffer = get_sp_context().res_buffer
+                lse_buffer = get_sp_context().lse_buffer
                 lse = lse.to(torch.bfloat16)
                 gathered_o = o.view([sp_size, max_num_seqs, num_head, head_dim])
                 gathered_lse = lse.view([sp_size, max_num_seqs, num_head, 1])
 
-                all_ranks_output_combine_0 = torch.cat(
-                    [gathered_o, gathered_lse], dim=3
+                res_local_buffer = res_buffer.local_buffer.view(get_sp_context().dtype)
+                res_local_buffer[
+                    sp_rank
+                    * max_num_seqs
+                    * (num_head * (head_dim)) : (sp_rank * max_num_seqs + bs)
+                    * (num_head * (head_dim))
+                ].copy_(
+                    gathered_o.flatten()[
+                        sp_rank
+                        * max_num_seqs
+                        * (num_head * (head_dim)) : (sp_rank * max_num_seqs + bs)
+                        * (num_head * (head_dim))
+                    ]
                 )
-                all_ranks_output_combine = res_lse_buffer.all_to_all_ll(
-                    all_ranks_output_combine_0.view(sp_size * max_num_seqs, -1),
-                    mask=context.context_lens,
+                lse_local_buffer = lse_buffer.local_buffer.view(get_sp_context().dtype)
+                lse_local_buffer[
+                    sp_rank
+                    * max_num_seqs
+                    * (num_head * (1)) : (sp_rank * max_num_seqs + bs)
+                    * (num_head * (1))
+                ].copy_(
+                    gathered_lse.flatten()[
+                        sp_rank
+                        * max_num_seqs
+                        * (num_head * (1)) : (sp_rank * max_num_seqs + bs)
+                        * (num_head * (1))
+                    ]
+                )
+
+                all_ranks_res_output_combine = res_buffer.all_to_all_ll(
+                    gathered_o.view(sp_size * max_num_seqs, -1),
+                    mask=context.res_lse_mask,
                     is_transpose=True,
-                ).view(sp_size, max_num_seqs, num_head, head_dim + 1)
+                ).view(sp_size, max_num_seqs, num_head, head_dim)
+                all_ranks_lse_output_combine = lse_buffer.all_to_all_ll(
+                    gathered_lse.view(sp_size * max_num_seqs, -1),
+                    mask=context.res_lse_mask,
+                    is_transpose=True,
+                ).view(sp_size, max_num_seqs, num_head, 1)
 
                 o = inter_rank_gqa_fwd_batch_decode_combine_kv(
-                    all_ranks_output_combine,
+                    all_ranks_res_output_combine,
+                    all_ranks_lse_output_combine,
                     context.global_context_lens,
                     num_head,
                     head_dim,
                     get_sp_context().max_num_seqs,
                     sp_size,
-                )
-
-                o = o.view([max_num_seqs, num_head, head_dim])[:bs]
+                ).view([max_num_seqs, num_head, head_dim])[:bs]
 
         return o
