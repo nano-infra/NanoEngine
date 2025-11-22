@@ -24,7 +24,8 @@ class SPContext:
     sp_size: int
 
     q_buffer: AllToAllIntraLLBuffer | None = None
-    res_lse_buffer: AllToAllIntraLLBuffer | None = None
+    res_buffer: AllToAllIntraLLBuffer | None = None
+    lse_buffer: AllToAllIntraLLBuffer | None = None
 
     def __post_init__(self):
 
@@ -48,7 +49,15 @@ class SPContext:
             q_res_lse_buffer_size,
         )
 
-        self.res_lse_buffer = AllToAllIntraLLBuffer(
+        self.res_buffer = AllToAllIntraLLBuffer(
+            1,
+            self.max_num_seqs,
+            sp_rank,
+            sp_world_size,
+            q_res_lse_buffer_size,
+        )
+
+        self.lse_buffer = AllToAllIntraLLBuffer(
             1,
             self.max_num_seqs,
             sp_rank,
@@ -57,7 +66,8 @@ class SPContext:
         )
 
         self.q_buffer.connect_full_mesh(get_dist_context().attn_sp_group)
-        self.res_lse_buffer.connect_full_mesh(get_dist_context().attn_sp_group)
+        self.res_buffer.connect_full_mesh(get_dist_context().attn_sp_group)
+        self.lse_buffer.connect_full_mesh(get_dist_context().attn_sp_group)
 
 
 _SP_CONTEXT: SPContext

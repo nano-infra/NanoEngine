@@ -102,7 +102,7 @@ class ModelRunner:
 
         self.run_count = 0
         self.prof_start = 0
-        self.prof_end = 50
+        self.prof_end = 16
         self.profiler = None
 
         self.prof_kwargs = {
@@ -110,7 +110,7 @@ class ModelRunner:
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            "schedule": profiler.schedule(wait=1, warmup=1, active=30),
+            "schedule": profiler.schedule(wait=1, warmup=1, active=10),
             "on_trace_ready": torch.profiler.tensorboard_trace_handler(
                 dir_name="/mnt/nvme1n1/ml_research/majinming/src/nano-deploy/",
                 worker_name=f"trace_rank_{dist.get_rank()}",
@@ -410,6 +410,10 @@ class ModelRunner:
             global_context_lens, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(dp_seqs)
+        q_mask = global_context_lens.clone()
+        q_mask[sp_rank].fill_(0)
+        res_lse_mask = context_lens.clone()
+        res_lse_mask[sp_rank].fill_(0)
         set_context(
             False,
             self.config.max_num_seqs,
@@ -417,6 +421,8 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             global_context_lens=global_context_lens,
+            q_mask=q_mask,
+            res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
         )
 
@@ -456,6 +462,10 @@ class ModelRunner:
             graph_vars["context_lens"].copy_(context.context_lens)  # type: ignore
             graph_vars["global_context_lens"].zero_()
             graph_vars["global_context_lens"].copy_(context.global_context_lens)  # type: ignore
+            graph_vars["q_mask"].zero_()
+            graph_vars["q_mask"].copy_(context.q_mask)  # type: ignore
+            graph_vars["res_lse_mask"].zero_()
+            graph_vars["res_lse_mask"].copy_(context.res_lse_mask)  # type: ignore
             graph_vars["block_tables"][
                 :, :, : context.block_tables.size(2)  # type: ignore
             ] = context.block_tables
@@ -535,17 +545,17 @@ class ModelRunner:
                 seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_rank] += 1
             self.run_count += 1  # 每次调用计数+1
             reset_context()
-        # if in_prof_range and self.profiler is not None:
-        #     self.profiler.step()
-        #     # 在范围内时，每次调用结束后停止并记录（配合 schedule=active=1）
-        #     # self.profiler.stop()
-        #     print(f"记录第 {self.run_count} 次调用的性能数据")
+        #     if in_prof_range and self.profiler is not None:
+        #         self.profiler.step()
+        #         # 在范围内时，每次调用结束后停止并记录（配合 schedule=active=1）
+        #         # self.profiler.stop()
+        #         print(f"记录第 {self.run_count} 次调用的性能数据")
 
-        # if self.run_count > self.prof_end and self.profiler is not None:
-        #     self.profiler.stop()
-        #     # 超出范围后关闭 profiler
-        #     self.profiler = None
-        #     print(f"结束 profiling（共记录 {self.prof_end - self.prof_start + 1} 次）")
+        #     if self.run_count > self.prof_end and self.profiler is not None:
+        #         self.profiler.stop()
+        #         # 超出范围后关闭 profiler
+        #         self.profiler = None
+        #         print(f"结束 profiling（共记录 {self.prof_end - self.prof_start + 1} 次）")
         # end_event.record()
         # torch.cuda.synchronize()
         # cuda_elapse_ms = start_event.elapsed_time(end_event)
@@ -573,6 +583,8 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
+        q_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
+        res_lse_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         block_tables = torch.zeros(
             sp_world_size, max_bs, max_num_blocks, dtype=torch.int32
         )
@@ -590,6 +602,8 @@ class ModelRunner:
                 context_lens=context_lens,
                 block_tables=block_tables,
                 global_context_lens=global_context_lens,
+                q_mask=q_mask,
+                res_lse_mask=res_lse_mask,
             )
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
@@ -609,4 +623,6 @@ class ModelRunner:
             block_tables=block_tables,
             global_context_lens=global_context_lens,
             outputs=outputs,
+            q_mask=q_mask,
+            res_lse_mask=res_lse_mask,
         )
