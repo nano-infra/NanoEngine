@@ -20,7 +20,7 @@ def main():
         ffn_ep=8,
         ffn_tp=1,
         mode="decode",
-        loop_count=1,
+        loop_count=16,
         master_address="10.103.5.41:6006",
         ray_address="10.103.5.41:7077",
         dummy_prefill=False,

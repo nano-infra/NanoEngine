@@ -412,8 +412,10 @@ class ModelRunner:
         block_tables = self.prepare_block_tables(dp_seqs)
         q_mask = global_context_lens.clone()
         q_mask[sp_rank].fill_(0)
+        q_mask[q_mask != 0] = 1
         res_lse_mask = context_lens.clone()
         res_lse_mask[sp_rank].fill_(0)
+        res_lse_mask[res_lse_mask != 0] = 1
         set_context(
             False,
             self.config.max_num_seqs,
@@ -425,6 +427,45 @@ class ModelRunner:
             res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
         )
+
+        return input_ids, positions
+
+    def update_decode(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, dp_seqs: list[Sequence]
+    ):
+        # update position
+        positions.add_(1)
+
+        sp_rank = get_dist_context().attn_sp_rank
+        num_sp_seqs = sum(
+            1
+            for seq in dp_seqs
+            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank
+        )
+
+        # update slot mapping
+        slot_mapping = []
+        for seq in dp_seqs:
+            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank:
+                slot_mapping.append(
+                    seq.last_block_page_id(self.engine_id, sp_rank)
+                    * get_cache_context().block_size
+                    + seq.last_block_num_tokens(self.engine_id, sp_rank)
+                    - 1
+                )
+
+        # update context
+        context = get_context()
+
+        context.slot_mapping = torch.tensor(
+            slot_mapping, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        # update context length
+        context.context_lens[sp_rank][:num_sp_seqs].add_(1)
+
+        # update global context length
+        context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
 
         return input_ids, positions
 
@@ -519,32 +560,40 @@ class ModelRunner:
         ]
 
         loop_count = self.config.loop_count if not is_prefill else 1
-
-        loop_count_token_ids = [[] for _ in sp_seqs]
-
         for i in range(loop_count):
-            input_ids, positions = (
-                self.prepare_prefill(dp_seqs, is_dummy)
-                if is_prefill
-                else self.prepare_decode(dp_seqs, is_dummy)
-            )
+            if is_prefill:
+                input_ids, positions = self.prepare_prefill(dp_seqs, is_dummy)
+            else:
+                if i == 0:
+                    input_ids, positions = self.prepare_decode(dp_seqs, is_dummy)
+                else:
+                    input_ids, positions = self.update_decode(
+                        input_ids, positions, dp_seqs
+                    )
+
             logits = self.run_model(input_ids, positions, is_prefill)
+
             tp_rank = get_dist_context().attn_tp_rank
-            temperatures = (
-                self.prepare_sample(dp_seqs) if tp_rank == 0 else [None] * len(sp_seqs)
-            )
-            token_ids = (
-                self.sampler(logits, temperatures).tolist()
-                if tp_rank == 0
-                else [None] * len(sp_seqs)
-            )
-            for i, (seq, token_id) in enumerate(zip(sp_seqs, token_ids)):
-                loop_count_token_ids[i].append(token_id)
+            if tp_rank == 0:
+                temperatures = (
+                    self.prepare_sample(dp_seqs)
+                    if tp_rank == 0
+                    else [None] * len(sp_seqs)
+                )
+                input_ids = self.sampler(logits, temperatures)
+            else:
+                input_ids = torch.zeros_like(input_ids)
+            dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
+
+            for i, seq in enumerate(sp_seqs):
                 seq.num_tokens += 1
-                seq.last_token = token_id
                 seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_rank] += 1
+
             self.run_count += 1  # 每次调用计数+1
-            reset_context()
+            get_context().token_ids.append(input_ids[None, ...])
+
+        loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
+        reset_context()
         #     if in_prof_range and self.profiler is not None:
         #         self.profiler.step()
         #         # 在范围内时，每次调用结束后停止并记录（配合 schedule=active=1）

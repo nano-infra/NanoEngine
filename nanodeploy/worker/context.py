@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -28,6 +28,8 @@ class Context:
     res_lse_mask: torch.Tensor | None = None
 
     is_dummy: bool = False
+
+    token_ids: list[torch.Tensor] = field(default_factory=list)
 
 
 _CONTEXT = Context()
