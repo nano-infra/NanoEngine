@@ -1,15 +1,13 @@
 import numpy as np
-
 import ray
 import torch
 import torch.distributed as dist
-
 import torch.profiler as profiler
-
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
+from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.cache import get_cache_context, set_cache_context
@@ -30,6 +28,7 @@ logger = get_logger()
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
+    "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
 }
 
 
@@ -96,7 +95,6 @@ class ModelRunner:
                 sp_size,
                 sp_rank,
             )
-
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
 
@@ -128,7 +126,6 @@ class ModelRunner:
 
             deep_ep.Buffer.num_sms = 16
             dist.barrier(group=get_dist_context().cuda_world_group)
-
         if sp_size > 1:
             sp_rank = get_dist_context().attn_sp_rank
             set_sp_context(
@@ -139,14 +136,13 @@ class ModelRunner:
                 sp_size,
                 sp_rank,
             )
-
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
-
         dist.barrier()
 
         self.sampler = Sampler()
-        self.warmup_model()
+        # self.warmup_model()
+
         self.preallocate_kvcache()
 
     def num_kvcache_blocks(self):
@@ -158,9 +154,14 @@ class ModelRunner:
         cache_context.allocate_kvcache(num_kvcache_blocks)
         layer_id = 0
         for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = cache_context.kv_cache[0, layer_id]
-                module.v_cache = cache_context.kv_cache[1, layer_id]
+            allocated = False
+            if hasattr(module, "k_cache"):
+                module.k_cache = cache_context.kv_cache[0][layer_id]
+                allocated = True
+            if hasattr(module, "v_cache"):
+                module.v_cache = cache_context.kv_cache[1][layer_id]
+                allocated = True
+            if allocated:
                 layer_id += 1
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -209,6 +210,14 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
 
+        mode = "gqa" if hf_config.num_key_value_heads > 1 else "mla"
+        kv_lora_rank = (
+            hf_config.kv_lora_rank if hasattr(hf_config, "kv_lora_rank") else 0
+        )
+        qk_rope_head_dim = (
+            hf_config.qk_rope_head_dim if hasattr(hf_config, "qk_rope_head_dim") else 0
+        )
+
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
@@ -216,9 +225,11 @@ class ModelRunner:
             num_hidden_layers=hf_config.num_hidden_layers,
             attention_tp=config.attention_tp,
             gpu_memory_utilization=config.gpu_memory_utilization,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
             device=torch.get_default_device(),
             dtype=torch.get_default_dtype(),
-            mode="gqa",
+            mode=mode,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
@@ -357,7 +368,6 @@ class ModelRunner:
                     + seq.last_block_num_tokens(self.engine_id, sp_rank)
                     - 1
                 )
-
         sp_size = get_dist_context().attn_sp_world_size
         sp_seqs = [
             [
@@ -434,6 +444,7 @@ class ModelRunner:
         self, input_ids: torch.Tensor, positions: torch.Tensor, dp_seqs: list[Sequence]
     ):
         # update position
+
         positions.add_(1)
 
         sp_rank = get_dist_context().attn_sp_rank
@@ -444,6 +455,7 @@ class ModelRunner:
         )
 
         # update slot mapping
+
         slot_mapping = []
         for seq in dp_seqs:
             if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank:
@@ -453,8 +465,8 @@ class ModelRunner:
                     + seq.last_block_num_tokens(self.engine_id, sp_rank)
                     - 1
                 )
-
         # update context
+
         context = get_context()
 
         context.slot_mapping = torch.tensor(
@@ -462,9 +474,11 @@ class ModelRunner:
         ).cuda(non_blocking=True)
 
         # update context length
+
         context.context_lens[sp_rank][:num_sp_seqs].add_(1)
 
         # update global context length
+
         context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
 
         return input_ids, positions
@@ -552,7 +566,6 @@ class ModelRunner:
 
             seq.block_ctx(self.engine_id).sp_block_table[sp_rank] = [0]
             dp_seqs.append(seq)
-
         sp_seqs = [
             seq
             for seq in dp_seqs
@@ -570,7 +583,6 @@ class ModelRunner:
                     input_ids, positions = self.update_decode(
                         input_ids, positions, dp_seqs
                     )
-
             logits = self.run_model(input_ids, positions, is_prefill)
 
             tp_rank = get_dist_context().attn_tp_rank
@@ -588,10 +600,8 @@ class ModelRunner:
             for i, seq in enumerate(sp_seqs):
                 seq.num_tokens += 1
                 seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_rank] += 1
-
             self.run_count += 1  # 每次调用计数+1
             get_context().token_ids.append(input_ids[None, ...])
-
         loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
         reset_context()
         #     if in_prof_range and self.profiler is not None:
@@ -614,6 +624,7 @@ class ModelRunner:
         #     print(
         #         f"model run latency: {(float(cuda_time) / get_dist_context().attn_dp_world_size):.2f} ms\n"
         #     )
+
         return loop_count_token_ids
 
     @torch.inference_mode()
@@ -663,7 +674,6 @@ class ModelRunner:
             torch.cuda.synchronize()
             dist.barrier(group=get_dist_context().cuda_world_group)
             reset_context()
-
         self.graph_vars = dict(
             input_ids=input_ids,
             positions=positions,

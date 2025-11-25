@@ -10,6 +10,7 @@ class Config:
     model: str
 
     # scheduler config
+
     loop_count: int = 16
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 256
@@ -17,6 +18,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
 
     # parallel config
+
     attention_tp: int = 1
     attention_sp: int = 1
     attention_dp: int = 1
@@ -25,13 +27,15 @@ class Config:
     ffn_dp: int = 1
 
     # runner config
+
     enforce_eager: bool = False
     hf_config: Any = None
     eos: int = -1
-    kvcache_block_size: int = 256
+    kvcache_block_size: int = 64
     num_kvcache_blocks: int = 15000
 
     # deployment config
+
     engine_id: str | None = None
     mode: Literal["prefill", "decode", "hybrid"] = "hybrid"
 
@@ -40,21 +44,33 @@ class Config:
     perfect_eplb: bool | None = False
 
     # dist config
+
     master_address: str = "127.0.0.1:6006"
     ray_address: str = "127.0.0.1:6379"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        assert self.kvcache_block_size % 256 == 0
-        assert 1 <= self.attention_tp <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+            assert self.kvcache_block_size == 64
+            assert self.attention_tp == 1
+        else:
+            assert self.kvcache_block_size % 256 == 0
+            assert 1 <= self.attention_tp <= 8
         # self.max_model_len = max(
         #     self.max_model_len, self.hf_config.max_position_embeddings
         # )
+
         self.hf_config.max_position_embeddings = max(
             self.max_model_len, self.hf_config.max_position_embeddings
         )
         assert self.max_num_batched_tokens >= self.max_model_len
+
+        if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+            # MLA requires num_kv_heads == 1
+
+            if hasattr(self.hf_config, "num_key_value_heads"):
+                self.hf_config.num_key_value_heads = 1
 
     @property
     def attn_world_size(self):

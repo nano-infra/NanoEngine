@@ -3,11 +3,9 @@ from collections import defaultdict
 from typing import Literal
 
 import dlslime
-
 import torch
 import torch.distributed as dist
 from dlslime.assignment import Assignment
-
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.worker.distributed import get_dist_context
 
@@ -29,14 +27,16 @@ class CacheContext:
     selected_nic: str | None = None
     endpoints: dict[str, dict[int, dlslime.RDMAEndpoint]] = None
 
+    # used for MLA mode
+
+    kv_lora_rank: int = 0
+    qk_rope_head_dim: int = 0
+
     @property
     def num_local_kv_heads(self):
         return self.num_kv_heads // self.attention_tp
 
     def __post_init__(self):
-
-        assert self.mode == "gqa"
-        assert self.attention_tp <= self.num_kv_heads
 
         free, total = torch.cuda.mem_get_info()
         used = total - free
@@ -44,18 +44,41 @@ class CacheContext:
         peak = memory_stats["allocated_bytes.all.peak"]
         current = memory_stats["allocated_bytes.all.current"]
 
-        block_bytes = (
-            2
-            * self.num_hidden_layers
-            * self.block_size
-            * self.num_local_kv_heads
-            * self.head_dim
-            * self.dtype.itemsize
-        )
-
+        if self.mode == "gqa":
+            assert self.attention_tp <= self.num_kv_heads
+        elif self.mode == "mla":
+            assert self.attention_tp == 1
+            assert self.block_size == 64, "MLA mode only support block_size=64"
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+        if self.mode == "gqa":
+            block_bytes = (
+                2
+                * self.num_hidden_layers
+                * self.block_size
+                * self.num_local_kv_heads
+                * self.head_dim
+                * self.dtype.itemsize
+            )
+        elif self.mode == "mla":
+            head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+            k_head_dim = head_dim
+            v_head_dim = 0
+            num_key_value_heads = 1
+            block_bytes = (
+                self.num_hidden_layers
+                * self.block_size
+                * num_key_value_heads
+                * (k_head_dim + v_head_dim)
+                * self.dtype.itemsize
+            )
         self.num_local_kvcache_blocks = (
             int(total * self.gpu_memory_utilization - used - peak + current)
             // block_bytes
+        )
+
+        print(
+            f"Rank{dist.get_rank()} num_local_kvcache_blocks: {self.num_local_kvcache_blocks}"
         )
 
         assert self.num_local_kvcache_blocks > 0
@@ -103,22 +126,80 @@ class CacheContext:
 
     def allocate_kvcache(self, num_kvcache_blocks):
         self.num_local_kvcache_blocks = num_kvcache_blocks
-        self.kv_cache = torch.empty(
-            2,
-            self.num_hidden_layers,
-            self.num_local_kvcache_blocks,
-            self.block_size,
-            self.num_local_kv_heads,
-            self.head_dim,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if self.mode == "gqa":
+            # 1. 获取 key/value 相关维度（GQA 中 key 和 value 维度一致）
+
+            num_key_value_heads = self.num_local_kv_heads
+            k_head_dim = self.head_dim
+            v_head_dim = self.head_dim
+
+            # 2. 定义 key 和 value 的 block shape（保持统一结构）
+
+            key_block_shape = (self.block_size, num_key_value_heads, k_head_dim)
+            value_block_shape = (self.block_size, num_key_value_heads, v_head_dim)
+
+            # 3. 分别分配 key 和 value 缓存
+            # shape 结构：(num_layers, num_blocks, block_size, num_kv_heads, head_dim)
+
+            key_cache = torch.empty(
+                self.num_hidden_layers,
+                self.num_local_kvcache_blocks,
+                *key_block_shape,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+            value_cache = torch.empty(
+                self.num_hidden_layers,
+                self.num_local_kvcache_blocks,
+                *value_block_shape,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+            self.kv_cache = (key_cache, value_cache)
+        elif self.mode == "mla":
+            # 1. 获取 key 相关维度
+
+            head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+            k_head_dim = head_dim
+            num_key_value_heads = 1
+            key_block_shape = (self.block_size, num_key_value_heads, k_head_dim)
+
+            # 2. 获取 value 相关维度
+
+            v_head_dim = 0
+            value_block_shape = (self.block_size, num_key_value_heads, v_head_dim)
+
+            # 3. 分别分配 key 和 value 缓存（保持与参考代码一致的 shape 顺序）
+            # shape 结构：(num_layers, num_blocks, block_size, num_kv_heads, head_dim)
+
+            key_cache = torch.empty(
+                self.num_hidden_layers,
+                self.num_local_kvcache_blocks,
+                *key_block_shape,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+            value_cache = torch.empty(
+                self.num_hidden_layers,
+                self.num_local_kvcache_blocks,
+                *value_block_shape,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+            self.kv_cache = (key_cache, value_cache)
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
 
     def p2p_init(
         self, remote_engine_name: str, num_kv_blocks: int, remote_world_size: int
     ) -> dict[int, dict]:
         # init endpoint
         # register memory region
+
         endpoints = self.endpoints[remote_engine_name] = {}
         endpoints_info = {}
         self.num_remote_kvcache_blocks[remote_engine_name] = num_kv_blocks
@@ -173,7 +254,6 @@ class CacheContext:
                                 * seq.block_ctx(seq.backup_engine_id).attention_sp
                                 + remote_block_idx[0]
                             ].append(assignment)
-
             futures = []
             for endpoint_key, endpoint_assign_batch in assigns.items():
                 for replica_key, assign_batch in endpoint_assign_batch.items():
@@ -182,7 +262,6 @@ class CacheContext:
                             assign_batch, async_op=True
                         )
                     )
-
             [future.wait() for future in futures]
 
 
@@ -200,6 +279,8 @@ def set_cache_context(
     num_hidden_layers: int,
     attention_tp: int,
     gpu_memory_utilization: float,
+    kv_lora_rank: int = 0,
+    qk_rope_head_dim: int = 0,
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     mode: Literal["gqa", "mla"] = "gqa",
@@ -208,6 +289,8 @@ def set_cache_context(
     _CACHE_CONTEXT = CacheContext(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
         block_size=block_size,
         num_hidden_layers=num_hidden_layers,
         attention_tp=attention_tp,

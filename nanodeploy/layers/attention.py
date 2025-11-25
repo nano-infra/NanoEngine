@@ -1,22 +1,18 @@
+import flash_mla
 import torch
-
 from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanodeploy.kernels.attention import inter_rank_gqa_fwd_batch_decode_combine_kv
-
 from nanodeploy.kernels.kvcache import store_kvcache
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
 from nanodeploy.worker.sp_context import get_sp_context
-
 from torch import nn
-
 
 logger = get_logger()
 
 
-class Attention(nn.Module):
-
+class FlashAttentionImpl:
     def __init__(
         self,
         num_heads,
@@ -29,11 +25,16 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        self.k_cache = self.v_cache = torch.tensor([])
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ):
         context = get_context()
-        k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel() and not get_context().is_dummy:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         sp_rank = get_dist_context().attn_sp_rank
@@ -75,7 +76,6 @@ class Attention(nn.Module):
             else:
                 context_lens = context.context_lens[sp_rank][:bs]
                 block_tables = context.block_tables[sp_rank][:bs]
-
             o, lse = flash_attn_with_kvcache(
                 q.unsqueeze(1),
                 k_cache,
@@ -143,5 +143,112 @@ class Attention(nn.Module):
                     get_sp_context().max_num_seqs,
                     sp_size,
                 ).view([max_num_seqs, num_head, head_dim])[:bs]
-
         return o
+
+
+class FlashMLAImpl:
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float = None,
+        num_kv_heads: int = None,
+        v_head_size: int = None,
+        causal: bool = True,
+        **kwargs,
+    ):
+        if scale is None:
+            scale = 1.0 / (head_size**0.5)
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+        if v_head_size is None:
+            v_head_size = head_size
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads
+        self.v_head_size = v_head_size
+        self.causal = causal
+
+        assert num_kv_heads == 1, "MLA requires num kv heads equal to 1"
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ):
+
+        context = get_context()
+        # if k_cache.numel() and v_cache.numel() and not get_context().is_dummy:
+        #     store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
+        sp_rank = get_dist_context().attn_sp_rank
+        sp_size = get_dist_context().attn_sp_world_size
+
+        if not context.is_prefill:  # decode
+            bs, num_head, head_dim = q.shape
+            if sp_size > 1:
+                pass
+            else:
+                context_lens = context.context_lens[sp_rank][:bs]
+                block_tables = context.block_tables[sp_rank][:bs]
+            tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
+                cache_seqlens=context_lens,
+                num_heads_per_head_k=self.num_heads // self.num_kv_heads,
+                num_heads_k=self.num_kv_heads,
+            )
+
+            out, lse = flash_mla.flash_mla_with_kvcache(
+                q.unsqueeze(1),
+                k_cache,
+                block_tables,
+                context_lens,
+                self.v_head_size,
+                tile_scheduler_metadata,
+                num_splits,
+                self.scale,
+                self.causal,
+            )
+            out = out.squeeze(1)
+        return out
+
+
+class Attention(nn.Module):
+
+    def __init__(
+        self,
+        num_heads,
+        head_dim,
+        scale,
+        num_kv_heads,
+        v_head_dim,
+        attention_type: str = "MLA",
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.forward_method = None
+
+        if attention_type == "MLA":
+            self.impl = FlashMLAImpl(
+                num_heads, head_dim, scale, num_kv_heads, v_head_dim
+            )
+        elif attention_type == "GQA":
+            self.impl = FlashAttentionImpl(
+                num_heads,
+                head_dim,
+                scale,
+                num_kv_heads,
+            )
+        else:
+            raise ValueError(f"Unknown attention type: {attention_type}")
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        """forward."""
+        return self.impl.forward(q, k, v, self.k_cache, self.v_cache)
