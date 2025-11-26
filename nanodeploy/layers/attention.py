@@ -191,17 +191,34 @@ class FlashMLAImpl:
         if not context.is_prefill:  # decode
             bs, num_head, head_dim = q.shape
             if sp_size > 1:
-                pass
+                max_num_seqs = get_sp_context().max_num_seqs
+                q = q.view([bs, -1])
+                q_buffer = get_sp_context().q_buffer
+
+                get_sp_context().q_buffer.local_buffer.view(get_sp_context().dtype)[
+                    sp_rank
+                    * max_num_seqs
+                    * (num_head * head_dim) : (sp_rank * max_num_seqs + bs)
+                    * (num_head * head_dim)
+                ].copy_(q.flatten())
+
+                q = q_buffer.all_to_all_ll(
+                    q,
+                    mask=context.q_mask,
+                ).view([sp_size * max_num_seqs, num_head, head_dim])
+                context_lens = context.context_lens.view(-1)
+                block_tables = context.block_tables.view(sp_size * max_num_seqs, -1)
             else:
                 context_lens = context.context_lens[sp_rank][:bs]
                 block_tables = context.block_tables[sp_rank][:bs]
+
             tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
                 cache_seqlens=context_lens,
                 num_heads_per_head_k=self.num_heads // self.num_kv_heads,
                 num_heads_k=self.num_kv_heads,
             )
 
-            out, lse = flash_mla.flash_mla_with_kvcache(
+            o, lse = flash_mla.flash_mla_with_kvcache(
                 q.unsqueeze(1),
                 k_cache,
                 block_tables,
@@ -212,8 +229,69 @@ class FlashMLAImpl:
                 self.scale,
                 self.causal,
             )
-            out = out.squeeze(1)
-        return out
+
+            o = o.squeeze(1)
+
+            if sp_size > 1:
+                _, num_head, v_head_dim = o.shape
+
+                res_buffer = get_sp_context().res_buffer
+                lse_buffer = get_sp_context().lse_buffer
+                lse = lse.to(torch.bfloat16)
+                gathered_o = o.view([sp_size, max_num_seqs, num_head, v_head_dim])
+                gathered_lse = lse.view([sp_size, max_num_seqs, num_head, 1])
+
+                res_local_buffer = res_buffer.local_buffer.view(get_sp_context().dtype)
+                res_local_buffer[
+                    sp_rank
+                    * max_num_seqs
+                    * (num_head * (v_head_dim)) : (sp_rank * max_num_seqs + bs)
+                    * (num_head * (v_head_dim))
+                ].copy_(
+                    gathered_o.flatten()[
+                        sp_rank
+                        * max_num_seqs
+                        * (num_head * (v_head_dim)) : (sp_rank * max_num_seqs + bs)
+                        * (num_head * (v_head_dim))
+                    ]
+                )
+                lse_local_buffer = lse_buffer.local_buffer.view(get_sp_context().dtype)
+                lse_local_buffer[
+                    sp_rank
+                    * max_num_seqs
+                    * (num_head * (1)) : (sp_rank * max_num_seqs + bs)
+                    * (num_head * (1))
+                ].copy_(
+                    gathered_lse.flatten()[
+                        sp_rank
+                        * max_num_seqs
+                        * (num_head * (1)) : (sp_rank * max_num_seqs + bs)
+                        * (num_head * (1))
+                    ]
+                )
+
+                all_ranks_res_output_combine = res_buffer.all_to_all_ll(
+                    gathered_o.view(sp_size * max_num_seqs, -1),
+                    mask=context.res_lse_mask,
+                    is_transpose=True,
+                ).view(sp_size, max_num_seqs, num_head, v_head_dim)
+                all_ranks_lse_output_combine = lse_buffer.all_to_all_ll(
+                    gathered_lse.view(sp_size * max_num_seqs, -1),
+                    mask=context.res_lse_mask,
+                    is_transpose=True,
+                ).view(sp_size, max_num_seqs, num_head, 1)
+
+                o = inter_rank_gqa_fwd_batch_decode_combine_kv(
+                    all_ranks_res_output_combine,
+                    all_ranks_lse_output_combine,
+                    context.global_context_lens,
+                    num_head,
+                    v_head_dim,
+                    get_sp_context().max_num_seqs,
+                    sp_size,
+                ).view([max_num_seqs, num_head, v_head_dim])[:bs]
+
+        return o
 
 
 class Attention(nn.Module):
