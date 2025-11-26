@@ -623,6 +623,9 @@ class DeepseekV2Attention(nn.Module):
             hidden_states, num_heads=num_heads
         )
 
+        key_states = key_states.unsqueeze(1)
+        value_states = value_states.unsqueeze(1)
+
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         # query_states[..., nope_size:] = q_pe
         # key_states[..., nope_size:] = k_pe

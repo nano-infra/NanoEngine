@@ -2,7 +2,7 @@ import flash_mla
 import torch
 from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanodeploy.kernels.attention import inter_rank_gqa_fwd_batch_decode_combine_kv
-from nanodeploy.kernels.kvcache import store_kvcache
+from nanodeploy.kernels.kvcache import store_kcache, store_kvcache
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
@@ -182,8 +182,8 @@ class FlashMLAImpl:
     ):
 
         context = get_context()
-        # if k_cache.numel() and v_cache.numel() and not get_context().is_dummy:
-        #     store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        if k_cache.numel() and not get_context().is_dummy:
+            store_kcache(k, k_cache, context.slot_mapping)
 
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
