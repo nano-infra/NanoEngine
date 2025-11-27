@@ -95,14 +95,14 @@ class ModelRunner:
                     self.config.hf_config.kv_lora_rank
                     + self.config.hf_config.qk_rope_head_dim
                 )
-                set_sp_context(
-                    config.max_num_seqs,
-                    max_head_dim,
-                    hf_config.num_attention_heads,
-                    torch.get_default_dtype(),
-                    sp_size,
-                    sp_rank,
-                )
+            set_sp_context(
+                config.max_num_seqs,
+                max_head_dim,
+                hf_config.num_attention_heads,
+                torch.get_default_dtype(),
+                sp_size,
+                sp_rank,
+            )
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
 
