@@ -208,15 +208,19 @@ class FlashMLAImpl:
                 ).view([sp_size * max_num_seqs, num_head, head_dim])
                 context_lens = context.context_lens.view(-1)
                 block_tables = context.block_tables.view(sp_size * max_num_seqs, -1)
+                tile_scheduler_metadata = context.tile_scheduler_metadata
+                num_splits = context.num_splits[: sp_size * max_num_seqs + 1]
             else:
                 context_lens = context.context_lens[sp_rank][:bs]
                 block_tables = context.block_tables[sp_rank][:bs]
+                tile_scheduler_metadata = context.tile_scheduler_metadata
+                num_splits = context.num_splits[: bs + 1]
 
-            tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
-                cache_seqlens=context_lens,
-                num_heads_per_head_k=self.num_heads // self.num_kv_heads,
-                num_heads_k=self.num_kv_heads,
-            )
+            # tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
+            #     cache_seqlens=context_lens,
+            #     num_heads_per_head_k=self.num_heads // self.num_kv_heads,
+            #     num_heads_k=self.num_kv_heads,
+            # )
 
             o, lse = flash_mla.flash_mla_with_kvcache(
                 q.unsqueeze(1),

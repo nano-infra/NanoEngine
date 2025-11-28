@@ -2,7 +2,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
-
 from nanodeploy.logging import get_logger
 
 # Initialize logger with NANODEPLOY namespace
@@ -28,6 +27,8 @@ class Context:
     res_lse_mask: torch.Tensor | None = None
 
     is_dummy: bool = False
+    tile_scheduler_metadata: torch.Tensor | None = None
+    num_splits: torch.Tensor | None = None
 
     token_ids: list[torch.Tensor] = field(default_factory=list)
 
@@ -53,6 +54,8 @@ def set_context(
     q_mask: Optional[torch.Tensor] = None,
     res_lse_mask: Optional[torch.Tensor] = None,
     is_dummy: bool = False,
+    tile_scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: Optional[torch.Tensor] = None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -69,6 +72,8 @@ def set_context(
         q_mask=q_mask,
         res_lse_mask=res_lse_mask,
         is_dummy=is_dummy,
+        tile_scheduler_metadata=tile_scheduler_metadata,
+        num_splits=num_splits,
     )
 
 
