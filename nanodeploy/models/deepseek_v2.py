@@ -160,16 +160,16 @@ class DeepseekV2MoE(nn.Module):
                 chunk_size=16 * 1024,
             )
         self.shared_experts = None
-        # if config.n_shared_experts is not None:
-        #     intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-        #     self.shared_experts = DeepseekV2MLP(
-        #         hidden_size=config.hidden_size,
-        #         intermediate_size=intermediate_size,
-        #         hidden_act=config.hidden_act,
-        #         meta=False,
-        #         config=config,
-        #         quantization_config=quantization_config,
-        #     )
+        if config.n_shared_experts is not None:
+            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            self.shared_experts = DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                meta=False,
+                config=config,
+                quantization_config=quantization_config,
+            )
 
     @property
     def num_experts_per_rank(self):
