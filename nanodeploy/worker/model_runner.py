@@ -489,6 +489,18 @@ class ModelRunner:
 
         context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
 
+        # update mla metadata
+        config = self.config
+        hf_config = config.hf_config
+        if hf_config.num_key_value_heads == 1:
+            new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
+                context.context_lens.view(-1),
+                hf_config.num_attention_heads // hf_config.num_key_value_heads,
+                hf_config.num_key_value_heads,
+            )
+            context.tile_scheduler_metadata = new_tile_scheduler_metadata
+            context.num_splits = new_num_splits
+
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
