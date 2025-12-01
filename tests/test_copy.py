@@ -6,7 +6,10 @@ import triton.language as tl
 
 
 # Fused general kernel (handles any D > 1)
-# 将请求按 BLOCK_M 融合，每个 program 在一个 head 上遍历完整 D（分块），并在一个小的常量循环里处理最多 BLOCK_M 个请求，避免 Python 分支与动态控制。
+# 优化点：
+# 1. 移除了内部的 static_range(BLOCK_M) 循环，改为 2D Block 处理。
+# 2. 引入了 [BLOCK_M, 1] 和 [1, BLOCK_D] 的广播机制，实现并行搬运。
+# 3. 索引只加载一次。
 @triton.jit
 def copy_batch_indexed_kernel_fused(
     src_ptr,
@@ -27,47 +30,60 @@ def copy_batch_indexed_kernel_fused(
     BLOCK_D: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    pid_m_block = tl.program_id(0)  # block of requests
-    pid_h = tl.program_id(1)  # head index
+    # 1. 确定当前 Block 处理的 M 范围
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
 
-    base_m = pid_m_block * BLOCK_M
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
 
-    # contiguous D loop
-    offs_d = tl.arange(0, BLOCK_D)
-    d_start = 0
-    while d_start < D:
-        cur_d = d_start + offs_d
-        mask_d = cur_d < D
+    # 2. 向量化加载索引 (Vectorized Load Indices)
+    # 即使 offs_m 超出 M，通过 mask 保护加载，避免非法内存访问
+    mask_m = offs_m < M
 
-        # process BLOCK_M requests as scalars
-        for i in tl.static_range(0, BLOCK_M):
-            m_idx = base_m + i
-            # bounds predicate for this request
-            p_in = m_idx < M
+    # 加载 mask, src_idx, dst_idx (形状均为 [BLOCK_M])
+    m_mask = tl.load(mask_ptr + offs_m, mask=mask_m, other=0)
+    src_idx = tl.load(src_idx_ptr + offs_m, mask=mask_m, other=-1)
+    dst_idx = tl.load(dst_idx_ptr + offs_m, mask=mask_m, other=-1)
 
-            # scalar loads with predicate
-            m_mask = tl.load(mask_ptr + m_idx, mask=p_in, other=0)
-            sb = tl.load(src_idx_ptr + m_idx, mask=p_in, other=-1)
-            db = tl.load(dst_idx_ptr + m_idx, mask=p_in, other=-1)
+    # 3. 计算请求的有效性 (Validity Check)
+    # 逻辑与原代码一致，但现在是并行计算整个向量
+    p_valid = (
+        (mask_m)
+        & (m_mask == 1)
+        & (src_idx >= 0)
+        & (src_idx < B)
+        & (dst_idx >= 0)
+        & (dst_idx < B)
+    )
 
-            # validity predicate
-            p_valid = p_in & (m_mask == 1) & (sb >= 0) & (sb < B) & (db >= 0) & (db < B)
-            # if not valid, skip by predicate on loads/stores
-            src_base = sb * strideB_src + pid_h * strideH_src
-            dst_base = db * strideB_dst + pid_h * strideH_dst
+    # 4. 计算 Base 指针 (广播到 [BLOCK_M, 1])
+    # src_base: [BLOCK_M, 1]
+    src_base = (src_idx * strideB_src + pid_h * strideH_src)[:, None]
+    dst_base = (dst_idx * strideB_dst + pid_h * strideH_dst)[:, None]
 
-            src_offsets = src_base + cur_d * strideD_src
-            dst_offsets = dst_base + cur_d * strideD_dst
+    # 5. 循环处理 D 维度 (Chunked Loop over D)
+    # 使用 tl.range 替代 while，更符合 Triton 风格
+    for d_start in tl.range(0, D, BLOCK_D):
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
 
-            req_mask = p_valid & mask_d
-            vals = tl.load(src_ptr + src_offsets, mask=req_mask, other=0)
-            tl.store(dst_ptr + dst_offsets, vals, mask=req_mask)
+        # 6. 计算 2D 指针矩阵
+        # src_base [BLOCK_M, 1] + offs_d [1, BLOCK_D] * stride -> [BLOCK_M, BLOCK_D]
+        src_ptrs = src_ptr + src_base + (offs_d[None, :] * strideD_src)
+        dst_ptrs = dst_ptr + dst_base + (offs_d[None, :] * strideD_dst)
 
-        d_start += BLOCK_D
+        # 7. 合并 Mask
+        # 请求有效且 D 维度在范围内
+        curr_mask = p_valid[:, None] & mask_d[None, :]
+
+        # 8. 块读写
+        val = tl.load(src_ptrs, mask=curr_mask, other=0.0)
+        tl.store(dst_ptrs, val, mask=curr_mask)
 
 
 # Specialized kernel for D = 1
-# 去掉 D 循环，按 head 并行，每个 program 处理 BLOCK_M 个请求的标量搬运。
+# 优化点：
+# 1. 同样移除了循环，直接处理长度为 BLOCK_M 的向量。
 @triton.jit
 def copy_batch_indexed_kernel_D1(
     src_ptr,
@@ -86,27 +102,35 @@ def copy_batch_indexed_kernel_D1(
     strideD_dst,
     BLOCK_M: tl.constexpr,
 ):
-    pid_m_block = tl.program_id(0)
+    pid_m = tl.program_id(0)
     pid_h = tl.program_id(1)
 
-    base_m = pid_m_block * BLOCK_M
+    # 1. 向量化处理 M
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
 
-    # scalar per request
-    for i in tl.static_range(0, BLOCK_M):
-        m_idx = base_m + i
-        p_in = m_idx < M
+    # 2. 加载索引
+    m_mask = tl.load(mask_ptr + offs_m, mask=mask_m, other=0)
+    src_idx = tl.load(src_idx_ptr + offs_m, mask=mask_m, other=-1)
+    dst_idx = tl.load(dst_idx_ptr + offs_m, mask=mask_m, other=-1)
 
-        m_mask = tl.load(mask_ptr + m_idx, mask=p_in, other=0)
-        sb = tl.load(src_idx_ptr + m_idx, mask=p_in, other=-1)
-        db = tl.load(dst_idx_ptr + m_idx, mask=p_in, other=-1)
+    # 3. 校验
+    p_valid = (
+        (mask_m)
+        & (m_mask == 1)
+        & (src_idx >= 0)
+        & (src_idx < B)
+        & (dst_idx >= 0)
+        & (dst_idx < B)
+    )
 
-        p_valid = p_in & (m_mask == 1) & (sb >= 0) & (sb < B) & (db >= 0) & (db < B)
+    # 4. 计算指针 (D=1, 所以不需要 strideD)
+    src_offsets = src_idx * strideB_src + pid_h * strideH_src
+    dst_offsets = dst_idx * strideB_dst + pid_h * strideH_dst
 
-        src_offset = sb * strideB_src + pid_h * strideH_src
-        dst_offset = db * strideB_dst + pid_h * strideH_dst
-
-        val = tl.load(src_ptr + src_offset, mask=p_valid, other=0)
-        tl.store(dst_ptr + dst_offset, val, mask=p_valid)
+    # 5. 读写
+    val = tl.load(src_ptr + src_offsets, mask=p_valid, other=0.0)
+    tl.store(dst_ptr + dst_offsets, val, mask=p_valid)
 
 
 def copy_batch_indexed_triton(
@@ -126,16 +150,19 @@ def copy_batch_indexed_triton(
     B, H, D = src.shape
     M = src_idx.numel()
 
-    # num_warps heuristic by shape only
+    # 调整了 BLOCK_M 的默认值。
+    # 在 2D Tiling 模式下，BLOCK_M * BLOCK_D 决定了寄存器压力。
+    # 32 是一个比较平衡的值，既能保证 parallelism，又不会导致寄存器溢出。
+    BLOCK_M = 32
+
+    # num_warps heuristic
     if num_warps is None:
         if D >= 512:
-            num_warps = 8
+            num_warps = 4  # 降低 warp 数，避免小 block_m 下的资源浪费
         elif D >= 128:
             num_warps = 4
         else:
             num_warps = 2
-
-    BLOCK_M = 16  # for M_MAX=256 a good default; keep constant across runs
 
     if D == 1:
         grid = (triton.cdiv(M, BLOCK_M), H)
@@ -160,8 +187,16 @@ def copy_batch_indexed_triton(
         return
 
     # D > 1 fused path
-    BLOCK_D = 256 if D >= 512 else max(64, block_d)
+    # 动态调整 BLOCK_D，确保 tile 形状合理
+    BLOCK_D = 128 if D >= 128 else 64
+    if D >= 512:
+        BLOCK_D = 256
+
+    # 确保 BLOCK_D 不超过 D 的下一个 2 的幂次太多，虽然 triton handle mask，但太大会浪费
+    BLOCK_D = min(BLOCK_D, triton.next_power_of_2(D))
+
     grid = (triton.cdiv(M, BLOCK_M), H)
+
     copy_batch_indexed_kernel_fused[grid](
         src,
         dst,
