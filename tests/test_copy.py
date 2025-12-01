@@ -1,17 +1,14 @@
-import math
 import random
-import time
 
 import torch
 import triton
 import triton.language as tl
 
 
-# =========================
-# Kernel B: batch-indexed mapping copy
-# =========================
+# Fused general kernel (handles any D > 1)
+# 将请求按 BLOCK_M 融合，每个 program 在一个 head 上遍历完整 D（分块），并在一个小的常量循环里处理最多 BLOCK_M 个请求，避免 Python 分支与动态控制。
 @triton.jit
-def copy_batch_indexed_kernel(
+def copy_batch_indexed_kernel_fused(
     src_ptr,
     dst_ptr,
     src_idx_ptr,
@@ -28,34 +25,88 @@ def copy_batch_indexed_kernel(
     strideH_dst,
     strideD_dst,
     BLOCK_D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)  # request index
+    pid_m_block = tl.program_id(0)  # block of requests
     pid_h = tl.program_id(1)  # head index
-    pid_d = tl.program_id(2)  # block along D
 
-    if pid_m >= M or pid_h >= H:
-        return
+    base_m = pid_m_block * BLOCK_M
 
-    # check mask: if 0, skip
-    m = tl.load(mask_ptr + pid_m)
-    if m == 0:
-        return
+    # contiguous D loop
+    offs_d = tl.arange(0, BLOCK_D)
+    d_start = 0
+    while d_start < D:
+        cur_d = d_start + offs_d
+        mask_d = cur_d < D
 
-    b_src = tl.load(src_idx_ptr + pid_m)
-    b_dst = tl.load(dst_idx_ptr + pid_m)
+        # process BLOCK_M requests as scalars
+        for i in tl.static_range(0, BLOCK_M):
+            m_idx = base_m + i
+            # bounds predicate for this request
+            p_in = m_idx < M
 
-    # bounds guard for batch indices
-    if (b_src < 0) | (b_src >= B) | (b_dst < 0) | (b_dst >= B):
-        return
+            # scalar loads with predicate
+            m_mask = tl.load(mask_ptr + m_idx, mask=p_in, other=0)
+            sb = tl.load(src_idx_ptr + m_idx, mask=p_in, other=-1)
+            db = tl.load(dst_idx_ptr + m_idx, mask=p_in, other=-1)
 
-    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    mask_d = offs_d < D
+            # validity predicate
+            p_valid = p_in & (m_mask == 1) & (sb >= 0) & (sb < B) & (db >= 0) & (db < B)
+            # if not valid, skip by predicate on loads/stores
+            src_base = sb * strideB_src + pid_h * strideH_src
+            dst_base = db * strideB_dst + pid_h * strideH_dst
 
-    src_offsets = b_src * strideB_src + pid_h * strideH_src + offs_d * strideD_src
-    dst_offsets = b_dst * strideB_dst + pid_h * strideH_dst + offs_d * strideD_dst
+            src_offsets = src_base + cur_d * strideD_src
+            dst_offsets = dst_base + cur_d * strideD_dst
 
-    vals = tl.load(src_ptr + src_offsets, mask=mask_d, other=0)
-    tl.store(dst_ptr + dst_offsets, vals, mask=mask_d)
+            req_mask = p_valid & mask_d
+            vals = tl.load(src_ptr + src_offsets, mask=req_mask, other=0)
+            tl.store(dst_ptr + dst_offsets, vals, mask=req_mask)
+
+        d_start += BLOCK_D
+
+
+# Specialized kernel for D = 1
+# 去掉 D 循环，按 head 并行，每个 program 处理 BLOCK_M 个请求的标量搬运。
+@triton.jit
+def copy_batch_indexed_kernel_D1(
+    src_ptr,
+    dst_ptr,
+    src_idx_ptr,
+    dst_idx_ptr,
+    mask_ptr,
+    B,
+    H,
+    M,
+    strideB_src,
+    strideH_src,
+    strideD_src,  # kept for signature consistency
+    strideB_dst,
+    strideH_dst,
+    strideD_dst,
+    BLOCK_M: tl.constexpr,
+):
+    pid_m_block = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    base_m = pid_m_block * BLOCK_M
+
+    # scalar per request
+    for i in tl.static_range(0, BLOCK_M):
+        m_idx = base_m + i
+        p_in = m_idx < M
+
+        m_mask = tl.load(mask_ptr + m_idx, mask=p_in, other=0)
+        sb = tl.load(src_idx_ptr + m_idx, mask=p_in, other=-1)
+        db = tl.load(dst_idx_ptr + m_idx, mask=p_in, other=-1)
+
+        p_valid = p_in & (m_mask == 1) & (sb >= 0) & (sb < B) & (db >= 0) & (db < B)
+
+        src_offset = sb * strideB_src + pid_h * strideH_src
+        dst_offset = db * strideB_dst + pid_h * strideH_dst
+
+        val = tl.load(src_ptr + src_offset, mask=p_valid, other=0)
+        tl.store(dst_ptr + dst_offset, val, mask=p_valid)
 
 
 def copy_batch_indexed_triton(
@@ -67,24 +118,15 @@ def copy_batch_indexed_triton(
     block_d=128,
     num_warps=None,
 ):
-    """
-    离散批量映射复制：仅复制 mask[i]==1 的位置
-    src, dst: [B, H, D] 3D 张量（批量×头×维度）
-    src_idx, dst_idx, mask: shape [M_max]，mask 取值 {0,1}
-    功能：dst[dst_idx[i], :, :] = src[src_idx[i], :, :]（仅当 mask[i]==1 时生效）
-    """
     assert src.is_cuda and dst.is_cuda, "张量必须在 CUDA 设备上"
     assert src.dtype == dst.dtype, "源和目标张量 dtype 必须一致"
     assert src.dim() == 3 and dst.dim() == 3, "张量必须是 3D (B, H, D)"
-    assert src.is_contiguous(
-        memory_format=torch.contiguous_format
-    ) and dst.is_contiguous(memory_format=torch.contiguous_format), "张量必须是连续的"
+    assert src.is_contiguous() and dst.is_contiguous(), "张量必须是连续的"
 
     B, H, D = src.shape
     M = src_idx.numel()
-    assert dst_idx.numel() == M and mask.numel() == M, "索引和掩码长度必须一致"
 
-    # 自动选择线程束数量（根据 D 维度大小 heuristic）
+    # num_warps heuristic by shape only
     if num_warps is None:
         if D >= 512:
             num_warps = 8
@@ -93,11 +135,34 @@ def copy_batch_indexed_triton(
         else:
             num_warps = 2
 
-    # 定义网格维度：(请求数, 头数, 维度块数)
-    grid = (M, H, triton.cdiv(D, block_d))
+    BLOCK_M = 16  # for M_MAX=256 a good default; keep constant across runs
 
-    # 启动 Triton 内核
-    copy_batch_indexed_kernel[grid](
+    if D == 1:
+        grid = (triton.cdiv(M, BLOCK_M), H)
+        copy_batch_indexed_kernel_D1[grid](
+            src,
+            dst,
+            src_idx,
+            dst_idx,
+            mask,
+            B,
+            H,
+            M,
+            src.stride(0),
+            src.stride(1),
+            src.stride(2),
+            dst.stride(0),
+            dst.stride(1),
+            dst.stride(2),
+            BLOCK_M=BLOCK_M,
+            num_warps=num_warps,
+        )
+        return
+
+    # D > 1 fused path
+    BLOCK_D = 256 if D >= 512 else max(64, block_d)
+    grid = (triton.cdiv(M, BLOCK_M), H)
+    copy_batch_indexed_kernel_fused[grid](
         src,
         dst,
         src_idx,
@@ -113,7 +178,8 @@ def copy_batch_indexed_triton(
         dst.stride(0),
         dst.stride(1),
         dst.stride(2),
-        BLOCK_D=block_d,
+        BLOCK_D=BLOCK_D,
+        BLOCK_M=BLOCK_M,
         num_warps=num_warps,
     )
 
@@ -315,11 +381,11 @@ def benchmark_suite_per_config_graphs():
 
     # 测试配置组合（覆盖不同模型尺寸）
     test_configs = [
-        (128, 512),  # 大模型常见：128头×512维
-        (128, 576),  # 大模型常见：128头×576维
-        (64, 128),  # 中小模型：64头×128维
-        (32, 256),  # 轻量化模型：32头×256维
-        (256, 1024),  # 超大型模型：256头×1024维
+        (128, 512),
+        (128, 576),
+        (64, 128),
+        (128, 1),
+        (64, 1),
     ]
     request_counts = [2, 8, 32, 64, 128, 256]  # 不同请求数（稀疏程度）
     modes = ["contig", "noncontig"]  # 连续/非连续映射模式
