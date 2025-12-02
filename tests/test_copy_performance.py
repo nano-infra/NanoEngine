@@ -232,10 +232,11 @@ def benchmark_suite_per_config_graphs():
 
     # 2. 测试配置
     test_configs = [
-        (128, 512),
-        (128, 576),  # 常见
-        (64, 128),
-        (128, 1),  # 极端小
+        (128, 512),  # ds3 q
+        (128, 576),  # ds3 attn
+        (64, 128),  # qwen3 q
+        (128, 1),  # ds3 lse
+        (64, 1),  # qwen3 lse
     ]
     request_counts = [32, 64, 128, 256]  # 不同的稀疏度
     modes = ["contig", "noncontig"]

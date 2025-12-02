@@ -195,14 +195,11 @@ def benchmark_contiguous_copy():
         (128, 128, 512, "ds3 large q"),
         (8, 128, 1, "ds3 small lse"),
         (128, 128, 1, "ds3 large lse"),
-        (8, 32, 128, "qwen3 small q"),
-        (128, 32, 128, "qwen3 large q"),
-        (8, 32, 1, "qwen3 small lse"),
-        (128, 32, 1, "qwen3 large lse"),
+        (8, 64, 128, "qwen3 small q"),
+        (128, 64, 128, "qwen3 large q"),
+        (8, 64, 1, "qwen3 small lse"),
+        (128, 64, 1, "qwen3 large lse"),
     ]
-
-    # 添加D=1的特殊情况
-    test_configs.append((32, 128, 1, "D=1特殊情况"))
 
     print(f"[性能测试] 准备测试 {len(test_configs)} 种配置...")
 
