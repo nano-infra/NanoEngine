@@ -54,7 +54,7 @@ def check_correctness_contiguous_copy():
 
     torch.manual_seed(0)
     device = "cuda"
-    dtype = torch.float16
+    dtype = torch.bfloat16
 
     # 配置：B=32, H=128, D=576
     B, H, D = 32, 128, 576
@@ -88,7 +88,7 @@ def check_correctness_contiguous_copy():
 # =========================
 # 性能测试 - 连续拷贝
 # =========================
-def build_contig_triton_graph_for_config(B, H, D, dtype=torch.float16, device="cuda"):
+def build_contig_triton_graph_for_config(B, H, D, dtype=torch.bfloat16, device="cuda"):
     """预捕获连续拷贝的CUDA Graph"""
     static_src = torch.zeros(B, H, D, device=device, dtype=dtype)
     static_dst = torch.zeros_like(static_src)
@@ -180,7 +180,7 @@ def benchmark_contiguous_copy():
         return
 
     device = "cuda"
-    dtype = torch.float16
+    dtype = torch.bfloat16
     random.seed(0)
 
     # 1. 获取硬件峰值带宽
@@ -300,7 +300,7 @@ def benchmark_vs_index_copy():
         return
 
     device = "cuda"
-    dtype = torch.float16
+    dtype = torch.bfloat16
 
     print("\n" + "=" * 80)
     print("补充测试: 与PyTorch index_copy_的对比")

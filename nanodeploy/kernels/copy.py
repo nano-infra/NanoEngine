@@ -11,7 +11,7 @@ import triton.language as tl
         triton.Config({"BLOCK_M": 32, "BLOCK_D": 256}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_M": 128, "BLOCK_D": 32}, num_warps=4, num_stages=2),
     ],
-    key=["D", "M", "H"],  # 根据 input shape 自动选择最佳配置
+    key=["D", "M", "H"],
 )
 @triton.jit
 def copy_batch_indexed_kernel_opt(
@@ -20,7 +20,8 @@ def copy_batch_indexed_kernel_opt(
     src_idx_ptr,
     dst_idx_ptr,
     mask_ptr,
-    B,
+    B_src,
+    B_dst,
     H,
     D,
     M,
@@ -30,6 +31,7 @@ def copy_batch_indexed_kernel_opt(
     strideB_dst,
     strideH_dst,
     strideD_dst,
+    dtype: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -59,9 +61,9 @@ def copy_batch_indexed_kernel_opt(
     is_active = (
         (m_mask_val == 1)
         & (src_idx >= 0)
-        & (src_idx < B)
+        & (src_idx < B_src)
         & (dst_idx >= 0)
-        & (dst_idx < B)
+        & (dst_idx < B_dst)
     )
     p_valid = mask_m & is_active
 
@@ -70,6 +72,7 @@ def copy_batch_indexed_kernel_opt(
 
     num_full_blocks = D // BLOCK_D
 
+    # 根据dtype进行load/store
     for i in range(num_full_blocks):
         d_offset = i * BLOCK_D
         offs_d = d_offset + tl.arange(0, BLOCK_D)
@@ -77,8 +80,19 @@ def copy_batch_indexed_kernel_opt(
         curr_src_ptr = src_ptr + src_base + offs_d[None, :] * strideD_src
         curr_dst_ptr = dst_ptr + dst_base + offs_d[None, :] * strideD_dst
 
-        val = tl.load(curr_src_ptr, mask=p_valid[:, None], other=0.0)
-        tl.store(curr_dst_ptr, val, mask=p_valid[:, None])
+        if dtype == tl.float16:
+            val = tl.load(curr_src_ptr, mask=p_valid[:, None], other=0.0)
+            tl.store(curr_dst_ptr, val, mask=p_valid[:, None])
+        elif dtype == tl.bfloat16:
+            val = tl.load(curr_src_ptr, mask=p_valid[:, None], other=0.0)
+            tl.store(curr_dst_ptr, val, mask=p_valid[:, None])
+        elif dtype == tl.float32:
+            val = tl.load(curr_src_ptr, mask=p_valid[:, None], other=0.0)
+            tl.store(curr_dst_ptr, val, mask=p_valid[:, None])
+        else:
+            # 默认处理
+            val = tl.load(curr_src_ptr, mask=p_valid[:, None], other=0.0)
+            tl.store(curr_dst_ptr, val, mask=p_valid[:, None])
 
     if num_full_blocks * BLOCK_D < D:
         d_offset = num_full_blocks * BLOCK_D
@@ -94,7 +108,6 @@ def copy_batch_indexed_kernel_opt(
         tl.store(curr_dst_ptr, val, mask=curr_mask)
 
 
-# Specialized kernel for D=1 (Keep fast path for extremely small D)
 @triton.jit
 def copy_batch_indexed_kernel_D1(
     src_ptr,
@@ -102,7 +115,8 @@ def copy_batch_indexed_kernel_D1(
     src_idx_ptr,
     dst_idx_ptr,
     mask_ptr,
-    B,
+    B_src,
+    B_dst,
     H,
     M,
     strideB_src,
@@ -111,6 +125,7 @@ def copy_batch_indexed_kernel_D1(
     strideB_dst,
     strideH_dst,
     strideD_dst,
+    dtype: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -130,14 +145,15 @@ def copy_batch_indexed_kernel_D1(
         mask_m
         & (m_mask == 1)
         & (src_idx >= 0)
-        & (src_idx < B)
+        & (src_idx < B_src)
         & (dst_idx >= 0)
-        & (dst_idx < B)
+        & (dst_idx < B_dst)
     )
 
     src_offsets = src_idx * strideB_src + pid_h * strideH_src
     dst_offsets = dst_idx * strideB_dst + pid_h * strideH_dst
 
+    # load/store会根据dtype自动处理
     val = tl.load(src_ptr + src_offsets, mask=p_valid, other=0.0)
     tl.store(dst_ptr + dst_offsets, val, mask=p_valid)
 
@@ -148,14 +164,30 @@ def copy_batch_indexed_triton(
     src_idx: torch.Tensor,
     dst_idx: torch.Tensor,
     mask: torch.Tensor,
-    # block_d/num_warps deprecated, handled by autotuner
     **kwargs,
 ):
     assert src.is_cuda and dst.is_cuda
     assert src.is_contiguous() and dst.is_contiguous()
+    assert src.dtype == dst.dtype, "src和dst的数据类型必须相同"
 
-    B, H, D = src.shape
+    B_src, H, D = src.shape
+    B_dst, H_dst, D_dst = dst.shape
+
+    # 验证维度兼容性
+    assert H == H_dst and D == D_dst, "H和D维度必须相同"
+
     M = src_idx.numel()
+
+    # 将torch dtype映射到triton dtype
+    dtype_mapping = {
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+        torch.float32: tl.float32,
+    }
+
+    triton_dtype = dtype_mapping.get(src.dtype)
+    if triton_dtype is None:
+        raise ValueError(f"不支持的数据类型: {src.dtype}")
 
     # 极小 D 优化
     if D == 1:
@@ -167,7 +199,8 @@ def copy_batch_indexed_triton(
             src_idx,
             dst_idx,
             mask,
-            B,
+            B_src,
+            B_dst,
             H,
             M,
             src.stride(0),
@@ -176,6 +209,7 @@ def copy_batch_indexed_triton(
             dst.stride(0),
             dst.stride(1),
             dst.stride(2),
+            dtype=triton_dtype,  # 传入数据类型
             BLOCK_M=BLOCK_M,
         )
         return
@@ -190,7 +224,8 @@ def copy_batch_indexed_triton(
         src_idx,
         dst_idx,
         mask,
-        B,
+        B_src,
+        B_dst,
         H,
         D,
         M,
@@ -200,4 +235,5 @@ def copy_batch_indexed_triton(
         dst.stride(0),
         dst.stride(1),
         dst.stride(2),
+        dtype=triton_dtype,  # 传入数据类型
     )

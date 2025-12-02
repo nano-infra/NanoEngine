@@ -56,7 +56,7 @@ def check_correctness_batch_indexed():
 
     torch.manual_seed(0)
     device = "cuda"
-    dtype = torch.float16
+    dtype = torch.bfloat16
 
     # 配置：B=32, H=128, D=576
     B, H, D = 32, 128, 576
@@ -224,7 +224,7 @@ def run_case_on_config(static_config, B, k_requests, mode, iters=100):
 
 def benchmark_suite_per_config_graphs():
     device = "cuda"
-    dtype = torch.float16
+    dtype = torch.bfloat16
     random.seed(0)
 
     # 1. 获取硬件峰值带宽 (H200 -> 4800 GB/s)
