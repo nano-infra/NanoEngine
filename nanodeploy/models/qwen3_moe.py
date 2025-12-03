@@ -474,8 +474,113 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # all_to_all
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        print(f"{hidden_states.shape=}")
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+    # 把本来 Qwen3MoeSparseMoeBlock 要做的工作分步骤拆解到这里
+    def forward_yield(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) :
+        # stage 0
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        yield
+        # stage 1
+        
+        # all_gather
+        hidden_states = self.self_attn(positions, hidden_states)
+        # all_to_all
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        
+        if isinstance(self.mlp, Qwen3MoeSparseMoeBlock) and self.mlp.ep_size > 1:
+            assert (
+                self.mlp.quantization_config.quant_method == "fp8"
+            ), "Only FP8 EP is supported by now"
+            
+            context = get_context()
+            # Assuming decode mode (low latency)
+            moe = self.mlp.fusedmoe_build(low_latency_mode=not context.is_prefill)
+            
+            router_logits = self.mlp.gate(hidden_states)
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(
+                routing_weights, self.mlp.top_k, dim=-1
+            )
+
+            if get_runner_config().perfect_eplb:
+                ep_size = get_dist_context().ffn_ep_world_size
+                selected_experts = compute_topk_ids(
+                    selected_experts, ep_size, self.mlp.num_experts
+                )
+            
+            print(f"{hidden_states.shape=}, {routing_weights.shape=}, {selected_experts.shape=}")
+            if context.is_prefill:
+                hs_quant, hs_scale = moe.per_token_group_quant_fp8(hidden_states)
+                x, recv_topk_ids, recv_topk_weights, recv_tokens_per_expert = moe.token_dispatcher.dispatch(
+                    (hs_quant, hs_scale),
+                    selected_experts,
+                    routing_weights,
+                    self.mlp.expert_list_this_rank,
+                )
+                yield
+                state = {
+                    "recv_hidden_states": x,
+                    "recv_topk_idx": recv_topk_ids,
+                    "recv_topk_weights": recv_topk_weights,
+                    "recv_tokens_per_expert": recv_tokens_per_expert,
+                }
+                out_states = moe.fusedmoe_forward(
+                    state,
+                    self.mlp.gate_up_proj,
+                    self.mlp.gate_up_scale_inv,
+                    self.mlp.down_proj,
+                    self.mlp.down_scale_inv,
+                )
+                yield
+                final_hidden_states = moe.token_dispatcher.combine(out_states)
+                yield
+            else:
+                recv_hidden_states, topk_idx, topk_weights, masked_m, expected_m = moe.token_dispatcher.dispatch(
+                    hidden_states,
+                    selected_experts,
+                    routing_weights,
+                    self.mlp.num_experts,
+                )
+
+                yield
+
+                out_states = moe.experts(
+                    recv_hidden_states,
+                    self.mlp.gate_up_proj,
+                    self.mlp.gate_up_scale_inv,
+                    self.mlp.down_proj,
+                    self.mlp.down_scale_inv,
+                    masked_m,
+                    expected_m,
+                )
+
+                yield
+
+                final_hidden_states = moe.token_dispatcher.combine(
+                    out_states, topk_idx, topk_weights
+                )
+
+                yield
+        else:
+            final_hidden_states = self.mlp(hidden_states)
+            yield
+            yield
+            yield
+
+        outputs = (final_hidden_states, residual)
+        return outputs
 
 
 class Qwen3MoeModel(nn.Module):
@@ -503,7 +608,18 @@ class Qwen3MoeModel(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            Y = 0
+            if Y:
+                print(f"{hidden_states.shape=}, entering layer {layer}")
+                runner = layer.forward_yield(positions, hidden_states, residual)
+                try:
+                    while True:
+                        next(runner)
+                except StopIteration as e:
+                    hidden_states, residual = e.value
+            else:
+                print(f"{hidden_states.shape=}, entering layer {layer}")
+                hidden_states, residual = layer.forward(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
