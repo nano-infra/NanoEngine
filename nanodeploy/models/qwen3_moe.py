@@ -186,6 +186,71 @@ def compute_topk_ids(topk_ids, ranks, num_experts):
     return topk_ids
 
 
+class MoEGate(nn.Module):
+    """MoE Gate module for computing topk_idx and topk_weights."""
+
+    def __init__(
+        self,
+        config: Qwen3MoeConfig,
+        dtype: torch.dtype = None,
+        device: torch.device = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.renormalize = getattr(config, "norm_topk_prob", True)
+
+        # gating weight - shape: (num_experts, hidden_size) to match nn.Linear
+        self.weight = nn.Parameter(
+            torch.empty(
+                (self.num_experts, self.hidden_size),
+                dtype=dtype,
+                device=device,
+            )
+        )
+        # No bias for gate
+        self.register_parameter("bias", None)
+
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute topk_weights and topk_idx from hidden_states.
+
+        Args:
+            hidden_states: Input tensor of shape (num_tokens, hidden_size)
+
+        Returns:
+            topk_weights: Tensor of shape (num_tokens, top_k)
+            topk_idx: Tensor of shape (num_tokens, top_k)
+        """
+        # Compute router logits: (num_tokens, num_experts)
+        router_logits = F.linear(hidden_states, self.weight.to( hidden_states.dtype))
+
+        # Compute routing weights via softmax
+        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
+
+        # Select top-k experts
+        topk_weights, topk_idx = torch.topk(
+            routing_weights, self.top_k, dim=-1
+        )
+
+        # Apply EPLB if enabled
+        if get_runner_config().perfect_eplb:
+            ep_size = get_dist_context().ffn_ep_world_size
+            topk_idx = compute_topk_ids(topk_idx, ep_size, self.num_experts)
+
+        # Renormalize weights if needed
+        if self.renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            if not topk_weights.is_contiguous():
+                topk_weights = topk_weights.contiguous()
+
+        return topk_weights, topk_idx
+
+
 class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def __init__(
@@ -203,10 +268,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
 
-        # gating
-        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
-
         weight_dtype = quantization_config.dtype or config.dtype
+
+        # gating - use separate MoEGate module
+        self.gate = MoEGate(config, dtype=weight_dtype, device="cuda")
 
         self.tp_size = get_dist_context().ffn_tp_world_size
 
@@ -347,18 +412,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             ), "Only FP8 EP is supported by now"
             context = get_context()
             moe = self.fusedmoe_build(not context.is_prefill)
-            router_logits = self.gate(hidden_states)
+            
+            # Use MoEGate to compute topk_weights and topk_idx
+            routing_weights, selected_experts = self.gate(hidden_states)
 
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1
-            )
-
-            if get_runner_config().perfect_eplb:
-                ep_size = get_dist_context().ffn_ep_world_size
-                selected_experts = compute_topk_ids(
-                    selected_experts, ep_size, self.num_experts
-                )
             final_hidden_states = moe.forward(
                 hidden_states,
                 routing_weights,
@@ -371,13 +428,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
         else:
             _, hidden_dim = hidden_states.shape
-            router_logits = self.gate(hidden_states)
-
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1
-            )
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            
+            # Use MoEGate to compute topk_weights and topk_idx
+            routing_weights, selected_experts = self.gate(hidden_states)
+            
             # we cast back to the input dtype
             routing_weights = routing_weights.to(hidden_states.dtype)
 
@@ -508,25 +562,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
             # Assuming decode mode (low latency)
             moe = self.mlp.fusedmoe_build(low_latency_mode=not context.is_prefill)
             
-            router_logits = self.mlp.gate(hidden_states)
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.mlp.top_k, dim=-1
-            )
-
-            if get_runner_config().perfect_eplb:
-                ep_size = get_dist_context().ffn_ep_world_size
-                selected_experts = compute_topk_ids(
-                    selected_experts, ep_size, self.mlp.num_experts
-                )
+            # Use MoEGate to compute topk_weights and topk_idx
+            topk_weights, topk_idx = self.mlp.gate(hidden_states)
             
-            print(f"{hidden_states.shape=}, {routing_weights.shape=}, {selected_experts.shape=}")
+            print(f"{hidden_states.shape=}, {topk_weights.shape=}, {topk_idx.shape=}")
             if context.is_prefill:
                 hs_quant, hs_scale = moe.per_token_group_quant_fp8(hidden_states)
                 x, recv_topk_ids, recv_topk_weights, recv_tokens_per_expert = moe.token_dispatcher.dispatch(
                     (hs_quant, hs_scale),
-                    selected_experts,
-                    routing_weights,
+                    topk_idx,
+                    topk_weights,
                     self.mlp.expert_list_this_rank,
                 )
                 yield
@@ -547,12 +592,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 final_hidden_states = moe.token_dispatcher.combine(out_states)
                 yield
             else:
-                recv_hidden_states, topk_idx, topk_weights, masked_m, expected_m = moe.token_dispatcher.dispatch(
+                # Low latency decode mode
+                (recv_hidden_states, recv_expert_count, handle, event,
+                 hook) = moe.token_dispatcher.dispatch_async(
                     hidden_states,
-                    selected_experts,
-                    routing_weights,
-                    self.mlp.num_experts,
+                    topk_idx,
+                    use_fp8=False,
+                    async_finish=False
                 )
+                hook()
 
                 yield
 
@@ -562,8 +610,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                     self.mlp.gate_up_scale_inv,
                     self.mlp.down_proj,
                     self.mlp.down_scale_inv,
-                    masked_m,
-                    expected_m,
+                    recv_expert_count,
                 )
 
                 yield
