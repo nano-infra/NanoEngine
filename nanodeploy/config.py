@@ -14,6 +14,9 @@ class Config:
     loop_count: int = 16
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 256
+    max_attention_comp_seqs: int = 256
+    max_num_send_seqs: int = 16
+    max_num_recv_seqs: int = 32
     max_model_len: int = 16384
     gpu_memory_utilization: float = 0.9
 
@@ -47,6 +50,11 @@ class Config:
 
     master_address: str = "127.0.0.1:6006"
     ray_address: str = "127.0.0.1:6379"
+
+    # profiler
+    enable_profiler: bool = True
+    profiler_start_step: int = 16
+    profiling_step: int = 16
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
