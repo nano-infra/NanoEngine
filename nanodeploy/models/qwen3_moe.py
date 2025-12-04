@@ -510,6 +510,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.ep_size = get_dist_context().ffn_ep_world_size
+
 
     def forward(
         self,
@@ -528,7 +530,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # all_to_all
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        print(f"{hidden_states.shape=}")
+        # print(f"{hidden_states.shape=}")
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
     # 把本来 Qwen3MoeSparseMoeBlock 要做的工作分步骤拆解到这里
@@ -565,7 +567,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             # Use MoEGate to compute topk_weights and topk_idx
             topk_weights, topk_idx = self.mlp.gate(hidden_states)
             
-            print(f"{hidden_states.shape=}, {topk_weights.shape=}, {topk_idx.shape=}")
+            # print(f"{hidden_states.shape=}, {topk_weights.shape=}, {topk_idx.shape=}")
             if context.is_prefill:
                 hs_quant, hs_scale = moe.per_token_group_quant_fp8(hidden_states)
                 x, recv_topk_ids, recv_topk_weights, recv_tokens_per_expert = moe.token_dispatcher.dispatch(
@@ -597,27 +599,35 @@ class Qwen3MoeDecoderLayer(nn.Module):
                  hook) = moe.token_dispatcher.dispatch_async(
                     hidden_states,
                     topk_idx,
-                    use_fp8=False,
+                    use_fp8=True, # 这样子 recv_hidden_states 是一个元组
                     async_finish=False
                 )
                 hook()
 
                 yield
-
+                hidden_shape = hidden_states.shape
+                expected_m = (hidden_shape[0] * self.ep_size  * topk_idx.shape[1] +
+                       moe.token_dispatcher.num_experts) //  moe.token_dispatcher.num_experts
+                # out_states = moe.experts(
                 out_states = moe.experts(
-                    recv_hidden_states,
+                    recv_hidden_states, # 传入的需要是 权重和对应的 scale，需要前面开 Fp8
+                    # recv_hidden_states,
                     self.mlp.gate_up_proj,
                     self.mlp.gate_up_scale_inv,
                     self.mlp.down_proj,
                     self.mlp.down_scale_inv,
                     recv_expert_count,
+                    expected_m,
                 )
 
                 yield
-
-                final_hidden_states = moe.token_dispatcher.combine(
-                    out_states, topk_idx, topk_weights
+                # print(f"{out_states.shape=};{topk_idx.shape=};{topk_weights.shape=}")
+                final_hidden_states, event, hook = moe.token_dispatcher.combine_async(
+                    out_states, topk_idx, topk_weights, handle, async_finish=False
+                    # out_states, topk_idx, topk_weights.to(torch.float32), handle, async_finish=False
                 )
+                
+                hook()
 
                 yield
         else:
@@ -655,9 +665,9 @@ class Qwen3MoeModel(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
-            Y = 0
+            Y = 1
             if Y:
-                print(f"{hidden_states.shape=}, entering layer {layer}")
+                # print(f"{hidden_states.shape=}, entering layer {layer}")
                 runner = layer.forward_yield(positions, hidden_states, residual)
                 try:
                     while True:
@@ -665,7 +675,7 @@ class Qwen3MoeModel(nn.Module):
                 except StopIteration as e:
                     hidden_states, residual = e.value
             else:
-                print(f"{hidden_states.shape=}, entering layer {layer}")
+                # print(f"{hidden_states.shape=}, entering layer {layer}")
                 hidden_states, residual = layer.forward(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
