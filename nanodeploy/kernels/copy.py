@@ -11,7 +11,7 @@ import triton.language as tl
         triton.Config({"BLOCK_M": 32, "BLOCK_D": 256}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_M": 128, "BLOCK_D": 32}, num_warps=4, num_stages=2),
     ],
-    key=["D", "M", "H"],
+    key=["D", "H"],
 )
 @triton.jit
 def copy_batch_indexed_kernel_opt(
@@ -35,21 +35,8 @@ def copy_batch_indexed_kernel_opt(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    grid_m = tl.cdiv(M, BLOCK_M)
-    grid_h = H
-
-    GROUP_SIZE_M = 8
-    num_pid_m = grid_m
-    num_pid_in_group = GROUP_SIZE_M * grid_h
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_h = (pid % num_pid_in_group) // group_size_m
-
-    if pid_m >= grid_m or pid_h >= grid_h:
-        return
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < M
@@ -72,7 +59,6 @@ def copy_batch_indexed_kernel_opt(
 
     num_full_blocks = D // BLOCK_D
 
-    # 根据dtype进行load/store
     for i in range(num_full_blocks):
         d_offset = i * BLOCK_D
         offs_d = d_offset + tl.arange(0, BLOCK_D)
@@ -80,19 +66,9 @@ def copy_batch_indexed_kernel_opt(
         curr_src_ptr = src_ptr + src_base + offs_d[None, :] * strideD_src
         curr_dst_ptr = dst_ptr + dst_base + offs_d[None, :] * strideD_dst
 
-        if dtype == tl.float16:
-            val = tl.load(curr_src_ptr, mask=p_valid[:, None], other=0.0)
-            tl.store(curr_dst_ptr, val, mask=p_valid[:, None])
-        elif dtype == tl.bfloat16:
-            val = tl.load(curr_src_ptr, mask=p_valid[:, None], other=0.0)
-            tl.store(curr_dst_ptr, val, mask=p_valid[:, None])
-        elif dtype == tl.float32:
-            val = tl.load(curr_src_ptr, mask=p_valid[:, None], other=0.0)
-            tl.store(curr_dst_ptr, val, mask=p_valid[:, None])
-        else:
-            # 默认处理
-            val = tl.load(curr_src_ptr, mask=p_valid[:, None], other=0.0)
-            tl.store(curr_dst_ptr, val, mask=p_valid[:, None])
+        mask_curr = p_valid[:, None]
+        val = tl.load(curr_src_ptr, mask=mask_curr, other=0.0)
+        tl.store(curr_dst_ptr, val, mask=mask_curr)
 
     if num_full_blocks * BLOCK_D < D:
         d_offset = num_full_blocks * BLOCK_D
@@ -153,7 +129,6 @@ def copy_batch_indexed_kernel_D1(
     src_offsets = src_idx * strideB_src + pid_h * strideH_src
     dst_offsets = dst_idx * strideB_dst + pid_h * strideH_dst
 
-    # load/store会根据dtype自动处理
     val = tl.load(src_ptr + src_offsets, mask=p_valid, other=0.0)
     tl.store(dst_ptr + dst_offsets, val, mask=p_valid)
 
@@ -166,30 +141,18 @@ def copy_batch_indexed_triton(
     mask: torch.Tensor,
     **kwargs,
 ):
-    assert src.is_cuda and dst.is_cuda
-    assert src.is_contiguous() and dst.is_contiguous()
-    assert src.dtype == dst.dtype, "src和dst的数据类型必须相同"
-
     B_src, H, D = src.shape
-    B_dst, H_dst, D_dst = dst.shape
-
-    # 验证维度兼容性
-    assert H == H_dst and D == D_dst, "H和D维度必须相同"
-
+    B_dst, _, _ = dst.shape
     M = src_idx.numel()
 
-    # 将torch dtype映射到triton dtype
     dtype_mapping = {
         torch.float16: tl.float16,
         torch.bfloat16: tl.bfloat16,
         torch.float32: tl.float32,
     }
+    triton_dtype = dtype_mapping.get(src.dtype, tl.float32)
 
-    triton_dtype = dtype_mapping.get(src.dtype)
-    if triton_dtype is None:
-        raise ValueError(f"不支持的数据类型: {src.dtype}")
-
-    # 极小 D 优化
+    # --- Case 1: 极小 D 优化 (LSE Copy) ---
     if D == 1:
         BLOCK_M = 128
         grid = (triton.cdiv(M, BLOCK_M) * H,)
@@ -209,14 +172,14 @@ def copy_batch_indexed_triton(
             dst.stride(0),
             dst.stride(1),
             dst.stride(2),
-            dtype=triton_dtype,  # 传入数据类型
+            dtype=triton_dtype,
             BLOCK_M=BLOCK_M,
         )
         return
 
-    # 普通情况 (D > 1)
+    # --- Case 2: 普通情况 (D > 1) ---
     def grid_fn(meta):
-        return (triton.cdiv(M, meta["BLOCK_M"]) * H,)
+        return (triton.cdiv(M, meta["BLOCK_M"]), H)
 
     copy_batch_indexed_kernel_opt[grid_fn](
         src,
@@ -235,5 +198,83 @@ def copy_batch_indexed_triton(
         dst.stride(0),
         dst.stride(1),
         dst.stride(2),
-        dtype=triton_dtype,  # 传入数据类型
+        dtype=triton_dtype,
     )
+
+
+def warmup_copy_kernel(shapes=None, dtype=torch.float16):
+    """
+    预热 copy_batch_indexed_triton kernel。
+
+    原理：
+    由于 Autotune Key 仅包含 ["D", "H"]，我们只需对每种唯一的 (H, D) 组合
+    执行一次调用即可触发编译并生成 Cache。后续真实的推理请求无论 Batch Size 是多少，
+    只要 H 和 D 命中缓存，都不会再有编译开销。
+
+    Args:
+        shapes: 可选。一个包含 (B, H, D, ...) 元组的列表。如果不传，默认使用代码中内置的常用配置。
+        dtype: 预热使用的数据类型，建议与推理时保持一致 (默认 float16)。
+    """
+    if shapes is None:
+        configs = [
+            # ds3 attn 系列
+            (8, 128, 576, "ds3 small attn"),
+            (64, 128, 576, "ds3 medium attn"),
+            (128, 128, 576, "ds3 large attn"),
+            # ds3 q 系列
+            (8, 128, 512, "ds3 small q"),
+            (64, 128, 512, "ds3 medium q"),
+            (128, 128, 512, "ds3 large q"),
+            # ds3 lse 系列
+            (8, 128, 1, "ds3 small lse"),
+            (64, 128, 1, "ds3 medium lse"),
+            (128, 128, 1, "ds3 large lse"),
+            # qwen3 q 系列
+            (8, 64, 128, "qwen3 small q"),
+            (64, 64, 128, "qwen3 medium q"),
+            (128, 64, 128, "qwen3 large q"),
+            # qwen3 lse 系列
+            (8, 64, 1, "qwen3 small lse"),
+            (64, 64, 1, "qwen3 medium lse"),
+            (128, 64, 1, "qwen3 large lse"),
+        ]
+        unique_shapes = list(set((c[1], c[2]) for c in configs))
+    else:
+        unique_shapes = list(set((s[1], s[2]) for s in shapes))
+
+    unique_shapes.sort()
+
+    print(f"[Warmup] Starting warmup for {len(unique_shapes)} unique (H, D) configs...")
+
+    M_warmup = 32
+    device = torch.device("cuda")
+
+    max_h = max(s[0] for s in unique_shapes)
+    max_d = max(s[1] for s in unique_shapes)
+
+    B_src_dst = M_warmup * 2
+
+    try:
+        src_buffer = torch.randn((B_src_dst, max_h, max_d), device=device, dtype=dtype)
+        dst_buffer = torch.randn((B_src_dst, max_h, max_d), device=device, dtype=dtype)
+
+        src_idx = torch.arange(M_warmup, device=device, dtype=torch.int32)
+        dst_idx = torch.arange(M_warmup, device=device, dtype=torch.int32)
+        mask = torch.ones(M_warmup, device=device, dtype=torch.int32)
+
+        for H, D in unique_shapes:
+            curr_src = src_buffer[:, :H, :D].contiguous()
+            curr_dst = dst_buffer[:, :H, :D].contiguous()
+
+            print(f"[Warmup] Compiling/Running Copy Kernel for H={H}, D={D} ...")
+
+            copy_batch_indexed_triton(curr_src, curr_dst, src_idx, dst_idx, mask)
+
+        torch.cuda.synchronize()
+        print(f"[Warmup] Completed. Triton kernels are cached.")
+
+    except Exception as e:
+        import traceback
+
+        print(f"[Warmup] Failed! Error: {e}")
+        traceback.print_exc()
