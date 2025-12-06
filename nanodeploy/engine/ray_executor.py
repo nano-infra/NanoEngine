@@ -1,6 +1,5 @@
 import threading
 from typing import Any, Dict, List, Tuple
-
 from urllib.parse import urlparse
 
 import ray
@@ -221,14 +220,21 @@ class RayExecutor:
         dp_seqs: List[List[Sequence]],
         is_prefill: bool,
         timeout: float | None = None,
-    ) -> list[list[list[int]]]:
-        return ray.get(
+    ) -> tuple[list[list[list[int]]], float, float]:
+        results = ray.get(
             [
                 getattr(worker, "run").remote(seqs, is_prefill)
                 for seqs, worker in zip(dp_seqs, self.workers)
             ],
             timeout=timeout,
         )
+
+        token_ids = [res[0] for res in results]
+
+        run_latencies = [res[1] for res in results]
+        model_latencies = [res[2] for res in results]
+
+        return token_ids, run_latencies, model_latencies
 
     def update_kvcache_blocks(self):
         num_cache_blocks = min(self.collective_rpc("num_kvcache_blocks"))

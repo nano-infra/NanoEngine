@@ -159,7 +159,9 @@ class ModelRunner:
                 ],
                 schedule=None,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    dir_name=profiler_dir, worker_name=f"rank_{rank}", use_gzip=False
+                    dir_name=profiler_dir,
+                    worker_name=f"{self.engine_id}_rank_{self.rank}",
+                    use_gzip=False,
                 ),
                 record_shapes=True,
                 profile_memory=True,
@@ -437,6 +439,36 @@ class ModelRunner:
                 if ctx_len > 0:
                     context_lens_for_attn.append(ctx_len)
             context_lens.append(current_context_lens)
+
+        send_req_num = 0
+        recv_req_num = 0
+
+        for sp_idx in range(sp_size):
+            if sp_idx == sp_rank:
+                continue
+
+            for seq_id in range(sp_num_seqs[sp_idx]):
+                if context_lens[sp_idx][seq_id] > 0:
+                    recv_req_num += 1
+
+        for seq in sp_seqs[sp_rank]:
+            has_remote_kv = False
+            for remote_rank in range(sp_size):
+                if remote_rank == sp_rank:
+                    continue
+                if seq.context_len(self.engine_id, remote_rank) > 0:
+                    has_remote_kv = True
+                    break
+            if has_remote_kv:
+                send_req_num += 1
+
+        if (
+            send_req_num > self.config.max_num_send_seqs
+            or recv_req_num > self.config.max_num_recv_seqs
+        ):
+            raise ValueError(
+                f"send_req_num({send_req_num}) or recv_req_num({recv_req_num}) exceeds max_num_send_seqs({self.config.max_num_send_seqs}) or max_num_recv_seqs({self.config.max_num_recv_seqs})"
+            )
 
         global_context_lens = [
             [
@@ -725,10 +757,25 @@ class ModelRunner:
             bs = input_ids.size(0)
             context = get_context()
             attention_compute_bs = context.attention_compute_bs
-            selected_master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
-            selected_attn_bs = next(
-                x for x in self.graph_attn_compute_bs if x >= attention_compute_bs
+            selected_master_bs = next(
+                (x for x in self.graph_master_rank_bs if x >= bs), None
             )
+            if selected_master_bs is None:
+                raise ValueError(
+                    f"No suitable graph_master_rank_bs found for batch size {bs}. "
+                    f"Max available is {max(self.graph_master_rank_bs) if self.graph_master_rank_bs else 'Empty'}. "
+                    f"Available buckets: {self.graph_master_rank_bs}"
+                )
+            selected_attn_bs = next(
+                (x for x in self.graph_attn_compute_bs if x >= attention_compute_bs),
+                None,  # 默认返回 None
+            )
+            if selected_attn_bs is None:
+                raise ValueError(
+                    f"No suitable graph_attn_compute_bs found for attn compute size {attention_compute_bs}. "
+                    f"Max available is {max(self.graph_attn_compute_bs) if self.graph_attn_compute_bs else 'Empty'}. "
+                    f"Available buckets: {self.graph_attn_compute_bs}"
+                )
             sp_size = get_dist_context().attn_sp_world_size
             if sp_size == 1:
                 assert selected_master_bs == selected_attn_bs
@@ -793,23 +840,14 @@ class ModelRunner:
     def migrate(self, seqs: list[Sequence]) -> None:
         get_cache_context().migrate(seqs=seqs)
 
-    def run(self, dp_seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
-        # start_event = torch.cuda.Event(enable_timing=True)
-        # end_event = torch.cuda.Event(enable_timing=True)
+    def run(
+        self, dp_seqs: list[Sequence], is_prefill: bool
+    ) -> tuple[list[list[int]], float, float]:
+        run_start_event = torch.cuda.Event(enable_timing=True)
+        run_end_event = torch.cuda.Event(enable_timing=True)
+        model_events = []
 
-        # """封装 run_model 的调用，加入 profiler 控制"""
-
-        # # # 判断是否在目标范围内（50~100 次）
-        # in_prof_range = (self.run_count >= self.prof_start) and (
-        #     self.run_count <= self.prof_end
-        # )
-
-        # if self.run_count == self.prof_start and self.profiler is None:
-        #     # 进入范围时启动 profiler
-        #     self.profiler = profiler.profile(**self.prof_kwargs)
-        #     self.profiler.start()
-        #     print(f"开始 profiling（第 {self.run_count} 次）")
-        # start_event.record()
+        run_start_event.record()
 
         sp_rank = get_dist_context().attn_sp_rank
 
@@ -852,7 +890,14 @@ class ModelRunner:
                     input_ids, positions = self.update_decode(
                         input_ids, positions, dp_seqs
                     )
+            m_start = torch.cuda.Event(enable_timing=True)
+            m_end = torch.cuda.Event(enable_timing=True)
+
+            m_start.record()
             logits = self.run_model(input_ids, positions, is_prefill)
+            m_end.record()
+
+            model_events.append((m_start, m_end))
 
             tp_rank = get_dist_context().attn_tp_rank
             if tp_rank == 0:
@@ -885,28 +930,14 @@ class ModelRunner:
             get_context().token_ids.append(input_ids[None, ...])
         loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
         reset_context()
-        #     if in_prof_range and self.profiler is not None:
-        #         self.profiler.step()
-        #         # 在范围内时，每次调用结束后停止并记录（配合 schedule=active=1）
-        #         # self.profiler.stop()
-        #         print(f"记录第 {self.run_count} 次调用的性能数据")
 
-        #     if self.run_count > self.prof_end and self.profiler is not None:
-        #         self.profiler.stop()
-        #         # 超出范围后关闭 profiler
-        #         self.profiler = None
-        #         print(f"结束 profiling（共记录 {self.prof_end - self.prof_start + 1} 次）")
-        # end_event.record()
-        # torch.cuda.synchronize()
-        # cuda_elapse_ms = start_event.elapsed_time(end_event)
-        # cuda_time = torch.tensor(cuda_elapse_ms)
-        # dist.all_reduce(cuda_time)
-        # if dist.get_rank() == 0:
-        #     print(
-        #         f"model run latency: {(float(cuda_time) / get_dist_context().attn_dp_world_size):.2f} ms\n"
-        #     )
+        run_end_event.record()
+        torch.cuda.synchronize()
 
-        return loop_count_token_ids
+        run_latency = run_start_event.elapsed_time(run_end_event)
+        model_latency_sum = sum(s.elapsed_time(e) for s, e in model_events)
+
+        return loop_count_token_ids, run_latency, model_latency_sum
 
     @torch.inference_mode()
     def capture_cudagraph(self):
