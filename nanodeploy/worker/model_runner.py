@@ -295,41 +295,33 @@ class ModelRunner:
         sp_size = get_dist_context().attn_sp_world_size
         sp_rank = get_dist_context().attn_sp_rank
 
-        valid_block_tables = []
+        master_sp_indices = np.array(
+            [s.block_ctx(self.engine_id).master_sp_idx for s in dp_seqs], dtype=np.int32
+        )
 
-        for sp_idx in range(sp_size):
-            group_seqs = [
-                seq
-                for seq in dp_seqs
-                if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
-            ]
+        sorted_indices = np.argsort(master_sp_indices)
 
-            for seq in group_seqs:
-                bt = seq.block_table(self.engine_id, sp_rank)
-                if len(bt) > 0:
-                    valid_block_tables.append(bt)
+        collected_tables = []
+        max_len = 0
 
-        if not valid_block_tables:
-            max_num_blocks = 0
-        else:
-            max_num_blocks = max(len(bt) for bt in valid_block_tables)
+        for idx in sorted_indices:
+            seq = dp_seqs[idx]
+            bt = seq.block_table(self.engine_id, sp_rank)
+            if bt:
+                collected_tables.append(bt)
+                if len(bt) > max_len:
+                    max_len = len(bt)
 
-        final_table_data = []
-        if max_num_blocks > 0:
-            for bt in valid_block_tables:
-                padding = [-1] * (max_num_blocks - len(bt))
-                final_table_data.append(bt + padding)
+        if not collected_tables:
+            return torch.empty((0, 0), dtype=torch.int32, device="cuda")
 
-        if not final_table_data:
-            block_tables = torch.empty((0, 0), dtype=torch.int32).cuda(
-                non_blocking=True
-            )
-        else:
-            block_tables = torch.tensor(
-                final_table_data, dtype=torch.int32, pin_memory=True
-            ).cuda(non_blocking=True)
+        num_valid_tables = len(collected_tables)
+        padded_table = np.full((num_valid_tables, max_len), -1, dtype=np.int32)
 
-        return block_tables
+        for i, bt in enumerate(collected_tables):
+            padded_table[i, : len(bt)] = bt
+
+        return torch.from_numpy(padded_table).pin_memory().cuda(non_blocking=True)
 
     def prepare_prefill(self, seqs: list[Sequence], is_dummy: bool = False):
         input_ids = []
@@ -400,235 +392,193 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, dp_seqs: list[Sequence], is_dummy: bool = False):
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
         sp_rank = get_dist_context().attn_sp_rank
-
-        for seq in dp_seqs:
-            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank:
-                input_ids.append(seq.last_token)
-                positions.append(len(seq) - 1)
-                slot_mapping.append(
-                    seq.last_block_page_id(self.engine_id, sp_rank)
-                    * get_cache_context().block_size
-                    + seq.last_block_num_tokens(self.engine_id, sp_rank)
-                    - 1
-                )
         sp_size = get_dist_context().attn_sp_world_size
-        sp_seqs = [
-            [
-                seq
-                for seq in dp_seqs
-                if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
-            ]
-            for sp_idx in range(sp_size)
-        ]
-        sp_num_seqs = [len(seqs) for seqs in sp_seqs]
-
-        context_lens_for_attn = []
+        block_size = get_cache_context().block_size
         max_num_seqs = self.config.max_num_seqs
+        max_num_send_recv_seqs = max(
+            self.config.max_num_send_seqs, self.config.max_num_recv_seqs
+        )
 
-        for sp_idx in range(sp_size):
-            current_sp_num = sp_num_seqs[sp_idx]
-            current_context_lens = [0] * max_num_seqs
-            for seq_id in range(current_sp_num):
-                ctx_len = sp_seqs[sp_idx][seq_id].context_len(self.engine_id, sp_rank)
-                current_context_lens[seq_id] = ctx_len
-                if ctx_len > 0:
-                    context_lens_for_attn.append(ctx_len)
-            context_lens.append(current_context_lens)
+        all_master_sp_idx = np.array(
+            [s.block_ctx(self.engine_id).master_sp_idx for s in dp_seqs], dtype=np.int32
+        )
 
-        send_req_num = 0
-        recv_req_num = 0
+        master_indices = np.where(all_master_sp_idx == sp_rank)[0]
 
-        for sp_idx in range(sp_size):
-            if sp_idx == sp_rank:
-                continue
+        input_ids_list = []
+        positions_list = []
+        slot_mapping_list = []
 
-            for seq_id in range(sp_num_seqs[sp_idx]):
-                if context_lens[sp_idx][seq_id] > 0:
-                    recv_req_num += 1
+        for idx in master_indices:
+            seq = dp_seqs[idx]
+            input_ids_list.append(seq.last_token)
+            positions_list.append(len(seq) - 1)
+            slot_mapping_list.append(
+                seq.last_block_page_id(self.engine_id, sp_rank) * block_size
+                + seq.last_block_num_tokens(self.engine_id, sp_rank)
+                - 1
+            )
 
-        for seq in sp_seqs[sp_rank]:
-            has_remote_kv = False
-            for remote_rank in range(sp_size):
-                if remote_rank == sp_rank:
-                    continue
-                if seq.context_len(self.engine_id, remote_rank) > 0:
-                    has_remote_kv = True
-                    break
-            if has_remote_kv:
-                send_req_num += 1
+        # context_lens: [sp_size, max_num_seqs] - 当前 Rank 视角下的长度
+        # global_context_lens: [sp_size, max_num_seqs] - 全局视角下的长度（仅填充当前 Rank 主持的序列）
+        context_lens_np = np.zeros((sp_size, max_num_seqs), dtype=np.int32)
+        global_context_lens_np = np.zeros((sp_size, max_num_seqs), dtype=np.int32)
+
+        sp_num_seqs = np.zeros(sp_size, dtype=np.int32)
+
+        for i, seq in enumerate(dp_seqs):
+            master_idx = all_master_sp_idx[i]
+            local_seq_idx = sp_num_seqs[master_idx]
+
+            if local_seq_idx < max_num_seqs:
+                ctx_len = seq.context_len(self.engine_id, sp_rank)
+                context_lens_np[master_idx, local_seq_idx] = ctx_len
+
+                if master_idx == sp_rank:
+                    for remote_rank in range(sp_size):
+                        global_context_lens_np[remote_rank, local_seq_idx] = (
+                            seq.context_len(self.engine_id, remote_rank)
+                        )
+
+            sp_num_seqs[master_idx] += 1
+
+        sp_valid_request_counts = np.sum(context_lens_np > 0, axis=1)
+        attention_compute_bs = np.sum(sp_valid_request_counts)
+
+        context_lens_for_attn_np = context_lens_np[context_lens_np > 0]
+
+        # 计算 recv_req_num: 其他 Rank 的序列在当前 Rank 有长度
+        recv_mask = context_lens_np.copy()
+        recv_mask[sp_rank, :] = 0
+        recv_req_num = np.sum(recv_mask > 0)
+
+        # 计算 send_req_num: 当前 Rank 的序列在其他 Rank 有长度
+        send_req_check = global_context_lens_np[:, : sp_num_seqs[sp_rank]]
+        seq_needs_send_mask = np.any(
+            np.delete(send_req_check, sp_rank, axis=0) > 0, axis=0
+        )
+        send_req_num = np.sum(seq_needs_send_mask)
 
         if (
             send_req_num > self.config.max_num_send_seqs
             or recv_req_num > self.config.max_num_recv_seqs
         ):
             raise ValueError(
-                f"send_req_num({send_req_num}) or recv_req_num({recv_req_num}) exceeds max_num_send_seqs({self.config.max_num_send_seqs}) or max_num_recv_seqs({self.config.max_num_recv_seqs})"
+                f"send_req_num({send_req_num}) or recv_req_num({recv_req_num}) "
+                f"exceeds max limits ({self.config.max_num_send_seqs}, {self.config.max_num_recv_seqs})"
             )
 
-        global_context_lens = [
-            [
-                (
-                    sp_seqs[sp_rank][seq_id].context_len(self.engine_id, sp_idx)
-                    if seq_id < sp_num_seqs[sp_rank]
-                    else 0
-                )
-                for seq_id in range(self.config.max_num_seqs)
-            ]
-            for sp_idx in range(sp_size)
-        ]
+        q_slice_get = np.where(context_lens_np[sp_rank, :] > 0)[0].astype(np.int32)
 
-        # context_lens: 每个 SP 分片的每个序列，在当前 GPU 视角下的上下文长度
-        # global_context_lens: 当前 SP 分片的每个序列，在其他 SP 分片视角下的上下文长度
+        offsets = np.zeros(sp_size + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(sp_valid_request_counts)
 
-        # 计算每个SP分片的有效请求数
-        sp_valid_request_counts = [
-            sum(1 for val in sp_ctx_len if val > 0) for sp_ctx_len in context_lens
-        ]
+        start_pos = offsets[sp_rank]
+        q_slice_fill = np.arange(
+            start_pos, start_pos + len(q_slice_get), dtype=np.int32
+        )
+        q_copy_mask = np.ones(len(q_slice_get), dtype=np.int32)
 
-        attention_compute_bs = sum(sp_valid_request_counts)
+        res_slice_get_to_buffer_output = q_slice_fill
+        res_slice_fill_to_buffer_output = (sp_rank * max_num_seqs + q_slice_get).astype(
+            np.int32
+        )
+        res_to_buffer_output_mask = np.ones(
+            len(res_slice_get_to_buffer_output), dtype=np.int32
+        )
 
-        # 计算q_slice_get - 本地需要获取的序列索引 Q -> All2All Q Output Buffer
-        q_slice_get = []
-        for seq_id in range(sp_num_seqs[sp_rank]):
-            if context_lens[sp_rank][seq_id] > 0:
-                q_slice_get.append(seq_id)
-
-        # 计算q_slice_fill - 在全局缓冲区中的填充位置 Q -> All2All Q Output Buffer
-        q_slice_fill = []
-        current_pos = 0
-        for sp_idx in range(sp_size):
-            if sp_idx == sp_rank:
-                # 对于当前rank，位置从current_pos开始连续分配
-                for i in range(len(q_slice_get)):
-                    q_slice_fill.append(current_pos + i)
-                current_pos += sp_valid_request_counts[sp_idx]
-            else:
-                # 对于其他rank，跳过相应的位置
-                current_pos += sp_valid_request_counts[sp_idx]
-
-        # 计算q_copy_mask - q copy操作的掩码（1表示有效copy）
-        q_copy_mask = [1] * len(q_slice_get)
-
-        # 在 Attention Output 中获取 Master Rank 是自己 Rank 的 Attention Output -> All2All Res Output Buffer
-        res_slice_get_to_buffer_output = q_slice_fill.copy()
-
-        # 在全局缓冲区中的填充位置 Res -> All2All Res Output Buffer
-        res_slice_fill_to_buffer_output = [
-            sp_rank * self.config.max_num_seqs + seq_index for seq_index in q_slice_get
-        ]
-
-        # 计算res_to_buffer_output_mask
-        res_to_buffer_output_mask = [1] * len(res_slice_get_to_buffer_output)
-
-        # 在 Attention Output 中获取 Master Rank 非自己 Rank 的 Attention Output -> All2All Res Output Buffer
         res_slice_get_to_buffer_input = []
-        # 在全局缓冲区中的填充位置 Res -> All2All Res Output Buffer
         res_slice_fill_to_buffer_input = []
 
-        current_attention_pos = 0
         for sp_idx in range(sp_size):
             if sp_idx == sp_rank:
-                # 跳过自己Rank的序列，它们的位置用于res_slice_get_to_buffer_output
-                current_attention_pos += sp_valid_request_counts[sp_idx]
                 continue
 
-            # 处理非自己Rank的序列
-            for seq_id in range(sp_num_seqs[sp_idx]):
-                if context_lens[sp_idx][seq_id] > 0:  # 该序列在当前rank有context_len
-                    res_slice_get_to_buffer_input.append(current_attention_pos)
-                    res_slice_fill_to_buffer_input.append(
-                        sp_idx * self.config.max_num_seqs + seq_id
-                    )
-                    current_attention_pos += 1
+            valid_indices = np.where(
+                context_lens_np[sp_idx, : sp_num_seqs[sp_idx]] > 0
+            )[0]
 
-        # 计算res_to_buffer_input_mask
-        res_to_buffer_input_mask = [1] * len(res_slice_get_to_buffer_input)
+            if len(valid_indices) > 0:
+                count = len(valid_indices)
+                base_pos = offsets[sp_idx]
 
-        def pad_to_size(arr, size, pad_value=-1):
-            if len(arr) >= size:
-                return arr[:size]
-            else:
-                return arr + [pad_value] * (size - len(arr))
+                slice_get = np.arange(base_pos, base_pos + count, dtype=np.int32)
+                res_slice_get_to_buffer_input.append(slice_get)
 
-        q_slice_get_tensor = torch.tensor(
-            q_slice_get, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+                slice_fill = (sp_idx * max_num_seqs + valid_indices).astype(np.int32)
+                res_slice_fill_to_buffer_input.append(slice_fill)
 
-        q_slice_fill_tensor = torch.tensor(
-            q_slice_fill, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+        if res_slice_get_to_buffer_input:
+            res_slice_get_to_buffer_input = np.concatenate(
+                res_slice_get_to_buffer_input
+            )
+            res_slice_fill_to_buffer_input = np.concatenate(
+                res_slice_fill_to_buffer_input
+            )
+        else:
+            res_slice_get_to_buffer_input = np.array([], dtype=np.int32)
+            res_slice_fill_to_buffer_input = np.array([], dtype=np.int32)
 
-        q_copy_mask_tensor = torch.tensor(
-            q_copy_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        res_slice_get_to_buffer_output_tensor = torch.tensor(
-            res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        res_slice_fill_to_buffer_output_tensor = torch.tensor(
-            res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        res_to_buffer_output_mask_tensor = torch.tensor(
-            res_to_buffer_output_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        max_num_send_recv_seqs = max(
-            self.config.max_num_send_seqs, self.config.max_num_recv_seqs
+        res_to_buffer_input_mask = np.ones(
+            len(res_slice_get_to_buffer_input), dtype=np.int32
         )
 
-        res_slice_get_to_buffer_input_tensor = torch.tensor(
-            pad_to_size(res_slice_get_to_buffer_input, max_num_send_recv_seqs, -1),
-            dtype=torch.int32,
-            pin_memory=True,
-        ).cuda(non_blocking=True)
+        def to_gpu_tensor(np_array, dtype=np.int32, pad_to=None, pad_val=0):
+            if pad_to is not None and np_array.size < pad_to:
+                padding = np.full(pad_to - np_array.size, pad_val, dtype=dtype)
+                np_array = np.concatenate((np_array, padding))
+            elif pad_to is not None and np_array.size >= pad_to:
+                np_array = np_array[:pad_to]
 
-        res_slice_fill_to_buffer_input_tensor = torch.tensor(
-            pad_to_size(res_slice_fill_to_buffer_input, max_num_send_recv_seqs, -1),
-            dtype=torch.int32,
-            pin_memory=True,
-        ).cuda(non_blocking=True)
+            return (
+                torch.from_numpy(np_array.astype(dtype))
+                .pin_memory()
+                .cuda(non_blocking=True)
+            )
 
-        res_to_buffer_input_mask_tensor = torch.tensor(
-            pad_to_size(res_to_buffer_input_mask, max_num_send_recv_seqs, 0),
-            dtype=torch.int32,
-            pin_memory=True,
-        ).cuda(non_blocking=True)
+        input_ids = to_gpu_tensor(np.array(input_ids_list), dtype=np.int64)
+        positions = to_gpu_tensor(np.array(positions_list), dtype=np.int64)
+        slot_mapping = to_gpu_tensor(np.array(slot_mapping_list), dtype=np.int32)
 
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
-            non_blocking=True
-        )
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(
-            non_blocking=True
-        )
-        slot_mapping = torch.tensor(
-            slot_mapping, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        context_lens = torch.tensor(
-            context_lens, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        context_lens_for_attn = torch.tensor(
-            context_lens_for_attn, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        global_context_lens = torch.tensor(
-            global_context_lens, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+        context_lens = to_gpu_tensor(context_lens_np)
+        context_lens_for_attn = to_gpu_tensor(context_lens_for_attn_np)
+        global_context_lens = to_gpu_tensor(global_context_lens_np)
+
         block_tables = self.prepare_block_tables(dp_seqs)
-        q_mask = global_context_lens.clone()
+
+        q_mask = (global_context_lens != 0).int()
         q_mask[sp_rank].fill_(0)
-        q_mask[q_mask != 0] = 1
-        res_lse_mask = context_lens.clone()
+
+        res_lse_mask = (context_lens != 0).int()
         res_lse_mask[sp_rank].fill_(0)
-        res_lse_mask[res_lse_mask != 0] = 1
+
+        q_slice_get_tensor = to_gpu_tensor(q_slice_get)
+        q_slice_fill_tensor = to_gpu_tensor(q_slice_fill)
+        q_copy_mask_tensor = to_gpu_tensor(q_copy_mask)
+
+        res_slice_get_to_buffer_output_tensor = to_gpu_tensor(
+            res_slice_get_to_buffer_output
+        )
+        res_slice_fill_to_buffer_output_tensor = to_gpu_tensor(
+            res_slice_fill_to_buffer_output
+        )
+        res_to_buffer_output_mask_tensor = to_gpu_tensor(res_to_buffer_output_mask)
+
+        res_slice_get_to_buffer_input_tensor = to_gpu_tensor(
+            res_slice_get_to_buffer_input, pad_to=max_num_send_recv_seqs, pad_val=-1
+        )
+        res_slice_fill_to_buffer_input_tensor = to_gpu_tensor(
+            res_slice_fill_to_buffer_input, pad_to=max_num_send_recv_seqs, pad_val=-1
+        )
+        res_to_buffer_input_mask_tensor = to_gpu_tensor(
+            res_to_buffer_input_mask, pad_to=max_num_send_recv_seqs, pad_val=0
+        )
 
         config = self.config
         hf_config = config.hf_config
+        new_tile_scheduler_metadata, new_num_splits = None, None
+
         if hf_config.num_key_value_heads == 1:
             padded_context_lens = pad_context_lens(
                 context_lens_for_attn, self.graph_attn_compute_bs, self.enforce_eager
@@ -638,11 +588,6 @@ class ModelRunner:
                 hf_config.num_attention_heads // hf_config.num_key_value_heads,
                 hf_config.num_key_value_heads,
             )
-        else:
-            new_tile_scheduler_metadata, new_num_splits = None, None
-
-        # print(f"prepare_decode, context_lens_for_attn.shape={context_lens_for_attn.shape}",flush=True)
-        # print(f"prepare_decode, block_tables.shape={block_tables.shape}",flush=True)
 
         set_context(
             is_prefill=False,
@@ -666,7 +611,7 @@ class ModelRunner:
             res_slice_get_to_buffer_input=res_slice_get_to_buffer_input_tensor,
             res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input_tensor,
             res_to_buffer_input_mask=res_to_buffer_input_mask_tensor,
-            attention_compute_bs=attention_compute_bs,
+            attention_compute_bs=int(attention_compute_bs),
         )
 
         return input_ids, positions
@@ -674,47 +619,40 @@ class ModelRunner:
     def update_decode(
         self, input_ids: torch.Tensor, positions: torch.Tensor, dp_seqs: list[Sequence]
     ):
-        # update position
+        sp_rank = get_dist_context().attn_sp_rank
+        context = get_context()
+        block_size = get_cache_context().block_size
 
         positions.add_(1)
 
-        sp_rank = get_dist_context().attn_sp_rank
-        num_sp_seqs = sum(
-            1
+        target_slots = [
+            seq.last_block_page_id(self.engine_id, sp_rank) * block_size
+            + seq.last_block_num_tokens(self.engine_id, sp_rank)
+            - 1
             for seq in dp_seqs
             if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank
-        )
+        ]
 
-        # update slot mapping
+        num_sp_seqs = len(target_slots)
 
-        slot_mapping = []
-        for seq in dp_seqs:
-            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank:
-                slot_mapping.append(
-                    seq.last_block_page_id(self.engine_id, sp_rank)
-                    * get_cache_context().block_size
-                    + seq.last_block_num_tokens(self.engine_id, sp_rank)
-                    - 1
-                )
-        # update context
+        if num_sp_seqs > 0:
+            slots_np = np.array(target_slots, dtype=np.int32)
+            context.slot_mapping = (
+                torch.from_numpy(slots_np).pin_memory().cuda(non_blocking=True)
+            )
+        else:
+            context.slot_mapping = torch.empty(0, dtype=torch.int32, device="cuda")
 
-        context = get_context()
+        if num_sp_seqs > 0:
+            context.context_lens[sp_rank][:num_sp_seqs].add_(1)
 
-        context.slot_mapping = torch.tensor(
-            slot_mapping, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+        if num_sp_seqs > 0:
+            context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
 
-        # update context length
+        context.context_lens_for_attn = context.context_lens.flatten()[
+            context.context_lens.flatten() > 0
+        ]
 
-        context.context_lens[sp_rank][:num_sp_seqs].add_(1)
-
-        # update global context length
-
-        context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
-
-        # TODO: update context_lens_for_attn
-
-        # update mla metadata
         config = self.config
         hf_config = config.hf_config
         if hf_config.num_key_value_heads == 1:
