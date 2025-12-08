@@ -1,7 +1,7 @@
 import enum
 from collections import deque
 from itertools import count
-from typing import Literal, TYPE_CHECKING
+from typing import List, Literal, postprocess_step, TYPE_CHECKING
 
 import numpy as np
 
@@ -9,6 +9,7 @@ from nanodeploy.config import Config
 from nanodeploy.engine.block_manager import BlockManager
 from nanodeploy.engine.sequence import Sequence, SequenceStatus
 from nanodeploy.logging import get_logger
+
 if TYPE_CHECKING:
     from nanodeploy.metrics import MetricsManager
 
@@ -102,13 +103,11 @@ class SPStateManager:
         block_ctx = seq.block_ctx(self.engine_id)
         block_ctx.num_dispatched_tokens.clear()
 
-        num_segments = (seq.num_tokens + self._segment_size -
-                        1) // self._segment_size
+        num_segments = (seq.num_tokens + self._segment_size - 1) // self._segment_size
         num_segments_per_rank = (
             num_segments + self.attention_sp - 1
         ) // self.attention_sp
-        num_ranks = (num_segments + num_segments_per_rank -
-                     1) // num_segments_per_rank
+        num_ranks = (num_segments + num_segments_per_rank - 1) // num_segments_per_rank
 
         master_rank = next(self.sp_rr_counter)
 
@@ -267,8 +266,7 @@ class Scheduler:
                 ):
                     if self.running(selected_dp_idx):
                         self.preempt(
-                            selected_dp_idx, self.running(
-                                selected_dp_idx).pop()
+                            selected_dp_idx, self.running(selected_dp_idx).pop()
                         )
                     else:
                         self.preempt(selected_dp_idx, seq)
@@ -286,8 +284,7 @@ class Scheduler:
         for dp_idx, dp_seqs in enumerate(scheduled_seqs):
             sp_lens = [0 for _ in range(self.attention_sp)]
             for seq in dp_seqs:
-                sp_lens[seq.block_ctx(
-                    self.engine_id).master_sp_idx] += len(seq)
+                sp_lens[seq.block_ctx(self.engine_id).master_sp_idx] += len(seq)
 
             for sp_idx in range(self.attention_sp):
                 if sp_lens[sp_idx] == 0:
@@ -320,45 +317,39 @@ class Scheduler:
 
     def postprocess(
         self,
-        dp_seqs: list[list[list[Sequence]]],
-        dp_token_ids: list[list[list[list[int]]]],
+        dp_seqs: List[List[List[Sequence]]],
+        dp_token_ids: List[List[List[List[int]]]],
         metrics_manager: "MetricsManager | None" = None,
     ):
-        for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
-            for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
-                for _, (seq, loop_count_token_id) in enumerate(zip(seqs, token_ids)):
-                    if seq in self.worker_state[dp_idx].dummy_seqs:
-                        continue
-                    for token_id in loop_count_token_id:
-                        assert sp_idx == seq.block_ctx(
-                            self.engine_id).master_sp_idx
-                        seq.append_token(
-                            token_id, engine_id=self.engine_id, sp_idx=sp_idx
-                        )
+        dp_dummy_seqs = [ws.dummy_seqs for ws in self.worker_state]
 
-                        if metrics_manager and seq.metric:
-                            if seq.metric.num_generated_tokens == 0:
-                                # First token just generated
-                                seq.metric.record_first_token()
-                                seq.metric.num_generated_tokens = 1
-                            else:
-                                # Subsequent tokens - record ITL
-                                seq.metric.record_token()
+        postprocess_result = postprocess_step(
+            dp_seqs,
+            dp_token_ids,
+            dp_dummy_seqs,
+            self.engine_id,
+            self.eos,
+            self.mode == "prefill",
+            metrics_manager,
+        )
 
-                        if (
-                            not seq.ignore_eos and token_id == self.eos
-                        ) or seq.num_completed_tokens == seq.max_tokens:
-                            seq.status = SequenceStatus.FINISHED
-                            self.worker_state[dp_idx].deallocate(seq)
-                            self.running(dp_idx).remove(seq)
-                            break
-                        elif self.mode == "prefill":
-                            seq.status = SequenceStatus.TO_BE_MIGRATED
-                            seq.backup_engine_id = seq.active_engine_id
-                            seq.active_engine_id = None
-                            self.running(dp_idx).remove(seq)
-                            self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
-                            break
+        finished_list = postprocess_result.finished
+        migrated_list = postprocess_result.migrated
+
+        for dp_idx, seq in finished_list:
+            self.worker_state[dp_idx].deallocate(seq)
+            try:
+                self.running(dp_idx).remove(seq)
+            except ValueError:
+                pass
+
+        for dp_idx, seq in migrated_list:
+            # 已经在 C++ 设置了 seq.status, backup_engine_id 等
+            try:
+                self.running(dp_idx).remove(seq)
+            except ValueError:
+                pass
+            self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):
