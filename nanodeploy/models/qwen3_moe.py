@@ -3,9 +3,7 @@ from typing import Dict
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
 from dlblas.layers.moe.ep_moe import build_deepep_moe
-
 from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -19,7 +17,6 @@ from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
 from nanodeploy.worker.runner_config import get_runner_config
-
 from torch import nn
 from transformers import Qwen3MoeConfig
 
@@ -89,8 +86,10 @@ class Qwen3MoeAttention(nn.Module):
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
+            self.head_dim,
             self.scaling,
             self.num_kv_heads,
+            "GQA",
         )
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -128,6 +127,7 @@ class Qwen3MoeMLP(nn.Module):
         quantization_config: QuantizationConfig | None = None,
     ) -> None:
         # by now, all FFN layers are SparseMLP
+
         super().__init__()
 
         self.config = config
@@ -204,6 +204,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
 
         # gating
+
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
 
         weight_dtype = quantization_config.dtype or config.dtype
@@ -211,6 +212,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.tp_size = get_dist_context().ffn_tp_world_size
 
         # global parameter for DeepGEMM
+
         self.gate_up_proj = nn.Parameter(
             torch.ones(
                 self.num_experts_per_rank,
@@ -260,7 +262,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 if quantization_config.quant_method == "fp8"
                 else None
             )
-
         local_expert_id = lambda i: i - self.expert_list_this_rank[0]
         is_local_expert = lambda i: i in self.expert_list_this_rank
 
@@ -307,7 +308,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 layer_idx=0,
                 chunk_size=16 * 1024,
             )
-
         self.act_fn = config.hidden_act
 
     def fusedmoe_build(self, low_latency_mode):
@@ -379,6 +379,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
             # we cast back to the input dtype
+
             routing_weights = routing_weights.to(hidden_states.dtype)
 
             final_hidden_states = torch.zeros(
@@ -389,6 +390,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
             # One hot encode the selected experts to create an expert mask
             # this will be used to easily index which expert is going to be sollicitated
+
             expert_mask = torch.nn.functional.one_hot(
                 selected_experts, num_classes=self.num_experts
             ).permute(2, 1, 0)
@@ -400,6 +402,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 # Index the correct hidden states and compute the expert hidden state for
                 # the current expert. We need to make sure to multiply the output hidden
                 # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+
                 current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
                 current_hidden_states = (
                     expert_layer(current_state) * routing_weights[top_x, idx, None]
@@ -407,6 +410,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
                 # However `index_add_` only support torch tensors for indexing so we'll use
                 # the `top_x` tensor here.
+
                 final_hidden_states.index_add_(
                     0, top_x, current_hidden_states.to(hidden_states.dtype)
                 )
@@ -451,7 +455,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 config=config,
                 quantization_config=quantization_config,
             )
-
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -468,8 +471,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
         # all_gather
+
         hidden_states = self.self_attn(positions, hidden_states)
         # all_to_all
 

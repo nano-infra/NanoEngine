@@ -3,11 +3,9 @@ from typing import List
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
 from nanodeploy.kernels.block_gemm_fp8 import deep_gemm_fp8, quant_fp8_tma
 from nanodeploy.models.quant_config import QuantizationConfig
 from nanodeploy.worker.distributed import get_dist_context
-
 from torch import nn
 
 
@@ -58,14 +56,14 @@ class LinearBase(nn.Module):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
-
+        n_blk_size, k_blk_size = quantization_config.block_size
         if scale_tensor is not None:
             self.weight_scale_inv = nn.Parameter(scale_tensor)
         elif quantization_config.quant_method == "fp8":
             self.weight_scale_inv = nn.Parameter(
                 torch.empty(
-                    output_size // quantization_config.block_size[0],
-                    input_size // quantization_config.block_size[1],
+                    (output_size + n_blk_size - 1) // n_blk_size,
+                    (input_size + k_blk_size - 1) // k_blk_size,
                     dtype=torch.float32,
                     device=device,
                 )
@@ -94,7 +92,6 @@ class LinearBase(nn.Module):
             out = out[: x.size(0)]
             if self.bias is not None:
                 out += self.bias
-
             return out
         else:
             raise AttributeError(f"Unsupported Quant Method")
@@ -147,7 +144,6 @@ class ReplicatedLinear(LinearBase):
             out = out[: x.size(0)]
             if self.bias is not None:
                 out += self.bias
-
             return out
         else:
             raise AttributeError(f"Unsupported Quant Method")
@@ -206,7 +202,6 @@ class ColumnParallelLinear(LinearBase):
             out = out[: x.size(0)]
             if self.bias is not None:
                 out += self.bias
-
             return out
         else:
             raise AttributeError(f"Unsupported Quant Method")
@@ -381,7 +376,6 @@ class RowParallelLinear(LinearBase):
             out = out[: x.size(0)]
             if self.bias is not None:
                 out += self.bias
-
             out = out.unflatten(0, x_shape[:-1])
             if self.tp_size > 1:
                 dist.all_reduce(out, group=get_dist_context().attn_tp_group)

@@ -6,15 +6,14 @@ from time import perf_counter
 from typing import Literal
 
 import numpy as np
-from tqdm.auto import tqdm
-from transformers import AutoTokenizer
-
 from nanodeploy.config import Config
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.metrics import MetricsManager
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer
 
 
 logger = get_logger()
@@ -39,7 +38,10 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+
+        # Initialize metrics manager
         self.metrics_manager = MetricsManager()
+
         atexit.register(self.exit)
 
     def exit(self):
@@ -55,6 +57,7 @@ class LLMEngine:
             seq.set_engine_id(
                 self.engine_id, self.config.attention_dp, self.config.attention_sp
             )
+            # Create sequence metric
             seq.metric = self.metrics_manager.create_sequence_metric(
                 seq.seq_id, seq.num_prompt_tokens
             )
@@ -69,17 +72,15 @@ class LLMEngine:
         tp_size = self.config.attention_tp
         sch_begin = time.time()
         dp_seqs, is_prefill = self.scheduler.schedule()
+
+        # Update server metrics - running and waiting requests
         total_running = sum(len(seqs) for seqs in dp_seqs)
-        total_waiting = len(self.scheduler.waiting)
-        total_waiting_migration = len(self.scheduler.waiting_migration)
+        total_waiting = len(self.scheduler.waiting) + len(
+            self.scheduler.waiting_migration
+        )
         self.metrics_manager.server_metric.update_running_requests(total_running)
         self.metrics_manager.server_metric.update_waiting_requests(total_waiting)
-        self.metrics_manager.server_metric.update_waiting_migration_requests(
-            total_waiting_migration
-        )
 
-        if self.scheduler.waiting_migration:
-            logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
         # TODO (JimyMa): For loop
         filtered_dp_sp_seqs = [
             [
@@ -98,28 +99,6 @@ class LLMEngine:
         ]
 
         dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
-        dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
-        sp_batch_sizes = [
-            [
-                len(filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx])
-                for sp_idx in range(sp_size)
-            ]
-            for dp_idx in range(dp_size)
-        ]
-
-        logger.info(
-            {
-                "dp_batch_sizes": dp_batch_sizes,
-                "sp_batch_sizes": sp_batch_sizes,
-                "free_blocks": [
-                    [
-                        len(worker_state.block_manager[i].free_block_ids)
-                        for i in range(self.scheduler.attention_sp)
-                    ]
-                    for worker_state in self.scheduler.worker_state
-                ],
-            }
-        )
 
         sch_end = time.time()
         post_sch_begin = 0
@@ -137,19 +116,7 @@ class LLMEngine:
             else:
                 [[seq.append_token(0) for seq in seqs] for seqs in dp_seqs]
         else:
-            model_begin = time.time()
-            token_ids, worker_run_latencies, worker_model_latencies = self.executor.run(
-                dp_sp_tp_seqs, is_prefill
-            )[::tp_size]
-            model_end = time.time()
-            model_latency = (model_end - model_begin) * 1000
-
-            logger.info(f"Call self.executor.run Time: {model_latency:.2f} ms")
-            formatted_run_lats = [f"{x:.3f}" for x in worker_run_latencies]
-            formatted_model_lats = [f"{x:.3f}" for x in worker_model_latencies]
-            logger.info(f"Worker GPU Run Latencies (ms): {formatted_run_lats}")
-            logger.info(f"Worker GPU Model Latencies (ms): {formatted_model_lats}")
-
+            token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
             post_sch_begin = time.time()
             token_ids = [
                 token_ids[i * sp_size : (i + 1) * sp_size] for i in range(0, dp_size)
@@ -162,33 +129,27 @@ class LLMEngine:
                 filtered_dp_sp_seqs, token_ids, self.metrics_manager
             )
             post_sch_end = time.time()
-        outputs = []
-        num_tokens = 0
 
+        # Update token usage per DP rank
         for dp_idx, seqs in enumerate(dp_seqs):
             num_tokens_in_dp = sum(len(seq) for seq in seqs)
             self.metrics_manager.server_metric.update_token_usage(
                 dp_idx, num_tokens_in_dp
             )
 
+        outputs = []
+        num_tokens = 0
         for seqs in dp_seqs:
-            outputs.extend(
-                [
-                    (seq.seq_id, seq.completion_token_ids)
-                    for seq in seqs
-                    if seq.is_finished
-                ]
-            )
-            num_tokens += (
-                sum(len(seq) for seq in seqs)
-                if is_prefill
-                else -len(seqs) * self.config.loop_count
-            )
             for seq in seqs:
                 if seq.is_finished:
                     # Complete sequence metric and log
                     self.metrics_manager.complete_sequence(seq.seq_id)
                     outputs.append((seq.seq_id, seq.completion_token_ids))
+            num_tokens += (
+                sum(len(seq) for seq in seqs)
+                if is_prefill
+                else -len(seqs) * self.config.loop_count
+            )
         return (
             outputs,
             num_tokens,
@@ -228,18 +189,27 @@ class LLMEngine:
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens, bs, sch_latency, post_sch_latency = self.step()
+            step_duration = perf_counter() - t
+
+            # Record throughput metrics
+            if num_tokens > 0:
+                prefill_throughput = num_tokens / step_duration
+                self.metrics_manager.server_metric.record_prefill_throughput(
+                    num_tokens, step_duration
+                )
+            else:
+                decode_throughput = -num_tokens / step_duration
+                self.metrics_manager.server_metric.record_decode_throughput(
+                    -num_tokens, step_duration
+                )
+
+            # Log server metrics periodically
+            step_count += 1
+            if step_count % log_metrics_interval == 0:
+                self.metrics_manager.log_server_metrics(include_detailed=False)
+
             if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                    self.metrics_manager.server_metric.record_prefill_throughput(
-                        num_tokens, (perf_counter() - t)
-                    )
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                    self.metrics_manager.server_metric.record_decode_throughput(
-                        -num_tokens, (perf_counter() - t)
-                    )
-                itl = (perf_counter() - t) * 1000 / self.config.loop_count
+                itl = step_duration * 1000 / self.config.loop_count
                 pbar.set_postfix(
                     {
                         "bs": f"{bs}",
@@ -257,6 +227,7 @@ class LLMEngine:
         if use_tqdm:
             pbar.close()
 
+        # Log final server metrics
         logger.info("=" * 60)
         logger.info("Final Server Metrics Summary")
         logger.info("=" * 60)

@@ -70,7 +70,7 @@ def kernel_inter_rank_gqa_fwd_batch_decode_combine_kv(
 def inter_rank_gqa_fwd_batch_decode_combine_kv(
     all_ranks_output_combine: torch.Tensor,
     all_ranks_lse_output_combine: torch.Tensor,
-    context_lens: torch.Tensor,
+    global_context_lens: torch.Tensor,
     num_attention_heads: int,
     v_head_dim: int,
     max_num_seqs: int,
@@ -87,7 +87,7 @@ def inter_rank_gqa_fwd_batch_decode_combine_kv(
         all_ranks_output_combine,
         all_ranks_lse_output_combine,
         final_output,
-        context_lens,
+        global_context_lens,
         max_num_seqs,
         num_attention_heads,
         all_ranks_output_combine.stride(1),  # batch stride for output
