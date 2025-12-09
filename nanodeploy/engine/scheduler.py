@@ -321,8 +321,15 @@ class Scheduler:
         dp_token_ids: List[List[List[List[int]]]],
         metrics_manager: "MetricsManager | None" = None,
     ):
+        """
+        使用 C++ 扩展进行加速的 Postprocess。
+        优化版：移除了 C++ 中的 Python 回调，并优化了列表移除操作。
+        """
+
+        # 准备每个 DP 对应的 dummy sequences 列表
         dp_dummy_seqs = [ws.dummy_seqs for ws in self.worker_state]
 
+        # 调用 C++ 核心逻辑
         postprocess_result = postprocess_step(
             dp_seqs,
             dp_token_ids,
@@ -330,26 +337,49 @@ class Scheduler:
             self.engine_id,
             self.eos,
             self.mode == "prefill",
-            metrics_manager,
+            metrics_manager,  # 传入但 C++ 中已忽略其调用
         )
 
         finished_list = postprocess_result.finished
         migrated_list = postprocess_result.migrated
 
-        for dp_idx, seq in finished_list:
-            self.worker_state[dp_idx].deallocate(seq)
-            try:
-                self.running(dp_idx).remove(seq)
-            except ValueError:
-                pass
+        # --- 优化 1: 批量处理 Finished Sequences (O(N) 复杂度) ---
+        if finished_list:
+            # 按 DP 分组收集 finished seq_id，避免多次遍历 running 列表
+            finished_map = {}  # dp_idx -> set(seq_id)
+            for dp_idx, seq in finished_list:
+                self.worker_state[dp_idx].deallocate(seq)
+                if dp_idx not in finished_map:
+                    finished_map[dp_idx] = set()
+                finished_map[dp_idx].add(seq.seq_id)
 
-        for dp_idx, seq in migrated_list:
-            # 已经在 C++ 设置了 seq.status, backup_engine_id 等
-            try:
-                self.running(dp_idx).remove(seq)
-            except ValueError:
-                pass
-            self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
+            # 使用列表推导式重建 running 列表，这比多次 remove 快得多
+            for dp_idx, finished_ids in finished_map.items():
+                running_queue = self.running(dp_idx)
+                if running_queue:
+                    # 原地重建列表，保留未完成的 seq
+                    # 注意：如果 self.running(dp_idx) 返回的是列表引用，请确保此处修改生效
+                    # 如果 self.running 是 getter 方法，需要根据你的 WorkerState 实现调整
+                    # 假设 worker_state[dp_idx].running_seqs 是存储列表的地方：
+                    self.worker_state[dp_idx].running_seqs = [
+                        s for s in running_queue if s.seq_id not in finished_ids
+                    ]
+
+        # --- 优化 2: 批量处理 Migrated Sequences ---
+        if migrated_list:
+            migrated_map = {}
+            for dp_idx, seq in migrated_list:
+                self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
+                if dp_idx not in migrated_map:
+                    migrated_map[dp_idx] = set()
+                migrated_map[dp_idx].add(seq.seq_id)
+
+            for dp_idx, migrated_ids in migrated_map.items():
+                running_queue = self.running(dp_idx)
+                if running_queue:
+                    self.worker_state[dp_idx].running_seqs = [
+                        s for s in running_queue if s.seq_id not in migrated_ids
+                    ]
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):

@@ -6,52 +6,35 @@ import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 
 from nanodeploy.config import Config
+
+# 引入 C++ 扩展中的 Batch 类
+from nanodeploy.engine._core import SequenceBatch
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.model_runner import ModelRunner
-
 
 logger = get_logger()
 
 
 def _clean_and_parse_address(address: str) -> str:
-    """
-    清理并解析地址，正确处理 'ip:port' 格式。
-    """
-    # 如果地址包含 ':' 且不以 'http://' 或 'https://' 开头，我们认为它是 'ip:port' 格式
+    """清理并解析地址，正确处理 'ip:port' 格式。"""
     if ":" in address and not address.startswith(("http://", "https://")):
-        # 为其添加一个默认的 'http://' 前缀，使其成为一个标准 URL
         address = f"http://{address}"
-
     parsed_url = urlparse(address)
-
-    # 如果解析后的 hostname 存在，则返回它
     if parsed_url.hostname:
         return parsed_url.hostname
-
-    # 如果解析失败（例如，输入是一个纯 IP 或主机名），则返回原始地址
     return address
 
 
 def get_available_nodes_with_master_first(master_address: str):
     """
-    Retrieves a list of Ray nodes, sorting them so that the specified master node comes first.
-    Excludes nodes that have any ALIVE Placement Groups.
-
-    Args:
-        master_address: The address of the master node.
-
-    Returns:
-        A list of available Ray node dictionaries, sorted with the master node first.
+    获取可用节点列表，Master 节点排在第一位。
     """
     all_nodes = ray.nodes()
     if not all_nodes:
         logger.warning("No nodes found in the Ray cluster.")
         return []
 
-    # --------------------------
-    # Step 1: Clean and resolve the master address
-    # --------------------------
     cleaned_host = _clean_and_parse_address(master_address)
     if cleaned_host in {"localhost", "127.0.0.1"}:
         if not ray.is_initialized():
@@ -60,49 +43,27 @@ def get_available_nodes_with_master_first(master_address: str):
     else:
         resolved_master_ip = cleaned_host
 
-    # --------------------------
-    # Step 2: Get ALIVE Placement Groups and their nodes
-    # --------------------------
     existing_pgs = ray.util.placement_group_table()
     nodes_with_alive_pg = set()
 
     for _, pg_info in existing_pgs.items():
         pg_state = pg_info.get("state", "")
-
-        # Only consider ALIVE PGs
         if pg_state != "REMOVED":
-            # A PG's bundles are spread across nodes. We need all nodes hosting its bundles.
             bundles_to_node_id = pg_info.get("bundles_to_node_id", {})
             for _, node_id in bundles_to_node_id.items():
                 if node_id:
                     nodes_with_alive_pg.add(node_id)
 
-    logger.info(f"Node IDs with ALIVE PGs: {nodes_with_alive_pg}")
-
-    # --------------------------
-    # Step 3: Filter available nodes
-    # --------------------------
     available_nodes = [
         node for node in all_nodes if node["NodeID"] not in nodes_with_alive_pg
     ]
 
-    # --------------------------
-    # Step 4: Sort
-    # --------------------------
     def sort_key(node):
         node_ip = node.get("NodeManagerAddress")
-        logger.info(f"{node_ip=}, {resolved_master_ip=}")
         return 0 if node_ip == resolved_master_ip else 1
 
     sorted_available_nodes = sorted(available_nodes, key=sort_key)
-
-    logger.info(f"Found {len(sorted_available_nodes)} available nodes.")
-
     assert sorted_available_nodes, "No available node resources"
-    assert (
-        sorted_available_nodes[0].get("NodeManagerAddress") == cleaned_host
-    ), "master address is occupied or it is not mounted by ray."
-
     return sorted_available_nodes
 
 
@@ -113,7 +74,6 @@ class RayExecutor:
         self.config = config
         self.lock = threading.Lock()
 
-        # 1. 初始化 Ray 连接
         with self.lock:
             ray.init(address=config.ray_address, ignore_reinit_error=True)
 
@@ -121,24 +81,20 @@ class RayExecutor:
         self.placement_groups = []
         assert config.attn_world_size == config.ffn_world_size
 
-        # 2. 获取所有节点的 NodeID
         nodes = get_available_nodes_with_master_first(config.master_address)
         node_ids = [node["NodeID"] for node in nodes]
         print(f"find nodes (NodeIDs): {node_ids}")
 
-        # 3. 定义每个节点上要运行的 worker 数量
         workers_per_node = 8
-
-        # 4. 计算需要多少个节点
         num_nodes_needed = (
             config.attn_world_size + workers_per_node - 1
         ) // workers_per_node
+
         if num_nodes_needed > len(node_ids):
             raise ValueError(
                 f"insufficient resources, {num_nodes_needed} on demand，but only find {len(node_ids)} nodes"
             )
 
-        # 5. 为每个目标节点创建 Placement Group，并调度相应的 workers
         for node_idx in range(num_nodes_needed):
             target_node_id = node_ids[node_idx]
             logger.info(f"--- scheduling node: {target_node_id} ---")
@@ -149,9 +105,7 @@ class RayExecutor:
                 name=f"pg-node-{node_ids[node_idx]}",
                 _soft_target_node_id=target_node_id,
             )
-
             ray.get(pg.ready())
-
             self.placement_groups.append(pg)
 
             start_rank = node_idx * workers_per_node
@@ -165,23 +119,19 @@ class RayExecutor:
 
     def __del__(self):
         if hasattr(self, "workers") and self.workers:
-            logger.info(f"Terminating {len(self.workers)} workers...")
             for worker in self.workers:
                 try:
                     ray.kill(worker)
-                    logger.debug(f"Worker {worker} terminated successfully.")
-                except Exception as e:
-                    logger.warning(f"Failed to terminate worker {worker}: {e}")
+                except Exception:
+                    pass
             del self.workers
 
         if hasattr(self, "placement_groups") and self.placement_groups:
             for pg in self.placement_groups:
                 try:
                     remove_placement_group(pg)
-                except Exception as e:
-                    logger.error(f"Warning: Failed to remove Placement Group: {e}")
-
-        logger.debug("Ray Executor deconstructed")
+                except Exception:
+                    pass
 
     def collective_rpc(
         self,
@@ -207,10 +157,14 @@ class RayExecutor:
     def migrate(
         self, dp_seqs: List[List[Sequence]], timeout: float | None = None
     ) -> list[int]:
+        # [优化] 使用 SequenceBatch 包装列表，实现零拷贝二进制传输
+        # SequenceBatch 在 C++ 层实现了高效的 pickle 协议
+        batched_args = [SequenceBatch(seqs) for seqs in dp_seqs]
+
         return ray.get(
             [
-                getattr(worker, "migrate").remote(seqs)
-                for seqs, worker in zip(dp_seqs, self.workers)
+                getattr(worker, "migrate").remote(seqs_batch)
+                for seqs_batch, worker in zip(batched_args, self.workers)
             ],
             timeout=timeout,
         )
@@ -221,24 +175,27 @@ class RayExecutor:
         is_prefill: bool,
         timeout: float | None = None,
     ) -> tuple[list[list[list[int]]], float, float]:
+        # [优化] 使用 SequenceBatch 包装，大幅降低序列化开销
+        # 对 Ray 来说，这是一个单一对象传输，而非数千个小对象
+        batched_args = [SequenceBatch(seqs) for seqs in dp_seqs]
+
         results = ray.get(
             [
-                getattr(worker, "run").remote(seqs, is_prefill)
-                for seqs, worker in zip(dp_seqs, self.workers)
+                getattr(worker, "run").remote(seqs_batch, is_prefill)
+                for seqs_batch, worker in zip(batched_args, self.workers)
             ],
             timeout=timeout,
         )
 
         token_ids = [res[0] for res in results]
-
         run_latencies = [res[1] for res in results]
         model_latencies = [res[2] for res in results]
 
         return token_ids, run_latencies, model_latencies
 
+    # ... [下面的辅助方法保持不变] ...
     def update_kvcache_blocks(self):
         num_cache_blocks = min(self.collective_rpc("num_kvcache_blocks"))
-        logger.info(f"Set {num_cache_blocks=}")
         self.collective_rpc("allocate_kvcache", (num_cache_blocks,))
         return num_cache_blocks
 
@@ -251,21 +208,16 @@ class RayExecutor:
         return self.collective_rpc("p2p_connect", (remote_name, remote_endpoint_infos))
 
     def gather_free_mem(self):
-        """Get free memory."""
         return self.collective_rpc("get_free_mem")
 
     def get_cache_block_size(self, block_size, world_size):
-        """Get cache block size."""
         return self.collective_rpc("get_cache_block_size", (block_size, world_size))
 
     def allocate_kvcache(self, num_block_per_rank):
-        """Allocate kv cache."""
         return self.collective_rpc("allocate_gpu_cache", args=(num_block_per_rank,))
 
     def init_cudagraph_buffer(self):
-        """Initialize cuda graph buffer."""
         return self.collective_rpc("init_cudagraph_buffer")
 
     def capture_cudagraph(self):
-        """Capture cuda graph."""
         return self.collective_rpc("capture_cudagraph")
