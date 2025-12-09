@@ -561,6 +561,13 @@ public:
     std::vector<char> data;
     size_t            read_pos = 0;
 
+    BinaryBuffer()
+    {
+        // [优化] 预分配 1MB 空间 (根据你的实际负载调整，1MB 通常足够容纳数千个请求的基础信息)
+        // 这避免了 vector 在追加数据时的多次扩容和内存拷贝
+        data.reserve(1024 * 1024);
+    }
+
     void write(const void* ptr, size_t size)
     {
         const char* src = static_cast<const char*>(ptr);
@@ -690,7 +697,7 @@ public:
     }
 
     // [Updated] 完整支持 Metric 序列化
-    py::bytes serialize()
+    std::string serialize(bool include_metrics = true)
     {
         BinaryBuffer buf;
         buf.write_val(sequences.size());
@@ -751,24 +758,32 @@ public:
                 }
             }
 
-            // [Added] 4. Metric Serialization
-            bool has_metric = (seq->metric != nullptr);
-            buf.write_val(has_metric);
-            if (has_metric) {
-                auto& m = seq->metric;
-                buf.write_string(m->seq_id);
-                buf.write_opt_double(m->arrival_time);
-                buf.write_opt_double(m->decode_first_scheduled_time);
-                buf.write_opt_double(m->first_token_time);
-                buf.write_opt_double(m->completion_time);
-                buf.write_opt_double(m->last_token_time);
-                buf.write_val(m->num_prompt_tokens);
-                buf.write_val(m->num_generated_tokens);
-                buf.write_vec(m->itl_samples);  // double vector
+            // [核心优化逻辑] 4. Metric Serialization
+            // 如果 include_metrics 为 false，直接写入 false。
+            // 对应的 deserialize 读取到 false 时会跳过 metric 解析，逻辑完全兼容。
+            if (include_metrics) {
+                bool has_metric = (seq->metric != nullptr);
+                buf.write_val(has_metric);
+                if (has_metric) {
+                    auto& m = seq->metric;
+                    buf.write_string(m->seq_id);
+                    buf.write_opt_double(m->arrival_time);
+                    buf.write_opt_double(m->decode_first_scheduled_time);
+                    buf.write_opt_double(m->first_token_time);
+                    buf.write_opt_double(m->completion_time);
+                    buf.write_opt_double(m->last_token_time);
+                    buf.write_val(m->num_prompt_tokens);
+                    buf.write_val(m->num_generated_tokens);
+                    buf.write_vec(m->itl_samples);
+                }
+            }
+            else {
+                // 不传输 metric，节省带宽
+                buf.write_val(false);
             }
         }
 
-        return py::bytes(buf.data.data(), buf.data.size());
+        return std::string(buf.data.begin(), buf.data.end());
     }
 
     static std::shared_ptr<SequenceBatch> deserialize(const std::string& bytes)
@@ -1316,10 +1331,32 @@ PYBIND11_MODULE(_core, m)
             "__iter__",
             [](SequenceBatch& s) { return py::make_iterator(s.sequences.begin(), s.sequences.end()); },
             py::keep_alive<0, 1>())
-        .def(py::pickle([](SequenceBatch& s) { return py::make_tuple(s.serialize()); },
-                        [](py::tuple t) {
-                            if (t.size() != 1)
-                                throw std::runtime_error("Invalid state");
-                            return SequenceBatch::deserialize(t[0].cast<std::string>());
-                        }));
+        .def(py::pickle(
+            [](SequenceBatch& s) {
+                // 1. 定义一个 C++ 字符串用于接收数据
+                std::string data;
+
+                {
+                    py::gil_scoped_release release;
+
+                    data = s.serialize(false);
+                }
+
+                return py::make_tuple(py::bytes(data));
+            },
+            [](py::tuple t) {
+                if (t.size() != 1)
+                    throw std::runtime_error("Invalid state");
+
+                std::string                    bytes = t[0].cast<std::string>();
+                std::shared_ptr<SequenceBatch> batch;
+
+                {
+                    py::gil_scoped_release release;
+
+                    batch = SequenceBatch::deserialize(bytes);
+                }
+
+                return batch;
+            }));
 }
