@@ -673,11 +673,13 @@ public:
 class SequenceBatch {
 public:
     std::vector<std::shared_ptr<Sequence>> sequences;
+    bool                                   is_decode_mode = false;
 
     SequenceBatch() = default;
 
-    SequenceBatch(const py::list& seq_list)
+    SequenceBatch(const py::list& seq_list, bool is_decode = false)
     {
+        this->is_decode_mode = is_decode;
         sequences.reserve(seq_list.size());
         for (auto handle : seq_list) {
             sequences.push_back(handle.cast<std::shared_ptr<Sequence>>());
@@ -696,26 +698,36 @@ public:
         return sequences[index];
     }
 
-    // [Updated] 完整支持 Metric 序列化
+    // 完整支持 Metric 序列化
     std::string serialize(bool include_metrics = true)
     {
         BinaryBuffer buf;
+
         buf.write_val(sequences.size());
+        buf.write_val(is_decode_mode);
 
         for (const auto& seq : sequences) {
-            // 1. Basic fields
             buf.write_string(seq->seq_id);
             buf.write_val(seq->status);
-            buf.write_vec(seq->token_ids);
+
+            // 如果是 Decode 模式，且 token_ids 不为空，只传最后一个 token
+            if (is_decode_mode && !seq->token_ids.empty()) {
+                buf.write_val(seq->token_ids.back());
+            }
+            else {
+                // Prefill 模式，或者空序列：传输全量 Vector
+                buf.write_vec(seq->token_ids);
+            }
+
             buf.write_val(seq->num_tokens);
+
             buf.write_val(seq->num_prompt_tokens);
             buf.write_val(seq->num_checkpointed_tokens);
             buf.write_val(seq->num_cached_tokens);
             buf.write_opt_string(seq->backup_engine_id);
             buf.write_opt_string(seq->active_engine_id);
-            buf.write_val(seq->last_token);  // 添加 last_token
+            buf.write_val(seq->last_token);
 
-            // 2. Config
             bool has_temp = seq->temperature.has_value();
             buf.write_val(has_temp);
             if (has_temp)
@@ -728,29 +740,24 @@ public:
 
             buf.write_val(seq->ignore_eos);
 
-            // 3. BlockContextMap
             buf.write_val(seq->block_ctx_map.size());
             for (const auto& kv : seq->block_ctx_map) {
                 buf.write_opt_string(kv.first);
-
                 const auto& ctx = kv.second;
                 buf.write_opt_string(ctx.engine_id);
                 buf.write_val(ctx.dp_idx);
                 buf.write_val(ctx.master_sp_idx);
                 buf.write_val(ctx.attention_sp);
                 buf.write_val(ctx.attention_dp);
-
                 size_t loc_len = ctx.block_location.size();
                 buf.write_val(loc_len);
                 if (loc_len > 0)
                     buf.write(ctx.block_location.data(), loc_len * sizeof(std::pair<int, int>));
-
                 buf.write_val(ctx.num_dispatched_tokens.size());
                 for (auto const& [k, v] : ctx.num_dispatched_tokens) {
                     buf.write_val(k);
                     buf.write_val(v);
                 }
-
                 buf.write_val(ctx.sp_block_table.size());
                 for (auto const& [k, v] : ctx.sp_block_table) {
                     buf.write_val(k);
@@ -758,9 +765,6 @@ public:
                 }
             }
 
-            // [核心优化逻辑] 4. Metric Serialization
-            // 如果 include_metrics 为 false，直接写入 false。
-            // 对应的 deserialize 读取到 false 时会跳过 metric 解析，逻辑完全兼容。
             if (include_metrics) {
                 bool has_metric = (seq->metric != nullptr);
                 buf.write_val(has_metric);
@@ -778,11 +782,9 @@ public:
                 }
             }
             else {
-                // 不传输 metric，节省带宽
                 buf.write_val(false);
             }
         }
-
         return std::string(buf.data.begin(), buf.data.end());
     }
 
@@ -792,20 +794,27 @@ public:
         BinaryBuffer buf;
         buf.data.assign(bytes.begin(), bytes.end());
 
-        size_t count = buf.read_val<size_t>();
+        size_t count             = buf.read_val<size_t>();
+        bool   is_decode_payload = buf.read_val<bool>();
+
         batch->sequences.reserve(count);
 
         for (size_t i = 0; i < count; ++i) {
-            // [Optimized] 使用静态工厂方法，不调用繁重的构造函数
             auto seq = Sequence::create_empty();
 
-            // 1. Basic fields
             seq->seq_id = buf.read_string();
             seq->status = buf.read_val<SequenceStatus>();
-            // [Optimized] 移动语义减少拷贝
-            seq->token_ids = std::move(buf.read_vec<int>());
 
-            seq->num_tokens              = buf.read_val<int64_t>();
+            if (is_decode_payload) {
+                int last_token = buf.read_val<int>();
+                seq->token_ids.push_back(last_token);
+            }
+            else {
+                seq->token_ids = std::move(buf.read_vec<int>());
+            }
+
+            seq->num_tokens = buf.read_val<int64_t>();
+
             seq->num_prompt_tokens       = buf.read_val<int64_t>();
             seq->num_checkpointed_tokens = buf.read_val<int64_t>();
             seq->num_cached_tokens       = buf.read_val<int64_t>();
@@ -813,47 +822,39 @@ public:
             seq->active_engine_id        = buf.read_opt_string();
             seq->last_token              = buf.read_val<int>();
 
-            // 2. Config
             if (buf.read_val<bool>())
                 seq->temperature = buf.read_val<float>();
             if (buf.read_val<bool>())
                 seq->max_tokens = buf.read_val<int>();
             seq->ignore_eos = buf.read_val<bool>();
 
-            // 3. BlockContextMap
             size_t map_size = buf.read_val<size_t>();
             for (size_t j = 0; j < map_size; ++j) {
                 std::optional<std::string> key = buf.read_opt_string();
-
-                BlockContext ctx;
+                BlockContext               ctx;
                 ctx.engine_id     = buf.read_opt_string();
                 ctx.dp_idx        = buf.read_val<int>();
                 ctx.master_sp_idx = buf.read_val<int>();
                 ctx.attention_sp  = buf.read_val<int>();
                 ctx.attention_dp  = buf.read_val<int>();
-
-                size_t loc_len = buf.read_val<size_t>();
+                size_t loc_len    = buf.read_val<size_t>();
                 ctx.block_location.resize(loc_len);
                 if (loc_len > 0)
                     buf.read(ctx.block_location.data(), loc_len * sizeof(std::pair<int, int>));
-
                 size_t dispatched_len = buf.read_val<size_t>();
                 for (size_t k = 0; k < dispatched_len; ++k) {
                     int dk                        = buf.read_val<int>();
                     int dv                        = buf.read_val<int>();
                     ctx.num_dispatched_tokens[dk] = dv;
                 }
-
                 size_t table_len = buf.read_val<size_t>();
                 for (size_t k = 0; k < table_len; ++k) {
                     int tk                 = buf.read_val<int>();
                     ctx.sp_block_table[tk] = buf.read_vec<int>();
                 }
-
                 seq->block_ctx_map[key] = ctx;
             }
 
-            // [Added] 4. Metric Deserialization
             bool has_metric = buf.read_val<bool>();
             if (has_metric) {
                 auto m                         = std::make_shared<SequenceMetric>();
@@ -1324,7 +1325,7 @@ PYBIND11_MODULE(_core, m)
             }));
 
     py::class_<SequenceBatch, std::shared_ptr<SequenceBatch>>(m, "SequenceBatch")
-        .def(py::init<const py::list&>())
+        .def(py::init<const py::list&, bool>(), py::arg("seq_list"), py::arg("is_decode") = false)
         .def("__len__", &SequenceBatch::size)
         .def("__getitem__", &SequenceBatch::get_item)
         .def(

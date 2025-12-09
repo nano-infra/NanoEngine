@@ -175,9 +175,13 @@ class RayExecutor:
         is_prefill: bool,
         timeout: float | None = None,
     ) -> tuple[list[list[list[int]]], float, float]:
-        # [优化] 使用 SequenceBatch 包装，大幅降低序列化开销
+        # 如果 is_prefill 为 True，则 is_decode 为 False (传输全量)
+        # 如果 is_prefill 为 False，则 is_decode 为 True (只传最后一个 token)
+        is_decode = not is_prefill
+
+        # 使用 SequenceBatch 包装，大幅降低序列化开销
         # 对 Ray 来说，这是一个单一对象传输，而非数千个小对象
-        batched_args = [SequenceBatch(seqs) for seqs in dp_seqs]
+        batched_args = [SequenceBatch(seqs, is_decode) for seqs in dp_seqs]
 
         results = ray.get(
             [
