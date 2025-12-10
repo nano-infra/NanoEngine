@@ -1332,6 +1332,14 @@ PYBIND11_MODULE(_core, m)
             "__iter__",
             [](SequenceBatch& s) { return py::make_iterator(s.sequences.begin(), s.sequences.end()); },
             py::keep_alive<0, 1>())
+        .def(
+            "serialize",
+            [](SequenceBatch& self, bool include_metrics) {
+                std::string s = self.serialize(include_metrics);
+                return py::bytes(s);
+            },
+            py::arg("include_metrics") = true)
+        .def_static("deserialize", &SequenceBatch::deserialize)
         .def(py::pickle(
             [](SequenceBatch& s) {
                 // 1. 定义一个 C++ 字符串用于接收数据
