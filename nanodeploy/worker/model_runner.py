@@ -780,7 +780,7 @@ class ModelRunner:
 
     def run(
         self, dp_seqs: list[Sequence], is_prefill: bool
-    ) -> tuple[list[list[int]], float, float]:
+    ) -> tuple[torch.Tensor, float, float]:
         run_start_event = torch.cuda.Event(enable_timing=True)
         run_end_event = torch.cuda.Event(enable_timing=True)
         model_events = []
@@ -866,7 +866,7 @@ class ModelRunner:
             self.run_count += 1
 
             get_context().token_ids.append(input_ids[None, ...])
-        loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
+        output_tensor = torch.cat(get_context().token_ids, dim=0).T.cpu()
         reset_context()
 
         run_end_event.record()
@@ -875,7 +875,7 @@ class ModelRunner:
         run_latency = run_start_event.elapsed_time(run_end_event)
         model_latency_sum = sum(s.elapsed_time(e) for s, e in model_events)
 
-        return loop_count_token_ids, run_latency, model_latency_sum
+        return output_tensor, run_latency, model_latency_sum
 
     @torch.inference_mode()
     def capture_cudagraph(self):

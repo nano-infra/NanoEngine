@@ -191,13 +191,19 @@ class RayExecutor:
             timeout=timeout,
         )
 
-        token_ids = [res[0] for res in results]
-        run_latencies = [res[1] for res in results]
-        model_latencies = [res[2] for res in results]
+        token_ids_list = []
+        run_latencies = []
+        model_latencies = []
 
-        return token_ids, run_latencies, model_latencies
+        for res in results:
+            tensor_out, r_lat, m_lat = res
+            token_ids_list.append(tensor_out.tolist())
 
-    # ... [下面的辅助方法保持不变] ...
+            run_latencies.append(r_lat)
+            model_latencies.append(m_lat)
+
+        return token_ids_list, run_latencies, model_latencies
+
     def update_kvcache_blocks(self):
         num_cache_blocks = min(self.collective_rpc("num_kvcache_blocks"))
         self.collective_rpc("allocate_kvcache", (num_cache_blocks,))
