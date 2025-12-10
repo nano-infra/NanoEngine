@@ -10,12 +10,12 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from nanodeploy.config import Config
+from nanodeploy.engine._core import prepare_step_inputs
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.metrics import MetricsManager
-
 
 logger = get_logger()
 
@@ -80,32 +80,40 @@ class LLMEngine:
 
         if self.scheduler.waiting_migration:
             logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
-        # TODO (JimyMa): For loop
-        filtered_dp_sp_seqs = [
-            [
-                seq
-                for seq in seqs
-                if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
-            ]
-            for seqs in dp_seqs
-            for sp_idx in range(self.config.attention_sp)
-        ]
+        # # TODO (JimyMa): For loop
+        # filtered_dp_sp_seqs = [
+        #     [
+        #         seq
+        #         for seq in seqs
+        #         if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
+        #     ]
+        #     for seqs in dp_seqs
+        #     for sp_idx in range(self.config.attention_sp)
+        # ]
 
-        dp_sp_seqs = [
-            [seq for seq in seqs]
-            for seqs in dp_seqs
-            for _ in range(self.config.attention_sp)
-        ]
+        # dp_sp_seqs = [
+        #     [seq for seq in seqs]
+        #     for seqs in dp_seqs
+        #     for _ in range(self.config.attention_sp)
+        # ]
 
-        dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
-        dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
-        sp_batch_sizes = [
-            [
-                len(filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx])
-                for sp_idx in range(sp_size)
-            ]
-            for dp_idx in range(dp_size)
-        ]
+        # dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
+        # dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
+        # sp_batch_sizes = [
+        #     [
+        #         len(filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx])
+        #         for sp_idx in range(sp_size)
+        #     ]
+        #     for dp_idx in range(dp_size)
+        # ]
+
+        inputs = prepare_step_inputs(dp_seqs, self.engine_id, sp_size, tp_size)
+
+        filtered_dp_sp_seqs = inputs.filtered_dp_sp_seqs
+        dp_sp_seqs = inputs.dp_sp_seqs
+        dp_sp_tp_seqs = inputs.dp_sp_tp_seqs
+        dp_batch_sizes = inputs.dp_batch_sizes
+        sp_batch_sizes = inputs.sp_batch_sizes
 
         logger.info(
             {

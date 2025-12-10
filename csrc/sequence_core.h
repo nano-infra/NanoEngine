@@ -550,3 +550,5 @@ public:
         }
     }
 };
+
+void bind_scheduler_ops(py::module& m);

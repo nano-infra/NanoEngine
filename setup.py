@@ -18,7 +18,7 @@ extra_link_args.append("-fopenmp")
 ext_modules = [
     Extension(
         "nanodeploy.engine._core",
-        sources=["csrc/sequence_binding.cpp"],
+        sources=["csrc/sequence_binding.cpp", "csrc/scheduler_binding.cpp"],
         include_dirs=["csrc", pybind11.get_include(), pybind11.get_include(user=True)],
         language="c++",
         extra_compile_args=extra_compile_args,

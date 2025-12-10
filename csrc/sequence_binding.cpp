@@ -1,7 +1,5 @@
 #include "sequence_core.h"
 
-namespace py = pybind11;
-
 // =========================================================================
 // 新增: 二进制序列化辅助工具 (扩展支持 Metric)
 // =========================================================================
@@ -417,6 +415,8 @@ PostProcessOps postprocess_step(py::list    dp_seqs_list,
 
 PYBIND11_MODULE(_core, m)
 {
+    bind_scheduler_ops(m);
+
     py::bind_vector<std::vector<int>>(m, "IntVector")
         .def(py::pickle(
             [](const std::vector<int>& v) {
