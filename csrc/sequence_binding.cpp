@@ -1,4 +1,5 @@
 #include "sequence_core.h"
+#include <future>
 
 // =========================================================================
 // 新增: 二进制序列化辅助工具 (扩展支持 Metric)
@@ -787,6 +788,36 @@ PYBIND11_MODULE(_core, m)
                 std::string s = self.serialize(include_metrics);
                 return py::bytes(s);
             },
+            py::arg("include_metrics") = true)
+        .def_static(
+            "parallel_serialize",
+            [](std::vector<std::shared_ptr<SequenceBatch>>& batches, bool include_metrics) {
+                size_t                   n = batches.size();
+                std::vector<std::string> results(n);
+
+                {
+                    py::gil_scoped_release release;
+
+                    std::vector<std::future<void>> futures;
+                    futures.reserve(n);
+
+                    for (size_t i = 0; i < n; ++i) {
+                        futures.push_back(std::async(
+                            std::launch::async, [&, i]() { results[i] = batches[i]->serialize(include_metrics); }));
+                    }
+
+                    for (auto& f : futures) {
+                        f.get();
+                    }
+                }
+
+                py::list py_results;
+                for (size_t i = 0; i < n; ++i) {
+                    py_results.append(py::bytes(results[i]));
+                }
+                return py_results;
+            },
+            py::arg("batches"),
             py::arg("include_metrics") = true)
         .def_static("deserialize", &SequenceBatch::deserialize)
         .def(py::pickle(
