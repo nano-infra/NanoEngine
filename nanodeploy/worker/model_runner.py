@@ -10,12 +10,14 @@ import torch.nn.functional as F
 import torch.profiler as profiler
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.engine._core import Sequence, SequenceBatch
 from nanodeploy.kernels.copy import warmup_copy_kernel
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
 from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
+from nanodeploy.utils.rdma_manager import get_available_nics, RDMAManager
 from nanodeploy.worker.cache import get_cache_context, set_cache_context
 from nanodeploy.worker.context import get_context, reset_context, set_context
 from nanodeploy.worker.distributed import (
@@ -26,7 +28,6 @@ from nanodeploy.worker.distributed import (
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 from nanodeploy.worker.sp_context import set_sp_context
-
 
 logger = get_logger()
 
@@ -141,6 +142,14 @@ class ModelRunner:
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
 
+        nic_list = get_available_nics()
+
+        if not nic_list:
+            pass
+        else:
+            my_nic = nic_list[self.rank % len(nic_list)]
+            self.rdma_mgr = RDMAManager(nic_name=my_nic, buffer_size=64 * 1024 * 1024)
+
         self.run_count = 0
 
         self.profiler = None
@@ -202,6 +211,12 @@ class ModelRunner:
         # self.warmup_model()
 
         self.preallocate_kvcache()
+
+    def get_rdma_connect_info(self):
+        return self.rdma_mgr.get_context()
+
+    def connect_master_rdma(self, master_ctx):
+        self.rdma_mgr.connect(master_ctx)
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
@@ -779,8 +794,14 @@ class ModelRunner:
         get_cache_context().migrate(seqs=seqs)
 
     def run(
-        self, dp_seqs: list[Sequence], is_prefill: bool
+        self, payload_size: int, is_prefill: bool
     ) -> tuple[torch.Tensor, float, float]:
+        # print(f"Rank {self.rank}: Waiting for RDMA data ({payload_size} bytes)...", flush=True)
+        data_bytes = self.rdma_mgr.recv_data(payload_size)
+        # print(f"Rank {self.rank}: RDMA data received!", flush=True)
+        seq_batch = SequenceBatch.deserialize(data_bytes)
+        dp_seqs = [seq_batch[i] for i in range(len(seq_batch))]
+
         run_start_event = torch.cuda.Event(enable_timing=True)
         run_end_event = torch.cuda.Event(enable_timing=True)
         model_events = []
@@ -874,6 +895,11 @@ class ModelRunner:
 
         run_latency = run_start_event.elapsed_time(run_end_event)
         model_latency_sum = sum(s.elapsed_time(e) for s, e in model_events)
+
+        print(
+            f"output_tensor.shape: {output_tensor.shape}, output_tensor.dtype: {output_tensor.dtype}",
+            flush=True,
+        )
 
         return output_tensor, run_latency, model_latency_sum
 
