@@ -821,7 +821,21 @@ PYBIND11_MODULE(_core, m)
             },
             py::arg("batches"),
             py::arg("include_metrics") = true)
-        .def_static("deserialize", &SequenceBatch::deserialize)
+        .def_static(
+            "deserialize",
+            [](const std::string& bytes) {
+                py::gil_scoped_release release;
+                return SequenceBatch::deserialize(bytes);
+            },
+            py::arg("bytes"))
+        .def("to_list",
+             [](SequenceBatch& self) {
+                 py::list l;
+                 for (const auto& seq_ptr : self.sequences) {
+                     l.append(py::cast(seq_ptr));
+                 }
+                 return l;
+             })
         .def(py::pickle(
             [](SequenceBatch& s) {
                 // 1. 定义一个 C++ 字符串用于接收数据

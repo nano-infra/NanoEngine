@@ -1,4 +1,6 @@
 import threading
+import time
+from contextlib import contextmanager
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
 
@@ -11,9 +13,18 @@ from nanodeploy.config import Config
 from nanodeploy.engine._core import SequenceBatch
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
+from nanodeploy.utils.rdma_manager import get_available_nics, RDMAManager
 from nanodeploy.worker.model_runner import ModelRunner
 
 logger = get_logger()
+
+
+@contextmanager
+def my_profile(name):
+    start = time.time()
+    yield
+    end = time.time()
+    print(f"[TimeCost] {name}: {(end - start) * 1000:.2f} ms", flush=True)
 
 
 def _clean_and_parse_address(address: str) -> str:
@@ -117,6 +128,32 @@ class RayExecutor:
 
         logger.info("All workers scheduled successfully.")
 
+        self.rdma_mgrs = []
+        nic_list = get_available_nics()
+
+        if not nic_list:
+            # 如果没有 RDMA 环境，这里可以抛错或者降级
+            # raise RuntimeError("No RDMA NICs found on Master!")
+            print("Warning: No RDMA NICs found on Master. RDMA features will fail.")
+
+        if nic_list:
+            print(
+                f"[Executor] Initializing {len(self.workers)} RDMA channels (CPU Buffer)..."
+            )
+
+            for i, worker in enumerate(self.workers):
+                target_nic = nic_list[i % len(nic_list)]
+
+                # 初始化 Manager
+                mgr = RDMAManager(nic_name=target_nic, buffer_size=64 * 1024 * 1024)
+
+                # 握手
+                worker_ctx = ray.get(worker.get_rdma_connect_info.remote())
+                mgr.connect(worker_ctx)
+                ray.get(worker.connect_master_rdma.remote(mgr.get_context()))
+
+                self.rdma_mgrs.append(mgr)
+
     def __del__(self):
         if hasattr(self, "workers") and self.workers:
             for worker in self.workers:
@@ -175,21 +212,52 @@ class RayExecutor:
         is_prefill: bool,
         timeout: float | None = None,
     ) -> tuple[list[list[list[int]]], float, float]:
-        # 如果 is_prefill 为 True，则 is_decode 为 False (传输全量)
-        # 如果 is_prefill 为 False，则 is_decode 为 True (只传最后一个 token)
+
         is_decode = not is_prefill
 
-        # 使用 SequenceBatch 包装，大幅降低序列化开销
-        # 对 Ray 来说，这是一个单一对象传输，而非数千个小对象
-        batched_args = [SequenceBatch(seqs, is_decode) for seqs in dp_seqs]
+        # serialized_payloads = []
+        # payload_sizes = []
 
-        results = ray.get(
-            [
-                getattr(worker, "run").remote(seqs_batch, is_prefill)
-                for seqs_batch, worker in zip(batched_args, self.workers)
-            ],
-            timeout=timeout,
-        )
+        # with my_profile("Driver:Serialize"):
+        #     for seqs in dp_seqs:
+        #         batch_obj = SequenceBatch(seqs, is_decode)
+        #         data = batch_obj.serialize(include_metrics=True)
+        #         serialized_payloads.append(data)
+        #         payload_sizes.append(len(data))
+
+        with my_profile("Driver:Serialize"):
+            batches = [SequenceBatch(seqs, is_decode) for seqs in dp_seqs]
+            serialized_payloads = SequenceBatch.parallel_serialize(
+                batches, include_metrics=False
+            )
+            payload_sizes = [len(data) for data in serialized_payloads]
+
+        with my_profile("Driver:RaySubmit"):
+            result_refs = []
+            for i, worker in enumerate(self.workers):
+                ref = worker.run.remote(payload_sizes[i], is_prefill)
+                result_refs.append(ref)
+
+        # with my_profile("Driver:RDMASendLoop"):
+        #     for i, payload in enumerate(serialized_payloads):
+        #         print(f"Sending to rank {i}...",flush=True)
+        #         self.rdma_mgrs[i].send_data(payload)
+        #         print(f"Sent to rank {i}",flush=True)
+
+        with my_profile("Driver:RDMASendLoop"):
+            active_mgrs = []
+            for i, payload in enumerate(serialized_payloads):
+                if len(payload) > 0:
+                    self.rdma_mgrs[i].post_send(payload)
+                    active_mgrs.append(self.rdma_mgrs[i])
+
+            for mgr in active_mgrs:
+                mgr.wait_send()
+
+            print("All RDMA sends completed.", flush=True)
+
+        with my_profile("Driver:WaitResults"):
+            results = ray.get(result_refs, timeout=timeout)
 
         token_ids_list = []
         run_latencies = []
@@ -198,7 +266,6 @@ class RayExecutor:
         for res in results:
             tensor_out, r_lat, m_lat = res
             token_ids_list.append(tensor_out.tolist())
-
             run_latencies.append(r_lat)
             model_latencies.append(m_lat)
 
