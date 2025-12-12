@@ -278,6 +278,11 @@ public:
         return std::vector<int>(free_block_ids_.begin(), free_block_ids_.end());
     }
 
+    int free_count() const
+    {
+        return (int)free_block_ids_.size();
+    }
+
     bool can_allocate(Sequence& seq) const
     {
         return (int)free_block_ids_.size() >= seq.num_blocks(engine_id_, sp_idx_);

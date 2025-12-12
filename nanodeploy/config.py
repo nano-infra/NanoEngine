@@ -50,6 +50,9 @@ class Config:
     # Keep Python BlockManager as default for easy A/B correctness comparisons.
     use_cpp_block_manager: bool = True
 
+    # Phase 2: optionally use C++ SPStateManager (includes running queue + dummy seqs)
+    use_cpp_sp_state_manager: bool = True
+
     # dist config
 
     master_address: str = "127.0.0.1:6006"
