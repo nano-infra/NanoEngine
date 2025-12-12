@@ -1,4 +1,5 @@
 #include "sequence_core.h"
+#include "block_manager_core.h"
 #include <future>
 
 // =========================================================================
@@ -417,6 +418,7 @@ PostProcessOps postprocess_step(py::list    dp_seqs_list,
 PYBIND11_MODULE(_core, m)
 {
     bind_scheduler_ops(m);
+    bind_block_manager(m);
 
     py::bind_vector<std::vector<int>>(m, "IntVector")
         .def(py::pickle(

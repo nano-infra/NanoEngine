@@ -46,6 +46,10 @@ class Config:
     dummy_weight: bool | None = False
     perfect_eplb: bool | None = False
 
+    # backend switches
+    # Keep Python BlockManager as default for easy A/B correctness comparisons.
+    use_cpp_block_manager: bool = True
+
     # dist config
 
     master_address: str = "127.0.0.1:6006"

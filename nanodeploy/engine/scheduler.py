@@ -6,7 +6,7 @@ from typing import List, Literal, TYPE_CHECKING
 import numpy as np
 
 from nanodeploy.config import Config
-from nanodeploy.engine.block_manager import BlockManager
+from nanodeploy.engine.block_manager import get_block_manager_cls
 from nanodeploy.engine.sequence import postprocess_step, Sequence, SequenceStatus
 from nanodeploy.logging import get_logger
 
@@ -34,6 +34,7 @@ class SPStateManager:
         kvcache_block_size: int,
         max_num_seqs: int,
         max_num_batched_tokens: int,
+        use_cpp_block_manager: bool = False,
     ):
         self.engine_id = engine_id
         self.attention_sp = attention_sp
@@ -41,8 +42,9 @@ class SPStateManager:
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
 
-        self.block_manager: dict[int, BlockManager] = {
-            i: BlockManager(
+        BlockManagerCls = get_block_manager_cls(use_cpp_block_manager)
+        self.block_manager = {
+            i: BlockManagerCls(
                 engine_id,
                 i,
                 num_kvcache_blocks,
@@ -172,6 +174,8 @@ class Scheduler:
         self.attention_sp = config.attention_sp
         self.rounting_strategy = RoutingStrategy.RoundRobin
 
+        self.use_cpp_block_manager = getattr(config, "use_cpp_block_manager", False)
+
         self.worker_state = [
             SPStateManager(
                 config.engine_id,
@@ -180,6 +184,7 @@ class Scheduler:
                 config.kvcache_block_size,
                 config.max_num_seqs,
                 config.max_num_batched_tokens,
+                use_cpp_block_manager=self.use_cpp_block_manager,
             )
             for _ in range(self.attention_dp)
         ]

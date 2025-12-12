@@ -5,6 +5,12 @@ import xxhash
 
 from nanodeploy.engine.sequence import Sequence
 
+try:
+    # C++ backend (optional)
+    from nanodeploy.engine._core import BlockManager as CppBlockManager  # type: ignore
+except Exception:  # pragma: no cover
+    CppBlockManager = None
+
 
 class Block:
 
@@ -154,3 +160,28 @@ class BlockManager:
             else:
                 continue
                 assert last_block.hash == -1
+
+
+# ---------------------------------------------------------------------------
+# Backend selection helpers
+# ---------------------------------------------------------------------------
+
+PyBlock = Block
+PyBlockManager = BlockManager
+
+
+def get_block_manager_cls(use_cpp: bool):
+    """Return the BlockManager class for the requested backend.
+
+    - use_cpp=False: always return the original Python implementation.
+    - use_cpp=True: return the pybind11 C++ implementation if available.
+    """
+
+    if not use_cpp:
+        return PyBlockManager
+    if CppBlockManager is None:
+        raise ImportError(
+            "C++ BlockManager backend is not available. "
+            "Rebuild the extension and ensure nanodeploy.engine._core exports BlockManager."
+        )
+    return CppBlockManager
