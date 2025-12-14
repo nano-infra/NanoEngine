@@ -10,7 +10,7 @@ from nanodeploy.config import Config
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
-from nanodeploy.logging import get_logger
+from nanodeploy.logger import get_logger
 from nanodeploy.metrics import MetricsManager
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer

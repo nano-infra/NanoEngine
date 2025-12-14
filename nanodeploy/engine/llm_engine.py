@@ -14,7 +14,7 @@ from nanodeploy.engine._core import prepare_step_inputs
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
-from nanodeploy.logging import get_logger
+from nanodeploy.logger import get_logger
 from nanodeploy.metrics import MetricsManager
 
 logger = get_logger()

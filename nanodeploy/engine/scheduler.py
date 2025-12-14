@@ -14,7 +14,7 @@ try:
 except Exception:  # pragma: no cover
     CppSPStateManager = None
 from nanodeploy.engine.sequence import postprocess_step, Sequence, SequenceStatus
-from nanodeploy.logging import get_logger
+from nanodeploy.logger import get_logger
 
 if TYPE_CHECKING:
     from nanodeploy.metrics import MetricsManager

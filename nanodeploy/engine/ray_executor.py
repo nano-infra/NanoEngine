@@ -12,7 +12,7 @@ from nanodeploy.config import Config
 # 引入 C++ 扩展中的 Batch 类
 from nanodeploy.engine._core import SequenceBatch
 from nanodeploy.engine.sequence import Sequence
-from nanodeploy.logging import get_logger
+from nanodeploy.logger import get_logger
 from nanodeploy.utils.rdma_manager import get_available_nics, RDMAManager
 from nanodeploy.worker.model_runner import ModelRunner
 

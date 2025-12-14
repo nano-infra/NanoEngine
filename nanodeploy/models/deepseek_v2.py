@@ -17,7 +17,7 @@ from nanodeploy.layers.linear import (
     RowParallelLinear,
 )
 from nanodeploy.layers.rotary_embedding import get_rope
-from nanodeploy.logging import get_logger
+from nanodeploy.logger import get_logger
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
 from nanodeploy.worker.runner_config import get_runner_config

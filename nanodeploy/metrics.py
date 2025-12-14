@@ -14,7 +14,7 @@ from nanodeploy.engine._core import (
     SequenceMetric as CppSequenceMetric,
     ServerMetric as CppServerMetric,
 )
-from nanodeploy.logging import get_logger
+from nanodeploy.logger import get_logger
 
 logger = get_logger()
 

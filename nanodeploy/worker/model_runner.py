@@ -13,7 +13,7 @@ from nanodeploy.engine.sequence import Sequence
 from nanodeploy.engine._core import Sequence, SequenceBatch
 from nanodeploy.kernels.copy import warmup_copy_kernel
 from nanodeploy.layers.sampler import Sampler
-from nanodeploy.logging import get_logger
+from nanodeploy.logger import get_logger
 from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM

@@ -4,7 +4,7 @@ from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanodeploy.kernels.attention import inter_rank_gqa_fwd_batch_decode_combine_kv
 from nanodeploy.kernels.copy import copy_batch_indexed_triton
 from nanodeploy.kernels.kvcache import store_kcache, store_kvcache
-from nanodeploy.logging import get_logger
+from nanodeploy.logger import get_logger
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
 from nanodeploy.worker.sp_context import get_sp_context
