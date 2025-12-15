@@ -1,6 +1,7 @@
 #include "sequence_core.h"
 #include "block_manager_core.h"
 #include "sp_state_manager_core.h"
+#include "model_runner_core.h"
 #include <future>
 
 // =========================================================================
@@ -421,6 +422,7 @@ PYBIND11_MODULE(_core, m)
     bind_scheduler_ops(m);
     bind_block_manager(m);
     bind_sp_state_manager(m);
+    bind_model_runner(m);
 
     py::bind_vector<std::vector<int>>(m, "IntVector")
         .def(py::pickle(

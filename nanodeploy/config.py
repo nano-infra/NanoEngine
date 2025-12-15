@@ -53,6 +53,9 @@ class Config:
     # Phase 2: optionally use C++ SPStateManager (includes running queue + dummy seqs)
     use_cpp_sp_state_manager: bool = True
 
+    # Phase 3: optionally use C++ ModelRunner (prepare_prefill/decode)
+    use_cpp_model_runner: bool = True
+
     # dist config
 
     master_address: str = "127.0.0.1:6006"
