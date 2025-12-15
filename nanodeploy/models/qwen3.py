@@ -1,6 +1,5 @@
 import torch
 import torch.distributed as dist
-
 from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -12,9 +11,7 @@ from nanodeploy.layers.linear import (
 )
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.worker.distributed import get_dist_context
-
 from torch import nn
-
 from transformers import Qwen3Config
 
 
@@ -67,8 +64,10 @@ class Qwen3Attention(nn.Module):
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
+            self.head_dim,
             self.scaling,
             self.num_kv_heads,
+            "GQA",
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)

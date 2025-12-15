@@ -1,14 +1,21 @@
 import enum
 from collections import deque
 from itertools import count
-from typing import Literal, TYPE_CHECKING
+from typing import List, Literal, TYPE_CHECKING
 
 import numpy as np
 
 from nanodeploy.config import Config
-from nanodeploy.engine.block_manager import BlockManager
-from nanodeploy.engine.sequence import Sequence, SequenceStatus
-from nanodeploy.logging import get_logger
+from nanodeploy.engine.block_manager import get_block_manager_cls
+
+try:
+    # C++ backend (optional)
+    from nanodeploy.engine._core import SPStateManager as CppSPStateManager  # type: ignore
+except Exception:  # pragma: no cover
+    CppSPStateManager = None
+from nanodeploy.engine.sequence import postprocess_step, Sequence, SequenceStatus
+from nanodeploy.logger import get_logger
+
 if TYPE_CHECKING:
     from nanodeploy.metrics import MetricsManager
 
@@ -33,6 +40,7 @@ class SPStateManager:
         kvcache_block_size: int,
         max_num_seqs: int,
         max_num_batched_tokens: int,
+        use_cpp_block_manager: bool = False,
     ):
         self.engine_id = engine_id
         self.attention_sp = attention_sp
@@ -40,8 +48,9 @@ class SPStateManager:
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
 
-        self.block_manager: dict[int, BlockManager] = {
-            i: BlockManager(
+        BlockManagerCls = get_block_manager_cls(use_cpp_block_manager)
+        self.block_manager = {
+            i: BlockManagerCls(
                 engine_id,
                 i,
                 num_kvcache_blocks,
@@ -59,6 +68,30 @@ class SPStateManager:
 
         self.dummy_seqs: list[Sequence] = []
         self._initialize_dummy_seqs()
+
+    # --- Running queue compat helpers (so Scheduler can be backend-agnostic) ---
+    def running_has_any(self) -> bool:
+        return bool(self.running)
+
+    def running_size(self) -> int:
+        return len(self.running)
+
+    def running_append(self, seq: Sequence) -> None:
+        self.running.append(seq)
+
+    def running_popleft(self) -> Sequence:
+        return self.running.popleft()
+
+    def running_pop(self) -> Sequence:
+        return self.running.pop()
+
+    def running_extendleft(self, seqs: list[Sequence]) -> None:
+        self.running.extendleft(reversed(seqs))
+
+    def running_remove_seq_ids(self, seq_ids: set[str]) -> None:
+        if not self.running:
+            return
+        self.running = deque([s for s in self.running if s.seq_id not in seq_ids])
 
     @property
     def is_empty(self):
@@ -102,13 +135,11 @@ class SPStateManager:
         block_ctx = seq.block_ctx(self.engine_id)
         block_ctx.num_dispatched_tokens.clear()
 
-        num_segments = (seq.num_tokens + self._segment_size -
-                        1) // self._segment_size
+        num_segments = (seq.num_tokens + self._segment_size - 1) // self._segment_size
         num_segments_per_rank = (
             num_segments + self.attention_sp - 1
         ) // self.attention_sp
-        num_ranks = (num_segments + num_segments_per_rank -
-                     1) // num_segments_per_rank
+        num_ranks = (num_segments + num_segments_per_rank - 1) // num_segments_per_rank
 
         master_rank = next(self.sp_rr_counter)
 
@@ -151,7 +182,7 @@ class SPStateManager:
 
     def deallocate(self, seq: Sequence):
         for sp_idx in range(self.attention_sp):
-            return self.block_manager[sp_idx].deallocate(seq)
+            self.block_manager[sp_idx].deallocate(seq)
         seq.block_ctx(self.engine_id).sp_block_table.clear()
         seq.block_ctx(self.engine_id).block_location.clear()
         seq.block_ctx(self.engine_id).num_dispatched_tokens.clear()
@@ -173,17 +204,40 @@ class Scheduler:
         self.attention_sp = config.attention_sp
         self.rounting_strategy = RoutingStrategy.RoundRobin
 
-        self.worker_state = [
-            SPStateManager(
-                config.engine_id,
-                self.attention_sp,
-                config.num_kvcache_blocks,
-                config.kvcache_block_size,
-                config.max_num_seqs,
-                config.max_num_batched_tokens,
+        self.use_cpp_block_manager = getattr(config, "use_cpp_block_manager", False)
+        self.use_cpp_sp_state_manager = getattr(config, "use_cpp_sp_state_manager", False)
+
+        if self.use_cpp_sp_state_manager and CppSPStateManager is None:
+            raise ImportError(
+                "C++ SPStateManager backend is not available. "
+                "Rebuild the extension and ensure nanodeploy.engine._core exports SPStateManager."
             )
-            for _ in range(self.attention_dp)
-        ]
+
+        if self.use_cpp_sp_state_manager:
+            self.worker_state = [
+                CppSPStateManager(
+                    config.engine_id,
+                    self.attention_sp,
+                    config.num_kvcache_blocks,
+                    config.kvcache_block_size,
+                    config.max_num_seqs,
+                    config.max_num_batched_tokens,
+                )
+                for _ in range(self.attention_dp)
+            ]
+        else:
+            self.worker_state = [
+                SPStateManager(
+                    config.engine_id,
+                    self.attention_sp,
+                    config.num_kvcache_blocks,
+                    config.kvcache_block_size,
+                    config.max_num_seqs,
+                    config.max_num_batched_tokens,
+                    use_cpp_block_manager=self.use_cpp_block_manager,
+                )
+                for _ in range(self.attention_dp)
+            ]
         self.to_be_migrated: dict[str, tuple[Sequence, int]] = {}
 
         self.mode: Literal["prefill", "decode", "hybrid"] = config.mode
@@ -202,7 +256,12 @@ class Scheduler:
             seq.metric.record_arrival()
 
     def running(self, dp_idx: int):
-        return self.worker_state[dp_idx].running
+        # For debugging only; internal scheduler logic uses running_* methods.
+        ws = self.worker_state[dp_idx]
+        if hasattr(ws, "running"):
+            return ws.running
+        # C++ backend: return a snapshot list
+        return ws.running_snapshot()
 
     def block_manager(self, dp_idx: int):
         return self.worker_state[dp_idx].block_manager
@@ -241,7 +300,7 @@ class Scheduler:
                     )
                     seq.status = SequenceStatus.RUNNING
                     waiting.popleft()
-                    self.running(selected_dp_idx).append(seq)
+                    self.worker_state[selected_dp_idx].running_append(seq)
                     scheduled_seqs[selected_dp_idx].append(seq)
                     if seq.metric:
                         seq.metric.record_first_scheduled()
@@ -260,16 +319,14 @@ class Scheduler:
         scheduled_seqs = [[] for _ in range(self.attention_dp)]
         num_seqs = {replica_id: 0 for replica_id in range(self.attention_dp)}
         for selected_dp_idx in range(self.attention_dp):
-            while self.running(selected_dp_idx):
-                seq = self.running(selected_dp_idx).popleft()
+            ws = self.worker_state[selected_dp_idx]
+            while ws.running_has_any():
+                seq = ws.running_popleft()
                 while not self.worker_state[selected_dp_idx].can_append(
                     seq, num_tokens=self.loop_count
                 ):
-                    if self.running(selected_dp_idx):
-                        self.preempt(
-                            selected_dp_idx, self.running(
-                                selected_dp_idx).pop()
-                        )
+                    if ws.running_has_any():
+                        self.preempt(selected_dp_idx, ws.running_pop())
                     else:
                         self.preempt(selected_dp_idx, seq)
                         break
@@ -279,15 +336,12 @@ class Scheduler:
                         seq, num_tokens=self.loop_count
                     )
                     scheduled_seqs[selected_dp_idx].append(seq)
-            self.running(selected_dp_idx).extendleft(
-                reversed(scheduled_seqs[selected_dp_idx])
-            )
+            ws.running_extendleft(scheduled_seqs[selected_dp_idx])
 
         for dp_idx, dp_seqs in enumerate(scheduled_seqs):
             sp_lens = [0 for _ in range(self.attention_sp)]
             for seq in dp_seqs:
-                sp_lens[seq.block_ctx(
-                    self.engine_id).master_sp_idx] += len(seq)
+                sp_lens[seq.block_ctx(self.engine_id).master_sp_idx] += len(seq)
 
             for sp_idx in range(self.attention_sp):
                 if sp_lens[sp_idx] == 0:
@@ -324,41 +378,46 @@ class Scheduler:
         dp_token_ids: list[list[list[list[int]]]],
         metrics_manager: "MetricsManager | None" = None,
     ):
-        for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
-            for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
-                for _, (seq, loop_count_token_id) in enumerate(zip(seqs, token_ids)):
-                    if seq in self.worker_state[dp_idx].dummy_seqs:
-                        continue
-                    for token_id in loop_count_token_id:
-                        assert sp_idx == seq.block_ctx(
-                            self.engine_id).master_sp_idx
-                        seq.append_token(
-                            token_id, engine_id=self.engine_id, sp_idx=sp_idx
-                        )
+        dp_dummy_seqs = [ws.dummy_seqs for ws in self.worker_state]
 
-                        if metrics_manager and seq.metric:
-                            if seq.metric.num_generated_tokens == 0:
-                                # First token just generated
-                                seq.metric.record_first_token()
-                                seq.metric.num_generated_tokens = 1
-                            else:
-                                # Subsequent tokens - record ITL
-                                seq.metric.record_token()
+        # 1. 调用 C++ 核心逻辑
+        postprocess_result = postprocess_step(
+            dp_seqs,
+            dp_token_ids,
+            dp_dummy_seqs,
+            self.engine_id,
+            self.eos,
+            self.mode == "prefill",
+            metrics_manager,
+        )
 
-                        if (
-                            not seq.ignore_eos and token_id == self.eos
-                        ) or seq.num_completed_tokens == seq.max_tokens:
-                            seq.status = SequenceStatus.FINISHED
-                            self.worker_state[dp_idx].deallocate(seq)
-                            self.running(dp_idx).remove(seq)
-                            break
-                        elif self.mode == "prefill":
-                            seq.status = SequenceStatus.TO_BE_MIGRATED
-                            seq.backup_engine_id = seq.active_engine_id
-                            seq.active_engine_id = None
-                            self.running(dp_idx).remove(seq)
-                            self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
-                            break
+        finished_list = postprocess_result.finished
+        migrated_list = postprocess_result.migrated
+
+        # --- 优化 1: 批量处理 Finished Sequences ---
+        if finished_list:
+            finished_map = {}
+            for dp_idx, seq in finished_list:
+                self.worker_state[dp_idx].deallocate(seq)
+
+                if dp_idx not in finished_map:
+                    finished_map[dp_idx] = set()
+                finished_map[dp_idx].add(seq.seq_id)
+
+            for dp_idx, finished_ids in finished_map.items():
+                self.worker_state[dp_idx].running_remove_seq_ids(finished_ids)
+
+        # --- 优化 2: 批量处理 Migrated Sequences ---
+        if migrated_list:
+            migrated_map = {}
+            for dp_idx, seq in migrated_list:
+                self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
+                if dp_idx not in migrated_map:
+                    migrated_map[dp_idx] = set()
+                migrated_map[dp_idx].add(seq.seq_id)
+
+            for dp_idx, migrated_ids in migrated_map.items():
+                self.worker_state[dp_idx].running_remove_seq_ids(migrated_ids)
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):

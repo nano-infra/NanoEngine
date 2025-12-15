@@ -1,7 +1,7 @@
 import dataclasses
 from typing import Optional
 
-from nanodeploy.logging import get_logger
+from nanodeploy.logger import get_logger
 
 # Initialize logger with NANODEPLOY namespace
 logger = get_logger()
