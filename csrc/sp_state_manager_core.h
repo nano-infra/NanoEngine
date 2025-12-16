@@ -231,6 +231,48 @@ public:
         block_managers_[(size_t)ctx.master_sp_idx].allocate(*seq);
     }
 
+    std::pair<std::vector<std::shared_ptr<Sequence>>, std::vector<std::shared_ptr<Sequence>>>
+    schedule_decode(int loop_count)
+    {
+        std::vector<std::shared_ptr<Sequence>> scheduled;
+        std::vector<std::shared_ptr<Sequence>> preempted;
+
+        while (!running_.empty()) {
+            auto seq = running_.front();
+            running_.pop_front();
+
+            while (!can_append(seq, loop_count)) {
+                if (!running_.empty()) {
+                    auto victim = running_.back();
+                    running_.pop_back();
+
+                    deallocate(victim);
+                    victim->status = SequenceStatus::WAITING;
+                    victim->num_checkpointed_tokens = victim->token_ids.size();
+                    preempted.push_back(victim);
+                } else {
+                    deallocate(seq);
+                    seq->status = SequenceStatus::WAITING;
+                    seq->num_checkpointed_tokens = seq->token_ids.size();
+                    preempted.push_back(seq);
+                    seq = nullptr;
+                    break;
+                }
+            }
+
+            if (seq) {
+                may_append(seq, loop_count);
+                scheduled.push_back(seq);
+            }
+        }
+
+        for (auto it = scheduled.rbegin(); it != scheduled.rend(); ++it) {
+            running_.push_front(*it);
+        }
+
+        return {scheduled, preempted};
+    }
+
     void deallocate(const std::shared_ptr<Sequence>& seq)
     {
         for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {

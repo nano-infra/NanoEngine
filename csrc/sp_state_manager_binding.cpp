@@ -36,5 +36,6 @@ void bind_sp_state_manager(py::module& m)
         .def("may_append", &NDSPStateManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def("can_allocate", &NDSPStateManager::can_allocate, py::arg("seq"), py::arg("num_seqs"), py::arg("num_batched_tokens"))
         .def("allocate", &NDSPStateManager::allocate, py::arg("seq"))
+        .def("schedule_decode", &NDSPStateManager::schedule_decode, py::arg("loop_count"))
         .def("deallocate", &NDSPStateManager::deallocate, py::arg("seq"));
 }

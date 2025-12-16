@@ -320,23 +320,30 @@ class Scheduler:
         num_seqs = {replica_id: 0 for replica_id in range(self.attention_dp)}
         for selected_dp_idx in range(self.attention_dp):
             ws = self.worker_state[selected_dp_idx]
-            while ws.running_has_any():
-                seq = ws.running_popleft()
-                while not self.worker_state[selected_dp_idx].can_append(
-                    seq, num_tokens=self.loop_count
-                ):
-                    if ws.running_has_any():
-                        self.preempt(selected_dp_idx, ws.running_pop())
-                    else:
-                        self.preempt(selected_dp_idx, seq)
-                        break
-                else:
-                    num_seqs[selected_dp_idx] += 1
-                    self.worker_state[selected_dp_idx].may_append(
+            if self.use_cpp_sp_state_manager:
+                scheduled, preempted = ws.schedule_decode(self.loop_count)
+                scheduled_seqs[selected_dp_idx] = scheduled
+                for seq in preempted:
+                    logger.info("preemption happens")
+                    self.waiting.appendleft(seq)
+            else:
+                while ws.running_has_any():
+                    seq = ws.running_popleft()
+                    while not self.worker_state[selected_dp_idx].can_append(
                         seq, num_tokens=self.loop_count
-                    )
-                    scheduled_seqs[selected_dp_idx].append(seq)
-            ws.running_extendleft(scheduled_seqs[selected_dp_idx])
+                    ):
+                        if ws.running_has_any():
+                            self.preempt(selected_dp_idx, ws.running_pop())
+                        else:
+                            self.preempt(selected_dp_idx, seq)
+                            break
+                    else:
+                        num_seqs[selected_dp_idx] += 1
+                        self.worker_state[selected_dp_idx].may_append(
+                            seq, num_tokens=self.loop_count
+                        )
+                        scheduled_seqs[selected_dp_idx].append(seq)
+                ws.running_extendleft(scheduled_seqs[selected_dp_idx])
 
         for dp_idx, dp_seqs in enumerate(scheduled_seqs):
             sp_lens = [0 for _ in range(self.attention_sp)]
