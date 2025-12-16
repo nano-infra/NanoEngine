@@ -599,6 +599,9 @@ class ModelRunner:
             .cuda(non_blocking=True)
         )
 
+        start = meta.context_lens_for_attn_start_pos
+        end = meta.context_lens_for_attn_end_pos
+
         config = self.config
         hf_config = config.hf_config
         new_tile_scheduler_metadata, new_num_splits = None, None
@@ -637,6 +640,7 @@ class ModelRunner:
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             attention_compute_bs=int(meta.attention_compute_bs),
         )
+        get_context().context_lens_for_attn_cur_rank_slice = slice(start, end)
 
         return input_ids, positions
 
@@ -696,6 +700,14 @@ class ModelRunner:
         attention_compute_bs = np.sum(sp_valid_request_counts)
 
         context_lens_for_attn_np = context_lens_np[context_lens_np > 0]
+
+        offsets = np.zeros(sp_size + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(sp_valid_request_counts)
+
+        start_pos = offsets[sp_rank]
+        end_pos = start_pos + sp_valid_request_counts[sp_rank]
+
+        context_lens_for_attn_cur_rank_slice = slice(int(start_pos), int(end_pos))
 
         # 计算 recv_req_num: 其他 Rank 的序列在当前 Rank 有长度
         recv_mask = context_lens_np.copy()
@@ -862,6 +874,9 @@ class ModelRunner:
             res_to_buffer_input_mask=res_to_buffer_input_mask_tensor,
             attention_compute_bs=int(attention_compute_bs),
         )
+        get_context().context_lens_for_attn_cur_rank_slice = (
+            context_lens_for_attn_cur_rank_slice
+        )
 
         return input_ids, positions
 
@@ -904,9 +919,9 @@ class ModelRunner:
         if num_sp_seqs > 0:
             context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
 
-        context.context_lens_for_attn = context.context_lens.flatten()[
-            context.context_lens.flatten() > 0
-        ]
+        context.context_lens_for_attn[
+            context.context_lens_for_attn_cur_rank_slice
+        ].add_(1)
 
         config = self.config
         hf_config = config.hf_config

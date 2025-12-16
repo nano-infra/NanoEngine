@@ -42,6 +42,7 @@ class Context:
     res_slice_fill_to_buffer_input: torch.Tensor | None = None
     res_to_buffer_input_mask: Optional[torch.Tensor] = None
     attention_compute_bs: Optional[int] = None
+    context_lens_for_attn_cur_rank_slice: slice | None = None
 
 
 _CONTEXT = Context()
