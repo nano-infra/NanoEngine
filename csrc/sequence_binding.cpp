@@ -440,7 +440,31 @@ PYBIND11_MODULE(_core, m)
                     v.push_back(item.cast<int>());
                 }
                 return v;
-            }));
+            }))
+
+        // [新增] 支持 IntVector + list (例如: vec + [1, 2])
+        .def("__add__",
+             [](const std::vector<int>& v, const py::list& other) {
+                 std::vector<int> result = v;  // 拷贝原向量
+                 result.reserve(v.size() + other.size());
+                 for (auto item : other) {
+                     result.push_back(item.cast<int>());
+                 }
+                 return result;  // 返回新向量 (会被自动封装为 IntVector)
+             })
+
+        // [新增] 支持 list + IntVector (例如: [1, 2] + vec)
+        .def("__radd__", [](const std::vector<int>& v, const py::list& other) {
+            std::vector<int> result;
+            result.reserve(other.size() + v.size());
+            // 先放 list 的内容
+            for (auto item : other) {
+                result.push_back(item.cast<int>());
+            }
+            // 再追加 vector 的内容
+            result.insert(result.end(), v.begin(), v.end());
+            return result;
+        });
 
     py::bind_map<std::map<int, int>>(m, "IntIntMap")
         .def("clear", [](std::map<int, int>& m) { m.clear(); })
@@ -756,26 +780,35 @@ PYBIND11_MODULE(_core, m)
         .def(py::pickle(
             [](const Sequence& s) {
                 py::object token_state;
-                if (s.num_generated_tokens_since_checkpoint() == 0)
-                    token_state = py::cast(s.token_ids);
-                else
+                // [关键修复 1] 显式转换为 py::list，而不是 IntVector
+                if (s.num_generated_tokens_since_checkpoint() == 0) {
+                    py::list l;
+                    for (int token : s.token_ids) {
+                        l.append(token);
+                    }
+                    token_state = l;
+                }
+                else {
                     token_state = py::cast(s.last_token);
-                return py::make_tuple(s.num_tokens,
-                                      s.num_checkpointed_tokens,
-                                      s.num_cached_tokens,
-                                      s.backup_engine_id,
-                                      s.active_engine_id,
-                                      s.block_ctx_map,
-                                      s.temperature,
-                                      token_state,
-                                      s.seq_id,
-                                      // [Changed] 传输 metric 对象
-                                      s.metric);
+                }
+
+                return py::make_tuple(s.num_tokens,               // 0
+                                      s.num_checkpointed_tokens,  // 1
+                                      s.num_cached_tokens,        // 2
+                                      s.backup_engine_id,         // 3
+                                      s.active_engine_id,         // 4
+                                      s.block_ctx_map,            // 5
+                                      s.temperature,              // 6
+                                      token_state,                // 7
+                                      s.seq_id,                   // 8
+                                      s.metric,                   // 9
+                                      s.num_prompt_tokens         // 10 [新增] 补上漏掉的字段
+                );
             },
             [](py::tuple t) {
-                // [Optimized] 使用 create_empty 避免开销
                 auto s_ptr = Sequence::create_empty();
 
+                // 基础字段读取
                 s_ptr->num_tokens              = t[0].cast<int64_t>();
                 s_ptr->num_checkpointed_tokens = t[1].cast<int64_t>();
                 s_ptr->num_cached_tokens       = t[2].cast<int64_t>();
@@ -784,25 +817,53 @@ PYBIND11_MODULE(_core, m)
                 s_ptr->block_ctx_map           = t[5].cast<std::map<std::optional<std::string>, BlockContext>>();
                 s_ptr->temperature             = t[6].cast<std::optional<float>>();
 
-                // 处理 token/last_token 逻辑
+                // [关键修复 2] Token 恢复逻辑
+                // 因为序列化强制转成了 list，这里 isinstance<list> 就会成功
                 if (py::isinstance<py::list>(t[7])) {
                     auto l = t[7].cast<py::list>();
                     s_ptr->token_ids.reserve(l.size());
-                    for (auto item : l)
+                    for (auto item : l) {
                         s_ptr->token_ids.push_back(item.cast<int>());
+                    }
+                    // 如果传入的是列表，说明是 Prefill 阶段，last_token 是最后一个
+                    if (!s_ptr->token_ids.empty()) {
+                        s_ptr->last_token = s_ptr->token_ids.back();
+                    }
                 }
                 else if (py::isinstance<py::int_>(t[7])) {
                     s_ptr->last_token = t[7].cast<int>();
+                    // Decode 阶段通常不需要完整的 token_ids，或者通过其他方式同步
                 }
 
-                s_ptr->seq_id = t[8].cast<std::string>();
+                // [关键修复 3] 安全读取后续字段 (防止 Python 端传来的 tuple 长度不够)
+                if (t.size() > 8) {
+                    s_ptr->seq_id = t[8].cast<std::string>();
+                }
+                else {
+                    s_ptr->seq_id = generate_uuid();
+                }
 
-                // [Changed] 恢复 metric
                 if (t.size() > 9 && !t[9].is_none()) {
                     s_ptr->metric = t[9].cast<std::shared_ptr<SequenceMetric>>();
                 }
                 else {
                     s_ptr->metric = nullptr;
+                }
+
+                // [关键修复 4] 恢复 num_prompt_tokens
+                if (t.size() > 10) {
+                    s_ptr->num_prompt_tokens = t[10].cast<int64_t>();
+                }
+                else {
+                    // 如果没有传 (比如来自旧版本 Python 代码)，根据现有 token 推断
+                    // 在 Prefill 阶段，prompt tokens 等于当前 tokens 长度
+                    if (s_ptr->num_tokens == s_ptr->num_checkpointed_tokens) {
+                        s_ptr->num_prompt_tokens = s_ptr->num_tokens;
+                    }
+                    else {
+                        // Fallback: 假设除了最后生成的都是 prompt (不一定对，但比 0 好)
+                        s_ptr->num_prompt_tokens = std::max((int64_t)0, s_ptr->num_tokens - 1);
+                    }
                 }
 
                 return s_ptr;
