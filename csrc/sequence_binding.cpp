@@ -1,7 +1,7 @@
-#include "sequence_core.h"
 #include "block_manager_core.h"
-#include "sp_state_manager_core.h"
 #include "model_runner_core.h"
+#include "sequence_core.h"
+#include "sp_state_manager_core.h"
 #include <future>
 
 // =========================================================================
@@ -462,6 +462,15 @@ PYBIND11_MODULE(_core, m)
 
     py::bind_map<std::map<int, std::vector<int>>>(m, "IntVectorMap")
         .def("clear", [](std::map<int, std::vector<int>>& m) { m.clear(); })
+        .def("__setitem__",
+             [](std::map<int, std::vector<int>>& m, int key, const py::list& value) {
+                 std::vector<int> vec;
+                 vec.reserve(value.size());
+                 for (auto item : value) {
+                     vec.push_back(item.cast<int>());
+                 }
+                 m[key] = vec;
+             })
         .def(py::pickle(
             [](const std::map<int, std::vector<int>>& map) {
                 py::dict d;
@@ -702,12 +711,31 @@ PYBIND11_MODULE(_core, m)
         .def("context_len", &Sequence::context_len, py::arg("engine_id") = py::none(), py::arg("sp_idx") = py::none())
         .def("__len__", [](const Sequence& s) { return s.num_tokens; })
         .def("__getitem__",
-             [](const Sequence& s, int i) {
-                 if (i < 0)
-                     i += s.token_ids.size();
-                 if (i < 0 || i >= (int)s.token_ids.size())
-                     throw py::index_error();
-                 return s.token_ids[i];
+             [](const Sequence& s, py::object item) -> py::object {
+                 if (py::isinstance<py::int_>(item)) {
+                     int i = item.cast<int>();
+                     if (i < 0)
+                         i += s.token_ids.size();
+                     if (i < 0 || i >= (int)s.token_ids.size())
+                         throw py::index_error();
+                     return py::cast(s.token_ids[i]);
+                 }
+                 else if (py::isinstance<py::slice>(item)) {
+                     py::slice slice = item.cast<py::slice>();
+                     size_t    start, stop, step, slicelength;
+                     if (!slice.compute(s.token_ids.size(), &start, &stop, &step, &slicelength))
+                         throw py::error_already_set();
+                     std::vector<int> result;
+                     result.reserve(slicelength);
+                     for (size_t i = 0; i < slicelength; ++i) {
+                         result.push_back(s.token_ids[start]);
+                         start += step;
+                     }
+                     return py::cast(result);
+                 }
+                 else {
+                     throw py::type_error("Invalid argument type for __getitem__");
+                 }
              })
         .def_property_readonly("is_finished", &Sequence::is_finished)
         .def_property_readonly("num_completed_tokens", &Sequence::num_completed_tokens)

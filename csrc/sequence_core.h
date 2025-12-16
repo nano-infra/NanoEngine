@@ -404,6 +404,9 @@ public:
         this->metric = std::make_shared<SequenceMetric>(this->seq_id, this->num_tokens);
 
         BlockContext ctx(engine_id, -1, master_sp_rank, 1, 1);
+
+        ctx.num_dispatched_tokens[master_sp_rank] = 0;
+
         this->block_ctx_map[engine_id] = ctx;
     }
 
@@ -429,9 +432,15 @@ public:
         this->active_engine_id = engine_id;
         if (block_ctx_map.count(engine_id))
             return;
+
         BlockContext ctx(engine_id, -1, 0, attention_sp, attention_dp);
-        for (int i = 0; i < attention_sp; ++i)
+
+        for (int i = 0; i < attention_sp; ++i) {
             ctx.sp_block_table[i] = {};
+
+            ctx.num_dispatched_tokens[i] = 0;
+        }
+
         block_ctx_map[engine_id] = ctx;
     }
 
