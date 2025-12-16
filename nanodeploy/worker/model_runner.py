@@ -10,11 +10,10 @@ import torch.nn.functional as F
 import torch.profiler as profiler
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
-from nanodeploy.engine._core import Sequence, SequenceBatch, ModelRunnerCore
+from nanodeploy.engine._core import ModelRunnerCore, Sequence, SequenceBatch
 from nanodeploy.kernels.copy import warmup_copy_kernel
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logger import get_logger
-from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.utils.rdma_manager import get_available_nics, RDMAManager
@@ -35,7 +34,6 @@ logger = get_logger()
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
-    "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
 }
 
 
@@ -219,7 +217,7 @@ class ModelRunner:
             config.max_num_recv_seqs,
             config.kvcache_block_size,
             get_dist_context().attn_sp_rank,
-            get_dist_context().attn_sp_world_size
+            get_dist_context().attn_sp_world_size,
         )
 
         self.preallocate_kvcache()
@@ -352,17 +350,47 @@ class ModelRunner:
 
     def _prepare_prefill_cpp(self, seqs: list[Sequence], is_dummy: bool = False):
         meta = self.cpp_runner.prepare_prefill(seqs, is_dummy)
-        
-        input_ids = torch.from_numpy(meta.input_ids).to(torch.int64).pin_memory().cuda(non_blocking=True)
-        positions = torch.from_numpy(meta.positions).to(torch.int64).pin_memory().cuda(non_blocking=True)
-        cu_seqlens_q = torch.from_numpy(meta.cu_seqlens_q).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        cu_seqlens_k = torch.from_numpy(meta.cu_seqlens_k).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        slot_mapping = torch.from_numpy(meta.slot_mapping).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        
+
+        input_ids = (
+            torch.from_numpy(meta.input_ids)
+            .to(torch.int64)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        positions = (
+            torch.from_numpy(meta.positions)
+            .to(torch.int64)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        cu_seqlens_q = (
+            torch.from_numpy(meta.cu_seqlens_q)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        cu_seqlens_k = (
+            torch.from_numpy(meta.cu_seqlens_k)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        slot_mapping = (
+            torch.from_numpy(meta.slot_mapping)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+
         if meta.block_tables.size > 0:
-             block_tables = torch.from_numpy(meta.block_tables).to(torch.int32).pin_memory().cuda(non_blocking=True)
+            block_tables = (
+                torch.from_numpy(meta.block_tables)
+                .to(torch.int32)
+                .pin_memory()
+                .cuda(non_blocking=True)
+            )
         else:
-             block_tables = None
+            block_tables = None
 
         set_context(
             True,
@@ -455,31 +483,121 @@ class ModelRunner:
 
     def _prepare_decode_cpp(self, dp_seqs: list[Sequence], is_dummy: bool = False):
         meta = self.cpp_runner.prepare_decode(dp_seqs, is_dummy)
-        
-        input_ids = torch.from_numpy(meta.input_ids).to(torch.int64).pin_memory().cuda(non_blocking=True)
-        positions = torch.from_numpy(meta.positions).to(torch.int64).pin_memory().cuda(non_blocking=True)
-        slot_mapping = torch.from_numpy(meta.slot_mapping).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        
-        context_lens = torch.from_numpy(meta.context_lens).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        context_lens_for_attn = torch.from_numpy(meta.context_lens_for_attn).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        global_context_lens = torch.from_numpy(meta.global_context_lens).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        
-        block_tables = torch.from_numpy(meta.block_tables).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        
-        q_mask = torch.from_numpy(meta.q_mask).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        res_lse_mask = torch.from_numpy(meta.res_lse_mask).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        
-        q_slice_get = torch.from_numpy(meta.q_slice_get).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        q_slice_fill = torch.from_numpy(meta.q_slice_fill).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        q_copy_mask = torch.from_numpy(meta.q_copy_mask).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        
-        res_slice_get_to_buffer_output = torch.from_numpy(meta.res_slice_get_to_buffer_output).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        res_slice_fill_to_buffer_output = torch.from_numpy(meta.res_slice_fill_to_buffer_output).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        res_to_buffer_output_mask = torch.from_numpy(meta.res_to_buffer_output_mask).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        
-        res_slice_get_to_buffer_input = torch.from_numpy(meta.res_slice_get_to_buffer_input).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        res_slice_fill_to_buffer_input = torch.from_numpy(meta.res_slice_fill_to_buffer_input).to(torch.int32).pin_memory().cuda(non_blocking=True)
-        res_to_buffer_input_mask = torch.from_numpy(meta.res_to_buffer_input_mask).to(torch.int32).pin_memory().cuda(non_blocking=True)
+
+        input_ids = (
+            torch.from_numpy(meta.input_ids)
+            .to(torch.int64)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        positions = (
+            torch.from_numpy(meta.positions)
+            .to(torch.int64)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        slot_mapping = (
+            torch.from_numpy(meta.slot_mapping)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+
+        context_lens = (
+            torch.from_numpy(meta.context_lens)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        context_lens_for_attn = (
+            torch.from_numpy(meta.context_lens_for_attn)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        global_context_lens = (
+            torch.from_numpy(meta.global_context_lens)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+
+        block_tables = (
+            torch.from_numpy(meta.block_tables)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+
+        q_mask = (
+            torch.from_numpy(meta.q_mask)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        res_lse_mask = (
+            torch.from_numpy(meta.res_lse_mask)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+
+        q_slice_get = (
+            torch.from_numpy(meta.q_slice_get)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        q_slice_fill = (
+            torch.from_numpy(meta.q_slice_fill)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        q_copy_mask = (
+            torch.from_numpy(meta.q_copy_mask)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+
+        res_slice_get_to_buffer_output = (
+            torch.from_numpy(meta.res_slice_get_to_buffer_output)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        res_slice_fill_to_buffer_output = (
+            torch.from_numpy(meta.res_slice_fill_to_buffer_output)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        res_to_buffer_output_mask = (
+            torch.from_numpy(meta.res_to_buffer_output_mask)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+
+        res_slice_get_to_buffer_input = (
+            torch.from_numpy(meta.res_slice_get_to_buffer_input)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        res_slice_fill_to_buffer_input = (
+            torch.from_numpy(meta.res_slice_fill_to_buffer_input)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
+        res_to_buffer_input_mask = (
+            torch.from_numpy(meta.res_to_buffer_input_mask)
+            .to(torch.int32)
+            .pin_memory()
+            .cuda(non_blocking=True)
+        )
 
         config = self.config
         hf_config = config.hf_config
