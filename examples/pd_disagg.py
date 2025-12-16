@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("/models/models--Qwen--Qwen3-30B-A3B-Instruct-2507-FP8")
+    path = os.path.expanduser("/models/qwen3-235B-Instruct-2507-FP8")
     tokenizer = AutoTokenizer.from_pretrained(path)
 
     decode = LLM(
@@ -21,13 +21,14 @@ def main():
         ffn_tp=1,
         mode="decode",
         loop_count=16,
-        master_address="10.103.5.41:6006",
-        ray_address="10.103.5.41:7077",
+        master_address="10.102.97.179:6006",
+        ray_address="10.102.97.179:7078",
         dummy_prefill=False,
         max_num_seqs=2,
         gpu_memory_utilization=0.5,
         max_model_len=4096,
         max_num_batched_tokens=4096,
+        dummy_weight=False,
     )
 
     prefill = LLM(
@@ -41,11 +42,12 @@ def main():
         ffn_ep=8,
         ffn_tp=1,
         mode="prefill",
-        master_address="10.103.11.87:6006",
-        ray_address="10.103.5.41:7077",
+        master_address="10.102.97.183:6006",
+        ray_address="10.102.97.179:7078",
         gpu_memory_utilization=0.5,
         max_model_len=4096,
         max_num_batched_tokens=4096,
+        dummy_weight=False,
     )
 
     prefill_endpoints_info = prefill.p2p_init(

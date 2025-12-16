@@ -7,9 +7,7 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser(
-        "/models/models--Qwen--Qwen3-235B-A22B-Instruct-2507-FP8/snapshots/ba82a1060073fa0ecdc70d7b1922ec071f60cf3e"
-    )
+    path = os.path.expanduser("/models/qwen3-235B-Instruct-2507-FP8")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(
         path,
@@ -20,8 +18,8 @@ def main():
         ffn_dp=1,
         ffn_ep=32,
         ffn_tp=1,
-        ray_address="10.103.5.41:7077",
-        master_address="10.103.5.41:29901",
+        ray_address="10.102.97.179:7078",
+        master_address="10.102.97.179:29901",
         loop_count=16,
         max_model_len=4096,
         max_num_batched_tokens=4096,

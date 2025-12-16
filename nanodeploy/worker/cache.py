@@ -125,7 +125,7 @@ class CacheContext:
         for i in range(remote_world_size):
             endpoint = dlslime.RDMAEndpoint(self.selected_nic, qp_num=2)
             endpoint.register_memory_region(
-                mr_key="kv",
+                mr_key=0,
                 addr=self.kv_cache.data_ptr(),
                 offset=self.kv_cache.storage_offset(),
                 length=self.kv_cache.numel() * self.kv_cache.itemsize,
@@ -156,7 +156,7 @@ class CacheContext:
                     for layer_idx in range(self.num_hidden_layers):
                         if source_block_idx[0] == sp_idx:
                             assignment = Assignment(
-                                mr_key="kv",
+                                mr_key=0,
                                 target_offset=self.remote_kv_stride(
                                     kv_idx,
                                     layer_idx,
