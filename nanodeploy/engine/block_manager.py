@@ -1,5 +1,7 @@
 from collections import deque
 
+from typing import Any, cast
+
 import numpy as np
 import xxhash
 
@@ -51,7 +53,7 @@ class BlockManager:
         self.used_block_ids.add(block_id)
         return self.blocks[block_id]
 
-    def _deallocate_block(self, block_id: int) -> Block:
+    def _deallocate_block(self, block_id: int) -> None:
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
@@ -92,8 +94,16 @@ class BlockManager:
             if h != -1:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
-            seq.block_ctx(self.engine_id).block_location.append((self.sp_idx, block_id))
-            seq.block_table(self.engine_id, self.sp_idx).append(block_id)
+            seq_any = cast(Any, seq)
+            if hasattr(seq_any, "block_location_append"):
+                seq_any.block_location_append(self.sp_idx, block_id, self.engine_id)
+            else:
+                seq.block_ctx(self.engine_id).block_location.append((self.sp_idx, block_id))
+
+            if hasattr(seq_any, "block_table_append"):
+                seq_any.block_table_append(block_id, self.engine_id, self.sp_idx)
+            else:
+                seq.block_table(self.engine_id, self.sp_idx).append(block_id)
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table(self.engine_id, self.sp_idx)):
@@ -102,7 +112,11 @@ class BlockManager:
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
-        seq.block_table(self.engine_id, self.sp_idx).clear()
+        seq_any = cast(Any, seq)
+        if hasattr(seq_any, "block_table_clear"):
+            seq_any.block_table_clear(self.engine_id, self.sp_idx)
+        else:
+            seq.block_table(self.engine_id, self.sp_idx).clear()
 
     def can_append(self, seq: Sequence, num_tokens: int = 1) -> bool:
         total_tokens_needed_before = (
@@ -129,11 +143,18 @@ class BlockManager:
             ) % self.block_size == 1:
                 # assert last_block.hash != -1
                 block_id = self.free_block_ids[0]
-                seq.block_ctx(self.engine_id).block_location.append(
-                    (self.sp_idx, block_id)
-                )
+                seq_any = cast(Any, seq)
+                if hasattr(seq_any, "block_location_append"):
+                    seq_any.block_location_append(self.sp_idx, block_id, self.engine_id)
+                else:
+                    seq.block_ctx(self.engine_id).block_location.append(
+                        (self.sp_idx, block_id)
+                    )
                 self._allocate_block(block_id)
-                block_table.append(block_id)
+                if hasattr(seq_any, "block_table_append"):
+                    seq_any.block_table_append(block_id, self.engine_id, self.sp_idx)
+                else:
+                    block_table.append(block_id)
             elif (
                 seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx]
                 + idx

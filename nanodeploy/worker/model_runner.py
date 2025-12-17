@@ -550,7 +550,11 @@ class ModelRunner:
                 master_sp_rank=get_dist_context().attn_sp_rank,
             )
 
-            seq.block_ctx(self.engine_id).sp_block_table[sp_rank] = [0]
+            # Ensure block_table is initialized for dummy seq in both Python and C++ backends.
+            if hasattr(seq, "block_table_set"):
+                seq.block_table_set([0], self.engine_id, sp_rank)
+            else:
+                seq.block_ctx(self.engine_id).sp_block_table[sp_rank] = [0]
             dp_seqs.append(seq)
 
         sp_seqs = [
