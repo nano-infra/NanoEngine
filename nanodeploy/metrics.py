@@ -80,7 +80,7 @@ class SequenceMetric:
         Time to first token (TTFT) in milliseconds. Includes queueing time.
         Returns None if first token hasn't been generated yet.
         """
-        if self.first_token_time is None:
+        if self.first_token_time is None or self.arrival_time is None:
             return None
         return (self.first_token_time - self.arrival_time) * 1000
 
@@ -90,7 +90,7 @@ class SequenceMetric:
         End-to-end latency in milliseconds.
         Returns None if sequence hasn't completed yet.
         """
-        if self.completion_time is None:
+        if self.completion_time is None or self.arrival_time is None:
             return None
         return (self.completion_time - self.arrival_time) * 1000
 
@@ -100,19 +100,34 @@ class SequenceMetric:
         Time per output token (TPOT) in milliseconds. Includes queueing time.
         Returns None if no tokens have been generated yet.
         """
-        if self.num_generated_tokens == 0 or self.completion_time is None:
+        if (
+            self.num_generated_tokens == 0
+            or self.completion_time is None
+            or self.arrival_time is None
+        ):
             return None
         total_decode_time = (self.completion_time - self.arrival_time) * 1000  # ms
         return total_decode_time / self.num_generated_tokens
 
     @property
     def avg_tpot_wo_queueing(self) -> Optional[float]:
-        if self.num_generated_tokens == 0 or self.completion_time is None:
+        if (
+            self.num_generated_tokens == 0
+            or self.completion_time is None
+            or self.decode_first_scheduled_time is None
+        ):
             return None
         total_decode_time = (
             self.completion_time - self.decode_first_scheduled_time
         ) * 1000  # ms
         return total_decode_time / self.num_generated_tokens
+
+    @property
+    def queueing_time_ms(self) -> Optional[float]:
+        """Queueing time in milliseconds (arrival -> first scheduled)."""
+        if self.decode_first_scheduled_time is None or self.arrival_time is None:
+            return None
+        return (self.decode_first_scheduled_time - self.arrival_time) * 1000
 
     @property
     def avg_itl(self) -> Optional[float]:
@@ -122,21 +137,21 @@ class SequenceMetric:
         """
         if not self.itl_samples:
             return None
-        return np.mean(self.itl_samples)
+        return float(np.mean(self.itl_samples))
 
     @property
     def p50_itl(self) -> Optional[float]:
         """P50 (median) inter-token latency in milliseconds."""
         if not self.itl_samples:
             return None
-        return np.median(self.itl_samples)
+        return float(np.median(self.itl_samples))
 
     @property
     def p99_itl(self) -> Optional[float]:
         """P99 inter-token latency in milliseconds."""
         if not self.itl_samples:
             return None
-        return np.percentile(self.itl_samples, 99)
+        return float(np.percentile(self.itl_samples, 99))
 
     def log_metrics(self):
         """Log all metrics for this sequence."""
@@ -156,8 +171,9 @@ class SequenceMetric:
 
         tpot_wo_queue_str = f"{self.avg_tpot_wo_queueing:.2f}ms" if self.avg_tpot_wo_queueing is not None else "N/A"
         tpot_with_queue_str = f"{self.avg_tpot_with_queueing:.2f}ms" if self.avg_tpot_with_queueing is not None else "N/A"
-        queueing_time = self.decode_first_scheduled_time - self.arrival_time if self.decode_first_scheduled_time is not None and self.arrival_time is not None else None
-        queueing_time_str = f"{queueing_time:.5f}ms" if queueing_time is not None else "N/A"
+        queueing_time_str = (
+            f"{self.queueing_time_ms:.2f}ms" if self.queueing_time_ms is not None else "N/A"
+        )
 
         logger.info(
             f"SequenceMetric [{self.seq_id[:8]}...] - "
