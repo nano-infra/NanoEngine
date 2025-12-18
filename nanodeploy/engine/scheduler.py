@@ -1,7 +1,7 @@
 import enum
 from collections import deque
 from itertools import count
-from typing import Literal
+from typing import Literal, TYPE_CHECKING
 
 import numpy as np
 
@@ -9,6 +9,8 @@ from nanodeploy.config import Config
 from nanodeploy.engine.block_manager import BlockManager
 from nanodeploy.engine.sequence import Sequence, SequenceStatus
 from nanodeploy.logging import get_logger
+if TYPE_CHECKING:
+    from nanodeploy.metrics import MetricsManager
 
 
 logger = get_logger()
@@ -100,11 +102,13 @@ class SPStateManager:
         block_ctx = seq.block_ctx(self.engine_id)
         block_ctx.num_dispatched_tokens.clear()
 
-        num_segments = (seq.num_tokens + self._segment_size - 1) // self._segment_size
+        num_segments = (seq.num_tokens + self._segment_size -
+                        1) // self._segment_size
         num_segments_per_rank = (
             num_segments + self.attention_sp - 1
         ) // self.attention_sp
-        num_ranks = (num_segments + num_segments_per_rank - 1) // num_segments_per_rank
+        num_ranks = (num_segments + num_segments_per_rank -
+                     1) // num_segments_per_rank
 
         master_rank = next(self.sp_rr_counter)
 
@@ -192,8 +196,10 @@ class Scheduler:
     def add(self, seq: Sequence):
         if self.mode == "decode":
             self.waiting_migration.append(seq)
+            seq.metric.record_arrival()
         else:
             self.waiting.append(seq)
+            seq.metric.record_arrival()
 
     def running(self, dp_idx: int):
         return self.worker_state[dp_idx].running
@@ -237,6 +243,8 @@ class Scheduler:
                     waiting.popleft()
                     self.running(selected_dp_idx).append(seq)
                     scheduled_seqs[selected_dp_idx].append(seq)
+                    if seq.metric:
+                        seq.metric.record_first_scheduled()
                     break
                 else:
                     break
@@ -259,7 +267,8 @@ class Scheduler:
                 ):
                     if self.running(selected_dp_idx):
                         self.preempt(
-                            selected_dp_idx, self.running(selected_dp_idx).pop()
+                            selected_dp_idx, self.running(
+                                selected_dp_idx).pop()
                         )
                     else:
                         self.preempt(selected_dp_idx, seq)
@@ -277,7 +286,8 @@ class Scheduler:
         for dp_idx, dp_seqs in enumerate(scheduled_seqs):
             sp_lens = [0 for _ in range(self.attention_sp)]
             for seq in dp_seqs:
-                sp_lens[seq.block_ctx(self.engine_id).master_sp_idx] += len(seq)
+                sp_lens[seq.block_ctx(
+                    self.engine_id).master_sp_idx] += len(seq)
 
             for sp_idx in range(self.attention_sp):
                 if sp_lens[sp_idx] == 0:
@@ -312,6 +322,7 @@ class Scheduler:
         self,
         dp_seqs: list[list[list[Sequence]]],
         dp_token_ids: list[list[list[list[int]]]],
+        metrics_manager: "MetricsManager | None" = None,
     ):
         for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
             for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
@@ -319,10 +330,21 @@ class Scheduler:
                     if seq in self.worker_state[dp_idx].dummy_seqs:
                         continue
                     for token_id in loop_count_token_id:
-                        assert sp_idx == seq.block_ctx(self.engine_id).master_sp_idx
+                        assert sp_idx == seq.block_ctx(
+                            self.engine_id).master_sp_idx
                         seq.append_token(
                             token_id, engine_id=self.engine_id, sp_idx=sp_idx
                         )
+
+                        if metrics_manager and seq.metric:
+                            if seq.metric.num_generated_tokens == 0:
+                                # First token just generated
+                                seq.metric.record_first_token()
+                                seq.metric.num_generated_tokens = 1
+                            else:
+                                # Subsequent tokens - record ITL
+                                seq.metric.record_token()
+
                         if (
                             not seq.ignore_eos and token_id == self.eos
                         ) or seq.num_completed_tokens == seq.max_tokens:

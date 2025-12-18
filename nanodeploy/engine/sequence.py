@@ -6,8 +6,11 @@ from enum import auto, Enum
 from itertools import count
 
 from pydantic import BaseModel
+from typing import TYPE_CHECKING
 
-from nanodeploy.metrics import SeqMetrics
+if TYPE_CHECKING:
+    from nanodeploy.metrics import SequenceMetric
+
 
 from nanodeploy.sampling_params import SamplingParams
 
@@ -79,7 +82,7 @@ class Sequence:
             )
         }
 
-        self.metrics = SeqMetrics()
+        self.metric: "SequenceMetric | None" = None
 
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
