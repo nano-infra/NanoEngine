@@ -342,17 +342,14 @@ if not _USING_CPP:
             """Server uptime in seconds."""
             return time.time() - self.start_time
 
-        def log_metrics(self, include_detailed: bool = False):
+        def get_metric_report(self, include_detailed: bool = False) -> str:
             """
-            Log server metrics.
-
-            Args:
-                include_detailed: Whether to include detailed per-DP metrics
+            Generate a string report of server metrics.
             """
             prefill_tput = self.current_prefill_throughput or 0
             decode_tput = self.current_decode_throughput or 0
 
-            logger.info(
+            report = (
                 f"ServerMetric - "
                 f"Running/Waiting/Waiting migration: {self.num_running_requests}/{self.num_waiting_requests}/{self.num_waiting_migration_requests}, "
                 f"Completed: {self.num_completed_requests}, "
@@ -362,8 +359,11 @@ if not _USING_CPP:
             )
 
             if include_detailed and self.token_usage_by_dp:
+                report += "\nDetailed Token Usage:"
                 for dp_idx, tokens in self.token_usage_by_dp.items():
-                    logger.debug(f"  DP[{dp_idx}] token usage: {tokens}")
+                    report += f"\n  DP[{dp_idx}] token usage: {tokens}"
+
+            return report
 
         def get_summary(self) -> dict:
             """
@@ -434,8 +434,16 @@ class MetricsManager:
         self.sequence_metrics.pop(seq_id, None)
 
     def log_server_metrics(self, include_detailed: bool = False):
-        """Log current server metrics."""
-        self.server_metric.log_metrics(include_detailed=include_detailed)
+        """Log current server metrics using the Python logger."""
+        if hasattr(self.server_metric, "get_metric_report"):
+            report_str = self.server_metric.get_metric_report(include_detailed)
+            logger.info(report_str)
+        else:
+            logger.warning(
+                "C++ backend outdated: 'get_metric_report' not found. Falling back to stdout."
+            )
+            if hasattr(self.server_metric, "log_metrics"):
+                self.server_metric.log_metrics(include_detailed)
 
     def get_server_summary(self) -> dict:
         """Get server metrics summary."""

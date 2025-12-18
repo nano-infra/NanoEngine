@@ -1,9 +1,9 @@
 #include "server_metric.h"
 #include <algorithm>
 #include <iomanip>
-#include <iostream>
 #include <memory>
 #include <numeric>
+#include <sstream>
 
 namespace nanodeploy {
 
@@ -110,8 +110,10 @@ double ServerMetric::uptime() const
     return current_time() - start_time;
 }
 
-void ServerMetric::log_metrics(bool include_detailed) const
+std::string ServerMetric::get_metric_report(bool include_detailed) const
 {
+    std::stringstream ss;
+
     double prefill_tput = 0.0;
     if (!prefill_throughput_samples.empty())
         prefill_tput = prefill_throughput_samples.back();
@@ -120,20 +122,23 @@ void ServerMetric::log_metrics(bool include_detailed) const
     if (!decode_throughput_samples.empty())
         decode_tput = decode_throughput_samples.back();
 
-    std::cout << "[INFO] ServerMetric - "
-              << "Running/Waiting/Waiting migration: " << num_running_requests << "/" << num_waiting_requests << "/"
-              << num_waiting_migration_requests << ", "
-              << "Completed: " << num_completed_requests << ", "
-              << "Tokens: " << total_tokens << " (prompt: " << total_prompt_tokens
-              << ", gen: " << total_generated_tokens << "), "
-              << "Throughput: Prefill " << std::fixed << std::setprecision(0) << prefill_tput << " tok/s, "
-              << "Decode " << decode_tput << " tok/s" << std::endl;
+    ss << "ServerMetric - "
+       << "Running/Waiting/Waiting migration: " << num_running_requests << "/" << num_waiting_requests << "/"
+       << num_waiting_migration_requests << ", "
+       << "Completed: " << num_completed_requests << ", "
+       << "Tokens: " << total_tokens << " (prompt: " << total_prompt_tokens << ", gen: " << total_generated_tokens
+       << "), "
+       << "Throughput: Prefill " << std::fixed << std::setprecision(0) << prefill_tput << " tok/s, "
+       << "Decode " << decode_tput << " tok/s";
 
     if (include_detailed && !token_usage_by_dp.empty()) {
+        ss << "\nDetailed Token Usage:";
         for (const auto& kv : token_usage_by_dp) {
-            std::cout << "[DEBUG]   DP[" << kv.first << "] token usage: " << kv.second << std::endl;
+            ss << "\n  DP[" << kv.first << "] token usage: " << kv.second;
         }
     }
+
+    return ss.str();
 }
 
 }  // namespace nanodeploy

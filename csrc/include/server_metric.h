@@ -35,7 +35,7 @@ public:
     double    uptime() const;
 
     // Logging
-    void log_metrics(bool include_detailed = false) const;
+    std::string get_metric_report(bool include_detailed = false) const;
 
     // Public fields
     long long total_tokens           = 0;

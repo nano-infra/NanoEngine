@@ -88,7 +88,7 @@ void bind_sequence_metric(py::module_& m)
         .def_property_readonly("uptime", &ServerMetric::uptime)
 
         // Logging
-        .def("log_metrics", &ServerMetric::log_metrics, py::arg("include_detailed") = false)
+        .def("get_metric_report", &ServerMetric::get_metric_report, py::arg("include_detailed") = false)
 
         // get_summary
         .def("get_summary", [](const ServerMetric& self) {
