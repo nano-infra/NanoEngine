@@ -113,21 +113,21 @@ bool SPStateManager::can_allocate(Sequence& seq,
     
     std::sort(rank_free_count.begin(), rank_free_count.end(), 
               [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
-                  return a.second < b.second;
+                  return a.second > b.second;
               });
               
-    std::vector<int> top_least_free_ranks;
+    std::vector<int> top_most_free_ranks;
     int ranks_to_pick = std::min((int)rank_free_count.size(), num_ranks - 1);
     for (int i = 0; i < ranks_to_pick; ++i) {
-        top_least_free_ranks.push_back(rank_free_count[i].first);
+        top_most_free_ranks.push_back(rank_free_count[i].first);
     }
-    top_least_free_ranks.push_back(master_rank);
+    top_most_free_ranks.push_back(master_rank);
     
     // Step 2: allocation setup
     block_ctx.master_sp_idx = master_rank;
     int total_token_unalloc = seq.num_tokens;
     
-    for (int sp_idx : top_least_free_ranks) {
+    for (int sp_idx : top_most_free_ranks) {
         int tokens_to_dispatch = std::min(total_token_unalloc, num_segments_per_rank * segment_size);
         block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
         total_token_unalloc -= tokens_to_dispatch;
