@@ -446,7 +446,7 @@ class MetricsManager:
             logger.info(report_str)
         else:
             logger.warning(
-                "C++ backend outdated: 'get_metric_report' not found. Falling back to stdout."
+                "C++ backend outdated: 'get_metric_report' not found. Falling back to legacy 'log_metrics' method."
             )
             if hasattr(self.server_metric, "log_metrics"):
                 self.server_metric.log_metrics(include_detailed)
