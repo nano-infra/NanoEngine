@@ -247,16 +247,10 @@ class ModelRunner:
         block_tables = [
             [
                 (
-                    dp_sp_seqs[sp_idx][seq_id].block_table(self.engine_id, sp_rank)
-                    + [-1]
-                    * (
-                        max_num_blocks
-                        - len(
-                            dp_sp_seqs[sp_idx][seq_id].block_table(
-                                self.engine_id, sp_rank
-                            )
-                        )
-                    )
+                    (bt := list(
+                        dp_sp_seqs[sp_idx][seq_id].block_table(self.engine_id, sp_rank)
+                    ))
+                    + [-1] * (max_num_blocks - len(bt))
                     if seq_id < sp_num_seqs[sp_idx]
                     else [-1] * max_num_blocks
                 )
@@ -550,7 +544,11 @@ class ModelRunner:
                 master_sp_rank=get_dist_context().attn_sp_rank,
             )
 
-            seq.block_ctx(self.engine_id).sp_block_table[sp_rank] = [0]
+            # Ensure block_table is initialized for dummy seq in both Python and C++ backends.
+            if hasattr(seq, "block_table_set"):
+                seq.block_table_set([0], self.engine_id, sp_rank)
+            else:
+                seq.block_ctx(self.engine_id).sp_block_table[sp_rank] = [0]
             dp_seqs.append(seq)
 
         sp_seqs = [

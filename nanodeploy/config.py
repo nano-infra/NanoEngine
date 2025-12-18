@@ -4,6 +4,30 @@ from typing import Any, Literal
 
 from transformers import AutoConfig
 
+# ==================== C++ Backend Configuration ====================
+# Control whether to use C++ implementation for components
+# Set to True to use C++ version, False to use Python version
+
+USE_CPP_SEQUENCE: bool = True       # Sequence and BlockContext classes
+USE_CPP_METRIC: bool = True         # SequenceMetric class
+USE_CPP_BLOCK_MANAGER: bool = True  # Block and BlockManager classes
+USE_CPP_SP_STATE_MANAGER: bool = False  # SPStateManager class
+
+# One-click switch for all components
+USE_CPP_BACKEND: bool = False
+
+def get_use_cpp_sequence() -> bool:
+    return USE_CPP_BACKEND or USE_CPP_SEQUENCE
+
+def get_use_cpp_metric() -> bool:
+    return USE_CPP_BACKEND or USE_CPP_METRIC
+
+def get_use_cpp_block_manager() -> bool:
+    return USE_CPP_BACKEND or USE_CPP_BLOCK_MANAGER
+
+def get_use_cpp_sp_state_manager() -> bool:
+    return USE_CPP_BACKEND or USE_CPP_SP_STATE_MANAGER
+# ===================================================================
 
 @dataclass
 class Config:
