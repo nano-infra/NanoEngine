@@ -433,6 +433,7 @@ class MetricsManager:
             # Only log if the sequence has meaningful metrics
             if metric.first_token_time is not None or metric.num_generated_tokens > 0:
                 metric.log_metrics()
+            self.server_metric.add_tokens(num_generated=metric.num_generated_tokens)
             self.server_metric.add_completed_request()
 
     def remove_sequence_metric(self, seq_id: str):
