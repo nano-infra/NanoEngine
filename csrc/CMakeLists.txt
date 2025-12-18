@@ -13,12 +13,15 @@ find_package(pybind11 CONFIG REQUIRED)
 set(CPP_SOURCES
     src/sequence_metric.cpp
     src/sequence.cpp
+    src/block.cpp
+    src/block_manager.cpp
 )
 
 set(BINDING_SOURCES
     bindings/module.cpp
     bindings/metric_binding.cpp
     bindings/sequence_binding.cpp
+    bindings/block_manager_binding.cpp
 )
 
 # ===== Build pybind11 module =====
