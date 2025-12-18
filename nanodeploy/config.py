@@ -10,7 +10,7 @@ from transformers import AutoConfig
 
 USE_CPP_SEQUENCE: bool = True       # Sequence and BlockContext classes
 USE_CPP_METRIC: bool = True         # SequenceMetric class
-USE_CPP_BLOCK_MANAGER: bool = False  # Block and BlockManager classes
+USE_CPP_BLOCK_MANAGER: bool = True  # Block and BlockManager classes
 USE_CPP_SP_STATE_MANAGER: bool = False  # SPStateManager class
 
 # One-click switch for all components

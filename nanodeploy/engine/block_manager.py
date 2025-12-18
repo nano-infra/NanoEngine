@@ -4,154 +4,169 @@ import numpy as np
 import xxhash
 
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.config import get_use_cpp_block_manager
+
+if get_use_cpp_block_manager():
+    try:
+        from nanodeploy._cpp import BlockManager as _CppBlockManager
+        from nanodeploy._cpp import Block as _CppBlock
+        BlockManager = _CppBlockManager
+        Block = _CppBlock
+        _USING_CPP = True
+    except ImportError as e:
+        import warnings
+        warnings.warn(f"C++ backend requested but not available: {e}. Falling back to Python.")
+        _USING_CPP = False
+else:
+    _USING_CPP = False
+
+if not _USING_CPP:
+    class Block:
+
+        def __init__(self, block_id):
+            self.block_id = block_id
+            self.ref_count = 0
+            self.hash = -1
+            self.token_ids = []
+
+        def update(self, hash: int, token_ids: list[int]):
+            self.hash = hash
+            self.token_ids = token_ids
+
+        def reset(self):
+            self.ref_count = 1
+            self.hash = -1
+            self.token_ids = []
 
 
-class Block:
+    class BlockManager:
 
-    def __init__(self, block_id):
-        self.block_id = block_id
-        self.ref_count = 0
-        self.hash = -1
-        self.token_ids = []
+        def __init__(self, engine_id: str | None, sp_idx, num_blocks: int, block_size: int):
+            self.engine_id = engine_id
+            self.sp_idx = sp_idx
+            self.block_size = block_size
+            self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+            self.hash_to_block_id: dict[int, int] = dict()
+            self.free_block_ids: deque[int] = deque(range(num_blocks))
+            self.used_block_ids: set[int] = set()
 
-    def update(self, hash: int, token_ids: list[int]):
-        self.hash = hash
-        self.token_ids = token_ids
+        @classmethod
+        def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+            h = xxhash.xxh64()
+            if prefix != -1:
+                h.update(prefix.to_bytes(8, "little"))
+            h.update(np.array(token_ids).tobytes())
+            return h.intdigest()
 
-    def reset(self):
-        self.ref_count = 1
-        self.hash = -1
-        self.token_ids = []
-
-
-class BlockManager:
-
-    def __init__(self, engine_id: str | None, sp_idx, num_blocks: int, block_size: int):
-        self.engine_id = engine_id
-        self.sp_idx = sp_idx
-        self.block_size = block_size
-        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.used_block_ids: set[int] = set()
-
-    @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
-        h = xxhash.xxh64()
-        if prefix != -1:
-            h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
-        return h.intdigest()
-
-    def _allocate_block(self, block_id: int) -> Block:
-        block = self.blocks[block_id]
-        assert block.ref_count == 0
-        block.reset()
-        self.free_block_ids.remove(block_id)
-        self.used_block_ids.add(block_id)
-        return self.blocks[block_id]
-
-    def _deallocate_block(self, block_id: int) -> None:
-        assert self.blocks[block_id].ref_count == 0
-        self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
-
-    def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks(self.engine_id, self.sp_idx)
-
-    def allocate(
-        self,
-        seq: Sequence,
-        token_idx_from: int = -1,
-        token_idx_to: int = -1,
-    ):
-        assert not seq.block_table(self.engine_id, self.sp_idx)
-        h = -1
-        cache_miss = False
-        num_blocks = seq.num_blocks(self.engine_id, self.sp_idx)
-        for i in range(num_blocks):
-            token_ids = seq.block(i, self.engine_id, self.sp_idx)
-            h = (
-                self.compute_hash(token_ids, h)
-                if len(token_ids) == self.block_size
-                else -1
-            )
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                cache_miss = True
-            if cache_miss:
-                block_id = self.free_block_ids[0]
-                block = self._allocate_block(block_id)
-            else:
-                # seq.num_cached_tokens += self.block_size
-                if block_id in self.used_block_ids:
-                    block = self.blocks[block_id]
-                    block.ref_count += 1
-                else:
-                    block = self._allocate_block(block_id)
-            if h != -1:
-                block.update(h, token_ids)
-                self.hash_to_block_id[h] = block_id
-            
-            seq.block_ctx(self.engine_id).block_location.append((self.sp_idx, block_id))
-            seq.block_table(self.engine_id, self.sp_idx).append(block_id)
-
-    def deallocate(self, seq: Sequence):
-        for block_id in reversed(seq.block_table(self.engine_id, self.sp_idx)):
+        def _allocate_block(self, block_id: int) -> Block:
             block = self.blocks[block_id]
-            block.ref_count -= 1
-            if block.ref_count == 0:
-                self._deallocate_block(block_id)
-        seq.num_cached_tokens = 0
-        seq.block_table(self.engine_id, self.sp_idx).clear()
+            assert block.ref_count == 0
+            block.reset()
+            self.free_block_ids.remove(block_id)
+            self.used_block_ids.add(block_id)
+            return self.blocks[block_id]
 
-    def can_append(self, seq: Sequence, num_tokens: int = 1) -> bool:
-        total_tokens_needed_before = (
-            seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx]
-            + self.block_size
-            - 1
-        ) // self.block_size
-        total_tokens_needed_after = (
-            seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx]
-            + num_tokens
-            + self.block_size
-            - 1
-        ) // self.block_size
-        return len(self.free_block_ids) >= (
-            total_tokens_needed_after - total_tokens_needed_before
-        )
+        def _deallocate_block(self, block_id: int) -> None:
+            assert self.blocks[block_id].ref_count == 0
+            self.used_block_ids.remove(block_id)
+            self.free_block_ids.append(block_id)
 
-    def may_append(self, seq: Sequence, num_tokens: int = 1):
-        for idx in range(num_tokens):
-            block_table = seq.block_table(self.engine_id, self.sp_idx)
-            last_block = self.blocks[block_table[-1]]
-            if (
-                seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx] + idx
-            ) % self.block_size == 1:
-                # assert last_block.hash != -1
-                block_id = self.free_block_ids[0]
-                seq.block_ctx(self.engine_id).block_location.append(
-                    (self.sp_idx, block_id)
+        def can_allocate(self, seq: Sequence) -> bool:
+            return len(self.free_block_ids) >= seq.num_blocks(self.engine_id, self.sp_idx)
+
+        def allocate(
+            self,
+            seq: Sequence,
+            token_idx_from: int = -1,
+            token_idx_to: int = -1,
+        ):
+            assert not seq.block_table(self.engine_id, self.sp_idx)
+            h = -1
+            cache_miss = False
+            num_blocks = seq.num_blocks(self.engine_id, self.sp_idx)
+            for i in range(num_blocks):
+                token_ids = seq.block(i, self.engine_id, self.sp_idx)
+                h = (
+                    self.compute_hash(token_ids, h)
+                    if len(token_ids) == self.block_size
+                    else -1
                 )
-                self._allocate_block(block_id)
+                block_id = self.hash_to_block_id.get(h, -1)
+                if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                    cache_miss = True
+                if cache_miss:
+                    block_id = self.free_block_ids[0]
+                    block = self._allocate_block(block_id)
+                else:
+                    # seq.num_cached_tokens += self.block_size
+                    if block_id in self.used_block_ids:
+                        block = self.blocks[block_id]
+                        block.ref_count += 1
+                    else:
+                        block = self._allocate_block(block_id)
+                if h != -1:
+                    block.update(h, token_ids)
+                    self.hash_to_block_id[h] = block_id
+                
+                seq.block_ctx(self.engine_id).block_location.append((self.sp_idx, block_id))
                 seq.block_table(self.engine_id, self.sp_idx).append(block_id)
-            elif (
+
+        def deallocate(self, seq: Sequence):
+            for block_id in reversed(seq.block_table(self.engine_id, self.sp_idx)):
+                block = self.blocks[block_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._deallocate_block(block_id)
+            seq.num_cached_tokens = 0
+            seq.block_table(self.engine_id, self.sp_idx).clear()
+
+        def can_append(self, seq: Sequence, num_tokens: int = 1) -> bool:
+            total_tokens_needed_before = (
                 seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx]
-                + idx
+                + self.block_size
                 - 1
-            ) % self.block_size == 0:
-                # assert last_block.hash == -1
-                token_ids = seq.block(
-                    seq.num_blocks(self.engine_id, self.sp_idx) - 1,
-                    self.engine_id,
-                    self.sp_idx,
-                )
-                prefix = (
-                    self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-                )
-                # h = self.compute_hash(token_ids, prefix)
-                # last_block.update(h, token_ids)
-                # self.hash_to_block_id[h] = last_block.block_id
-            else:
-                continue
-                assert last_block.hash == -1
+            ) // self.block_size
+            total_tokens_needed_after = (
+                seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx]
+                + num_tokens
+                + self.block_size
+                - 1
+            ) // self.block_size
+            return len(self.free_block_ids) >= (
+                total_tokens_needed_after - total_tokens_needed_before
+            )
+
+        def may_append(self, seq: Sequence, num_tokens: int = 1):
+            for idx in range(num_tokens):
+                block_table = seq.block_table(self.engine_id, self.sp_idx)
+                last_block = self.blocks[block_table[-1]]
+                if (
+                    seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx] + idx
+                ) % self.block_size == 1:
+                    # assert last_block.hash != -1
+                    block_id = self.free_block_ids[0]
+                    seq.block_ctx(self.engine_id).block_location.append(
+                        (self.sp_idx, block_id)
+                    )
+                    self._allocate_block(block_id)
+                    seq.block_table(self.engine_id, self.sp_idx).append(block_id)
+                elif (
+                    seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx]
+                    + idx
+                    - 1
+                ) % self.block_size == 0:
+                    # assert last_block.hash == -1
+                    token_ids = seq.block(
+                        seq.num_blocks(self.engine_id, self.sp_idx) - 1,
+                        self.engine_id,
+                        self.sp_idx,
+                    )
+                    prefix = (
+                        self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                    )
+                    # h = self.compute_hash(token_ids, prefix)
+                    # last_block.update(h, token_ids)
+                    # self.hash_to_block_id[h] = last_block.block_id
+                else:
+                    continue
+                    assert last_block.hash == -1
