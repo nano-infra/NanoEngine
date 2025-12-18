@@ -228,6 +228,7 @@ if not _USING_CPP:
             total_generated_tokens: Total number of generated tokens
             num_running_requests: Current number of running requests
             num_waiting_requests: Current number of waiting requests
+            num_waiting_migration_requests: Current number of waiting migration requests
             num_completed_requests: Total number of completed requests
             prefill_throughput_samples: List of prefill throughput samples (tokens/s)
             decode_throughput_samples: List of decode throughput samples (tokens/s)
@@ -365,6 +366,12 @@ if not _USING_CPP:
                     logger.debug(f"  DP[{dp_idx}] token usage: {tokens}")
 
         def get_summary(self) -> dict:
+            """
+            Return a snapshot of high-level server metrics.
+            Returns:
+                dict: A mapping containing uptime, request counts, token usage,
+                and average/current throughput statistics.
+            """
             return {
                 "uptime_seconds": self.uptime,
                 "total_requests": self.num_completed_requests,
