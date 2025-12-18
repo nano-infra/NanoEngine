@@ -43,10 +43,11 @@ BlockContext BlockContext::setstate(const std::tuple<std::optional<std::string>,
 
 std::string Sequence::generate_uuid() {
     // Simple UUID generation (not RFC compliant but sufficient for unique ID)
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
-    static std::uniform_int_distribution<> dis(0, 15);
-    static std::uniform_int_distribution<> dis2(8, 11);
+    // Use thread_local to avoid data races in multi-threaded environment
+    thread_local std::random_device rd;
+    thread_local std::mt19937 gen(rd());
+    thread_local std::uniform_int_distribution<> dis(0, 15);
+    thread_local std::uniform_int_distribution<> dis2(8, 11);
 
     std::stringstream ss;
     ss << std::hex;

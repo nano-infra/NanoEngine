@@ -11,28 +11,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from nanodeploy.metrics import SequenceMetric
 
-
-from nanodeploy.sampling_params import SamplingParams
-
-
-class SequenceConfig(BaseModel):
-    temperature: float | None = None
-
-
-import dataclasses
-import uuid
-from collections import defaultdict
-from copy import copy
-from enum import auto, Enum
-from itertools import count
-
-from pydantic import BaseModel
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from nanodeploy.metrics import SequenceMetric
-
-
 from nanodeploy.sampling_params import SamplingParams
 from nanodeploy.config import get_use_cpp_sequence
 
@@ -60,6 +38,7 @@ if get_use_cpp_sequence():
         
         class Sequence(_CppSequence):
             block_size = 256
+            counter = count()
             
             def __init__(
                 self,

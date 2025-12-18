@@ -172,15 +172,15 @@ if not _USING_CPP:
             ttft_str = f"{self.ttft:.2f}ms" if self.ttft is not None else "N/A"
             e2e_str = f"{self.e2e_latency:.2f}ms" if self.e2e_latency is not None else "N/A"
 
-            # Format ITL metrics, handling None values
-            if (
-                self.avg_itl is not None
-                and self.p50_itl is not None
-                and self.p99_itl is not None
-            ):
-                itl_str = f"{self.avg_itl:.2f}/{self.p50_itl:.2f}/{self.p99_itl:.2f}ms"
-            else:
-                itl_str = "N/A"
+            # # Format ITL metrics, handling None values
+            # if (
+            #     self.avg_itl is not None
+            #     and self.p50_itl is not None
+            #     and self.p99_itl is not None
+            # ):
+            #     itl_str = f"{self.avg_itl:.2f}/{self.p50_itl:.2f}/{self.p99_itl:.2f}ms"
+            # else:
+            #     itl_str = "N/A"
 
             tpot_wo_queue_str = f"{self.avg_tpot_wo_queueing:.2f}ms" if self.avg_tpot_wo_queueing is not None else "N/A"
             tpot_with_queue_str = f"{self.avg_tpot_with_queueing:.2f}ms" if self.avg_tpot_with_queueing is not None else "N/A"

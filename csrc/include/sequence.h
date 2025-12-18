@@ -8,7 +8,6 @@
 #include <random>
 #include <sstream>
 #include <iomanip>
-#include <memory>
 
 namespace nanodeploy {
 

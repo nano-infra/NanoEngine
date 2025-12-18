@@ -12,7 +12,7 @@ class CMakeExtension(Extension):
 class CMakeBuild(build_ext):
     def run(self):
         try:
-            out = subprocess.check_output(['cmake', '--version'])
+            subprocess.check_output(['cmake', '--version'])
         except OSError:
             raise RuntimeError("CMake must be installed to build the following extensions: " +
                                ", ".join(e.name for e in self.extensions))
@@ -49,8 +49,13 @@ class CMakeBuild(build_ext):
             import pybind11  # type: ignore
 
             cmake_args += [f"-Dpybind11_DIR={pybind11.get_cmake_dir()}"]
-        except Exception:
-            pass
+        except ImportError:
+            raise RuntimeError(
+                "pybind11 is required to build the C++ extension. "
+                "Please install it with 'pip install pybind11'."
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to get pybind11 CMake directory: {e}")
         build_args = []
         
         # Adding CMake arguments set as environment variable
