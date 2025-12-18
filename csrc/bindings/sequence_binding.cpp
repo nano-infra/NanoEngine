@@ -2,11 +2,7 @@
 #include <pybind11/stl_bind.h>
 #include "sequence.h"
 #include "sequence_metric.h"
-
-// Declare opaque map types *before* including <pybind11/stl.h> to prevent
-// automatic conversion to Python dict copies.
-PYBIND11_MAKE_OPAQUE(std::unordered_map<int, int>);
-PYBIND11_MAKE_OPAQUE(nanodeploy::Sequence::BlockCtxMap);
+#include "opaque_types.h"
 
 #include <pybind11/stl.h>
 
@@ -79,6 +75,7 @@ void bind_sequence(py::module_& m) {
     
     // Wrapper class for num_dispatched_tokens to provide defaultdict(int) behavior
     py::class_<std::unordered_map<int, int>>(m, "DefaultIntDict")
+        .def(py::init<>())
         .def("__getitem__", [](std::unordered_map<int, int>& self, int key) -> int& {
             // This mimics defaultdict(int) - returns 0 for missing keys and creates entry
             return self[key];

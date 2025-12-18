@@ -11,10 +11,10 @@ from transformers import AutoConfig
 USE_CPP_SEQUENCE: bool = True       # Sequence and BlockContext classes
 USE_CPP_METRIC: bool = True         # SequenceMetric class
 USE_CPP_BLOCK_MANAGER: bool = True  # Block and BlockManager classes
-USE_CPP_SP_STATE_MANAGER: bool = False  # SPStateManager class
+USE_CPP_SP_STATE_MANAGER: bool = True  # SPStateManager class
 
 # One-click switch for all components
-USE_CPP_BACKEND: bool = False
+USE_CPP_BACKEND: bool = True
 
 def get_use_cpp_sequence() -> bool:
     return USE_CPP_BACKEND or USE_CPP_SEQUENCE
