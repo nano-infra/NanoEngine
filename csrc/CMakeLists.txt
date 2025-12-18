@@ -12,6 +12,7 @@ find_package(pybind11 CONFIG REQUIRED)
 # ===== Sources =====
 set(CPP_SOURCES
     src/sequence_metric.cpp
+    src/server_metric.cpp
     src/sequence.cpp
     src/block.cpp
     src/block_manager.cpp
@@ -27,7 +28,7 @@ set(BINDING_SOURCES
 )
 
 # ===== Build pybind11 module =====
-pybind11_add_module(_nanodeploy_cpp 
+pybind11_add_module(_nanodeploy_cpp
     ${CPP_SOURCES}
     ${BINDING_SOURCES}
 )
