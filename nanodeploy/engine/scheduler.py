@@ -5,7 +5,7 @@ from typing import Literal, TYPE_CHECKING
 
 import numpy as np
 
-from nanodeploy.config import Config
+from nanodeploy.config import Config, get_use_cpp_sp_state_manager
 from nanodeploy.engine.block_manager import BlockManager
 from nanodeploy.engine.sequence import Sequence, SequenceStatus
 from nanodeploy.logging import get_logger
@@ -15,14 +15,29 @@ if TYPE_CHECKING:
 
 logger = get_logger()
 
+if get_use_cpp_sp_state_manager():
+    try:
+        from nanodeploy._cpp import (
+            SPStateManager as _CppSPStateManager,
+            RoutingStrategy as _CppRoutingStrategy,
+            DefaultIntDict as _CppDefaultIntDict
+        )
+        _USING_CPP = True
+    except ImportError as e:
+        import warnings
+        warnings.warn(f"C++ backend requested but not available: {e}. Falling back to Python.")
+        _USING_CPP = False
+else:
+    _USING_CPP = False
 
-class RoutingStrategy(enum.Enum):
+
+class _PyRoutingStrategy(enum.Enum):
     RoundRobin = enum.auto()
     LeastToken = enum.auto()
     LeastCache = enum.auto()
 
 
-class SPStateManager:
+class _PySPStateManager:
     _segment_size = 1024
 
     def __init__(
@@ -54,7 +69,7 @@ class SPStateManager:
 
         self.running: deque[Sequence] = deque()
 
-        self.routing_startegy = RoutingStrategy.RoundRobin
+        self.routing_startegy = _PyRoutingStrategy.RoundRobin
         self.sp_rr_counter = (idx % self.attention_sp for idx in count())
 
         self.dummy_seqs: list[Sequence] = []
@@ -157,6 +172,14 @@ class SPStateManager:
         seq.block_ctx(self.engine_id).num_dispatched_tokens.clear()
 
 
+if _USING_CPP:
+    SPStateManager = _CppSPStateManager
+    RoutingStrategy = _CppRoutingStrategy
+else:
+    SPStateManager = _PySPStateManager
+    RoutingStrategy = _PyRoutingStrategy
+
+
 class Scheduler:
 
     def __init__(self, config: Config):
@@ -209,14 +232,25 @@ class Scheduler:
 
     def _schedule_prefill(self) -> list[list[Sequence]]:
         scheduled_seqs = [[] for _ in range(self.attention_dp)]
-        num_seqs: dict[int, dict[int, int]] = {
-            dp_id: {sp_id: 0 for sp_id in range(self.attention_sp)}
-            for dp_id in range(self.attention_dp)
-        }
-        num_batched_tokens: dict[int, dict[int, int]] = {
-            dp_id: {sp_id: 0 for sp_id in range(self.attention_sp)}
-            for dp_id in range(self.attention_dp)
-        }
+        
+        if _USING_CPP:
+            num_seqs = {
+                dp_id: _CppDefaultIntDict()
+                for dp_id in range(self.attention_dp)
+            }
+            num_batched_tokens = {
+                dp_id: _CppDefaultIntDict()
+                for dp_id in range(self.attention_dp)
+            }
+        else:
+            num_seqs: dict[int, dict[int, int]] = {
+                dp_id: {sp_id: 0 for sp_id in range(self.attention_sp)}
+                for dp_id in range(self.attention_dp)
+            }
+            num_batched_tokens: dict[int, dict[int, int]] = {
+                dp_id: {sp_id: 0 for sp_id in range(self.attention_sp)}
+                for dp_id in range(self.attention_dp)
+            }
 
         waiting = self.waiting if self.mode != "decode" else self.waiting_migration
 
@@ -227,7 +261,7 @@ class Scheduler:
                     selected_dp_idx = next(self.dp_rr_counter)
 
                     can_allocate = self.worker_state[selected_dp_idx].can_allocate(
-                        seq, num_seqs[selected_dp_idx], num_seqs[selected_dp_idx]
+                        seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]
                     )
                     if not can_allocate:
                         continue

@@ -15,6 +15,7 @@ set(CPP_SOURCES
     src/sequence.cpp
     src/block.cpp
     src/block_manager.cpp
+    src/sp_state_manager.cpp
 )
 
 set(BINDING_SOURCES
@@ -22,6 +23,7 @@ set(BINDING_SOURCES
     bindings/metric_binding.cpp
     bindings/sequence_binding.cpp
     bindings/block_manager_binding.cpp
+    bindings/sp_state_manager_binding.cpp
 )
 
 # ===== Build pybind11 module =====

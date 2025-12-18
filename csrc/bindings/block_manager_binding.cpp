@@ -16,7 +16,7 @@ void bind_block_manager(py::module_& m) {
         .def_readwrite("hash", &Block::hash)
         .def_readwrite("token_ids", &Block::token_ids);
 
-    py::class_<BlockManager>(m, "BlockManager")
+    py::class_<BlockManager, std::shared_ptr<BlockManager>>(m, "BlockManager")
         .def(py::init<const std::optional<std::string>&, int, int, int>(),
              py::arg("engine_id"),
              py::arg("sp_idx"),

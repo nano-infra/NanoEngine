@@ -8,7 +8,7 @@ import os
 
 try:
     from ._nanodeploy_cpp import *
-except ImportError:
-    # If not found, maybe it's not compiled or not in the right place
-    # We can try to look for it in the build directory if we are in dev mode
-    pass
+except ImportError as e:
+    # Propagate the error so that the caller can see why the import failed
+    # This is crucial for debugging (e.g. missing dependencies, symbol errors)
+    raise e
