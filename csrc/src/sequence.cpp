@@ -168,40 +168,6 @@ void Sequence::append_token(int token_id, const std::optional<std::string>& engi
     ctx.num_dispatched_tokens[idx]++;
 }
 
-void Sequence::block_table_append(int block_id,
-                                 const std::optional<std::string>& engine_id,
-                                 int sp_idx) {
-    block_table(engine_id, sp_idx).push_back(block_id);
-}
-
-void Sequence::block_table_clear(const std::optional<std::string>& engine_id, int sp_idx) {
-    block_table(engine_id, sp_idx).clear();
-}
-
-void Sequence::block_table_set(const std::vector<int>& table,
-                              const std::optional<std::string>& engine_id,
-                              int sp_idx) {
-    block_ctx(engine_id).sp_block_table[sp_idx] = BlockContext::BlockIdList(table.begin(), table.end());
-}
-
-void Sequence::block_location_append(int sp_idx,
-                                     int block_id,
-                                     const std::optional<std::string>& engine_id) {
-    block_ctx(engine_id).block_location.emplace_back(sp_idx, block_id);
-}
-
-void Sequence::block_location_clear(const std::optional<std::string>& engine_id) {
-    block_ctx(engine_id).block_location.clear();
-}
-
-void Sequence::sp_block_table_clear(const std::optional<std::string>& engine_id) {
-    block_ctx(engine_id).sp_block_table.clear();
-}
-
-void Sequence::num_dispatched_tokens_clear(const std::optional<std::string>& engine_id) {
-    block_ctx(engine_id).num_dispatched_tokens.clear();
-}
-
 int Sequence::num_blocks(const std::optional<std::string>& engine_id, int sp_idx) {
     int n_tokens = block_ctx(engine_id).num_dispatched_tokens[sp_idx];
     return (n_tokens + block_size - 1) / block_size;

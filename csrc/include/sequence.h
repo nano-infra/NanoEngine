@@ -103,26 +103,6 @@ public:
                       const std::optional<std::string>& engine_id = std::nullopt,
                       std::optional<int> sp_idx = std::nullopt);
 
-    // Helpers for Python-side mutation of internal containers.
-    // pybind11 converts STL containers to Python copies by default; these methods
-    // ensure mutations update the underlying C++ state.
-    void block_table_append(int block_id,
-                            const std::optional<std::string>& engine_id = std::nullopt,
-                            int sp_idx = 0);
-    void block_table_clear(const std::optional<std::string>& engine_id = std::nullopt,
-                           int sp_idx = 0);
-    void block_table_set(const std::vector<int>& table,
-                         const std::optional<std::string>& engine_id = std::nullopt,
-                         int sp_idx = 0);
-
-    void block_location_append(int sp_idx,
-                               int block_id,
-                               const std::optional<std::string>& engine_id = std::nullopt);
-    void block_location_clear(const std::optional<std::string>& engine_id = std::nullopt);
-
-    void sp_block_table_clear(const std::optional<std::string>& engine_id = std::nullopt);
-    void num_dispatched_tokens_clear(const std::optional<std::string>& engine_id = std::nullopt);
-    
     // Block related methods
     int num_blocks(const std::optional<std::string>& engine_id, int sp_idx);
     int last_block_page_id(const std::optional<std::string>& engine_id, int sp_idx);

@@ -191,29 +191,6 @@ void bind_sequence(py::module_& m) {
              py::arg("engine_id") = std::nullopt,
              py::arg("sp_idx") = std::nullopt)
 
-           .def("block_table_append", &Sequence::block_table_append,
-               py::arg("block_id"),
-               py::arg("engine_id") = std::nullopt,
-               py::arg("sp_idx") = 0)
-           .def("block_table_clear", &Sequence::block_table_clear,
-               py::arg("engine_id") = std::nullopt,
-               py::arg("sp_idx") = 0)
-           .def("block_table_set", &Sequence::block_table_set,
-               py::arg("table"),
-               py::arg("engine_id") = std::nullopt,
-               py::arg("sp_idx") = 0)
-
-           .def("block_location_append", &Sequence::block_location_append,
-               py::arg("sp_idx"),
-               py::arg("block_id"),
-               py::arg("engine_id") = std::nullopt)
-           .def("block_location_clear", &Sequence::block_location_clear,
-               py::arg("engine_id") = std::nullopt)
-
-           .def("sp_block_table_clear", &Sequence::sp_block_table_clear,
-               py::arg("engine_id") = std::nullopt)
-           .def("num_dispatched_tokens_clear", &Sequence::num_dispatched_tokens_clear,
-               py::arg("engine_id") = std::nullopt)
         .def("block_ctx", 
              static_cast<BlockContext& (Sequence::*)(const std::optional<std::string>&)>
              (&Sequence::block_ctx),
