@@ -345,6 +345,12 @@ if not _USING_CPP:
         def get_metric_report(self, include_detailed: bool = False) -> str:
             """
             Generate a string report of server metrics.
+
+            Args:
+                include_detailed: Whether to include detailed per-DP token usage metrics.
+
+            Returns:
+                str: A formatted string report of server metrics.
             """
             prefill_tput = self.current_prefill_throughput or 0
             decode_tput = self.current_decode_throughput or 0
