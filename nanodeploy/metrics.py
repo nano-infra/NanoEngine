@@ -13,25 +13,32 @@ from typing import Optional
 
 import numpy as np
 
+from nanodeploy.config import get_use_cpp_metric
 from nanodeploy.logging import get_logger
 
-
 logger = get_logger()
-
-from nanodeploy.config import get_use_cpp_metric
 
 _USING_CPP = False
 if get_use_cpp_metric():
     try:
-        from nanodeploy._cpp import SequenceMetric as _CppSequenceMetric
+        from nanodeploy._cpp import (
+            SequenceMetric as _CppSequenceMetric,
+            ServerMetric as _CppServerMetric,
+        )
+
         SequenceMetric = _CppSequenceMetric
+        ServerMetric = _CppServerMetric
         _USING_CPP = True
     except ImportError as e:
         import warnings
-        warnings.warn(f"C++ backend requested but not available: {e}. Falling back to Python.")
+
+        warnings.warn(
+            f"C++ backend requested but not available: {e}. Falling back to Python."
+        )
         _USING_CPP = False
 
 if not _USING_CPP:
+
     @dataclass
     class SequenceMetric:
         """
@@ -110,9 +117,9 @@ if not _USING_CPP:
         @property
         def avg_tpot_with_queueing(self) -> Optional[float]:
             """
-            Time per output token (TPOT) in milliseconds. Includes queueing time.
-        Returns None if no tokens have been generated yet.
-        """
+                Time per output token (TPOT) in milliseconds. Includes queueing time.
+            Returns None if no tokens have been generated yet.
+            """
             if (
                 self.num_generated_tokens == 0
                 or self.completion_time is None
@@ -170,7 +177,9 @@ if not _USING_CPP:
             """Log all metrics for this sequence."""
 
             ttft_str = f"{self.ttft:.2f}ms" if self.ttft is not None else "N/A"
-            e2e_str = f"{self.e2e_latency:.2f}ms" if self.e2e_latency is not None else "N/A"
+            e2e_str = (
+                f"{self.e2e_latency:.2f}ms" if self.e2e_latency is not None else "N/A"
+            )
 
             # # Format ITL metrics, handling None values
             # if (
@@ -182,10 +191,20 @@ if not _USING_CPP:
             # else:
             #     itl_str = "N/A"
 
-            tpot_wo_queue_str = f"{self.avg_tpot_wo_queueing:.2f}ms" if self.avg_tpot_wo_queueing is not None else "N/A"
-            tpot_with_queue_str = f"{self.avg_tpot_with_queueing:.2f}ms" if self.avg_tpot_with_queueing is not None else "N/A"
+            tpot_wo_queue_str = (
+                f"{self.avg_tpot_wo_queueing:.2f}ms"
+                if self.avg_tpot_wo_queueing is not None
+                else "N/A"
+            )
+            tpot_with_queue_str = (
+                f"{self.avg_tpot_with_queueing:.2f}ms"
+                if self.avg_tpot_with_queueing is not None
+                else "N/A"
+            )
             queueing_time_str = (
-                f"{self.queueing_time_ms:.2f}ms" if self.queueing_time_ms is not None else "N/A"
+                f"{self.queueing_time_ms:.2f}ms"
+                if self.queueing_time_ms is not None
+                else "N/A"
             )
 
             logger.info(
@@ -198,166 +217,168 @@ if not _USING_CPP:
                 f"ITL With Queue: {tpot_with_queue_str}"
             )
 
-
-@dataclass
-class ServerMetric:
-    """
-    Server-level metrics for tracking overall performance.
-
-    Attributes:
-        total_tokens: Total number of tokens processed (prompt + generated)
-        total_prompt_tokens: Total number of prompt tokens
-        total_generated_tokens: Total number of generated tokens
-        num_running_requests: Current number of running requests
-        num_waiting_requests: Current number of waiting requests
-        num_completed_requests: Total number of completed requests
-        prefill_throughput_samples: List of prefill throughput samples (tokens/s)
-        decode_throughput_samples: List of decode throughput samples (tokens/s)
-        token_usage_by_dp: Token usage per data parallel rank
-        start_time: Server start timestamp
-    """
-
-    total_tokens: int = 0
-    total_prompt_tokens: int = 0
-    total_generated_tokens: int = 0
-    num_running_requests: int = 0
-    num_waiting_requests: int = 0
-    num_waiting_migration_requests : int = 0
-    num_completed_requests: int = 0
-    prefill_throughput_samples: list[float] = field(default_factory=list)
-    decode_throughput_samples: list[float] = field(default_factory=list)
-    token_usage_by_dp: dict[int, int] = field(default_factory=lambda: defaultdict(int))
-    start_time: float = field(default_factory=time.time)
-
-    def update_running_requests(self, count: int):
-        """Update the number of running requests."""
-        self.num_running_requests = count
-
-    def update_waiting_requests(self, count: int):
-        """Update the number of waiting requests."""
-        self.num_waiting_requests = count
-        
-    def update_waiting_migration_requests(self, count: int):
-        """Update the number of waiting requests."""
-        self.num_waiting_migration_requests = count
-
-    def add_completed_request(self):
-        """Increment the completed request counter."""
-        self.num_completed_requests += 1
-
-    def add_tokens(self, num_prompt: int = 0, num_generated: int = 0):
-        """Add tokens to the total count."""
-        self.total_prompt_tokens += num_prompt
-        self.total_generated_tokens += num_generated
-        self.total_tokens += num_prompt + num_generated
-
-    def record_prefill_throughput(self, num_tokens: int, duration: float):
+    @dataclass
+    class ServerMetric:
         """
-        Record prefill throughput.
+        Server-level metrics for tracking overall performance.
 
-        Args:
-            num_tokens: Number of tokens processed
-            duration: Duration in seconds
+        Attributes:
+            total_tokens: Total number of tokens processed (prompt + generated)
+            total_prompt_tokens: Total number of prompt tokens
+            total_generated_tokens: Total number of generated tokens
+            num_running_requests: Current number of running requests
+            num_waiting_requests: Current number of waiting requests
+            num_completed_requests: Total number of completed requests
+            prefill_throughput_samples: List of prefill throughput samples (tokens/s)
+            decode_throughput_samples: List of decode throughput samples (tokens/s)
+            token_usage_by_dp: Token usage per data parallel rank
+            start_time: Server start timestamp
         """
-        if duration > 0:
-            throughput = num_tokens / duration
-            self.prefill_throughput_samples.append(throughput)
 
-    def record_decode_throughput(self, num_tokens: int, duration: float):
-        """
-        Record decode throughput.
-
-        Args:
-            num_tokens: Number of tokens generated
-            duration: Duration in seconds
-        """
-        if duration > 0:
-            throughput = num_tokens / duration
-            self.decode_throughput_samples.append(throughput)
-
-    def update_token_usage(self, dp_idx: int, num_tokens: int):
-        """Update token usage for a specific data parallel rank."""
-        self.token_usage_by_dp[dp_idx] = num_tokens
-
-    @property
-    def avg_prefill_throughput(self) -> Optional[float]:
-        """Average prefill throughput in tokens/s."""
-        if not self.prefill_throughput_samples:
-            return None
-        return sum(self.prefill_throughput_samples) / len(
-            self.prefill_throughput_samples
+        total_tokens: int = 0
+        total_prompt_tokens: int = 0
+        total_generated_tokens: int = 0
+        num_running_requests: int = 0
+        num_waiting_requests: int = 0
+        num_waiting_migration_requests: int = 0
+        num_completed_requests: int = 0
+        prefill_throughput_samples: list[float] = field(default_factory=list)
+        decode_throughput_samples: list[float] = field(default_factory=list)
+        token_usage_by_dp: dict[int, int] = field(
+            default_factory=lambda: defaultdict(int)
         )
+        start_time: float = field(default_factory=time.time)
 
-    @property
-    def avg_decode_throughput(self) -> Optional[float]:
-        """Average decode throughput in tokens/s."""
-        if not self.decode_throughput_samples:
-            return None
-        return sum(self.decode_throughput_samples) / len(self.decode_throughput_samples)
+        def update_running_requests(self, count: int):
+            """Update the number of running requests."""
+            self.num_running_requests = count
 
-    @property
-    def current_prefill_throughput(self) -> Optional[float]:
-        """Most recent prefill throughput in tokens/s."""
-        if not self.prefill_throughput_samples:
-            return None
-        return self.prefill_throughput_samples[-1]
+        def update_waiting_requests(self, count: int):
+            """Update the number of waiting requests."""
+            self.num_waiting_requests = count
 
-    @property
-    def current_decode_throughput(self) -> Optional[float]:
-        """Most recent decode throughput in tokens/s."""
-        if not self.decode_throughput_samples:
-            return None
-        return self.decode_throughput_samples[-1]
+        def update_waiting_migration_requests(self, count: int):
+            """Update the number of waiting migration requests."""
+            self.num_waiting_migration_requests = count
 
-    @property
-    def total_token_usage(self) -> int:
-        """Total token usage across all DP ranks."""
-        return sum(self.token_usage_by_dp.values())
+        def add_completed_request(self):
+            """Increment the completed request counter."""
+            self.num_completed_requests += 1
 
-    @property
-    def uptime(self) -> float:
-        """Server uptime in seconds."""
-        return time.time() - self.start_time
+        def add_tokens(self, num_prompt: int = 0, num_generated: int = 0):
+            """Add tokens to the total count."""
+            self.total_prompt_tokens += num_prompt
+            self.total_generated_tokens += num_generated
+            self.total_tokens += num_prompt + num_generated
 
-    def log_metrics(self, include_detailed: bool = False):
-        """
-        Log server metrics.
+        def record_prefill_throughput(self, num_tokens: int, duration: float):
+            """
+            Record prefill throughput.
 
-        Args:
-            include_detailed: Whether to include detailed per-DP metrics
-        """
-        prefill_tput = self.current_prefill_throughput or 0
-        decode_tput = self.current_decode_throughput or 0
+            Args:
+                num_tokens: Number of tokens processed
+                duration: Duration in seconds
+            """
+            if duration > 0:
+                throughput = num_tokens / duration
+                self.prefill_throughput_samples.append(throughput)
 
-        logger.info(
-            f"ServerMetric - "
-            f"Running/Waiting/Waiting migration: {self.num_running_requests}/{self.num_waiting_requests}/{self.num_waiting_migration_requests}, "
-            f"Completed: {self.num_completed_requests}, "
-            f"Tokens: {self.total_tokens} (prompt: {self.total_prompt_tokens}, gen: {self.total_generated_tokens}), "
-            f"Throughput: Prefill {prefill_tput:.0f} tok/s, "
-            f"Decode {decode_tput:.0f} tok/s"
-        )
+        def record_decode_throughput(self, num_tokens: int, duration: float):
+            """
+            Record decode throughput.
 
-        if include_detailed and self.token_usage_by_dp:
-            for dp_idx, tokens in self.token_usage_by_dp.items():
-                logger.debug(f"  DP[{dp_idx}] token usage: {tokens}")
+            Args:
+                num_tokens: Number of tokens generated
+                duration: Duration in seconds
+            """
+            if duration > 0:
+                throughput = num_tokens / duration
+                self.decode_throughput_samples.append(throughput)
 
-    def get_summary(self) -> dict:
-        """Get a summary dictionary of all metrics."""
-        return {
-            "uptime_seconds": self.uptime,
-            "total_requests": self.num_completed_requests,
-            "running_requests": self.num_running_requests,
-            "waiting_requests": self.num_waiting_requests,
-            "total_tokens": self.total_tokens,
-            "total_prompt_tokens": self.total_prompt_tokens,
-            "total_generated_tokens": self.total_generated_tokens,
-            "avg_prefill_throughput": self.avg_prefill_throughput,
-            "avg_decode_throughput": self.avg_decode_throughput,
-            "current_prefill_throughput": self.current_prefill_throughput,
-            "current_decode_throughput": self.current_decode_throughput,
-            "total_token_usage": self.total_token_usage,
-        }
+        def update_token_usage(self, dp_idx: int, num_tokens: int):
+            """Update token usage for a specific data parallel rank."""
+            self.token_usage_by_dp[dp_idx] = num_tokens
+
+        @property
+        def avg_prefill_throughput(self) -> Optional[float]:
+            """Average prefill throughput in tokens/s."""
+            if not self.prefill_throughput_samples:
+                return None
+            return sum(self.prefill_throughput_samples) / len(
+                self.prefill_throughput_samples
+            )
+
+        @property
+        def avg_decode_throughput(self) -> Optional[float]:
+            """Average decode throughput in tokens/s."""
+            if not self.decode_throughput_samples:
+                return None
+            return sum(self.decode_throughput_samples) / len(
+                self.decode_throughput_samples
+            )
+
+        @property
+        def current_prefill_throughput(self) -> Optional[float]:
+            """Most recent prefill throughput in tokens/s."""
+            if not self.prefill_throughput_samples:
+                return None
+            return self.prefill_throughput_samples[-1]
+
+        @property
+        def current_decode_throughput(self) -> Optional[float]:
+            """Most recent decode throughput in tokens/s."""
+            if not self.decode_throughput_samples:
+                return None
+            return self.decode_throughput_samples[-1]
+
+        @property
+        def total_token_usage(self) -> int:
+            """Total token usage across all DP ranks."""
+            return sum(self.token_usage_by_dp.values())
+
+        @property
+        def uptime(self) -> float:
+            """Server uptime in seconds."""
+            return time.time() - self.start_time
+
+        def log_metrics(self, include_detailed: bool = False):
+            """
+            Log server metrics.
+
+            Args:
+                include_detailed: Whether to include detailed per-DP metrics
+            """
+            prefill_tput = self.current_prefill_throughput or 0
+            decode_tput = self.current_decode_throughput or 0
+
+            logger.info(
+                f"ServerMetric - "
+                f"Running/Waiting/Waiting migration: {self.num_running_requests}/{self.num_waiting_requests}/{self.num_waiting_migration_requests}, "
+                f"Completed: {self.num_completed_requests}, "
+                f"Tokens: {self.total_tokens} (prompt: {self.total_prompt_tokens}, gen: {self.total_generated_tokens}), "
+                f"Throughput: Prefill {prefill_tput:.0f} tok/s, "
+                f"Decode {decode_tput:.0f} tok/s"
+            )
+
+            if include_detailed and self.token_usage_by_dp:
+                for dp_idx, tokens in self.token_usage_by_dp.items():
+                    logger.debug(f"  DP[{dp_idx}] token usage: {tokens}")
+
+        def get_summary(self) -> dict:
+            return {
+                "uptime_seconds": self.uptime,
+                "total_requests": self.num_completed_requests,
+                "running_requests": self.num_running_requests,
+                "waiting_requests": self.num_waiting_requests,
+                "total_tokens": self.total_tokens,
+                "total_prompt_tokens": self.total_prompt_tokens,
+                "total_generated_tokens": self.total_generated_tokens,
+                "avg_prefill_throughput": self.avg_prefill_throughput,
+                "avg_decode_throughput": self.avg_decode_throughput,
+                "current_prefill_throughput": self.current_prefill_throughput,
+                "current_decode_throughput": self.current_decode_throughput,
+                "total_token_usage": self.total_token_usage,
+            }
 
 
 class MetricsManager:
