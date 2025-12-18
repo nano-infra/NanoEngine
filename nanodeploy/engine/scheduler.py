@@ -194,7 +194,7 @@ class Scheduler:
 
         self.attention_dp = config.attention_dp
         self.attention_sp = config.attention_sp
-        self.rounting_strategy = RoutingStrategy.RoundRobin
+        self.routing_strategy = RoutingStrategy.RoundRobin
 
         self.worker_state = [
             SPStateManager(
@@ -256,7 +256,7 @@ class Scheduler:
 
         while waiting:
             seq = waiting[0]
-            if self.rounting_strategy == RoutingStrategy.RoundRobin:
+            if self.routing_strategy == RoutingStrategy.RoundRobin:
                 for _ in range(self.attention_dp):
                     selected_dp_idx = next(self.dp_rr_counter)
 
@@ -282,9 +282,9 @@ class Scheduler:
                     break
                 else:
                     break
-            elif self.rounting_strategy == RoutingStrategy.LeastToken:
+            elif self.routing_strategy == RoutingStrategy.LeastToken:
                 pass
-            elif self.rounting_strategy == RoutingStrategy.LeastCache:
+            elif self.routing_strategy == RoutingStrategy.LeastCache:
                 pass
             else:
                 raise AttributeError

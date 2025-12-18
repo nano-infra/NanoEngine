@@ -152,13 +152,6 @@ class LLMEngine:
         
         
         for seqs in dp_seqs:
-            outputs.extend(
-                [
-                    (seq.seq_id, seq.completion_token_ids)
-                    for seq in seqs
-                    if seq.is_finished
-                ]
-            )
             num_tokens += (
                 sum(len(seq) for seq in seqs)
                 if is_prefill

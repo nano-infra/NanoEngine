@@ -26,7 +26,41 @@ if get_use_cpp_metric():
             ServerMetric as _CppServerMetric,
         )
 
-        SequenceMetric = _CppSequenceMetric
+        class SequenceMetric(_CppSequenceMetric):
+            def log_metrics(self):
+                """Log all metrics for this sequence."""
+
+                ttft_str = f"{self.ttft:.2f}ms" if self.ttft is not None else "N/A"
+                e2e_str = (
+                    f"{self.e2e_latency:.2f}ms" if self.e2e_latency is not None else "N/A"
+                )
+
+                tpot_wo_queue_str = (
+                    f"{self.avg_tpot_wo_queueing:.2f}ms"
+                    if self.avg_tpot_wo_queueing is not None
+                    else "N/A"
+                )
+                tpot_with_queue_str = (
+                    f"{self.avg_tpot_with_queueing:.2f}ms"
+                    if self.avg_tpot_with_queueing is not None
+                    else "N/A"
+                )
+                queueing_time_str = (
+                    f"{self.queueing_time_ms:.2f}ms"
+                    if self.queueing_time_ms is not None
+                    else "N/A"
+                )
+
+                logger.info(
+                    f"SequenceMetric [{self.seq_id[:8]}...] - "
+                    f"TTFT: {ttft_str}, "
+                    f"E2E: {e2e_str}, "
+                    f"Prompt Length: {self.num_prompt_tokens}, Output Length: {self.num_generated_tokens}, "
+                    f"Queueing Time: {queueing_time_str}, "
+                    f"ITL Wo Queue: {tpot_wo_queue_str}, "
+                    f"ITL With Queue: {tpot_with_queue_str}"
+                )
+
         ServerMetric = _CppServerMetric
         _USING_CPP = True
     except ImportError as e:
