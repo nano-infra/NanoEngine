@@ -1,14 +1,75 @@
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <pybind11/stl_bind.h>
 #include "sequence.h"
 #include "sequence_metric.h"
+
+// Declare opaque map types *before* including <pybind11/stl.h> to prevent
+// automatic conversion to Python dict copies.
+PYBIND11_MAKE_OPAQUE(std::unordered_map<int, int>);
+PYBIND11_MAKE_OPAQUE(nanodeploy::Sequence::BlockCtxMap);
+
+#include <pybind11/stl.h>
 
 namespace py = pybind11;
 using namespace nanodeploy;
 
-PYBIND11_MAKE_OPAQUE(std::unordered_map<int, int>);
+namespace {
+
+BlockContext::BlockIdList block_id_list_from_iterable(const py::iterable& it) {
+    BlockContext::BlockIdList out;
+    for (auto item : it) {
+        out.push_back(item.cast<int>());
+    }
+    return out;
+}
+
+} // namespace
 
 void bind_sequence(py::module_& m) {
+    // Bind wrapper containers used for mutable proxy views.
+    // These are intentionally distinct from std::vector<int> used by token_ids.
+    auto block_id_list = py::bind_vector<BlockContext::BlockIdList>(m, "BlockIdList");
+    block_id_list
+        .def(py::init<>())
+        .def(py::init([](py::iterable it) { return block_id_list_from_iterable(it); }));
+    py::implicitly_convertible<py::list, BlockContext::BlockIdList>();
+
+    py::bind_vector<BlockContext::BlockLocationList>(m, "BlockLocationList")
+        .def(py::init<>());
+
+    // Wrapper class for sp_block_table to provide defaultdict(list) behavior.
+    py::class_<BlockContext::SpBlockTable>(m, "DefaultListDict")
+        .def(py::init<>())
+        .def("__getitem__", [](BlockContext::SpBlockTable& self, int key) -> BlockContext::BlockIdList& {
+            // Mimic defaultdict(list): create empty list for missing keys.
+            return self[key];
+        }, py::return_value_policy::reference_internal)
+        .def("__setitem__", [](BlockContext::SpBlockTable& self, int key, py::iterable value) {
+            self[key] = block_id_list_from_iterable(value);
+        })
+        .def("__contains__", [](const BlockContext::SpBlockTable& self, int key) {
+            return self.find(key) != self.end();
+        })
+        .def("keys", [](const BlockContext::SpBlockTable& self) {
+            py::list keys;
+            for (const auto& pair : self) {
+                keys.append(pair.first);
+            }
+            return keys;
+        })
+        .def("items", [](const BlockContext::SpBlockTable& self) {
+            // Debug/introspection helper; returns Python copies.
+            py::list items;
+            for (const auto& pair : self) {
+                items.append(py::make_tuple(pair.first, py::cast(std::vector<int>(pair.second.begin(), pair.second.end()))));
+            }
+            return items;
+        })
+        .def("clear", [](BlockContext::SpBlockTable& self) { self.clear(); });
+
+    // Bind Sequence.block_ctx_map as a mutable mapping proxy.
+    py::bind_map<Sequence::BlockCtxMap>(m, "BlockCtxMap");
+
     py::enum_<SequenceStatus>(m, "SequenceStatus")
         .value("WAITING", SequenceStatus::WAITING)
         .value("RUNNING", SequenceStatus::RUNNING)
@@ -72,8 +133,22 @@ void bind_sequence(py::module_& m) {
         .def_readwrite("master_sp_idx", &BlockContext::master_sp_idx)
         .def_readwrite("attention_sp", &BlockContext::attention_sp)
         .def_readwrite("attention_dp", &BlockContext::attention_dp)
-        .def_readwrite("block_location", &BlockContext::block_location)
-        .def_readwrite("sp_block_table", &BlockContext::sp_block_table)
+        .def_property("block_location",
+            [](BlockContext& self) -> BlockContext::BlockLocationList& {
+                return self.block_location;
+            },
+            [](BlockContext& self, const BlockContext::BlockLocationList& value) {
+                self.block_location = value;
+            },
+            py::return_value_policy::reference_internal)
+        .def_property("sp_block_table",
+            [](BlockContext& self) -> BlockContext::SpBlockTable& {
+                return self.sp_block_table;
+            },
+            [](BlockContext& self, const BlockContext::SpBlockTable& value) {
+                self.sp_block_table = value;
+            },
+            py::return_value_policy::reference_internal)
         .def_property("num_dispatched_tokens",
             [](BlockContext& self) -> std::unordered_map<int, int>& { 
                 return self.num_dispatched_tokens; 
@@ -164,7 +239,26 @@ void bind_sequence(py::module_& m) {
         .def_readwrite("num_cached_tokens", &Sequence::num_cached_tokens)
         .def_readwrite("backup_engine_id", &Sequence::backup_engine_id)
         .def_readwrite("active_engine_id", &Sequence::active_engine_id)
-        .def_readwrite("block_ctx_map", &Sequence::block_ctx_map)
+        .def_property("block_ctx_map",
+            [](Sequence& self) -> Sequence::BlockCtxMap& {
+                return self.block_ctx_map;
+            },
+            [](Sequence& self, py::object value) {
+                if (py::isinstance<py::dict>(value)) {
+                    py::dict d = value.cast<py::dict>();
+                    self.block_ctx_map.clear();
+                    for (auto item : d) {
+                        auto eid = item.first.cast<std::optional<std::string>>();
+                        auto ctx = item.second.cast<BlockContext>();
+                        self.block_ctx_map[eid] = ctx;
+                    }
+                    return;
+                }
+
+                // Allow assigning from an existing BlockCtxMap proxy.
+                self.block_ctx_map = value.cast<Sequence::BlockCtxMap>();
+            },
+            py::return_value_policy::reference_internal)
         .def_readwrite("metric", &Sequence::metric)
         .def_readwrite("temperature", &Sequence::temperature)
         .def_readwrite("max_tokens", &Sequence::max_tokens)

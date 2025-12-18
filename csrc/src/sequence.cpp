@@ -19,8 +19,17 @@ std::tuple<std::optional<std::string>, int, int, int, int,
            std::vector<std::pair<int, int>>,
            std::unordered_map<int, std::vector<int>>,
            std::unordered_map<int, int>> BlockContext::getstate() const {
+    std::unordered_map<int, std::vector<int>> sp_block_table_state;
+    sp_block_table_state.reserve(sp_block_table.size());
+    for (const auto& pair : sp_block_table) {
+        sp_block_table_state.emplace(pair.first,
+                                     std::vector<int>(pair.second.begin(), pair.second.end()));
+    }
+
     return std::make_tuple(engine_id, dp_idx, master_sp_idx, attention_sp, attention_dp,
-                           block_location, sp_block_table, num_dispatched_tokens);
+                           std::vector<std::pair<int, int>>(block_location.begin(), block_location.end()),
+                           std::move(sp_block_table_state),
+                           num_dispatched_tokens);
 }
 
 BlockContext BlockContext::setstate(const std::tuple<std::optional<std::string>, int, int, int, int, 
@@ -33,8 +42,11 @@ BlockContext BlockContext::setstate(const std::tuple<std::optional<std::string>,
     ctx.master_sp_idx = std::get<2>(state);
     ctx.attention_sp = std::get<3>(state);
     ctx.attention_dp = std::get<4>(state);
-    ctx.block_location = std::get<5>(state);
-    ctx.sp_block_table = std::get<6>(state);
+    ctx.block_location = BlockContext::BlockLocationList(std::get<5>(state).begin(), std::get<5>(state).end());
+    ctx.sp_block_table.clear();
+    for (const auto& pair : std::get<6>(state)) {
+        ctx.sp_block_table[pair.first] = BlockContext::BlockIdList(pair.second.begin(), pair.second.end());
+    }
     ctx.num_dispatched_tokens = std::get<7>(state);
     return ctx;
 }
@@ -119,7 +131,7 @@ int Sequence::dp_idx(const std::optional<std::string>& engine_id) {
     return block_ctx(engine_id).dp_idx;
 }
 
-std::vector<int>& Sequence::block_table(const std::optional<std::string>& engine_id, int sp_idx) {
+BlockContext::BlockIdList& Sequence::block_table(const std::optional<std::string>& engine_id, int sp_idx) {
     return block_ctx(engine_id).sp_block_table[sp_idx];
 }
 
@@ -169,7 +181,7 @@ void Sequence::block_table_clear(const std::optional<std::string>& engine_id, in
 void Sequence::block_table_set(const std::vector<int>& table,
                               const std::optional<std::string>& engine_id,
                               int sp_idx) {
-    block_ctx(engine_id).sp_block_table[sp_idx] = table;
+    block_ctx(engine_id).sp_block_table[sp_idx] = BlockContext::BlockIdList(table.begin(), table.end());
 }
 
 void Sequence::block_location_append(int sp_idx,

@@ -247,16 +247,10 @@ class ModelRunner:
         block_tables = [
             [
                 (
-                    dp_sp_seqs[sp_idx][seq_id].block_table(self.engine_id, sp_rank)
-                    + [-1]
-                    * (
-                        max_num_blocks
-                        - len(
-                            dp_sp_seqs[sp_idx][seq_id].block_table(
-                                self.engine_id, sp_rank
-                            )
-                        )
-                    )
+                    (bt := list(
+                        dp_sp_seqs[sp_idx][seq_id].block_table(self.engine_id, sp_rank)
+                    ))
+                    + [-1] * (max_num_blocks - len(bt))
                     if seq_id < sp_num_seqs[sp_idx]
                     else [-1] * max_num_blocks
                 )

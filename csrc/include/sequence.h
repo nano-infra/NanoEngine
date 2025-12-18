@@ -21,11 +21,27 @@ struct BlockContext {
     int attention_sp = 1;
     int attention_dp = 1;
     
+    // Wrapper container types.
+    //
+    // Motivation: pybind11 converts STL containers to Python list/dict copies by
+    // default. These wrappers are distinct C++ types, allowing us to bind them
+    // with pybind11 (stl_bind) as *mutable proxy objects* without affecting other
+    // std::vector<int> usages (e.g., Sequence::token_ids).
+    struct BlockLocationList : public std::vector<std::pair<int, int>> {
+        using std::vector<std::pair<int, int>>::vector;
+    };
+    struct BlockIdList : public std::vector<int> {
+        using std::vector<int>::vector;
+    };
+    struct SpBlockTable : public std::unordered_map<int, BlockIdList> {
+        using std::unordered_map<int, BlockIdList>::unordered_map;
+    };
+
     // block_location: vector of (sp_idx, block_id) pairs
-    std::vector<std::pair<int, int>> block_location;
+    BlockLocationList block_location;
     
     // sp_block_table: sp_idx -> list of block_ids
-    std::unordered_map<int, std::vector<int>> sp_block_table;
+    SpBlockTable sp_block_table;
     
     // num_dispatched_tokens: sp_idx -> count
     std::unordered_map<int, int> num_dispatched_tokens;
@@ -116,8 +132,8 @@ public:
     // Accessors
     BlockContext& block_ctx(const std::optional<std::string>& engine_id = std::nullopt);
     const BlockContext& block_ctx(const std::optional<std::string>& engine_id = std::nullopt) const;
-    std::vector<int>& block_table(const std::optional<std::string>& engine_id = std::nullopt, 
-                                   int sp_idx = 0);
+    BlockContext::BlockIdList& block_table(const std::optional<std::string>& engine_id = std::nullopt, 
+                                          int sp_idx = 0);
     
     int dp_idx(const std::optional<std::string>& engine_id);
 
@@ -161,7 +177,8 @@ public:
     
     std::optional<std::string> backup_engine_id;
     std::optional<std::string> active_engine_id;
-    std::unordered_map<std::optional<std::string>, BlockContext, OptionalStringHash> block_ctx_map;
+    using BlockCtxMap = std::unordered_map<std::optional<std::string>, BlockContext, OptionalStringHash>;
+    BlockCtxMap block_ctx_map;
     
     std::shared_ptr<SequenceMetric> metric;
     
