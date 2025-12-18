@@ -13,7 +13,15 @@ BlockContext::BlockContext(const std::optional<std::string>& engine_id,
                            int dp_idx, int master_sp_idx,
                            int attention_sp, int attention_dp)
     : engine_id(engine_id), dp_idx(dp_idx), master_sp_idx(master_sp_idx),
-      attention_sp(attention_sp), attention_dp(attention_dp) {}
+      attention_sp(attention_sp), attention_dp(attention_dp) {
+    // Initialize sp_block_table and num_dispatched_tokens for range(attention_sp)
+    // This mimics Python's defaultdict behavior and ensures keys exist
+    for (int i = 0; i < attention_sp; ++i) {
+        // Accessing via [] creates the entry if it doesn't exist
+        (void)sp_block_table[i];
+        (void)num_dispatched_tokens[i];
+    }
+}
 
 std::tuple<std::optional<std::string>, int, int, int, int, 
            std::vector<std::pair<int, int>>,
@@ -141,14 +149,8 @@ void Sequence::set_engine_id(const std::string& engine_id, int attention_dp, int
         return;
     }
     
-    BlockContext ctx(engine_id, -1, 0, attention_sp, attention_dp);
-    // Initialize sp_block_table and num_dispatched_tokens for range(attention_sp)
-    // This mimics Python's defaultdict behavior
-    for (int i = 0; i < attention_sp; ++i) {
-        ctx.sp_block_table[i] = {};
-        ctx.num_dispatched_tokens[i] = 0;
-    }
-    block_ctx_map[engine_id] = ctx;
+    // BlockContext constructor now handles initialization of internal maps
+    block_ctx_map.emplace(engine_id, BlockContext(engine_id, -1, 0, attention_sp, attention_dp));
 }
 
 int Sequence::context_len(const std::optional<std::string>& engine_id, std::optional<int> sp_idx) {
