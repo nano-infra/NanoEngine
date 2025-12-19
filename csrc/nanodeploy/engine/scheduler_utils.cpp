@@ -127,15 +127,15 @@ MigrationList postprocess_sequences(
             const auto& batch_seqs = sp_seqs[sp_idx];
             const auto& batch_tokens = sp_tokens[sp_idx];
 
-            // 修改开始：移除严格相等检查，改为检查 tokens 数量是否足够
-            // Python: zip(seqs, tokens) 会在 seqs 耗尽时停止，忽略多余的 tokens
+            // Begin modification: Remove strict equality check, check if token count is sufficient
+            // Python: zip(seqs, tokens) stops when seqs is exhausted, ignoring extra tokens
             if (batch_seqs.size() > batch_tokens.size()) {
                 throw std::runtime_error("batch_seqs size mismatch with batch_tokens: not enough tokens");
             }
-            // 如果 batch_tokens.size() > batch_seqs.size()，我们允许这种情况（忽略多余的）
+            // If batch_tokens.size() > batch_seqs.size(), we allow this case (ignore extra tokens)
 
-            size_t batch_size = batch_seqs.size(); // 以 seqs 的数量为准
-            // 修改结束
+            size_t batch_size = batch_seqs.size(); // Use the number of seqs as batch size
+            // End modification
 
             for (size_t i = 0; i < batch_size; ++i) {
                 ctx.tasks.push_back({
