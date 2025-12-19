@@ -54,12 +54,16 @@ public:
                std::optional<double>,
                std::optional<double>,
                std::optional<double>,
+               std::optional<double>,
+               std::optional<double>,
                int,
                int,
                std::vector<double>>
     getstate() const;
 
     static std::shared_ptr<SequenceMetric> setstate(const std::tuple<std::string,
+                                                                     std::optional<double>,
+                                                                     std::optional<double>,
                                                                      std::optional<double>,
                                                                      std::optional<double>,
                                                                      std::optional<double>,
