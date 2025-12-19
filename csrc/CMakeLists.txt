@@ -17,6 +17,7 @@ set(CPP_SOURCES
     src/block.cpp
     src/block_manager.cpp
     src/sp_state_manager.cpp
+    src/scheduler_utils.cpp
 )
 
 set(BINDING_SOURCES

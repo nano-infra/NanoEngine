@@ -20,7 +20,8 @@ if get_use_cpp_sp_state_manager():
         from nanodeploy._cpp import (
             SPStateManager as _CppSPStateManager,
             RoutingStrategy as _CppRoutingStrategy,
-            DefaultIntDict as _CppDefaultIntDict
+            DefaultIntDict as _CppDefaultIntDict,
+            postprocess_sequences as _cpp_postprocess_sequences
         )
         _USING_CPP = True
     except ImportError as e:
@@ -358,6 +359,21 @@ class Scheduler:
         dp_token_ids: list[list[list[list[int]]]],
         metrics_manager: "MetricsManager | None" = None,
     ):
+        if _USING_CPP:
+            # 调用 C++ 实现
+            _cpp_postprocess_sequences(
+                self.worker_state,
+                dp_seqs,
+                dp_token_ids,
+                self.engine_id,
+                self.eos,
+                self.mode == "prefill",
+                self.to_be_migrated,
+                metrics_manager is not None
+            )
+            return
+
+        # Python 回退实现
         for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
             for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
                 for _, (seq, loop_count_token_id) in enumerate(zip(seqs, token_ids)):

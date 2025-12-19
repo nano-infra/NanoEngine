@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 #include "sp_state_manager.h"
+#include "scheduler_utils.h"
 
 namespace py = pybind11;
 using namespace nanodeploy;
@@ -88,4 +89,15 @@ void bind_sp_state_manager(py::module_& m) {
         .def_readwrite("running", &SPStateManager::running)
         .def_readwrite("dummy_seqs", &SPStateManager::dummy_seqs)
         .def_readwrite("routing_strategy", &SPStateManager::routing_strategy);
+
+    m.def("postprocess_sequences", &postprocess_sequences,
+        py::arg("worker_states"),
+        py::arg("dp_seqs"),
+        py::arg("dp_token_ids"),
+        py::arg("engine_id"),
+        py::arg("eos_id"),
+        py::arg("is_prefill"),
+        py::arg("to_be_migrated"),
+        py::arg("update_metrics")
+    );
 }
