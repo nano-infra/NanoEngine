@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(nanodeploy C CXX)
+project(_nanodeploy_cpp C CXX)
 
 # CXX Configuration
 set(CMAKE_CXX_STANDARD 17)
