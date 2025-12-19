@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <iostream>
 #include <exception>
+#include <stdexcept>
 
 namespace nanodeploy {
 
