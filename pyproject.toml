@@ -9,7 +9,7 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "nano-deploy"
+name = "nanodeploy"
 version = "0.2.0"
 authors = [{ name = "DeepLink-MLSysResearch" }]
 license = "MIT"
