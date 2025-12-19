@@ -1,5 +1,5 @@
 import enum
-from collections import deque
+from collections import deque, defaultdict
 from itertools import count
 from typing import Literal, TYPE_CHECKING
 
@@ -127,7 +127,13 @@ class _PySPStateManager:
 
         master_rank = next(self.sp_rr_counter)
 
-        if num_seqs[master_rank] >= self.max_num_seqs:
+        # Check if sequences for this master_rank exceeds max_num_seqs
+        running_master_count = sum(
+            1
+            for s in self.running
+            if s.block_ctx(self.engine_id).master_sp_idx == master_rank
+        )
+        if num_seqs[master_rank] + running_master_count + 1 > self.max_num_seqs:
             return False
 
         if num_batched_tokens[master_rank] + len(seq) >= self.max_num_batched_tokens:
@@ -217,12 +223,14 @@ class Scheduler:
         return not waiting and all(w.is_empty for w in self.worker_state)
 
     def add(self, seq: Sequence):
+        if seq.metric:
+            seq.metric.record_arrival()
         if self.mode == "decode":
             self.waiting_migration.append(seq)
-            seq.metric.record_arrival()
+            if seq.metric:
+                seq.metric.record_decode_arrival()
         else:
             self.waiting.append(seq)
-            seq.metric.record_arrival()
 
     def running(self, dp_idx: int):
         return self.worker_state[dp_idx].running
@@ -279,6 +287,8 @@ class Scheduler:
                     scheduled_seqs[selected_dp_idx].append(seq)
                     if seq.metric:
                         seq.metric.record_first_scheduled()
+                        if self.mode == "decode":
+                            seq.metric.record_decode_scheduled()
                     break
                 else:
                     break
@@ -292,10 +302,16 @@ class Scheduler:
 
     def _schedule_decode(self) -> list[list[Sequence]]:
         scheduled_seqs = [[] for _ in range(self.attention_dp)]
-        num_seqs = {replica_id: 0 for replica_id in range(self.attention_dp)}
+        num_seqs = [defaultdict(int) for _ in range(self.attention_dp)]
         for selected_dp_idx in range(self.attention_dp):
+            skipped = deque()
             while self.running(selected_dp_idx):
                 seq = self.running(selected_dp_idx).popleft()
+                master_rank = seq.block_ctx(self.engine_id).master_sp_idx
+                if num_seqs[selected_dp_idx][master_rank] >= self.max_num_seqs:
+                    skipped.append(seq)
+                    continue
+
                 while not self.worker_state[selected_dp_idx].can_append(
                     seq, num_tokens=self.loop_count
                 ):
@@ -304,15 +320,20 @@ class Scheduler:
                             selected_dp_idx, self.running(
                                 selected_dp_idx).pop()
                         )
+                    elif skipped:
+                        self.preempt(selected_dp_idx, skipped.pop())
                     else:
                         self.preempt(selected_dp_idx, seq)
                         break
                 else:
-                    num_seqs[selected_dp_idx] += 1
+                    num_seqs[selected_dp_idx][master_rank] += 1
                     self.worker_state[selected_dp_idx].may_append(
                         seq, num_tokens=self.loop_count
                     )
                     scheduled_seqs[selected_dp_idx].append(seq)
+            
+            # Put skipped sequences back to the front of the running queue
+            self.running(selected_dp_idx).extendleft(reversed(skipped))
             self.running(selected_dp_idx).extendleft(
                 reversed(scheduled_seqs[selected_dp_idx])
             )

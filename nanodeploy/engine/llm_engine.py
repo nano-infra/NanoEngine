@@ -99,13 +99,13 @@ class LLMEngine:
         ]
 
         dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
-        dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
+        # dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
         sp_batch_sizes = [[len(filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx]) 
                           for sp_idx in range(sp_size)] 
                           for dp_idx in range(dp_size)]
         
         logger.info({
-            "dp_batch_sizes": dp_batch_sizes,
+            # "dp_batch_sizes": dp_batch_sizes,
             "sp_batch_sizes": sp_batch_sizes,
             "free_blocks": [
                 [
@@ -131,6 +131,11 @@ class LLMEngine:
                 self.executor.migrate(dp_sp_seqs)
             else:
                 [[seq.append_token(0) for seq in seqs] for seqs in dp_seqs]
+                for seqs in dp_seqs:
+                    for seq in seqs:
+                        if seq.metric and seq.metric.num_generated_tokens == 0:
+                            seq.metric.record_first_token()
+                            seq.metric.num_generated_tokens = 1
         else:
             token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
             post_sch_begin = time.time()
@@ -165,7 +170,7 @@ class LLMEngine:
         return (
             outputs,
             num_tokens,
-            [len(seqs) for seqs in dp_seqs],
+            sum(len(seqs) for seqs in dp_seqs),
             (sch_end - sch_begin) * 1000,
             (post_sch_end - post_sch_begin) * 1000,
         )
