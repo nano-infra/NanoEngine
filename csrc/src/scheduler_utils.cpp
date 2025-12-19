@@ -7,20 +7,25 @@
 #include <vector>
 #include <algorithm>
 #include <unordered_set>
+#include <cassert>
+#include <exception>
 
 namespace nanodeploy {
 
 struct CompactTask {
     Sequence* seq_ptr;
     PyObject* seq_obj;
-    uint32_t token_offset;
-    uint16_t token_count;
+    size_t token_offset;
+    uint32_t token_count;
     uint16_t sp_idx;
+    uint16_t dp_idx;
 };
 
 struct WorkerContext {
     std::vector<CompactTask> tasks;
     std::vector<std::pair<PyObject*, int>> migration_candidates;
+    std::exception_ptr eptr = nullptr;
+
     void reserve(size_t n) { tasks.reserve(n); }
 };
 
@@ -34,62 +39,72 @@ void optimized_worker_func(
     bool is_prefill,
     bool update_metrics
 ) {
-    std::unordered_set<Sequence*> dummy_set;
-    for (const auto& dummy : state_manager->dummy_seqs) {
-        dummy_set.insert(dummy.get());
-    }
+    try {
+        std::unordered_set<Sequence*> dummy_set;
+        for (const auto& dummy : state_manager->dummy_seqs) {
+            dummy_set.insert(dummy.get());
+        }
 
-    for (const auto& task : ctx->tasks) {
-        Sequence* seq = task.seq_ptr;
+        for (const auto& task : ctx->tasks) {
+            Sequence* seq = task.seq_ptr;
 
-        if (dummy_set.count(seq)) continue;
+            if (dummy_set.count(seq)) continue;
 
-        const int* tokens_begin = token_storage + task.token_offset;
-        const int* tokens_end = tokens_begin + task.token_count;
-
-        for (const int* it = tokens_begin; it != tokens_end; ++it) {
-            int token_id = *it;
-            
-            seq->append_token(token_id, engine_id, task.sp_idx);
-
-            if (update_metrics && seq->metric) {
-                if (seq->metric->num_generated_tokens == 0) {
-                     seq->metric->record_first_token();
-                     seq->metric->num_generated_tokens = 1;
-                } else {
-                     seq->metric->record_token();
-                }
+            #ifndef NDEBUG
+            {
+                assert(task.sp_idx == seq->block_ctx(engine_id).master_sp_idx);
             }
-            
-            bool finished = (!seq->ignore_eos && token_id == eos_id) || 
-                            (seq->num_completed_tokens() == seq->max_tokens);
-                            
-            if (finished) {
-                seq->status = SequenceStatus::FINISHED;
-                state_manager->deallocate(*seq);
-                break; 
-            } else if (is_prefill) {
-                seq->status = SequenceStatus::TO_BE_MIGRATED;
-                seq->backup_engine_id = seq->active_engine_id;
-                seq->active_engine_id = std::nullopt;
+            #endif
+
+            const int* tokens_begin = token_storage + task.token_offset;
+            const int* tokens_end = tokens_begin + task.token_count;
+
+            for (const int* it = tokens_begin; it != tokens_end; ++it) {
+                int token_id = *it;
                 
-                result_ctx->migration_candidates.push_back({task.seq_obj, task.sp_idx});
-                break;
+                seq->append_token(token_id, engine_id, task.sp_idx);
+
+                if (update_metrics && seq->metric) {
+                    if (seq->metric->num_generated_tokens == 0) {
+                         seq->metric->record_first_token();
+                         seq->metric->num_generated_tokens = 1;
+                    } else {
+                         seq->metric->record_token();
+                    }
+                }
+                
+                bool finished = (!seq->ignore_eos && token_id == eos_id) || 
+                                (seq->num_completed_tokens() == seq->max_tokens);
+                                
+                if (finished) {
+                    seq->status = SequenceStatus::FINISHED;
+                    state_manager->deallocate(*seq);
+                    break; 
+                } else if (is_prefill) {
+                    seq->status = SequenceStatus::TO_BE_MIGRATED;
+                    seq->backup_engine_id = seq->active_engine_id;
+                    seq->active_engine_id = std::nullopt;
+                    
+                    result_ctx->migration_candidates.push_back({task.seq_obj, (int)task.dp_idx});
+                    break;
+                }
             }
         }
-    }
 
-    auto& running = state_manager->running;
-    if (!running.empty()) {
-        running.erase(
-            std::remove_if(running.begin(), running.end(),
-                [](const std::shared_ptr<Sequence>& s) {
-                    return s->status == SequenceStatus::FINISHED || 
-                           s->status == SequenceStatus::TO_BE_MIGRATED;
-                }
-            ),
-            running.end()
-        );
+        auto& running = state_manager->running;
+        if (!running.empty()) {
+            running.erase(
+                std::remove_if(running.begin(), running.end(),
+                    [](const std::shared_ptr<Sequence>& s) {
+                        return s->status == SequenceStatus::FINISHED || 
+                               s->status == SequenceStatus::TO_BE_MIGRATED;
+                    }
+                ),
+                running.end()
+            );
+        }
+    } catch (...) {
+        result_ctx->eptr = std::current_exception();
     }
 }
 
@@ -138,24 +153,31 @@ void postprocess_sequences(
                 Sequence* seq_ptr = py::handle(py_seq).cast<Sequence*>();
 
                 Py_ssize_t n_tokens = PyList_GET_SIZE(py_tokens);
-                uint32_t start_offset = (uint32_t)global_token_storage.size();
+                size_t start_offset = global_token_storage.size();
                 
+                auto add_token = [&](PyObject* item) {
+                    long val = PyLong_AsLong(item);
+                    if (val == -1 && PyErr_Occurred()) {
+                        throw py::error_already_set();
+                    }
+                    global_token_storage.push_back((int)val);
+                };
+
                 if (n_tokens == 1) {
-                    PyObject* item = PyList_GET_ITEM(py_tokens, 0);
-                    global_token_storage.push_back((int)PyLong_AsLong(item));
+                    add_token(PyList_GET_ITEM(py_tokens, 0));
                 } else {
                     for (Py_ssize_t j = 0; j < n_tokens; ++j) {
-                        PyObject* item = PyList_GET_ITEM(py_tokens, j);
-                        global_token_storage.push_back((int)PyLong_AsLong(item));
+                        add_token(PyList_GET_ITEM(py_tokens, j));
                     }
                 }
 
                 ctx.tasks.push_back({
                     seq_ptr,
-                    py_seq,
+                    py_seq, 
                     start_offset,
-                    (uint16_t)n_tokens,
-                    (uint16_t)sp_idx
+                    (uint32_t)n_tokens,
+                    (uint16_t)sp_idx,
+                    (uint16_t)dp_idx
                 });
             }
         }
@@ -174,7 +196,7 @@ void postprocess_sequences(
                 worker_states[dp_idx],
                 &contexts[dp_idx],
                 token_ptr,
-                &contexts[dp_idx],
+                &contexts[dp_idx], 
                 engine_id,
                 eos_id,
                 is_prefill,
@@ -188,10 +210,15 @@ void postprocess_sequences(
     }
 
     for (const auto& ctx : contexts) {
+        if (ctx.eptr) {
+            std::rethrow_exception(ctx.eptr);
+        }
+    }
+
+    for (const auto& ctx : contexts) {
         for (const auto& item : ctx.migration_candidates) {
             PyObject* seq_obj = item.first;
             Sequence* seq_ptr = py::handle(seq_obj).cast<Sequence*>();
-            
             to_be_migrated[py::str(seq_ptr->seq_id)] = py::make_tuple(py::handle(seq_obj), item.second);
         }
     }
