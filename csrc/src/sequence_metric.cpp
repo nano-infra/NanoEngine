@@ -19,8 +19,20 @@ void SequenceMetric::record_arrival() {
 }
 
 void SequenceMetric::record_first_scheduled() {
-    if (!decode_first_scheduled_time.has_value()) {
-        decode_first_scheduled_time = current_time();
+    if (!first_scheduled_time.has_value()) {
+        first_scheduled_time = current_time();
+    }
+}
+
+void SequenceMetric::record_decode_arrival() {
+    if (!decode_arrival_time.has_value()) {
+        decode_arrival_time = current_time();
+    }
+}
+
+void SequenceMetric::record_decode_scheduled() {
+    if (!decode_scheduled_time.has_value()) {
+        decode_scheduled_time = current_time();
     }
 }
 
@@ -72,17 +84,24 @@ std::optional<double> SequenceMetric::avg_tpot_wo_queueing() const {
     //     return std::nullopt;
     // }
     // return ((completion_time.value() - first_token_time.value()) * 1000.0) / (num_generated_tokens - 1);
-    if (!completion_time.has_value() || !decode_first_scheduled_time.has_value() || num_generated_tokens == 0) {
+    if (!completion_time.has_value() || !first_scheduled_time.has_value() || num_generated_tokens == 0) {
         return std::nullopt;
     }
-    return ((completion_time.value() - decode_first_scheduled_time.value()) * 1000.0) / num_generated_tokens;
+    return ((completion_time.value() - first_scheduled_time.value()) * 1000.0) / num_generated_tokens;
 }
 
 std::optional<double> SequenceMetric::queueing_time_ms() const {
-    if (!decode_first_scheduled_time.has_value() || !arrival_time.has_value()) {
+    if (!first_scheduled_time.has_value() || !arrival_time.has_value()) {
         return std::nullopt;
     }
-    return (decode_first_scheduled_time.value() - arrival_time.value()) * 1000.0;
+    return (first_scheduled_time.value() - arrival_time.value()) * 1000.0;
+}
+
+std::optional<double> SequenceMetric::decode_queue_time_ms() const {
+    if (!decode_scheduled_time.has_value() || !decode_arrival_time.has_value()) {
+        return std::nullopt;
+    }
+    return (decode_scheduled_time.value() - decode_arrival_time.value()) * 1000.0;
 }
 
 std::optional<double> SequenceMetric::avg_itl() const {
@@ -120,24 +139,29 @@ void SequenceMetric::log_metrics() const {
 
 std::tuple<std::string, std::optional<double>, std::optional<double>, 
            std::optional<double>, std::optional<double>, std::optional<double>,
+           std::optional<double>, std::optional<double>,
            int, int, std::vector<double>> SequenceMetric::getstate() const {
-    return std::make_tuple(seq_id, arrival_time, decode_first_scheduled_time,
+    return std::make_tuple(seq_id, arrival_time, first_scheduled_time,
+                           decode_arrival_time, decode_scheduled_time,
                            first_token_time, completion_time, last_token_time,
                            num_prompt_tokens, num_generated_tokens, itl_samples);
 }
 
 std::shared_ptr<SequenceMetric> SequenceMetric::setstate(const std::tuple<std::string, std::optional<double>, std::optional<double>, 
            std::optional<double>, std::optional<double>, std::optional<double>,
+           std::optional<double>, std::optional<double>,
            int, int, std::vector<double>>& state) {
     auto metric = std::make_shared<SequenceMetric>(std::get<0>(state));
     metric->arrival_time = std::get<1>(state);
-    metric->decode_first_scheduled_time = std::get<2>(state);
-    metric->first_token_time = std::get<3>(state);
-    metric->completion_time = std::get<4>(state);
-    metric->last_token_time = std::get<5>(state);
-    metric->num_prompt_tokens = std::get<6>(state);
-    metric->num_generated_tokens = std::get<7>(state);
-    metric->itl_samples = std::get<8>(state);
+    metric->first_scheduled_time = std::get<2>(state);
+    metric->decode_arrival_time = std::get<3>(state);
+    metric->decode_scheduled_time = std::get<4>(state);
+    metric->first_token_time = std::get<5>(state);
+    metric->completion_time = std::get<6>(state);
+    metric->last_token_time = std::get<7>(state);
+    metric->num_prompt_tokens = std::get<8>(state);
+    metric->num_generated_tokens = std::get<9>(state);
+    metric->itl_samples = std::get<10>(state);
     
     return metric;
 }

@@ -217,12 +217,14 @@ class Scheduler:
         return not waiting and all(w.is_empty for w in self.worker_state)
 
     def add(self, seq: Sequence):
+        if seq.metric:
+            seq.metric.record_arrival()
         if self.mode == "decode":
             self.waiting_migration.append(seq)
-            seq.metric.record_arrival()
+            if seq.metric:
+                seq.metric.record_decode_arrival()
         else:
             self.waiting.append(seq)
-            seq.metric.record_arrival()
 
     def running(self, dp_idx: int):
         return self.worker_state[dp_idx].running
@@ -279,6 +281,8 @@ class Scheduler:
                     scheduled_seqs[selected_dp_idx].append(seq)
                     if seq.metric:
                         seq.metric.record_first_scheduled()
+                        if self.mode == "decode":
+                            seq.metric.record_decode_scheduled()
                     break
                 else:
                     break

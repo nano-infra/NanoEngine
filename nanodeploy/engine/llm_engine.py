@@ -131,6 +131,11 @@ class LLMEngine:
                 self.executor.migrate(dp_sp_seqs)
             else:
                 [[seq.append_token(0) for seq in seqs] for seqs in dp_seqs]
+                for seqs in dp_seqs:
+                    for seq in seqs:
+                        if seq.metric and seq.metric.num_generated_tokens == 0:
+                            seq.metric.record_first_token()
+                            seq.metric.num_generated_tokens = 1
         else:
             token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
             post_sch_begin = time.time()

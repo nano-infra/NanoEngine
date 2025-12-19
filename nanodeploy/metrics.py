@@ -50,6 +50,11 @@ if get_use_cpp_metric():
                     if self.queueing_time_ms is not None
                     else "N/A"
                 )
+                decode_queueing_time_str = (
+                    f"{self.decode_queue_time_ms:.2f}ms"
+                    if self.decode_queue_time_ms is not None
+                    else "N/A"
+                )
 
                 logger.info(
                     f"SequenceMetric [{self.seq_id[:8]}...] - "
@@ -57,6 +62,7 @@ if get_use_cpp_metric():
                     f"E2E: {e2e_str}, "
                     f"Prompt Length: {self.num_prompt_tokens}, Output Length: {self.num_generated_tokens}, "
                     f"Queueing Time: {queueing_time_str}, "
+                    f"Decode Queueing Time: {decode_queueing_time_str}, "
                     f"ITL Wo Queue: {tpot_wo_queue_str}, "
                     f"ITL With Queue: {tpot_with_queue_str}"
                 )
@@ -90,7 +96,9 @@ if not _USING_CPP:
 
         seq_id: str
         arrival_time: Optional[float] = None
-        decode_first_scheduled_time: Optional[float] = None
+        first_scheduled_time: Optional[float] = None
+        decode_arrival_time: Optional[float] = None
+        decode_scheduled_time: Optional[float] = None
         first_token_time: Optional[float] = None
         completion_time: Optional[float] = None
         num_prompt_tokens: int = 0
@@ -106,8 +114,18 @@ if not _USING_CPP:
 
         def record_first_scheduled(self):
             """Record the timestamp of the first token scheduled."""
-            if self.decode_first_scheduled_time is None:
-                self.decode_first_scheduled_time = time.time()
+            if self.first_scheduled_time is None:
+                self.first_scheduled_time = time.time()
+
+        def record_decode_arrival(self):
+            """Record the timestamp of arrival at decode engine."""
+            if self.decode_arrival_time is None:
+                self.decode_arrival_time = time.time()
+
+        def record_decode_scheduled(self):
+            """Record the timestamp of first scheduled at decode engine."""
+            if self.decode_scheduled_time is None:
+                self.decode_scheduled_time = time.time()
 
         def record_first_token(self):
             """Record the timestamp of the first generated token."""
@@ -168,20 +186,27 @@ if not _USING_CPP:
             if (
                 self.num_generated_tokens == 0
                 or self.completion_time is None
-                or self.decode_first_scheduled_time is None
+                or self.first_scheduled_time is None
             ):
                 return None
             total_decode_time = (
-                self.completion_time - self.decode_first_scheduled_time
+                self.completion_time - self.first_scheduled_time
             ) * 1000  # ms
             return total_decode_time / self.num_generated_tokens
 
         @property
         def queueing_time_ms(self) -> Optional[float]:
             """Queueing time in milliseconds (arrival -> first scheduled)."""
-            if self.decode_first_scheduled_time is None or self.arrival_time is None:
+            if self.first_scheduled_time is None or self.arrival_time is None:
                 return None
-            return (self.decode_first_scheduled_time - self.arrival_time) * 1000
+            return (self.first_scheduled_time - self.arrival_time) * 1000
+
+        @property
+        def decode_queue_time_ms(self) -> Optional[float]:
+            """Secondary queueing time in milliseconds (migration arrival -> decode scheduled)."""
+            if self.decode_scheduled_time is None or self.decode_arrival_time is None:
+                return None
+            return (self.decode_scheduled_time - self.decode_arrival_time) * 1000
 
         @property
         def avg_itl(self) -> Optional[float]:
@@ -240,6 +265,11 @@ if not _USING_CPP:
                 if self.queueing_time_ms is not None
                 else "N/A"
             )
+            decode_queueing_time_str = (
+                f"{self.decode_queue_time_ms:.2f}ms"
+                if self.decode_queue_time_ms is not None
+                else "N/A"
+            )
 
             logger.info(
                 f"SequenceMetric [{self.seq_id[:8]}...] - "
@@ -247,6 +277,7 @@ if not _USING_CPP:
                 f"E2E: {e2e_str}, "
                 f"Prompt Length: {self.num_prompt_tokens}, Output Length: {self.num_generated_tokens}, "
                 f"Queueing Time: {queueing_time_str}, "
+                f"Decode Queueing Time: {decode_queueing_time_str}, "
                 f"ITL Wo Queue: {tpot_wo_queue_str}, "
                 f"ITL With Queue: {tpot_with_queue_str}"
             )
