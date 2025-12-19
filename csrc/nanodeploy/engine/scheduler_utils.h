@@ -7,7 +7,7 @@
 
 namespace nanodeploy {
 
-// 定义返回值类型: vector<pair<序列指针, 目标DP索引>>
+// Return type: vector<pair<sequence pointer, target DP index>>
 // 对应 Python 返回值: List[Tuple[Sequence, int]]
 using MigrationList = std::vector<std::pair<Sequence*, int>>;
 
