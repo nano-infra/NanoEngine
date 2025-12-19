@@ -91,9 +91,17 @@ bool SPStateManager::can_allocate(Sequence& seq,
     int master_rank = next_sp_idx();
     
     // Check constraints
+    int running_master_count = 0;
+    for (const auto& s : running) {
+        if (s->block_ctx(engine_id_).master_sp_idx == master_rank) {
+            running_master_count++;
+        }
+    }
+    
     auto it_seqs = num_seqs.find(master_rank);
     int current_num_seqs = (it_seqs != num_seqs.end()) ? it_seqs->second : 0;
-    if (current_num_seqs >= max_num_seqs_) {
+    
+    if (current_num_seqs + running_master_count + 1 > max_num_seqs_) {
         return false;
     }
     
