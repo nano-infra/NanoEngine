@@ -1,5 +1,5 @@
-#include "sequence_metric.h"
-#include "server_metric.h"
+#include "nanodeploy/metrics/sequence_metric.h"
+#include "nanodeploy/metrics/server_metric.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 

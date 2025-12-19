@@ -1,7 +1,7 @@
 #pragma once
+#include "nanodeploy/engine/sequence.h"
 #include <pybind11/pybind11.h>
 #include <unordered_map>
-#include "sequence.h"
 
 // Declare opaque map types *before* including <pybind11/stl.h> to prevent
 // automatic conversion to Python dict copies.
