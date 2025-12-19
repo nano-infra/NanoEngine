@@ -374,7 +374,7 @@ class Scheduler:
                 self.to_be_migrated[seq.seq_id] = (seq, dp_idx)
             return
         
-        # Python 回退实现
+        # Python fallback implementation
         for dp_idx, (sp_seqs, sp_token_ids) in enumerate(zip(dp_seqs, dp_token_ids)):
             for sp_idx, (seqs, token_ids) in enumerate(zip(sp_seqs, sp_token_ids)):
                 for _, (seq, loop_count_token_id) in enumerate(zip(seqs, token_ids)):
