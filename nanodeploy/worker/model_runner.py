@@ -335,7 +335,7 @@ class ModelRunner:
         )
         return input_ids, positions
 
-    def prepare_prefill_py(self, seqs: list[Sequence], is_dummy: bool = False):
+    def _prepare_prefill_py(self, seqs: list[Sequence], is_dummy: bool = False):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
