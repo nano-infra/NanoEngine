@@ -13,6 +13,7 @@ USE_CPP_METRIC: bool = True         # SequenceMetric class
 USE_CPP_BLOCK_MANAGER: bool = True  # Block and BlockManager classes
 USE_CPP_SP_STATE_MANAGER: bool = True  # SPStateManager class
 USE_CPP_MODEL_RUNNER: bool = True   # ModelRunner utils (prepare_prefill/decode)
+USE_CPP_SCHEDULER: bool = True      # Scheduler class
 
 # One-click switch for all components
 USE_CPP_BACKEND: bool = True
@@ -28,6 +29,9 @@ def get_use_cpp_block_manager() -> bool:
 
 def get_use_cpp_sp_state_manager() -> bool:
     return USE_CPP_BACKEND or USE_CPP_SP_STATE_MANAGER
+
+def get_use_cpp_scheduler() -> bool:
+    return USE_CPP_BACKEND or USE_CPP_SCHEDULER
 
 def get_use_cpp_model_runner() -> bool:
     return USE_CPP_BACKEND or USE_CPP_MODEL_RUNNER
