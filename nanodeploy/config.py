@@ -30,7 +30,7 @@ def get_use_cpp_sp_state_manager() -> bool:
     return USE_CPP_BACKEND or USE_CPP_SP_STATE_MANAGER
 
 def get_use_cpp_model_runner() -> bool:
-    return (USE_CPP_BACKEND or USE_CPP_MODEL_RUNNER)
+    return USE_CPP_BACKEND or USE_CPP_MODEL_RUNNER
 # ===================================================================
 
 @dataclass
