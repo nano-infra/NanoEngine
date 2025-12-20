@@ -5,6 +5,7 @@ set(CPP_SOURCES
     sp_state_manager.cpp
     scheduler_utils.cpp
     scheduler.cpp
+    model_runner_utils.cpp
 )
 
 add_library(
