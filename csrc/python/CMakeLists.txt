@@ -9,6 +9,7 @@ set(BINDING_SOURCES
     block_manager_binding.cpp
     sp_state_manager_binding.cpp
     scheduler_binding.cpp
+    model_runner_binding.cpp
 )
 
 # ===== Build pybind11 module =====

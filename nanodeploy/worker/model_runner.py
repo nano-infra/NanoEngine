@@ -6,7 +6,7 @@ import torch.distributed as dist
 
 import torch.profiler as profiler
 
-from nanodeploy.config import Config
+from nanodeploy.config import Config, get_use_cpp_model_runner
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
@@ -24,7 +24,19 @@ from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 from nanodeploy.worker.sp_context import set_sp_context
 
 
+
 logger = get_logger()
+
+if get_use_cpp_model_runner():
+    try:
+        from nanodeploy._cpp import prepare_prefill_cpp, prepare_decode_cpp
+        _USING_CPP_UTILS = True
+        logger.info("ModelRunner using C++ backend utils.")
+    except ImportError as e:
+        logger.warning(f"C++ model runner utils requested but not available: {e}. Falling back to Python.")
+        _USING_CPP_UTILS = False
+else:
+    _USING_CPP_UTILS = False
 
 
 architectures = {
@@ -267,6 +279,63 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence], is_dummy: bool = False):
+        if _USING_CPP_UTILS:
+            return self._prepare_prefill_cpp(seqs, is_dummy)
+        else:
+            return self._prepare_prefill_py(seqs, is_dummy)
+
+    def _prepare_prefill_cpp(self, seqs: list[Sequence], is_dummy: bool = False):
+        sp_rank = get_dist_context().attn_sp_rank
+        sp_size = get_dist_context().attn_sp_world_size
+        block_size = self.config.kvcache_block_size
+        
+        meta = prepare_prefill_cpp(
+            seqs, 
+            self.engine_id, 
+            sp_rank, 
+            sp_size,
+            block_size, 
+            self.config.max_num_seqs
+        )
+        
+        input_ids = torch.tensor(meta.input_ids, dtype=torch.int64, pin_memory=True).cuda(
+            non_blocking=True
+        )
+        positions = torch.tensor(meta.positions, dtype=torch.int64, pin_memory=True).cuda(
+            non_blocking=True
+        )
+        cu_seqlens_q = torch.tensor(
+            meta.cu_seqlens_q, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(
+            meta.cu_seqlens_k, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(
+            meta.slot_mapping, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        
+        block_tables = None
+        if meta.use_block_tables:
+            block_tables = torch.tensor(
+                meta.block_tables_flat, dtype=torch.int32, pin_memory=True
+            ).reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks).cuda(non_blocking=True)
+
+        set_context(
+            True,
+            self.config.max_num_seqs,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            meta.max_seqlen_q,
+            meta.max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+            None,
+            is_dummy=is_dummy,
+        )
+        return input_ids, positions
+
+    def _prepare_prefill_py(self, seqs: list[Sequence], is_dummy: bool = False):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -335,6 +404,69 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, dp_seqs: list[Sequence], is_dummy: bool = False):
+        if _USING_CPP_UTILS:
+            return self._prepare_decode_cpp(dp_seqs, is_dummy)
+        else:
+            return self._prepare_decode_py(dp_seqs, is_dummy)
+
+    def _prepare_decode_cpp(self, dp_seqs: list[Sequence], is_dummy: bool = False):
+        sp_rank = get_dist_context().attn_sp_rank
+        sp_size = get_dist_context().attn_sp_world_size
+        block_size = self.config.kvcache_block_size
+
+        meta = prepare_decode_cpp(
+            dp_seqs,
+            self.engine_id,
+            sp_rank,
+            sp_size,
+            block_size,
+            self.config.max_num_seqs
+        )
+
+        input_ids = torch.tensor(meta.input_ids, dtype=torch.int64, pin_memory=True).cuda(
+            non_blocking=True
+        )
+        positions = torch.tensor(meta.positions, dtype=torch.int64, pin_memory=True).cuda(
+            non_blocking=True
+        )
+        slot_mapping = torch.tensor(
+            meta.slot_mapping, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        
+        context_lens = torch.tensor(
+            meta.context_lens_flat, dtype=torch.int32, pin_memory=True
+        ).reshape(sp_size, self.config.max_num_seqs).cuda(non_blocking=True)
+        
+        global_context_lens = torch.tensor(
+            meta.global_context_lens_flat, dtype=torch.int32, pin_memory=True
+        ).reshape(sp_size, self.config.max_num_seqs).cuda(non_blocking=True)
+
+        block_tables = torch.tensor(
+            meta.block_tables_flat, dtype=torch.int32, pin_memory=True
+        ).reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks).cuda(non_blocking=True)
+
+        q_mask = global_context_lens.clone()
+        q_mask[sp_rank].fill_(0)
+        q_mask[q_mask != 0] = 1
+        res_lse_mask = context_lens.clone()
+        res_lse_mask[sp_rank].fill_(0)
+        res_lse_mask[res_lse_mask != 0] = 1
+
+        set_context(
+            False,
+            self.config.max_num_seqs,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            global_context_lens=global_context_lens,
+            q_mask=q_mask,
+            res_lse_mask=res_lse_mask,
+            is_dummy=is_dummy,
+        )
+
+        return input_ids, positions
+
+    def _prepare_decode_py(self, dp_seqs: list[Sequence], is_dummy: bool = False):
         input_ids = []
         positions = []
         slot_mapping = []
