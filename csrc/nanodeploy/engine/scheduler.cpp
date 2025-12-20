@@ -280,7 +280,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
 
 void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
 {
-    std::cout << "Preemption happens for seq_id=" << seq->seq_id << std::endl;
+    std::cerr << "Preemption happens for seq_id=" << seq->seq_id << std::endl;
     seq->status = SequenceStatus::WAITING;
     worker_state[dp_idx]->deallocate(*seq);
     seq->num_checkpointed_tokens = static_cast<int>(seq->token_ids.size());
