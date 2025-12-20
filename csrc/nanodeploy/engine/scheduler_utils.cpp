@@ -10,7 +10,7 @@
 namespace nanodeploy {
 
 struct Task {
-    Sequence* seq;
+    std::shared_ptr<Sequence> seq;
     const std::vector<int>* tokens;
     int sp_idx;
 };
@@ -25,7 +25,7 @@ struct WorkerContext {
 };
 
 static void worker_func(
-    SPStateManager* state_manager,
+    std::shared_ptr<SPStateManager> state_manager,
     const WorkerContext* ctx,
     WorkerContext* result_ctx,
     const std::string& engine_id,
@@ -34,13 +34,13 @@ static void worker_func(
     bool update_metrics
 ) {
     try {
-        std::unordered_set<Sequence*> dummy_set;
+        std::unordered_set<std::shared_ptr<Sequence>> dummy_set;
         for (const auto& dummy : state_manager->dummy_seqs) {
-            dummy_set.insert(dummy.get());
+            dummy_set.insert(dummy);
         }
 
         for (const auto& task : ctx->tasks) {
-            Sequence* seq = task.seq;
+            std::shared_ptr<Sequence> seq = task.seq;
 
             if (dummy_set.count(seq)) continue;
 
@@ -102,8 +102,8 @@ static void worker_func(
 }
 
 MigrationList postprocess_sequences(
-    std::vector<SPStateManager*> worker_states,
-    const std::vector<std::vector<std::vector<Sequence*>>>& dp_seqs,
+    std::vector<std::shared_ptr<SPStateManager>> worker_states,
+    const std::vector<std::vector<std::vector<std::shared_ptr<Sequence>>>>& dp_seqs,
     const std::vector<std::vector<std::vector<std::vector<int>>>>& dp_token_ids,
     const std::string& engine_id,
     int eos_id,

@@ -59,6 +59,22 @@ void bind_sp_state_manager(py::module_& m)
                      throw py::value_error("list.remove(x): x not in list");
                  }
              })
+        .def("__getitem__",
+             [](const std::deque<std::shared_ptr<Sequence>>& d, int idx) {
+                 if (idx < 0)
+                     idx += d.size();
+                 if (idx < 0 || idx >= (int)d.size())
+                     throw py::index_error();
+                 return d[idx];
+             })
+        .def("__setitem__",
+             [](std::deque<std::shared_ptr<Sequence>>& d, int idx, std::shared_ptr<Sequence> s) {
+                 if (idx < 0)
+                     idx += d.size();
+                 if (idx < 0 || idx >= (int)d.size())
+                     throw py::index_error();
+                 d[idx] = s;
+             })
         .def("__len__", [](const std::deque<std::shared_ptr<Sequence>>& d) { return d.size(); })
         .def("__bool__", [](const std::deque<std::shared_ptr<Sequence>>& d) { return !d.empty(); })
         .def(
@@ -67,7 +83,7 @@ void bind_sp_state_manager(py::module_& m)
             py::keep_alive<0, 1>());
 
     // Bind SPStateManager
-    py::class_<SPStateManager>(m, "SPStateManager")
+    py::class_<SPStateManager, std::shared_ptr<SPStateManager>>(m, "SPStateManager")
         .def(py::init<const std::optional<std::string>&, int, int, int, int, int>(),
              py::arg("engine_id"),
              py::arg("attention_sp"),
