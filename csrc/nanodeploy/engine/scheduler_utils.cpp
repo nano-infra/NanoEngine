@@ -5,7 +5,7 @@
 #include <unordered_set>
 #include <iostream>
 #include <exception>
-#include <stdexcept>
+#include <string> 
 
 namespace nanodeploy {
 
@@ -46,6 +46,15 @@ static void worker_func(
 
             for (int token_id : *task.tokens) {
                 
+                int master_sp_idx = seq->block_ctx(engine_id).master_sp_idx;
+                if (task.sp_idx != master_sp_idx) {
+                    throw std::runtime_error(
+                        "sp_idx mismatch: task.sp_idx=" + std::to_string(task.sp_idx) + 
+                        " != master_sp_idx=" + std::to_string(master_sp_idx) + 
+                        " for seq_id=" + seq->seq_id
+                    );
+                }
+
                 seq->append_token(token_id, engine_id, task.sp_idx);
 
                 if (update_metrics && seq->metric) {
@@ -127,16 +136,12 @@ MigrationList postprocess_sequences(
             const auto& batch_seqs = sp_seqs[sp_idx];
             const auto& batch_tokens = sp_tokens[sp_idx];
 
-            // Begin modification: Remove strict equality check, check if token count is sufficient
-            // Python: zip(seqs, tokens) stops when seqs is exhausted, ignoring extra tokens
             if (batch_seqs.size() > batch_tokens.size()) {
                 throw std::runtime_error("batch_seqs size mismatch with batch_tokens: not enough tokens");
             }
-            // If batch_tokens.size() > batch_seqs.size(), we allow this case (ignore extra tokens)
 
-            size_t batch_size = batch_seqs.size(); // Use the number of seqs as batch size
-            // End modification
-
+            size_t batch_size = batch_seqs.size();
+            
             for (size_t i = 0; i < batch_size; ++i) {
                 ctx.tasks.push_back({
                     batch_seqs[i],
