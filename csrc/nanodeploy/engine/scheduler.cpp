@@ -112,20 +112,6 @@ std::pair<std::vector<std::vector<std::shared_ptr<Sequence>>>, bool> Scheduler::
     // No prefill sequences, schedule decode
     scheduled_seqs = _schedule_decode();
 
-    // Assert that we have decode sequences
-#ifdef NDEBUG
-    bool has_decode = false;
-    for (const auto& dp_seqs : scheduled_seqs) {
-        if (!dp_seqs.empty()) {
-            has_decode = true;
-            break;
-        }
-    }
-    if (!has_decode) {
-        throw std::runtime_error("Scheduler::schedule(): No sequences scheduled in decode phase");
-    }
-#endif
-
     return {scheduled_seqs, false};
 }
 

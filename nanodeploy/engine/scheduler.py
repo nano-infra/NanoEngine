@@ -453,64 +453,42 @@ class _PyScheduler:
             del self.to_be_migrated[seq.seq_id]
 
 
-# Adapter class for C++ Scheduler to work with Config object
-class _CppSchedulerAdapter:
-    def __init__(self, config: Config):
-        # C++ Scheduler expects individual parameters, not Config object
-        self._cpp_scheduler = _CppScheduler(
-            config.engine_id,
-            config.loop_count,
-            config.max_num_seqs,
-            config.max_num_batched_tokens,
-            config.eos,
-            config.attention_dp,
-            config.attention_sp,
-            config.num_kvcache_blocks,
-            config.kvcache_block_size,
-            config.mode
-        )
-        # Store config for compatibility
-        self.engine_id = config.engine_id
-        self.loop_count = config.loop_count
-        self.max_num_seqs = config.max_num_seqs
-        self.max_num_batched_tokens = config.max_num_batched_tokens
-        self.eos = config.eos
-        self.attention_dp = config.attention_dp
-        self.attention_sp = config.attention_sp
-        self.mode = config.mode
-
-    def add(self, seq: Sequence):
-        return self._cpp_scheduler.add(seq)
-
-    def is_finished(self):
-        return self._cpp_scheduler.is_finished()
-
-    def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
-        if isinstance(seqs, Sequence):
-            seqs = [seqs]
-        return self._cpp_scheduler.free_to_be_migrated(seqs)
-
-    def postprocess(
-        self,
-        dp_seqs: list[list[list[Sequence]]],
-        dp_token_ids: list[list[list[list[int]]]],
-        metrics_manager: "MetricsManager | None" = None,
-    ):
-        # Use the C++ implementation directly
-        return self._cpp_scheduler.postprocess(
-            dp_seqs, dp_token_ids, metrics_manager is not None
-        )
-
-    def schedule(self) -> tuple[list[list[Sequence]], bool]:
-        # Use the C++ implementation directly
-        return self._cpp_scheduler.schedule()
-
-    def __getattr__(self, name):
-        # Delegate all other attributes/methods to the C++ scheduler
-        return getattr(self._cpp_scheduler, name)
-
-
 if _USING_CPP_SCHEDULER:
-    Scheduler = _CppSchedulerAdapter
+    # Adapter class for C++ Scheduler to work with Config object
+    class Scheduler(_CppScheduler):
+        def __init__(self, config: Config):
+            # C++ Scheduler expects individual parameters, not Config object
+            super().__init__(
+                config.engine_id,
+                config.loop_count,
+                config.max_num_seqs,
+                config.max_num_batched_tokens,
+                config.eos,
+                config.attention_dp,
+                config.attention_sp,
+                config.num_kvcache_blocks,
+                config.kvcache_block_size,
+                config.mode
+            )
+            # Store config for compatibility
+            self.engine_id = config.engine_id
+            self.loop_count = config.loop_count
+            self.max_num_seqs = config.max_num_seqs
+            self.max_num_batched_tokens = config.max_num_batched_tokens
+            self.eos = config.eos
+            self.attention_dp = config.attention_dp
+            self.attention_sp = config.attention_sp
+            self.mode = config.mode
+
+        def postprocess(
+            self,
+            dp_seqs: list[list[list[Sequence]]],
+            dp_token_ids: list[list[list[list[int]]]],
+            metrics_manager: "MetricsManager | None" = None,
+        ):
+            # Use the C++ implementation directly
+            return super().postprocess(
+                dp_seqs, dp_token_ids, metrics_manager is not None
+            )
 else:
     Scheduler = _PyScheduler
