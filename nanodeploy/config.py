@@ -79,6 +79,7 @@ class Config:
     enable_profiler: bool = False
     profiler_start_step: int = 16
     profiling_step: int = 16
+    profiler_dir: str = "./profiler_logs"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
