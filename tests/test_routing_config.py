@@ -4,7 +4,7 @@ import os
 
 def test_routing_strategy():
     # Mock a model path
-    model_path = "dummy_model"
+    model_path = "/models/qwen3-235B-Instruct-2507-FP8"
     os.makedirs(model_path, exist_ok=True)
     
     # Test default
@@ -18,9 +18,6 @@ def test_routing_strategy():
     scheduler = Scheduler(config)
     print(f"Set strategy: {scheduler.routing_strategy}")
     assert scheduler.routing_strategy == RoutingStrategy.LeastBatch
-    
-    # Clean up
-    os.removedirs(model_path)
 
 if __name__ == "__main__":
     try:
