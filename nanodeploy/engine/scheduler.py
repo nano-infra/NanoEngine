@@ -46,7 +46,7 @@ else:
 
 class _PyRoutingStrategy(enum.Enum):
     RoundRobin = enum.auto()
-    LeastToken = enum.auto()
+    LeastBatch = enum.auto()
     LeastCache = enum.auto()
 
 
@@ -82,7 +82,7 @@ class _PySPStateManager:
 
         self.running: deque[Sequence] = deque()
 
-        self.routing_startegy = _PyRoutingStrategy.RoundRobin
+        self.routing_strategy = _PyRoutingStrategy.RoundRobin
         self.sp_rr_counter = (idx % self.attention_sp for idx in count())
 
         self.dummy_seqs: list[Sequence] = []
@@ -185,7 +185,7 @@ class _PySPStateManager:
 
     def deallocate(self, seq: Sequence):
         for sp_idx in range(self.attention_sp):
-            return self.block_manager[sp_idx].deallocate(seq)
+            self.block_manager[sp_idx].deallocate(seq)
         seq.block_ctx(self.engine_id).sp_block_table.clear()
         seq.block_ctx(self.engine_id).block_location.clear()
         seq.block_ctx(self.engine_id).num_dispatched_tokens.clear()
@@ -213,7 +213,7 @@ class _PyScheduler:
 
         self.attention_dp = config.attention_dp
         self.attention_sp = config.attention_sp
-        self.routing_strategy = RoutingStrategy.RoundRobin
+        self.routing_strategy = RoutingStrategy[config.routing_strategy]
 
         self.worker_state = [
             SPStateManager(
@@ -305,12 +305,88 @@ class _PyScheduler:
                     break
                 else:
                     break
-            elif self.routing_strategy == RoutingStrategy.LeastToken:
-                pass
+            elif self.routing_strategy == RoutingStrategy.LeastBatch:
+                # Calculate current sequence count for each dp_idx
+                dp_seq_counts = []
+                for dp_idx in range(self.attention_dp):
+                    seq_count = len(self.running(dp_idx))
+                    dp_seq_counts.append((dp_idx, seq_count))
+
+                # Sort by sequence count, select the minimum
+                dp_seq_counts_sorted = sorted(dp_seq_counts, key=lambda x: x[1])
+
+                scheduled = False
+                for selected_dp_idx, _ in dp_seq_counts_sorted:
+                    can_allocate = self.worker_state[selected_dp_idx].can_allocate(
+                        seq,
+                        num_seqs[selected_dp_idx],
+                        num_batched_tokens[selected_dp_idx],
+                    )
+                    if not can_allocate:
+                        continue
+
+                    block_ctx = seq.block_ctx(self.engine_id)
+                    num_seqs[selected_dp_idx][block_ctx.master_sp_idx] += 1
+                    seq.block_ctx_map[self.engine_id].dp_idx = selected_dp_idx
+
+                    self.worker_state[selected_dp_idx].allocate(seq)
+                    num_batched_tokens[selected_dp_idx][block_ctx.master_sp_idx] += (
+                        len(seq) - seq.num_cached_tokens
+                    )
+                    seq.status = SequenceStatus.RUNNING
+                    waiting.popleft()
+                    self.running(selected_dp_idx).append(seq)
+                    scheduled_seqs[selected_dp_idx].append(seq)
+                    if seq.metric:
+                        seq.metric.record_first_scheduled()
+                        if self.mode == "decode":
+                            seq.metric.record_decode_scheduled()
+                    scheduled = True
+                    break
+                if not scheduled:
+                    break
             elif self.routing_strategy == RoutingStrategy.LeastCache:
-                pass
+                # Calculate current token count for each dp_idx
+                dp_token_counts = []
+                for dp_idx in range(self.attention_dp):
+                    token_count = sum(len(s) for s in self.running(dp_idx))
+                    dp_token_counts.append((dp_idx, token_count))
+
+                # Sort by token count, select the minimum
+                dp_token_counts_sorted = sorted(dp_token_counts, key=lambda x: x[1])
+
+                scheduled = False
+                for selected_dp_idx, _ in dp_token_counts_sorted:
+                    can_allocate = self.worker_state[selected_dp_idx].can_allocate(
+                        seq,
+                        num_seqs[selected_dp_idx],
+                        num_batched_tokens[selected_dp_idx],
+                    )
+                    if not can_allocate:
+                        continue
+
+                    block_ctx = seq.block_ctx(self.engine_id)
+                    num_seqs[selected_dp_idx][block_ctx.master_sp_idx] += 1
+                    seq.block_ctx_map[self.engine_id].dp_idx = selected_dp_idx
+
+                    self.worker_state[selected_dp_idx].allocate(seq)
+                    num_batched_tokens[selected_dp_idx][block_ctx.master_sp_idx] += (
+                        len(seq) - seq.num_cached_tokens
+                    )
+                    seq.status = SequenceStatus.RUNNING
+                    waiting.popleft()
+                    self.running(selected_dp_idx).append(seq)
+                    scheduled_seqs[selected_dp_idx].append(seq)
+                    if seq.metric:
+                        seq.metric.record_first_scheduled()
+                        if self.mode == "decode":
+                            seq.metric.record_decode_scheduled()
+                    scheduled = True
+                    break
+                if not scheduled:
+                    break
             else:
-                raise AttributeError
+                raise ValueError(f"Unknown routing strategy: {self.routing_strategy!r}")
         return scheduled_seqs
 
     def _schedule_decode(self) -> list[list[Sequence]]:
@@ -340,10 +416,12 @@ class _PyScheduler:
                         break
                 else:
                     num_seqs[selected_dp_idx][master_rank] += 1
-                    self.worker_state[selected_dp_idx].may_append(
+                    if not self.worker_state[selected_dp_idx].may_append(
                         seq, num_tokens=self.loop_count
-                    )
-                    scheduled_seqs[selected_dp_idx].append(seq)
+                    ):
+                        self.preempt(selected_dp_idx, seq)
+                    else:
+                        scheduled_seqs[selected_dp_idx].append(seq)
             
             # Put skipped sequences back to the front of the running queue
             self.running(selected_dp_idx).extendleft(reversed(skipped))
@@ -479,6 +557,7 @@ if _USING_CPP_SCHEDULER:
             self.attention_dp = config.attention_dp
             self.attention_sp = config.attention_sp
             self.mode = config.mode
+            self.routing_strategy = RoutingStrategy[config.routing_strategy]
 
         def postprocess(
             self,

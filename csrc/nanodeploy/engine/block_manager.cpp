@@ -145,16 +145,16 @@ bool BlockManager::can_append(Sequence& seq, int num_tokens) const
     return static_cast<int>(free_block_ids_.size()) >= (total_tokens_needed_after - total_tokens_needed_before);
 }
 
-void BlockManager::may_append(Sequence& seq, int num_tokens)
+bool BlockManager::may_append(Sequence& seq, int num_tokens)
 {
     for (int idx = 0; idx < num_tokens; ++idx) {
         auto& table = seq.block_table(engine_id_, sp_idx_);
 
         int current_dispatched = seq.block_ctx(engine_id_).num_dispatched_tokens[sp_idx_];
 
-        if ((current_dispatched + idx) % block_size_ == 1) {
+        if ((current_dispatched + idx) % block_size_ == 0) {
             if (free_block_ids_.empty()) {
-                throw std::runtime_error("No free blocks available in may_append");
+                return false;
             }
             int block_id = free_block_ids_.front();
             seq.block_ctx(engine_id_).block_location.emplace_back(sp_idx_, block_id);
@@ -165,6 +165,7 @@ void BlockManager::may_append(Sequence& seq, int num_tokens)
             // Logic for updating hash of the previous block (commented out in Python)
         }
     }
+    return true;
 }
 
 }  // namespace nanodeploy

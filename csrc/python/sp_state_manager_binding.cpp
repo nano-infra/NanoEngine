@@ -16,9 +16,22 @@ void bind_sp_state_manager(py::module_& m)
     // Bind RoutingStrategy
     py::enum_<RoutingStrategy>(m, "RoutingStrategy")
         .value("RoundRobin", RoutingStrategy::RoundRobin)
-        .value("LeastToken", RoutingStrategy::LeastToken)
+        .value("LeastBatch", RoutingStrategy::LeastBatch)
         .value("LeastCache", RoutingStrategy::LeastCache)
-        .export_values();
+        .export_values()
+        .def_static("__class_getitem__", [](const std::string& name) {
+            if (name == "RoundRobin") return RoutingStrategy::RoundRobin;
+            if (name == "LeastBatch") return RoutingStrategy::LeastBatch;
+            if (name == "LeastCache") return RoutingStrategy::LeastCache;
+            throw py::key_error(name);
+        })
+        .def_property_readonly_static("__members__", [](py::object /* self */) {
+            py::dict m;
+            m["RoundRobin"] = RoutingStrategy::RoundRobin;
+            m["LeastBatch"] = RoutingStrategy::LeastBatch;
+            m["LeastCache"] = RoutingStrategy::LeastCache;
+            return m;
+        });
 
     // Bind BlockManagerMap
     py::bind_map<std::unordered_map<int, std::shared_ptr<BlockManager>>>(m, "BlockManagerMap");

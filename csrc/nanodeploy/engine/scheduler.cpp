@@ -182,13 +182,101 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                 break;
             }
         }
-        else if (routing_strategy == RoutingStrategy::LeastToken) {
-            // TODO: Implement LeastToken strategy
-            throw std::runtime_error("LeastToken routing strategy not implemented");
+        else if (routing_strategy == RoutingStrategy::LeastBatch) {
+            std::vector<std::pair<int, int>> dp_seq_counts;
+            for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+                dp_seq_counts.push_back({dp_idx, (int)worker_state[dp_idx]->running.size()});
+            }
+
+            std::sort(dp_seq_counts.begin(), dp_seq_counts.end(), [](const auto& a, const auto& b) {
+                return a.second < b.second;
+            });
+
+            for (const auto& dp_info : dp_seq_counts) {
+                int selected_dp_idx = dp_info.first;
+
+                bool can_allocate = worker_state[selected_dp_idx]->can_allocate(
+                    *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
+
+                if (!can_allocate) {
+                    continue;
+                }
+
+                worker_state[selected_dp_idx]->allocate(*seq);
+
+                auto& block_ctx         = seq->block_ctx(engine_id_);
+                block_ctx.dp_idx        = selected_dp_idx;
+                int master_sp_idx       = block_ctx.master_sp_idx;
+
+                num_seqs[selected_dp_idx][master_sp_idx] += 1;
+                num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens - seq->num_cached_tokens);
+
+                seq->status = SequenceStatus::RUNNING;
+
+                waiting_queue.pop_front();
+                worker_state[selected_dp_idx]->running.push_back(seq);
+                scheduled_seqs[selected_dp_idx].push_back(seq);
+
+                if (seq->metric) {
+                    seq->metric->record_first_scheduled();
+                    if (mode_ == "decode") {
+                        seq->metric->record_decode_scheduled();
+                    }
+                }
+
+                scheduled = true;
+                break;
+            }
         }
         else if (routing_strategy == RoutingStrategy::LeastCache) {
-            // TODO: Implement LeastCache strategy
-            throw std::runtime_error("LeastCache routing strategy not implemented");
+            std::vector<std::pair<int, int>> dp_token_counts;
+            for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+                int token_count = 0;
+                for (const auto& s : worker_state[dp_idx]->running) {
+                    token_count += s->num_tokens;
+                }
+                dp_token_counts.push_back({dp_idx, token_count});
+            }
+
+            std::sort(dp_token_counts.begin(), dp_token_counts.end(), [](const auto& a, const auto& b) {
+                return a.second < b.second;
+            });
+
+            for (const auto& dp_info : dp_token_counts) {
+                int selected_dp_idx = dp_info.first;
+
+                bool can_allocate = worker_state[selected_dp_idx]->can_allocate(
+                    *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
+
+                if (!can_allocate) {
+                    continue;
+                }
+
+                worker_state[selected_dp_idx]->allocate(*seq);
+
+                auto& block_ctx         = seq->block_ctx(engine_id_);
+                block_ctx.dp_idx        = selected_dp_idx;
+                int master_sp_idx       = block_ctx.master_sp_idx;
+
+                num_seqs[selected_dp_idx][master_sp_idx] += 1;
+                num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens - seq->num_cached_tokens);
+
+                seq->status = SequenceStatus::RUNNING;
+
+                waiting_queue.pop_front();
+                worker_state[selected_dp_idx]->running.push_back(seq);
+                scheduled_seqs[selected_dp_idx].push_back(seq);
+
+                if (seq->metric) {
+                    seq->metric->record_first_scheduled();
+                    if (mode_ == "decode") {
+                        seq->metric->record_decode_scheduled();
+                    }
+                }
+
+                scheduled = true;
+                break;
+            }
         }
         else {
             throw std::runtime_error("Unknown routing strategy");
@@ -249,8 +337,13 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
             if (seq) {
                 // Successfully ensured space for this sequence
                 num_seqs[master_rank] += 1;
-                worker_state[selected_dp_idx]->may_append(*seq, loop_count_);
-                scheduled_seqs[selected_dp_idx].push_back(seq);
+                if (!worker_state[selected_dp_idx]->may_append(*seq, loop_count_)) {
+                    // This should not happen if can_append is correct, but handle it gracefully
+                    preempt(selected_dp_idx, seq);
+                }
+                else {
+                    scheduled_seqs[selected_dp_idx].push_back(seq);
+                }
             }
         }
 

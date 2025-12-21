@@ -1,98 +1,129 @@
 import re
+import ast
 import matplotlib.pyplot as plt
-import pandas as pd
-from datetime import datetime
+import sys
+import os
 
-def parse_nanodeploy_log(file_path):
-    sequence_data = []
-    server_data = []
-    
-    # 正则表达式匹配
-    # 匹配 SequenceMetric
-    seq_re = re.compile(r"\[(?P<time>.*?)\] .* SequenceMetric \[(?P<id>.*?)\] - TTFT: (?P<ttft>.*?)ms, E2E: (?P<e2e>.*?)ms, Prompt Length: (?P<plen>\d+), Output Length: (?P<olen>\d+), Queueing Time: (?P<qtime>.*?)ms, ITL Wo Queue: (?P<itl>.*?)ms")
-    
-    # 匹配 Server Metric (LLM Engine step)
-    server_re = re.compile(r"\[(?P<time>.*?)\] .* nanodeploy/engine/llm_engine.py:\d+ step - (?P<dict_str>\{.*\})")
+def parse_and_plot_log(file_path):
+    # --- 1. 检查文件是否存在 ---
+    if not os.path.exists(file_path):
+        print(f"Error: 文件 '{file_path}' 不存在。")
+        sys.exit(1)
 
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            # 1. 尝试解析 Sequence Metric
-            seq_match = seq_re.search(line)
-            if seq_match:
-                d = seq_match.groupdict()
-                sequence_data.append({
-                    'timestamp': datetime.strptime(d['time'], '%Y-%m-%d %H:%M:%S'),
-                    'ttft': float(d['ttft']),
-                    'e2e': float(d['e2e']) / 1000.0, # 转为秒
-                    'itl': float(d['itl']),
-                    'qtime': float(d['qtime'])
-                })
-                continue
+    # --- 2. 准备输出文件名 ---
+    # 去掉扩展名，加上 .png
+    base_name = os.path.splitext(file_path)[0]
+    output_png = f"{base_name}.png"
+
+    # --- 3. 读取并清洗日志 ---
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        sys.exit(1)
+
+    # 清除 ANSI 颜色代码 (非常重要，否则无法解析字典)
+    ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
+    clean_content = ansi_escape.sub('', content)
+
+    # --- 4. 提取数据 ---
+    # 查找 "step - " 后面的字典结构
+    dict_pattern = re.compile(r"step - (\{.*?\})")
+    matches = dict_pattern.findall(clean_content)
+
+    steps = []
+    # 动态初始化 rank 数据：sp_history[rank_id] = [val1, val2...]
+    sp_history = [] 
+    free_history = []
+    
+    decode_step_count = 0
+
+    print(f"正在分析 {file_path} ...")
+    print(f"找到 {len(matches)} 条 step 日志，正在提取 decode 数据...")
+
+    for dict_str in matches:
+        try:
+            data = ast.literal_eval(dict_str)
             
-            # 2. 尝试解析 Server Metric
-            server_match = server_re.search(line)
-            if server_match:
-                d = server_match.groupdict()
-                try:
-                    stats = eval(d['dict_str'])
-                    # 这里假设我们关心总的 DP Batch Size 和剩余 Block 数量
-                    server_data.append({
-                        'timestamp': datetime.strptime(d['time'], '%Y-%m-%d %H:%M:%S'),
-                        'total_batch_size': sum(stats['dp_batch_sizes']),
-                        'min_free_blocks': min([min(b) if isinstance(b, list) else b for b in stats['free_blocks']])
-                    })
-                except:
-                    continue
+            # 仅处理 decode 阶段
+            if data.get('mode') != 'decode':
+                continue
 
-    return pd.DataFrame(sequence_data), pd.DataFrame(server_data)
+            # 提取并扁平化数据
+            # 原始格式 [[34], [43]...] -> 目标格式 [34, 43...]
+            raw_sp = data.get('sp_batch_sizes', [])
+            flat_sp = [item[0] if isinstance(item, list) else item for item in raw_sp]
+            
+            raw_free = data.get('free_blocks', [])
+            flat_free = [item[0] if isinstance(item, list) else item for item in raw_free]
 
-def plot_metrics(df_seq, df_server):
-    fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=False)
-    plt.subplots_adjust(hspace=0.4)
+            # 第一次遇到数据时，初始化 list
+            if not sp_history:
+                num_ranks = len(flat_sp)
+                sp_history = [[] for _ in range(num_ranks)]
+                free_history = [[] for _ in range(num_ranks)]
 
-    # 图 1: Sequence Metrics (延迟相关)
-    if not df_seq.empty:
-        ax1 = axes[0]
-        ax1.plot(df_seq['ttft'], label='TTFT (ms)', color='blue', alpha=0.7)
-        ax1.set_ylabel('Latency (ms)')
-        ax1.set_title('Sequence Latency Metrics')
-        
-        ax1_e2e = ax1.twinx()
-        ax1_e2e.plot(df_seq['e2e'], label='E2E (s)', color='red', linestyle='--')
-        ax1_e2e.set_ylabel('E2E Time (seconds)')
-        
-        # 合并图例
-        lines, labels = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax1_e2e.get_legend_handles_labels()
-        ax1.legend(lines + lines2, labels + labels2, loc='upper left')
-        ax1.grid(True, linestyle=':', alpha=0.6)
+            # 记录数据
+            for i in range(len(flat_sp)):
+                sp_history[i].append(flat_sp[i])
+                free_history[i].append(flat_free[i])
 
-    # 图 2: Server Metrics (负载相关)
-    if not df_server.empty:
-        ax2 = axes[1]
-        ax2.plot(df_server['total_batch_size'], label='Total Batch Size', color='green')
-        ax2.set_ylabel('Batch Size')
-        ax2.set_title('Server Runtime Status')
-        
-        ax2_blocks = ax2.twinx()
-        ax2_blocks.plot(df_server['min_free_blocks'], label='Min Free Blocks', color='orange', linestyle=':')
-        ax2_blocks.set_ylabel('Free Memory Blocks')
-        
-        lines, labels = ax2.get_legend_handles_labels()
-        lines2, labels2 = ax2_blocks.get_legend_handles_labels()
-        ax2.legend(lines + lines2, labels + labels2, loc='upper left')
-        ax2.grid(True, linestyle=':', alpha=0.6)
+            decode_step_count += 1
+            steps.append(decode_step_count)
 
-    plt.suptitle('NanoDeploy Performance Analysis', fontsize=16)
-    plt.show()
+        except (ValueError, SyntaxError):
+            continue
 
-# 使用示例
-if __name__ == "__main__":
-    LOG_FILE_PATH = "your_log_file.log" # 替换为你的日志路径
-    # 模拟生成一个临时文件进行测试，或者直接指定路径
-    df_seq, df_server = parse_nanodeploy_log(LOG_FILE_PATH)
+    if decode_step_count == 0:
+        print("未找到 decode 阶段的数据，不生成图片。")
+        return
+
+    # --- 5. 绘图 (不显示，直接保存) ---
+    print(f"解析完成，生成图表中 (共 {decode_step_count} 个数据点)...")
+
+    _, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
     
-    if df_seq.empty and df_server.empty:
-        print("未解析到有效数据，请检查日志路径及格式。")
+    num_ranks = len(sp_history)
+    # 使用 Tab10 调色板确保区分度
+    colors = plt.cm.get_cmap('tab10', max(10, num_ranks))
+
+    # 子图 1: SP Batch Size
+    for rank_idx in range(num_ranks):
+        ax1.plot(steps, sp_history[rank_idx], 
+                 label=f'Rank {rank_idx}', 
+                 color=colors(rank_idx),
+                 linewidth=1.5, alpha=0.8)
+    
+    ax1.set_title('SP Batch Size (Decode Phase)', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Batch Size', fontsize=12)
+    ax1.grid(True, linestyle='--', alpha=0.5)
+    # 图例放在图外侧，避免遮挡数据
+    ax1.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+
+    # 子图 2: Free Blocks
+    for rank_idx in range(num_ranks):
+        ax2.plot(steps, free_history[rank_idx], 
+                 label=f'Rank {rank_idx}', 
+                 color=colors(rank_idx),
+                 linewidth=1.5, alpha=0.8)
+    
+    ax2.set_title('Free Blocks (Decode Phase)', fontsize=14, fontweight='bold')
+    ax2.set_ylabel('Free Blocks Count', fontsize=12)
+    ax2.set_xlabel('Decode Step', fontsize=12)
+    ax2.grid(True, linestyle='--', alpha=0.5)
+    ax2.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+
+    plt.tight_layout()
+    
+    # --- 6. 保存文件 ---
+    plt.savefig(output_png, dpi=300, bbox_inches='tight')
+    plt.close() # 关闭图形，释放内存
+    
+    print(f"成功! 图片已保存为: {output_png}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(f"Usage: python {os.path.basename(sys.argv[0])} <log_filename>")
     else:
-        plot_metrics(df_seq, df_server)
+        parse_and_plot_log(sys.argv[1])
