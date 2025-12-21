@@ -124,6 +124,6 @@ def parse_and_plot_log(file_path):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python plot_metrics.py <log_filename>")
+        print(f"Usage: python {os.path.basename(sys.argv[0])} <log_filename>")
     else:
         parse_and_plot_log(sys.argv[1])
