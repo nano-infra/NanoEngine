@@ -182,7 +182,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                 break;
             }
         }
-        else if (routing_strategy == RoutingStrategy::LeastToken) {
+        else if (routing_strategy == RoutingStrategy::LeastBatch) {
             std::vector<std::pair<int, int>> dp_seq_counts;
             for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
                 dp_seq_counts.push_back({dp_idx, (int)worker_state[dp_idx]->running.size()});

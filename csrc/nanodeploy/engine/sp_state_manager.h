@@ -12,7 +12,7 @@ namespace nanodeploy {
 
 enum class RoutingStrategy {
     RoundRobin,
-    LeastToken,
+    LeastBatch,
     LeastCache
 };
 

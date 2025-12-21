@@ -46,7 +46,7 @@ else:
 
 class _PyRoutingStrategy(enum.Enum):
     RoundRobin = enum.auto()
-    LeastToken = enum.auto()
+    LeastBatch = enum.auto()
     LeastCache = enum.auto()
 
 
@@ -305,7 +305,7 @@ class _PyScheduler:
                     break
                 else:
                     break
-            elif self.routing_strategy == RoutingStrategy.LeastToken:
+            elif self.routing_strategy == RoutingStrategy.LeastBatch:
                 # Calculate current sequence count for each dp_idx
                 dp_seq_counts = []
                 for dp_idx in range(self.attention_dp):
