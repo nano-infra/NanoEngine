@@ -26,7 +26,7 @@ public:
 
     // Append related
     bool can_append(Sequence& seq, int num_tokens = 1) const;
-    void may_append(Sequence& seq, int num_tokens = 1);
+    bool may_append(Sequence& seq, int num_tokens = 1);
 
     // Accessors
     const std::deque<int>& free_block_ids() const

@@ -19,7 +19,7 @@ void bind_sp_state_manager(py::module_& m)
         .value("LeastBatch", RoutingStrategy::LeastBatch)
         .value("LeastCache", RoutingStrategy::LeastCache)
         .export_values()
-        .def_static("__getitem__", [](const std::string& name) {
+        .def_static("__class_getitem__", [](const std::string& name) {
             if (name == "RoundRobin") return RoutingStrategy::RoundRobin;
             if (name == "LeastBatch") return RoutingStrategy::LeastBatch;
             if (name == "LeastCache") return RoutingStrategy::LeastCache;

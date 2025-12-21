@@ -337,8 +337,13 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
             if (seq) {
                 // Successfully ensured space for this sequence
                 num_seqs[master_rank] += 1;
-                worker_state[selected_dp_idx]->may_append(*seq, loop_count_);
-                scheduled_seqs[selected_dp_idx].push_back(seq);
+                if (!worker_state[selected_dp_idx]->may_append(*seq, loop_count_)) {
+                    // This should not happen if can_append is correct, but handle it gracefully
+                    preempt(selected_dp_idx, seq);
+                }
+                else {
+                    scheduled_seqs[selected_dp_idx].push_back(seq);
+                }
             }
         }
 

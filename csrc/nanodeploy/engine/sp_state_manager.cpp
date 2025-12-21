@@ -65,12 +65,13 @@ bool SPStateManager::can_append(Sequence& seq, int num_tokens)
     return block_manager[master_sp_idx]->can_append(seq, num_tokens);
 }
 
-void SPStateManager::may_append(Sequence& seq, int num_tokens)
+bool SPStateManager::may_append(Sequence& seq, int num_tokens)
 {
     int master_sp_idx = seq.block_ctx(engine_id_).master_sp_idx;
     if (block_manager.find(master_sp_idx) != block_manager.end()) {
-        block_manager[master_sp_idx]->may_append(seq, num_tokens);
+        return block_manager[master_sp_idx]->may_append(seq, num_tokens);
     }
+    return false;
 }
 
 bool SPStateManager::can_allocate(Sequence&                           seq,

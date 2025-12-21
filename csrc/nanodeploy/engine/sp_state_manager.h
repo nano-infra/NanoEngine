@@ -35,7 +35,7 @@ public:
 
     // Block management delegation
     bool can_append(Sequence& seq, int num_tokens = 1);
-    void may_append(Sequence& seq, int num_tokens = 1);
+    bool may_append(Sequence& seq, int num_tokens = 1);
 
     // Allocation logic
     // num_seqs and num_batched_tokens are maps from dp_idx to count/tokens

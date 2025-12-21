@@ -13,7 +13,7 @@ from transformers import AutoTokenizer
 
 from nanodeploy.config import Config
 from nanodeploy.engine.ray_executor import RayExecutor
-from nanodeploy.engine.scheduler import Scheduler
+from nanodeploy.engine.scheduler import Scheduler, RoutingStrategy
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.metrics import MetricsManager
@@ -42,6 +42,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        logger.info(f"Initialized Scheduler with RoutingStrategy: {self.scheduler.routing_strategy}")
         self.metrics_manager = MetricsManager()
         atexit.register(self.exit)
 
@@ -105,6 +106,7 @@ class LLMEngine:
                           for dp_idx in range(dp_size)]
         
         logger.info({
+            "mode": "prefill" if is_prefill else "decode",
             # "dp_batch_sizes": dp_batch_sizes,
             "sp_batch_sizes": sp_batch_sizes,
             "free_blocks": [
@@ -130,7 +132,10 @@ class LLMEngine:
                         )
                 self.executor.migrate(dp_sp_seqs)
             else:
-                [[seq.append_token(0) for seq in seqs] for seqs in dp_seqs]
+                for dp_idx, seqs in enumerate(dp_seqs):
+                    for seq in seqs:
+                        self.scheduler.worker_state[dp_idx].may_append(seq, 1)
+                        seq.append_token(0)
                 for seqs in dp_seqs:
                     for seq in seqs:
                         if seq.metric and seq.metric.num_generated_tokens == 0:

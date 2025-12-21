@@ -139,11 +139,11 @@ if not _USING_CPP:
         def may_append(self, seq: Sequence, num_tokens: int = 1):
             for idx in range(num_tokens):
                 block_table = seq.block_table(self.engine_id, self.sp_idx)
-                last_block = self.blocks[block_table[-1]]
                 if (
                     seq.block_ctx(self.engine_id).num_dispatched_tokens[self.sp_idx] + idx
-                ) % self.block_size == 1:
-                    # assert last_block.hash != -1
+                ) % self.block_size == 0:
+                    if not self.free_block_ids:
+                        return False
                     block_id = self.free_block_ids[0]
                     seq.block_ctx(self.engine_id).block_location.append(
                         (self.sp_idx, block_id)
@@ -155,18 +155,6 @@ if not _USING_CPP:
                     + idx
                     - 1
                 ) % self.block_size == 0:
-                    # assert last_block.hash == -1
-                    token_ids = seq.block(
-                        seq.num_blocks(self.engine_id, self.sp_idx) - 1,
-                        self.engine_id,
-                        self.sp_idx,
-                    )
-                    prefix = (
-                        self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-                    )
-                    # h = self.compute_hash(token_ids, prefix)
-                    # last_block.update(h, token_ids)
-                    # self.hash_to_block_id[h] = last_block.block_id
-                else:
-                    continue
-                    assert last_block.hash == -1
+                    # Logic for updating hash of the previous block (commented out in Python)
+                    pass
+            return True

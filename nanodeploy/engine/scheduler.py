@@ -185,7 +185,7 @@ class _PySPStateManager:
 
     def deallocate(self, seq: Sequence):
         for sp_idx in range(self.attention_sp):
-            return self.block_manager[sp_idx].deallocate(seq)
+            self.block_manager[sp_idx].deallocate(seq)
         seq.block_ctx(self.engine_id).sp_block_table.clear()
         seq.block_ctx(self.engine_id).block_location.clear()
         seq.block_ctx(self.engine_id).num_dispatched_tokens.clear()
@@ -213,7 +213,7 @@ class _PyScheduler:
 
         self.attention_dp = config.attention_dp
         self.attention_sp = config.attention_sp
-        self.routing_strategy = RoutingStrategy.RoundRobin
+        self.routing_strategy = RoutingStrategy[config.routing_strategy]
 
         self.worker_state = [
             SPStateManager(
@@ -416,10 +416,12 @@ class _PyScheduler:
                         break
                 else:
                     num_seqs[selected_dp_idx][master_rank] += 1
-                    self.worker_state[selected_dp_idx].may_append(
+                    if not self.worker_state[selected_dp_idx].may_append(
                         seq, num_tokens=self.loop_count
-                    )
-                    scheduled_seqs[selected_dp_idx].append(seq)
+                    ):
+                        self.preempt(selected_dp_idx, seq)
+                    else:
+                        scheduled_seqs[selected_dp_idx].append(seq)
             
             # Put skipped sequences back to the front of the running queue
             self.running(selected_dp_idx).extendleft(reversed(skipped))
@@ -555,6 +557,7 @@ if _USING_CPP_SCHEDULER:
             self.attention_dp = config.attention_dp
             self.attention_sp = config.attention_sp
             self.mode = config.mode
+            self.routing_strategy = RoutingStrategy[config.routing_strategy]
 
         def postprocess(
             self,
