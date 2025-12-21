@@ -386,7 +386,7 @@ class _PyScheduler:
                 if not scheduled:
                     break
             else:
-                raise AttributeError
+                raise ValueError(f"Unknown routing strategy: {self.routing_strategy!r}")
         return scheduled_seqs
 
     def _schedule_decode(self) -> list[list[Sequence]]:
