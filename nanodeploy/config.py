@@ -75,6 +75,12 @@ class Config:
     master_address: str = "127.0.0.1:6006"
     ray_address: str = "127.0.0.1:6379"
 
+    # profiler
+    enable_profiler: bool = False
+    profiler_start_step: int = 16
+    profiling_step: int = 16
+    profiler_dir: str = "./profiler_logs"
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0

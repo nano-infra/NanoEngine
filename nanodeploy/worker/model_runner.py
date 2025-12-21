@@ -1,3 +1,4 @@
+import os
 import numpy as np
 
 import ray
@@ -113,24 +114,33 @@ class ModelRunner:
         self.model = architectures[model_architecture](hf_config)
 
         self.run_count = 0
-        self.prof_start = 0
-        self.prof_end = 16
         self.profiler = None
+        if getattr(config, "enable_profiler", False):
+            self.profiler_start_step = getattr(config, "profiler_start_step", 10)
+            self.profiler_steps = getattr(config, "profiling_step", 10)
+            self.profiler_end_step = self.profiler_start_step + self.profiler_steps
+            profiler_dir = getattr(config, "profiler_dir", "./profiler_logs")
 
-        self.prof_kwargs = {
-            "activities": [
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            "schedule": profiler.schedule(wait=1, warmup=1, active=10),
-            "on_trace_ready": torch.profiler.tensorboard_trace_handler(
-                dir_name="/mnt/nvme1n1/ml_research/majinming/src/nano-deploy/",
-                worker_name=f"trace_rank_{dist.get_rank()}",
-            ),
-            "record_shapes": True,
-            "profile_memory": True,
-            "with_stack": True,
-        }
+            os.makedirs(profiler_dir, exist_ok=True)
+
+            self.profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=None,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    dir_name=profiler_dir,
+                    worker_name=f"{self.engine_id}_rank_{self.rank}",
+                    use_gzip=False,
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+            logger.info(
+                f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, duration {self.profiler_steps} steps."
+            )
 
         sp_size = get_dist_context().attn_sp_world_size
         ep_size = get_dist_context().ffn_ep_world_size
@@ -643,22 +653,7 @@ class ModelRunner:
         get_cache_context().migrate(seqs=seqs)
 
     def run(self, dp_seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
-        # start_event = torch.cuda.Event(enable_timing=True)
-        # end_event = torch.cuda.Event(enable_timing=True)
-
-        # """封装 run_model 的调用，加入 profiler 控制"""
-
-        # # # 判断是否在目标范围内（50~100 次）
-        # in_prof_range = (self.run_count >= self.prof_start) and (
-        #     self.run_count <= self.prof_end
-        # )
-
-        # if self.run_count == self.prof_start and self.profiler is None:
-        #     # 进入范围时启动 profiler
-        #     self.profiler = profiler.profile(**self.prof_kwargs)
-        #     self.profiler.start()
-        #     print(f"开始 profiling（第 {self.run_count} 次）")
-        # start_event.record()
+        
 
         sp_rank = get_dist_context().attn_sp_rank
 
@@ -691,6 +686,12 @@ class ModelRunner:
 
         loop_count = self.config.loop_count if not is_prefill else 1
         for i in range(loop_count):
+            if self.profiler and self.run_count == self.profiler_start_step:
+                self.profiler.start()
+                logger.info(
+                    f"Rank {self.rank}: Profiler started at step {self.run_count}"
+                )
+
             if is_prefill:
                 input_ids, positions = self.prepare_prefill(dp_seqs, is_dummy)
             else:
@@ -719,31 +720,22 @@ class ModelRunner:
                 seq.num_tokens += 1
                 seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_rank] += 1
 
+            if self.profiler and self.run_count >= self.profiler_start_step:
+                if self.run_count < self.profiler_end_step:
+                    self.profiler.step()
+
+                if self.run_count == self.profiler_end_step - 1:
+                    self.profiler.stop()
+                    logger.info(
+                        f"Rank {self.rank}: Profiler stopped and saved at step {self.run_count}"
+                    )
+
             self.run_count += 1  # 每次调用计数+1
             get_context().token_ids.append(input_ids[None, ...])
 
         loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
         reset_context()
-        #     if in_prof_range and self.profiler is not None:
-        #         self.profiler.step()
-        #         # 在范围内时，每次调用结束后停止并记录（配合 schedule=active=1）
-        #         # self.profiler.stop()
-        #         print(f"记录第 {self.run_count} 次调用的性能数据")
 
-        #     if self.run_count > self.prof_end and self.profiler is not None:
-        #         self.profiler.stop()
-        #         # 超出范围后关闭 profiler
-        #         self.profiler = None
-        #         print(f"结束 profiling（共记录 {self.prof_end - self.prof_start + 1} 次）")
-        # end_event.record()
-        # torch.cuda.synchronize()
-        # cuda_elapse_ms = start_event.elapsed_time(end_event)
-        # cuda_time = torch.tensor(cuda_elapse_ms)
-        # dist.all_reduce(cuda_time)
-        # if dist.get_rank() == 0:
-        #     print(
-        #         f"model run latency: {(float(cuda_time) / get_dist_context().attn_dp_world_size):.2f} ms\n"
-        #     )
         return loop_count_token_ids
 
     @torch.inference_mode()
