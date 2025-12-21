@@ -134,7 +134,12 @@ class LLMEngine:
             else:
                 for dp_idx, seqs in enumerate(dp_seqs):
                     for seq in seqs:
-                        self.scheduler.worker_state[dp_idx].may_append(seq, 1)
+                        if not self.scheduler.worker_state[dp_idx].may_append(seq, 1):
+                            logger.error(
+                                "Failed to allocate block for sequence %s during dummy prefill; skipping token append.",
+                                getattr(seq, "seq_id", "<unknown>"),
+                            )
+                            continue
                         seq.append_token(0)
                 for seqs in dp_seqs:
                     for seq in seqs:

@@ -82,7 +82,7 @@ def parse_and_plot_log(file_path):
     # --- 5. 绘图 (不显示，直接保存) ---
     print(f"解析完成，生成图表中 (共 {decode_step_count} 个数据点)...")
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    _, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
     
     num_ranks = len(sp_history)
     # 使用 Tab10 调色板确保区分度
@@ -124,6 +124,6 @@ def parse_and_plot_log(file_path):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python plot_metrics.py <log_filename>")
+        print(f"Usage: python {os.path.basename(sys.argv[0])} <log_filename>")
     else:
         parse_and_plot_log(sys.argv[1])
