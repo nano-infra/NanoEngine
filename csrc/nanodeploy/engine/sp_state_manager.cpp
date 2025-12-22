@@ -167,6 +167,9 @@ void SPStateManager::allocate(Sequence& seq)
         }
     }
     block_manager[master_sp_idx]->allocate(seq);
+
+    num_running_seqs_++;
+    num_running_tokens_ += seq.num_tokens;
 }
 
 void SPStateManager::deallocate(Sequence& seq)
@@ -179,6 +182,9 @@ void SPStateManager::deallocate(Sequence& seq)
     block_ctx.sp_block_table.clear();
     block_ctx.block_location.clear();
     block_ctx.num_dispatched_tokens.clear();
+
+    num_running_seqs_--;
+    num_running_tokens_ -= seq.num_tokens;
 }
 
 }  // namespace nanodeploy

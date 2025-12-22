@@ -56,6 +56,5 @@ private:
     std::vector<std::list<int>::iterator> block_id_to_free_list_it_;
     std::unordered_set<int>          used_block_ids_;
 };
-};
 
 }  // namespace nanodeploy

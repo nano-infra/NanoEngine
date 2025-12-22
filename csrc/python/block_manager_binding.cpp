@@ -11,7 +11,7 @@ void bind_block_manager(py::module_& m)
 {
     py::class_<Block>(m, "Block")
         .def(py::init<int>())
-        .def("update", &Block::update)
+        .def("update", py::overload_cast<int64_t, const std::vector<int>&>(&Block::update))
         .def("reset", &Block::reset)
         .def_readwrite("block_id", &Block::block_id)
         .def_readwrite("ref_count", &Block::ref_count)
@@ -24,7 +24,9 @@ void bind_block_manager(py::module_& m)
              py::arg("sp_idx"),
              py::arg("num_blocks"),
              py::arg("block_size"))
-        .def_static("compute_hash", &BlockManager::compute_hash, py::arg("token_ids"), py::arg("prefix") = -1)
+        .def_static("compute_hash", 
+                    py::overload_cast<const std::vector<int>&, int64_t>(&BlockManager::compute_hash), 
+                    py::arg("token_ids"), py::arg("prefix") = -1)
         .def("can_allocate", &BlockManager::can_allocate)
         .def("allocate",
              &BlockManager::allocate,

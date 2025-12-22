@@ -24,7 +24,8 @@ void bind_scheduler_utils(py::module_& m)
           py::arg("engine_id"),
           py::arg("eos_id"),
           py::arg("is_prefill"),
-          py::arg("update_metrics") = true);
+          py::arg("update_metrics") = true,
+          py::arg("thread_pool") = nullptr);
 
     // Bind the SPStateManagerList type
     py::class_<std::vector<std::shared_ptr<SPStateManager>>>(m, "SPStateManagerList")

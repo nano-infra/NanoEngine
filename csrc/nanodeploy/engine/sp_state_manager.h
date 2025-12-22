@@ -51,6 +51,11 @@ public:
     void allocate(Sequence& seq);
     void deallocate(Sequence& seq);
 
+    // Load tracking
+    int num_running_seqs() const { return num_running_seqs_; }
+    int num_running_tokens() const { return num_running_tokens_; }
+    void add_running_tokens(int count) { num_running_tokens_ += count; }
+
     // Public members to be exposed to Python
     std::unordered_map<int, std::shared_ptr<BlockManager>> block_manager;
     std::deque<std::shared_ptr<Sequence>>                  running;
@@ -68,6 +73,8 @@ private:
     int                        max_num_batched_tokens_;
 
     int sp_rr_counter_ = 0;
+    int num_running_seqs_ = 0;
+    int num_running_tokens_ = 0;
 };
 
 }  // namespace nanodeploy
