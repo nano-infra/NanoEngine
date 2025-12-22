@@ -56,6 +56,8 @@ def set_context(
     q_mask: Optional[torch.Tensor] = None,
     res_lse_mask: Optional[torch.Tensor] = None,
     is_dummy: bool = False,
+    tile_scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: Optional[torch.Tensor] = None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -72,6 +74,8 @@ def set_context(
         q_mask=q_mask,
         res_lse_mask=res_lse_mask,
         is_dummy=is_dummy,
+        tile_scheduler_metadata=tile_scheduler_metadata,
+        num_splits=num_splits,
     )
 
 

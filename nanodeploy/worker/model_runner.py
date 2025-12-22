@@ -4,8 +4,8 @@ import numpy as np
 import ray
 import torch
 import torch.distributed as dist
-
 import torch.profiler as profiler
+import flash_mla
 
 from nanodeploy.config import Config, get_use_cpp_model_runner
 from nanodeploy.engine.sequence import Sequence
@@ -479,9 +479,20 @@ class ModelRunner:
         res_lse_mask[sp_rank].fill_(0)
         res_lse_mask[res_lse_mask != 0] = 1
 
+        config = self.config
+        hf_config = config.hf_config
+        if hf_config.num_key_value_heads == 1:
+            new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
+                context_lens.view(-1),
+                hf_config.num_attention_heads // hf_config.num_key_value_heads,
+                hf_config.num_key_value_heads,
+            )
+        else:
+            new_tile_scheduler_metadata, new_num_splits = None, None
+
         set_context(
-            False,
-            self.config.max_num_seqs,
+            is_prefill=False,
+            max_bs=self.config.max_num_seqs,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
@@ -489,6 +500,8 @@ class ModelRunner:
             q_mask=q_mask,
             res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
+            tile_scheduler_metadata=new_tile_scheduler_metadata,
+            num_splits=new_num_splits,
         )
 
         return input_ids, positions
@@ -663,6 +676,15 @@ class ModelRunner:
             graph_vars["block_tables"][
                 :, :, : context.block_tables.size(2)  # type: ignore
             ] = context.block_tables
+
+            config = self.config
+            hf_config = config.hf_config
+            if hf_config.num_key_value_heads == 1:
+                graph_vars["tile_scheduler_metadata"].zero_()
+                graph_vars["num_splits"].zero_()
+                graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
+                graph_vars["num_splits"].copy_(context.num_splits)  # type: ignore
+
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -777,6 +799,20 @@ class ModelRunner:
             sp_world_size, max_bs, max_num_blocks, dtype=torch.int32
         )
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+
+        if hf_config.num_key_value_heads == 1:
+            tile_scheduler_metadata_buffer, num_splits_buffer = (
+                flash_mla.get_mla_metadata(
+                    torch.ones(
+                        sp_world_size * max_bs, dtype=torch.int32, device="cuda"
+                    ),
+                    hf_config.num_attention_heads // hf_config.num_key_value_heads,
+                    hf_config.num_key_value_heads,
+                )
+            )
+        else:
+            tile_scheduler_metadata_buffer, num_splits_buffer = None, None
+
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
@@ -792,6 +828,8 @@ class ModelRunner:
                 global_context_lens=global_context_lens,
                 q_mask=q_mask,
                 res_lse_mask=res_lse_mask,
+                tile_scheduler_metadata=tile_scheduler_metadata_buffer,
+                num_splits=num_splits_buffer,
             )
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
@@ -813,4 +851,6 @@ class ModelRunner:
             outputs=outputs,
             q_mask=q_mask,
             res_lse_mask=res_lse_mask,
+            tile_scheduler_metadata=tile_scheduler_metadata_buffer,
+            num_splits=num_splits_buffer,
         )
