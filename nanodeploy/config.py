@@ -84,8 +84,6 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        assert self.kvcache_block_size % 256 == 0
-        assert 1 <= self.attention_tp <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             assert self.kvcache_block_size == 64

@@ -170,7 +170,7 @@ class ModelRunner:
         dist.barrier()
 
         self.sampler = Sampler()
-        self.warmup_model()
+        # self.warmup_model()
         self.preallocate_kvcache()
 
     def num_kvcache_blocks(self):

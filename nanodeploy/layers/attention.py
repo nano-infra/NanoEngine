@@ -149,6 +149,7 @@ class FlashAttentionImpl:
                     get_sp_context().max_num_seqs,
                     sp_size,
                 ).view([max_num_seqs, num_head, head_dim])[:bs]
+        
         return o
 
 class FlashMLAImpl:
