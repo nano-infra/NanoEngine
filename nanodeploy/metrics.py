@@ -111,16 +111,8 @@ class MetricsManager:
 
     def log_server_metrics(self, include_detailed: bool = False):
         """Log current server metrics using the Python logger."""
-        if hasattr(self.server_metric, "get_metric_report"):
-            report_str = self.server_metric.get_metric_report(include_detailed)
-            logger.info(report_str)
-        else:
-            logger.warning(
-                "C++ backend outdated: 'get_metric_report' not found. Falling back to legacy 'log_metrics' method."
-            )
-            if hasattr(self.server_metric, "log_metrics"):
-                self.server_metric.log_metrics(include_detailed)
-
+        report_str = self.server_metric.get_metric_report(include_detailed)
+        logger.info(report_str)
     def get_server_summary(self) -> dict:
         """Get server metrics summary."""
         return self.server_metric.get_summary()
