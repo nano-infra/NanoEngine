@@ -52,16 +52,69 @@ public:
     void deallocate(Sequence& seq);
 
     // Load tracking
+    /// \brief Returns the total number of sequences currently running on this engine.
+    ///
+    /// This aggregates the number of active sequences across all sequence-parallel
+    /// (SP) partitions managed by this SPStateManager.
+    ///
+    /// \note This class does not provide internal synchronization. Callers must
+    ///       ensure external synchronization if accessed from multiple threads.
     int num_running_seqs() const { return num_running_seqs_; }
+
+    /// \brief Returns the total number of tokens currently being processed.
+    ///
+    /// The returned value is the sum of running tokens across all running
+    /// sequences and all SP partitions in this manager.
+    ///
+    /// \note This class does not provide internal synchronization. Callers must
+    ///       ensure external synchronization if accessed from multiple threads.
     int num_running_tokens() const { return num_running_tokens_; }
+
+    /// \brief Returns the number of running sequences assigned to a given SP index.
+    ///
+    /// \param sp_idx The zero-based sequence-parallel index for which to query
+    ///               the number of running sequences.
+    /// \return The number of currently running sequences mapped to \p sp_idx.
+    ///
+    /// \warning No bounds checking is performed on \p sp_idx; callers must ensure
+    ///          that it is within the valid range of SP indices for this engine.
+    /// \note This class does not provide internal synchronization. Callers must
+    ///       ensure external synchronization if accessed from multiple threads.
     int num_running_seqs_per_sp(int sp_idx) const { return num_running_seqs_per_sp_[sp_idx]; }
+
+    /// \brief Returns the number of running tokens assigned to a given SP index.
+    ///
+    /// \param sp_idx The zero-based sequence-parallel index for which to query
+    ///               the number of running tokens.
+    /// \return The number of tokens currently being processed on \p sp_idx.
+    ///
+    /// \warning No bounds checking is performed on \p sp_idx; callers must ensure
+    ///          that it is within the valid range of SP indices for this engine.
+    /// \note This class does not provide internal synchronization. Callers must
+    ///       ensure external synchronization if accessed from multiple threads.
     int num_running_tokens_per_sp(int sp_idx) const { return num_running_tokens_per_sp_[sp_idx]; }
 
     // WARNING: This method modifies shared state without thread safety protection.
     // If called concurrently from multiple threads (e.g., in worker_func), 
     // this will cause race conditions on the counters.
-    void add_running_tokens(int sp_idx, int count) { 
-        num_running_tokens_ += count; 
+
+    /// \brief Adjusts the number of running tokens for a given SP index.
+    ///
+    /// This updates both the global running-token count and the per-SP running
+    /// token count for the specified \p sp_idx.
+    ///
+    /// \param sp_idx The zero-based sequence-parallel index whose token count
+    ///               should be updated.
+    /// \param count  The number of tokens to add. Implementations may pass a
+    ///               negative value to decrement the counters when tokens are
+    ///               completed or removed.
+    ///
+    /// \warning No bounds checking is performed on \p sp_idx; callers must ensure
+    ///          that it is within the valid range of SP indices for this engine.
+    /// \note This class does not provide internal synchronization. Callers must
+    ///       ensure external synchronization if accessed from multiple threads.
+    void add_running_tokens(int sp_idx, int count) {
+        num_running_tokens_ += count;
         num_running_tokens_per_sp_[sp_idx] += count;
     }
 

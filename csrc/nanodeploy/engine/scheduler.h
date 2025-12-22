@@ -15,10 +15,31 @@ namespace nanodeploy {
 // Forward declaration
 class MetricsManager;
 
+// Result of a single scheduling step.
+// This struct is returned by `schedule()` and summarizes which sequences
+// should be executed on each data-parallel (DP) worker (and, if applicable,
+// on each sequence-parallel (SP) shard) for the current iteration.
 struct ScheduleResult {
+    // Sequences scheduled per DP worker for this step.
+    // Outer index: DP worker index.
+    // Inner vector: sequences assigned to that DP worker.
     std::vector<std::vector<std::shared_ptr<Sequence>>> dp_seqs;
+
+    // Sequences laid out per (DP, SP) shard for this step.
+    // Outer index: DP worker index.
+    // Inner vector: sequences assigned to that DP worker after applying
+    // sequence-parallel (SP) partitioning / layout.
     std::vector<std::vector<std::shared_ptr<Sequence>>> dp_sp_seqs;
+
+    // Filtered subset of `dp_sp_seqs` that will actually be executed in this
+    // iteration (for example, after removing finished / paused sequences or
+    // enforcing per-step limits on tokens or sequences).
+    // Same indexing convention as `dp_sp_seqs`.
     std::vector<std::vector<std::shared_ptr<Sequence>>> filtered_dp_sp_seqs;
+
+    // Indicates whether this scheduling step is a prefill step (true) or a
+    // decode step (false). Callers can use this to select the appropriate
+    // execution path.
     bool                                                is_prefill;
 };
 
