@@ -11,6 +11,7 @@ from nanodeploy.config import Config, get_use_cpp_model_runner
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
+from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.cache import get_cache_context, set_cache_context
@@ -43,6 +44,7 @@ else:
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
+    "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
 }
 
 
@@ -180,9 +182,14 @@ class ModelRunner:
         cache_context.allocate_kvcache(num_kvcache_blocks)
         layer_id = 0
         for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = cache_context.kv_cache[0, layer_id]
-                module.v_cache = cache_context.kv_cache[1, layer_id]
+            allocated = False
+            if hasattr(module, "k_cache"):
+                module.k_cache = cache_context.kv_cache[0][layer_id]
+                allocated = True
+            if hasattr(module, "v_cache"):
+                module.v_cache = cache_context.kv_cache[1][layer_id]
+                allocated = True
+            if allocated:
                 layer_id += 1
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -231,6 +238,14 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
 
+        mode = "gqa" if hf_config.num_key_value_heads > 1 else "mla"
+        kv_lora_rank = (
+            hf_config.kv_lora_rank if hasattr(hf_config, "kv_lora_rank") else 0
+        )
+        qk_rope_head_dim = (
+            hf_config.qk_rope_head_dim if hasattr(hf_config, "qk_rope_head_dim") else 0
+        )
+
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
@@ -238,9 +253,11 @@ class ModelRunner:
             num_hidden_layers=hf_config.num_hidden_layers,
             attention_tp=config.attention_tp,
             gpu_memory_utilization=config.gpu_memory_utilization,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
             device=torch.get_default_device(),
             dtype=torch.get_default_dtype(),
-            mode="gqa",
+            mode=mode,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
