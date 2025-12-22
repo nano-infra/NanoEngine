@@ -92,28 +92,50 @@ int Scheduler::next_dp_idx()
     return idx;
 }
 
-std::pair<std::vector<std::vector<std::shared_ptr<Sequence>>>, bool> Scheduler::schedule()
+ScheduleResult Scheduler::schedule()
 {
     // Try prefill first
-    auto scheduled_seqs = _schedule_prefill();
+    auto dp_seqs = _schedule_prefill();
 
     // Check if any sequences were scheduled in prefill
     bool has_prefill = false;
-    for (const auto& dp_seqs : scheduled_seqs) {
-        if (!dp_seqs.empty()) {
+    for (const auto& seqs : dp_seqs) {
+        if (!seqs.empty()) {
             has_prefill = true;
             break;
         }
     }
 
-    if (has_prefill) {
-        return {scheduled_seqs, true};
+    if (!has_prefill) {
+        // No prefill sequences, schedule decode
+        dp_seqs = _schedule_decode();
     }
 
-    // No prefill sequences, schedule decode
-    scheduled_seqs = _schedule_decode();
+    ScheduleResult result;
+    result.dp_seqs = dp_seqs;
+    result.is_prefill = has_prefill;
 
-    return {scheduled_seqs, false};
+    // Prepare dp_sp_seqs and filtered_dp_sp_seqs
+    result.dp_sp_seqs.reserve(attention_dp_ * attention_sp_);
+    result.filtered_dp_sp_seqs.reserve(attention_dp_ * attention_sp_);
+
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+            // dp_sp_seqs is just dp_seqs[dp_idx] repeated for each sp_idx
+            result.dp_sp_seqs.push_back(dp_seqs[dp_idx]);
+
+            // filtered_dp_sp_seqs is dp_seqs[dp_idx] filtered by master_sp_idx
+            std::vector<std::shared_ptr<Sequence>> filtered;
+            for (const auto& seq : dp_seqs[dp_idx]) {
+                if (seq->block_ctx(engine_id_).master_sp_idx == sp_idx) {
+                    filtered.push_back(seq);
+                }
+            }
+            result.filtered_dp_sp_seqs.push_back(std::move(filtered));
+        }
+    }
+
+    return result;
 }
 
 std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill()
@@ -341,13 +363,13 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
 }
 
 void Scheduler::postprocess(
-    const std::vector<std::vector<std::vector<std::shared_ptr<Sequence>>>>& dp_seqs,
-    const std::vector<std::vector<std::vector<std::vector<int>>>>&          dp_token_ids,
-    bool                                                                     update_metrics)
+    const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+    const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+    bool                                                       update_metrics)
 {
     // Call the C++ postprocess_sequences utility directly with shared_ptrs
     auto migrations = postprocess_sequences(
-        worker_state, dp_seqs, dp_token_ids, engine_id_.value_or(""), eos_, mode_ == "prefill", update_metrics, thread_pool_.get());
+        worker_state, dp_sp_seqs, dp_sp_token_ids, engine_id_.value_or(""), eos_, mode_ == "prefill", update_metrics, thread_pool_.get());
 
     // Store migrations
     for (const auto& [seq_shared, dp_idx] : migrations) {

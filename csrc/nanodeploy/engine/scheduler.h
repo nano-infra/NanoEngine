@@ -15,6 +15,13 @@ namespace nanodeploy {
 // Forward declaration
 class MetricsManager;
 
+struct ScheduleResult {
+    std::vector<std::vector<std::shared_ptr<Sequence>>> dp_seqs;
+    std::vector<std::vector<std::shared_ptr<Sequence>>> dp_sp_seqs;
+    std::vector<std::vector<std::shared_ptr<Sequence>>> filtered_dp_sp_seqs;
+    bool                                                is_prefill;
+};
+
 class Scheduler {
 public:
     Scheduler(const std::optional<std::string>& engine_id,
@@ -32,13 +39,13 @@ public:
     void add(std::shared_ptr<Sequence> seq);
 
     // Main scheduling functions
-    std::pair<std::vector<std::vector<std::shared_ptr<Sequence>>>, bool> schedule();
+    ScheduleResult schedule();
 
     // Postprocessing
     void postprocess(
-        const std::vector<std::vector<std::vector<std::shared_ptr<Sequence>>>>& dp_seqs,
-        const std::vector<std::vector<std::vector<std::vector<int>>>>&          dp_token_ids,
-        bool                                                                     update_metrics = true);
+        const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+        const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+        bool                                                       update_metrics = true);
 
     // State queries
     bool is_finished() const;
