@@ -1,5 +1,6 @@
 #include "scheduler_utils.h"
 #include "nanodeploy/metrics/sequence_metric.h"
+#include "thread_pool.h"
 #include <thread>
 #include <algorithm>
 #include <unordered_set>
@@ -56,6 +57,7 @@ static void worker_func(
                 }
 
                 seq->append_token(token_id, engine_id, task.sp_idx);
+                state_manager->add_running_tokens(task.sp_idx, 1);
 
                 if (update_metrics && seq->metric) {
                     if (seq->metric->num_generated_tokens == 0) {
@@ -103,19 +105,24 @@ static void worker_func(
 
 MigrationList postprocess_sequences(
     std::vector<std::shared_ptr<SPStateManager>> worker_states,
-    const std::vector<std::vector<std::vector<std::shared_ptr<Sequence>>>>& dp_seqs,
-    const std::vector<std::vector<std::vector<std::vector<int>>>>& dp_token_ids,
+    const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+    const std::vector<std::vector<std::vector<int>>>& dp_sp_token_ids,
     const std::string& engine_id,
     int eos_id,
     bool is_prefill,
-    bool update_metrics
+    bool update_metrics,
+    ThreadPool* thread_pool
 ) {
-    size_t num_dp = dp_seqs.size();
-    if (worker_states.size() != num_dp) {
-         throw std::runtime_error("dp_seqs length mismatch with worker_states");
+    size_t num_dp = worker_states.size();
+    size_t num_dp_sp = dp_sp_seqs.size();
+    if (num_dp == 0) return {};
+    if (num_dp_sp % num_dp != 0) {
+        throw std::runtime_error("dp_sp_seqs size is not a multiple of num_dp");
     }
-    if (dp_token_ids.size() != num_dp) {
-         throw std::runtime_error("dp_token_ids length mismatch with dp_seqs");
+    size_t num_sp = num_dp_sp / num_dp;
+
+    if (dp_sp_token_ids.size() != num_dp_sp) {
+         throw std::runtime_error("dp_sp_token_ids length mismatch with dp_sp_seqs");
     }
 
     std::vector<WorkerContext> contexts(num_dp);
@@ -124,17 +131,10 @@ MigrationList postprocess_sequences(
         auto& ctx = contexts[dp_idx];
         ctx.dp_idx = static_cast<int>(dp_idx);
         
-        const auto& sp_seqs = dp_seqs[dp_idx];
-        const auto& sp_tokens = dp_token_ids[dp_idx];
-        
-        if (sp_seqs.size() != sp_tokens.size()) {
-            throw std::runtime_error("sp_seqs size mismatch with sp_tokens");
-        }
-
-        size_t num_sp = sp_seqs.size();
         for (size_t sp_idx = 0; sp_idx < num_sp; ++sp_idx) {
-            const auto& batch_seqs = sp_seqs[sp_idx];
-            const auto& batch_tokens = sp_tokens[sp_idx];
+            size_t idx = dp_idx * num_sp + sp_idx;
+            const auto& batch_seqs = dp_sp_seqs[idx];
+            const auto& batch_tokens = dp_sp_token_ids[idx];
 
             if (batch_seqs.size() > batch_tokens.size()) {
                 throw std::runtime_error("batch_seqs size mismatch with batch_tokens: not enough tokens");
@@ -152,7 +152,27 @@ MigrationList postprocess_sequences(
         }
     }
 
-    {
+    if (thread_pool) {
+        std::vector<std::future<void>> futures;
+        futures.reserve(num_dp);
+
+        for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
+            futures.push_back(thread_pool->enqueue(
+                worker_func,
+                worker_states[dp_idx],
+                &contexts[dp_idx],
+                &contexts[dp_idx], 
+                engine_id,
+                eos_id,
+                is_prefill,
+                update_metrics
+            ));
+        }
+
+        for (auto& f : futures) {
+            f.get();
+        }
+    } else {
         std::vector<std::thread> threads;
         threads.reserve(num_dp);
 

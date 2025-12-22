@@ -1,14 +1,16 @@
 #pragma once
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 
 namespace nanodeploy {
 
 class Block {
 public:
-    explicit Block(int block_id);
+    explicit Block(int block_id, int block_size = 256);
 
     void update(int64_t hash, const std::vector<int>& token_ids);
+    void update(int64_t hash, const int* token_ids, size_t size);
     void reset();
 
     int              block_id;

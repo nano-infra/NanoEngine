@@ -72,7 +72,12 @@ class LLMEngine:
         sp_size = self.config.attention_sp
         tp_size = self.config.attention_tp
         sch_begin = time.time()
-        dp_seqs, is_prefill = self.scheduler.schedule()
+        sch_res = self.scheduler.schedule()
+        dp_seqs = sch_res.dp_seqs
+        is_prefill = sch_res.is_prefill
+        dp_sp_seqs = sch_res.dp_sp_seqs
+        filtered_dp_sp_seqs = sch_res.filtered_dp_sp_seqs
+
         total_running = sum(len(seqs) for seqs in dp_seqs)
         total_waiting = len(self.scheduler.waiting) 
         total_waiting_migration = len(self.scheduler.waiting_migration)
@@ -82,22 +87,8 @@ class LLMEngine:
 
         if self.scheduler.waiting_migration:
             logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
-        # TODO (JimyMa): For loop
-        filtered_dp_sp_seqs = [
-            [
-                seq
-                for seq in seqs
-                if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
-            ]
-            for seqs in dp_seqs
-            for sp_idx in range(self.config.attention_sp)
-        ]
-
-        dp_sp_seqs = [
-            [seq for seq in seqs]
-            for seqs in dp_seqs
-            for _ in range(self.config.attention_sp)
-        ]
+        
+        dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
 
         dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
         # dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
@@ -149,13 +140,6 @@ class LLMEngine:
         else:
             token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
             post_sch_begin = time.time()
-            token_ids = [
-                token_ids[i * sp_size : (i + 1) * sp_size] for i in range(0, dp_size)
-            ]
-            filtered_dp_sp_seqs = [
-                filtered_dp_sp_seqs[i * sp_size : (i + 1) * sp_size]
-                for i in range(0, dp_size)
-            ]
             self.scheduler.postprocess(filtered_dp_sp_seqs, token_ids, self.metrics_manager)
             post_sch_end = time.time()
         outputs = []
