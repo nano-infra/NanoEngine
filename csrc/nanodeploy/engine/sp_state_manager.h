@@ -56,6 +56,10 @@ public:
     int num_running_tokens() const { return num_running_tokens_; }
     int num_running_seqs_per_sp(int sp_idx) const { return num_running_seqs_per_sp_[sp_idx]; }
     int num_running_tokens_per_sp(int sp_idx) const { return num_running_tokens_per_sp_[sp_idx]; }
+
+    // WARNING: This method modifies shared state without thread safety protection.
+    // If called concurrently from multiple threads (e.g., in worker_func), 
+    // this will cause race conditions on the counters.
     void add_running_tokens(int sp_idx, int count) { 
         num_running_tokens_ += count; 
         num_running_tokens_per_sp_[sp_idx] += count;

@@ -228,7 +228,10 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                     continue;
                 }
 
-                // Update load set: remove old load, allocate, insert new load
+                // WARNING: erase(it) invalidates the iterator. This is safe here because 
+                // we break the loop immediately after. If refactoring to remove the break 
+                // or making dp_load_set a member variable, ensure thread-safety and 
+                // correct iterator management.
                 dp_load_set.erase(it);
                 worker_state[selected_dp_idx]->allocate(*seq);
                 int new_load = (routing_strategy == RoutingStrategy::LeastBatch) 
