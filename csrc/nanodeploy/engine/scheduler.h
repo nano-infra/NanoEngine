@@ -1,6 +1,7 @@
 #pragma once
 #include "sequence.h"
 #include "sp_state_manager.h"
+#include "thread_pool.h"
 #include <deque>
 #include <memory>
 #include <optional>
@@ -84,6 +85,8 @@ private:
     std::string                mode_;
 
     int dp_rr_counter_ = 0;
+
+    std::unique_ptr<ThreadPool> thread_pool_;
 };
 
 }  // namespace nanodeploy

@@ -108,7 +108,8 @@ MigrationList postprocess_sequences(
     const std::string& engine_id,
     int eos_id,
     bool is_prefill,
-    bool update_metrics
+    bool update_metrics,
+    ThreadPool* thread_pool
 ) {
     size_t num_dp = dp_seqs.size();
     if (worker_states.size() != num_dp) {
@@ -152,7 +153,27 @@ MigrationList postprocess_sequences(
         }
     }
 
-    {
+    if (thread_pool) {
+        std::vector<std::future<void>> futures;
+        futures.reserve(num_dp);
+
+        for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
+            futures.push_back(thread_pool->enqueue(
+                worker_func,
+                worker_states[dp_idx],
+                &contexts[dp_idx],
+                &contexts[dp_idx], 
+                engine_id,
+                eos_id,
+                is_prefill,
+                update_metrics
+            ));
+        }
+
+        for (auto& f : futures) {
+            f.get();
+        }
+    } else {
         std::vector<std::thread> threads;
         threads.reserve(num_dp);
 

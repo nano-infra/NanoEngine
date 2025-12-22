@@ -32,7 +32,8 @@ Scheduler::Scheduler(const std::optional<std::string>& engine_id,
         worker_state.push_back(std::make_shared<SPStateManager>(
             engine_id_, attention_sp_, num_kvcache_blocks, kvcache_block_size, max_num_seqs_, max_num_batched_tokens_));
     }
-}
+    // Initialize thread pool with attention_dp_ threads
+    thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);}
 
 void Scheduler::add(std::shared_ptr<Sequence> seq)
 {
@@ -387,7 +388,7 @@ void Scheduler::postprocess(
 {
     // Call the C++ postprocess_sequences utility directly with shared_ptrs
     auto migrations = postprocess_sequences(
-        worker_state, dp_seqs, dp_token_ids, engine_id_.value_or(""), eos_, mode_ == "prefill", update_metrics);
+        worker_state, dp_seqs, dp_token_ids, engine_id_.value_or(""), eos_, mode_ == "prefill", update_metrics, thread_pool_.get());
 
     // Store migrations
     for (const auto& [seq_shared, dp_idx] : migrations) {

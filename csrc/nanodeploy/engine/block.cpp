@@ -10,6 +10,12 @@ void Block::update(int64_t hash, const std::vector<int>& token_ids)
     this->token_ids = token_ids;
 }
 
+void Block::update(int64_t hash, const int* token_ids, size_t size)
+{
+    this->hash = hash;
+    this->token_ids.assign(token_ids, token_ids + size);
+}
+
 void Block::reset()
 {
     ref_count = 1;

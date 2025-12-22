@@ -226,9 +226,9 @@ int Sequence::last_block_num_tokens(const std::optional<std::string>& engine_id,
     return n_tokens - (num_blocks(engine_id, sp_idx) - 1) * block_size;
 }
 
-std::vector<int> Sequence::block(int i, const std::optional<std::string>& engine_id, int sp_idx)
+std::pair<const int*, size_t> Sequence::block_view(int i, const std::optional<std::string>& engine_id, int sp_idx) const
 {
-    int n_blocks = num_blocks(engine_id, sp_idx);
+    int n_blocks = const_cast<Sequence*>(this)->num_blocks(engine_id, sp_idx);
     if (i < 0 || i >= n_blocks) {
         throw std::out_of_range("Block index out of range");
     }
@@ -236,17 +236,17 @@ std::vector<int> Sequence::block(int i, const std::optional<std::string>& engine
     int start = i * block_size;
     int end   = std::min((i + 1) * block_size, static_cast<int>(token_ids.size()));
 
-    // Note: Python implementation slices token_ids.
-    // However, token_ids stores ALL tokens.
-    // block() seems to return tokens for a specific block.
-    // Wait, Python implementation:
-    // return self.token_ids[i * self.block_size : (i + 1) * self.block_size]
-    // This assumes token_ids corresponds to the blocks.
-
     if (start >= static_cast<int>(token_ids.size())) {
-        return {};
+        return {nullptr, 0};
     }
-    return std::vector<int>(token_ids.begin() + start, token_ids.begin() + end);
+    return {&token_ids[start], static_cast<size_t>(end - start)};
+}
+
+std::vector<int> Sequence::block(int i, const std::optional<std::string>& engine_id, int sp_idx)
+{
+    auto view = block_view(i, engine_id, sp_idx);
+    if (view.second == 0) return {};
+    return std::vector<int>(view.first, view.first + view.second);
 }
 
 std::vector<int> Sequence::prompt_token_ids() const

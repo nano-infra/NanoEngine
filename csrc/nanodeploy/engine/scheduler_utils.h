@@ -5,6 +5,7 @@
 #include <memory>
 #include "sp_state_manager.h"
 #include "sequence.h"
+#include "thread_pool.h"
 
 namespace nanodeploy {
 
@@ -21,7 +22,8 @@ MigrationList postprocess_sequences(
     const std::string& engine_id,
     int eos_id,
     bool is_prefill,
-    bool update_metrics
+    bool update_metrics,
+    ThreadPool* thread_pool = nullptr
 );
 
 } // namespace nanodeploy

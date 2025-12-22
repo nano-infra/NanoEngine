@@ -115,6 +115,7 @@ public:
     int              num_blocks(const std::optional<std::string>& engine_id, int sp_idx);
     int              last_block_page_id(const std::optional<std::string>& engine_id, int sp_idx);
     int              last_block_num_tokens(const std::optional<std::string>& engine_id, int sp_idx);
+    std::pair<const int*, size_t> block_view(int i, const std::optional<std::string>& engine_id, int sp_idx) const;
     std::vector<int> block(int i, const std::optional<std::string>& engine_id, int sp_idx);
 
     // Accessors
