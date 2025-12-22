@@ -19,12 +19,14 @@ void bind_scheduler_utils(py::module_& m)
     m.def("postprocess_sequences",
           &postprocess_sequences,
           py::arg("worker_states"),
-          py::arg("dp_seqs"),
-          py::arg("dp_token_ids"),
+          py::arg("dp_sp_seqs"),
+          py::arg("dp_sp_token_ids"),
           py::arg("engine_id"),
           py::arg("eos_id"),
           py::arg("is_prefill"),
-          py::arg("update_metrics") = true);
+          py::arg("update_metrics") = true,
+          py::arg("thread_pool") = nullptr,
+          py::call_guard<py::gil_scoped_release>());
 
     // Bind the SPStateManagerList type
     py::class_<std::vector<std::shared_ptr<SPStateManager>>>(m, "SPStateManagerList")
@@ -95,6 +97,13 @@ void bind_scheduler_utils(py::module_& m)
                  return items;
              });
 
+    // Bind the ScheduleResult struct
+    py::class_<ScheduleResult>(m, "ScheduleResult")
+        .def_readwrite("dp_seqs", &ScheduleResult::dp_seqs)
+        .def_readwrite("dp_sp_seqs", &ScheduleResult::dp_sp_seqs)
+        .def_readwrite("filtered_dp_sp_seqs", &ScheduleResult::filtered_dp_sp_seqs)
+        .def_readwrite("is_prefill", &ScheduleResult::is_prefill);
+
     // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
         .def(py::init<const std::optional<std::string>&, int, int, int, int, int, int, int, int, const std::string&>(),
@@ -113,14 +122,15 @@ void bind_scheduler_utils(py::module_& m)
         .def("add", &Scheduler::add, py::arg("seq"))
 
         // Scheduling
-        .def("schedule", &Scheduler::schedule)
+        .def("schedule", &Scheduler::schedule, py::call_guard<py::gil_scoped_release>())
 
         // Postprocessing
         .def("postprocess",
              &Scheduler::postprocess,
              py::arg("dp_seqs"),
              py::arg("dp_token_ids"),
-             py::arg("update_metrics") = true)
+             py::arg("update_metrics") = true,
+             py::call_guard<py::gil_scoped_release>())
 
         // State queries
         .def("is_finished", &Scheduler::is_finished)
