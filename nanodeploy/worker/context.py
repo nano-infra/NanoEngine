@@ -28,7 +28,10 @@ class Context:
     res_lse_mask: torch.Tensor | None = None
 
     is_dummy: bool = False
-
+    
+    tile_scheduler_metadata: torch.Tensor | None = None
+    num_splits: torch.Tensor | None = None
+    
     token_ids: list[torch.Tensor] = field(default_factory=list)
 
 
