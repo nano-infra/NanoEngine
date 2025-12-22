@@ -282,6 +282,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
 
         std::unordered_map<int, int> num_seqs;
         std::deque<std::shared_ptr<Sequence>> skipped;
+        std::vector<int> sp_lens(attention_sp_, 0);
 
         while (!running_queue.empty()) {
             auto seq = running_queue.front();
@@ -325,6 +326,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
                 }
                 else {
                     scheduled_seqs[selected_dp_idx].push_back(seq);
+                    sp_lens[master_rank] += seq->num_tokens;
                 }
             }
         }
@@ -338,11 +340,6 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
         }
 
         // Add dummy sequences for SP ranks with no work
-        std::vector<int> sp_lens(attention_sp_, 0);
-        for (const auto& seq : scheduled_seqs[selected_dp_idx]) {
-            sp_lens[seq->block_ctx(engine_id_).master_sp_idx] += seq->num_tokens;
-        }
-
         for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
             if (sp_lens[sp_idx] == 0) {
                 scheduled_seqs[selected_dp_idx].push_back(worker_state[selected_dp_idx]->dummy_seqs[sp_idx]);

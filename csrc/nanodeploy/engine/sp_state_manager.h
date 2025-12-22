@@ -54,7 +54,12 @@ public:
     // Load tracking
     int num_running_seqs() const { return num_running_seqs_; }
     int num_running_tokens() const { return num_running_tokens_; }
-    void add_running_tokens(int count) { num_running_tokens_ += count; }
+    int num_running_seqs_per_sp(int sp_idx) const { return num_running_seqs_per_sp_[sp_idx]; }
+    int num_running_tokens_per_sp(int sp_idx) const { return num_running_tokens_per_sp_[sp_idx]; }
+    void add_running_tokens(int sp_idx, int count) { 
+        num_running_tokens_ += count; 
+        num_running_tokens_per_sp_[sp_idx] += count;
+    }
 
     // Public members to be exposed to Python
     std::unordered_map<int, std::shared_ptr<BlockManager>> block_manager;
@@ -75,6 +80,8 @@ private:
     int sp_rr_counter_ = 0;
     int num_running_seqs_ = 0;
     int num_running_tokens_ = 0;
+    std::vector<int> num_running_seqs_per_sp_;
+    std::vector<int> num_running_tokens_per_sp_;
 };
 
 }  // namespace nanodeploy

@@ -14,7 +14,7 @@ BlockManager::BlockManager(const std::optional<std::string>& engine_id, int sp_i
     blocks_.reserve(num_blocks);
     block_id_to_free_list_it_.resize(num_blocks, free_block_ids_.end());
     for (int i = 0; i < num_blocks; ++i) {
-        blocks_.emplace_back(i);
+        blocks_.emplace_back(i, block_size);
         free_block_ids_.push_back(i);
         block_id_to_free_list_it_[i] = std::prev(free_block_ids_.end());
     }

@@ -121,6 +121,8 @@ Sequence::Sequence(const std::vector<int>&           token_ids,
     max_tokens(max_tokens),
     ignore_eos(ignore_eos)
 {
+    this->token_ids.reserve(max_tokens);
+    this->token_ids = token_ids;
 
     seq_id     = generate_uuid();
     status     = SequenceStatus::WAITING;

@@ -57,7 +57,7 @@ static void worker_func(
                 }
 
                 seq->append_token(token_id, engine_id, task.sp_idx);
-                state_manager->add_running_tokens(1);
+                state_manager->add_running_tokens(task.sp_idx, 1);
 
                 if (update_metrics && seq->metric) {
                     if (seq->metric->num_generated_tokens == 0) {
