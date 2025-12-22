@@ -175,7 +175,10 @@ class ModelRunner:
                 module.k_cache = cache_context.kv_cache[0][layer_id]
                 allocated = True
             if hasattr(module, "v_cache"):
-                module.v_cache = cache_context.kv_cache[1][layer_id]
+                if cache_context.kv_cache.size(0) > 1:
+                    module.v_cache = cache_context.kv_cache[1][layer_id]
+                else:
+                    module.v_cache = torch.tensor([], device=cache_context.device)
                 allocated = True
             if allocated:
                 layer_id += 1

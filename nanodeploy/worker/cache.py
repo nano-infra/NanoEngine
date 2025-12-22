@@ -50,29 +50,21 @@ class CacheContext:
         elif self.mode == "mla":
             assert self.attention_tp == 1
             assert self.block_size == 64, "MLA mode only support block_size=64"
+            self.num_kv_heads = 1
+            self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
+        
+        block_bytes = (
+            self.num_hidden_layers
+            * self.block_size
+            * self.num_local_kv_heads
+            * self.head_dim
+            * self.dtype.itemsize
+        )
         if self.mode == "gqa":
-            block_bytes = (
-                2
-                * self.num_hidden_layers
-                * self.block_size
-                * self.num_local_kv_heads
-                * self.head_dim
-                * self.dtype.itemsize
-            )
-        elif self.mode == "mla":
-            head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-            k_head_dim = head_dim
-            v_head_dim = 0
-            num_key_value_heads = 1
-            block_bytes = (
-                self.num_hidden_layers
-                * self.block_size
-                * num_key_value_heads
-                * (k_head_dim + v_head_dim)
-                * self.dtype.itemsize
-            )
+            block_bytes *= 2
+
         self.num_local_kvcache_blocks = (
             int(total * self.gpu_memory_utilization - used - peak + current)
             // block_bytes
@@ -96,7 +88,7 @@ class CacheContext:
         return (
             block_idx
             * self.block_size
-            * self.num_kv_heads
+            * self.num_local_kv_heads
             * self.head_dim
             * self.dtype.itemsize
         )
@@ -127,73 +119,19 @@ class CacheContext:
 
     def allocate_kvcache(self, num_kvcache_blocks):
         self.num_local_kvcache_blocks = num_kvcache_blocks
-        if self.mode == "gqa":
-            # 1. 获取 key/value 相关维度（GQA 中 key 和 value 维度一致）
-
-            num_key_value_heads = self.num_local_kv_heads
-            k_head_dim = self.head_dim
-            v_head_dim = self.head_dim
-
-            # 2. 定义 key 和 value 的 block shape（保持统一结构）
-
-            key_block_shape = (self.block_size, num_key_value_heads, k_head_dim)
-            value_block_shape = (self.block_size, num_key_value_heads, v_head_dim)
-
-            # 3. 分别分配 key 和 value 缓存
-            # shape 结构：(num_layers, num_blocks, block_size, num_kv_heads, head_dim)
-
-            key_cache = torch.empty(
-                self.num_hidden_layers,
-                self.num_local_kvcache_blocks,
-                *key_block_shape,
-                dtype=self.dtype,
-                device=self.device,
-            )
-
-            value_cache = torch.empty(
-                self.num_hidden_layers,
-                self.num_local_kvcache_blocks,
-                *value_block_shape,
-                dtype=self.dtype,
-                device=self.device,
-            )
-
-            self.kv_cache = (key_cache, value_cache)
-        elif self.mode == "mla":
-            # 1. 获取 key 相关维度
-
-            head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-            k_head_dim = head_dim
-            num_key_value_heads = 1
-            key_block_shape = (self.block_size, num_key_value_heads, k_head_dim)
-
-            # 2. 获取 value 相关维度
-
-            v_head_dim = 0
-            value_block_shape = (self.block_size, num_key_value_heads, v_head_dim)
-
-            # 3. 分别分配 key 和 value 缓存（保持与参考代码一致的 shape 顺序）
-            # shape 结构：(num_layers, num_blocks, block_size, num_kv_heads, head_dim)
-
-            key_cache = torch.empty(
-                self.num_hidden_layers,
-                self.num_local_kvcache_blocks,
-                *key_block_shape,
-                dtype=self.dtype,
-                device=self.device,
-            )
-
-            value_cache = torch.empty(
-                self.num_hidden_layers,
-                self.num_local_kvcache_blocks,
-                *value_block_shape,
-                dtype=self.dtype,
-                device=self.device,
-            )
-
-            self.kv_cache = (key_cache, value_cache)
-        else:
-            raise ValueError(f"Unknown mode: {self.mode}")
+        
+        kv_count = 2 if self.mode == "gqa" else 1
+        
+        self.kv_cache = torch.empty(
+            kv_count,
+            self.num_hidden_layers,
+            self.num_local_kvcache_blocks,
+            self.block_size,
+            self.num_local_kv_heads,
+            self.head_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
 
     def p2p_init(
         self, remote_engine_name: str, num_kv_blocks: int, remote_world_size: int
