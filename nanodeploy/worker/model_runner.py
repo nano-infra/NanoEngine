@@ -730,6 +730,10 @@ class ModelRunner:
             pin_memory=True,
         ).cuda(non_blocking=True)
 
+        q_output_stride_tensor = torch.tensor(
+            sp_valid_request_counts, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
@@ -783,6 +787,7 @@ class ModelRunner:
             res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input_tensor,
             res_to_buffer_input_mask=res_to_buffer_input_mask_tensor,
             attention_compute_bs=attention_compute_bs,
+            q_output_stride=q_output_stride_tensor,
         )
 
         return input_ids, positions
@@ -903,6 +908,9 @@ class ModelRunner:
             graph_vars["res_slice_get_to_buffer_input"].copy_(context.res_slice_get_to_buffer_input)  # type: ignore
             graph_vars["res_slice_fill_to_buffer_input"].copy_(context.res_slice_fill_to_buffer_input)  # type: ignore
             graph_vars["res_to_buffer_input_mask"].copy_(context.res_to_buffer_input_mask)  # type: ignore
+
+            if context.q_output_stride is not None:
+                graph_vars["q_output_stride"].copy_(context.q_output_stride)  # type: ignore
 
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -1037,6 +1045,7 @@ class ModelRunner:
         res_to_buffer_input_mask = torch.zeros(
             max_num_send_recv_seqs, dtype=torch.int32
         )
+        q_output_stride = torch.zeros(sp_world_size, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_master_rank_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graph_attn_compute_bs = [1, 2, 4, 8] + list(
@@ -1099,6 +1108,7 @@ class ModelRunner:
                     res_to_buffer_input_mask=res_to_buffer_input_mask,
                     attention_compute_bs=attn_bs,
                     context_lens_for_attn=context_lens_for_attn,
+                    q_output_stride=q_output_stride,
                 )
 
                 outputs[:master_bs] = self.model(
@@ -1141,4 +1151,5 @@ class ModelRunner:
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             attention_compute_bs=attn_bs,
             context_lens_for_attn=context_lens_for_attn,
+            q_output_stride=q_output_stride,
         )
