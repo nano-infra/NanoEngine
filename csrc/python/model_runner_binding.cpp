@@ -27,7 +27,18 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("context_lens_flat", &DecodeMetadata::context_lens_flat)
         .def_readonly("global_context_lens_flat", &DecodeMetadata::global_context_lens_flat)
         .def_readonly("block_tables_flat", &DecodeMetadata::block_tables_flat)
-        .def_readonly("max_num_blocks", &DecodeMetadata::max_num_blocks);
+        .def_readonly("max_num_blocks", &DecodeMetadata::max_num_blocks)
+        .def_readonly("context_lens_for_attn", &DecodeMetadata::context_lens_for_attn)
+        .def_readonly("q_slice_get", &DecodeMetadata::q_slice_get)
+        .def_readonly("q_slice_fill", &DecodeMetadata::q_slice_fill)
+        .def_readonly("q_copy_mask", &DecodeMetadata::q_copy_mask)
+        .def_readonly("res_slice_get_to_buffer_output", &DecodeMetadata::res_slice_get_to_buffer_output)
+        .def_readonly("res_slice_fill_to_buffer_output", &DecodeMetadata::res_slice_fill_to_buffer_output)
+        .def_readonly("res_to_buffer_output_mask", &DecodeMetadata::res_to_buffer_output_mask)
+        .def_readonly("res_slice_get_to_buffer_input", &DecodeMetadata::res_slice_get_to_buffer_input)
+        .def_readonly("res_slice_fill_to_buffer_input", &DecodeMetadata::res_slice_fill_to_buffer_input)
+        .def_readonly("res_to_buffer_input_mask", &DecodeMetadata::res_to_buffer_input_mask)
+        .def_readonly("attention_compute_bs", &DecodeMetadata::attention_compute_bs);
 
     m.def("prepare_prefill_cpp",
           &prepare_prefill_cpp,

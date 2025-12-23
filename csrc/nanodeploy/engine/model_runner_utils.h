@@ -30,9 +30,26 @@ struct DecodeMetadata {
     // Flattened [sp_size * max_num_seqs]
     std::vector<int> global_context_lens_flat;
     
-    // Flattened block tables
+    // Flattened packed block tables [num_valid_seqs * max_num_blocks]
     std::vector<int> block_tables_flat;
     int max_num_blocks = 0;
+
+    // New fields matching _prepare_decode_py logic
+    std::vector<int> context_lens_for_attn;
+    
+    std::vector<int> q_slice_get;
+    std::vector<int> q_slice_fill;
+    std::vector<int> q_copy_mask;
+    
+    std::vector<int> res_slice_get_to_buffer_output;
+    std::vector<int> res_slice_fill_to_buffer_output;
+    std::vector<int> res_to_buffer_output_mask;
+    
+    std::vector<int> res_slice_get_to_buffer_input;
+    std::vector<int> res_slice_fill_to_buffer_input;
+    std::vector<int> res_to_buffer_input_mask;
+
+    int attention_compute_bs = 0;
 };
 
 PrefillMetadata prepare_prefill_cpp(

@@ -428,6 +428,7 @@ class ModelRunner:
         sp_size = get_dist_context().attn_sp_world_size
         block_size = self.config.kvcache_block_size
 
+        # 调用 C++ 扩展获取元数据
         meta = prepare_decode_cpp(
             dp_seqs,
             self.engine_id,
@@ -437,6 +438,7 @@ class ModelRunner:
             self.config.max_num_seqs
         )
 
+        # 1. 基础输入转换
         input_ids = torch.tensor(meta.input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
@@ -447,6 +449,7 @@ class ModelRunner:
             meta.slot_mapping, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
         
+        # 2. Context Lens 转换 (Flattened -> Reshaped)
         context_lens = torch.tensor(
             meta.context_lens_flat, dtype=torch.int32, pin_memory=True
         ).reshape(sp_size, self.config.max_num_seqs).cuda(non_blocking=True)
@@ -455,19 +458,82 @@ class ModelRunner:
             meta.global_context_lens_flat, dtype=torch.int32, pin_memory=True
         ).reshape(sp_size, self.config.max_num_seqs).cuda(non_blocking=True)
 
-        block_tables = torch.tensor(
-            meta.block_tables_flat, dtype=torch.int32, pin_memory=True
-        ).reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks).cuda(non_blocking=True)
+        # 3. Block Tables 转换
+        # C++ 新实现返回的是 packed 格式，直接 reshape 成 [-1, max_num_blocks]
+        # 如果 meta.block_tables_flat 为空，创建一个空的 tensor
+        if len(meta.block_tables_flat) == 0:
+             block_tables = torch.empty((0, 0), dtype=torch.int32).cuda(non_blocking=True)
+        else:
+            block_tables = torch.tensor(
+                meta.block_tables_flat, dtype=torch.int32, pin_memory=True
+            ).reshape(-1, meta.max_num_blocks).cuda(non_blocking=True)
 
+        # 4. 辅助掩码计算 (虽然 C++ 可以算，但保留 Python 计算 mask 逻辑通常更灵活，
+        # 不过为了与 _prepare_decode_py 保持一致，这里使用 global/context_lens 计算)
         q_mask = global_context_lens.clone()
         q_mask[sp_rank].fill_(0)
         q_mask[q_mask != 0] = 1
+        
         res_lse_mask = context_lens.clone()
         res_lse_mask[sp_rank].fill_(0)
         res_lse_mask[res_lse_mask != 0] = 1
 
+        # 5. 新增字段转换 (Slices & Masks)
+        context_lens_for_attn = torch.tensor(
+            meta.context_lens_for_attn, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        q_slice_get = torch.tensor(
+            meta.q_slice_get, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        
+        q_slice_fill = torch.tensor(
+            meta.q_slice_fill, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        
+        q_copy_mask = torch.tensor(
+            meta.q_copy_mask, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        res_slice_get_to_buffer_output = torch.tensor(
+            meta.res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        
+        res_slice_fill_to_buffer_output = torch.tensor(
+            meta.res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        
+        res_to_buffer_output_mask = torch.tensor(
+            meta.res_to_buffer_output_mask, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        # 需要 padding 的字段
+        max_num_send_recv_seqs = max(
+            self.config.max_num_send_seqs, self.config.max_num_recv_seqs
+        )
+
+        def pad_tensor(data_list, size, pad_val, dtype=torch.int32):
+            if len(data_list) >= size:
+                t_data = data_list[:size]
+            else:
+                t_data = data_list + [pad_val] * (size - len(data_list))
+            return torch.tensor(t_data, dtype=dtype, pin_memory=True).cuda(non_blocking=True)
+
+        res_slice_get_to_buffer_input = pad_tensor(
+            meta.res_slice_get_to_buffer_input, max_num_send_recv_seqs, -1
+        )
+        
+        res_slice_fill_to_buffer_input = pad_tensor(
+            meta.res_slice_fill_to_buffer_input, max_num_send_recv_seqs, -1
+        )
+        
+        res_to_buffer_input_mask = pad_tensor(
+            meta.res_to_buffer_input_mask, max_num_send_recv_seqs, 0
+        )
+
+        # 6. 设置 Context
         set_context(
-            False,
+            False, # is_prefill
             self.config.max_num_seqs,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
@@ -476,6 +542,18 @@ class ModelRunner:
             q_mask=q_mask,
             res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
+            # 新增参数
+            context_lens_for_attn=context_lens_for_attn,
+            q_slice_get=q_slice_get,
+            q_slice_fill=q_slice_fill,
+            q_copy_mask=q_copy_mask,
+            res_slice_get_to_buffer_output=res_slice_get_to_buffer_output,
+            res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output,
+            res_to_buffer_output_mask=res_to_buffer_output_mask,
+            res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
+            res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
+            res_to_buffer_input_mask=res_to_buffer_input_mask,
+            attention_compute_bs=meta.attention_compute_bs,
         )
 
         return input_ids, positions

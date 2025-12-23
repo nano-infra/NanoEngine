@@ -4,13 +4,12 @@
 
 namespace nanodeploy {
 
-// Helper to mimic Python's prepare_block_tables
-static void build_block_tables(
+// Helper to mimic Python's updated prepare_block_tables logic (Packed format)
+static void build_block_tables_packed(
     const std::vector<Sequence*>& dp_seqs,
     const std::string& engine_id,
     int sp_rank,
     int sp_size,
-    int max_num_seqs,
     std::vector<int>& block_tables_flat,
     int& max_num_blocks
 ) {
@@ -23,7 +22,65 @@ static void build_block_tables(
         }
     }
 
-    // 2. Calculate max_num_blocks based on the local sp_rank's block table size for all seqs
+    // 2. Collect valid block tables and calculate max_num_blocks
+    struct ValidBlockTable {
+        const std::vector<int>* bt_ptr;
+    };
+    std::vector<ValidBlockTable> valid_tables;
+
+    max_num_blocks = 0;
+    
+    // Iterate in sp_idx order as per Python implementation
+    for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
+        for (auto* seq : dp_sp_seqs[sp_idx]) {
+            const auto& bt = seq->block_table(engine_id, sp_rank);
+            if (!bt.empty()) {
+                valid_tables.push_back({&bt});
+                if ((int)bt.size() > max_num_blocks) {
+                    max_num_blocks = (int)bt.size();
+                }
+            }
+        }
+    }
+
+    // 3. Fill flattened table: [num_valid_seqs, max_num_blocks]
+    if (valid_tables.empty()) {
+        block_tables_flat.clear();
+        max_num_blocks = 0;
+        return;
+    }
+
+    size_t total_size = valid_tables.size() * max_num_blocks;
+    block_tables_flat.assign(total_size, -1);
+
+    for (size_t i = 0; i < valid_tables.size(); ++i) {
+        const auto& bt = *valid_tables[i].bt_ptr;
+        size_t base_offset = i * max_num_blocks;
+        for (size_t k = 0; k < bt.size(); ++k) {
+            block_tables_flat[base_offset + k] = bt[k];
+        }
+    }
+}
+
+static void build_block_tables_sparse(
+    const std::vector<Sequence*>& dp_seqs,
+    const std::string& engine_id,
+    int sp_rank,
+    int sp_size,
+    int max_num_seqs,
+    std::vector<int>& block_tables_flat,
+    int& max_num_blocks
+) {
+     // 1. Group sequences by master_sp_idx
+    std::vector<std::vector<Sequence*>> dp_sp_seqs(sp_size);
+    for (auto* seq : dp_seqs) {
+        int m_sp = seq->block_ctx(engine_id).master_sp_idx;
+        if (m_sp >= 0 && m_sp < sp_size) {
+            dp_sp_seqs[m_sp].push_back(seq);
+        }
+    }
+
+    // 2. Calculate max_num_blocks
     max_num_blocks = 0;
     for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
         for (auto* seq : dp_sp_seqs[sp_idx]) {
@@ -38,12 +95,11 @@ static void build_block_tables(
 
     for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
         const auto& seqs = dp_sp_seqs[sp_idx];
-        size_t num_seqs_in_sp = seqs.size();
         
         for (int seq_id = 0; seq_id < max_num_seqs; ++seq_id) {
             size_t base_offset = ((size_t)sp_idx * max_num_seqs + seq_id) * max_num_blocks;
             
-            if (seq_id < (int)num_seqs_in_sp) {
+            if (seq_id < (int)seqs.size()) {
                 Sequence* seq = seqs[seq_id];
                 const auto& bt = seq->block_table(engine_id, sp_rank);
                 for (size_t i = 0; i < bt.size(); ++i) {
@@ -72,7 +128,6 @@ PrefillMetadata prepare_prefill_cpp(
     meta.slot_mapping.reserve(est_tokens);
 
     for (auto* seq : seqs) {
-        // Filter by master_sp_rank
         if (seq->block_ctx(engine_id).master_sp_idx != sp_rank) {
              continue; 
         }
@@ -82,7 +137,6 @@ PrefillMetadata prepare_prefill_cpp(
         int seqlen_q = seqlen - num_cached;
         int seqlen_k = seqlen;
 
-        // [FIXED] Always append input_ids/positions FIRST, regardless of block table state.
         const auto& full_tokens = seq->token_ids;
         for (int i = num_cached; i < seqlen; ++i) {
             meta.input_ids.push_back(full_tokens[i]);
@@ -94,14 +148,11 @@ PrefillMetadata prepare_prefill_cpp(
         meta.max_seqlen_q = std::max(meta.max_seqlen_q, seqlen_q);
         meta.max_seqlen_k = std::max(meta.max_seqlen_k, seqlen_k);
 
-        // [FIXED] Check for empty block table (Warmup case) AFTER processing tokens.
-        // If empty, we just skip slot mapping calculation.
         const auto& bt = seq->block_table(engine_id, sp_rank);
         if (bt.empty()) {
             continue; 
         }
 
-        // Calculate slot mapping
         int num_blocks = seq->num_blocks(engine_id, sp_rank);
         int num_cached_blocks = seq->num_cached_blocks();
         
@@ -120,8 +171,9 @@ PrefillMetadata prepare_prefill_cpp(
 
     if (meta.cu_seqlens_k.back() > meta.cu_seqlens_q.back()) {
         meta.use_block_tables = true;
-        build_block_tables(seqs, engine_id, sp_rank, sp_size, max_num_seqs, 
-                           meta.block_tables_flat, meta.max_num_blocks);
+        // Prefill currently seems to use the sparse format in Python wrapper
+        build_block_tables_sparse(seqs, engine_id, sp_rank, sp_size, max_num_seqs, 
+                                  meta.block_tables_flat, meta.max_num_blocks);
     }
 
     return meta;
@@ -137,7 +189,16 @@ DecodeMetadata prepare_decode_cpp(
 ) {
     DecodeMetadata meta;
     
-    // 1. Prepare input_ids, positions, slot_mapping 
+    // 1. Group sequences
+    std::vector<std::vector<Sequence*>> sp_seqs(sp_size);
+    for (auto* seq : dp_seqs) {
+        int m_sp = seq->block_ctx(engine_id).master_sp_idx;
+        if (m_sp >= 0 && m_sp < sp_size) {
+            sp_seqs[m_sp].push_back(seq);
+        }
+    }
+
+    // 2. Prepare input_ids, positions, slot_mapping (Local SP Rank)
     for (auto* seq : dp_seqs) {
         if (seq->block_ctx(engine_id).master_sp_idx == sp_rank) {
             meta.input_ids.push_back(seq->last_token);
@@ -149,32 +210,33 @@ DecodeMetadata prepare_decode_cpp(
         }
     }
 
-    // 2. Prepare context_lens
+    // 3. Prepare context_lens and global_context_lens
     meta.context_lens_flat.assign(sp_size * max_num_seqs, 0);
     meta.global_context_lens_flat.assign(sp_size * max_num_seqs, 0);
 
-    // Group sequences
-    std::vector<std::vector<Sequence*>> sp_seqs(sp_size);
-    for (auto* seq : dp_seqs) {
-        int m_sp = seq->block_ctx(engine_id).master_sp_idx;
-        if (m_sp >= 0 && m_sp < sp_size) {
-            sp_seqs[m_sp].push_back(seq);
-        }
-    }
+    // To track valid request counts per SP
+    std::vector<int> sp_valid_request_counts(sp_size, 0);
 
-    // Fill context_lens
+    // context_lens
     for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
         const auto& batch_seqs = sp_seqs[sp_idx];
         for (int seq_id = 0; seq_id < max_num_seqs; ++seq_id) {
             if (seq_id < (int)batch_seqs.size()) {
                 Sequence* seq = batch_seqs[seq_id];
-                meta.context_lens_flat[sp_idx * max_num_seqs + seq_id] = 
-                    seq->context_len(engine_id, sp_rank);
+                int ctx_len = seq->context_len(engine_id, sp_rank);
+                meta.context_lens_flat[sp_idx * max_num_seqs + seq_id] = ctx_len;
+                
+                if (ctx_len > 0) {
+                    meta.context_lens_for_attn.push_back(ctx_len);
+                    sp_valid_request_counts[sp_idx]++;
+                }
             }
         }
     }
+    meta.attention_compute_bs = 0;
+    for(int c : sp_valid_request_counts) meta.attention_compute_bs += c;
     
-    // Fill global_context_lens
+    // global_context_lens
     const auto& my_master_seqs = sp_seqs[sp_rank];
     for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
         for (int seq_id = 0; seq_id < max_num_seqs; ++seq_id) {
@@ -186,9 +248,67 @@ DecodeMetadata prepare_decode_cpp(
         }
     }
 
-    // 3. Block tables
-    build_block_tables(dp_seqs, engine_id, sp_rank, sp_size, max_num_seqs, 
-                       meta.block_tables_flat, meta.max_num_blocks);
+    // 4. Calculate q_slice_get
+    // Indices of sequences in the current sp_rank that have context_len > 0
+    for (int seq_id = 0; seq_id < (int)sp_seqs[sp_rank].size(); ++seq_id) {
+        // Access via flat array we just filled
+        if (meta.context_lens_flat[sp_rank * max_num_seqs + seq_id] > 0) {
+            meta.q_slice_get.push_back(seq_id);
+        }
+    }
+
+    // 5. Calculate q_slice_fill, res_slice_get_to_buffer_output
+    int current_pos = 0;
+    for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
+        if (sp_idx == sp_rank) {
+            for (size_t i = 0; i < meta.q_slice_get.size(); ++i) {
+                meta.q_slice_fill.push_back(current_pos + i);
+            }
+            current_pos += sp_valid_request_counts[sp_idx];
+        } else {
+            current_pos += sp_valid_request_counts[sp_idx];
+        }
+    }
+    
+    // q_copy_mask is just 1s
+    meta.q_copy_mask.assign(meta.q_slice_get.size(), 1);
+
+    // res_slice_get_to_buffer_output is same as q_slice_fill
+    meta.res_slice_get_to_buffer_output = meta.q_slice_fill;
+
+    // 6. Calculate res_slice_fill_to_buffer_output
+    for (int seq_idx : meta.q_slice_get) {
+        meta.res_slice_fill_to_buffer_output.push_back(sp_rank * max_num_seqs + seq_idx);
+    }
+    
+    // res_to_buffer_output_mask is 1s
+    meta.res_to_buffer_output_mask.assign(meta.res_slice_get_to_buffer_output.size(), 1);
+
+    // 7. Calculate res_slice_get_to_buffer_input, res_slice_fill_to_buffer_input
+    int current_attention_pos = 0;
+    for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
+        if (sp_idx == sp_rank) {
+             current_attention_pos += sp_valid_request_counts[sp_idx];
+             continue;
+        }
+
+        const auto& batch_seqs = sp_seqs[sp_idx];
+        for (int seq_id = 0; seq_id < (int)batch_seqs.size(); ++seq_id) {
+             // check context len
+             if (meta.context_lens_flat[sp_idx * max_num_seqs + seq_id] > 0) {
+                 meta.res_slice_get_to_buffer_input.push_back(current_attention_pos);
+                 meta.res_slice_fill_to_buffer_input.push_back(sp_idx * max_num_seqs + seq_id);
+                 current_attention_pos++;
+             }
+        }
+    }
+    
+    // res_to_buffer_input_mask is 1s
+    meta.res_to_buffer_input_mask.assign(meta.res_slice_get_to_buffer_input.size(), 1);
+
+    // 8. Block tables (Packed format for decode)
+    build_block_tables_packed(dp_seqs, engine_id, sp_rank, sp_size, 
+                              meta.block_tables_flat, meta.max_num_blocks);
 
     return meta;
 }
