@@ -91,9 +91,17 @@ class ModelRunner:
 
         if sp_size > 1:
             sp_rank = get_dist_context().attn_sp_rank
+            max_head_dim = 0
+            if self.config.hf_config.num_key_value_heads > 1:
+                max_head_dim = self.config.hf_config.head_dim
+            else:
+                max_head_dim = (
+                    self.config.hf_config.kv_lora_rank
+                    + self.config.hf_config.qk_rope_head_dim
+                )
             set_sp_context(
                 config.max_num_seqs,
-                hf_config.head_dim,
+                max_head_dim,
                 hf_config.num_attention_heads,
                 torch.get_default_dtype(),
                 sp_size,
@@ -140,17 +148,6 @@ class ModelRunner:
 
             deep_ep.Buffer.num_sms = 16
             dist.barrier(group=get_dist_context().cuda_world_group)
-
-        if sp_size > 1:
-            sp_rank = get_dist_context().attn_sp_rank
-            set_sp_context(
-                config.max_num_seqs,
-                hf_config.head_dim,
-                hf_config.num_attention_heads,
-                torch.get_default_dtype(),
-                sp_size,
-                sp_rank,
-            )
 
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
