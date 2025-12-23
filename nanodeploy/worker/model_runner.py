@@ -29,8 +29,16 @@ from nanodeploy.worker.sp_context import set_sp_context
 
 logger = get_logger()
 
-_USING_CPP_UTILS = False
-
+if get_use_cpp_model_runner():
+    try:
+        from nanodeploy._cpp import prepare_prefill_cpp, prepare_decode_cpp
+        _USING_CPP_UTILS = True
+        logger.info("ModelRunner using C++ backend utils.")
+    except ImportError as e:
+        logger.warning(f"C++ model runner utils requested but not available: {e}. Falling back to Python.")
+        _USING_CPP_UTILS = False
+else:
+    _USING_CPP_UTILS = False
 
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
