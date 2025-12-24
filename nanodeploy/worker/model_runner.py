@@ -531,6 +531,10 @@ class ModelRunner:
             meta.res_to_buffer_input_mask, max_num_send_recv_seqs, 0
         )
 
+        q_output_stride = torch.tensor(
+            meta.q_output_stride, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
         # 6. 设置 Context
         set_context(
             False, # is_prefill
@@ -554,6 +558,7 @@ class ModelRunner:
             res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             attention_compute_bs=meta.attention_compute_bs,
+            q_output_stride=q_output_stride,
         )
 
         return input_ids, positions

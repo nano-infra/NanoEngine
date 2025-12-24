@@ -233,6 +233,8 @@ DecodeMetadata prepare_decode_cpp(
             }
         }
     }
+    meta.q_output_stride = sp_valid_request_counts;
+
     meta.attention_compute_bs = 0;
     for(int c : sp_valid_request_counts) meta.attention_compute_bs += c;
     

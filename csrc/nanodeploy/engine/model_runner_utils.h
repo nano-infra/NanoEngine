@@ -50,6 +50,8 @@ struct DecodeMetadata {
     std::vector<int> res_to_buffer_input_mask;
 
     int attention_compute_bs = 0;
+
+    std::vector<int> q_output_stride;
 };
 
 PrefillMetadata prepare_prefill_cpp(
