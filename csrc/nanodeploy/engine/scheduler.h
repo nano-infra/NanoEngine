@@ -1,9 +1,11 @@
 #pragma once
 #include "sequence.h"
 #include "sp_state_manager.h"
+#include "thread_pool.h"
 #include <deque>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -12,6 +14,34 @@ namespace nanodeploy {
 
 // Forward declaration
 class MetricsManager;
+
+// Result of a single scheduling step.
+// This struct is returned by `schedule()` and summarizes which sequences
+// should be executed on each data-parallel (DP) worker (and, if applicable,
+// on each sequence-parallel (SP) shard) for the current iteration.
+struct ScheduleResult {
+    // Sequences scheduled per DP worker for this step.
+    // Outer index: DP worker index.
+    // Inner vector: sequences assigned to that DP worker.
+    std::vector<std::vector<std::shared_ptr<Sequence>>> dp_seqs;
+
+    // Sequences laid out per (DP, SP) shard for this step.
+    // Outer index: DP worker index.
+    // Inner vector: sequences assigned to that DP worker after applying
+    // sequence-parallel (SP) partitioning / layout.
+    std::vector<std::vector<std::shared_ptr<Sequence>>> dp_sp_seqs;
+
+    // Filtered subset of `dp_sp_seqs` that will actually be executed in this
+    // iteration (for example, after removing finished / paused sequences or
+    // enforcing per-step limits on tokens or sequences).
+    // Same indexing convention as `dp_sp_seqs`.
+    std::vector<std::vector<std::shared_ptr<Sequence>>> filtered_dp_sp_seqs;
+
+    // Indicates whether this scheduling step is a prefill step (true) or a
+    // decode step (false). Callers can use this to select the appropriate
+    // execution path.
+    bool                                                is_prefill;
+};
 
 class Scheduler {
 public:
@@ -30,13 +60,13 @@ public:
     void add(std::shared_ptr<Sequence> seq);
 
     // Main scheduling functions
-    std::pair<std::vector<std::vector<std::shared_ptr<Sequence>>>, bool> schedule();
+    ScheduleResult schedule();
 
     // Postprocessing
     void postprocess(
-        const std::vector<std::vector<std::vector<std::shared_ptr<Sequence>>>>& dp_seqs,
-        const std::vector<std::vector<std::vector<std::vector<int>>>>&          dp_token_ids,
-        bool                                                                     update_metrics = true);
+        const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+        const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+        bool                                                       update_metrics = true);
 
     // State queries
     bool is_finished() const;
@@ -84,6 +114,8 @@ private:
     std::string                mode_;
 
     int dp_rr_counter_ = 0;
+
+    std::unique_ptr<ThreadPool> thread_pool_;
 };
 
 }  // namespace nanodeploy
