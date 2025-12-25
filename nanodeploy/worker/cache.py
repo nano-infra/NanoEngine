@@ -1,6 +1,5 @@
 import dataclasses
 from collections import defaultdict
-from copy import deepcopy
 from typing import Literal
 
 import dlslime
