@@ -1017,7 +1017,7 @@ class ModelRunner:
         sp_world_size = get_dist_context().attn_sp_world_size
         config = self.config
         hf_config = config.hf_config
-        # assert config.max_attention_comp_seqs > config.max_num_seqs
+        max_attention_comp_seqs = config.max_num_seqs + config.max_num_recv_seqs
         hf_config.max_position_embeddings = max(
             config.max_model_len, hf_config.max_position_embeddings
         )
@@ -1028,14 +1028,14 @@ class ModelRunner:
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens_for_attn = torch.zeros(
-            config.max_attention_comp_seqs, dtype=torch.int32
+            max_attention_comp_seqs, dtype=torch.int32
         )
         context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         q_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         res_lse_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         block_tables = torch.zeros(
-            config.max_attention_comp_seqs, max_num_blocks, dtype=torch.int32
+            max_attention_comp_seqs, max_num_blocks, dtype=torch.int32
         )
         max_num_send_recv_seqs = max(config.max_num_send_seqs, config.max_num_recv_seqs)
         q_slice_get = torch.full((max_bs,), -1, dtype=torch.int32)
@@ -1057,7 +1057,7 @@ class ModelRunner:
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_master_rank_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graph_attn_compute_bs = [1, 2, 4, 8] + list(
-            range(16, config.max_attention_comp_seqs + 1, 16)
+            range(16, max_attention_comp_seqs + 1, 16)
         )
         self.graphs = {}
         self.graph_pool = None
