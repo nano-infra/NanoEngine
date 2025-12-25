@@ -19,6 +19,7 @@ class Context:
     max_seqlen_k: int = 0
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
+    context_lens_for_attn: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
 
     global_context_lens: torch.Tensor | None = None
@@ -48,6 +49,7 @@ def set_context(
     max_seqlen_k: int = 0,
     slot_mapping: Optional[torch.Tensor] = None,
     context_lens: torch.Tensor | None = None,
+    context_lens_for_attn: torch.Tensor | None = None,
     block_tables: Optional[torch.Tensor] = None,
     global_context_lens: Optional[torch.Tensor] = None,
     q_mask: Optional[torch.Tensor] = None,
@@ -64,6 +66,7 @@ def set_context(
         max_seqlen_k,
         slot_mapping,
         context_lens,
+        context_lens_for_attn,
         block_tables,
         global_context_lens,
         q_mask=q_mask,

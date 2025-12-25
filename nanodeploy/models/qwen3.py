@@ -69,6 +69,8 @@ class Qwen3Attention(nn.Module):
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
+            self.head_dim,
+            "GQA",
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)

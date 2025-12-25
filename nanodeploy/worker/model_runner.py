@@ -31,13 +31,11 @@ logger = get_logger()
 if get_use_cpp_model_runner():
     try:
         from nanodeploy._cpp import prepare_prefill_cpp, prepare_decode_cpp
-        _USING_CPP_UTILS = True
         logger.info("ModelRunner using C++ backend utils.")
     except ImportError as e:
         logger.warning(f"C++ model runner utils requested but not available: {e}. Falling back to Python.")
-        _USING_CPP_UTILS = False
-else:
-    _USING_CPP_UTILS = False
+
+_USING_CPP_UTILS = False
 
 
 architectures = {
@@ -244,47 +242,87 @@ class ModelRunner:
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
+    # def prepare_block_tables(self, dp_seqs: list[Sequence]):
+    #     sp_size = get_dist_context().attn_sp_world_size
+    #     sp_rank = get_dist_context().attn_sp_rank
+
+    #     dp_sp_seqs = [
+    #         [
+    #             seq
+    #             for seq in dp_seqs
+    #             if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
+    #         ]
+    #         for sp_idx in range(sp_size)
+    #     ]
+
+    #     max_num_blocks = max(
+    #         [
+    #             max([len(seq.block_table(self.engine_id, sp_rank)) for seq in seqs])
+    #             for seqs in dp_sp_seqs
+    #         ]
+    #     )
+
+    #     sp_num_seqs = [len(seqs) for seqs in dp_sp_seqs]
+
+    #     block_tables = [
+    #         [
+    #             (
+    #                 (bt := list(
+    #                     dp_sp_seqs[sp_idx][seq_id].block_table(self.engine_id, sp_rank)
+    #                 ))
+    #                 + [-1] * (max_num_blocks - len(bt))
+    #                 if seq_id < sp_num_seqs[sp_idx]
+    #                 else [-1] * max_num_blocks
+    #             )
+    #             for seq_id in range(self.config.max_num_seqs)
+    #         ]
+    #         for sp_idx in range(sp_size)
+    #     ]
+    #     # logger.info(f"{sp_rank=}, {block_tables=}")
+
+    #     block_tables = torch.tensor(
+    #         block_tables, dtype=torch.int32, pin_memory=True
+    #     ).cuda(non_blocking=True)
+
+    #     return block_tables
+
     def prepare_block_tables(self, dp_seqs: list[Sequence]):
         sp_size = get_dist_context().attn_sp_world_size
         sp_rank = get_dist_context().attn_sp_rank
 
-        dp_sp_seqs = [
-            [
+        valid_block_tables = []
+
+        for sp_idx in range(sp_size):
+            group_seqs = [
                 seq
                 for seq in dp_seqs
                 if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
             ]
-            for sp_idx in range(sp_size)
-        ]
 
-        max_num_blocks = max(
-            [
-                max([len(seq.block_table(self.engine_id, sp_rank)) for seq in seqs])
-                for seqs in dp_sp_seqs
-            ]
-        )
+            for seq in group_seqs:
+                bt = seq.block_table(self.engine_id, sp_rank)
+                if len(bt) > 0:
+                    valid_block_tables.append(bt)
 
-        sp_num_seqs = [len(seqs) for seqs in dp_sp_seqs]
+        if not valid_block_tables:
+            max_num_blocks = 0
+        else:
+            max_num_blocks = max(len(bt) for bt in valid_block_tables)
 
-        block_tables = [
-            [
-                (
-                    (bt := list(
-                        dp_sp_seqs[sp_idx][seq_id].block_table(self.engine_id, sp_rank)
-                    ))
-                    + [-1] * (max_num_blocks - len(bt))
-                    if seq_id < sp_num_seqs[sp_idx]
-                    else [-1] * max_num_blocks
-                )
-                for seq_id in range(self.config.max_num_seqs)
-            ]
-            for sp_idx in range(sp_size)
-        ]
-        # logger.info(f"{sp_rank=}, {block_tables=}")
+        final_table_data = []
+        if max_num_blocks > 0:
+            for bt in valid_block_tables:
+                padding = [-1] * (max_num_blocks - len(bt))
+                final_table_data.append(list(bt) + padding)
 
-        block_tables = torch.tensor(
-            block_tables, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+        if not final_table_data:
+            block_tables = torch.empty((0, 0), dtype=torch.int32).cuda(
+                non_blocking=True
+            )
+        else:
+            block_tables = torch.tensor(
+                final_table_data, dtype=torch.int32, pin_memory=True
+            ).cuda(non_blocking=True)
 
         return block_tables
 
@@ -381,8 +419,8 @@ class ModelRunner:
                 else:
                     end = start + seq.last_block_num_tokens(self.engine_id, sp_idx)
                 slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+        # if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
+        #     block_tables = self.prepare_block_tables_prefill(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
@@ -516,6 +554,15 @@ class ModelRunner:
             for sp_idx in range(sp_size)
         ]
 
+        context_lens_for_attn = []
+
+        for sp_idx in range(sp_size):
+            current_sp_num = sp_num_seqs[sp_idx]
+            for seq_id in range(current_sp_num):
+                ctx_len = sp_seqs[sp_idx][seq_id].context_len(self.engine_id, sp_rank)
+                if ctx_len > 0:
+                    context_lens_for_attn.append(ctx_len)
+
         global_context_lens = [
             [
                 (
@@ -542,6 +589,9 @@ class ModelRunner:
         context_lens = torch.tensor(
             context_lens, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+        context_lens_for_attn = torch.tensor(
+            context_lens_for_attn, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
         global_context_lens = torch.tensor(
             global_context_lens, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
@@ -557,6 +607,7 @@ class ModelRunner:
             self.config.max_num_seqs,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
+            context_lens_for_attn=context_lens_for_attn,
             block_tables=block_tables,
             global_context_lens=global_context_lens,
             q_mask=q_mask,
@@ -643,9 +694,13 @@ class ModelRunner:
             graph_vars["q_mask"].copy_(context.q_mask)  # type: ignore
             graph_vars["res_lse_mask"].zero_()
             graph_vars["res_lse_mask"].copy_(context.res_lse_mask)  # type: ignore
+            graph_vars["block_tables"].zero_()
             graph_vars["block_tables"][
-                :, :, : context.block_tables.size(2)  # type: ignore
+                : context.block_tables.size(0), : context.block_tables.size(1)
             ] = context.block_tables
+            graph_vars["context_lens_for_attn"].zero_()
+            graph_vars["context_lens_for_attn"][: context.context_lens_for_attn.shape[0]].copy_(context.context_lens_for_attn)
+
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -752,12 +807,15 @@ class ModelRunner:
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens_for_attn = torch.zeros(
+            config.max_attention_comp_seqs, dtype=torch.int32
+        )
         context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         q_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         res_lse_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         block_tables = torch.zeros(
-            sp_world_size, max_bs, max_num_blocks, dtype=torch.int32
+            config.max_attention_comp_seqs, max_num_blocks, dtype=torch.int32
         )
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
@@ -775,6 +833,7 @@ class ModelRunner:
                 global_context_lens=global_context_lens,
                 q_mask=q_mask,
                 res_lse_mask=res_lse_mask,
+                context_lens_for_attn=context_lens_for_attn,
             )
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
@@ -796,4 +855,5 @@ class ModelRunner:
             outputs=outputs,
             q_mask=q_mask,
             res_lse_mask=res_lse_mask,
+            context_lens_for_attn=context_lens_for_attn,
         )

@@ -14,9 +14,7 @@ from torch import nn
 
 logger = get_logger()
 
-
-class Attention(nn.Module):
-
+class FlashAttentionImpl:
     def __init__(
         self,
         num_heads,
@@ -29,11 +27,16 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        self.k_cache = self.v_cache = torch.tensor([])
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ):
         context = get_context()
-        k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel() and not get_context().is_dummy:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         sp_rank = get_dist_context().attn_sp_rank
@@ -73,8 +76,8 @@ class Attention(nn.Module):
                 context_lens = context.context_lens.view(-1)
                 block_tables = context.block_tables.view(sp_size * max_num_seqs, -1)
             else:
-                context_lens = context.context_lens[sp_rank][:bs]
-                block_tables = context.block_tables[sp_rank][:bs]
+                context_lens_for_attn = context.context_lens_for_attn[: bs]
+                block_tables = context.block_tables[: bs]
 
             o, lse = flash_attn_with_kvcache(
                 q.unsqueeze(1),
@@ -145,3 +148,38 @@ class Attention(nn.Module):
                 ).view([max_num_seqs, num_head, head_dim])[:bs]
 
         return o
+
+class Attention(nn.Module):
+
+    def __init__(
+        self,
+        num_heads,
+        head_dim,
+        scale,
+        num_kv_heads,
+        v_head_dim,
+        attention_type: str = "GQA",
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.forward_method = None
+
+        if attention_type == "MLA":
+            raise NotImplementedError("MLA attention is not implemented yet.")
+        elif attention_type == "GQA":
+            self.impl = FlashAttentionImpl(
+                num_heads,
+                head_dim,
+                scale,
+                num_kv_heads,
+            )
+        else:
+            raise ValueError(f"Unknown attention type: {attention_type}")
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        """forward."""
+        return self.impl.forward(q, k, v, self.k_cache, self.v_cache)
