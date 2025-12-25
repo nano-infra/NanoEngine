@@ -88,8 +88,6 @@ Sequence::Sequence(const std::vector<int>& token_ids, double temperature, int ma
     this->token_ids.reserve(max_tokens);
     this->token_ids = token_ids;
 
-    this->token_ids = token_ids;
-
     seq_id     = next_seq_id_.fetch_add(1);
     status     = SequenceStatus::WAITING;
     num_tokens = static_cast<int>(token_ids.size());
