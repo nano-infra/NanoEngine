@@ -12,7 +12,7 @@ from transformers import AutoTokenizer
 from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.config import Config
 from nanodeploy.engine.ray_executor import RayExecutor
-from nanodeploy.engine.scheduler import RoutingStrategy, Scheduler
+from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.metrics import MetricsManager
