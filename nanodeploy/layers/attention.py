@@ -73,9 +73,14 @@ class FlashAttentionImpl:
                     context.q_copy_mask,
                 )
 
+                # Compute offsets from q_output_stride for contiguous layout
+                q_offsets = torch.zeros(sp_size + 1, dtype=torch.int32, device=context.q_output_stride.device)
+                q_offsets[1:] = torch.cumsum(context.q_output_stride, dim=0)
+
                 q = q_buffer.all_to_all_ll(
                     q.view([bs, -1]),
                     mask=context.q_mask,
+                    offsets=q_offsets,
                 ).view([sp_size * max_num_seqs, num_head, head_dim])
 
                 q = q[: context.attention_compute_bs]

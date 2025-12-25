@@ -233,7 +233,25 @@ DecodeMetadata prepare_decode_cpp(
             }
         }
     }
-    meta.q_output_stride = sp_valid_request_counts;
+    
+    // Calculate q_output_stride (res_rank_start_loc)
+    std::vector<int> res_rank_start_loc(sp_size, 0);
+    for (int target_rank = 0; target_rank < sp_size; ++target_rank) {
+        int offset = 0;
+        
+        // 遍历所有在当前 rank 之前的 sender rank
+        for (int sender_rank = 0; sender_rank < sp_rank; ++sender_rank) {
+            // 统计 sender_rank 发送给 target_rank 的有效请求数
+            for (Sequence* seq : sp_seqs[target_rank]) {
+                if (seq->context_len(engine_id, sender_rank) > 0) {
+                    offset++;
+                }
+            }
+        }
+        
+        res_rank_start_loc[target_rank] = offset;
+    }
+    meta.q_output_stride = res_rank_start_loc;
 
     meta.attention_compute_bs = 0;
     for(int c : sp_valid_request_counts) meta.attention_compute_bs += c;
