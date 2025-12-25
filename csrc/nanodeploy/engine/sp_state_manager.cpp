@@ -184,7 +184,9 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
     int   master_sp_idx = block_ctx.master_sp_idx_;
     block_ctx.sp_block_table.clear();
     block_ctx.block_location.clear();
-    memset(block_ctx.num_dispatched_tokens.data(), 0, sizeof(int) * attention_sp_);
+    std::fill(block_ctx.num_dispatched_tokens.begin(),
+              block_ctx.num_dispatched_tokens.end(),
+              0);
 
     num_running_seqs_--;
     num_running_tokens_ -= seq.num_tokens;
