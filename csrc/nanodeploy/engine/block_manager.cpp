@@ -7,7 +7,7 @@
 
 namespace nanodeploy {
 
-BlockManager::BlockManager(const std::optional<std::string>& engine_id, int sp_idx, int num_blocks, int block_size):
+BlockManager::BlockManager(const std::string& engine_id, int sp_idx, int num_blocks, int block_size):
     engine_id_(engine_id), sp_idx_(sp_idx), block_size_(block_size)
 {
 
@@ -97,8 +97,8 @@ void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
             block_id = hash_to_block_id_.at(h);
         }
 
-        if (block_id == -1 || blocks_[block_id].token_ids.size() != view.second ||
-            !std::equal(blocks_[block_id].token_ids.begin(), blocks_[block_id].token_ids.end(), view.first)) {
+        if (block_id == -1 || blocks_[block_id].token_ids.size() != view.second
+            || !std::equal(blocks_[block_id].token_ids.begin(), blocks_[block_id].token_ids.end(), view.first)) {
             cache_miss = true;
         }
 

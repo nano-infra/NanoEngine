@@ -16,11 +16,11 @@ namespace nanodeploy {
 class SequenceMetric;
 
 struct BlockContext {
-    std::optional<std::string> engine_id;
-    int                        dp_idx        = -1;
-    int                        master_sp_idx = 0;
-    int                        attention_sp  = 1;
-    int                        attention_dp  = 1;
+    std::string engine_id;
+    int         dp_idx        = -1;
+    int         master_sp_idx = 0;
+    int         attention_sp  = 1;
+    int         attention_dp  = 1;
 
     // Wrapper container types.
     //
@@ -48,11 +48,10 @@ struct BlockContext {
     std::vector<int> num_dispatched_tokens;
 
     BlockContext() = default;
-    BlockContext(
-        const std::optional<std::string>& engine_id, int dp_idx, int master_sp_idx, int attention_sp, int attention_dp);
+    BlockContext(const std::string& engine_id, int dp_idx, int master_sp_idx, int attention_sp, int attention_dp);
 
     // For pickle
-    std::tuple<std::optional<std::string>,
+    std::tuple<std::string,
                int,
                int,
                int,
@@ -62,7 +61,7 @@ struct BlockContext {
                std::vector<int>>
     getstate() const;
 
-    static BlockContext setstate(const std::tuple<std::optional<std::string>,
+    static BlockContext setstate(const std::tuple<std::string,
                                                   int,
                                                   int,
                                                   int,
@@ -94,41 +93,38 @@ class Sequence {
 public:
     static constexpr int block_size = 256;
 
-    Sequence(const std::vector<int>&           token_ids,
-             double                            temperature    = 1.0,
-             int                               max_tokens     = 256,
-             bool                              ignore_eos     = false,
-             const std::optional<std::string>& engine_id      = std::nullopt,
-             int                               master_sp_rank = 0);
+    Sequence(const std::vector<int>& token_ids,
+             double                  temperature    = 1.0,
+             int                     max_tokens     = 256,
+             bool                    ignore_eos     = false,
+             const std::string&      engine_id      = "",
+             int                     master_sp_rank = 0);
 
     // Core methods
     void set_engine_id(const std::string& engine_id, int attention_dp = 1, int attention_sp = 1);
 
-    int context_len(const std::optional<std::string>& engine_id = std::nullopt,
-                    std::optional<int>                sp_idx    = std::nullopt);
+    int context_len(const std::string& engine_id = "", std::optional<int> sp_idx = std::nullopt);
 
-    void append_token(int                               token_id,
-                      const std::optional<std::string>& engine_id = std::nullopt,
-                      std::optional<int>                sp_idx    = std::nullopt);
+    void append_token(int token_id, const std::string& engine_id = "", std::optional<int> sp_idx = std::nullopt);
 
     // Block related methods
-    int num_blocks(const std::optional<std::string>& engine_id, int sp_idx);
-    int last_block_page_id(const std::optional<std::string>& engine_id, int sp_idx);
-    int last_block_num_tokens(const std::optional<std::string>& engine_id, int sp_idx);
+    int num_blocks(const std::string& engine_id, int sp_idx);
+    int last_block_page_id(const std::string& engine_id, int sp_idx);
+    int last_block_num_tokens(const std::string& engine_id, int sp_idx);
     // Returns a pointer/size view into the internal token storage for block `i`.
     // The returned pointer is valid only as long as the underlying storage is not
     // modified in a way that can reallocate or invalidate the buffer (e.g., appending
     // tokens to the same sequence). Callers MUST NOT store this pointer beyond the
     // duration in which they can guarantee no such modifications occur.
-    std::pair<const int*, size_t> block_view(int i, const std::optional<std::string>& engine_id, int sp_idx) const;
-    std::vector<int>              block(int i, const std::optional<std::string>& engine_id, int sp_idx);
+    std::pair<const int*, size_t> block_view(int i, const std::string& engine_id, int sp_idx) const;
+    std::vector<int>              block(int i, const std::string& engine_id, int sp_idx);
 
     // Accessors
-    BlockContext&              block_ctx(const std::optional<std::string>& engine_id = std::nullopt);
-    const BlockContext&        block_ctx(const std::optional<std::string>& engine_id = std::nullopt) const;
-    BlockContext::BlockIdList& block_table(const std::optional<std::string>& engine_id = std::nullopt, int sp_idx = 0);
+    BlockContext&              block_ctx(const std::string& engine_id);
+    const BlockContext&        block_ctx(const std::string& engine_id) const;
+    BlockContext::BlockIdList& block_table(const std::string& engine_id, int sp_idx = 0);
 
-    int dp_idx(const std::optional<std::string>& engine_id);
+    int dp_idx(const std::string& engine_id);
 
     // Properties
     bool is_finished() const
@@ -181,9 +177,9 @@ public:
     int              num_checkpointed_tokens;
     int              num_cached_tokens = 0;
 
-    std::optional<std::string> backup_engine_id;
-    std::optional<std::string> active_engine_id;
-    using BlockCtxMap = std::unordered_map<std::optional<std::string>, BlockContext, OptionalStringHash>;
+    std::string backup_engine_id;
+    std::string active_engine_id;
+    using BlockCtxMap = std::unordered_map<std::string, BlockContext, OptionalStringHash>;
     BlockCtxMap block_ctx_map;
 
     std::shared_ptr<SequenceMetric> metric;

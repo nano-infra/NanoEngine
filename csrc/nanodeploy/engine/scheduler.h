@@ -40,21 +40,21 @@ struct ScheduleResult {
     // Indicates whether this scheduling step is a prefill step (true) or a
     // decode step (false). Callers can use this to select the appropriate
     // execution path.
-    bool                                                is_prefill;
+    bool is_prefill;
 };
 
 class Scheduler {
 public:
-    Scheduler(const std::optional<std::string>& engine_id,
-              int                                loop_count,
-              int                                max_num_seqs,
-              int                                max_num_batched_tokens,
-              int                                eos,
-              int                                attention_dp,
-              int                                attention_sp,
-              int                                num_kvcache_blocks,
-              int                                kvcache_block_size,
-              const std::string&                 mode);
+    Scheduler(const std::string& engine_id,
+              int                loop_count,
+              int                max_num_seqs,
+              int                max_num_batched_tokens,
+              int                eos,
+              int                attention_dp,
+              int                attention_sp,
+              int                num_kvcache_blocks,
+              int                kvcache_block_size,
+              const std::string& mode);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -63,10 +63,9 @@ public:
     ScheduleResult schedule();
 
     // Postprocessing
-    void postprocess(
-        const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
-        const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
-        bool                                                       update_metrics = true);
+    void postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+                     const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+                     bool                                                       update_metrics = true);
 
     // State queries
     bool is_finished() const;
@@ -79,17 +78,17 @@ public:
     void free_to_be_migrated(const std::vector<std::shared_ptr<Sequence>>& seqs);
 
     // Access to running sequences
-    std::deque<std::shared_ptr<Sequence>>& running(int dp_idx);
+    std::deque<std::shared_ptr<Sequence>>&       running(int dp_idx);
     const std::deque<std::shared_ptr<Sequence>>& running(int dp_idx) const;
 
     // Access to block managers
-    std::unordered_map<int, std::shared_ptr<BlockManager>>& block_manager(int dp_idx);
+    std::unordered_map<int, std::shared_ptr<BlockManager>>&       block_manager(int dp_idx);
     const std::unordered_map<int, std::shared_ptr<BlockManager>>& block_manager(int dp_idx) const;
 
     // Public members exposed to Python
-    std::deque<std::shared_ptr<Sequence>>                waiting;
-    std::deque<std::shared_ptr<Sequence>>                waiting_migration;
-    std::vector<std::shared_ptr<SPStateManager>>         worker_state;
+    std::deque<std::shared_ptr<Sequence>>                                      waiting;
+    std::deque<std::shared_ptr<Sequence>>                                      waiting_migration;
+    std::vector<std::shared_ptr<SPStateManager>>                               worker_state;
     std::unordered_map<std::string, std::pair<std::shared_ptr<Sequence>, int>> to_be_migrated;
 
     // Configuration
@@ -104,14 +103,14 @@ private:
     int next_dp_idx();
 
     // Configuration
-    std::optional<std::string> engine_id_;
-    int                        loop_count_;
-    int                        max_num_seqs_;
-    int                        max_num_batched_tokens_;
-    int                        eos_;
-    int                        attention_dp_;
-    int                        attention_sp_;
-    std::string                mode_;
+    std::string engine_id_;
+    int         loop_count_;
+    int         max_num_seqs_;
+    int         max_num_batched_tokens_;
+    int         eos_;
+    int         attention_dp_;
+    int         attention_sp_;
+    std::string mode_;
 
     int dp_rr_counter_ = 0;
 

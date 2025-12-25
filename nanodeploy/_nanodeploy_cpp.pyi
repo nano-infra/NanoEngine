@@ -70,26 +70,19 @@ class Block:
 
 class BlockContext:
     block_location: BlockLocationList
-    engine_id: str | None
+    engine_id: str
     sp_block_table: DefaultListDict
     def __getstate__(
         self,
     ) -> tuple[
-        str | None,
-        int,
-        int,
-        int,
-        int,
-        list[tuple[int, int]],
-        dict[int, list[int]],
-        list[int],
+        str, int, int, int, int, list[tuple[int, int]], dict[int, list[int]], list[int]
     ]: ...
     @typing.overload
     def __init__(self) -> None: ...
     @typing.overload
     def __init__(
         self,
-        engine_id: str | None,
+        engine_id: str,
         dp_idx: typing.SupportsInt,
         master_sp_idx: typing.SupportsInt,
         attention_sp: typing.SupportsInt,
@@ -98,7 +91,7 @@ class BlockContext:
     def __setstate__(
         self,
         arg0: tuple[
-            str | None,
+            str,
             typing.SupportsInt,
             typing.SupportsInt,
             typing.SupportsInt,
@@ -134,15 +127,15 @@ class BlockCtxMap:
         """
 
     @typing.overload
-    def __contains__(self, arg0: str | None) -> bool: ...
+    def __contains__(self, arg0: str) -> bool: ...
     @typing.overload
     def __contains__(self, arg0: typing.Any) -> bool: ...
-    def __delitem__(self, arg0: str | None) -> None: ...
-    def __getitem__(self, arg0: str | None) -> ...: ...
+    def __delitem__(self, arg0: str) -> None: ...
+    def __getitem__(self, arg0: str) -> ...: ...
     def __init__(self) -> None: ...
-    def __iter__(self) -> collections.abc.Iterator[str | None]: ...
+    def __iter__(self) -> collections.abc.Iterator[str]: ...
     def __len__(self) -> int: ...
-    def __setitem__(self, arg0: str | None, arg1: ...) -> None: ...
+    def __setitem__(self, arg0: str, arg1: ...) -> None: ...
     def items(self) -> typing.ItemsView: ...
     def keys(self) -> typing.KeysView: ...
     def values(self) -> typing.ValuesView: ...
@@ -380,7 +373,7 @@ class BlockManager:
     ) -> int: ...
     def __init__(
         self,
-        engine_id: str | None,
+        engine_id: str,
         sp_idx: typing.SupportsInt,
         num_blocks: typing.SupportsInt,
         block_size: typing.SupportsInt,
@@ -551,7 +544,7 @@ class SPStateManager:
     running: SequenceDeque
     def __init__(
         self,
-        engine_id: str | None,
+        engine_id: str,
         attention_sp: typing.SupportsInt,
         num_kvcache_blocks: typing.SupportsInt,
         kvcache_block_size: typing.SupportsInt,
@@ -615,7 +608,7 @@ class Scheduler:
     worker_state: SPStateManagerList
     def __init__(
         self,
-        engine_id: str | None,
+        engine_id: str,
         loop_count: typing.SupportsInt,
         max_num_seqs: typing.SupportsInt,
         max_num_batched_tokens: typing.SupportsInt,
@@ -649,8 +642,8 @@ class Scheduler:
 
 class Sequence:
     block_size: typing.ClassVar[int] = 256
-    active_engine_id: str | None
-    backup_engine_id: str | None
+    active_engine_id: str
+    backup_engine_id: str
     ignore_eos: bool
     metric: SequenceMetric
     seq_id: str
@@ -658,14 +651,14 @@ class Sequence:
     def __getitem__(self: typing.Sequence, arg0: typing.Any) -> typing.Any: ...
     def __getstate__(
         self: typing.Sequence,
-    ) -> tuple[int, int, int, str | None, str | None, list, float, list[int]]: ...
+    ) -> tuple[int, int, int, str, str, list, float, list[int]]: ...
     def __init__(
         self: typing.Sequence,
         token_ids: collections.abc.Sequence[typing.SupportsInt],
         temperature: typing.SupportsFloat = 1.0,
         max_tokens: typing.SupportsInt = 256,
         ignore_eos: bool = False,
-        engine_id: str | None = None,
+        engine_id: str = "",
         master_sp_rank: typing.SupportsInt = 0,
     ) -> None: ...
     def __len__(self: typing.Sequence) -> int: ...
@@ -675,8 +668,8 @@ class Sequence:
             typing.SupportsInt,
             typing.SupportsInt,
             typing.SupportsInt,
-            str | None,
-            str | None,
+            str,
+            str,
             list,
             typing.SupportsFloat,
             collections.abc.Sequence[typing.SupportsInt],
@@ -685,37 +678,31 @@ class Sequence:
     def append_token(
         self: typing.Sequence,
         token_id: typing.SupportsInt,
-        engine_id: str | None = None,
+        engine_id: str,
         sp_idx: typing.SupportsInt | None = None,
     ) -> None: ...
     def block(
         self: typing.Sequence,
         i: typing.SupportsInt,
-        engine_id: str | None,
+        engine_id: str,
         sp_idx: typing.SupportsInt,
     ) -> list[int]: ...
-    def block_ctx(
-        self: typing.Sequence, engine_id: str | None = None
-    ) -> BlockContext: ...
+    def block_ctx(self: typing.Sequence, engine_id: str) -> BlockContext: ...
     def block_table(
-        self: typing.Sequence,
-        engine_id: str | None = None,
-        sp_idx: typing.SupportsInt = 0,
+        self: typing.Sequence, engine_id: str, sp_idx: typing.SupportsInt = 0
     ) -> BlockIdList: ...
     def context_len(
-        self: typing.Sequence,
-        engine_id: str | None = None,
-        sp_idx: typing.SupportsInt | None = None,
+        self: typing.Sequence, engine_id: str, sp_idx: typing.SupportsInt | None = None
     ) -> int: ...
-    def dp_idx(self: typing.Sequence, engine_id: str | None) -> int: ...
+    def dp_idx(self: typing.Sequence, engine_id: str) -> int: ...
     def last_block_num_tokens(
-        self: typing.Sequence, engine_id: str | None, sp_idx: typing.SupportsInt
+        self: typing.Sequence, engine_id: str, sp_idx: typing.SupportsInt
     ) -> int: ...
     def last_block_page_id(
-        self: typing.Sequence, engine_id: str | None, sp_idx: typing.SupportsInt
+        self: typing.Sequence, engine_id: str, sp_idx: typing.SupportsInt
     ) -> int: ...
     def num_blocks(
-        self: typing.Sequence, engine_id: str | None, sp_idx: typing.SupportsInt
+        self: typing.Sequence, engine_id: str, sp_idx: typing.SupportsInt
     ) -> int: ...
     def set_engine_id(
         self: typing.Sequence,

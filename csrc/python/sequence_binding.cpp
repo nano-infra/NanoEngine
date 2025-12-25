@@ -126,7 +126,7 @@ void bind_sequence(py::module_& m)
 
     py::class_<BlockContext>(m, "BlockContext")
         .def(py::init<>())
-        .def(py::init<const std::optional<std::string>&, int, int, int, int>(),
+        .def(py::init<const std::string&, int, int, int, int>(),
              py::arg("engine_id"),
              py::arg("dp_idx"),
              py::arg("master_sp_idx"),
@@ -148,7 +148,7 @@ void bind_sequence(py::module_& m)
             [](BlockContext& self, const BlockContext::SpBlockTable& value) { self.sp_block_table = value; },
             py::return_value_policy::reference_internal)
         .def(py::pickle([](const BlockContext& p) { return p.getstate(); },
-                        [](const std::tuple<std::optional<std::string>,
+                        [](const std::tuple<std::string,
                                             int,
                                             int,
                                             int,
@@ -158,12 +158,12 @@ void bind_sequence(py::module_& m)
                                             std::vector<int>>& t) { return BlockContext::setstate(t); }));
 
     py::class_<Sequence, std::shared_ptr<Sequence>>(m, "Sequence")
-        .def(py::init<const std::vector<int>&, double, int, bool, const std::optional<std::string>&, int>(),
+        .def(py::init<const std::vector<int>&, double, int, bool, const std::string&, int>(),
              py::arg("token_ids"),
              py::arg("temperature")    = 1.0,
              py::arg("max_tokens")     = 256,
              py::arg("ignore_eos")     = false,
-             py::arg("engine_id")      = std::nullopt,
+             py::arg("engine_id")      = "",
              py::arg("master_sp_rank") = 0)
 
         .def("set_engine_id",
@@ -171,24 +171,21 @@ void bind_sequence(py::module_& m)
              py::arg("engine_id"),
              py::arg("attention_dp") = 1,
              py::arg("attention_sp") = 1)
-        .def("context_len",
-             &Sequence::context_len,
-             py::arg("engine_id") = std::nullopt,
-             py::arg("sp_idx")    = std::nullopt)
+        .def("context_len", &Sequence::context_len, py::arg("engine_id"), py::arg("sp_idx") = std::nullopt)
         .def("append_token",
              &Sequence::append_token,
              py::arg("token_id"),
-             py::arg("engine_id") = std::nullopt,
-             py::arg("sp_idx")    = std::nullopt)
+             py::arg("engine_id"),
+             py::arg("sp_idx") = std::nullopt)
 
         .def("block_ctx",
-             static_cast<BlockContext& (Sequence::*)(const std::optional<std::string>&)>(&Sequence::block_ctx),
-             py::arg("engine_id") = std::nullopt,
+             static_cast<BlockContext& (Sequence::*)(const std::string&)>(&Sequence::block_ctx),
+             py::arg("engine_id"),
              py::return_value_policy::reference_internal)
         .def("block_table",
              &Sequence::block_table,
-             py::arg("engine_id") = std::nullopt,
-             py::arg("sp_idx")    = 0,
+             py::arg("engine_id"),
+             py::arg("sp_idx") = 0,
              py::return_value_policy::reference_internal)
         .def("dp_idx", &Sequence::dp_idx, py::arg("engine_id"))
         .def("num_blocks", &Sequence::num_blocks, py::arg("engine_id"), py::arg("sp_idx"))
@@ -214,7 +211,7 @@ void bind_sequence(py::module_& m)
                     py::dict d = value.cast<py::dict>();
                     self.block_ctx_map.clear();
                     for (auto item : d) {
-                        auto eid                = item.first.cast<std::optional<std::string>>();
+                        auto eid                = item.first.cast<std::string>();
                         auto ctx                = item.second.cast<BlockContext>();
                         self.block_ctx_map[eid] = ctx;
                     }
@@ -295,8 +292,8 @@ void bind_sequence(py::module_& m)
             [](const std::tuple<int,
                                 int,
                                 int,
-                                std::optional<std::string>,
-                                std::optional<std::string>,
+                                std::string,
+                                std::string,
                                 py::list,
                                 double,
                                 std::vector<int>>& t) {  // __setstate__
@@ -330,7 +327,7 @@ void bind_sequence(py::module_& m)
                 seq->block_ctx_map.clear();  // Clear default one
                 for (auto item : block_ctx_list) {
                     auto tuple              = item.cast<py::tuple>();
-                    auto eid                = tuple[0].cast<std::optional<std::string>>();
+                    auto eid                = tuple[0].cast<std::string>();
                     auto ctx                = tuple[1].cast<BlockContext>();
                     seq->block_ctx_map[eid] = ctx;
                 }

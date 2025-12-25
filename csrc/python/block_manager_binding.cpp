@@ -19,14 +19,15 @@ void bind_block_manager(py::module_& m)
         .def_readwrite("token_ids", &Block::token_ids);
 
     py::class_<BlockManager, std::shared_ptr<BlockManager>>(m, "BlockManager")
-        .def(py::init<const std::optional<std::string>&, int, int, int>(),
+        .def(py::init<const std::string&, int, int, int>(),
              py::arg("engine_id"),
              py::arg("sp_idx"),
              py::arg("num_blocks"),
              py::arg("block_size"))
-        .def_static("compute_hash", 
-                    py::overload_cast<const std::vector<int>&, int64_t>(&BlockManager::compute_hash), 
-                    py::arg("token_ids"), py::arg("prefix") = -1)
+        .def_static("compute_hash",
+                    py::overload_cast<const std::vector<int>&, int64_t>(&BlockManager::compute_hash),
+                    py::arg("token_ids"),
+                    py::arg("prefix") = -1)
         .def("can_allocate", &BlockManager::can_allocate)
         .def("allocate",
              &BlockManager::allocate,

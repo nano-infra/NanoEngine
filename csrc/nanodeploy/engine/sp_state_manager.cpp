@@ -7,12 +7,12 @@
 
 namespace nanodeploy {
 
-SPStateManager::SPStateManager(const std::optional<std::string>& engine_id,
-                               int                               attention_sp,
-                               int                               num_kvcache_blocks,
-                               int                               kvcache_block_size,
-                               int                               max_num_seqs,
-                               int                               max_num_batched_tokens):
+SPStateManager::SPStateManager(const std::string& engine_id,
+                               int                attention_sp,
+                               int                num_kvcache_blocks,
+                               int                kvcache_block_size,
+                               int                max_num_seqs,
+                               int                max_num_batched_tokens):
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
