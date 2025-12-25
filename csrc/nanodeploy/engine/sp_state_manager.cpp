@@ -85,7 +85,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
 {
     // Step 1: cal num_blocks and num_blocks_per_rank
     auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
-    memset(block_ctx.num_dispatched_tokens.data(), 0, sizeof(int) * attention_sp_);
+    block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
 
     int num_tokens            = seq.num_tokens;
     int num_segments          = (num_tokens + segment_size - 1) / segment_size;
