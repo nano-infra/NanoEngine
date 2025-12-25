@@ -554,15 +554,6 @@ class ModelRunner:
             for sp_idx in range(sp_size)
         ]
 
-        context_lens_for_attn = []
-
-        for sp_idx in range(sp_size):
-            current_sp_num = sp_num_seqs[sp_idx]
-            for seq_id in range(current_sp_num):
-                ctx_len = sp_seqs[sp_idx][seq_id].context_len(self.engine_id, sp_rank)
-                if ctx_len > 0:
-                    context_lens_for_attn.append(ctx_len)
-
         global_context_lens = [
             [
                 (
@@ -589,9 +580,6 @@ class ModelRunner:
         context_lens = torch.tensor(
             context_lens, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
-        context_lens_for_attn = torch.tensor(
-            context_lens_for_attn, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
         global_context_lens = torch.tensor(
             global_context_lens, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
@@ -607,7 +595,6 @@ class ModelRunner:
             self.config.max_num_seqs,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
-            context_lens_for_attn=context_lens_for_attn,
             block_tables=block_tables,
             global_context_lens=global_context_lens,
             q_mask=q_mask,
@@ -698,9 +685,6 @@ class ModelRunner:
             graph_vars["block_tables"][
                 : context.block_tables.size(0), : context.block_tables.size(1)
             ] = context.block_tables
-            graph_vars["context_lens_for_attn"].zero_()
-            graph_vars["context_lens_for_attn"][: context.context_lens_for_attn.shape[0]].copy_(context.context_lens_for_attn)
-
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -807,9 +791,6 @@ class ModelRunner:
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens_for_attn = torch.zeros(
-            config.max_attention_comp_seqs, dtype=torch.int32
-        )
         context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         q_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
@@ -833,7 +814,6 @@ class ModelRunner:
                 global_context_lens=global_context_lens,
                 q_mask=q_mask,
                 res_lse_mask=res_lse_mask,
-                context_lens_for_attn=context_lens_for_attn,
             )
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
@@ -855,5 +835,4 @@ class ModelRunner:
             outputs=outputs,
             q_mask=q_mask,
             res_lse_mask=res_lse_mask,
-            context_lens_for_attn=context_lens_for_attn,
         )
