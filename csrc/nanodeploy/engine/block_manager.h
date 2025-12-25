@@ -1,5 +1,6 @@
 #pragma once
 #include "block.h"
+#include "nanodeploy/engine/sequence.h"
 #include <list>
 #include <memory>
 #include <optional>
@@ -23,7 +24,7 @@ public:
     // Block allocation and deallocation
     bool can_allocate(Sequence& seq) const;
     void allocate(Sequence& seq, int token_idx_from = -1, int token_idx_to = -1);
-    void deallocate(Sequence& seq);
+    void deallocate(Sequence& seq, BlockContextSlot slot);
 
     // Append related
     bool can_append(Sequence& seq, int num_tokens = 1) const;

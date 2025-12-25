@@ -1,4 +1,5 @@
 #include "scheduler_utils.h"
+#include "nanodeploy/engine/sequence.h"
 #include "nanodeploy/metrics/sequence_metric.h"
 #include "thread_pool.h"
 #include <algorithm>
@@ -31,7 +32,6 @@ struct WorkerContext {
 static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                         const WorkerContext*            ctx,
                         WorkerContext*                  result_ctx,
-                        const std::string&              engine_id,
                         int                             eos_id,
                         bool                            is_prefill,
                         bool                            update_metrics)
@@ -50,14 +50,14 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
 
             for (int token_id : *task.tokens) {
 
-                int master_sp_idx = seq->block_ctx(engine_id).master_sp_idx;
+                int master_sp_idx = seq->block_ctx().master_sp_idx_;
                 if (task.sp_idx != master_sp_idx) {
                     throw std::runtime_error("sp_idx mismatch: task.sp_idx=" + std::to_string(task.sp_idx)
                                              + " != master_sp_idx=" + std::to_string(master_sp_idx)
-                                             + " for seq_id=" + seq->seq_id);
+                                             + " for seq_id=" + std::to_string(seq->seq_id));
                 }
 
-                seq->append_token(token_id, engine_id, task.sp_idx);
+                seq->append_token(token_id, BlockContextSlot::ACTIVE, task.sp_idx);
                 state_manager->add_running_tokens(task.sp_idx, 1);
 
                 if (update_metrics && seq->metric) {
@@ -79,10 +79,9 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                     break;
                 }
                 else if (is_prefill) {
-                    seq->status           = SequenceStatus::TO_BE_MIGRATED;
-                    seq->backup_engine_id = seq->active_engine_id;
-                    seq->active_engine_id = "";
-
+                    seq->status = SequenceStatus::TO_BE_MIGRATED;
+                    seq->migrate();
+                    std::cout << "migrating" << std::endl;
                     result_ctx->migration_candidates.push_back({seq, result_ctx->dp_idx});
                     break;
                 }
@@ -108,7 +107,6 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
 MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>               worker_states,
                                     const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
                                     const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
-                                    const std::string&                                         engine_id,
                                     int                                                        eos_id,
                                     bool                                                       is_prefill,
                                     bool                                                       update_metrics,
@@ -159,7 +157,6 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
                                                    worker_states[dp_idx],
                                                    &contexts[dp_idx],
                                                    &contexts[dp_idx],
-                                                   engine_id,
                                                    eos_id,
                                                    is_prefill,
                                                    update_metrics));
@@ -178,7 +175,6 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
                                  worker_states[dp_idx],
                                  &contexts[dp_idx],
                                  &contexts[dp_idx],
-                                 engine_id,
                                  eos_id,
                                  is_prefill,
                                  update_metrics);

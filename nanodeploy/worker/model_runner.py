@@ -1,18 +1,16 @@
 import os
 
 import numpy as np
-
 import ray
 import torch
 import torch.distributed as dist
-
 import torch.profiler as profiler
 from nanodeploy._cpp import (
+    BlockContextSlot,
     prepare_decode_cpp,
     prepare_prefill_cpp,
     update_seqs_inner_loop,
 )
-
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
@@ -209,14 +207,15 @@ class ModelRunner:
             max_num_batched_tokens // max_model_len, self.config.max_num_seqs
         )
         sp_rank = get_dist_context().attn_sp_rank
-        seqs = [
-            Sequence(
-                list(np.random.randint(low=0, high=10000, size=max_model_len)),
-                engine_id=self.engine_id,
-                master_sp_rank=sp_rank,
+        sp_size = get_dist_context().attn_sp_world_size
+        seqs = []
+        for _ in range(num_seqs):
+            seq = Sequence(
+                list(np.random.randint(low=0, high=10000, size=max_model_len))
             )
-            for _ in range(num_seqs)
-        ]
+            seq.active(self.engine_id, sp_size, 1)
+            seq.block_ctx().master_sp_idx = sp_rank
+
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
@@ -243,7 +242,7 @@ class ModelRunner:
         block_size = self.config.kvcache_block_size
 
         meta = prepare_prefill_cpp(
-            seqs, self.engine_id, sp_rank, sp_size, block_size, self.config.max_num_seqs
+            seqs, sp_rank, sp_size, block_size, self.config.max_num_seqs
         )
 
         input_ids = torch.tensor(
@@ -292,7 +291,6 @@ class ModelRunner:
 
         meta = prepare_decode_cpp(
             dp_seqs,
-            self.engine_id,
             sp_rank,
             sp_size,
             block_size,
@@ -360,17 +358,17 @@ class ModelRunner:
         num_sp_seqs = sum(
             1
             for seq in dp_seqs
-            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank
+            if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
         )
 
         # update slot mapping
         slot_mapping = []
         for seq in dp_seqs:
-            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank:
+            if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank:
                 slot_mapping.append(
-                    seq.last_block_page_id(self.engine_id, sp_rank)
+                    seq.last_block_page_id(BlockContextSlot.ACTIVE, sp_rank)
                     * get_cache_context().block_size
-                    + seq.last_block_num_tokens(self.engine_id, sp_rank)
+                    + seq.last_block_num_tokens(BlockContextSlot.ACTIVE, sp_rank)
                     - 1
                 )
 
@@ -393,7 +391,7 @@ class ModelRunner:
         temperatures = []
         for seq in seqs:
             if (
-                seq.block_ctx(self.engine_id).master_sp_idx
+                seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
                 == get_dist_context().attn_sp_rank
             ):
                 temperatures.append(seq.temperature)
@@ -439,27 +437,25 @@ class ModelRunner:
     def run(self, dp_seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
 
         sp_rank = get_dist_context().attn_sp_rank
+        sp_size = get_dist_context().attn_sp_world_size
 
         num_sp_seqs = sum(
             1
             for seq in dp_seqs
-            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank
+            if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
         )
         is_dummy = False
         if num_sp_seqs == 0:
             is_dummy = True
-            seq = Sequence(
-                [np.random.randint(self.config.hf_config.vocab_size - 1)],
-                engine_id=self.engine_id,
-                master_sp_rank=get_dist_context().attn_sp_rank,
-            )
-
+            seq = Sequence([np.random.randint(self.config.hf_config.vocab_size - 1)])
+            seq.block_ctx().reset(self.engine_id, sp_size, 1)
+            seq.block_ctx().master_sp_idx = sp_rank
             dp_seqs.append(seq)
 
         sp_seqs = [
             seq
             for seq in dp_seqs
-            if seq.block_ctx(self.engine_id).master_sp_idx == sp_rank
+            if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
         ]
 
         loop_count = self.config.loop_count if not is_prefill else 1
@@ -494,7 +490,7 @@ class ModelRunner:
                 input_ids = torch.zeros_like(input_ids)
             dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
 
-            update_seqs_inner_loop(sp_seqs, self.engine_id, sp_rank)
+            update_seqs_inner_loop(sp_seqs, sp_rank)
 
             if self.profiler and self.run_count >= self.profiler_start_step:
                 if self.run_count < self.profiler_end_step:

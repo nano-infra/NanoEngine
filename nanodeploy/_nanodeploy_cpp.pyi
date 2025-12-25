@@ -8,8 +8,10 @@ import collections.abc
 import typing
 
 __all__: list[str] = [
+    "ACTIVE",
     "Block",
     "BlockContext",
+    "BlockContextSlot",
     "BlockCtxMap",
     "BlockIdList",
     "BlockLocationList",
@@ -21,6 +23,7 @@ __all__: list[str] = [
     "FINISHED",
     "LeastBatch",
     "LeastCache",
+    "MIGRATE",
     "MigrationMap",
     "PrefillMetadata",
     "RUNNING",
@@ -28,6 +31,7 @@ __all__: list[str] = [
     "RoutingStrategy",
     "SPStateManager",
     "SPStateManagerList",
+    "SWAP",
     "ScheduleResult",
     "Scheduler",
     "Sequence",
@@ -77,17 +81,7 @@ class BlockContext:
     ) -> tuple[
         str, int, int, int, int, list[tuple[int, int]], dict[int, list[int]], list[int]
     ]: ...
-    @typing.overload
     def __init__(self) -> None: ...
-    @typing.overload
-    def __init__(
-        self,
-        engine_id: str,
-        dp_idx: typing.SupportsInt,
-        master_sp_idx: typing.SupportsInt,
-        attention_sp: typing.SupportsInt,
-        attention_dp: typing.SupportsInt,
-    ) -> None: ...
     def __setstate__(
         self,
         arg0: tuple[
@@ -102,6 +96,12 @@ class BlockContext:
             ],
             collections.abc.Sequence[typing.SupportsInt],
         ],
+    ) -> None: ...
+    def reset(
+        self,
+        engine_id: str,
+        attention_sp: typing.SupportsInt,
+        attention_dp: typing.SupportsInt,
     ) -> None: ...
     @property
     def attention_dp(self) -> int: ...
@@ -119,6 +119,38 @@ class BlockContext:
     def master_sp_idx(self) -> int: ...
     @master_sp_idx.setter
     def master_sp_idx(self, arg0: typing.SupportsInt) -> None: ...
+
+class BlockContextSlot:
+    """
+    Members:
+
+      ACTIVE
+
+      MIGRATE
+
+      SWAP
+    """
+
+    ACTIVE: typing.ClassVar[BlockContextSlot]  # value = <BlockContextSlot.ACTIVE: 0>
+    MIGRATE: typing.ClassVar[BlockContextSlot]  # value = <BlockContextSlot.MIGRATE: 1>
+    SWAP: typing.ClassVar[BlockContextSlot]  # value = <BlockContextSlot.SWAP: 2>
+    __members__: typing.ClassVar[
+        dict[str, BlockContextSlot]
+    ]  # value = {'ACTIVE': <BlockContextSlot.ACTIVE: 0>, 'MIGRATE': <BlockContextSlot.MIGRATE: 1>, 'SWAP': <BlockContextSlot.SWAP: 2>}
+    def __eq__(self, other: typing.Any) -> bool: ...
+    def __getstate__(self) -> int: ...
+    def __hash__(self) -> int: ...
+    def __index__(self) -> int: ...
+    def __init__(self, value: typing.SupportsInt) -> None: ...
+    def __int__(self) -> int: ...
+    def __ne__(self, other: typing.Any) -> bool: ...
+    def __repr__(self) -> str: ...
+    def __setstate__(self, state: typing.SupportsInt) -> None: ...
+    def __str__(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
 
 class BlockCtxMap:
     def __bool__(self) -> bool:
@@ -388,7 +420,7 @@ class BlockManager:
     def can_append(
         self, seq: typing.Sequence, num_tokens: typing.SupportsInt = 1
     ) -> bool: ...
-    def deallocate(self, arg0: typing.Sequence) -> None: ...
+    def deallocate(self, arg0: typing.Sequence, arg1: BlockContextSlot) -> None: ...
     def may_append(
         self, seq: typing.Sequence, num_tokens: typing.SupportsInt = 1
     ) -> bool: ...
@@ -561,7 +593,7 @@ class SPStateManager:
     def can_append(
         self, seq: typing.Sequence, num_tokens: typing.SupportsInt = 1
     ) -> bool: ...
-    def deallocate(self, seq: typing.Sequence) -> None: ...
+    def deallocate(self, seq: typing.Sequence, slot: BlockContextSlot) -> None: ...
     def may_append(
         self, seq: typing.Sequence, num_tokens: typing.SupportsInt = 1
     ) -> bool: ...
@@ -602,7 +634,6 @@ class ScheduleResult:
 
 class Scheduler:
     routing_strategy: RoutingStrategy
-    to_be_migrated: MigrationMap
     waiting: SequenceDeque
     waiting_migration: SequenceDeque
     worker_state: SPStateManagerList
@@ -639,27 +670,38 @@ class Scheduler:
     def preempt(self, dp_idx: typing.SupportsInt, seq: typing.Sequence) -> None: ...
     def running(self, dp_idx: typing.SupportsInt) -> SequenceDeque: ...
     def schedule(self) -> ScheduleResult: ...
+    @property
+    def to_be_migrated(self) -> dict[int, tuple[typing.Sequence, int]]: ...
+    @to_be_migrated.setter
+    def to_be_migrated(
+        self,
+        arg0: collections.abc.Mapping[
+            typing.SupportsInt, tuple[typing.Sequence, typing.SupportsInt]
+        ],
+    ) -> None: ...
 
 class Sequence:
     block_size: typing.ClassVar[int] = 256
-    active_engine_id: str
-    backup_engine_id: str
     ignore_eos: bool
     metric: SequenceMetric
-    seq_id: str
     status: SequenceStatus
     def __getitem__(self: typing.Sequence, arg0: typing.Any) -> typing.Any: ...
     def __getstate__(
         self: typing.Sequence,
-    ) -> tuple[int, int, int, str, str, list, float, list[int]]: ...
+    ) -> tuple[
+        int,
+        int,
+        int,
+        typing.Annotated[list[BlockContext], "FixedSize(3)"],
+        float,
+        list[int],
+    ]: ...
     def __init__(
         self: typing.Sequence,
         token_ids: collections.abc.Sequence[typing.SupportsInt],
         temperature: typing.SupportsFloat = 1.0,
         max_tokens: typing.SupportsInt = 256,
         ignore_eos: bool = False,
-        engine_id: str = "",
-        master_sp_rank: typing.SupportsInt = 0,
     ) -> None: ...
     def __len__(self: typing.Sequence) -> int: ...
     def __setstate__(
@@ -668,52 +710,51 @@ class Sequence:
             typing.SupportsInt,
             typing.SupportsInt,
             typing.SupportsInt,
-            str,
-            str,
-            list,
+            typing.Annotated[collections.abc.Sequence[BlockContext], "FixedSize(3)"],
             typing.SupportsFloat,
             collections.abc.Sequence[typing.SupportsInt],
         ],
     ) -> None: ...
+    def active(
+        self: typing.Sequence,
+        engine_id: str,
+        attention_sp: typing.SupportsInt,
+        attention_dp: typing.SupportsInt,
+    ) -> int: ...
     def append_token(
         self: typing.Sequence,
         token_id: typing.SupportsInt,
-        engine_id: str,
+        slot: BlockContextSlot,
         sp_idx: typing.SupportsInt | None = None,
     ) -> None: ...
     def block(
         self: typing.Sequence,
         i: typing.SupportsInt,
-        engine_id: str,
+        slot: BlockContextSlot,
         sp_idx: typing.SupportsInt,
     ) -> list[int]: ...
-    def block_ctx(self: typing.Sequence, engine_id: str) -> BlockContext: ...
+    def block_ctx(
+        self: typing.Sequence, slot: BlockContextSlot = ...
+    ) -> BlockContext: ...
     def block_table(
-        self: typing.Sequence, engine_id: str, sp_idx: typing.SupportsInt = 0
+        self: typing.Sequence, slot: BlockContextSlot, sp_idx: typing.SupportsInt = 0
     ) -> BlockIdList: ...
     def context_len(
-        self: typing.Sequence, engine_id: str, sp_idx: typing.SupportsInt | None = None
+        self: typing.Sequence,
+        engine_id: BlockContextSlot,
+        sp_idx: typing.SupportsInt | None = None,
     ) -> int: ...
-    def dp_idx(self: typing.Sequence, engine_id: str) -> int: ...
+    def dp_idx(self: typing.Sequence, slot: BlockContextSlot) -> int: ...
     def last_block_num_tokens(
-        self: typing.Sequence, engine_id: str, sp_idx: typing.SupportsInt
+        self: typing.Sequence, slot: BlockContextSlot, sp_idx: typing.SupportsInt
     ) -> int: ...
     def last_block_page_id(
-        self: typing.Sequence, engine_id: str, sp_idx: typing.SupportsInt
+        self: typing.Sequence, slot: BlockContextSlot, sp_idx: typing.SupportsInt
     ) -> int: ...
+    def migrate(self: typing.Sequence) -> int: ...
     def num_blocks(
-        self: typing.Sequence, engine_id: str, sp_idx: typing.SupportsInt
+        self: typing.Sequence, slot: BlockContextSlot, sp_idx: typing.SupportsInt
     ) -> int: ...
-    def set_engine_id(
-        self: typing.Sequence,
-        engine_id: str,
-        attention_dp: typing.SupportsInt = 1,
-        attention_sp: typing.SupportsInt = 1,
-    ) -> None: ...
-    @property
-    def block_ctx_map(self) -> BlockCtxMap: ...
-    @block_ctx_map.setter
-    def block_ctx_map(self, arg1: typing.Any) -> None: ...
     @property
     def completion_token_ids(self) -> list[int]: ...
     @property
@@ -751,6 +792,10 @@ class Sequence:
     @property
     def prompt_token_ids(self) -> list[int]: ...
     @property
+    def seq_id(self) -> int: ...
+    @seq_id.setter
+    def seq_id(self, arg0: typing.SupportsInt) -> None: ...
+    @property
     def temperature(self) -> float: ...
     @temperature.setter
     def temperature(self, arg0: typing.SupportsFloat) -> None: ...
@@ -773,11 +818,10 @@ class SequenceDeque:
     def remove(self, arg0: typing.Sequence) -> None: ...
 
 class SequenceMetric:
-    seq_id: str
     def __getstate__(
         self,
     ) -> tuple[
-        str,
+        int,
         float | None,
         float | None,
         float | None,
@@ -790,12 +834,12 @@ class SequenceMetric:
         list[float],
     ]: ...
     def __init__(
-        self, seq_id: str, num_prompt_tokens: typing.SupportsInt = 0
+        self, seq_id: typing.SupportsInt, num_prompt_tokens: typing.SupportsInt = 0
     ) -> None: ...
     def __setstate__(
         self,
         arg0: tuple[
-            str,
+            typing.SupportsInt,
             typing.SupportsFloat | None,
             typing.SupportsFloat | None,
             typing.SupportsFloat | None,
@@ -874,6 +918,10 @@ class SequenceMetric:
     def p99_itl(self) -> float | None: ...
     @property
     def queueing_time_ms(self) -> float | None: ...
+    @property
+    def seq_id(self) -> int: ...
+    @seq_id.setter
+    def seq_id(self, arg0: typing.SupportsInt) -> None: ...
     @property
     def ttft(self) -> float | None: ...
 
@@ -1004,7 +1052,6 @@ def postprocess_sequences(
     dp_sp_token_ids: collections.abc.Sequence[
         collections.abc.Sequence[collections.abc.Sequence[typing.SupportsInt]]
     ],
-    engine_id: str,
     eos_id: typing.SupportsInt,
     is_prefill: bool,
     update_metrics: bool = True,
@@ -1012,7 +1059,6 @@ def postprocess_sequences(
 ) -> list[tuple[typing.Sequence, int]]: ...
 def prepare_decode_cpp(
     dp_seqs: collections.abc.Sequence[typing.Sequence],
-    engine_id: str,
     sp_rank: typing.SupportsInt,
     sp_size: typing.SupportsInt,
     block_size: typing.SupportsInt,
@@ -1020,22 +1066,22 @@ def prepare_decode_cpp(
 ) -> DecodeMetadata: ...
 def prepare_prefill_cpp(
     seqs: collections.abc.Sequence[typing.Sequence],
-    engine_id: str,
     sp_rank: typing.SupportsInt,
     sp_size: typing.SupportsInt,
     block_size: typing.SupportsInt,
     max_num_seqs: typing.SupportsInt,
 ) -> PrefillMetadata: ...
 def update_seqs_inner_loop(
-    dp_seqs: collections.abc.Sequence[typing.Sequence],
-    engine_id: str,
-    sp_rank: typing.SupportsInt,
+    dp_seqs: collections.abc.Sequence[typing.Sequence], sp_rank: typing.SupportsInt
 ) -> None: ...
 
+ACTIVE: BlockContextSlot  # value = <BlockContextSlot.ACTIVE: 0>
 FINISHED: SequenceStatus  # value = <SequenceStatus.FINISHED: 2>
 LeastBatch: RoutingStrategy  # value = <RoutingStrategy.LeastBatch: 1>
 LeastCache: RoutingStrategy  # value = <RoutingStrategy.LeastCache: 2>
+MIGRATE: BlockContextSlot  # value = <BlockContextSlot.MIGRATE: 1>
 RUNNING: SequenceStatus  # value = <SequenceStatus.RUNNING: 1>
 RoundRobin: RoutingStrategy  # value = <RoutingStrategy.RoundRobin: 0>
+SWAP: BlockContextSlot  # value = <BlockContextSlot.SWAP: 2>
 TO_BE_MIGRATED: SequenceStatus  # value = <SequenceStatus.TO_BE_MIGRATED: 3>
 WAITING: SequenceStatus  # value = <SequenceStatus.WAITING: 0>

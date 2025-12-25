@@ -86,10 +86,10 @@ public:
     const std::unordered_map<int, std::shared_ptr<BlockManager>>& block_manager(int dp_idx) const;
 
     // Public members exposed to Python
-    std::deque<std::shared_ptr<Sequence>>                                      waiting;
-    std::deque<std::shared_ptr<Sequence>>                                      waiting_migration;
-    std::vector<std::shared_ptr<SPStateManager>>                               worker_state;
-    std::unordered_map<std::string, std::pair<std::shared_ptr<Sequence>, int>> to_be_migrated;
+    std::deque<std::shared_ptr<Sequence>>                              waiting;
+    std::deque<std::shared_ptr<Sequence>>                              waiting_migration;
+    std::vector<std::shared_ptr<SPStateManager>>                       worker_state;
+    std::unordered_map<int, std::pair<std::shared_ptr<Sequence>, int>> to_be_migrated;
 
     // Configuration
     RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;

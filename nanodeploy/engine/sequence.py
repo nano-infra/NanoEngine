@@ -36,8 +36,6 @@ class Sequence(_CppSequence):
             sampling_params.temperature,
             sampling_params.max_tokens,
             sampling_params.ignore_eos,
-            engine_id,
-            master_sp_rank,
         )
 
 

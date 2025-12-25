@@ -65,7 +65,7 @@ void BlockManager::deallocate_block(int block_id)
 
 bool BlockManager::can_allocate(Sequence& seq) const
 {
-    return static_cast<int>(free_block_ids_.size()) >= seq.num_blocks(engine_id_, sp_idx_);
+    return static_cast<int>(free_block_ids_.size()) >= seq.num_blocks(BlockContextSlot::ACTIVE, sp_idx_);
 }
 
 void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
@@ -73,17 +73,17 @@ void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
     (void)token_idx_from;  // Unused
     (void)token_idx_to;    // Unused
 
-    auto& table = seq.block_table(engine_id_, sp_idx_);
+    auto& table = seq.block_table(BlockContextSlot::ACTIVE, sp_idx_);
     if (!table.empty()) {
         throw std::runtime_error("Block table is not empty");
     }
 
     int64_t h          = -1;
     bool    cache_miss = false;
-    int     num_blocks = seq.num_blocks(engine_id_, sp_idx_);
+    int     num_blocks = seq.num_blocks(BlockContextSlot::ACTIVE, sp_idx_);
 
     for (int i = 0; i < num_blocks; ++i) {
-        auto view = seq.block_view(i, engine_id_, sp_idx_);
+        auto view = seq.block_view(i, BlockContextSlot::ACTIVE, sp_idx_);
 
         if (view.second == static_cast<size_t>(block_size_)) {
             h = compute_hash(view.first, view.second, h);
@@ -125,14 +125,14 @@ void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
             hash_to_block_id_[h] = block_id;
         }
 
-        seq.block_ctx(engine_id_).block_location.emplace_back(sp_idx_, block_id);
+        seq.block_ctx(BlockContextSlot::ACTIVE).block_location.emplace_back(sp_idx_, block_id);
         table.push_back(block_id);
     }
 }
 
-void BlockManager::deallocate(Sequence& seq)
+void BlockManager::deallocate(Sequence& seq, BlockContextSlot slot)
 {
-    auto& table = seq.block_table(engine_id_, sp_idx_);
+    auto& table = seq.block_table(slot, sp_idx_);
     // Iterate in reverse
     for (auto it = table.rbegin(); it != table.rend(); ++it) {
         int    block_id = *it;
@@ -148,7 +148,7 @@ void BlockManager::deallocate(Sequence& seq)
 
 bool BlockManager::can_append(Sequence& seq, int num_tokens) const
 {
-    int num_dispatched             = seq.block_ctx(engine_id_).num_dispatched_tokens[sp_idx_];
+    int num_dispatched             = seq.block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_idx_];
     int total_tokens_needed_before = (num_dispatched + block_size_ - 1) / block_size_;
     int total_tokens_needed_after  = (num_dispatched + num_tokens + block_size_ - 1) / block_size_;
 
@@ -158,16 +158,16 @@ bool BlockManager::can_append(Sequence& seq, int num_tokens) const
 bool BlockManager::may_append(Sequence& seq, int num_tokens)
 {
     for (int idx = 0; idx < num_tokens; ++idx) {
-        auto& table = seq.block_table(engine_id_, sp_idx_);
+        auto& table = seq.block_table(BlockContextSlot::ACTIVE, sp_idx_);
 
-        int current_dispatched = seq.block_ctx(engine_id_).num_dispatched_tokens[sp_idx_];
+        int current_dispatched = seq.block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_idx_];
 
         if ((current_dispatched + idx) % block_size_ == 0) {
             if (free_block_ids_.empty()) {
                 return false;
             }
             int block_id = free_block_ids_.front();
-            seq.block_ctx(engine_id_).block_location.emplace_back(sp_idx_, block_id);
+            seq.block_ctx(BlockContextSlot::ACTIVE).block_location.emplace_back(sp_idx_, block_id);
             allocate_block(block_id);
             table.push_back(block_id);
         }

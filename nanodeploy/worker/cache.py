@@ -1,12 +1,12 @@
 import dataclasses
 from collections import defaultdict
+from copy import deepcopy
 from typing import Literal
 
 import dlslime
-
 import torch
 import torch.distributed as dist
-
+from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.worker.distributed import get_dist_context
 
@@ -122,13 +122,14 @@ class CacheContext:
         endpoints_info = {}
         self.num_remote_kvcache_blocks[remote_engine_name] = num_kv_blocks
         for i in range(remote_world_size):
-            endpoint = dlslime.RDMAEndpoint(device_name=self.selected_nic, qp_num=2)
-            endpoint.register_memory_region(
-                0,
-                self.kv_cache.data_ptr() + self.kv_cache.storage_offset(),
-                self.kv_cache.numel() * self.kv_cache.itemsize,
-            )
-            endpoint_info = endpoint.endpoint_info
+            endpoint = dlslime.RDMAEndpoint(device_name=self.selected_nic, num_qp=1)
+            if i == 0:
+                endpoint.register_memory_region(
+                    get_dist_context().rank,
+                    self.kv_cache.data_ptr() + self.kv_cache.storage_offset(),
+                    self.kv_cache.numel() * self.kv_cache.itemsize,
+                )
+            endpoint_info = endpoint.endpoint_info()
             endpoints[i] = endpoint
             endpoints_info[i] = endpoint_info
         return endpoints_info
@@ -145,29 +146,33 @@ class CacheContext:
         sp_idx = get_dist_context().attn_sp_rank
         for seq in seqs:
             for remote_block_idx, source_block_idx in zip(
-                seq.block_ctx(seq.backup_engine_id).block_location,
-                seq.block_ctx(seq.active_engine_id).block_location,
+                seq.block_ctx(BlockContextSlot.MIGRATE).block_location,
+                seq.block_ctx(BlockContextSlot.ACTIVE).block_location,
             ):
                 for kv_idx in range(self.kv_cache.size(0)):
                     for layer_idx in range(self.num_hidden_layers):
                         if source_block_idx[0] == sp_idx:
+                            remote_rank = (
+                                seq.dp_idx(BlockContextSlot.MIGRATE)
+                                * seq.block_ctx(BlockContextSlot.MIGRATE).attention_sp
+                                + remote_block_idx[0]
+                            )
                             assignment = (
-                                0,
+                                get_dist_context().rank,
+                                remote_rank,
                                 self.remote_kv_stride(
                                     kv_idx,
                                     layer_idx,
                                     remote_block_idx[1],
-                                    seq.backup_engine_id,
+                                    seq.block_ctx(BlockContextSlot.MIGRATE).engine_id,
                                 ),
                                 self.local_kv_stride(
                                     kv_idx, layer_idx, source_block_idx[1]
                                 ),
                                 self.block_stride(1),
                             )
-                            assigns[seq.backup_engine_id][
-                                seq.dp_idx(seq.backup_engine_id)
-                                * seq.block_ctx(seq.backup_engine_id).attention_sp
-                                + remote_block_idx[0]
+                            assigns[seq.block_ctx(BlockContextSlot.MIGRATE).engine_id][
+                                remote_rank
                             ].append(assignment)
 
             futures = []

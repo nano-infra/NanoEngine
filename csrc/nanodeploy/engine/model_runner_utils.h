@@ -35,20 +35,12 @@ struct DecodeMetadata {
     int              max_num_blocks = 0;
 };
 
-PrefillMetadata prepare_prefill_cpp(const std::vector<Sequence*>& seqs,
-                                    const std::string&            engine_id,
-                                    int                           sp_rank,
-                                    int                           sp_size,
-                                    int                           block_size,
-                                    int                           max_num_seqs);
+PrefillMetadata
+prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs);
 
-DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
-                                  const std::string&            engine_id,
-                                  int                           sp_rank,
-                                  int                           sp_size,
-                                  int                           block_size,
-                                  int                           max_num_seqs);
+DecodeMetadata
+prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs);
 
-void update_seqs_inner_loop(const std::vector<Sequence*>& sp_seqs, const std::string& engine_id, int sp_rank);
+void update_seqs_inner_loop(const std::vector<Sequence*>& sp_seqs, int sp_rank);
 
 }  // namespace nanodeploy

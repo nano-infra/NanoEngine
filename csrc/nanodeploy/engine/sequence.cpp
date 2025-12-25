@@ -10,18 +10,22 @@ namespace nanodeploy {
 
 // BlockContext Implementation
 
-BlockContext::BlockContext(
-    const std::string& engine_id, int dp_idx, int master_sp_idx, int attention_sp, int attention_dp):
-    engine_id(engine_id),
-    dp_idx(dp_idx),
-    master_sp_idx(master_sp_idx),
-    attention_sp(attention_sp),
-    attention_dp(attention_dp)
+BlockContext::BlockContext(const std::string& engine_id, int attention_sp, int attention_dp)
 {
+    reset(engine_id, attention_sp, attention_dp);
+}
+
+void BlockContext::reset(const std::string& engine_id, int attention_sp, int attention_dp)
+{
+    engine_id_     = engine_id;
+    dp_idx_        = 0;
+    master_sp_idx_ = 0;
+    attention_sp_  = attention_sp;
+    attention_dp_  = attention_dp;
     for (int i = 0; i < attention_sp; ++i) {
         (void)sp_block_table[i];
     }
-    num_dispatched_tokens.resize(8, 0);
+    num_dispatched_tokens.resize(attention_sp, 0);
 }
 
 std::tuple<std::string,
@@ -40,11 +44,11 @@ BlockContext::getstate() const
         sp_block_table_state.emplace(pair.first, std::vector<int>(pair.second.begin(), pair.second.end()));
     }
 
-    return std::make_tuple(engine_id,
-                           dp_idx,
-                           master_sp_idx,
-                           attention_sp,
-                           attention_dp,
+    return std::make_tuple(engine_id_,
+                           dp_idx_,
+                           master_sp_idx_,
+                           attention_sp_,
+                           attention_dp_,
                            std::vector<std::pair<int, int>>(block_location.begin(), block_location.end()),
                            std::move(sp_block_table_state),
                            num_dispatched_tokens);
@@ -60,11 +64,11 @@ BlockContext BlockContext::setstate(const std::tuple<std::string,
                                                      std::vector<int>>& state)
 {
     BlockContext ctx;
-    ctx.engine_id      = std::get<0>(state);
-    ctx.dp_idx         = std::get<1>(state);
-    ctx.master_sp_idx  = std::get<2>(state);
-    ctx.attention_sp   = std::get<3>(state);
-    ctx.attention_dp   = std::get<4>(state);
+    ctx.engine_id_     = std::get<0>(state);
+    ctx.dp_idx_        = std::get<1>(state);
+    ctx.master_sp_idx_ = std::get<2>(state);
+    ctx.attention_sp_  = std::get<3>(state);
+    ctx.attention_dp_  = std::get<4>(state);
     ctx.block_location = BlockContext::BlockLocationList(std::get<5>(state).begin(), std::get<5>(state).end());
     ctx.sp_block_table.clear();
     for (const auto& pair : std::get<6>(state)) {
@@ -76,52 +80,17 @@ BlockContext BlockContext::setstate(const std::tuple<std::string,
 
 // Sequence Implementation
 
-std::string Sequence::generate_uuid()
-{
-    // Simple UUID generation (not RFC compliant but sufficient for unique ID)
-    // Use thread_local to avoid data races in multi-threaded environment
-    thread_local std::random_device              rd;
-    thread_local std::mt19937                    gen(rd());
-    thread_local std::uniform_int_distribution<> dis(0, 15);
-    thread_local std::uniform_int_distribution<> dis2(8, 11);
+std::atomic<uint64_t> Sequence::next_seq_id_{0};
 
-    std::stringstream ss;
-    ss << std::hex;
-    for (int i = 0; i < 8; i++)
-        ss << dis(gen);
-    ss << "-";
-    for (int i = 0; i < 4; i++)
-        ss << dis(gen);
-    ss << "-4";  // UUID version 4
-    for (int i = 0; i < 3; i++)
-        ss << dis(gen);
-    ss << "-";
-    ss << dis2(gen);  // UUID variant
-    for (int i = 0; i < 3; i++)
-        ss << dis(gen);
-    ss << "-";
-    for (int i = 0; i < 12; i++)
-        ss << dis(gen);
-    return ss.str();
-}
-
-Sequence::Sequence(const std::vector<int>& token_ids,
-                   double                  temperature,
-                   int                     max_tokens,
-                   bool                    ignore_eos,
-                   const std::string&      engine_id,
-                   int                     master_sp_rank):
-    token_ids(token_ids),
-    backup_engine_id(engine_id),
-    active_engine_id(engine_id),
-    temperature(temperature),
-    max_tokens(max_tokens),
-    ignore_eos(ignore_eos)
+Sequence::Sequence(const std::vector<int>& token_ids, double temperature, int max_tokens, bool ignore_eos):
+    token_ids(token_ids), temperature(temperature), max_tokens(max_tokens), ignore_eos(ignore_eos)
 {
     this->token_ids.reserve(max_tokens);
     this->token_ids = token_ids;
 
-    seq_id     = generate_uuid();
+    this->token_ids = token_ids;
+
+    seq_id     = next_seq_id_.fetch_add(1);
     status     = SequenceStatus::WAITING;
     num_tokens = static_cast<int>(token_ids.size());
     if (!token_ids.empty()) {
@@ -133,65 +102,39 @@ Sequence::Sequence(const std::vector<int>& token_ids,
     num_prompt_tokens       = num_tokens;
     num_checkpointed_tokens = num_tokens;
     num_cached_tokens       = 0;
-
-    BlockContext ctx(engine_id, -1, master_sp_rank, 1, 1);
-
-    block_ctx_map[engine_id] = ctx;
 }
 
-BlockContext& Sequence::block_ctx(const std::string& engine_id)
+BlockContext& Sequence::block_ctx(BlockContextSlot slot)
 {
-    auto eid = engine_id != "" ? engine_id : active_engine_id;
-    auto it  = block_ctx_map.find(eid);
-    if (it == block_ctx_map.end()) {
-        throw std::runtime_error("BlockContext not found for engine_id");
-    }
-    return it->second;
+    return slots_[(size_t)slot];
 }
 
-const BlockContext& Sequence::block_ctx(const std::string& engine_id) const
+const BlockContext& Sequence::block_ctx(BlockContextSlot slot) const
 {
-    auto eid = engine_id != "" ? engine_id : active_engine_id;
-    auto it  = block_ctx_map.find(eid);
-    if (it == block_ctx_map.end()) {
-        throw std::runtime_error("BlockContext not found for engine_id");
-    }
-    return it->second;
+    return slots_[(size_t)slot];
 }
 
-int Sequence::dp_idx(const std::string& engine_id)
+int Sequence::dp_idx(BlockContextSlot slot)
 {
-    return block_ctx(engine_id).dp_idx;
+    return block_ctx(slot).dp_idx_;
 }
 
-BlockContext::BlockIdList& Sequence::block_table(const std::string& engine_id, int sp_idx)
+BlockContext::BlockIdList& Sequence::block_table(BlockContextSlot slot, int sp_idx)
 {
-    return block_ctx(engine_id).sp_block_table[sp_idx];
+    return block_ctx(slot).sp_block_table[sp_idx];
 }
 
-void Sequence::set_engine_id(const std::string& engine_id, int attention_dp, int attention_sp)
+int Sequence::context_len(BlockContextSlot slot, std::optional<int> sp_idx)
 {
-    active_engine_id = engine_id;
-    if (block_ctx_map.find(engine_id) != block_ctx_map.end()) {
-        return;
-    }
-
-    // BlockContext constructor now handles initialization of internal maps
-    block_ctx_map.emplace(engine_id, BlockContext(engine_id, -1, 0, attention_sp, attention_dp));
-}
-
-int Sequence::context_len(const std::string& engine_id, std::optional<int> sp_idx)
-{
-    auto& ctx = block_ctx(engine_id);
-    int   idx = sp_idx.has_value() ? sp_idx.value() : ctx.master_sp_idx;
+    auto& ctx = block_ctx(slot);
+    int   idx = sp_idx.has_value() ? sp_idx.value() : ctx.master_sp_idx_;
     return ctx.num_dispatched_tokens[idx];
 }
 
-void Sequence::append_token(int token_id, const std::string& engine_id, std::optional<int> sp_idx)
+void Sequence::append_token(int token_id, BlockContextSlot slot, std::optional<int> sp_idx)
 {
-    auto  eid = engine_id != "" ? engine_id : active_engine_id;
-    auto& ctx = block_ctx(eid);
-    int   idx = sp_idx.has_value() ? sp_idx.value() : ctx.master_sp_idx;
+    auto& ctx = block_ctx(slot);
+    int   idx = sp_idx.has_value() ? sp_idx.value() : ctx.master_sp_idx_;
 
     token_ids.push_back(token_id);
     last_token = token_id;
@@ -199,32 +142,32 @@ void Sequence::append_token(int token_id, const std::string& engine_id, std::opt
     ctx.num_dispatched_tokens[idx]++;
 }
 
-int Sequence::num_blocks(const std::string& engine_id, int sp_idx)
+int Sequence::num_blocks(BlockContextSlot slot, int sp_idx)
 {
-    int n_tokens = block_ctx(engine_id).num_dispatched_tokens[sp_idx];
+    int n_tokens = block_ctx(slot).num_dispatched_tokens[sp_idx];
     return (n_tokens + block_size - 1) / block_size;
 }
 
-int Sequence::last_block_page_id(const std::string& engine_id, int sp_idx)
+int Sequence::last_block_page_id(BlockContextSlot slot, int sp_idx)
 {
-    int   n_tokens       = block_ctx(engine_id).num_dispatched_tokens[sp_idx];
+    int   n_tokens       = block_ctx(slot).num_dispatched_tokens[sp_idx];
     int   last_block_idx = (n_tokens - 1) / block_size;
-    auto& table          = block_table(engine_id, sp_idx);
+    auto& table          = block_table(slot, sp_idx);
     if (last_block_idx >= static_cast<int>(table.size())) {
         throw std::out_of_range("Block index out of range");
     }
     return table[last_block_idx];
 }
 
-int Sequence::last_block_num_tokens(const std::string& engine_id, int sp_idx)
+int Sequence::last_block_num_tokens(BlockContextSlot slot, int sp_idx)
 {
-    int n_tokens = block_ctx(engine_id).num_dispatched_tokens[sp_idx];
-    return n_tokens - (num_blocks(engine_id, sp_idx) - 1) * block_size;
+    int n_tokens = block_ctx(slot).num_dispatched_tokens[sp_idx];
+    return n_tokens - (num_blocks(slot, sp_idx) - 1) * block_size;
 }
 
-std::pair<const int*, size_t> Sequence::block_view(int i, const std::string& engine_id, int sp_idx) const
+std::pair<const int*, size_t> Sequence::block_view(int i, BlockContextSlot slot, int sp_idx) const
 {
-    int n_blocks = const_cast<Sequence*>(this)->num_blocks(engine_id, sp_idx);
+    int n_blocks = const_cast<Sequence*>(this)->num_blocks(slot, sp_idx);
     if (i < 0 || i >= n_blocks) {
         throw std::out_of_range("Block index out of range");
     }
@@ -238,9 +181,9 @@ std::pair<const int*, size_t> Sequence::block_view(int i, const std::string& eng
     return {&token_ids[start], static_cast<size_t>(end - start)};
 }
 
-std::vector<int> Sequence::block(int i, const std::string& engine_id, int sp_idx)
+std::vector<int> Sequence::block(int i, BlockContextSlot slot, int sp_idx)
 {
-    auto view = block_view(i, engine_id, sp_idx);
+    auto view = block_view(i, slot, sp_idx);
     if (view.second == 0)
         return {};
     return std::vector<int>(view.first, view.first + view.second);

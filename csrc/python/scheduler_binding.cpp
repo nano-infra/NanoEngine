@@ -21,7 +21,6 @@ void bind_scheduler_utils(py::module_& m)
           py::arg("worker_states"),
           py::arg("dp_sp_seqs"),
           py::arg("dp_sp_token_ids"),
-          py::arg("engine_id"),
           py::arg("eos_id"),
           py::arg("is_prefill"),
           py::arg("update_metrics") = true,

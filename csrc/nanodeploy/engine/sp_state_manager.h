@@ -49,7 +49,7 @@ public:
                       const std::unordered_map<int, int>& num_batched_tokens);
 
     void allocate(Sequence& seq);
-    void deallocate(Sequence& seq);
+    void deallocate(Sequence& seq, BlockContextSlot slot = BlockContextSlot::ACTIVE);
 
     // Load tracking
     /// \brief Returns the total number of sequences currently running on this engine.

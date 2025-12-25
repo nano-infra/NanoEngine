@@ -6,18 +6,16 @@ from time import perf_counter
 from typing import Literal
 
 import numpy as np
-
 from tqdm.auto import tqdm
-
 from transformers import AutoTokenizer
 
+from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.config import Config
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import RoutingStrategy, Scheduler
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.metrics import MetricsManager
-
 
 logger = get_logger()
 
@@ -57,9 +55,6 @@ class LLMEngine:
         if isinstance(seqs, Sequence):
             seqs = [seqs]
         for seq in seqs:
-            seq.set_engine_id(
-                self.engine_id, self.config.attention_dp, self.config.attention_sp
-            )
             seq.metric = self.metrics_manager.create_sequence_metric(
                 seq.seq_id, seq.num_prompt_tokens
             )
@@ -127,8 +122,8 @@ class LLMEngine:
                 for seqs in filtered_dp_sp_seqs:
                     for seq in seqs:
                         logger.debug(
-                            f"{seq.block_ctx(seq.backup_engine_id).block_location}, "
-                            f"{seq.block_ctx(seq.active_engine_id).block_location}"
+                            f"{seq.block_ctx().block_location}, "
+                            f"{seq.block_ctx(BlockContextSlot.MIGRATE).block_location}"
                         )
                 self.executor.migrate(dp_sp_seqs)
             else:
@@ -140,7 +135,7 @@ class LLMEngine:
                                 getattr(seq, "seq_id", "<unknown>"),
                             )
                             continue
-                        seq.append_token(0, self.engine_id)
+                        seq.append_token(0, BlockContextSlot.ACTIVE)
                 for seqs in dp_seqs:
                     for seq in seqs:
                         if seq.metric and seq.metric.num_generated_tokens == 0:

@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "nanodeploy/engine/sequence.h"
 #include "nanodeploy/metrics/sequence_metric.h"
 #include "scheduler_utils.h"
 #include <algorithm>
@@ -38,6 +39,8 @@ Scheduler::Scheduler(const std::string& engine_id,
 
 void Scheduler::add(std::shared_ptr<Sequence> seq)
 {
+    seq->active(engine_id_, attention_sp_, attention_dp_);
+
     if (seq->metric) {
         seq->metric->record_arrival();
     }
@@ -128,7 +131,7 @@ ScheduleResult Scheduler::schedule()
             // filtered_dp_sp_seqs is dp_seqs[dp_idx] filtered by master_sp_idx
             std::vector<std::shared_ptr<Sequence>> filtered;
             for (const auto& seq : dp_seqs[dp_idx]) {
-                if (seq->block_ctx(engine_id_).master_sp_idx == sp_idx) {
+                if (seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_ == sp_idx) {
                     filtered.push_back(seq);
                 }
             }
@@ -191,9 +194,9 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                 worker_state[selected_dp_idx]->allocate(*seq);
 
                 // Update tracking
-                auto& block_ctx   = seq->block_ctx(engine_id_);
-                block_ctx.dp_idx  = selected_dp_idx;
-                int master_sp_idx = block_ctx.master_sp_idx;
+                auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
+                block_ctx.dp_idx_ = selected_dp_idx;
+                int master_sp_idx = block_ctx.master_sp_idx_;
 
                 num_seqs[selected_dp_idx][master_sp_idx] += 1;
                 num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens - seq->num_cached_tokens);
@@ -241,9 +244,9 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                                    worker_state[selected_dp_idx]->num_running_tokens();
                 dp_load_set.insert({new_load, selected_dp_idx});
 
-                auto& block_ctx   = seq->block_ctx(engine_id_);
-                block_ctx.dp_idx  = selected_dp_idx;
-                int master_sp_idx = block_ctx.master_sp_idx;
+                auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
+                block_ctx.dp_idx_ = selected_dp_idx;
+                int master_sp_idx = block_ctx.master_sp_idx_;
 
                 num_seqs[selected_dp_idx][master_sp_idx] += 1;
                 num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens - seq->num_cached_tokens);
@@ -293,7 +296,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
             auto seq = running_queue.front();
             running_queue.pop_front();
 
-            int master_rank = seq->block_ctx(engine_id_).master_sp_idx;
+            int master_rank = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
 
             // Check if we've reached the max sequences for this SP rank
             if (num_seqs[master_rank] >= max_num_seqs_) {
@@ -369,14 +372,8 @@ void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequen
                             bool                                                       update_metrics)
 {
     // Call the C++ postprocess_sequences utility directly with shared_ptrs
-    auto migrations = postprocess_sequences(worker_state,
-                                            dp_sp_seqs,
-                                            dp_sp_token_ids,
-                                            engine_id_ != "" ? engine_id_ : "",
-                                            eos_,
-                                            mode_ == "prefill",
-                                            update_metrics,
-                                            thread_pool_.get());
+    auto migrations = postprocess_sequences(
+        worker_state, dp_sp_seqs, dp_sp_token_ids, eos_, mode_ == "prefill", update_metrics, thread_pool_.get());
 
     // Store migrations
     for (const auto& [seq_shared, dp_idx] : migrations) {
@@ -388,11 +385,11 @@ void Scheduler::free_to_be_migrated(std::shared_ptr<Sequence> seq)
 {
     auto it = to_be_migrated.find(seq->seq_id);
     if (it == to_be_migrated.end()) {
-        throw std::runtime_error("Sequence " + seq->seq_id + " not found in to_be_migrated");
+        throw std::runtime_error("Sequence " + std::to_string(seq->seq_id) + " not found in to_be_migrated");
     }
 
     int selected_dp_idx = it->second.second;
-    worker_state[selected_dp_idx]->deallocate(*seq);
+    worker_state[selected_dp_idx]->deallocate(*seq, BlockContextSlot::MIGRATE);
     to_be_migrated.erase(it);
 }
 

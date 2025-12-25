@@ -32,7 +32,6 @@ void bind_model_runner_utils(py::module_& m)
     m.def("prepare_prefill_cpp",
           &prepare_prefill_cpp,
           py::arg("seqs"),
-          py::arg("engine_id"),
           py::arg("sp_rank"),
           py::arg("sp_size"),
           py::arg("block_size"),
@@ -41,14 +40,9 @@ void bind_model_runner_utils(py::module_& m)
     m.def("prepare_decode_cpp",
           &prepare_decode_cpp,
           py::arg("dp_seqs"),
-          py::arg("engine_id"),
           py::arg("sp_rank"),
           py::arg("sp_size"),
           py::arg("block_size"),
           py::arg("max_num_seqs"));
-    m.def("update_seqs_inner_loop",
-          &update_seqs_inner_loop,
-          py::arg("dp_seqs"),
-          py::arg("engine_id"),
-          py::arg("sp_rank"));
+    m.def("update_seqs_inner_loop", &update_seqs_inner_loop, py::arg("dp_seqs"), py::arg("sp_rank"));
 }

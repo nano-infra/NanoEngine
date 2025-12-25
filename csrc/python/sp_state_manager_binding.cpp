@@ -121,7 +121,7 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("num_batched_tokens"))
 
         .def("allocate", &SPStateManager::allocate, py::arg("seq"))
-        .def("deallocate", &SPStateManager::deallocate, py::arg("seq"))
+        .def("deallocate", &SPStateManager::deallocate, py::arg("seq"), py::arg("slot"))
 
         .def_readwrite("block_manager", &SPStateManager::block_manager)
         .def_readwrite("running", &SPStateManager::running)
