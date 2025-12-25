@@ -12,7 +12,7 @@ namespace nanodeploy {
 
 class SequenceMetric {
 public:
-    explicit SequenceMetric(const std::string& seq_id, int num_prompt_tokens = 0);
+    explicit SequenceMetric(uint64_t seq_id, int num_prompt_tokens = 0);
 
     void record_arrival();
     void record_first_scheduled();
@@ -35,7 +35,7 @@ public:
     void log_metrics() const;
 
     // Public fields (match Python dataclass mutability)
-    std::string           seq_id;
+    uint64_t              seq_id;
     std::optional<double> arrival_time;
     std::optional<double> first_scheduled_time;
     std::optional<double> decode_arrival_time;
@@ -48,7 +48,7 @@ public:
     std::optional<double> last_token_time;
 
     // For pickle support
-    std::tuple<std::string,
+    std::tuple<uint64_t,
                std::optional<double>,
                std::optional<double>,
                std::optional<double>,
@@ -61,7 +61,7 @@ public:
                std::vector<double>>
     getstate() const;
 
-    static std::shared_ptr<SequenceMetric> setstate(const std::tuple<std::string,
+    static std::shared_ptr<SequenceMetric> setstate(const std::tuple<uint64_t,
                                                                      std::optional<double>,
                                                                      std::optional<double>,
                                                                      std::optional<double>,

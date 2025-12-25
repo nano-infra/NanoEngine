@@ -9,7 +9,7 @@ using namespace nanodeploy;
 void bind_sequence_metric(py::module_& m)
 {
     py::class_<SequenceMetric, std::shared_ptr<SequenceMetric>>(m, "SequenceMetric")
-        .def(py::init<const std::string&, int>(), py::arg("seq_id"), py::arg("num_prompt_tokens") = 0)
+        .def(py::init<uint64_t, int>(), py::arg("seq_id"), py::arg("num_prompt_tokens") = 0)
 
         // Dataclass-like fields (must be writable; scheduler mutates these)
         .def_readwrite("seq_id", &SequenceMetric::seq_id)
@@ -43,7 +43,7 @@ void bind_sequence_metric(py::module_& m)
 
         .def("log_metrics", &SequenceMetric::log_metrics)
         .def(py::pickle([](const SequenceMetric& p) { return p.getstate(); },
-                        [](const std::tuple<std::string,
+                        [](const std::tuple<uint64_t,
                                             std::optional<double>,
                                             std::optional<double>,
                                             std::optional<double>,
