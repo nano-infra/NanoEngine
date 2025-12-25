@@ -147,11 +147,6 @@ void bind_sequence(py::module_& m)
             [](BlockContext& self) -> BlockContext::SpBlockTable& { return self.sp_block_table; },
             [](BlockContext& self, const BlockContext::SpBlockTable& value) { self.sp_block_table = value; },
             py::return_value_policy::reference_internal)
-        .def_property(
-            "num_dispatched_tokens",
-            [](BlockContext& self) -> std::unordered_map<int, int>& { return self.num_dispatched_tokens; },
-            [](BlockContext& self, const std::unordered_map<int, int>& value) { self.num_dispatched_tokens = value; },
-            py::return_value_policy::reference_internal)
         .def(py::pickle([](const BlockContext& p) { return p.getstate(); },
                         [](const std::tuple<std::optional<std::string>,
                                             int,
@@ -160,7 +155,7 @@ void bind_sequence(py::module_& m)
                                             int,
                                             std::vector<std::pair<int, int>>,
                                             std::unordered_map<int, std::vector<int>>,
-                                            std::unordered_map<int, int>>& t) { return BlockContext::setstate(t); }));
+                                            std::vector<int>>& t) { return BlockContext::setstate(t); }));
 
     py::class_<Sequence, std::shared_ptr<Sequence>>(m, "Sequence")
         .def(py::init<const std::vector<int>&, double, int, bool, const std::optional<std::string>&, int>(),

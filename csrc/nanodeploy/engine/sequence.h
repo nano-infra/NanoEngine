@@ -45,7 +45,7 @@ struct BlockContext {
     SpBlockTable sp_block_table;
 
     // num_dispatched_tokens: sp_idx -> count
-    std::unordered_map<int, int> num_dispatched_tokens;
+    std::vector<int> num_dispatched_tokens;
 
     BlockContext() = default;
     BlockContext(
@@ -59,7 +59,7 @@ struct BlockContext {
                int,
                std::vector<std::pair<int, int>>,
                std::unordered_map<int, std::vector<int>>,
-               std::unordered_map<int, int>>
+               std::vector<int>>
     getstate() const;
 
     static BlockContext setstate(const std::tuple<std::optional<std::string>,
@@ -69,7 +69,7 @@ struct BlockContext {
                                                   int,
                                                   std::vector<std::pair<int, int>>,
                                                   std::unordered_map<int, std::vector<int>>,
-                                                  std::unordered_map<int, int>>& state);
+                                                  std::vector<int>>& state);
 };
 
 enum class SequenceStatus {
@@ -112,16 +112,16 @@ public:
                       std::optional<int>                sp_idx    = std::nullopt);
 
     // Block related methods
-    int              num_blocks(const std::optional<std::string>& engine_id, int sp_idx);
-    int              last_block_page_id(const std::optional<std::string>& engine_id, int sp_idx);
-    int              last_block_num_tokens(const std::optional<std::string>& engine_id, int sp_idx);
+    int num_blocks(const std::optional<std::string>& engine_id, int sp_idx);
+    int last_block_page_id(const std::optional<std::string>& engine_id, int sp_idx);
+    int last_block_num_tokens(const std::optional<std::string>& engine_id, int sp_idx);
     // Returns a pointer/size view into the internal token storage for block `i`.
     // The returned pointer is valid only as long as the underlying storage is not
     // modified in a way that can reallocate or invalidate the buffer (e.g., appending
     // tokens to the same sequence). Callers MUST NOT store this pointer beyond the
     // duration in which they can guarantee no such modifications occur.
     std::pair<const int*, size_t> block_view(int i, const std::optional<std::string>& engine_id, int sp_idx) const;
-    std::vector<int> block(int i, const std::optional<std::string>& engine_id, int sp_idx);
+    std::vector<int>              block(int i, const std::optional<std::string>& engine_id, int sp_idx);
 
     // Accessors
     BlockContext&              block_ctx(const std::optional<std::string>& engine_id = std::nullopt);

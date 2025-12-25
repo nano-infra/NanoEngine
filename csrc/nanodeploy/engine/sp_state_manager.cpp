@@ -1,5 +1,7 @@
 #include "sp_state_manager.h"
+
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <random>
 
@@ -82,7 +84,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
 {
     // Step 1: cal num_blocks and num_blocks_per_rank
     auto& block_ctx = seq.block_ctx(engine_id_);
-    block_ctx.num_dispatched_tokens.clear();
+    memset(block_ctx.num_dispatched_tokens.data(), 0, sizeof(int) * attention_sp_);
 
     int num_tokens            = seq.num_tokens;
     int num_segments          = (num_tokens + segment_size - 1) / segment_size;
@@ -100,10 +102,10 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
 
     // Check constraints
     int running_master_count = num_running_seqs_per_sp_[master_rank];
-    
-    auto it_seqs = num_seqs.find(master_rank);
-    int current_num_seqs = (it_seqs != num_seqs.end()) ? it_seqs->second : 0;
-    
+
+    auto it_seqs          = num_seqs.find(master_rank);
+    int  current_num_seqs = (it_seqs != num_seqs.end()) ? it_seqs->second : 0;
+
     if (current_num_seqs + running_master_count + 1 > max_num_seqs_) {
         return false;
     }
@@ -177,11 +179,11 @@ void SPStateManager::deallocate(Sequence& seq)
         block_manager[sp_idx]->deallocate(seq);
     }
 
-    auto& block_ctx = seq.block_ctx(engine_id_);
-    int master_sp_idx = block_ctx.master_sp_idx;
+    auto& block_ctx     = seq.block_ctx(engine_id_);
+    int   master_sp_idx = block_ctx.master_sp_idx;
     block_ctx.sp_block_table.clear();
     block_ctx.block_location.clear();
-    block_ctx.num_dispatched_tokens.clear();
+    memset(block_ctx.num_dispatched_tokens.data(), 0, sizeof(int) * attention_sp_);
 
     num_running_seqs_--;
     num_running_tokens_ -= seq.num_tokens;

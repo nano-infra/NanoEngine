@@ -18,13 +18,10 @@ BlockContext::BlockContext(
     attention_sp(attention_sp),
     attention_dp(attention_dp)
 {
-    // Initialize sp_block_table and num_dispatched_tokens for range(attention_sp)
-    // This mimics Python's defaultdict behavior and ensures keys exist
     for (int i = 0; i < attention_sp; ++i) {
-        // Accessing via [] creates the entry if it doesn't exist
         (void)sp_block_table[i];
-        (void)num_dispatched_tokens[i];
     }
+    num_dispatched_tokens.resize(8, 0);
 }
 
 std::tuple<std::optional<std::string>,
@@ -34,7 +31,7 @@ std::tuple<std::optional<std::string>,
            int,
            std::vector<std::pair<int, int>>,
            std::unordered_map<int, std::vector<int>>,
-           std::unordered_map<int, int>>
+           std::vector<int>>
 BlockContext::getstate() const
 {
     std::unordered_map<int, std::vector<int>> sp_block_table_state;
@@ -60,7 +57,7 @@ BlockContext BlockContext::setstate(const std::tuple<std::optional<std::string>,
                                                      int,
                                                      std::vector<std::pair<int, int>>,
                                                      std::unordered_map<int, std::vector<int>>,
-                                                     std::unordered_map<int, int>>& state)
+                                                     std::vector<int>>& state)
 {
     BlockContext ctx;
     ctx.engine_id      = std::get<0>(state);
@@ -138,9 +135,6 @@ Sequence::Sequence(const std::vector<int>&           token_ids,
     num_cached_tokens       = 0;
 
     BlockContext ctx(engine_id, -1, master_sp_rank, 1, 1);
-    // Initialize sp_block_table and num_dispatched_tokens defaults
-    // Python: sp_block_table=defaultdict(list), num_dispatched_tokens=defaultdict(int)
-    // In C++, we just leave them empty, map[] will create default constructed value (empty vector/0)
 
     block_ctx_map[engine_id] = ctx;
 }
@@ -247,7 +241,8 @@ std::pair<const int*, size_t> Sequence::block_view(int i, const std::optional<st
 std::vector<int> Sequence::block(int i, const std::optional<std::string>& engine_id, int sp_idx)
 {
     auto view = block_view(i, engine_id, sp_idx);
-    if (view.second == 0) return {};
+    if (view.second == 0)
+        return {};
     return std::vector<int>(view.first, view.first + view.second);
 }
 

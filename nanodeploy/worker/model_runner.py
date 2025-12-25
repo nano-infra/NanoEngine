@@ -1,4 +1,5 @@
 import os
+
 import numpy as np
 
 import ray
@@ -6,6 +7,11 @@ import torch
 import torch.distributed as dist
 
 import torch.profiler as profiler
+from nanodeploy._cpp import (
+    prepare_decode_cpp,
+    prepare_prefill_cpp,
+    update_seqs_inner_loop,
+)
 
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
@@ -23,7 +29,6 @@ from nanodeploy.worker.distributed import (
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 from nanodeploy.worker.sp_context import set_sp_context
-from nanodeploy._cpp import prepare_prefill_cpp, prepare_decode_cpp
 
 logger = get_logger()
 
@@ -232,70 +237,21 @@ class ModelRunner:
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
-    def prepare_block_tables(self, dp_seqs: list[Sequence]):
-        sp_size = get_dist_context().attn_sp_world_size
-        sp_rank = get_dist_context().attn_sp_rank
-
-        dp_sp_seqs = [
-            [
-                seq
-                for seq in dp_seqs
-                if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
-            ]
-            for sp_idx in range(sp_size)
-        ]
-
-        max_num_blocks = max(
-            [
-                max([len(seq.block_table(self.engine_id, sp_rank)) for seq in seqs])
-                for seqs in dp_sp_seqs
-            ]
-        )
-
-        sp_num_seqs = [len(seqs) for seqs in dp_sp_seqs]
-
-        block_tables = [
-            [
-                (
-                    (bt := list(
-                        dp_sp_seqs[sp_idx][seq_id].block_table(self.engine_id, sp_rank)
-                    ))
-                    + [-1] * (max_num_blocks - len(bt))
-                    if seq_id < sp_num_seqs[sp_idx]
-                    else [-1] * max_num_blocks
-                )
-                for seq_id in range(self.config.max_num_seqs)
-            ]
-            for sp_idx in range(sp_size)
-        ]
-        # logger.info(f"{sp_rank=}, {block_tables=}")
-
-        block_tables = torch.tensor(
-            block_tables, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        return block_tables
-
     def prepare_prefill(self, seqs: list[Sequence], is_dummy: bool = False):
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
         block_size = self.config.kvcache_block_size
-        
+
         meta = prepare_prefill_cpp(
-            seqs, 
-            self.engine_id, 
-            sp_rank, 
-            sp_size,
-            block_size, 
-            self.config.max_num_seqs
+            seqs, self.engine_id, sp_rank, sp_size, block_size, self.config.max_num_seqs
         )
-        
-        input_ids = torch.tensor(meta.input_ids, dtype=torch.int64, pin_memory=True).cuda(
-            non_blocking=True
-        )
-        positions = torch.tensor(meta.positions, dtype=torch.int64, pin_memory=True).cuda(
-            non_blocking=True
-        )
+
+        input_ids = torch.tensor(
+            meta.input_ids, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        positions = torch.tensor(
+            meta.positions, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(
             meta.cu_seqlens_q, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
@@ -305,12 +261,14 @@ class ModelRunner:
         slot_mapping = torch.tensor(
             meta.slot_mapping, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
-        
+
         block_tables = None
         if meta.use_block_tables:
-            block_tables = torch.tensor(
-                meta.block_tables_flat, dtype=torch.int32, pin_memory=True
-            ).reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks).cuda(non_blocking=True)
+            block_tables = (
+                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
+                .reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks)
+                .cuda(non_blocking=True)
+            )
 
         set_context(
             True,
@@ -338,30 +296,38 @@ class ModelRunner:
             sp_rank,
             sp_size,
             block_size,
-            self.config.max_num_seqs
+            self.config.max_num_seqs,
         )
 
-        input_ids = torch.tensor(meta.input_ids, dtype=torch.int64, pin_memory=True).cuda(
-            non_blocking=True
-        )
-        positions = torch.tensor(meta.positions, dtype=torch.int64, pin_memory=True).cuda(
-            non_blocking=True
-        )
+        input_ids = torch.tensor(
+            meta.input_ids, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        positions = torch.tensor(
+            meta.positions, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
         slot_mapping = torch.tensor(
             meta.slot_mapping, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
-        
-        context_lens = torch.tensor(
-            meta.context_lens_flat, dtype=torch.int32, pin_memory=True
-        ).reshape(sp_size, self.config.max_num_seqs).cuda(non_blocking=True)
-        
-        global_context_lens = torch.tensor(
-            meta.global_context_lens_flat, dtype=torch.int32, pin_memory=True
-        ).reshape(sp_size, self.config.max_num_seqs).cuda(non_blocking=True)
 
-        block_tables = torch.tensor(
-            meta.block_tables_flat, dtype=torch.int32, pin_memory=True
-        ).reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks).cuda(non_blocking=True)
+        context_lens = (
+            torch.tensor(meta.context_lens_flat, dtype=torch.int32, pin_memory=True)
+            .reshape(sp_size, self.config.max_num_seqs)
+            .cuda(non_blocking=True)
+        )
+
+        global_context_lens = (
+            torch.tensor(
+                meta.global_context_lens_flat, dtype=torch.int32, pin_memory=True
+            )
+            .reshape(sp_size, self.config.max_num_seqs)
+            .cuda(non_blocking=True)
+        )
+
+        block_tables = (
+            torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
+            .reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks)
+            .cuda(non_blocking=True)
+        )
 
         q_mask = global_context_lens.clone()
         q_mask[sp_rank].fill_(0)
@@ -471,7 +437,6 @@ class ModelRunner:
         get_cache_context().migrate(seqs=seqs)
 
     def run(self, dp_seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
-        
 
         sp_rank = get_dist_context().attn_sp_rank
 
@@ -489,11 +454,6 @@ class ModelRunner:
                 master_sp_rank=get_dist_context().attn_sp_rank,
             )
 
-            # Ensure block_table is initialized for dummy seq in both Python and C++ backends.
-            if hasattr(seq, "block_table_set"):
-                seq.block_table_set([0], self.engine_id, sp_rank)
-            else:
-                seq.block_ctx(self.engine_id).sp_block_table[sp_rank] = [0]
             dp_seqs.append(seq)
 
         sp_seqs = [
@@ -534,9 +494,7 @@ class ModelRunner:
                 input_ids = torch.zeros_like(input_ids)
             dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
 
-            for i, seq in enumerate(sp_seqs):
-                seq.num_tokens += 1
-                seq.block_ctx(self.engine_id).num_dispatched_tokens[sp_rank] += 1
+            update_seqs_inner_loop(sp_seqs, self.engine_id, sp_rank)
 
             if self.profiler and self.run_count >= self.profiler_start_step:
                 if self.run_count < self.profiler_end_step:
