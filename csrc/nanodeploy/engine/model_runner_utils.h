@@ -52,6 +52,7 @@ struct DecodeMetadata {
     int attention_compute_bs = 0;
 
     std::vector<int> q_output_stride;
+    std::vector<int> q_offsets;
 };
 
 PrefillMetadata prepare_prefill_cpp(

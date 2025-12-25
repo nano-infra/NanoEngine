@@ -253,6 +253,14 @@ DecodeMetadata prepare_decode_cpp(
     }
     meta.q_output_stride = res_rank_start_loc;
 
+    // Calculate q_offsets
+    meta.q_offsets.assign(sp_size + 1, 0);
+    int current_offset = 0;
+    for (int i = 0; i < sp_size; ++i) {
+        current_offset += res_rank_start_loc[i];
+        meta.q_offsets[i + 1] = current_offset;
+    }
+
     meta.attention_compute_bs = 0;
     for(int c : sp_valid_request_counts) meta.attention_compute_bs += c;
     

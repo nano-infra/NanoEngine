@@ -535,6 +535,10 @@ class ModelRunner:
             meta.q_output_stride, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
 
+        q_offsets = torch.tensor(
+            meta.q_offsets, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
         # 6. 设置 Context
         set_context(
             False, # is_prefill
@@ -559,6 +563,7 @@ class ModelRunner:
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             attention_compute_bs=meta.attention_compute_bs,
             q_output_stride=q_output_stride,
+            q_offsets=q_offsets,
         )
 
         return input_ids, positions
@@ -739,6 +744,10 @@ class ModelRunner:
             sp_valid_request_counts, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
 
+        q_offsets = torch.zeros(sp_size + 1, dtype=torch.int32, pin_memory=True)
+        q_offsets[1:] = torch.cumsum(q_output_stride_tensor.cpu(), dim=0) # cumsum on cpu to avoid sync if needed, or just tensor op
+        q_offsets_tensor = q_offsets.cuda(non_blocking=True)
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
@@ -793,6 +802,7 @@ class ModelRunner:
             res_to_buffer_input_mask=res_to_buffer_input_mask_tensor,
             attention_compute_bs=attention_compute_bs,
             q_output_stride=q_output_stride_tensor,
+            q_offsets=q_offsets_tensor,
         )
 
         return input_ids, positions

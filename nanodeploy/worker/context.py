@@ -45,6 +45,7 @@ class Context:
 
     # used for all2all q transfer
     q_output_stride: torch.Tensor | None = None
+    q_offsets: torch.Tensor | None = None
 
 _CONTEXT = Context()
 
@@ -79,6 +80,7 @@ def set_context(
     res_to_buffer_input_mask: Optional[torch.Tensor] = None,
     attention_compute_bs: Optional[torch.Tensor] = None,
     q_output_stride: Optional[torch.Tensor] = None,
+    q_offsets: Optional[torch.Tensor] = None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -107,6 +109,7 @@ def set_context(
         res_to_buffer_input_mask=res_to_buffer_input_mask,
         attention_compute_bs=attention_compute_bs,
         q_output_stride=q_output_stride,
+        q_offsets=q_offsets,
     )
 
 
