@@ -1,30 +1,31 @@
 #include "scheduler.h"
-#include "scheduler_utils.h"
+#include "nanodeploy/engine/sequence.h"
 #include "nanodeploy/metrics/sequence_metric.h"
+#include "scheduler_utils.h"
 #include <algorithm>
-#include <stdexcept>
 #include <iostream>
+#include <stdexcept>
 
 namespace nanodeploy {
 
-Scheduler::Scheduler(const std::optional<std::string>& engine_id,
-                     int                                loop_count,
-                     int                                max_num_seqs,
-                     int                                max_num_batched_tokens,
-                     int                                eos,
-                     int                                attention_dp,
-                     int                                attention_sp,
-                     int                                num_kvcache_blocks,
-                     int                                kvcache_block_size,
-                     const std::string&                 mode)
-    : engine_id_(engine_id)
-    , loop_count_(loop_count)
-    , max_num_seqs_(max_num_seqs)
-    , max_num_batched_tokens_(max_num_batched_tokens)
-    , eos_(eos)
-    , attention_dp_(attention_dp)
-    , attention_sp_(attention_sp)
-    , mode_(mode)
+Scheduler::Scheduler(const std::string& engine_id,
+                     int                loop_count,
+                     int                max_num_seqs,
+                     int                max_num_batched_tokens,
+                     int                eos,
+                     int                attention_dp,
+                     int                attention_sp,
+                     int                num_kvcache_blocks,
+                     int                kvcache_block_size,
+                     const std::string& mode):
+    engine_id_(engine_id),
+    loop_count_(loop_count),
+    max_num_seqs_(max_num_seqs),
+    max_num_batched_tokens_(max_num_batched_tokens),
+    eos_(eos),
+    attention_dp_(attention_dp),
+    attention_sp_(attention_sp),
+    mode_(mode)
 {
     // Initialize worker states for each DP rank
     worker_state.reserve(attention_dp_);
@@ -32,10 +33,14 @@ Scheduler::Scheduler(const std::optional<std::string>& engine_id,
         worker_state.push_back(std::make_shared<SPStateManager>(
             engine_id_, attention_sp_, num_kvcache_blocks, kvcache_block_size, max_num_seqs_, max_num_batched_tokens_));
     }
+    // Initialize thread pool with attention_dp_ threads
+    thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
 }
 
 void Scheduler::add(std::shared_ptr<Sequence> seq)
 {
+    seq->active(engine_id_, attention_sp_, attention_dp_);
+
     if (seq->metric) {
         seq->metric->record_arrival();
     }
@@ -86,40 +91,62 @@ const std::unordered_map<int, std::shared_ptr<BlockManager>>& Scheduler::block_m
 
 int Scheduler::next_dp_idx()
 {
-    int idx       = dp_rr_counter_;
+    int idx        = dp_rr_counter_;
     dp_rr_counter_ = (dp_rr_counter_ + 1) % attention_dp_;
     return idx;
 }
 
-std::pair<std::vector<std::vector<std::shared_ptr<Sequence>>>, bool> Scheduler::schedule()
+ScheduleResult Scheduler::schedule()
 {
     // Try prefill first
-    auto scheduled_seqs = _schedule_prefill();
+    auto dp_seqs = _schedule_prefill();
 
     // Check if any sequences were scheduled in prefill
     bool has_prefill = false;
-    for (const auto& dp_seqs : scheduled_seqs) {
-        if (!dp_seqs.empty()) {
+    for (const auto& seqs : dp_seqs) {
+        if (!seqs.empty()) {
             has_prefill = true;
             break;
         }
     }
 
-    if (has_prefill) {
-        return {scheduled_seqs, true};
+    if (!has_prefill) {
+        // No prefill sequences, schedule decode
+        dp_seqs = _schedule_decode();
     }
 
-    // No prefill sequences, schedule decode
-    scheduled_seqs = _schedule_decode();
+    ScheduleResult result;
+    result.dp_seqs    = dp_seqs;
+    result.is_prefill = has_prefill;
 
-    return {scheduled_seqs, false};
+    // Prepare dp_sp_seqs and filtered_dp_sp_seqs
+    result.dp_sp_seqs.reserve(attention_dp_ * attention_sp_);
+    result.filtered_dp_sp_seqs.reserve(attention_dp_ * attention_sp_);
+
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+            // dp_sp_seqs is just dp_seqs[dp_idx] repeated for each sp_idx
+            result.dp_sp_seqs.push_back(dp_seqs[dp_idx]);
+
+            // filtered_dp_sp_seqs is dp_seqs[dp_idx] filtered by master_sp_idx
+            std::vector<std::shared_ptr<Sequence>> filtered;
+            for (const auto& seq : dp_seqs[dp_idx]) {
+                if (seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_ == sp_idx) {
+                    filtered.push_back(seq);
+                }
+            }
+            result.filtered_dp_sp_seqs.push_back(std::move(filtered));
+        }
+    }
+
+    return result;
 }
 
 std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill()
 {
     std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled_seqs(attention_dp_);
 
-    // num_seqs and num_batched_tokens track per-DP, per-SP-rank counts
+    // num_seqs and num_batched_tokens track per-DP, per-SP-rank counts for the CURRENT batch
     std::vector<std::unordered_map<int, int>> num_seqs(attention_dp_);
     std::vector<std::unordered_map<int, int>> num_batched_tokens(attention_dp_);
 
@@ -133,9 +160,21 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
     auto& waiting_queue = (mode_ != "decode") ? waiting : waiting_migration;
 
-    while (!waiting_queue.empty()) {
-        auto seq = waiting_queue.front();
+    // For LeastBatch and LeastCache, we maintain a set to act as a min-heap
+    std::set<std::pair<int, int>> dp_load_set;
+    if (routing_strategy == RoutingStrategy::LeastBatch) {
+        for (int i = 0; i < attention_dp_; ++i) {
+            dp_load_set.insert({worker_state[i]->num_running_seqs(), i});
+        }
+    }
+    else if (routing_strategy == RoutingStrategy::LeastCache) {
+        for (int i = 0; i < attention_dp_; ++i) {
+            dp_load_set.insert({worker_state[i]->num_running_tokens(), i});
+        }
+    }
 
+    while (!waiting_queue.empty()) {
+        auto seq       = waiting_queue.front();
         bool scheduled = false;
 
         if (routing_strategy == RoutingStrategy::RoundRobin) {
@@ -155,9 +194,9 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                 worker_state[selected_dp_idx]->allocate(*seq);
 
                 // Update tracking
-                auto& block_ctx         = seq->block_ctx(engine_id_);
-                block_ctx.dp_idx        = selected_dp_idx;
-                int master_sp_idx       = block_ctx.master_sp_idx;
+                auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
+                block_ctx.dp_idx_ = selected_dp_idx;
+                int master_sp_idx = block_ctx.master_sp_idx_;
 
                 num_seqs[selected_dp_idx][master_sp_idx] += 1;
                 num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens - seq->num_cached_tokens);
@@ -182,18 +221,10 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                 break;
             }
         }
-        else if (routing_strategy == RoutingStrategy::LeastBatch) {
-            std::vector<std::pair<int, int>> dp_seq_counts;
-            for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-                dp_seq_counts.push_back({dp_idx, (int)worker_state[dp_idx]->running.size()});
-            }
-
-            std::sort(dp_seq_counts.begin(), dp_seq_counts.end(), [](const auto& a, const auto& b) {
-                return a.second < b.second;
-            });
-
-            for (const auto& dp_info : dp_seq_counts) {
-                int selected_dp_idx = dp_info.first;
+        else if (routing_strategy == RoutingStrategy::LeastBatch || routing_strategy == RoutingStrategy::LeastCache) {
+            // Iterate through DP ranks in increasing order of load
+            for (auto it = dp_load_set.begin(); it != dp_load_set.end(); ++it) {
+                int selected_dp_idx = it->second;
 
                 bool can_allocate = worker_state[selected_dp_idx]->can_allocate(
                     *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
@@ -202,61 +233,20 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                     continue;
                 }
 
+                // WARNING: erase(it) invalidates the iterator. This is safe here because
+                // we break the loop immediately after. If refactoring to remove the break
+                // or making dp_load_set a member variable, ensure thread-safety and
+                // correct iterator management.
+                dp_load_set.erase(it);
                 worker_state[selected_dp_idx]->allocate(*seq);
+                int new_load = (routing_strategy == RoutingStrategy::LeastBatch) ?
+                                   worker_state[selected_dp_idx]->num_running_seqs() :
+                                   worker_state[selected_dp_idx]->num_running_tokens();
+                dp_load_set.insert({new_load, selected_dp_idx});
 
-                auto& block_ctx         = seq->block_ctx(engine_id_);
-                block_ctx.dp_idx        = selected_dp_idx;
-                int master_sp_idx       = block_ctx.master_sp_idx;
-
-                num_seqs[selected_dp_idx][master_sp_idx] += 1;
-                num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens - seq->num_cached_tokens);
-
-                seq->status = SequenceStatus::RUNNING;
-
-                waiting_queue.pop_front();
-                worker_state[selected_dp_idx]->running.push_back(seq);
-                scheduled_seqs[selected_dp_idx].push_back(seq);
-
-                if (seq->metric) {
-                    seq->metric->record_first_scheduled();
-                    if (mode_ == "decode") {
-                        seq->metric->record_decode_scheduled();
-                    }
-                }
-
-                scheduled = true;
-                break;
-            }
-        }
-        else if (routing_strategy == RoutingStrategy::LeastCache) {
-            std::vector<std::pair<int, int>> dp_token_counts;
-            for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-                int token_count = 0;
-                for (const auto& s : worker_state[dp_idx]->running) {
-                    token_count += s->num_tokens;
-                }
-                dp_token_counts.push_back({dp_idx, token_count});
-            }
-
-            std::sort(dp_token_counts.begin(), dp_token_counts.end(), [](const auto& a, const auto& b) {
-                return a.second < b.second;
-            });
-
-            for (const auto& dp_info : dp_token_counts) {
-                int selected_dp_idx = dp_info.first;
-
-                bool can_allocate = worker_state[selected_dp_idx]->can_allocate(
-                    *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
-
-                if (!can_allocate) {
-                    continue;
-                }
-
-                worker_state[selected_dp_idx]->allocate(*seq);
-
-                auto& block_ctx         = seq->block_ctx(engine_id_);
-                block_ctx.dp_idx        = selected_dp_idx;
-                int master_sp_idx       = block_ctx.master_sp_idx;
+                auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
+                block_ctx.dp_idx_ = selected_dp_idx;
+                int master_sp_idx = block_ctx.master_sp_idx_;
 
                 num_seqs[selected_dp_idx][master_sp_idx] += 1;
                 num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens - seq->num_cached_tokens);
@@ -298,14 +288,15 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
     for (int selected_dp_idx = 0; selected_dp_idx < attention_dp_; ++selected_dp_idx) {
         auto& running_queue = worker_state[selected_dp_idx]->running;
 
-        std::unordered_map<int, int> num_seqs;
+        std::unordered_map<int, int>          num_seqs;
         std::deque<std::shared_ptr<Sequence>> skipped;
+        std::vector<int>                      sp_lens(attention_sp_, 0);
 
         while (!running_queue.empty()) {
             auto seq = running_queue.front();
             running_queue.pop_front();
 
-            int master_rank = seq->block_ctx(engine_id_).master_sp_idx;
+            int master_rank = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
 
             // Check if we've reached the max sequences for this SP rank
             if (num_seqs[master_rank] >= max_num_seqs_) {
@@ -343,6 +334,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
                 }
                 else {
                     scheduled_seqs[selected_dp_idx].push_back(seq);
+                    sp_lens[master_rank] += seq->num_tokens;
                 }
             }
         }
@@ -356,11 +348,6 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
         }
 
         // Add dummy sequences for SP ranks with no work
-        std::vector<int> sp_lens(attention_sp_, 0);
-        for (const auto& seq : scheduled_seqs[selected_dp_idx]) {
-            sp_lens[seq->block_ctx(engine_id_).master_sp_idx] += seq->num_tokens;
-        }
-
         for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
             if (sp_lens[sp_idx] == 0) {
                 scheduled_seqs[selected_dp_idx].push_back(worker_state[selected_dp_idx]->dummy_seqs[sp_idx]);
@@ -380,14 +367,13 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
     waiting.push_front(seq);
 }
 
-void Scheduler::postprocess(
-    const std::vector<std::vector<std::vector<std::shared_ptr<Sequence>>>>& dp_seqs,
-    const std::vector<std::vector<std::vector<std::vector<int>>>>&          dp_token_ids,
-    bool                                                                     update_metrics)
+void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+                            const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+                            bool                                                       update_metrics)
 {
     // Call the C++ postprocess_sequences utility directly with shared_ptrs
     auto migrations = postprocess_sequences(
-        worker_state, dp_seqs, dp_token_ids, engine_id_.value_or(""), eos_, mode_ == "prefill", update_metrics);
+        worker_state, dp_sp_seqs, dp_sp_token_ids, eos_, mode_ == "prefill", update_metrics, thread_pool_.get());
 
     // Store migrations
     for (const auto& [seq_shared, dp_idx] : migrations) {
@@ -399,11 +385,11 @@ void Scheduler::free_to_be_migrated(std::shared_ptr<Sequence> seq)
 {
     auto it = to_be_migrated.find(seq->seq_id);
     if (it == to_be_migrated.end()) {
-        throw std::runtime_error("Sequence " + seq->seq_id + " not found in to_be_migrated");
+        throw std::runtime_error("Sequence " + std::to_string(seq->seq_id) + " not found in to_be_migrated");
     }
 
     int selected_dp_idx = it->second.second;
-    worker_state[selected_dp_idx]->deallocate(*seq);
+    worker_state[selected_dp_idx]->deallocate(*seq, BlockContextSlot::MIGRATE);
     to_be_migrated.erase(it);
 }
 

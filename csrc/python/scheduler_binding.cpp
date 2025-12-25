@@ -19,12 +19,13 @@ void bind_scheduler_utils(py::module_& m)
     m.def("postprocess_sequences",
           &postprocess_sequences,
           py::arg("worker_states"),
-          py::arg("dp_seqs"),
-          py::arg("dp_token_ids"),
-          py::arg("engine_id"),
+          py::arg("dp_sp_seqs"),
+          py::arg("dp_sp_token_ids"),
           py::arg("eos_id"),
           py::arg("is_prefill"),
-          py::arg("update_metrics") = true);
+          py::arg("update_metrics") = true,
+          py::arg("thread_pool")    = nullptr,
+          py::call_guard<py::gil_scoped_release>());
 
     // Bind the SPStateManagerList type
     py::class_<std::vector<std::shared_ptr<SPStateManager>>>(m, "SPStateManagerList")
@@ -44,9 +45,7 @@ void bind_scheduler_utils(py::module_& m)
              })
         .def(
             "__iter__",
-            [](std::vector<std::shared_ptr<SPStateManager>>& v) {
-                return py::make_iterator(v.begin(), v.end());
-            },
+            [](std::vector<std::shared_ptr<SPStateManager>>& v) { return py::make_iterator(v.begin(), v.end()); },
             py::keep_alive<0, 1>());
 
     // Bind the to_be_migrated map type
@@ -66,11 +65,11 @@ void bind_scheduler_utils(py::module_& m)
              })
         .def("__setitem__",
              [](std::unordered_map<std::string, std::pair<std::shared_ptr<Sequence>, int>>& m,
-                const std::string&                                                           key,
+                const std::string&                                                          key,
                 const std::pair<std::shared_ptr<Sequence>, int>&                            value) { m[key] = value; })
         .def("__contains__",
              [](const std::unordered_map<std::string, std::pair<std::shared_ptr<Sequence>, int>>& m,
-                const std::string&                                                                key) { return m.count(key) > 0; })
+                const std::string& key) { return m.count(key) > 0; })
         .def("__delitem__",
              [](std::unordered_map<std::string, std::pair<std::shared_ptr<Sequence>, int>>& m, const std::string& key) {
                  auto it = m.find(key);
@@ -86,18 +85,24 @@ void bind_scheduler_utils(py::module_& m)
                  }
                  return keys;
              })
-        .def("items",
-             [](const std::unordered_map<std::string, std::pair<std::shared_ptr<Sequence>, int>>& m) {
-                 py::list items;
-                 for (const auto& kv : m) {
-                     items.append(py::make_tuple(kv.first, kv.second));
-                 }
-                 return items;
-             });
+        .def("items", [](const std::unordered_map<std::string, std::pair<std::shared_ptr<Sequence>, int>>& m) {
+            py::list items;
+            for (const auto& kv : m) {
+                items.append(py::make_tuple(kv.first, kv.second));
+            }
+            return items;
+        });
+
+    // Bind the ScheduleResult struct
+    py::class_<ScheduleResult>(m, "ScheduleResult")
+        .def_readwrite("dp_seqs", &ScheduleResult::dp_seqs)
+        .def_readwrite("dp_sp_seqs", &ScheduleResult::dp_sp_seqs)
+        .def_readwrite("filtered_dp_sp_seqs", &ScheduleResult::filtered_dp_sp_seqs)
+        .def_readwrite("is_prefill", &ScheduleResult::is_prefill);
 
     // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
-        .def(py::init<const std::optional<std::string>&, int, int, int, int, int, int, int, int, const std::string&>(),
+        .def(py::init<const std::string&, int, int, int, int, int, int, int, int, const std::string&>(),
              py::arg("engine_id"),
              py::arg("loop_count"),
              py::arg("max_num_seqs"),
@@ -113,14 +118,15 @@ void bind_scheduler_utils(py::module_& m)
         .def("add", &Scheduler::add, py::arg("seq"))
 
         // Scheduling
-        .def("schedule", &Scheduler::schedule)
+        .def("schedule", &Scheduler::schedule, py::call_guard<py::gil_scoped_release>())
 
         // Postprocessing
         .def("postprocess",
              &Scheduler::postprocess,
              py::arg("dp_seqs"),
              py::arg("dp_token_ids"),
-             py::arg("update_metrics") = true)
+             py::arg("update_metrics") = true,
+             py::call_guard<py::gil_scoped_release>())
 
         // State queries
         .def("is_finished", &Scheduler::is_finished)

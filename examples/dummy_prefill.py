@@ -2,7 +2,6 @@ import os
 
 from nanodeploy import LLM, SamplingParams
 from nanodeploy.engine.sequence import Sequence
-
 from transformers import AutoTokenizer
 
 
@@ -34,7 +33,7 @@ def main():
 
     long_seqs = [
         Sequence(
-            [0] * 400000,
+            [0] * 400001,
             sampling_params=sampling_params,
         )
     ]
@@ -42,7 +41,7 @@ def main():
 
     short_seqs = [
         Sequence(
-            [0] * 1024,
+            [0] * 1023,
             sampling_params=sampling_params,
         )
         for _ in range(512)

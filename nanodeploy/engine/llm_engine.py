@@ -6,19 +6,16 @@ from time import perf_counter
 from typing import Literal
 
 import numpy as np
-
 from tqdm.auto import tqdm
-
 from transformers import AutoTokenizer
 
+from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.config import Config
 from nanodeploy.engine.ray_executor import RayExecutor
-from nanodeploy.engine.scheduler import Scheduler, RoutingStrategy
+from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.metrics import MetricsManager
-
-
 
 logger = get_logger()
 
@@ -42,7 +39,9 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
-        logger.info(f"Initialized Scheduler with RoutingStrategy: {self.scheduler.routing_strategy}")
+        logger.info(
+            f"Initialized Scheduler with RoutingStrategy: {self.scheduler.routing_strategy}"
+        )
         self.metrics_manager = MetricsManager()
         atexit.register(self.exit)
 
@@ -56,9 +55,6 @@ class LLMEngine:
         if isinstance(seqs, Sequence):
             seqs = [seqs]
         for seq in seqs:
-            seq.set_engine_id(
-                self.engine_id, self.config.attention_dp, self.config.attention_sp
-            )
             seq.metric = self.metrics_manager.create_sequence_metric(
                 seq.seq_id, seq.num_prompt_tokens
             )
@@ -72,51 +68,50 @@ class LLMEngine:
         sp_size = self.config.attention_sp
         tp_size = self.config.attention_tp
         sch_begin = time.time()
-        dp_seqs, is_prefill = self.scheduler.schedule()
+        sch_res = self.scheduler.schedule()
+        dp_seqs = sch_res.dp_seqs
+        is_prefill = sch_res.is_prefill
+        dp_sp_seqs = sch_res.dp_sp_seqs
+        filtered_dp_sp_seqs = sch_res.filtered_dp_sp_seqs
+
         total_running = sum(len(seqs) for seqs in dp_seqs)
-        total_waiting = len(self.scheduler.waiting) 
+        total_waiting = len(self.scheduler.waiting)
         total_waiting_migration = len(self.scheduler.waiting_migration)
         self.metrics_manager.server_metric.update_running_requests(total_running)
         self.metrics_manager.server_metric.update_waiting_requests(total_waiting)
-        self.metrics_manager.server_metric.update_waiting_migration_requests(total_waiting_migration)
+        self.metrics_manager.server_metric.update_waiting_migration_requests(
+            total_waiting_migration
+        )
 
         if self.scheduler.waiting_migration:
             logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
-        # TODO (JimyMa): For loop
-        filtered_dp_sp_seqs = [
-            [
-                seq
-                for seq in seqs
-                if seq.block_ctx(self.engine_id).master_sp_idx == sp_idx
-            ]
-            for seqs in dp_seqs
-            for sp_idx in range(self.config.attention_sp)
-        ]
 
-        dp_sp_seqs = [
-            [seq for seq in seqs]
-            for seqs in dp_seqs
-            for _ in range(self.config.attention_sp)
-        ]
+        dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
 
         dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
         # dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
-        sp_batch_sizes = [[len(filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx]) 
-                          for sp_idx in range(sp_size)] 
-                          for dp_idx in range(dp_size)]
-        
-        logger.info({
-            "mode": "prefill" if is_prefill else "decode",
-            # "dp_batch_sizes": dp_batch_sizes,
-            "sp_batch_sizes": sp_batch_sizes,
-            "free_blocks": [
-                [
-                    len(worker_state.block_manager[i].free_block_ids) 
-                    for i in range(self.scheduler.attention_sp)
-                ]
-                for worker_state in self.scheduler.worker_state
+        sp_batch_sizes = [
+            [
+                len(filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx])
+                for sp_idx in range(sp_size)
             ]
-        })
+            for dp_idx in range(dp_size)
+        ]
+
+        logger.info(
+            {
+                "mode": "prefill" if is_prefill else "decode",
+                # "dp_batch_sizes": dp_batch_sizes,
+                "sp_batch_sizes": sp_batch_sizes,
+                "free_blocks": [
+                    [
+                        len(worker_state.block_manager[i].free_block_ids)
+                        for i in range(self.scheduler.attention_sp)
+                    ]
+                    for worker_state in self.scheduler.worker_state
+                ],
+            }
+        )
 
         sch_end = time.time()
         post_sch_begin = 0
@@ -127,8 +122,8 @@ class LLMEngine:
                 for seqs in filtered_dp_sp_seqs:
                     for seq in seqs:
                         logger.debug(
-                            f"{seq.block_ctx(seq.backup_engine_id).block_location}, "
-                            f"{seq.block_ctx(seq.active_engine_id).block_location}"
+                            f"{seq.block_ctx().block_location}, "
+                            f"{seq.block_ctx(BlockContextSlot.MIGRATE).block_location}"
                         )
                 self.executor.migrate(dp_sp_seqs)
             else:
@@ -140,7 +135,7 @@ class LLMEngine:
                                 getattr(seq, "seq_id", "<unknown>"),
                             )
                             continue
-                        seq.append_token(0)
+                        seq.append_token(0, BlockContextSlot.ACTIVE)
                 for seqs in dp_seqs:
                     for seq in seqs:
                         if seq.metric and seq.metric.num_generated_tokens == 0:
@@ -149,23 +144,19 @@ class LLMEngine:
         else:
             token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
             post_sch_begin = time.time()
-            token_ids = [
-                token_ids[i * sp_size : (i + 1) * sp_size] for i in range(0, dp_size)
-            ]
-            filtered_dp_sp_seqs = [
-                filtered_dp_sp_seqs[i * sp_size : (i + 1) * sp_size]
-                for i in range(0, dp_size)
-            ]
-            self.scheduler.postprocess(filtered_dp_sp_seqs, token_ids, self.metrics_manager)
+            self.scheduler.postprocess(
+                filtered_dp_sp_seqs, token_ids, self.metrics_manager
+            )
             post_sch_end = time.time()
         outputs = []
         num_tokens = 0
-        
+
         for dp_idx, seqs in enumerate(dp_seqs):
             num_tokens_in_dp = sum(len(seq) for seq in seqs)
-            self.metrics_manager.server_metric.update_token_usage(dp_idx, num_tokens_in_dp)
-        
-        
+            self.metrics_manager.server_metric.update_token_usage(
+                dp_idx, num_tokens_in_dp
+            )
+
         for seqs in dp_seqs:
             num_tokens += (
                 sum(len(seq) for seq in seqs)
@@ -220,12 +211,12 @@ class LLMEngine:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
                     self.metrics_manager.server_metric.record_prefill_throughput(
-                    num_tokens, (perf_counter() - t) 
+                        num_tokens, (perf_counter() - t)
                     )
                 else:
                     decode_throughput = -num_tokens / (perf_counter() - t)
                     self.metrics_manager.server_metric.record_decode_throughput(
-                    -num_tokens, (perf_counter() - t)
+                        -num_tokens, (perf_counter() - t)
                     )
                 itl = (perf_counter() - t) * 1000 / self.config.loop_count
                 pbar.set_postfix(
@@ -244,7 +235,7 @@ class LLMEngine:
                     pbar.update(1)
         if use_tqdm:
             pbar.close()
-            
+
         logger.info("=" * 60)
         logger.info("Final Server Metrics Summary")
         logger.info("=" * 60)
@@ -254,5 +245,5 @@ class LLMEngine:
             if value is not None:
                 logger.info(f"  {key}: {value}")
         logger.info("=" * 60)
-        
+
         return

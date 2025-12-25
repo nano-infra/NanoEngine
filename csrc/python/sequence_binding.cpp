@@ -5,6 +5,7 @@
 #include <pybind11/stl_bind.h>
 
 #include <pybind11/stl.h>
+#include <utility>
 
 namespace py = pybind11;
 using namespace nanodeploy;
@@ -78,6 +79,12 @@ void bind_sequence(py::module_& m)
         .value("TO_BE_MIGRATED", SequenceStatus::TO_BE_MIGRATED)
         .export_values();
 
+    py::enum_<BlockContextSlot>(m, "BlockContextSlot")
+        .value("ACTIVE", BlockContextSlot::ACTIVE)
+        .value("MIGRATE", BlockContextSlot::MIGRATE)
+        .value("SWAP", BlockContextSlot::SWAP)
+        .export_values();
+
     // Wrapper class for num_dispatched_tokens to provide defaultdict(int) behavior
     py::class_<std::unordered_map<int, int>>(m, "DefaultIntDict")
         .def(py::init<>())
@@ -126,17 +133,11 @@ void bind_sequence(py::module_& m)
 
     py::class_<BlockContext>(m, "BlockContext")
         .def(py::init<>())
-        .def(py::init<const std::optional<std::string>&, int, int, int, int>(),
-             py::arg("engine_id"),
-             py::arg("dp_idx"),
-             py::arg("master_sp_idx"),
-             py::arg("attention_sp"),
-             py::arg("attention_dp"))
-        .def_readwrite("engine_id", &BlockContext::engine_id)
-        .def_readwrite("dp_idx", &BlockContext::dp_idx)
-        .def_readwrite("master_sp_idx", &BlockContext::master_sp_idx)
-        .def_readwrite("attention_sp", &BlockContext::attention_sp)
-        .def_readwrite("attention_dp", &BlockContext::attention_dp)
+        .def_readwrite("engine_id", &BlockContext::engine_id_)
+        .def_readwrite("dp_idx", &BlockContext::dp_idx_)
+        .def_readwrite("master_sp_idx", &BlockContext::master_sp_idx_)
+        .def_readwrite("attention_sp", &BlockContext::attention_sp_)
+        .def_readwrite("attention_dp", &BlockContext::attention_dp_)
         .def_property(
             "block_location",
             [](BlockContext& self) -> BlockContext::BlockLocationList& { return self.block_location; },
@@ -147,59 +148,45 @@ void bind_sequence(py::module_& m)
             [](BlockContext& self) -> BlockContext::SpBlockTable& { return self.sp_block_table; },
             [](BlockContext& self, const BlockContext::SpBlockTable& value) { self.sp_block_table = value; },
             py::return_value_policy::reference_internal)
-        .def_property(
-            "num_dispatched_tokens",
-            [](BlockContext& self) -> std::unordered_map<int, int>& { return self.num_dispatched_tokens; },
-            [](BlockContext& self, const std::unordered_map<int, int>& value) { self.num_dispatched_tokens = value; },
-            py::return_value_policy::reference_internal)
+        .def("reset", &BlockContext::reset, py::arg("engine_id"), py::arg("attention_sp"), py::arg("attention_dp"))
         .def(py::pickle([](const BlockContext& p) { return p.getstate(); },
-                        [](const std::tuple<std::optional<std::string>,
+                        [](const std::tuple<std::string,
                                             int,
                                             int,
                                             int,
                                             int,
                                             std::vector<std::pair<int, int>>,
                                             std::unordered_map<int, std::vector<int>>,
-                                            std::unordered_map<int, int>>& t) { return BlockContext::setstate(t); }));
+                                            std::vector<int>>& t) { return BlockContext::setstate(t); }));
 
     py::class_<Sequence, std::shared_ptr<Sequence>>(m, "Sequence")
-        .def(py::init<const std::vector<int>&, double, int, bool, const std::optional<std::string>&, int>(),
+        .def(py::init<const std::vector<int>&, double, int, bool>(),
              py::arg("token_ids"),
-             py::arg("temperature")    = 1.0,
-             py::arg("max_tokens")     = 256,
-             py::arg("ignore_eos")     = false,
-             py::arg("engine_id")      = std::nullopt,
-             py::arg("master_sp_rank") = 0)
-
-        .def("set_engine_id",
-             &Sequence::set_engine_id,
-             py::arg("engine_id"),
-             py::arg("attention_dp") = 1,
-             py::arg("attention_sp") = 1)
-        .def("context_len",
-             &Sequence::context_len,
-             py::arg("engine_id") = std::nullopt,
-             py::arg("sp_idx")    = std::nullopt)
+             py::arg("temperature") = 1.0,
+             py::arg("max_tokens")  = 256,
+             py::arg("ignore_eos")  = false)
+        .def("active", &Sequence::active, py::arg("engine_id"), py::arg("attention_sp"), py::arg("attention_dp"))
+        .def("migrate", &Sequence::migrate)
+        .def("context_len", &Sequence::context_len, py::arg("engine_id"), py::arg("sp_idx") = std::nullopt)
         .def("append_token",
              &Sequence::append_token,
              py::arg("token_id"),
-             py::arg("engine_id") = std::nullopt,
-             py::arg("sp_idx")    = std::nullopt)
-
+             py::arg("slot"),
+             py::arg("sp_idx") = std::nullopt)
         .def("block_ctx",
-             static_cast<BlockContext& (Sequence::*)(const std::optional<std::string>&)>(&Sequence::block_ctx),
-             py::arg("engine_id") = std::nullopt,
+             static_cast<BlockContext& (Sequence::*)(BlockContextSlot)>(&Sequence::block_ctx),
+             py::arg("slot") = BlockContextSlot::ACTIVE,
              py::return_value_policy::reference_internal)
         .def("block_table",
              &Sequence::block_table,
-             py::arg("engine_id") = std::nullopt,
-             py::arg("sp_idx")    = 0,
+             py::arg("slot"),
+             py::arg("sp_idx") = 0,
              py::return_value_policy::reference_internal)
-        .def("dp_idx", &Sequence::dp_idx, py::arg("engine_id"))
-        .def("num_blocks", &Sequence::num_blocks, py::arg("engine_id"), py::arg("sp_idx"))
-        .def("last_block_page_id", &Sequence::last_block_page_id, py::arg("engine_id"), py::arg("sp_idx"))
-        .def("last_block_num_tokens", &Sequence::last_block_num_tokens, py::arg("engine_id"), py::arg("sp_idx"))
-        .def("block", &Sequence::block, py::arg("i"), py::arg("engine_id"), py::arg("sp_idx"))
+        .def("dp_idx", &Sequence::dp_idx, py::arg("slot"))
+        .def("num_blocks", &Sequence::num_blocks, py::arg("slot"), py::arg("sp_idx"))
+        .def("last_block_page_id", &Sequence::last_block_page_id, py::arg("slot"), py::arg("sp_idx"))
+        .def("last_block_num_tokens", &Sequence::last_block_num_tokens, py::arg("slot"), py::arg("sp_idx"))
+        .def("block", &Sequence::block, py::arg("i"), py::arg("slot"), py::arg("sp_idx"))
 
         .def_readwrite("seq_id", &Sequence::seq_id)
         .def_readwrite("status", &Sequence::status)
@@ -209,27 +196,6 @@ void bind_sequence(py::module_& m)
         .def_readwrite("num_prompt_tokens", &Sequence::num_prompt_tokens)
         .def_readwrite("num_checkpointed_tokens", &Sequence::num_checkpointed_tokens)
         .def_readwrite("num_cached_tokens", &Sequence::num_cached_tokens)
-        .def_readwrite("backup_engine_id", &Sequence::backup_engine_id)
-        .def_readwrite("active_engine_id", &Sequence::active_engine_id)
-        .def_property(
-            "block_ctx_map",
-            [](Sequence& self) -> Sequence::BlockCtxMap& { return self.block_ctx_map; },
-            [](Sequence& self, py::object value) {
-                if (py::isinstance<py::dict>(value)) {
-                    py::dict d = value.cast<py::dict>();
-                    self.block_ctx_map.clear();
-                    for (auto item : d) {
-                        auto eid                = item.first.cast<std::optional<std::string>>();
-                        auto ctx                = item.second.cast<BlockContext>();
-                        self.block_ctx_map[eid] = ctx;
-                    }
-                    return;
-                }
-
-                // Allow assigning from an existing BlockCtxMap proxy.
-                self.block_ctx_map = value.cast<Sequence::BlockCtxMap>();
-            },
-            py::return_value_policy::reference_internal)
         .def_readwrite("metric", &Sequence::metric)
         .def_readwrite("temperature", &Sequence::temperature)
         .def_readwrite("max_tokens", &Sequence::max_tokens)
@@ -282,27 +248,17 @@ void bind_sequence(py::module_& m)
                     last_element = {p.last_token};
                 }
 
-                // Convert block_ctx_map to list of tuples to avoid map conversion issues
-                py::list block_ctx_list;
-                for (const auto& pair : p.block_ctx_map) {
-                    block_ctx_list.append(py::make_tuple(pair.first, pair.second));
-                }
-
                 return std::make_tuple(p.num_tokens,
                                        p.num_checkpointed_tokens,
                                        p.num_cached_tokens,
-                                       p.backup_engine_id,
-                                       p.active_engine_id,
-                                       block_ctx_list,
+                                       p.slots_,
                                        p.temperature,
                                        last_element);
             },
             [](const std::tuple<int,
                                 int,
                                 int,
-                                std::optional<std::string>,
-                                std::optional<std::string>,
-                                py::list,
+                                std::array<BlockContext, (size_t)BlockContextSlot::_COUNT>,
                                 double,
                                 std::vector<int>>& t) {  // __setstate__
                 // We need to reconstruct the object.
@@ -311,7 +267,7 @@ void bind_sequence(py::module_& m)
                 // But the existing constructor requires token_ids.
 
                 // Let's extract token_ids from the last element if possible.
-                std::vector<int> last_element = std::get<7>(t);
+                std::vector<int> last_element = std::get<5>(t);
                 std::vector<int> initial_tokens;
 
                 // If num_generated_tokens_since_checkpoint == 0, last_element is token_ids.
@@ -327,20 +283,10 @@ void bind_sequence(py::module_& m)
                 seq->num_tokens              = std::get<0>(t);
                 seq->num_checkpointed_tokens = std::get<1>(t);
                 seq->num_cached_tokens       = std::get<2>(t);
-                seq->backup_engine_id        = std::get<3>(t);
-                seq->active_engine_id        = std::get<4>(t);
 
-                // Reconstruct block_ctx_map
-                py::list block_ctx_list = std::get<5>(t);
-                seq->block_ctx_map.clear();  // Clear default one
-                for (auto item : block_ctx_list) {
-                    auto tuple              = item.cast<py::tuple>();
-                    auto eid                = tuple[0].cast<std::optional<std::string>>();
-                    auto ctx                = tuple[1].cast<BlockContext>();
-                    seq->block_ctx_map[eid] = ctx;
-                }
+                seq->slots_ = std::move(std::get<3>(t));
 
-                seq->temperature = std::get<6>(t);
+                seq->temperature = std::get<4>(t);
 
                 if (num_tokens - num_checkpointed_tokens != 0) {
                     if (!last_element.empty()) {
