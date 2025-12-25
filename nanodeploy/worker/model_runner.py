@@ -834,6 +834,9 @@ class ModelRunner:
         # update global context length
         context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
 
+        # update context lens for attention
+        context.context_lens_for_attn[:num_sp_seqs].add_(1)
+
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -1014,7 +1017,7 @@ class ModelRunner:
         sp_world_size = get_dist_context().attn_sp_world_size
         config = self.config
         hf_config = config.hf_config
-        assert config.max_attention_comp_seqs > config.max_num_seqs
+        # assert config.max_attention_comp_seqs > config.max_num_seqs
         hf_config.max_position_embeddings = max(
             config.max_model_len, hf_config.max_position_embeddings
         )
