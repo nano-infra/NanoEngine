@@ -1,15 +1,10 @@
 #include "nanodeploy/engine/sp_state_manager.h"
-#include "opaque_types.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 
 namespace py = pybind11;
 using namespace nanodeploy;
-
-// Bind the map and deque types
-PYBIND11_MAKE_OPAQUE(std::unordered_map<int, std::shared_ptr<BlockManager>>);
-PYBIND11_MAKE_OPAQUE(std::deque<std::shared_ptr<Sequence>>);
 
 void bind_sp_state_manager(py::module_& m)
 {

@@ -40,29 +40,10 @@ struct BlockContext {
     int         attention_sp_  = 1;
     int         attention_dp_  = 1;
 
-    // Wrapper container types.
-    //
-    // Motivation: pybind11 converts STL containers to Python list/dict copies by
-    // default. These wrappers are distinct C++ types, allowing us to bind them
-    // with pybind11 (stl_bind) as *mutable proxy objects* without affecting other
-    // std::vector<int> usages (e.g., Sequence::token_ids).
-    struct BlockLocationList: public std::vector<std::pair<int, int>> {
-        using std::vector<std::pair<int, int>>::vector;
-    };
-    struct BlockIdList: public std::vector<int> {
-        using std::vector<int>::vector;
-    };
-    struct SpBlockTable: public std::unordered_map<int, BlockIdList> {
-        using std::unordered_map<int, BlockIdList>::unordered_map;
-    };
+    std::vector<std::pair<int, int>> block_location;
 
-    // block_location: vector of (sp_idx, block_id) pairs
-    BlockLocationList block_location;
+    std::vector<std::vector<int>> sp_block_table;
 
-    // sp_block_table: sp_idx -> list of block_ids
-    SpBlockTable sp_block_table;
-
-    // num_dispatched_tokens: sp_idx -> count
     std::vector<int> num_dispatched_tokens;
 
     BlockContext() = default;
@@ -75,7 +56,7 @@ struct BlockContext {
                int,
                int,
                std::vector<std::pair<int, int>>,
-               std::unordered_map<int, std::vector<int>>,
+               std::vector<std::vector<int>>,
                std::vector<int>>
     getstate() const;
 
@@ -85,7 +66,7 @@ struct BlockContext {
                                                   int,
                                                   int,
                                                   std::vector<std::pair<int, int>>,
-                                                  std::unordered_map<int, std::vector<int>>,
+                                                  std::vector<std::vector<int>>,
                                                   std::vector<int>>& state);
 
     void reset(const std::string& engine_id, int attention_sp, int attention_dp);
@@ -111,7 +92,6 @@ public:
              int                     max_tokens  = 256,
              bool                    ignore_eos  = false);
 
-    // Jumping
     int32_t active(const std::string& engine_id, int attention_sp, int attention_dp)
     {
         slots_[(size_t)BlockContextSlot::ACTIVE].reset(engine_id, attention_sp, attention_dp);
@@ -140,22 +120,16 @@ public:
                       BlockContextSlot   slot   = BlockContextSlot::ACTIVE,
                       std::optional<int> sp_idx = std::nullopt);
 
-    // Block related methods
     int num_blocks(BlockContextSlot slot, int sp_idx);
     int last_block_page_id(BlockContextSlot slot, int sp_idx);
     int last_block_num_tokens(BlockContextSlot slot, int sp_idx);
-    // Returns a pointer/size view into the internal token storage for block `i`.
-    // The returned pointer is valid only as long as the underlying storage is not
-    // modified in a way that can reallocate or invalidate the buffer (e.g., appending
-    // tokens to the same sequence). Callers MUST NOT store this pointer beyond the
-    // duration in which they can guarantee no such modifications occur.
+
     std::pair<const int*, size_t> block_view(int i, BlockContextSlot slot, int sp_idx) const;
     std::vector<int>              block(int i, BlockContextSlot slot, int sp_idx);
 
-    // Accessors
-    BlockContext&              block_ctx(BlockContextSlot slot = BlockContextSlot::ACTIVE);
-    const BlockContext&        block_ctx(BlockContextSlot slot = BlockContextSlot::ACTIVE) const;
-    BlockContext::BlockIdList& block_table(BlockContextSlot slot = BlockContextSlot::ACTIVE, int sp_idx = 0);
+    BlockContext&       block_ctx(BlockContextSlot slot = BlockContextSlot::ACTIVE);
+    const BlockContext& block_ctx(BlockContextSlot slot = BlockContextSlot::ACTIVE) const;
+    std::vector<int>&   block_table(BlockContextSlot slot = BlockContextSlot::ACTIVE, int sp_idx = 0);
 
     int dp_idx(BlockContextSlot slot);
 
@@ -179,28 +153,6 @@ public:
         return num_cached_tokens / block_size;
     }
 
-    // Pickle support
-    // (num_tokens, num_checkpointed_tokens, num_cached_tokens, backup_engine_id, active_engine_id, block_ctx_map,
-    // temperature, token_ids/last_token) Note: token_ids/last_token logic is handled in getstate implementation
-    using StateTuple =
-        std::tuple<int,
-                   int,
-                   int,
-                   std::optional<std::string>,
-                   std::optional<std::string>,
-                   std::array<BlockContext, (size_t)BlockContextSlot::_COUNT>,
-                   double,
-                   std::vector<int>,  // We will always return full token_ids for simplicity in C++ or handle the logic
-                   int                // last_token, used if we don't return full token_ids?
-                        // Python logic: if num_generated_tokens_since_checkpoint == 0: token_ids else: last_token
-                        // We can use a variant or just return both and ignore one.
-                        // Let's stick to Python's tuple structure. It returns a tuple where the last element varies.
-                        // In C++, we can't easily return a tuple with varying types.
-                        // We will return a custom struct or handle it in binding.
-                        // Let's define a specific getstate for binding.
-                   >;
-
-    // Public members
     uint64_t         seq_id;
     SequenceStatus   status = SequenceStatus::WAITING;
     std::vector<int> token_ids;
@@ -209,9 +161,6 @@ public:
     int              num_prompt_tokens;
     int              num_checkpointed_tokens;
     int              num_cached_tokens = 0;
-
-    using BlockCtxMap = std::unordered_map<std::string, BlockContext, OptionalStringHash>;
-    BlockCtxMap block_ctx_map;
 
     std::shared_ptr<SequenceMetric> metric;
 

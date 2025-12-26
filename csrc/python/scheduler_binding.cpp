@@ -1,6 +1,5 @@
 #include "nanodeploy/engine/scheduler.h"
 #include "nanodeploy/engine/scheduler_utils.h"
-#include "opaque_types.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>

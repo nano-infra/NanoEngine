@@ -135,7 +135,6 @@ inline void print_stack_trace()
 #define NANODEPLOY_ASSERT(Expr, Msg, ...)                                                                              \
     {                                                                                                                  \
         if (!(Expr)) {                                                                                                 \
-            NANODEPLOY_CONSOLE_LOCK                                                                                    \
             std::cerr << "\033[1;91m"                                                                                  \
                       << "[Assertion Failed]"                                                                          \
                       << "\033[m " << __FILE__ << ":" << __LINE__ << ": " << __FUNCTION__ << ", Expected: " << #Expr   \

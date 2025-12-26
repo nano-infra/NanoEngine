@@ -2,6 +2,7 @@
 #include <memory>
 #include <stdexcept>
 
+#include "nanodeploy/logging.h"
 #include "nanodeploy/metrics/sequence_metric.h"
 
 #include "sequence.h"
@@ -22,9 +23,8 @@ void BlockContext::reset(const std::string& engine_id, int attention_sp, int att
     master_sp_idx_ = 0;
     attention_sp_  = attention_sp;
     attention_dp_  = attention_dp;
-    for (int i = 0; i < attention_sp; ++i) {
-        (void)sp_block_table[i];
-    }
+
+    sp_block_table.resize(attention_sp, {});
     num_dispatched_tokens.resize(attention_sp, 0);
 }
 
@@ -34,14 +34,14 @@ std::tuple<std::string,
            int,
            int,
            std::vector<std::pair<int, int>>,
-           std::unordered_map<int, std::vector<int>>,
+           std::vector<std::vector<int>>,
            std::vector<int>>
 BlockContext::getstate() const
 {
-    std::unordered_map<int, std::vector<int>> sp_block_table_state;
+    std::vector<std::vector<int>> sp_block_table_state;
     sp_block_table_state.reserve(sp_block_table.size());
     for (const auto& pair : sp_block_table) {
-        sp_block_table_state.emplace(pair.first, std::vector<int>(pair.second.begin(), pair.second.end()));
+        sp_block_table_state.push_back(std::vector<int>(pair.begin(), pair.end()));
     }
 
     return std::make_tuple(engine_id_,
@@ -60,7 +60,7 @@ BlockContext BlockContext::setstate(const std::tuple<std::string,
                                                      int,
                                                      int,
                                                      std::vector<std::pair<int, int>>,
-                                                     std::unordered_map<int, std::vector<int>>,
+                                                     std::vector<std::vector<int>>,
                                                      std::vector<int>>& state)
 {
     BlockContext ctx;
@@ -69,10 +69,10 @@ BlockContext BlockContext::setstate(const std::tuple<std::string,
     ctx.master_sp_idx_ = std::get<2>(state);
     ctx.attention_sp_  = std::get<3>(state);
     ctx.attention_dp_  = std::get<4>(state);
-    ctx.block_location = BlockContext::BlockLocationList(std::get<5>(state).begin(), std::get<5>(state).end());
+    ctx.block_location = std::vector<std::pair<int, int>>(std::get<5>(state).begin(), std::get<5>(state).end());
     ctx.sp_block_table.clear();
     for (const auto& pair : std::get<6>(state)) {
-        ctx.sp_block_table[pair.first] = BlockContext::BlockIdList(pair.second.begin(), pair.second.end());
+        ctx.sp_block_table.push_back(std::vector<int>(pair.begin(), pair.end()));
     }
     ctx.num_dispatched_tokens = std::get<7>(state);
     return ctx;
@@ -117,7 +117,7 @@ int Sequence::dp_idx(BlockContextSlot slot)
     return block_ctx(slot).dp_idx_;
 }
 
-BlockContext::BlockIdList& Sequence::block_table(BlockContextSlot slot, int sp_idx)
+std::vector<int>& Sequence::block_table(BlockContextSlot slot, int sp_idx)
 {
     return block_ctx(slot).sp_block_table[sp_idx];
 }
@@ -151,9 +151,7 @@ int Sequence::last_block_page_id(BlockContextSlot slot, int sp_idx)
     int   n_tokens       = block_ctx(slot).num_dispatched_tokens[sp_idx];
     int   last_block_idx = (n_tokens - 1) / block_size;
     auto& table          = block_table(slot, sp_idx);
-    if (last_block_idx >= static_cast<int>(table.size())) {
-        throw std::out_of_range("Block index out of range");
-    }
+    NANODEPLOY_ASSERT(last_block_idx < static_cast<int>(table.size()), "Block index out of range");
     return table[last_block_idx];
 }
 
