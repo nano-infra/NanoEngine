@@ -8,6 +8,7 @@ void bind_block_manager(py::module_& m);
 void bind_sp_state_manager(py::module_& m);
 void bind_scheduler_utils(py::module_& m);
 void bind_model_runner_utils(py::module_& m);
+void bind_rpc_endpoint(py::module_& m);
 
 PYBIND11_MODULE(_nanodeploy_cpp, m)
 {
@@ -19,4 +20,5 @@ PYBIND11_MODULE(_nanodeploy_cpp, m)
     bind_sp_state_manager(m);
     bind_scheduler_utils(m);
     bind_model_runner_utils(m);
+    bind_rpc_endpoint(m);
 }

@@ -164,7 +164,66 @@ class RayExecutor:
 
         logger.info("All workers scheduled successfully.")
 
+        # 3. 初始化 RDMA 通信
+        self._init_rdma()
+
+        logger.info("All workers rdma init successfully.")
+
+    def _init_rdma(self):
+        logger.info("Initializing RDMA channels...")
+        from dlslime import RDMAEndpoint, available_nic
+        from nanodeploy._cpp import RpcEndpoint
+
+        nics = available_nic()
+        assert nics
+        
+        # 本地发送端
+        self.rdma_endpoint = RDMAEndpoint(num_qp=len(self.workers), device_name=nics[0], ib_port=1, link_type="RoCE")
+        # C++ RPC 处理器
+        self.rpc_endpoint = RpcEndpoint()
+        
+        # 初始化 Worker 端 RDMA 接收
+        buffer_size = 128 * 1024 * 1024 # 128MB
+        worker_infos = ray.get([
+            w.init_rdma_receiver.remote(self.rdma_endpoint.endpoint_info(), buffer_size)
+            for w in self.workers
+        ])
+        
+        self.worker_buf_ptrs = []
+        self.worker_rkeys = []
+        self.registered_buffers = {} # Cache lkey for local pointers
+        
+        for i, info in enumerate(worker_infos):
+            self.rdma_endpoint.connect(info['endpoint_info'])
+            remote_ptr = info['buffer_ptr']
+            mr_info = info['mr_info']
+            rkey = self.rdma_endpoint.register_remote_memory_region(remote_ptr, mr_info)
+            self.worker_buf_ptrs.append(remote_ptr)
+            self.worker_rkeys.append(rkey)
+            
+        logger.info("RDMA initialized.")
+
+    def _rdma_send(self, worker_idx, data_ptr, size):
+        if data_ptr not in self.registered_buffers:
+            lkey = self.rdma_endpoint.register_memory_region(data_ptr, data_ptr + size, size)
+            self.registered_buffers[data_ptr] = lkey
+        else:
+            lkey = self.registered_buffers[data_ptr]
+            
+        remote_ptr = self.worker_buf_ptrs[worker_idx]
+        rkey = self.worker_rkeys[worker_idx]
+        
+        # Write with Imm: imm_data 传递 payload 大小
+        self.rdma_endpoint.write_with_imm(
+            [(data_ptr, remote_ptr, size, lkey, rkey)],
+            size, 
+            None
+        ).wait()
+
     def __del__(self):
+        if hasattr(self, "rdma_endpoint"):
+            del self.rdma_endpoint
+
         if hasattr(self, "workers") and self.workers:
             logger.info(f"Terminating {len(self.workers)} workers...")
             for worker in self.workers:
@@ -208,13 +267,15 @@ class RayExecutor:
     def migrate(
         self, dp_seqs: List[List[Sequence]], timeout: float | None = None
     ) -> list[int]:
-        return ray.get(
-            [
-                getattr(worker, "migrate").remote(seqs)
-                for seqs, worker in zip(dp_seqs, self.workers)
-            ],
-            timeout=timeout,
-        )
+        for i, seqs in enumerate(dp_seqs):
+            self.rpc_endpoint.feed_sequences(seqs)
+            self.rpc_endpoint.serialize_for_migrate()
+            ptr = self.rpc_endpoint.data()
+            size = self.rpc_endpoint.size()
+            self._rdma_send(i, ptr, size)
+            
+        futures = [w.migrate_rdma.remote() for w in self.workers]
+        return ray.get(futures, timeout=timeout)
 
     def run(
         self,
@@ -222,13 +283,28 @@ class RayExecutor:
         is_prefill: bool,
         timeout: float | None = None,
     ) -> list[list[list[int]]]:
-        return ray.get(
-            [
-                getattr(worker, "run").remote(seqs, is_prefill)
-                for seqs, worker in zip(dp_seqs, self.workers)
-            ],
-            timeout=timeout,
-        )
+        
+        # 1. 序列化并发送
+        for i, seqs in enumerate(dp_seqs):
+            # 将 seqs 喂给 C++ 对象
+            self.rpc_endpoint.feed_sequences(seqs)
+            
+            # 执行序列化
+            if is_prefill:
+                self.rpc_endpoint.serialize_for_prefill()
+            else:
+                self.rpc_endpoint.serialize_for_decode()
+            
+            # 获取底层指针
+            ptr = self.rpc_endpoint.data()
+            size = self.rpc_endpoint.size()
+            
+            # RDMA 发送
+            self._rdma_send(i, ptr, size)
+            
+        # 2. 通知 Worker 计算
+        futures = [w.run_rdma.remote(is_prefill) for w in self.workers]
+        return ray.get(futures, timeout=timeout)
 
     def update_kvcache_blocks(self):
         num_cache_blocks = min(self.collective_rpc("num_kvcache_blocks"))

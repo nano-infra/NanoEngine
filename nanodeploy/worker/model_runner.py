@@ -162,6 +162,37 @@ class ModelRunner:
         self.warmup_model()
         self.preallocate_kvcache()
 
+        from nanodeploy._cpp import RpcEndpoint
+        self.rpc_endpoint = RpcEndpoint()
+
+    def init_rdma_receiver(self, executor_info: dict, buffer_size: int):
+        from dlslime import RDMAEndpoint, available_nic
+
+        nics = available_nic()
+        # 创建 Endpoint (Target)
+        self.rdma_endpoint = RDMAEndpoint(num_qp=1, device_name=nics[0], ib_port=1, link_type="RoCE")
+        
+        # 分配 Pinned Memory (Device=CPU, pin_memory=True)
+        self.recv_buffer = torch.zeros(buffer_size, dtype=torch.uint8, pin_memory=True)
+        self.recv_buffer_ptr = self.recv_buffer.data_ptr()
+        
+        # 注册内存
+        self.rdma_endpoint.register_memory_region(
+            self.recv_buffer_ptr, 
+            self.recv_buffer_ptr + buffer_size, 
+            buffer_size
+        )
+        
+        # 连接并 Post Recv
+        self.rdma_endpoint.connect(executor_info)
+        self.rdma_recv_future = self.rdma_endpoint.imm_recv()
+        
+        return {
+            "endpoint_info": self.rdma_endpoint.endpoint_info(),
+            "buffer_ptr": self.recv_buffer_ptr,
+            "mr_info": self.rdma_endpoint.endpoint_info()["mr_info"]
+        }
+
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
 
@@ -216,7 +247,7 @@ class ModelRunner:
             seq.active(self.engine_id, sp_size, 1)
             seq.block_ctx().master_sp_idx = sp_rank
 
-        self.run(seqs, True)
+        self.run(True)
         torch.cuda.empty_cache()
 
     def preallocate_kvcache(self):
@@ -431,10 +462,39 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def migrate(self, seqs: list[Sequence]) -> None:
+    def migrate(self) -> None:
+        self.rdma_recv_future.wait()
+        data_len = self.rdma_recv_future.imm_data()
+        
+        self.rpc_endpoint.set_buffer(self.recv_buffer_ptr, data_len)
+        self.rpc_endpoint.deserialize_for_migrate()
+        seqs = self.rpc_endpoint.sequences()
+        
+        self.rdma_recv_future = self.rdma_endpoint.imm_recv()
+
         get_cache_context().migrate(seqs=seqs)
 
-    def run(self, dp_seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
+    def run(self, is_prefill: bool) -> list[list[int]]:
+
+        # 1. 等待 RDMA 写入完成 (imm_data 携带 payload 长度)
+        self.rdma_recv_future.wait()
+        data_len = self.rdma_recv_future.imm_data()
+        
+        # 2. 将 Pinned Memory 指针传给 C++ RpcEndpoint
+        # 这里调用的是我们在 C++ 中新增的 set_buffer 接口
+        self.rpc_endpoint.set_buffer(self.recv_buffer_ptr, data_len)
+        
+        # 3. 反序列化
+        if is_prefill:
+            self.rpc_endpoint.deserialize_for_prefill()
+        else:
+            self.rpc_endpoint.deserialize_for_decode()
+            
+        # 4. 获取 Sequence 列表
+        dp_seqs = self.rpc_endpoint.sequences()
+        
+        # 5. Post 下一个 Receive
+        self.rdma_recv_future = self.rdma_endpoint.imm_recv()
 
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
