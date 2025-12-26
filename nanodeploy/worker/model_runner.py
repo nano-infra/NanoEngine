@@ -247,7 +247,7 @@ class ModelRunner:
             seq.active(self.engine_id, sp_size, 1)
             seq.block_ctx().master_sp_idx = sp_rank
 
-        self.run(True)
+        self.run(seqs, True)
         torch.cuda.empty_cache()
 
     def preallocate_kvcache(self):
@@ -474,27 +474,24 @@ class ModelRunner:
 
         get_cache_context().migrate(seqs=seqs)
 
-    def run(self, is_prefill: bool) -> list[list[int]]:
+    def run_rdma(self, is_prefill: bool):
 
-        # 1. 等待 RDMA 写入完成 (imm_data 携带 payload 长度)
         self.rdma_recv_future.wait()
         data_len = self.rdma_recv_future.imm_data()
         
-        # 2. 将 Pinned Memory 指针传给 C++ RpcEndpoint
-        # 这里调用的是我们在 C++ 中新增的 set_buffer 接口
         self.rpc_endpoint.set_buffer(self.recv_buffer_ptr, data_len)
-        
-        # 3. 反序列化
         if is_prefill:
             self.rpc_endpoint.deserialize_for_prefill()
         else:
             self.rpc_endpoint.deserialize_for_decode()
-            
-        # 4. 获取 Sequence 列表
+        
         dp_seqs = self.rpc_endpoint.sequences()
         
-        # 5. Post 下一个 Receive
         self.rdma_recv_future = self.rdma_endpoint.imm_recv()
+        
+        return self.run(dp_seqs, is_prefill)
+
+    def run(self, dp_seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
 
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
