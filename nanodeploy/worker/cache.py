@@ -177,8 +177,24 @@ class CacheContext:
             futures = []
             for endpoint_key, endpoint_assign_batch in assigns.items():
                 for replica_key, assign_batch in endpoint_assign_batch.items():
+                    # assign_batch is a list of tuples:
+                    # (local_rank, remote_rank, remote_offset, local_offset, length)
+                    # dlslime.read expected:
+                    # (mr_key, remote_mr_key, target_offset, source_offset, length, stream)
+                    # We assume Target = Local, Source = Remote for Read.
+                    
+                    # zip(*assign_batch) transposes the list of tuples into tuples of items
+                    # columns: 0=local_rank, 1=remote_rank, 2=remote_offset, 3=local_offset, 4=length
+                    columns = list(zip(*assign_batch))
+                    
                     futures.append(
-                        self.endpoints[endpoint_key][replica_key].read(assign_batch)
+                        self.endpoints[endpoint_key][replica_key].read(
+                            list(columns[0]), # mr_key
+                            list(columns[1]), # remote_mr_key
+                            list(columns[3]), # target_offset (Local)
+                            list(columns[2]), # source_offset (Remote)
+                            list(columns[4]), # length
+                        )
                     )
 
             [future.wait() for future in futures]

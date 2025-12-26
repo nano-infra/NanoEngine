@@ -7,7 +7,7 @@ namespace nanodeploy {
 
 // Helper to mimic Python's prepare_block_tables
 // Helper to mimic Python's updated prepare_block_tables logic (Packed format)
-[[maybe_unused]]
+// Helper to mimic Python's updated prepare_block_tables logic (Packed format)
 static void build_block_tables_packed(
     const std::vector<Sequence*>& dp_seqs,
     int sp_rank,
@@ -233,7 +233,11 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
     }
 
     // 3. Block tables
-    build_block_tables(dp_seqs, sp_rank, sp_size, max_num_seqs, meta.block_tables_flat, meta.max_num_blocks);
+    // 3. Block tables
+    build_block_tables_packed(dp_seqs, sp_rank, sp_size, meta.block_tables_flat, meta.max_num_blocks);
+
+    meta.attention_compute_bs = (int)meta.input_ids.size();
+    meta.q_output_stride.assign(sp_size, 0);
 
     return meta;
 }

@@ -30,6 +30,8 @@ from nanodeploy.worker.sp_context import set_sp_context
 
 logger = get_logger()
 
+_USING_CPP_UTILS = True
+
 
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
@@ -377,7 +379,7 @@ class ModelRunner:
 
         block_tables = (
             torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
-            .reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks)
+            .reshape(-1, meta.max_num_blocks)
             .cuda(non_blocking=True)
         )
 
@@ -557,6 +559,7 @@ class ModelRunner:
         res_lse_mask = context_lens.clone()
         res_lse_mask[sp_rank].fill_(0)
         res_lse_mask[res_lse_mask != 0] = 1
+        attention_compute_bs = len(input_ids)
         set_context(
             False,
             self.config.max_num_seqs,
@@ -567,6 +570,9 @@ class ModelRunner:
             q_mask=q_mask,
             res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
+            attention_compute_bs=torch.tensor(
+                [attention_compute_bs], dtype=torch.int32, pin_memory=True
+            ).cuda(non_blocking=True),
         )
 
         return input_ids, positions
