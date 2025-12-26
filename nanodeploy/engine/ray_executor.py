@@ -175,37 +175,57 @@ class RayExecutor:
         from nanodeploy._cpp import RpcEndpoint
 
         nics = available_nic()
-        assert nics
+        assert nics, "No RDMA NIC found"
         
-        # 本地发送端
-        self.rdma_endpoint = RDMAEndpoint(num_qp=len(self.workers), device_name=nics[0], ib_port=1, link_type="RoCE")
-        # C++ RPC 处理器
         self.rpc_endpoint = RpcEndpoint()
         
-        # 初始化 Worker 端 RDMA 接收
+        # [修改] 为每个 Worker 创建一个独立的 Endpoint (num_qp=1)
+        self.rdma_endpoints = []
+        for _ in self.workers:
+            ep = RDMAEndpoint(num_qp=1, device_name=nics[0], ib_port=1, link_type="RoCE")
+            self.rdma_endpoints.append(ep)
+            
         buffer_size = 128 * 1024 * 1024 # 128MB
-        worker_infos = ray.get([
-            w.init_rdma_receiver.remote(self.rdma_endpoint.endpoint_info(), buffer_size)
-            for w in self.workers
-        ])
+        
+        # [修改] 并行初始化，向每个 Worker 发送对应的 Endpoint Info
+        worker_futures = []
+        for i, worker in enumerate(self.workers):
+            # 获取对应 Executor Endpoint 的连接信息
+            local_info = self.rdma_endpoints[i].endpoint_info()
+            worker_futures.append(
+                worker.init_rdma_receiver.remote(local_info, buffer_size)
+            )
+        
+        worker_infos = ray.get(worker_futures)
         
         self.worker_buf_ptrs = []
         self.worker_rkeys = []
-        self.registered_buffers = {} # Cache lkey for local pointers
+        self.registered_buffers = {} 
         
+        # [修改] 建立连接
         for i, info in enumerate(worker_infos):
-            self.rdma_endpoint.connect(info['endpoint_info'])
+            # 连接对应的 Endpoint
+            self.rdma_endpoints[i].connect(info['endpoint_info'])
+            
             remote_ptr = info['buffer_ptr']
             mr_info = info['mr_info']
-            rkey = self.rdma_endpoint.register_remote_memory_region(remote_ptr, mr_info)
+            
+            # 注册远程内存 (RKey)
+            # 因为所有 Endpoint 共享同一个 Context/PD，所以任选一个 Endpoint 注册即可
+            # 但为了逻辑清晰，使用对应的 Endpoint 注册
+            rkey = self.rdma_endpoints[i].register_remote_memory_region(remote_ptr, mr_info)
+            
             self.worker_buf_ptrs.append(remote_ptr)
             self.worker_rkeys.append(rkey)
             
         logger.info("RDMA initialized.")
 
     def _rdma_send(self, worker_idx, data_ptr, size):
+        # 1. 注册本地内存
         if data_ptr not in self.registered_buffers:
-            lkey = self.rdma_endpoint.register_memory_region(data_ptr, data_ptr + size, size)
+            # 同样，利用 PD 共享特性，使用第一个 Endpoint 进行注册即可
+            # 这样注册的 Memory Region 对所有 Endpoint 都有效
+            lkey = self.rdma_endpoints[0].register_memory_region(data_ptr, data_ptr + size, size)
             self.registered_buffers[data_ptr] = lkey
         else:
             lkey = self.registered_buffers[data_ptr]
@@ -213,8 +233,9 @@ class RayExecutor:
         remote_ptr = self.worker_buf_ptrs[worker_idx]
         rkey = self.worker_rkeys[worker_idx]
         
-        # Write with Imm: imm_data 传递 payload 大小
-        self.rdma_endpoint.write_with_imm(
+        # [修改] 使用对应的 Endpoint 发送数据
+        target_ep = self.rdma_endpoints[worker_idx]
+        target_ep.write_with_imm(
             [(data_ptr, remote_ptr, size, lkey, rkey)],
             size, 
             None
@@ -264,9 +285,7 @@ class RayExecutor:
             timeout=timeout,
         )
 
-    def migrate(
-        self, dp_seqs: List[List[Sequence]], timeout: float | None = None
-    ) -> list[int]:
+    def migrate(self, dp_seqs: List[List[Sequence]], timeout: float = None) -> List[int]:
         for i, seqs in enumerate(dp_seqs):
             self.rpc_endpoint.feed_sequences(seqs)
             self.rpc_endpoint.serialize_for_migrate()
@@ -274,35 +293,23 @@ class RayExecutor:
             size = self.rpc_endpoint.size()
             self._rdma_send(i, ptr, size)
             
-        futures = [w.migrate_rdma.remote() for w in self.workers]
+        futures = [w.migrate.remote() for w in self.workers]
         return ray.get(futures, timeout=timeout)
 
-    def run(
-        self,
-        dp_seqs: List[List[Sequence]],
-        is_prefill: bool,
-        timeout: float | None = None,
-    ) -> list[list[list[int]]]:
-        
-        # 1. 序列化并发送
+    def run(self, dp_seqs: List[List[Sequence]], is_prefill: bool, timeout: float = None) -> List[List[List[int]]]:
         for i, seqs in enumerate(dp_seqs):
-            # 将 seqs 喂给 C++ 对象
             self.rpc_endpoint.feed_sequences(seqs)
             
-            # 执行序列化
             if is_prefill:
                 self.rpc_endpoint.serialize_for_prefill()
             else:
                 self.rpc_endpoint.serialize_for_decode()
             
-            # 获取底层指针
             ptr = self.rpc_endpoint.data()
             size = self.rpc_endpoint.size()
             
-            # RDMA 发送
             self._rdma_send(i, ptr, size)
             
-        # 2. 通知 Worker 计算
         futures = [w.run_rdma.remote(is_prefill) for w in self.workers]
         return ray.get(futures, timeout=timeout)
 
