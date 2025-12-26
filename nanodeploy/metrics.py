@@ -12,22 +12,22 @@ from typing import Optional
 
 import numpy as np
 
-from nanodeploy.logging import get_logger
 from nanodeploy._cpp import (
     SequenceMetric as _CppSequenceMetric,
     ServerMetric as _CppServerMetric,
 )
 
+from nanodeploy.logging import get_logger
+
 logger = get_logger()
+
 
 class SequenceMetric(_CppSequenceMetric):
     def log_metrics(self):
         """Log all metrics for this sequence."""
 
         ttft_str = f"{self.ttft:.2f}ms" if self.ttft is not None else "N/A"
-        e2e_str = (
-            f"{self.e2e_latency:.2f}ms" if self.e2e_latency is not None else "N/A"
-        )
+        e2e_str = f"{self.e2e_latency:.2f}ms" if self.e2e_latency is not None else "N/A"
 
         tpot_wo_queue_str = (
             f"{self.avg_tpot_wo_queueing:.2f}ms"
@@ -51,7 +51,7 @@ class SequenceMetric(_CppSequenceMetric):
         )
 
         logger.info(
-            f"SequenceMetric [{self.seq_id[:8]}...] - "
+            f"SequenceMetric [{self.seq_id}...] - "
             f"TTFT: {ttft_str}, "
             f"E2E: {e2e_str}, "
             f"Prompt Length: {self.num_prompt_tokens}, Output Length: {self.num_generated_tokens}, "
@@ -61,7 +61,9 @@ class SequenceMetric(_CppSequenceMetric):
             f"ITL With Queue: {tpot_with_queue_str}"
         )
 
+
 ServerMetric = _CppServerMetric
+
 
 class MetricsManager:
     """
@@ -113,6 +115,7 @@ class MetricsManager:
         """Log current server metrics using the Python logger."""
         report_str = self.server_metric.get_metric_report(include_detailed)
         logger.info(report_str)
+
     def get_server_summary(self) -> dict:
         """Get server metrics summary."""
         return self.server_metric.get_summary()
