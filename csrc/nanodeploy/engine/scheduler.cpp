@@ -193,14 +193,14 @@ ScheduleResult Scheduler::schedule()
 
         // SP Communication Matrix Logic
         // Initialize matrix for this DP rank: [attention_sp_][attention_sp_]
-        result.sp_comm_matrix.push_back(
-            std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+        // result.sp_comm_matrix.push_back(
+            // std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
         
         result.sp_q_matrix.push_back(
             std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
 
-        result.sp_res_matrix.push_back(
-            std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+        // result.sp_res_matrix.push_back(
+        //     std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
 
         for (const auto& seq : dp_seqs[dp_idx]) {
             bool is_dummy = false;
@@ -226,7 +226,7 @@ ScheduleResult Scheduler::schedule()
                 for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
                     if (tokens[sp_idx] > 0) {
                         // Original matrix (Master -> Participant) - kept for compatibility if needed
-                        result.sp_comm_matrix[dp_idx][master_sp_idx][sp_idx]++;
+                        // result.sp_comm_matrix[dp_idx][master_sp_idx][sp_idx]++;
 
                         // Q Matrix: Master broadcast to all Participants
                         // Master sends Q to Participant
@@ -234,7 +234,7 @@ ScheduleResult Scheduler::schedule()
 
                         // Res Matrix: Participant sends results back to Master
                         // Participant sends Res to Master
-                        result.sp_res_matrix[dp_idx][sp_idx][master_sp_idx]++;
+                        // result.sp_res_matrix[dp_idx][sp_idx][master_sp_idx]++;
                     }
                 }
             }

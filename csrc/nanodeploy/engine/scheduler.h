@@ -49,7 +49,7 @@ struct ScheduleResult {
     // Matrix of SP communication counts.
     // Dimensions: [dp_idx][master_sp_rank][participant_sp_rank]
     // Value: Number of requests sent from master_sp_rank to participant_sp_rank.
-    std::vector<std::vector<std::vector<int>>> sp_comm_matrix;
+    // std::vector<std::vector<std::vector<int>>> sp_comm_matrix;
 
     // Matrix of Q communication counts (Master -> Participant).
     // Dimensions: [dp_idx][master_sp_rank][participant_sp_rank]
@@ -59,7 +59,7 @@ struct ScheduleResult {
     // Matrix of Res communication counts (Participant -> Master).
     // Dimensions: [dp_idx][participant_sp_rank][master_sp_rank]
     // Value: Number of Res requests sent from participant_sp_rank to master_sp_rank.
-    std::vector<std::vector<std::vector<int>>> sp_res_matrix;
+    // std::vector<std::vector<std::vector<int>>> sp_res_matrix;
 };
 
 class Scheduler {
