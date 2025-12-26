@@ -183,7 +183,7 @@ ScheduleResult Scheduler::schedule()
                         if (count > 0) active_ranks++;
                     }
 
-                    if (active_ranks > 1) {
+                    if (active_ranks > 1 && tokens[sp_idx] > 0) {
                         recv_count++;
                     }
                 }
