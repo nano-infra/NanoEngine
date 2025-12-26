@@ -25,7 +25,9 @@ Scheduler::Scheduler(const std::string& engine_id,
     eos_(eos),
     attention_dp_(attention_dp),
     attention_sp_(attention_sp),
-    mode_(mode)
+    mode_(mode),
+    sp_req_send_counts_(attention_sp, 0),
+    sp_req_recv_counts_(attention_sp, 0)
 {
     // Initialize worker states for each DP rank
     worker_state.reserve(attention_dp_);
@@ -209,6 +211,14 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                 worker_state[selected_dp_idx]->running.push_back(seq);
                 scheduled_seqs[selected_dp_idx].push_back(seq);
 
+                // Update SP Request Metrics
+                sp_req_send_counts_[master_sp_idx]++;
+                for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                    if (block_ctx.num_dispatched_tokens[sp_idx] > 0 && sp_idx != master_sp_idx) {
+                         sp_req_recv_counts_[sp_idx]++;
+                    }
+                }
+
                 // Record metrics
                 if (seq->metric) {
                     seq->metric->record_first_scheduled();
@@ -255,7 +265,16 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
                 waiting_queue.pop_front();
                 worker_state[selected_dp_idx]->running.push_back(seq);
+                worker_state[selected_dp_idx]->running.push_back(seq);
                 scheduled_seqs[selected_dp_idx].push_back(seq);
+
+                // Update SP Request Metrics
+                sp_req_send_counts_[master_sp_idx]++;
+                for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                    if (block_ctx.num_dispatched_tokens[sp_idx] > 0 && sp_idx != master_sp_idx) {
+                         sp_req_recv_counts_[sp_idx]++;
+                    }
+                }
 
                 if (seq->metric) {
                     seq->metric->record_first_scheduled();
@@ -400,4 +419,11 @@ void Scheduler::free_to_be_migrated(const std::vector<std::shared_ptr<Sequence>>
     }
 }
 
+std::pair<std::vector<int>, std::vector<int>> Scheduler::get_sp_request_counts() const
+{
+    return {sp_req_send_counts_, sp_req_recv_counts_};
+}
+
 }  // namespace nanodeploy
+
+// }  // namespace nanodeploy

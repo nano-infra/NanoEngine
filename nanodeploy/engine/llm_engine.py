@@ -98,11 +98,17 @@ class LLMEngine:
             for dp_idx in range(dp_size)
         ]
 
+        
+        sp_send, sp_recv = self.scheduler.get_sp_request_counts()
         logger.info(
             {
                 "mode": "prefill" if is_prefill else "decode",
                 # "dp_batch_sizes": dp_batch_sizes,
                 "sp_batch_sizes": sp_batch_sizes,
+                "sp_requests": {
+                    f"rank_{i}": {"send": sp_send[i], "recv": sp_recv[i]} 
+                    for i in range(self.scheduler.attention_sp)
+                },
                 "free_blocks": [
                     [
                         len(worker_state.block_manager[i].free_block_ids)
@@ -244,6 +250,7 @@ class LLMEngine:
         for key, value in summary.items():
             if value is not None:
                 logger.info(f"  {key}: {value}")
+        
         logger.info("=" * 60)
 
         return

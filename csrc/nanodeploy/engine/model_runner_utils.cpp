@@ -192,6 +192,9 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
             int page_id = seq->last_block_page_id(BlockContextSlot::ACTIVE, sp_rank);
             int offset  = seq->last_block_num_tokens(BlockContextSlot::ACTIVE, sp_rank);
             meta.slot_mapping.push_back(page_id * block_size + offset - 1);
+
+            // Populating context_lens_for_attn with current sequence length
+            meta.context_lens_for_attn.push_back(seq->num_tokens);
         }
     }
 

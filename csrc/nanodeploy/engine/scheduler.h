@@ -62,6 +62,9 @@ public:
     // Main scheduling functions
     ScheduleResult schedule();
 
+    // Metrics
+    std::pair<std::vector<int>, std::vector<int>> get_sp_request_counts() const;
+
     // Postprocessing
     void postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
                      const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
@@ -113,6 +116,10 @@ private:
     std::string mode_;
 
     int dp_rr_counter_ = 0;
+
+    // SP Request Metrics
+    std::vector<int> sp_req_send_counts_;
+    std::vector<int> sp_req_recv_counts_;
 
     std::unique_ptr<ThreadPool> thread_pool_;
 };

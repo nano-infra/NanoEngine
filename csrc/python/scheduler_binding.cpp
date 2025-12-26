@@ -157,5 +157,8 @@ void bind_scheduler_utils(py::module_& m)
         .def_readwrite("waiting_migration", &Scheduler::waiting_migration)
         .def_readwrite("worker_state", &Scheduler::worker_state)
         .def_readwrite("to_be_migrated", &Scheduler::to_be_migrated)
-        .def_readwrite("routing_strategy", &Scheduler::routing_strategy);
+        .def_readwrite("routing_strategy", &Scheduler::routing_strategy)
+        
+        // Metrics
+        .def("get_sp_request_counts", &Scheduler::get_sp_request_counts);
 }
