@@ -190,6 +190,55 @@ ScheduleResult Scheduler::schedule()
             }
             result.sp_recv_counts[dp_idx][sp_idx] = recv_count;
         }
+
+        // SP Communication Matrix Logic
+        // Initialize matrix for this DP rank: [attention_sp_][attention_sp_]
+        result.sp_comm_matrix.push_back(
+            std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+        
+        result.sp_q_matrix.push_back(
+            std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+
+        result.sp_res_matrix.push_back(
+            std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+
+        for (const auto& seq : dp_seqs[dp_idx]) {
+            bool is_dummy = false;
+            for (const auto& dummy : worker_state[dp_idx]->dummy_seqs) {
+                if (seq == dummy) {
+                    is_dummy = true;
+                    break;
+                }
+            }
+            if (is_dummy) continue;
+
+            const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+            int active_ranks = 0;
+            for (int count : tokens) {
+                if (count > 0) active_ranks++;
+            }
+
+            // Only count if SP is truly enabled (distributed across > 1 ranks)
+            if (active_ranks > 1) {
+                int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+                
+                // For each participating rank:
+                for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                    if (tokens[sp_idx] > 0) {
+                        // Original matrix (Master -> Participant) - kept for compatibility if needed
+                        result.sp_comm_matrix[dp_idx][master_sp_idx][sp_idx]++;
+
+                        // Q Matrix: Master broadcast to all Participants
+                        // Master sends Q to Participant
+                        result.sp_q_matrix[dp_idx][master_sp_idx][sp_idx]++;
+
+                        // Res Matrix: Participant sends results back to Master
+                        // Participant sends Res to Master
+                        result.sp_res_matrix[dp_idx][sp_idx][master_sp_idx]++;
+                    }
+                }
+            }
+        }
     }
 
     return result;

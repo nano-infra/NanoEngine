@@ -100,6 +100,9 @@ class LLMEngine:
 
         sp_send_counts = sch_res.sp_send_counts
         sp_recv_counts = sch_res.sp_recv_counts
+        # sp_comm_matrix = sch_res.sp_comm_matrix
+        sp_q_matrix = sch_res.sp_q_matrix
+        sp_res_matrix = sch_res.sp_res_matrix
         
         # Update metrics with raw counts
         self.metrics_manager.server_metric.update_sp_stats(sp_send_counts, sp_recv_counts)
@@ -111,6 +114,9 @@ class LLMEngine:
                 "sp_batch_sizes": sp_batch_sizes,
                 "sp_send_counts": sp_send_counts,
                 "sp_recv_counts": sp_recv_counts,
+                # "sp_comm_matrix": sp_comm_matrix,
+                "sp_q_matrix": sp_q_matrix,
+                "sp_res_matrix": sp_res_matrix,
                 "free_blocks": [
                     [
                         len(worker_state.block_manager[i].free_block_ids)

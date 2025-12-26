@@ -100,7 +100,10 @@ void bind_scheduler_utils(py::module_& m)
         .def_readwrite("filtered_dp_sp_seqs", &ScheduleResult::filtered_dp_sp_seqs)
         .def_readwrite("is_prefill", &ScheduleResult::is_prefill)
         .def_readonly("sp_send_counts", &ScheduleResult::sp_send_counts)
-        .def_readonly("sp_recv_counts", &ScheduleResult::sp_recv_counts);
+        .def_readonly("sp_recv_counts", &ScheduleResult::sp_recv_counts)
+        .def_readonly("sp_comm_matrix", &ScheduleResult::sp_comm_matrix)
+        .def_readonly("sp_q_matrix", &ScheduleResult::sp_q_matrix)
+        .def_readonly("sp_res_matrix", &ScheduleResult::sp_res_matrix);
 
     // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
