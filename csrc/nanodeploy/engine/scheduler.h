@@ -41,6 +41,10 @@ struct ScheduleResult {
     // decode step (false). Callers can use this to select the appropriate
     // execution path.
     bool is_prefill;
+
+    // SP counts
+    std::vector<std::vector<int>> sp_send_counts;
+    std::vector<std::vector<int>> sp_recv_counts;
 };
 
 class Scheduler {

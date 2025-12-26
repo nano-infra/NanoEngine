@@ -139,6 +139,39 @@ ScheduleResult Scheduler::schedule()
         }
     }
 
+    result.sp_send_counts.resize(attention_dp_);
+    result.sp_recv_counts.resize(attention_dp_);
+
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        result.sp_send_counts[dp_idx].resize(attention_sp_);
+        result.sp_recv_counts[dp_idx].resize(attention_sp_);
+
+        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+            // SP Send Count: Number of sequences where this SP rank is MASTER (initiator)
+            // This corresponds to filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx].size()
+            result.sp_send_counts[dp_idx][sp_idx] =
+                result.filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx].size();
+
+            // SP Recv Count: Number of sequences where this SP rank PARTICIPATES
+            // This corresponds to all non-dummy sequences scheduled on this DP rank.
+            int recv_count = 0;
+            for (const auto& seq : dp_seqs[dp_idx]) {
+                bool is_dummy = false;
+                for (const auto& dummy : worker_state[dp_idx]->dummy_seqs) {
+                    if (seq == dummy) {
+                        is_dummy = true;
+                        break;
+                    }
+                }
+                
+                if (!is_dummy) {
+                    recv_count++;
+                }
+            }
+            result.sp_recv_counts[dp_idx][sp_idx] = recv_count;
+        }
+    }
+
     return result;
 }
 

@@ -85,6 +85,10 @@ void bind_sequence_metric(py::module_& m)
              py::arg("num_tokens"),
              py::arg("duration"))
         .def("update_token_usage", &ServerMetric::update_token_usage, py::arg("dp_idx"), py::arg("num_tokens"))
+        .def("update_sp_stats",
+             &ServerMetric::update_sp_stats,
+             py::arg("sp_send_counts"),
+             py::arg("sp_recv_counts"))
 
         // Properties
         .def_property_readonly("avg_prefill_throughput", &ServerMetric::avg_prefill_throughput)
