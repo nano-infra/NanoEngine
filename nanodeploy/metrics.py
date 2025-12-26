@@ -51,7 +51,7 @@ class SequenceMetric(_CppSequenceMetric):
         )
 
         logger.info(
-            f"SequenceMetric [{self.seq_id[:8]}...] - "
+            f"SequenceMetric [{str(self.seq_id)[:8]}...] - "
             f"TTFT: {ttft_str}, "
             f"E2E: {e2e_str}, "
             f"Prompt Length: {self.num_prompt_tokens}, Output Length: {self.num_generated_tokens}, "
