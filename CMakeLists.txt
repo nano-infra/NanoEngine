@@ -12,5 +12,8 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(DLSLIME_INSTALL_PATH "lib" CACHE STRING "Library installation directory")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+find_package(dlslime REQUIRED)
+
+include_directories(${dlslime_INCLUDE_DIR})
 include_directories(csrc)
 add_subdirectory(csrc)
