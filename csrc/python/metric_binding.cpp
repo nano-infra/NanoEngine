@@ -116,6 +116,8 @@ void bind_sequence_metric(py::module_& m)
             summary["current_prefill_throughput"] = self.current_prefill_throughput();
             summary["current_decode_throughput"]  = self.current_decode_throughput();
             summary["total_token_usage"]          = self.total_token_usage();
+            summary["sp_send_counts"]             = self.sp_send_request_counts;
+            summary["sp_recv_counts"]             = self.sp_recv_request_counts;
             return summary;
         });
 }

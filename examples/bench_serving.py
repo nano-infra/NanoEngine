@@ -52,10 +52,6 @@ from nanodeploy import LLM, SamplingParams
 from nanodeploy.engine.sequence import Sequence
 from tqdm.auto import tqdm
 
-# --- Constants ---
-MODEL_PATH = os.path.expanduser(
-    "/models/models--Qwen--Qwen3-235B-A22B-Instruct-2507-FP8/snapshots/ba82a1060073fa0ecdc70d7b1922ec071f60cf3e"
-)
 MAX_INPUT_LEN = 1024
 MAX_OUTPUT_LEN = 1024
 
@@ -84,7 +80,7 @@ def main():
         "<1.0 = more regular, >1.0 = more bursty.",
     )
     parser.add_argument(
-        "--model-path", type=str, default=MODEL_PATH, help="Path to the model."
+        "--model-path", type=str, default="/models/qwen3-235B-Instruct-2507-FP8", help="Path to the model."
     )
     parser.add_argument(
         "--max-model-len", type=int, default=4096, help="Maximum model length."
@@ -111,6 +107,28 @@ def main():
         default=None,
         help="Path to CSV file (required when --dataset=csv). CSV should have 'prompt_len' and 'output_len' columns.",
     )
+    # Distributed / Cluster arguments
+    parser.add_argument(
+        "--master-address",
+        type=str,
+        default=None,
+        help="Address of the Ray master/head node (e.g. '127.0.0.1:6379').",
+    )
+    parser.add_argument(
+        "--ray-address",
+        type=str,
+        default=None,
+        help="Address of the Ray cluster (e.g. 'auto' or '127.0.0.1:6379').",
+    )
+    # Parallelism arguments
+    parser.add_argument("--tp", type=int, default=1, help="Tensor Parallel size")
+    parser.add_argument("--sp", type=int, default=1, help="Sequence Parallel size")
+    parser.add_argument("--dp", type=int, default=1, help="Data Parallel size (for attention)")
+    parser.add_argument("--ep", type=int, default=1, help="Expert Parallel size")
+    # Other engine args
+    parser.add_argument("--max-num-seqs", type=int, default=256, help="Max number of sequences per iteration.")
+    parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill (mock execution).")
+    parser.add_argument("--loop-count", type=int, default=16, help="Number of steps per iteration (default 16).")
     args = parser.parse_args()
 
     NUM_REQUESTS = args.num_requests
@@ -137,22 +155,22 @@ def main():
         enforce_eager=args.enforce_eager,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        # master_address="10.102.207.84:26379",
-        # ray_address="10.102.207.84:6400",
-        master_address="10.102.217.55:26333",
-        ray_address="10.102.217.55:6400",
+        master_address=args.master_address,
+        ray_address=args.ray_address,
         mode="decode",
-        dummy_prefill=True,
+        dummy_prefill=args.dummy_prefill,
         dummy_weight=True,
         perfect_eplb=True,
-        attention_dp=1,
-        attention_sp=8,
-        attention_tp=1,
-        ffn_dp=1,
-        ffn_ep=8,
-        ffn_tp=1,
-        max_num_seqs=64,
-        routing_strategy="least_token",
+        attention_dp=args.dp,
+        attention_sp=args.sp,
+        attention_tp=args.tp,
+        # Scaling FFN config with same params for now or customize as needed
+        ffn_dp=1, # Often 1 if fully sharded or different strategy
+        ffn_ep=args.ep,
+        ffn_tp=1, # Assuming 1 for simplicity unless mapped to tp arg
+        max_num_seqs=args.max_num_seqs,
+        loop_count=args.loop_count,
+        routing_strategy="LeastBatch",
     )
     engine = llm
 
@@ -206,6 +224,10 @@ def main():
             sampling_params_list.append(sp)
 
         print(f"Loaded {len(prompts)} requests from CSV")
+        if len(prompts) < 10:
+             print(f"DEBUG: Prompts list: {prompts}")
+
+    print(f"DEBUG: Total NUM_REQUESTS: {NUM_REQUESTS}")
 
     # --- Generate request arrival times ---
     # BURSTINESS = 1.0 for Poisson (exponential inter-arrival times)
@@ -233,10 +255,15 @@ def main():
         while requests_sent < NUM_REQUESTS or not engine.is_finished():
             # --- Send new requests ---
             current_time = time.perf_counter()
+            # DEBUG: Trace loop status periodically
+            if requests_sent < NUM_REQUESTS and (requests_sent < 5 or requests_sent % 10 == 0):
+                 pass # print(f"DEBUG: Checking arrival. Sent: {requests_sent}, Elapsed: {current_time - start_time:.4f}, Next: {arrival_times[requests_sent]:.4f}")
+
             while (
                 requests_sent < NUM_REQUESTS
                 and current_time - start_time >= arrival_times[requests_sent]
             ):
+                print(f"DEBUG: Adding request {requests_sent} at {current_time - start_time:.4f}s")
                 prompt = prompts[requests_sent]
                 sp = sampling_params_list[requests_sent]
 
@@ -257,6 +284,8 @@ def main():
             if not engine.is_finished():
                 # Get outputs from step
                 outputs, num_tokens, bs, sch_latency, post_sch_latency = engine.step()
+                if bs > 0:
+                     pass # print(f"DEBUG: Step batch size: {bs}, num_tokens: {num_tokens}")
 
                 # Process completed sequences
                 for seq_id, output_ids in outputs:
