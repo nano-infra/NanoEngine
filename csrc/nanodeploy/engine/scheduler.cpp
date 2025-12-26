@@ -148,12 +148,24 @@ ScheduleResult Scheduler::schedule()
 
         for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
             // SP Send Count: Number of sequences where this SP rank is MASTER (initiator)
-            // This corresponds to filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx].size()
-            result.sp_send_counts[dp_idx][sp_idx] =
-                result.filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx].size();
+            // AND the sequence is actually distributed (has blocks on > 1 ranks).
+            int send_count = 0;
+            const auto& sp_seqs = result.filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx];
+            for (const auto& seq : sp_seqs) {
+                const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+                int active_ranks = 0;
+                for (int count : tokens) {
+                    if (count > 0) active_ranks++;
+                }
+
+                if (active_ranks > 1) {
+                    send_count++;
+                }
+            }
+            result.sp_send_counts[dp_idx][sp_idx] = send_count;
 
             // SP Recv Count: Number of sequences where this SP rank PARTICIPATES
-            // This corresponds to all non-dummy sequences scheduled on this DP rank.
+            // AND the sequence is actually distributed.
             int recv_count = 0;
             for (const auto& seq : dp_seqs[dp_idx]) {
                 bool is_dummy = false;
@@ -165,7 +177,15 @@ ScheduleResult Scheduler::schedule()
                 }
                 
                 if (!is_dummy) {
-                    recv_count++;
+                    const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+                    int active_ranks = 0;
+                    for (int count : tokens) {
+                        if (count > 0) active_ranks++;
+                    }
+
+                    if (active_ranks > 1) {
+                        recv_count++;
+                    }
                 }
             }
             result.sp_recv_counts[dp_idx][sp_idx] = recv_count;
