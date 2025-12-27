@@ -90,7 +90,6 @@ class RPCClientEndpoint:
         binding = self.client_binding
         future = binding.endpoint.imm_recv()
         future.wait()
-        binding = self.client_binding
         buffer = binding.buffer
         buffer_ptr = buffer.data_ptr() + buffer.storage_offset()
         return deserialize(buffer_ptr, future.imm_data())
