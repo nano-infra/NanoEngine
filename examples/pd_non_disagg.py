@@ -12,11 +12,11 @@ def main():
     llm = LLM(
         path,
         enforce_eager=False,
-        attention_dp=16,
+        attention_dp=8,
         attention_sp=1,
         attention_tp=1,
         ffn_dp=1,
-        ffn_ep=16,
+        ffn_ep=8,
         ffn_tp=1,
         ray_address="10.102.97.179:7078",
         master_address="10.102.97.179:29901",

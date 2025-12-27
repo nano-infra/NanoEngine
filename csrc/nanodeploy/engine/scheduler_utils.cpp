@@ -1,39 +1,41 @@
 #include "scheduler_utils.h"
+#include "nanodeploy/engine/sequence.h"
 #include "nanodeploy/metrics/sequence_metric.h"
 #include "thread_pool.h"
-#include <thread>
 #include <algorithm>
-#include <unordered_set>
-#include <iostream>
 #include <exception>
-#include <string> 
+#include <iostream>
+#include <string>
+#include <thread>
+#include <unordered_set>
 
 namespace nanodeploy {
 
 struct Task {
     std::shared_ptr<Sequence> seq;
-    const std::vector<int>* tokens;
-    int sp_idx;
+    const std::vector<int>*   tokens;
+    int                       sp_idx;
 };
 
 struct WorkerContext {
-    std::vector<Task> tasks;
-    MigrationList migration_candidates;
+    std::vector<Task>  tasks;
+    MigrationList      migration_candidates;
     std::exception_ptr eptr = nullptr;
-    int dp_idx;
+    int                dp_idx;
 
-    void reserve(size_t n) { tasks.reserve(n); }
+    void reserve(size_t n)
+    {
+        tasks.reserve(n);
+    }
 };
 
-static void worker_func(
-    std::shared_ptr<SPStateManager> state_manager,
-    const WorkerContext* ctx,
-    WorkerContext* result_ctx,
-    const std::string& engine_id,
-    int eos_id,
-    bool is_prefill,
-    bool update_metrics
-) {
+static void worker_func(std::shared_ptr<SPStateManager> state_manager,
+                        const WorkerContext*            ctx,
+                        WorkerContext*                  result_ctx,
+                        int                             eos_id,
+                        bool                            is_prefill,
+                        bool                            update_metrics)
+{
     try {
         std::unordered_set<std::shared_ptr<Sequence>> dummy_set;
         for (const auto& dummy : state_manager->dummy_seqs) {
@@ -43,43 +45,43 @@ static void worker_func(
         for (const auto& task : ctx->tasks) {
             std::shared_ptr<Sequence> seq = task.seq;
 
-            if (dummy_set.count(seq)) continue;
+            if (dummy_set.count(seq))
+                continue;
 
             for (int token_id : *task.tokens) {
-                
-                int master_sp_idx = seq->block_ctx(engine_id).master_sp_idx;
+
+                int master_sp_idx = seq->block_ctx().master_sp_idx_;
                 if (task.sp_idx != master_sp_idx) {
-                    throw std::runtime_error(
-                        "sp_idx mismatch: task.sp_idx=" + std::to_string(task.sp_idx) + 
-                        " != master_sp_idx=" + std::to_string(master_sp_idx) + 
-                        " for seq_id=" + seq->seq_id
-                    );
+                    throw std::runtime_error("sp_idx mismatch: task.sp_idx=" + std::to_string(task.sp_idx)
+                                             + " != master_sp_idx=" + std::to_string(master_sp_idx)
+                                             + " for seq_id=" + std::to_string(seq->seq_id));
                 }
 
-                seq->append_token(token_id, engine_id, task.sp_idx);
+                seq->append_token(token_id, BlockContextSlot::ACTIVE, task.sp_idx);
                 state_manager->add_running_tokens(task.sp_idx, 1);
 
                 if (update_metrics && seq->metric) {
                     if (seq->metric->num_generated_tokens == 0) {
-                         seq->metric->record_first_token();
-                         seq->metric->num_generated_tokens = 1;
-                    } else {
-                         seq->metric->record_token();
+                        seq->metric->record_first_token();
+                        seq->metric->num_generated_tokens = 1;
+                    }
+                    else {
+                        seq->metric->record_token();
                     }
                 }
-                
-                bool finished = (!seq->ignore_eos && token_id == eos_id) || 
-                                (seq->num_completed_tokens() == seq->max_tokens);
-                                
+
+                bool finished =
+                    (!seq->ignore_eos && token_id == eos_id) || (seq->num_completed_tokens() == seq->max_tokens);
+
                 if (finished) {
                     seq->status = SequenceStatus::FINISHED;
                     state_manager->deallocate(*seq);
-                    break; 
-                } else if (is_prefill) {
+                    break;
+                }
+                else if (is_prefill) {
                     seq->status = SequenceStatus::TO_BE_MIGRATED;
-                    seq->backup_engine_id = seq->active_engine_id;
-                    seq->active_engine_id = std::nullopt;
-                    
+                    seq->migrate();
+                    std::cout << "migrating" << std::endl;
                     result_ctx->migration_candidates.push_back({seq, result_ctx->dp_idx});
                     break;
                 }
@@ -88,52 +90,50 @@ static void worker_func(
 
         auto& running = state_manager->running;
         if (!running.empty()) {
-            running.erase(
-                std::remove_if(running.begin(), running.end(),
-                    [](const std::shared_ptr<Sequence>& s) {
-                        return s->status == SequenceStatus::FINISHED || 
-                               s->status == SequenceStatus::TO_BE_MIGRATED;
-                    }
-                ),
-                running.end()
-            );
+            running.erase(std::remove_if(running.begin(),
+                                         running.end(),
+                                         [](const std::shared_ptr<Sequence>& s) {
+                                             return s->status == SequenceStatus::FINISHED
+                                                    || s->status == SequenceStatus::TO_BE_MIGRATED;
+                                         }),
+                          running.end());
         }
-    } catch (...) {
+    }
+    catch (...) {
         result_ctx->eptr = std::current_exception();
     }
 }
 
-MigrationList postprocess_sequences(
-    std::vector<std::shared_ptr<SPStateManager>> worker_states,
-    const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
-    const std::vector<std::vector<std::vector<int>>>& dp_sp_token_ids,
-    const std::string& engine_id,
-    int eos_id,
-    bool is_prefill,
-    bool update_metrics,
-    ThreadPool* thread_pool
-) {
-    size_t num_dp = worker_states.size();
+MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>               worker_states,
+                                    const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+                                    const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+                                    int                                                        eos_id,
+                                    bool                                                       is_prefill,
+                                    bool                                                       update_metrics,
+                                    ThreadPool*                                                thread_pool)
+{
+    size_t num_dp    = worker_states.size();
     size_t num_dp_sp = dp_sp_seqs.size();
-    if (num_dp == 0) return {};
+    if (num_dp == 0)
+        return {};
     if (num_dp_sp % num_dp != 0) {
         throw std::runtime_error("dp_sp_seqs size is not a multiple of num_dp");
     }
     size_t num_sp = num_dp_sp / num_dp;
 
     if (dp_sp_token_ids.size() != num_dp_sp) {
-         throw std::runtime_error("dp_sp_token_ids length mismatch with dp_sp_seqs");
+        throw std::runtime_error("dp_sp_token_ids length mismatch with dp_sp_seqs");
     }
 
     std::vector<WorkerContext> contexts(num_dp);
-    
+
     for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
-        auto& ctx = contexts[dp_idx];
+        auto& ctx  = contexts[dp_idx];
         ctx.dp_idx = static_cast<int>(dp_idx);
-        
+
         for (size_t sp_idx = 0; sp_idx < num_sp; ++sp_idx) {
-            size_t idx = dp_idx * num_sp + sp_idx;
-            const auto& batch_seqs = dp_sp_seqs[idx];
+            size_t      idx          = dp_idx * num_sp + sp_idx;
+            const auto& batch_seqs   = dp_sp_seqs[idx];
             const auto& batch_tokens = dp_sp_token_ids[idx];
 
             if (batch_seqs.size() > batch_tokens.size()) {
@@ -141,13 +141,9 @@ MigrationList postprocess_sequences(
             }
 
             size_t batch_size = batch_seqs.size();
-            
+
             for (size_t i = 0; i < batch_size; ++i) {
-                ctx.tasks.push_back({
-                    batch_seqs[i],
-                    &batch_tokens[i],
-                    (int)sp_idx
-                });
+                ctx.tasks.push_back({batch_seqs[i], &batch_tokens[i], (int)sp_idx});
             }
         }
     }
@@ -157,40 +153,36 @@ MigrationList postprocess_sequences(
         futures.reserve(num_dp);
 
         for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
-            futures.push_back(thread_pool->enqueue(
-                worker_func,
-                worker_states[dp_idx],
-                &contexts[dp_idx],
-                &contexts[dp_idx], 
-                engine_id,
-                eos_id,
-                is_prefill,
-                update_metrics
-            ));
+            futures.push_back(thread_pool->enqueue(worker_func,
+                                                   worker_states[dp_idx],
+                                                   &contexts[dp_idx],
+                                                   &contexts[dp_idx],
+                                                   eos_id,
+                                                   is_prefill,
+                                                   update_metrics));
         }
 
         for (auto& f : futures) {
             f.get();
         }
-    } else {
+    }
+    else {
         std::vector<std::thread> threads;
         threads.reserve(num_dp);
 
         for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
-            threads.emplace_back(
-                worker_func,
-                worker_states[dp_idx],
-                &contexts[dp_idx],
-                &contexts[dp_idx], 
-                engine_id,
-                eos_id,
-                is_prefill,
-                update_metrics
-            );
+            threads.emplace_back(worker_func,
+                                 worker_states[dp_idx],
+                                 &contexts[dp_idx],
+                                 &contexts[dp_idx],
+                                 eos_id,
+                                 is_prefill,
+                                 update_metrics);
         }
 
         for (auto& t : threads) {
-            if (t.joinable()) t.join();
+            if (t.joinable())
+                t.join();
         }
     }
 
@@ -199,14 +191,10 @@ MigrationList postprocess_sequences(
         if (ctx.eptr) {
             std::rethrow_exception(ctx.eptr);
         }
-        all_migrations.insert(
-            all_migrations.end(),
-            ctx.migration_candidates.begin(),
-            ctx.migration_candidates.end()
-        );
+        all_migrations.insert(all_migrations.end(), ctx.migration_candidates.begin(), ctx.migration_candidates.end());
     }
 
     return all_migrations;
 }
 
-} // namespace nanodeploy
+}  // namespace nanodeploy
