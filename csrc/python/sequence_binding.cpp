@@ -43,34 +43,9 @@ void bind_sequence(py::module_& m)
                 return self[key];
             },
             py::return_value_policy::reference_internal)
-        .def("__setitem__",
-             [](BlockContext::SpBlockTable& self, int key, py::iterable value) {
-                 self[key] = block_id_list_from_iterable(value);
-             })
-        .def("__contains__",
-             [](const BlockContext::SpBlockTable& self, int key) { return self.find(key) != self.end(); })
-        .def("keys",
-             [](const BlockContext::SpBlockTable& self) {
-                 py::list keys;
-                 for (const auto& pair : self) {
-                     keys.append(pair.first);
-                 }
-                 return keys;
-             })
-        .def("items",
-             [](const BlockContext::SpBlockTable& self) {
-                 // Debug/introspection helper; returns Python copies.
-                 py::list items;
-                 for (const auto& pair : self) {
-                     items.append(py::make_tuple(pair.first,
-                                                 py::cast(std::vector<int>(pair.second.begin(), pair.second.end()))));
-                 }
-                 return items;
-             })
-        .def("clear", [](BlockContext::SpBlockTable& self) { self.clear(); });
-
-    // Bind Sequence.block_ctx_map as a mutable mapping proxy.
-    py::bind_map<Sequence::BlockCtxMap>(m, "BlockCtxMap");
+        .def("__setitem__", [](BlockContext::SpBlockTable& self, int key, py::iterable value) {
+            self[key] = block_id_list_from_iterable(value);
+        });
 
     py::enum_<SequenceStatus>(m, "SequenceStatus")
         .value("WAITING", SequenceStatus::WAITING)
@@ -156,7 +131,7 @@ void bind_sequence(py::module_& m)
                                             int,
                                             int,
                                             std::vector<std::pair<int, int>>,
-                                            std::unordered_map<int, std::vector<int>>,
+                                            std::vector<std::vector<int>>,
                                             std::vector<int>>& t) { return BlockContext::setstate(t); }));
 
     py::class_<Sequence, std::shared_ptr<Sequence>>(m, "Sequence")

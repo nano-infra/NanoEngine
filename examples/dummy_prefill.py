@@ -11,11 +11,11 @@ def main():
     decode = LLM(
         path,
         enforce_eager=False,
-        attention_dp=1,
+        attention_dp=2,
         attention_sp=8,
         attention_tp=1,
         ffn_dp=1,
-        ffn_ep=8,
+        ffn_ep=16,
         ffn_tp=1,
         mode="decode",
         master_address="10.102.97.179:6006",
@@ -23,7 +23,7 @@ def main():
         dummy_prefill=True,
         dummy_weight=True,
         perfect_eplb=True,
-        max_num_seqs=64,
+        max_num_seqs=128,
         max_model_len=524288,
         max_num_batched_tokens=524288,
         loop_count=48,
@@ -41,10 +41,10 @@ def main():
 
     short_seqs = [
         Sequence(
-            [0] * 1023,
+            [0] * 1024,
             sampling_params=sampling_params,
         )
-        for _ in range(512)
+        for _ in range(2048)
     ]
 
     seqs = long_seqs + short_seqs

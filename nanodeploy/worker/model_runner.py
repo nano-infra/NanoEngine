@@ -5,6 +5,7 @@ import ray
 import torch
 import torch.distributed as dist
 import torch.profiler as profiler
+
 from nanodeploy._cpp import (
     BlockContextSlot,
     prepare_decode_cpp,
@@ -12,6 +13,7 @@ from nanodeploy._cpp import (
     update_seqs_inner_loop,
 )
 from nanodeploy.config import Config
+from nanodeploy.endpoint.rpc_endpoint import RPCClientEndpoint
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
@@ -161,6 +163,14 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.preallocate_kvcache()
+
+        self.endpoint = RPCClientEndpoint(32_000_000, get_dist_context().rank)
+
+    def init_rpc_endpoint(self, server_info):
+        client_info = self.endpoint.init_client_endpoint()
+        self.endpoint.connect(server_info)
+        logger.info("client endpoint initialized")
+        return client_info
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
@@ -482,8 +492,12 @@ class ModelRunner:
     def migrate(self, seqs: list[Sequence]) -> None:
         get_cache_context().migrate(seqs=seqs)
 
-    def run(self, dp_seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
+    def run(
+        self, dp_seqs: list[Sequence], is_prefill: bool, enable_rpc: bool = False
+    ) -> list[list[int]]:
 
+        if enable_rpc:
+            dp_seqs = self.endpoint.recv_seqs()
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
 
