@@ -9,4 +9,3 @@
 // with pybind11/stl.h, BEFORE including pybind11/stl.h.
 
 PYBIND11_MAKE_OPAQUE(std::unordered_map<int, int>);
-PYBIND11_MAKE_OPAQUE(nanodeploy::Sequence::BlockCtxMap);
