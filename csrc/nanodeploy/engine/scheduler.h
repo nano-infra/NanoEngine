@@ -41,6 +41,29 @@ struct ScheduleResult {
     // decode step (false). Callers can use this to select the appropriate
     // execution path.
     bool is_prefill;
+
+    // SP counts
+    std::vector<std::vector<int>> sp_send_counts;
+    std::vector<std::vector<int>> sp_recv_counts;
+    
+    // Matrix of SP communication counts.
+    // Dimensions: [dp_idx][master_sp_rank][participant_sp_rank]
+    // Value: Number of requests sent from master_sp_rank to participant_sp_rank.
+    // std::vector<std::vector<std::vector<int>>> sp_comm_matrix;
+
+    // Matrix of Q communication counts (Master -> Participant).
+    // Dimensions: [dp_idx][master_sp_rank][participant_sp_rank]
+    // Value: Number of Q requests sent from master_sp_rank to participant_sp_rank.
+    std::vector<std::vector<std::vector<int>>> sp_q_matrix;
+
+    // Matrix of Res communication counts (Participant -> Master).
+    // Dimensions: [dp_idx][participant_sp_rank][master_sp_rank]
+    // Value: Number of Res requests sent from participant_sp_rank to master_sp_rank.
+    // std::vector<std::vector<std::vector<int>>> sp_res_matrix;
+
+    // Metrics for waiting queue blocks
+    int waiting_head_blocks  = 0;
+    int waiting_total_blocks = 0;
 };
 
 class Scheduler {
