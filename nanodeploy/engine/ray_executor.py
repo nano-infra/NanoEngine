@@ -227,14 +227,19 @@ class RayExecutor:
         timeout: float | None = None,
     ) -> list[list[list[int]]]:
 
-        ray_futures = [
-            getattr(worker, "run").remote(
-                [] if self.config.use_dlslime_rpc else seqs, is_prefill, True
-            )
-            for seqs, worker in zip(dp_seqs, self.workers)
-        ]
         if self.config.use_dlslime_rpc:
+            # When using dlslime RPC, sequences are delivered via the endpoint.
+            ray_futures = [
+                getattr(worker, "run").remote([], is_prefill, True)
+                for _, worker in zip(dp_seqs, self.workers)
+            ]
             self.endpoint.send_seqs(dp_seqs)
+        else:
+            # When not using dlslime RPC, pass sequences directly to workers.
+            ray_futures = [
+                getattr(worker, "run").remote(seqs, is_prefill, False)
+                for seqs, worker in zip(dp_seqs, self.workers)
+            ]
         return ray.get(
             ray_futures,
             timeout=timeout,
