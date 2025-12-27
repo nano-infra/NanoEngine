@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from transformers import AutoConfig
 
+
 @dataclass
 class Config:
     model: str
@@ -48,6 +49,9 @@ class Config:
     profiler_start_step: int = 16
     profiling_step: int = 16
     profiler_dir: str = "./profiler_logs"
+
+    # performance optimization
+    use_dlslime_rpc: bool = True
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
