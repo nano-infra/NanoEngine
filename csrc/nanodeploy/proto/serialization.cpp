@@ -6,7 +6,7 @@ namespace nanodeploy {
 
 namespace {
 
-// --- 底层原子写入操作 (Inlined for Performance) ---
+// --- Low-level atomic write operations (inlined for performance) ---
 template<typename T>
 inline void write_raw(uintptr_t base, size_t& off, size_t max_size, const T& val)
 {
