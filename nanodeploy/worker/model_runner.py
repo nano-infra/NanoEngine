@@ -519,11 +519,15 @@ class ModelRunner:
             config.max_model_len, hf_config.max_position_embeddings
         )
         max_bs = min(self.config.max_num_seqs, 512)
+        max_attention_comp_seqs = max_bs + config.max_num_recv_seqs
         block_size = get_cache_context().block_size
         max_num_blocks = (config.max_model_len + block_size - 1) // block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens_for_attn = torch.zeros(
+            max_attention_comp_seqs, dtype=torch.int32
+        )
         context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         q_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
@@ -531,32 +535,106 @@ class ModelRunner:
         block_tables = torch.zeros(
             sp_world_size, max_bs, max_num_blocks, dtype=torch.int32
         )
+        max_num_send_recv_seqs = max(config.max_num_send_seqs, config.max_num_recv_seqs)
+        q_slice_get = torch.full((max_bs,), -1, dtype=torch.int32)
+        q_slice_fill = torch.full((max_bs,), -1, dtype=torch.int32)
+        q_copy_mask = torch.zeros(max_bs, dtype=torch.int32)
+        res_slice_get_to_buffer_output = torch.full((max_bs,), -1, dtype=torch.int32)
+        res_slice_fill_to_buffer_output = torch.full((max_bs,), -1, dtype=torch.int32)
+        res_to_buffer_output_mask = torch.zeros(max_bs, dtype=torch.int32)
+        res_slice_get_to_buffer_input = torch.full(
+            (max_num_send_recv_seqs,), -1, dtype=torch.int32
+        )
+        res_slice_fill_to_buffer_input = torch.full(
+            (max_num_send_recv_seqs,), -1, dtype=torch.int32
+        )
+        res_to_buffer_input_mask = torch.zeros(
+            max_num_send_recv_seqs, dtype=torch.int32
+        )
+        q_output_stride = torch.zeros(sp_world_size, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_master_rank_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_attn_compute_bs = [1, 2, 4, 8] + list(
+            range(16, max_attention_comp_seqs + 1, 16)
+        )
         self.graphs = {}
         self.graph_pool = None
 
-        for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
-            set_context(
-                False,
-                self.config.max_num_seqs,
-                slot_mapping=slot_mapping[:bs],
-                context_lens=context_lens,
-                block_tables=block_tables,
-                global_context_lens=global_context_lens,
-                q_mask=q_mask,
-                res_lse_mask=res_lse_mask,
-            )
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            dist.barrier(group=get_dist_context().cuda_world_group)
-            reset_context()
+        total_graphs = len(self.graph_master_rank_bs) * len(self.graph_attn_compute_bs)
+        completed_graphs = 0
+        skipped_graphs = 0
+        sp_size = get_dist_context().attn_sp_world_size
+        logger.info(f"开始捕获 CUDAGraph，总共需要捕获 {total_graphs} 个图")
+
+        for master_bs in reversed(self.graph_master_rank_bs):
+            for attn_bs in reversed(self.graph_attn_compute_bs):
+                if (attn_bs < master_bs - config.max_num_send_seqs) or (
+                    attn_bs > master_bs + config.max_num_recv_seqs
+                ):
+                    skipped_graphs += 1
+                    logger.info(
+                        f"跳过无效图组合 - (master_bs={master_bs}, attn_bs={attn_bs}) "
+                        f"原因: attn_bs({attn_bs}) > master_bs×sp_size({master_bs}×{sp_size}={master_bs*sp_size})"
+                    )
+                    continue
+                if sp_size == 1 and attn_bs != master_bs:
+                    skipped_graphs += 1
+                    logger.info(
+                        f"跳过无效图组合 - (master_bs={master_bs}, attn_bs={attn_bs}) "
+                        f"原因: SP Size = 1 下 attn_bs({attn_bs}) != master_bs({master_bs})"
+                    )
+                    continue
+
+                completed_graphs += 1
+                logger.info(
+                    f"正在捕获图 {completed_graphs}/{total_graphs} - (master_bs={master_bs}, attn_bs={attn_bs})"
+                )
+                graph = torch.cuda.CUDAGraph()
+                set_context(
+                    is_prefill=False,
+                    max_bs=self.config.max_num_seqs,
+                    slot_mapping=slot_mapping[:master_bs],
+                    context_lens=context_lens,
+                    block_tables=block_tables,
+                    global_context_lens=global_context_lens,
+                    q_mask=q_mask,
+                    res_lse_mask=res_lse_mask,
+                    q_slice_get=q_slice_get[:master_bs],
+                    q_slice_fill=q_slice_fill[:master_bs],
+                    q_copy_mask=q_copy_mask[:master_bs],
+                    res_slice_get_to_buffer_output=res_slice_get_to_buffer_output[
+                        :master_bs
+                    ],
+                    res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output[
+                        :master_bs
+                    ],
+                    res_to_buffer_output_mask=res_to_buffer_output_mask[:master_bs],
+                    res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
+                    res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
+                    res_to_buffer_input_mask=res_to_buffer_input_mask,
+                    attention_compute_bs=attn_bs,
+                    context_lens_for_attn=context_lens_for_attn,
+                    q_output_stride=q_output_stride,
+                )
+
+                outputs[:master_bs] = self.model(
+                    input_ids[:master_bs], positions[:master_bs]
+                )  # warmup
+
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs[:master_bs] = self.model(
+                        input_ids[:master_bs], positions[:master_bs]
+                    )  # capture
+
+                if self.graph_pool is None:
+                    self.graph_pool = graph.pool()
+
+                self.graphs[(master_bs, attn_bs)] = graph
+                torch.cuda.synchronize()
+                dist.barrier(group=get_dist_context().cuda_world_group)
+                reset_context()
+
+        logger.info(f"完成所有 graph 的捕获，成功捕获 {len(self.graphs)} 个图")
 
         self.graph_vars = dict(
             input_ids=input_ids,
@@ -568,4 +646,16 @@ class ModelRunner:
             outputs=outputs,
             q_mask=q_mask,
             res_lse_mask=res_lse_mask,
+            q_slice_get=q_slice_get,
+            q_slice_fill=q_slice_fill,
+            q_copy_mask=q_copy_mask,
+            res_slice_get_to_buffer_output=res_slice_get_to_buffer_output,
+            res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output,
+            res_to_buffer_output_mask=res_to_buffer_output_mask,
+            res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
+            res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
+            res_to_buffer_input_mask=res_to_buffer_input_mask,
+            attention_compute_bs=attn_bs,
+            context_lens_for_attn=context_lens_for_attn,
+            q_output_stride=q_output_stride,
         )
