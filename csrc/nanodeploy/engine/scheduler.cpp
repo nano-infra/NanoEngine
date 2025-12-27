@@ -241,6 +241,22 @@ ScheduleResult Scheduler::schedule()
         }
     }
 
+    // Calculate waiting queue block metrics
+    auto& wait_queue = (mode_ != "decode") ? waiting : waiting_migration;
+    
+    if (!wait_queue.empty()) {
+        auto head_seq = wait_queue.front();
+        // Calculate blocks for head sequence: ceil(num_tokens / block_size)
+        // Note: We use Sequence::block_size which is static constexpr int block_size = 256;
+        result.waiting_head_blocks = (head_seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+    }
+
+    int total_blocks = 0;
+    for (const auto& seq : wait_queue) {
+        total_blocks += (seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+    }
+    result.waiting_total_blocks = total_blocks;
+
     return result;
 }
 

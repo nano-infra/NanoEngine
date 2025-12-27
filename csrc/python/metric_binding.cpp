@@ -75,6 +75,9 @@ void bind_sequence_metric(py::module_& m)
         .def("update_waiting_requests", &ServerMetric::update_waiting_requests, py::arg("count"))
         .def("update_waiting_migration_requests", &ServerMetric::update_waiting_migration_requests, py::arg("count"))
         .def("add_completed_request", &ServerMetric::add_completed_request)
+        .def("update_waiting_blocks", &ServerMetric::update_waiting_blocks, py::arg("head_blocks"), py::arg("total_blocks"))
+        .def_readwrite("num_waiting_head_blocks", &ServerMetric::num_waiting_head_blocks)
+        .def_readwrite("num_waiting_total_blocks", &ServerMetric::num_waiting_total_blocks)
         .def("add_tokens", &ServerMetric::add_tokens, py::arg("num_prompt") = 0, py::arg("num_generated") = 0)
         .def("record_prefill_throughput",
              &ServerMetric::record_prefill_throughput,
@@ -118,6 +121,8 @@ void bind_sequence_metric(py::module_& m)
             summary["total_token_usage"]          = self.total_token_usage();
             summary["sp_send_counts"]             = self.sp_send_request_counts;
             summary["sp_recv_counts"]             = self.sp_recv_request_counts;
+            summary["waiting_head_blocks"]        = self.num_waiting_head_blocks;
+            summary["waiting_total_blocks"]       = self.num_waiting_total_blocks;
             return summary;
         });
 }

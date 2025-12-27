@@ -18,6 +18,8 @@ public:
     void update_waiting_migration_requests(int count);
     void add_completed_request();
 
+    void update_waiting_blocks(int head_blocks, int total_blocks);
+
     void add_tokens(long long num_prompt = 0, long long num_generated = 0);
 
     void record_prefill_throughput(long long num_tokens, double duration);
@@ -48,6 +50,9 @@ public:
     int num_waiting_requests           = 0;
     int num_waiting_migration_requests = 0;
     int num_completed_requests         = 0;
+
+    int num_waiting_head_blocks        = 0;
+    int num_waiting_total_blocks       = 0;
 
     std::vector<double>                prefill_throughput_samples;
     std::vector<double>                decode_throughput_samples;

@@ -106,6 +106,10 @@ class LLMEngine:
         
         # Update metrics with raw counts
         self.metrics_manager.server_metric.update_sp_stats(sp_send_counts, sp_recv_counts)
+        
+        waiting_head_blocks = sch_res.waiting_head_blocks
+        waiting_total_blocks = sch_res.waiting_total_blocks
+        self.metrics_manager.server_metric.update_waiting_blocks(waiting_head_blocks, waiting_total_blocks)
 
         logger.info(
             {
@@ -114,6 +118,8 @@ class LLMEngine:
                 "sp_batch_sizes": sp_batch_sizes,
                 "sp_send_counts": sp_send_counts,
                 "sp_recv_counts": sp_recv_counts,
+                "waiting_head_blocks": waiting_head_blocks,
+                "waiting_total_blocks": waiting_total_blocks,
                 # "sp_comm_matrix": sp_comm_matrix,
                 "sp_q_matrix": sp_q_matrix,
                 # "sp_res_matrix": sp_res_matrix,
