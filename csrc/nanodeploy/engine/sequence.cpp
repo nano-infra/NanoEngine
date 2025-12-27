@@ -22,9 +22,8 @@ void BlockContext::reset(const std::string& engine_id, int attention_sp, int att
     master_sp_idx_ = 0;
     attention_sp_  = attention_sp;
     attention_dp_  = attention_dp;
-    for (int i = 0; i < attention_sp; ++i) {
-        (void)sp_block_table[i];
-    }
+
+    sp_block_table.resize(attention_sp, {});
     num_dispatched_tokens.resize(attention_sp, 0);
 }
 
@@ -34,14 +33,14 @@ std::tuple<std::string,
            int,
            int,
            std::vector<std::pair<int, int>>,
-           std::unordered_map<int, std::vector<int>>,
+           std::vector<std::vector<int>>,
            std::vector<int>>
 BlockContext::getstate() const
 {
-    std::unordered_map<int, std::vector<int>> sp_block_table_state;
+    std::vector<std::vector<int>> sp_block_table_state;
     sp_block_table_state.reserve(sp_block_table.size());
     for (const auto& pair : sp_block_table) {
-        sp_block_table_state.emplace(pair.first, std::vector<int>(pair.second.begin(), pair.second.end()));
+        sp_block_table_state.emplace_back(std::vector<int>(pair.begin(), pair.end()));
     }
 
     return std::make_tuple(engine_id_,
@@ -60,7 +59,7 @@ BlockContext BlockContext::setstate(const std::tuple<std::string,
                                                      int,
                                                      int,
                                                      std::vector<std::pair<int, int>>,
-                                                     std::unordered_map<int, std::vector<int>>,
+                                                     std::vector<std::vector<int>>,
                                                      std::vector<int>>& state)
 {
     BlockContext ctx;
@@ -70,15 +69,16 @@ BlockContext BlockContext::setstate(const std::tuple<std::string,
     ctx.attention_sp_  = std::get<3>(state);
     ctx.attention_dp_  = std::get<4>(state);
     ctx.block_location = BlockContext::BlockLocationList(std::get<5>(state).begin(), std::get<5>(state).end());
-    ctx.sp_block_table.clear();
-    for (const auto& pair : std::get<6>(state)) {
-        ctx.sp_block_table[pair.first] = BlockContext::BlockIdList(pair.second.begin(), pair.second.end());
+
+    auto block_table = std::get<6>(state);
+    ctx.sp_block_table.resize(block_table.size(), {});
+    for (size_t i = 0; i < block_table.size(); ++i) {
+        ctx.sp_block_table[i] = BlockContext::BlockIdList(block_table[i].begin(), block_table[i].end());
     }
+
     ctx.num_dispatched_tokens = std::get<7>(state);
     return ctx;
 }
-
-// Sequence Implementation
 
 std::atomic<uint64_t> Sequence::next_seq_id_{0};
 

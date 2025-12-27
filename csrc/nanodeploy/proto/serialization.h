@@ -1,0 +1,30 @@
+#pragma once
+
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "nanodeploy/engine/sequence.h"
+
+namespace nanodeploy {
+
+/**
+ * @brief 序列化一组 Sequence
+ * @param data_ptr 目标缓冲区的起始物理/虚拟地址
+ * @param buffer_size 缓冲区总长度（用于安全检查）
+ * @param seqs 要序列化的数据
+ * @return size_t 实际写入的字节总数
+ */
+size_t serialize_sequences(uintptr_t data_ptr, size_t buffer_size, const std::vector<std::shared_ptr<Sequence>>& seqs);
+
+/**
+ * @brief 反序列化一组 Sequence
+ * @param data_ptr 源数据缓冲区的起始地址
+ * @param data_len 有效数据长度
+ * @return std::vector<std::shared_ptr<Sequence>> 还原出的对象列表
+ */
+std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr, size_t data_len);
+
+}  // namespace nanodeploy
