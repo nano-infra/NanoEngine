@@ -112,7 +112,7 @@ void deserialize_block_context(uintptr_t base, size_t& off, size_t max, BlockCon
 
 }  // namespace
 
-// ==================== 导出接口 ====================
+// ==================== Public API ====================
 
 size_t serialize_sequences(uintptr_t data_ptr, size_t buffer_size, const std::vector<std::shared_ptr<Sequence>>& seqs)
 {
