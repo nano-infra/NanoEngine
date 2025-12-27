@@ -334,6 +334,34 @@ class ModelRunner:
         res_lse_mask[sp_rank].fill_(0)
         res_lse_mask[res_lse_mask != 0] = 1
 
+        # Initialize missing tensors with default values (similar to capture_cudagraph)
+        max_bs = self.config.max_num_seqs
+        max_attention_comp_seqs = max_bs + self.config.max_num_recv_seqs
+        max_num_send_recv_seqs = max(self.config.max_num_send_seqs, self.config.max_num_recv_seqs)
+
+        q_slice_get = torch.full((max_bs,), -1, dtype=torch.int32, device="cuda")
+        q_slice_fill = torch.full((max_bs,), -1, dtype=torch.int32, device="cuda")
+        q_copy_mask = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
+        
+        res_slice_get_to_buffer_output = torch.full((max_bs,), -1, dtype=torch.int32, device="cuda")
+        res_slice_fill_to_buffer_output = torch.full((max_bs,), -1, dtype=torch.int32, device="cuda")
+        res_to_buffer_output_mask = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
+        
+        res_slice_get_to_buffer_input = torch.full(
+            (max_num_send_recv_seqs,), -1, dtype=torch.int32, device="cuda"
+        )
+        res_slice_fill_to_buffer_input = torch.full(
+            (max_num_send_recv_seqs,), -1, dtype=torch.int32, device="cuda"
+        )
+        res_to_buffer_input_mask = torch.zeros(
+            max_num_send_recv_seqs, dtype=torch.int32, device="cuda"
+        )
+        
+        context_lens_for_attn = torch.zeros(
+            max_attention_comp_seqs, dtype=torch.int32, device="cuda"
+        )
+        q_output_stride = torch.zeros(sp_size, dtype=torch.int32, device="cuda")
+
         set_context(
             False,
             self.config.max_num_seqs,
@@ -344,6 +372,18 @@ class ModelRunner:
             q_mask=q_mask,
             res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
+            q_slice_get=q_slice_get,
+            q_slice_fill=q_slice_fill,
+            q_copy_mask=q_copy_mask,
+            res_slice_get_to_buffer_output=res_slice_get_to_buffer_output,
+            res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output,
+            res_to_buffer_output_mask=res_to_buffer_output_mask,
+            res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
+            res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
+            res_to_buffer_input_mask=res_to_buffer_input_mask,
+            attention_compute_bs=input_ids.size(0), # Approximate, or pass appropriate tensor/value
+            context_lens_for_attn=context_lens_for_attn,
+            q_output_stride=q_output_stride,
         )
 
         return input_ids, positions
@@ -410,7 +450,15 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            
+            master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
+            
+            ac_bs = context.attention_compute_bs
+            if ac_bs is None:
+                ac_bs = bs
+            attn_bs = next(x for x in self.graph_attn_compute_bs if x >= ac_bs)
+            
+            graph = self.graphs[(master_bs, attn_bs)]
 
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
