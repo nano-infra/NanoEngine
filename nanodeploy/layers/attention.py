@@ -159,7 +159,7 @@ class Attention(nn.Module):
                     context.res_to_buffer_input_mask,
                 )
 
-                # 5. 拷贝 gathered_lse 到 lse_all_to_all_input_buffer
+                # 5. Copy gathered_lse to lse_all_to_all_input_buffer
                 copy_batch_indexed_triton(
                     gathered_lse.view(-1, num_head, 1),
                     lse_all_to_all_input_buffer,
