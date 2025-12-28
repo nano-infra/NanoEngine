@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from transformers import AutoConfig
 
+
 @dataclass
 class Config:
     model: str
@@ -12,6 +13,8 @@ class Config:
     loop_count: int = 16
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 256
+    max_num_send_seqs: int = 16
+    max_num_recv_seqs: int = 32
     max_model_len: int = 16384
     gpu_memory_utilization: float = 0.9
     routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
@@ -48,6 +51,9 @@ class Config:
     profiler_start_step: int = 16
     profiling_step: int = 16
     profiler_dir: str = "./profiler_logs"
+
+    # performance optimization
+    use_dlslime_rpc: bool = True
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

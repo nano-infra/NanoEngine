@@ -27,7 +27,18 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("context_lens_flat", &DecodeMetadata::context_lens_flat)
         .def_readonly("global_context_lens_flat", &DecodeMetadata::global_context_lens_flat)
         .def_readonly("block_tables_flat", &DecodeMetadata::block_tables_flat)
-        .def_readonly("max_num_blocks", &DecodeMetadata::max_num_blocks);
+        .def_readonly("max_num_blocks", &DecodeMetadata::max_num_blocks)
+        .def_readonly("context_lens_for_attn", &DecodeMetadata::context_lens_for_attn)
+        .def_readonly("q_slice_get", &DecodeMetadata::q_slice_get)
+        .def_readonly("q_slice_fill", &DecodeMetadata::q_slice_fill)
+        .def_readonly("q_copy_mask", &DecodeMetadata::q_copy_mask)
+        .def_readonly("res_slice_get_to_buffer_output", &DecodeMetadata::res_slice_get_to_buffer_output)
+        .def_readonly("res_slice_fill_to_buffer_output", &DecodeMetadata::res_slice_fill_to_buffer_output)
+        .def_readonly("res_to_buffer_output_mask", &DecodeMetadata::res_to_buffer_output_mask)
+        .def_readonly("res_slice_get_to_buffer_input", &DecodeMetadata::res_slice_get_to_buffer_input)
+        .def_readonly("res_slice_fill_to_buffer_input", &DecodeMetadata::res_slice_fill_to_buffer_input)
+        .def_readonly("res_to_buffer_input_mask", &DecodeMetadata::res_to_buffer_input_mask)
+        .def_readonly("q_offsets", &DecodeMetadata::q_offsets);
 
     m.def("prepare_prefill_cpp",
           &prepare_prefill_cpp,
@@ -43,6 +54,7 @@ void bind_model_runner_utils(py::module_& m)
           py::arg("sp_rank"),
           py::arg("sp_size"),
           py::arg("block_size"),
-          py::arg("max_num_seqs"));
-    m.def("update_seqs_inner_loop", &update_seqs_inner_loop, py::arg("dp_seqs"), py::arg("sp_rank"));
+          py::arg("max_num_seqs"),
+          py::arg("max_num_send_recv_seqs"));
+        m.def("update_seqs_inner_loop", &update_seqs_inner_loop, py::arg("dp_seqs"), py::arg("sp_rank"));
 }

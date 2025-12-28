@@ -10,6 +10,7 @@ set(BINDING_SOURCES
     sp_state_manager_binding.cpp
     scheduler_binding.cpp
     model_runner_binding.cpp
+    proto_binding.cpp
 )
 
 # ===== Build pybind11 module =====
@@ -17,7 +18,7 @@ pybind11_add_module(_nanodeploy_cpp
     ${BINDING_SOURCES}
 )
 
-target_link_libraries(_nanodeploy_cpp PRIVATE _nanodeploy_engine _nanodeploy_metrics)
+target_link_libraries(_nanodeploy_cpp PRIVATE _nanodeploy_engine _nanodeploy_metrics _nanodeploy_proto)
 
 set_target_properties(
     _nanodeploy_cpp

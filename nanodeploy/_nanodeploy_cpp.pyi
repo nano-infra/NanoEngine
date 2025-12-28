@@ -12,7 +12,6 @@ __all__: list[str] = [
     "Block",
     "BlockContext",
     "BlockContextSlot",
-    "BlockCtxMap",
     "BlockIdList",
     "BlockLocationList",
     "BlockManager",
@@ -41,9 +40,11 @@ __all__: list[str] = [
     "ServerMetric",
     "TO_BE_MIGRATED",
     "WAITING",
+    "deserialize",
     "postprocess_sequences",
     "prepare_decode_cpp",
     "prepare_prefill_cpp",
+    "serialize",
     "update_seqs_inner_loop",
 ]
 
@@ -79,7 +80,7 @@ class BlockContext:
     def __getstate__(
         self,
     ) -> tuple[
-        str, int, int, int, int, list[tuple[int, int]], dict[int, list[int]], list[int]
+        str, int, int, int, int, list[tuple[int, int]], list[list[int]], list[int]
     ]: ...
     def __init__(self) -> None: ...
     def __setstate__(
@@ -91,9 +92,7 @@ class BlockContext:
             typing.SupportsInt,
             typing.SupportsInt,
             collections.abc.Sequence[tuple[typing.SupportsInt, typing.SupportsInt]],
-            collections.abc.Mapping[
-                typing.SupportsInt, collections.abc.Sequence[typing.SupportsInt]
-            ],
+            collections.abc.Sequence[collections.abc.Sequence[typing.SupportsInt]],
             collections.abc.Sequence[typing.SupportsInt],
         ],
     ) -> None: ...
@@ -151,26 +150,6 @@ class BlockContextSlot:
     def name(self) -> str: ...
     @property
     def value(self) -> int: ...
-
-class BlockCtxMap:
-    def __bool__(self) -> bool:
-        """
-        Check whether the map is nonempty
-        """
-
-    @typing.overload
-    def __contains__(self, arg0: str) -> bool: ...
-    @typing.overload
-    def __contains__(self, arg0: typing.Any) -> bool: ...
-    def __delitem__(self, arg0: str) -> None: ...
-    def __getitem__(self, arg0: str) -> ...: ...
-    def __init__(self) -> None: ...
-    def __iter__(self) -> collections.abc.Iterator[str]: ...
-    def __len__(self) -> int: ...
-    def __setitem__(self, arg0: str, arg1: ...) -> None: ...
-    def items(self) -> typing.ItemsView: ...
-    def keys(self) -> typing.KeysView: ...
-    def values(self) -> typing.ValuesView: ...
 
 class BlockIdList:
     __hash__: typing.ClassVar[None] = None
@@ -486,15 +465,11 @@ class DefaultIntDict:
     def keys(self) -> list: ...
 
 class DefaultListDict:
-    def __contains__(self, arg0: typing.SupportsInt) -> bool: ...
     def __getitem__(self, arg0: typing.SupportsInt) -> BlockIdList: ...
     def __init__(self) -> None: ...
     def __setitem__(
         self, arg0: typing.SupportsInt, arg1: collections.abc.Iterable
     ) -> None: ...
-    def clear(self) -> None: ...
-    def items(self) -> list: ...
-    def keys(self) -> list: ...
 
 class MigrationMap:
     def __contains__(self, arg0: str) -> bool: ...
@@ -1045,6 +1020,9 @@ class ServerMetric:
     @property
     def uptime(self) -> float: ...
 
+def deserialize(
+    data_ptr: typing.SupportsInt, data_len: typing.SupportsInt
+) -> list[typing.Sequence]: ...
 def postprocess_sequences(
     worker_states: ...,
     std: ...,
@@ -1071,6 +1049,11 @@ def prepare_prefill_cpp(
     block_size: typing.SupportsInt,
     max_num_seqs: typing.SupportsInt,
 ) -> PrefillMetadata: ...
+def serialize(
+    data_ptr: typing.SupportsInt,
+    buffer_size: typing.SupportsInt,
+    seqs: collections.abc.Sequence[typing.Sequence],
+) -> int: ...
 def update_seqs_inner_loop(
     dp_seqs: collections.abc.Sequence[typing.Sequence], sp_rank: typing.SupportsInt
 ) -> None: ...

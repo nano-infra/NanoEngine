@@ -50,6 +50,7 @@ class LLMEngine:
 
     def update_num_kvcache_blocks(self):
         self.config.num_kvcache_blocks = self.executor.update_kvcache_blocks()
+        self.executor.init_rpc_endpoint()
 
     def add_request(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):

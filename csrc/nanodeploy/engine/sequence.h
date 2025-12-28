@@ -8,7 +8,6 @@
 #include <sstream>
 #include <string>
 #include <tuple>
-#include <unordered_map>
 #include <vector>
 
 namespace nanodeploy {
@@ -52,8 +51,8 @@ struct BlockContext {
     struct BlockIdList: public std::vector<int> {
         using std::vector<int>::vector;
     };
-    struct SpBlockTable: public std::unordered_map<int, BlockIdList> {
-        using std::unordered_map<int, BlockIdList>::unordered_map;
+    struct SpBlockTable: public std::vector<BlockIdList> {
+        using std::vector<BlockIdList>::vector;
     };
 
     // block_location: vector of (sp_idx, block_id) pairs
@@ -75,7 +74,7 @@ struct BlockContext {
                int,
                int,
                std::vector<std::pair<int, int>>,
-               std::unordered_map<int, std::vector<int>>,
+               std::vector<std::vector<int>>,
                std::vector<int>>
     getstate() const;
 
@@ -85,13 +84,12 @@ struct BlockContext {
                                                   int,
                                                   int,
                                                   std::vector<std::pair<int, int>>,
-                                                  std::unordered_map<int, std::vector<int>>,
+                                                  std::vector<std::vector<int>>,
                                                   std::vector<int>>& state);
 
     void reset(const std::string& engine_id, int attention_sp, int attention_dp);
 };
 
-// Custom hash for optional string to be used in unordered_map
 struct OptionalStringHash {
     std::size_t operator()(const std::optional<std::string>& s) const
     {
@@ -179,9 +177,6 @@ public:
         return num_cached_tokens / block_size;
     }
 
-    // Pickle support
-    // (num_tokens, num_checkpointed_tokens, num_cached_tokens, backup_engine_id, active_engine_id, block_ctx_map,
-    // temperature, token_ids/last_token) Note: token_ids/last_token logic is handled in getstate implementation
     using StateTuple =
         std::tuple<int,
                    int,
@@ -209,9 +204,6 @@ public:
     int              num_prompt_tokens;
     int              num_checkpointed_tokens;
     int              num_cached_tokens = 0;
-
-    using BlockCtxMap = std::unordered_map<std::string, BlockContext, OptionalStringHash>;
-    BlockCtxMap block_ctx_map;
 
     std::shared_ptr<SequenceMetric> metric;
 

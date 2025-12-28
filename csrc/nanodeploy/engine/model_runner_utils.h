@@ -33,13 +33,30 @@ struct DecodeMetadata {
     // Flattened block tables
     std::vector<int> block_tables_flat;
     int              max_num_blocks = 0;
+
+    std::vector<int> context_lens_for_attn;
+
+    std::vector<int> q_slice_get;
+    std::vector<int> q_slice_fill;
+    std::vector<int> q_copy_mask;
+
+    std::vector<int> res_slice_get_to_buffer_output;
+    std::vector<int> res_slice_fill_to_buffer_output;
+    std::vector<int> res_to_buffer_output_mask;
+
+    std::vector<int> res_slice_get_to_buffer_input;
+    std::vector<int> res_slice_fill_to_buffer_input;
+    std::vector<int> res_to_buffer_input_mask;
+
+    std::vector<int> q_output_stride;
+    std::vector<int> q_offsets;
 };
 
 PrefillMetadata
 prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs);
 
 DecodeMetadata
-prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs);
+prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs, int max_num_send_recv_seqs);
 
 void update_seqs_inner_loop(const std::vector<Sequence*>& sp_seqs, int sp_rank);
 
