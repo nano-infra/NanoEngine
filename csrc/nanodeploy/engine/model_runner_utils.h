@@ -33,6 +33,8 @@ struct DecodeMetadata {
     // Flattened block tables
     std::vector<int> block_tables_flat;
     int              max_num_blocks = 0;
+
+    std::vector<int> context_lens_for_attn;
 };
 
 PrefillMetadata

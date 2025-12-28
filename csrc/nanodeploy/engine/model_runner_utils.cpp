@@ -5,15 +5,13 @@
 
 namespace nanodeploy {
 
-// Helper to mimic Python's prepare_block_tables
-static void build_block_tables(const std::vector<Sequence*>& dp_seqs,
-                               int                           sp_rank,
-                               int                           sp_size,
-                               int                           max_num_seqs,
-                               std::vector<int>&             block_tables_flat,
-                               int&                          max_num_blocks)
+static void build_block_tables_packed(const std::vector<Sequence*>& dp_seqs,
+                                      int                           sp_rank,
+                                      int                           sp_size,
+                                      std::vector<int>&             block_tables_flat,
+                                      int&                          max_num_blocks)
 {
-    // 1. Group sequences by master_sp_idx
+    // 1. Group sequences
     std::vector<std::vector<Sequence*>> dp_sp_seqs(sp_size);
     for (auto* seq : dp_seqs) {
         int m_sp = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
@@ -22,7 +20,59 @@ static void build_block_tables(const std::vector<Sequence*>& dp_seqs,
         }
     }
 
-    // 2. Calculate max_num_blocks based on the local sp_rank's block table size for all seqs
+    // 2. Collect valid block tables and calculate max_num_blocks
+    max_num_blocks = 0;
+    std::vector<std::vector<int>> valid_tables;
+
+    for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
+        for (auto* seq : dp_sp_seqs[sp_idx]) {
+            const auto& bt = seq->block_table(BlockContextSlot::ACTIVE, sp_rank);
+            if (!bt.empty()) {
+                valid_tables.push_back(bt);
+                if ((int)bt.size() > max_num_blocks) {
+                    max_num_blocks = (int)bt.size();
+                }
+            }
+        }
+    }
+
+    // 3. Flatten and pad
+    // 如果没有有效的 block table，block_tables_flat 为空，max_num_blocks 为 0
+    if (valid_tables.empty()) {
+        block_tables_flat.clear();
+        return;
+    }
+
+    block_tables_flat.reserve(valid_tables.size() * max_num_blocks);
+    for (const auto& bt : valid_tables) {
+        // Copy data
+        block_tables_flat.insert(block_tables_flat.end(), bt.begin(), bt.end());
+        // Pad with -1
+        int padding = max_num_blocks - (int)bt.size();
+        for (int k = 0; k < padding; ++k) {
+            block_tables_flat.push_back(-1);
+        }
+    }
+}
+
+// Helper for dense block tables (keep for prefill if needed, or implement inline)
+static void build_block_tables_dense(const std::vector<Sequence*>& dp_seqs,
+                                     int                           sp_rank,
+                                     int                           sp_size,
+                                     int                           max_num_seqs,
+                                     std::vector<int>&             block_tables_flat,
+                                     int&                          max_num_blocks)
+{
+     // 1. Group sequences by master_sp_idx
+    std::vector<std::vector<Sequence*>> dp_sp_seqs(sp_size);
+    for (auto* seq : dp_seqs) {
+        int m_sp = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+        if (m_sp >= 0 && m_sp < sp_size) {
+            dp_sp_seqs[m_sp].push_back(seq);
+        }
+    }
+
+    // 2. Calculate max_num_blocks
     max_num_blocks = 0;
     for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
         for (auto* seq : dp_sp_seqs[sp_idx]) {
@@ -38,13 +88,10 @@ static void build_block_tables(const std::vector<Sequence*>& dp_seqs,
 
     for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
         const auto& seqs           = dp_sp_seqs[sp_idx];
-        size_t      num_seqs_in_sp = seqs.size();
-
         for (int seq_id = 0; seq_id < max_num_seqs; ++seq_id) {
             size_t base_offset = ((size_t)sp_idx * max_num_seqs + seq_id) * max_num_blocks;
-
-            if (seq_id < (int)num_seqs_in_sp) {
-                Sequence*   seq = seqs[seq_id];
+            if (seq_id < (int)seqs.size()) {
+                Sequence* seq = seqs[seq_id];
                 const auto& bt  = seq->block_table(BlockContextSlot::ACTIVE, sp_rank);
                 for (size_t i = 0; i < bt.size(); ++i) {
                     block_tables_flat[base_offset + i] = bt[i];
@@ -67,7 +114,6 @@ prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size
     meta.slot_mapping.reserve(est_tokens);
 
     for (auto* seq : seqs) {
-        // Filter by master_sp_rank
         if (seq->block_ctx().master_sp_idx_ != sp_rank) {
             continue;
         }
@@ -77,7 +123,6 @@ prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size
         int seqlen_q   = seqlen - num_cached;
         int seqlen_k   = seqlen;
 
-        // [FIXED] Always append input_ids/positions FIRST, regardless of block table state.
         const auto& full_tokens = seq->token_ids;
         for (int i = num_cached; i < seqlen; ++i) {
             meta.input_ids.push_back(full_tokens[i]);
@@ -89,14 +134,11 @@ prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size
         meta.max_seqlen_q = std::max(meta.max_seqlen_q, seqlen_q);
         meta.max_seqlen_k = std::max(meta.max_seqlen_k, seqlen_k);
 
-        // [FIXED] Check for empty block table (Warmup case) AFTER processing tokens.
-        // If empty, we just skip slot mapping calculation.
         const auto& bt = seq->block_table(BlockContextSlot::ACTIVE, sp_rank);
         if (bt.empty()) {
             continue;
         }
 
-        // Calculate slot mapping
         int num_blocks        = seq->num_blocks(BlockContextSlot::ACTIVE, sp_rank);
         int num_cached_blocks = seq->num_cached_blocks();
 
@@ -114,7 +156,7 @@ prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size
 
     if (meta.cu_seqlens_k.back() > meta.cu_seqlens_q.back()) {
         meta.use_block_tables = true;
-        build_block_tables(seqs, sp_rank, sp_size, max_num_seqs, meta.block_tables_flat, meta.max_num_blocks);
+        build_block_tables_dense(seqs, sp_rank, sp_size, max_num_seqs, meta.block_tables_flat, meta.max_num_blocks);
     }
 
     return meta;
@@ -137,10 +179,6 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
         }
     }
 
-    // 2. Prepare context_lens
-    meta.context_lens_flat.assign(sp_size * max_num_seqs, 0);
-    meta.global_context_lens_flat.assign(sp_size * max_num_seqs, 0);
-
     // Group sequences
     std::vector<std::vector<Sequence*>> sp_seqs(sp_size);
     for (auto* seq : dp_seqs) {
@@ -150,7 +188,11 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
         }
     }
 
-    // Fill context_lens
+    // 2. Prepare context_lens and global_context_lens
+    meta.context_lens_flat.assign(sp_size * max_num_seqs, 0);
+    meta.global_context_lens_flat.assign(sp_size * max_num_seqs, 0);
+
+    // context_lens
     for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
         const auto& batch_seqs = sp_seqs[sp_idx];
         for (int seq_id = 0; seq_id < max_num_seqs; ++seq_id) {
@@ -175,7 +217,18 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
     }
 
     // 3. Block tables
-    build_block_tables(dp_seqs, sp_rank, sp_size, max_num_seqs, meta.block_tables_flat, meta.max_num_blocks);
+    build_block_tables_packed(dp_seqs, sp_rank, sp_size, meta.block_tables_flat, meta.max_num_blocks);
+
+    // 4. context_lens_for_attn
+    for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
+        const auto& batch_seqs = sp_seqs[sp_idx];
+        for (int seq_id = 0; seq_id < (int)batch_seqs.size(); ++seq_id) {
+            int ctx_len = batch_seqs[seq_id]->context_len(BlockContextSlot::ACTIVE, sp_rank);
+            if (ctx_len > 0) {
+                meta.context_lens_for_attn.push_back(ctx_len);
+            }
+        }
+    }
 
     return meta;
 }

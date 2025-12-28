@@ -73,8 +73,10 @@ class Attention(nn.Module):
                 context_lens = context.context_lens.view(-1)
                 block_tables = context.block_tables.view(sp_size * max_num_seqs, -1)
             else:
-                context_lens = context.context_lens[sp_rank][:bs]
-                block_tables = context.block_tables[sp_rank][:bs]
+                context_lens = context.context_lens_for_attn[
+                    : context.attention_compute_bs
+                ]
+                block_tables = context.block_tables[: context.attention_compute_bs]
 
             o, lse = flash_attn_with_kvcache(
                 q.unsqueeze(1),

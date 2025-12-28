@@ -308,11 +308,14 @@ class ModelRunner:
             .cuda(non_blocking=True)
         )
 
-        block_tables = (
-            torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
-            .reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks)
-            .cuda(non_blocking=True)
-        )
+        if len(meta.block_tables_flat) == 0:
+             block_tables = torch.empty((0, 0), dtype=torch.int32).cuda(non_blocking=True)
+        else:
+            block_tables = torch.tensor(
+                meta.block_tables_flat, dtype=torch.int32, pin_memory=True
+            ).reshape(-1, meta.max_num_blocks).cuda(non_blocking=True)
+
+        logger.info(f"ModelRunner block_tables.shape: {block_tables.shape}")
 
         q_mask = global_context_lens.clone()
         q_mask[sp_rank].fill_(0)
@@ -321,33 +324,11 @@ class ModelRunner:
         res_lse_mask[sp_rank].fill_(0)
         res_lse_mask[res_lse_mask != 0] = 1
 
-        # Initialize missing tensors with default values (similar to capture_cudagraph)
-        max_bs = self.config.max_num_seqs
-        max_attention_comp_seqs = max_bs + self.config.max_num_recv_seqs
-        max_num_send_recv_seqs = max(self.config.max_num_send_seqs, self.config.max_num_recv_seqs)
+        context_lens_for_attn = torch.tensor(
+            meta.context_lens_for_attn, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
 
-        q_slice_get = torch.full((max_bs,), -1, dtype=torch.int32, device="cuda")
-        q_slice_fill = torch.full((max_bs,), -1, dtype=torch.int32, device="cuda")
-        q_copy_mask = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
-        
-        res_slice_get_to_buffer_output = torch.full((max_bs,), -1, dtype=torch.int32, device="cuda")
-        res_slice_fill_to_buffer_output = torch.full((max_bs,), -1, dtype=torch.int32, device="cuda")
-        res_to_buffer_output_mask = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
-        
-        res_slice_get_to_buffer_input = torch.full(
-            (max_num_send_recv_seqs,), -1, dtype=torch.int32, device="cuda"
-        )
-        res_slice_fill_to_buffer_input = torch.full(
-            (max_num_send_recv_seqs,), -1, dtype=torch.int32, device="cuda"
-        )
-        res_to_buffer_input_mask = torch.zeros(
-            max_num_send_recv_seqs, dtype=torch.int32, device="cuda"
-        )
-        
-        context_lens_for_attn = torch.zeros(
-            max_attention_comp_seqs, dtype=torch.int32, device="cuda"
-        )
-        q_output_stride = torch.zeros(sp_size, dtype=torch.int32, device="cuda")
+        attention_compute_bs = context_lens_for_attn.numel()
 
         set_context(
             False,
@@ -359,18 +340,8 @@ class ModelRunner:
             q_mask=q_mask,
             res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
-            q_slice_get=q_slice_get,
-            q_slice_fill=q_slice_fill,
-            q_copy_mask=q_copy_mask,
-            res_slice_get_to_buffer_output=res_slice_get_to_buffer_output,
-            res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output,
-            res_to_buffer_output_mask=res_to_buffer_output_mask,
-            res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
-            res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
-            res_to_buffer_input_mask=res_to_buffer_input_mask,
-            attention_compute_bs=input_ids.size(0), # Approximate, or pass appropriate tensor/value
             context_lens_for_attn=context_lens_for_attn,
-            q_output_stride=q_output_stride,
+            attention_compute_bs=attention_compute_bs
         )
 
         return input_ids, positions
@@ -411,6 +382,9 @@ class ModelRunner:
 
         # update global context length
         context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
+
+        # update context lens for attention
+        context.context_lens_for_attn[:num_sp_seqs].add_(1)
 
         return input_ids, positions
 
@@ -460,9 +434,13 @@ class ModelRunner:
             graph_vars["q_mask"].copy_(context.q_mask)  # type: ignore
             graph_vars["res_lse_mask"].zero_()
             graph_vars["res_lse_mask"].copy_(context.res_lse_mask)  # type: ignore
+            graph_vars["block_tables"].zero_()
             graph_vars["block_tables"][
-                :, :, : context.block_tables.size(2)  # type: ignore
+                : context.block_tables.size(0), : context.block_tables.size(1)  # type: ignore
             ] = context.block_tables
+
+            graph_vars["context_lens_for_attn"].zero_()
+            graph_vars["context_lens_for_attn"][: context.context_lens_for_attn.shape[0]].copy_(context.context_lens_for_attn)  # type: ignore
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -572,7 +550,7 @@ class ModelRunner:
         q_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         res_lse_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         block_tables = torch.zeros(
-            sp_world_size, max_bs, max_num_blocks, dtype=torch.int32
+            max_attention_comp_seqs, max_num_blocks, dtype=torch.int32
         )
         max_num_send_recv_seqs = max(config.max_num_send_seqs, config.max_num_recv_seqs)
         q_slice_get = torch.full((max_bs,), -1, dtype=torch.int32)

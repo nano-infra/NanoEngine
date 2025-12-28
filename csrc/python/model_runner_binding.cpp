@@ -27,7 +27,8 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("context_lens_flat", &DecodeMetadata::context_lens_flat)
         .def_readonly("global_context_lens_flat", &DecodeMetadata::global_context_lens_flat)
         .def_readonly("block_tables_flat", &DecodeMetadata::block_tables_flat)
-        .def_readonly("max_num_blocks", &DecodeMetadata::max_num_blocks);
+        .def_readonly("max_num_blocks", &DecodeMetadata::max_num_blocks)
+        .def_readonly("context_lens_for_attn", &DecodeMetadata::context_lens_for_attn);
 
     m.def("prepare_prefill_cpp",
           &prepare_prefill_cpp,
@@ -44,5 +45,5 @@ void bind_model_runner_utils(py::module_& m)
           py::arg("sp_size"),
           py::arg("block_size"),
           py::arg("max_num_seqs"));
-    m.def("update_seqs_inner_loop", &update_seqs_inner_loop, py::arg("dp_seqs"), py::arg("sp_rank"));
+        m.def("update_seqs_inner_loop", &update_seqs_inner_loop, py::arg("dp_seqs"), py::arg("sp_rank"));
 }
