@@ -124,7 +124,7 @@ class Attention(nn.Module):
                     context.res_to_buffer_output_mask,
                 )
 
-                # 2. 拷贝 gathered_lse 到 lse_local_buffer
+                # 2. Copy gathered_lse to lse_local_buffer
                 lse_local_buffer_3d = lse_buffer.local_buffer.view(
                     get_sp_context().dtype
                 )[: sp_size * max_num_seqs * num_head * 1].view(
