@@ -138,7 +138,7 @@ class Attention(nn.Module):
                     context.res_to_buffer_output_mask,
                 )
 
-                # 3. 分配 All-to-All Input Buffer
+                # 3. Allocate All-to-All Input Buffer
                 res_all_to_all_input_buffer = torch.empty(
                     (sp_size * max_num_seqs, num_head, head_dim),
                     dtype=gathered_o.dtype,
