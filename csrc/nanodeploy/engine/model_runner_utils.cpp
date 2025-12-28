@@ -192,7 +192,7 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
     meta.context_lens_flat.assign(sp_size * max_num_seqs, 0);
     meta.global_context_lens_flat.assign(sp_size * max_num_seqs, 0);
     
-    // 用于内部计算 q_slice_fill 和 q_offsets
+    // Used internally to calculate q_slice_fill and q_offsets
     std::vector<int> sp_valid_request_counts(sp_size, 0);
 
     // context_lens
