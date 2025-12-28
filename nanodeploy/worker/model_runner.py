@@ -88,9 +88,6 @@ class ModelRunner:
 
             deep_ep.Buffer.num_sms = 16
             dist.barrier(group=get_dist_context().cuda_world_group)
-        import time
-
-        time.sleep(10)
 
         if sp_size > 1:
             sp_rank = get_dist_context().attn_sp_rank
@@ -102,9 +99,6 @@ class ModelRunner:
                 sp_size,
                 sp_rank,
             )
-
-        model_architecture = hf_config.architectures[0]
-        self.model = architectures[model_architecture](hf_config)
 
         self.run_count = 0
         self.profiler = None
@@ -135,25 +129,8 @@ class ModelRunner:
                 f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, duration {self.profiler_steps} steps."
             )
 
-        sp_size = get_dist_context().attn_sp_world_size
-        ep_size = get_dist_context().ffn_ep_world_size
-
-        if ep_size > 1:
-            import deep_ep
-
-            deep_ep.Buffer.num_sms = 16
-            dist.barrier(group=get_dist_context().cuda_world_group)
-
-        if sp_size > 1:
-            sp_rank = get_dist_context().attn_sp_rank
-            set_sp_context(
-                config.max_num_seqs,
-                hf_config.head_dim,
-                hf_config.num_attention_heads,
-                torch.get_default_dtype(),
-                sp_size,
-                sp_rank,
-            )
+        model_architecture = hf_config.architectures[0]
+        self.model = architectures[model_architecture](hf_config)
 
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
