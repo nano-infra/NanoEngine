@@ -288,8 +288,6 @@ class ModelRunner:
             max_num_send_recv_seqs,
         )
 
-        print(f"meta.q_offset: {meta.q_offset}",flush=True)
-
         input_ids = torch.tensor(
             meta.input_ids, dtype=torch.int64, pin_memory=True
         ).cuda(non_blocking=True)
