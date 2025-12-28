@@ -275,6 +275,9 @@ class ModelRunner:
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
         block_size = self.config.kvcache_block_size
+        max_num_send_recv_seqs = max(
+            self.config.max_num_send_seqs, self.config.max_num_recv_seqs
+        )
 
         meta = prepare_decode_cpp(
             dp_seqs,
@@ -282,7 +285,10 @@ class ModelRunner:
             sp_size,
             block_size,
             self.config.max_num_seqs,
+            max_num_send_recv_seqs,
         )
+
+        print(f"meta.q_offset: {meta.q_offset}",flush=True)
 
         input_ids = torch.tensor(
             meta.input_ids, dtype=torch.int64, pin_memory=True
@@ -328,6 +334,37 @@ class ModelRunner:
             meta.context_lens_for_attn, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
 
+        q_slice_get = torch.tensor(
+            meta.q_slice_get, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        q_slice_fill = torch.tensor(
+            meta.q_slice_fill, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        q_copy_mask = torch.tensor(
+            meta.q_copy_mask, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_slice_get_to_buffer_output = torch.tensor(
+            meta.res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_slice_fill_to_buffer_output = torch.tensor(
+            meta.res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_to_buffer_output_mask = torch.tensor(
+            meta.res_to_buffer_output_mask, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_slice_get_to_buffer_input = torch.tensor(
+            meta.res_slice_get_to_buffer_input, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_slice_fill_to_buffer_input = torch.tensor(
+            meta.res_slice_fill_to_buffer_input, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_to_buffer_input_mask = torch.tensor(
+            meta.res_to_buffer_input_mask, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        q_offsets = torch.tensor(
+            meta.q_offsets, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        
         attention_compute_bs = context_lens_for_attn.numel()
 
         set_context(
@@ -341,7 +378,17 @@ class ModelRunner:
             res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
             context_lens_for_attn=context_lens_for_attn,
-            attention_compute_bs=attention_compute_bs
+            attention_compute_bs=attention_compute_bs,
+            q_slice_get=q_slice_get,
+            q_slice_fill=q_slice_fill,
+            q_copy_mask=q_copy_mask,
+            res_slice_get_to_buffer_output=res_slice_get_to_buffer_output,
+            res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output,
+            res_to_buffer_output_mask=res_to_buffer_output_mask,
+            res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
+            res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
+            res_to_buffer_input_mask=res_to_buffer_input_mask,
+            q_offsets=q_offsets,
         )
 
         return input_ids, positions
@@ -441,6 +488,31 @@ class ModelRunner:
 
             graph_vars["context_lens_for_attn"].zero_()
             graph_vars["context_lens_for_attn"][: context.context_lens_for_attn.shape[0]].copy_(context.context_lens_for_attn)  # type: ignore
+            
+            graph_vars["q_slice_get"].fill_(-1)
+            graph_vars["q_slice_fill"].fill_(-1)
+            graph_vars["q_copy_mask"].zero_()
+            graph_vars["q_slice_get"][: context.q_slice_get.shape[0]] = context.q_slice_get  # type: ignore
+            graph_vars["q_slice_fill"][: context.q_slice_fill.shape[0]] = context.q_slice_fill  # type: ignore
+            graph_vars["q_copy_mask"][: context.q_copy_mask.shape[0]] = context.q_copy_mask  # type: ignore
+
+            graph_vars["res_slice_get_to_buffer_output"].fill_(-1)
+            graph_vars["res_slice_fill_to_buffer_output"].fill_(-1)
+            graph_vars["res_to_buffer_output_mask"].zero_()
+            graph_vars["res_slice_get_to_buffer_output"][: context.res_slice_get_to_buffer_output.shape[0]] = context.res_slice_get_to_buffer_output  # type: ignore
+            graph_vars["res_slice_fill_to_buffer_output"][: context.res_slice_fill_to_buffer_output.shape[0]] = context.res_slice_fill_to_buffer_output  # type: ignore
+            graph_vars["res_to_buffer_output_mask"][: context.res_to_buffer_output_mask.shape[0]] = context.res_to_buffer_output_mask  # type: ignore
+
+            graph_vars["res_slice_get_to_buffer_input"].fill_(-1)
+            graph_vars["res_slice_fill_to_buffer_input"].fill_(-1)
+            graph_vars["res_to_buffer_input_mask"].zero_()
+            graph_vars["res_slice_get_to_buffer_input"].copy_(context.res_slice_get_to_buffer_input)  # type: ignore
+            graph_vars["res_slice_fill_to_buffer_input"].copy_(context.res_slice_fill_to_buffer_input)  # type: ignore
+            graph_vars["res_to_buffer_input_mask"].copy_(context.res_to_buffer_input_mask)  # type: ignore
+
+            graph_vars["q_offsets"].zero_()
+            graph_vars["q_offsets"].copy_(context.q_offsets)  # type: ignore
+            
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -568,7 +640,7 @@ class ModelRunner:
         res_to_buffer_input_mask = torch.zeros(
             max_num_send_recv_seqs, dtype=torch.int32
         )
-        q_output_stride = torch.zeros(sp_world_size, dtype=torch.int32)
+        q_offsets = torch.zeros(sp_world_size + 1, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_master_rank_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graph_attn_compute_bs = [1, 2, 4, 8] + list(
@@ -631,7 +703,7 @@ class ModelRunner:
                     res_to_buffer_input_mask=res_to_buffer_input_mask,
                     attention_compute_bs=attn_bs,
                     context_lens_for_attn=context_lens_for_attn,
-                    q_output_stride=q_output_stride,
+                    q_offsets=q_offsets,
                 )
 
                 outputs[:master_bs] = self.model(
@@ -674,5 +746,5 @@ class ModelRunner:
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             attention_compute_bs=attn_bs,
             context_lens_for_attn=context_lens_for_attn,
-            q_output_stride=q_output_stride,
+            q_offsets=q_offsets,
         )

@@ -43,7 +43,6 @@ class Context:
     attention_compute_bs: Optional[int] = None
 
     # used for all2all q transfer
-    q_output_stride: torch.Tensor | None = None
     q_offsets: torch.Tensor | None = None
     context_lens_for_attn: torch.Tensor | None = None
 
@@ -79,7 +78,6 @@ def set_context(
     res_slice_fill_to_buffer_input: Optional[torch.Tensor] = None,
     res_to_buffer_input_mask: Optional[torch.Tensor] = None,
     attention_compute_bs: Optional[int] = None,
-    q_output_stride: Optional[torch.Tensor] = None,
     q_offsets: Optional[torch.Tensor] = None,
     context_lens_for_attn: Optional[torch.Tensor] = None,
 ):
@@ -108,7 +106,6 @@ def set_context(
         res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
         res_to_buffer_input_mask=res_to_buffer_input_mask,
         attention_compute_bs=attention_compute_bs,
-        q_output_stride=q_output_stride,
         q_offsets=q_offsets,
         context_lens_for_attn=context_lens_for_attn,
     )
