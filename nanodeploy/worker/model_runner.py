@@ -455,7 +455,6 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            
             master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
             
             ac_bs = context.attention_compute_bs
