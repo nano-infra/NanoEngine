@@ -204,16 +204,19 @@ def copy_batch_indexed_triton(
 
 def warmup_copy_kernel(shapes=None, dtype=torch.float16):
     """
-    预热 copy_batch_indexed_triton kernel。
+    Warm up the ``copy_batch_indexed_triton`` kernel.
 
-    原理：
-    由于 Autotune Key 仅包含 ["D", "H"]，我们只需对每种唯一的 (H, D) 组合
-    执行一次调用即可触发编译并生成 Cache。后续真实的推理请求无论 Batch Size 是多少，
-    只要 H 和 D 命中缓存，都不会再有编译开销。
+    Rationale:
+    Since the autotune key only contains ["D", "H"], we only need to invoke the kernel
+    once for each unique (H, D) pair to trigger compilation and populate the cache.
+    For subsequent real inference requests, regardless of batch size, as long as H and D
+    hit the cache, there will be no additional compilation overhead.
 
     Args:
-        shapes: 可选。一个包含 (B, H, D, ...) 元组的列表。如果不传，默认使用代码中内置的常用配置。
-        dtype: 预热使用的数据类型，建议与推理时保持一致 (默认 float16)。
+        shapes: Optional. A list of (B, H, D, ...) tuples. If not provided, commonly used
+            configurations hard-coded in this function will be used.
+        dtype: Data type used during warmup. It is recommended to keep it the same as the
+            one used during inference (default: float16).
     """
     if shapes is None:
         configs = [
