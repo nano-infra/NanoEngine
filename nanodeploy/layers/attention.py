@@ -58,7 +58,7 @@ class Attention(nn.Module):
                 max_num_seqs = get_sp_context().max_num_seqs
                 q_buffer = get_sp_context().q_buffer
 
-                # Q 拷贝
+                # Q copy
                 local_q_buffer_3d = q_buffer.local_buffer.view(get_sp_context().dtype)[
                     : sp_size * max_num_seqs * num_head * head_dim
                 ].view(sp_size * max_num_seqs, num_head, head_dim)
