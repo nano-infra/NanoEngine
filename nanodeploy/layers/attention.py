@@ -150,7 +150,7 @@ class Attention(nn.Module):
                     device=gathered_lse.device,
                 )
 
-                # 4. 拷贝 gathered_o 到 res_all_to_all_input_buffer
+                # 4. Copy gathered_o to res_all_to_all_input_buffer
                 copy_batch_indexed_triton(
                     gathered_o.view(-1, num_head, head_dim),
                     res_all_to_all_input_buffer,
