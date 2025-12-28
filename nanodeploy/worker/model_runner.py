@@ -362,7 +362,6 @@ class ModelRunner:
         q_offsets = torch.tensor(
             meta.q_offsets, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
-        
         attention_compute_bs = context_lens_for_attn.numel()
 
         set_context(
