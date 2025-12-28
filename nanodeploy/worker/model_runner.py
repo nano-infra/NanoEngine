@@ -338,6 +338,18 @@ class ModelRunner:
             meta.q_offsets, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
 
+        q_slice_get = torch.tensor(
+            meta.q_slice_get, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        q_slice_fill = torch.tensor(
+            meta.q_slice_fill, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        q_copy_mask = torch.tensor(
+            meta.q_copy_mask, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
         set_context(
             False,
             self.config.max_num_seqs,
@@ -352,6 +364,9 @@ class ModelRunner:
             attention_compute_bs=attention_compute_bs,
             q_output_stride=q_output_stride,
             q_offsets=q_offsets,
+            q_slice_get=q_slice_get,
+            q_slice_fill=q_slice_fill,
+            q_copy_mask=q_copy_mask,
         )
 
         return input_ids, positions
@@ -453,7 +468,15 @@ class ModelRunner:
             graph_vars["context_lens_for_attn"][: context.context_lens_for_attn.shape[0]].copy_(context.context_lens_for_attn)  # type: ignore
 
             graph_vars["q_output_stride"].copy_(context.q_output_stride)
+            graph_vars["q_output_stride"].copy_(context.q_output_stride)
             graph_vars["q_offsets"].copy_(context.q_offsets)
+            
+            graph_vars["q_slice_get"].fill_(-1)
+            graph_vars["q_slice_get"][: context.q_slice_get.shape[0]].copy_(context.q_slice_get)
+            graph_vars["q_slice_fill"].fill_(-1)
+            graph_vars["q_slice_fill"][: context.q_slice_fill.shape[0]].copy_(context.q_slice_fill)
+            graph_vars["q_copy_mask"].zero_()
+            graph_vars["q_copy_mask"][: context.q_copy_mask.shape[0]].copy_(context.q_copy_mask)
 
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])

@@ -38,6 +38,10 @@ struct DecodeMetadata {
 
     std::vector<int> q_output_stride;
     std::vector<int> q_offsets;
+
+    std::vector<int> q_slice_get;
+    std::vector<int> q_slice_fill;
+    std::vector<int> q_copy_mask;
 };
 
 PrefillMetadata

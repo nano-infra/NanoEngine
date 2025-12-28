@@ -241,6 +241,15 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
         meta.q_offsets[sp_idx + 1] = meta.q_offsets[sp_idx] + count;
     }
 
+    // 6. q_slice_*
+    int my_q_count = meta.q_output_stride[sp_rank];
+    int my_q_offset = meta.q_offsets[sp_rank];
+    for(int i = 0; i < my_q_count; ++i) {
+        meta.q_slice_get.push_back(i);
+        meta.q_slice_fill.push_back(my_q_offset + i);
+        meta.q_copy_mask.push_back(1);
+    }
+
     return meta;
 }
 
