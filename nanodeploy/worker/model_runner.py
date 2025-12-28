@@ -370,7 +370,14 @@ class ModelRunner:
         context_lens_for_attn = torch.zeros(
             max_attention_comp_seqs, dtype=torch.int32, device="cuda"
         )
-        q_output_stride = torch.zeros(sp_size, dtype=torch.int32, device="cuda")
+
+        q_output_stride = torch.tensor(
+            meta.q_output_stride, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        q_offsets = torch.tensor(
+            meta.q_offsets, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
 
         set_context(
             False,
@@ -394,6 +401,7 @@ class ModelRunner:
             attention_compute_bs=input_ids.size(0), # Approximate, or pass appropriate tensor/value
             context_lens_for_attn=context_lens_for_attn,
             q_output_stride=q_output_stride,
+            q_offsets=q_offsets,
         )
 
         return input_ids, positions
@@ -486,6 +494,8 @@ class ModelRunner:
             graph_vars["block_tables"][
                 :, :, : context.block_tables.size(2)  # type: ignore
             ] = context.block_tables
+            graph_vars["q_offsets"].copy_(context.q_offsets)  # type: ignore
+            graph_vars["q_output_stride"].copy_(context.q_output_stride)  # type: ignore
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -614,6 +624,7 @@ class ModelRunner:
             max_num_send_recv_seqs, dtype=torch.int32
         )
         q_output_stride = torch.zeros(sp_world_size, dtype=torch.int32)
+        q_offsets = torch.zeros(sp_world_size + 1, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_master_rank_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graph_attn_compute_bs = [1, 2, 4, 8] + list(
@@ -677,6 +688,7 @@ class ModelRunner:
                     attention_compute_bs=attn_bs,
                     context_lens_for_attn=context_lens_for_attn,
                     q_output_stride=q_output_stride,
+                    q_offsets=q_offsets,
                 )
 
                 outputs[:master_bs] = self.model(
@@ -720,4 +732,5 @@ class ModelRunner:
             attention_compute_bs=attn_bs,
             context_lens_for_attn=context_lens_for_attn,
             q_output_stride=q_output_stride,
+            q_offsets=q_offsets,
         )

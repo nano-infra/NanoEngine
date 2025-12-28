@@ -177,6 +177,28 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
     // 3. Block tables
     build_block_tables(dp_seqs, sp_rank, sp_size, max_num_seqs, meta.block_tables_flat, meta.max_num_blocks);
 
+    // 4. Compute q_output_stride and q_offsets
+    meta.q_output_stride.assign(sp_size, 0);
+    meta.q_offsets.assign(sp_size + 1, 0);
+
+    for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
+        int count = 0;
+        // Count valid requests in this SP rank (based on context_lens calculated above)
+        for (int seq_id = 0; seq_id < max_num_seqs; ++seq_id) {
+            // context_lens_flat layout: [sp_idx * max_num_seqs + seq_id]
+            if (meta.context_lens_flat[sp_idx * max_num_seqs + seq_id] > 0) {
+                count++;
+            }
+        }
+        meta.q_output_stride[sp_idx] = count;
+    }
+
+    // Prefix sum for q_offsets
+    meta.q_offsets[0] = 0;
+    for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
+        meta.q_offsets[sp_idx + 1] = meta.q_offsets[sp_idx] + meta.q_output_stride[sp_idx];
+    }
+
     return meta;
 }
 

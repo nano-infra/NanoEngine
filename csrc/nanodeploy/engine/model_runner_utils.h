@@ -33,6 +33,10 @@ struct DecodeMetadata {
     // Flattened block tables
     std::vector<int> block_tables_flat;
     int              max_num_blocks = 0;
+
+    // For all2all q transfer
+    std::vector<int> q_output_stride;
+    std::vector<int> q_offsets;
 };
 
 PrefillMetadata
