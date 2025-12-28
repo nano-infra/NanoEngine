@@ -31,7 +31,7 @@ class Config:
     enforce_eager: bool = False
     hf_config: Any = None
     eos: int = -1
-    kvcache_block_size: int = 256
+    kvcache_block_size: int = 256//4
     num_kvcache_blocks: int = 15000
 
     # deployment config

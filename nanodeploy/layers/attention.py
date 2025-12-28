@@ -257,15 +257,21 @@ class FlashMLAImpl:
                     q,
                     mask=context.q_mask,
                 ).view([sp_size * max_num_seqs, num_head, head_dim])
-                context_lens = context.context_lens.view(-1)
-                block_tables = context.block_tables.view(sp_size * max_num_seqs, -1)
+
+                q = q[: context.attention_compute_bs]
+                context_lens = context.context_lens_for_attn[
+                    : context.attention_compute_bs
+                ]
+                block_tables = context.block_tables[: context.attention_compute_bs]
                 tile_scheduler_metadata = context.tile_scheduler_metadata
-                num_splits = context.num_splits[: sp_size * max_num_seqs + 1]
+                num_splits = context.num_splits[: context.attention_compute_bs + 1]
             else:
-                context_lens = context.context_lens[sp_rank][:bs]
-                block_tables = context.block_tables[sp_rank][:bs]
+                context_lens = context.context_lens_for_attn[
+                    : context.attention_compute_bs
+                ]
+                block_tables = context.block_tables[: context.attention_compute_bs]
                 tile_scheduler_metadata = context.tile_scheduler_metadata
-                num_splits = context.num_splits[: bs + 1]
+                num_splits = context.num_splits[: context.attention_compute_bs + 1]
 
             # tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
             #     cache_seqlens=context_lens,

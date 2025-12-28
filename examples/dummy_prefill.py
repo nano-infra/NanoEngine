@@ -7,16 +7,17 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("/models/qwen3-235B-Instruct-2507-FP8")
+    path = os.path.expanduser("/models/deepseek-v3")
 
     decode = LLM(
         path,
         enforce_eager=False,
-        attention_dp=2,
-        attention_sp=8,
+        attention_dp=8
+        ,
+        attention_sp=1,
         attention_tp=1,
         ffn_dp=1,
-        ffn_ep=16,
+        ffn_ep=8,
         ffn_tp=1,
         mode="decode",
         master_address='10.102.98.166:26444',
@@ -47,7 +48,7 @@ def main():
             # [0] * 2048,
             sampling_params=sampling_params,
         )
-        for _ in range(1024)
+        for _ in range(512)
     ]
 
     seqs = long_seqs + short_seqs
