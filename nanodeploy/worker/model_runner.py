@@ -508,7 +508,6 @@ class ModelRunner:
 
             graph_vars["q_offsets"].zero_()
             graph_vars["q_offsets"].copy_(context.q_offsets)  # type: ignore
-            
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
