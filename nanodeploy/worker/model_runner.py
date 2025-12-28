@@ -691,4 +691,5 @@ class ModelRunner:
             attention_compute_bs=attn_bs,
             context_lens_for_attn=context_lens_for_attn,
             q_output_stride=q_output_stride,
+            q_offsets=q_offsets,
         )

@@ -230,6 +230,17 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
         }
     }
 
+    // 5. q_output_stride and q_offsets
+    meta.q_output_stride.resize(sp_size);
+    meta.q_offsets.resize(sp_size + 1);
+    meta.q_offsets[0] = 0;
+
+    for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
+        int count = (int)sp_seqs[sp_idx].size();
+        meta.q_output_stride[sp_idx] = count;
+        meta.q_offsets[sp_idx + 1] = meta.q_offsets[sp_idx] + count;
+    }
+
     return meta;
 }
 
