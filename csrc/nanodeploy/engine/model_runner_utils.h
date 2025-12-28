@@ -35,6 +35,9 @@ struct DecodeMetadata {
     int              max_num_blocks = 0;
 
     std::vector<int> context_lens_for_attn;
+
+    std::vector<int> q_output_stride;
+    std::vector<int> q_offsets;
 };
 
 PrefillMetadata

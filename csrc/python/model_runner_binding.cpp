@@ -28,7 +28,9 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("global_context_lens_flat", &DecodeMetadata::global_context_lens_flat)
         .def_readonly("block_tables_flat", &DecodeMetadata::block_tables_flat)
         .def_readonly("max_num_blocks", &DecodeMetadata::max_num_blocks)
-        .def_readonly("context_lens_for_attn", &DecodeMetadata::context_lens_for_attn);
+        .def_readonly("context_lens_for_attn", &DecodeMetadata::context_lens_for_attn)
+        .def_readonly("q_output_stride", &DecodeMetadata::q_output_stride)
+        .def_readonly("q_offsets", &DecodeMetadata::q_offsets);
 
     m.def("prepare_prefill_cpp",
           &prepare_prefill_cpp,
