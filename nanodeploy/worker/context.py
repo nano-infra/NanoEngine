@@ -31,6 +31,21 @@ class Context:
 
     token_ids: list[torch.Tensor] = field(default_factory=list)
 
+    q_slice_get: torch.Tensor | None = None
+    q_slice_fill: torch.Tensor | None = None
+    q_copy_mask: torch.Tensor | None = None
+    res_slice_get_to_buffer_output: torch.Tensor | None = None
+    res_slice_fill_to_buffer_output: torch.Tensor | None = None
+    res_to_buffer_output_mask: Optional[torch.Tensor] = None
+    res_slice_get_to_buffer_input: torch.Tensor | None = None
+    res_slice_fill_to_buffer_input: torch.Tensor | None = None
+    res_to_buffer_input_mask: Optional[torch.Tensor] = None
+    attention_compute_bs: Optional[int] = None
+
+    # used for all2all q transfer
+    q_offsets: torch.Tensor | None = None
+    context_lens_for_attn: torch.Tensor | None = None
+
 
 _CONTEXT = Context()
 
@@ -53,6 +68,18 @@ def set_context(
     q_mask: Optional[torch.Tensor] = None,
     res_lse_mask: Optional[torch.Tensor] = None,
     is_dummy: bool = False,
+    q_slice_get: Optional[torch.Tensor] = None,
+    q_slice_fill: Optional[torch.Tensor] = None,
+    q_copy_mask: Optional[torch.Tensor] = None,
+    res_slice_get_to_buffer_output: Optional[torch.Tensor] = None,
+    res_slice_fill_to_buffer_output: Optional[torch.Tensor] = None,
+    res_to_buffer_output_mask: Optional[torch.Tensor] = None,
+    res_slice_get_to_buffer_input: Optional[torch.Tensor] = None,
+    res_slice_fill_to_buffer_input: Optional[torch.Tensor] = None,
+    res_to_buffer_input_mask: Optional[torch.Tensor] = None,
+    attention_compute_bs: Optional[int] = None,
+    q_offsets: Optional[torch.Tensor] = None,
+    context_lens_for_attn: Optional[torch.Tensor] = None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -69,6 +96,18 @@ def set_context(
         q_mask=q_mask,
         res_lse_mask=res_lse_mask,
         is_dummy=is_dummy,
+        q_slice_get=q_slice_get,
+        q_slice_fill=q_slice_fill,
+        q_copy_mask=q_copy_mask,
+        res_slice_get_to_buffer_output=res_slice_get_to_buffer_output,
+        res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output,
+        res_to_buffer_output_mask=res_to_buffer_output_mask,
+        res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
+        res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
+        res_to_buffer_input_mask=res_to_buffer_input_mask,
+        attention_compute_bs=attention_compute_bs,
+        q_offsets=q_offsets,
+        context_lens_for_attn=context_lens_for_attn,
     )
 
 
