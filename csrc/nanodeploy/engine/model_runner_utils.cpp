@@ -37,7 +37,7 @@ static void build_block_tables_packed(const std::vector<Sequence*>& dp_seqs,
     }
 
     // 3. Flatten and pad
-    // 如果没有有效的 block table，block_tables_flat 为空，max_num_blocks 为 0
+    // If there are no valid block tables, block_tables_flat is empty and max_num_blocks is 0
     if (valid_tables.empty()) {
         block_tables_flat.clear();
         return;
