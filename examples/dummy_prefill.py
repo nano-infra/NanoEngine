@@ -12,8 +12,7 @@ def main():
     decode = LLM(
         path,
         enforce_eager=False,
-        attention_dp=8
-        ,
+        attention_dp=8,
         attention_sp=1,
         attention_tp=1,
         ffn_dp=1,
@@ -29,8 +28,9 @@ def main():
         max_model_len=200_000,
         max_num_batched_tokens=200_000,
         loop_count=48,
-        max_num_send_seqs=128,
-        max_num_recv_seqs=130,
+        max_num_send_seqs=32,
+        max_num_recv_seqs=32,
+        routing_strategy="IQR",
     )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=256, ignore_eos=True)

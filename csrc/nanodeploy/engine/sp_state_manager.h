@@ -13,7 +13,8 @@ namespace nanodeploy {
 enum class RoutingStrategy {
     RoundRobin,
     LeastBatch,
-    LeastCache
+    LeastCache,
+    IQR
 };
 
 class SPStateManager {

@@ -3,6 +3,7 @@
 #include "nanodeploy/metrics/sequence_metric.h"
 #include "scheduler_utils.h"
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 
@@ -278,6 +279,15 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
     auto& waiting_queue = (mode_ != "decode") ? waiting : waiting_migration;
 
+    // 1. Pre-sorting (Length-Based) for IQR Strategy
+    // Sort requests by sequence length in descending order to prioritize heavy requests (Fill-the-valley)
+    if (routing_strategy == RoutingStrategy::IQR) {
+        std::sort(waiting_queue.begin(), waiting_queue.end(),
+            [](const std::shared_ptr<Sequence>& a, const std::shared_ptr<Sequence>& b) {
+                return a->num_tokens > b->num_tokens;
+            });
+    }
+
     // For LeastBatch and LeastCache, we maintain a set to act as a min-heap
     std::set<std::pair<int, int>> dp_load_set;
     if (routing_strategy == RoutingStrategy::LeastBatch) {
@@ -384,6 +394,94 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
                 scheduled = true;
                 break;
+            }
+        }
+        else if (routing_strategy == RoutingStrategy::IQR){
+            
+            // 2. Outlier Detection (Masking) using IQR
+            // Collect current loads (KV cache usage) from all DP units
+            std::vector<double> loads;
+            loads.reserve(attention_dp_);
+            for(int i=0; i < attention_dp_; ++i) {
+                loads.push_back(static_cast<double>(worker_state[i]->num_running_tokens()));
+            }
+            std::vector<double> sorted_loads = loads;
+            std::sort(sorted_loads.begin(), sorted_loads.end());
+
+            // Calculate Q1 and Q3
+            auto get_percentile = [&](double p) {
+                if (sorted_loads.empty()) return 0.0;
+                double pos = p * (sorted_loads.size() - 1);
+                int idx = static_cast<int>(pos);
+                double frac = pos - idx;
+                if (idx + 1 < sorted_loads.size())
+                     return sorted_loads[idx] * (1.0 - frac) + sorted_loads[idx + 1] * frac;
+                return sorted_loads[idx];
+            };
+
+            double q1 = get_percentile(0.25);
+            double q3 = get_percentile(0.75);
+            double iqr = q3 - q1;
+            double k_factor = 1.5; 
+            double threshold = q3 + k_factor * iqr;
+
+            // Identify safe candidates (not outliers)
+            std::vector<int> candidates;
+            for(int i=0; i < attention_dp_; ++i) {
+                if (loads[i] <= threshold) {
+                    candidates.push_back(i);
+                }
+            }
+            // Fallback: if all nodes are outliers (e.g., cluster is uniformly busy), use all nodes
+            if (candidates.empty()) {
+                for(int i=0; i < attention_dp_; ++i) candidates.push_back(i);
+            }
+
+            // 3. Lexicographical Selection
+            // Sort candidates based on: 1. Batch Size (ASC), 2. KV Cache Load (ASC)
+            std::sort(candidates.begin(), candidates.end(), [&](int a, int b){
+                int b_a = worker_state[a]->num_running_seqs();
+                int b_b = worker_state[b]->num_running_seqs();
+                // Primary Key: Batch Size
+                if (b_a != b_b) {
+                    return b_a < b_b;
+                }
+                // Secondary Key: KV Cache Load (Tie-breaker)
+                return worker_state[a]->num_running_tokens() < worker_state[b]->num_running_tokens();
+            });
+
+            // 4. Try to allocate in the optimal order
+            for (int dp_idx : candidates) {
+                bool can_allocate = worker_state[dp_idx]->can_allocate(
+                    *seq, num_seqs[dp_idx], num_batched_tokens[dp_idx]);
+
+                if (can_allocate) {
+                    // Standard booking logic
+                    worker_state[dp_idx]->allocate(*seq);
+                    
+                    auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
+                    block_ctx.dp_idx_ = dp_idx;
+                    int master_sp_idx = block_ctx.master_sp_idx_;
+
+                    num_seqs[dp_idx][master_sp_idx] += 1;
+                    num_batched_tokens[dp_idx][master_sp_idx] += (seq->num_tokens - seq->num_cached_tokens);
+
+                    seq->status = SequenceStatus::RUNNING;
+
+                    waiting_queue.pop_front();
+                    worker_state[dp_idx]->running.push_back(seq);
+                    scheduled_seqs[dp_idx].push_back(seq);
+
+                    if (seq->metric) {
+                        seq->metric->record_first_scheduled();
+                        if (mode_ == "decode") {
+                            seq->metric->record_decode_scheduled();
+                        }
+                    }
+
+                    scheduled = true;
+                    break; // Successfully scheduled, move to next request
+                }
             }
         }
         else {
