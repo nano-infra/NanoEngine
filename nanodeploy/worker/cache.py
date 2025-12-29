@@ -27,14 +27,15 @@ class CacheContext:
     selected_nic: str | None = None
     endpoints: dict[str, dict[int, dlslime.RDMAEndpoint]] = None
 
+    # used for MLA mode
+    kv_lora_rank: int = 0
+    qk_rope_head_dim: int = 0
+
     @property
     def num_local_kv_heads(self):
         return self.num_kv_heads // self.attention_tp
 
     def __post_init__(self):
-
-        assert self.mode == "gqa"
-        assert self.attention_tp <= self.num_kv_heads
 
         free, total = torch.cuda.mem_get_info()
         used = total - free
@@ -42,18 +43,33 @@ class CacheContext:
         peak = memory_stats["allocated_bytes.all.peak"]
         current = memory_stats["allocated_bytes.all.current"]
 
+        if self.mode == "gqa":
+            assert self.attention_tp <= self.num_kv_heads
+        elif self.mode == "mla":
+            assert self.attention_tp == 1
+            assert self.block_size == 64, "MLA mode only support block_size=64"
+            self.num_kv_heads = 1
+            self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+        
         block_bytes = (
-            2
-            * self.num_hidden_layers
+            self.num_hidden_layers
             * self.block_size
             * self.num_local_kv_heads
             * self.head_dim
             * self.dtype.itemsize
         )
+        if self.mode == "gqa":
+            block_bytes *= 2
 
         self.num_local_kvcache_blocks = (
             int(total * self.gpu_memory_utilization - used - peak + current)
             // block_bytes
+        )
+
+        print(
+            f"Rank{dist.get_rank()} num_local_kvcache_blocks: {self.num_local_kvcache_blocks}"
         )
 
         assert self.num_local_kvcache_blocks > 0
@@ -70,7 +86,7 @@ class CacheContext:
         return (
             block_idx
             * self.block_size
-            * self.num_kv_heads
+            * self.num_local_kv_heads
             * self.head_dim
             * self.dtype.itemsize
         )
@@ -101,8 +117,11 @@ class CacheContext:
 
     def allocate_kvcache(self, num_kvcache_blocks):
         self.num_local_kvcache_blocks = num_kvcache_blocks
+        
+        kv_count = 2 if self.mode == "gqa" else 1
+        
         self.kv_cache = torch.empty(
-            2,
+            kv_count,
             self.num_hidden_layers,
             self.num_local_kvcache_blocks,
             self.block_size,
@@ -198,6 +217,8 @@ def set_cache_context(
     num_hidden_layers: int,
     attention_tp: int,
     gpu_memory_utilization: float,
+    kv_lora_rank: int = 0,
+    qk_rope_head_dim: int = 0,
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     mode: Literal["gqa", "mla"] = "gqa",
@@ -206,6 +227,8 @@ def set_cache_context(
     _CACHE_CONTEXT = CacheContext(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
         block_size=block_size,
         num_hidden_layers=num_hidden_layers,
         attention_tp=attention_tp,

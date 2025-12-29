@@ -5,6 +5,8 @@ import ray
 import torch
 import torch.distributed as dist
 import torch.profiler as profiler
+import flash_mla
+
 
 from nanodeploy._cpp import (
     BlockContextSlot,
@@ -17,6 +19,7 @@ from nanodeploy.endpoint.rpc_endpoint import RPCClientEndpoint
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
+from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.cache import get_cache_context, set_cache_context
@@ -36,6 +39,7 @@ logger = get_logger()
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
+    "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
 }
 
 
@@ -91,9 +95,17 @@ class ModelRunner:
 
         if sp_size > 1:
             sp_rank = get_dist_context().attn_sp_rank
+            max_head_dim = 0
+            if self.config.hf_config.num_key_value_heads > 1:
+                max_head_dim = self.config.hf_config.head_dim
+            else:
+                max_head_dim = (
+                    self.config.hf_config.kv_lora_rank
+                    + self.config.hf_config.qk_rope_head_dim
+                )
             set_sp_context(
                 config.max_num_seqs,
-                hf_config.head_dim,
+                max_head_dim,
                 hf_config.num_attention_heads,
                 torch.get_default_dtype(),
                 sp_size,
@@ -138,7 +150,7 @@ class ModelRunner:
         dist.barrier()
 
         self.sampler = Sampler()
-        self.warmup_model()
+        # self.warmup_model()
         self.preallocate_kvcache()
 
         self.endpoint = RPCClientEndpoint(32_000_000, get_dist_context().rank)
@@ -158,9 +170,17 @@ class ModelRunner:
         cache_context.allocate_kvcache(num_kvcache_blocks)
         layer_id = 0
         for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = cache_context.kv_cache[0, layer_id]
-                module.v_cache = cache_context.kv_cache[1, layer_id]
+            allocated = False
+            if hasattr(module, "k_cache"):
+                module.k_cache = cache_context.kv_cache[0][layer_id]
+                allocated = True
+            if hasattr(module, "v_cache"):
+                if cache_context.kv_cache.size(0) > 1:
+                    module.v_cache = cache_context.kv_cache[1][layer_id]
+                else:
+                    module.v_cache = torch.tensor([], device=cache_context.device)
+                allocated = True
+            if allocated:
                 layer_id += 1
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -210,6 +230,14 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
 
+        mode = "gqa" if hf_config.num_key_value_heads > 1 else "mla"
+        kv_lora_rank = (
+            hf_config.kv_lora_rank if hasattr(hf_config, "kv_lora_rank") else 0
+        )
+        qk_rope_head_dim = (
+            hf_config.qk_rope_head_dim if hasattr(hf_config, "qk_rope_head_dim") else 0
+        )
+
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
@@ -217,9 +245,11 @@ class ModelRunner:
             num_hidden_layers=hf_config.num_hidden_layers,
             attention_tp=config.attention_tp,
             gpu_memory_utilization=config.gpu_memory_utilization,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
             device=torch.get_default_device(),
             dtype=torch.get_default_dtype(),
-            mode="gqa",
+            mode=mode,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
@@ -364,9 +394,56 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         attention_compute_bs = context_lens_for_attn.numel()
 
+        context_lens_for_attn = torch.tensor(
+            meta.context_lens_for_attn, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        q_slice_get = torch.tensor(
+            meta.q_slice_get, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        q_slice_fill = torch.tensor(
+            meta.q_slice_fill, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        q_copy_mask = torch.tensor(
+            meta.q_copy_mask, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_slice_get_to_buffer_output = torch.tensor(
+            meta.res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_slice_fill_to_buffer_output = torch.tensor(
+            meta.res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_to_buffer_output_mask = torch.tensor(
+            meta.res_to_buffer_output_mask, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_slice_get_to_buffer_input = torch.tensor(
+            meta.res_slice_get_to_buffer_input, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_slice_fill_to_buffer_input = torch.tensor(
+            meta.res_slice_fill_to_buffer_input, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        res_to_buffer_input_mask = torch.tensor(
+            meta.res_to_buffer_input_mask, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        q_offsets = torch.tensor(
+            meta.q_offsets, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        attention_compute_bs = context_lens_for_attn.numel()
+        
+        config = self.config
+        hf_config = config.hf_config
+        if hf_config.num_key_value_heads == 1:
+            new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
+                context_lens_for_attn.view(-1),
+                hf_config.num_attention_heads // hf_config.num_key_value_heads,
+                hf_config.num_key_value_heads,
+            )
+        else:
+            new_tile_scheduler_metadata, new_num_splits = None, None
+
         set_context(
-            False,
-            self.config.max_num_seqs,
+            is_prefill=False,
+            max_bs=self.config.max_num_seqs,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
@@ -386,6 +463,8 @@ class ModelRunner:
             res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             q_offsets=q_offsets,
+            tile_scheduler_metadata=new_tile_scheduler_metadata,
+            num_splits=new_num_splits,
         )
 
         return input_ids, positions
@@ -481,6 +560,15 @@ class ModelRunner:
             graph_vars["block_tables"][
                 : context.block_tables.size(0), : context.block_tables.size(1)  # type: ignore
             ] = context.block_tables
+
+            config = self.config
+            hf_config = config.hf_config
+            if hf_config.num_key_value_heads == 1:
+                graph_vars["tile_scheduler_metadata"].zero_()
+                graph_vars["num_splits"].zero_()
+                graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
+                graph_vars["num_splits"][:context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
+
 
             graph_vars["context_lens_for_attn"].zero_()
             graph_vars["context_lens_for_attn"][: context.context_lens_for_attn.shape[0]].copy_(context.context_lens_for_attn)  # type: ignore
@@ -637,6 +725,21 @@ class ModelRunner:
         )
         q_offsets = torch.zeros(sp_world_size + 1, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+
+        if hf_config.num_key_value_heads == 1:
+            tile_scheduler_metadata_buffer, num_splits_buffer = (
+                flash_mla.get_mla_metadata(
+                    torch.ones(
+                        max_attention_comp_seqs, dtype=torch.int32, device="cuda"
+                    ),
+                    hf_config.num_attention_heads // hf_config.num_key_value_heads,
+                    hf_config.num_key_value_heads,
+                )
+            )
+        else:
+            tile_scheduler_metadata_buffer, num_splits_buffer = None, None
+
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graph_master_rank_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graph_attn_compute_bs = [1, 2, 4, 8] + list(
             range(16, max_attention_comp_seqs + 1, 16)
@@ -699,6 +802,8 @@ class ModelRunner:
                     attention_compute_bs=attn_bs,
                     context_lens_for_attn=context_lens_for_attn,
                     q_offsets=q_offsets,
+                    tile_scheduler_metadata=tile_scheduler_metadata_buffer,
+                    num_splits=num_splits_buffer,
                 )
 
                 outputs[:master_bs] = self.model(
@@ -730,6 +835,9 @@ class ModelRunner:
             outputs=outputs,
             q_mask=q_mask,
             res_lse_mask=res_lse_mask,
+            tile_scheduler_metadata=tile_scheduler_metadata_buffer,
+            num_splits=num_splits_buffer,
+            context_lens_for_attn=context_lens_for_attn,
             q_slice_get=q_slice_get,
             q_slice_fill=q_slice_fill,
             q_copy_mask=q_copy_mask,
@@ -739,7 +847,5 @@ class ModelRunner:
             res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
             res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
             res_to_buffer_input_mask=res_to_buffer_input_mask,
-            attention_compute_bs=attn_bs,
-            context_lens_for_attn=context_lens_for_attn,
             q_offsets=q_offsets,
         )

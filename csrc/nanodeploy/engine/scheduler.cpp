@@ -139,6 +139,124 @@ ScheduleResult Scheduler::schedule()
         }
     }
 
+    result.sp_send_counts.resize(attention_dp_);
+    result.sp_recv_counts.resize(attention_dp_);
+
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        result.sp_send_counts[dp_idx].resize(attention_sp_);
+        result.sp_recv_counts[dp_idx].resize(attention_sp_);
+
+        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+            // SP Send Count: Number of sequences where this SP rank is MASTER (initiator)
+            // AND the sequence is actually distributed (has blocks on > 1 ranks).
+            int send_count = 0;
+            const auto& sp_seqs = result.filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx];
+            for (const auto& seq : sp_seqs) {
+                const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+                int active_ranks = 0;
+                for (int count : tokens) {
+                    if (count > 0) active_ranks++;
+                }
+
+                if (active_ranks > 1) {
+                    send_count++;
+                }
+            }
+            result.sp_send_counts[dp_idx][sp_idx] = send_count;
+
+            // SP Recv Count: Number of sequences where this SP rank PARTICIPATES
+            // AND the sequence is actually distributed.
+            int recv_count = 0;
+            for (const auto& seq : dp_seqs[dp_idx]) {
+                bool is_dummy = false;
+                for (const auto& dummy : worker_state[dp_idx]->dummy_seqs) {
+                    if (seq == dummy) {
+                        is_dummy = true;
+                        break;
+                    }
+                }
+                
+                if (!is_dummy) {
+                    const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+                    int active_ranks = 0;
+                    for (int count : tokens) {
+                        if (count > 0) active_ranks++;
+                    }
+
+                    if (active_ranks > 1 && tokens[sp_idx] > 0) {
+                        recv_count++;
+                    }
+                }
+            }
+            result.sp_recv_counts[dp_idx][sp_idx] = recv_count;
+        }
+
+        // SP Communication Matrix Logic
+        // Initialize matrix for this DP rank: [attention_sp_][attention_sp_]
+        // result.sp_comm_matrix.push_back(
+            // std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+        
+        result.sp_q_matrix.push_back(
+            std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+
+        // result.sp_res_matrix.push_back(
+        //     std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+
+        for (const auto& seq : dp_seqs[dp_idx]) {
+            bool is_dummy = false;
+            for (const auto& dummy : worker_state[dp_idx]->dummy_seqs) {
+                if (seq == dummy) {
+                    is_dummy = true;
+                    break;
+                }
+            }
+            if (is_dummy) continue;
+
+            const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+            int active_ranks = 0;
+            for (int count : tokens) {
+                if (count > 0) active_ranks++;
+            }
+
+            // Only count if SP is truly enabled (distributed across > 1 ranks)
+            if (active_ranks > 1) {
+                int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+                
+                // For each participating rank:
+                for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                    if (tokens[sp_idx] > 0) {
+                        // Original matrix (Master -> Participant) - kept for compatibility if needed
+                        // result.sp_comm_matrix[dp_idx][master_sp_idx][sp_idx]++;
+
+                        // Q Matrix: Master broadcast to all Participants
+                        // Master sends Q to Participant
+                        result.sp_q_matrix[dp_idx][master_sp_idx][sp_idx]++;
+
+                        // Res Matrix: Participant sends results back to Master
+                        // Participant sends Res to Master
+                        // result.sp_res_matrix[dp_idx][sp_idx][master_sp_idx]++;
+                    }
+                }
+            }
+        }
+    }
+
+    // Calculate waiting queue block metrics
+    auto& wait_queue = (mode_ != "decode") ? waiting : waiting_migration;
+    
+    if (!wait_queue.empty()) {
+        auto head_seq = wait_queue.front();
+        // Calculate blocks for head sequence: ceil(num_tokens / block_size)
+        // Note: We use Sequence::block_size which is static constexpr int block_size = 256;
+        result.waiting_head_blocks = (head_seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+    }
+
+    int total_blocks = 0;
+    for (const auto& seq : wait_queue) {
+        total_blocks += (seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+    }
+    result.waiting_total_blocks = total_blocks;
+
     return result;
 }
 

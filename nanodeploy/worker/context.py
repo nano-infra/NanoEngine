@@ -28,7 +28,10 @@ class Context:
     res_lse_mask: torch.Tensor | None = None
 
     is_dummy: bool = False
-
+    
+    tile_scheduler_metadata: torch.Tensor | None = None
+    num_splits: torch.Tensor | None = None
+    
     token_ids: list[torch.Tensor] = field(default_factory=list)
 
     q_slice_get: torch.Tensor | None = None
@@ -68,6 +71,8 @@ def set_context(
     q_mask: Optional[torch.Tensor] = None,
     res_lse_mask: Optional[torch.Tensor] = None,
     is_dummy: bool = False,
+    tile_scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: Optional[torch.Tensor] = None,
     q_slice_get: Optional[torch.Tensor] = None,
     q_slice_fill: Optional[torch.Tensor] = None,
     q_copy_mask: Optional[torch.Tensor] = None,
@@ -96,6 +101,8 @@ def set_context(
         q_mask=q_mask,
         res_lse_mask=res_lse_mask,
         is_dummy=is_dummy,
+        tile_scheduler_metadata=tile_scheduler_metadata,
+        num_splits=num_splits,
         q_slice_get=q_slice_get,
         q_slice_fill=q_slice_fill,
         q_copy_mask=q_copy_mask,
