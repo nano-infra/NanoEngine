@@ -46,6 +46,10 @@ def parse_args():
     parser.add_argument("--max-num-seqs", type=int, default=128, help="Max sequences per iteration.")
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
+
+    parser.add_argument("--routing-strategy", type=str, default="IQR", 
+                        choices=["RoundRobin", "LeastBatch", "LeastCache", "IQR"],
+                        help="Routing strategy.")
     
     args = parser.parse_args()
     
@@ -283,7 +287,7 @@ def main():
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=1024000,
         loop_count=args.loop_count,
-        routing_strategy="LeastBatch",
+        routing_strategy=args.routing_strategy,
     )
     
     # Print Config
