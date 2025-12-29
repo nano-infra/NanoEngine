@@ -144,15 +144,6 @@ class ModelRunner:
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
 
-        sp_size = get_dist_context().attn_sp_world_size
-        ep_size = get_dist_context().ffn_ep_world_size
-
-        if ep_size > 1:
-            import deep_ep
-
-            deep_ep.Buffer.num_sms = 16
-            dist.barrier(group=get_dist_context().cuda_world_group)
-
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
 
