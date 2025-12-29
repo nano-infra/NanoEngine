@@ -430,8 +430,6 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         attention_compute_bs = context_lens_for_attn.numel()
         
-        print(f"context_lens_for_attn.shape: {context_lens_for_attn.shape}",flush=True)
-
         config = self.config
         hf_config = config.hf_config
         if hf_config.num_key_value_heads == 1:
