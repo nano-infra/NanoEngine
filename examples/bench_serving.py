@@ -47,8 +47,8 @@ def parse_args():
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
 
-    parser.add_argument("--routing-strategy", type=str, default="IQR", 
-                        choices=["RoundRobin", "LeastBatch", "LeastCache", "IQR"],
+    parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
+                        choices=["RoundRobin", "LeastBatch", "LeastCache"],
                         help="Routing strategy.")
     
     args = parser.parse_args()
