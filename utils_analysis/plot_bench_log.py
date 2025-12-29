@@ -28,7 +28,7 @@ def parse_and_plot_log(file_path):
 
     # --- 4. Extract Data ---
     # Find dictionary structure after "step - "
-    dict_pattern = re.compile(r"step - (\{.*?\})")
+    dict_pattern = re.compile(r"step\s+-\s+(\{.*?\})")
     matches = dict_pattern.findall(clean_content)
 
     steps = []

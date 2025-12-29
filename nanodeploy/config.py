@@ -33,6 +33,7 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256//4
     num_kvcache_blocks: int = 15000
+    segment_size: int = 1024
 
     # deployment config
     engine_id: str | None = None
