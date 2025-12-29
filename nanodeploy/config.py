@@ -47,10 +47,10 @@ class Config:
     ray_address: str = "127.0.0.1:6379"
 
     # profiler
-    enable_profiler: bool = False
-    profiler_start_step: int = 16
+    enable_profiler: bool = True
+    profiler_start_step: int = 40
     profiling_step: int = 16
-    profiler_dir: str = "./profiler_logs"
+    profiler_dir: str = "/mnt/nvme1n1/ml_research/linbinbin1/profiler_res"
 
     # performance optimization
     use_dlslime_rpc: bool = True

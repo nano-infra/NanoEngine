@@ -26,9 +26,11 @@ def main():
         dummy_weight=True,
         perfect_eplb=True,
         max_num_seqs=128,
-        max_model_len=524288,
-        max_num_batched_tokens=524288,
-        loop_count=16,
+        max_model_len=200_000,
+        max_num_batched_tokens=200_000,
+        loop_count=48,
+        max_num_send_seqs=128,
+        max_num_recv_seqs=130,
     )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=256, ignore_eos=True)

@@ -438,12 +438,14 @@ class ModelRunner:
             meta.q_offsets, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
         attention_compute_bs = context_lens_for_attn.numel()
+        
+        print(f"context_lens_for_attn.shape: {context_lens_for_attn.shape}",flush=True)
 
         config = self.config
         hf_config = config.hf_config
         if hf_config.num_key_value_heads == 1:
             new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
-                context_lens.view(-1),
+                context_lens_for_attn.view(-1),
                 hf_config.num_attention_heads // hf_config.num_key_value_heads,
                 hf_config.num_key_value_heads,
             )
@@ -576,7 +578,7 @@ class ModelRunner:
                 graph_vars["tile_scheduler_metadata"].zero_()
                 graph_vars["num_splits"].zero_()
                 graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
-                graph_vars["num_splits"].copy_(context.num_splits)  # type: ignore
+                graph_vars["num_splits"][:context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
 
 
             graph_vars["context_lens_for_attn"].zero_()
@@ -739,7 +741,7 @@ class ModelRunner:
             tile_scheduler_metadata_buffer, num_splits_buffer = (
                 flash_mla.get_mla_metadata(
                     torch.ones(
-                        sp_world_size * max_bs, dtype=torch.int32, device="cuda"
+                        max_attention_comp_seqs, dtype=torch.int32, device="cuda"
                     ),
                     hf_config.num_attention_heads // hf_config.num_key_value_heads,
                     hf_config.num_key_value_heads,
