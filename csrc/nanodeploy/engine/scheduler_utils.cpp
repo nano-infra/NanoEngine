@@ -34,7 +34,8 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                         WorkerContext*                  result_ctx,
                         int                             eos_id,
                         bool                            is_prefill,
-                        bool                            update_metrics)
+                        bool                            update_metrics,
+                        double                          step_itl_ms)
 {
     try {
         std::unordered_set<std::shared_ptr<Sequence>> dummy_set;
@@ -42,11 +43,21 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
             dummy_set.insert(dummy);
         }
 
+        // Track the number of tokens generated per sequence in this step
+        std::unordered_map<std::shared_ptr<Sequence>, int> seq_tokens_this_step;
+        std::unordered_map<std::shared_ptr<Sequence>, bool> seq_is_first_token;
+
         for (const auto& task : ctx->tasks) {
             std::shared_ptr<Sequence> seq = task.seq;
 
             if (dummy_set.count(seq))
                 continue;
+
+            // Check if this is the first token for this sequence
+            if (seq_tokens_this_step.find(seq) == seq_tokens_this_step.end()) {
+                seq_tokens_this_step[seq] = 0;
+                seq_is_first_token[seq] = (seq->metric && seq->metric->num_generated_tokens == 0);
+            }
 
             for (int token_id : *task.tokens) {
 
@@ -59,16 +70,7 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
 
                 seq->append_token(token_id, BlockContextSlot::ACTIVE, task.sp_idx);
                 state_manager->add_running_tokens(task.sp_idx, 1);
-
-                if (update_metrics && seq->metric) {
-                    if (seq->metric->num_generated_tokens == 0) {
-                        seq->metric->record_first_token();
-                        seq->metric->num_generated_tokens = 1;
-                    }
-                    else {
-                        seq->metric->record_token();
-                    }
-                }
+                seq_tokens_this_step[seq]++;
 
                 bool finished =
                     (!seq->ignore_eos && token_id == eos_id) || (seq->num_completed_tokens() == seq->max_tokens);
@@ -84,6 +86,18 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                     std::cout << "migrating" << std::endl;
                     result_ctx->migration_candidates.push_back({seq, result_ctx->dp_idx});
                     break;
+                }
+            }
+        }
+
+        // Record metrics for all sequences processed in this step
+        if (update_metrics) {
+            for (const auto& [seq, num_tokens] : seq_tokens_this_step) {
+                if (seq->metric && num_tokens > 0) {
+                    if (seq_is_first_token[seq]) {
+                        seq->metric->record_first_token();
+                    }
+                    seq->metric->record_step_tokens(num_tokens, step_itl_ms);
                 }
             }
         }
@@ -110,6 +124,8 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
                                     int                                                        eos_id,
                                     bool                                                       is_prefill,
                                     bool                                                       update_metrics,
+                                    double                                                     step_duration_ms,
+                                    int                                                        loop_count,
                                     ThreadPool*                                                thread_pool)
 {
     size_t num_dp    = worker_states.size();
@@ -148,6 +164,9 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
         }
     }
 
+    // Calculate step ITL: fair share of step time per token slot
+    double step_itl_ms = (loop_count > 0) ? (step_duration_ms / loop_count) : 0.0;
+
     if (thread_pool) {
         std::vector<std::future<void>> futures;
         futures.reserve(num_dp);
@@ -159,7 +178,8 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
                                                    &contexts[dp_idx],
                                                    eos_id,
                                                    is_prefill,
-                                                   update_metrics));
+                                                   update_metrics,
+                                                   step_itl_ms));
         }
 
         for (auto& f : futures) {
@@ -177,7 +197,8 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
                                  &contexts[dp_idx],
                                  eos_id,
                                  is_prefill,
-                                 update_metrics);
+                                 update_metrics,
+                                 step_itl_ms);
         }
 
         for (auto& t : threads) {

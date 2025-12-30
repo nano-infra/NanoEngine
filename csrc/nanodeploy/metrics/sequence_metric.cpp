@@ -62,6 +62,25 @@ void SequenceMetric::record_token()
     num_generated_tokens++;
 }
 
+void SequenceMetric::record_step_tokens(int num_tokens, double step_itl_ms)
+{
+    // Record ITL samples based on step timing instead of per-token timing
+    // step_itl_ms = step_duration_ms / loop_count (fair share per token slot)
+    
+    // If this is the first batch of tokens, the first token is TTFT, not ITL.
+    // So we record (num_tokens - 1) ITL samples.
+    int samples_to_record = num_tokens;
+    if (num_generated_tokens == 0) {
+        samples_to_record = std::max(0, num_tokens - 1);
+    }
+
+    for (int i = 0; i < samples_to_record; ++i) {
+        itl_samples.push_back(step_itl_ms);
+    }
+    num_generated_tokens += num_tokens;
+    last_token_time = current_time();
+}
+
 void SequenceMetric::record_completion()
 {
     completion_time = current_time();
@@ -127,6 +146,15 @@ std::optional<double> SequenceMetric::avg_itl() const
     }
     double sum = std::accumulate(itl_samples.begin(), itl_samples.end(), 0.0);
     return sum / itl_samples.size();
+}
+
+std::optional<double> SequenceMetric::avg_itl_exclude_first() const
+{
+    if (itl_samples.size() <= 1) {
+        return std::nullopt;
+    }
+    double sum = std::accumulate(itl_samples.begin() + 1, itl_samples.end(), 0.0);
+    return sum / (itl_samples.size() - 1);
 }
 
 std::optional<double> SequenceMetric::p50_itl() const

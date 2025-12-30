@@ -49,6 +49,11 @@ class SequenceMetric(_CppSequenceMetric):
             if self.decode_queue_time_ms is not None
             else "N/A"
         )
+        tpot_wo_queue_ex_first_str = (
+            f"{self.avg_itl_exclude_first:.2f}ms"
+            if self.avg_itl_exclude_first is not None
+            else "N/A"
+        )
 
         logger.info(
             f"SequenceMetric [{str(self.seq_id)[:8]}...] - "
@@ -58,6 +63,7 @@ class SequenceMetric(_CppSequenceMetric):
             f"Queueing Time: {queueing_time_str}, "
             f"Decode Queueing Time: {decode_queueing_time_str}, "
             f"ITL Wo Queue: {tpot_wo_queue_str}, "
+            f"ITL Wo Queue(exclude first token): {tpot_wo_queue_ex_first_str}, "
             f"ITL With Queue: {tpot_with_queue_str}"
         )
 

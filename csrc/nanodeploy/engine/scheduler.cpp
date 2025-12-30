@@ -487,11 +487,13 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
 
 void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
                             const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
-                            bool                                                       update_metrics)
+                            bool                                                       update_metrics,
+                            double                                                     step_duration_ms,
+                            int                                                        loop_count)
 {
     // Call the C++ postprocess_sequences utility directly with shared_ptrs
     auto migrations = postprocess_sequences(
-        worker_state, dp_sp_seqs, dp_sp_token_ids, eos_, mode_ == "prefill", update_metrics, thread_pool_.get());
+        worker_state, dp_sp_seqs, dp_sp_token_ids, eos_, mode_ == "prefill", update_metrics, step_duration_ms, loop_count, thread_pool_.get());
 
     // Store migrations
     for (const auto& [seq_shared, dp_idx] : migrations) {

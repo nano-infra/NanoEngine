@@ -51,8 +51,11 @@ class Scheduler(_CppScheduler):
         dp_sp_seqs: list[list[Sequence]],
         dp_sp_token_ids: list[list[list[int]]],
         metrics_manager: "MetricsManager | None" = None,
+        step_duration_ms: float = 0.0,
+        loop_count: int = 1,
     ):
         # Use the C++ implementation directly
         return super().postprocess(
-            dp_sp_seqs, dp_sp_token_ids, metrics_manager is not None
+            dp_sp_seqs, dp_sp_token_ids, metrics_manager is not None,
+            step_duration_ms, loop_count
         )

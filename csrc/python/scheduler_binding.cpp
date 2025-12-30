@@ -23,7 +23,9 @@ void bind_scheduler_utils(py::module_& m)
           py::arg("dp_sp_token_ids"),
           py::arg("eos_id"),
           py::arg("is_prefill"),
-          py::arg("update_metrics") = true,
+          py::arg("update_metrics"),
+          py::arg("step_duration_ms"),
+          py::arg("loop_count"),
           py::arg("thread_pool")    = nullptr,
           py::call_guard<py::gil_scoped_release>());
 
@@ -132,7 +134,9 @@ void bind_scheduler_utils(py::module_& m)
              &Scheduler::postprocess,
              py::arg("dp_seqs"),
              py::arg("dp_token_ids"),
-             py::arg("update_metrics") = true,
+             py::arg("update_metrics"),
+             py::arg("step_duration_ms"),
+             py::arg("loop_count"),
              py::call_guard<py::gil_scoped_release>())
 
         // State queries

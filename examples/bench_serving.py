@@ -248,6 +248,16 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent):
         print(f"  P99:  {tpot_stats.get('p99', 0):.2f}")
         print()
 
+    # TPOT exclude first token
+    itls_ex_first = [s.metric.avg_itl_exclude_first for s in completed_seqs if s.metric.avg_itl_exclude_first]
+    if itls_ex_first:
+        print("--- ITL Wo Queue (exclude first token) (ms/token) ---")
+        print(f"  Avg:  {np.mean(itls_ex_first):.2f}")
+        print(f"  P50:  {np.median(itls_ex_first):.2f}")
+        print(f"  P90:  {np.percentile(itls_ex_first, 90):.2f}")
+        print(f"  P99:  {np.percentile(itls_ex_first, 99):.2f}")
+        print()
+
     if tpot_wq_stats:
         print("--- TPOT with Queueing Time (ms/token) ---")
         print(f"  Avg:  {tpot_wq_stats.get('avg', 0):.2f}")

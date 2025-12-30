@@ -88,7 +88,9 @@ public:
     // Postprocessing
     void postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
                      const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
-                     bool                                                       update_metrics = true);
+                     bool                                                       update_metrics,
+                     double                                                     step_duration_ms,
+                     int                                                        loop_count);
 
     // State queries
     bool is_finished() const;
