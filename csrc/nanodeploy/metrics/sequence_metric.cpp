@@ -101,7 +101,7 @@ std::optional<double> SequenceMetric::e2e_latency() const
     }
     return (completion_time.value() - arrival_time.value()) * 1000.0;
 }
-
+// loop_count bias
 std::optional<double> SequenceMetric::avg_tpot_with_queueing() const
 {
     auto e2e = e2e_latency();
@@ -110,7 +110,7 @@ std::optional<double> SequenceMetric::avg_tpot_with_queueing() const
     }
     return e2e.value() / num_generated_tokens;
 }
-
+// loop_count bias
 std::optional<double> SequenceMetric::avg_tpot_wo_queueing() const
 {
     // if (!completion_time.has_value() || !first_token_time.has_value() || num_generated_tokens <= 1) {
@@ -155,6 +155,18 @@ std::optional<double> SequenceMetric::avg_itl_exclude_first() const
     }
     double sum = std::accumulate(itl_samples.begin() + 1, itl_samples.end(), 0.0);
     return sum / (itl_samples.size() - 1);
+}
+
+std::optional<double> SequenceMetric::avg_itl_with_decode_queue() const
+{
+    auto itl = avg_itl();
+    auto decode_queue = decode_queue_time_ms();
+    
+    if (!itl.has_value() || !decode_queue.has_value() || num_generated_tokens == 0) {
+        return std::nullopt;
+    }
+    
+    return itl.value() + (decode_queue.value() / num_generated_tokens);
 }
 
 std::optional<double> SequenceMetric::p50_itl() const

@@ -31,6 +31,7 @@ public:
     std::optional<double> decode_queue_time_ms() const;
     std::optional<double> avg_itl() const;
     std::optional<double> avg_itl_exclude_first() const;
+    std::optional<double> avg_itl_with_decode_queue() const;
     std::optional<double> p50_itl() const;
     std::optional<double> p99_itl() const;
 

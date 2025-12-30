@@ -40,6 +40,7 @@ void bind_sequence_metric(py::module_& m)
         .def_property_readonly("decode_queue_time_ms", &SequenceMetric::decode_queue_time_ms)
         .def_property_readonly("avg_itl", &SequenceMetric::avg_itl)
         .def_property_readonly("avg_itl_exclude_first", &SequenceMetric::avg_itl_exclude_first)
+        .def_property_readonly("avg_itl_with_decode_queue", &SequenceMetric::avg_itl_with_decode_queue)
         .def_property_readonly("p50_itl", &SequenceMetric::p50_itl)
         .def_property_readonly("p99_itl", &SequenceMetric::p99_itl)
 

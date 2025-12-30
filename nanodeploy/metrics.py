@@ -29,16 +29,6 @@ class SequenceMetric(_CppSequenceMetric):
             f"{self.e2e_latency:.2f}ms" if self.e2e_latency is not None else "N/A"
         )
 
-        tpot_wo_queue_str = (
-            f"{self.avg_tpot_wo_queueing:.2f}ms"
-            if self.avg_tpot_wo_queueing is not None
-            else "N/A"
-        )
-        tpot_with_queue_str = (
-            f"{self.avg_tpot_with_queueing:.2f}ms"
-            if self.avg_tpot_with_queueing is not None
-            else "N/A"
-        )
         queueing_time_str = (
             f"{self.queueing_time_ms:.2f}ms"
             if self.queueing_time_ms is not None
@@ -49,17 +39,18 @@ class SequenceMetric(_CppSequenceMetric):
             if self.decode_queue_time_ms is not None
             else "N/A"
         )
-        tpot_wo_queue_ex_first_str = (
-            f"{self.avg_itl_exclude_first:.2f}ms"
-            if self.avg_itl_exclude_first is not None
-            else "N/A"
-        )
         
         # Format ITL samples (up to first 32)
         itl_samples = self.itl_samples
         num_samples_to_show = min(len(itl_samples), 32)
         samples_str = ", ".join([f"{s:.2f}" for s in itl_samples[:num_samples_to_show]])
         itl_samples_log = f"ITL Samples(First {num_samples_to_show}): [{samples_str}]"
+
+        itl_with_dq_str = (
+            f"{self.avg_itl_with_decode_queue:.2f}ms"
+            if self.avg_itl_with_decode_queue is not None
+            else "N/A"
+        )
 
         logger.info(
             f"SequenceMetric [{str(self.seq_id)[:8]}...] - "
@@ -68,9 +59,8 @@ class SequenceMetric(_CppSequenceMetric):
             f"Prompt Length: {self.num_prompt_tokens}, Output Length: {self.num_generated_tokens}, "
             f"Queueing Time: {queueing_time_str}, "
             f"Decode Queueing Time: {decode_queueing_time_str}, "
-            f"ITL Wo Queue: {tpot_wo_queue_str}, "
-            f"ITL Wo Queue(exclude first token): {tpot_wo_queue_ex_first_str}, "
-            f"ITL With Queue: {tpot_with_queue_str}, "
+            f"ITL: {self.avg_itl:.2f}ms, "
+            f"ITL with DQ: {itl_with_dq_str}, "
             f"{itl_samples_log}"
         )
 
