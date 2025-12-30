@@ -245,6 +245,7 @@ class ModelRunner:
             num_hidden_layers=hf_config.num_hidden_layers,
             attention_tp=config.attention_tp,
             gpu_memory_utilization=config.gpu_memory_utilization,
+            gpu_memory_limit_gb=config.gpu_memory_limit_gb,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             device=torch.get_default_device(),

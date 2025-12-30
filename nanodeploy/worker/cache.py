@@ -18,6 +18,7 @@ class CacheContext:
     num_hidden_layers: int
     attention_tp: int
     gpu_memory_utilization: float
+    gpu_memory_limit_gb: float | None = None
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     mode: Literal["gqa", "mla"] = "gqa"
@@ -38,7 +39,9 @@ class CacheContext:
     def __post_init__(self):
 
         free, total = torch.cuda.mem_get_info()
-        used = total - free
+        if self.gpu_memory_limit_gb is not None:
+             total = min(total, self.gpu_memory_limit_gb * 1024**3)
+        used = torch.cuda.mem_get_info()[1] - free # real used
         memory_stats = torch.cuda.memory_stats()
         peak = memory_stats["allocated_bytes.all.peak"]
         current = memory_stats["allocated_bytes.all.current"]
@@ -217,6 +220,7 @@ def set_cache_context(
     num_hidden_layers: int,
     attention_tp: int,
     gpu_memory_utilization: float,
+    gpu_memory_limit_gb: float | None = None,
     kv_lora_rank: int = 0,
     qk_rope_head_dim: int = 0,
     device: torch.device | str = "cuda",
@@ -233,6 +237,7 @@ def set_cache_context(
         num_hidden_layers=num_hidden_layers,
         attention_tp=attention_tp,
         gpu_memory_utilization=gpu_memory_utilization,
+        gpu_memory_limit_gb=gpu_memory_limit_gb,
         device=device,
         dtype=dtype,
         mode=mode,

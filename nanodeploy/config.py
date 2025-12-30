@@ -17,6 +17,7 @@ class Config:
     max_num_recv_seqs: int = 32
     max_model_len: int = 16384
     gpu_memory_utilization: float = 0.9
+    gpu_memory_limit_gb: float | None = None
     routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
 
     # parallel config
