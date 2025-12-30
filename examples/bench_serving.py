@@ -28,6 +28,7 @@ def parse_args():
     parser.add_argument("--model-path", type=str, default="/models/qwen3-235B-Instruct-2507-FP8", help="Model path.")
     parser.add_argument("--max-model-len", type=int, default=4096, help="Max model length.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization.")
+    parser.add_argument("--gpu-memory-limit-gb", type=float, default=None, help="GPU memory limit in GB.")
     parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager mode.")
     parser.add_argument("--dataset", type=str, default="random", choices=["random", "csv"], help="Dataset type.")
     parser.add_argument("--csv-path", type=str, default=None, help="Path to CSV file.")
@@ -272,6 +273,7 @@ def main():
         enforce_eager=args.enforce_eager,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        gpu_memory_limit_gb=args.gpu_memory_limit_gb,
         master_address=args.master_address,
         ray_address=args.ray_address,
         mode="decode",
