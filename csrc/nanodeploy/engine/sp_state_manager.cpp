@@ -13,11 +13,13 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                int                num_kvcache_blocks,
                                int                kvcache_block_size,
                                int                max_num_seqs,
-                               int                max_num_batched_tokens):
+                               int                max_num_batched_tokens,
+                               int                segment_size):
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
     max_num_batched_tokens_(max_num_batched_tokens),
+    segment_size_(segment_size),
     num_running_seqs_per_sp_(attention_sp, 0),
     num_running_tokens_per_sp_(attention_sp, 0)
 {
@@ -88,7 +90,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
 
     int num_tokens            = seq.num_tokens;
-    int num_segments          = (num_tokens + segment_size - 1) / segment_size;
+    int num_segments          = (num_tokens + segment_size_ - 1) / segment_size_;
     int num_segments_per_rank = (num_segments + attention_sp_ - 1) / attention_sp_;
     int num_ranks             = (num_segments + num_segments_per_rank - 1) / num_segments_per_rank;
 
@@ -141,7 +143,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     int total_token_unalloc  = seq.num_tokens;
 
     for (int sp_idx : top_most_free_ranks) {
-        int tokens_to_dispatch                  = std::min(total_token_unalloc, num_segments_per_rank * segment_size);
+        int tokens_to_dispatch                  = std::min(total_token_unalloc, num_segments_per_rank * segment_size_);
         block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
         total_token_unalloc -= tokens_to_dispatch;
     }
