@@ -85,10 +85,11 @@ def get_dataset(args):
         raise ValueError("CSV file must contain 'prompt_len' and 'output_len' columns")
 
     if len(df) < args.num_requests:
-        print(f"Warning: CSV has {len(df)} rows, requested {args.num_requests}. Using {len(df)}.")
-        args.num_requests = len(df)
-    else:
-        df = df.head(args.num_requests)
+        print(f"Warning: CSV has {len(df)} rows, requested {args.num_requests}. Cycling data to meet request count.")
+        repeats = (args.num_requests // len(df)) + 1
+        df = pd.concat([df] * repeats, ignore_index=True)
+    
+    df = df.head(args.num_requests)
 
     prompts = []
     sampling_params_list = []
