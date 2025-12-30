@@ -54,6 +54,12 @@ class SequenceMetric(_CppSequenceMetric):
             if self.avg_itl_exclude_first is not None
             else "N/A"
         )
+        
+        # Format ITL samples (up to first 32)
+        itl_samples = self.itl_samples
+        num_samples_to_show = min(len(itl_samples), 32)
+        samples_str = ", ".join([f"{s:.2f}" for s in itl_samples[:num_samples_to_show]])
+        itl_samples_log = f"ITL Samples(First {num_samples_to_show}): [{samples_str}]"
 
         logger.info(
             f"SequenceMetric [{str(self.seq_id)[:8]}...] - "
@@ -64,7 +70,8 @@ class SequenceMetric(_CppSequenceMetric):
             f"Decode Queueing Time: {decode_queueing_time_str}, "
             f"ITL Wo Queue: {tpot_wo_queue_str}, "
             f"ITL Wo Queue(exclude first token): {tpot_wo_queue_ex_first_str}, "
-            f"ITL With Queue: {tpot_with_queue_str}"
+            f"ITL With Queue: {tpot_with_queue_str}, "
+            f"{itl_samples_log}"
         )
 
 ServerMetric = _CppServerMetric

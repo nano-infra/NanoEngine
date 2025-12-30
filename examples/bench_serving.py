@@ -136,6 +136,53 @@ def print_model_config(engine):
     print("=" * 40 + "\n")
 
 
+def run_warmup(engine, max_num_seqs, world_size):
+    """Runs warmup phase before the actual benchmark."""
+    warmup_input_len = 512
+    warmup_output_len = 256
+    num_warmup_requests = max_num_seqs * world_size
+    
+    print(f"\n{'=' * 60}")
+    print(f"Running Warmup Phase: {num_warmup_requests} requests")
+    print(f"  Input tokens: {warmup_input_len}")
+    print(f"  Output tokens: {warmup_output_len}")
+    print(f"{'=' * 60}\n")
+    
+    # Generate warmup requests
+    warmup_prompts = [
+        [randint(0, 10000) for _ in range(warmup_input_len)]
+        for _ in range(num_warmup_requests)
+    ]
+    warmup_sampling_params = SamplingParams(
+        temperature=0.6, 
+        ignore_eos=True, 
+        max_tokens=warmup_output_len
+    )
+    
+    warmup_seqs = []
+    for prompt in warmup_prompts:
+        seq = Sequence(token_ids=prompt, sampling_params=warmup_sampling_params)
+        warmup_seqs.append(seq)
+        engine.add_request(seq)
+    
+    # Process warmup requests
+    warmup_start = time.perf_counter()
+    with tqdm(total=num_warmup_requests, desc="Warmup Requests") as pbar:
+        completed = 0
+        while completed < num_warmup_requests:
+            if not engine.is_finished():
+                outputs, _, _, _, _ = engine.step()
+                for seq_id, _ in outputs:
+                    completed += 1
+                    pbar.update(1)
+            else:
+                time.sleep(0.001)
+    
+    warmup_time = time.perf_counter() - warmup_start
+    print(f"\nWarmup completed in {warmup_time:.2f}s")
+    print(f"{'=' * 60}\n")
+
+
 def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requests):
     """Runs the main benchmark loop."""
     seq_map = {}
@@ -305,6 +352,10 @@ def main():
     
     # Print Config
     print_model_config(engine)
+
+    # Run Warmup
+    world_size = args.ep
+    run_warmup(engine, args.max_num_seqs, world_size)
 
     # Prepare Data
     prompts, sampling_params_list = get_dataset(args)
