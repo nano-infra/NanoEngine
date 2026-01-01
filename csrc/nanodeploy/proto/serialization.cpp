@@ -114,7 +114,7 @@ void deserialize_block_context(uintptr_t base, size_t& off, size_t max, BlockCon
 
 // ==================== Public API ====================
 
-size_t serialize_sequences(uintptr_t data_ptr, size_t buffer_size, const std::vector<std::shared_ptr<Sequence>>& seqs)
+size_t serialize_sequences(uintptr_t data_ptr, size_t buffer_size, const std::vector<std::shared_ptr<Sequence>>& seqs, bool is_prefill)
 {
     size_t off = 0;
 
@@ -139,9 +139,16 @@ size_t serialize_sequences(uintptr_t data_ptr, size_t buffer_size, const std::ve
         write_raw(data_ptr, off, buffer_size, seq.num_cached_tokens);
 
         // token_ids
-        size_t tid_count = seq.token_ids.size();
-        write_raw(data_ptr, off, buffer_size, tid_count);
-        write_bytes(data_ptr, off, buffer_size, seq.token_ids.data(), tid_count * sizeof(int));
+        if (is_prefill) {
+            // Prefill 阶段：传输完整的 token_ids
+            size_t tid_count = seq.token_ids.size();
+            write_raw(data_ptr, off, buffer_size, tid_count);
+            write_bytes(data_ptr, off, buffer_size, seq.token_ids.data(), tid_count * sizeof(int));
+        } else {
+            // Decode 阶段：不传输 token_ids，写入长度 0
+            size_t tid_count = 0;
+            write_raw(data_ptr, off, buffer_size, tid_count);
+        }
 
         // Slots (BlockContexts)
         for (size_t i = 0; i < (size_t)BlockContextSlot::_COUNT; ++i) {

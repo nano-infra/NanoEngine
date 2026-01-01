@@ -15,9 +15,10 @@ namespace nanodeploy {
  * @param data_ptr 目标缓冲区的起始物理/虚拟地址
  * @param buffer_size 缓冲区总长度（用于安全检查）
  * @param seqs 要序列化的数据
+ * @param is_prefill 是否为预填充阶段（影响序列化格式）
  * @return size_t 实际写入的字节总数
  */
-size_t serialize_sequences(uintptr_t data_ptr, size_t buffer_size, const std::vector<std::shared_ptr<Sequence>>& seqs);
+size_t serialize_sequences(uintptr_t data_ptr, size_t buffer_size, const std::vector<std::shared_ptr<Sequence>>& seqs, bool is_prefill);
 
 /**
  * @brief 反序列化一组 Sequence
