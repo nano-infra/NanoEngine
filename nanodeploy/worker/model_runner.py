@@ -508,7 +508,7 @@ class ModelRunner:
         context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
 
         # update context lens for attention
-        context.context_lens_for_attn[:num_sp_seqs].add_(1)
+        context.context_lens_for_attn[context.q_slice_fill.long()] += 1
 
         return input_ids, positions
 
