@@ -18,7 +18,7 @@ enum class RoutingStrategy {
 
 class SPStateManager {
 public:
-    static constexpr int segment_size = 1024;
+    static constexpr int segment_size = 65536;
 
     SPStateManager(const std::string& engine_id,
                    int                attention_sp,
