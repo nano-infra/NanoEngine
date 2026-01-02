@@ -18,10 +18,10 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
     max_num_batched_tokens_(max_num_batched_tokens),
+    kvcache_block_size_(kvcache_block_size),
     num_running_seqs_per_sp_(attention_sp, 0),
     num_running_tokens_per_sp_(attention_sp, 0)
 {
-
     for (int i = 0; i < attention_sp; ++i) {
         block_manager[i] = std::make_shared<BlockManager>(engine_id, i, num_kvcache_blocks, kvcache_block_size);
     }
@@ -83,72 +83,128 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
                                   const std::unordered_map<int, int>& num_seqs,
                                   const std::unordered_map<int, int>& num_batched_tokens)
 {
-    // Step 1: cal num_blocks and num_blocks_per_rank
+    // ==========================================
+    // Step 1: Determine SP Size (Number of Ranks)
+    // ==========================================
+    // Use segment logic to calculate minimum ranks needed to minimize communication overhead.
+    int num_tokens = seq.num_tokens;
+    int num_segments = (num_tokens + segment_size - 1) / segment_size;
+
+    int num_ranks_needed = std::max(1, std::min(attention_sp_, num_segments));
+
+    // ==========================================
+    // Step 2: Get Current Load Info for All Ranks
+    // ==========================================
+    struct RankLoadInfo {
+        int id;
+        long long current_tokens; // KV Cache load
+        int current_seqs;         // Master load
+    };
+    std::vector<RankLoadInfo> all_ranks;
+    all_ranks.reserve(attention_sp_);
+
+    for (int i = 0; i < attention_sp_; ++i) {
+        // 1. Calculate Token load: running + scheduled (in queue)
+        long long tokens = num_running_tokens_per_sp_[i];
+        if (num_batched_tokens.count(i)) {
+            tokens += num_batched_tokens.at(i);
+        }
+        
+        // 2. Calculate Sequence load: running + scheduled (in queue)
+        int seqs = num_running_seqs_per_sp_[i];
+        if (num_seqs.count(i)) {
+            seqs += num_seqs.at(i);
+        }
+        
+        all_ranks.push_back({i, tokens, seqs});
+    }
+
+    // ==========================================
+    // Step 3: Select Participants (Prioritize KV Cache)
+    // ==========================================
+    // Sort by token load ascending; pick emptiest ranks first.
+    std::sort(all_ranks.begin(), all_ranks.end(), 
+              [](const RankLoadInfo& a, const RankLoadInfo& b) {
+                  return a.current_tokens < b.current_tokens;
+              });
+
+    // Select top K ranks as participants.
+    std::vector<RankLoadInfo> participants;
+    participants.reserve(num_ranks_needed);
+    for(int i = 0; i < num_ranks_needed; ++i) {
+        participants.push_back(all_ranks[i]);
+    }
+
+    // ==========================================
+    // Step 4: Distribute Tokens (Water-Filling Algorithm)
+    // ==========================================
     auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
     block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
 
-    int num_tokens            = seq.num_tokens;
-    int num_segments          = (num_tokens + segment_size - 1) / segment_size;
-    int num_segments_per_rank = (num_segments + attention_sp_ - 1) / attention_sp_;
-    int num_ranks             = (num_segments + num_segments_per_rank - 1) / num_segments_per_rank;
+    std::vector<long long> simulated_loads;
+    for(const auto& p : participants) {
+        simulated_loads.push_back(p.current_tokens);
+    }
+    std::vector<int> alloc_counts(participants.size(), 0);
+    
+    int tokens_remaining = num_tokens;
+    
+    // Use kvcache_block_size_ as unit to avoid fragmented blocks and wasted memory.
+    const int CHUNK_SIZE = kvcache_block_size_; 
 
-    // Handle division by zero if num_segments_per_rank is 0 (empty sequence?)
-    // Assuming num_tokens > 0, so num_segments >= 1.
-    if (num_segments_per_rank == 0)
-        num_segments_per_rank = 1;
-    if (num_ranks == 0)
-        num_ranks = 1;
-
-    int master_rank = next_sp_idx();
-
-    // Check constraints
-    int running_master_count = num_running_seqs_per_sp_[master_rank];
-
-    auto it_seqs          = num_seqs.find(master_rank);
-    int  current_num_seqs = (it_seqs != num_seqs.end()) ? it_seqs->second : 0;
-
-    if (current_num_seqs + running_master_count + 1 > max_num_seqs_) {
-        return false;
+    while (tokens_remaining > 0) {
+        // 1. Find rank with lowest simulated load.
+        auto min_it = std::min_element(simulated_loads.begin(), simulated_loads.end());
+        int idx = std::distance(simulated_loads.begin(), min_it);
+        
+        // 2. Allocate chunk (or remaining tokens).
+        int current_alloc = std::min(CHUNK_SIZE, tokens_remaining);
+        
+        simulated_loads[idx] += current_alloc;
+        alloc_counts[idx]   += current_alloc;
+        tokens_remaining    -= current_alloc;
     }
 
-    auto it_tokens              = num_batched_tokens.find(master_rank);
-    int  current_batched_tokens = (it_tokens != num_batched_tokens.end()) ? it_tokens->second : 0;
-    if (current_batched_tokens + seq.num_tokens >= max_num_batched_tokens_) {
-        return false;
+    // Apply allocation results to block_ctx.
+    for (size_t i = 0; i < participants.size(); ++i) {
+        int rank_id = participants[i].id;
+        block_ctx.num_dispatched_tokens[rank_id] = alloc_counts[i];
     }
 
-    // Rank selection logic
-    std::vector<std::pair<int, int>> rank_free_count;
-    for (const auto& [rank, bm] : block_manager) {
-        if (rank != master_rank) {
-            rank_free_count.push_back({rank, bm->num_free_blocks()});
-        }
-    }
-
-    std::sort(rank_free_count.begin(),
-              rank_free_count.end(),
-              [](const std::pair<int, int>& a, const std::pair<int, int>& b) { return a.second > b.second; });
-
-    std::vector<int> top_most_free_ranks;
-    int              ranks_to_pick = std::min((int)rank_free_count.size(), num_ranks - 1);
-    for (int i = 0; i < ranks_to_pick; ++i) {
-        top_most_free_ranks.push_back(rank_free_count[i].first);
-    }
-    top_most_free_ranks.push_back(master_rank);
-
-    // Step 2: allocation setup
+    // ==========================================
+    // Step 5: Select Master (Load Balancing)
+    // ==========================================
+    // Choose participant with fewest sequences as Master.
+    auto min_seq_it = std::min_element(participants.begin(), participants.end(),
+        [](const RankLoadInfo& a, const RankLoadInfo& b) {
+            return a.current_seqs < b.current_seqs;
+        });
+        
+    int master_rank = min_seq_it->id;
     block_ctx.master_sp_idx_ = master_rank;
-    int total_token_unalloc  = seq.num_tokens;
 
-    for (int sp_idx : top_most_free_ranks) {
-        int tokens_to_dispatch                  = std::min(total_token_unalloc, num_segments_per_rank * segment_size);
-        block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
-        total_token_unalloc -= tokens_to_dispatch;
+    // ==========================================
+    // Step 6: Resource and Physical Memory Checks
+    // ==========================================
+    
+    // 1. Check Master's Max Seqs limit using estimated load.
+    if (min_seq_it->current_seqs + 1 > max_num_seqs_) {
+        return false;
     }
 
-    // Check if all involved block managers can allocate
-    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-        if (!block_manager[sp_idx]->can_allocate(seq)) {
+    // 2. Check Master's Max Batched Tokens limit.
+    long long master_pending_tokens = num_batched_tokens.count(master_rank) ? num_batched_tokens.at(master_rank) : 0;
+    // Maintain original logic: throttle if Master is overloaded, even if tokens are distributed.
+    if (master_pending_tokens + seq.num_tokens >= max_num_batched_tokens_) {
+         return false;
+    }
+
+    // 3. Check physical memory (BlockManager) for all participants.
+    // Crucial: validates logical calculation against actual free blocks.
+    for (size_t i = 0; i < participants.size(); ++i) {
+        int rank_id = participants[i].id;
+        // BlockManager checks based on num_dispatched_tokens set above.
+        if (!block_manager[rank_id]->can_allocate(seq)) {
             return false;
         }
     }
