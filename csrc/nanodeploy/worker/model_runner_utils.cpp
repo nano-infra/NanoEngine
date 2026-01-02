@@ -1,7 +1,9 @@
-#include "model_runner_utils.h"
-#include "nanodeploy/engine/sequence.h"
 #include <algorithm>
 #include <iostream>
+
+#include "nanodeploy/sequence/sequence.h"
+
+#include "model_runner_utils.h"
 
 namespace nanodeploy {
 
@@ -63,7 +65,7 @@ static void build_block_tables_dense(const std::vector<Sequence*>& dp_seqs,
                                      std::vector<int>&             block_tables_flat,
                                      int&                          max_num_blocks)
 {
-     // 1. Group sequences by master_sp_idx
+    // 1. Group sequences by master_sp_idx
     std::vector<std::vector<Sequence*>> dp_sp_seqs(sp_size);
     for (auto* seq : dp_seqs) {
         int m_sp = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
@@ -87,11 +89,11 @@ static void build_block_tables_dense(const std::vector<Sequence*>& dp_seqs,
     block_tables_flat.assign(total_size, -1);
 
     for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
-        const auto& seqs           = dp_sp_seqs[sp_idx];
+        const auto& seqs = dp_sp_seqs[sp_idx];
         for (int seq_id = 0; seq_id < max_num_seqs; ++seq_id) {
             size_t base_offset = ((size_t)sp_idx * max_num_seqs + seq_id) * max_num_blocks;
             if (seq_id < (int)seqs.size()) {
-                Sequence* seq = seqs[seq_id];
+                Sequence*   seq = seqs[seq_id];
                 const auto& bt  = seq->block_table(BlockContextSlot::ACTIVE, sp_rank);
                 for (size_t i = 0; i < bt.size(); ++i) {
                     block_tables_flat[base_offset + i] = bt[i];
@@ -162,8 +164,12 @@ prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size
     return meta;
 }
 
-DecodeMetadata
-prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs, int max_num_send_recv_seqs)
+DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
+                                  int                           sp_rank,
+                                  int                           sp_size,
+                                  int                           block_size,
+                                  int                           max_num_seqs,
+                                  int                           max_num_send_recv_seqs)
 {
     DecodeMetadata meta;
 
@@ -191,20 +197,20 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
     // 2. Prepare context_lens, global_context_lens
     meta.context_lens_flat.assign(sp_size * max_num_seqs, 0);
     meta.global_context_lens_flat.assign(sp_size * max_num_seqs, 0);
-    
+
     // Used internally to calculate q_slice_fill and q_offsets
     std::vector<int> sp_valid_request_counts(sp_size, 0);
 
     // context_lens
     for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
-        const auto& batch_seqs = sp_seqs[sp_idx];
-        int valid_count = 0;
+        const auto& batch_seqs  = sp_seqs[sp_idx];
+        int         valid_count = 0;
         for (int seq_id = 0; seq_id < max_num_seqs; ++seq_id) {
             if (seq_id < (int)batch_seqs.size()) {
-                Sequence* seq = batch_seqs[seq_id];
-                int ctx_len = seq->context_len(BlockContextSlot::ACTIVE, sp_rank);
+                Sequence* seq     = batch_seqs[seq_id];
+                int       ctx_len = seq->context_len(BlockContextSlot::ACTIVE, sp_rank);
                 meta.context_lens_flat[sp_idx * max_num_seqs + seq_id] = ctx_len;
-                
+
                 if (ctx_len > 0) {
                     valid_count++;
                 }
@@ -315,7 +321,7 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
     meta.q_offsets.resize(sp_size + 1);
     meta.q_offsets[0] = 0;
     for (int i = 0; i < sp_size; ++i) {
-        meta.q_offsets[i+1] = meta.q_offsets[i] + sp_valid_request_counts[i];
+        meta.q_offsets[i + 1] = meta.q_offsets[i] + sp_valid_request_counts[i];
     }
 
     return meta;

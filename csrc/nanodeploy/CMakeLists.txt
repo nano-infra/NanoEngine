@@ -1,3 +1,4 @@
-add_subdirectory(engine)
 add_subdirectory(metrics)
-add_subdirectory(proto)
+add_subdirectory(scheduler)
+add_subdirectory(sequence)
+add_subdirectory(worker)

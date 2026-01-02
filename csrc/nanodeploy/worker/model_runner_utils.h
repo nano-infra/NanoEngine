@@ -1,7 +1,9 @@
 #pragma once
-#include "sequence.h"
+
 #include <string>
 #include <vector>
+
+#include "nanodeploy/sequence/sequence.h"
 
 namespace nanodeploy {
 
@@ -55,8 +57,12 @@ struct DecodeMetadata {
 PrefillMetadata
 prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs);
 
-DecodeMetadata
-prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs, int max_num_send_recv_seqs);
+DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
+                                  int                           sp_rank,
+                                  int                           sp_size,
+                                  int                           block_size,
+                                  int                           max_num_seqs,
+                                  int                           max_num_send_recv_seqs);
 
 void update_seqs_inner_loop(const std::vector<Sequence*>& sp_seqs, int sp_rank);
 

@@ -1,5 +1,5 @@
 #pragma once
-#include "nanodeploy/engine/sequence.h"
+#include "nanodeploy/sequence/sequence.h"
 #include <pybind11/pybind11.h>
 #include <unordered_map>
 

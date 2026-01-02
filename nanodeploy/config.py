@@ -32,7 +32,7 @@ class Config:
     enforce_eager: bool = False
     hf_config: Any = None
     eos: int = -1
-    kvcache_block_size: int = 256//4
+    kvcache_block_size: int = 256
     num_kvcache_blocks: int = 15000
 
     # deployment config
@@ -48,7 +48,7 @@ class Config:
     ray_address: str = "127.0.0.1:6379"
 
     # profiler
-    enable_profiler: bool = True
+    enable_profiler: bool = False
     profiler_start_step: int = 40
     profiling_step: int = 16
     profiler_dir: str = "/mnt/nvme1n1/ml_research/linbinbin1/profiler_res"

@@ -1,7 +1,5 @@
 #pragma once
-#include "sequence.h"
-#include "sp_state_manager.h"
-#include "thread_pool.h"
+
 #include <deque>
 #include <memory>
 #include <optional>
@@ -9,6 +7,11 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "nanodeploy/sequence/sequence.h"
+
+#include "sp_state_manager.h"
+#include "thread_pool.h"
 
 namespace nanodeploy {
 
@@ -45,7 +48,7 @@ struct ScheduleResult {
     // SP counts
     std::vector<std::vector<int>> sp_send_counts;
     std::vector<std::vector<int>> sp_recv_counts;
-    
+
     // Matrix of SP communication counts.
     // Dimensions: [dp_idx][master_sp_rank][participant_sp_rank]
     // Value: Number of requests sent from master_sp_rank to participant_sp_rank.
