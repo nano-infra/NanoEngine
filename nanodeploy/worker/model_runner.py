@@ -434,11 +434,12 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         if hf_config.num_key_value_heads == 1:
-            new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
-                context_lens_for_attn.view(-1),
-                hf_config.num_attention_heads // hf_config.num_key_value_heads,
-                hf_config.num_key_value_heads,
-            )
+            # new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
+            #     context_lens_for_attn.view(-1),
+            #     hf_config.num_attention_heads // hf_config.num_key_value_heads,
+            #     hf_config.num_key_value_heads,
+            # )
+            new_tile_scheduler_metadata, new_num_splits = None, None
         else:
             new_tile_scheduler_metadata, new_num_splits = None, None
 
