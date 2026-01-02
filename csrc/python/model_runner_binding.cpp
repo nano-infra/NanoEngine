@@ -1,7 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "nanodeploy/engine/model_runner_utils.h"
+#include "nanodeploy/worker/model_runner_utils.h"
 
 namespace py = pybind11;
 using namespace nanodeploy;
@@ -56,5 +56,5 @@ void bind_model_runner_utils(py::module_& m)
           py::arg("block_size"),
           py::arg("max_num_seqs"),
           py::arg("max_num_send_recv_seqs"));
-        m.def("update_seqs_inner_loop", &update_seqs_inner_loop, py::arg("dp_seqs"), py::arg("sp_rank"));
+    m.def("update_seqs_inner_loop", &update_seqs_inner_loop, py::arg("dp_seqs"), py::arg("sp_rank"));
 }

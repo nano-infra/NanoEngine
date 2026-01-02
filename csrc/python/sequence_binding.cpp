@@ -1,11 +1,15 @@
-#include "nanodeploy/engine/sequence.h"
-#include "nanodeploy/metrics/sequence_metric.h"
-#include "opaque_types.h"
+#include <utility>
+
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 
-#include <pybind11/stl.h>
-#include <utility>
+#include "nanodeploy/metrics/sequence_metric.h"
+
+#include "nanodeploy/sequence/sequence.h"
+#include "nanodeploy/sequence/serialization.h"
+
+#include "opaque_types.h"
 
 namespace py = pybind11;
 using namespace nanodeploy;
@@ -32,6 +36,16 @@ void bind_sequence(py::module_& m)
     py::implicitly_convertible<py::list, BlockContext::BlockIdList>();
 
     py::bind_vector<BlockContext::BlockLocationList>(m, "BlockLocationList").def(py::init<>());
+
+    // Directly accepts address and size
+    m.def("serialize",
+          &serialize_sequences,
+          py::arg("data_ptr"),
+          py::arg("buffer_size"),
+          py::arg("seqs"),
+          py::arg("is_prefill"));
+
+    m.def("deserialize", &deserialize_sequences, py::arg("data_ptr"), py::arg("data_len"));
 
     // Wrapper class for sp_block_table to provide defaultdict(list) behavior.
     py::class_<BlockContext::SpBlockTable>(m, "DefaultListDict")

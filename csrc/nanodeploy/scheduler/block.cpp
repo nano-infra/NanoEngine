@@ -2,7 +2,8 @@
 
 namespace nanodeploy {
 
-Block::Block(int block_id, int block_size): block_id(block_id) {
+Block::Block(int block_id, int block_size): block_id(block_id)
+{
     token_ids.reserve(block_size);
 }
 

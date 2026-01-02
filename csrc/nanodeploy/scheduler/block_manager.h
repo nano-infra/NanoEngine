@@ -1,6 +1,5 @@
 #pragma once
-#include "block.h"
-#include "nanodeploy/engine/sequence.h"
+
 #include <list>
 #include <memory>
 #include <optional>
@@ -8,6 +7,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "block.h"
+#include "nanodeploy/sequence/sequence.h"
 
 namespace nanodeploy {
 

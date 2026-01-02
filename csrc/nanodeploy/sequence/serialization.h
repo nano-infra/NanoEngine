@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "nanodeploy/engine/sequence.h"
+#include "sequence.h"
 
 namespace nanodeploy {
 
@@ -18,7 +18,10 @@ namespace nanodeploy {
  * @param is_prefill 是否为预填充阶段（影响序列化格式）
  * @return size_t 实际写入的字节总数
  */
-size_t serialize_sequences(uintptr_t data_ptr, size_t buffer_size, const std::vector<std::shared_ptr<Sequence>>& seqs, bool is_prefill);
+size_t serialize_sequences(uintptr_t                                     data_ptr,
+                           size_t                                        buffer_size,
+                           const std::vector<std::shared_ptr<Sequence>>& seqs,
+                           bool                                          is_prefill);
 
 /**
  * @brief 反序列化一组 Sequence

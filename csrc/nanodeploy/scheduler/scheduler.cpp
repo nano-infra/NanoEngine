@@ -1,10 +1,13 @@
-#include "scheduler.h"
-#include "nanodeploy/engine/sequence.h"
-#include "nanodeploy/metrics/sequence_metric.h"
-#include "scheduler_utils.h"
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
+
+#include "nanodeploy/metrics/sequence_metric.h"
+#include "nanodeploy/sequence/sequence.h"
+
+#include "scheduler_utils.h"
+
+#include "scheduler.h"
 
 namespace nanodeploy {
 
@@ -149,13 +152,14 @@ ScheduleResult Scheduler::schedule()
         for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
             // SP Send Count: Number of sequences where this SP rank is MASTER (initiator)
             // AND the sequence is actually distributed (has blocks on > 1 ranks).
-            int send_count = 0;
-            const auto& sp_seqs = result.filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx];
+            int         send_count = 0;
+            const auto& sp_seqs    = result.filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx];
             for (const auto& seq : sp_seqs) {
-                const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
-                int active_ranks = 0;
+                const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+                int         active_ranks = 0;
                 for (int count : tokens) {
-                    if (count > 0) active_ranks++;
+                    if (count > 0)
+                        active_ranks++;
                 }
 
                 if (active_ranks > 1) {
@@ -175,12 +179,13 @@ ScheduleResult Scheduler::schedule()
                         break;
                     }
                 }
-                
+
                 if (!is_dummy) {
-                    const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
-                    int active_ranks = 0;
+                    const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+                    int         active_ranks = 0;
                     for (int count : tokens) {
-                        if (count > 0) active_ranks++;
+                        if (count > 0)
+                            active_ranks++;
                     }
 
                     if (active_ranks > 1 && tokens[sp_idx] > 0) {
@@ -194,10 +199,9 @@ ScheduleResult Scheduler::schedule()
         // SP Communication Matrix Logic
         // Initialize matrix for this DP rank: [attention_sp_][attention_sp_]
         // result.sp_comm_matrix.push_back(
-            // std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
-        
-        result.sp_q_matrix.push_back(
-            std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+        // std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+
+        result.sp_q_matrix.push_back(std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
 
         // result.sp_res_matrix.push_back(
         //     std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
@@ -210,18 +214,20 @@ ScheduleResult Scheduler::schedule()
                     break;
                 }
             }
-            if (is_dummy) continue;
+            if (is_dummy)
+                continue;
 
-            const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
-            int active_ranks = 0;
+            const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+            int         active_ranks = 0;
             for (int count : tokens) {
-                if (count > 0) active_ranks++;
+                if (count > 0)
+                    active_ranks++;
             }
 
             // Only count if SP is truly enabled (distributed across > 1 ranks)
             if (active_ranks > 1) {
                 int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
-                
+
                 // For each participating rank:
                 for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
                     if (tokens[sp_idx] > 0) {
@@ -243,7 +249,7 @@ ScheduleResult Scheduler::schedule()
 
     // Calculate waiting queue block metrics
     auto& wait_queue = (mode_ != "decode") ? waiting : waiting_migration;
-    
+
     if (!wait_queue.empty()) {
         auto head_seq = wait_queue.front();
         // Calculate blocks for head sequence: ceil(num_tokens / block_size)

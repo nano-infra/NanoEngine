@@ -1,10 +1,11 @@
-#include "sp_state_manager.h"
-#include "nanodeploy/engine/sequence.h"
-
 #include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <random>
+
+#include "nanodeploy/sequence/sequence.h"
+
+#include "sp_state_manager.h"
 
 namespace nanodeploy {
 
@@ -87,7 +88,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     // Step 1: Determine SP Size (Number of Ranks)
     // ==========================================
     // Use segment logic to calculate minimum ranks needed to minimize communication overhead.
-    int num_tokens = seq.num_tokens;
+    int num_tokens   = seq.num_tokens;
     int num_segments = (num_tokens + segment_size - 1) / segment_size;
 
     int num_ranks_needed = std::max(1, std::min(attention_sp_, num_segments));
@@ -96,9 +97,9 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     // Step 2: Get Current Load Info for All Ranks
     // ==========================================
     struct RankLoadInfo {
-        int id;
-        long long current_tokens; // KV Cache load
-        int current_seqs;         // Master load
+        int       id;
+        long long current_tokens;  // KV Cache load
+        int       current_seqs;    // Master load
     };
     std::vector<RankLoadInfo> all_ranks;
     all_ranks.reserve(attention_sp_);
@@ -109,13 +110,13 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         if (num_batched_tokens.count(i)) {
             tokens += num_batched_tokens.at(i);
         }
-        
+
         // 2. Calculate Sequence load: running + scheduled (in queue)
         int seqs = num_running_seqs_per_sp_[i];
         if (num_seqs.count(i)) {
             seqs += num_seqs.at(i);
         }
-        
+
         all_ranks.push_back({i, tokens, seqs});
     }
 
@@ -123,15 +124,14 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     // Step 3: Select Participants (Prioritize KV Cache)
     // ==========================================
     // Sort by token load ascending; pick emptiest ranks first.
-    std::sort(all_ranks.begin(), all_ranks.end(), 
-              [](const RankLoadInfo& a, const RankLoadInfo& b) {
-                  return a.current_tokens < b.current_tokens;
-              });
+    std::sort(all_ranks.begin(), all_ranks.end(), [](const RankLoadInfo& a, const RankLoadInfo& b) {
+        return a.current_tokens < b.current_tokens;
+    });
 
     // Select top K ranks as participants.
     std::vector<RankLoadInfo> participants;
     participants.reserve(num_ranks_needed);
-    for(int i = 0; i < num_ranks_needed; ++i) {
+    for (int i = 0; i < num_ranks_needed; ++i) {
         participants.push_back(all_ranks[i]);
     }
 
@@ -142,32 +142,32 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
 
     std::vector<long long> simulated_loads;
-    for(const auto& p : participants) {
+    for (const auto& p : participants) {
         simulated_loads.push_back(p.current_tokens);
     }
     std::vector<int> alloc_counts(participants.size(), 0);
-    
+
     int tokens_remaining = num_tokens;
-    
+
     // Use kvcache_block_size_ as unit to avoid fragmented blocks and wasted memory.
-    const int CHUNK_SIZE = kvcache_block_size_; 
+    const int CHUNK_SIZE = kvcache_block_size_;
 
     while (tokens_remaining > 0) {
         // 1. Find rank with lowest simulated load.
         auto min_it = std::min_element(simulated_loads.begin(), simulated_loads.end());
-        int idx = std::distance(simulated_loads.begin(), min_it);
-        
+        int  idx    = std::distance(simulated_loads.begin(), min_it);
+
         // 2. Allocate chunk (or remaining tokens).
         int current_alloc = std::min(CHUNK_SIZE, tokens_remaining);
-        
+
         simulated_loads[idx] += current_alloc;
-        alloc_counts[idx]   += current_alloc;
-        tokens_remaining    -= current_alloc;
+        alloc_counts[idx] += current_alloc;
+        tokens_remaining -= current_alloc;
     }
 
     // Apply allocation results to block_ctx.
     for (size_t i = 0; i < participants.size(); ++i) {
-        int rank_id = participants[i].id;
+        int rank_id                              = participants[i].id;
         block_ctx.num_dispatched_tokens[rank_id] = alloc_counts[i];
     }
 
@@ -175,18 +175,18 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     // Step 5: Select Master (Load Balancing)
     // ==========================================
     // Choose participant with fewest sequences as Master.
-    auto min_seq_it = std::min_element(participants.begin(), participants.end(),
-        [](const RankLoadInfo& a, const RankLoadInfo& b) {
+    auto min_seq_it =
+        std::min_element(participants.begin(), participants.end(), [](const RankLoadInfo& a, const RankLoadInfo& b) {
             return a.current_seqs < b.current_seqs;
         });
-        
-    int master_rank = min_seq_it->id;
+
+    int master_rank          = min_seq_it->id;
     block_ctx.master_sp_idx_ = master_rank;
 
     // ==========================================
     // Step 6: Resource and Physical Memory Checks
     // ==========================================
-    
+
     // 1. Check Master's Max Seqs limit using estimated load.
     if (min_seq_it->current_seqs + 1 > max_num_seqs_) {
         return false;
@@ -196,7 +196,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     long long master_pending_tokens = num_batched_tokens.count(master_rank) ? num_batched_tokens.at(master_rank) : 0;
     // Maintain original logic: throttle if Master is overloaded, even if tokens are distributed.
     if (master_pending_tokens + seq.num_tokens >= max_num_batched_tokens_) {
-         return false;
+        return false;
     }
 
     // 3. Check physical memory (BlockManager) for all participants.
@@ -240,9 +240,7 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
     int   master_sp_idx = block_ctx.master_sp_idx_;
     block_ctx.sp_block_table.clear();
     block_ctx.block_location.clear();
-    std::fill(block_ctx.num_dispatched_tokens.begin(),
-              block_ctx.num_dispatched_tokens.end(),
-              0);
+    std::fill(block_ctx.num_dispatched_tokens.begin(), block_ctx.num_dispatched_tokens.end(), 0);
 
     num_running_seqs_--;
     num_running_tokens_ -= seq.num_tokens;
