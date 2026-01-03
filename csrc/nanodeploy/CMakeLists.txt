@@ -1,3 +1,22 @@
+# NanoDeploy C++ Core and Worker
+add_library(nanodeploy_core STATIC
+    core/config.h
+    core/module.h
+    core/weight_mapping.h
+)
+
+target_include_directories(nanodeploy_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Link with third-party and core dependencies
+target_link_libraries(nanodeploy_core PUBLIC
+    flashinfer
+    deep_gemm
+    deep_ep
+    DLSlime::dlslime
+    Spoke::core
+    Torch::Torch
+)
+
 add_subdirectory(sequence)
 add_subdirectory(scheduler)
 add_subdirectory(worker)

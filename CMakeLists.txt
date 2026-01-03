@@ -16,7 +16,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(pybind11 CONFIG REQUIRED)
 find_package(Torch REQUIRED)
-find_package(Spoke REQUIRED)
+
+# DLSlime and Spoke are now handled via third_party submodules
+# find_package(Spoke REQUIRED)
+# find_package(DLSlime REQUIRED)
+
+# Include third-party interfaces and subdirectories
+add_subdirectory(third_party)
 
 include_directories(csrc)
 add_subdirectory(csrc)
