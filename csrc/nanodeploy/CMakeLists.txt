@@ -1,5 +1,5 @@
+add_subdirectory(sequence)
+add_subdirectory(scheduler)
+add_subdirectory(worker)
 add_subdirectory(executor)
 add_subdirectory(metrics)
-add_subdirectory(scheduler)
-add_subdirectory(sequence)
-add_subdirectory(worker)
