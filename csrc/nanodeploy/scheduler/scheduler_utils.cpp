@@ -1,13 +1,17 @@
-#include "scheduler_utils.h"
-#include "nanodeploy/engine/sequence.h"
-#include "nanodeploy/metrics/sequence_metric.h"
-#include "thread_pool.h"
+
 #include <algorithm>
 #include <exception>
 #include <iostream>
 #include <string>
 #include <thread>
 #include <unordered_set>
+
+#include "nanodeploy/metrics/sequence_metric.h"
+#include "nanodeploy/sequence/sequence.h"
+
+#include "thread_pool.h"
+
+#include "scheduler_utils.h"
 
 namespace nanodeploy {
 

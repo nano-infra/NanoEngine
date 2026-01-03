@@ -1,27 +1,27 @@
 import os
 
+import numpy as np
+
 from nanodeploy import LLM, SamplingParams
 from nanodeploy.engine.sequence import Sequence
-import numpy as np
 from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("/models/deepseek-v3")
+    path = os.path.expanduser("/models/qwen3-235B-Instruct-2507-FP8")
 
     decode = LLM(
         path,
         enforce_eager=False,
-        attention_dp=8
-        ,
+        attention_dp=8,
         attention_sp=1,
         attention_tp=1,
         ffn_dp=1,
         ffn_ep=8,
         ffn_tp=1,
         mode="decode",
-        master_address='10.102.98.166:26444',
-        ray_address=   '10.102.98.166:6444',
+        master_address="10.102.97.179:26444",
+        ray_address="10.102.97.179:7078",
         dummy_prefill=True,
         dummy_weight=True,
         perfect_eplb=True,
@@ -31,6 +31,8 @@ def main():
         loop_count=48,
         max_num_send_seqs=128,
         max_num_recv_seqs=130,
+        kvcache_block_size=256,
+        enable_profiler=False,
     )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=256, ignore_eos=True)

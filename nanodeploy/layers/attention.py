@@ -197,162 +197,6 @@ class FlashAttentionImpl:
         
         return o
 
-# class FlashMLAImpl:
-#     def __init__(
-#         self,
-#         num_heads: int,
-#         head_size: int,
-#         scale: float = None,
-#         num_kv_heads: int = None,
-#         v_head_size: int = None,
-#         causal: bool = True,
-#         **kwargs,
-#     ):
-#         if scale is None:
-#             scale = 1.0 / (head_size**0.5)
-#         if num_kv_heads is None:
-#             num_kv_heads = num_heads
-#         if v_head_size is None:
-#             v_head_size = head_size
-#         self.num_heads = num_heads
-#         self.head_size = head_size
-#         self.scale = scale
-#         self.num_kv_heads = num_kv_heads
-#         self.v_head_size = v_head_size
-#         self.causal = causal
-
-#         assert num_kv_heads == 1, "MLA requires num kv heads equal to 1"
-
-#     def forward(
-#         self,
-#         q: torch.Tensor,
-#         k: torch.Tensor,
-#         v: torch.Tensor,
-#         k_cache: torch.Tensor,
-#         v_cache: torch.Tensor,
-#     ):
-
-#         context = get_context()
-#         if k_cache.numel() and not get_context().is_dummy:
-#             store_kcache(k, k_cache, context.slot_mapping)
-
-#         sp_rank = get_dist_context().attn_sp_rank
-#         sp_size = get_dist_context().attn_sp_world_size
-
-#         if not context.is_prefill:  # decode
-#             bs, num_head, head_dim = q.shape
-#             if sp_size > 1:
-#                 max_num_seqs = get_sp_context().max_num_seqs
-#                 q = q.view([bs, -1])
-#                 q_buffer = get_sp_context().q_buffer
-
-#                 get_sp_context().q_buffer.local_buffer.view(get_sp_context().dtype)[
-#                     sp_rank
-#                     * max_num_seqs
-#                     * (num_head * head_dim) : (sp_rank * max_num_seqs + bs)
-#                     * (num_head * head_dim)
-#                 ].copy_(q.flatten())
-
-#                 q = q_buffer.all_to_all_ll(
-#                     q,
-#                     mask=context.q_mask,
-#                 ).view([sp_size * max_num_seqs, num_head, head_dim])
-
-#                 q = q[: context.attention_compute_bs]
-#                 context_lens = context.context_lens_for_attn[
-#                     : context.attention_compute_bs
-#                 ]
-#                 block_tables = context.block_tables[: context.attention_compute_bs]
-#                 tile_scheduler_metadata = context.tile_scheduler_metadata
-#                 num_splits = context.num_splits[: context.attention_compute_bs + 1]
-#             else:
-#                 context_lens = context.context_lens_for_attn[
-#                     : context.attention_compute_bs
-#                 ]
-#                 block_tables = context.block_tables[: context.attention_compute_bs]
-#                 tile_scheduler_metadata = context.tile_scheduler_metadata
-#                 num_splits = context.num_splits[: context.attention_compute_bs + 1]
-
-#             # tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
-#             #     cache_seqlens=context_lens,
-#             #     num_heads_per_head_k=self.num_heads // self.num_kv_heads,
-#             #     num_heads_k=self.num_kv_heads,
-#             # )
-
-#             o, lse = flash_mla.flash_mla_with_kvcache(
-#                 q.unsqueeze(1),
-#                 k_cache,
-#                 block_tables,
-#                 context_lens,
-#                 self.v_head_size,
-#                 tile_scheduler_metadata,
-#                 num_splits,
-#                 self.scale,
-#                 self.causal,
-#             )
-
-#             o = o.squeeze(1)
-
-#             if sp_size > 1:
-#                 _, num_head, v_head_dim = o.shape
-
-#                 res_buffer = get_sp_context().res_buffer
-#                 lse_buffer = get_sp_context().lse_buffer
-#                 lse = lse.to(torch.bfloat16)
-#                 gathered_o = o.view([sp_size, max_num_seqs, num_head, v_head_dim])
-#                 gathered_lse = lse.view([sp_size, max_num_seqs, num_head, 1])
-
-#                 res_local_buffer = res_buffer.local_buffer.view(get_sp_context().dtype)
-#                 res_local_buffer[
-#                     sp_rank
-#                     * max_num_seqs
-#                     * (num_head * (v_head_dim)) : (sp_rank * max_num_seqs + bs)
-#                     * (num_head * (v_head_dim))
-#                 ].copy_(
-#                     gathered_o.flatten()[
-#                         sp_rank
-#                         * max_num_seqs
-#                         * (num_head * (v_head_dim)) : (sp_rank * max_num_seqs + bs)
-#                         * (num_head * (v_head_dim))
-#                     ]
-#                 )
-#                 lse_local_buffer = lse_buffer.local_buffer.view(get_sp_context().dtype)
-#                 lse_local_buffer[
-#                     sp_rank
-#                     * max_num_seqs
-#                     * (num_head * (1)) : (sp_rank * max_num_seqs + bs)
-#                     * (num_head * (1))
-#                 ].copy_(
-#                     gathered_lse.flatten()[
-#                         sp_rank
-#                         * max_num_seqs
-#                         * (num_head * (1)) : (sp_rank * max_num_seqs + bs)
-#                         * (num_head * (1))
-#                     ]
-#                 )
-
-#                 all_ranks_res_output_combine = res_buffer.all_to_all_ll(
-#                     gathered_o.view(sp_size * max_num_seqs, -1),
-#                     mask=context.res_lse_mask,
-#                     is_transpose=True,
-#                 ).view(sp_size, max_num_seqs, num_head, v_head_dim)
-#                 all_ranks_lse_output_combine = lse_buffer.all_to_all_ll(
-#                     gathered_lse.view(sp_size * max_num_seqs, -1),
-#                     mask=context.res_lse_mask,
-#                     is_transpose=True,
-#                 ).view(sp_size, max_num_seqs, num_head, 1)
-
-#                 o = inter_rank_gqa_fwd_batch_decode_combine_kv(
-#                     all_ranks_res_output_combine,
-#                     all_ranks_lse_output_combine,
-#                     context.global_context_lens,
-#                     num_head,
-#                     v_head_dim,
-#                     get_sp_context().max_num_seqs,
-#                     sp_size,
-#                 ).view([max_num_seqs, num_head, v_head_dim])[:bs]
-
-#         return o
 class FlashMLAImpl:
     def __init__(
         self,
@@ -418,32 +262,32 @@ class FlashMLAImpl:
                 ).view([sp_size * max_num_seqs, num_head, head_dim])
 
                 q = q[: context.attention_compute_bs]
-                context_lens_for_attn = context.context_lens_for_attn[
+                context_lens = context.context_lens_for_attn[
                     : context.attention_compute_bs
                 ]
                 block_tables = context.block_tables[: context.attention_compute_bs]
-                tile_scheduler_metadata = context.tile_scheduler_metadata
-                num_splits = context.num_splits[: context.attention_compute_bs + 1]
+                # tile_scheduler_metadata = context.tile_scheduler_metadata
+                # num_splits = context.num_splits[: context.attention_compute_bs + 1]
             else:
                 q = q[: context.attention_compute_bs]
-                context_lens_for_attn = context.context_lens_for_attn[
+                context_lens = context.context_lens_for_attn[
                     : context.attention_compute_bs
                 ]
                 block_tables = context.block_tables[: context.attention_compute_bs]
-                tile_scheduler_metadata = context.tile_scheduler_metadata
-                num_splits = context.num_splits[: context.attention_compute_bs + 1]
+                # tile_scheduler_metadata = context.tile_scheduler_metadata
+                # num_splits = context.num_splits[: context.attention_compute_bs + 1]
 
-            # tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
-            #     cache_seqlens=context_lens,
-            #     num_heads_per_head_k=self.num_heads // self.num_kv_heads,
-            #     num_heads_k=self.num_kv_heads,
-            # )
+            tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
+                context_lens,
+                self.num_heads // self.num_kv_heads,
+                self.num_kv_heads,
+            )
 
             o, lse = flash_mla.flash_mla_with_kvcache(
                 q.unsqueeze(1),
                 k_cache,
                 block_tables,
-                context_lens_for_attn,
+                context_lens,
                 self.v_head_size,
                 tile_scheduler_metadata,
                 num_splits,

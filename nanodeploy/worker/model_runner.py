@@ -434,11 +434,12 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         if hf_config.num_key_value_heads == 1:
-            new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
-                context_lens_for_attn.view(-1),
-                hf_config.num_attention_heads // hf_config.num_key_value_heads,
-                hf_config.num_key_value_heads,
-            )
+            # new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
+            #     context_lens_for_attn.view(-1),
+            #     hf_config.num_attention_heads // hf_config.num_key_value_heads,
+            #     hf_config.num_key_value_heads,
+            # )
+            new_tile_scheduler_metadata, new_num_splits = None, None
         else:
             new_tile_scheduler_metadata, new_num_splits = None, None
 
@@ -508,7 +509,7 @@ class ModelRunner:
         context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
 
         # update context lens for attention
-        context.context_lens_for_attn[:num_sp_seqs].add_(1)
+        context.context_lens_for_attn[context.q_slice_fill.long()] += 1
 
         return input_ids, positions
 
@@ -567,8 +568,8 @@ class ModelRunner:
             if hf_config.num_key_value_heads == 1:
                 graph_vars["tile_scheduler_metadata"].zero_()
                 graph_vars["num_splits"].zero_()
-                graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
-                graph_vars["num_splits"][:context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
+                # graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
+                # graph_vars["num_splits"][:context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
 
 
             graph_vars["context_lens_for_attn"].zero_()

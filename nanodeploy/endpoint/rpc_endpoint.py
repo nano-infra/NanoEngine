@@ -43,14 +43,14 @@ class RPCServerEndpoint:
             self.server_bindings[i].endpoint.connect(info[0])
             self.server_bindings[i].remote_buffer_ptr = info[1]
 
-    def send_seqs(self, dp_seqs: list[list[Sequence]]):
+    def send_seqs(self, dp_seqs: list[list[Sequence]], is_prefill: bool):
         assert len(dp_seqs) == self.world_size
         futures: list[_slime_c.SlimeReadWriteFuture] = []
         for i in range(self.world_size):
             binding = self.server_bindings[i]
             buffer = binding.buffer
             buffer_ptr = buffer.data_ptr() + buffer.storage_offset()
-            off = serialize(buffer_ptr, buffer.numel(), dp_seqs[i])
+            off = serialize(buffer_ptr, buffer.numel(), dp_seqs[i], is_prefill)
             future = binding.endpoint.write_with_imm(
                 [(buffer_ptr, binding.remote_buffer_ptr, 0, 0, off)], off
             )

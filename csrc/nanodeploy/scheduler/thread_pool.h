@@ -15,7 +15,7 @@ namespace nanodeploy {
 class ThreadPool {
 public:
     explicit ThreadPool(size_t threads);
-    template <class F, class... Args>
+    template<class F, class... Args>
     auto enqueue(F&& f, Args&&... args) -> std::future<typename std::result_of<F(Args...)>::type>;
     ~ThreadPool();
 
@@ -26,13 +26,13 @@ private:
     std::queue<std::function<void()>> tasks;
 
     // synchronization
-    std::mutex               queue_mutex;
+    std::mutex              queue_mutex;
     std::condition_variable condition;
-    bool                     stop;
+    bool                    stop;
 };
 
 // the constructor just launches some amount of workers
-inline ThreadPool::ThreadPool(size_t threads) : stop(false)
+inline ThreadPool::ThreadPool(size_t threads): stop(false)
 {
     for (size_t i = 0; i < threads; ++i)
         workers.emplace_back([this] {
@@ -54,13 +54,13 @@ inline ThreadPool::ThreadPool(size_t threads) : stop(false)
 }
 
 // add new work item to the pool
-template <class F, class... Args>
+template<class F, class... Args>
 auto ThreadPool::enqueue(F&& f, Args&&... args) -> std::future<typename std::result_of<F(Args...)>::type>
 {
     using return_type = typename std::result_of<F(Args...)>::type;
 
-    auto task = std::make_shared<std::packaged_task<return_type()>>(
-        std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+    auto task =
+        std::make_shared<std::packaged_task<return_type()>>(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
 
     std::future<return_type> res = task->get_future();
     {

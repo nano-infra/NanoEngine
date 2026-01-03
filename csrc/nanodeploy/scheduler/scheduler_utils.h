@@ -1,11 +1,14 @@
 #pragma once
-#include "sequence.h"
-#include "sp_state_manager.h"
-#include "thread_pool.h"
+
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "nanodeploy/sequence/sequence.h"
+
+#include "sp_state_manager.h"
+#include "thread_pool.h"
 
 namespace nanodeploy {
 

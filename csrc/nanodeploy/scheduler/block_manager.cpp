@@ -1,9 +1,11 @@
-#include "block_manager.h"
-#include "sequence.h"
-#include "xxhash.hpp"
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
+
+#include "nanodeploy/sequence/sequence.h"
+#include "xxhash.hpp"
+
+#include "block_manager.h"
 
 namespace nanodeploy {
 

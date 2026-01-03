@@ -1,12 +1,15 @@
 #pragma once
-#include "block_manager.h"
-#include "sequence.h"
+
 #include <deque>
 #include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "nanodeploy/sequence/sequence.h"
+
+#include "block_manager.h"
 
 namespace nanodeploy {
 
@@ -18,7 +21,7 @@ enum class RoutingStrategy {
 
 class SPStateManager {
 public:
-    static constexpr int segment_size = 1024;
+    static constexpr int segment_size = 65536;
 
     SPStateManager(const std::string& engine_id,
                    int                attention_sp,
@@ -146,6 +149,8 @@ private:
     int         attention_sp_;
     int         max_num_seqs_;
     int         max_num_batched_tokens_;
+
+    int kvcache_block_size_;
 
     int              sp_rr_counter_      = 0;
     int              num_running_seqs_   = 0;

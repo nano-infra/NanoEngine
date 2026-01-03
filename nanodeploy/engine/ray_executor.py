@@ -233,7 +233,7 @@ class RayExecutor:
                 getattr(worker, "run").remote([], is_prefill, True)
                 for _, worker in zip(dp_seqs, self.workers)
             ]
-            self.endpoint.send_seqs(dp_seqs)
+            self.endpoint.send_seqs(dp_seqs, is_prefill)
         else:
             # When not using dlslime RPC, pass sequences directly to workers.
             ray_futures = [

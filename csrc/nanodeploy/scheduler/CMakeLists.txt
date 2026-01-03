@@ -1,25 +1,23 @@
 set(CPP_SOURCES
-    sequence.cpp
     block.cpp
     block_manager.cpp
     sp_state_manager.cpp
     scheduler_utils.cpp
     scheduler.cpp
-    model_runner_utils.cpp
 )
 
 add_library(
-    _nanodeploy_engine
+    _nanodeploy_scheduler
     SHARED
     ${CPP_SOURCES}
 )
 
-target_compile_options(_nanodeploy_engine PRIVATE -O3 -Wall -Wextra)
+target_compile_options(_nanodeploy_scheduler PRIVATE -O3 -Wall -Wextra)
 
-target_link_libraries(_nanodeploy_engine PRIVATE _nanodeploy_metrics)
+target_link_libraries(_nanodeploy_scheduler PRIVATE _nanodeploy_metrics _nanodeploy_sequence)
 
 set_target_properties(
-    _nanodeploy_engine
+    _nanodeploy_scheduler
     PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "\${ORIGIN}"
@@ -27,6 +25,6 @@ set_target_properties(
 
 install(
     TARGETS
-    _nanodeploy_engine
+    _nanodeploy_scheduler
     LIBRARY DESTINATION ${NANODEPLOY_INSTALL_PATH}
 )

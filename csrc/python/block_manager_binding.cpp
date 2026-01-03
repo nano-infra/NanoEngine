@@ -1,8 +1,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "nanodeploy/engine/block_manager.h"
-#include "nanodeploy/engine/sequence.h"
+#include "nanodeploy/scheduler/block_manager.h"
+#include "nanodeploy/sequence/sequence.h"
 
 namespace py = pybind11;
 using namespace nanodeploy;
