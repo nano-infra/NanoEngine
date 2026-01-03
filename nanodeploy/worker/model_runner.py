@@ -568,8 +568,8 @@ class ModelRunner:
             if hf_config.num_key_value_heads == 1:
                 graph_vars["tile_scheduler_metadata"].zero_()
                 graph_vars["num_splits"].zero_()
-                graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
-                graph_vars["num_splits"][:context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
+                # graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
+                # graph_vars["num_splits"][:context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
 
 
             graph_vars["context_lens_for_attn"].zero_()
