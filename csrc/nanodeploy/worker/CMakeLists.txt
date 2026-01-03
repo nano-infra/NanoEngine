@@ -1,4 +1,5 @@
 set(CPP_SOURCES
+    dummy_runner.cpp
     model_runner_utils.cpp
 )
 

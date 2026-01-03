@@ -44,6 +44,10 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/nanodeploy-project/nano-deploy"
 
+[project.scripts]
+nanodeploy_agent = "nanodeploy.cli:agent_entry"
+nanodeploy_hub = "nanodeploy.cli:hub_entry"
+
 [tool.scikit-build]
 # optional env variable:
 # BUILD_TORCH_PLUGIN: OFF

@@ -51,14 +51,14 @@ public:
     int num_waiting_migration_requests = 0;
     int num_completed_requests         = 0;
 
-    int num_waiting_head_blocks        = 0;
-    int num_waiting_total_blocks       = 0;
+    int num_waiting_head_blocks  = 0;
+    int num_waiting_total_blocks = 0;
 
     std::vector<double>                prefill_throughput_samples;
     std::vector<double>                decode_throughput_samples;
-    std::unordered_map<int, long long> token_usage_by_dp; // dp_idx -> count
-    std::unordered_map<int, long long> sp_send_request_counts; // sp_idx -> count
-    std::unordered_map<int, long long> sp_recv_request_counts; // sp_idx -> count
+    std::unordered_map<int, long long> token_usage_by_dp;       // dp_idx -> count
+    std::unordered_map<int, long long> sp_send_request_counts;  // sp_idx -> count
+    std::unordered_map<int, long long> sp_recv_request_counts;  // sp_idx -> count
 
     double start_time;
 
