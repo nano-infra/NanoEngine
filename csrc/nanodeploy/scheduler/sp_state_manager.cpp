@@ -85,125 +85,187 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
                                   const std::unordered_map<int, int>& num_batched_tokens)
 {
     // ==========================================
-    // Step 1: Determine SP Size (Number of Ranks)
+    // Step 1: Determine required number of ranks (SP Size)
     // ==========================================
-    // Use segment logic to calculate minimum ranks needed to minimize communication overhead.
-    int num_tokens   = seq.num_tokens;
+    int num_tokens = seq.num_tokens;
     int num_segments = (num_tokens + segment_size - 1) / segment_size;
-
+    
+    // Simplified SP Size calculation
     int num_ranks_needed = std::max(1, std::min(attention_sp_, num_segments));
 
     // ==========================================
-    // Step 2: Get Current Load Info for All Ranks
+    // Step 2: Gather load info for all ranks
     // ==========================================
-    struct RankLoadInfo {
-        int       id;
-        long long current_tokens;  // KV Cache load
-        int       current_seqs;    // Master load
+    struct RankStatus {
+        int id;
+        long long current_kv_load; // Occupied tokens (for load balancing)
+        int current_batch_load;    // Current batch size (for selection)
+        int free_blocks;           // Available physical blocks (for capacity check)
     };
-    std::vector<RankLoadInfo> all_ranks;
+
+    std::vector<RankStatus> all_ranks;
     all_ranks.reserve(attention_sp_);
 
     for (int i = 0; i < attention_sp_; ++i) {
-        // 1. Calculate Token load: running + scheduled (in queue)
+        // 1. KV Load (Running + Pending)
         long long tokens = num_running_tokens_per_sp_[i];
-        if (num_batched_tokens.count(i)) {
-            tokens += num_batched_tokens.at(i);
-        }
-
-        // 2. Calculate Sequence load: running + scheduled (in queue)
+        if (num_batched_tokens.count(i)) tokens += num_batched_tokens.at(i);
+        
+        // 2. Batch Load (Running + Pending)
         int seqs = num_running_seqs_per_sp_[i];
-        if (num_seqs.count(i)) {
-            seqs += num_seqs.at(i);
+        if (num_seqs.count(i)) seqs += num_seqs.at(i);
+        
+        // 3. Physical capacity (critical for feasibility)
+        int free_blks = block_manager[i]->num_free_blocks();
+        
+        all_ranks.push_back({i, tokens, seqs, free_blks});
+    }
+
+    // ==========================================
+    // Step 3: Candidate selection (batch-size-first strategy)
+    // ==========================================
+    // Sort by batch size (ascending), then by free memory (descending)
+    std::sort(all_ranks.begin(), all_ranks.end(), 
+              [](const RankStatus& a, const RankStatus& b) {
+                  if (a.current_batch_load != b.current_batch_load) {
+                      return a.current_batch_load < b.current_batch_load;
+                  }
+                  return a.free_blocks > b.free_blocks;
+              });
+
+    // Select top K least-loaded ranks
+    std::vector<RankStatus> participants;
+    std::vector<RankStatus> candidates_pool; // Backup pool
+    
+    participants.reserve(num_ranks_needed);
+    candidates_pool.reserve(attention_sp_ - num_ranks_needed);
+
+    long long total_free_blocks_capacity = 0;
+    int needed_blocks = (num_tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
+
+    for(int i = 0; i < attention_sp_; ++i) {
+        if (i < num_ranks_needed) {
+            participants.push_back(all_ranks[i]);
+            total_free_blocks_capacity += all_ranks[i].free_blocks;
+        } else {
+            candidates_pool.push_back(all_ranks[i]);
+        }
+    }
+
+    // ==========================================
+    // Step 4: Capacity check and adjustment
+    // ==========================================
+    // If selected ranks lack memory, swap with richer candidates
+    
+    // Sort pool by free memory (descending)
+    auto sort_pool_by_mem_desc = [](const RankStatus& a, const RankStatus& b) {
+        return a.free_blocks > b.free_blocks;
+    };
+    std::sort(candidates_pool.begin(), candidates_pool.end(), sort_pool_by_mem_desc);
+
+    while (total_free_blocks_capacity < needed_blocks) {
+        if (candidates_pool.empty()) {
+            // Insufficient total memory or no candidates left
+            return false;
         }
 
-        all_ranks.push_back({i, tokens, seqs});
+        // Swap poorest participant with richest candidate
+        auto min_mem_it = std::min_element(participants.begin(), participants.end(), 
+            [](const RankStatus& a, const RankStatus& b) {
+                return a.free_blocks < b.free_blocks;
+            });
+        
+        const auto& rich_candidate = candidates_pool.front();
+
+        // If richest candidate isn't richer, swapping won't help
+        if (rich_candidate.free_blocks <= min_mem_it->free_blocks) {
+            return false;
+        }
+
+        // Perform swap
+        total_free_blocks_capacity -= min_mem_it->free_blocks;
+        total_free_blocks_capacity += rich_candidate.free_blocks;
+
+        *min_mem_it = rich_candidate; // Replace
+        
+        candidates_pool.erase(candidates_pool.begin()); 
     }
 
     // ==========================================
-    // Step 3: Select Participants (Prioritize KV Cache)
-    // ==========================================
-    // Sort by token load ascending; pick emptiest ranks first.
-    std::sort(all_ranks.begin(), all_ranks.end(), [](const RankLoadInfo& a, const RankLoadInfo& b) {
-        return a.current_tokens < b.current_tokens;
-    });
-
-    // Select top K ranks as participants.
-    std::vector<RankLoadInfo> participants;
-    participants.reserve(num_ranks_needed);
-    for (int i = 0; i < num_ranks_needed; ++i) {
-        participants.push_back(all_ranks[i]);
-    }
-
-    // ==========================================
-    // Step 4: Distribute Tokens (Water-Filling Algorithm)
+    // Step 5: Load balancing within final K ranks
     // ==========================================
     auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
     block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
 
-    std::vector<long long> simulated_loads;
-    for (const auto& p : participants) {
-        simulated_loads.push_back(p.current_tokens);
+    // Prepare load simulation data
+    std::vector<long long> simulated_kv_loads;
+    for(const auto& p : participants) {
+        simulated_kv_loads.push_back(p.current_kv_load);
     }
     std::vector<int> alloc_counts(participants.size(), 0);
-
+    
     int tokens_remaining = num_tokens;
-
-    // Use kvcache_block_size_ as unit to avoid fragmented blocks and wasted memory.
-    const int CHUNK_SIZE = kvcache_block_size_;
+    const int CHUNK_SIZE = kvcache_block_size_; 
 
     while (tokens_remaining > 0) {
-        // 1. Find rank with lowest simulated load.
-        auto min_it = std::min_element(simulated_loads.begin(), simulated_loads.end());
-        int  idx    = std::distance(simulated_loads.begin(), min_it);
+        // Find rank with lowest simulated load
+        auto min_it = std::min_element(simulated_kv_loads.begin(), simulated_kv_loads.end());
+        int idx = std::distance(simulated_kv_loads.begin(), min_it);
+        
+        // Attempt allocation
+        int attempt_alloc = std::min(CHUNK_SIZE, tokens_remaining);
+        
+        // Check per-rank physical capacity
+        int rank_capacity_tokens = participants[idx].free_blocks * kvcache_block_size_;
+        if (alloc_counts[idx] + attempt_alloc > rank_capacity_tokens) {
+            // This rank is full, exclude from further allocation
+            *min_it = std::numeric_limits<long long>::max();
+            
+            // Check if all ranks are full
+            bool all_full = true;
+            for(auto val : simulated_kv_loads) {
+                if (val != std::numeric_limits<long long>::max()) {
+                    all_full = false; 
+                    break;
+                }
+            }
+            if (all_full) return false; // Should not happen after Step 4
+            continue;
+        }
 
-        // 2. Allocate chunk (or remaining tokens).
-        int current_alloc = std::min(CHUNK_SIZE, tokens_remaining);
-
-        simulated_loads[idx] += current_alloc;
-        alloc_counts[idx] += current_alloc;
-        tokens_remaining -= current_alloc;
+        simulated_kv_loads[idx] += attempt_alloc;
+        alloc_counts[idx]       += attempt_alloc;
+        tokens_remaining        -= attempt_alloc;
     }
 
-    // Apply allocation results to block_ctx.
+    // Store results
     for (size_t i = 0; i < participants.size(); ++i) {
-        int rank_id                              = participants[i].id;
+        int rank_id = participants[i].id;
         block_ctx.num_dispatched_tokens[rank_id] = alloc_counts[i];
     }
 
     // ==========================================
-    // Step 5: Select Master (Load Balancing)
+    // Step 6: Select master rank
     // ==========================================
-    // Choose participant with fewest sequences as Master.
-    auto min_seq_it =
-        std::min_element(participants.begin(), participants.end(), [](const RankLoadInfo& a, const RankLoadInfo& b) {
-            return a.current_seqs < b.current_seqs;
+    // Choose rank with smallest batch load among participants
+    auto min_batch_it = std::min_element(participants.begin(), participants.end(),
+        [](const RankStatus& a, const RankStatus& b) {
+            return a.current_batch_load < b.current_batch_load;
         });
-
-    int master_rank          = min_seq_it->id;
+        
+    int master_rank = min_batch_it->id;
     block_ctx.master_sp_idx_ = master_rank;
 
     // ==========================================
-    // Step 6: Resource and Physical Memory Checks
+    // Step 7: Final physical checks
     // ==========================================
+    // 1. Master sequence limit
+    if (min_batch_it->current_batch_load + 1 > max_num_seqs_) return false;
 
-    // 1. Check Master's Max Seqs limit using estimated load.
-    if (min_seq_it->current_seqs + 1 > max_num_seqs_) {
-        return false;
-    }
-
-    // 2. Check Master's Max Batched Tokens limit.
-    long long master_pending_tokens = num_batched_tokens.count(master_rank) ? num_batched_tokens.at(master_rank) : 0;
-    // Maintain original logic: throttle if Master is overloaded, even if tokens are distributed.
-    if (master_pending_tokens + seq.num_tokens >= max_num_batched_tokens_) {
-        return false;
-    }
-
-    // 3. Check physical memory (BlockManager) for all participants.
-    // Crucial: validates logical calculation against actual free blocks.
+    // 2. Physical block allocation check
     for (size_t i = 0; i < participants.size(); ++i) {
         int rank_id = participants[i].id;
-        // BlockManager checks based on num_dispatched_tokens set above.
+        // BlockManager performs final verification
         if (!block_manager[rank_id]->can_allocate(seq)) {
             return false;
         }
