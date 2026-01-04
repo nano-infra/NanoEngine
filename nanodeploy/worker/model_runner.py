@@ -346,8 +346,6 @@ class ModelRunner:
                 meta.block_tables_flat, dtype=torch.int32, pin_memory=True
             ).reshape(-1, meta.max_num_blocks).cuda(non_blocking=True)
 
-        logger.info(f"ModelRunner block_tables.shape: {block_tables.shape}")
-
         q_mask = global_context_lens.clone()
         q_mask[sp_rank].fill_(0)
         q_mask[q_mask != 0] = 1

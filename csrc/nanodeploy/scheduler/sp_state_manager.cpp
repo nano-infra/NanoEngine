@@ -14,14 +14,17 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                int                num_kvcache_blocks,
                                int                kvcache_block_size,
                                int                max_num_seqs,
-                               int                max_num_batched_tokens):
+                               int                max_num_batched_tokens,
+                               int                max_num_recv_seqs):
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
     max_num_batched_tokens_(max_num_batched_tokens),
+    max_num_recv_seqs_(max_num_recv_seqs),
     kvcache_block_size_(kvcache_block_size),
     num_running_seqs_per_sp_(attention_sp, 0),
-    num_running_tokens_per_sp_(attention_sp, 0)
+    num_running_tokens_per_sp_(attention_sp, 0),
+    num_recv_seqs_per_sp_(attention_sp, 0)
 {
     for (int i = 0; i < attention_sp; ++i) {
         block_manager[i] = std::make_shared<BlockManager>(engine_id, i, num_kvcache_blocks, kvcache_block_size);
@@ -223,27 +226,57 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             continue; // Try larger SP Size
         }
 
-        // Step 6 & 7: Success - write results and return
-        
-        // 1. Fill dispatch results
+        // Step 6: Fill dispatch results
         for (size_t i = 0; i < participants.size(); ++i) {
             int rank_id = participants[i].id;
             block_ctx.num_dispatched_tokens[rank_id] = alloc_counts[i];
         }
 
-        // 2. Select master (least loaded)
-        auto min_batch_it = std::min_element(participants.begin(), participants.end(),
+        // Step 7: Select Master with RECV Constraints
+        // 必须从 participants 中选一个 Master，满足：
+        // 1. Master 自己的 Batch 没满
+        // 2. 其他所有 Participant 的 Recv 队列没满
+        
+        std::vector<RankStatus> eligible_masters;
+        
+        for (const auto& candidate_m : participants) {
+            // 约束 1: 候选 Master 负载检查
+            if (candidate_m.current_batch_load + 1 > max_num_seqs_) {
+                continue;
+            }
+
+            // 约束 2: 其他参与者能否作为 Receiver
+            bool others_ok = true;
+            for (const auto& p : participants) {
+                if (p.id == candidate_m.id) continue; // 跳过 Master 自己
+                
+                // 检查 p 是否能再接一个 Recv 请求
+                if (num_recv_seqs_per_sp_[p.id] >= max_num_recv_seqs_) {
+                    others_ok = false;
+                    break;
+                }
+            }
+
+            if (others_ok) {
+                eligible_masters.push_back(candidate_m);
+            }
+        }
+
+        if (eligible_masters.empty()) {
+            // 这组 SP Size 下找不到合法的 Master，尝试更大的 SP Size
+            continue; 
+        }
+
+        // 从合法的 Master 中选负载最小的
+        auto best_master_it = std::min_element(eligible_masters.begin(), eligible_masters.end(),
             [](const RankStatus& a, const RankStatus& b) {
                 return a.current_batch_load < b.current_batch_load;
             });
-        int master_rank = min_batch_it->id;
+        
+        int master_rank = best_master_it->id;
         block_ctx.master_sp_idx_ = master_rank;
 
-        // 3. Final physical check
-        if (min_batch_it->current_batch_load + 1 > max_num_seqs_) {
-            continue; // Max seq limit reached, try larger SP Size
-        }
-        
+        // Final physical check
         bool physical_check_ok = true;
         for (size_t i = 0; i < participants.size(); ++i) {
             int rank_id = participants[i].id;
@@ -271,6 +304,14 @@ void SPStateManager::allocate(Sequence& seq)
     int   master_sp_idx = block_ctx.master_sp_idx_;
 
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        // [修改] 更新 Recv 计数
+        // 只有确实分到了 token 且不是 Master 的才算 Receiver
+        if (block_ctx.num_dispatched_tokens[sp_idx] > 0) {
+            if (sp_idx != master_sp_idx) {
+                 num_recv_seqs_per_sp_[sp_idx]++;
+            }
+        }
+
         if (sp_idx != master_sp_idx) {
             block_manager[sp_idx]->allocate(seq);
         }
@@ -285,12 +326,22 @@ void SPStateManager::allocate(Sequence& seq)
 
 void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
 {
+    auto& block_ctx     = seq.block_ctx(slot);
+    int   master_sp_idx = block_ctx.master_sp_idx_;
+
+    // [修改] 在清理 block_ctx 之前，先减少 Recv 计数
+    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        if (block_ctx.num_dispatched_tokens[sp_idx] > 0) {
+            if (sp_idx != master_sp_idx) {
+                num_recv_seqs_per_sp_[sp_idx]--;
+            }
+        }
+    }
+
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
         block_manager[sp_idx]->deallocate(seq, slot);
     }
 
-    auto& block_ctx     = seq.block_ctx(BlockContextSlot::ACTIVE);
-    int   master_sp_idx = block_ctx.master_sp_idx_;
     block_ctx.sp_block_table.clear();
     block_ctx.block_location.clear();
     std::fill(block_ctx.num_dispatched_tokens.begin(), block_ctx.num_dispatched_tokens.end(), 0);

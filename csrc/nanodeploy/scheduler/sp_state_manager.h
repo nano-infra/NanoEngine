@@ -28,7 +28,8 @@ public:
                    int                num_kvcache_blocks,
                    int                kvcache_block_size,
                    int                max_num_seqs,
-                   int                max_num_batched_tokens);
+                   int                max_num_batched_tokens,
+                   int                max_num_recv_seqs);
 
     // State queries
     bool is_empty() const
@@ -109,6 +110,8 @@ public:
         return num_running_tokens_per_sp_[sp_idx];
     }
 
+    int num_recv_seqs_per_sp(int sp_idx) const { return num_recv_seqs_per_sp_[sp_idx]; }
+
     // WARNING: This method modifies shared state without thread safety protection.
     // If called concurrently from multiple threads (e.g., in worker_func),
     // this will cause race conditions on the counters.
@@ -149,6 +152,7 @@ private:
     int         attention_sp_;
     int         max_num_seqs_;
     int         max_num_batched_tokens_;
+    int         max_num_recv_seqs_;
 
     int kvcache_block_size_;
 
@@ -157,6 +161,7 @@ private:
     int              num_running_tokens_ = 0;
     std::vector<int> num_running_seqs_per_sp_;
     std::vector<int> num_running_tokens_per_sp_;
+    std::vector<int> num_recv_seqs_per_sp_;
 };
 
 }  // namespace nanodeploy

@@ -15,6 +15,7 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                loop_count,
                      int                max_num_seqs,
                      int                max_num_batched_tokens,
+                     int                max_num_recv_seqs,
                      int                eos,
                      int                attention_dp,
                      int                attention_sp,
@@ -25,18 +26,19 @@ Scheduler::Scheduler(const std::string& engine_id,
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
     max_num_batched_tokens_(max_num_batched_tokens),
+    max_num_recv_seqs_(max_num_recv_seqs),
     eos_(eos),
     attention_dp_(attention_dp),
     attention_sp_(attention_sp),
     mode_(mode)
 {
-    // Initialize worker states for each DP rank
+    // Initialize worker states
     worker_state.reserve(attention_dp_);
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
         worker_state.push_back(std::make_shared<SPStateManager>(
-            engine_id_, attention_sp_, num_kvcache_blocks, kvcache_block_size, max_num_seqs_, max_num_batched_tokens_));
+            engine_id_, attention_sp_, num_kvcache_blocks, kvcache_block_size, 
+            max_num_seqs_, max_num_batched_tokens_, max_num_recv_seqs_));
     }
-    // Initialize thread pool with attention_dp_ threads
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
 }
 

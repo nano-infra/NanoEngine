@@ -109,11 +109,12 @@ void bind_scheduler_utils(py::module_& m)
 
     // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
-        .def(py::init<const std::string&, int, int, int, int, int, int, int, int, const std::string&>(),
+        .def(py::init<const std::string&, int, int, int, int, int, int, int, int, int, const std::string&>(),
              py::arg("engine_id"),
              py::arg("loop_count"),
              py::arg("max_num_seqs"),
              py::arg("max_num_batched_tokens"),
+             py::arg("max_num_recv_seqs"),
              py::arg("eos"),
              py::arg("attention_dp"),
              py::arg("attention_sp"),
