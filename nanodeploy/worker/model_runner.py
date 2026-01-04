@@ -761,7 +761,10 @@ class ModelRunner:
             
             current_attn_bs_candidates = []
             curr = master_bs
-            limit = master_bs + config.max_num_recv_seqs
+            if sp_world_size == 1:
+                limit = master_bs
+            else:
+                limit = master_bs + config.max_num_recv_seqs
             while curr <= limit:
                 current_attn_bs_candidates.append(curr)
                 curr += self.attn_bs_step
