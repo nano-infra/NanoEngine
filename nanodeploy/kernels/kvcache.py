@@ -93,7 +93,6 @@ def store_kcache(
     D = num_heads * head_dim
 
     # Layout checks (your existing asserts)
-    print(f"MLA k_cache.shape: {k_cache.shape}, key.shape:{key.shape}",flush=True)
     assert key.stride(-1) == 1
     assert key.stride(1) == head_dim
     assert k_cache.stride(1) == D
