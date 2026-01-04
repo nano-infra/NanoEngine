@@ -8,6 +8,7 @@
 #include <vector>
 
 namespace nanodeploy {
+namespace core {
 
 struct WeightMapping {
     std::string internal_name;
@@ -51,4 +52,5 @@ public:
     }
 };
 
+}  // namespace core
 }  // namespace nanodeploy

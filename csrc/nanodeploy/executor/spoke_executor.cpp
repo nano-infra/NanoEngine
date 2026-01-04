@@ -1,4 +1,4 @@
-#include "spoke/actor.h"
+#include "spoke/csrc/actor.h"
 
 #include <memory>
 #include <string>

@@ -32,6 +32,7 @@ def agent_entry():
         sys.exit(1)
 
     # Exec the binary, replacing the current process
+    # Exec the binary, replacing the current process
     try:
         os.execv(str(bin_path), [str(bin_path)] + sys.argv[1:])
     except OSError as e:

@@ -8,13 +8,18 @@ add_library(nanodeploy_core STATIC
 target_include_directories(nanodeploy_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Link with third-party and core dependencies
+set_target_properties(nanodeploy_core PROPERTIES LINKER_LANGUAGE CXX)
+
+# Link with third-party and core dependencies
 target_link_libraries(nanodeploy_core PUBLIC
     flashinfer
     deep_gemm
     deep_ep
-    DLSlime::dlslime
+    dlslime::dlslime  # standardized alias
     Spoke::core
-    Torch::Torch
+    torch
+    torch_cpu
+    c10
 )
 
 add_subdirectory(sequence)

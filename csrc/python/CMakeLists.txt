@@ -15,7 +15,7 @@ pybind11_add_module(_nanodeploy_cpp
     ${BINDING_SOURCES}
 )
 
-target_link_libraries(_nanodeploy_cpp PRIVATE _nanodeploy_scheduler _nanodeploy_metrics _nanodeploy_sequence _nanodeploy_worker)
+target_link_libraries(_nanodeploy_cpp PRIVATE _nanodeploy_scheduler _nanodeploy_metrics _nanodeploy_sequence _nanodeploy_worker nanodeploy_core)
 
 set_target_properties(
     _nanodeploy_cpp

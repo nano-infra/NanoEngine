@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "nanodeploy/models/qwen3_moe.h"
 #include "nanodeploy/worker/model_runner_utils.h"
 
 namespace py = pybind11;
@@ -57,4 +58,8 @@ void bind_model_runner_utils(py::module_& m)
           py::arg("max_num_seqs"),
           py::arg("max_num_send_recv_seqs"));
     m.def("update_seqs_inner_loop", &update_seqs_inner_loop, py::arg("dp_seqs"), py::arg("sp_rank"));
+
+    // Compile check for Qwen3Moe
+    using QwenModelFP16 = models::Qwen3MoeForCausalLM<QuantType::FP16>;
+    py::class_<QwenModelFP16>(m, "Qwen3MoeForCausalLM_FP16").def(py::init<const core::ModelConfig&>());
 }

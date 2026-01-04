@@ -2,12 +2,14 @@
 
 #include <fstream>
 #include <map>
-#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "nanodeploy/json.hpp"
+
 namespace nanodeploy {
+namespace core {
 
 struct ModelConfig {
     std::string model_type;
@@ -24,6 +26,9 @@ struct ModelConfig {
     int  num_experts         = 0;
     int  num_experts_per_tok = 0;
     bool is_moe              = false;
+    int  decoder_sparse_step = 1;
+
+    float rope_theta = 10000.0f;
 
     // Quantization
     std::string quant_method = "none";  // "none", "fp8", "w8a8"
@@ -51,10 +56,14 @@ struct ModelConfig {
             config.num_experts         = j["num_experts"];
             config.num_experts_per_tok = j.value("num_experts_per_tok", 0);
             config.is_moe              = true;
+            config.decoder_sparse_step = j.value("decoder_sparse_step", 1);
         }
+
+        config.rope_theta = j.value("rope_theta", 10000.0f);
 
         return config;
     }
 };
 
+}  // namespace core
 }  // namespace nanodeploy

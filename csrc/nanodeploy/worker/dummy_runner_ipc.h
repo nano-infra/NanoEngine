@@ -4,7 +4,7 @@
 
 #include "nanodeploy/sequence/serialization.h"
 #include "nanodeploy/worker/dummy_runner.h"
-#include "spoke/serializer.h"
+#include "spoke/csrc/serializer.h"
 
 namespace nanodeploy {
 struct RunAllReduceReq {};

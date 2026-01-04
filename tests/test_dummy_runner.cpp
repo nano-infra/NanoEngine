@@ -9,7 +9,7 @@
 
 #include "nanodeploy/worker/dummy_runner.h"
 #include "nanodeploy/worker/dummy_runner_ipc.h"  // Includes serialization
-#include "spoke/client.h"
+#include "spoke/csrc/client.h"
 
 using namespace nanodeploy;
 

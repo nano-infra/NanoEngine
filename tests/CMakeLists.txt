@@ -1,6 +1,7 @@
 project(NanoDeployTests)
 
-find_package(Spoke REQUIRED)
+# Spoke is already linked via third_party/Spoke submodule
+# find_package(Spoke REQUIRED)
 find_package(Torch REQUIRED)
 
 add_executable(test_dummy_runner test_dummy_runner.cpp)
@@ -19,5 +20,6 @@ target_link_libraries(test_dummy_runner
 # Include directories for nanodeploy headers (e.g. for serialization, sequence)
 target_include_directories(test_dummy_runner
     PRIVATE
-    ${CMAKE_SOURCE_DIR}/../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
 )
