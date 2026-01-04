@@ -7,6 +7,8 @@ import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 
 from nanodeploy.config import Config
+
+from nanodeploy.endpoint.rpc_endpoint import RPCServerEndpoint
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.model_runner import ModelRunner
@@ -162,6 +164,8 @@ class RayExecutor:
                 worker = ModelRunner.options(placement_group=pg).remote(config, rank)
                 self.workers.append(worker)
 
+        self.endpoint = RPCServerEndpoint(32_000_000, self.config.attn_world_size)
+
         logger.info("All workers scheduled successfully.")
 
     def __del__(self):
@@ -222,13 +226,31 @@ class RayExecutor:
         is_prefill: bool,
         timeout: float | None = None,
     ) -> list[list[list[int]]]:
-        return ray.get(
-            [
-                getattr(worker, "run").remote(seqs, is_prefill)
+
+        if self.config.use_dlslime_rpc:
+            # When using dlslime RPC, sequences are delivered via the endpoint.
+            ray_futures = [
+                getattr(worker, "run").remote([], is_prefill, True)
+                for _, worker in zip(dp_seqs, self.workers)
+            ]
+            self.endpoint.send_seqs(dp_seqs, is_prefill)
+        else:
+            # When not using dlslime RPC, pass sequences directly to workers.
+            ray_futures = [
+                getattr(worker, "run").remote(seqs, is_prefill, False)
                 for seqs, worker in zip(dp_seqs, self.workers)
-            ],
+            ]
+        return ray.get(
+            ray_futures,
             timeout=timeout,
         )
+
+    def init_rpc_endpoint(self):
+        info = self.endpoint.init_server_endpoint()
+        client_info = self.collective_rpc("init_rpc_endpoint", (info,))
+        self.endpoint.connect(client_info)
+        logger.info("Server endpoint initialized")
+        return 0
 
     def update_kvcache_blocks(self):
         num_cache_blocks = min(self.collective_rpc("num_kvcache_blocks"))

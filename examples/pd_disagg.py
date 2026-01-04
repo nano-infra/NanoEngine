@@ -2,7 +2,6 @@ import os
 
 from nanodeploy import LLM, SamplingParams
 from nanodeploy.engine.sequence import Sequence
-
 from transformers import AutoTokenizer
 
 
@@ -24,7 +23,7 @@ def main():
         master_address="10.102.97.179:6006",
         ray_address="10.102.97.179:7078",
         dummy_prefill=False,
-        max_num_seqs=2,
+        max_num_seqs=128,
         gpu_memory_utilization=0.5,
         max_model_len=4096,
         max_num_batched_tokens=4096,
