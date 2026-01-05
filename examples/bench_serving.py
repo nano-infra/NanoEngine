@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager mode.")
     parser.add_argument("--dataset", type=str, default="random", choices=["random", "csv"], help="Dataset type.")
     parser.add_argument("--csv-path", type=str, default=None, help="Path to CSV file.")
+    parser.add_argument("--itl-log-path", type=str, default="itl_samples.jsonl", help="Path to save ITL samples (JSONL).")
     
     # Distributed / Cluster arguments
     parser.add_argument("--master-address", type=str, default=None, help="Ray master address.")
@@ -230,7 +231,7 @@ def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requ
     return total_time, seq_map
 
 
-def calculate_and_print_metrics(total_time, seq_map, requests_sent):
+def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path=None):
     """Calculates and prints performance metrics."""
     completed_seqs = [s for s in seq_map.values() if s.metric and s.metric.completion_time]
     
@@ -328,6 +329,20 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent):
     print(f"  SLO Success: {slo_success}/{total_seqs}")
     print(f"  Goodput: {goodput:.2f}%")
     print("=" * 60 + "\n")
+    
+    if itl_log_path:
+        print(f"Logging ITL samples to {itl_log_path}...")
+        data = []
+        for s in completed_seqs:
+            if s.metric and s.metric.itl_samples:
+                data.append({"seq_id": s.seq_id, "itl_samples": s.metric.itl_samples})
+        
+        if data:
+            df = pd.DataFrame(data)
+            df.to_json(itl_log_path, orient="records", lines=True)
+            print(f"Saved {len(df)} ITL samples to {itl_log_path}.")
+        else:
+            print("No ITL samples to log.")
 
 
 def main():
@@ -375,7 +390,7 @@ def main():
     total_time, seq_map = run_benchmark(engine, prompts, sampling_params_list, arrival_times, args.num_requests)
 
     # Report
-    calculate_and_print_metrics(total_time, seq_map, args.num_requests)
+    calculate_and_print_metrics(total_time, seq_map, args.num_requests, itl_log_path=args.itl_log_path)
 
 
 if __name__ == "__main__":
