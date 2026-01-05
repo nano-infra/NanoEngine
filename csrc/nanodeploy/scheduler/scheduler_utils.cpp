@@ -60,7 +60,8 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
             // Check if this is the first token for this sequence
             if (seq_tokens_this_step.find(seq) == seq_tokens_this_step.end()) {
                 seq_tokens_this_step[seq] = 0;
-                seq_is_first_token[seq] = (seq->metric && seq->metric->num_generated_tokens == 0);
+                seq_is_first_token[seq] = (seq->metric && (seq->metric->num_generated_tokens == 0 ||
+                                                           !seq->metric->first_token_time.has_value()));
             }
 
             for (int token_id : *task.tokens) {

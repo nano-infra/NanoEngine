@@ -492,9 +492,21 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
 void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
 {
     std::cerr << "Preemption happens for seq_id=" << seq->seq_id << std::endl;
+
+    // Reset metrics for fresh start
+    if (seq->metric) {
+        seq->metric->on_preemption();
+    }
+
+    // Reset sequence to prompt-only state (discard generated tokens)
+    int prompt_len = seq->num_prompt_tokens;
+    seq->token_ids.resize(prompt_len);
+    seq->num_tokens = prompt_len;
+    seq->num_checkpointed_tokens = prompt_len;
+    seq->last_token = seq->token_ids.empty() ? 0 : seq->token_ids.back();
+
     seq->status = SequenceStatus::WAITING;
     worker_state[dp_idx]->deallocate(*seq);
-    seq->num_checkpointed_tokens = static_cast<int>(seq->token_ids.size());
     waiting.push_front(seq);
 }
 

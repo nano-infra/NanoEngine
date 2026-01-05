@@ -22,6 +22,7 @@ public:
     void record_token();
     void record_step_tokens(int num_tokens, double step_itl_ms);
     void record_completion();
+    void on_preemption();
 
     std::optional<double> ttft() const;
     std::optional<double> e2e_latency() const;

@@ -86,6 +86,23 @@ void SequenceMetric::record_completion()
     completion_time = current_time();
 }
 
+void SequenceMetric::on_preemption()
+{
+    // Clear ITL history to avoid outliers across preemption gap
+    itl_samples.clear();
+
+    // Reset scheduling timers so they can be re-recorded upon re-scheduling
+    first_scheduled_time  = std::nullopt;
+    decode_scheduled_time = std::nullopt;
+
+    // Reset token timers to strictly measure performance of the new run
+    first_token_time = std::nullopt;
+    last_token_time  = std::nullopt;
+
+    // Reset generated token count for the new run
+    num_generated_tokens = 0;
+}
+
 std::optional<double> SequenceMetric::ttft() const
 {
     if (!first_token_time.has_value() || !arrival_time.has_value()) {
