@@ -11,7 +11,7 @@ add_executable(nanodeploy_agent ${CPP_SOURCES})
 
 
 # Link Torch to nanodeploy_agent
-target_link_libraries(nanodeploy_agent PUBLIC _nanodeploy_sequence torch torch_cpu c10 Spoke::daemon ${TORCH_LIBRARIES})
+target_link_libraries(nanodeploy_agent PUBLIC _nanodeploy_worker _nanodeploy_sequence torch torch_cpu c10 Spoke::daemon ${TORCH_LIBRARIES})
 
 # Set RPATH so it can find lib_nanodeploy_sequence.so in the parent directory relative to bin/
 # Also find PyTorch library path to fix MKL loading issues
@@ -31,7 +31,7 @@ endif()
 
 set_target_properties(nanodeploy_agent PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
-     "\${ORIGIN}/..:${_torch_rpath}"
+    INSTALL_RPATH "\${ORIGIN}/..:${_torch_rpath}"
 )
 
 # Determine installation directory for tools (User requested python bin)

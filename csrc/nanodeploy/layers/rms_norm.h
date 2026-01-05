@@ -12,7 +12,7 @@ public:
         weight = register_parameter("weight", torch::ones({hidden_size}));
     }
 
-    torch::Tensor forward(torch::Tensor hidden_states, torch::Tensor residual = {})
+    torch::Tensor forward(torch::Tensor hidden_states, torch::Tensor /*residual*/ = {})
     {
         // Pytorch Reference:
         // input_dtype = hidden_states.dtype
@@ -28,7 +28,7 @@ public:
         return (weight * x).to(input_dtype);
     }
 
-private:
+public:
     double        eps_;
     torch::Tensor weight;
 };

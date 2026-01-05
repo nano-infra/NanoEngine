@@ -6,6 +6,8 @@
 #include "nanodeploy/logging.h"
 #include "nanodeploy/worker/dummy_runner.h"
 #include "nanodeploy/worker/dummy_runner_ipc.h"
+#include "nanodeploy/worker/model_runner.h"
+#include "nanodeploy/worker/model_runner_ipc.h"
 
 using namespace nanodeploy;
 
@@ -44,5 +46,36 @@ private:
     nanodeploy::DummyRunner runner_;
 };
 
+// Define ModelRunner Actor
+class ModelRunnerActor: public spoke::Actor {
+public:
+    ModelRunnerActor(const std::string& id, int rx, int tx): spoke::Actor(id, rx, tx) {}
+
+    SPOKE_METHOD(ModelRunnerActor,
+                 init,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 10),
+                 nanodeploy::ModelInitReq,
+                 nanodeploy::ModelInitResp)
+    {
+        std::cout << "[Executor] Received Init Request. Calling runner_.init()..." << std::endl;
+        runner_.init(val.config_path, val.rank, val.world_size);
+        std::cout << "[Executor] runner_.init() returned. Sending response..." << std::endl;
+        return true;
+    }
+
+    SPOKE_METHOD(ModelRunnerActor,
+                 run,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 11),
+                 nanodeploy::ModelRunReq,
+                 nanodeploy::ModelRunResp)
+    {
+        return {runner_.run(val)};
+    }
+
+private:
+    nanodeploy::ModelRunner runner_;
+};
+
 // Register Actor Type
 SPOKE_REGISTER_ACTOR("DummyRunner", DummyRunnerActor)
+SPOKE_REGISTER_ACTOR("ModelRunner", ModelRunnerActor)

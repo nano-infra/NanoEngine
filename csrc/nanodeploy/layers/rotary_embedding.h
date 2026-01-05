@@ -14,7 +14,7 @@ public:
         _set_cos_sin_cache(max_position, torch::kFloat32, torch::kCPU);
     }
 
-    std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor positions, torch::Tensor q, torch::Tensor k)
+    std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor /*positions*/, torch::Tensor q, torch::Tensor k)
     {
         // q, k: [batch, seq, num_heads, head_dim]
         // positions: [batch, seq] (or [seq])

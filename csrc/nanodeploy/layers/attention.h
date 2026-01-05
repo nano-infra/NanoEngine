@@ -7,8 +7,12 @@ namespace layers {
 
 class Attention: public core::Module {
 public:
-    Attention(
-        int num_heads, int head_dim, float scaling, int num_kv_heads, int q_head_dim, const std::string& type = "GQA")
+    Attention(int   num_heads,
+              int   head_dim,
+              float scaling,
+              int   num_kv_heads,
+              int   q_head_dim,
+              const std::string& /*type*/ = "GQA")
     {
     }
 

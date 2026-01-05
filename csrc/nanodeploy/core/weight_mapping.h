@@ -2,10 +2,11 @@
 
 #include <fstream>
 #include <map>
-#include <nlohmann/json.hpp>
 #include <regex>
 #include <string>
 #include <vector>
+
+#include "nanodeploy/json.hpp"
 
 namespace nanodeploy {
 namespace core {

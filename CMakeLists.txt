@@ -14,7 +14,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(NANODEPLOY_INSTALL_PATH "nanodeploy" CACHE STRING "Python module installation directory")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(pybind11 CONFIG REQUIRED)
+# find_package(pybind11 CONFIG REQUIRED)
 find_package(Torch REQUIRED)
 
 # DLSlime and Spoke are now handled via third_party submodules

@@ -122,7 +122,7 @@ public:
         return o_proj_->forward(attn_output);
     }
 
-private:
+    // private:
     std::unique_ptr<layers::QKVParallelLinear<Q>> qkv_proj_;
     std::unique_ptr<layers::RowParallelLinear<Q>> o_proj_;
     std::unique_ptr<layers::RotaryEmbedding>      rotary_emb_;
@@ -162,10 +162,11 @@ public:
         return down_proj_->forward(act_out);
     }
 
-private:
+    // private:
     std::unique_ptr<layers::MergedColumnParallelLinear<Q>> gate_up_proj_;
     std::unique_ptr<layers::RowParallelLinear<Q>>          down_proj_;
     std::unique_ptr<layers::SiluAndMul>                    act_fn_;
+    std::unique_ptr<layers::RMSNorm> gate_up_norm_;  // Added placeholder if needed or just expose existing
 };
 
 // =========================================================================
@@ -174,7 +175,7 @@ private:
 template<QuantType Q>
 class Qwen3MoeSparseMoeBlock: public core::Module {
 public:
-    Qwen3MoeSparseMoeBlock(const core::ModelConfig& config): core::Module()
+    Qwen3MoeSparseMoeBlock(const core::ModelConfig& /*config*/): core::Module()
     {
         // DeepEP logic will go here
     }
@@ -184,7 +185,7 @@ public:
         return hidden_states;
     }
 
-private:
+    // private:
     // Gating
     std::unique_ptr<torch::nn::Linear> gate_;
 
@@ -221,13 +222,13 @@ public:
     }
 
     std::tuple<torch::Tensor, torch::Tensor>
-    forward(torch::Tensor positions, torch::Tensor hidden_states, torch::Tensor residual)
+    forward(torch::Tensor /*positions*/, torch::Tensor hidden_states, torch::Tensor residual)
     {
         // Forward logic
         return {hidden_states, residual};
     }
 
-private:
+    // private:
     std::unique_ptr<Qwen3MoeAttention<Q>> self_attn_;
     // Using Module* or Variant for MLP/MoE
     std::unique_ptr<core::Module> mlp_;
@@ -279,7 +280,7 @@ public:
         return hidden_states;
     }
 
-private:
+    // private:
     std::unique_ptr<layers::VocabParallelEmbedding>       embed_tokens_;
     std::vector<std::unique_ptr<Qwen3MoeDecoderLayer<Q>>> layers_;
     std::unique_ptr<layers::RMSNorm>                      norm_;
@@ -308,7 +309,7 @@ public:
         return hidden_states;
     }
 
-private:
+    // private:
     std::unique_ptr<Qwen3MoeModel<Q>>       model_;
     std::unique_ptr<layers::ParallelLMHead> lm_head_;
 };

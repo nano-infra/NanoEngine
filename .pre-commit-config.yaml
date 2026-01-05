@@ -36,6 +36,7 @@ repos:
       - id: clang-format
         args: ["--style=file"]
         files: \.(cpp|hpp|c|h|cu|cuh)$
+        exclude: '(?i).*(json).*'
 
   # - repo: https://github.com/myint/docformatter
   #   rev: v1.4

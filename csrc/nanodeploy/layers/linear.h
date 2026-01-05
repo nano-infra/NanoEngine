@@ -24,7 +24,7 @@ public:
         return torch::nn::functional::linear(input, weight, bias);
     }
 
-protected:
+    // protected:
     int           in_features_;
     int           out_features_;
     torch::Tensor weight;

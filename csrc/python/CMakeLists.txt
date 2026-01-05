@@ -11,6 +11,8 @@ set(BINDING_SOURCES
 )
 
 # ===== Build pybind11 module =====
+set(PYBIND11_FINDPYTHON ON)
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
 pybind11_add_module(_nanodeploy_cpp
     ${BINDING_SOURCES}
 )

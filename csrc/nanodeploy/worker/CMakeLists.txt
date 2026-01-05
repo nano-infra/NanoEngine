@@ -1,6 +1,7 @@
 set(CPP_SOURCES
     dummy_runner.cpp
     model_runner_utils.cpp
+    model_runner.cpp
 )
 
 add_library(
@@ -9,7 +10,14 @@ add_library(
     ${CPP_SOURCES}
 )
 
-target_link_libraries(_nanodeploy_worker PUBLIC _nanodeploy_sequence)
+target_link_libraries(_nanodeploy_worker
+    PUBLIC
+    _nanodeploy_sequence
+    nanodeploy_core
+    torch
+    torch_cpu
+    c10
+)
 
 target_compile_options(_nanodeploy_worker PRIVATE -O3 -Wall -Wextra)
 

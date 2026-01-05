@@ -17,7 +17,7 @@ public:
         return torch::nn::functional::embedding(input, weight);
     }
 
-protected:
+public:
     torch::Tensor weight;
 };
 
@@ -29,7 +29,17 @@ public:
 
 class ParallelLMHead: public core::Module {
 public:
-    ParallelLMHead(int vocab_size, int hidden_size) {}
+    ParallelLMHead(int vocab_size, int hidden_size)
+    {
+        weight = register_parameter("weight", torch::randn({vocab_size, hidden_size}));
+    }
+
+    torch::Tensor forward(torch::Tensor input)
+    {
+        return torch::nn::functional::linear(input, weight);
+    }
+
+    torch::Tensor weight;
 };
 
 }  // namespace layers

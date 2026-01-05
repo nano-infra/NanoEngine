@@ -23,3 +23,18 @@ target_include_directories(test_dummy_runner
     ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
 )
+
+add_executable(test_model_runner test_model_runner.cpp)
+target_link_libraries(test_model_runner
+    PRIVATE
+    Spoke::core
+    torch
+    torch_cpu
+    c10
+    _nanodeploy_sequence
+)
+target_include_directories(test_model_runner
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
+)

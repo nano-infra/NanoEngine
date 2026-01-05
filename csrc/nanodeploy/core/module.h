@@ -18,12 +18,12 @@ class Module {
 public:
     virtual ~Module() = default;
 
-    virtual std::vector<WeightSpec> weight_specs(const std::string& prefix) const
+    virtual std::vector<WeightSpec> weight_specs(const std::string& /*prefix*/) const
     {
         return {};
     }
 
-    virtual void set_weights(const std::map<std::string, torch::Tensor>& weights, const std::string& prefix)
+    virtual void set_weights(const std::map<std::string, torch::Tensor>& /*weights*/, const std::string& /*prefix*/)
     {
         // Default implementation does nothing or warns
     }
@@ -34,13 +34,13 @@ public:
     // BUT WAIT: Linear/RMSNorm are calling register_parameter. Where is that defined?
     // It must be in this class!
 
-    torch::Tensor register_parameter(const std::string& name, torch::Tensor tensor)
+    torch::Tensor register_parameter(const std::string& /*name*/, torch::Tensor tensor)
     {
         // Placeholder registry
         return tensor;
     }
 
-    torch::Tensor register_buffer(const std::string& name, torch::Tensor tensor)
+    torch::Tensor register_buffer(const std::string& /*name*/, torch::Tensor tensor)
     {
         return tensor;
     }
