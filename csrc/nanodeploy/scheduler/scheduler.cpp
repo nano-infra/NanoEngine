@@ -32,6 +32,7 @@ Scheduler::Scheduler(const std::string& engine_id,
     attention_sp_(attention_sp),
     mode_(mode)
 {
+    Sequence::block_size = kvcache_block_size;
     // Initialize worker states
     worker_state.reserve(attention_dp_);
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
