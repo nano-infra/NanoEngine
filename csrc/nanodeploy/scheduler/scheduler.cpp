@@ -35,9 +35,13 @@ Scheduler::Scheduler(const std::string& engine_id,
     // Initialize worker states
     worker_state.reserve(attention_dp_);
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-        worker_state.push_back(std::make_shared<SPStateManager>(
+        auto sp_manager = std::make_shared<SPStateManager>(
             engine_id_, attention_sp_, num_kvcache_blocks, kvcache_block_size, 
-            max_num_seqs_, max_num_batched_tokens_, max_num_recv_seqs_));
+            max_num_seqs_, max_num_batched_tokens_, max_num_recv_seqs_);
+        
+        sp_manager->set_dp_idx(dp_idx);
+        
+        worker_state.push_back(sp_manager);
     }
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
 }

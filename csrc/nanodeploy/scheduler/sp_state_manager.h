@@ -31,6 +31,8 @@ public:
                    int                max_num_batched_tokens,
                    int                max_num_recv_seqs);
 
+    void set_dp_idx(int dp_idx) { dp_idx_ = dp_idx; }
+
     // State queries
     bool is_empty() const
     {
@@ -149,6 +151,7 @@ private:
     int  next_sp_idx();  // Round-robin counter
 
     std::string engine_id_;
+    int         dp_idx_ = -1;
     int         attention_sp_;
     int         max_num_seqs_;
     int         max_num_batched_tokens_;
