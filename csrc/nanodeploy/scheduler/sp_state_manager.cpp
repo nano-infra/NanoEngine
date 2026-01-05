@@ -22,8 +22,6 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     max_num_batched_tokens_(max_num_batched_tokens),
     max_num_recv_seqs_(max_num_recv_seqs),
     kvcache_block_size_(kvcache_block_size),
-    num_running_seqs_per_sp_(attention_sp, 0),
-    num_running_tokens_per_sp_(attention_sp, 0),
     num_recv_seqs_per_sp_(attention_sp, 0)
 {
     for (int i = 0; i < attention_sp; ++i) {
@@ -106,12 +104,10 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     int master_rank = next_sp_idx();
 
     // Check constraints
-    int running_master_count = num_running_seqs_per_sp_[master_rank];
-
     auto it_seqs          = num_seqs.find(master_rank);
     int  current_num_seqs = (it_seqs != num_seqs.end()) ? it_seqs->second : 0;
 
-    if (current_num_seqs + running_master_count + 1 > max_num_seqs_) {
+    if (current_num_seqs + 1 > max_num_seqs_) {
         return false;
     }
 
@@ -182,8 +178,6 @@ void SPStateManager::allocate(Sequence& seq)
 
     num_running_seqs_++;
     num_running_tokens_ += seq.num_tokens;
-    num_running_seqs_per_sp_[master_sp_idx]++;
-    num_running_tokens_per_sp_[master_sp_idx] += seq.num_tokens;
 }
 
 void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
@@ -210,8 +204,6 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
 
     num_running_seqs_--;
     num_running_tokens_ -= seq.num_tokens;
-    num_running_seqs_per_sp_[master_sp_idx]--;
-    num_running_tokens_per_sp_[master_sp_idx] -= seq.num_tokens;
 }
 
 }  // namespace nanodeploy
