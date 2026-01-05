@@ -15,7 +15,6 @@ from nanodeploy.metrics import MetricsManager
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-
 logger = get_logger()
 
 

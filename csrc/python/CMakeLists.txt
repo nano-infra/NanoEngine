@@ -1,7 +1,5 @@
 set(PYBIND11_FINDPYTHON ON)
 
-find_package(pybind11 CONFIG REQUIRED)
-
 set(BINDING_SOURCES
     module.cpp
     metric_binding.cpp
@@ -13,11 +11,13 @@ set(BINDING_SOURCES
 )
 
 # ===== Build pybind11 module =====
+set(PYBIND11_FINDPYTHON ON)
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
 pybind11_add_module(_nanodeploy_cpp
     ${BINDING_SOURCES}
 )
 
-target_link_libraries(_nanodeploy_cpp PRIVATE _nanodeploy_scheduler _nanodeploy_metrics _nanodeploy_sequence _nanodeploy_worker)
+target_link_libraries(_nanodeploy_cpp PRIVATE _nanodeploy_scheduler _nanodeploy_metrics _nanodeploy_sequence _nanodeploy_worker nanodeploy_core)
 
 set_target_properties(
     _nanodeploy_cpp

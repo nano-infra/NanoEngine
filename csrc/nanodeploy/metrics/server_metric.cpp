@@ -91,14 +91,14 @@ void ServerMetric::update_sp_stats(const std::vector<std::vector<int>>& sp_send_
             // Or just store by sp_idx if user implies SP ranks within a DP group?
             // Given "sp_batch_sizes" is [dp][sp], we should probably aggregate by SP index if SP is uniform across DP?
             // Or more likely, the user wants stats per logical rank.
-            
+
             // NOTE: In `llm_engine.py`, `sp_batch_sizes` is `[dp_idx][sp_idx]`.
             // Let's store aggregated stats for simplicity, or flattened.
             // Let's map global sp_rank = dp_idx * attention_sp + sp_idx.
             // But `server_metric.h` has `std::unordered_map<int, long long> sp_send_request_counts;`.
             // Let's use `dp_idx * sp_size + sp_idx` as keys.
             // Using size of vector to infer sp_size.
-            
+
             int global_sp_rank = dp_idx * sp_send_counts[dp_idx].size() + sp_idx;
             sp_send_request_counts[global_sp_rank] += sp_send_counts[dp_idx][sp_idx];
             sp_recv_request_counts[global_sp_rank] += sp_recv_counts[dp_idx][sp_idx];
@@ -182,7 +182,8 @@ std::string ServerMetric::get_metric_report(bool include_detailed) const
         ss << "\nDetailed SP Request Stats (Send/Recv):";
         // Iterate through sorted keys for stable output?
         std::vector<int> rank_ids;
-        for (const auto& kv : sp_send_request_counts) rank_ids.push_back(kv.first);
+        for (const auto& kv : sp_send_request_counts)
+            rank_ids.push_back(kv.first);
         std::sort(rank_ids.begin(), rank_ids.end());
 
         for (int rank : rank_ids) {

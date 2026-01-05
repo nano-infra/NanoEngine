@@ -13,14 +13,25 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 namespace nanodeploy {
 
-// -----------------------------------------------------------------------------
-// Stack Trace Utility
-// -----------------------------------------------------------------------------
+inline std::mutex& get_console_mutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline int& get_log_level()
+{
+    static int level = 2;  // Default to DEBUG (2)
+    return level;
+}
+
+#define NANODEPLOY_CONSOLE_LOCK std::lock_guard<std::mutex> console_lock(nanodeploy::get_console_mutex());
 
 /**
  * @brief Captures and prints the current stack trace to stderr.

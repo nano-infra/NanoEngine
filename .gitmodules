@@ -1,0 +1,18 @@
+[submodule "third_party/flashinfer"]
+	path = third_party/flashinfer
+	url = https://github.com/flashinfer-ai/flashinfer.git
+[submodule "third_party/DeepGemm"]
+	path = third_party/DeepGemm
+	url = https://github.com/deepseek-ai/DeepGemm.git
+[submodule "third_party/DeepEP"]
+	path = third_party/DeepEP
+	url = https://github.com/deepseek-ai/DeepEP.git
+[submodule "third_party/DLSlime"]
+	path = third_party/DLSlime
+	url = https://github.com/Deeplink-org/DLSlime.git
+[submodule "third_party/Spoke"]
+	path = third_party/Spoke
+	url = git@github.com:DeepLink-org/Spoke.git
+[submodule "third_party/pybind11"]
+	path = third_party/pybind11
+	url = https://github.com/pybind/pybind11

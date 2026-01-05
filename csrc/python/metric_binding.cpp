@@ -75,7 +75,10 @@ void bind_sequence_metric(py::module_& m)
         .def("update_waiting_requests", &ServerMetric::update_waiting_requests, py::arg("count"))
         .def("update_waiting_migration_requests", &ServerMetric::update_waiting_migration_requests, py::arg("count"))
         .def("add_completed_request", &ServerMetric::add_completed_request)
-        .def("update_waiting_blocks", &ServerMetric::update_waiting_blocks, py::arg("head_blocks"), py::arg("total_blocks"))
+        .def("update_waiting_blocks",
+             &ServerMetric::update_waiting_blocks,
+             py::arg("head_blocks"),
+             py::arg("total_blocks"))
         .def_readwrite("num_waiting_head_blocks", &ServerMetric::num_waiting_head_blocks)
         .def_readwrite("num_waiting_total_blocks", &ServerMetric::num_waiting_total_blocks)
         .def("add_tokens", &ServerMetric::add_tokens, py::arg("num_prompt") = 0, py::arg("num_generated") = 0)
@@ -88,10 +91,7 @@ void bind_sequence_metric(py::module_& m)
              py::arg("num_tokens"),
              py::arg("duration"))
         .def("update_token_usage", &ServerMetric::update_token_usage, py::arg("dp_idx"), py::arg("num_tokens"))
-        .def("update_sp_stats",
-             &ServerMetric::update_sp_stats,
-             py::arg("sp_send_counts"),
-             py::arg("sp_recv_counts"))
+        .def("update_sp_stats", &ServerMetric::update_sp_stats, py::arg("sp_send_counts"), py::arg("sp_recv_counts"))
 
         // Properties
         .def_property_readonly("avg_prefill_throughput", &ServerMetric::avg_prefill_throughput)
