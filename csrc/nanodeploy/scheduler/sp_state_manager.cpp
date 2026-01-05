@@ -87,322 +87,77 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
                                   const std::unordered_map<int, int>& num_seqs,
                                   const std::unordered_map<int, int>& num_batched_tokens)
 {
-    // =========================================================================
-    // Branch 1: Sequence Parallel (SP > 1)
-    // Strategy: Adaptive SP Size + LeastBatch Sort + Memory Swap
-    // =========================================================================
-    if (attention_sp_ > 1) {
-        // Debug logging setup
-        std::vector<std::string> fail_reasons;
-        bool debug_enabled = false; 
+    // Step 1: cal num_blocks and num_blocks_per_rank
+    auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
+    block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
 
-        // Step 1: Determine min required ranks (Initial SP Size)
-        int num_tokens = seq.num_tokens;
-        int num_segments = (num_tokens + segment_size - 1) / segment_size;
-        int initial_ranks_needed = std::max(1, std::min(attention_sp_, num_segments));
-        int needed_blocks = (num_tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
+    int num_tokens            = seq.num_tokens;
+    int num_segments          = (num_tokens + segment_size - 1) / segment_size;
+    int num_segments_per_rank = (num_segments + attention_sp_ - 1) / attention_sp_;
+    int num_ranks             = (num_segments + num_segments_per_rank - 1) / num_segments_per_rank;
 
-        if (debug_enabled) {
-             std::stringstream ss;
-             ss << "Req(DP=" << dp_idx_ << "): seq_id=" << seq.seq_id << ", tokens=" << num_tokens 
-                << ", blocks=" << needed_blocks << ", init_ranks=" << initial_ranks_needed;
-             fail_reasons.push_back(ss.str());
-        }
+    // Handle division by zero if num_segments_per_rank is 0 (empty sequence?)
+    // Assuming num_tokens > 0, so num_segments >= 1.
+    if (num_segments_per_rank == 0)
+        num_segments_per_rank = 1;
+    if (num_ranks == 0)
+        num_ranks = 1;
 
-        // Step 2 & 3: Prepare and sort all ranks
-        struct RankStatus {
-            int id;
-            long long current_kv_load;
-            int current_batch_load;
-            int free_blocks;
-        };
+    int master_rank = next_sp_idx();
 
-        std::vector<RankStatus> all_ranks;
-        all_ranks.reserve(attention_sp_);
+    // Check constraints
+    int running_master_count = num_running_seqs_per_sp_[master_rank];
 
-        for (int i = 0; i < attention_sp_; ++i) {
-            long long tokens = num_running_tokens_per_sp_[i];
-            if (num_batched_tokens.count(i)) tokens += num_batched_tokens.at(i);
-            
-            int seqs = num_running_seqs_per_sp_[i];
-            if (num_seqs.count(i)) seqs += num_seqs.at(i);
-            
-            int free_blks = block_manager[i]->num_free_blocks();
-            all_ranks.push_back({i, tokens, seqs, free_blks});
-        }
+    auto it_seqs          = num_seqs.find(master_rank);
+    int  current_num_seqs = (it_seqs != num_seqs.end()) ? it_seqs->second : 0;
 
-        // Keep batch-first sorting (LeastBatch)
-        std::sort(all_ranks.begin(), all_ranks.end(), 
-                  [](const RankStatus& a, const RankStatus& b) {
-                      if (a.current_batch_load != b.current_batch_load) {
-                          return a.current_batch_load < b.current_batch_load;
-                      }
-                      return a.free_blocks > b.free_blocks;
-                  });
-
-        // Outer loop: Adaptively increase SP Size
-        for (int current_sp_size = initial_ranks_needed; current_sp_size <= attention_sp_; ++current_sp_size) {
-            
-            // Step 4: Select participants for current size
-            std::vector<RankStatus> participants;
-            std::vector<RankStatus> candidates_pool;
-            
-            participants.reserve(current_sp_size);
-            candidates_pool.reserve(attention_sp_ - current_sp_size);
-
-            long long total_free_blocks_capacity = 0;
-
-            for(int i = 0; i < attention_sp_; ++i) {
-                if (i < current_sp_size) {
-                    participants.push_back(all_ranks[i]);
-                    total_free_blocks_capacity += all_ranks[i].free_blocks;
-                } else {
-                    candidates_pool.push_back(all_ranks[i]);
-                }
-            }
-
-            // Step 4.5: Swap participants if capacity insufficient
-            auto sort_pool_by_mem_desc = [](const RankStatus& a, const RankStatus& b) {
-                return a.free_blocks > b.free_blocks;
-            };
-            std::sort(candidates_pool.begin(), candidates_pool.end(), sort_pool_by_mem_desc);
-
-            bool capacity_check_passed = true;
-            while (total_free_blocks_capacity < needed_blocks) {
-                if (candidates_pool.empty()) {
-                    capacity_check_passed = false;
-                    break;
-                }
-
-                auto min_mem_it = std::min_element(participants.begin(), participants.end(), 
-                    [](const RankStatus& a, const RankStatus& b) {
-                        return a.free_blocks < b.free_blocks;
-                    });
-                
-                const auto& rich_candidate = candidates_pool.front();
-
-                if (rich_candidate.free_blocks <= min_mem_it->free_blocks) {
-                    capacity_check_passed = false;
-                    break;
-                }
-
-                total_free_blocks_capacity -= min_mem_it->free_blocks;
-                total_free_blocks_capacity += rich_candidate.free_blocks;
-
-                *min_mem_it = rich_candidate;
-                candidates_pool.erase(candidates_pool.begin()); 
-            }
-
-            if (!capacity_check_passed) {
-                if (debug_enabled) {
-                    std::stringstream ss;
-                    ss << "  [SP=" << current_sp_size << "] Cap Fail: Available " << total_free_blocks_capacity << " < Needed " << needed_blocks;
-                    ss << ". Participants: [";
-                    for (size_t i = 0; i < participants.size(); ++i) {
-                        ss << participants[i].id << "(" << participants[i].free_blocks << ")";
-                        if (i < participants.size() - 1) ss << ", ";
-                    }
-                    ss << "]";
-                    fail_reasons.push_back(ss.str());
-                }
-                continue; // Try next SP Size
-            }
-
-            // Step 5: Water-filling allocation
-            auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
-            block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
-
-            std::vector<long long> simulated_kv_loads;
-            std::vector<int> alloc_counts(participants.size(), 0);
-            for(const auto& p : participants) simulated_kv_loads.push_back(p.current_kv_load);
-            
-            int tokens_remaining = num_tokens;
-            const int CHUNK_SIZE = kvcache_block_size_; 
-            bool water_fill_failed = false;
-
-            while (tokens_remaining > 0) {
-                auto min_it = std::min_element(simulated_kv_loads.begin(), simulated_kv_loads.end());
-                int idx = std::distance(simulated_kv_loads.begin(), min_it);
-                
-                int attempt_alloc = std::min(CHUNK_SIZE, tokens_remaining);
-                int rank_capacity_tokens = participants[idx].free_blocks * kvcache_block_size_;
-                
-                if (alloc_counts[idx] + attempt_alloc > rank_capacity_tokens) {
-                    *min_it = std::numeric_limits<long long>::max(); // Mark rank as full
-                    
-                    bool all_full = true;
-                    for(auto val : simulated_kv_loads) {
-                        if (val != std::numeric_limits<long long>::max()) {
-                            all_full = false; break;
-                        }
-                    }
-                    if (all_full) {
-                        water_fill_failed = true;
-                        break;
-                    }
-                    continue;
-                }
-
-                simulated_kv_loads[idx] += attempt_alloc;
-                alloc_counts[idx]       += attempt_alloc;
-                tokens_remaining        -= attempt_alloc;
-            }
-
-            if (water_fill_failed) {
-                 if (debug_enabled) {
-                    std::stringstream ss;
-                    ss << "  [SP=" << current_sp_size << "] WaterFill Fail: Fragmentation or per-rank memory limits.";
-                    ss << " Participants: [";
-                    for (size_t i = 0; i < participants.size(); ++i) {
-                        ss << participants[i].id << "(" << participants[i].free_blocks << ")";
-                        if (i < participants.size() - 1) ss << ", ";
-                    }
-                    ss << "]";
-                    fail_reasons.push_back(ss.str());
-                }
-                continue; // Try larger SP Size
-            }
-
-            // Step 6: Fill dispatch results
-            for (size_t i = 0; i < participants.size(); ++i) {
-                int rank_id = participants[i].id;
-                block_ctx.num_dispatched_tokens[rank_id] = alloc_counts[i];
-            }
-
-            // Step 7: Select Master with RECV Constraints
-            std::vector<RankStatus> eligible_masters;
-            
-            for (const auto& candidate_m : participants) {
-                // Constraint 1: Master load check
-                if (candidate_m.current_batch_load + 1 > max_num_seqs_) {
-                    if (debug_enabled) {
-                        std::stringstream ss;
-                        ss << "    MasterReject(Rank" << candidate_m.id << "): BatchLoad " << candidate_m.current_batch_load + 1 << " > " << max_num_seqs_;
-                        fail_reasons.push_back(ss.str());
-                    }
-                    continue;
-                }
-
-                // Constraint 2: Other participants as Receivers
-                bool others_ok = true;
-                for (const auto& p : participants) {
-                    if (p.id == candidate_m.id) continue; // Skip Master itself
-                    
-                    // Check if p can accept another Recv request
-                    if (num_recv_seqs_per_sp_[p.id] >= max_num_recv_seqs_) {
-                        if (debug_enabled) {
-                            std::stringstream ss;
-                            ss << "    MasterReject(Rank" << candidate_m.id << "): Peer Rank" << p.id 
-                               << " RecvFull (" << num_recv_seqs_per_sp_[p.id] << " >= " << max_num_recv_seqs_ << ")";
-                            fail_reasons.push_back(ss.str());
-                        }
-                        others_ok = false;
-                        break;
-                    }
-                }
-
-                if (others_ok) {
-                    eligible_masters.push_back(candidate_m);
-                }
-            }
-
-            if (eligible_masters.empty()) {
-                if (debug_enabled) {
-                    std::stringstream ss;
-                    ss << "  [SP=" << current_sp_size << "] No Eligible Master found.";
-                    fail_reasons.push_back(ss.str());
-                }
-                continue; 
-            }
-
-            // Select Master with least load
-            auto best_master_it = std::min_element(eligible_masters.begin(), eligible_masters.end(),
-                [](const RankStatus& a, const RankStatus& b) {
-                    return a.current_batch_load < b.current_batch_load;
-                });
-            
-            int master_rank = best_master_it->id;
-            block_ctx.master_sp_idx_ = master_rank;
-
-            // Final physical check
-            bool physical_check_ok = true;
-            for (size_t i = 0; i < participants.size(); ++i) {
-                int rank_id = participants[i].id;
-                // Only check ranks with allocated tokens
-                if (block_ctx.num_dispatched_tokens[rank_id] > 0) {
-                     if (!block_manager[rank_id]->can_allocate(seq)) {
-                        if (debug_enabled) {
-                            std::stringstream ss;
-                            ss << "  [SP=" << current_sp_size << "] PhysicalAlloc Fail at Rank " << rank_id;
-                            fail_reasons.push_back(ss.str());
-                        }
-                        physical_check_ok = false;
-                        break;
-                    }
-                }
-            }
-
-            if (physical_check_ok) {
-                // *** Success! ***
-                return true;
-            }
-            
-            // Physical check failed, try larger SP Size
-        }
-
-        // All SP sizes failed
-        if (debug_enabled) {
-            std::cerr << "\n[SP_ALLOC_FAIL] EngineID: " << engine_id_ 
-                      << " DP_Idx: " << dp_idx_ 
-                      << " Failed to allocate seq " << seq.seq_id << std::endl;
-            for (const auto& reason : fail_reasons) {
-                std::cerr << reason << std::endl;
-            }
-            std::cerr << "[SP_ALLOC_FAIL] End Report\n" << std::endl;
-        }
-
+    if (current_num_seqs + running_master_count + 1 > max_num_seqs_) {
         return false;
     }
-    // =========================================================================
-    // Branch 2: Pure Data Parallel (SP = 1)
-    // Strategy: Simple Check (Next RR -> Load Check -> Block Check)
-    // =========================================================================
-    else {
-        auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
-        // Reset state
-        block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
 
-        int master_rank = next_sp_idx(); 
-
-        // 1. Batch Size Constraint (Max Seqs)
-        int running_master_count = num_running_seqs_per_sp_[master_rank];
-        
-        auto it_seqs = num_seqs.find(master_rank);
-        int current_num_seqs = (it_seqs != num_seqs.end()) ? it_seqs->second : 0;
-
-        if (current_num_seqs + running_master_count + 1 > max_num_seqs_) {
-            return false;
-        }
-
-        // 2. Batched Tokens Constraint
-        auto it_tokens = num_batched_tokens.find(master_rank);
-        int current_batched_tokens = (it_tokens != num_batched_tokens.end()) ? it_tokens->second : 0;
-        
-        if (current_batched_tokens + seq.num_tokens >= max_num_batched_tokens_) {
-            return false;
-        }
-
-        // 3. Prepare allocation info
-        block_ctx.master_sp_idx_ = master_rank;
-        block_ctx.num_dispatched_tokens[master_rank] = seq.num_tokens;
-
-        // 4. Physical memory check
-        if (!block_manager[master_rank]->can_allocate(seq)) {
-            return false;
-        }
-
-        return true;
+    auto it_tokens              = num_batched_tokens.find(master_rank);
+    int  current_batched_tokens = (it_tokens != num_batched_tokens.end()) ? it_tokens->second : 0;
+    if (current_batched_tokens + seq.num_tokens >= max_num_batched_tokens_) {
+        return false;
     }
+
+    // Rank selection logic
+    std::vector<std::pair<int, int>> rank_free_count;
+    for (const auto& [rank, bm] : block_manager) {
+        if (rank != master_rank) {
+            rank_free_count.push_back({rank, bm->num_free_blocks()});
+        }
+    }
+
+    std::sort(rank_free_count.begin(),
+              rank_free_count.end(),
+              [](const std::pair<int, int>& a, const std::pair<int, int>& b) { return a.second > b.second; });
+
+    std::vector<int> top_most_free_ranks;
+    int              ranks_to_pick = std::min((int)rank_free_count.size(), num_ranks - 1);
+    for (int i = 0; i < ranks_to_pick; ++i) {
+        top_most_free_ranks.push_back(rank_free_count[i].first);
+    }
+    top_most_free_ranks.push_back(master_rank);
+
+    // Step 2: allocation setup
+    block_ctx.master_sp_idx_ = master_rank;
+    int total_token_unalloc  = seq.num_tokens;
+
+    for (int sp_idx : top_most_free_ranks) {
+        int tokens_to_dispatch                  = std::min(total_token_unalloc, num_segments_per_rank * segment_size);
+        block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
+        total_token_unalloc -= tokens_to_dispatch;
+    }
+
+    // Check if all involved block managers can allocate
+    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        if (!block_manager[sp_idx]->can_allocate(seq)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 void SPStateManager::allocate(Sequence& seq)
