@@ -15,7 +15,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                int                kvcache_block_size,
                                int                max_num_seqs,
                                int                max_num_batched_tokens,
-                               int                max_num_recv_seqs):
+                               int                max_num_recv_seqs,
+                               double             reserved_blocks_per_req):
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
@@ -144,6 +145,44 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         int tokens_to_dispatch                  = std::min(total_token_unalloc, num_segments_per_rank * segment_size);
         block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
         total_token_unalloc -= tokens_to_dispatch;
+    }
+
+    // Reservation Check for Decode
+    
+    // 1. Count master requests for each SP rank
+    std::vector<int> master_req_counts(attention_sp_, 0);
+
+    // (a) Count currently running requests
+    for (const auto& running_seq : running) {
+        int m_idx = running_seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+        if (m_idx >= 0 && m_idx < attention_sp_) {
+            master_req_counts[m_idx]++;
+        }
+    }
+
+    // (b) Count scheduled requests in current batch
+    for (const auto& [m_idx, count] : num_seqs) {
+        if (m_idx >= 0 && m_idx < attention_sp_) {
+            master_req_counts[m_idx] += count;
+        }
+    }
+
+    // (c) Add the current request
+    master_req_counts[master_rank]++;
+
+    // 2. Check each SP rank: Free Blocks >= Prefill Consumption + Reservation
+    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        int free_blocks = block_manager[sp_idx]->num_free_blocks();
+        
+        int prefill_tokens = block_ctx.num_dispatched_tokens[sp_idx];
+        int prefill_blocks_needed = (prefill_tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
+
+        double needed_float = master_req_counts[sp_idx] * reserved_blocks_per_req_;
+        int reservation_blocks_needed = static_cast<int>(std::ceil(needed_float));
+
+        if (free_blocks < prefill_blocks_needed + reservation_blocks_needed) {
+            return false;
+        }
     }
 
     // Check if all involved block managers can allocate
