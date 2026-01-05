@@ -111,7 +111,7 @@ void bind_scheduler_utils(py::module_& m)
 
     // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
-        .def(py::init<const std::string&, int, int, int, int, int, int, int, int, int, const std::string&>(),
+        .def(py::init<const std::string&, int, int, int, int, int, int, int, int, int, const std::string&, double>(),
              py::arg("engine_id"),
              py::arg("loop_count"),
              py::arg("max_num_seqs"),
@@ -122,7 +122,8 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("attention_sp"),
              py::arg("num_kvcache_blocks"),
              py::arg("kvcache_block_size"),
-             py::arg("mode"))
+             py::arg("mode"),
+             py::arg("reserved_blocks_per_req"))
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))

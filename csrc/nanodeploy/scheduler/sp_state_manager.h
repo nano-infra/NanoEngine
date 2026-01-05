@@ -29,7 +29,8 @@ public:
                    int                kvcache_block_size,
                    int                max_num_seqs,
                    int                max_num_batched_tokens,
-                   int                max_num_recv_seqs);
+                   int                max_num_recv_seqs,
+                   double             reserved_blocks_per_req);
 
     void set_dp_idx(int dp_idx) { dp_idx_ = dp_idx; }
 
@@ -109,6 +110,7 @@ private:
     int         max_num_seqs_;
     int         max_num_batched_tokens_;
     int         max_num_recv_seqs_;
+    double      reserved_blocks_per_req_;
 
     int kvcache_block_size_;
 
