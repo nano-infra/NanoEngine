@@ -22,7 +22,8 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                num_kvcache_blocks,
                      int                kvcache_block_size,
                      const std::string& mode,
-                     double             reserved_blocks_per_req):
+                     double             reserved_blocks_per_req,
+                     bool               enable_dynamic_sp_size):
     engine_id_(engine_id),
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
@@ -32,7 +33,8 @@ Scheduler::Scheduler(const std::string& engine_id,
     attention_dp_(attention_dp),
     attention_sp_(attention_sp),
     mode_(mode),
-    reserved_blocks_per_req_(reserved_blocks_per_req)
+    reserved_blocks_per_req_(reserved_blocks_per_req),
+    enable_dynamic_sp_size_(enable_dynamic_sp_size)
 {
     Sequence::block_size = kvcache_block_size;
     // Initialize worker states
@@ -41,7 +43,7 @@ Scheduler::Scheduler(const std::string& engine_id,
         auto sp_manager = std::make_shared<SPStateManager>(
             engine_id_, attention_sp_, num_kvcache_blocks, kvcache_block_size, 
             max_num_seqs_, max_num_batched_tokens_, max_num_recv_seqs_,
-            reserved_blocks_per_req_);
+            reserved_blocks_per_req_, enable_dynamic_sp_size_);
         
         sp_manager->set_dp_idx(dp_idx);
         

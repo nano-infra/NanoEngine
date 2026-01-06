@@ -58,6 +58,9 @@ class Config:
     # reserve for decode
     reserved_blocks_per_req: float = 1.0
 
+    # Dynamic SP Size Knob
+    enable_dynamic_sp_size: bool = False
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         self.hf_config = AutoConfig.from_pretrained(self.model)

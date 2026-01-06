@@ -30,7 +30,8 @@ public:
                    int                max_num_seqs,
                    int                max_num_batched_tokens,
                    int                max_num_recv_seqs,
-                   double             reserved_blocks_per_req);
+                   double             reserved_blocks_per_req,
+                   bool               enable_dynamic_sp_size);
 
     void set_dp_idx(int dp_idx) { dp_idx_ = dp_idx; }
 
@@ -118,6 +119,8 @@ private:
     int              num_running_seqs_   = 0;
     int              num_running_tokens_ = 0;
     std::vector<int> num_recv_seqs_per_sp_;
+
+    bool             enable_dynamic_sp_size_;
 };
 
 }  // namespace nanodeploy
