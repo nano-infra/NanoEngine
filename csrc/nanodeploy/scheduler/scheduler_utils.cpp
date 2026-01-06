@@ -77,7 +77,7 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                 seq_tokens_this_step[seq]++;
 
                 bool finished =
-                    (!seq->ignore_eos && token_id == eos_id) || (seq->num_completed_tokens() == seq->max_tokens);
+                    (!seq->ignore_eos && token_id == eos_id) || (seq->num_completed_tokens() >= seq->max_tokens);
 
                 if (finished) {
                     seq->status = SequenceStatus::FINISHED;
