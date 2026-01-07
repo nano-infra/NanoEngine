@@ -101,7 +101,7 @@ void bind_sp_state_manager(py::module_& m)
 
     // Bind SPStateManager
     py::class_<SPStateManager, std::shared_ptr<SPStateManager>>(m, "SPStateManager")
-        .def(py::init<const std::string&, int, int, int, int, int, int, double, bool>(),
+        .def(py::init<const std::string&, int, int, int, int, int, int, double, bool, bool>(), 
              py::arg("engine_id"),
              py::arg("attention_sp"),
              py::arg("num_kvcache_blocks"),
@@ -110,7 +110,8 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("max_num_batched_tokens"),
              py::arg("max_num_recv_seqs"),
              py::arg("reserved_blocks_per_req"),
-             py::arg("enable_dynamic_sp_size"))
+             py::arg("enable_dynamic_sp_size"),
+             py::arg("enable_non_uniform_split"))
 
         .def_property_readonly("is_empty", &SPStateManager::is_empty)
 

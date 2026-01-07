@@ -83,7 +83,8 @@ public:
               int                kvcache_block_size,
               const std::string& mode,
               double             reserved_blocks_per_req,
-              bool               enable_dynamic_sp_size);
+              bool               enable_dynamic_sp_size,
+              bool               enable_non_uniform_split);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -145,6 +146,7 @@ private:
     std::string mode_;
     double reserved_blocks_per_req_;
     bool   enable_dynamic_sp_size_;
+    bool   enable_non_uniform_split_;
 
     int dp_rr_counter_ = 0;
 

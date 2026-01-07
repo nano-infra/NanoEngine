@@ -61,6 +61,9 @@ class Config:
     # Dynamic SP Size Knob
     enable_dynamic_sp_size: bool = False
 
+    # Enable non-uniform KVCache partitioning for load balancing
+    enable_non_uniform_split: bool = False
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         self.hf_config = AutoConfig.from_pretrained(self.model)

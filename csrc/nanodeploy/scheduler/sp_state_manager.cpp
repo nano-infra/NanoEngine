@@ -17,7 +17,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                int                max_num_batched_tokens,
                                int                max_num_recv_seqs,
                                double             reserved_blocks_per_req,
-                               bool               enable_dynamic_sp_size):
+                               bool               enable_dynamic_sp_size,
+                               bool               enable_non_uniform_split):
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
@@ -26,7 +27,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     reserved_blocks_per_req_(reserved_blocks_per_req),
     kvcache_block_size_(kvcache_block_size),
     num_recv_seqs_per_sp_(attention_sp, 0),
-    enable_dynamic_sp_size_(enable_dynamic_sp_size)
+    enable_dynamic_sp_size_(enable_dynamic_sp_size),
+    enable_non_uniform_split_(enable_non_uniform_split)
 {
     for (int i = 0; i < attention_sp; ++i) {
         block_manager[i] = std::make_shared<BlockManager>(engine_id, i, num_kvcache_blocks, kvcache_block_size);
@@ -133,6 +135,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
             block_ctx.master_sp_idx_ = master_rank;
 
+            // Select participating ranks
             std::vector<int> top_most_free_ranks;
             int              ranks_to_pick = std::min((int)rank_free_count.size(), target_num_ranks - 1);
             for (int i = 0; i < ranks_to_pick; ++i) {
@@ -140,11 +143,101 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             }
             top_most_free_ranks.push_back(master_rank);
 
-            int total_token_unalloc = seq.num_tokens;
-            for (int sp_idx : top_most_free_ranks) {
-                int tokens_to_dispatch                  = std::min(total_token_unalloc, num_segments_per_rank * segment_size);
-                block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
-                total_token_unalloc -= tokens_to_dispatch;
+            // =================================================================
+            // [New Feature] Non-Uniform Split (Water-filling / Valley-filling)
+            // =================================================================
+            if (enable_non_uniform_split_) {
+                // 1. Collect free blocks info for all participating ranks (including master)
+                std::vector<std::pair<int, int>> sorted_ranks; // {sp_idx, free_blocks}
+                for (int sp_idx : top_most_free_ranks) {
+                    sorted_ranks.push_back({sp_idx, block_manager[sp_idx]->num_free_blocks()});
+                }
+                
+                // 2. Sort participating ranks by free blocks descending (richest first)
+                std::sort(sorted_ranks.begin(), sorted_ranks.end(),
+                          [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                              return a.second > b.second;
+                          });
+
+                long long total_tokens_needed = seq.num_tokens;
+                long long final_target_free_tokens = 0;
+                int k = 0; // Number of ranks contributing to "water-filling"
+
+                // 3. Find the optimal "water level" (target free tokens)
+                // We greedily check if the top k ranks can absorb the load such that
+                // their remaining capacity is balanced.
+                for (k = 1; k <= (int)sorted_ranks.size(); ++k) {
+                    long long sum_free_tokens = 0;
+                    for (int i = 0; i < k; ++i) {
+                        sum_free_tokens += (long long)sorted_ranks[i].second * kvcache_block_size_;
+                    }
+
+                    // If we use top k ranks, what would be the equalized remaining capacity?
+                    long long remaining_after_alloc = sum_free_tokens - total_tokens_needed;
+                    long long target_free = remaining_after_alloc / k;
+
+                    // If we are at the last rank, or if the calculated target level is 
+                    // higher than the next rank's capacity (meaning next rank doesn't need to help),
+                    // then we found our split point.
+                    if (k == (int)sorted_ranks.size()) {
+                        final_target_free_tokens = target_free;
+                        break;
+                    } else {
+                        long long next_rank_free = (long long)sorted_ranks[k].second * kvcache_block_size_;
+                        if (target_free >= next_rank_free) {
+                            final_target_free_tokens = target_free;
+                            break;
+                        }
+                    }
+                }
+
+                // 4. Assign tokens based on the target level
+                long long allocated_sum = 0;
+                for (int i = 0; i < (int)sorted_ranks.size(); ++i) {
+                    int sp_idx = sorted_ranks[i].first;
+                    long long current_free = (long long)sorted_ranks[i].second * kvcache_block_size_;
+                    
+                    // Alloc = Current - Target
+                    long long alloc = current_free - final_target_free_tokens;
+                    
+                    if (alloc < 0) alloc = 0;
+                    if (alloc > current_free) alloc = current_free; // Safety cap
+
+                    block_ctx.num_dispatched_tokens[sp_idx] = (int)alloc;
+                    allocated_sum += alloc;
+                }
+
+                // 5. Handle integer division remainders
+                long long remainder = total_tokens_needed - allocated_sum;
+                int idx = 0;
+                
+                // If we allocated too few (remainder > 0), distribute to the richest ranks
+                while (remainder > 0) {
+                    block_ctx.num_dispatched_tokens[sorted_ranks[idx].first]++;
+                    remainder--;
+                    idx = (idx + 1) % k;
+                }
+                
+                // If we allocated too many (remainder < 0), take back from richest ranks
+                // (This can happen if target calculation slightly overshoots due to integer math)
+                while (remainder < 0) {
+                    if (block_ctx.num_dispatched_tokens[sorted_ranks[idx].first] > 0) {
+                        block_ctx.num_dispatched_tokens[sorted_ranks[idx].first]--;
+                        remainder++;
+                    }
+                    idx = (idx + 1) % k;
+                }
+            } 
+            else {
+                // =================================================================
+                // Standard Feature: Uniform Split
+                // =================================================================
+                int total_token_unalloc = seq.num_tokens;
+                for (int sp_idx : top_most_free_ranks) {
+                    int tokens_to_dispatch                  = std::min(total_token_unalloc, num_segments_per_rank * segment_size);
+                    block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
+                    total_token_unalloc -= tokens_to_dispatch;
+                }
             }
 
             // Reservation Check
