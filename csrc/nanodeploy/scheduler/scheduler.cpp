@@ -196,14 +196,18 @@ ScheduleResult Scheduler::schedule()
                 }
 
                 if (!is_dummy) {
-                    const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+                    const auto& block_ctx    = seq->block_ctx(BlockContextSlot::ACTIVE);
+                    const auto& tokens       = block_ctx.num_dispatched_tokens;
+                    
                     int         active_ranks = 0;
                     for (int count : tokens) {
                         if (count > 0)
                             active_ranks++;
                     }
 
-                    if (active_ranks > 1 && tokens[sp_idx] > 0) {
+                    int master_sp_idx = block_ctx.master_sp_idx_;
+
+                    if (active_ranks > 1 && tokens[sp_idx] > 0 && master_sp_idx != sp_idx) {
                         recv_count++;
                     }
                 }

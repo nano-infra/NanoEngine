@@ -296,6 +296,14 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             bool memory_check_passed = true;
             for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
                 if (block_ctx.num_dispatched_tokens[sp_idx] > 0 || sp_idx == master_rank) {
+                    
+                    if (sp_idx != master_rank && block_ctx.num_dispatched_tokens[sp_idx] > 0) {
+                        if (num_recv_seqs_per_sp_[sp_idx] >= max_num_recv_seqs_) {
+                            memory_check_passed = false;
+                            break;
+                        }
+                    }
+
                     int free_blocks = block_manager[sp_idx]->num_free_blocks();
                     int prefill_tokens = block_ctx.num_dispatched_tokens[sp_idx];
                     int prefill_blocks_needed = (prefill_tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
