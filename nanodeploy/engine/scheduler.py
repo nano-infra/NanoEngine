@@ -35,7 +35,8 @@ class Scheduler(_CppScheduler):
             config.num_kvcache_blocks,
             config.kvcache_block_size,
             config.mode,
-            config.reserved_blocks_per_req
+            config.reserved_blocks_per_req,
+            config.segment_size
         )
         # Store config for compatibility
         self.engine_id = config.engine_id

@@ -21,8 +21,6 @@ enum class RoutingStrategy {
 
 class SPStateManager {
 public:
-    static constexpr int segment_size = 65536;
-
     SPStateManager(const std::string& engine_id,
                    int                attention_sp,
                    int                num_kvcache_blocks,
@@ -30,9 +28,12 @@ public:
                    int                max_num_seqs,
                    int                max_num_batched_tokens,
                    int                max_num_recv_seqs,
-                   double             reserved_blocks_per_req);
+                   double             reserved_blocks_per_req,
+                   int                segment_size);
 
     void set_dp_idx(int dp_idx) { dp_idx_ = dp_idx; }
+
+    int segment_size() const { return segment_size_; }
 
     // State queries
     bool is_empty() const
@@ -113,6 +114,7 @@ private:
     double      reserved_blocks_per_req_;
 
     int kvcache_block_size_;
+    int segment_size_;
 
     int              sp_rr_counter_      = 0;
     int              num_running_seqs_   = 0;

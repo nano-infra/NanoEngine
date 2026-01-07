@@ -48,6 +48,7 @@ def parse_args():
     parser.add_argument("--max-num-seqs", type=int, default=128, help="Max sequences per iteration.")
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
+    parser.add_argument("--segment-size", type=int, default=65536, help="Segment size for SP.")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache"],
@@ -373,6 +374,8 @@ def main():
         max_num_batched_tokens=1024000,
         loop_count=args.loop_count,
         routing_strategy=args.routing_strategy,
+        segment_size=args.segment_size,
+        kvcache_block_size=64
     )
     
     # Print Config

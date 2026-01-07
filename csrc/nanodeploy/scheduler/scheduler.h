@@ -82,7 +82,8 @@ public:
               int                num_kvcache_blocks,
               int                kvcache_block_size,
               const std::string& mode,
-              double             reserved_blocks_per_req);
+              double             reserved_blocks_per_req,
+              int                segment_size);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -143,6 +144,7 @@ private:
     int         attention_sp_;
     std::string mode_;
     double reserved_blocks_per_req_;
+    int segment_size_;
 
     int dp_rr_counter_ = 0;
 

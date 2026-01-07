@@ -16,7 +16,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                int                max_num_seqs,
                                int                max_num_batched_tokens,
                                int                max_num_recv_seqs,
-                               double             reserved_blocks_per_req):
+                               double             reserved_blocks_per_req,
+                               int                segment_size):
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
@@ -24,6 +25,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     max_num_recv_seqs_(max_num_recv_seqs),
     reserved_blocks_per_req_(reserved_blocks_per_req),
     kvcache_block_size_(kvcache_block_size),
+    segment_size_(segment_size),
     num_recv_seqs_per_sp_(attention_sp, 0)
 {
     for (int i = 0; i < attention_sp; ++i) {
@@ -34,7 +36,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     
     std::cerr << "[SPStateManager] Initialized with attention_sp=" << attention_sp_ 
               << ", kvcache_block_size=" << kvcache_block_size_
-              << ", reserved_blocks_per_req=" << reserved_blocks_per_req_ << std::endl;
+              << ", reserved_blocks_per_req=" << reserved_blocks_per_req_
+              << ", segment_size=" << segment_size_ << std::endl;
 
     if (attention_sp_ <= 0) {
         throw std::runtime_error("attention_sp must be positive to prevent division by zero");
@@ -103,7 +106,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
 
     int num_tokens            = seq.num_tokens;
-    int num_segments          = (num_tokens + segment_size - 1) / segment_size;
+    int num_segments          = (num_tokens + segment_size_ - 1) / segment_size_;
     int num_segments_per_rank = (num_segments + attention_sp_ - 1) / attention_sp_;
 
     // Handle division by zero if num_segments_per_rank is 0 (empty sequence?)
@@ -155,7 +158,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     int total_token_unalloc  = seq.num_tokens;
 
     for (int sp_idx : top_most_free_ranks) {
-        int tokens_to_dispatch                  = std::min(total_token_unalloc, num_segments_per_rank * segment_size);
+        int tokens_to_dispatch                  = std::min(total_token_unalloc, num_segments_per_rank * segment_size_);
         block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
         total_token_unalloc -= tokens_to_dispatch;
     }
