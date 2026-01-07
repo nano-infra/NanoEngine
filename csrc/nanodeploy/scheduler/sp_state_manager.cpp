@@ -22,6 +22,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     max_num_seqs_(max_num_seqs),
     max_num_batched_tokens_(max_num_batched_tokens),
     max_num_recv_seqs_(max_num_recv_seqs),
+    reserved_blocks_per_req_(reserved_blocks_per_req),
     kvcache_block_size_(kvcache_block_size),
     num_recv_seqs_per_sp_(attention_sp, 0)
 {
@@ -30,6 +31,17 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     }
 
     initialize_dummy_seqs();
+    
+    std::cerr << "[SPStateManager] Initialized with attention_sp=" << attention_sp_ 
+              << ", kvcache_block_size=" << kvcache_block_size_
+              << ", reserved_blocks_per_req=" << reserved_blocks_per_req_ << std::endl;
+
+    if (attention_sp_ <= 0) {
+        throw std::runtime_error("attention_sp must be positive to prevent division by zero");
+    }
+    if (kvcache_block_size_ <= 0) {
+        throw std::runtime_error("kvcache_block_size must be positive to prevent division by zero");
+    }
 }
 
 void SPStateManager::initialize_dummy_seqs()
@@ -93,12 +105,13 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     int num_tokens            = seq.num_tokens;
     int num_segments          = (num_tokens + segment_size - 1) / segment_size;
     int num_segments_per_rank = (num_segments + attention_sp_ - 1) / attention_sp_;
-    int num_ranks             = (num_segments + num_segments_per_rank - 1) / num_segments_per_rank;
 
     // Handle division by zero if num_segments_per_rank is 0 (empty sequence?)
     // Assuming num_tokens > 0, so num_segments >= 1.
     if (num_segments_per_rank == 0)
         num_segments_per_rank = 1;
+
+    int num_ranks = (num_segments + num_segments_per_rank - 1) / num_segments_per_rank;
     if (num_ranks == 0)
         num_ranks = 1;
 
@@ -237,7 +250,7 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
         block_manager[sp_idx]->deallocate(seq, slot);
     }
 
-    block_ctx.sp_block_table.clear();
+    block_ctx.sp_block_table.assign(attention_sp_, {});
     block_ctx.block_location.clear();
     std::fill(block_ctx.num_dispatched_tokens.begin(), block_ctx.num_dispatched_tokens.end(), 0);
 
