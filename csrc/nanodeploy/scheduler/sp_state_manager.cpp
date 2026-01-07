@@ -48,6 +48,17 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     }
 
     initialize_dummy_seqs();
+
+    std::cerr << "[SPStateManager] Initialized with attention_sp=" << attention_sp_ 
+              << ", kvcache_block_size=" << kvcache_block_size_
+              << ", reserved_blocks_per_req=" << reserved_blocks_per_req_ << std::endl;
+
+    if (attention_sp_ <= 0) {
+        throw std::runtime_error("attention_sp must be positive to prevent division by zero");
+    }
+    if (kvcache_block_size_ <= 0) {
+        throw std::runtime_error("kvcache_block_size must be positive to prevent division by zero");
+    }
 }
 
 void SPStateManager::initialize_dummy_seqs()
@@ -477,7 +488,7 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
         block_manager[sp_idx]->deallocate(seq, slot);
     }
 
-    block_ctx.sp_block_table.clear();
+    block_ctx.sp_block_table.assign(attention_sp_, {});
     block_ctx.block_location.clear();
     std::fill(block_ctx.num_dispatched_tokens.begin(), block_ctx.num_dispatched_tokens.end(), 0);
 

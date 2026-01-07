@@ -519,7 +519,16 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
 
     seq->status = SequenceStatus::WAITING;
     worker_state[dp_idx]->deallocate(*seq);
-    waiting.push_front(seq);
+    
+    // Re-initialize BlockContext for fresh scheduling
+    seq->active(engine_id_, attention_sp_, attention_dp_);
+
+    if (mode_ == "decode") {
+        waiting_migration.push_front(seq);
+    }
+    else {
+        waiting.push_front(seq);
+    }
 }
 
 void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
