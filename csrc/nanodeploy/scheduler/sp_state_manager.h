@@ -19,6 +19,12 @@ enum class RoutingStrategy {
     LeastCache
 };
 
+enum class SPMasterSelector {
+    RoundRobin,
+    LeastBatch,
+    LeastCache
+};
+
 class SPStateManager {
 public:
     static constexpr int segment_size = 65536;
@@ -32,7 +38,8 @@ public:
                    int                max_num_recv_seqs,
                    double             reserved_blocks_per_req,
                    bool               enable_dynamic_sp_size,
-                   bool               enable_non_uniform_split);
+                   bool               enable_non_uniform_split,
+                   const std::string& sp_master_selector);
 
     void set_dp_idx(int dp_idx) { dp_idx_ = dp_idx; }
 
@@ -104,7 +111,7 @@ public:
 
 private:
     void initialize_dummy_seqs();
-    int  next_sp_idx();  // Round-robin counter
+    int select_master_rank();
 
     std::string engine_id_;
     int         dp_idx_ = -1;
@@ -123,6 +130,9 @@ private:
 
     bool enable_dynamic_sp_size_;
     bool enable_non_uniform_split_;
+
+    SPMasterSelector master_selector_;
+    std::vector<int> master_seq_counts_;
 };
 
 }  // namespace nanodeploy

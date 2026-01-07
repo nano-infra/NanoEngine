@@ -36,6 +36,11 @@ void bind_sp_state_manager(py::module_& m)
             m["LeastCache"] = RoutingStrategy::LeastCache;
             return m;
         });
+    py::enum_<SPMasterSelector>(m, "SPMasterSelector")
+        .value("RoundRobin", SPMasterSelector::RoundRobin)
+        .value("LeastBatch", SPMasterSelector::LeastBatch)
+        .value("LeastCache", SPMasterSelector::LeastCache)
+        .export_values();
 
     // Bind BlockManagerMap
     py::bind_map<std::unordered_map<int, std::shared_ptr<BlockManager>>>(m, "BlockManagerMap");
@@ -101,7 +106,7 @@ void bind_sp_state_manager(py::module_& m)
 
     // Bind SPStateManager
     py::class_<SPStateManager, std::shared_ptr<SPStateManager>>(m, "SPStateManager")
-        .def(py::init<const std::string&, int, int, int, int, int, int, double, bool, bool>(), 
+        .def(py::init<const std::string&, int, int, int, int, int, int, double, bool, bool, const std::string&>(),
              py::arg("engine_id"),
              py::arg("attention_sp"),
              py::arg("num_kvcache_blocks"),
@@ -111,7 +116,8 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("max_num_recv_seqs"),
              py::arg("reserved_blocks_per_req"),
              py::arg("enable_dynamic_sp_size"),
-             py::arg("enable_non_uniform_split"))
+             py::arg("enable_non_uniform_split"),
+             py::arg("sp_master_selector"))
 
         .def_property_readonly("is_empty", &SPStateManager::is_empty)
 

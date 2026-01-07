@@ -24,7 +24,8 @@ Scheduler::Scheduler(const std::string& engine_id,
                      const std::string& mode,
                      double             reserved_blocks_per_req,
                      bool               enable_dynamic_sp_size,
-                     bool               enable_non_uniform_split):
+                     bool               enable_non_uniform_split,
+                     const std::string& sp_master_selector) :
     engine_id_(engine_id),
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
@@ -45,7 +46,8 @@ Scheduler::Scheduler(const std::string& engine_id,
             engine_id_, attention_sp_, num_kvcache_blocks, kvcache_block_size, 
             max_num_seqs_, max_num_batched_tokens_, max_num_recv_seqs_,
             reserved_blocks_per_req_, enable_dynamic_sp_size_, 
-            enable_non_uniform_split);
+            enable_non_uniform_split,
+            sp_master_selector);
         
         sp_manager->set_dp_idx(dp_idx);
         worker_state.push_back(sp_manager);

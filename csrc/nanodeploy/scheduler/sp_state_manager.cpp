@@ -18,7 +18,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                int                max_num_recv_seqs,
                                double             reserved_blocks_per_req,
                                bool               enable_dynamic_sp_size,
-                               bool               enable_non_uniform_split):
+                               bool               enable_non_uniform_split,
+                               const std::string& sp_master_selector) :
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
@@ -30,6 +31,18 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     enable_dynamic_sp_size_(enable_dynamic_sp_size),
     enable_non_uniform_split_(enable_non_uniform_split)
 {
+    // Initialize Strategy
+    if (sp_master_selector == "LeastBatch") {
+        master_selector_ = SPMasterSelector::LeastBatch;
+    } else if (sp_master_selector == "LeastCache") {
+        master_selector_ = SPMasterSelector::LeastCache;
+    } else {
+        master_selector_ = SPMasterSelector::RoundRobin;
+    }
+
+    // Initialize Running Load Counter
+    master_seq_counts_.assign(attention_sp_, 0);
+
     for (int i = 0; i < attention_sp; ++i) {
         block_manager[i] = std::make_shared<BlockManager>(engine_id, i, num_kvcache_blocks, kvcache_block_size);
     }
@@ -62,11 +75,44 @@ void SPStateManager::initialize_dummy_seqs()
     }
 }
 
-int SPStateManager::next_sp_idx()
+int SPStateManager::select_master_rank()
 {
-    int idx        = sp_rr_counter_;
-    sp_rr_counter_ = (sp_rr_counter_ + 1) % attention_sp_;
-    return idx;
+    if (master_selector_ == SPMasterSelector::RoundRobin) {
+        int idx = sp_rr_counter_;
+        sp_rr_counter_ = (sp_rr_counter_ + 1) % attention_sp_;
+        return idx;
+    } 
+    else if (master_selector_ == SPMasterSelector::LeastBatch) {
+        int best_idx = 0;
+        int min_load = std::numeric_limits<int>::max();
+
+        for (int i = 0; i < attention_sp_; ++i) {
+
+            int current_load = master_seq_counts_[i]; 
+
+            if (current_load < min_load) {
+                min_load = current_load;
+                best_idx = i;
+            }
+        }
+        return best_idx;
+    } 
+    else if (master_selector_ == SPMasterSelector::LeastCache) {
+        int best_idx = 0;
+        int max_free = -1;
+
+        for (int i = 0; i < attention_sp_; ++i) {
+
+            int free_blocks = block_manager[i]->num_free_blocks();
+            
+            if (free_blocks > max_free) {
+                max_free = free_blocks;
+                best_idx = i;
+            }
+        }
+        return best_idx;
+    }
+    return 0; // Fallback
 }
 
 bool SPStateManager::can_append(Sequence& seq, int num_tokens)
@@ -105,12 +151,8 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         if (num_segments_per_rank == 0) num_segments_per_rank = 1;
         if (initial_num_ranks == 0) initial_num_ranks = 1;
 
-        int master_rank = next_sp_idx();
-
-        // Check basic constraints
-        auto it_seqs          = num_seqs.find(master_rank);
-        int  current_num_seqs = (it_seqs != num_seqs.end()) ? it_seqs->second : 0;
-        if (current_num_seqs + 1 > max_num_seqs_) return false;
+        int master_rank = select_master_rank();
+        if (master_seq_counts_[master_rank] + 1 > max_num_seqs_) return false;
 
         auto it_tokens              = num_batched_tokens.find(master_rank);
         int  current_batched_tokens = (it_tokens != num_batched_tokens.end()) ? it_tokens->second : 0;
@@ -296,12 +338,8 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         if (num_ranks == 0)
             num_ranks = 1;
 
-        int master_rank = next_sp_idx();
-
-        auto it_seqs          = num_seqs.find(master_rank);
-        int  current_num_seqs = (it_seqs != num_seqs.end()) ? it_seqs->second : 0;
-
-        if (current_num_seqs + 1 > max_num_seqs_) {
+        int master_rank = select_master_rank();
+        if (master_seq_counts_[master_rank] + 1 > max_num_seqs_) {
             return false;
         }
 
@@ -384,6 +422,10 @@ void SPStateManager::allocate(Sequence& seq)
     auto& block_ctx     = seq.block_ctx(BlockContextSlot::ACTIVE);
     int   master_sp_idx = block_ctx.master_sp_idx_;
 
+    if (master_sp_idx >= 0 && master_sp_idx < attention_sp_) {
+        master_seq_counts_[master_sp_idx]++;
+    }
+
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
         // [修改] 更新 Recv 计数
         // 只有确实分到了 token 且不是 Master 的才算 Receiver
@@ -407,6 +449,12 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
 {
     auto& block_ctx     = seq.block_ctx(slot);
     int   master_sp_idx = block_ctx.master_sp_idx_;
+
+    if (master_sp_idx >= 0 && master_sp_idx < attention_sp_) {
+        if (master_seq_counts_[master_sp_idx] > 0) {
+            master_seq_counts_[master_sp_idx]--;
+        }
+    }
 
     // [修改] 在清理 block_ctx 之前，先减少 Recv 计数
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {

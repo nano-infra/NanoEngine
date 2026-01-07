@@ -64,6 +64,9 @@ class Config:
     # Enable non-uniform KVCache partitioning for load balancing
     enable_non_uniform_split: bool = False
 
+    # Strategy for how to select 
+    sp_master_selector: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         self.hf_config = AutoConfig.from_pretrained(self.model)

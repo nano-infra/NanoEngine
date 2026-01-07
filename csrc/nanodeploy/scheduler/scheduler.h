@@ -84,7 +84,8 @@ public:
               const std::string& mode,
               double             reserved_blocks_per_req,
               bool               enable_dynamic_sp_size,
-              bool               enable_non_uniform_split);
+              bool               enable_non_uniform_split,
+              const std::string& sp_master_selector);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
