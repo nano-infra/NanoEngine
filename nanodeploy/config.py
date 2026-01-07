@@ -57,6 +57,7 @@ class Config:
 
     # reserve for decode
     reserved_blocks_per_req: float = 1.0
+    segment_size: int = 65536
 
     # Dynamic SP Size Knob
     enable_dynamic_sp_size: bool = False

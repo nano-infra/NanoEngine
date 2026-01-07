@@ -23,6 +23,7 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                kvcache_block_size,
                      const std::string& mode,
                      double             reserved_blocks_per_req,
+                     int                segment_size,
                      bool               enable_dynamic_sp_size,
                      bool               enable_non_uniform_split,
                      const std::string& sp_master_selector) :
@@ -36,7 +37,10 @@ Scheduler::Scheduler(const std::string& engine_id,
     attention_sp_(attention_sp),
     mode_(mode),
     reserved_blocks_per_req_(reserved_blocks_per_req),
-    enable_dynamic_sp_size_(enable_dynamic_sp_size)
+    segment_size_(segment_size),
+    enable_dynamic_sp_size_(enable_dynamic_sp_size),
+    enable_non_uniform_split_(enable_non_uniform_split),
+    sp_master_selector_(sp_master_selector)
 {
     Sequence::block_size = kvcache_block_size;
     // Initialize worker states
@@ -45,13 +49,14 @@ Scheduler::Scheduler(const std::string& engine_id,
         auto sp_manager = std::make_shared<SPStateManager>(
             engine_id_, attention_sp_, num_kvcache_blocks, kvcache_block_size, 
             max_num_seqs_, max_num_batched_tokens_, max_num_recv_seqs_,
-            reserved_blocks_per_req_, enable_dynamic_sp_size_, 
+            reserved_blocks_per_req_, segment_size_, enable_dynamic_sp_size_, 
             enable_non_uniform_split,
             sp_master_selector);
         
         sp_manager->set_dp_idx(dp_idx);
         worker_state.push_back(sp_manager);
     }
+    std::cerr << "[Scheduler] Initialized with segment_size=" << segment_size_ << std::endl;
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
 }
 
