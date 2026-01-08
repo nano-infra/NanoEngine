@@ -151,6 +151,8 @@ private:
     bool        enable_dynamic_sp_size_;
     bool        enable_non_uniform_split_;
 
+    std::string sp_master_selector_;
+
     int dp_rr_counter_ = 0;
 
     std::unique_ptr<ThreadPool> thread_pool_;

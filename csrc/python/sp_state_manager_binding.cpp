@@ -114,8 +114,8 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("max_num_seqs"),
              py::arg("max_num_batched_tokens"),
              py::arg("max_num_recv_seqs"),
-             py::arg("segment_size") = 65536),
              py::arg("reserved_blocks_per_req"),
+             py::arg("segment_size") = 65536,
              py::arg("enable_dynamic_sp_size"),
              py::arg("enable_non_uniform_split"),
              py::arg("sp_master_selector"))
