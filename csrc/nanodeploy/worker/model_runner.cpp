@@ -196,7 +196,7 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
     }
 
     NANODEPLOY_LOG_INFO("Process request: batch=", req.seqs.size(), " prefill=", req.is_prefill);
-    std::cerr << "  [ModelRunner] Step 1: Building Tensors..." << std::endl;
+    // std::cerr << "  [ModelRunner] Step 1: Building Tensors..." << std::endl;
     NANODEPLOY_LOG_DEBUG("Step 1: Preparing Metadata Tensors...");
     std::vector<int64_t> input_ids_vec;
     std::vector<int64_t> positions_vec;
@@ -290,12 +290,13 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
     }
 
     // Move to Device
-    std::cerr << "  [ModelRunner] Step 1.5: Moving to Device..." << std::endl;
+    // std::cerr << "  [ModelRunner] Step 1.5: Moving to Device..." << std::endl;
     auto options_long = torch::TensorOptions().dtype(torch::kLong).device(device_);
     auto options_int  = torch::TensorOptions().dtype(torch::kInt).device(device_);
 
-    std::cerr << "  [ModelRunner] Step 1.6: Verifying Inputs..." << std::endl;
-    // Verify Inputs
+    // std::cerr << "  [ModelRunner] Step 1.6: Verifying Inputs..." << std::endl;
+    // Verify Inputs REMOVED for performance
+    /*
     {
         // input_ids_vec is std::vector<int64_t>, so use kLong
         int64_t max_id = torch::max(torch::from_blob(input_ids_vec.data(), {(long)input_ids_vec.size()}, torch::kLong))
@@ -306,6 +307,7 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
             std::exit(1);
         }
     }
+    */
 
     auto input_ids = torch::from_blob(input_ids_vec.data(), {(long)input_ids_vec.size()}, torch::kLong).to(device_);
     auto positions =
@@ -313,34 +315,28 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
     auto slot_mapping =
         torch::from_blob(slot_mapping_vec.data(), {(long)slot_mapping_vec.size()}, torch::kInt).to(device_);
 
-    // Verify Slot Mapping
+    // Verify Slot Mapping REMOVED for performance
+    /*
     {
-        // slot_mapping is kInt (from vector<int32>)
-        int32_t max_slot = torch::max(slot_mapping).item<int32_t>();
-        int     kv_capacity =
-            kv_cache_->k_caches[0].numel()
-            / (kv_cache_->k_caches[0].size(3) * kv_cache_->k_caches[0].size(1));  // Approx blocks * block_size
-        // Actually k_caches[0] is [num_blocks, num_kv, block_size, head_dim].
-        // Flattened size for first dim of view is num_blocks * block_size.
-        int total_slots = kv_cache_->k_caches[0].size(0) * kv_cache_->k_caches[0].size(2);
-
-        NANODEPLOY_LOG_DEBUG("Max Slot Index: ", max_slot, " KV Capacity: ", total_slots);
-        if (max_slot >= total_slots) {
-            NANODEPLOY_LOG_ERROR("Slot Mapping out of bounds! Max: ", max_slot, " Capacity: ", total_slots);
-            std::exit(1);
-        }
+        // ...
+        // int32_t max_slot = torch::max(slot_mapping).item<int32_t>();
+        // ...
     }
+    */
+
     auto block_tables =
         torch::from_blob(block_tables_vec.data(), {batch_size, max_num_blocks}, torch::kInt).to(device_);
     auto seq_lens = torch::from_blob(seq_lens_vec.data(), {batch_size}, torch::kInt).to(device_);
-    std::cerr << "  [ModelRunner] Step 2: Preparing FlashInfer Metadata..." << std::endl;
+    // std::cerr << "  [ModelRunner] Step 2: Preparing FlashInfer Metadata..." << std::endl;
 
     NANODEPLOY_LOG_DEBUG("Step 2: Preparing FlashInfer Metadata...");
     if (!req.is_prefill) {
         NANODEPLOY_LOG_DEBUG("Calling FlashInfer begin_forward...");
-        std::cerr << "  [ModelRunner] Calling flashinfer_handler_->begin_forward..." << std::endl;
-        flashinfer_handler_->begin_forward(block_tables.data_ptr<int>(),
-                                           seq_lens.data_ptr<int>(),
+        // std::cerr << "  [ModelRunner] Calling flashinfer_handler_->begin_forward..." << std::endl;
+
+        // Pass Host Pointers directly!
+        flashinfer_handler_->begin_forward(block_tables_vec.data(),
+                                           seq_lens_vec.data(),
                                            batch_size,
                                            max_num_blocks,
                                            config_->num_attention_heads,
@@ -351,7 +347,6 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
     NANODEPLOY_LOG_DEBUG("FlashInfer metadata prepared.");
 
     // 3. Run Model
-    std::cerr << "  [ModelRunner] Step 3: Running Model Forward..." << std::endl;
     NANODEPLOY_LOG_INFO("Step 3: Running Model Forward...");
     auto hidden_states = model_->forward(
         input_ids, positions, kv_cache_.get(), flashinfer_handler_.get(), slot_mapping, block_tables, seq_lens);
@@ -403,7 +398,6 @@ void ModelRunner::load_weights(const std::string& /*weight_path*/)
         }
         load_layer_weights(i, model_->model_->layers_[i].get());
     }
-    // std::cout << std::endl; // Newline unnecessary with logging macros
 
     // 3. Final Norm
     NANODEPLOY_LOG_INFO("Loading Final Norm...");
@@ -437,7 +431,6 @@ void ModelRunner::load_layer_weights(int layer_idx, Qwen3DecoderLayer<QuantType:
     // Fix: Cast FP8 to FP16 before cat if needed.
     // torch::cat for FP8 on CPU might be problematic or not implemented efficiently.
     if (q_w.scalar_type() == torch::kFloat8_e4m3fn) {
-        // std::cout << "  [ModelRunner] Converting FP8 weights to FP16 for concat..." << std::endl;
         // Optimization: Ensure contiguous memory on CPU before casting,
         // as casting from mmap view might trigger bad kernels.
         q_w = q_w.clone().to(torch::kFloat16);
@@ -445,9 +438,7 @@ void ModelRunner::load_layer_weights(int layer_idx, Qwen3DecoderLayer<QuantType:
         v_w = v_w.clone().to(torch::kFloat16);
     }
 
-    // std::cout << "  [ModelRunner] Concatenating QKV..." << std::endl;
     attn->qkv_proj_->weight = torch::cat({q_w, k_w, v_w}, 0);
-    // std::cout << "  [ModelRunner] QKV concatenated." << std::endl;
 
     // Bias (Optional)
     try {

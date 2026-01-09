@@ -19,44 +19,28 @@ public:
 
     std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor positions, torch::Tensor q, torch::Tensor k)
     {
-        NANODEPLOY_LOG_DEBUG("      [RoPE] Start.");
-        fprintf(stderr, "[RoPE] Start. SeqLen=%ld Base=%f\n", q.size(2), base_);
-        fflush(stderr);
+        NANODEPLOY_LOG_DEBUG("[RoPE] Start. SeqLen=", q.size(2), " Base=", base_);
+
         // positions: [batch, seq] (or [seq])
         // Expand cos/sin to match batch size
         // This is a simplified reference impl. Real impl should use FlashInfer/CUDA kernels.
 
         auto seq_len = q.size(2);
-        fprintf(stderr, "[RoPE] Start. SeqLen=%ld\n", seq_len);
-        fflush(stderr);
+        // Duplicate logging removed as it was redundant
 
         // Ensure cache is on correct device
         // Ensure cache is on correct device and dtype
         if (cos_cached_.device() != q.device() || cos_cached_.scalar_type() != q.scalar_type()) {
-            fprintf(stderr,
-                    "[RoPE] Syncing cache to device %s and dtype %s...\n",
-                    q.device().str().c_str(),
-                    c10::toString(q.scalar_type()));
-            fflush(stderr);
+            NANODEPLOY_LOG_DEBUG("[RoPE] Syncing cache to device ", q.device(), " and dtype ", q.scalar_type(), "...");
             cos_cached_ = cos_cached_.to(q.device(), q.scalar_type());
             sin_cached_ = sin_cached_.to(q.device(), q.scalar_type());
         }
 
         // Validate and Clamp positions
-        // fprintf(stderr, "[RoPE] Checking positions...\n"); fflush(stderr);
-        // auto max_pos_tensor = torch::max(positions);
-        // int64_t max_pos_val = max_pos_tensor.item<int64_t>();
-        // if (max_pos_val >= cos_cached_.size(0)) {
-        //    fprintf(stderr, "[RoPE] Out of bounds! Max=%ld\n", max_pos_val); fflush(stderr);
-        //    positions = positions.clamp(0, cos_cached_.size(0) - 1);
-        // }
-        // Optimization: Skip check for speed/stability if assured. Or keep it.
-        // For now comment out sync item() check to avoid sync overhead/hang possibility if that's it?
-        // But item() sync is fine usually.
+        // ... (commented out code remains commented)
 
         // Gather cos/sin based on positions
-        fprintf(stderr, "[RoPE] Indexing cache...\n");
-        fflush(stderr);
+        NANODEPLOY_LOG_DEBUG("[RoPE] Indexing cache...");
 
         // positions: [B, S] or [TotalTokens]
         // Flatten positions to handle both 1D and 2D
@@ -85,12 +69,10 @@ public:
             sin = sin.to(q.scalar_type());
         }
 
-        fprintf(stderr, "[RoPE] Applying rotation...\n");
-        fflush(stderr);
+        NANODEPLOY_LOG_DEBUG("[RoPE] Applying rotation...");
         auto q_out = _apply_rotary_pos_emb(q, cos, sin);
         auto k_out = _apply_rotary_pos_emb(k, cos, sin);
-        fprintf(stderr, "[RoPE] Done.\n");
-        fflush(stderr);
+        NANODEPLOY_LOG_DEBUG("[RoPE] Done.");
         return {q_out, k_out};
     }
 

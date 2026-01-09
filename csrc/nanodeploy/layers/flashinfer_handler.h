@@ -19,8 +19,9 @@ public:
     ~FlashInferHandler();  // Destructor needed for pimpl
 
     // Prepare metadata for a batch
-    void begin_forward(int* block_tables_ptr,
-                       int* seq_lens_ptr,
+    // NOTE: block_tables_host and seq_lens_host MUST point to CPU (Host) memory!
+    void begin_forward(int* block_tables_host,
+                       int* seq_lens_host,
                        int  batch_size,
                        int  max_num_blocks,
                        int  num_qo_heads,
@@ -30,8 +31,8 @@ public:
                        int  window_left = -1);
 
     // Internal impl mostly for pimpl pattern if needed
-    void begin_forward_impl(int* block_tables_ptr,
-                            int* seq_lens_ptr,
+    void begin_forward_impl(int* block_tables_host,
+                            int* seq_lens_host,
                             int  batch_size,
                             int  max_num_blocks,
                             int  num_qo_heads,
