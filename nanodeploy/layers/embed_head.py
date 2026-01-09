@@ -28,13 +28,26 @@ class VocabParallelEmbedding(nn.Module):
         self.weight.weight_loader = self.weight_loader
 
     def weight_loader(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str = None
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str = None, ckpt_shard_id=None, ckpt_num_shards=None, **kwargs
     ):
         param_data = param.data
         shard_size = param_data.size(0)
-        start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
-        param_data.copy_(loaded_weight)
+        
+        if loaded_weight.size(0) == shard_size:
+            if ckpt_shard_id is not None and self.tp_size > 1:
+                # If we have shard info, only load if it matches our rank
+                # This assumes 1:1 mapping between ckpt shards and TP ranks
+                if ckpt_shard_id == self.tp_rank:
+                    param_data.copy_(loaded_weight)
+            else:
+                param_data.copy_(loaded_weight)
+        elif loaded_weight.size(0) > shard_size:
+             start_idx = self.tp_rank * shard_size
+             if start_idx + shard_size <= loaded_weight.size(0):
+                loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
+                param_data.copy_(loaded_weight)
+        # Handle cases where loaded weight is a subset but not matching exact shard? 
+        # For now, this covers the "full weight" and "exact shard" cases.
 
     def forward(self, x: torch.Tensor):
         if self.tp_size > 1:

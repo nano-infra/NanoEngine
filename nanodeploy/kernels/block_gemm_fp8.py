@@ -59,6 +59,9 @@ def _quant_fp8_kernel(
 def _quant_fp8_launcher(A: Tensor, group_size: int, out: Tensor, scales: Tensor):
     """Quant online."""
     M, K = A.shape
+    if M == 0:
+        return out, scales
+
     num_groups = K // group_size
     M_out = out.size(0)
 

@@ -135,6 +135,10 @@ class Qwen3MoeMLP(nn.Module):
         self.config = config
         self.quantization_config = quantization_config
 
+        tp_size = get_dist_context().ffn_tp_world_size
+        tp_rank = get_dist_context().ffn_tp_rank
+        tp_group = get_dist_context().ffn_tp_group
+
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -143,6 +147,9 @@ class Qwen3MoeMLP(nn.Module):
             weight_tensor=gate_up_proj_tensor,
             scale_tensor=gate_up_scale_inv_tensor,
             quantization_config=quantization_config,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            tp_group=tp_group,
         )
 
         self.down_proj = RowParallelLinear(
@@ -153,6 +160,9 @@ class Qwen3MoeMLP(nn.Module):
             weight_tensor=down_proj_tenosr,
             scale_tensor=down_scale_inv_tensor,
             quantization_config=quantization_config,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            tp_group=tp_group,
         )
 
         assert hidden_act == "silu"
@@ -343,6 +353,33 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         return list(range(expert_id_begin, expert_id_end))
 
     def forward(self, hidden_states: torch.Tensor):
+        attn_tp_size = get_dist_context().attn_tp_world_size
+        attn_tp_rank = get_dist_context().attn_tp_rank
+
+        orig_shape = hidden_states.shape
+        if hidden_states.dim() == 3:
+            hidden_states = hidden_states.flatten(0, 1)
+
+        # SP Split
+        pad_len = 0
+        if attn_tp_size > 1:
+            total_tokens = hidden_states.shape[0]
+            if total_tokens % attn_tp_size != 0:
+                pad_len = attn_tp_size - (total_tokens % attn_tp_size)
+                # Use replication padding instead of zero padding to avoid routing issues
+                if total_tokens > 0:
+                    last_token = hidden_states[-1:]
+                    padding = last_token.repeat(pad_len, 1)
+                    hidden_states = torch.cat([hidden_states, padding], dim=0)
+                else:
+                    hidden_states = F.pad(hidden_states, (0, 0, 0, pad_len))
+            
+            total_tokens = hidden_states.shape[0]
+            chunk_size = total_tokens // attn_tp_size
+            start = attn_tp_rank * chunk_size
+            end = (attn_tp_rank + 1) * chunk_size
+            hidden_states = hidden_states[start:end]
+
         if self.ep_size > 1:
             assert (
                 self.quantization_config.quant_method == "fp8"
@@ -412,6 +449,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 final_hidden_states.index_add_(
                     0, top_x, current_hidden_states.to(hidden_states.dtype)
                 )
+
+        # SP Gather
+        if attn_tp_size > 1:
+            group = get_dist_context().attn_tp_group
+            gathered = [torch.empty_like(final_hidden_states) for _ in range(attn_tp_size)]
+            dist.all_gather(gathered, final_hidden_states, group=group)
+            final_hidden_states = torch.cat(gathered, dim=0)
+            
+            if pad_len > 0:
+                final_hidden_states = final_hidden_states[:-pad_len]
+
+        if len(orig_shape) == 3:
+            final_hidden_states = final_hidden_states.view(orig_shape)
+
         return final_hidden_states
 
 
