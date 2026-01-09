@@ -12,9 +12,10 @@ class Linear: public core::Module {
 public:
     Linear(int in_features, int out_features, bool bias = false): in_features_(in_features), out_features_(out_features)
     {
-        weight = this->register_parameter("weight", torch::randn({out_features, in_features}));
+        // Use empty initialization for speed (we load weights immediately after)
+        weight = this->register_parameter("weight", torch::empty({out_features, in_features}));
         if (bias) {
-            this->bias = this->register_parameter("bias", torch::zeros({out_features}));
+            this->bias = this->register_parameter("bias", torch::empty({out_features}));
         }
     }
 

@@ -1,0 +1,16 @@
+/home/majinming/miniconda3/envs/py310/lib/python3.10/site-packages/torch/_subclasses/functional_tensor.py:279: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+Inspecting model in: /mnt/c/Users/majinming/Downloads/qwen3-0.6b-local
+Found single model.safetensors.
+model.embed_tokens.weight: torch.Size([151936, 1024]) torch.bfloat16
+model.layers.0.input_layernorm.weight: torch.Size([1024]) torch.bfloat16
+model.layers.0.mlp.down_proj.weight: torch.Size([1024, 3072]) torch.bfloat16
+model.layers.0.mlp.gate_proj.weight: torch.Size([3072, 1024]) torch.bfloat16
+model.layers.0.mlp.up_proj.weight: torch.Size([3072, 1024]) torch.bfloat16
+model.layers.0.post_attention_layernorm.weight: torch.Size([1024]) torch.bfloat16
+model.layers.0.self_attn.k_norm.weight: torch.Size([128]) torch.bfloat16
+model.layers.0.self_attn.k_proj.weight: torch.Size([1024, 1024]) torch.bfloat16
+model.layers.0.self_attn.o_proj.weight: torch.Size([1024, 2048]) torch.bfloat16
+model.layers.0.self_attn.q_norm.weight: torch.Size([128]) torch.bfloat16
+model.layers.0.self_attn.q_proj.weight: torch.Size([2048, 1024]) torch.bfloat16
+model.layers.0.self_attn.v_proj.weight: torch.Size([1024, 1024]) torch.bfloat16

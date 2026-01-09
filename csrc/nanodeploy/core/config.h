@@ -21,6 +21,7 @@ struct ModelConfig {
     float       rms_norm_eps;
     int         vocab_size;
     int         max_position_embeddings;
+    int         head_dim = 0;  // 0 means derived
 
     // MoE specific
     int  num_experts         = 0;
@@ -52,6 +53,15 @@ struct ModelConfig {
         config.vocab_size              = j.value("vocab_size", 0);
         config.max_position_embeddings = j.value("max_position_embeddings", 0);
 
+        // Qwen3/2 optional explicit head_dim (overrides hidden/heads)
+        // Qwen3/2 optional explicit head_dim (overrides hidden/heads)
+        if (j.contains("head_dim")) {
+            config.head_dim = j["head_dim"];
+        }
+        else {
+            config.head_dim = 0;  // Use 0 to signal fallback to hidden/heads
+        }
+
         if (j.contains("num_experts")) {
             config.num_experts         = j["num_experts"];
             config.num_experts_per_tok = j.value("num_experts_per_tok", 0);
@@ -59,7 +69,7 @@ struct ModelConfig {
             config.decoder_sparse_step = j.value("decoder_sparse_step", 1);
         }
 
-        config.rope_theta = j.value("rope_theta", 10000.0f);
+        config.rope_theta = j.value("rope_theta", 1000000.0f);
 
         return config;
     }

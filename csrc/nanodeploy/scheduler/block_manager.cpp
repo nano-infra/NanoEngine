@@ -164,11 +164,17 @@ bool BlockManager::may_append(Sequence& seq, int num_tokens)
 
         int current_dispatched = seq.block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_idx_];
 
+        std::cerr << "[BlockManager] may_append: current_dispatched=" << current_dispatched << " idx=" << idx
+                  << " block_size=" << block_size_ << " check=" << ((current_dispatched + idx) % block_size_)
+                  << " num_blocks=" << table.size() << std::endl;
+
         if ((current_dispatched + idx) % block_size_ == 0) {
             if (free_block_ids_.empty()) {
+                std::cerr << "[BlockManager] ERROR: No free blocks!" << std::endl;
                 return false;
             }
             int block_id = free_block_ids_.front();
+            std::cerr << "[BlockManager] Allocating block " << block_id << " for seq " << seq.seq_id << std::endl;
             seq.block_ctx(BlockContextSlot::ACTIVE).block_location.emplace_back(sp_idx_, block_id);
             allocate_block(block_id);
             table.push_back(block_id);

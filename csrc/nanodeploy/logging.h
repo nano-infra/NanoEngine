@@ -4,13 +4,19 @@
 
 #pragma once
 
+#ifdef _WIN32
+// #include <windows.h> // Not available in some environments, stack trace disabled anyway
+#else
 #include <cxxabi.h>
 #include <execinfo.h>
 #include <unistd.h>
+#endif
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -27,7 +33,7 @@ inline std::mutex& get_console_mutex()
 
 inline int& get_log_level()
 {
-    static int level = 2;  // Default to DEBUG (2)
+    static int level = 0;  // Default to INFO (1)
     return level;
 }
 
@@ -44,6 +50,9 @@ inline int& get_log_level()
  */
 inline void print_stack_trace()
 {
+#ifdef _WIN32
+    std::cerr << "  <Stack trace not supported on Windows>" << std::endl;
+#else
     const int max_frames = 64;
     void*     addr_list[max_frames];
 
@@ -110,6 +119,7 @@ inline void print_stack_trace()
                   << "\033[90m" << offset << " " << address << "\033[m" << std::endl;
     }
     std::cerr << std::endl;
+#endif
 }
 
 // -----------------------------------------------------------------------------
@@ -180,7 +190,12 @@ inline void print_stack_trace()
 #define NANODEPLOY_LOG_LEVEL(MsgType, FlagFormat, Level, ...)                                                          \
     {                                                                                                                  \
         if (get_log_level() >= Level) {                                                                                \
-            std::cerr << FlagFormat << "[" << MsgType << "]"                                                           \
+            auto    now   = std::chrono::system_clock::now();                                                          \
+            auto    ms    = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;      \
+            auto    timer = std::chrono::system_clock::to_time_t(now);                                                 \
+            std::tm bt    = *std::localtime(&timer);                                                                   \
+            std::cerr << "[" << std::put_time(&bt, "%H:%M:%S") << "." << std::setfill('0') << std::setw(3)             \
+                      << ms.count() << "] " << FlagFormat << "[" << MsgType << "]"                                     \
                       << "\033[m " << __FILE__ << ":" << __LINE__ << ": " << __FUNCTION__                              \
                       << ": " __VA_OPT__(STREAM_VAR_ARGS(__VA_ARGS__)) << std::endl;                                   \
         }                                                                                                              \

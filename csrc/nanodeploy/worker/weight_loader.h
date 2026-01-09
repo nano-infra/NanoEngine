@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "nanodeploy/json.hpp"
+#include "nanodeploy/logging.h"
 
 namespace nanodeploy {
 
@@ -44,7 +45,7 @@ public:
                 continue;
             tensors_[it.key()] = it.value();
         }
-        std::cout << "    [SafeTensorLoader] Constructed. Addr: " << addr_ << std::endl;
+        NANODEPLOY_LOG_DEBUG("[SafeTensorLoader] Constructed. Addr: ", addr_);
     }
 
     // Move Constructor
@@ -58,7 +59,7 @@ public:
     {
         other.fd_   = -1;
         other.addr_ = MAP_FAILED;
-        std::cout << "    [SafeTensorLoader] Moved. Addr: " << addr_ << std::endl;
+        NANODEPLOY_LOG_DEBUG("[SafeTensorLoader] Moved. Addr: ", addr_);
     }
 
     // Move Assignment
@@ -79,7 +80,7 @@ public:
 
             other.fd_   = -1;
             other.addr_ = MAP_FAILED;
-            std::cout << "    [SafeTensorLoader] Move Assigned. Addr: " << addr_ << std::endl;
+            NANODEPLOY_LOG_DEBUG("[SafeTensorLoader] Move Assigned. Addr: ", addr_);
         }
         return *this;
     }
@@ -91,7 +92,7 @@ public:
     ~SafeTensorLoader()
     {
         if (addr_ != MAP_FAILED) {
-            std::cout << "    [SafeTensorLoader] Destructing... Unmapping addr: " << addr_ << std::endl;
+            NANODEPLOY_LOG_DEBUG("[SafeTensorLoader] Destructing... Unmapping addr: ", addr_);
             munmap(addr_, size_);
         }
         if (fd_ >= 0)
@@ -109,7 +110,7 @@ public:
         std::vector<uint64_t> data_offsets = info["data_offsets"].get<std::vector<uint64_t>>();
         std::string           dtype_str    = info["dtype"];
 
-        std::cout << "    [SafeTensorLoader] info: " << name << " | Dtype: " << dtype_str << std::endl;
+        NANODEPLOY_LOG_DEBUG("[SafeTensorLoader] info: ", name, " | Dtype: ", dtype_str);
 
         torch::ScalarType dtype;
         int               element_size = 0;
@@ -147,23 +148,22 @@ public:
         size_t tensor_bytes = num_elements * element_size;
 
         // Debug Prints
-        // std::cout << "      Base Addr: " << addr_ << std::endl;
-        // std::cout << "      Header Size: " << header_size_ << std::endl;
-        // std::cout << "      Data Start Offset: " << data_start_offset << std::endl;
-        // std::cout << "      Tensor Offset (rel to data): " << data_offsets[0] << std::endl;
-        // std::cout << "      Final File Offset: " << tensor_offset_in_file << std::endl;
-        // std::cout << "      Tensor Bytes: " << tensor_bytes << std::endl;
-        // std::cout << "      Total File Size: " << size_ << std::endl;
+        NANODEPLOY_LOG_DEBUG("      Base Addr: ", addr_);
+        NANODEPLOY_LOG_DEBUG("      Header Size: ", header_size_);
+        NANODEPLOY_LOG_DEBUG("      Data Start Offset: ", data_start_offset);
+        NANODEPLOY_LOG_DEBUG("      Tensor Offset (rel to data): ", data_offsets[0]);
+        NANODEPLOY_LOG_DEBUG("      Final File Offset: ", tensor_offset_in_file);
+        NANODEPLOY_LOG_DEBUG("      Tensor Bytes: ", tensor_bytes);
+        NANODEPLOY_LOG_DEBUG("      Total File Size: ", size_);
 
         if (tensor_offset_in_file + tensor_bytes > size_) {
-            std::cerr << "CRITICAL ERROR: OOB Access! " << (tensor_offset_in_file + tensor_bytes) << " > " << size_
-                      << std::endl;
+            NANODEPLOY_LOG_ERROR("CRITICAL ERROR: OOB Access! ", (tensor_offset_in_file + tensor_bytes), " > ", size_);
             throw std::runtime_error("Tensor OOB");
         }
 
         void* data_ptr = (char*)addr_ + tensor_offset_in_file;
 
-        // std::cout << "      Creating from blob at: " << data_ptr << std::endl;
+        NANODEPLOY_LOG_DEBUG("      Creating from blob at: ", data_ptr);
         auto          options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
         torch::Tensor t       = torch::from_blob(data_ptr, shape, options);
 

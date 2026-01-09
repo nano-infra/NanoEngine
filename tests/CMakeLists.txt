@@ -38,3 +38,48 @@ target_include_directories(test_model_runner
     ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
 )
+
+add_executable(test_qwen3_runner test_qwen3_runner.cpp)
+target_link_libraries(test_qwen3_runner
+    PUBLIC
+    _nanodeploy_worker
+    _nanodeploy_sequence
+    _nanodeploy_scheduler
+    nanodeploy_core
+    torch
+    torch_cpu
+    c10
+    Spoke::core
+)
+target_include_directories(test_qwen3_runner
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+)
+
+add_executable(test_flashinfer_ops test_flashinfer_ops.cpp)
+target_link_libraries(test_flashinfer_ops
+    PRIVATE
+    _nanodeploy_worker
+    _nanodeploy_sequence
+    nanodeploy_core
+    torch
+    torch_cpu
+    c10
+)
+target_include_directories(test_flashinfer_ops
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+)
+
+add_executable(test_rope_ops test_rope_ops.cpp)
+target_link_libraries(test_rope_ops
+    PRIVATE
+    nanodeploy_core
+    torch
+    torch_cpu
+    c10
+)
+target_include_directories(test_rope_ops
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+)

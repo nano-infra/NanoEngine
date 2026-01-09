@@ -2,7 +2,11 @@ set(CPP_SOURCES
     dummy_runner.cpp
     model_runner_utils.cpp
     model_runner.cpp
+    ../layers/flashinfer_handler.cu
 )
+
+set_property(SOURCE ../layers/flashinfer_handler.cu PROPERTY LANGUAGE CUDA)
+
 
 add_library(
     _nanodeploy_worker
@@ -19,7 +23,8 @@ target_link_libraries(_nanodeploy_worker
     c10
 )
 
-target_compile_options(_nanodeploy_worker PRIVATE -O3 -Wall -Wextra)
+target_compile_options(_nanodeploy_worker PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wextra>)
+target_compile_features(_nanodeploy_worker PRIVATE cxx_std_17)
 
 set_target_properties(
     _nanodeploy_worker
