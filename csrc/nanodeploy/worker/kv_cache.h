@@ -2,6 +2,7 @@
 
 #include <torch/torch.h>
 #include <vector>
+#include <cuda_runtime.h> // Added for cudaDeviceSynchronize
 
 namespace nanodeploy {
 
@@ -9,7 +10,8 @@ class KvCache {
 public:
     KvCache(int num_layers, int num_kv_heads, int head_dim, int num_blocks, int block_size, torch::Device device)
     {
-        auto options = torch::TensorOptions().dtype(torch::kHalf).device(device);
+        // Use BFloat16 to match FlashInfer handler and Model weights
+        auto options = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
         // Layout: [num_blocks, num_kv_heads, block_size, head_dim] (NHD-like but block-based)
         // This matches FlashInfer typical expectation (NHD or HND supported).
         // We choose [num_blocks, num_kv_heads, block_size, head_dim].
@@ -29,76 +31,38 @@ public:
     // k, v: [batch_size, num_kv_heads, head_dim]
     void set_kv(int layer_idx, torch::Tensor slot_mapping, torch::Tensor k, torch::Tensor v)
     {
-        // k, v are [Batch, NumKV, Dim]
-        // cache is [NumBlocks, NumKV, BlockSize, Dim]
-
-        if (layer_idx == 0)
-            fprintf(stderr, "      [KvCache] set_kv: CPU Loop approach (Source on CPU).\n");
-
-        // Log Cache Shape
-        if (layer_idx == 0) {
-            auto s = k_caches[layer_idx].sizes();
-            fprintf(stderr, "      [KvCache] Cache Shape: [%ld, %ld, %ld, %ld]\n", s[0], s[1], s[2], s[3]);
-        }
-
-        // 1. Sync slot_mapping to CPU
-        auto slots_cpu  = slot_mapping.to(torch::kCPU, torch::kLong);
-        auto slots_acc  = slots_cpu.accessor<int64_t, 1>();
-        int  batch_size = slot_mapping.size(0);
-        int  block_size = k_caches[layer_idx].size(2);
-
-        // Cast inputs once
-        if (k.scalar_type() != k_caches[layer_idx].scalar_type())
-            k = k.to(k_caches[layer_idx].scalar_type());
-        if (v.scalar_type() != v_caches[layer_idx].scalar_type())
-            v = v.to(v_caches[layer_idx].scalar_type());
-
-        // Move source to CPU to avoid D2D copy issues and force contiguity
-        auto k_cpu = k.to(torch::kCPU).contiguous();
-        auto v_cpu = v.to(torch::kCPU).contiguous();
-
-        // 2. Loop
+        // Loop-based method with correct indexing
+        // Cache layout: [NumBlocks, NumKV, BlockSize, HeadDim]
+        
+        // Ensure k, v are on same device/dtype as cache
+        auto device = k_caches[layer_idx].device();
+        auto dtype  = k_caches[layer_idx].scalar_type();
+        
+        if (k.scalar_type() != dtype) k = k.to(dtype);
+        if (v.scalar_type() != dtype) v = v.to(dtype);
+        // Keep k, v on GPU
+        if (k.device() != device) k = k.to(device);
+        if (v.device() != device) v = v.to(device);
+        
+        int64_t block_size = k_caches[layer_idx].size(2);
+        int batch_size = slot_mapping.size(0);
+        
+        // Sync slot_mapping to CPU for indexing
+        auto slots_cpu = slot_mapping.to(torch::kCPU, torch::kLong);
+        auto slots_acc = slots_cpu.accessor<int64_t, 1>();
+        
+        using namespace torch::indexing;
+        
         for (int i = 0; i < batch_size; ++i) {
-            int64_t s = slots_acc[i];
-            int64_t b = s / block_size;
-            int64_t o = s % block_size;
-
-            // Validation
-            if (i == 0 && layer_idx == 0) {
-                fprintf(stderr, "      [KvCache] Token 0: Slot %ld -> Block %ld Offset %ld\n", s, b, o);
-                if (b >= k_caches[layer_idx].size(0)) {
-                    fprintf(stderr,
-                            "      [KvCache] ERROR: Block index %ld out of bounds (Size %ld)\n",
-                            b,
-                            k_caches[layer_idx].size(0));
-                    std::exit(1);
-                }
-            }
-
-            using namespace torch::indexing;
-            // cache[b, :, o, :] = k_cpu[i]
-            // We use .to(device) on the RHS to ensure type match if needed, but PyTorch handles CPU->GPU assignment.
-            // Actually, assigning CPU tensor to GPU index triggers H2D copy.
-
-            // Note: index({b, ...}) returns a generic reference (Tensor).
-            // But assignment to it in C++ rebinds the variable, it doesn't call __setitem__.
-            // We MUST use index_put_ for in-place modification.
-
-            auto k_val = k_cpu[i].to(k_caches[layer_idx].device());
-            auto v_val = v_cpu[i].to(v_caches[layer_idx].device());
-
-            k_caches[layer_idx].index_put_({(int64_t)b, Slice(), (int64_t)o, Slice()}, k_val);
-            v_caches[layer_idx].index_put_({(int64_t)b, Slice(), (int64_t)o, Slice()}, v_val);
-
-            if (i == 0 && layer_idx == 0) {
-                fprintf(stderr, "      [KvCache] Token 0 Assigned.\n");
-                fflush(stderr);
-            }
-        }
-
-        if (layer_idx == 0) {
-            fprintf(stderr, "      [KvCache] set_kv: Done.\n");
-            fflush(stderr);
+            int64_t slot = slots_acc[i];
+            int64_t block_idx = slot / block_size;
+            int64_t offset = slot % block_size;
+            
+            // k[i] is [NumKV, HeadDim]
+            // Target: cache[block_idx, :, offset, :] which is [NumKV, HeadDim]
+            // Use index_put_ with scalar indices
+            k_caches[layer_idx].index_put_({block_idx, Slice(), offset, Slice()}, k[i]);
+            v_caches[layer_idx].index_put_({block_idx, Slice(), offset, Slice()}, v[i]);
         }
     }
     // Gather KV from cache for SDPA (Slow Path)
