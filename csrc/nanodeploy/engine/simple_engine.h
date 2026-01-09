@@ -78,66 +78,95 @@ public:
         }
     }
 
-    std::vector<int> generate(const std::vector<int>& prompt_ids, int max_new_tokens)
+    // Step-by-Step API
+    void add_request(const std::vector<int>& prompt_ids, int max_new_tokens)
     {
-        std::cout << "[SimpleEngine] Starting Scheduled Generation..." << std::endl;
-
-        // 1. Add Request
+        std::cout << "[SimpleEngine] Adding Request..." << std::endl;
         auto seq =
             std::make_shared<Sequence>(prompt_ids, /*temp=*/1.0, /*max_tokens=*/prompt_ids.size() + max_new_tokens);
         scheduler_->add(seq);
+    }
 
-        std::vector<int> output_tokens;
+    bool is_finished() const
+    {
+        return scheduler_->is_finished();
+    }
+
+    std::vector<int> step()
+    {
+        std::vector<int> step_tokens;
         constexpr int    kRunAction = static_cast<int>(spoke::Action::kUserActionStart) + 11;
 
-        // 2. Schedule Loop
-        while (!scheduler_->is_finished()) {
-            auto  sched_res  = scheduler_->schedule();
-            auto& batch_seqs = sched_res.dp_sp_seqs[0];
+        if (scheduler_->is_finished()) {
+            return step_tokens;
+        }
 
-            if (batch_seqs.empty())
-                continue;
+        auto  sched_res  = scheduler_->schedule();
+        auto& batch_seqs = sched_res.dp_sp_seqs[0];
 
-            // Prepare Request
-            ModelRunReq req;
-            req.is_prefill = sched_res.is_prefill;
-            req.seqs       = batch_seqs;
+        if (sched_res.is_prefill) {
+            std::cout << "[SimpleEngine] Scheduled PREFILL." << std::endl;
+        } else {
+            std::cout << "[SimpleEngine] Scheduled DECODE." << std::endl;
+        }
 
-            // Call Remote
-            auto resp =
-                client_->callRemote<ModelRunReq, ModelRunResp>(actor_id_, static_cast<spoke::Action>(kRunAction), req)
-                    .get();
+        if (batch_seqs.empty())
+            return step_tokens;
 
-            if (resp.tensor.numel() == 0)
-                break;
+        // Prepare Request
+        ModelRunReq req;
+        req.is_prefill = sched_res.is_prefill;
+        req.seqs       = batch_seqs;
 
-            // Extract outputs (Assuming [batch, vocab] logits or similar)
-            auto logits = resp.tensor;
-            // For decode phase with seq_len=1, logits may be [B, 1, V] or [B, V]
-            // Squeeze to ensure [B, V] before argmax
-            if (logits.dim() == 3) {
-                logits = logits.squeeze(1);  // [B, S, V] -> [B, V] when S=1
-            }
-            auto next_tokens = torch::argmax(logits, -1);  // [batch_size]
+        // Call Remote
+        auto resp =
+            client_->callRemote<ModelRunReq, ModelRunResp>(actor_id_, static_cast<spoke::Action>(kRunAction), req)
+                .get();
 
-            // Postprocess preparation
-            std::vector<std::vector<std::vector<int>>> dp_sp_token_ids(1);
-            dp_sp_token_ids[0].resize(1);
+        if (resp.tensor.numel() == 0)
+            return step_tokens;
 
-            auto next_tokens_cpu = next_tokens.cpu();
-            auto access          = next_tokens_cpu.accessor<int64_t, 1>();
+        // Extract outputs (Assuming [batch, vocab] logits or similar)
+        auto logits = resp.tensor;
+        // For decode phase with seq_len=1, logits may be [B, 1, V] or [B, V]
+        // Squeeze to ensure [B, V] before argmax
+        if (logits.dim() == 3) {
+            logits = logits.squeeze(1);  // [B, S, V] -> [B, V] when S=1
+        }
+        auto next_tokens = torch::argmax(logits, -1);  // [batch_size]
 
-            for (int k = 0; k < batch_seqs.size(); ++k) {
-                int token = (int)access[k];
-                dp_sp_token_ids[0][0].push_back(token);
+        // Postprocess preparation
+        std::vector<std::vector<std::vector<int>>> dp_sp_token_ids(1);
+        dp_sp_token_ids[0].resize(1);
 
-                if (batch_seqs[k]->seq_id == seq->seq_id) {
-                    output_tokens.push_back(token);
-                    std::cout << token << " " << std::flush;
-                }
-            }
+        auto next_tokens_cpu = next_tokens.cpu();
+        auto access          = next_tokens_cpu.accessor<int64_t, 1>();
 
-            scheduler_->postprocess(sched_res.dp_sp_seqs, dp_sp_token_ids, /*update_metrics=*/false);
+        for (int k = 0; k < batch_seqs.size(); ++k) {
+            int token = (int)access[k];
+            dp_sp_token_ids[0][0].push_back(token);
+            
+            // Note: For multi-seq, this returns mixed tokens. 
+            // Caller should track by seq_id if needed, but for now we return all generated in this step.
+            step_tokens.push_back(token);
+            std::cout << token << " " << std::flush;
+        }
+
+        scheduler_->postprocess(sched_res.dp_sp_seqs, dp_sp_token_ids, /*update_metrics=*/false);
+        return step_tokens;
+    }
+
+    std::vector<int> generate(const std::vector<int>& prompt_ids, int max_new_tokens)
+    {
+        std::cout << "[SimpleEngine] Starting Scheduled Generation..." << std::endl;
+        
+        add_request(prompt_ids, max_new_tokens);
+        
+        std::vector<int> output_tokens;
+        
+        while (!is_finished()) {
+            auto new_tokens = step();
+            output_tokens.insert(output_tokens.end(), new_tokens.begin(), new_tokens.end());
         }
         std::cout << std::endl;
         return output_tokens;

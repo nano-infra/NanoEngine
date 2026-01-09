@@ -69,8 +69,26 @@ int main(int argc, char** argv)
         std::cout << id << " ";
     std::cout << std::endl;
 
-    std::cout << "Generating response..." << std::endl;
-    std::vector<int> output_ids = engine.generate(prompt_ids, 20);
+    std::cout << "Starting generation (Step-by-Step interaction)..." << std::endl;
+    
+    // 1. Add Request
+    engine.add_request(prompt_ids, 20);
+    
+    std::vector<int> output_ids;
+    
+    // 2. Step Loop
+    int step_count = 0;
+    while (!engine.is_finished()) {
+        step_count++;
+        // std::cout << "  [Test] Executing Step " << step_count << "..." << std::endl;
+        
+        auto step_tokens = engine.step();
+        
+        output_ids.insert(output_ids.end(), step_tokens.begin(), step_tokens.end());
+        
+        // Optional: Add sleep or interaction logic here
+    }
+    std::cout << "\nGeneration Finished in " << step_count << " steps." << std::endl;
 
     std::cout << "Generated IDs: ";
     for (int id : output_ids)
