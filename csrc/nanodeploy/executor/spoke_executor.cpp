@@ -4,6 +4,7 @@
 #include <string>
 
 #include "nanodeploy/logging.h"
+#include "nanodeploy/worker/deep_ep_runner.h"
 #include "nanodeploy/worker/dummy_runner.h"
 #include "nanodeploy/worker/dummy_runner_ipc.h"
 #include "nanodeploy/worker/model_runner.h"
@@ -58,7 +59,15 @@ public:
                  nanodeploy::ModelInitResp)
     {
         std::cout << "[Executor] Received Init Request. Calling runner_.init()..." << std::endl;
-        runner_.init(val.config_path, val.rank, val.world_size);
+
+        nanodeploy::DistributedConfig dconf;
+        dconf.global_rank = val.rank;
+        dconf.world_size  = val.world_size;
+        dconf.tp_degree   = val.tp_degree;
+        dconf.pp_degree   = val.pp_degree;
+        dconf.dp_degree   = val.dp_degree;
+
+        runner_.init(val.config_path, dconf);
         std::cout << "[Executor] runner_.init() returned. Sending response..." << std::endl;
         return true;
     }
@@ -76,6 +85,52 @@ private:
     nanodeploy::ModelRunner runner_;
 };
 
+// Define DeepEPTest Actor
+class DeepEPTestActor: public spoke::Actor {
+public:
+    DeepEPTestActor(const std::string& id, int rx, int tx): spoke::Actor(id, rx, tx) {}
+
+    SPOKE_METHOD(DeepEPTestActor,
+                 init,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 20),
+                 nanodeploy::DeepEPInitReq,
+                 nanodeploy::DeepEPInitResp)
+    {
+        return runner_.init(val);
+    }
+
+    SPOKE_METHOD(DeepEPTestActor,
+                 get_info,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 21),
+                 nanodeploy::DeepEPInfoReq,
+                 nanodeploy::DeepEPInfoResp)
+    {
+        return runner_.get_info();
+    }
+
+    SPOKE_METHOD(DeepEPTestActor,
+                 sync,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 22),
+                 nanodeploy::DeepEPSyncReq,
+                 nanodeploy::DeepEPSyncResp)
+    {
+        return runner_.sync(val);
+    }
+
+    SPOKE_METHOD(DeepEPTestActor,
+                 run_test,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 23),
+                 nanodeploy::DeepEPTestReq,
+                 nanodeploy::DeepEPTestResp)
+    {
+        return runner_.run_test(val);
+    }
+
+private:
+    nanodeploy::DeepEPRunner runner_;
+};
+
 // Register Actor Type
 SPOKE_REGISTER_ACTOR("DummyRunner", DummyRunnerActor)
 SPOKE_REGISTER_ACTOR("ModelRunner", ModelRunnerActor)
+SPOKE_REGISTER_ACTOR("DeepEPTestActor", DeepEPTestActor)

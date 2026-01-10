@@ -57,7 +57,7 @@ int main(int argc, char** argv)
 
     nanodeploy::SimpleEngine engine;
     try {
-        engine.init(config_path, agent_ip, agent_port);
+        engine.init(config_path, 1, 1, 1, agent_ip, agent_port);
     }
     catch (const std::exception& e) {
         std::cerr << "Engine init failed: " << e.what() << std::endl;
@@ -70,22 +70,22 @@ int main(int argc, char** argv)
     std::cout << std::endl;
 
     std::cout << "Starting generation (Step-by-Step interaction)..." << std::endl;
-    
+
     // 1. Add Request
     engine.add_request(prompt_ids, 20);
-    
+
     std::vector<int> output_ids;
-    
+
     // 2. Step Loop
     int step_count = 0;
     while (!engine.is_finished()) {
         step_count++;
         // std::cout << "  [Test] Executing Step " << step_count << "..." << std::endl;
-        
+
         auto step_tokens = engine.step();
-        
+
         output_ids.insert(output_ids.end(), step_tokens.begin(), step_tokens.end());
-        
+
         // Optional: Add sleep or interaction logic here
     }
     std::cout << "\nGeneration Finished in " << step_count << " steps." << std::endl;

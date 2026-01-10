@@ -83,3 +83,18 @@ target_include_directories(test_rope_ops
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
 )
+
+add_executable(test_deep_ep_actor test_deep_ep_actor.cpp)
+target_link_libraries(test_deep_ep_actor
+    PRIVATE
+    Spoke::core
+    torch
+    torch_cpu
+    c10
+    _nanodeploy_sequence
+)
+target_include_directories(test_deep_ep_actor
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
+)

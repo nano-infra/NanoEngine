@@ -20,6 +20,9 @@ struct ModelInitReq {
     std::string weight_path;
     int         rank;
     int         world_size;
+    int         tp_degree;
+    int         pp_degree;
+    int         dp_degree;
 };
 
 struct ModelRunResp {
@@ -40,13 +43,11 @@ struct Serializer<nanodeploy::ModelRunReq> {
     {
         std::vector<char> buf(kMaxBufSize);
         // Serialize sequences
-        size_t sz = nanodeploy::serialize_sequences((uintptr_t)buf.data(), buf.size(), data.seqs, true);
+        size_t sz = nanodeploy::serialize_sequences((uintptr_t)buf.data(), buf.size(), data.seqs, data.is_prefill);
 
         // Append is_prefill boolean
-        // We need 1 extra byte. Check bounds effectively or use strict sizing.
-        // serialize_sequences returns used size.
         if (sz + 1 > buf.size()) {
-            // Handle overflow or resize logic? For now assume kMaxBufSize is enough.
+            // ...
         }
         buf[sz] = data.is_prefill ? 1 : 0;
 
@@ -127,7 +128,7 @@ template<>
 struct Serializer<nanodeploy::ModelInitReq> {
     static size_t size(const nanodeploy::ModelInitReq& data)
     {
-        return sizeof(int) * 3 + data.config_path.size();
+        return sizeof(int) * 6 + data.config_path.size();  // rank, ws, tp, pp, dp, size_of_str
     }
     static void packTo(const nanodeploy::ModelInitReq& data, char* buf)
     {
@@ -143,6 +144,13 @@ struct Serializer<nanodeploy::ModelInitReq> {
         *(int*)ptr = data.rank;
         ptr += sizeof(int);
         *(int*)ptr = data.world_size;
+        ptr += sizeof(int);
+
+        *(int*)ptr = data.tp_degree;
+        ptr += sizeof(int);
+        *(int*)ptr = data.pp_degree;
+        ptr += sizeof(int);
+        *(int*)ptr = data.dp_degree;
     }
     static nanodeploy::ModelInitReq unpackFrom(const char* buf, size_t)
     {
@@ -158,6 +166,14 @@ struct Serializer<nanodeploy::ModelInitReq> {
         req.rank = *(int*)ptr;
         ptr += sizeof(int);
         req.world_size = *(int*)ptr;
+        ptr += sizeof(int);
+
+        req.tp_degree = *(int*)ptr;
+        ptr += sizeof(int);
+        req.pp_degree = *(int*)ptr;
+        ptr += sizeof(int);
+        req.dp_degree = *(int*)ptr;
+
         return req;
     }
     static std::string pack(const nanodeploy::ModelInitReq& data)

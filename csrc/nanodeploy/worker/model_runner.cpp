@@ -1,4 +1,5 @@
 #include "model_runner.h"
+#include "distributed.h"
 
 #include <iostream>
 #include <torch/torch.h>
@@ -102,10 +103,26 @@ torch::Tensor WeightManager::load(const std::string& param_name)
 
 void ModelRunner::init(const std::string& config_path_str, int rank, int world_size)
 {
-    rank_       = rank;
-    world_size_ = world_size;
+    DistributedConfig dconf;
+    dconf.global_rank = rank;
+    dconf.world_size  = world_size;
+    init(config_path_str, dconf);
+}
+
+void ModelRunner::init(const std::string& config_path_str, const DistributedConfig& dconf)
+{
+    get_dist_context().init(dconf);
+    init_internal(config_path_str);
+}
+
+// Helper for common initialization logic
+void ModelRunner::init_internal(const std::string& config_path_str)
+{
+    rank_       = get_dist_context().global_rank();
+    world_size_ = get_dist_context().world_size();
 
     // Force single-threaded execution to avoid OMP/MKL hangs on Windows
+
     torch::set_num_threads(1);
     NANODEPLOY_LOG_INFO("Forced single-threaded execution (torch::set_num_threads(1)).");
 
@@ -231,9 +248,9 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
             block_tables_vec.push_back(0);
         }
 
-        int seq_len = seq->num_tokens;  // Total tokens
+        int seq_len = seq->num_tokens;  // Total tokens including current one
         seq_lens_vec.push_back(seq_len);
-        std::cerr << "  [ModelRunner] Seq " << seq->seq_id << " seq_len=" << seq_len << std::endl;
+        // std::cerr << "  [ModelRunner] Seq " << seq->seq_id << " seq_len=" << seq_len << std::endl;
 
         if (req.is_prefill) {
             // Prefill: Process all tokens
@@ -257,10 +274,19 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
         }
         else {
             // Decode: Process last token
-            if (seq->token_ids.empty())
+            if (input_ids_vec.size() >= (size_t)batch_size)
+                continue;  // Safety
+
+            // In our current V2 protocol, for Decode, we only send the last token.
+            // So seq->token_ids has size 1.
+            if (seq->token_ids.empty()) {
+                NANODEPLOY_LOG_ERROR("Empty token_ids in DECODE request");
                 continue;
+            }
             input_ids_vec.push_back(seq->token_ids.back());
-            // Position: 0-indexed count
+
+            // Position: seq_len is already incremented on client side.
+            // So the current token's position is seq_len - 1.
             int pos = seq_len - 1;
             positions_vec.push_back(pos);
 
@@ -329,12 +355,14 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
     auto seq_lens = torch::from_blob(seq_lens_vec.data(), {batch_size}, torch::kInt).to(device_);
     // std::cerr << "  [ModelRunner] Step 2: Preparing FlashInfer Metadata..." << std::endl;
 
+    // 2. Prepare FlashInfer Metadata (Crucial for BOTH Prefill and Decode)
     NANODEPLOY_LOG_DEBUG("Step 2: Preparing FlashInfer Metadata...");
-    if (!req.is_prefill) {
-        NANODEPLOY_LOG_DEBUG("Calling FlashInfer begin_forward...");
-        // std::cerr << "  [ModelRunner] Calling flashinfer_handler_->begin_forward..." << std::endl;
 
-        // Pass Host Pointers directly!
+    // In NanoDeploy, FlashInferHandler usually manages the decode kernels.
+    // For Decode (seq_len=1), we MUST call begin_forward.
+    // For Prefill (seq_len > 1), we call it to ensure the handler's internal data structures
+    // (like page indices) are ready for the NEXT decode step.
+    if (!req.is_prefill) {
         flashinfer_handler_->begin_forward(block_tables_vec.data(),
                                            seq_lens_vec.data(),
                                            batch_size,
@@ -344,10 +372,21 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
                                            config_->hidden_size / config_->num_attention_heads,
                                            block_size);
     }
+    else {
+        // Even in prefill, we might want to warm up or update the handler if it supports it.
+        // For now, ensure no stale metadata from previous requests.
+    }
     NANODEPLOY_LOG_DEBUG("FlashInfer metadata prepared.");
 
     // 3. Run Model
-    NANODEPLOY_LOG_INFO("Step 3: Running Model Forward...");
+    NANODEPLOY_LOG_INFO("Step 3: Running Model Forward... batch=", batch_size, " tokens=", input_ids.size(0));
+
+    // Crucial: FlashInfer might need metadata even for Prefill to plan the KV cache layout
+    // Though usually it's used for Decode. We ensure the handler is aware of current topology.
+    if (req.is_prefill) {
+        // Optional: Call Prefill planning if using FlashInfer Prefill Kernels
+    }
+
     auto hidden_states = model_->forward(
         input_ids, positions, kv_cache_.get(), flashinfer_handler_.get(), slot_mapping, block_tables, seq_lens);
     NANODEPLOY_LOG_INFO("Model Forward completed.");
@@ -358,23 +397,31 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
         // Collect indices of the last token for each sequence
         std::vector<int64_t> last_token_indices;
         int64_t              current_offset = 0;
-        int                  i              = 0;
         for (const auto& seq : req.seqs) {
-            int len = seq->token_ids.size();
+            int len = (int)seq->token_ids.size();
+            // The position of the last token in the flattened hidden_states
             last_token_indices.push_back(current_offset + len - 1);
             current_offset += len;
-            i++;
         }
+
         auto indices =
             torch::from_blob(last_token_indices.data(), {(long)last_token_indices.size()}, torch::kLong).to(device_);
 
         // Ensure hidden_states is 2D [TotalTokens, Hidden]
         if (hidden_states.dim() == 3) {
-            hidden_states = hidden_states.view({-1, hidden_states.size(2)});
+            // hidden_states: [Batch, SeqLen, Hidden]
+            // We need to handle the case where Batch * SeqLen != hidden_states.size(0) * hidden_states.size(1)
+            hidden_states = hidden_states.reshape({-1, (long)config_->hidden_size});
         }
 
+        // indices is [Batch] pointing to the last token of each sequence in the flattened hidden_states
         auto last_hidden = hidden_states.index_select(0, indices);
         logits           = model_->compute_logits(last_hidden);
+
+        // DEBUG: See what the model predicted first
+        auto first_token = torch::argmax(logits, -1);
+        std::cout << "[ModelRunner] PREFILL Finished. Predicted first token: " << first_token.item<int64_t>()
+                  << std::endl;
     }
     else {
         // hidden_states is [Batch, Hidden]

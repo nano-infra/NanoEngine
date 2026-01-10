@@ -10,6 +10,7 @@
 #include "nanodeploy/core/weight_mapping.h"
 #include "nanodeploy/layers/flashinfer_handler.h"
 #include "nanodeploy/models/qwen3.h"
+#include "nanodeploy/worker/distributed.h"
 #include "nanodeploy/worker/kv_cache.h"
 #include "nanodeploy/worker/model_runner_ipc.h"
 #include "nanodeploy/worker/weight_loader.h"
@@ -37,11 +38,13 @@ public:
     // Initialize model, KV cache, and load weights
     // Initialize model, KV cache, and load weights
     void init(const std::string& config_path, int rank, int world_size);
+    void init(const std::string& config_path, const DistributedConfig& dconf);
 
     // Main execution entry point
     ModelRunResp run(ModelRunReq req);
 
 private:
+    void init_internal(const std::string& config_path);
     void load_weights(const std::string& weight_path);
 
     // Helpers to load specific components
