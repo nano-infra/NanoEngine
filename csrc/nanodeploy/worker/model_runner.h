@@ -10,14 +10,14 @@
 #include "nanodeploy/core/weight_mapping.h"
 #include "nanodeploy/layers/flashinfer_handler.h"
 #include "nanodeploy/models/qwen3.h"
-#include "nanodeploy/models/qwen3_moe.h"
+#include "nanodeploy/models/qwen3_moe_simple.h"
 #include "nanodeploy/worker/distributed.h"
 #include "nanodeploy/worker/kv_cache.h"
 #include "nanodeploy/worker/model_runner_ipc.h"
 #include "nanodeploy/worker/weight_loader.h"
 
 // Third-party
-#include "deep_ep.hpp"
+// #include "deep_ep.hpp"
 
 namespace nanodeploy {
 
@@ -66,7 +66,7 @@ private:
 
     // MoE Model
     std::unique_ptr<models::Qwen3MoeForCausalLM<QuantType::FP16>> moe_model_;
-    std::unique_ptr<deep_ep::Buffer>                              ep_buffer_;
+    // std::unique_ptr<deep_ep::Buffer>                              ep_buffer_;
 
     std::unique_ptr<KvCache>                   kv_cache_;
     std::unique_ptr<layers::FlashInferHandler> flashinfer_handler_;

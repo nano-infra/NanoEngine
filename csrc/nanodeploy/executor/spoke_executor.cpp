@@ -80,6 +80,7 @@ public:
                  nanodeploy::ModelRunReq,
                  nanodeploy::ModelRunResp)
     {
+        NANODEPLOY_LOG_DEBUG("[Executor] Received Run Request");
         return {runner_.run(val)};
     }
 

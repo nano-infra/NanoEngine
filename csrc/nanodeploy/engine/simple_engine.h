@@ -25,6 +25,9 @@ public:
         client_ = std::make_shared<spoke::Client>(ip, port, /*is_hub_mode=*/true);
 
         int world_size = tp * pp * dp;
+        if (world_size <= 0) {
+            throw std::runtime_error("Invalid world_size: " + std::to_string(world_size));
+        }
 
         // 2. Resource Allocation (Gang Scheduling)
         std::cout << "[SimpleEngine] Requesting Gang Allocation for " << world_size << " actors (TP=" << tp << ")..."

@@ -6,38 +6,47 @@
 
 ## 完成状态
 
-### Phase 1: 单卡 FP16 (基础实现) ✅ 编译通过
+### Phase 0: 单卡 FP16 Simplified (当前阶段) ✅ **已完成**
 
-**目标**: 使用标准 PyTorch 操作验证 MoE 基础逻辑
+**目标**: 使用最简化的 C++ 实现 (仅依赖 LibTorch) 在单机单卡上跑通 Qwen3 MoE 的推理流程，不依赖 DeepEP/DeepGemm，确保基础逻辑正确。
 
-**已完成工作**:
+**已完成工作 (2026-01-11)**:
 
-1. **配置更新** (`csrc/nanodeploy/core/config.h`)
+1. **简化版模型实现** (`csrc/nanodeploy/models/qwen3_moe_simple.h`)
 
-   - 添加 MoE 相关字段: `num_experts`, `num_experts_per_tok`, `moe_intermediate_size`, `shared_expert_intermediate_size`
-   - 从 HuggingFace `config.json` 自动解析
+   - 参考 `nanovllm/models/qwen3_moe.py` 的逻辑实现。
+   - 移除 DeepEP 和 DeepGemm 依赖，使用 `torch::topk`, `index_select`, `index_add_` 实现 MoE 路由。
+   - `Qwen3MoeSparseMoeBlock`: 实现了专家路由和计算。
+   - `Qwen3MoeMLP`: 标准 MLP 实现。
 
-2. **分布式上下文** (`csrc/nanodeploy/worker/distributed.h/.cpp`)
+2. **ModelRunner 集成** (`csrc/nanodeploy/worker/model_runner.cpp`)
 
-   - 添加 EP (Expert Parallel) 支持: `ep_rank()`, `ep_world_size()`, `ffn_ep_world_size()`
+   - 切换包含 `qwen3_moe_simple.h`。
+   - 调整权重加载逻辑：直接加载到 `std::vector<std::shared_ptr<Qwen3MoeMLP>> experts_` 中。
+   - 移除 DeepEP buffer 初始化。
 
-3. **Qwen3 MoE 模型** (`csrc/nanodeploy/models/qwen3_moe.h`)
+3. **测试工具更新** (`tests/test_qwen3_moe_runner.cpp`)
 
-   - `Qwen3MoeAttention`: Prefill (SDPA) 和 Decode (FlashInfer) 分离
-   - `Qwen3MoeMLP`: 稠密 MLP 层
-   - `Qwen3MoeSparseMoeBlock`: 稀疏 MoE 层，集成 DeepEP dispatch/combine
-   - `Qwen3MoeDecoderLayer`: 支持 `decoder_sparse_step` 配置
-   - `Qwen3MoeModel` / `Qwen3MoeForCausalLM`: 完整模型组装
+   - 支持命令行参数解析，适配 `tools/run_qwen_chat.py`。
+   - 实现了与 Python Chat 脚本的交互接口。
 
-4. **ModelRunner 集成** (`csrc/nanodeploy/worker/model_runner.h/.cpp`)
+4. **Correctness Verification (Debug Success)**
 
-   - 支持 MoE 模型加载和推理
-   - DeepEP Buffer 初始化
-   - MoE 权重加载逻辑 (专家权重堆叠)
+   - **问题**: 初始版本存在 "Dirty Generation" (重复生成 `...the...the`)。
+   - **原因**: `Qwen3MoeDecoderLayer::forward` 中 Residual Logic 实现错误。当 `residual` 未定义（首层或简化调用）时，代码逻辑导致层计算被跳过或未正确累加。
+   - **修复**: 统一 Residual Stream 逻辑，将 `hidden_states` 作为累加流 (`accumulator`)，确保 `Pre-Norm -> Attn -> Add -> Post-Norm -> MoE -> Add` 流程正确执行。
+   - **结果**:
+     - Prompt: "introduce yourself"
+     - Output: "Hello! I'm Qwen, a large-scale language model developed by Alibaba Cloud. I'm designed to assist..."
+     - 验证了单卡 FP16 MoE 通路的正确性。
 
-5. **测试用例** (`tests/test_qwen3_moe_runner.cpp`)
+### Phase 1: 单卡 FP16 (DeepEP/DeepGemm 集成) ⏳ 待启动
 
-   - 单卡 MoE 推理测试
+**计划**:
+
+- 恢复 `qwen3_moe.h` (完整版实现)。
+- 集成 DeepEP (Expert Parallel 通信库) 的单卡模拟模式或多卡模式。
+- 集成 DeepGemm 以提升 GEMM 性能。
 
 ### Phase 2: 单卡 FP8 ⏳ 待验证
 
@@ -55,52 +64,43 @@
 - 专家分片和路由
 - 跨节点验证
 
-## 关键设计决策
+## 关键设计与实现细节 (Phase 0)
 
-### 1. DeepGemm ODR 问题
+为了快速定位问题，我们实现了 `qwen3_moe_simple.h`。
 
-**问题**: DeepGemm 头文件包含全局变量定义，多个编译单元包含会导致链接器报 "multiple definition" 错误。
+### 1. 路由逻辑 (Routing)
 
-**解决方案**:
+不使用 DeepEP 的 `dispatch` / `combine`，而是使用 PyTorch 原语模拟：
 
-- Phase 1: 使用标准 PyTorch `torch::bmm` 替代 DeepGemm
-- Phase 2+: 将 DeepGemm 调用封装在 `deep_gemm_runner.cpp` 中，其他文件通过接口调用
+- **Gating**: `torch::topk` 选出 TopK 专家。
+- **Dispatch**: 使用 `at::_unique` 找出当前 batch 激活的专家列表。
+- **Compute**: 循环遍历激活的专家，使用 `torch::where` 找出对应的 token indices，执行 `expert->forward()`。
+- **Combine**: 使用 `index_add_` 将专家输出累加回 `final_hidden_states`。
 
-### 2. Prefill vs Decode 分离
+### 2. 权重存储
 
-| 阶段    | Attention                                 | MoE Dispatch           |
-| ------- | ----------------------------------------- | ---------------------- |
-| Prefill | SDPA (`at::scaled_dot_product_attention`) | `low_latency_dispatch` |
-| Decode  | FlashInfer PagedAttention                 | `low_latency_dispatch` |
+- 专家权重存储为 `std::vector<std::shared_ptr<Qwen3MoeMLP>> experts_`。
+- 每个 `Qwen3MoeMLP` 包含独立的 `gate_up_proj` (MergedColumnParallelLinear) 和 `down_proj` (RowParallelLinear)。
+- 这种结构方便单卡调试和逐个加载权重，但在大规模分布式场景下效率不如 DeepEP 的平铺布局。
 
-### 3. 权重布局
+### 3. Layer Implementation
 
-MoE 专家权重从 HuggingFace 格式转换为 DeepGemm 格式:
+- **Decoder Layer**: 遵循 Pre-Norm 结构。
+  ```cpp
+  normed = norm(hidden);
+  hidden = hidden + attn(normed);
+  normed = norm(hidden);
+  hidden = hidden + moe(normed);
+  ```
+  *注意*: 即使是 "Simple" 版本，也必须严格遵守 Transformer 的 Residual Add 顺序。
 
-- GateUp: `[num_local_experts, moe_inter*2, hidden]`
-- Down: `[num_local_experts, hidden, moe_inter]`
+## 验证方法
 
-## 文件变更清单
+使用 Python 脚本驱动 C++ Runner 进行端对端测试：
 
-| 文件                                      | 变更类型 | 说明               |
-| ----------------------------------------- | -------- | ------------------ |
-| `csrc/nanodeploy/core/config.h`           | 修改     | 添加 MoE 配置字段  |
-| `csrc/nanodeploy/worker/distributed.h`    | 修改     | 添加 EP 支持       |
-| `csrc/nanodeploy/worker/distributed.cpp`  | 修改     | 实现 `ep_rank()`   |
-| `csrc/nanodeploy/models/qwen3_moe.h`      | 新建     | Qwen3 MoE 完整实现 |
-| `csrc/nanodeploy/worker/model_runner.h`   | 修改     | 添加 MoE 模型成员  |
-| `csrc/nanodeploy/worker/model_runner.cpp` | 修改     | MoE 模型加载和推理 |
-| `tests/test_qwen3_moe_runner.cpp`         | 新建     | MoE 测试用例       |
-| `tests/CMakeLists.txt`                    | 修改     | 添加测试目标       |
-
-## 下一步
-
-1. 运行 `test_qwen3_moe_runner` 验证 Phase 1 正确性
-2. 准备 FP8 权重和 scales 用于 Phase 2 测试
-3. 实现 DeepGemm wrapper 用于 Phase 2 FP8 优化
-
-## 参考
-
-- [cpp_modelrunner_migration_plan.md](cpp_modelrunner_migration_plan.md) - 原始迁移计划
-- [DeepEP](../third_party/DeepEP) - Expert Parallel 通信库
-- [DeepGemm](../third_party/DeepGemm) - 高性能 GEMM 内核
+```bash
+python ./tools/run_qwen_chat.py \
+    --model_path /models/Qwen3-30B-A3B-Instruct-2507 \
+    --exe_path ./build/bin/test_qwen3_moe_runner \
+    --agent_port 8888 --prompt "introduce yourself"
+```

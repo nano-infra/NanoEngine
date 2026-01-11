@@ -28,12 +28,6 @@ public:
         // Default implementation does nothing or warns
     }
 
-    // Helper for registering parameters (if not already existing in PyTorch Module style)
-    // Since we are likely implementing proper weight management later, let's add a basic registry map
-    // or just rely on manual member management for now.
-    // BUT WAIT: Linear/RMSNorm are calling register_parameter. Where is that defined?
-    // It must be in this class!
-
     torch::Tensor register_parameter(const std::string& /*name*/, torch::Tensor tensor)
     {
         // Placeholder registry
@@ -43,6 +37,15 @@ public:
     torch::Tensor register_buffer(const std::string& /*name*/, torch::Tensor tensor)
     {
         return tensor;
+    }
+
+    // Generic register_module to match PyTorch API in simple cases
+    template<typename T>
+    T register_module(const std::string& /*name*/, T module)
+    {
+        // In a full implementation, we'd store this for traversal.
+        // For now, just pass through.
+        return module;
     }
 };
 

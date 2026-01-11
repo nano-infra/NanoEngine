@@ -50,9 +50,6 @@ bool WeightManager::has_param(const std::string& param_name)
         return param_to_file_.find(param_name) != param_to_file_.end();
     }
     else {
-        // Single file: assume if loader exists, we can try (or need check)
-        // Ideally SafeTensorLoader exposes `has_tensor`.
-        // For now returning true for single file mode as loose check.
         return !loaders_.empty();
     }
 }
@@ -91,9 +88,6 @@ void ModelRunner::init(const std::string& config_path_str, int rank, int world_s
     DistributedConfig dconf;
     dconf.global_rank = rank;
     dconf.world_size  = world_size;
-    // Assume EP = WorldSize for MoE unless specified otherwise
-    // But config is loaded later. We'll refine EP degree if needed or assume 1 if not MoE.
-    // Ideally user sets dconf correctly.
     init(config_path_str, dconf);
 }
 
@@ -116,11 +110,7 @@ void ModelRunner::init_internal(const std::string& config_path_str)
     NANODEPLOY_LOG_INFO("Loading config from ", config_path);
     config_ = std::make_unique<core::ModelConfig>(core::ModelConfig::load_hf(config_path.string()));
 
-    // Update DistributedContext EP degree if implicit
     if (config_->is_moe && get_dist_context().ep_world_size() == 1 && world_size_ > 1) {
-        // Heuristic: If MoE and EP not set, assume EP = WorldSize (common for inference)
-        // But DistContext is already initialized. We can't easily change it without re-init.
-        // Assuming user passed correct dconf or we rely on default 1.
         NANODEPLOY_LOG_WARN("MoE detected but EP degree is 1. Running in TP/DP only mode?");
     }
 
@@ -146,40 +136,7 @@ void ModelRunner::init_internal(const std::string& config_path_str)
 
         moe_model_ = std::make_unique<Qwen3MoeForCausalLM<QuantType::FP16>>(*config_);
 
-        // Initialize DeepEP Buffer
-        if (get_dist_context().ep_world_size() > 1) {
-            NANODEPLOY_LOG_INFO("Initializing DeepEP Buffer...");
-            // Calculate buffer size hint
-            // Use defaults or formula from DeepEP
-            int num_tokens  = 4096;  // Max batch tokens?
-            int hidden      = config_->hidden_size;
-            int num_experts = config_->num_experts;
-            int ep_size     = get_dist_context().ep_world_size();
-            // Need a reasonable estimate
-            size_t rdma_size = deep_ep::get_low_latency_rdma_size_hint(num_tokens, hidden, ep_size, num_experts);
-            // nvl size hint is in Config class in deep_ep.cpp/hpp?
-            // deep_ep::Config::get_nvl_buffer_size_hint?
-            // Wait, deep_ep.cpp exposes get_nvl_buffer_size_hint as member of Config.
-            // But get_low_latency_rdma_size_hint as free function.
-            // I need an instance of deep_ep::Config to call get_nvl_buffer_size_hint?
-            // Or assume nvl_size based on similar logic?
-            // Or instantiate dummy Config? Config constructor takes params.
-            // Let's use a safe large number for NVL or construct Config.
-
-            deep_ep::Config dep_config(20, 6, 256, 6, 256);                              // Defaults from python
-            size_t nvl_size = dep_config.get_nvl_buffer_size_hint(hidden * 2, ep_size);  // hidden_bytes? BF16=2 bytes
-            // Wait, get_nvl_buffer_size_hint takes (hidden_bytes, num_ranks).
-
-            ep_buffer_ = std::make_unique<deep_ep::Buffer>(get_dist_context().ep_rank(),
-                                                           ep_size,
-                                                           nvl_size,
-                                                           rdma_size,
-                                                           true,   // low_latency_mode
-                                                           true,   // explicitly_destroy
-                                                           false,  // enable_shrink
-                                                           false   // use_fabric
-            );
-        }
+        // DeepEP initialization removed for Simple MoE
     }
     else {
         model_ = std::make_unique<Qwen3ForCausalLM<QuantType::FP16>>(*config_, device_);
@@ -206,13 +163,6 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
 {
     if (req.seqs.empty())
         return ModelRunResp{};
-
-    // ... (Tensor preparation code identical to original, omitted for brevity, assuming we keep it)
-    // To implement "continue" properly, I should paste the whole function content
-    // or just the relevant diffs? 'write' tool overwrites.
-    // I must preserve the logic. I will copy-paste the preparation logic from previous file read.
-
-    // ... [RE-IMPLEMENTING PREPARATION LOGIC] ...
 
     std::vector<int64_t> input_ids_vec;
     std::vector<int64_t> positions_vec;
@@ -298,8 +248,9 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
     // Run Forward
     torch::Tensor hidden_states;
     if (config_->is_moe) {
+        // Simple MoE forward signature doesn't take ep_buffer
         hidden_states = moe_model_->forward(
-            input_ids, positions, kv_cache_.get(), flashinfer_handler_.get(), slot_mapping, ep_buffer_.get());
+            input_ids, positions, kv_cache_.get(), flashinfer_handler_.get(), slot_mapping, block_tables, seq_lens);
     }
     else {
         hidden_states = model_->forward(
@@ -354,12 +305,6 @@ void ModelRunner::load_weights(const std::string& /*weight_path*/)
             NANODEPLOY_LOG_INFO("Loading Layer ", i, " / ", total_layers);
 
         if (config_->is_moe) {
-            // Need get() on unique_ptr inside vector
-            // Accessing unique_ptr in vector by reference then get()
-            // Actually layers_ is vector<unique_ptr>.
-            // Need to access raw pointer.
-            // moe_model_ -> model_ -> layers_[i]
-            // The layers_ is vector of unique_ptr.
             load_moe_layer_weights(i, moe_model_->model_->layers_[i].get());
         }
         else {
@@ -381,11 +326,7 @@ void ModelRunner::load_weights(const std::string& /*weight_path*/)
 void ModelRunner::load_layer_weights(int layer_idx, Qwen3DecoderLayer<QuantType::FP16>* layer)
 {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
-    // ... (Use previous logic for dense loading) ...
-    // To save context space, I assume I can copy paste the previous logic logic here?
-    // Yes, 'write' overwrites the file. I MUST include the implementation.
 
-    // Copying Dense Logic:
     auto q_w = weight_manager_->load(prefix + "self_attn.q_proj.weight");
     auto k_w = weight_manager_->load(prefix + "self_attn.k_proj.weight");
     auto v_w = weight_manager_->load(prefix + "self_attn.v_proj.weight");
@@ -429,13 +370,11 @@ void ModelRunner::load_moe_layer_weights(int layer_idx, models::Qwen3MoeDecoderL
 {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
 
-    // A. Attention (Same as Dense, mostly)
-    // Actually Qwen3MoeAttention structure is similar.
+    // A. Attention
     auto q_w = weight_manager_->load(prefix + "self_attn.q_proj.weight");
     auto k_w = weight_manager_->load(prefix + "self_attn.k_proj.weight");
     auto v_w = weight_manager_->load(prefix + "self_attn.v_proj.weight");
 
-    // BF16 expected for MoE currently
     layer->self_attn_->qkv_proj_->weight = torch::cat({q_w, k_w, v_w}, 0);
 
     try {
@@ -445,7 +384,6 @@ void ModelRunner::load_moe_layer_weights(int layer_idx, models::Qwen3MoeDecoderL
         layer->self_attn_->qkv_proj_->bias = torch::cat({q_b, k_b, v_b}, 0);
     }
     catch (...) {
-        // handle missing bias
         auto out_features                  = layer->self_attn_->qkv_proj_->weight.size(0);
         layer->self_attn_->qkv_proj_->bias = torch::zeros({out_features}, q_w.options());
     }
@@ -454,31 +392,19 @@ void ModelRunner::load_moe_layer_weights(int layer_idx, models::Qwen3MoeDecoderL
     layer->self_attn_->q_norm_->weight = weight_manager_->load(prefix + "self_attn.q_norm.weight");
     layer->self_attn_->k_norm_->weight = weight_manager_->load(prefix + "self_attn.k_norm.weight");
 
-    layer->input_norm_->weight     = weight_manager_->load(prefix + "input_layernorm.weight");
-    layer->post_attn_norm_->weight = weight_manager_->load(prefix + "post_attention_layernorm.weight");
+    layer->input_layernorm_->weight          = weight_manager_->load(prefix + "input_layernorm.weight");
+    layer->post_attention_layernorm_->weight = weight_manager_->load(prefix + "post_attention_layernorm.weight");
 
     // B. MLP (Sparse or Dense)
     if (layer->is_sparse_) {
         // MoE Loading
-        auto* block = layer->mlp_.get();  // Qwen3MoeSparseMoeBlock
+        auto* block = layer->mlp_moe_.get();  // Qwen3MoeSparseMoeBlock (simple.h)
 
         // Gate
         block->gate_->weight = weight_manager_->load(prefix + "mlp.gate.weight");
 
         // Experts
-        // Needs FUSION from experts.0...N to Groups
-        // Placeholder for phase 4 logic:
-        // Assume for now we just load if they exist, or create random for testing if not found.
-        // Implementing proper loop:
-
-        int num_experts       = config_->num_experts;
-        int ep_size           = get_dist_context().ep_world_size();
-        int ep_rank           = get_dist_context().ep_rank();
-        int num_local_experts = num_experts / ep_size;
-        int expert_offset     = ep_rank * num_local_experts;
-
-        std::vector<torch::Tensor> gate_up_list;
-        std::vector<torch::Tensor> down_list;
+        int num_experts = config_->num_experts;
 
         // Try to load first expert to detect existence
         if (!weight_manager_->has_param(prefix + "mlp.experts.0.gate_proj.weight")) {
@@ -486,38 +412,17 @@ void ModelRunner::load_moe_layer_weights(int layer_idx, models::Qwen3MoeDecoderL
             return;
         }
 
-        for (int i = 0; i < num_local_experts; ++i) {
-            int         global_id  = expert_offset + i;
-            std::string exp_prefix = prefix + "mlp.experts." + std::to_string(global_id) + ".";
+        for (int i = 0; i < num_experts; ++i) {
+            std::string exp_prefix = prefix + "mlp.experts." + std::to_string(i) + ".";
 
             auto g = weight_manager_->load(exp_prefix + "gate_proj.weight");
             auto u = weight_manager_->load(exp_prefix + "up_proj.weight");
             auto d = weight_manager_->load(exp_prefix + "down_proj.weight");
 
-            // Cat Gate/Up
-            auto gu = torch::cat({g, u}, 0);  // [Inter*2, Hidden]
-
-            gate_up_list.push_back(gu);
-            down_list.push_back(d);  // [Hidden, Inter] - Wait.
-            // DeepGemm expects [LocalExperts, Hidden, Inter].
-            // HF Linear weight is [Out, In].
-            // DownProj: In=Inter, Out=Hidden. Weight is [Hidden, Inter].
-            // Correct.
+            auto& expert                  = block->experts_[i];
+            expert->gate_up_proj_->weight = torch::cat({g, u}, 0);
+            expert->down_proj_->weight    = d;
         }
-
-        // Stack -> [LocalExperts, Inter*2, Hidden] ?
-        // HF Linear [Out, In].
-        // GateUp List elements: [Inter*2, Hidden].
-        // Stack(0) -> [LocalExperts, Inter*2, Hidden].
-        // This matches `register_parameter` shape in qwen3_moe.h
-
-        auto gate_up_stacked = torch::stack(gate_up_list, 0);
-        auto down_stacked    = torch::stack(down_list, 0);
-
-        block->gate_up_proj_ = gate_up_stacked.to(device_);
-        block->down_proj_    = down_stacked.to(device_);
-
-        // Scales handling if FP8...
     }
     else {
         // Dense MLP in MoE model (Shared expert or non-sparse layer)
