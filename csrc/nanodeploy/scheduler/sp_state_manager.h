@@ -10,6 +10,8 @@
 #include "nanodeploy/sequence/sequence.h"
 
 #include "block_manager.h"
+#include "load_statistics.h"
+#include "sp_size_policy.h"
 
 namespace nanodeploy {
 
@@ -38,7 +40,12 @@ public:
                    int                segment_size,
                    bool               enable_dynamic_sp_size,
                    bool               enable_non_uniform_split,
-                   const std::string& sp_master_selector);
+                   const std::string& sp_master_selector,
+                   // SP size policy parameters
+                   const std::string& sp_size_mode              = "segment",
+                   float              initial_avg_prompt_length = 1024.0f,
+                   float              initial_avg_output_length = 256.0f,
+                   int                stats_window_size         = 1000);
 
     void set_dp_idx(int dp_idx)
     {
@@ -107,7 +114,7 @@ public:
     // WARNING: This method modifies shared state without thread safety protection.
     // If called concurrently from multiple threads (e.g., in worker_func),
     // this will cause race conditions on the counters.
-    void add_running_tokens(int sp_idx, int count)
+    void add_running_tokens([[maybe_unused]] int sp_idx, int count)
     {
         num_running_tokens_ += count;
     }
@@ -118,6 +125,36 @@ public:
     std::vector<std::shared_ptr<Sequence>>                 dummy_seqs;
 
     RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;
+
+    // === Load Statistics Access ===
+    LoadStatistics&       load_stats() { return load_stats_; }
+    const LoadStatistics& load_stats() const { return load_stats_; }
+    
+    // === SP Size Policy Access ===
+    SPSizePolicy&       sp_size_policy() { return sp_size_policy_; }
+    const SPSizePolicy& sp_size_policy() const { return sp_size_policy_; }
+
+    // === Helper Methods for SP Size Decision ===
+    
+    /**
+     * @brief Get free blocks per rank
+     */
+    std::vector<int> get_free_blocks_per_rank() const;
+    
+    /**
+     * @brief Get used blocks per rank
+     */
+    std::vector<int> get_used_blocks_per_rank() const;
+    
+    /**
+     * @brief Get current batch size (master seq count) per rank
+     */
+    std::vector<int> get_batch_size_per_rank() const;
+    
+    /**
+     * @brief Record waiting queue size for load statistics
+     */
+    void record_waiting_queue_size(int queue_size);
 
 private:
     void initialize_dummy_seqs();
@@ -144,6 +181,14 @@ private:
 
     SPMasterSelector master_selector_;
     std::vector<int> master_seq_counts_;
+
+    // === Load-aware SP size policy ===
+    int            num_kvcache_blocks_;  // Total blocks per rank
+    LoadStatistics load_stats_;
+    SPSizePolicy   sp_size_policy_;
+    
+    // === Scheduling log ===
+    bool enable_scheduling_log_ = true;  // Log each scheduling decision
 };
 
 }  // namespace nanodeploy

@@ -54,6 +54,19 @@ def parse_args():
                         choices=["RoundRobin", "LeastBatch", "LeastCache"],
                         help="Routing strategy.")
     
+    # SP Size Policy arguments
+    parser.add_argument("--sp-size-mode", type=str, default="segment",
+                        choices=["segment", "load_aware"],
+                        help="SP size mode: 'segment' (original) or 'load_aware' (adaptive).")
+    parser.add_argument("--initial-avg-prompt-length", type=float, default=1024.0,
+                        help="Initial estimate of average prompt length (for load_aware mode).")
+    parser.add_argument("--initial-avg-output-length", type=float, default=256.0,
+                        help="Initial estimate of average output length (for load_aware mode).")
+    parser.add_argument("--enable-dynamic-sp-size", action="store_true",
+                        help="Enable dynamic SP size adjustment.")
+    parser.add_argument("--enable-non-uniform-split", action="store_true",
+                        help="Enable non-uniform KVCache partitioning (water-filling).")
+    
     args = parser.parse_args()
     
     if args.dataset == "csv":
@@ -350,6 +363,20 @@ def main():
     args = parse_args()
 
     print(f"\n--- Benchmark: {args.num_requests} reqs, {args.request_rate} req/s, burst={args.burstiness} ---")
+    
+    # Print SP Size Policy Configuration
+    print("\n" + "=" * 60)
+    print("SP Size Policy Configuration")
+    print("=" * 60)
+    print(f"  sp_size_mode:              {args.sp_size_mode}")
+    print(f"  enable_dynamic_sp_size:    {args.enable_dynamic_sp_size}")
+    print(f"  enable_non_uniform_split:  {args.enable_non_uniform_split}")
+    if args.sp_size_mode == "load_aware":
+        print(f"  initial_avg_prompt_length: {args.initial_avg_prompt_length}")
+        print(f"  initial_avg_output_length: {args.initial_avg_output_length}")
+    else:
+        print(f"  segment_size:              {args.segment_size}")
+    print("=" * 60 + "\n")
 
     # Initialize Engine
     engine = LLM(
@@ -375,7 +402,13 @@ def main():
         loop_count=args.loop_count,
         routing_strategy=args.routing_strategy,
         segment_size=args.segment_size,
-        kvcache_block_size=64
+        kvcache_block_size=64,
+        # SP Size Policy parameters
+        sp_size_mode=args.sp_size_mode,
+        initial_avg_prompt_length=args.initial_avg_prompt_length,
+        initial_avg_output_length=args.initial_avg_output_length,
+        enable_dynamic_sp_size=args.enable_dynamic_sp_size,
+        enable_non_uniform_split=args.enable_non_uniform_split,
     )
     
     # Print Config

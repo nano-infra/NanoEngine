@@ -1,6 +1,8 @@
 set(CPP_SOURCES
     block.cpp
     block_manager.cpp
+    load_statistics.cpp
+    sp_size_policy.cpp
     sp_state_manager.cpp
     scheduler_utils.cpp
     scheduler.cpp

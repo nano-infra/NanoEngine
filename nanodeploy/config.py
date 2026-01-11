@@ -68,6 +68,24 @@ class Config:
     # Strategy for how to select 
     sp_master_selector: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
 
+    # === SP Size Policy Configuration ===
+    # Mode: "segment" (original segment_size based) or "load_aware" (new adaptive strategy)
+    # 
+    # In "load_aware" mode, the system automatically:
+    # - Learns long_req_threshold from historical traces
+    # - Estimates expected waiting requests from arrival patterns
+    # - Detects KVCache imbalance and balances Attention computation
+    # - Uses LeastBatch strategy for master rank selection
+    sp_size_mode: Literal["segment", "load_aware"] = "segment"
+    
+    # Initial statistics (optional, will be learned from runtime traces)
+    # Can be set from offline analysis of dataset for faster warm-up
+    initial_avg_prompt_length: float = 1024.0
+    initial_avg_output_length: float = 256.0
+    
+    # Sliding window size for runtime statistics update
+    stats_window_size: int = 1000
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         self.hf_config = AutoConfig.from_pretrained(self.model)

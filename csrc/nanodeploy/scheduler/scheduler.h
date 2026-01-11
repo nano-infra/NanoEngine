@@ -86,7 +86,12 @@ public:
               int                segment_size,
               bool               enable_dynamic_sp_size,
               bool               enable_non_uniform_split,
-              const std::string& sp_master_selector);
+              const std::string& sp_master_selector,
+              // SP size policy parameters
+              const std::string& sp_size_mode              = "segment",
+              float              initial_avg_prompt_length = 1024.0f,
+              float              initial_avg_output_length = 256.0f,
+              int                stats_window_size         = 1000);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -152,6 +157,12 @@ private:
     bool        enable_non_uniform_split_;
 
     std::string sp_master_selector_;
+
+    // SP size policy parameters
+    std::string sp_size_mode_;
+    float       initial_avg_prompt_length_;
+    float       initial_avg_output_length_;
+    int         stats_window_size_;
 
     int dp_rr_counter_ = 0;
 

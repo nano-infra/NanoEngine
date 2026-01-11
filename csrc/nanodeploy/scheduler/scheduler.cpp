@@ -26,7 +26,11 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                segment_size,
                      bool               enable_dynamic_sp_size,
                      bool               enable_non_uniform_split,
-                     const std::string& sp_master_selector) :
+                     const std::string& sp_master_selector,
+                     const std::string& sp_size_mode,
+                     float              initial_avg_prompt_length,
+                     float              initial_avg_output_length,
+                     int                stats_window_size) :
     engine_id_(engine_id),
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
@@ -40,7 +44,11 @@ Scheduler::Scheduler(const std::string& engine_id,
     segment_size_(segment_size),
     enable_dynamic_sp_size_(enable_dynamic_sp_size),
     enable_non_uniform_split_(enable_non_uniform_split),
-    sp_master_selector_(sp_master_selector)
+    sp_master_selector_(sp_master_selector),
+    sp_size_mode_(sp_size_mode),
+    initial_avg_prompt_length_(initial_avg_prompt_length),
+    initial_avg_output_length_(initial_avg_output_length),
+    stats_window_size_(stats_window_size)
 {
     Sequence::block_size = kvcache_block_size;
     // Initialize worker states
@@ -51,12 +59,17 @@ Scheduler::Scheduler(const std::string& engine_id,
             max_num_seqs_, max_num_batched_tokens_, max_num_recv_seqs_,
             reserved_blocks_per_req_, segment_size_, enable_dynamic_sp_size_, 
             enable_non_uniform_split,
-            sp_master_selector);
+            sp_master_selector,
+            sp_size_mode,
+            initial_avg_prompt_length,
+            initial_avg_output_length,
+            stats_window_size);
         
         sp_manager->set_dp_idx(dp_idx);
         worker_state.push_back(sp_manager);
     }
-    std::cerr << "[Scheduler] Initialized with segment_size=" << segment_size_ << std::endl;
+    std::cerr << "[Scheduler] Initialized with segment_size=" << segment_size_ 
+              << ", sp_size_mode=" << sp_size_mode_ << std::endl;
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
 }
 
@@ -328,7 +341,8 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
         if (routing_strategy == RoutingStrategy::RoundRobin) {
             // Try all DP ranks in round-robin order
             for (int attempt = 0; attempt < attention_dp_; ++attempt) {
-                int selected_dp_idx = next_dp_idx();
+                // int selected_dp_idx = next_dp_idx();
+                int selected_dp_idx = 0;
 
                 // Check if this DP rank can allocate the sequence
                 bool can_allocate = worker_state[selected_dp_idx]->can_allocate(

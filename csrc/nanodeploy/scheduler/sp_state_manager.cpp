@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <random>
 
@@ -20,7 +21,11 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                int                segment_size,
                                bool               enable_dynamic_sp_size,
                                bool               enable_non_uniform_split,
-                               const std::string& sp_master_selector) :
+                               const std::string& sp_master_selector,
+                               const std::string& sp_size_mode,
+                               float              initial_avg_prompt_length,
+                               float              initial_avg_output_length,
+                               int                stats_window_size) :
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
@@ -31,15 +36,44 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     segment_size_(segment_size),
     num_recv_seqs_per_sp_(attention_sp, 0),
     enable_dynamic_sp_size_(enable_dynamic_sp_size),
-    enable_non_uniform_split_(enable_non_uniform_split)
+    enable_non_uniform_split_(enable_non_uniform_split),
+    num_kvcache_blocks_(num_kvcache_blocks),
+    load_stats_(attention_sp, initial_avg_prompt_length, initial_avg_output_length, stats_window_size)
 {
-    // Initialize Strategy
+    // Initialize SP Master Selector Strategy (kept for backward compatibility)
     if (sp_master_selector == "LeastBatch") {
         master_selector_ = SPMasterSelector::LeastBatch;
     } else if (sp_master_selector == "LeastCache") {
         master_selector_ = SPMasterSelector::LeastCache;
     } else {
         master_selector_ = SPMasterSelector::RoundRobin;
+    }
+
+    // Initialize SP Size Policy
+    SPSizeConfig sp_config;
+    if (sp_size_mode == "load_aware") {
+        sp_config.mode = SPSizeMode::LoadAware;
+    } else {
+        sp_config.mode = SPSizeMode::Segment;
+    }
+    sp_config.initial_avg_prompt_length = initial_avg_prompt_length;
+    sp_config.initial_avg_output_length = initial_avg_output_length;
+    sp_config.stats_window_size         = stats_window_size;
+    sp_config.segment_size              = segment_size;
+    sp_size_policy_ = SPSizePolicy(sp_config);
+    
+    // Log SP Size Policy configuration
+    std::cout << "[SPStateManager] SP Size Policy initialized:" << std::endl;
+    std::cout << "  - sp_size_mode: " << sp_size_mode 
+              << " (" << (sp_config.mode == SPSizeMode::LoadAware ? "LoadAware" : "Segment") << ")" << std::endl;
+    std::cout << "  - enable_dynamic_sp_size: " << (enable_dynamic_sp_size_ ? "true" : "false") << std::endl;
+    std::cout << "  - enable_non_uniform_split: " << (enable_non_uniform_split_ ? "true" : "false") << std::endl;
+    if (sp_config.mode == SPSizeMode::LoadAware) {
+        std::cout << "  - initial_avg_prompt_length: " << initial_avg_prompt_length << std::endl;
+        std::cout << "  - initial_avg_output_length: " << initial_avg_output_length << std::endl;
+        std::cout << "  - stats_window_size: " << stats_window_size << std::endl;
+    } else {
+        std::cout << "  - segment_size: " << segment_size << std::endl;
     }
 
     // Initialize Running Load Counter
@@ -54,7 +88,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     std::cerr << "[SPStateManager] Initialized with attention_sp=" << attention_sp_ 
               << ", kvcache_block_size=" << kvcache_block_size_
               << ", reserved_blocks_per_req=" << reserved_blocks_per_req_ 
-              << ", segment_size=" << segment_size_ << std::endl;
+              << ", segment_size=" << segment_size_ 
+              << ", sp_size_mode=" << sp_size_mode << std::endl;
 
     if (attention_sp_ <= 0) {
         throw std::runtime_error("attention_sp must be positive to prevent division by zero");
@@ -62,6 +97,39 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     if (kvcache_block_size_ <= 0) {
         throw std::runtime_error("kvcache_block_size must be positive to prevent division by zero");
     }
+}
+
+// === Helper Methods ===
+
+std::vector<int> SPStateManager::get_free_blocks_per_rank() const
+{
+    std::vector<int> result;
+    result.reserve(attention_sp_);
+    for (int i = 0; i < attention_sp_; ++i) {
+        result.push_back(block_manager.at(i)->num_free_blocks());
+    }
+    return result;
+}
+
+std::vector<int> SPStateManager::get_used_blocks_per_rank() const
+{
+    std::vector<int> result;
+    result.reserve(attention_sp_);
+    for (int i = 0; i < attention_sp_; ++i) {
+        int free = block_manager.at(i)->num_free_blocks();
+        result.push_back(num_kvcache_blocks_ - free);
+    }
+    return result;
+}
+
+std::vector<int> SPStateManager::get_batch_size_per_rank() const
+{
+    return master_seq_counts_;
+}
+
+void SPStateManager::record_waiting_queue_size(int queue_size)
+{
+    load_stats_.record_waiting_queue_size(queue_size);
 }
 
 void SPStateManager::initialize_dummy_seqs()
@@ -151,195 +219,149 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
                                   const std::unordered_map<int, int>& num_seqs,
                                   const std::unordered_map<int, int>& num_batched_tokens)
 {
+    // Record arrival for statistics
+    load_stats_.record_arrival();
+    
+    // =========================================================================
+    // Real-time Workload Scan: Identify short request BS and long request load
+    // =========================================================================
+    int short_seq_count = 0;
+    std::vector<int> long_used_per_rank(attention_sp_, 0);
+
+    for (const auto& s : running) {
+        if (load_stats_.is_long_request(s->num_prompt_tokens)) {
+            const auto& ctx = s->block_ctx(BlockContextSlot::ACTIVE);
+            for (int i = 0; i < attention_sp_; ++i) {
+                int tokens = ctx.num_dispatched_tokens[i];
+                int blocks = (tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
+                long_used_per_rank[i] += blocks;
+            }
+        } else {
+            short_seq_count++;
+        }
+    }
+    // Update load statistics with real-time short request batch size
+    load_stats_.record_short_batch_size(short_seq_count);
+
     if (attention_sp_ > 1) {
         // ==========================================
-        //  Optimized Strategy (Dynamic SP Size)
+        //  Load-Aware Dynamic SP Size Strategy
         // ==========================================
         auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
+        int num_tokens = seq.num_tokens;
+
+        // Collect current state for SP size decision
+        std::vector<int> free_blocks_per_rank = get_free_blocks_per_rank();
+        std::vector<int> used_blocks_per_rank = get_used_blocks_per_rank();
+        std::vector<int> batch_size_per_rank = get_batch_size_per_rank();
+
+        // Use new SP size policy to determine SP size, master rank AND detailed distribution
+        SPSizeDecision decision = sp_size_policy_.determine_sp_size(
+            num_tokens,
+            free_blocks_per_rank,
+            used_blocks_per_rank,
+            long_used_per_rank,
+            batch_size_per_rank,
+            num_kvcache_blocks_,
+            load_stats_,
+            attention_sp_,
+            kvcache_block_size_
+        );
         
-        int num_tokens            = seq.num_tokens;
-        int num_segments          = (num_tokens + segment_size_ - 1) / segment_size_;
-        int num_segments_per_rank = (num_segments + attention_sp_ - 1) / attention_sp_;
-        int initial_num_ranks     = (num_segments + num_segments_per_rank - 1) / num_segments_per_rank;
+        // Apply the decision
+        block_ctx.master_sp_idx_ = decision.master_rank;
+        block_ctx.num_dispatched_tokens = decision.dispatch_tokens;
 
-        if (num_segments_per_rank == 0) num_segments_per_rank = 1;
-        if (initial_num_ranks == 0) initial_num_ranks = 1;
-
-        int master_rank = select_master_rank();
+        // Final sanity check for capacity (reservation and physical)
+        // Note: The policy already simulated this, but we double-check here against current master load limits
+        int master_rank = decision.master_rank;
         if (master_seq_counts_[master_rank] + 1 > max_num_seqs_) return false;
 
         auto it_tokens              = num_batched_tokens.find(master_rank);
         int  current_batched_tokens = (it_tokens != num_batched_tokens.end()) ? it_tokens->second : 0;
         if (current_batched_tokens + seq.num_tokens >= max_num_batched_tokens_) return false;
 
-        // Rank selection preparation
-        std::vector<std::pair<int, int>> rank_free_count;
-        for (const auto& [rank, bm] : block_manager) {
-            if (rank != master_rank) {
-                rank_free_count.push_back({rank, bm->num_free_blocks()});
+        // Perform final memory and reservation check for the selected distribution
+        std::vector<int> master_req_counts(attention_sp_, 0);
+        for (const auto& rs : running) {
+            int m_idx = rs->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+            if (m_idx >= 0 && m_idx < attention_sp_) master_req_counts[m_idx]++;
+        }
+        for (const auto& [m_idx, count] : num_seqs) {
+            if (m_idx >= 0 && m_idx < attention_sp_) master_req_counts[m_idx] += count;
+        }
+        master_req_counts[master_rank]++;
+
+        bool memory_check_passed = true;
+        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+            int dispatched = block_ctx.num_dispatched_tokens[sp_idx];
+            if (dispatched > 0 || sp_idx == master_rank) {
+                // Check per-rank receiver limits
+                if (sp_idx != master_rank && dispatched > 0) {
+                    if (num_recv_seqs_per_sp_[sp_idx] >= max_num_recv_seqs_) {
+                        memory_check_passed = false;
+                        break;
+                    }
+                }
+
+                int free_blocks = block_manager[sp_idx]->num_free_blocks();
+                int prefill_blocks_needed = (dispatched + kvcache_block_size_ - 1) / kvcache_block_size_;
+
+                // Standard per-request reservation check
+                double needed_float = master_req_counts[sp_idx] * reserved_blocks_per_req_;
+                int reservation_blocks_needed = static_cast<int>(std::ceil(needed_float));
+
+                if (free_blocks < prefill_blocks_needed + reservation_blocks_needed) {
+                    memory_check_passed = false;
+                    break;
+                }
+                
+                if (!block_manager[sp_idx]->can_allocate(seq)) {
+                    memory_check_passed = false;
+                    break;
+                }
             }
         }
-        std::sort(rank_free_count.begin(),
-                  rank_free_count.end(),
-                  [](const std::pair<int, int>& a, const std::pair<int, int>& b) { return a.second > b.second; });
 
-        int start_ranks = initial_num_ranks;
-        int end_ranks   = enable_dynamic_sp_size_ ? attention_sp_ : initial_num_ranks;
-
-        for (int target_num_ranks = start_ranks; target_num_ranks <= end_ranks; ++target_num_ranks) {
-            
-            block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
-            block_ctx.master_sp_idx_ = master_rank;
-
-            // Select participating ranks
-            std::vector<int> top_most_free_ranks;
-            int              ranks_to_pick = std::min((int)rank_free_count.size(), target_num_ranks - 1);
-            for (int i = 0; i < ranks_to_pick; ++i) {
-                top_most_free_ranks.push_back(rank_free_count[i].first);
-            }
-            top_most_free_ranks.push_back(master_rank);
-
-            // =================================================================
-            // [New Feature] Non-Uniform Split (Water-filling / Valley-filling)
-            // =================================================================
-            if (enable_non_uniform_split_) {
-                // 1. Collect free blocks info for all participating ranks (including master)
-                std::vector<std::pair<int, int>> sorted_ranks; // {sp_idx, free_blocks}
-                for (int sp_idx : top_most_free_ranks) {
-                    sorted_ranks.push_back({sp_idx, block_manager[sp_idx]->num_free_blocks()});
-                }
+        if (memory_check_passed) {
+            // Log scheduling decision for debugging
+            if (enable_scheduling_log_) {
+                std::cout << "[SP Schedule] seq_id=" << seq.seq_id
+                            << " | tokens=" << num_tokens
+                            << " | sp_size=" << decision.sp_size
+                            << " | master=" << master_rank
+                            << " | reason=" << (decision.due_to_imbalance ? "imbalance" : 
+                                                (decision.due_to_pressure ? "pressure" : "default"));
                 
-                // 2. Sort participating ranks by free blocks descending (richest first)
-                std::sort(sorted_ranks.begin(), sorted_ranks.end(),
-                          [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
-                              return a.second > b.second;
-                          });
-
-                long long total_tokens_needed = seq.num_tokens;
-                long long final_target_free_tokens = 0;
-                int k = 0; // Number of ranks contributing to "water-filling"
-
-                // 3. Find the optimal "water level" (target free tokens)
-                // We greedily check if the top k ranks can absorb the load such that
-                // their remaining capacity is balanced.
-                for (k = 1; k <= (int)sorted_ranks.size(); ++k) {
-                    long long sum_free_tokens = 0;
-                    for (int i = 0; i < k; ++i) {
-                        sum_free_tokens += (long long)sorted_ranks[i].second * kvcache_block_size_;
-                    }
-
-                    // If we use top k ranks, what would be the equalized remaining capacity?
-                    long long remaining_after_alloc = sum_free_tokens - total_tokens_needed;
-                    long long target_free = remaining_after_alloc / k;
-
-                    // If we are at the last rank, or if the calculated target level is 
-                    // higher than the next rank's capacity (meaning next rank doesn't need to help),
-                    // then we found our split point.
-                    if (k == (int)sorted_ranks.size()) {
-                        final_target_free_tokens = target_free;
-                        break;
-                    } else {
-                        long long next_rank_free = (long long)sorted_ranks[k].second * kvcache_block_size_;
-                        if (target_free >= next_rank_free) {
-                            final_target_free_tokens = target_free;
-                            break;
-                        }
+                std::cout << " | dispatch=[";
+                bool first = true;
+                for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                    if (block_ctx.num_dispatched_tokens[sp_idx] > 0) {
+                        if (!first) std::cout << ",";
+                        std::cout << "r" << sp_idx << ":" << block_ctx.num_dispatched_tokens[sp_idx];
+                        first = false;
                     }
                 }
-
-                // 4. Assign tokens based on the target level
-                long long allocated_sum = 0;
-                for (int i = 0; i < (int)sorted_ranks.size(); ++i) {
-                    int sp_idx = sorted_ranks[i].first;
-                    long long current_free = (long long)sorted_ranks[i].second * kvcache_block_size_;
-                    
-                    // Alloc = Current - Target
-                    long long alloc = current_free - final_target_free_tokens;
-                    
-                    if (alloc < 0) alloc = 0;
-                    if (alloc > current_free) alloc = current_free; // Safety cap
-
-                    block_ctx.num_dispatched_tokens[sp_idx] = (int)alloc;
-                    allocated_sum += alloc;
-                }
-
-                // 5. Handle integer division remainders
-                long long remainder = total_tokens_needed - allocated_sum;
-                int idx = 0;
+                std::cout << "]";
                 
-                // If we allocated too few (remainder > 0), distribute to the richest ranks
-                while (remainder > 0) {
-                    block_ctx.num_dispatched_tokens[sorted_ranks[idx].first]++;
-                    remainder--;
-                    idx = (idx + 1) % k;
+                std::cout << " | free=[";
+                for (int i = 0; i < attention_sp_; ++i) {
+                    if (i > 0) std::cout << ",";
+                    std::cout << block_manager[i]->num_free_blocks();
                 }
+                std::cout << "]";
                 
-                // If we allocated too many (remainder < 0), take back from richest ranks
-                // (This can happen if target calculation slightly overshoots due to integer math)
-                while (remainder < 0) {
-                    if (block_ctx.num_dispatched_tokens[sorted_ranks[idx].first] > 0) {
-                        block_ctx.num_dispatched_tokens[sorted_ranks[idx].first]--;
-                        remainder++;
-                    }
-                    idx = (idx + 1) % k;
+                if (sp_size_policy_.config().mode == SPSizeMode::LoadAware) {
+                    std::cout << " | is_long=" << (load_stats_.is_long_request(num_tokens) ? "Y" : "N")
+                                << " | imbalance=" << std::fixed << std::setprecision(2) 
+                                << load_stats_.kvcache_imbalance_ratio()
+                                << " | long_used_avg=" << std::accumulate(long_used_per_rank.begin(), long_used_per_rank.end(), 0) / attention_sp_
+                                << " | exp_wait=" << std::setprecision(1) 
+                                << load_stats_.expected_waiting_requests();
                 }
-            } 
-            else {
-                // =================================================================
-                // Standard Feature: Uniform Split
-                // =================================================================
-                int total_token_unalloc = seq.num_tokens;
-                for (int sp_idx : top_most_free_ranks) {
-                    int tokens_to_dispatch                  = std::min(total_token_unalloc, num_segments_per_rank * segment_size_);
-                    block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
-                    total_token_unalloc -= tokens_to_dispatch;
-                }
+                std::cout << std::endl;
             }
-
-            // Reservation Check
-            std::vector<int> master_req_counts(attention_sp_, 0);
-            for (const auto& running_seq : running) {
-                int m_idx = running_seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
-                if (m_idx >= 0 && m_idx < attention_sp_) master_req_counts[m_idx]++;
-            }
-            for (const auto& [m_idx, count] : num_seqs) {
-                if (m_idx >= 0 && m_idx < attention_sp_) master_req_counts[m_idx] += count;
-            }
-            master_req_counts[master_rank]++;
-
-            bool memory_check_passed = true;
-            for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-                if (block_ctx.num_dispatched_tokens[sp_idx] > 0 || sp_idx == master_rank) {
-                    
-                    if (sp_idx != master_rank && block_ctx.num_dispatched_tokens[sp_idx] > 0) {
-                        if (num_recv_seqs_per_sp_[sp_idx] >= max_num_recv_seqs_) {
-                            memory_check_passed = false;
-                            break;
-                        }
-                    }
-
-                    int free_blocks = block_manager[sp_idx]->num_free_blocks();
-                    int prefill_tokens = block_ctx.num_dispatched_tokens[sp_idx];
-                    int prefill_blocks_needed = (prefill_tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
-
-                    double needed_float = master_req_counts[sp_idx] * reserved_blocks_per_req_;
-                    int reservation_blocks_needed = static_cast<int>(std::ceil(needed_float));
-
-                    if (free_blocks < prefill_blocks_needed + reservation_blocks_needed) {
-                        memory_check_passed = false;
-                        break;
-                    }
-                    
-                    if (!block_manager[sp_idx]->can_allocate(seq)) {
-                        memory_check_passed = false;
-                        break;
-                    }
-                }
-            }
-
-            if (memory_check_passed) {
-                return true;
-            }
+            return true;
         }
         return false;
     } 
@@ -350,90 +372,33 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
         block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
 
-        int num_tokens            = seq.num_tokens;
-        int num_segments          = (num_tokens + segment_size_ - 1) / segment_size_;
-        int num_segments_per_rank = (num_segments + attention_sp_ - 1) / attention_sp_;
-        int num_ranks             = (num_segments + num_segments_per_rank - 1) / num_segments_per_rank;
-
-        if (num_segments_per_rank == 0)
-            num_segments_per_rank = 1;
-        if (num_ranks == 0)
-            num_ranks = 1;
-
         int master_rank = select_master_rank();
-        if (master_seq_counts_[master_rank] + 1 > max_num_seqs_) {
-            return false;
-        }
+        if (master_seq_counts_[master_rank] + 1 > max_num_seqs_) return false;
 
         auto it_tokens              = num_batched_tokens.find(master_rank);
         int  current_batched_tokens = (it_tokens != num_batched_tokens.end()) ? it_tokens->second : 0;
-        if (current_batched_tokens + seq.num_tokens >= max_num_batched_tokens_) {
-            return false;
-        }
-
-        std::vector<std::pair<int, int>> rank_free_count;
-        for (const auto& [rank, bm] : block_manager) {
-            if (rank != master_rank) {
-                rank_free_count.push_back({rank, bm->num_free_blocks()});
-            }
-        }
-
-        std::sort(rank_free_count.begin(),
-                  rank_free_count.end(),
-                  [](const std::pair<int, int>& a, const std::pair<int, int>& b) { return a.second > b.second; });
-
-        std::vector<int> top_most_free_ranks;
-        int              ranks_to_pick = std::min((int)rank_free_count.size(), num_ranks - 1);
-        for (int i = 0; i < ranks_to_pick; ++i) {
-            top_most_free_ranks.push_back(rank_free_count[i].first);
-        }
-        top_most_free_ranks.push_back(master_rank);
+        if (current_batched_tokens + seq.num_tokens >= max_num_batched_tokens_) return false;
 
         block_ctx.master_sp_idx_ = master_rank;
-        int total_token_unalloc  = seq.num_tokens;
-
-        for (int sp_idx : top_most_free_ranks) {
-            int tokens_to_dispatch                  = std::min(total_token_unalloc, num_segments_per_rank * segment_size_);
-            block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
-            total_token_unalloc -= tokens_to_dispatch;
-        }
+        block_ctx.num_dispatched_tokens[master_rank] = seq.num_tokens;
 
         std::vector<int> master_req_counts(attention_sp_, 0);
-
-        for (const auto& running_seq : running) {
-            int m_idx = running_seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
-            if (m_idx >= 0 && m_idx < attention_sp_) {
-                master_req_counts[m_idx]++;
-            }
+        for (const auto& s : running) {
+            int m_idx = s->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+            if (m_idx >= 0 && m_idx < attention_sp_) master_req_counts[m_idx]++;
         }
-
         for (const auto& [m_idx, count] : num_seqs) {
-            if (m_idx >= 0 && m_idx < attention_sp_) {
-                master_req_counts[m_idx] += count;
-            }
+            if (m_idx >= 0 && m_idx < attention_sp_) master_req_counts[m_idx] += count;
         }
-
         master_req_counts[master_rank]++;
 
-        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-            int free_blocks = block_manager[sp_idx]->num_free_blocks();
-            
-            int prefill_tokens = block_ctx.num_dispatched_tokens[sp_idx];
-            int prefill_blocks_needed = (prefill_tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
+        int free_blocks = block_manager[master_rank]->num_free_blocks();
+        int prefill_blocks_needed = (seq.num_tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
+        double needed_float = master_req_counts[master_rank] * reserved_blocks_per_req_;
+        int reservation_blocks_needed = static_cast<int>(std::ceil(needed_float));
 
-            double needed_float = master_req_counts[sp_idx] * reserved_blocks_per_req_;
-            int reservation_blocks_needed = static_cast<int>(std::ceil(needed_float));
-
-            if (free_blocks < prefill_blocks_needed + reservation_blocks_needed) {
-                return false;
-            }
-        }
-
-        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-            if (!block_manager[sp_idx]->can_allocate(seq)) {
-                return false;
-            }
-        }
+        if (free_blocks < prefill_blocks_needed + reservation_blocks_needed) return false;
+        if (!block_manager[master_rank]->can_allocate(seq)) return false;
 
         return true;
     }
@@ -449,8 +414,6 @@ void SPStateManager::allocate(Sequence& seq)
     }
 
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-        // [修改] 更新 Recv 计数
-        // 只有确实分到了 token 且不是 Master 的才算 Receiver
         if (block_ctx.num_dispatched_tokens[sp_idx] > 0) {
             if (sp_idx != master_sp_idx) {
                  num_recv_seqs_per_sp_[sp_idx]++;
@@ -472,13 +435,46 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
     auto& block_ctx     = seq.block_ctx(slot);
     int   master_sp_idx = block_ctx.master_sp_idx_;
 
+    int actual_sp_size = 0;
+    for (int tokens : block_ctx.num_dispatched_tokens) {
+        if (tokens > 0) actual_sp_size++;
+    }
+
+    int prompt_length = seq.num_prompt_tokens;
+    int output_length = seq.num_tokens - seq.num_prompt_tokens;
+    load_stats_.record_request(prompt_length, output_length);
+
+    if (actual_sp_size > 1) {
+        float kv_imbalance = load_stats_.kvcache_imbalance_ratio();
+        std::vector<int> bs_per_rank = get_batch_size_per_rank();
+        float bs_sum = std::accumulate(bs_per_rank.begin(), bs_per_rank.end(), 0.0f);
+        float bs_avg = bs_sum / attention_sp_;
+        float bs_sq_sum = 0;
+        for (int bs : bs_per_rank) {
+            float diff = static_cast<float>(bs) - bs_avg;
+            bs_sq_sum += diff * diff;
+        }
+        float bs_cv = (bs_avg > 0) ? std::sqrt(bs_sq_sum / attention_sp_) / bs_avg : 0.0f;
+
+        bool was_beneficial = (kv_imbalance > 1.5f) || (bs_cv > 0.3f);
+        load_stats_.update_learned_thresholds(actual_sp_size, was_beneficial);
+        
+        if (enable_scheduling_log_) {
+            std::cout << "[SP Feedback] seq_id=" << seq.seq_id 
+                      << " | sp_size=" << actual_sp_size 
+                      << " | beneficial=" << (was_beneficial ? "Y" : "N")
+                      << " | kv_imb=" << std::fixed << std::setprecision(2) << kv_imbalance 
+                      << " | bs_cv=" << bs_cv 
+                      << " | long_req_thr=" << load_stats_.long_req_threshold() << std::endl;
+        }
+    }
+
     if (master_sp_idx >= 0 && master_sp_idx < attention_sp_) {
         if (master_seq_counts_[master_sp_idx] > 0) {
             master_seq_counts_[master_sp_idx]--;
         }
     }
 
-    // [修改] 在清理 block_ctx 之前，先减少 Recv 计数
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
         if (block_ctx.num_dispatched_tokens[sp_idx] > 0) {
             if (sp_idx != master_sp_idx) {

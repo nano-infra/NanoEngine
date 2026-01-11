@@ -106,7 +106,8 @@ void bind_sp_state_manager(py::module_& m)
 
     // Bind SPStateManager
     py::class_<SPStateManager, std::shared_ptr<SPStateManager>>(m, "SPStateManager")
-        .def(py::init<const std::string&, int, int, int, int, int, int, double, int, bool, bool, const std::string&>(),
+        .def(py::init<const std::string&, int, int, int, int, int, int, double, int, bool, bool, 
+                      const std::string&, const std::string&, float, float, int>(),
              py::arg("engine_id"),
              py::arg("attention_sp"),
              py::arg("num_kvcache_blocks"),
@@ -118,7 +119,12 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("segment_size") = 65536,
              py::arg("enable_dynamic_sp_size"),
              py::arg("enable_non_uniform_split"),
-             py::arg("sp_master_selector"))
+             py::arg("sp_master_selector"),
+             // SP size policy parameters (thresholds auto-learned)
+             py::arg("sp_size_mode") = "segment",
+             py::arg("initial_avg_prompt_length") = 1024.0f,
+             py::arg("initial_avg_output_length") = 256.0f,
+             py::arg("stats_window_size") = 1000)
 
         .def_property_readonly("is_empty", &SPStateManager::is_empty)
 
@@ -133,6 +139,15 @@ void bind_sp_state_manager(py::module_& m)
 
         .def("allocate", &SPStateManager::allocate, py::arg("seq"))
         .def("deallocate", &SPStateManager::deallocate, py::arg("seq"), py::arg("slot"))
+
+        // Load statistics access (for monitoring/debugging)
+        .def("get_avg_prompt_length", [](SPStateManager& m) { return m.load_stats().avg_prompt_length(); })
+        .def("get_avg_output_length", [](SPStateManager& m) { return m.load_stats().avg_output_length(); })
+        .def("get_stats_num_samples", [](SPStateManager& m) { return m.load_stats().num_samples(); })
+        .def("get_expected_waiting_requests", [](SPStateManager& m) { return m.load_stats().expected_waiting_requests(); })
+        .def("get_kvcache_imbalance", [](SPStateManager& m) { return m.load_stats().kvcache_imbalance_ratio(); })
+        .def("get_learned_long_req_threshold", [](SPStateManager& m) { return m.load_stats().long_req_threshold(); })
+        .def("get_learned_imbalance_threshold", [](SPStateManager& m) { return m.load_stats().imbalance_threshold(); })
 
         .def_readwrite("block_manager", &SPStateManager::block_manager)
         .def_readwrite("running", &SPStateManager::running)

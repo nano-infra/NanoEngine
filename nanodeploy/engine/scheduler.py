@@ -39,7 +39,12 @@ class Scheduler(_CppScheduler):
             config.segment_size,
             config.enable_dynamic_sp_size,
             config.enable_non_uniform_split,
-            config.sp_master_selector
+            config.sp_master_selector,
+            # SP size policy parameters (thresholds are now auto-learned)
+            config.sp_size_mode,
+            config.initial_avg_prompt_length,
+            config.initial_avg_output_length,
+            config.stats_window_size,
         )
         # Store config for compatibility
         self.engine_id = config.engine_id
