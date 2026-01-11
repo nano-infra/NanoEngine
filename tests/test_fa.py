@@ -2,11 +2,8 @@ import time
 
 import torch
 import torch.nn.functional as F
-
 from einops import rearrange
-
 from flash_attn_interface import flash_attn_with_kvcache, get_scheduler_metadata
-
 from triton.testing import do_bench, do_bench_cudagraph
 
 try:

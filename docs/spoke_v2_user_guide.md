@@ -8,11 +8,12 @@
 Spoke V2 introduces a powerful **Resource-Aware Gang Scheduling** system designed for high-performance AI inference and training. It solves the critical problem of bootstrapping distributed process groups (e.g., NCCL/PyTorch DDP) by decoupling **Resource Allocation** from **Actor Launch**.
 
 ### Key Features
+
 - **Resource Awareness**: Hub tracks GPU usage per node.
 - **Gang Scheduling**: Allocates multiple actors atomically on the same node (or across nodes) to ensure locality and prevent resource fragmentation.
-- **Two-Phase Launch**: 
-    1. `gangAllocate()`: Reserve resources and get a topology map.
-    2. `launchActor()`: Start processes with precise placement and configuration.
+- **Two-Phase Launch**:
+  1. `gangAllocate()`: Reserve resources and get a topology map.
+  2. `launchActor()`: Start processes with precise placement and configuration.
 - **GPU Isolation**: Automatically sets `CUDA_VISIBLE_DEVICES` for each actor.
 - **Self-Contained**: DLSlime (RDMA) is now vendored, simplifying deployment.
 
@@ -21,12 +22,14 @@ Spoke V2 introduces a powerful **Resource-Aware Gang Scheduling** system designe
 ### 2.1 Start Infrastructure
 
 1. **Start Hub**:
+
    ```bash
    ./bin/spoke_hub [port]
    ```
 
 2. **Start Agent (Daemon)**:
    Report available resources (e.g., 8 GPUs) to the Hub.
+
    ```bash
    ./bin/smoke_v7_agent [my_port] [hub_ip] [hub_port] --gpus 8
    ```
@@ -44,12 +47,12 @@ int main() {
     // 1. Define Requirement: 1 Node, 8 Actors, 1 GPU each
     spoke::ResourceSpec res;
     res.num_gpus = 1;
-    
+
     // 2. Allocation Phase (Blocking)
     // Request: "Give me 1 node with 8 slots"
     auto fut = client.gangAllocate(1, 8, res);
     auto resp = fut.get();
-    
+
     std::cout << "Allocation Ticket: " << resp.ticket_id << std::endl;
 
     // 3. Configuration Phase (Local)
@@ -61,7 +64,7 @@ int main() {
         // Launch rank 'i' using the reserved ticket
         client.launchActor(resp.ticket_id, i, "ModelRunner", "worker_" + std::to_string(i), "--rank " + std::to_string(i));
     }
-    
+
     return 0;
 }
 ```
@@ -69,14 +72,18 @@ int main() {
 ## 3. Architecture Deep Dive
 
 ### 3.1 Allocation Strategy
+
 When `gangAllocate` is called:
+
 1. Hub scans registered nodes for availability (Free GPUs = Total - Used).
 2. Hub uses a greedy packing algorithm (currently) to find nodes that fit `actors_per_node`.
 3. Hub **commits** the usage immediately and generates a `ticket_id`.
 4. Hub returns the `AllocatedSlot` list (Ticket ID + Topology).
 
 ### 3.2 GPU Isolation mechanism
+
 When `launchActor` is called:
+
 1. Hub looks up the `AllocatedSlot` for the given `ticket_id` and `rank`.
 2. Hub retrieves the assigned physical `gpu_id` (e.g., GPU 3).
 3. Hub sends a `kNetLaunch` command to the specific Agent on that node.
@@ -91,10 +98,13 @@ When `launchActor` is called:
 ## 4. Build & Integration
 
 ### 4.1 Vendored DLSlime
+
 Spoke now includes DLSlime in `third_party/DLSlime`. You do not need to install DLSlime system-wide.
+
 - **CMake**: `target_link_libraries(your_target Spoke::core)` automatically links the internal RDMA transport.
 
 ### 4.2 Creating Custom Agents
+
 Inherit from `spoke::Actor` as usual. The resource management is transparent to the Actor class.
 
 ```cpp
@@ -110,24 +120,28 @@ SPOKE_REGISTER_ACTOR("MyActor", MyActor);
 ## 5. API Reference
 
 ### `Client::gangAllocate`
+
 ```cpp
 std::future<AllocateResp> gangAllocate(
-    uint32_t num_nodes, 
-    uint32_t actors_per_node, 
-    const ResourceSpec& res_per_actor, 
+    uint32_t num_nodes,
+    uint32_t actors_per_node,
+    const ResourceSpec& res_per_actor,
     bool strict_pack = true
 );
 ```
+
 - **strict_pack**: If true, ensures `actors_per_node` are on the SAME physical node.
 
 ### `Client::launchActor`
+
 ```cpp
 std::future<bool> launchActor(
-    const std::string& ticket_id, 
-    uint32_t global_rank, 
-    const std::string& type, 
-    const std::string& id, 
+    const std::string& ticket_id,
+    uint32_t global_rank,
+    const std::string& type,
+    const std::string& id,
     const std::string& args_serialized
 );
 ```
-- **global_rank**: The index [0..N-1] within the Gang allocation.
+
+- **global_rank**: The index \[0..N-1\] within the Gang allocation.

@@ -2,7 +2,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
-
 from nanodeploy.logging import get_logger
 
 # Initialize logger with NANODEPLOY namespace
@@ -28,10 +27,10 @@ class Context:
     res_lse_mask: torch.Tensor | None = None
 
     is_dummy: bool = False
-    
+
     tile_scheduler_metadata: torch.Tensor | None = None
     num_splits: torch.Tensor | None = None
-    
+
     token_ids: list[torch.Tensor] = field(default_factory=list)
 
     q_slice_get: torch.Tensor | None = None

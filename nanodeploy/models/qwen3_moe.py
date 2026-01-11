@@ -3,9 +3,7 @@ from typing import Dict
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
 from dlblas.layers.moe.ep_moe import build_deepep_moe
-
 from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -19,7 +17,6 @@ from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
 from nanodeploy.worker.runner_config import get_runner_config
-
 from torch import nn
 from transformers import Qwen3MoeConfig
 
@@ -92,7 +89,7 @@ class Qwen3MoeAttention(nn.Module):
             self.scaling,
             self.num_kv_heads,
             self.head_dim,
-            "GQA"
+            "GQA",
         )
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)

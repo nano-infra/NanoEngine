@@ -56,7 +56,7 @@ target_link_libraries(_nanodeploy_worker
 
 set_target_properties(_nanodeploy_worker PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-target_include_directories(_nanodeploy_worker PUBLIC 
+target_include_directories(_nanodeploy_worker PUBLIC
     "/mnt/nvme1n1/ml_research/majinming/install/include"
 )
 target_include_directories(_nanodeploy_worker PUBLIC

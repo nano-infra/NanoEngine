@@ -40,8 +40,8 @@ class CacheContext:
 
         free, total = torch.cuda.mem_get_info()
         if self.gpu_memory_limit_gb is not None:
-             total = min(total, self.gpu_memory_limit_gb * 1024**3)
-        used = torch.cuda.mem_get_info()[1] - free # real used
+            total = min(total, self.gpu_memory_limit_gb * 1024**3)
+        used = torch.cuda.mem_get_info()[1] - free  # real used
         memory_stats = torch.cuda.memory_stats()
         peak = memory_stats["allocated_bytes.all.peak"]
         current = memory_stats["allocated_bytes.all.current"]
@@ -55,7 +55,7 @@ class CacheContext:
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
-        
+
         block_bytes = (
             self.num_hidden_layers
             * self.block_size
@@ -120,9 +120,9 @@ class CacheContext:
 
     def allocate_kvcache(self, num_kvcache_blocks):
         self.num_local_kvcache_blocks = num_kvcache_blocks
-        
+
         kv_count = 2 if self.mode == "gqa" else 1
-        
+
         self.kv_cache = torch.empty(
             kv_count,
             self.num_hidden_layers,

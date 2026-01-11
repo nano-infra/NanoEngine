@@ -63,7 +63,10 @@ public:
         return config_.ep_degree;
     }
     // Alias for Qwen3 MoE compatibility
-    int ffn_ep_world_size() const { return ep_world_size(); }
+    int ffn_ep_world_size() const
+    {
+        return ep_world_size();
+    }
 
     // Helper to get group information (placeholder for DLSlime/ProcessGroup integration)
     // For now, we calculate ranks based on assumed topology ordering:

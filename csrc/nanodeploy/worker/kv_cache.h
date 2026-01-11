@@ -1,8 +1,8 @@
 #pragma once
 
+#include <cuda_runtime.h>  // Added for cudaDeviceSynchronize
 #include <torch/torch.h>
 #include <vector>
-#include <cuda_runtime.h> // Added for cudaDeviceSynchronize
 
 namespace nanodeploy {
 
@@ -33,31 +33,35 @@ public:
     {
         // Loop-based method with correct indexing
         // Cache layout: [NumBlocks, NumKV, BlockSize, HeadDim]
-        
+
         // Ensure k, v are on same device/dtype as cache
         auto device = k_caches[layer_idx].device();
         auto dtype  = k_caches[layer_idx].scalar_type();
-        
-        if (k.scalar_type() != dtype) k = k.to(dtype);
-        if (v.scalar_type() != dtype) v = v.to(dtype);
+
+        if (k.scalar_type() != dtype)
+            k = k.to(dtype);
+        if (v.scalar_type() != dtype)
+            v = v.to(dtype);
         // Keep k, v on GPU
-        if (k.device() != device) k = k.to(device);
-        if (v.device() != device) v = v.to(device);
-        
+        if (k.device() != device)
+            k = k.to(device);
+        if (v.device() != device)
+            v = v.to(device);
+
         int64_t block_size = k_caches[layer_idx].size(2);
-        int batch_size = slot_mapping.size(0);
-        
+        int     batch_size = slot_mapping.size(0);
+
         // Sync slot_mapping to CPU for indexing
         auto slots_cpu = slot_mapping.to(torch::kCPU, torch::kLong);
         auto slots_acc = slots_cpu.accessor<int64_t, 1>();
-        
+
         using namespace torch::indexing;
-        
+
         for (int i = 0; i < batch_size; ++i) {
-            int64_t slot = slots_acc[i];
+            int64_t slot      = slots_acc[i];
             int64_t block_idx = slot / block_size;
-            int64_t offset = slot % block_size;
-            
+            int64_t offset    = slot % block_size;
+
             // k[i] is [NumKV, HeadDim]
             // Target: cache[block_idx, :, offset, :] which is [NumKV, HeadDim]
             // Use index_put_ with scalar indices

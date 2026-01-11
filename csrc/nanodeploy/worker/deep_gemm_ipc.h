@@ -21,19 +21,19 @@ struct DeepGemmInitResp {
 };
 
 enum class DeepGemmTestMode : int {
-    kFp8Gemm = 0,
+    kFp8Gemm         = 0,
     kMaskedGroupGemm = 1
 };
 
 struct DeepGemmTestReq {
-    int mode = 0; // 0: Fp8Gemm, 1: MaskedGroupGemm
-    int m = 4096;
-    int n = 4096;
-    int k = 4096;
-    int num_groups = 128; // For masked grouped gemm
-    int seed = 1;
+    int mode         = 0;  // 0: Fp8Gemm, 1: MaskedGroupGemm
+    int m            = 4096;
+    int n            = 4096;
+    int k            = 4096;
+    int num_groups   = 128;  // For masked grouped gemm
+    int seed         = 1;
     int warmup_iters = 5;
-    int test_iters = 20;
+    int test_iters   = 20;
 };
 
 struct DeepGemmTestResp {
@@ -46,7 +46,7 @@ struct DeepGemmTestResp {
 
 namespace spoke {
 
-// Reuse helper for string serialization from deep_ep_ipc.h if possible, 
+// Reuse helper for string serialization from deep_ep_ipc.h if possible,
 // but since headers might be included separately, better to redefine or make common utils.
 // For now, I'll assume simple implementation here or duplicate helper.
 // Actually deep_ep_ipc.h had them inline. I will copy them for safety/independence.
@@ -139,8 +139,9 @@ struct Serializer<nanodeploy::DeepGemmInitResp> {
     static nanodeploy::DeepGemmInitResp unpackFrom(const char* buf, size_t len)
     {
         nanodeploy::DeepGemmInitResp obj;
-        const char* ptr = buf;
-        if (len < sizeof(bool)) return obj;
+        const char*                  ptr = buf;
+        if (len < sizeof(bool))
+            return obj;
         std::memcpy(&obj.success, ptr, sizeof(bool));
         ptr += sizeof(bool);
         deserialize_str_gemm(ptr, obj.message);
@@ -212,8 +213,9 @@ struct Serializer<nanodeploy::DeepGemmTestResp> {
     static nanodeploy::DeepGemmTestResp unpackFrom(const char* buf, size_t len)
     {
         nanodeploy::DeepGemmTestResp obj;
-        const char* ptr = buf;
-        if (len < sizeof(bool) + sizeof(double)) return obj;
+        const char*                  ptr = buf;
+        if (len < sizeof(bool) + sizeof(double))
+            return obj;
         std::memcpy(&obj.success, ptr, sizeof(bool));
         ptr += sizeof(bool);
         std::memcpy(&obj.lat_us, ptr, sizeof(double));
@@ -236,4 +238,4 @@ struct Serializer<nanodeploy::DeepGemmTestResp> {
     }
 };
 
-} // namespace spoke
+}  // namespace spoke

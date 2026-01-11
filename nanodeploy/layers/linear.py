@@ -3,11 +3,9 @@ from typing import List
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
 from nanodeploy.kernels.block_gemm_fp8 import deep_gemm_fp8, quant_fp8_tma
 from nanodeploy.models.quant_config import QuantizationConfig
 from nanodeploy.worker.distributed import get_dist_context
-
 from torch import nn
 
 
@@ -58,7 +56,7 @@ class LinearBase(nn.Module):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
-        
+
         n_blk_size, k_blk_size = quantization_config.block_size
         if scale_tensor is not None:
             self.weight_scale_inv = nn.Parameter(scale_tensor)

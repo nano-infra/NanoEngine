@@ -1,15 +1,15 @@
 from typing import Literal, TYPE_CHECKING
 
+from nanodeploy._cpp import (
+    DefaultIntDict as _CppDefaultIntDict,
+    postprocess_sequences as _cpp_postprocess_sequences,
+    RoutingStrategy as _CppRoutingStrategy,
+    Scheduler as _CppScheduler,
+    SPStateManager as _CppSPStateManager,
+)
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
-from nanodeploy._cpp import (
-    Scheduler as _CppScheduler,
-    SPStateManager as _CppSPStateManager,
-    RoutingStrategy as _CppRoutingStrategy,
-    DefaultIntDict as _CppDefaultIntDict,
-    postprocess_sequences as _cpp_postprocess_sequences
-)
 
 if TYPE_CHECKING:
     from nanodeploy.metrics import MetricsManager
@@ -18,6 +18,7 @@ logger = get_logger()
 
 SPStateManager = _CppSPStateManager
 RoutingStrategy = _CppRoutingStrategy
+
 
 # Adapter class for C++ Scheduler to work with Config object
 class Scheduler(_CppScheduler):
@@ -33,7 +34,7 @@ class Scheduler(_CppScheduler):
             config.attention_sp,
             config.num_kvcache_blocks,
             config.kvcache_block_size,
-            config.mode
+            config.mode,
         )
         # Store config for compatibility
         self.engine_id = config.engine_id

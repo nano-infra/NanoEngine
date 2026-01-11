@@ -1,1 +1,1 @@
-from nanodeploy._cpp import BlockManager, Block
+from nanodeploy._cpp import Block, BlockManager

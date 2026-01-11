@@ -19,9 +19,9 @@ public:
     DeepGemmTestResp run_test(const DeepGemmTestReq& req);
 
 private:
-    int rank_ = -1;
+    int rank_       = -1;
     int world_size_ = -1;
-    int device_id_ = 0;
+    int device_id_  = 0;
 };
 
 }  // namespace nanodeploy

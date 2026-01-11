@@ -26,7 +26,7 @@ public:
     explicit WeightManager(const std::filesystem::path& model_dir, torch::Device device = torch::kCPU);
 
     torch::Tensor load(const std::string& param_name);
-    
+
     // Helper to check existence
     bool has_param(const std::string& param_name);
 
@@ -63,10 +63,10 @@ private:
 
     // Dense Model
     std::unique_ptr<models::Qwen3ForCausalLM<QuantType::FP16>> model_;
-    
+
     // MoE Model
     std::unique_ptr<models::Qwen3MoeForCausalLM<QuantType::FP16>> moe_model_;
-    std::unique_ptr<deep_ep::Buffer> ep_buffer_;
+    std::unique_ptr<deep_ep::Buffer>                              ep_buffer_;
 
     std::unique_ptr<KvCache>                   kv_cache_;
     std::unique_ptr<layers::FlashInferHandler> flashinfer_handler_;

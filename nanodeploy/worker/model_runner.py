@@ -1,13 +1,11 @@
 import os
 
+import flash_mla
 import numpy as np
 import ray
 import torch
 import torch.distributed as dist
 import torch.profiler as profiler
-import flash_mla
-
-
 from nanodeploy._cpp import (
     BlockContextSlot,
     prepare_decode_cpp,
@@ -344,11 +342,15 @@ class ModelRunner:
         )
 
         if len(meta.block_tables_flat) == 0:
-            block_tables = torch.empty((0, 0), dtype=torch.int32).cuda(non_blocking=True)
+            block_tables = torch.empty((0, 0), dtype=torch.int32).cuda(
+                non_blocking=True
+            )
         else:
-            block_tables = torch.tensor(
-                meta.block_tables_flat, dtype=torch.int32, pin_memory=True
-            ).reshape(-1, meta.max_num_blocks).cuda(non_blocking=True)
+            block_tables = (
+                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
+                .reshape(-1, meta.max_num_blocks)
+                .cuda(non_blocking=True)
+            )
 
         logger.info(f"ModelRunner block_tables.shape: {block_tables.shape}")
 
@@ -430,7 +432,7 @@ class ModelRunner:
             meta.q_offsets, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
         attention_compute_bs = context_lens_for_attn.numel()
-        
+
         config = self.config
         hf_config = config.hf_config
         if hf_config.num_key_value_heads == 1:
@@ -537,12 +539,12 @@ class ModelRunner:
             bs = input_ids.size(0)
             context = get_context()
             master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
-            
+
             ac_bs = context.attention_compute_bs
             if ac_bs is None:
                 ac_bs = bs
             attn_bs = next(x for x in self.graph_attn_compute_bs if x >= ac_bs)
-            
+
             graph = self.graphs[(master_bs, attn_bs)]
 
             graph_vars = self.graph_vars
@@ -571,10 +573,9 @@ class ModelRunner:
                 # graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
                 # graph_vars["num_splits"][:context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
 
-
             graph_vars["context_lens_for_attn"].zero_()
             graph_vars["context_lens_for_attn"][: context.context_lens_for_attn.shape[0]].copy_(context.context_lens_for_attn)  # type: ignore
-            
+
             graph_vars["q_slice_get"].fill_(-1)
             graph_vars["q_slice_fill"].fill_(-1)
             graph_vars["q_copy_mask"].zero_()
@@ -699,9 +700,7 @@ class ModelRunner:
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens_for_attn = torch.zeros(
-            max_attention_comp_seqs, dtype=torch.int32
-        )
+        context_lens_for_attn = torch.zeros(max_attention_comp_seqs, dtype=torch.int32)
         context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         q_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)

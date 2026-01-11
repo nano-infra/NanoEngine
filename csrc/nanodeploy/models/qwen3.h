@@ -1,7 +1,7 @@
 #pragma once
+#include <cstdio>
 #include <memory>
 #include <string>
-#include <cstdio>
 #include <torch/torch.h>
 #include <vector>
 
@@ -52,12 +52,12 @@ public:
         // NANODEPLOY_LOG_DEBUG("Hidden: ", hidden_size, " Heads: ", num_heads, " HeadDim: ", head_dim);
 
         qkv_proj_ = std::make_unique<layers::QKVParallelLinear<Quant>>(hidden_size,
-                                                                   (num_heads + 2 * num_kv_heads) * head_dim,
-                                                                   /*bias=*/true);
+                                                                       (num_heads + 2 * num_kv_heads) * head_dim,
+                                                                       /*bias=*/true);
 
         o_proj_ = std::make_unique<layers::RowParallelLinear<Quant>>(num_heads * head_dim,
-                                                                 hidden_size,
-                                                                 /*bias=*/false);
+                                                                     hidden_size,
+                                                                     /*bias=*/false);
 
         // rotary_emb_ is properly initialized via shared_ptr
 
@@ -109,11 +109,11 @@ public:
         // Split
         // Note: split logic depends on QKV layout.
         // Assuming packed [Q, K, V] where Q has H heads, K has nKV heads, V has nKV heads
-        int num_kv_heads = (qkv.size(2) - num_heads) / 2;
-        auto chunks = qkv.split({num_heads, num_kv_heads, num_kv_heads}, 2);
-        auto q      = chunks[0];
-        auto k      = chunks[1];
-        auto v      = chunks[2];
+        int  num_kv_heads = (qkv.size(2) - num_heads) / 2;
+        auto chunks       = qkv.split({num_heads, num_kv_heads, num_kv_heads}, 2);
+        auto q            = chunks[0];
+        auto k            = chunks[1];
+        auto v            = chunks[2];
 
         // Transpose to [B, H, S, D]
         q = q.transpose(1, 2);
@@ -147,38 +147,39 @@ public:
             bool use_flashinfer_decode = (seq_len == 1);
 
             if (use_flashinfer_decode) {
-                 // --- FlashInfer Path (Decode) ---
-                 int batch = q.size(0);
-                 int heads = q.size(1);
-                 int seq   = q.size(2);
-                 int dim   = q.size(3);
+                // --- FlashInfer Path (Decode) ---
+                int batch = q.size(0);
+                int heads = q.size(1);
+                int seq   = q.size(2);
+                int dim   = q.size(3);
 
-                 if (!q.is_contiguous()) q = q.contiguous();
-                 auto q_fi = q.squeeze(2); // [B, H, D]
-                 
-                 // Ensure q is BF16 for FlashInfer
-                 if (q_fi.scalar_type() != torch::kBFloat16) {
-                     q_fi = q_fi.to(torch::kBFloat16);
-                 }
+                if (!q.is_contiguous())
+                    q = q.contiguous();
+                auto q_fi = q.squeeze(2);  // [B, H, D]
 
-                 auto k_cache_tensor = kv_cache->k_caches[layer_idx];
-                 auto v_cache_tensor = kv_cache->v_caches[layer_idx];
-                 
-                 auto output_fi = handler->attention(q_fi.data_ptr(),
-                                                  k_cache_tensor.data_ptr(),
-                                                  v_cache_tensor.data_ptr(),
-                                                  batch,
-                                                  seq,
-                                                  heads,
-                                                  dim,
-                                                  layer_idx);
-                 
-                 // FlashInfer returns [B, H, D], reshape to [B, H, 1, D] for consistency
-                 attn_output = output_fi.unsqueeze(2);
-            } 
+                // Ensure q is BF16 for FlashInfer
+                if (q_fi.scalar_type() != torch::kBFloat16) {
+                    q_fi = q_fi.to(torch::kBFloat16);
+                }
+
+                auto k_cache_tensor = kv_cache->k_caches[layer_idx];
+                auto v_cache_tensor = kv_cache->v_caches[layer_idx];
+
+                auto output_fi = handler->attention(q_fi.data_ptr(),
+                                                    k_cache_tensor.data_ptr(),
+                                                    v_cache_tensor.data_ptr(),
+                                                    batch,
+                                                    seq,
+                                                    heads,
+                                                    dim,
+                                                    layer_idx);
+
+                // FlashInfer returns [B, H, D], reshape to [B, H, 1, D] for consistency
+                attn_output = output_fi.unsqueeze(2);
+            }
             else {
                 // --- SDPA Path (Prefill) ---
-                
+
                 // For prefill, K/V are simply the current input's K/V (full sequence)
                 auto k_sdpa = k;
                 auto v_sdpa = v;
@@ -186,13 +187,13 @@ public:
                 // GQA Repeat
                 if (num_heads > num_kv_heads) {
                     int n_rep = num_heads / num_kv_heads;
-                    k_sdpa = k_sdpa.repeat_interleave(n_rep, 1);
-                    v_sdpa = v_sdpa.repeat_interleave(n_rep, 1);
+                    k_sdpa    = k_sdpa.repeat_interleave(n_rep, 1);
+                    v_sdpa    = v_sdpa.repeat_interleave(n_rep, 1);
                 }
 
                 // Causal Masking for Prefill
-                bool is_causal = true; 
-                attn_output = torch::scaled_dot_product_attention(q, k_sdpa, v_sdpa, {}, 0.0, is_causal);
+                bool is_causal = true;
+                attn_output    = torch::scaled_dot_product_attention(q, k_sdpa, v_sdpa, {}, 0.0, is_causal);
             }
         }
         else {
@@ -223,10 +224,10 @@ public:
 
     std::unique_ptr<layers::QKVParallelLinear<Quant>> qkv_proj_;
     std::unique_ptr<layers::RowParallelLinear<Quant>> o_proj_;
-    std::shared_ptr<layers::RotaryEmbedding>      rotary_emb_;
-    std::unique_ptr<layers::Attention>            attn_;
-    std::unique_ptr<layers::RMSNorm>              q_norm_;
-    std::unique_ptr<layers::RMSNorm>              k_norm_;
+    std::shared_ptr<layers::RotaryEmbedding>          rotary_emb_;
+    std::unique_ptr<layers::Attention>                attn_;
+    std::unique_ptr<layers::RMSNorm>                  q_norm_;
+    std::unique_ptr<layers::RMSNorm>                  k_norm_;
 
     int num_heads_;
     int num_kv_heads_;
@@ -244,12 +245,12 @@ public:
         int intermediate_size = config.intermediate_size;
 
         gate_up_proj_ = std::make_unique<layers::MergedColumnParallelLinear<Quant>>(hidden_size,
-                                                                                2 * intermediate_size,
-                                                                                /*bias=*/false);
+                                                                                    2 * intermediate_size,
+                                                                                    /*bias=*/false);
 
         down_proj_ = std::make_unique<layers::RowParallelLinear<Quant>>(intermediate_size,
-                                                                    hidden_size,
-                                                                    /*bias=*/false);
+                                                                        hidden_size,
+                                                                        /*bias=*/false);
 
         act_fn_ = std::make_unique<layers::SiluAndMul>();
     }
@@ -263,7 +264,7 @@ public:
 
     std::unique_ptr<layers::MergedColumnParallelLinear<Quant>> gate_up_proj_;
     std::unique_ptr<layers::RowParallelLinear<Quant>>          down_proj_;
-    std::unique_ptr<layers::SiluAndMul>                    act_fn_;
+    std::unique_ptr<layers::SiluAndMul>                        act_fn_;
 };
 
 // =========================================================================
@@ -328,8 +329,8 @@ public:
     // Members
     std::unique_ptr<Qwen3Attention<Quant>> self_attn_;
     std::unique_ptr<Qwen3MLP<Quant>>       mlp_;
-    std::unique_ptr<layers::RMSNorm>   input_layernorm_;
-    std::unique_ptr<layers::RMSNorm>   post_attention_layernorm_;
+    std::unique_ptr<layers::RMSNorm>       input_layernorm_;
+    std::unique_ptr<layers::RMSNorm>       post_attention_layernorm_;
 };
 
 // =========================================================================
@@ -382,10 +383,10 @@ public:
     // (Garbage removed)
 
 public:
-    std::unique_ptr<layers::VocabParallelEmbedding>    embed_tokens_;
+    std::unique_ptr<layers::VocabParallelEmbedding>        embed_tokens_;
     std::vector<std::unique_ptr<Qwen3DecoderLayer<Quant>>> layers_;
-    std::unique_ptr<layers::RMSNorm>                   norm_;
-    std::shared_ptr<layers::RotaryEmbedding>           rotary_emb_;
+    std::unique_ptr<layers::RMSNorm>                       norm_;
+    std::shared_ptr<layers::RotaryEmbedding>               rotary_emb_;
 };
 
 // =========================================================================
@@ -417,7 +418,7 @@ public:
     }
 
     // Public exposure for loading
-    std::unique_ptr<Qwen3Model<Quant>>          model_;
+    std::unique_ptr<Qwen3Model<Quant>>      model_;
     std::unique_ptr<layers::ParallelLMHead> lm_head_;
 };
 

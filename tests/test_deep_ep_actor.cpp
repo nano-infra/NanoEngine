@@ -80,7 +80,7 @@ int main(int argc, char** argv)
         req.num_nvl_bytes    = 1024 * 1024 * 1024;  // 1GB
         init_futs.push_back(client.callRemote<DeepEPInitReq, DeepEPInitResp>(actor_ids[i], kInit, req));
     }
-    
+
     // Wait for all Init responses
     for (int i = 0; i < actor_ids.size(); ++i) {
         auto resp = init_futs[i].get();
