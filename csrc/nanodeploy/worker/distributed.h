@@ -57,6 +57,14 @@ public:
         return config_.dp_degree;
     }
 
+    int ep_rank() const;
+    int ep_world_size() const
+    {
+        return config_.ep_degree;
+    }
+    // Alias for Qwen3 MoE compatibility
+    int ffn_ep_world_size() const { return ep_world_size(); }
+
     // Helper to get group information (placeholder for DLSlime/ProcessGroup integration)
     // For now, we calculate ranks based on assumed topology ordering:
     // [PP, DP, TP] -> Inner to Outer: TP is innermost dimension (contiguous ranks)

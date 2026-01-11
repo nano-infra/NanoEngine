@@ -54,4 +54,11 @@ int DistContext::pp_rank() const
     return rank_div_tp_dp % config_.pp_degree;
 }
 
+int DistContext::ep_rank() const
+{
+    // EP usually partitions the model at the level of TP groups (experts are not usually TP sliced in basic EP)
+    // So all TP ranks in a group belong to the same EP rank.
+    return (config_.global_rank / config_.tp_degree) % config_.ep_degree;
+}
+
 }  // namespace nanodeploy

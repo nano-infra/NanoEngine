@@ -67,7 +67,10 @@ int main(int argc, char** argv)
     Action kSync    = static_cast<Action>(static_cast<int>(Action::kUserActionStart) + 22);
     Action kTest    = static_cast<Action>(static_cast<int>(Action::kUserActionStart) + 23);
 
-    std::cout << "Initializing DeepEP..." << std::endl;
+    // IMPORTANT: Init requests MUST be sent in parallel!
+    // NVSHMEM initialization is a collective operation - all ranks must enter simultaneously.
+    std::cout << "Initializing DeepEP (parallel)..." << std::endl;
+    std::vector<std::future<DeepEPInitResp>> init_futs;
     for (int i = 0; i < actor_ids.size(); ++i) {
         DeepEPInitReq req;
         req.rank             = i;
@@ -75,23 +78,33 @@ int main(int argc, char** argv)
         req.low_latency_mode = true;
         req.num_rdma_bytes   = 1024 * 1024 * 1024;  // 1GB
         req.num_nvl_bytes    = 1024 * 1024 * 1024;  // 1GB
-        auto resp            = client.callRemote<DeepEPInitReq, DeepEPInitResp>(actor_ids[i], kInit, req).get();
+        init_futs.push_back(client.callRemote<DeepEPInitReq, DeepEPInitResp>(actor_ids[i], kInit, req));
+    }
+    
+    // Wait for all Init responses
+    for (int i = 0; i < actor_ids.size(); ++i) {
+        auto resp = init_futs[i].get();
         if (!resp.success) {
             std::cerr << "Init failed on " << actor_ids[i] << ": " << resp.message << std::endl;
             return 1;
         }
     }
+    std::cout << "All actors initialized." << std::endl;
 
-    // 5. Get Info (Handles)
-    std::cout << "Gathering IPC Handles..." << std::endl;
-    DeepEPSyncReq sync_req;
-    sync_req.valid_mask.resize(actor_ids.size(), 0);
-    // sync_req.handle_size will be set from first response
-
-    // Flattened buffer
+    // 5. Get Info (Handles) - send in parallel for consistency
+    std::cout << "Gathering IPC Handles (parallel)..." << std::endl;
+    std::vector<std::future<DeepEPInfoResp>> info_futs;
     for (int i = 0; i < actor_ids.size(); ++i) {
         DeepEPInfoReq req;
-        auto          resp = client.callRemote<DeepEPInfoReq, DeepEPInfoResp>(actor_ids[i], kGetInfo, req).get();
+        info_futs.push_back(client.callRemote<DeepEPInfoReq, DeepEPInfoResp>(actor_ids[i], kGetInfo, req));
+    }
+
+    DeepEPSyncReq sync_req;
+    sync_req.valid_mask.resize(actor_ids.size(), 0);
+
+    // Collect responses
+    for (int i = 0; i < actor_ids.size(); ++i) {
+        auto resp = info_futs[i].get();
 
         if (resp.ipc_handle.empty()) {
             std::cerr << "Got empty handle from " << actor_ids[i] << std::endl;

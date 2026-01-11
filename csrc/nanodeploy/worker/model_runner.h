@@ -10,10 +10,14 @@
 #include "nanodeploy/core/weight_mapping.h"
 #include "nanodeploy/layers/flashinfer_handler.h"
 #include "nanodeploy/models/qwen3.h"
+#include "nanodeploy/models/qwen3_moe.h"
 #include "nanodeploy/worker/distributed.h"
 #include "nanodeploy/worker/kv_cache.h"
 #include "nanodeploy/worker/model_runner_ipc.h"
 #include "nanodeploy/worker/weight_loader.h"
+
+// Third-party
+#include "deep_ep.hpp"
 
 namespace nanodeploy {
 
@@ -22,6 +26,9 @@ public:
     explicit WeightManager(const std::filesystem::path& model_dir, torch::Device device = torch::kCPU);
 
     torch::Tensor load(const std::string& param_name);
+    
+    // Helper to check existence
+    bool has_param(const std::string& param_name);
 
 private:
     std::filesystem::path                             model_dir_;
@@ -36,7 +43,6 @@ public:
     ModelRunner() = default;
 
     // Initialize model, KV cache, and load weights
-    // Initialize model, KV cache, and load weights
     void init(const std::string& config_path, int rank, int world_size);
     void init(const std::string& config_path, const DistributedConfig& dconf);
 
@@ -49,13 +55,18 @@ private:
 
     // Helpers to load specific components
     void load_layer_weights(int layer_idx, models::Qwen3DecoderLayer<QuantType::FP16>* layer);
+    void load_moe_layer_weights(int layer_idx, models::Qwen3MoeDecoderLayer<QuantType::FP16>* layer);
 
 private:
     std::unique_ptr<core::ModelConfig> config_;
     std::unique_ptr<WeightManager>     weight_manager_;
 
-    // Assume FP16 for now
+    // Dense Model
     std::unique_ptr<models::Qwen3ForCausalLM<QuantType::FP16>> model_;
+    
+    // MoE Model
+    std::unique_ptr<models::Qwen3MoeForCausalLM<QuantType::FP16>> moe_model_;
+    std::unique_ptr<deep_ep::Buffer> ep_buffer_;
 
     std::unique_ptr<KvCache>                   kv_cache_;
     std::unique_ptr<layers::FlashInferHandler> flashinfer_handler_;

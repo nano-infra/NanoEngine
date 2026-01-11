@@ -98,3 +98,35 @@ target_include_directories(test_deep_ep_actor
     ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
 )
+
+add_executable(test_deep_gemm_actor test_deep_gemm_actor.cpp)
+target_link_libraries(test_deep_gemm_actor
+    PRIVATE
+    Spoke::core
+    torch
+    torch_cpu
+    c10
+    _nanodeploy_sequence
+)
+target_include_directories(test_deep_gemm_actor
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
+)
+
+add_executable(test_qwen3_moe_runner test_qwen3_moe_runner.cpp)
+target_link_libraries(test_qwen3_moe_runner
+    PUBLIC
+    _nanodeploy_worker
+    _nanodeploy_sequence
+    _nanodeploy_scheduler
+    nanodeploy_core
+    torch
+    torch_cpu
+    c10
+    Spoke::core
+)
+target_include_directories(test_qwen3_moe_runner
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+)

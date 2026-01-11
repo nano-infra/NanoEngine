@@ -4,6 +4,8 @@
 #include <string>
 
 #include "nanodeploy/logging.h"
+#include "nanodeploy/worker/deep_gemm_runner.h"
+#include "nanodeploy/worker/deep_gemm_ipc.h"
 #include "nanodeploy/worker/deep_ep_runner.h"
 #include "nanodeploy/worker/dummy_runner.h"
 #include "nanodeploy/worker/dummy_runner_ipc.h"
@@ -130,7 +132,35 @@ private:
     nanodeploy::DeepEPRunner runner_;
 };
 
+// Define DeepGemmTest Actor
+class DeepGemmTestActor: public spoke::Actor {
+public:
+    DeepGemmTestActor(const std::string& id, int rx, int tx): spoke::Actor(id, rx, tx) {}
+
+    SPOKE_METHOD(DeepGemmTestActor,
+                 init,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 30),
+                 nanodeploy::DeepGemmInitReq,
+                 nanodeploy::DeepGemmInitResp)
+    {
+        return runner_.init(val);
+    }
+
+    SPOKE_METHOD(DeepGemmTestActor,
+                 run_test,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 31),
+                 nanodeploy::DeepGemmTestReq,
+                 nanodeploy::DeepGemmTestResp)
+    {
+        return runner_.run_test(val);
+    }
+
+private:
+    nanodeploy::DeepGemmRunner runner_;
+};
+
 // Register Actor Type
 SPOKE_REGISTER_ACTOR("DummyRunner", DummyRunnerActor)
 SPOKE_REGISTER_ACTOR("ModelRunner", ModelRunnerActor)
 SPOKE_REGISTER_ACTOR("DeepEPTestActor", DeepEPTestActor)
+SPOKE_REGISTER_ACTOR("DeepGemmTestActor", DeepGemmTestActor)

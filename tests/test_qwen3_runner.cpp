@@ -126,7 +126,7 @@ int main(int argc, char** argv)
         std::cerr << "Failed to save output to " << output_path << std::endl;
     }
 
-    // Use exit(0) to skip potentially crashing destructors (like Spoke Client threads)
-    // The OS will clean up resources.
-    std::exit(0);
+    // Normal return allows proper destructor calls for resource cleanup
+    // Client destructor will auto-release unreleased gang allocations
+    return 0;
 }
