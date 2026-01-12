@@ -141,6 +141,22 @@ public:
      */
     void update_learned_thresholds(int sp_size, bool was_beneficial);
 
+    // === Hyperparameter Export/Load ===
+    
+    /**
+     * @brief Export learned hyperparameters to JSON file
+     * 
+     * @param filepath Path to JSON file to write
+     */
+    void export_hyperparams(const std::string& filepath) const;
+    
+    /**
+     * @brief Load pre-learned hyperparameters from JSON file
+     * 
+     * @param filepath Path to JSON file to read
+     */
+    void load_hyperparams(const std::string& filepath);
+
     // === Accessors ===
     
     size_t num_samples() const { return prompt_length_window_.size(); }

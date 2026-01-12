@@ -45,9 +45,12 @@ class Scheduler(_CppScheduler):
             config.initial_avg_prompt_length,
             config.initial_avg_output_length,
             config.stats_window_size,
+            config.load_hyperparams_path or "",
+            config.export_hyperparams_path or "",
         )
         # Store config for compatibility
         self.engine_id = config.engine_id
+        self.config = config  # Store config for later export
         self.loop_count = config.loop_count
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens

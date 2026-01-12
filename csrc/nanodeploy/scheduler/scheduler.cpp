@@ -30,7 +30,9 @@ Scheduler::Scheduler(const std::string& engine_id,
                      const std::string& sp_size_mode,
                      float              initial_avg_prompt_length,
                      float              initial_avg_output_length,
-                     int                stats_window_size) :
+                     int                stats_window_size,
+                     const std::string& load_hyperparams_path,
+                     const std::string& export_hyperparams_path) :
     engine_id_(engine_id),
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
@@ -48,7 +50,9 @@ Scheduler::Scheduler(const std::string& engine_id,
     sp_size_mode_(sp_size_mode),
     initial_avg_prompt_length_(initial_avg_prompt_length),
     initial_avg_output_length_(initial_avg_output_length),
-    stats_window_size_(stats_window_size)
+    stats_window_size_(stats_window_size),
+    load_hyperparams_path_(load_hyperparams_path),
+    export_hyperparams_path_(export_hyperparams_path)
 {
     Sequence::block_size = kvcache_block_size;
     // Initialize worker states
@@ -66,11 +70,34 @@ Scheduler::Scheduler(const std::string& engine_id,
             stats_window_size);
         
         sp_manager->set_dp_idx(dp_idx);
+        
+        // Load pre-learned hyperparameters if path provided
+        if (!load_hyperparams_path_.empty()) {
+            std::cout << "[Scheduler] Loading hyperparameters from: " << load_hyperparams_path_ << std::endl;
+            sp_manager->load_stats().load_hyperparams(load_hyperparams_path_);
+        }
+        
         worker_state.push_back(sp_manager);
     }
     std::cerr << "[Scheduler] Initialized with segment_size=" << segment_size_ 
               << ", sp_size_mode=" << sp_size_mode_ << std::endl;
+    if (!load_hyperparams_path_.empty()) {
+        std::cerr << "[Scheduler] Loaded hyperparameters from: " << load_hyperparams_path_ << std::endl;
+    }
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
+}
+
+void Scheduler::export_hyperparams()
+{
+    if (export_hyperparams_path_.empty() || worker_state.empty()) {
+        return;
+    }
+    
+    // Export from the first worker_state (they should all have similar stats after convergence)
+    // In practice, you might want to aggregate across all DP workers
+    std::cout << "[Scheduler] Exporting hyperparameters to: " << export_hyperparams_path_ << std::endl;
+    worker_state[0]->load_stats().export_hyperparams(export_hyperparams_path_);
+    std::cout << "[Scheduler] Hyperparameters exported successfully." << std::endl;
 }
 
 void Scheduler::add(std::shared_ptr<Sequence> seq)

@@ -85,6 +85,10 @@ class Config:
     
     # Sliding window size for runtime statistics update
     stats_window_size: int = 1000
+    
+    # Hyperparameter learning/loading paths for offline trace-driven optimization
+    export_hyperparams_path: str | None = None  # Path to export learned hyperparams (JSON)
+    load_hyperparams_path: str | None = None     # Path to load pre-learned hyperparams (JSON)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

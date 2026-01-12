@@ -91,7 +91,9 @@ public:
               const std::string& sp_size_mode              = "segment",
               float              initial_avg_prompt_length = 1024.0f,
               float              initial_avg_output_length = 256.0f,
-              int                stats_window_size         = 1000);
+              int                stats_window_size         = 1000,
+              const std::string& load_hyperparams_path    = "",
+              const std::string& export_hyperparams_path  = "");
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -132,6 +134,9 @@ public:
 
     // Configuration
     RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;
+    
+    // Hyperparameter export (called before destruction)
+    void export_hyperparams();
 
 private:
     // Internal scheduling logic
@@ -163,6 +168,10 @@ private:
     float       initial_avg_prompt_length_;
     float       initial_avg_output_length_;
     int         stats_window_size_;
+    
+    // Hyperparameter learning paths
+    std::string load_hyperparams_path_;
+    std::string export_hyperparams_path_;
 
     int dp_rr_counter_ = 0;
 

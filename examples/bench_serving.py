@@ -67,6 +67,14 @@ def parse_args():
     parser.add_argument("--enable-non-uniform-split", action="store_true",
                         help="Enable non-uniform KVCache partitioning (water-filling).")
     
+    # Hyperparameter learning/loading
+    parser.add_argument("--export-hyperparams", type=str, default=None,
+                        help="Path to export learned hyperparameters (JSON). "
+                             "Used when running with 32DP to collect traces and search optimal params.")
+    parser.add_argument("--load-hyperparams", type=str, default=None,
+                        help="Path to load pre-learned hyperparameters (JSON). "
+                             "Used when SP is enabled to use offline-learned optimal thresholds.")
+    
     args = parser.parse_args()
     
     if args.dataset == "csv":
@@ -374,6 +382,10 @@ def main():
     if args.sp_size_mode == "load_aware":
         print(f"  initial_avg_prompt_length: {args.initial_avg_prompt_length}")
         print(f"  initial_avg_output_length: {args.initial_avg_output_length}")
+        if args.load_hyperparams:
+            print(f"  load_hyperparams_path:      {args.load_hyperparams}")
+        if args.export_hyperparams:
+            print(f"  export_hyperparams_path:    {args.export_hyperparams}")
     else:
         print(f"  segment_size:              {args.segment_size}")
     print("=" * 60 + "\n")
@@ -409,6 +421,8 @@ def main():
         initial_avg_output_length=args.initial_avg_output_length,
         enable_dynamic_sp_size=args.enable_dynamic_sp_size,
         enable_non_uniform_split=args.enable_non_uniform_split,
+        export_hyperparams_path=args.export_hyperparams,
+        load_hyperparams_path=args.load_hyperparams,
     )
     
     # Print Config

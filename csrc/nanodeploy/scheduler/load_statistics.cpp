@@ -2,7 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <iostream>
 #include <numeric>
+#include <sstream>
+#include <iomanip>
 
 namespace nanodeploy {
 
@@ -331,6 +335,113 @@ void LoadStatistics::update_learned_thresholds(int sp_size, bool was_beneficial)
             learned_imbalance_threshold_ = std::min(2.5f, learned_imbalance_threshold_ * 1.02f);
         }
     }
+}
+
+// === Hyperparameter Export/Load ===
+
+void LoadStatistics::export_hyperparams(const std::string& filepath) const
+{
+    std::ofstream out_file(filepath);
+    if (!out_file.is_open()) {
+        std::cerr << "[LoadStatistics] Failed to open file for writing: " << filepath << std::endl;
+        return;
+    }
+    
+    // Export current learned thresholds and statistics
+    out_file << "{\n";
+    out_file << "  \"learned_long_req_threshold\": " << std::fixed << std::setprecision(3) 
+         << learned_long_req_threshold_ << ",\n";
+    out_file << "  \"learned_imbalance_threshold\": " << std::fixed << std::setprecision(3) 
+         << learned_imbalance_threshold_ << ",\n";
+    out_file << "  \"avg_short_prompt_length\": " << std::fixed << std::setprecision(2) 
+         << avg_short_prompt_length() << ",\n";
+    out_file << "  \"avg_short_output_length\": " << std::fixed << std::setprecision(2) 
+         << avg_short_output_length() << ",\n";
+    out_file << "  \"avg_short_batch_size\": " << std::fixed << std::setprecision(2) 
+         << avg_short_batch_size() << ",\n";
+    out_file << "  \"avg_prompt_length\": " << std::fixed << std::setprecision(2) 
+         << avg_prompt_length() << ",\n";
+    out_file << "  \"avg_output_length\": " << std::fixed << std::setprecision(2) 
+         << avg_output_length() << ",\n";
+    out_file << "  \"sp_decision_count\": " << sp_decision_count_ << ",\n";
+    out_file << "  \"running_benefit_ratio\": " << std::fixed << std::setprecision(4) 
+         << running_benefit_ratio_ << "\n";
+    out_file << "}\n";
+    
+    out_file.close();
+    std::cout << "[LoadStatistics] Hyperparameters exported to: " << filepath << std::endl;
+}
+
+void LoadStatistics::load_hyperparams(const std::string& filepath)
+{
+    std::ifstream in_file(filepath);
+    if (!in_file.is_open()) {
+        std::cerr << "[LoadStatistics] Failed to open file for reading: " << filepath << std::endl;
+        return;
+    }
+    
+    // Simple JSON parsing (assumes well-formatted JSON)
+    std::string line;
+    std::string content;
+    while (std::getline(in_file, line)) {
+        content += line + "\n";
+    }
+    in_file.close();
+    
+    // Extract values using simple string search (not a full JSON parser, but works for our format)
+    auto extract_float = [&content](const std::string& key) -> float {
+        size_t pos = content.find("\"" + key + "\"");
+        if (pos == std::string::npos) return 0.0f;
+        pos = content.find(':', pos);
+        if (pos == std::string::npos) return 0.0f;
+        pos++; // skip ':'
+        while (pos < content.length() && (content[pos] == ' ' || content[pos] == '\t')) pos++;
+        size_t end = pos;
+        while (end < content.length() && content[end] != ',' && content[end] != '\n' && content[end] != '}') end++;
+        std::string value_str = content.substr(pos, end - pos);
+        return std::stof(value_str);
+    };
+    
+    auto extract_int = [&content](const std::string& key) -> int {
+        size_t pos = content.find("\"" + key + "\"");
+        if (pos == std::string::npos) return 0;
+        pos = content.find(':', pos);
+        if (pos == std::string::npos) return 0;
+        pos++; // skip ':'
+        while (pos < content.length() && (content[pos] == ' ' || content[pos] == '\t')) pos++;
+        size_t end = pos;
+        while (end < content.length() && content[end] != ',' && content[end] != '\n' && content[end] != '}') end++;
+        std::string value_str = content.substr(pos, end - pos);
+        return std::stoi(value_str);
+    };
+    
+    // Load thresholds
+    learned_long_req_threshold_ = extract_float("learned_long_req_threshold");
+    learned_imbalance_threshold_ = extract_float("learned_imbalance_threshold");
+    
+    // Load statistics (these will initialize the sliding windows)
+    float loaded_avg_short_prompt = extract_float("avg_short_prompt_length");
+    float loaded_avg_short_output = extract_float("avg_short_output_length");
+    
+    // Initialize statistics with loaded values
+    // Note: This sets initial values, actual runtime stats will update via record_request
+    initial_avg_prompt_length_ = loaded_avg_short_prompt > 0 ? loaded_avg_short_prompt : initial_avg_prompt_length_;
+    initial_avg_output_length_ = loaded_avg_short_output > 0 ? loaded_avg_short_output : initial_avg_output_length_;
+    
+    // Load decision count for reference
+    int loaded_decision_count = extract_int("sp_decision_count");
+    sp_decision_count_ = loaded_decision_count;
+    
+    float loaded_benefit_ratio = extract_float("running_benefit_ratio");
+    if (loaded_benefit_ratio > 0.0f) {
+        running_benefit_ratio_ = loaded_benefit_ratio;
+    }
+    
+    std::cout << "[LoadStatistics] Loaded hyperparameters from: " << filepath << std::endl;
+    std::cout << "  learned_long_req_threshold: " << learned_long_req_threshold_ << std::endl;
+    std::cout << "  learned_imbalance_threshold: " << learned_imbalance_threshold_ << std::endl;
+    std::cout << "  avg_short_prompt_length: " << loaded_avg_short_prompt << std::endl;
+    std::cout << "  avg_short_output_length: " << loaded_avg_short_output << std::endl;
 }
 
 }  // namespace nanodeploy

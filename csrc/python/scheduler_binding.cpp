@@ -113,7 +113,7 @@ void bind_scheduler_utils(py::module_& m)
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
         .def(py::init<const std::string&, int, int, int, int, int, int, int, int, int, 
               const std::string&, double, int, bool, bool, const std::string&,
-              const std::string&, float, float, int>(),
+              const std::string&, float, float, int, const std::string&, const std::string&>(),
              py::arg("engine_id"),
              py::arg("loop_count"),
              py::arg("max_num_seqs"),
@@ -134,7 +134,9 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("sp_size_mode") = "segment",
              py::arg("initial_avg_prompt_length") = 1024.0f,
              py::arg("initial_avg_output_length") = 256.0f,
-             py::arg("stats_window_size") = 1000)
+             py::arg("stats_window_size") = 1000,
+             py::arg("load_hyperparams_path") = "",
+             py::arg("export_hyperparams_path") = "")
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))
@@ -181,5 +183,8 @@ void bind_scheduler_utils(py::module_& m)
         .def_readwrite("waiting_migration", &Scheduler::waiting_migration)
         .def_readwrite("worker_state", &Scheduler::worker_state)
         .def_readwrite("to_be_migrated", &Scheduler::to_be_migrated)
-        .def_readwrite("routing_strategy", &Scheduler::routing_strategy);
+        .def_readwrite("routing_strategy", &Scheduler::routing_strategy)
+        
+        // Hyperparameter export
+        .def("export_hyperparams", &Scheduler::export_hyperparams);
 }

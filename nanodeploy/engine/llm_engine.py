@@ -46,6 +46,14 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        # Export hyperparameters if path is specified
+        if self.config.export_hyperparams_path:
+            try:
+                self.scheduler.export_hyperparams()
+                logger.info(f"Hyperparameters exported to: {self.config.export_hyperparams_path}")
+            except Exception as e:
+                logger.error(f"Failed to export hyperparameters: {e}")
+        
         del self.executor
 
     def update_num_kvcache_blocks(self):
