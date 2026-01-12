@@ -140,8 +140,8 @@ public:
 
 private:
     // Internal scheduling logic
-    std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill();
-    std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
+    std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill(const std::vector<int>& base_used_blocks, const std::vector<int>& base_batch_sizes);
+    std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode(const std::vector<int>& base_used_blocks, const std::vector<int>& base_batch_sizes);
 
     // Round-robin counter for DP
     int next_dp_idx();
@@ -168,10 +168,12 @@ private:
     float       initial_avg_prompt_length_;
     float       initial_avg_output_length_;
     int         stats_window_size_;
+    int         kvcache_block_size_;
     
     // Hyperparameter learning paths
     std::string load_hyperparams_path_;
     std::string export_hyperparams_path_;
+    bool        trace_enabled_ = false;  // True if export_hyperparams_path_ ends with .jsonl
 
     int dp_rr_counter_ = 0;
 

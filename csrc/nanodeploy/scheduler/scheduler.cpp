@@ -51,6 +51,7 @@ Scheduler::Scheduler(const std::string& engine_id,
     initial_avg_prompt_length_(initial_avg_prompt_length),
     initial_avg_output_length_(initial_avg_output_length),
     stats_window_size_(stats_window_size),
+    kvcache_block_size_(kvcache_block_size),
     load_hyperparams_path_(load_hyperparams_path),
     export_hyperparams_path_(export_hyperparams_path)
 {
@@ -82,6 +83,7 @@ Scheduler::Scheduler(const std::string& engine_id,
         if (!export_hyperparams_path_.empty()) {
             if (export_hyperparams_path_.size() >= 6 && 
                 export_hyperparams_path_.substr(export_hyperparams_path_.size() - 6) == ".jsonl") {
+                trace_enabled_ = true;  // Set flag for performance optimization
                 std::cout << "[Scheduler] Enabling Trace collection (JSONL format) to: " 
                           << export_hyperparams_path_ << std::endl;
                 sp_manager->set_trace_export_path(export_hyperparams_path_);
@@ -200,8 +202,24 @@ ScheduleResult Scheduler::schedule()
         ws->record_waiting_queue_size(waiting_queue_size);
     }
     
+    // Collect base system metrics (across all DP/SP ranks) at iteration start
+    // Only compute if trace collection is enabled to reduce overhead
+    std::vector<int> all_rank_used_blocks;
+    std::vector<int> all_rank_batch_sizes;
+    if (trace_enabled_) {
+        all_rank_used_blocks.reserve(attention_dp_ * attention_sp_);
+        all_rank_batch_sizes.reserve(attention_dp_ * attention_sp_);
+        
+        for (int i = 0; i < attention_dp_; ++i) {
+            std::vector<int> used = worker_state[i]->get_used_blocks_per_rank();
+            std::vector<int> bs = worker_state[i]->get_batch_size_per_rank();
+            all_rank_used_blocks.insert(all_rank_used_blocks.end(), used.begin(), used.end());
+            all_rank_batch_sizes.insert(all_rank_batch_sizes.end(), bs.begin(), bs.end());
+        }
+    }
+    
     // Try prefill first
-    auto dp_seqs = _schedule_prefill();
+    auto dp_seqs = _schedule_prefill(all_rank_used_blocks, all_rank_batch_sizes);
 
     // Check if any sequences were scheduled in prefill
     bool has_prefill = false;
@@ -214,7 +232,7 @@ ScheduleResult Scheduler::schedule()
 
     if (!has_prefill) {
         // No prefill sequences, schedule decode
-        dp_seqs = _schedule_decode();
+        dp_seqs = _schedule_decode(all_rank_used_blocks, all_rank_batch_sizes);
     }
 
     ScheduleResult result;
@@ -369,11 +387,12 @@ ScheduleResult Scheduler::schedule()
     return result;
 }
 
-std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill()
+std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill(const std::vector<int>& base_used_blocks, const std::vector<int>& base_batch_sizes)
 {
     std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled_seqs(attention_dp_);
 
     // num_seqs and num_batched_tokens track per-DP, per-SP-rank counts for the CURRENT batch
+    // We will use these to calculate real-time global imbalance metrics
     std::vector<std::unordered_map<int, int>> num_seqs(attention_dp_);
     std::vector<std::unordered_map<int, int>> num_batched_tokens(attention_dp_);
 
@@ -407,12 +426,59 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
         if (routing_strategy == RoutingStrategy::RoundRobin) {
             // Try all DP ranks in round-robin order
             for (int attempt = 0; attempt < attention_dp_; ++attempt) {
-                // int selected_dp_idx = next_dp_idx();
-                int selected_dp_idx = 0;
+                int selected_dp_idx = next_dp_idx();
+
+                // Calculate REAL-TIME global metrics only if trace collection is enabled
+                float real_time_kvcache_imbalance = -1.0f;
+                float real_time_bs_cv = -1.0f;
+                
+                if (!base_used_blocks.empty()) {
+                    // Trace collection enabled: compute real-time metrics
+                    std::vector<float> current_rank_used_blocks(attention_dp_ * attention_sp_);
+                    std::vector<float> current_rank_batch_sizes(attention_dp_ * attention_sp_);
+                    
+                    for (int dp = 0; dp < attention_dp_; ++dp) {
+                        for (int sp = 0; sp < attention_sp_; ++sp) {
+                            int idx = dp * attention_sp_ + sp;
+                            float prefill_blocks = static_cast<float>(num_batched_tokens[dp][sp]) / kvcache_block_size_;
+                            current_rank_used_blocks[idx] = static_cast<float>(base_used_blocks[idx]) + prefill_blocks;
+                            current_rank_batch_sizes[idx] = static_cast<float>(base_batch_sizes[idx]) + num_seqs[dp][sp];
+                        }
+                    }
+                    
+                    float total_used = std::accumulate(current_rank_used_blocks.begin(), current_rank_used_blocks.end(), 0.0f);
+                    float max_used = *std::max_element(current_rank_used_blocks.begin(), current_rank_used_blocks.end());
+                    if (total_used > 0) {
+                        float avg_used = total_used / current_rank_used_blocks.size();
+                        real_time_kvcache_imbalance = (avg_used > 0) ? max_used / avg_used : 1.0f;
+                    }
+                    
+                    float bs_sum = std::accumulate(current_rank_batch_sizes.begin(), current_rank_batch_sizes.end(), 0.0f);
+                    if (bs_sum > 0) {
+                        float bs_avg = bs_sum / current_rank_batch_sizes.size();
+                        float bs_variance = 0.0f;
+                        for (float bs : current_rank_batch_sizes) {
+                            float diff = bs - bs_avg;
+                            bs_variance += diff * diff;
+                        }
+                        bs_variance /= current_rank_batch_sizes.size();
+                        real_time_bs_cv = (bs_avg > 0) ? std::sqrt(bs_variance) / bs_avg : 0.0f;
+                    }
+
+                    // Debug log for the first request in the first batch to verify attention_dp_
+                    static bool first_debug = true;
+                    if (first_debug && attention_dp_ > 1) {
+                        std::cout << "[Scheduler Debug] 32DP Metrics Check: attention_dp_=" << attention_dp_ 
+                                  << ", real_time_kvcache_imbalance=" << real_time_kvcache_imbalance
+                                  << ", real_time_bs_cv=" << real_time_bs_cv << std::endl;
+                        first_debug = false;
+                    }
+                }
 
                 // Check if this DP rank can allocate the sequence
                 bool can_allocate = worker_state[selected_dp_idx]->can_allocate(
-                    *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
+                    *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx],
+                    real_time_kvcache_imbalance, real_time_bs_cv);
 
                 if (!can_allocate) {
                     continue;
@@ -454,8 +520,56 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
             for (auto it = dp_load_set.begin(); it != dp_load_set.end(); ++it) {
                 int selected_dp_idx = it->second;
 
+                // Calculate REAL-TIME global metrics only if trace collection is enabled
+                float real_time_kvcache_imbalance = -1.0f;
+                float real_time_bs_cv = -1.0f;
+                
+                if (!base_used_blocks.empty()) {
+                    // Trace collection enabled: compute real-time metrics
+                    std::vector<float> current_rank_used_blocks(attention_dp_ * attention_sp_);
+                    std::vector<float> current_rank_batch_sizes(attention_dp_ * attention_sp_);
+                    
+                    for (int dp = 0; dp < attention_dp_; ++dp) {
+                        for (int sp = 0; sp < attention_sp_; ++sp) {
+                            int idx = dp * attention_sp_ + sp;
+                            float prefill_blocks = static_cast<float>(num_batched_tokens[dp][sp]) / kvcache_block_size_;
+                            current_rank_used_blocks[idx] = static_cast<float>(base_used_blocks[idx]) + prefill_blocks;
+                            current_rank_batch_sizes[idx] = static_cast<float>(base_batch_sizes[idx]) + num_seqs[dp][sp];
+                        }
+                    }
+                    
+                    float total_used = std::accumulate(current_rank_used_blocks.begin(), current_rank_used_blocks.end(), 0.0f);
+                    float max_used = *std::max_element(current_rank_used_blocks.begin(), current_rank_used_blocks.end());
+                    if (total_used > 0) {
+                        float avg_used = total_used / current_rank_used_blocks.size();
+                        real_time_kvcache_imbalance = (avg_used > 0) ? max_used / avg_used : 1.0f;
+                    }
+                    
+                    float bs_sum = std::accumulate(current_rank_batch_sizes.begin(), current_rank_batch_sizes.end(), 0.0f);
+                    if (bs_sum > 0) {
+                        float bs_avg = bs_sum / current_rank_batch_sizes.size();
+                        float bs_variance = 0.0f;
+                        for (float bs : current_rank_batch_sizes) {
+                            float diff = bs - bs_avg;
+                            bs_variance += diff * diff;
+                        }
+                        bs_variance /= current_rank_batch_sizes.size();
+                        real_time_bs_cv = (bs_avg > 0) ? std::sqrt(bs_variance) / bs_avg : 0.0f;
+                    }
+
+                    // Debug log for the first request in the first batch to verify attention_dp_
+                    static bool first_debug_lb = true;
+                    if (first_debug_lb && attention_dp_ > 1) {
+                        std::cout << "[Scheduler Debug] 32DP Metrics Check (LeastBatch): attention_dp_=" << attention_dp_ 
+                                  << ", real_time_kvcache_imbalance=" << real_time_kvcache_imbalance
+                                  << ", real_time_bs_cv=" << real_time_bs_cv << std::endl;
+                        first_debug_lb = false;
+                    }
+                }
+
                 bool can_allocate = worker_state[selected_dp_idx]->can_allocate(
-                    *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
+                    *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx],
+                    real_time_kvcache_imbalance, real_time_bs_cv);
 
                 if (!can_allocate) {
                     continue;
@@ -509,7 +623,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
     return scheduled_seqs;
 }
 
-std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode()
+std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(const std::vector<int>& /* base_used_blocks */, const std::vector<int>& /* base_batch_sizes */)
 {
     std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled_seqs(attention_dp_);
 

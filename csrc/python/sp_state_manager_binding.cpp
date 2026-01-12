@@ -135,7 +135,9 @@ void bind_sp_state_manager(py::module_& m)
              &SPStateManager::can_allocate,
              py::arg("seq"),
              py::arg("num_seqs"),
-             py::arg("num_batched_tokens"))
+             py::arg("num_batched_tokens"),
+             py::arg("global_kvcache_imbalance") = -1.0f,
+             py::arg("global_bs_cv") = -1.0f)
 
         .def("allocate", &SPStateManager::allocate, py::arg("seq"))
         .def("deallocate", &SPStateManager::deallocate, py::arg("seq"), py::arg("slot"))

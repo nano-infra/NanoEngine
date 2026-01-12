@@ -77,7 +77,9 @@ public:
     // So passed to can_allocate is num_seqs[selected_dp_idx], which is dict[int, int] (sp_idx -> count)
     bool can_allocate(Sequence&                           seq,
                       const std::unordered_map<int, int>& num_seqs,
-                      const std::unordered_map<int, int>& num_batched_tokens);
+                      const std::unordered_map<int, int>& num_batched_tokens,
+                      float                               global_kvcache_imbalance = -1.0f,
+                      float                               global_bs_cv             = -1.0f);
 
     void allocate(Sequence& seq);
     void deallocate(Sequence& seq, BlockContextSlot slot = BlockContextSlot::ACTIVE);
@@ -171,7 +173,9 @@ public:
         const std::vector<int>&  free_blocks_per_rank,
         const std::vector<int>&  batch_size_per_rank,
         const std::vector<int>&  long_used_per_rank,
-        const SPSizeDecision&    decision);
+        const SPSizeDecision&    decision,
+        float                    global_kvcache_imbalance = -1.0f,
+        float                    global_bs_cv             = -1.0f);
     
     /**
      * @brief Set trace export path (enables trace collection)

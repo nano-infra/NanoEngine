@@ -33,7 +33,6 @@ SPSizeDecision SPSizePolicy::determine_sp_size(
     // 1. Evaluate request characteristics for "Life-cycle" estimation
     // Predict future growth: Prompt + half of expected output length (based on steady-state expectation)
     int estimated_total_tokens = num_tokens + static_cast<int>(stats.avg_output_length() / 2.0f);
-    int required_blocks = (estimated_total_tokens + block_size - 1) / block_size;
     
     // 2. Identify system-wide "Short Request" profile and workload reservation
     int   avg_short_blocks    = stats.estimate_short_req_blocks(block_size);

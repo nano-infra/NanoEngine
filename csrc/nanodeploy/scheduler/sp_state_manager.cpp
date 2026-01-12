@@ -172,8 +172,16 @@ void SPStateManager::record_trace_sample(
     const std::vector<int>&  free_blocks_per_rank,
     const std::vector<int>&  batch_size_per_rank,
     const std::vector<int>&  long_used_per_rank,
-    const SPSizeDecision&    decision)
+    const SPSizeDecision&    decision,
+    float                    global_kvcache_imbalance,
+    float                    global_bs_cv)
 {
+    // Trace collection is ONLY enabled in SP=1 mode (for 32DP analysis)
+    // Do not export trace when SP > 1
+    if (attention_sp_ > 1) {
+        return;
+    }
+    
     if (!trace_enabled_ || !trace_file_.is_open()) {
         return;
     }
@@ -181,30 +189,24 @@ void SPStateManager::record_trace_sample(
     // Debug: Log first few traces to confirm collection is working
     static std::atomic<int> trace_count{0};
     int count = trace_count.fetch_add(1);
-    if (count < 3) {
+    if (count < 5) {
         std::cout << "[SPStateManager] Recording trace #" << count 
                   << " (DP worker " << dp_idx_ << ", prompt_length=" << prompt_length << ")" << std::endl;
+        std::cout << "  batch_size_per_rank (before current): [";
+        for (size_t i = 0; i < batch_size_per_rank.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << batch_size_per_rank[i];
+        }
+        std::cout << "]" << std::endl;
     }
     
     // Calculate metrics
-    float kvcache_imbalance = load_stats_.kvcache_imbalance_ratio();
+    float kvcache_imbalance = (global_kvcache_imbalance >= 0) ? global_kvcache_imbalance : 1.0f;
+    float bs_cv             = (global_bs_cv >= 0) ? global_bs_cv : 0.0f;
     
-    // Calculate batch size CV (including the current request being allocated)
-    // Create a copy that includes the current request
-    std::vector<int> batch_size_with_current = batch_size_per_rank;
-    if (decision.master_rank >= 0 && decision.master_rank < static_cast<int>(batch_size_with_current.size())) {
-        batch_size_with_current[decision.master_rank]++;
+    if (count < 5) {
+        std::cout << "  global_bs_cv=" << bs_cv << ", global_kvcache_imbalance=" << kvcache_imbalance << std::endl;
     }
-    
-    float bs_sum = std::accumulate(batch_size_with_current.begin(), batch_size_with_current.end(), 0.0f);
-    float bs_avg = bs_sum / batch_size_with_current.size();
-    float bs_variance = 0.0f;
-    for (int bs : batch_size_with_current) {
-        float diff = static_cast<float>(bs) - bs_avg;
-        bs_variance += diff * diff;
-    }
-    bs_variance /= batch_size_with_current.size();
-    float bs_cv = (bs_avg > 0) ? std::sqrt(bs_variance) / bs_avg : 0.0f;
     
     // Calculate memory pressure
     int total_blocks = num_kvcache_blocks_;
@@ -244,7 +246,6 @@ void SPStateManager::record_trace_sample(
                 << bs_cv << ",";
     trace_file_ << "\"memory_pressure\":" << std::fixed << std::setprecision(3) 
                 << memory_pressure << ",";
-    trace_file_ << "\"waiting_queue_size\":" << load_stats_.expected_waiting_requests() << ",";
     trace_file_ << "\"arrival_rate\":" << std::fixed << std::setprecision(2) 
                 << load_stats_.arrival_rate() << ",";
     trace_file_ << "\"avg_short_batch_size\":" << std::fixed << std::setprecision(2) 
@@ -353,7 +354,9 @@ bool SPStateManager::may_append(Sequence& seq, int num_tokens)
 
 bool SPStateManager::can_allocate(Sequence&                           seq,
                                   const std::unordered_map<int, int>& num_seqs,
-                                  const std::unordered_map<int, int>& num_batched_tokens)
+                                  const std::unordered_map<int, int>& num_batched_tokens,
+                                  float                               global_kvcache_imbalance,
+                                  float                               global_bs_cv)
 {
     // Record arrival for statistics
     load_stats_.record_arrival();
@@ -389,7 +392,22 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         // Collect current state for SP size decision
         std::vector<int> free_blocks_per_rank = get_free_blocks_per_rank();
         std::vector<int> used_blocks_per_rank = get_used_blocks_per_rank();
-        std::vector<int> batch_size_per_rank = get_batch_size_per_rank();
+        
+        // Calculate actual batch size per rank (including running sequences)
+        // This is more accurate than master_seq_counts_ which hasn't been updated yet
+        std::vector<int> batch_size_per_rank(attention_sp_, 0);
+        for (const auto& s : running) {
+            int m_idx = s->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+            if (m_idx >= 0 && m_idx < attention_sp_) {
+                batch_size_per_rank[m_idx]++;
+            }
+        }
+        // Also include sequences from num_seqs (current batch being scheduled)
+        for (const auto& [m_idx, count] : num_seqs) {
+            if (m_idx >= 0 && m_idx < attention_sp_) {
+                batch_size_per_rank[m_idx] += count;
+            }
+        }
 
         // Update KVCache distribution for imbalance calculation
         load_stats_.record_kvcache_distribution(used_blocks_per_rank);
@@ -407,9 +425,8 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             kvcache_block_size_
         );
         
-        // Record trace sample for offline analysis
-        record_trace_sample(num_tokens, free_blocks_per_rank, batch_size_per_rank, 
-                           long_used_per_rank, decision);
+        // Note: Trace collection is only enabled in SP=1 mode
+        // Do not record trace here for SP>1 mode
         
         // Apply the decision
         block_ctx.master_sp_idx_ = decision.master_rank;
@@ -522,10 +539,26 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         int  current_batched_tokens = (it_tokens != num_batched_tokens.end()) ? it_tokens->second : 0;
         if (current_batched_tokens + seq.num_tokens >= max_num_batched_tokens_) return false;
 
-        // Collect state for trace (even in SP=1 mode)
+        // Collect state for trace (SP=1 mode only)
         std::vector<int> free_blocks_per_rank = get_free_blocks_per_rank();
         std::vector<int> used_blocks_per_rank = get_used_blocks_per_rank();
-        std::vector<int> batch_size_per_rank = get_batch_size_per_rank();
+        
+        // Calculate actual batch size per rank (including running sequences and current batch)
+        std::vector<int> batch_size_per_rank(attention_sp_, 0);
+        // Count running sequences
+        for (const auto& s : running) {
+            int m_idx = s->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+            if (m_idx >= 0 && m_idx < attention_sp_) {
+                batch_size_per_rank[m_idx]++;
+            }
+        }
+        // Also include sequences from num_seqs (current batch being scheduled)
+        for (const auto& [m_idx, count] : num_seqs) {
+            if (m_idx >= 0 && m_idx < attention_sp_) {
+                batch_size_per_rank[m_idx] += count;
+            }
+        }
+        
         std::vector<int> long_used_per_rank(attention_sp_, 0);
         for (const auto& s : running) {
             if (load_stats_.is_long_request(s->num_prompt_tokens)) {
@@ -539,6 +572,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         }
         
         // Update KVCache distribution for imbalance calculation
+        // This is critical for accurate kvcache_imbalance_ratio
         load_stats_.record_kvcache_distribution(used_blocks_per_rank);
         
         // Create a dummy decision for SP=1
@@ -550,9 +584,9 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         decision.dispatch_tokens.assign(attention_sp_, 0);
         decision.dispatch_tokens[master_rank] = seq.num_tokens;
         
-        // Record trace sample
+        // Record trace sample (only in SP=1 mode)
         record_trace_sample(seq.num_tokens, free_blocks_per_rank, batch_size_per_rank, 
-                           long_used_per_rank, decision);
+                           long_used_per_rank, decision, global_kvcache_imbalance, global_bs_cv);
 
         block_ctx.master_sp_idx_ = master_rank;
         block_ctx.num_dispatched_tokens[master_rank] = seq.num_tokens;
