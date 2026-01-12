@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -155,6 +156,32 @@ public:
      * @brief Record waiting queue size for load statistics
      */
     void record_waiting_queue_size(int queue_size);
+    
+    /**
+     * @brief Record a trace sample for offline analysis
+     * 
+     * @param prompt_length Request prompt length
+     * @param free_blocks_per_rank Free blocks on each rank
+     * @param batch_size_per_rank Batch size on each rank
+     * @param long_used_per_rank Long request blocks on each rank
+     * @param decision SP size decision made
+     */
+    void record_trace_sample(
+        int                      prompt_length,
+        const std::vector<int>&  free_blocks_per_rank,
+        const std::vector<int>&  batch_size_per_rank,
+        const std::vector<int>&  long_used_per_rank,
+        const SPSizeDecision&    decision);
+    
+    /**
+     * @brief Set trace export path (enables trace collection)
+     */
+    void set_trace_export_path(const std::string& path);
+    
+    /**
+     * @brief Flush and close trace file
+     */
+    void flush_trace_file();
 
 private:
     void initialize_dummy_seqs();
@@ -189,6 +216,11 @@ private:
     
     // === Scheduling log ===
     bool enable_scheduling_log_ = true;  // Log each scheduling decision
+    
+    // === Trace collection for offline analysis ===
+    std::string trace_export_path_;
+    std::ofstream trace_file_;
+    bool trace_enabled_ = false;
 };
 
 }  // namespace nanodeploy

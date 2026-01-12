@@ -77,6 +77,20 @@ Scheduler::Scheduler(const std::string& engine_id,
             sp_manager->load_stats().load_hyperparams(load_hyperparams_path_);
         }
         
+        // Enable trace collection if export path ends with .jsonl
+        // Otherwise, it will be used for hyperparams export at program end
+        if (!export_hyperparams_path_.empty()) {
+            if (export_hyperparams_path_.size() >= 6 && 
+                export_hyperparams_path_.substr(export_hyperparams_path_.size() - 6) == ".jsonl") {
+                std::cout << "[Scheduler] Enabling Trace collection (JSONL format) to: " 
+                          << export_hyperparams_path_ << std::endl;
+                sp_manager->set_trace_export_path(export_hyperparams_path_);
+            } else {
+                std::cout << "[Scheduler] Will export hyperparameters (JSON format) to: " 
+                          << export_hyperparams_path_ << " at program end" << std::endl;
+            }
+        }
+        
         worker_state.push_back(sp_manager);
     }
     std::cerr << "[Scheduler] Initialized with segment_size=" << segment_size_ 
@@ -93,11 +107,30 @@ void Scheduler::export_hyperparams()
         return;
     }
     
-    // Export from the first worker_state (they should all have similar stats after convergence)
-    // In practice, you might want to aggregate across all DP workers
-    std::cout << "[Scheduler] Exporting hyperparameters to: " << export_hyperparams_path_ << std::endl;
-    worker_state[0]->load_stats().export_hyperparams(export_hyperparams_path_);
-    std::cout << "[Scheduler] Hyperparameters exported successfully." << std::endl;
+    // Close trace files if they were opened (for .jsonl files)
+    bool is_jsonl = export_hyperparams_path_.size() >= 6 && 
+                    export_hyperparams_path_.substr(export_hyperparams_path_.size() - 6) == ".jsonl";
+    
+    if (is_jsonl) {
+        std::cout << "[Scheduler] Closing Trace file (JSONL): " << export_hyperparams_path_ << std::endl;
+        for (auto& ws : worker_state) {
+            ws->flush_trace_file();
+        }
+        std::cout << "[Scheduler] Trace collection completed. Check " << export_hyperparams_path_ 
+                  << " for detailed trace data (one JSON object per line)." << std::endl;
+        return;  // Don't export hyperparams for .jsonl files
+    }
+    
+    // Export learned hyperparameters (only for .json files)
+    if (export_hyperparams_path_.size() >= 5 && 
+        export_hyperparams_path_.substr(export_hyperparams_path_.size() - 5) == ".json") {
+        std::cout << "[Scheduler] Exporting learned hyperparameters to: " << export_hyperparams_path_ << std::endl;
+        worker_state[0]->load_stats().export_hyperparams(export_hyperparams_path_);
+        std::cout << "[Scheduler] Hyperparameters exported successfully." << std::endl;
+    } else {
+        std::cerr << "[Scheduler] WARNING: export_hyperparams_path does not end with .json or .jsonl: " 
+                  << export_hyperparams_path_ << std::endl;
+    }
 }
 
 void Scheduler::add(std::shared_ptr<Sequence> seq)
@@ -161,6 +194,12 @@ int Scheduler::next_dp_idx()
 
 ScheduleResult Scheduler::schedule()
 {
+    // Record waiting queue size for all worker states (for trace collection)
+    int waiting_queue_size = static_cast<int>(waiting.size());
+    for (auto& ws : worker_state) {
+        ws->record_waiting_queue_size(waiting_queue_size);
+    }
+    
     // Try prefill first
     auto dp_seqs = _schedule_prefill();
 

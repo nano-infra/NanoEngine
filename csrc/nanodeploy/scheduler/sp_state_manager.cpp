@@ -1,8 +1,14 @@
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <random>
+#include <sstream>
 
 #include "nanodeploy/sequence/sequence.h"
 
@@ -132,6 +138,136 @@ void SPStateManager::record_waiting_queue_size(int queue_size)
     load_stats_.record_waiting_queue_size(queue_size);
 }
 
+void SPStateManager::set_trace_export_path(const std::string& path)
+{
+    trace_export_path_ = path;
+    if (!path.empty()) {
+        // Always use append mode to support multiple DP workers writing to the same file
+        // The first worker will create the file, others will append
+        trace_file_.open(path, std::ios::out | std::ios::app);
+        if (!trace_file_.is_open()) {
+            std::cerr << "[SPStateManager] Failed to open trace file: " << path << std::endl;
+            trace_enabled_ = false;
+        } else {
+            trace_enabled_ = true;
+            std::cout << "[SPStateManager] Trace collection enabled: " << path 
+                      << " (DP worker " << dp_idx_ << ")" << std::endl;
+        }
+    } else {
+        trace_enabled_ = false;
+    }
+}
+
+void SPStateManager::flush_trace_file()
+{
+    if (trace_file_.is_open()) {
+        trace_file_.flush();
+        trace_file_.close();
+        std::cout << "[SPStateManager] Trace file closed: " << trace_export_path_ << std::endl;
+    }
+}
+
+void SPStateManager::record_trace_sample(
+    int                      prompt_length,
+    const std::vector<int>&  free_blocks_per_rank,
+    const std::vector<int>&  batch_size_per_rank,
+    const std::vector<int>&  long_used_per_rank,
+    const SPSizeDecision&    decision)
+{
+    if (!trace_enabled_ || !trace_file_.is_open()) {
+        return;
+    }
+    
+    // Debug: Log first few traces to confirm collection is working
+    static std::atomic<int> trace_count{0};
+    int count = trace_count.fetch_add(1);
+    if (count < 3) {
+        std::cout << "[SPStateManager] Recording trace #" << count 
+                  << " (DP worker " << dp_idx_ << ", prompt_length=" << prompt_length << ")" << std::endl;
+    }
+    
+    // Calculate metrics
+    float kvcache_imbalance = load_stats_.kvcache_imbalance_ratio();
+    
+    // Calculate batch size CV (including the current request being allocated)
+    // Create a copy that includes the current request
+    std::vector<int> batch_size_with_current = batch_size_per_rank;
+    if (decision.master_rank >= 0 && decision.master_rank < static_cast<int>(batch_size_with_current.size())) {
+        batch_size_with_current[decision.master_rank]++;
+    }
+    
+    float bs_sum = std::accumulate(batch_size_with_current.begin(), batch_size_with_current.end(), 0.0f);
+    float bs_avg = bs_sum / batch_size_with_current.size();
+    float bs_variance = 0.0f;
+    for (int bs : batch_size_with_current) {
+        float diff = static_cast<float>(bs) - bs_avg;
+        bs_variance += diff * diff;
+    }
+    bs_variance /= batch_size_with_current.size();
+    float bs_cv = (bs_avg > 0) ? std::sqrt(bs_variance) / bs_avg : 0.0f;
+    
+    // Calculate memory pressure
+    int total_blocks = num_kvcache_blocks_;
+    int min_free = *std::min_element(free_blocks_per_rank.begin(), free_blocks_per_rank.end());
+    float memory_pressure = 1.0f - static_cast<float>(min_free) / total_blocks;
+    
+    // Write JSONL entry (compact single-line format for JSONL compatibility)
+    trace_file_ << "{";
+    trace_file_ << "\"prompt_length\":" << prompt_length << ",";
+    trace_file_ << "\"timestamp_ms\":" << std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() << ",";
+    
+    trace_file_ << "\"free_blocks_per_rank\":[";
+    for (size_t i = 0; i < free_blocks_per_rank.size(); ++i) {
+        if (i > 0) trace_file_ << ",";
+        trace_file_ << free_blocks_per_rank[i];
+    }
+    trace_file_ << "],";
+    
+    trace_file_ << "\"batch_size_per_rank\":[";
+    for (size_t i = 0; i < batch_size_per_rank.size(); ++i) {
+        if (i > 0) trace_file_ << ",";
+        trace_file_ << batch_size_per_rank[i];
+    }
+    trace_file_ << "],";
+    
+    trace_file_ << "\"long_used_per_rank\":[";
+    for (size_t i = 0; i < long_used_per_rank.size(); ++i) {
+        if (i > 0) trace_file_ << ",";
+        trace_file_ << long_used_per_rank[i];
+    }
+    trace_file_ << "],";
+    
+    trace_file_ << "\"kvcache_imbalance_ratio\":" << std::fixed << std::setprecision(3) 
+                << kvcache_imbalance << ",";
+    trace_file_ << "\"batch_size_cv\":" << std::fixed << std::setprecision(4) 
+                << bs_cv << ",";
+    trace_file_ << "\"memory_pressure\":" << std::fixed << std::setprecision(3) 
+                << memory_pressure << ",";
+    trace_file_ << "\"waiting_queue_size\":" << load_stats_.expected_waiting_requests() << ",";
+    trace_file_ << "\"arrival_rate\":" << std::fixed << std::setprecision(2) 
+                << load_stats_.arrival_rate() << ",";
+    trace_file_ << "\"avg_short_batch_size\":" << std::fixed << std::setprecision(2) 
+                << load_stats_.avg_short_batch_size() << ",";
+    trace_file_ << "\"avg_short_req_blocks\":" 
+                << load_stats_.estimate_short_req_blocks(kvcache_block_size_) << ",";
+    
+    trace_file_ << "\"decision\":{";
+    trace_file_ << "\"sp_size\":" << decision.sp_size << ",";
+    trace_file_ << "\"master_rank\":" << decision.master_rank << ",";
+    trace_file_ << "\"due_to_imbalance\":" << (decision.due_to_imbalance ? "true" : "false") << ",";
+    trace_file_ << "\"due_to_pressure\":" << (decision.due_to_pressure ? "true" : "false") << ",";
+    trace_file_ << "\"dispatch_tokens\":[";
+    for (size_t i = 0; i < decision.dispatch_tokens.size(); ++i) {
+        if (i > 0) trace_file_ << ",";
+        trace_file_ << decision.dispatch_tokens[i];
+    }
+    trace_file_ << "]}";
+    trace_file_ << "}\n";  // Newline after each JSON object (JSONL format)
+    
+    trace_file_.flush();  // Flush immediately for real-time analysis
+}
+
 void SPStateManager::initialize_dummy_seqs()
 {
     // Use a fixed seed for reproducibility or random device
@@ -255,6 +391,9 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         std::vector<int> used_blocks_per_rank = get_used_blocks_per_rank();
         std::vector<int> batch_size_per_rank = get_batch_size_per_rank();
 
+        // Update KVCache distribution for imbalance calculation
+        load_stats_.record_kvcache_distribution(used_blocks_per_rank);
+        
         // Use new SP size policy to determine SP size, master rank AND detailed distribution
         SPSizeDecision decision = sp_size_policy_.determine_sp_size(
             num_tokens,
@@ -267,6 +406,10 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             attention_sp_,
             kvcache_block_size_
         );
+        
+        // Record trace sample for offline analysis
+        record_trace_sample(num_tokens, free_blocks_per_rank, batch_size_per_rank, 
+                           long_used_per_rank, decision);
         
         // Apply the decision
         block_ctx.master_sp_idx_ = decision.master_rank;
@@ -378,6 +521,38 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         auto it_tokens              = num_batched_tokens.find(master_rank);
         int  current_batched_tokens = (it_tokens != num_batched_tokens.end()) ? it_tokens->second : 0;
         if (current_batched_tokens + seq.num_tokens >= max_num_batched_tokens_) return false;
+
+        // Collect state for trace (even in SP=1 mode)
+        std::vector<int> free_blocks_per_rank = get_free_blocks_per_rank();
+        std::vector<int> used_blocks_per_rank = get_used_blocks_per_rank();
+        std::vector<int> batch_size_per_rank = get_batch_size_per_rank();
+        std::vector<int> long_used_per_rank(attention_sp_, 0);
+        for (const auto& s : running) {
+            if (load_stats_.is_long_request(s->num_prompt_tokens)) {
+                const auto& ctx = s->block_ctx(BlockContextSlot::ACTIVE);
+                for (int i = 0; i < attention_sp_; ++i) {
+                    int tokens = ctx.num_dispatched_tokens[i];
+                    int blocks = (tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
+                    long_used_per_rank[i] += blocks;
+                }
+            }
+        }
+        
+        // Update KVCache distribution for imbalance calculation
+        load_stats_.record_kvcache_distribution(used_blocks_per_rank);
+        
+        // Create a dummy decision for SP=1
+        SPSizeDecision decision;
+        decision.sp_size = 1;
+        decision.master_rank = master_rank;
+        decision.due_to_imbalance = false;
+        decision.due_to_pressure = false;
+        decision.dispatch_tokens.assign(attention_sp_, 0);
+        decision.dispatch_tokens[master_rank] = seq.num_tokens;
+        
+        // Record trace sample
+        record_trace_sample(seq.num_tokens, free_blocks_per_rank, batch_size_per_rank, 
+                           long_used_per_rank, decision);
 
         block_ctx.master_sp_idx_ = master_rank;
         block_ctx.num_dispatched_tokens[master_rank] = seq.num_tokens;
