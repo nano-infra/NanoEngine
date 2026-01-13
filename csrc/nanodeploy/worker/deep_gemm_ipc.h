@@ -22,11 +22,12 @@ struct DeepGemmInitResp {
 
 enum class DeepGemmTestMode : int {
     kFp8Gemm         = 0,
-    kMaskedGroupGemm = 1
+    kMaskedGroupGemm = 1,
+    kGroupedBf16Gemm = 2
 };
 
 struct DeepGemmTestReq {
-    int mode         = 0;  // 0: Fp8Gemm, 1: MaskedGroupGemm
+    int mode         = 0;  // 0: Fp8Gemm, 1: MaskedGroupGemm, 2: GroupedBf16Gemm
     int m            = 4096;
     int n            = 4096;
     int k            = 4096;

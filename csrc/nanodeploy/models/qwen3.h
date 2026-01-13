@@ -378,9 +378,6 @@ public:
         // 3. Final Norm
         return norm_->forward(hidden_states);
     }
-    // ...
-
-    // (Garbage removed)
 
 public:
     std::unique_ptr<layers::VocabParallelEmbedding>        embed_tokens_;

@@ -103,7 +103,43 @@ int main(int argc, char** argv)
         std::cerr << "Masked Group GEMM Failed: " << test_resp_grp.message << std::endl;
     }
 
-    // 7. Shutdown Actor
+    // 7. Run Grouped BF16 GEMM Test (Large M)
+    std::cout << "Running Grouped BF16 GEMM Test (M=128)..." << std::endl;
+    DeepGemmTestReq test_req_grouped_bf16;
+    test_req_grouped_bf16.mode       = (int)DeepGemmTestMode::kGroupedBf16Gemm;
+    test_req_grouped_bf16.m          = 128;
+    test_req_grouped_bf16.n          = 4096;
+    test_req_grouped_bf16.k          = 4096;
+    test_req_grouped_bf16.num_groups = 8;
+
+    auto test_resp_grouped_bf16 =
+        client.callRemote<DeepGemmTestReq, DeepGemmTestResp>(actor_id, kRunTest, test_req_grouped_bf16).get();
+    if (test_resp_grouped_bf16.success) {
+        std::cout << "Grouped BF16 GEMM (M=128) Latency: " << test_resp_grouped_bf16.lat_us << " us" << std::endl;
+    }
+    else {
+        std::cerr << "Grouped BF16 GEMM (M=128) Failed: " << test_resp_grouped_bf16.message << std::endl;
+    }
+
+    // 8. Run Grouped BF16 GEMM Test (Small M - simulate single token decode)
+    std::cout << "Running Grouped BF16 GEMM Test (M=8)..." << std::endl;
+    DeepGemmTestReq test_req_small;
+    test_req_small.mode       = (int)DeepGemmTestMode::kGroupedBf16Gemm;
+    test_req_small.m          = 8;
+    test_req_small.n          = 4096;
+    test_req_small.k          = 4096;
+    test_req_small.num_groups = 8;
+
+    auto test_resp_small =
+        client.callRemote<DeepGemmTestReq, DeepGemmTestResp>(actor_id, kRunTest, test_req_small).get();
+    if (test_resp_small.success) {
+        std::cout << "Grouped BF16 GEMM (M=8) Latency: " << test_resp_small.lat_us << " us" << std::endl;
+    }
+    else {
+        std::cerr << "Grouped BF16 GEMM (M=8) Failed: " << test_resp_small.message << std::endl;
+    }
+
+    // 9. Shutdown Actor
     std::cout << "Shutting down actor..." << std::endl;
     try {
         client.stopRemote(actor_id);
@@ -111,7 +147,7 @@ int main(int argc, char** argv)
     catch (...) {
     }
 
-    // 8. Release Resources
+    // 10. Release Resources
     std::cout << "Releasing resources..." << std::endl;
     client.gangRelease(alloc_resp.ticket_id).get();
 

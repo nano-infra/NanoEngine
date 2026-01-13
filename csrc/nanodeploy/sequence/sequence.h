@@ -102,7 +102,7 @@ struct OptionalStringHash {
 
 class Sequence {
 public:
-    static constexpr int block_size = 16;  // Smaller for FlashInfer shared memory limits
+    static constexpr int block_size = 64;  // Smaller for FlashInfer shared memory limits
 
     Sequence(const std::vector<int>& token_ids,
              double                  temperature = 1.0,

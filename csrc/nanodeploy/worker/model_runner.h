@@ -17,7 +17,9 @@
 #include "nanodeploy/worker/weight_loader.h"
 
 // Third-party
-// #include "deep_ep.hpp"
+#ifdef DEEPSEEK_MOE
+#include "deep_ep.hpp"
+#endif
 
 namespace nanodeploy {
 
@@ -49,13 +51,17 @@ public:
     // Main execution entry point
     ModelRunResp run(ModelRunReq req);
 
+    // DeepEP sync methods (for multi-GPU MoE)
+    DeepEpInfoResp getDeepEpInfo();
+    bool           syncDeepEp(DeepEpSyncReq req);
+
 private:
-    void init_internal(const std::string& config_path);
+    void init_internal(const std::string& config_path, int rank);
     void load_weights(const std::string& weight_path);
 
     // Helpers to load specific components
     void load_layer_weights(int layer_idx, models::Qwen3DecoderLayer<QuantType::FP16>* layer);
-    void load_moe_layer_weights(int layer_idx, models::Qwen3MoeDecoderLayer<QuantType::FP16>* layer);
+    void load_moe_layer_weights(int layer_idx, models::DeepSeekMoeDecoderLayer<QuantType::FP16>* layer);
 
 private:
     std::unique_ptr<core::ModelConfig> config_;
@@ -66,7 +72,7 @@ private:
 
     // MoE Model
     std::unique_ptr<models::Qwen3MoeForCausalLM<QuantType::FP16>> moe_model_;
-    // std::unique_ptr<deep_ep::Buffer>                              ep_buffer_;
+    std::unique_ptr<deep_ep::Buffer>                              ep_buffer_;
 
     std::unique_ptr<KvCache>                   kv_cache_;
     std::unique_ptr<layers::FlashInferHandler> flashinfer_handler_;

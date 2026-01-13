@@ -118,6 +118,30 @@ ScheduleResult Scheduler::schedule()
         dp_seqs = _schedule_decode();
     }
 
+    // Check if any DP rank has work
+    bool has_any_work = false;
+    for (const auto& seqs : dp_seqs) {
+        if (!seqs.empty()) {
+            has_any_work = true;
+            break;
+        }
+    }
+
+    // Add dummy sequences for DP ranks with no work when other ranks have work
+    // This ensures all ranks participate in collective operations (e.g., DeepEP)
+    if (has_any_work) {
+        std::cout << "[Scheduler] has_any_work=true, checking for empty ranks. dp_seqs.size()=" << dp_seqs.size()
+                  << std::endl;
+        for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+            std::cout << "[Scheduler]   dp_seqs[" << dp_idx << "].size()=" << dp_seqs[dp_idx].size() << std::endl;
+            if (dp_seqs[dp_idx].empty()) {
+                // Add a dummy sequence for this DP rank (use sp_idx=0's dummy)
+                std::cout << "[Scheduler]   Adding dummy sequence for dp_idx=" << dp_idx << std::endl;
+                dp_seqs[dp_idx].push_back(worker_state[dp_idx]->dummy_seqs[0]);
+            }
+        }
+    }
+
     ScheduleResult result;
     result.dp_seqs    = dp_seqs;
     result.is_prefill = has_prefill;
@@ -402,6 +426,34 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
         }
     }
 
+    // Check if any real sequences were scheduled
+    bool any_real_scheduled = false;
+    for (const auto& seqs : scheduled_seqs) {
+        if (!seqs.empty()) {
+            any_real_scheduled = true;
+            break;
+        }
+    }
+
+    if (any_real_scheduled) {
+        // Add dummy sequences for SP ranks with no work
+        for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+            std::vector<bool> sp_has_work(attention_sp_, false);
+            for (const auto& seq : scheduled_seqs[dp_idx]) {
+                int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+                if (master_sp_idx >= 0 && master_sp_idx < attention_sp_) {
+                    sp_has_work[master_sp_idx] = true;
+                }
+            }
+
+            for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                if (!sp_has_work[sp_idx]) {
+                    scheduled_seqs[dp_idx].push_back(worker_state[dp_idx]->dummy_seqs[sp_idx]);
+                }
+            }
+        }
+    }
+
     return scheduled_seqs;
 }
 
@@ -471,10 +523,13 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
             running_queue.push_front(*it);
         }
 
-        // Add dummy sequences for SP ranks with no work
-        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-            if (sp_lens[sp_idx] == 0) {
-                scheduled_seqs[selected_dp_idx].push_back(worker_state[selected_dp_idx]->dummy_seqs[sp_idx]);
+        // Only add dummy sequences if we have active work in this batch
+        if (!scheduled_seqs[selected_dp_idx].empty()) {
+            // Add dummy sequences for SP ranks with no work
+            for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                if (sp_lens[sp_idx] == 0) {
+                    scheduled_seqs[selected_dp_idx].push_back(worker_state[selected_dp_idx]->dummy_seqs[sp_idx]);
+                }
             }
         }
     }

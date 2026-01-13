@@ -1,4 +1,6 @@
 #include "nanodeploy/worker/deep_ep_runner.h"
+#include "nanodeploy/worker/deep_ep_utils.h"
+#include "nanodeploy/worker/distributed.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -12,35 +14,6 @@
 #include <c10/cuda/CUDAStream.h>
 
 namespace nanodeploy {
-
-// Set NVSHMEM environment variables required for DeepEP low-latency mode
-// Must be called BEFORE creating the Buffer (which initializes NVSHMEM)
-static void setup_nvshmem_env(int num_qps_per_rank = 32)
-{
-    // Enable IBGDA (InfiniBand GPUDirect Async)
-    setenv("NVSHMEM_IB_ENABLE_IBGDA", "1", 0);
-
-    // Number of QPs per rank - should be >= number of local experts
-    setenv("NVSHMEM_IBGDA_NUM_RC_PER_PE", std::to_string(num_qps_per_rank).c_str(), 0);
-
-    // Allow P2P (NVLink) traffic
-    setenv("NVSHMEM_DISABLE_P2P", "0", 0);
-
-    // QP depth - must be larger than on-flight WRs
-    setenv("NVSHMEM_QP_DEPTH", "1024", 0);
-
-    // Reduce GPU memory usage
-    setenv("NVSHMEM_MAX_TEAMS", "7", 0);
-
-    // Disable NVLink SHArP
-    setenv("NVSHMEM_DISABLE_NVLS", "1", 0);
-
-    // NVSHMEM initialization requires at least 256 MiB granularity
-    setenv("NVSHMEM_CUMEM_GRANULARITY", "536870912", 0);  // 2^29 = 512 MiB
-
-    // Disable multi-node NVLink detection (for single node testing)
-    setenv("NVSHMEM_DISABLE_MNNVL", "1", 0);
-}
 
 // We need a global interpreter if we are to use pybind11 types in C++.
 // Since this is running in a dedicated Actor process, this is acceptable for now.
@@ -80,7 +53,8 @@ DeepEPInitResp DeepEPRunner::init(const DeepEPInitReq& req)
 
         // Setup NVSHMEM environment variables BEFORE creating buffer
         // num_qps_per_rank should be >= num_local_experts
-        setup_nvshmem_env(32);
+        // Use single_card mode when world_size == 1
+        setup_nvshmem_env(32, world_size_ == 1);
 
         buffer_ = std::make_unique<deep_ep::Buffer>(req.rank,
                                                     req.world_size,
@@ -296,6 +270,260 @@ DeepEPTestResp DeepEPRunner::run_test(const DeepEPTestReq& req)
     catch (const std::exception& e) {
         return {false, 0.0, 0.0, std::string("Test failed: ") + e.what()};
     }
+}
+
+DispatchResult DeepEPRunner::dispatch_normal(deep_ep::Buffer* buffer,
+                                             torch::Tensor    hidden_states,
+                                             torch::Tensor    topk_ids,
+                                             torch::Tensor    topk_weights,
+                                             int              num_experts,
+                                             int              expert_alignment)
+{
+    auto device      = hidden_states.device();
+    auto hidden_flat = hidden_states.view({-1, hidden_states.size(-1)});
+
+    // Get dispatch layout
+    std::optional<deep_ep::EventHandle> prev_event = std::nullopt;
+    auto layout                       = buffer->get_dispatch_layout(topk_ids, num_experts, prev_event, false, false);
+    auto num_tokens_per_rank          = std::get<0>(layout);
+    auto num_tokens_per_rdma_rank     = std::get<1>(layout);
+    auto num_tokens_per_expert_global = std::get<2>(layout);
+    auto is_token_in_rank             = std::get<3>(layout);
+
+    // Get config
+    int num_sms    = 0;
+    int device_idx = device.is_cuda() ? device.index() : 0;
+    if (device_idx < 0)
+        device_idx = 0;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_idx);
+    if (num_sms <= 0)
+        num_sms = 132;  // H100/H200 default
+
+    // Dynamically adjust config based on hidden_size to avoid buffer overflow
+    int hidden_size     = hidden_flat.size(1);
+    int nvl_send_tokens = 4096;
+    int nvl_recv_tokens = 8192;
+    if (hidden_size > 6000) {
+        nvl_send_tokens = 1024;
+        nvl_recv_tokens = 2048;
+    }
+    else if (hidden_size > 4000) {
+        nvl_send_tokens = 2048;
+        nvl_recv_tokens = 4096;
+    }
+    deep_ep::Config config(num_sms, nvl_send_tokens, nvl_recv_tokens, nvl_send_tokens, nvl_recv_tokens);
+
+    // Determine dispatch path
+    int  num_rdma_ranks = buffer->get_num_rdma_ranks();
+    bool use_internode  = (num_rdma_ranks > 1);
+
+    DispatchResult result;
+    result.handle.use_internode    = use_internode;
+    result.handle.hidden_size      = hidden_flat.size(1);
+    result.handle.config           = config;
+    result.handle.prev_event       = prev_event;
+    result.handle.is_token_in_rank = is_token_in_rank;
+
+    if (use_internode) {
+        // Internode dispatch
+        auto dispatch_ret = buffer->internode_dispatch(hidden_flat.contiguous(),
+                                                       std::nullopt,  // x_scales
+                                                       topk_ids,
+                                                       topk_weights,  // Must be float32
+                                                       num_tokens_per_rank,
+                                                       num_tokens_per_rdma_rank,
+                                                       is_token_in_rank,
+                                                       num_tokens_per_expert_global,
+                                                       0,  // cached_num_recv_tokens
+                                                       0,  // cached_num_rdma_recv_tokens
+                                                       std::nullopt,
+                                                       std::nullopt,
+                                                       std::nullopt,
+                                                       std::nullopt,  // cached matrices
+                                                       expert_alignment,
+                                                       0,  // num_worst_tokens
+                                                       config,
+                                                       prev_event,
+                                                       false,
+                                                       false);
+
+        result.recv_x                                 = std::get<0>(dispatch_ret);
+        result.recv_topk_idx                          = std::get<2>(dispatch_ret);
+        result.recv_topk_weights                      = std::get<3>(dispatch_ret);
+        result.handle.recv_rdma_channel_prefix_matrix = std::get<7>(dispatch_ret).value();
+        result.handle.recv_rdma_rank_prefix_sum       = std::get<8>(dispatch_ret);
+        result.handle.recv_gbl_channel_prefix_matrix  = std::get<9>(dispatch_ret).value();
+        result.handle.recv_src_meta                   = std::get<11>(dispatch_ret).value();
+        result.handle.send_rdma_head                  = std::get<12>(dispatch_ret).value();
+        result.handle.send_nvl_head                   = std::get<13>(dispatch_ret).value();
+    }
+    else {
+        // Intranode dispatch
+        auto dispatch_ret = buffer->intranode_dispatch(hidden_flat.contiguous(),
+                                                       std::nullopt,  // x_scales
+                                                       topk_ids,
+                                                       topk_weights,  // Must be float32
+                                                       num_tokens_per_rank,
+                                                       is_token_in_rank,
+                                                       num_tokens_per_expert_global,
+                                                       0,  // cached_num_recv_tokens
+                                                       std::nullopt,
+                                                       std::nullopt,  // cached matrices
+                                                       expert_alignment,
+                                                       0,  // num_worst_tokens
+                                                       config,
+                                                       prev_event,
+                                                       false,
+                                                       false);
+
+        result.recv_x                                  = std::get<0>(dispatch_ret);
+        result.recv_topk_idx                           = std::get<2>(dispatch_ret);
+        result.recv_topk_weights                       = std::get<3>(dispatch_ret);
+        result.handle.intra_rank_prefix_matrix         = std::get<5>(dispatch_ret);
+        result.handle.intra_recv_channel_prefix_matrix = std::get<7>(dispatch_ret);
+        result.handle.intra_recv_src_idx               = std::get<8>(dispatch_ret);
+        result.handle.intra_send_head                  = std::get<9>(dispatch_ret);
+    }
+
+    return result;
+}
+
+torch::Tensor
+DeepEPRunner::combine_normal(deep_ep::Buffer* buffer, torch::Tensor expert_output, const DispatchHandle& handle)
+{
+    auto device = expert_output.device();
+
+    // Handle empty output
+    torch::Tensor output_for_combine  = expert_output;
+    torch::Tensor src_idx_for_combine = handle.use_internode ? handle.recv_src_meta : handle.intra_recv_src_idx;
+
+    if (expert_output.size(0) == 0) {
+        // Create dummy tensors with at least 1 element
+        output_for_combine  = torch::zeros({1, handle.hidden_size}, expert_output.options());
+        src_idx_for_combine = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32).device(device));
+    }
+
+    // Create mutable copy of prev_event (DeepEP API requires non-const reference)
+    auto prev_event = handle.prev_event;
+
+    torch::Tensor combined_x;
+
+    if (handle.use_internode) {
+        auto combine_ret = buffer->internode_combine(output_for_combine,
+                                                     std::nullopt,  // weights already applied
+                                                     std::nullopt,
+                                                     std::nullopt,  // bias
+                                                     src_idx_for_combine,
+                                                     handle.is_token_in_rank,
+                                                     handle.recv_rdma_channel_prefix_matrix,
+                                                     handle.recv_rdma_rank_prefix_sum,
+                                                     handle.recv_gbl_channel_prefix_matrix,
+                                                     handle.send_rdma_head,
+                                                     handle.send_nvl_head,
+                                                     handle.config,
+                                                     prev_event,
+                                                     false,
+                                                     false);
+        combined_x       = std::get<0>(combine_ret);
+    }
+    else {
+        auto combine_ret = buffer->intranode_combine(output_for_combine,
+                                                     std::nullopt,  // weights already applied
+                                                     std::nullopt,
+                                                     std::nullopt,  // bias
+                                                     src_idx_for_combine,
+                                                     handle.intra_rank_prefix_matrix,
+                                                     handle.intra_recv_channel_prefix_matrix,
+                                                     handle.intra_send_head,
+                                                     handle.config,
+                                                     prev_event,
+                                                     false,
+                                                     false);
+        combined_x       = std::get<0>(combine_ret);
+    }
+
+    return combined_x;
+}
+
+LowLatencyDispatchResult DeepEPRunner::dispatch_low_latency(deep_ep::Buffer* buffer,
+                                                            torch::Tensor    hidden_states,
+                                                            torch::Tensor    topk_ids,
+                                                            torch::Tensor    topk_weights,
+                                                            int              num_max_dispatch_tokens_per_rank,
+                                                            int              num_experts)
+{
+    auto hidden_flat = hidden_states.view({-1, hidden_states.size(-1)});
+    int  num_tokens  = hidden_flat.size(0);
+    int  hidden_size = hidden_flat.size(1);
+    int  top_k       = topk_ids.size(1);
+
+    // Get world_size from DistContext
+    auto& dist_ctx   = get_dist_context();
+    int   world_size = dist_ctx.ffn_ep_world_size();
+
+    // Ensure topk_ids is int64 as required by DeepEP
+    auto topk_ids_i64 = topk_ids.to(torch::kLong);
+
+    // Call low_latency_dispatch
+    auto dispatch_ret = buffer->low_latency_dispatch(hidden_flat.contiguous(),
+                                                     topk_ids_i64,
+                                                     std::nullopt,  // cumulative_local_expert_recv_stats
+                                                     std::nullopt,  // dispatch_wait_recv_cost_stats
+                                                     num_max_dispatch_tokens_per_rank,
+                                                     num_experts,
+                                                     false,  // use_fp8
+                                                     false,  // round_scale
+                                                     false,  // use_ue8m0
+                                                     false,  // async
+                                                     false   // return_recv_hook
+    );
+
+    auto recv_x       = std::get<0>(dispatch_ret);  // [num_local_experts, max_m, hidden_size]
+    auto masked_m     = std::get<2>(dispatch_ret);  // [num_local_experts] - actual counts
+    auto src_info     = std::get<3>(dispatch_ret);  // for combine
+    auto layout_range = std::get<4>(dispatch_ret);  // for combine
+
+    // Calculate expected_m (average tokens per expert)
+    int expected_m = (num_tokens * world_size * top_k + num_experts - 1) / num_experts;
+    expected_m     = std::min(expected_m, static_cast<int>(recv_x.size(1)));  // Cap at actual max
+
+    LowLatencyDispatchResult result;
+    result.recv_x                                  = recv_x;
+    result.masked_m                                = masked_m;
+    result.expected_m                              = expected_m;
+    result.handle.topk_idx                         = topk_ids_i64;
+    result.handle.topk_weights                     = topk_weights;
+    result.handle.src_info                         = src_info;
+    result.handle.layout_range                     = layout_range;
+    result.handle.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank;
+    result.handle.num_experts                      = num_experts;
+    result.handle.hidden_size                      = hidden_size;
+
+    return result;
+}
+
+torch::Tensor DeepEPRunner::combine_low_latency(deep_ep::Buffer*                buffer,
+                                                torch::Tensor                   expert_output,
+                                                const LowLatencyDispatchHandle& handle)
+{
+    // Call low_latency_combine
+    // expert_output: [num_local_experts, max_m, hidden_size]
+    auto combine_ret = buffer->low_latency_combine(expert_output,
+                                                   handle.topk_idx,
+                                                   handle.topk_weights,
+                                                   handle.src_info,
+                                                   handle.layout_range,
+                                                   std::nullopt,  // combine_wait_recv_cost_stats
+                                                   handle.num_max_dispatch_tokens_per_rank,
+                                                   handle.num_experts,
+                                                   false,        // use_logfmt
+                                                   false,        // zero_copy
+                                                   false,        // async
+                                                   false,        // return_recv_hook
+                                                   std::nullopt  // out
+    );
+
+    return std::get<0>(combine_ret);
 }
 
 }  // namespace nanodeploy

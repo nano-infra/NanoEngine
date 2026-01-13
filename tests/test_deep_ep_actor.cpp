@@ -10,20 +10,34 @@ using namespace spoke;
 
 int main(int argc, char** argv)
 {
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <hub_ip> <hub_port>" << std::endl;
+    if (argc < 3 || argc > 4) {
+        std::cerr << "Usage: " << argv[0] << " <hub_ip> <hub_port> [num_actors]" << std::endl;
+        std::cerr << "  num_actors: Number of actors (2-8, default: 8). DeepEP requires multi-GPU." << std::endl;
         return 1;
     }
 
     std::string hub_ip   = argv[1];
     int         hub_port = std::atoi(argv[2]);
 
+    // Parse number of actors (default: 8, minimum: 2 for DeepEP)
+    uint32_t actors_per_node = 8;
+    if (argc >= 4) {
+        int num_actors = std::atoi(argv[3]);
+        if (num_actors < 2 || num_actors > 8) {
+            std::cerr << "Error: num_actors must be 2-8 (DeepEP requires multi-GPU), got " << num_actors << std::endl;
+            std::cerr << "Note: Single-card MoE uses local computation, not DeepEP." << std::endl;
+            return 1;
+        }
+        actors_per_node = static_cast<uint32_t>(num_actors);
+    }
+
+    std::cout << "=== DeepEP Test: " << actors_per_node << " Actor(s) ===" << std::endl;
+
     // 1. Connect to Hub
     Client client(hub_ip, hub_port, true);  // true = Hub Mode
 
-    // 2. Allocate Resources (e.g. 1 Node, 8 Actors)
-    uint32_t     num_nodes       = 1;
-    uint32_t     actors_per_node = 8;
+    // 2. Allocate Resources
+    uint32_t     num_nodes = 1;
     ResourceSpec res_spec;
     res_spec.num_gpus = 1;  // Require 1 GPU per actor
 
@@ -77,7 +91,8 @@ int main(int argc, char** argv)
         req.world_size       = actor_ids.size();
         req.low_latency_mode = true;
         req.num_rdma_bytes   = 1024 * 1024 * 1024;  // 1GB
-        req.num_nvl_bytes    = 1024 * 1024 * 1024;  // 1GB
+        // Use NVLink buffer only for multi-card; single-card doesn't need it
+        req.num_nvl_bytes = (actors_per_node > 1) ? (1024 * 1024 * 1024) : 0;
         init_futs.push_back(client.callRemote<DeepEPInitReq, DeepEPInitResp>(actor_ids[i], kInit, req));
     }
 

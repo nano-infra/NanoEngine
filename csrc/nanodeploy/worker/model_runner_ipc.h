@@ -23,12 +23,36 @@ struct ModelInitReq {
     int         tp_degree;
     int         pp_degree;
     int         dp_degree;
+
+    int attention_tp = 1;
+    int attention_dp = 1;
+    int attention_sp = 1;
+
+    int ffn_tp = 1;
+    int ffn_dp = 1;
+    int ffn_ep = 1;
 };
 
 struct ModelRunResp {
     torch::Tensor tensor;
 };
 using ModelInitResp = bool;
+
+// DeepEP sync structures
+struct DeepEpInfoResp {
+    int         device_id = -1;
+    std::string ipc_handle;         // Binary data of IPC handle
+    std::string nvshmem_unique_id;  // Optional, only for root rank
+    int         num_rdma_ranks = 1;
+    int         rdma_rank      = 0;
+    int         root_rdma_rank = 0;
+};
+
+struct DeepEpSyncReq {
+    std::vector<int>         device_ids;
+    std::vector<std::string> ipc_handles;             // One per rank
+    std::string              root_nvshmem_unique_id;  // Optional
+};
 
 }  // namespace nanodeploy
 
@@ -128,7 +152,8 @@ template<>
 struct Serializer<nanodeploy::ModelInitReq> {
     static size_t size(const nanodeploy::ModelInitReq& data)
     {
-        return sizeof(int) * 6 + data.config_path.size();  // rank, ws, tp, pp, dp, size_of_str
+        // rank, ws, tp, pp, dp, att_tp, att_dp, att_sp, ffn_tp, ffn_dp, ffn_ep, size_of_str
+        return sizeof(int) * 12 + data.config_path.size();
     }
     static void packTo(const nanodeploy::ModelInitReq& data, char* buf)
     {
@@ -151,6 +176,20 @@ struct Serializer<nanodeploy::ModelInitReq> {
         *(int*)ptr = data.pp_degree;
         ptr += sizeof(int);
         *(int*)ptr = data.dp_degree;
+        ptr += sizeof(int);
+
+        *(int*)ptr = data.attention_tp;
+        ptr += sizeof(int);
+        *(int*)ptr = data.attention_dp;
+        ptr += sizeof(int);
+        *(int*)ptr = data.attention_sp;
+        ptr += sizeof(int);
+
+        *(int*)ptr = data.ffn_tp;
+        ptr += sizeof(int);
+        *(int*)ptr = data.ffn_dp;
+        ptr += sizeof(int);
+        *(int*)ptr = data.ffn_ep;
     }
     static nanodeploy::ModelInitReq unpackFrom(const char* buf, size_t)
     {
@@ -173,6 +212,20 @@ struct Serializer<nanodeploy::ModelInitReq> {
         req.pp_degree = *(int*)ptr;
         ptr += sizeof(int);
         req.dp_degree = *(int*)ptr;
+        ptr += sizeof(int);
+
+        req.attention_tp = *(int*)ptr;
+        ptr += sizeof(int);
+        req.attention_dp = *(int*)ptr;
+        ptr += sizeof(int);
+        req.attention_sp = *(int*)ptr;
+        ptr += sizeof(int);
+
+        req.ffn_tp = *(int*)ptr;
+        ptr += sizeof(int);
+        req.ffn_dp = *(int*)ptr;
+        ptr += sizeof(int);
+        req.ffn_ep = *(int*)ptr;
 
         return req;
     }
@@ -211,6 +264,135 @@ struct Serializer<nanodeploy::ModelInitResp> {
     static nanodeploy::ModelInitResp unpackFrom(const char* buf, size_t)
     {
         return *buf == '1';
+    }
+};
+
+// === DeepEpInfoResp ===
+template<>
+struct Serializer<nanodeploy::DeepEpInfoResp> {
+    static size_t size(const nanodeploy::DeepEpInfoResp& data)
+    {
+        // device_id, num_rdma_ranks, rdma_rank, root_rdma_rank, ipc_handle_len, nvshmem_id_len, data...
+        return sizeof(int) * 6 + data.ipc_handle.size() + data.nvshmem_unique_id.size();
+    }
+    static void packTo(const nanodeploy::DeepEpInfoResp& data, char* buf)
+    {
+        char* ptr  = buf;
+        *(int*)ptr = data.device_id;
+        ptr += sizeof(int);
+        *(int*)ptr = data.num_rdma_ranks;
+        ptr += sizeof(int);
+        *(int*)ptr = data.rdma_rank;
+        ptr += sizeof(int);
+        *(int*)ptr = data.root_rdma_rank;
+        ptr += sizeof(int);
+        *(int*)ptr = (int)data.ipc_handle.size();
+        ptr += sizeof(int);
+        memcpy(ptr, data.ipc_handle.data(), data.ipc_handle.size());
+        ptr += data.ipc_handle.size();
+        *(int*)ptr = (int)data.nvshmem_unique_id.size();
+        ptr += sizeof(int);
+        memcpy(ptr, data.nvshmem_unique_id.data(), data.nvshmem_unique_id.size());
+    }
+    static nanodeploy::DeepEpInfoResp unpackFrom(const char* buf, size_t)
+    {
+        nanodeploy::DeepEpInfoResp resp;
+        const char*                ptr = buf;
+        resp.device_id                 = *(int*)ptr;
+        ptr += sizeof(int);
+        resp.num_rdma_ranks = *(int*)ptr;
+        ptr += sizeof(int);
+        resp.rdma_rank = *(int*)ptr;
+        ptr += sizeof(int);
+        resp.root_rdma_rank = *(int*)ptr;
+        ptr += sizeof(int);
+        int ipc_len = *(int*)ptr;
+        ptr += sizeof(int);
+        resp.ipc_handle = std::string(ptr, ipc_len);
+        ptr += ipc_len;
+        int nvshmem_len = *(int*)ptr;
+        ptr += sizeof(int);
+        resp.nvshmem_unique_id = std::string(ptr, nvshmem_len);
+        return resp;
+    }
+    static std::string pack(const nanodeploy::DeepEpInfoResp& data)
+    {
+        std::string s;
+        s.resize(size(data));
+        packTo(data, s.data());
+        return s;
+    }
+    static nanodeploy::DeepEpInfoResp unpack(const std::string& data)
+    {
+        return unpackFrom(data.data(), data.size());
+    }
+};
+
+// === DeepEpSyncReq ===
+template<>
+struct Serializer<nanodeploy::DeepEpSyncReq> {
+    static size_t size(const nanodeploy::DeepEpSyncReq& data)
+    {
+        size_t sz = sizeof(int) * 2;  // num_devices, root_id_len
+        sz += sizeof(int) * data.device_ids.size();
+        for (const auto& h : data.ipc_handles) {
+            sz += sizeof(int) + h.size();
+        }
+        sz += data.root_nvshmem_unique_id.size();
+        return sz;
+    }
+    static void packTo(const nanodeploy::DeepEpSyncReq& data, char* buf)
+    {
+        char* ptr  = buf;
+        *(int*)ptr = (int)data.device_ids.size();
+        ptr += sizeof(int);
+        for (int id : data.device_ids) {
+            *(int*)ptr = id;
+            ptr += sizeof(int);
+        }
+        for (const auto& h : data.ipc_handles) {
+            *(int*)ptr = (int)h.size();
+            ptr += sizeof(int);
+            memcpy(ptr, h.data(), h.size());
+            ptr += h.size();
+        }
+        *(int*)ptr = (int)data.root_nvshmem_unique_id.size();
+        ptr += sizeof(int);
+        memcpy(ptr, data.root_nvshmem_unique_id.data(), data.root_nvshmem_unique_id.size());
+    }
+    static nanodeploy::DeepEpSyncReq unpackFrom(const char* buf, size_t)
+    {
+        nanodeploy::DeepEpSyncReq req;
+        const char*               ptr         = buf;
+        int                       num_devices = *(int*)ptr;
+        ptr += sizeof(int);
+        req.device_ids.resize(num_devices);
+        for (int i = 0; i < num_devices; ++i) {
+            req.device_ids[i] = *(int*)ptr;
+            ptr += sizeof(int);
+        }
+        req.ipc_handles.resize(num_devices);
+        for (int i = 0; i < num_devices; ++i) {
+            int len = *(int*)ptr;
+            ptr += sizeof(int);
+            req.ipc_handles[i] = std::string(ptr, len);
+            ptr += len;
+        }
+        int root_id_len = *(int*)ptr;
+        ptr += sizeof(int);
+        req.root_nvshmem_unique_id = std::string(ptr, root_id_len);
+        return req;
+    }
+    static std::string pack(const nanodeploy::DeepEpSyncReq& data)
+    {
+        std::string s;
+        s.resize(size(data));
+        packTo(data, s.data());
+        return s;
+    }
+    static nanodeploy::DeepEpSyncReq unpack(const std::string& data)
+    {
+        return unpackFrom(data.data(), data.size());
     }
 };
 

@@ -69,6 +69,13 @@ public:
         dconf.pp_degree   = val.pp_degree;
         dconf.dp_degree   = val.dp_degree;
 
+        dconf.attention_tp = val.attention_tp;
+        dconf.attention_dp = val.attention_dp;
+        dconf.attention_sp = val.attention_sp;
+        dconf.ffn_tp       = val.ffn_tp;
+        dconf.ffn_dp       = val.ffn_dp;
+        dconf.ffn_ep       = val.ffn_ep;
+
         runner_.init(val.config_path, dconf);
         std::cout << "[Executor] runner_.init() returned. Sending response..." << std::endl;
         return true;
@@ -82,6 +89,29 @@ public:
     {
         NANODEPLOY_LOG_DEBUG("[Executor] Received Run Request");
         return {runner_.run(val)};
+    }
+
+    // DeepEP sync: get local info
+    SPOKE_METHOD(ModelRunnerActor,
+                 getDeepEpInfo,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 12),
+                 int,  // dummy request type
+                 nanodeploy::DeepEpInfoResp)
+    {
+        (void)val;  // unused
+        NANODEPLOY_LOG_DEBUG("[Executor] Received GetDeepEpInfo Request");
+        return runner_.getDeepEpInfo();
+    }
+
+    // DeepEP sync: sync all handles
+    SPOKE_METHOD(ModelRunnerActor,
+                 syncDeepEp,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 13),
+                 nanodeploy::DeepEpSyncReq,
+                 bool)
+    {
+        NANODEPLOY_LOG_DEBUG("[Executor] Received SyncDeepEp Request");
+        return runner_.syncDeepEp(val);
     }
 
 private:

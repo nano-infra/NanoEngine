@@ -82,49 +82,11 @@ int main(int argc, char** argv)
         step_count++;
         // std::cout << "  [Test] Executing Step " << step_count << "..." << std::endl;
 
-        auto step_tokens = engine.step();
-
-        output_ids.insert(output_ids.end(), step_tokens.begin(), step_tokens.end());
+        engine.step();
 
         // Optional: Add sleep or interaction logic here
     }
     std::cout << "\nGeneration Finished in " << step_count << " steps." << std::endl;
-
-    std::cout << "Generated IDs: ";
-    for (int id : output_ids)
-        std::cout << id << " ";
-    std::cout << std::endl;
-
-    // Save outputs to docs for reference
-    fs::path docs_dir = fs::path("d:/src/NanoDeploy/docs");  // Or relative to current path if needed
-    // Verify d:/ exists? On linux likely not.
-    // The user environment says Windows, but paths are mixed.
-    // The user uses /mnt/nvme... in the error log.
-    // I should use fs::current_path() / "docs" or similar to be safe, OR just use the relative path "docs" since we are
-    // running from build or root. The previous code had "d:/src/NanoDeploy/docs". I will use a relative path "../docs"
-    // assuming build is in "build/". Or just "docs" in current working dir.
-
-    // Actually the user's error says "/mnt/nvme1n1/.../tests/test_qwen3_runner.cpp", so it IS Linux environment despite
-    // the user info saying Windows. Wait, the User Info block says: "The USER's OS version is windows." But the error
-    // log is clearly Linux GCC output. This happens with WSL. I should use generic paths.
-
-    fs::path      output_path = fs::current_path() / "qwen3_chat_output.md";
-    std::ofstream out_file(output_path);
-    if (out_file.is_open()) {
-        out_file << "# Qwen3 Generation Output\n\n";
-        out_file << "**Input IDs:** ";
-        for (int id : prompt_ids)
-            out_file << id << " ";
-        out_file << "\n\n**Output IDs:** ";
-        for (int id : output_ids)
-            out_file << id << " ";
-        out_file << "\n";
-        out_file.close();
-        std::cout << "Output saved to " << output_path << std::endl;
-    }
-    else {
-        std::cerr << "Failed to save output to " << output_path << std::endl;
-    }
 
     // Normal return allows proper destructor calls for resource cleanup
     // Client destructor will auto-release unreleased gang allocations

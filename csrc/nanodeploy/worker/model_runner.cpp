@@ -1,10 +1,18 @@
 #include "model_runner.h"
 #include "distributed.h"
 
+#include <algorithm>
 #include <iostream>
 #include <torch/torch.h>
 
 #include "nanodeploy/logging.h"
+
+#ifdef DEEPSEEK_MOE
+#include "deep_ep.hpp"
+#include "nanodeploy/worker/deep_ep_utils.h"
+#include "nanodeploy/worker/deep_gemm_runner.h"
+#include <cuda_runtime.h>
+#endif
 
 namespace nanodeploy {
 
@@ -94,18 +102,20 @@ void ModelRunner::init(const std::string& config_path_str, int rank, int world_s
 void ModelRunner::init(const std::string& config_path_str, const DistributedConfig& dconf)
 {
     get_dist_context().init(dconf);
-    init_internal(config_path_str);
+    init_internal(config_path_str, dconf.global_rank);
 }
 
-void ModelRunner::init_internal(const std::string& config_path_str)
+void ModelRunner::init_internal(const std::string& config_path_str, int rank)
 {
-    rank_       = get_dist_context().global_rank();
+    rank_       = rank;
     world_size_ = get_dist_context().world_size();
 
     torch::set_num_threads(1);
 
     std::filesystem::path config_path(config_path_str);
     auto                  model_dir = config_path.parent_path();
+
+    nanodeploy::get_log_level() = 2;  // Set to DEBUG early
 
     NANODEPLOY_LOG_INFO("Loading config from ", config_path);
     config_ = std::make_unique<core::ModelConfig>(core::ModelConfig::load_hf(config_path.string()));
@@ -115,15 +125,29 @@ void ModelRunner::init_internal(const std::string& config_path_str)
     }
 
     if (torch::cuda::is_available()) {
-        device_ = torch::kCUDA;
-        NANODEPLOY_LOG_INFO("CUDA Detected. Using GPU.");
+        int num_devices = 0;
+        cudaGetDeviceCount(&num_devices);
+        NANODEPLOY_LOG_INFO("CUDA device count: ", num_devices, " rank_: ", rank_);
+        if (num_devices > 0) {
+            int device_id = rank_ % num_devices;
+            NANODEPLOY_LOG_INFO("Setting CUDA device to ", device_id, " for rank ", rank_);
+            cudaSetDevice(device_id);
+            device_ = torch::Device(torch::kCUDA, device_id);
+
+            // Verify device was set correctly
+            int current_device = -1;
+            cudaGetDevice(&current_device);
+            NANODEPLOY_LOG_INFO("CUDA device after cudaSetDevice: ", current_device, " (expected ", device_id, ")");
+        }
+        else {
+            device_ = torch::kCPU;
+            NANODEPLOY_LOG_INFO("CUDA Not Available (Count=0). Using CPU.");
+        }
     }
     else {
         device_ = torch::kCPU;
         NANODEPLOY_LOG_INFO("CUDA Not Available. Using CPU.");
     }
-
-    nanodeploy::get_log_level() = 1;
 
     NANODEPLOY_LOG_INFO("Initializing WeightManager for ", model_dir);
     weight_manager_ = std::make_unique<WeightManager>(model_dir, device_);
@@ -136,7 +160,74 @@ void ModelRunner::init_internal(const std::string& config_path_str)
 
         moe_model_ = std::make_unique<Qwen3MoeForCausalLM<QuantType::FP16>>(*config_);
 
+#ifdef DEEPSEEK_MOE
+        // Initialize DeepGemm via runner
+        DeepGemmRunner::init_utils();
+
+        // Initialize DeepEP Buffer for DeepSeek MoE (only for multi-GPU)
+        int ep_size = get_dist_context().ffn_ep_world_size();
+
+        if (ep_size > 1) {
+            // Multi-GPU: Initialize DeepEP for expert parallel communication
+            int num_experts = config_->num_experts;
+            int hidden_size = config_->hidden_size;
+
+            // Setup NVSHMEM environment variables BEFORE creating buffer
+            int num_local_experts = num_experts / ep_size;
+            int num_qps_per_rank  = std::max(32, num_local_experts);
+            setup_nvshmem_env(num_qps_per_rank, false);  // multi-card mode
+
+            // Calculate buffer sizes using DeepEP Config for Normal Mode
+            int num_sms = 0;
+            cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_.index());
+            if (num_sms <= 0)
+                num_sms = 132;  // H100/H200 default
+
+            // Dynamically adjust config based on hidden_size to avoid buffer overflow
+            // Buffer size ~ num_channels * num_nvl_ranks * recv_tokens * hidden_bytes
+            // For large models (hidden_size > 5000), use smaller token limits
+            int nvl_send_tokens = 4096;
+            int nvl_recv_tokens = 8192;
+            if (hidden_size > 6000) {
+                // 235B model: hidden=7168, need ~50% reduction
+                nvl_send_tokens = 1024;
+                nvl_recv_tokens = 2048;
+            }
+            else if (hidden_size > 4000) {
+                // Medium-large models
+                nvl_send_tokens = 2048;
+                nvl_recv_tokens = 4096;
+            }
+            deep_ep::Config config(num_sms, nvl_send_tokens, nvl_recv_tokens, nvl_send_tokens, nvl_recv_tokens);
+
+            int64_t hidden_size_bytes = hidden_size * 2;  // BF16
+            int64_t num_nvl_bytes     = config.get_nvl_buffer_size_hint(hidden_size_bytes, ep_size);
+            int64_t num_rdma_bytes    = config.get_rdma_buffer_size_hint(hidden_size_bytes, ep_size);
+
+            NANODEPLOY_LOG_INFO("DeepEP Config: nvl_send=" + std::to_string(nvl_send_tokens)
+                                + " nvl_recv=" + std::to_string(nvl_recv_tokens)
+                                + " buffer_size=" + std::to_string(num_nvl_bytes / (1024 * 1024)) + "MB");
+
+            ep_buffer_ = std::make_unique<deep_ep::Buffer>(rank_,
+                                                           ep_size,
+                                                           num_nvl_bytes,
+                                                           num_rdma_bytes,
+                                                           false,  // low_latency_mode = false (Normal Dispatch)
+                                                           true,   // explicitly_destroy
+                                                           true,   // enable_shrink
+                                                           false   // use_fabric
+            );
+
+            NANODEPLOY_LOG_INFO("DeepEP Buffer initialized for DeepSeek MoE (ep_size=" + std::to_string(ep_size) + ")");
+        }
+        else {
+            // Single-GPU: No DeepEP needed, use local computation
+            // ep_buffer_ remains nullptr
+            NANODEPLOY_LOG_INFO("DeepSeek MoE running in single-card mode (no DeepEP, local gather/scatter)");
+        }
+#else
         // DeepEP initialization removed for Simple MoE
+#endif
     }
     else {
         model_ = std::make_unique<Qwen3ForCausalLM<QuantType::FP16>>(*config_, device_);
@@ -161,8 +252,17 @@ void ModelRunner::init_internal(const std::string& config_path_str)
 
 ModelRunResp ModelRunner::run(ModelRunReq req)
 {
-    if (req.seqs.empty())
+    NANODEPLOY_LOG_INFO(
+        "ModelRunner::run called. Rank: ", rank_, " Seqs: ", req.seqs.size(), " Prefill: ", req.is_prefill);
+
+    if (req.seqs.empty()) {
+        NANODEPLOY_LOG_WARN("ModelRunner::run: Empty seqs for Rank ", rank_, ". Returning empty response.");
+        // WARN: This might cause deadlock if other ranks are waiting in collective ops!
+        // We should probably proceed with empty tensors if collective ops are expected.
+        // For now, just logging.
+
         return ModelRunResp{};
+    }
 
     std::vector<int64_t> input_ids_vec;
     std::vector<int64_t> positions_vec;
@@ -248,9 +348,20 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
     // Run Forward
     torch::Tensor hidden_states;
     if (config_->is_moe) {
+#ifdef DEEPSEEK_MOE
+        hidden_states = moe_model_->forward(input_ids,
+                                            positions,
+                                            kv_cache_.get(),
+                                            flashinfer_handler_.get(),
+                                            slot_mapping,
+                                            block_tables,
+                                            seq_lens,
+                                            ep_buffer_.get());
+#else
         // Simple MoE forward signature doesn't take ep_buffer
         hidden_states = moe_model_->forward(
             input_ids, positions, kv_cache_.get(), flashinfer_handler_.get(), slot_mapping, block_tables, seq_lens);
+#endif
     }
     else {
         hidden_states = model_->forward(
@@ -366,11 +477,11 @@ void ModelRunner::load_layer_weights(int layer_idx, Qwen3DecoderLayer<QuantType:
     layer->mlp_->down_proj_->weight    = weight_manager_->load(prefix + "mlp.down_proj.weight");
 }
 
-void ModelRunner::load_moe_layer_weights(int layer_idx, models::Qwen3MoeDecoderLayer<QuantType::FP16>* layer)
+void ModelRunner::load_moe_layer_weights(int layer_idx, models::DeepSeekMoeDecoderLayer<QuantType::FP16>* layer)
 {
     std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
 
-    // A. Attention
+    // A. Attention (same as Qwen3MoeDecoderLayer)
     auto q_w = weight_manager_->load(prefix + "self_attn.q_proj.weight");
     auto k_w = weight_manager_->load(prefix + "self_attn.k_proj.weight");
     auto v_w = weight_manager_->load(prefix + "self_attn.v_proj.weight");
@@ -397,41 +508,119 @@ void ModelRunner::load_moe_layer_weights(int layer_idx, models::Qwen3MoeDecoderL
 
     // B. MLP (Sparse or Dense)
     if (layer->is_sparse_) {
-        // MoE Loading
-        auto* block = layer->mlp_moe_.get();  // Qwen3MoeSparseMoeBlock (simple.h)
+        // DeepSeek MoE Loading
+        auto* block = layer->mlp_moe_.get();  // DeepSeekMoeSparseMoeBlock
 
         // Gate
         block->gate_->weight = weight_manager_->load(prefix + "mlp.gate.weight");
 
-        // Experts
-        int num_experts = config_->num_experts;
+        // Experts weights (tensor format: [num_local_experts, ...])
+        int num_experts       = config_->num_experts;
+        int ep_size           = get_dist_context().ffn_ep_world_size();
+        int num_local_experts = num_experts / ep_size;
 
-        // Try to load first expert to detect existence
-        if (!weight_manager_->has_param(prefix + "mlp.experts.0.gate_proj.weight")) {
-            NANODEPLOY_LOG_WARN("MoE experts not found in checkpoints. Skipping load (using uninit).");
-            return;
-        }
-
-        for (int i = 0; i < num_experts; ++i) {
-            std::string exp_prefix = prefix + "mlp.experts." + std::to_string(i) + ".";
+        // Load weights for each local expert
+        std::vector<torch::Tensor> gate_up_list, down_list;
+        for (int i = 0; i < num_local_experts; ++i) {
+            // Calculate global expert index
+            int         global_expert_idx = get_dist_context().ffn_ep_rank() * num_local_experts + i;
+            std::string exp_prefix        = prefix + "mlp.experts." + std::to_string(global_expert_idx) + ".";
 
             auto g = weight_manager_->load(exp_prefix + "gate_proj.weight");
             auto u = weight_manager_->load(exp_prefix + "up_proj.weight");
             auto d = weight_manager_->load(exp_prefix + "down_proj.weight");
 
-            auto& expert                  = block->experts_[i];
-            expert->gate_up_proj_->weight = torch::cat({g, u}, 0);
-            expert->down_proj_->weight    = d;
+            // Concatenate gate and up: [moe_inter*2, hidden_size]
+            // Storage format: [num_local_experts, moe_inter*2, hidden_size]
+            gate_up_list.push_back(torch::cat({g, u}, 0));
+            // Down proj: loaded as [hidden_size, moe_inter]
+            // Storage format: [num_local_experts, hidden_size, moe_inter] (no transpose needed)
+            down_list.push_back(d);
         }
+
+        // Stack into tensors: [num_local_experts, moe_inter*2, hidden_size] and [num_local_experts, hidden_size,
+        // moe_inter]
+        block->gate_up_proj_ = torch::stack(gate_up_list, 0).to(torch::kBFloat16);
+        block->down_proj_    = torch::stack(down_list, 0).to(torch::kBFloat16);
     }
     else {
-        // Dense MLP in MoE model (Shared expert or non-sparse layer)
+        // Dense MLP (same as Qwen3MoeDecoderLayer)
         auto* mlp                  = layer->mlp_dense_.get();
         auto  gate_w               = weight_manager_->load(prefix + "mlp.gate_proj.weight");
         auto  up_w                 = weight_manager_->load(prefix + "mlp.up_proj.weight");
         mlp->gate_up_proj_->weight = torch::cat(std::vector<torch::Tensor>{gate_w, up_w}, 0);
         mlp->down_proj_->weight    = weight_manager_->load(prefix + "mlp.down_proj.weight");
     }
+}
+
+DeepEpInfoResp ModelRunner::getDeepEpInfo()
+{
+    DeepEpInfoResp resp;
+    if (ep_buffer_) {
+        resp.device_id      = ep_buffer_->get_local_device_id();
+        resp.num_rdma_ranks = ep_buffer_->get_num_rdma_ranks();
+        resp.rdma_rank      = ep_buffer_->get_rdma_rank();
+        resp.root_rdma_rank = ep_buffer_->get_root_rdma_rank(true);
+
+        // Get IPC handle as binary string
+        auto ipc_handle_py = ep_buffer_->get_local_ipc_handle();
+        resp.ipc_handle    = ipc_handle_py.cast<std::string>();
+
+        // Get NVSHMEM unique ID if this is the root rank
+        if (resp.rdma_rank == resp.root_rdma_rank && resp.num_rdma_ranks > 1) {
+            auto nvshmem_id_py     = ep_buffer_->get_local_nvshmem_unique_id();
+            resp.nvshmem_unique_id = nvshmem_id_py.cast<std::string>();
+        }
+
+        NANODEPLOY_LOG_INFO("DeepEP Info: rank=",
+                            rank_,
+                            " device_id=",
+                            resp.device_id,
+                            " num_rdma_ranks=",
+                            resp.num_rdma_ranks,
+                            " ipc_handle_size=",
+                            resp.ipc_handle.size());
+    }
+    return resp;
+}
+
+bool ModelRunner::syncDeepEp(DeepEpSyncReq req)
+{
+    if (!ep_buffer_) {
+        NANODEPLOY_LOG_WARN("No DeepEP buffer to sync");
+        return false;
+    }
+
+    NANODEPLOY_LOG_INFO("Syncing DeepEP: rank=", rank_, " num_devices=", req.device_ids.size());
+
+    // Debug: print received handle sizes
+    for (size_t i = 0; i < req.ipc_handles.size(); ++i) {
+        NANODEPLOY_LOG_INFO("  Received handle[", i, "] size=", req.ipc_handles[i].size());
+    }
+
+    // Convert to pybind11 types for sync call
+    std::vector<std::optional<pybind11::bytearray>> all_handles;
+    all_handles.reserve(req.ipc_handles.size());
+    for (const auto& h : req.ipc_handles) {
+        // Use data() and size() explicitly for binary data
+        all_handles.push_back(pybind11::bytearray(h.data(), h.size()));
+    }
+
+    std::optional<pybind11::bytearray> root_unique_id;
+    if (!req.root_nvshmem_unique_id.empty()) {
+        root_unique_id = pybind11::bytearray(req.root_nvshmem_unique_id);
+    }
+
+    try {
+        ep_buffer_->sync(req.device_ids, all_handles, root_unique_id);
+        NANODEPLOY_LOG_INFO("DeepEP sync completed for rank ", rank_);
+        return true;
+    }
+    catch (const std::exception& e) {
+        NANODEPLOY_LOG_ERROR("DeepEP sync failed: ", e.what());
+        return false;
+    }
+    return true;
 }
 
 }  // namespace nanodeploy
