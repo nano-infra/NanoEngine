@@ -14,6 +14,12 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(NANODEPLOY_INSTALL_PATH "nanodeploy" CACHE STRING "Python module installation directory")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# DeepSeek MoE implementation option
+option(DEEPSEEK_MOE "Use DeepSeek MoE implementation (simplified DeepEP fused MoE)" OFF)
+if(DEEPSEEK_MOE)
+    add_definitions(-DDEEPSEEK_MOE)
+endif()
+
 # find_package(pybind11 CONFIG REQUIRED)
 find_package(Torch REQUIRED)
 
