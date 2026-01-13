@@ -4,6 +4,7 @@ set(CPP_SOURCES
     model_runner.cpp
     deep_ep_runner.cpp
     deep_gemm_runner.cpp
+    moe_expert_runner.cpp
     distributed.cpp
     ../layers/flashinfer_handler.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/DeepEP/csrc/deep_ep.cpp

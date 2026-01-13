@@ -177,45 +177,56 @@ void ModelRunner::init_internal(const std::string& config_path_str, int rank)
             int num_qps_per_rank  = std::max(32, num_local_experts);
             setup_nvshmem_env(num_qps_per_rank, false);  // multi-card mode
 
-            // Calculate buffer sizes using DeepEP Config for Normal Mode
+            // Calculate buffer sizes for COMMON buffer (supports both Normal and Low Latency)
+            // Strategy from DLBlas: use low_latency_mode=true with max buffer sizes
             int num_sms = 0;
             cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_.index());
             if (num_sms <= 0)
                 num_sms = 132;  // H100/H200 default
 
-            // Dynamically adjust config based on hidden_size to avoid buffer overflow
-            // Buffer size ~ num_channels * num_nvl_ranks * recv_tokens * hidden_bytes
-            // For large models (hidden_size > 5000), use smaller token limits
-            int nvl_send_tokens = 4096;
-            int nvl_recv_tokens = 8192;
-            if (hidden_size > 6000) {
-                // 235B model: hidden=7168, need ~50% reduction
-                nvl_send_tokens = 1024;
-                nvl_recv_tokens = 2048;
-            }
-            else if (hidden_size > 4000) {
-                // Medium-large models
-                nvl_send_tokens = 2048;
-                nvl_recv_tokens = 4096;
-            }
-            deep_ep::Config config(num_sms, nvl_send_tokens, nvl_recv_tokens, nvl_send_tokens, nvl_recv_tokens);
-
             int64_t hidden_size_bytes = hidden_size * 2;  // BF16
-            int64_t num_nvl_bytes     = config.get_nvl_buffer_size_hint(hidden_size_bytes, ep_size);
-            int64_t num_rdma_bytes    = config.get_rdma_buffer_size_hint(hidden_size_bytes, ep_size);
 
-            NANODEPLOY_LOG_INFO("DeepEP Config: nvl_send=" + std::to_string(nvl_send_tokens)
-                                + " nvl_recv=" + std::to_string(nvl_recv_tokens)
-                                + " buffer_size=" + std::to_string(num_nvl_bytes / (1024 * 1024)) + "MB");
+            // Use recommended configs from DeepEP (see deep_ep/buffer.py get_dispatch_config/get_combine_config)
+            // For ep_size=8: dispatch=(6,256,6,128), combine=(4,256,6,128)
+            // We take max of both for buffer allocation
+            int nvl_chunk_send  = 6;    // max(6, 4)
+            int nvl_chunk_recv  = 256;  // max(256, 256)
+            int rdma_chunk_send = 6;    // max(6, 6)
+            int rdma_chunk_recv = 128;  // max(128, 128)
+
+            deep_ep::Config config(num_sms, nvl_chunk_send, nvl_chunk_recv, rdma_chunk_send, rdma_chunk_recv);
+
+            // NVL buffer for Normal mode
+            int64_t num_nvl_bytes = config.get_nvl_buffer_size_hint(hidden_size_bytes, ep_size);
+
+            // RDMA buffer: max of Normal and Low Latency requirements
+            int     num_max_dispatch_tokens_per_rank = 256;  // Typical decode batch size
+            int64_t normal_rdma_bytes                = config.get_rdma_buffer_size_hint(hidden_size_bytes, ep_size);
+            int64_t ll_rdma_bytes                    = deep_ep::get_low_latency_rdma_size_hint(
+                num_max_dispatch_tokens_per_rank, hidden_size_bytes, ep_size, num_experts);
+            int64_t num_rdma_bytes = std::max(normal_rdma_bytes, ll_rdma_bytes);
+
+            NANODEPLOY_LOG_INFO("DeepEP Buffer params: ep_size=",
+                                ep_size,
+                                " hidden=",
+                                hidden_size,
+                                " hidden_bytes=",
+                                hidden_size_bytes,
+                                " num_sms=",
+                                num_sms);
+            NANODEPLOY_LOG_INFO("DeepEP Common Buffer: nvl=" + std::to_string(num_nvl_bytes / (1024 * 1024)) + "MB"
+                                + " rdma=" + std::to_string(num_rdma_bytes / (1024 * 1024)) + "MB"
+                                + " (normal_rdma=" + std::to_string(normal_rdma_bytes / (1024 * 1024)) + "MB"
+                                + " ll_rdma=" + std::to_string(ll_rdma_bytes / (1024 * 1024)) + "MB)");
 
             ep_buffer_ = std::make_unique<deep_ep::Buffer>(rank_,
                                                            ep_size,
                                                            num_nvl_bytes,
                                                            num_rdma_bytes,
-                                                           false,  // low_latency_mode = false (Normal Dispatch)
-                                                           true,   // explicitly_destroy
-                                                           true,   // enable_shrink
-                                                           false   // use_fabric
+                                                           true,  // low_latency_mode = true (common buffer)
+                                                           true,  // explicitly_destroy
+                                                           true,  // enable_shrink
+                                                           false  // use_fabric
             );
 
             NANODEPLOY_LOG_INFO("DeepEP Buffer initialized for DeepSeek MoE (ep_size=" + std::to_string(ep_size) + ")");
@@ -349,6 +360,7 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
     torch::Tensor hidden_states;
     if (config_->is_moe) {
 #ifdef DEEPSEEK_MOE
+        // Prefill uses normal dispatch (larger batches), decode uses low_latency (smaller batches)
         hidden_states = moe_model_->forward(input_ids,
                                             positions,
                                             kv_cache_.get(),
@@ -356,7 +368,8 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
                                             slot_mapping,
                                             block_tables,
                                             seq_lens,
-                                            ep_buffer_.get());
+                                            ep_buffer_.get(),
+                                            req.is_prefill);
 #else
         // Simple MoE forward signature doesn't take ep_buffer
         hidden_states = moe_model_->forward(
@@ -567,9 +580,16 @@ DeepEpInfoResp ModelRunner::getDeepEpInfo()
         resp.ipc_handle    = ipc_handle_py.cast<std::string>();
 
         // Get NVSHMEM unique ID if this is the root rank
-        if (resp.rdma_rank == resp.root_rdma_rank && resp.num_rdma_ranks > 1) {
-            auto nvshmem_id_py     = ep_buffer_->get_local_nvshmem_unique_id();
-            resp.nvshmem_unique_id = nvshmem_id_py.cast<std::string>();
+        // Note: In low_latency_mode, even single-node needs NVSHMEM, so always get it for root
+        if (resp.rdma_rank == resp.root_rdma_rank) {
+            try {
+                auto nvshmem_id_py     = ep_buffer_->get_local_nvshmem_unique_id();
+                resp.nvshmem_unique_id = nvshmem_id_py.cast<std::string>();
+                NANODEPLOY_LOG_INFO("Got NVSHMEM unique ID, size=", resp.nvshmem_unique_id.size());
+            }
+            catch (const std::exception& e) {
+                NANODEPLOY_LOG_WARN("Could not get NVSHMEM unique ID: ", e.what());
+            }
         }
 
         NANODEPLOY_LOG_INFO("DeepEP Info: rank=",

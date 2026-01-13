@@ -290,7 +290,7 @@ DispatchResult DeepEPRunner::dispatch_normal(deep_ep::Buffer* buffer,
     auto num_tokens_per_expert_global = std::get<2>(layout);
     auto is_token_in_rank             = std::get<3>(layout);
 
-    // Get config
+    // Get config - must match buffer allocation in model_runner.cpp
     int num_sms    = 0;
     int device_idx = device.is_cuda() ? device.index() : 0;
     if (device_idx < 0)
@@ -299,19 +299,14 @@ DispatchResult DeepEPRunner::dispatch_normal(deep_ep::Buffer* buffer,
     if (num_sms <= 0)
         num_sms = 132;  // H100/H200 default
 
-    // Dynamically adjust config based on hidden_size to avoid buffer overflow
-    int hidden_size     = hidden_flat.size(1);
-    int nvl_send_tokens = 4096;
-    int nvl_recv_tokens = 8192;
-    if (hidden_size > 6000) {
-        nvl_send_tokens = 1024;
-        nvl_recv_tokens = 2048;
-    }
-    else if (hidden_size > 4000) {
-        nvl_send_tokens = 2048;
-        nvl_recv_tokens = 4096;
-    }
-    deep_ep::Config config(num_sms, nvl_send_tokens, nvl_recv_tokens, nvl_send_tokens, nvl_recv_tokens);
+    // Use DeepEP recommended config from deep_ep/buffer.py get_dispatch_config/get_combine_config
+    // For ep_size=8: dispatch=(6,256,6,128), combine=(4,256,6,128)
+    // These values MUST match what was used to allocate the buffer in model_runner.cpp
+    int             nvl_chunk_send  = 6;    // max(dispatch=6, combine=4)
+    int             nvl_chunk_recv  = 256;  // max(dispatch=256, combine=256)
+    int             rdma_chunk_send = 6;
+    int             rdma_chunk_recv = 128;
+    deep_ep::Config config(num_sms, nvl_chunk_send, nvl_chunk_recv, rdma_chunk_send, rdma_chunk_recv);
 
     // Determine dispatch path
     int  num_rdma_ranks = buffer->get_num_rdma_ranks();
