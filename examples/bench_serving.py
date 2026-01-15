@@ -23,7 +23,7 @@ np.random.seed(SEED)
 def parse_args():
     parser = argparse.ArgumentParser(description="Serving benchmark for NanoDeploy.")
     parser.add_argument("--num-requests", type=int, default=256, help="Number of requests.")
-    parser.add_argument("--request-rate", type=int, default=8, help="Requests per second.")
+    parser.add_argument("--request-rate", type=float, default=8, help="Requests per second.")
     parser.add_argument("--burstiness", type=float, default=1.0, help="Burstiness factor (1.0 = Poisson).")
     parser.add_argument("--model-path", type=str, default="/models/qwen3-235B-Instruct-2507-FP8", help="Model path.")
     parser.add_argument("--max-model-len", type=int, default=4096, help="Max model length.")
@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager mode.")
     parser.add_argument("--dataset", type=str, default="random", choices=["random", "csv"], help="Dataset type.")
     parser.add_argument("--csv-path", type=str, default=None, help="Path to CSV file.")
+    parser.add_argument("--itl-log-path", type=str, default="itl_samples.jsonl", help="Path to save ITL samples (JSONL).")
     
     # Distributed / Cluster arguments
     parser.add_argument("--master-address", type=str, default=None, help="Ray master address.")
@@ -47,6 +48,7 @@ def parse_args():
     parser.add_argument("--max-num-seqs", type=int, default=128, help="Max sequences per iteration.")
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
+    parser.add_argument("--segment-size", type=int, default=16384, help="Segment size for SP.")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache"],
@@ -63,19 +65,15 @@ def parse_args():
     return args
 
 
-def get_dataset(args):
-    """Generates or loads the dataset of prompts and sampling params."""
+def get_dataset_generator(args):
+    """Generates the dataset of prompts and sampling params as a generator."""
     if args.dataset == "random":
-        print(f"Generating random dataset (input: {MAX_INPUT_LEN}, output: {MAX_OUTPUT_LEN})...")
-        prompts = [
-            [randint(0, 10000) for _ in range(MAX_INPUT_LEN)]
-            for _ in range(args.num_requests)
-        ]
-        sampling_params_list = [
-            SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=MAX_OUTPUT_LEN)
-            for _ in range(args.num_requests)
-        ]
-        return prompts, sampling_params_list
+        print(f"Generating random dataset generator (input: {MAX_INPUT_LEN}, output: {MAX_OUTPUT_LEN})...")
+        for _ in range(args.num_requests):
+            prompt = np.random.randint(0, 10000, size=MAX_INPUT_LEN).tolist()
+            sp = SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=MAX_OUTPUT_LEN)
+            yield prompt, sp
+        return
 
     # CSV dataset
     print(f"Reading dataset from CSV: {args.csv_path}...")
@@ -86,21 +84,29 @@ def get_dataset(args):
 
     if len(df) < args.num_requests:
         print(f"Warning: CSV has {len(df)} rows, requested {args.num_requests}. Cycling data to meet request count.")
-        repeats = (args.num_requests // len(df)) + 1
-        df = pd.concat([df] * repeats, ignore_index=True)
+        # No need to physical concat, just cycle logic in loop
     
-    df = df.head(args.num_requests)
-
-    prompts = []
-    sampling_params_list = []
-    for _, row in df.iterrows():
+    # Pre-calculate cycling indices to avoid mental overhead during yield
+    num_rows = len(df)
+    
+    for i in range(args.num_requests):
+        row = df.iloc[i % num_rows]
         prompt_len = int(row["prompt_len"])
         output_len = int(row["output_len"])
-        prompts.append([randint(0, 10000) for _ in range(prompt_len)])
-        sampling_params_list.append(SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=output_len))
+        
+        if prompt_len > args.max_model_len or prompt_len + output_len > args.max_model_len:
+            # Reserve at least 4 tokens for prompt
+            if args.max_model_len - output_len < 4:
+                output_len = args.max_model_len - 4
+                prompt_len = 4
+            else:
+                prompt_len = args.max_model_len - output_len
 
-    print(f"Loaded {len(prompts)} requests from CSV")
-    return prompts, sampling_params_list
+        prompt = np.random.randint(0, 10000, size=prompt_len).tolist()
+        sp = SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=output_len)
+        yield prompt, sp
+
+    print(f"Generator prepared for {args.num_requests} requests from CSV")
 
 
 def generate_arrival_times(num_requests, rate, burstiness):
@@ -149,8 +155,9 @@ def run_warmup(engine, max_num_seqs, world_size):
     print(f"{'=' * 60}\n")
     
     # Generate warmup requests
+    # Warmup is small, list is fine
     warmup_prompts = [
-        [randint(0, 10000) for _ in range(warmup_input_len)]
+        np.random.randint(0, 10000, size=warmup_input_len).tolist()
         for _ in range(num_warmup_requests)
     ]
     warmup_sampling_params = SamplingParams(
@@ -183,12 +190,16 @@ def run_warmup(engine, max_num_seqs, world_size):
     print(f"{'=' * 60}\n")
 
 
-def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requests):
+def run_benchmark(engine, request_generator, arrival_times, num_requests):
     """Runs the main benchmark loop."""
     seq_map = {}
     requests_sent = 0
     start_time = time.perf_counter()
     completed_latencies = []
+
+    # Prefetch the first request to avoid generator delay at t=0
+    # or handle naturally in the loop. 
+    # With numpy generation, delay is negligible.
 
     with tqdm(total=num_requests, desc="Processing Requests") as pbar:
         while requests_sent < num_requests or not engine.is_finished():
@@ -199,10 +210,11 @@ def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requ
             while (requests_sent < num_requests and 
                    elapsed >= arrival_times[requests_sent]):
                 
-                # print(f"DEBUG: Adding request {requests_sent} at {elapsed:.4f}s")
-                prompt = prompts[requests_sent]
-                sp = sampling_params_list[requests_sent]
-                
+                try:
+                    prompt, sp = next(request_generator)
+                except StopIteration:
+                    break
+
                 seq = Sequence(token_ids=prompt, sampling_params=sp)
                 engine.add_request(seq)
                 seq_map[seq.seq_id] = seq
@@ -230,7 +242,7 @@ def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requ
     return total_time, seq_map
 
 
-def calculate_and_print_metrics(total_time, seq_map, requests_sent):
+def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path=None):
     """Calculates and prints performance metrics."""
     completed_seqs = [s for s in seq_map.values() if s.metric and s.metric.completion_time]
     
@@ -245,15 +257,20 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent):
     latency_samples = [s.metric.e2e_latency for s in completed_seqs if s.metric.e2e_latency]
     avg_latency = np.mean(latency_samples) / 1000 if latency_samples else 0
 
-    # TPOT stats (Inter-Token Latency)
-    itls = [s.metric.avg_itl for s in completed_seqs if s.metric.avg_itl]
+    # TPOT stats (Inter-Token Latency) - Aggregate all individual token samples
+    all_itl_samples = []
+    for s in completed_seqs:
+        if s.metric and s.metric.itl_samples:
+            all_itl_samples.extend(s.metric.itl_samples)
+    
     tpot_stats = {}
-    if itls:
+    if all_itl_samples:
         tpot_stats = {
-            "avg": np.mean(itls),
-            "p50": np.median(itls),
-            "p90": np.percentile(itls, 90),
-            "p99": np.percentile(itls, 99)
+            "avg": np.mean(all_itl_samples),
+            "p50": np.median(all_itl_samples),
+            "p90": np.percentile(all_itl_samples, 90),
+            "p95": np.percentile(all_itl_samples, 95),
+            "p99": np.percentile(all_itl_samples, 99)
         }
     
     # TPOT with queueing
@@ -292,17 +309,8 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent):
         print(f"  Avg:  {tpot_stats.get('avg', 0):.2f}")
         print(f"  P50:  {tpot_stats.get('p50', 0):.2f}")
         print(f"  P90:  {tpot_stats.get('p90', 0):.2f}")
+        print(f"  P95:  {tpot_stats.get('p95', 0):.2f}")
         print(f"  P99:  {tpot_stats.get('p99', 0):.2f}")
-        print()
-
-    # TPOT exclude first token
-    itls_ex_first = [s.metric.avg_itl_exclude_first for s in completed_seqs if s.metric.avg_itl_exclude_first]
-    if itls_ex_first:
-        print("--- ITL Wo Queue (exclude first token) (ms/token) ---")
-        print(f"  Avg:  {np.mean(itls_ex_first):.2f}")
-        print(f"  P50:  {np.median(itls_ex_first):.2f}")
-        print(f"  P90:  {np.percentile(itls_ex_first, 90):.2f}")
-        print(f"  P99:  {np.percentile(itls_ex_first, 99):.2f}")
         print()
 
     # ITL with decode queue
@@ -312,22 +320,34 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent):
         print(f"  Avg:  {np.mean(itls_with_dq):.2f}")
         print(f"  P50:  {np.median(itls_with_dq):.2f}")
         print(f"  P90:  {np.percentile(itls_with_dq, 90):.2f}")
+        print(f"  P95:  {np.percentile(itls_with_dq, 95):.2f}")
         print(f"  P99:  {np.percentile(itls_with_dq, 99):.2f}")
-        print()
-
-    if tpot_wq_stats:
-        print("--- TPOT with Queueing Time (ms/token) ---")
-        print(f"  Avg:  {tpot_wq_stats.get('avg', 0):.2f}")
-        print(f"  P50:  {tpot_wq_stats.get('p50', 0):.2f}")
-        print(f"  P90:  {tpot_wq_stats.get('p90', 0):.2f}")
-        print(f"  P95:  {tpot_wq_stats.get('p95', 0):.2f}")
-        print(f"  P99:  {tpot_wq_stats.get('p99', 0):.2f}")
         print()
 
     print("--- Goodput (SLO: TPOT with queueing < 100ms) ---")
     print(f"  SLO Success: {slo_success}/{total_seqs}")
     print(f"  Goodput: {goodput:.2f}%")
     print("=" * 60 + "\n")
+    
+    if itl_log_path:
+        print(f"Logging ITL samples to {itl_log_path}...")
+        data = []
+        for s in completed_seqs:
+            if s.metric and s.metric.itl_samples:
+                data.append({
+                    "seq_id": s.seq_id, 
+                    "itl_samples": s.metric.itl_samples,
+                    "prompt_len": s.metric.num_prompt_tokens,
+                    "output_len": s.metric.num_generated_tokens,
+                    "queueing_time_ms": s.metric.queueing_time_ms
+                })
+        
+        if data:
+            df = pd.DataFrame(data)
+            df.to_json(itl_log_path, orient="records", lines=True)
+            print(f"Saved {len(df)} ITL samples to {itl_log_path}.")
+        else:
+            print("No ITL samples to log.")
 
 
 def main():
@@ -358,6 +378,9 @@ def main():
         max_num_batched_tokens=1024000,
         loop_count=args.loop_count,
         routing_strategy=args.routing_strategy,
+        segment_size=args.segment_size,
+        kvcache_block_size=64,
+        max_num_recv_seqs=48
     )
     
     # Print Config
@@ -368,14 +391,14 @@ def main():
     run_warmup(engine, args.max_num_seqs, world_size)
 
     # Prepare Data
-    prompts, sampling_params_list = get_dataset(args)
+    request_generator = get_dataset_generator(args)
     arrival_times = generate_arrival_times(args.num_requests, args.request_rate, args.burstiness)
 
     # Run Benchmark
-    total_time, seq_map = run_benchmark(engine, prompts, sampling_params_list, arrival_times, args.num_requests)
+    total_time, seq_map = run_benchmark(engine, request_generator, arrival_times, args.num_requests)
 
     # Report
-    calculate_and_print_metrics(total_time, seq_map, args.num_requests)
+    calculate_and_print_metrics(total_time, seq_map, args.num_requests, itl_log_path=args.itl_log_path)
 
 
 if __name__ == "__main__":
