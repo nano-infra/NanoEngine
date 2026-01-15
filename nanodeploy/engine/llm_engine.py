@@ -65,11 +65,11 @@ class LLMEngine:
         self.scheduler.free_to_be_migrated(seqs)
 
     def step(self):
-        step_begin = time.perf_counter()
+        step_start = time.perf_counter()
         dp_size = self.config.attention_dp
         sp_size = self.config.attention_sp
         tp_size = self.config.attention_tp
-        sch_begin = time.time()
+        sch_begin = time.perf_counter()
         sch_res = self.scheduler.schedule()
         dp_seqs = sch_res.dp_seqs
         is_prefill = sch_res.is_prefill
@@ -122,7 +122,7 @@ class LLMEngine:
             for dp_idx in range(dp_size)
         ]
 
-        sch_end = time.time()
+        sch_end = time.perf_counter()
         post_sch_begin = 0
         post_sch_end = 0
         if is_prefill and self.config.mode == "decode":
@@ -151,15 +151,16 @@ class LLMEngine:
                             seq.metric.record_first_token()
                             seq.metric.num_generated_tokens = 1
         else:
-            step_start = time.perf_counter()
+            model_runner_start = time.perf_counter()
             token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
+            model_runner_duration_ms = (time.perf_counter() - model_runner_start) * 1000.0
             step_duration_ms = (time.perf_counter() - step_start) * 1000.0
-            post_sch_begin = time.time()
+            post_sch_begin = time.perf_counter()
             self.scheduler.postprocess(
                 filtered_dp_sp_seqs, token_ids, self.metrics_manager,
                 step_duration_ms, self.config.loop_count
             )
-            post_sch_end = time.time()
+            post_sch_end = time.perf_counter()
         outputs = []
         num_tokens = 0
 
@@ -182,20 +183,19 @@ class LLMEngine:
                     outputs.append((seq.seq_id, seq.completion_token_ids))
         
         # Calculate and log ITL for this step
-        step_duration = time.perf_counter() - step_begin
-        itl = step_duration * 1000 / self.config.loop_count
         if not is_prefill:
+            itl = step_duration_ms / self.config.loop_count
             logger.info(
                 {
                     "mode": "prefill" if is_prefill else "decode",
                     "itl": f"{itl:.2f}ms",
                     "waiting_reqs": total_waiting,
-                "sp_seq_lens": sp_seq_lens,  # Per-GPU seq lens
-                # "dp_batch_sizes": dp_batch_sizes,
-                "sp_batch_sizes": sp_batch_sizes,
-                "sp_send_counts": sp_send_counts,
-                "sp_recv_counts": sp_recv_counts,
-                "waiting_head_blocks": waiting_head_blocks,
+                    "sp_seq_lens": sp_seq_lens,  # Per-GPU seq lens
+                    # "dp_batch_sizes": dp_batch_sizes,
+                    "sp_batch_sizes": sp_batch_sizes,
+                    "sp_send_counts": sp_send_counts,
+                    "sp_recv_counts": sp_recv_counts,
+                    "waiting_head_blocks": waiting_head_blocks,
                     "waiting_total_blocks": waiting_total_blocks,
                     # "sp_comm_matrix": sp_comm_matrix,
                     "sp_q_matrix": sp_q_matrix,

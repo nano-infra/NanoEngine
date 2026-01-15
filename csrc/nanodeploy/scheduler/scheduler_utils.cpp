@@ -10,6 +10,7 @@
 #include "nanodeploy/sequence/sequence.h"
 
 #include "thread_pool.h"
+#include <chrono>
 
 #include "scheduler_utils.h"
 
@@ -39,7 +40,9 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                         int                             eos_id,
                         bool                            is_prefill,
                         bool                            update_metrics,
-                        double                          step_itl_ms)
+                        double                          accumulated_step_time_ms,
+                        std::chrono::high_resolution_clock::time_point start_time,
+                        int                             loop_count)
 {
     try {
         std::unordered_set<std::shared_ptr<Sequence>> dummy_set;
@@ -101,7 +104,16 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                     if (seq_is_first_token[seq]) {
                         seq->metric->record_first_token();
                     }
-                    seq->metric->record_step_tokens(num_tokens, step_itl_ms);
+                    
+                    double final_step_itl_ms = 0.0;
+                    if (loop_count > 0) {
+                        auto current_time = std::chrono::high_resolution_clock::now();
+                        double delta_ms = std::chrono::duration<double, std::milli>(current_time - start_time).count();
+                        double total_duration_ms = accumulated_step_time_ms + delta_ms;
+                        final_step_itl_ms = total_duration_ms / loop_count;
+                    }
+
+                    seq->metric->record_step_tokens(num_tokens, final_step_itl_ms);
                 }
             }
         }
@@ -128,7 +140,7 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
                                     int                                                        eos_id,
                                     bool                                                       is_prefill,
                                     bool                                                       update_metrics,
-                                    double                                                     step_duration_ms,
+                                    double                                                     accumulated_step_time_ms,
                                     int                                                        loop_count,
                                     ThreadPool*                                                thread_pool)
 {
@@ -146,6 +158,8 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
     }
 
     std::vector<WorkerContext> contexts(num_dp);
+
+    auto start_time = std::chrono::high_resolution_clock::now();
 
     for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
         auto& ctx  = contexts[dp_idx];
@@ -169,7 +183,7 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
     }
 
     // Calculate step ITL: fair share of step time per token slot
-    double step_itl_ms = (loop_count > 0) ? (step_duration_ms / loop_count) : 0.0;
+    // double step_itl_ms = (loop_count > 0) ? (step_duration_ms / loop_count) : 0.0;
 
     if (thread_pool) {
         std::vector<std::future<void>> futures;
@@ -183,7 +197,9 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
                                                    eos_id,
                                                    is_prefill,
                                                    update_metrics,
-                                                   step_itl_ms));
+                                                   accumulated_step_time_ms,
+                                                   start_time,
+                                                   loop_count));
         }
 
         for (auto& f : futures) {
@@ -202,7 +218,9 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
                                  eos_id,
                                  is_prefill,
                                  update_metrics,
-                                 step_itl_ms);
+                                 accumulated_step_time_ms,
+                                 start_time,
+                                 loop_count);
         }
 
         for (auto& t : threads) {
