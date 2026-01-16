@@ -54,6 +54,14 @@ def parse_args():
                         choices=["RoundRobin", "LeastBatch", "LeastCache"],
                         help="Routing strategy.")
     
+    # Profiler arguments
+    parser.add_argument("--enable-profiler", action="store_true", help="Enable profiler.")
+    parser.add_argument("--profiler-start-step", type=int, default=40, help="Start profiling at this step (step-based mode).")
+    parser.add_argument("--profiling-step", type=int, default=16, help="Number of steps to profile (step-based mode).")
+    parser.add_argument("--profiler-dir", type=str, default="./profiler_logs", help="Directory to save profiler logs.")
+    parser.add_argument("--profiler-start-time", type=float, default=None, help="Start profiling after N seconds (time-based mode).")
+    parser.add_argument("--profiling-duration", type=float, default=None, help="Profile for N seconds (time-based mode).")
+    
     args = parser.parse_args()
     
     if args.dataset == "csv":
@@ -380,7 +388,13 @@ def main():
         routing_strategy=args.routing_strategy,
         segment_size=args.segment_size,
         kvcache_block_size=64,
-        max_num_recv_seqs=48
+        max_num_recv_seqs=48,
+        enable_profiler=args.enable_profiler,
+        profiler_start_step=args.profiler_start_step,
+        profiling_step=args.profiling_step,
+        profiler_dir=args.profiler_dir,
+        profiler_start_time=args.profiler_start_time,
+        profiling_duration=args.profiling_duration
     )
     
     # Print Config

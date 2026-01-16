@@ -1,4 +1,5 @@
 import os
+import time
 
 import numpy as np
 import ray
@@ -114,13 +115,43 @@ class ModelRunner:
 
         self.run_count = 0
         self.profiler = None
+        self.profiler_start_time = None
+        self.profiler_use_time = False
         if getattr(config, "enable_profiler", False):
-            self.profiler_start_step = getattr(config, "profiler_start_step", 10)
-            self.profiler_steps = getattr(config, "profiling_step", 10)
-            self.profiler_end_step = self.profiler_start_step + self.profiler_steps
+            # Check if using time-based profiling
+            profiler_start_time = getattr(config, "profiler_start_time", None)
+            profiling_duration = getattr(config, "profiling_duration", None)
+            
+            if profiler_start_time is not None and profiling_duration is not None:
+                # Time-based profiling mode
+                self.profiler_use_time = True
+                self.profiler_start_time = profiler_start_time
+                self.profiling_duration = profiling_duration
+                self.profiler_start_timestamp = None  # Will be set when profiling starts
+                self.profiler_end_timestamp = None  # Will be set when profiling starts
+                self.profiler_stopped = False  # Track if profiler has been stopped
+                self.profiler_step_count = 0  # Count profiler steps for logging
+                logger.info(
+                    f"Rank {rank}: Profiler enabled (time-based). Start after {self.profiler_start_time}s, duration {self.profiling_duration}s."
+                )
+            else:
+                # Step-based profiling mode (original)
+                self.profiler_use_time = False
+                self.profiler_start_step = getattr(config, "profiler_start_step", 10)
+                self.profiler_steps = getattr(config, "profiling_step", 10)
+                self.profiler_end_step = self.profiler_start_step + self.profiler_steps
+                self.profiler_stopped = False  # Track if profiler has been stopped
+                self.profiler_step_count = 0  # Count profiler steps for logging
+                logger.info(
+                    f"Rank {rank}: Profiler enabled (step-based). Start at {self.profiler_start_step}, duration {self.profiler_steps} steps."
+                )
+            
             profiler_dir = getattr(config, "profiler_dir", "./profiler_logs")
-
             os.makedirs(profiler_dir, exist_ok=True)
+            
+            # Store profiler directory for logging
+            self.profiler_dir = profiler_dir
+            self.profiler_worker_name = f"{self.engine_id}_rank_{self.rank}"
 
             self.profiler = torch.profiler.profile(
                 activities=[
@@ -130,16 +161,24 @@ class ModelRunner:
                 schedule=None,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
                     dir_name=profiler_dir,
-                    worker_name=f"{self.engine_id}_rank_{self.rank}",
+                    worker_name=self.profiler_worker_name,
                     use_gzip=False,
                 ),
                 record_shapes=True,
                 profile_memory=True,
                 with_stack=True,
             )
+            
             logger.info(
-                f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, duration {self.profiler_steps} steps."
+                f"Rank {rank}: Profiler initialized. Directory: {profiler_dir}, Worker name: {self.profiler_worker_name}"
             )
+            
+            # Record the start time for time-based profiling
+            if self.profiler_use_time:
+                self.profiler_init_time = time.time()
+                logger.info(
+                    f"Rank {rank}: Profiler init time recorded: {self.profiler_init_time:.2f}"
+                )
 
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
@@ -638,11 +677,43 @@ class ModelRunner:
 
         loop_count = self.config.loop_count if not is_prefill else 1
         for i in range(loop_count):
-            if self.profiler and self.run_count == self.profiler_start_step:
-                self.profiler.start()
+            current_time = time.time()
+            
+            # Check if should start profiling (time-based or step-based)
+            should_start_profiling = False
+            if self.profiler:
+                if self.profiler_use_time:
+                    # Time-based: check if enough time has passed since initialization
+                    elapsed_time = current_time - self.profiler_init_time
+                    if self.profiler_start_timestamp is None and elapsed_time >= self.profiler_start_time:
+                        should_start_profiling = True
+                else:
+                    # Step-based: check if reached start step
+                    if self.run_count == self.profiler_start_step:
+                        should_start_profiling = True
+            
+            if should_start_profiling:
                 logger.info(
-                    f"Rank {self.rank}: Profiler started at step {self.run_count}"
+                    f"Rank {self.rank}: Starting profiler... (profiler_dir={self.profiler_dir}, worker_name={self.profiler_worker_name})"
                 )
+                try:
+                    self.profiler.start()
+                    if self.profiler_use_time:
+                        self.profiler_start_timestamp = current_time
+                        self.profiler_end_timestamp = current_time + self.profiling_duration
+                        logger.info(
+                            f"Rank {self.rank}: ✓ Profiler STARTED successfully at time {current_time:.2f} "
+                            f"(elapsed {elapsed_time:.2f}s, will run for {self.profiling_duration}s until {self.profiler_end_timestamp:.2f})"
+                        )
+                    else:
+                        logger.info(
+                            f"Rank {self.rank}: ✓ Profiler STARTED successfully at step {self.run_count} "
+                            f"(will run until step {self.profiler_end_step})"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Rank {self.rank}: ✗ Failed to start profiler: {e}", exc_info=True
+                    )
 
             if is_prefill:
                 input_ids, positions = self.prepare_prefill(dp_seqs, is_dummy)
@@ -670,15 +741,99 @@ class ModelRunner:
 
             update_seqs_inner_loop(sp_seqs, sp_rank)
 
-            if self.profiler and self.run_count >= self.profiler_start_step:
-                if self.run_count < self.profiler_end_step:
-                    self.profiler.step()
-
-                if self.run_count == self.profiler_end_step - 1:
-                    self.profiler.stop()
+            # Check if should continue/stop profiling
+            is_profiling = False
+            if self.profiler and not self.profiler_stopped:
+                if self.profiler_use_time:
+                    # Time-based: check if profiling has started
+                    is_profiling = self.profiler_start_timestamp is not None
+                else:
+                    # Step-based: check if reached start step
+                    is_profiling = self.run_count >= self.profiler_start_step
+            
+            if is_profiling:
+                should_continue = False
+                should_stop = False
+                
+                if self.profiler_use_time:
+                    # Time-based: check current time
+                    current_time = time.time()
+                    if current_time < self.profiler_end_timestamp:
+                        should_continue = True
+                    else:
+                        should_stop = True
+                else:
+                    # Step-based: check step count
+                    if self.run_count < self.profiler_end_step:
+                        should_continue = True
+                    elif self.run_count == self.profiler_end_step - 1:
+                        should_stop = True
+                
+                if should_continue:
+                    try:
+                        self.profiler.step()
+                        self.profiler_step_count += 1
+                        # Log every 10 steps or at key intervals
+                        if self.profiler_use_time:
+                            remaining_time = self.profiler_end_timestamp - current_time
+                            if self.profiler_step_count % 10 == 0 or remaining_time < 1.0:
+                                logger.info(
+                                    f"Rank {self.rank}: Profiler step {self.profiler_step_count}, "
+                                    f"remaining time: {remaining_time:.2f}s"
+                                )
+                        else:
+                            remaining_steps = self.profiler_end_step - self.run_count
+                            if self.profiler_step_count % 10 == 0 or remaining_steps <= 2:
+                                logger.info(
+                                    f"Rank {self.rank}: Profiler step {self.profiler_step_count}, "
+                                    f"remaining steps: {remaining_steps}"
+                                )
+                    except RuntimeError as e:
+                        logger.warning(f"Rank {self.rank}: Failed to step profiler: {e}")
+                elif should_stop and not self.profiler_stopped:
                     logger.info(
-                        f"Rank {self.rank}: Profiler stopped and saved at step {self.run_count}"
+                        f"Rank {self.rank}: Stopping profiler... (profiler_dir={self.profiler_dir}, worker_name={self.profiler_worker_name})"
                     )
+                    try:
+                        self.profiler.stop()
+                        self.profiler_stopped = True
+                        # Reset timestamps to prevent further profiling attempts
+                        if self.profiler_use_time:
+                            elapsed_profiling_time = current_time - self.profiler_start_timestamp
+                            self.profiler_start_timestamp = None
+                            self.profiler_end_timestamp = None
+                            # Construct expected trace file path
+                            trace_file = os.path.join(
+                                self.profiler_dir,
+                                self.profiler_worker_name,
+                                "*.pt.trace.json"
+                            )
+                            logger.info(
+                                f"Rank {self.rank}: ✓ Profiler STOPPED and saved successfully at time {current_time:.2f} "
+                                f"(profiled for {elapsed_profiling_time:.2f}s, {self.profiler_step_count} steps). "
+                                f"Trace files should be in: {os.path.join(self.profiler_dir, self.profiler_worker_name)}"
+                            )
+                        else:
+                            trace_file = os.path.join(
+                                self.profiler_dir,
+                                self.profiler_worker_name,
+                                "*.pt.trace.json"
+                            )
+                            logger.info(
+                                f"Rank {self.rank}: ✓ Profiler STOPPED and saved successfully at step {self.run_count} "
+                                f"({self.profiler_step_count} profiler steps). "
+                                f"Trace files should be in: {os.path.join(self.profiler_dir, self.profiler_worker_name)}"
+                            )
+                    except RuntimeError as e:
+                        logger.error(
+                            f"Rank {self.rank}: ✗ Failed to stop profiler: {e}", exc_info=True
+                        )
+                        self.profiler_stopped = True  # Mark as stopped even if error occurred
+                    except Exception as e:
+                        logger.error(
+                            f"Rank {self.rank}: ✗ Unexpected error stopping profiler: {e}", exc_info=True
+                        )
+                        self.profiler_stopped = True
 
             self.run_count += 1  # 每次调用计数+1
             get_context().token_ids.append(input_ids[None, ...])

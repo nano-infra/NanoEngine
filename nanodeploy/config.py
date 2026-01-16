@@ -51,6 +51,9 @@ class Config:
     profiler_start_step: int = 40
     profiling_step: int = 16
     profiler_dir: str = "/mnt/nvme1n1/ml_research/linbinbin1/profiler_res"
+    # Time-based profiling (in seconds). If set, will use time instead of steps.
+    profiler_start_time: float | None = None  # Start profiling after N seconds
+    profiling_duration: float | None = None  # Profile for N seconds
 
     # performance optimization
     use_dlslime_rpc: bool = True
