@@ -19,6 +19,12 @@ enum class RoutingStrategy {
     LeastCache
 };
 
+enum class SPMasterSelector {
+    RoundRobin,
+    LeastBatch,
+    LeastCache
+};
+
 class SPStateManager {
 public:
     SPStateManager(const std::string& engine_id,
@@ -29,11 +35,20 @@ public:
                    int                max_num_batched_tokens,
                    int                max_num_recv_seqs,
                    double             reserved_blocks_per_req,
-                   int                segment_size);
+                   int                segment_size,
+                   bool               enable_dynamic_sp_size,
+                   bool               enable_non_uniform_split,
+                   const std::string& sp_master_selector);
 
-    void set_dp_idx(int dp_idx) { dp_idx_ = dp_idx; }
+    void set_dp_idx(int dp_idx)
+    {
+        dp_idx_ = dp_idx;
+    }
 
-    int segment_size() const { return segment_size_; }
+    int segment_size() const
+    {
+        return segment_size_;
+    }
 
     // State queries
     bool is_empty() const
@@ -84,7 +99,10 @@ public:
         return num_running_tokens_;
     }
 
-    int num_recv_seqs_per_sp(int sp_idx) const { return num_recv_seqs_per_sp_[sp_idx]; }
+    int num_recv_seqs_per_sp(int sp_idx) const
+    {
+        return num_recv_seqs_per_sp_[sp_idx];
+    }
 
     // WARNING: This method modifies shared state without thread safety protection.
     // If called concurrently from multiple threads (e.g., in worker_func),
@@ -103,7 +121,7 @@ public:
 
 private:
     void initialize_dummy_seqs();
-    int  next_sp_idx();  // Round-robin counter
+    int  select_master_rank();
 
     std::string engine_id_;
     int         dp_idx_ = -1;
@@ -120,6 +138,12 @@ private:
     int              num_running_seqs_   = 0;
     int              num_running_tokens_ = 0;
     std::vector<int> num_recv_seqs_per_sp_;
+
+    bool enable_dynamic_sp_size_;
+    bool enable_non_uniform_split_;
+
+    SPMasterSelector master_selector_;
+    std::vector<int> master_seq_counts_;
 };
 
 }  // namespace nanodeploy

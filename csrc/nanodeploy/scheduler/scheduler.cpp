@@ -23,7 +23,10 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                kvcache_block_size,
                      const std::string& mode,
                      double             reserved_blocks_per_req,
-                     int                segment_size):
+                     int                segment_size,
+                     bool               enable_dynamic_sp_size,
+                     bool               enable_non_uniform_split,
+                     const std::string& sp_master_selector) :
     engine_id_(engine_id),
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
@@ -34,7 +37,10 @@ Scheduler::Scheduler(const std::string& engine_id,
     attention_sp_(attention_sp),
     mode_(mode),
     reserved_blocks_per_req_(reserved_blocks_per_req),
-    segment_size_(segment_size)
+    segment_size_(segment_size),
+    enable_dynamic_sp_size_(enable_dynamic_sp_size),
+    enable_non_uniform_split_(enable_non_uniform_split),
+    sp_master_selector_(sp_master_selector)
 {
     Sequence::block_size = kvcache_block_size;
     // Initialize worker states
@@ -43,10 +49,11 @@ Scheduler::Scheduler(const std::string& engine_id,
         auto sp_manager = std::make_shared<SPStateManager>(
             engine_id_, attention_sp_, num_kvcache_blocks, kvcache_block_size, 
             max_num_seqs_, max_num_batched_tokens_, max_num_recv_seqs_,
-            reserved_blocks_per_req_, segment_size_);
+            reserved_blocks_per_req_, segment_size_, enable_dynamic_sp_size_, 
+            enable_non_uniform_split,
+            sp_master_selector);
         
         sp_manager->set_dp_idx(dp_idx);
-        
         worker_state.push_back(sp_manager);
     }
     std::cerr << "[Scheduler] Initialized with segment_size=" << segment_size_ << std::endl;
@@ -194,14 +201,18 @@ ScheduleResult Scheduler::schedule()
                 }
 
                 if (!is_dummy) {
-                    const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+                    const auto& block_ctx    = seq->block_ctx(BlockContextSlot::ACTIVE);
+                    const auto& tokens       = block_ctx.num_dispatched_tokens;
+                    
                     int         active_ranks = 0;
                     for (int count : tokens) {
                         if (count > 0)
                             active_ranks++;
                     }
 
-                    if (active_ranks > 1 && tokens[sp_idx] > 0) {
+                    int master_sp_idx = block_ctx.master_sp_idx_;
+
+                    if (active_ranks > 1 && tokens[sp_idx] > 0 && master_sp_idx != sp_idx) {
                         recv_count++;
                     }
                 }
@@ -513,7 +524,7 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
 
     seq->status = SequenceStatus::WAITING;
     worker_state[dp_idx]->deallocate(*seq);
-
+    
     // Re-initialize BlockContext for fresh scheduling
     seq->active(engine_id_, attention_sp_, attention_dp_);
 
@@ -528,12 +539,12 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
 void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
                             const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
                             bool                                                       update_metrics,
-                            double                                                     step_duration_ms,
+                            double                                                     accumulated_step_time_ms,
                             int                                                        loop_count)
 {
     // Call the C++ postprocess_sequences utility directly with shared_ptrs
     auto migrations = postprocess_sequences(
-        worker_state, dp_sp_seqs, dp_sp_token_ids, eos_, mode_ == "prefill", update_metrics, step_duration_ms, loop_count, thread_pool_.get());
+        worker_state, dp_sp_seqs, dp_sp_token_ids, eos_, mode_ == "prefill", update_metrics, accumulated_step_time_ms, loop_count, thread_pool_.get());
 
     // Store migrations
     for (const auto& [seq_shared, dp_idx] : migrations) {
