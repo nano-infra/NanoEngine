@@ -80,6 +80,10 @@ def fused_add_rms_norm_kernel(
 
 
 def rms_norm_triton(x: torch.Tensor, weight: torch.Tensor, eps: float):
+    # Flatten if needed, assuming [..., hidden_size]
+    orig_shape = x.shape
+    x = x.reshape(-1, orig_shape[-1])
+    
     n_rows, n_elements = x.shape
     out = torch.empty_like(x)
     
@@ -90,14 +94,14 @@ def rms_norm_triton(x: torch.Tensor, weight: torch.Tensor, eps: float):
         out, x, weight, n_elements, eps,
         BLOCK_SIZE=BLOCK_SIZE
     )
-    return out
+    return out.reshape(orig_shape)
 
 
 def fused_add_rms_norm_triton(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
     # Flatten if needed, assuming [..., hidden_size]
     orig_shape = x.shape
-    x = x.view(-1, orig_shape[-1])
-    residual = residual.view(-1, orig_shape[-1])
+    x = x.reshape(-1, orig_shape[-1])
+    residual = residual.reshape(-1, orig_shape[-1])
     
     n_rows, n_elements = x.shape
     
@@ -109,4 +113,4 @@ def fused_add_rms_norm_triton(x: torch.Tensor, residual: torch.Tensor, weight: t
         BLOCK_SIZE=BLOCK_SIZE
     )
     
-    return x.view(orig_shape), residual.view(orig_shape)
+    return x.reshape(orig_shape), residual.reshape(orig_shape)
