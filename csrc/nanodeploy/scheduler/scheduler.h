@@ -86,7 +86,8 @@ public:
               int                segment_size,
               bool               enable_dynamic_sp_size,
               bool               enable_non_uniform_split,
-              const std::string& sp_master_selector);
+              const std::string& sp_master_selector,
+              bool               sp_debug);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -150,6 +151,7 @@ private:
     int         segment_size_;
     bool        enable_dynamic_sp_size_;
     bool        enable_non_uniform_split_;
+    bool        sp_debug_;
 
     std::string sp_master_selector_;
 

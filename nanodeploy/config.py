@@ -71,6 +71,9 @@ class Config:
     # Strategy for how to select 
     sp_master_selector: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
 
+    # Debug mode for SP allocation (uses simplified RoundRobin + segment-based allocation)
+    sp_debug: bool = False
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         self.hf_config = AutoConfig.from_pretrained(self.model)

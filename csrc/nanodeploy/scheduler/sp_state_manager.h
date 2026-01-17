@@ -38,7 +38,8 @@ public:
                    int                segment_size,
                    bool               enable_dynamic_sp_size,
                    bool               enable_non_uniform_split,
-                   const std::string& sp_master_selector);
+                   const std::string& sp_master_selector,
+                   bool               sp_debug = false);
 
     void set_dp_idx(int dp_idx)
     {
@@ -109,6 +110,7 @@ public:
     // this will cause race conditions on the counters.
     void add_running_tokens(int sp_idx, int count)
     {
+        (void)sp_idx;  // Unused parameter (reserved for future use)
         num_running_tokens_ += count;
     }
 
@@ -141,6 +143,7 @@ private:
 
     bool enable_dynamic_sp_size_;
     bool enable_non_uniform_split_;
+    bool sp_debug_;
 
     SPMasterSelector master_selector_;
     std::vector<int> master_seq_counts_;

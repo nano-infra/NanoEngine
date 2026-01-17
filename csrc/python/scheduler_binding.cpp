@@ -112,7 +112,7 @@ void bind_scheduler_utils(py::module_& m)
     // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
         .def(py::init<const std::string&, int, int, int, int, int, int, int, int, int, 
-              const std::string&, double, int, bool, bool, const std::string&>(),
+              const std::string&, double, int, bool, bool, const std::string&, bool>(),
              py::arg("engine_id"),
              py::arg("loop_count"),
              py::arg("max_num_seqs"),
@@ -128,7 +128,8 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("segment_size") = 65536,
              py::arg("enable_dynamic_sp_size"),
              py::arg("enable_non_uniform_split"),
-             py::arg("sp_master_selector"))
+             py::arg("sp_master_selector"),
+             py::arg("sp_debug") = false)
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))
