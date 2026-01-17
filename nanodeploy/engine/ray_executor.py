@@ -164,7 +164,13 @@ class RayExecutor:
                 worker = ModelRunner.options(placement_group=pg).remote(config, rank)
                 self.workers.append(worker)
 
-        self.endpoint = RPCServerEndpoint(2*32_000_000, self.config.attn_world_size)
+        self.endpoint = RPCServerEndpoint(
+            2*32_000_000, 
+            self.config.attn_world_size,
+            self.config.attention_sp,
+            self.config.attention_tp,
+            self.config.optimize_decode_block_table
+        )
 
         logger.info("All workers scheduled successfully.")
 

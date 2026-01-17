@@ -764,9 +764,12 @@ class ModelRunner:
                         should_stop = True
                 else:
                     # Step-based: check step count
+                    # Note: run_count increments at the end of the loop, so we check before incrementing
+                    # We want to profile from start_step to (start_step + profiling_steps - 1)
+                    # After the last step, run_count will be >= profiler_end_step
                     if self.run_count < self.profiler_end_step:
                         should_continue = True
-                    elif self.run_count == self.profiler_end_step - 1:
+                    else:
                         should_stop = True
                 
                 if should_continue:

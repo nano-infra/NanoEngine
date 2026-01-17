@@ -57,6 +57,9 @@ class Config:
 
     # performance optimization
     use_dlslime_rpc: bool = True
+    # Optimize Block Table transmission in Decode phase: if True, only send BlockTable
+    # for sequences that have KVCache on the target rank; if False, send all BlockTables
+    optimize_decode_block_table: bool = True
 
     # reserve for decode
     reserved_blocks_per_req: float = 1.0

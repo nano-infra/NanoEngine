@@ -117,17 +117,40 @@ void deserialize_block_context(uintptr_t base, size_t& off, size_t max, BlockCon
 size_t serialize_sequences(uintptr_t                                     data_ptr,
                            size_t                                        buffer_size,
                            const std::vector<std::shared_ptr<Sequence>>& seqs,
-                           bool                                          is_prefill)
+                           bool                                          is_prefill,
+                           int                                           sp_rank,
+                           int                                           sp_size)
 {
     size_t off = 0;
 
-    // 写入数量
-    size_t count = seqs.size();
+    // 在Decode阶段，先过滤出需要传输的序列（即在该rank上有KVCache的序列）
+    std::vector<std::shared_ptr<Sequence>> filtered_seqs;
+    if (!is_prefill && sp_rank >= 0 && sp_size > 0) {
+        // Decode阶段：只传输在该rank上有KVCache的序列
+        for (const auto& seq_ptr : seqs) {
+            if (!seq_ptr)
+                continue;
+            // 检查该序列是否在目标rank上有KVCache
+            // 注意：seq_ptr是shared_ptr，解引用后使用非const的context_len方法
+            int ctx_len = seq_ptr->context_len(BlockContextSlot::ACTIVE, std::optional<int>(sp_rank));
+            if (ctx_len > 0) {
+                filtered_seqs.push_back(seq_ptr);
+            }
+        }
+    } else {
+        // Prefill阶段或未提供sp_rank/sp_size：传输所有序列
+        for (const auto& seq_ptr : seqs) {
+            if (seq_ptr) {
+                filtered_seqs.push_back(seq_ptr);
+            }
+        }
+    }
+
+    // 写入数量（过滤后的序列数量）
+    size_t count = filtered_seqs.size();
     write_raw(data_ptr, off, buffer_size, count);
 
-    for (const auto& seq_ptr : seqs) {
-        if (!seq_ptr)
-            continue;
+    for (const auto& seq_ptr : filtered_seqs) {
         const auto& seq = *seq_ptr;
 
         write_raw(data_ptr, off, buffer_size, seq.seq_id);
@@ -155,6 +178,7 @@ size_t serialize_sequences(uintptr_t                                     data_pt
         }
 
         // Slots (BlockContexts)
+        // 在Decode阶段，我们已经过滤了序列，所以传输的序列肯定有KVCache，需要传输完整的BlockContext
         for (size_t i = 0; i < (size_t)BlockContextSlot::_COUNT; ++i) {
             serialize_block_context(data_ptr, off, buffer_size, seq.slots_[i]);
         }
