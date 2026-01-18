@@ -6,6 +6,8 @@
 1. GQA (Grouped Query Attention) - 使用FlashAttention
 2. MLA (Multi-head Latent Attention) - 使用FlashMLA
 
+注意：测试用例假设整个系统中只有1个请求（batch_size=1），默认Master Rank=0。
+
 测试包括：
 1. Q的all-to-all通信
 2. Attention计算（FlashAttention或FlashMLA）
@@ -27,6 +29,8 @@
 
 import os
 import time
+import csv
+from datetime import datetime
 from typing import Optional, Literal
 
 import torch
@@ -229,8 +233,8 @@ def sp_attention_forward_gqa(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     global_context_lens: torch.Tensor,
-    q_mask: torch.Tensor,
-    res_lse_mask: torch.Tensor,
+    q_mask_adjusted: torch.Tensor,
+    res_lse_mask_adjusted: torch.Tensor,
     q_slice_get: torch.Tensor,
     q_slice_fill: torch.Tensor,
     q_copy_mask: torch.Tensor,
@@ -257,8 +261,8 @@ def sp_attention_forward_gqa(
         context_lens: Context lengths for attention computation
         block_tables: Block tables for paged attention
         global_context_lens: Global context lengths [sp_size, batch_size]
-        q_mask: Q mask for all-to-all [sp_size, batch_size]
-        res_lse_mask: Result/LSE mask for all-to-all [sp_size, batch_size]
+        q_mask_adjusted: Adjusted Q mask for all-to-all [sp_size, batch_size] (precomputed)
+        res_lse_mask_adjusted: Adjusted Result/LSE mask for all-to-all [sp_size, batch_size] (precomputed)
         q_slice_get: Q slice get indices
         q_slice_fill: Q slice fill indices
         q_copy_mask: Q copy mask
@@ -297,9 +301,12 @@ def sp_attention_forward_gqa(
     )
 
     # Q all-to-all
+    # 对于只有1个请求，Master Rank=0的情况：
+    #   - Rank 0: q_mask_adjusted[0]=0（不发送给自己），q_mask_adjusted[1]=1（发送给Rank 1）
+    #   - Rank 1: q_mask_adjusted全0（没有Q，不需要发送）
     q = q_buffer.all_to_all_ll(
         q.view([bs, -1]),
-        mask=q_mask,
+        mask=q_mask_adjusted,
         offsets=q_offsets,
     ).view([sp_size * max_num_seqs, num_head, head_dim])
 
@@ -315,7 +322,7 @@ def sp_attention_forward_gqa(
         cache_seqlens=context_lens_for_attn,
         page_table=block_tables_for_attn,
         softmax_scale=scale,
-        causal=False,
+        causal=True,
         return_softmax_lse=True,
     )[:2]
 
@@ -381,12 +388,12 @@ def sp_attention_forward_gqa(
     # All-to-all for results
     all_ranks_res_output_combine = res_buffer.all_to_all_ll(
         res_all_to_all_input_buffer.view(sp_size * max_num_seqs, -1),
-        mask=res_lse_mask,
+        mask=res_lse_mask_adjusted,
         is_transpose=True,
     ).view(sp_size, max_num_seqs, num_head, head_dim)
     all_ranks_lse_output_combine = lse_buffer.all_to_all_ll(
         lse_all_to_all_input_buffer.view(sp_size * max_num_seqs, -1),
-        mask=res_lse_mask,
+        mask=res_lse_mask_adjusted,
         is_transpose=True,
     ).view(sp_size, max_num_seqs, num_head, 1)
 
@@ -412,8 +419,8 @@ def sp_attention_forward_mla(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     global_context_lens: torch.Tensor,
-    q_mask: torch.Tensor,
-    res_lse_mask: torch.Tensor,
+    q_mask_adjusted: torch.Tensor,
+    res_lse_mask_adjusted: torch.Tensor,
     q_slice_get: torch.Tensor,
     q_slice_fill: torch.Tensor,
     q_copy_mask: torch.Tensor,
@@ -429,6 +436,9 @@ def sp_attention_forward_mla(
     v_head_dim: int,
     scale: float,
     sp_size: int,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    debug: bool = False,
 ) -> torch.Tensor:
     """
     SP Attention Forward Pass (MLA with FlashMLA)
@@ -437,10 +447,12 @@ def sp_attention_forward_mla(
         q: Query tensor [batch_size, num_heads, head_dim]
         k_cache: Key cache tensor (MLA only needs k_cache, not v_cache)
         context_lens: Context lengths for attention computation
+        tile_scheduler_metadata: Precomputed MLA metadata (computed once during initialization)
+        num_splits: Precomputed MLA num_splits (computed once during initialization)
         block_tables: Block tables for paged attention
         global_context_lens: Global context lengths [sp_size, batch_size]
-        q_mask: Q mask for all-to-all [sp_size, batch_size]
-        res_lse_mask: Result/LSE mask for all-to-all [sp_size, batch_size]
+        q_mask_adjusted: Adjusted Q mask for all-to-all [sp_size, batch_size] (precomputed)
+        res_lse_mask_adjusted: Adjusted Result/LSE mask for all-to-all [sp_size, batch_size] (precomputed)
         q_slice_get: Q slice get indices
         q_slice_fill: Q slice fill indices
         q_copy_mask: Q copy mask
@@ -456,6 +468,9 @@ def sp_attention_forward_mla(
         v_head_dim: V head dimension (for output)
         scale: Attention scale
         sp_size: SP world size
+        tile_scheduler_metadata: Precomputed MLA metadata (computed once during initialization)
+        num_splits: Precomputed MLA num_splits (computed once during initialization)
+        debug: Enable debug logging
         
     Returns:
         Output tensor [batch_size, num_heads, v_head_dim]
@@ -482,26 +497,18 @@ def sp_attention_forward_mla(
     )
 
     # Q all-to-all (MLA doesn't use offsets)
+    # 使用调整后的mask
     q = q_buffer.all_to_all_ll(
         q.view([bs, -1]),
-        mask=q_mask,
+        mask=q_mask_adjusted,
     ).view([sp_size * max_num_seqs, num_head, head_dim_q])
 
     q = q[:attention_compute_bs]
     context_lens_for_attn = context_lens[:attention_compute_bs]
     block_tables_for_attn = block_tables[:attention_compute_bs]
 
-    # Get MLA metadata
-    # For MLA: num_query_heads_per_kv = num_heads // num_kv_heads = num_heads // 1 = num_heads
-    # This matches the project implementation: self.num_heads // self.num_kv_heads
-    num_query_heads_per_kv = num_heads // 1  # For MLA, num_kv_heads is always 1
-    print(f"[TEST] get_mla_metadata: context_lens_for_attn.shape={context_lens_for_attn.shape}, "
-          f"num_query_heads_per_kv={num_query_heads_per_kv}, num_kv_heads=1")
-    tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
-        context_lens_for_attn,
-        num_query_heads_per_kv,  # num_heads // num_kv_heads (same as project: self.num_heads // self.num_kv_heads)
-        1,  # num_kv_heads (MLA requires num_kv_heads == 1)
-    )
+    # tile_scheduler_metadata and num_splits are precomputed during initialization
+    # and passed as parameters to avoid recalculating on each forward pass
 
     # Attention computation with FlashMLA
     # Note: For MLA:
@@ -520,18 +527,20 @@ def sp_attention_forward_mla(
     q_for_attn = q.unsqueeze(1)
     
     # Debug logs - match format with FlashMLAImpl
-    print(f"[TEST] Before flash_mla_with_kvcache:")
-    print(f"  q.shape: {q.shape}, q_for_attn.shape: {q_for_attn.shape}")
-    print(f"  k_cache.shape: {k_cache.shape}")
-    print(f"  k_cache last dimension: {k_cache.shape[-1]}")
-    print(f"  block_tables_for_attn.shape: {block_tables_for_attn.shape}")
-    print(f"  context_lens_for_attn.shape: {context_lens_for_attn.shape}")
-    print(f"  v_head_dim parameter: {v_head_dim} (type: {type(v_head_dim)})")
-    print(f"  head_dim parameter: {head_dim} (type: {type(head_dim)})")
-    print(f"  num_heads: {num_heads}, num_kv_heads: 1")
-    print(f"  scale: {scale}, causal: False")
-    print(f"  tile_scheduler_metadata type: {type(tile_scheduler_metadata)}")
-    print(f"  num_splits.shape: {num_splits.shape if hasattr(num_splits, 'shape') else type(num_splits)}")
+    if debug:
+        print(f"[TEST] Before flash_mla_with_kvcache:")
+        print(f"  q.shape: {q.shape}, q_for_attn.shape: {q_for_attn.shape}")
+        print(f"  k_cache.shape: {k_cache.shape}")
+        print(f"  k_cache last dimension: {k_cache.shape[-1]}")
+        print(f"  block_tables_for_attn.shape: {block_tables_for_attn.shape}")
+        print(f"  context_lens_for_attn.shape: {context_lens_for_attn.shape}")
+        print(f"  context_lens_for_attn: {context_lens_for_attn}")
+        print(f"  v_head_dim parameter: {v_head_dim} (type: {type(v_head_dim)})")
+        print(f"  head_dim parameter: {head_dim} (type: {type(head_dim)})")
+        print(f"  num_heads: {num_heads}, num_kv_heads: 1")
+        print(f"  scale: {scale}, causal: True")
+        print(f"  tile_scheduler_metadata type: {type(tile_scheduler_metadata)}")
+        print(f"  num_splits.shape: {num_splits.shape if hasattr(num_splits, 'shape') else type(num_splits)}")
     
     # For MLA: k_cache uses head_dim (576) for K, but v_head_dim (512) is passed to flash_mla_with_kvcache
     # This matches the working environment: k_cache.shape[-1]=576, but v_head_size=512
@@ -548,15 +557,17 @@ def sp_attention_forward_mla(
         tile_scheduler_metadata,
         num_splits,
         scale,
-        causal=False,
+        causal=True,
     )
     
-    print(f"[TEST] After flash_mla_with_kvcache:")
-    print(f"  o.shape (before squeeze): {o.shape}")
-    print(f"  lse.shape: {lse.shape}")
+    if debug:
+        print(f"[TEST] After flash_mla_with_kvcache:")
+        print(f"  o.shape (before squeeze): {o.shape}")
+        print(f"  lse.shape: {lse.shape}")
 
     o = o.squeeze(1)
-    print(f"  o.shape (after squeeze): {o.shape}")
+    if debug:
+        print(f"  o.shape (after squeeze): {o.shape}")
     # Verify output shape matches expected v_head_dim
     if o.shape[-1] != v_head_dim:
         print(f"[WARNING] Output shape mismatch: o.shape[-1]={o.shape[-1]}, expected v_head_dim={v_head_dim}")
@@ -623,12 +634,12 @@ def sp_attention_forward_mla(
     # All-to-all for results
     all_ranks_res_output_combine = res_buffer.all_to_all_ll(
         res_all_to_all_input_buffer.view(sp_size * max_num_seqs, -1),
-        mask=res_lse_mask,
+        mask=res_lse_mask_adjusted,
         is_transpose=True,
     ).view(sp_size, max_num_seqs, num_head, v_head_dim)
     all_ranks_lse_output_combine = lse_buffer.all_to_all_ll(
         lse_all_to_all_input_buffer.view(sp_size * max_num_seqs, -1),
-        mask=res_lse_mask,
+        mask=res_lse_mask_adjusted,
         is_transpose=True,
     ).view(sp_size, max_num_seqs, num_head, 1)
 
@@ -649,7 +660,6 @@ def sp_attention_forward_mla(
 
 
 def create_test_data(
-    batch_size: int,
     num_heads: int,
     head_dim: int,
     num_kv_heads: int,
@@ -662,7 +672,11 @@ def create_test_data(
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ):
-    """创建测试数据"""
+    """创建测试数据
+    注意：整个系统中只有1个请求（batch_size=1），Master Rank=0
+    """
+    batch_size = 1  # 固定为1，整个系统只有一个请求
+    
     # Q tensor
     q = torch.randn(batch_size, num_heads, head_dim, dtype=dtype, device=device)
 
@@ -693,18 +707,9 @@ def create_test_data(
         # MLA doesn't use v_cache, but we'll create a dummy tensor for compatibility
         v_cache = torch.tensor([], dtype=dtype, device=device)
 
-    # Block tables
-    num_pages = seq_len // page_size
-    block_tables = torch.arange(
-        batch_size * num_pages, device=device, dtype=torch.int32
-    ).view(batch_size, num_pages)
-
-    # Context lengths
-    context_lens = torch.full(
-        (max_num_seqs,), seq_len, dtype=torch.int32, device=device
-    )
-
     # Global context lengths [sp_size, batch_size]
+    # 表示每个rank处理每个序列的token数量
+    # 每个序列的KVCache被均分到所有SP ranks
     global_context_lens = torch.zeros(
         sp_size, max_num_seqs, dtype=torch.int32, device=device
     )
@@ -718,12 +723,65 @@ def create_test_data(
                     segment_len += 1
                 global_context_lens[sp_idx, i] = segment_len
 
-    # Masks and indices
-    q_mask = torch.zeros(sp_size, max_num_seqs, dtype=torch.int32, device=device)
-    q_mask[:, :batch_size] = 1
+    # Block tables
+    # 每个rank的block数量应该按照该rank处理的token数量来计算
+    # 对于每个序列，计算每个rank需要的pages数量
+    # 注意：所有ranks都创建相同的block_tables结构，但每个rank实际只使用自己负责的部分
+    # 实际上，block_tables应该是每个rank按照自己处理的segment_len来创建
+    # 但由于所有ranks都创建相同的test_data结构，我们使用segment_len（第一个rank的长度）来创建
+    segment_len_per_rank = seq_len // sp_size  # 每个rank处理的token数量（均匀分配时）
+    num_pages_per_rank = segment_len_per_rank // page_size  # 每个rank的pages数量
+    block_tables = torch.arange(
+        batch_size * num_pages_per_rank, device=device, dtype=torch.int32
+    ).view(batch_size, num_pages_per_rank)
 
-    res_lse_mask = torch.zeros(sp_size, max_num_seqs, dtype=torch.int32, device=device)
-    res_lse_mask[:, :batch_size] = 1
+    # Context lengths
+    # context_lens应该设置为每个rank实际处理的token数量
+    # 对于均匀分配：每个rank处理 seq_len // sp_size 个tokens
+    segment_len = seq_len // sp_size
+    context_lens = torch.full(
+        (max_num_seqs,), segment_len, dtype=torch.int32, device=device
+    )
+
+    # Q mask: Q需要发送到所有有KVCache的ranks
+    # 根据model_runner.py的实现逻辑:
+    #   q_mask = global_context_lens.clone()
+    #   q_mask[sp_rank].fill_(0)  # 不发送给自己
+    #   q_mask[q_mask != 0] = 1   # 其他有KVCache的ranks设为1
+    # 含义：q_mask[target_rank, seq_id] = 1 表示当前rank需要向target_rank发送seq_id的Q
+    # 
+    # 对于测试用例：只有1个请求（seq_id=0），Master Rank=0
+    # - Q在Master Rank (Rank 0)，需要发送到所有有KVCache的ranks（Rank 0-7）
+    # - 但在实际执行时，Rank 0会将自己的位置fill_(0)，所以只发送给Rank 1-7
+    # - Rank 1-7没有Q，所以它们的q_mask应该全0（不会发送）
+    # 注意：当前代码中所有ranks都使用相同的q_mask（基于global_context_lens），
+    # 但只有Master Rank (Rank 0)会真正使用q_mask发送Q，其他ranks虽然有相同的q_mask值，
+    # 但由于它们没有Q，实际上不会执行Q的发送操作
+    q_mask = global_context_lens.clone()
+    # 运行时，每个rank会将自己的rank位置fill_(0)（不发送给自己）
+
+    # Res/LSE mask: 结果只发送回Master Rank
+    # 根据model_runner.py的实现逻辑:
+    #   res_lse_mask = context_lens.clone()
+    #   res_lse_mask[sp_rank].fill_(0)  # 不发送给自己
+    #   res_lse_mask[res_lse_mask != 0] = 1
+    # 含义：res_lse_mask[target_rank, seq_id] = 1 表示当前rank需要向target_rank发送seq_id的结果
+    # 
+    # 对于测试用例：只有1个请求（seq_id=0），Master Rank=0
+    # - 所有ranks的结果都发送回Master Rank (Rank 0)
+    # - Rank 0: res_lse_mask[0, 0]会被fill_(0)，但res_lse_mask其他位置都是0（不需要发送给其他ranks）
+    # - Rank 1: res_lse_mask[0, 0] = context_len（非0），表示需要发送给Rank 0
+    # 使用context_lens作为基础，因为所有ranks都有完整的context_len
+    res_lse_mask = context_lens[:max_num_seqs].unsqueeze(0).expand(sp_size, -1).clone()
+    # 运行时，每个rank会将自己的rank位置fill_(0)（不发送给自己）
+    # 但我们需要确保只有Master Rank (Rank 0)接收结果
+    # 实际上，应该设置为：只有Rank 0的位置为非0，其他都为0
+    res_lse_mask.zero_()
+    for i in range(batch_size):
+        if i < max_num_seqs:
+            # 只有Master Rank (Rank 0)接收结果
+            # 设置为非0值（context_len），表示所有ranks都需要向Rank 0发送
+            res_lse_mask[0, i] = context_lens[i]
 
     q_slice_get = torch.arange(batch_size, dtype=torch.int32, device=device)
     q_slice_fill = torch.arange(batch_size, dtype=torch.int32, device=device)
@@ -784,7 +842,6 @@ def create_test_data(
 
 
 def benchmark_sp_attention_with_cudagraph(
-    batch_size: int,
     seq_len: int,
     num_heads: int,
     head_dim: int,
@@ -795,12 +852,16 @@ def benchmark_sp_attention_with_cudagraph(
     use_cudagraph: bool = True,
     num_warmup: int = 100,
     num_iterations: int = 200,
+    debug: bool = False,
+    enable_profiler: bool = False,
+    profiler_iterations: int = 50,
 ):
     """
     使用CUDA Graph对SP Attention进行性能测试
     
+    注意：整个系统中只有1个请求（batch_size=1），Master Rank=0
+    
     Args:
-        batch_size: Batch size
         seq_len: Sequence length
         num_heads: Number of query heads
         head_dim: Head dimension (for Q and K)
@@ -811,7 +872,12 @@ def benchmark_sp_attention_with_cudagraph(
         use_cudagraph: Whether to use CUDA Graph
         num_warmup: Number of warmup iterations
         num_iterations: Number of benchmark iterations
+        debug: Enable debug logging for tensor shapes
+        enable_profiler: Whether to run profiler after benchmark
+        profiler_iterations: Number of iterations to profile (default: 50)
     """
+    batch_size = 1  # 固定为1，整个系统只有一个请求
+    
     # Validate attention type
     if attention_type == "MLA":
         if num_kv_heads != 1:
@@ -828,7 +894,8 @@ def benchmark_sp_attention_with_cudagraph(
     
     device = "cuda"
     dtype = torch.bfloat16
-    max_num_seqs = batch_size * 2  # 留一些空间给recv sequences
+    batch_size = 1  # 固定为1，整个系统只有一个请求
+    max_num_seqs = 2  # 留一些空间，但实际上只有1个请求
     
     # MLA mode requires block_size=64, GQA can use page_size=16
     if attention_type == "MLA":
@@ -871,13 +938,14 @@ def benchmark_sp_attention_with_cudagraph(
     print(f"SP Attention Performance Test with CUDA Graph")
     print(f"{'='*80}")
     print(f"Attention Type: {attention_type}")
-    print(f"Batch Size: {batch_size}")
+    print(f"Batch Size: {batch_size} (fixed, single request in entire system)")
     print(f"Sequence Length: {seq_len}")
     print(f"Num Heads: {num_heads}, Num KV Heads: {num_kv_heads}")
     print(f"Head Dim: {head_dim}")
     if attention_type == "MLA":
         print(f"V Head Dim: {v_head_dim}")
     print(f"SP Size: {attention_sp}")
+    print(f"Master Rank: 0 (fixed)")
     print(f"Use CUDA Graph: {use_cudagraph}")
     print(f"{'='*80}\n")
 
@@ -915,9 +983,8 @@ def benchmark_sp_attention_with_cudagraph(
         print("Please ensure distributed context is properly initialized.")
         return
 
-    # 创建测试数据
+    # 创建测试数据（batch_size固定为1）
     test_data = create_test_data(
-        batch_size=batch_size,
         num_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
@@ -931,7 +998,45 @@ def benchmark_sp_attention_with_cudagraph(
         dtype=dtype,
     )
 
-    # 创建forward函数
+    # Precompute MLA metadata if needed (only once during initialization)
+    tile_scheduler_metadata = None
+    num_splits = None
+    if attention_type == "MLA":
+        # For MLA: num_query_heads_per_kv = num_heads // num_kv_heads = num_heads // 1 = num_heads
+        num_query_heads_per_kv = num_heads // 1  # For MLA, num_kv_heads is always 1
+        context_lens_for_mla_metadata = test_data["context_lens"][:batch_size]  # Only need first batch_size entries
+        if debug:
+            print(f"[TEST] Precomputing get_mla_metadata: context_lens_for_mla_metadata.shape={context_lens_for_mla_metadata.shape}, "
+                  f"context_lens_for_mla_metadata={context_lens_for_mla_metadata}, "
+                  f"num_query_heads_per_kv={num_query_heads_per_kv}, num_kv_heads=1")
+        tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
+            context_lens_for_mla_metadata,
+            num_query_heads_per_kv,
+            1,  # num_kv_heads (MLA requires num_kv_heads == 1)
+        )
+    
+    # Precompute adjusted masks (only compute once, not during forward)
+    sp_rank = get_dist_context().attn_sp_rank if attention_sp > 1 else 0
+    q_mask_adjusted = test_data["q_mask"].clone()
+    q_mask_adjusted[sp_rank].fill_(0)  # 不发送给自己
+    q_mask_adjusted[q_mask_adjusted != 0] = 1  # 非0值设为1
+    
+    res_lse_mask_adjusted = test_data["res_lse_mask"].clone()
+    res_lse_mask_adjusted[sp_rank].fill_(0)  # 不发送给自己
+    res_lse_mask_adjusted[res_lse_mask_adjusted != 0] = 1  # 非0值设为1
+    
+    # Debug print before creating forward_fn (to avoid printing during CUDA Graph capture)
+    if debug:
+        print("[TEST] Debug info (before CUDA Graph capture):")
+        print(f"  context_lens: {test_data['context_lens']}")
+        print(f"  block_tables.shape: {test_data['block_tables'].shape}")
+        print(f"  global_context_lens: {test_data['global_context_lens']}")
+        if attention_type == "MLA":
+            print(f"  tile_scheduler_metadata type: {type(tile_scheduler_metadata)}")
+            if hasattr(num_splits, 'shape'):
+                print(f"  num_splits.shape: {num_splits.shape}")
+    
+    # 创建forward函数（注意：在CUDA Graph capture期间，debug打印会被禁用以避免CUDA错误）
     if attention_type == "GQA":
         def forward_fn():
             return sp_attention_forward_gqa(
@@ -941,8 +1046,8 @@ def benchmark_sp_attention_with_cudagraph(
                 context_lens=test_data["context_lens"],
                 block_tables=test_data["block_tables"],
                 global_context_lens=test_data["global_context_lens"],
-                q_mask=test_data["q_mask"],
-                res_lse_mask=test_data["res_lse_mask"],
+                q_mask_adjusted=q_mask_adjusted,
+                res_lse_mask_adjusted=res_lse_mask_adjusted,
                 q_slice_get=test_data["q_slice_get"],
                 q_slice_fill=test_data["q_slice_fill"],
                 q_copy_mask=test_data["q_copy_mask"],
@@ -967,8 +1072,8 @@ def benchmark_sp_attention_with_cudagraph(
                 context_lens=test_data["context_lens"],
                 block_tables=test_data["block_tables"],
                 global_context_lens=test_data["global_context_lens"],
-                q_mask=test_data["q_mask"],
-                res_lse_mask=test_data["res_lse_mask"],
+                q_mask_adjusted=q_mask_adjusted,
+                res_lse_mask_adjusted=res_lse_mask_adjusted,
                 q_slice_get=test_data["q_slice_get"],
                 q_slice_fill=test_data["q_slice_fill"],
                 q_copy_mask=test_data["q_copy_mask"],
@@ -984,6 +1089,9 @@ def benchmark_sp_attention_with_cudagraph(
                 v_head_dim=v_head_dim,
                 scale=scale,
                 sp_size=attention_sp,
+                tile_scheduler_metadata=tile_scheduler_metadata,
+                num_splits=num_splits,
+                debug=False,  # 在forward_fn中禁用debug，避免CUDA Graph capture期间的tensor打印
             )
 
     # Warmup
@@ -992,6 +1100,9 @@ def benchmark_sp_attention_with_cudagraph(
         _ = forward_fn()
     torch.cuda.synchronize()
 
+    # Initialize graph variable for potential profiler use
+    graph = None
+    
     # Benchmark with or without CUDA Graph
     if use_cudagraph:
         print(f"Benchmarking with CUDA Graph ({num_iterations} iterations)...")
@@ -1088,14 +1199,167 @@ def benchmark_sp_attention_with_cudagraph(
     print(f"Efficiency: {ideal_h100_time / avg_time_us * 100:.1f}%")
     print(f"{'='*80}\n")
 
+    # Profiler (if enabled)
+    if enable_profiler:
+        sp_rank = get_dist_context().attn_sp_rank if attention_sp > 1 else 0
+        print(f"[Rank {sp_rank}] Running profiler ({profiler_iterations} iterations)...")
+        torch.cuda.synchronize()
+        
+        # Note: We don't need a barrier before profiler because profiler runs independently on each rank
+        # Each rank will profile its own operations, and forward_fn() will handle distributed communication internally
+        
+        # Generate output filename with timestamp, rank info, and mode
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        mode_str = "eager" if not use_cudagraph else "graph"
+        output_dir = f"profiler_traces/sp/{mode_str}"
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(
+            output_dir,
+            f"sp_attention_{attention_type.lower()}_sp{attention_sp}_rank{sp_rank}_seq{seq_len}_{mode_str}_{timestamp}.json"
+        )
+        
+        print(f"[Rank {sp_rank}] Profiler output file: {output_file}")
+        
+        # Create profiler
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+        
+        try:
+            if use_cudagraph:
+                # For CUDA Graph, profile the graph replay
+                print(f"[Rank {sp_rank}] Starting CUDA Graph profiler...")
+                with torch.profiler.profile(
+                    activities=activities,
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                ) as prof:
+                    for iter_idx in range(profiler_iterations):
+                        # Mark iteration boundary in profiler trace
+                        with torch.profiler.record_function(f"iteration_{iter_idx}"):
+                            graph.replay()
+                    torch.cuda.synchronize()
+            else:
+                # For non-graph mode, profile the forward function
+                print(f"[Rank {sp_rank}] Starting eager mode profiler...")
+                # For very long sequences, reduce profiler overhead
+                use_stack = seq_len < 100000  # Only use stack trace for shorter sequences
+                with torch.profiler.profile(
+                    activities=activities,
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=use_stack,  # Disable stack trace for very long sequences to reduce overhead
+                ) as prof:
+                    for iter_idx in range(profiler_iterations):
+                        # Mark iteration boundary in profiler trace
+                        with torch.profiler.record_function(f"iteration_{iter_idx}"):
+                            _ = forward_fn()
+                        # Print progress every 10 iterations for long runs
+                        if (iter_idx + 1) % 10 == 0:
+                            print(f"[Rank {sp_rank}] Profiler progress: {iter_idx + 1}/{profiler_iterations} iterations", flush=True)
+                    torch.cuda.synchronize()
+                print(f"[Rank {sp_rank}] Profiler iterations completed", flush=True)
+            
+            print(f"[Rank {sp_rank}] Profiler capture completed, exporting trace...", flush=True)
+            
+            # Export chrome trace
+            prof.export_chrome_trace(output_file)
+            print(f"[Rank {sp_rank}] Profiler trace saved to: {output_file}", flush=True)
+        except Exception as e:
+            print(f"[Rank {sp_rank}] Error during profiler: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+        
+        # Get all kernel statistics
+        print(f"[Rank {sp_rank}] Processing kernel statistics...", flush=True)
+        key_averages = prof.key_averages(group_by_input_shape=True)
+        print(f"[Rank {sp_rank}] Found {len(key_averages)} kernel events", flush=True)
+        
+        # Save kernel statistics to CSV
+        csv_file = output_file.replace('.json', '.csv')
+        with open(csv_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            # Write header
+            writer.writerow([
+                'Name',
+                'Self CPU Time (us)',
+                'CPU Time (us)',
+                'Self CUDA Time (us)',
+                'CUDA Time (us)',
+                'Avg Self CUDA Time (us)',
+                'Self CPU Memory (bytes)',
+                'CPU Memory (bytes)',
+                'Self CUDA Memory (bytes)',
+                'CUDA Memory (bytes)',
+                'Input Shapes',
+                'Call Count',
+            ])
+            
+            # Write data rows
+            for event in key_averages:
+                # Extract input shapes if available
+                input_shapes = ''
+                if hasattr(event, 'input_shapes') and event.input_shapes:
+                    input_shapes = str(event.input_shapes)
+                
+                # Get time values (already in microseconds for torch.profiler)
+                self_cpu_time = getattr(event, 'self_cpu_time_total', 0)
+                cpu_time = getattr(event, 'cpu_time_total', 0)
+                self_cuda_time = getattr(event, 'self_cuda_time_total', 0)
+                cuda_time = getattr(event, 'cuda_time_total', 0)
+                count = getattr(event, 'count', 1)
+                avg_self_cuda_time = self_cuda_time / count if count > 0 else 0
+                
+                # Get memory values (in bytes)
+                self_cpu_mem = getattr(event, 'self_cpu_memory_usage', 0)
+                cpu_mem = getattr(event, 'cpu_memory_usage', 0)
+                self_cuda_mem = getattr(event, 'self_cuda_memory_usage', 0)
+                cuda_mem = getattr(event, 'cuda_memory_usage', 0)
+                
+                writer.writerow([
+                    event.key,  # Kernel/operator name
+                    f'{self_cpu_time:.2f}',
+                    f'{cpu_time:.2f}',
+                    f'{self_cuda_time:.2f}',
+                    f'{cuda_time:.2f}',
+                    f'{avg_self_cuda_time:.2f}',
+                    self_cpu_mem,
+                    cpu_mem,
+                    self_cuda_mem,
+                    cuda_mem,
+                    input_shapes,
+                    count,
+                ])
+        
+        print(f"[Rank {sp_rank}] Kernel statistics saved to: {csv_file}", flush=True)
+        
+        # Print summary
+        print(f"\n[Rank {sp_rank}] {'='*80}", flush=True)
+        print(f"[Rank {sp_rank}] Profiler Summary (top 10 operators):", flush=True)
+        print(f"[Rank {sp_rank}] {'='*80}", flush=True)
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        print(f"[Rank {sp_rank}] {'='*80}\n", flush=True)
+        
+        # Ensure all ranks finish before exiting
+        if attention_sp > 1:
+            print(f"[Rank {sp_rank}] Waiting for all ranks to finish profiler...", flush=True)
+            # Synchronize CUDA first, then barrier
+            torch.cuda.synchronize()
+            dist.barrier()
+        print(f"[Rank {sp_rank}] Profiler completed successfully", flush=True)
+
 
 def main():
     """主函数：运行一系列测试"""
     import argparse
 
-    parser = argparse.ArgumentParser(description="SP Attention CUDA Graph Performance Test")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--seq_len", type=int, default=4096, help="Sequence length")
+    parser = argparse.ArgumentParser(description="SP Attention CUDA Graph Performance Test (single request)")
+    # Note: batch_size is fixed to 1 (single request in entire system), Master Rank=0
+    parser.add_argument("--seq_len", type=int, default=None, help="Sequence length (single value)")
+    parser.add_argument("--seq_lens", type=str, default=None, help="Comma-separated sequence lengths for batch testing (e.g., '1024,2048,4096,8192')")
     parser.add_argument("--num_heads", type=int, default=64, help="Number of attention heads")
     parser.add_argument("--num_kv_heads", type=int, default=8, help="Number of KV heads (must be 1 for MLA)")
     parser.add_argument("--head_dim", type=int, default=128, help="Head dimension (for Q and K). For MLA, must be 576 (512+64)")
@@ -1103,22 +1367,55 @@ def main():
     parser.add_argument("--attention_sp", type=int, default=2, help="SP parallelism size")
     parser.add_argument("--attention_type", type=str, default="GQA", choices=["GQA", "MLA"], help="Attention type (GQA or MLA)")
     parser.add_argument("--no_cudagraph", action="store_true", help="Disable CUDA Graph")
+    parser.add_argument("--eager", action="store_true", help="Use eager mode (equivalent to --no_cudagraph)")
     parser.add_argument("--iterations", type=int, default=200, help="Number of iterations")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging for tensor shapes")
+    parser.add_argument("--enable_profiler", action="store_true", help="Enable profiler to save trace data")
+    parser.add_argument("--profiler_iterations", type=int, default=50, help="Number of iterations to profile (default: 50)")
     
     args = parser.parse_args()
-
-    benchmark_sp_attention_with_cudagraph(
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        num_heads=args.num_heads,
-        head_dim=args.head_dim,
-        num_kv_heads=args.num_kv_heads,
-        attention_sp=args.attention_sp,
-        attention_type=args.attention_type,
-        v_head_dim=args.v_head_dim,
-        use_cudagraph=not args.no_cudagraph,
-        num_iterations=args.iterations,
-    )
+    
+    # Parse seq_lens: support both --seq_len (single) and --seq_lens (comma-separated)
+    if args.seq_lens:
+        # Parse comma-separated values
+        seq_lens = [int(x.strip()) for x in args.seq_lens.split(',')]
+        if args.seq_len is not None:
+            print("Warning: Both --seq_len and --seq_lens provided. Using --seq_lens.")
+    elif args.seq_len is not None:
+        seq_lens = [args.seq_len]
+    else:
+        # Default to 4096 if neither is provided
+        seq_lens = [4096]
+    
+    # Run benchmarks for each seq_len
+    total_runs = len(seq_lens)
+    for idx, seq_len in enumerate(seq_lens, 1):
+        print(f"\n{'='*80}")
+        print(f"Running benchmark {idx}/{total_runs}: seq_len={seq_len}")
+        print(f"{'='*80}\n")
+        
+        benchmark_sp_attention_with_cudagraph(
+            seq_len=seq_len,
+            num_heads=args.num_heads,
+            head_dim=args.head_dim,
+            num_kv_heads=args.num_kv_heads,
+            attention_sp=args.attention_sp,
+            attention_type=args.attention_type,
+            v_head_dim=args.v_head_dim,
+            use_cudagraph=not (args.no_cudagraph or args.eager),
+            num_iterations=args.iterations,
+            debug=args.debug,
+            enable_profiler=args.enable_profiler,
+            profiler_iterations=args.profiler_iterations,
+        )
+        
+        if idx < total_runs:
+            print(f"\nCompleted {idx}/{total_runs} runs. Continuing to next seq_len...\n")
+    
+    print(f"\n{'='*80}")
+    print(f"All benchmarks completed! Total runs: {total_runs}")
+    print(f"Sequence lengths tested: {seq_lens}")
+    print(f"{'='*80}\n")
 
 
 if __name__ == "__main__":
