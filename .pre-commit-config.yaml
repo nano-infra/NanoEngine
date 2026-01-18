@@ -19,6 +19,7 @@ repos:
     rev: 0.7.9
     hooks:
       - id: mdformat
+        exclude: ^server/vendor/
         args: ["--number"]
         additional_dependencies:
           - mdformat-openmmlab
@@ -28,7 +29,7 @@ repos:
     rev: v2.1.0
     hooks:
       - id: codespell
-        args: ["--skip=docs/imgs/*,csrc/nanodeploy/json.hpp"]
+        args: ["--skip=docs/imgs/*,nanodeploy/csrc/json.hpp,server/*"]
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.6

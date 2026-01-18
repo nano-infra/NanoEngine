@@ -39,6 +39,9 @@ else()
 endif()
 
 # DLSlime (Submodule)
+# Force USE_CUDA=OFF for DLSlime - we only need CPU-based RDMA transport.
+# CUDA operations are handled by nanodeploy directly, not through DLSlime's signal layer.
+set(USE_CUDA OFF CACHE BOOL "DLSlime: Disable CUDA (use HostOnlySignal for RDMA)" FORCE)
 set(DLSLIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/DLSlime")
 if(EXISTS "${DLSLIME_ROOT}/CMakeLists.txt")
     if (NOT TARGET dlslime)

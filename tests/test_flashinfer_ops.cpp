@@ -4,7 +4,7 @@
 #include <torch/torch.h>
 #include <vector>
 
-#include "nanodeploy/layers/flashinfer_handler.h"
+#include "nanodeploy/csrc/ops/flashinfer_ops.h"
 
 using namespace nanodeploy;
 
@@ -74,7 +74,7 @@ void test_single_token_decode_correctness()
     int max_num_blocks = 128;  // Sufficiently large
 
     // Initialize Handler
-    auto handler = std::make_unique<layers::FlashInferHandler>(1, num_heads, num_kv_heads, head_dim, page_size, device);
+    auto handler = std::make_unique<ops::FlashInferOps>(1, num_heads, num_kv_heads, head_dim, page_size, device);
 
     // Create Data (BFloat16)
     auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device);

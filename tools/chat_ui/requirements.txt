@@ -1,0 +1,6 @@
+chainlit
+fastapi
+requests
+torch
+transformers
+uvicorn

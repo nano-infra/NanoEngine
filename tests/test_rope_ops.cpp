@@ -4,7 +4,7 @@
 #include <torch/torch.h>
 #include <vector>
 
-#include "nanodeploy/layers/rotary_embedding.h"
+#include "nanodeploy/csrc/layers/rotary_embedding.h"
 
 using namespace nanodeploy;
 

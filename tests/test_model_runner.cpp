@@ -6,7 +6,7 @@
 #include <thread>
 #include <vector>
 
-#include "nanodeploy/worker/model_runner_ipc.h"
+#include "nanodeploy/csrc/worker/model_runner_ipc.h"
 #include "spoke/csrc/client.h"
 
 using namespace nanodeploy;

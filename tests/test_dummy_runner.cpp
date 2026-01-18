@@ -7,8 +7,8 @@
 #include <thread>
 #include <vector>
 
-#include "nanodeploy/worker/dummy_runner.h"
-#include "nanodeploy/worker/dummy_runner_ipc.h"  // Includes serialization
+#include "nanodeploy/csrc/worker/dummy_runner.h"
+#include "nanodeploy/csrc/worker/dummy_runner_ipc.h"  // Includes serialization
 #include "spoke/csrc/client.h"
 
 using namespace nanodeploy;

@@ -3,6 +3,7 @@ project(NanoDeployTests)
 # Spoke is already linked via third_party/Spoke submodule
 # find_package(Spoke REQUIRED)
 find_package(Torch REQUIRED)
+find_package(GTest REQUIRED)
 
 add_executable(test_dummy_runner test_dummy_runner.cpp)
 
@@ -20,7 +21,7 @@ target_link_libraries(test_dummy_runner
 # Include directories for nanodeploy headers (e.g. for serialization, sequence)
 target_include_directories(test_dummy_runner
     PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nanodeploy/csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
 )
 
@@ -35,42 +36,66 @@ target_link_libraries(test_model_runner
 )
 target_include_directories(test_model_runner
     PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nanodeploy/csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
 )
 
-add_executable(test_qwen3_runner test_qwen3_runner.cpp)
-target_link_libraries(test_qwen3_runner
-    PUBLIC
-    _nanodeploy_worker
-    _nanodeploy_sequence
-    _nanodeploy_scheduler
-    nanodeploy_core
-    torch
-    torch_cpu
-    c10
-    Spoke::core
-)
-target_include_directories(test_qwen3_runner
-    PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
-)
 
+
+if (NANODEPLOY_BUILD_CUDA)
 add_executable(test_flashinfer_ops test_flashinfer_ops.cpp)
 target_link_libraries(test_flashinfer_ops
-    PRIVATE
-    _nanodeploy_worker
-    _nanodeploy_sequence
+    PUBLIC
+    _nanodeploy_ops
     nanodeploy_core
     torch
     torch_cpu
     c10
+    GTest::gtest_main
 )
 target_include_directories(test_flashinfer_ops
     PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nanodeploy/csrc
 )
 
+# CUDA Graph Compatibility Test (GTest)
+add_executable(test_cuda_graph_compat cuda_graph_compat_test.cpp)
+target_link_libraries(test_cuda_graph_compat
+    PUBLIC
+    torch
+    torch_cpu
+    torch_cuda
+    c10
+    c10_cuda
+    GTest::gtest_main
+)
+target_include_directories(test_cuda_graph_compat
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nanodeploy/csrc
+)
+
+# FlashInfer + MoE CUDA Graph Test (GTest)
+add_executable(test_cuda_graph_flashinfer_moe cuda_graph_flashinfer_moe_test.cpp)
+target_link_libraries(test_cuda_graph_flashinfer_moe
+    PUBLIC
+    _nanodeploy_worker
+    _nanodeploy_ops
+    nanodeploy_core
+    torch
+    torch_cpu
+    torch_cuda
+    c10
+    c10_cuda
+    GTest::gtest_main
+)
+target_include_directories(test_cuda_graph_flashinfer_moe
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nanodeploy/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/FlashInfer/include
+)
+endif()
+
+if (NANODEPLOY_BUILD_CUDA)
 add_executable(test_rope_ops test_rope_ops.cpp)
 target_link_libraries(test_rope_ops
     PRIVATE
@@ -81,52 +106,6 @@ target_link_libraries(test_rope_ops
 )
 target_include_directories(test_rope_ops
     PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nanodeploy/csrc
 )
-
-add_executable(test_deep_ep_actor test_deep_ep_actor.cpp)
-target_link_libraries(test_deep_ep_actor
-    PRIVATE
-    Spoke::core
-    torch
-    torch_cpu
-    c10
-    _nanodeploy_sequence
-)
-target_include_directories(test_deep_ep_actor
-    PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
-    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
-)
-
-add_executable(test_deep_gemm_actor test_deep_gemm_actor.cpp)
-target_link_libraries(test_deep_gemm_actor
-    PRIVATE
-    Spoke::core
-    torch
-    torch_cpu
-    c10
-    _nanodeploy_sequence
-)
-target_include_directories(test_deep_gemm_actor
-    PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
-    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
-)
-
-add_executable(test_qwen3_moe_runner test_qwen3_moe_runner.cpp)
-target_link_libraries(test_qwen3_moe_runner
-    PUBLIC
-    _nanodeploy_worker
-    _nanodeploy_sequence
-    _nanodeploy_scheduler
-    nanodeploy_core
-    torch
-    torch_cpu
-    c10
-    Spoke::core
-)
-target_include_directories(test_qwen3_moe_runner
-    PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc
-)
+endif()
