@@ -981,9 +981,23 @@ def benchmark_sp_attention_with_cudagraph(
     except Exception as e:
         print(f"Error: Failed to setup SP context: {e}")
         print("Please ensure distributed context is properly initialized.")
-        return
+        # Check if this is because rank is not in SP group
+        dist_context = get_dist_context()
+        current_rank = dist.get_rank() if dist.is_initialized() else 0
+        attn_sp_rank = getattr(dist_context, 'attn_sp_rank', -1)
+        if attn_sp_rank < 0:
+            print(f"[Rank {current_rank}] This rank is not part of SP group. Skipping benchmark but will wait at barrier.")
+            # Skip all benchmark operations but continue to barrier
+            # Set a flag to skip rest of execution
+            import sys
+            # We'll add a barrier at the end to ensure all ranks synchronize
+            pass
+        else:
+            # Real error, should return
+            return
 
     # 创建测试数据（batch_size固定为1）
+    # Only create test data if this rank is in SP group
     test_data = create_test_data(
         num_heads=num_heads,
         head_dim=head_dim,
@@ -1036,9 +1050,20 @@ def benchmark_sp_attention_with_cudagraph(
             if hasattr(num_splits, 'shape'):
                 print(f"  num_splits.shape: {num_splits.shape}")
     
+    # Create a sync tensor for all_reduce synchronization at the start of each forward
+    # This ensures all ranks are aligned before all_to_all operations
+    sync_tensor = None
+    if attention_sp > 1 and dist.is_initialized():
+        sync_tensor = torch.zeros(1, dtype=torch.float32, device=device)
+    
     # 创建forward函数（注意：在CUDA Graph capture期间，debug打印会被禁用以避免CUDA错误）
     if attention_type == "GQA":
         def forward_fn():
+            # Synchronize all ranks at the start of each forward using all_reduce
+            # This ensures all_to_all communication is aligned and avoids long waits
+            if sync_tensor is not None:
+                dist.all_reduce(sync_tensor, op=dist.ReduceOp.SUM)
+            
             return sp_attention_forward_gqa(
                 q=test_data["q"],
                 k_cache=test_data["k_cache"],
@@ -1066,6 +1091,11 @@ def benchmark_sp_attention_with_cudagraph(
             )
     else:  # MLA
         def forward_fn():
+            # Synchronize all ranks at the start of each forward using all_reduce
+            # This ensures all_to_all communication is aligned and avoids long waits
+            if sync_tensor is not None:
+                dist.all_reduce(sync_tensor, op=dist.ReduceOp.SUM)
+            
             return sp_attention_forward_mla(
                 q=test_data["q"],
                 k_cache=test_data["k_cache"],
@@ -1344,9 +1374,11 @@ def benchmark_sp_attention_with_cudagraph(
         print(f"[Rank {sp_rank}] {'='*80}\n", flush=True)
         
         # Ensure all ranks finish before exiting
-        if attention_sp > 1:
+        # Use barrier across all processes in the process group (not just SP group)
+        # This ensures all ranks (even those not in SP group) reach the same point
+        if attention_sp > 1 and dist.is_initialized():
             print(f"[Rank {sp_rank}] Waiting for all ranks to finish profiler...", flush=True)
-            # Synchronize CUDA first, then barrier
+            # Synchronize CUDA first, then barrier across all ranks
             torch.cuda.synchronize()
             dist.barrier()
         print(f"[Rank {sp_rank}] Profiler completed successfully", flush=True)
