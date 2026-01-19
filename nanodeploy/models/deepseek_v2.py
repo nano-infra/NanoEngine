@@ -77,6 +77,7 @@ class DeepseekV2MoE(nn.Module):
         self.moe_intermediate_size = config.moe_intermediate_size
         self.num_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
+        self.distribution = "uniform"
 
         # Use optimized Linear layer for gate
         # For gate, we don't need quantization, so use standard Linear
@@ -234,7 +235,16 @@ class DeepseekV2MoE(nn.Module):
                 routing_weights, self.top_k, dim=-1, sorted=sorted_topk
             )
 
-            if get_runner_config().perfect_eplb:
+            if self.distribution == "uniform":
+                # Uniform random sampling
+                selected_experts = torch.randint(
+                    low=0,
+                    high=self.num_experts,
+                    size=(hidden_states.shape[0], self.top_k),
+                    dtype=selected_experts.dtype,
+                    device=hidden_states.device,
+                )
+            elif get_runner_config().perfect_eplb:
                 ep_size = get_dist_context().ffn_ep_world_size
                 selected_experts = compute_topk_ids(
                     selected_experts, ep_size, self.num_experts
