@@ -65,10 +65,11 @@ class LLMEngine:
         self.scheduler.free_to_be_migrated(seqs)
 
     def step(self):
+        step_start = time.perf_counter()
         dp_size = self.config.attention_dp
         sp_size = self.config.attention_sp
         tp_size = self.config.attention_tp
-        sch_begin = time.time()
+        sch_begin = time.perf_counter()
         sch_res = self.scheduler.schedule()
         dp_seqs = sch_res.dp_seqs
         is_prefill = sch_res.is_prefill
@@ -112,29 +113,16 @@ class LLMEngine:
         waiting_total_blocks = sch_res.waiting_total_blocks
         self.metrics_manager.server_metric.update_waiting_blocks(waiting_head_blocks, waiting_total_blocks)
 
-        logger.info(
-            {
-                "mode": "prefill" if is_prefill else "decode",
-                # "dp_batch_sizes": dp_batch_sizes,
-                "sp_batch_sizes": sp_batch_sizes,
-                "sp_send_counts": sp_send_counts,
-                "sp_recv_counts": sp_recv_counts,
-                "waiting_head_blocks": waiting_head_blocks,
-                "waiting_total_blocks": waiting_total_blocks,
-                # "sp_comm_matrix": sp_comm_matrix,
-                "sp_q_matrix": sp_q_matrix,
-                # "sp_res_matrix": sp_res_matrix,
-                "free_blocks": [
-                    [
-                        len(worker_state.block_manager[i].free_block_ids)
-                        for i in range(self.scheduler.attention_sp)
-                    ]
-                    for worker_state in self.scheduler.worker_state
-                ],
-            }
-        )
+        # Per-SP-rank seq_lens: organized as [dp_idx][sp_idx] -> list of seq lens on that GPU
+        sp_seq_lens = [
+            [
+                [len(seq) for seq in filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx]]
+                for sp_idx in range(sp_size)
+            ]
+            for dp_idx in range(dp_size)
+        ]
 
-        sch_end = time.time()
+        sch_end = time.perf_counter()
         post_sch_begin = 0
         post_sch_end = 0
         if is_prefill and self.config.mode == "decode":
@@ -163,15 +151,16 @@ class LLMEngine:
                             seq.metric.record_first_token()
                             seq.metric.num_generated_tokens = 1
         else:
-            step_start = time.perf_counter()
+            model_runner_start = time.perf_counter()
             token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
+            model_runner_duration_ms = (time.perf_counter() - model_runner_start) * 1000.0
             step_duration_ms = (time.perf_counter() - step_start) * 1000.0
-            post_sch_begin = time.time()
+            post_sch_begin = time.perf_counter()
             self.scheduler.postprocess(
                 filtered_dp_sp_seqs, token_ids, self.metrics_manager,
                 step_duration_ms, self.config.loop_count
             )
-            post_sch_end = time.time()
+            post_sch_end = time.perf_counter()
         outputs = []
         num_tokens = 0
 
@@ -192,6 +181,35 @@ class LLMEngine:
                     # Complete sequence metric and log
                     self.metrics_manager.complete_sequence(seq.seq_id)
                     outputs.append((seq.seq_id, seq.completion_token_ids))
+        
+        # Calculate and log ITL for this step
+        if not is_prefill:
+            itl = step_duration_ms / self.config.loop_count
+            logger.info(
+                {
+                    "mode": "prefill" if is_prefill else "decode",
+                    "itl": f"{itl:.2f}ms",
+                    "waiting_reqs": total_waiting,
+                    "sp_seq_lens": sp_seq_lens,  # Per-GPU seq lens
+                    # "dp_batch_sizes": dp_batch_sizes,
+                    "sp_batch_sizes": sp_batch_sizes,
+                    "sp_send_counts": sp_send_counts,
+                    "sp_recv_counts": sp_recv_counts,
+                    "waiting_head_blocks": waiting_head_blocks,
+                    "waiting_total_blocks": waiting_total_blocks,
+                    # "sp_comm_matrix": sp_comm_matrix,
+                    "sp_q_matrix": sp_q_matrix,
+                    # "sp_res_matrix": sp_res_matrix,
+                    "free_blocks": [
+                        [
+                            len(worker_state.block_manager[i].free_block_ids)
+                            for i in range(self.scheduler.attention_sp)
+                        ]
+                        for worker_state in self.scheduler.worker_state
+                    ],
+                }
+            )
+        
         return (
             outputs,
             num_tokens,

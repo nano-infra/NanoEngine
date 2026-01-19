@@ -43,7 +43,9 @@ void bind_sequence(py::module_& m)
           py::arg("data_ptr"),
           py::arg("buffer_size"),
           py::arg("seqs"),
-          py::arg("is_prefill"));
+          py::arg("is_prefill"),
+          py::arg("sp_rank") = -1,
+          py::arg("sp_size") = -1);
 
     m.def("deserialize", &deserialize_sequences, py::arg("data_ptr"), py::arg("data_len"));
 

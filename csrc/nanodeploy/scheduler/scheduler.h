@@ -83,7 +83,11 @@ public:
               int                kvcache_block_size,
               const std::string& mode,
               double             reserved_blocks_per_req,
-              int                segment_size);
+              int                segment_size,
+              bool               enable_dynamic_sp_size,
+              bool               enable_non_uniform_split,
+              const std::string& sp_master_selector,
+              bool               sp_debug);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -95,7 +99,7 @@ public:
     void postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
                      const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
                      bool                                                       update_metrics,
-                     double                                                     step_duration_ms,
+                     double                                                     accumulated_step_time_ms,
                      int                                                        loop_count);
 
     // State queries
@@ -143,8 +147,13 @@ private:
     int         attention_dp_;
     int         attention_sp_;
     std::string mode_;
-    double reserved_blocks_per_req_;
-    int segment_size_;
+    double      reserved_blocks_per_req_;
+    int         segment_size_;
+    bool        enable_dynamic_sp_size_;
+    bool        enable_non_uniform_split_;
+    bool        sp_debug_;
+
+    std::string sp_master_selector_;
 
     int dp_rr_counter_ = 0;
 

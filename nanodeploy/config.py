@@ -51,13 +51,31 @@ class Config:
     profiler_start_step: int = 40
     profiling_step: int = 16
     profiler_dir: str = "/mnt/nvme1n1/ml_research/linbinbin1/profiler_res"
+    # Time-based profiling (in seconds). If set, will use time instead of steps.
+    profiler_start_time: float | None = None  # Start profiling after N seconds
+    profiling_duration: float | None = None  # Profile for N seconds
 
     # performance optimization
     use_dlslime_rpc: bool = True
+    # Optimize Block Table transmission in Decode phase: if True, only send BlockTable
+    # for sequences that have KVCache on the target rank; if False, send all BlockTables
+    optimize_decode_block_table: bool = True
 
     # reserve for decode
     reserved_blocks_per_req: float = 1.0
     segment_size: int = 65536
+
+    # Dynamic SP Size Knob
+    enable_dynamic_sp_size: bool = False
+
+    # Enable non-uniform KVCache partitioning for load balancing
+    enable_non_uniform_split: bool = False
+
+    # Strategy for how to select 
+    sp_master_selector: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
+
+    # Debug mode for SP allocation (uses simplified RoundRobin + segment-based allocation)
+    sp_debug: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

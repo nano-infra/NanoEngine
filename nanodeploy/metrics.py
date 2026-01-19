@@ -23,46 +23,46 @@ logger = get_logger()
 class SequenceMetric(_CppSequenceMetric):
     def log_metrics(self):
         """Log all metrics for this sequence."""
+        return 
+        # ttft_str = f"{self.ttft:.2f}ms" if self.ttft is not None else "N/A"
+        # e2e_str = (
+        #     f"{self.e2e_latency:.2f}ms" if self.e2e_latency is not None else "N/A"
+        # )
 
-        ttft_str = f"{self.ttft:.2f}ms" if self.ttft is not None else "N/A"
-        e2e_str = (
-            f"{self.e2e_latency:.2f}ms" if self.e2e_latency is not None else "N/A"
-        )
-
-        queueing_time_str = (
-            f"{self.queueing_time_ms:.2f}ms"
-            if self.queueing_time_ms is not None
-            else "N/A"
-        )
-        decode_queueing_time_str = (
-            f"{self.decode_queue_time_ms:.2f}ms"
-            if self.decode_queue_time_ms is not None
-            else "N/A"
-        )
+        # queueing_time_str = (
+        #     f"{self.queueing_time_ms:.2f}ms"
+        #     if self.queueing_time_ms is not None
+        #     else "N/A"
+        # )
+        # decode_queueing_time_str = (
+        #     f"{self.decode_queue_time_ms:.2f}ms"
+        #     if self.decode_queue_time_ms is not None
+        #     else "N/A"
+        # )
         
-        # Format ITL samples (up to first 32)
-        itl_samples = self.itl_samples
-        num_samples_to_show = min(len(itl_samples), 32)
-        samples_str = ", ".join([f"{s:.2f}" for s in itl_samples[:num_samples_to_show]])
-        itl_samples_log = f"ITL Samples(First {num_samples_to_show}): [{samples_str}]"
+        # # Format ITL samples (up to first 32)
+        # itl_samples = self.itl_samples
+        # num_samples_to_show = min(len(itl_samples), 32)
+        # samples_str = ", ".join([f"{s:.2f}" for s in itl_samples[:num_samples_to_show]])
+        # itl_samples_log = f"ITL Samples(First {num_samples_to_show}): [{samples_str}]"
 
-        itl_with_dq_str = (
-            f"{self.avg_itl_with_decode_queue:.2f}ms"
-            if self.avg_itl_with_decode_queue is not None
-            else "N/A"
-        )
+        # itl_with_dq_str = (
+        #     f"{self.avg_itl_with_decode_queue:.2f}ms"
+        #     if self.avg_itl_with_decode_queue is not None
+        #     else "N/A"
+        # )
 
-        logger.info(
-            f"SequenceMetric [{str(self.seq_id)[:8]}...] - "
-            f"TTFT: {ttft_str}, "
-            f"E2E: {e2e_str}, "
-            f"Prompt Length: {self.num_prompt_tokens}, Output Length: {self.num_generated_tokens}, "
-            f"Queueing Time: {queueing_time_str}, "
-            f"Decode Queueing Time: {decode_queueing_time_str}, "
-            f"ITL: {self.avg_itl:.2f}ms, "
-            f"ITL with DQ: {itl_with_dq_str}, "
-            f"{itl_samples_log}"
-        )
+        # logger.info(
+        #     f"SequenceMetric [{str(self.seq_id)[:8]}...] - "
+        #     f"TTFT: {ttft_str}, "
+        #     f"E2E: {e2e_str}, "
+        #     f"Prompt Length: {self.num_prompt_tokens}, Output Length: {self.num_generated_tokens}, "
+        #     f"Queueing Time: {queueing_time_str}, "
+        #     f"Decode Queueing Time: {decode_queueing_time_str}, "
+        #     f"ITL: {self.avg_itl:.2f}ms, "
+        #     f"ITL with DQ: {itl_with_dq_str}, "
+        #     f"{itl_samples_log}"
+        # )
 
 ServerMetric = _CppServerMetric
 

@@ -16,9 +16,12 @@ class EndpointBinding:
 
 
 class RPCServerEndpoint:
-    def __init__(self, buffer_size: int, world_size: int):
+    def __init__(self, buffer_size: int, world_size: int, attention_sp: int = 1, attention_tp: int = 1, optimize_decode_block_table: bool = True):
         self.buffer_size = buffer_size
         self.world_size = world_size
+        self.attention_sp = attention_sp
+        self.attention_tp = attention_tp
+        self.optimize_decode_block_table = optimize_decode_block_table
 
         self.devices = _slime_c.available_nic()
         self.server_bindings: list[EndpointBinding] = []
@@ -50,7 +53,20 @@ class RPCServerEndpoint:
             binding = self.server_bindings[i]
             buffer = binding.buffer
             buffer_ptr = buffer.data_ptr() + buffer.storage_offset()
-            off = serialize(buffer_ptr, buffer.numel(), dp_seqs[i], is_prefill)
+            
+            # 计算目标rank的sp_rank和sp_size
+            # 如果启用优化且在Decode阶段，才进行过滤；否则传输全量BlockTable
+            if not is_prefill and self.optimize_decode_block_table:
+                # rank = dp_rank * (attention_sp * attention_tp) + sp_rank * attention_tp + tp_rank
+                # 所以 sp_rank = (rank // attention_tp) % attention_sp
+                sp_rank = (i // self.attention_tp) % self.attention_sp
+                sp_size = self.attention_sp
+            else:
+                # Prefill阶段或未启用优化：传输全量BlockTable
+                sp_rank = -1
+                sp_size = -1
+            
+            off = serialize(buffer_ptr, buffer.numel(), dp_seqs[i], is_prefill, sp_rank, sp_size)
             future = binding.endpoint.write_with_imm(
                 [(buffer_ptr, binding.remote_buffer_ptr, 0, 0, off)], off
             )
