@@ -68,8 +68,10 @@ private:
     void load_weights(const std::string& weight_path);
 
     // Helpers to load specific components
+    // Helpers to load specific components
     void load_layer_weights(int layer_idx, models::Qwen3DecoderLayer<QuantType::FP16>* layer);
     void load_moe_layer_weights(int layer_idx, models::DeepSeekMoeDecoderLayer<QuantType::FP16>* layer);
+    void load_moe_layer_weights(int layer_idx, models::DeepSeekMoeDecoderLayer<QuantType::FP8_E4M3>* layer);
 
 private:
     std::unique_ptr<core::ModelConfig> config_;
@@ -84,7 +86,8 @@ private:
     std::unique_ptr<models::Qwen3ForCausalLM<QuantType::FP16>> model_;
 
     // MoE Model
-    std::unique_ptr<models::Qwen3MoeForCausalLM<QuantType::FP16>> moe_model_;
+    std::unique_ptr<models::Qwen3MoeForCausalLM<QuantType::FP16>>     moe_model_;
+    std::unique_ptr<models::Qwen3MoeForCausalLM<QuantType::FP8_E4M3>> moe_model_fp8_;
 
     int           world_size_     = 1;
     int           rank_           = 0;

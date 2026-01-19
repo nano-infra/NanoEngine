@@ -381,7 +381,7 @@ async fn main() -> Result<(), BoxError> {
     // Init Engine (One-off via runtime connection)
     println!("[Rust] Initializing Engine...");
     let init_req = EngineInitReq {
-        config_path: string_to_bytes("/models/Qwen3-235B-A22B-Instruct-2507/config.json"), // Hardcoded for convenience
+        config_path: string_to_bytes("/models/model--Qwen--Qwen3-30B-A3B-FP8/config.json"), // Hardcoded for convenience
         tp: 1, pp: 1, dp: 1, hub_ip: string_to_bytes("127.0.0.1"), hub_port: 8888,
         attention_tp: 1, attention_dp: 8, attention_sp: 1, ffn_tp: 1, ffn_dp: 1, ffn_ep: 8,
         enable_rdma: true, enable_cuda_graph: enable_cuda_graph, _padding: [0; 2],

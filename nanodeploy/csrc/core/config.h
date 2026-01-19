@@ -75,6 +75,13 @@ struct ModelConfig {
 
         config.rope_theta = j.value("rope_theta", 1000000.0f);
 
+        if (j.contains("quantization_config")) {
+            auto qc = j["quantization_config"];
+            if (qc.contains("quant_method")) {
+                config.quant_method = qc["quant_method"];
+            }
+        }
+
         return config;
     }
 };

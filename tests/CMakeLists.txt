@@ -108,4 +108,24 @@ target_include_directories(test_rope_ops
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../nanodeploy/csrc
 )
+
+# DeepGEMM FP8 Test (GTest)
+add_executable(test_deepgemm_fp8 test_deepgemm_fp8.cpp)
+target_link_libraries(test_deepgemm_fp8
+    PUBLIC
+    _nanodeploy_ops
+    nanodeploy_core
+    torch
+    torch_cpu
+    torch_cuda
+    c10
+    c10_cuda
+    CUDA::nvrtc
+    CUDA::cuda_driver
+    GTest::gtest_main
+)
+target_include_directories(test_deepgemm_fp8
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nanodeploy/csrc
+)
 endif()

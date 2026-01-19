@@ -44,6 +44,15 @@ void DeepGemmOps::bf16_gemm_nt(const torch::Tensor&                a,
     deep_gemm::gemm::bf16_gemm_nt(a, b, d, c, compiled_dims);
 }
 
+void DeepGemmOps::fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                              const std::pair<torch::Tensor, torch::Tensor>& b,
+                              const torch::Tensor&                           d,
+                              const std::optional<torch::Tensor>&            c,
+                              const std::string&                             compiled_dims)
+{
+    deep_gemm::gemm::fp8_gemm_nt(a, b, d, c, std::nullopt, compiled_dims, false);
+}
+
 void DeepGemmOps::m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a,
                                                     const torch::Tensor& b,
                                                     const torch::Tensor& d,
@@ -61,6 +70,25 @@ void DeepGemmOps::m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a,
                                                 const std::string&   compiled_dims)
 {
     deep_gemm::gemm::m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims);
+}
+
+void DeepGemmOps::m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                   const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                   const torch::Tensor&                           d,
+                                                   const torch::Tensor&                           m_indices,
+                                                   const std::string&                             compiled_dims)
+{
+    deep_gemm::gemm::m_grouped_fp8_gemm_nt_contiguous(a, b, d, m_indices, std::nullopt, compiled_dims, false);
+}
+
+void DeepGemmOps::m_grouped_fp8_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                               const std::pair<torch::Tensor, torch::Tensor>& b,
+                                               const torch::Tensor&                           d,
+                                               const torch::Tensor&                           masked_m,
+                                               int                                            expected_m,
+                                               const std::string&                             compiled_dims)
+{
+    deep_gemm::gemm::m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m, std::nullopt, compiled_dims, false);
 }
 
 }  // namespace ops

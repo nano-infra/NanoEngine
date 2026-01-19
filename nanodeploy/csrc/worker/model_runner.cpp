@@ -174,10 +174,17 @@ void ModelRunner::init_internal(const std::string& config_path_str, int rank)
     deep_ep_ctx_ = std::make_unique<DeepEpContext>(rank_, world_size_);
 
     if (config_->is_moe) {
-        NANODEPLOY_LOG_INFO("      MoE Model Detected.");
+        NANODEPLOY_LOG_INFO("      MoE Model Detected. QuantMethod: ", config_->quant_method);
         NANODEPLOY_LOG_INFO("      Experts: ", config_->num_experts, " TopK: ", config_->num_experts_per_tok);
 
-        moe_model_ = std::make_unique<Qwen3MoeForCausalLM<QuantType::FP16>>(*config_, device_);
+        if (config_->quant_method == "fp8") {
+            NANODEPLOY_LOG_INFO("      Instantiating FP8 MoE Model...");
+            moe_model_fp8_ = std::make_unique<Qwen3MoeForCausalLM<QuantType::FP8_E4M3>>(*config_, device_);
+        }
+        else {
+            NANODEPLOY_LOG_INFO("      Instantiating BF16/FP16 MoE Model...");
+            moe_model_ = std::make_unique<Qwen3MoeForCausalLM<QuantType::FP16>>(*config_, device_);
+        }
 
         int ep_size = get_dist_context().ffn_ep();
         int ep_rank = get_dist_context().ffn_ep_rank();
@@ -469,25 +476,51 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
 
         // Run Forward
         torch::Tensor hidden_states;
+
         if (config_->is_moe) {
 #ifdef DEEPSEEK_MOE
-            hidden_states = moe_model_->forward(input_ids,
-                                                positions,
-                                                attn_ctx_->get_kv_cache(),
-                                                attn_ctx_->get_handler(),
-                                                slot_mapping,
-                                                block_tables,
-                                                seq_lens,
-                                                deep_ep_ctx_->get_buffer(),
-                                                req.is_prefill);
+            if (moe_model_fp8_) {
+                hidden_states = moe_model_fp8_->forward(input_ids,
+                                                        positions,
+                                                        attn_ctx_->get_kv_cache(),
+                                                        attn_ctx_->get_handler(),
+                                                        slot_mapping,
+                                                        block_tables,
+                                                        seq_lens,
+                                                        deep_ep_ctx_->get_buffer(),
+                                                        req.is_prefill);
+            }
+            else {
+                hidden_states = moe_model_->forward(input_ids,
+                                                    positions,
+                                                    attn_ctx_->get_kv_cache(),
+                                                    attn_ctx_->get_handler(),
+                                                    slot_mapping,
+                                                    block_tables,
+                                                    seq_lens,
+                                                    deep_ep_ctx_->get_buffer(),
+                                                    req.is_prefill);
+            }
 #else
-            hidden_states = moe_model_->forward(input_ids,
-                                                positions,
-                                                attn_ctx_->get_kv_cache(),
-                                                attn_ctx_->get_handler(),
-                                                slot_mapping,
-                                                block_tables,
-                                                seq_lens);
+            // Fallback if DEEPSEEK_MOE not defined (should not happen in this env)
+            if (moe_model_fp8_) {
+                hidden_states = moe_model_fp8_->forward(input_ids,
+                                                        positions,
+                                                        attn_ctx_->get_kv_cache(),
+                                                        attn_ctx_->get_handler(),
+                                                        slot_mapping,
+                                                        block_tables,
+                                                        seq_lens);
+            }
+            else {
+                hidden_states = moe_model_->forward(input_ids,
+                                                    positions,
+                                                    attn_ctx_->get_kv_cache(),
+                                                    attn_ctx_->get_handler(),
+                                                    slot_mapping,
+                                                    block_tables,
+                                                    seq_lens);
+            }
 #endif
         }
         else {
@@ -502,8 +535,6 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
 
         // Compute Logits
         if (req.is_prefill) {
-            // ...
-            // (Keep existing prefill logic)
             std::vector<int64_t> last_token_indices;
             int64_t              current_offset = 0;
             for (const auto& seq : req.seqs) {
@@ -518,14 +549,22 @@ ModelRunResp ModelRunner::run(ModelRunReq req)
 
             auto last_hidden = hidden_states.index_select(0, indices);
 
-            if (config_->is_moe)
-                logits = moe_model_->compute_logits(last_hidden);
+            if (config_->is_moe) {
+                if (moe_model_fp8_)
+                    logits = moe_model_fp8_->compute_logits(last_hidden);
+                else
+                    logits = moe_model_->compute_logits(last_hidden);
+            }
             else
                 logits = model_->compute_logits(last_hidden);
         }
         else {
-            if (config_->is_moe)
-                logits = moe_model_->compute_logits(hidden_states);
+            if (config_->is_moe) {
+                if (moe_model_fp8_)
+                    logits = moe_model_fp8_->compute_logits(hidden_states);
+                else
+                    logits = moe_model_->compute_logits(hidden_states);
+            }
             else
                 logits = model_->compute_logits(hidden_states);
         }
@@ -538,7 +577,10 @@ void ModelRunner::load_weights(const std::string& /*weight_path*/)
 {
     NANODEPLOY_LOG_INFO("Loading Embeddings...");
     if (config_->is_moe) {
-        moe_model_->model_->embed_tokens_->weight = weight_manager_->load("model.embed_tokens.weight");
+        if (moe_model_fp8_)
+            moe_model_fp8_->model_->embed_tokens_->weight = weight_manager_->load("model.embed_tokens.weight");
+        else
+            moe_model_->model_->embed_tokens_->weight = weight_manager_->load("model.embed_tokens.weight");
     }
     else {
         model_->model_->embed_tokens_->weight = weight_manager_->load("model.embed_tokens.weight");
@@ -550,7 +592,10 @@ void ModelRunner::load_weights(const std::string& /*weight_path*/)
             NANODEPLOY_LOG_INFO("Loading Layer ", i, " / ", total_layers);
 
         if (config_->is_moe) {
-            load_moe_layer_weights(i, moe_model_->model_->layers_[i].get());
+            if (moe_model_fp8_)
+                load_moe_layer_weights(i, moe_model_fp8_->model_->layers_[i].get());
+            else
+                load_moe_layer_weights(i, moe_model_->model_->layers_[i].get());
         }
         else {
             load_layer_weights(i, model_->model_->layers_[i].get());
@@ -559,8 +604,14 @@ void ModelRunner::load_weights(const std::string& /*weight_path*/)
 
     NANODEPLOY_LOG_INFO("Loading Final Norm...");
     if (config_->is_moe) {
-        moe_model_->model_->norm_->weight = weight_manager_->load("model.norm.weight");
-        moe_model_->lm_head_->weight      = weight_manager_->load("lm_head.weight");
+        if (moe_model_fp8_) {
+            moe_model_fp8_->model_->norm_->weight = weight_manager_->load("model.norm.weight");
+            moe_model_fp8_->lm_head_->weight      = weight_manager_->load("lm_head.weight");
+        }
+        else {
+            moe_model_->model_->norm_->weight = weight_manager_->load("model.norm.weight");
+            moe_model_->lm_head_->weight      = weight_manager_->load("lm_head.weight");
+        }
     }
     else {
         model_->model_->norm_->weight = weight_manager_->load("model.norm.weight");
@@ -951,8 +1002,12 @@ GraphCaptureResp ModelRunner::capture_decode_graphs(GraphCaptureReq req)
                                     static_seq_lens_.slice(0, 0, bs));
 
             torch::Tensor warmup_logits;
-            if (config_->is_moe)
-                warmup_logits = moe_model_->compute_logits(warmup_hidden);
+            if (config_->is_moe) {
+                if (moe_model_fp8_)
+                    warmup_logits = moe_model_fp8_->compute_logits(warmup_hidden);
+                else
+                    warmup_logits = moe_model_->compute_logits(warmup_hidden);
+            }
             else
                 warmup_logits = model_->compute_logits(warmup_hidden);
         }
@@ -967,31 +1022,71 @@ GraphCaptureResp ModelRunner::capture_decode_graphs(GraphCaptureReq req)
         cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
 
         // 2. Model Forward (pure GPU kernels)
-        auto hidden_states = config_->is_moe ? moe_model_->forward(static_input_ids_.slice(0, 0, bs),
-                                                                   static_positions_.slice(0, 0, bs),
-                                                                   attn_ctx_->get_kv_cache(),
-                                                                   attn_ctx_->get_handler(),
-                                                                   static_slot_mapping_.slice(0, 0, bs),
-                                                                   static_block_tables_.slice(0, 0, bs),
-                                                                   static_seq_lens_.slice(0, 0, bs)
+        torch::Tensor hidden_states;
+        if (config_->is_moe) {
 #ifdef DEEPSEEK_MOE
-                                                                       ,
-                                                                   deep_ep_ctx_->get_buffer(),
-                                                                   false  // is_prefill=false for decode graph capture
+            if (moe_model_fp8_) {
+                hidden_states = moe_model_fp8_->forward(static_input_ids_.slice(0, 0, bs),
+                                                        static_positions_.slice(0, 0, bs),
+                                                        attn_ctx_->get_kv_cache(),
+                                                        attn_ctx_->get_handler(),
+                                                        static_slot_mapping_.slice(0, 0, bs),
+                                                        static_block_tables_.slice(0, 0, bs),
+                                                        static_seq_lens_.slice(0, 0, bs),
+                                                        deep_ep_ctx_->get_buffer(),
+                                                        false);
+            }
+            else {
+                hidden_states = moe_model_->forward(static_input_ids_.slice(0, 0, bs),
+                                                    static_positions_.slice(0, 0, bs),
+                                                    attn_ctx_->get_kv_cache(),
+                                                    attn_ctx_->get_handler(),
+                                                    static_slot_mapping_.slice(0, 0, bs),
+                                                    static_block_tables_.slice(0, 0, bs),
+                                                    static_seq_lens_.slice(0, 0, bs),
+                                                    deep_ep_ctx_->get_buffer(),
+                                                    false);
+            }
+#else
+            // Fallback
+            if (moe_model_fp8_) {
+                hidden_states = moe_model_fp8_->forward(static_input_ids_.slice(0, 0, bs),
+                                                        static_positions_.slice(0, 0, bs),
+                                                        attn_ctx_->get_kv_cache(),
+                                                        attn_ctx_->get_handler(),
+                                                        static_slot_mapping_.slice(0, 0, bs),
+                                                        static_block_tables_.slice(0, 0, bs),
+                                                        static_seq_lens_.slice(0, 0, bs));
+            }
+            else {
+                hidden_states = moe_model_->forward(static_input_ids_.slice(0, 0, bs),
+                                                    static_positions_.slice(0, 0, bs),
+                                                    attn_ctx_->get_kv_cache(),
+                                                    attn_ctx_->get_handler(),
+                                                    static_slot_mapping_.slice(0, 0, bs),
+                                                    static_block_tables_.slice(0, 0, bs),
+                                                    static_seq_lens_.slice(0, 0, bs));
+            }
 #endif
-                                                                   ) :
-                                               model_->forward(static_input_ids_.slice(0, 0, bs),
-                                                               static_positions_.slice(0, 0, bs),
-                                                               attn_ctx_->get_kv_cache(),
-                                                               attn_ctx_->get_handler(),
-                                                               static_slot_mapping_.slice(0, 0, bs),
-                                                               static_block_tables_.slice(0, 0, bs),
-                                                               static_seq_lens_.slice(0, 0, bs));
+        }
+        else {
+            hidden_states = model_->forward(static_input_ids_.slice(0, 0, bs),
+                                            static_positions_.slice(0, 0, bs),
+                                            attn_ctx_->get_kv_cache(),
+                                            attn_ctx_->get_handler(),
+                                            static_slot_mapping_.slice(0, 0, bs),
+                                            static_block_tables_.slice(0, 0, bs),
+                                            static_seq_lens_.slice(0, 0, bs));
+        }
 
         // 3. Logits only - Sampler is OUTSIDE capture for future flexibility
         torch::Tensor logits;
-        if (config_->is_moe)
-            logits = moe_model_->compute_logits(hidden_states);
+        if (config_->is_moe) {
+            if (moe_model_fp8_)
+                logits = moe_model_fp8_->compute_logits(hidden_states);
+            else
+                logits = moe_model_->compute_logits(hidden_states);
+        }
         else
             logits = model_->compute_logits(hidden_states);
 
@@ -1009,6 +1104,106 @@ GraphCaptureResp ModelRunner::capture_decode_graphs(GraphCaptureReq req)
     }
 
     return true;
+}
+
+void ModelRunner::load_moe_layer_weights(int layer_idx, models::DeepSeekMoeDecoderLayer<QuantType::FP8_E4M3>* layer)
+{
+    std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
+
+    // A. Attention (FP8 Linear with concat)
+    auto q_w = weight_manager_->load(prefix + "self_attn.q_proj.weight");
+    auto q_s = weight_manager_->load(prefix + "self_attn.q_proj.weight_scale_inv");
+    auto k_w = weight_manager_->load(prefix + "self_attn.k_proj.weight");
+    auto k_s = weight_manager_->load(prefix + "self_attn.k_proj.weight_scale_inv");
+    auto v_w = weight_manager_->load(prefix + "self_attn.v_proj.weight");
+    auto v_s = weight_manager_->load(prefix + "self_attn.v_proj.weight_scale_inv");
+
+    // Concat FP8 weights
+    layer->self_attn_->qkv_proj_->weight           = torch::cat({q_w, k_w, v_w}, 0);
+    layer->self_attn_->qkv_proj_->weight_scale_inv = torch::cat({q_s, k_s, v_s}, 0);
+
+    try {
+        auto q_b                           = weight_manager_->load(prefix + "self_attn.q_proj.bias");
+        auto k_b                           = weight_manager_->load(prefix + "self_attn.k_proj.bias");
+        auto v_b                           = weight_manager_->load(prefix + "self_attn.v_proj.bias");
+        layer->self_attn_->qkv_proj_->bias = torch::cat({q_b, k_b, v_b}, 0);
+    }
+    catch (...) {
+        // Init bias to zeros if not found (BF16, on correct device)
+        auto out_features = layer->self_attn_->qkv_proj_->weight.size(0);
+        layer->self_attn_->qkv_proj_->bias =
+            torch::zeros({out_features}, torch::TensorOptions().dtype(torch::kBFloat16).device(device_));
+    }
+
+    layer->self_attn_->o_proj_->weight           = weight_manager_->load(prefix + "self_attn.o_proj.weight");
+    layer->self_attn_->o_proj_->weight_scale_inv = weight_manager_->load(prefix + "self_attn.o_proj.weight_scale_inv");
+
+    layer->self_attn_->q_norm_->weight = weight_manager_->load(prefix + "self_attn.q_norm.weight");
+    layer->self_attn_->k_norm_->weight = weight_manager_->load(prefix + "self_attn.k_norm.weight");
+
+    layer->input_layernorm_->weight          = weight_manager_->load(prefix + "input_layernorm.weight");
+    layer->post_attention_layernorm_->weight = weight_manager_->load(prefix + "post_attention_layernorm.weight");
+
+    // B. MLP (MoE FP8)
+    if (layer->is_sparse_) {
+        // DeepSeek MoE Loading
+        auto* block = layer->mlp_moe_.get();  // DeepSeekMoeSparseMoeBlock<FP8>
+
+        // Gate (Router) - usually BF16/FP32
+        block->gate_->weight = weight_manager_->load(prefix + "mlp.gate.weight");
+
+        // Experts weights
+        int num_experts       = config_->num_experts;
+        int ep_size           = get_dist_context().ffn_ep();
+        int num_local_experts = num_experts / ep_size;
+
+        // Load weights for each local expert
+        std::vector<torch::Tensor> gate_up_list, down_list;
+        std::vector<torch::Tensor> gate_up_scale_list, down_scale_list;
+
+        for (int i = 0; i < num_local_experts; ++i) {
+            // Calculate global expert index
+            int         global_expert_idx = get_dist_context().ffn_ep_rank() * num_local_experts + i;
+            std::string exp_prefix        = prefix + "mlp.experts." + std::to_string(global_expert_idx) + ".";
+
+            auto g   = weight_manager_->load(exp_prefix + "gate_proj.weight");
+            auto g_s = weight_manager_->load(exp_prefix + "gate_proj.weight_scale_inv");
+            auto u   = weight_manager_->load(exp_prefix + "up_proj.weight");
+            auto u_s = weight_manager_->load(exp_prefix + "up_proj.weight_scale_inv");
+            auto d   = weight_manager_->load(exp_prefix + "down_proj.weight");
+            auto d_s = weight_manager_->load(exp_prefix + "down_proj.weight_scale_inv");
+
+            // Concatenate gate and up
+            gate_up_list.push_back(torch::cat({g, u}, 0));
+            gate_up_scale_list.push_back(torch::cat({g_s, u_s}, 0));
+
+            down_list.push_back(d);
+            down_scale_list.push_back(d_s);
+        }
+
+        // Stack into tensors
+        block->gate_up_proj_      = torch::stack(gate_up_list, 0);        // FP8
+        block->gate_up_scale_inv_ = torch::stack(gate_up_scale_list, 0);  // FP32
+        block->down_proj_         = torch::stack(down_list, 0);           // FP8
+        block->down_scale_inv_    = torch::stack(down_scale_list, 0);     // FP32
+    }
+    else {
+        // Dense MLP (FP8) - Assume Qwen3MoeDecoderLayer handles dense fallback via mlp_dense_
+        // Qwen3MoeDecoderLayer has mlp_dense_ as MergedColumnParallelLinear
+        // But MergedColumnParallelLinear<FP8> IS Linear<FP8> so it works!
+
+        auto* mlp    = layer->mlp_dense_.get();
+        auto  gate_w = weight_manager_->load(prefix + "mlp.gate_proj.weight");
+        auto  gate_s = weight_manager_->load(prefix + "mlp.gate_proj.weight_scale_inv");
+        auto  up_w   = weight_manager_->load(prefix + "mlp.up_proj.weight");
+        auto  up_s   = weight_manager_->load(prefix + "mlp.up_proj.weight_scale_inv");
+
+        mlp->gate_up_proj_->weight           = torch::cat({gate_w, up_w}, 0);
+        mlp->gate_up_proj_->weight_scale_inv = torch::cat({gate_s, up_s}, 0);
+
+        mlp->down_proj_->weight           = weight_manager_->load(prefix + "mlp.down_proj.weight");
+        mlp->down_proj_->weight_scale_inv = weight_manager_->load(prefix + "mlp.down_proj.weight_scale_inv");
+    }
 }
 
 }  // namespace nanodeploy

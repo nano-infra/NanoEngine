@@ -418,6 +418,163 @@ public:
     std::unique_ptr<layers::SiluAndMul> act_fn_;
 };
 
+// =========================================================================
+// DeepSeekMoeSparseMoeBlock (Stage 2: FP8 specialization)
+// =========================================================================
+template<>
+class DeepSeekMoeSparseMoeBlock<QuantType::FP8_E4M3>: public core::Module {
+public:
+    static constexpr int BLOCK_SIZE = 128;
+
+    DeepSeekMoeSparseMoeBlock(const core::ModelConfig& config): core::Module()
+    {
+        hidden_size_ = config.hidden_size;
+        num_experts_ = config.num_experts;
+        top_k_       = config.num_experts_per_tok;
+
+        int moe_inter = config.moe_intermediate_size;
+
+        gate_ = register_module("gate",
+                                torch::nn::Linear(torch::nn::LinearOptions(hidden_size_, num_experts_).bias(false)));
+
+        int world_size        = get_dist_context().ffn_ep_world_size();
+        int num_local_experts = num_experts_ / world_size;
+
+        gate_up_proj_ = torch::empty({num_local_experts, moe_inter * 2, hidden_size_}, torch::kFloat8_e4m3fn);
+        down_proj_    = torch::empty({num_local_experts, hidden_size_, moe_inter}, torch::kFloat8_e4m3fn);
+
+        int gu_out_blocks  = (moe_inter * 2 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        int gu_in_blocks   = (hidden_size_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        gate_up_scale_inv_ = torch::empty({num_local_experts, gu_out_blocks, gu_in_blocks}, torch::kFloat32);
+
+        int d_out_blocks = (hidden_size_ + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        int d_in_blocks  = (moe_inter + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        down_scale_inv_  = torch::empty({num_local_experts, d_out_blocks, d_in_blocks}, torch::kFloat32);
+
+        register_parameter("gate_up_proj", gate_up_proj_);
+        register_parameter("down_proj", down_proj_);
+        register_parameter("gate_up_scale_inv", gate_up_scale_inv_);
+        register_parameter("down_scale_inv", down_scale_inv_);
+    }
+
+    torch::Tensor compute_experts(torch::Tensor input, torch::Tensor topk_idx, torch::Tensor topk_weights)
+    {
+        return ops::MoeExpertOps::compute_contiguous(input,
+                                                     topk_idx,
+                                                     topk_weights,
+                                                     {gate_up_proj_, gate_up_scale_inv_},
+                                                     {down_proj_, down_scale_inv_},
+                                                     hidden_size_);
+    }
+
+    torch::Tensor compute_experts_masked(torch::Tensor recv_x, torch::Tensor masked_m, int expected_m)
+    {
+        return ops::MoeExpertOps::compute_masked(
+            recv_x, masked_m, expected_m, {gate_up_proj_, gate_up_scale_inv_}, {down_proj_, down_scale_inv_});
+    }
+
+    torch::Tensor expert(torch::Tensor hidden_states)
+    {
+        auto original_shape = hidden_states.sizes();
+        auto hidden_flat    = hidden_states.view({-1, hidden_size_});
+
+        auto router_logits   = gate_->forward(hidden_flat);
+        auto routing_weights = torch::softmax(router_logits, -1);
+        auto topk            = torch::topk(routing_weights, top_k_, -1);
+        auto topk_weights    = std::get<0>(topk);
+        auto topk_ids        = std::get<1>(topk);
+
+        topk_weights = topk_weights / topk_weights.sum(-1, true);
+
+        auto output = compute_experts(hidden_flat, topk_ids, topk_weights);
+
+        return output.view(original_shape);
+    }
+
+    torch::Tensor forward_multi_card(torch::Tensor hidden_states, deep_ep::Buffer* ep_buffer)
+    {
+        auto original_shape = hidden_states.sizes();
+        auto hidden_flat    = hidden_states.view({-1, hidden_size_});
+
+        auto router_logits    = gate_->forward(hidden_flat);
+        auto routing_weights  = torch::softmax(router_logits, -1);
+        auto topk             = torch::topk(routing_weights, top_k_, -1);
+        auto topk_weights_f32 = std::get<0>(topk).to(torch::kFloat32);
+        auto topk_ids         = std::get<1>(topk).to(torch::kLong);
+
+        topk_weights_f32 = topk_weights_f32 / topk_weights_f32.sum(-1, true);
+
+        auto dispatch_result =
+            ops::DeepEpOps::dispatch_normal(ep_buffer, hidden_flat, topk_ids, topk_weights_f32, num_experts_);
+
+        torch::Tensor expert_output;
+        if (!dispatch_result.recv_topk_idx.has_value() || !dispatch_result.recv_topk_weights.has_value()) {
+            expert_output =
+                torch::zeros({dispatch_result.recv_x.size(0), hidden_size_}, dispatch_result.recv_x.options());
+        }
+        else {
+            expert_output = compute_experts(dispatch_result.recv_x,
+                                            dispatch_result.recv_topk_idx.value(),
+                                            dispatch_result.recv_topk_weights.value());
+        }
+
+        auto combined_x = ops::DeepEpOps::combine_normal(ep_buffer, expert_output, dispatch_result.handle);
+        return combined_x.view(original_shape);
+    }
+
+    torch::Tensor forward_multi_card_low_latency(torch::Tensor    hidden_states,
+                                                 deep_ep::Buffer* ep_buffer,
+                                                 int              num_max_dispatch_tokens_per_rank)
+    {
+        auto original_shape = hidden_states.sizes();
+        auto hidden_flat    = hidden_states.view({-1, hidden_size_});
+        auto device         = hidden_flat.device();
+
+        auto router_logits    = gate_->forward(hidden_flat);
+        auto routing_weights  = torch::softmax(router_logits, -1);
+        auto topk             = torch::topk(routing_weights, top_k_, -1);
+        auto topk_weights_f32 = std::get<0>(topk).to(torch::kFloat32);
+        auto topk_ids         = std::get<1>(topk).to(torch::kLong);
+
+        topk_weights_f32 = topk_weights_f32 / topk_weights_f32.sum(-1, true);
+
+        auto dispatch_result = ops::DeepEpOps::dispatch_low_latency(
+            ep_buffer, hidden_flat, topk_ids, topk_weights_f32, num_max_dispatch_tokens_per_rank, num_experts_);
+
+        auto expert_output =
+            compute_experts_masked(dispatch_result.recv_x, dispatch_result.masked_m, dispatch_result.expected_m);
+
+        auto combined_x = ops::DeepEpOps::combine_low_latency(ep_buffer, expert_output, dispatch_result.handle);
+        return combined_x.view(original_shape);
+    }
+
+    torch::Tensor forward(torch::Tensor    hidden_states,
+                          deep_ep::Buffer* ep_buffer               = nullptr,
+                          bool             use_low_latency         = true,
+                          int              num_max_dispatch_tokens = 256)
+    {
+        if (ep_buffer == nullptr) {
+            return expert(hidden_states);
+        }
+        else if (use_low_latency) {
+            return forward_multi_card_low_latency(hidden_states, ep_buffer, num_max_dispatch_tokens);
+        }
+        else {
+            return forward_multi_card(hidden_states, ep_buffer);
+        }
+    }
+
+    int               hidden_size_;
+    int               num_experts_;
+    int               top_k_;
+    torch::nn::Linear gate_ = nullptr;
+
+    torch::Tensor gate_up_proj_;
+    torch::Tensor down_proj_;
+    torch::Tensor gate_up_scale_inv_;
+    torch::Tensor down_scale_inv_;
+};
+
 template<QuantType Quant>
 class DeepSeekMoeDecoderLayer: public core::Module {
 public:

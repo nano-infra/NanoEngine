@@ -46,7 +46,8 @@ void DeepEpContext::init(const core::ModelConfig& config, int ffn_ep_world_size,
         deep_ep::Config dep_config(num_sms, nvl_chunk_send, nvl_chunk_recv, rdma_chunk_send, rdma_chunk_recv);
 
         // NVL buffer for Normal mode
-        int64_t num_nvl_bytes = dep_config.get_nvl_buffer_size_hint(hidden_size_bytes, ep_size);
+        // NOTE: FP8 mode requires extra space for scale buffers, multiply by 2x as safety margin
+        int64_t num_nvl_bytes = dep_config.get_nvl_buffer_size_hint(hidden_size_bytes, ep_size) * 2;
 
         // RDMA buffer: max of Normal and Low Latency requirements
         int     num_max_dispatch_tokens_per_rank = 256;  // Typical decode batch size

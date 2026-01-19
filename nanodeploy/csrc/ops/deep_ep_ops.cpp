@@ -15,7 +15,13 @@ DispatchResult DeepEpOps::dispatch_normal(deep_ep::Buffer* buffer,
                                           int              num_experts,
                                           int              expert_alignment)
 {
-    auto device      = hidden_states.device();
+    auto device = hidden_states.device();
+
+    // Ensure hidden_states is BF16 (DeepEP intranode dispatch doesn't support FP8 directly)
+    if (hidden_states.scalar_type() != torch::kBFloat16) {
+        hidden_states = hidden_states.to(torch::kBFloat16);
+    }
+
     auto hidden_flat = hidden_states.view({-1, hidden_states.size(-1)});
 
     std::optional<deep_ep::EventHandle> prev_event = std::nullopt;
@@ -168,6 +174,11 @@ LowLatencyDispatchResult DeepEpOps::dispatch_low_latency(deep_ep::Buffer* buffer
                                                          int              num_experts,
                                                          int              ep_world_size)
 {
+    // Ensure hidden_states is BF16
+    if (hidden_states.scalar_type() != torch::kBFloat16) {
+        hidden_states = hidden_states.to(torch::kBFloat16);
+    }
+
     auto hidden_flat = hidden_states.view({-1, hidden_states.size(-1)});
     int  num_tokens  = hidden_flat.size(0);
     int  hidden_size = hidden_flat.size(1);
