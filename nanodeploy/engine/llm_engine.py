@@ -77,16 +77,19 @@ class LLMEngine:
         filtered_dp_sp_seqs = sch_res.filtered_dp_sp_seqs
 
         total_running = sum(len(seqs) for seqs in dp_seqs)
-        total_waiting = len(self.scheduler.waiting)
-        total_waiting_migration = len(self.scheduler.waiting_migration)
+        total_waiting = self.scheduler.get_total_waiting_size()
+        total_waiting_migration = self.scheduler.get_total_waiting_migration_size()
         self.metrics_manager.server_metric.update_running_requests(total_running)
         self.metrics_manager.server_metric.update_waiting_requests(total_waiting)
         self.metrics_manager.server_metric.update_waiting_migration_requests(
             total_waiting_migration
         )
 
-        if self.scheduler.waiting_migration:
-            logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
+        if total_waiting_migration > 0:
+            # In decentralized mode, we can't directly access waiting_migration[0]
+            # This is just for logging, so we skip it in decentralized mode
+            if hasattr(self.scheduler, 'waiting_migration') and self.scheduler.waiting_migration:
+                logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
 
         dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
 
@@ -238,7 +241,7 @@ class LLMEngine:
         use_tqdm: bool = True,
         log_metrics_interval: int = 10,
     ) -> None:
-        num_reqs = len(self.scheduler.waiting)
+        num_reqs = self.scheduler.get_total_waiting_size()
         if use_tqdm:
             pbar = tqdm(total=num_reqs, desc="Generating", dynamic_ncols=True)
 

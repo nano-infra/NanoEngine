@@ -1,3 +1,4 @@
+import argparse
 import os
 
 import numpy as np
@@ -8,6 +9,22 @@ from transformers import AutoTokenizer
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Dummy prefill test with scheduler mode selection")
+    parser.add_argument(
+        "--scheduler-mode",
+        type=str,
+        default="centralized",
+        choices=["centralized", "decentralized"],
+        help="Scheduler mode: centralized or decentralized (default: centralized)"
+    )
+    parser.add_argument(
+        "--routing-strategy",
+        type=str,
+        default="RoundRobin",
+        choices=["RoundRobin", "LeastBatch", "LeastCache"],
+        help="Routing strategy for decentralized scheduler (default: RoundRobin)"
+    )
+    args = parser.parse_args()
     path = os.path.expanduser("/models/qwen3-235B-Instruct-2507-FP8")
 
     decode = LLM(
@@ -33,7 +50,11 @@ def main():
         max_num_recv_seqs=130,
         kvcache_block_size=256,
         enable_profiler=False,
+        scheduler_mode=args.scheduler_mode,
+        routing_strategy=args.routing_strategy,
     )
+    
+    print(f"Starting with scheduler_mode={args.scheduler_mode}, routing_strategy={args.routing_strategy}")
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=256, ignore_eos=True)
 

@@ -118,8 +118,28 @@ public:
     std::unordered_map<int, std::shared_ptr<BlockManager>> block_manager;
     std::deque<std::shared_ptr<Sequence>>                  running;
     std::vector<std::shared_ptr<Sequence>>                 dummy_seqs;
+    
+    // Waiting queues for decentralized scheduler mode
+    std::deque<std::shared_ptr<Sequence>>                  waiting;
+    std::deque<std::shared_ptr<Sequence>>                  waiting_migration;
 
     RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;
+    
+    // Helper methods for decentralized scheduler
+    bool is_waiting_empty() const
+    {
+        return waiting.empty() && waiting_migration.empty();
+    }
+    
+    int get_waiting_queue_size() const
+    {
+        return static_cast<int>(waiting.size() + waiting_migration.size());
+    }
+    
+    int get_total_load() const
+    {
+        return num_running_seqs_ + get_waiting_queue_size();
+    }
 
 private:
     void initialize_dummy_seqs();

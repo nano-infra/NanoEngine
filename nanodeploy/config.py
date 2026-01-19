@@ -18,6 +18,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     gpu_memory_limit_gb: float | None = None
     routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
+    scheduler_mode: Literal["centralized", "decentralized"] = "centralized"
 
     # parallel config
     attention_tp: int = 1

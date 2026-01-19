@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 #include "nanodeploy/metrics/sequence_metric.h"
@@ -27,7 +28,8 @@ Scheduler::Scheduler(const std::string& engine_id,
                      bool               enable_dynamic_sp_size,
                      bool               enable_non_uniform_split,
                      const std::string& sp_master_selector,
-                     bool               sp_debug) :
+                     bool               sp_debug,
+                     const std::string& scheduler_mode) :
     engine_id_(engine_id),
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
@@ -58,7 +60,16 @@ Scheduler::Scheduler(const std::string& engine_id,
         sp_manager->set_dp_idx(dp_idx);
         worker_state.push_back(sp_manager);
     }
-    std::cerr << "[Scheduler] Initialized with segment_size=" << segment_size_ << std::endl;
+    // Set scheduler mode
+    if (scheduler_mode == "decentralized") {
+        scheduler_mode_ = SchedulerMode::DECENTRALIZED;
+    } else {
+        scheduler_mode_ = SchedulerMode::CENTRALIZED;
+    }
+    
+    std::cerr << "[Scheduler] Initialized with segment_size=" << segment_size_ 
+              << ", scheduler_mode=" << (scheduler_mode_ == SchedulerMode::DECENTRALIZED ? "decentralized" : "centralized")
+              << std::endl;
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
 }
 
@@ -70,28 +81,82 @@ void Scheduler::add(std::shared_ptr<Sequence> seq)
         seq->metric->record_arrival();
     }
 
-    if (mode_ == "decode") {
-        waiting_migration.push_back(seq);
-        if (seq->metric) {
+    if (scheduler_mode_ == SchedulerMode::DECENTRALIZED) {
+        // Decentralized mode: immediately route to selected DP worker
+        int selected_dp_idx = select_dp_worker_for_routing(*seq);
+        auto& target_queue = (mode_ == "decode") ? 
+            worker_state[selected_dp_idx]->waiting_migration : 
+            worker_state[selected_dp_idx]->waiting;
+        target_queue.push_back(seq);
+        
+        // Set dp_idx (though resources haven't been allocated yet)
+        seq->block_ctx(BlockContextSlot::ACTIVE).dp_idx_ = selected_dp_idx;
+        
+        if (mode_ == "decode" && seq->metric) {
             seq->metric->record_decode_arrival();
         }
-    }
-    else {
-        waiting.push_back(seq);
+    } else {
+        // Centralized mode: add to global queue (original logic)
+        if (mode_ == "decode") {
+            waiting_migration.push_back(seq);
+            if (seq->metric) {
+                seq->metric->record_decode_arrival();
+            }
+        }
+        else {
+            waiting.push_back(seq);
+        }
     }
 }
 
 bool Scheduler::is_finished() const
 {
-    const auto& wait_queue = (mode_ != "decode") ? waiting : waiting_migration;
-    if (!wait_queue.empty())
-        return false;
-
-    for (const auto& ws : worker_state) {
-        if (!ws->is_empty())
+    if (scheduler_mode_ == SchedulerMode::DECENTRALIZED) {
+        // Check all workers' queues and running state
+        for (const auto& ws : worker_state) {
+            if (!ws->is_waiting_empty() || !ws->is_empty()) {
+                return false;
+            }
+        }
+        return true;
+    } else {
+        // Centralized mode: original logic
+        const auto& wait_queue = (mode_ != "decode") ? waiting : waiting_migration;
+        if (!wait_queue.empty())
             return false;
+
+        for (const auto& ws : worker_state) {
+            if (!ws->is_empty())
+                return false;
+        }
+        return true;
     }
-    return true;
+}
+
+int Scheduler::get_total_waiting_size() const
+{
+    if (scheduler_mode_ == SchedulerMode::DECENTRALIZED) {
+        int total = 0;
+        for (const auto& ws : worker_state) {
+            total += static_cast<int>(ws->waiting.size());
+        }
+        return total;
+    } else {
+        return static_cast<int>(waiting.size());
+    }
+}
+
+int Scheduler::get_total_waiting_migration_size() const
+{
+    if (scheduler_mode_ == SchedulerMode::DECENTRALIZED) {
+        int total = 0;
+        for (const auto& ws : worker_state) {
+            total += static_cast<int>(ws->waiting_migration.size());
+        }
+        return total;
+    } else {
+        return static_cast<int>(waiting_migration.size());
+    }
 }
 
 std::deque<std::shared_ptr<Sequence>>& Scheduler::running(int dp_idx)
@@ -121,23 +186,70 @@ int Scheduler::next_dp_idx()
     return idx;
 }
 
+int Scheduler::select_dp_worker_for_routing(Sequence& seq)
+{
+    if (routing_strategy == RoutingStrategy::RoundRobin) {
+        return next_dp_idx();
+    }
+    else if (routing_strategy == RoutingStrategy::LeastBatch) {
+        int best_idx = 0;
+        int min_load = std::numeric_limits<int>::max();
+        for (int i = 0; i < attention_dp_; ++i) {
+            int load = worker_state[i]->get_total_load();
+            if (load < min_load) {
+                min_load = load;
+                best_idx = i;
+            }
+        }
+        return best_idx;
+    }
+    else if (routing_strategy == RoutingStrategy::LeastCache) {
+        int best_idx = 0;
+        int max_free = -1;
+        for (int i = 0; i < attention_dp_; ++i) {
+            // Get free blocks from the first SP rank (or aggregate if needed)
+            int free_blocks = 0;
+            if (!worker_state[i]->block_manager.empty()) {
+                // Use the first available block manager to get free blocks
+                auto it = worker_state[i]->block_manager.begin();
+                if (it != worker_state[i]->block_manager.end()) {
+                    free_blocks = it->second->num_free_blocks();
+                }
+            }
+            if (free_blocks > max_free) {
+                max_free = free_blocks;
+                best_idx = i;
+            }
+        }
+        return best_idx;
+    }
+    return 0;
+}
+
 ScheduleResult Scheduler::schedule()
 {
-    // Try prefill first
-    auto dp_seqs = _schedule_prefill();
-
-    // Check if any sequences were scheduled in prefill
+    std::vector<std::vector<std::shared_ptr<Sequence>>> dp_seqs;
     bool has_prefill = false;
-    for (const auto& seqs : dp_seqs) {
-        if (!seqs.empty()) {
-            has_prefill = true;
-            break;
-        }
-    }
+    
+    if (scheduler_mode_ == SchedulerMode::DECENTRALIZED) {
+        return _schedule_decentralized();
+    } else {
+        // Centralized mode: original logic
+        // Try prefill first
+        dp_seqs = _schedule_prefill();
 
-    if (!has_prefill) {
-        // No prefill sequences, schedule decode
-        dp_seqs = _schedule_decode();
+        // Check if any sequences were scheduled in prefill
+        for (const auto& seqs : dp_seqs) {
+            if (!seqs.empty()) {
+                has_prefill = true;
+                break;
+            }
+        }
+
+        if (!has_prefill) {
+            // No prefill sequences, schedule decode
+            dp_seqs = _schedule_decode();
+        }
     }
 
     ScheduleResult result;
@@ -530,11 +642,22 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
     // Re-initialize BlockContext for fresh scheduling
     seq->active(engine_id_, attention_sp_, attention_dp_);
 
-    if (mode_ == "decode") {
-        waiting_migration.push_front(seq);
-    }
-    else {
-        waiting.push_front(seq);
+    if (scheduler_mode_ == SchedulerMode::DECENTRALIZED) {
+        // Decentralized mode: put back to the worker's queue
+        auto& target_queue = (mode_ == "decode") ? 
+            worker_state[dp_idx]->waiting_migration : 
+            worker_state[dp_idx]->waiting;
+        target_queue.push_front(seq);
+        // Keep the dp_idx that was set during routing
+        seq->block_ctx(BlockContextSlot::ACTIVE).dp_idx_ = dp_idx;
+    } else {
+        // Centralized mode: put back to global queue
+        if (mode_ == "decode") {
+            waiting_migration.push_front(seq);
+        }
+        else {
+            waiting.push_front(seq);
+        }
     }
 }
 
@@ -571,6 +694,285 @@ void Scheduler::free_to_be_migrated(const std::vector<std::shared_ptr<Sequence>>
     for (const auto& seq : seqs) {
         free_to_be_migrated(seq);
     }
+}
+
+ScheduleResult Scheduler::_schedule_decentralized()
+{
+    std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled_seqs(attention_dp_);
+    bool has_prefill = false;
+
+    // Each DP worker independently schedules its own queue
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        // Try prefill first (from waiting queue or waiting_migration queue)
+        // This should always be attempted, regardless of mode_
+        // _schedule_prefill_for_worker will select the correct queue based on mode_
+        scheduled_seqs[dp_idx] = _schedule_prefill_for_worker(dp_idx);
+        if (!scheduled_seqs[dp_idx].empty()) {
+            has_prefill = true;
+        }
+
+        // If no prefill, schedule decode
+        if (scheduled_seqs[dp_idx].empty()) {
+            scheduled_seqs[dp_idx] = _schedule_decode_for_worker(dp_idx);
+        }
+    }
+
+    ScheduleResult result;
+    result.dp_seqs    = scheduled_seqs;
+    result.is_prefill = has_prefill;
+
+    // Prepare dp_sp_seqs and filtered_dp_sp_seqs (same as centralized mode)
+    result.dp_sp_seqs.reserve(attention_dp_ * attention_sp_);
+    result.filtered_dp_sp_seqs.reserve(attention_dp_ * attention_sp_);
+
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+            // dp_sp_seqs is just dp_seqs[dp_idx] repeated for each sp_idx
+            result.dp_sp_seqs.push_back(scheduled_seqs[dp_idx]);
+
+            // filtered_dp_sp_seqs is dp_seqs[dp_idx] filtered by master_sp_idx
+            std::vector<std::shared_ptr<Sequence>> filtered;
+            for (const auto& seq : scheduled_seqs[dp_idx]) {
+                if (seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_ == sp_idx) {
+                    filtered.push_back(seq);
+                }
+            }
+            result.filtered_dp_sp_seqs.push_back(std::move(filtered));
+        }
+    }
+
+    // Calculate SP counts (same as centralized mode)
+    result.sp_send_counts.resize(attention_dp_);
+    result.sp_recv_counts.resize(attention_dp_);
+
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        result.sp_send_counts[dp_idx].resize(attention_sp_);
+        result.sp_recv_counts[dp_idx].resize(attention_sp_);
+
+        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+            // SP Send Count
+            int send_count = 0;
+            const auto& sp_seqs = result.filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx];
+            for (const auto& seq : sp_seqs) {
+                const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+                int         active_ranks = 0;
+                for (int count : tokens) {
+                    if (count > 0)
+                        active_ranks++;
+                }
+                if (active_ranks > 1) {
+                    send_count++;
+                }
+            }
+            result.sp_send_counts[dp_idx][sp_idx] = send_count;
+
+            // SP Recv Count
+            int recv_count = 0;
+            for (const auto& seq : scheduled_seqs[dp_idx]) {
+                bool is_dummy = false;
+                for (const auto& dummy : worker_state[dp_idx]->dummy_seqs) {
+                    if (seq == dummy) {
+                        is_dummy = true;
+                        break;
+                    }
+                }
+                if (!is_dummy) {
+                    const auto& block_ctx    = seq->block_ctx(BlockContextSlot::ACTIVE);
+                    const auto& tokens       = block_ctx.num_dispatched_tokens;
+                    int         active_ranks = 0;
+                    for (int count : tokens) {
+                        if (count > 0)
+                            active_ranks++;
+                    }
+                    int master_sp_idx = block_ctx.master_sp_idx_;
+                    if (active_ranks > 1 && tokens[sp_idx] > 0 && master_sp_idx != sp_idx) {
+                        recv_count++;
+                    }
+                }
+            }
+            result.sp_recv_counts[dp_idx][sp_idx] = recv_count;
+        }
+
+        // SP Q Matrix
+        result.sp_q_matrix.push_back(std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+
+        for (const auto& seq : scheduled_seqs[dp_idx]) {
+            bool is_dummy = false;
+            for (const auto& dummy : worker_state[dp_idx]->dummy_seqs) {
+                if (seq == dummy) {
+                    is_dummy = true;
+                    break;
+                }
+            }
+            if (is_dummy)
+                continue;
+
+            const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+            int         active_ranks = 0;
+            for (int count : tokens) {
+                if (count > 0)
+                    active_ranks++;
+            }
+
+            if (active_ranks > 1) {
+                int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+                for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                    if (tokens[sp_idx] > 0) {
+                        result.sp_q_matrix[dp_idx][master_sp_idx][sp_idx]++;
+                    }
+                }
+            }
+        }
+    }
+
+    // Calculate waiting queue block metrics (aggregate across all workers)
+    int total_waiting_head_blocks = 0;
+    int total_waiting_blocks = 0;
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        auto& worker = worker_state[dp_idx];
+        auto& wait_queue = (mode_ != "decode") ? worker->waiting : worker->waiting_migration;
+        
+        if (!wait_queue.empty()) {
+            auto head_seq = wait_queue.front();
+            total_waiting_head_blocks += (head_seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+        }
+        
+        for (const auto& seq : wait_queue) {
+            total_waiting_blocks += (seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+        }
+    }
+    result.waiting_head_blocks = total_waiting_head_blocks;
+    result.waiting_total_blocks = total_waiting_blocks;
+
+    return result;
+}
+
+std::vector<std::shared_ptr<Sequence>> Scheduler::_schedule_prefill_for_worker(int dp_idx)
+{
+    std::vector<std::shared_ptr<Sequence>> scheduled_seqs;
+    auto& worker = worker_state[dp_idx];
+    auto& waiting_queue = (mode_ != "decode") ? worker->waiting : worker->waiting_migration;
+
+    std::unordered_map<int, int> num_seqs;
+    std::unordered_map<int, int> num_batched_tokens;
+
+    // Initialize counts
+    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        num_seqs[sp_idx]           = 0;
+        num_batched_tokens[sp_idx] = 0;
+    }
+
+    // Schedule from this worker's queue
+    while (!waiting_queue.empty()) {
+        auto seq = waiting_queue.front();
+
+        // Check if can allocate
+        bool can_allocate = worker->can_allocate(*seq, num_seqs, num_batched_tokens);
+
+        if (!can_allocate) {
+            break;  // Cannot allocate more, stop scheduling
+        }
+
+        // Allocate resources
+        worker->allocate(*seq);
+
+        // Update counts
+        auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
+        int master_sp_idx = block_ctx.master_sp_idx_;
+        num_seqs[master_sp_idx] += 1;
+        num_batched_tokens[master_sp_idx] += (seq->num_tokens - seq->num_cached_tokens);
+
+        // Move to running queue
+        seq->status = SequenceStatus::RUNNING;
+        waiting_queue.pop_front();
+        worker->running.push_back(seq);
+        scheduled_seqs.push_back(seq);
+
+        // Record metrics
+        if (seq->metric) {
+            seq->metric->record_first_scheduled();
+            if (mode_ == "decode") {
+                seq->metric->record_decode_scheduled();
+            }
+        }
+    }
+
+    return scheduled_seqs;
+}
+
+std::vector<std::shared_ptr<Sequence>> Scheduler::_schedule_decode_for_worker(int dp_idx)
+{
+    std::vector<std::shared_ptr<Sequence>> scheduled_seqs;
+    auto& worker = worker_state[dp_idx];
+    auto& running_queue = worker->running;
+
+    std::unordered_map<int, int>          num_seqs;
+    std::deque<std::shared_ptr<Sequence>> skipped;
+    std::vector<int>                      sp_lens(attention_sp_, 0);
+
+    while (!running_queue.empty()) {
+        auto seq = running_queue.front();
+        running_queue.pop_front();
+
+        int master_rank = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+
+        // Check if we've reached the max sequences for this SP rank
+        if (num_seqs[master_rank] >= max_num_seqs_) {
+            skipped.push_back(seq);
+            continue;
+        }
+
+        // Try to ensure we can append tokens
+        while (!worker->can_append(*seq, loop_count_)) {
+            // Need to preempt to free up space
+            if (!running_queue.empty()) {
+                auto victim = running_queue.back();
+                running_queue.pop_back();
+                preempt(dp_idx, victim);
+            }
+            else if (!skipped.empty()) {
+                auto victim = skipped.back();
+                skipped.pop_back();
+                preempt(dp_idx, victim);
+            }
+            else {
+                // Preempt current sequence itself
+                preempt(dp_idx, seq);
+                seq = nullptr;
+                break;
+            }
+        }
+
+        if (seq) {
+            // Successfully ensured space for this sequence
+            num_seqs[master_rank] += 1;
+            if (!worker->may_append(*seq, loop_count_)) {
+                // This should not happen if can_append is correct, but handle it gracefully
+                preempt(dp_idx, seq);
+            }
+            else {
+                scheduled_seqs.push_back(seq);
+                sp_lens[master_rank] += seq->num_tokens;
+            }
+        }
+    }
+
+    // Put skipped and scheduled sequences back to running queue
+    for (auto it = scheduled_seqs.rbegin(); it != scheduled_seqs.rend(); ++it) {
+        running_queue.push_front(*it);
+    }
+    for (auto it = skipped.rbegin(); it != skipped.rend(); ++it) {
+        running_queue.push_front(*it);
+    }
+
+    // Add dummy sequences for SP ranks with no work
+    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        if (sp_lens[sp_idx] == 0) {
+            scheduled_seqs.push_back(worker->dummy_seqs[sp_idx]);
+        }
+    }
+
+    return scheduled_seqs;
 }
 
 }  // namespace nanodeploy

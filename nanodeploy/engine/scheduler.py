@@ -40,7 +40,8 @@ class Scheduler(_CppScheduler):
             config.enable_dynamic_sp_size,
             config.enable_non_uniform_split,
             config.sp_master_selector,
-            config.sp_debug
+            config.sp_debug,
+            config.scheduler_mode
         )
         # Store config for compatibility
         self.engine_id = config.engine_id
