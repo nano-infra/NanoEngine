@@ -18,6 +18,7 @@ void bind_sp_state_manager(py::module_& m)
         .value("RoundRobin", RoutingStrategy::RoundRobin)
         .value("LeastBatch", RoutingStrategy::LeastBatch)
         .value("LeastCache", RoutingStrategy::LeastCache)
+        .value("VLLMLoadBalance", RoutingStrategy::VLLMLoadBalance)
         .export_values()
         .def_static("__class_getitem__",
                     [](const std::string& name) {
@@ -27,6 +28,8 @@ void bind_sp_state_manager(py::module_& m)
                             return RoutingStrategy::LeastBatch;
                         if (name == "LeastCache")
                             return RoutingStrategy::LeastCache;
+                        if (name == "VLLMLoadBalance")
+                            return RoutingStrategy::VLLMLoadBalance;
                         throw py::key_error(name);
                     })
         .def_property_readonly_static("__members__", [](py::object /* self */) {
@@ -34,6 +37,7 @@ void bind_sp_state_manager(py::module_& m)
             m["RoundRobin"] = RoutingStrategy::RoundRobin;
             m["LeastBatch"] = RoutingStrategy::LeastBatch;
             m["LeastCache"] = RoutingStrategy::LeastCache;
+            m["VLLMLoadBalance"] = RoutingStrategy::VLLMLoadBalance;
             return m;
         });
     py::enum_<SPMasterSelector>(m, "SPMasterSelector")

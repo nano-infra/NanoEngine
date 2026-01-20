@@ -21,7 +21,7 @@ def main():
         "--routing-strategy",
         type=str,
         default="RoundRobin",
-        choices=["RoundRobin", "LeastBatch", "LeastCache"],
+        choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
         help="Routing strategy for decentralized scheduler (default: RoundRobin)"
     )
     args = parser.parse_args()

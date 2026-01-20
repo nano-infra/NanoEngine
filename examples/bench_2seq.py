@@ -50,7 +50,7 @@ def parse_args():
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
-                        choices=["RoundRobin", "LeastBatch", "LeastCache"],
+                        choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
                         help="Routing strategy.")
     
     args = parser.parse_args()

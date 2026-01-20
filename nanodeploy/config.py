@@ -17,7 +17,7 @@ class Config:
     max_model_len: int = 16384
     gpu_memory_utilization: float = 0.9
     gpu_memory_limit_gb: float | None = None
-    routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
+    routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"] = "RoundRobin"
     scheduler_mode: Literal["centralized", "decentralized"] = "centralized"
 
     # parallel config

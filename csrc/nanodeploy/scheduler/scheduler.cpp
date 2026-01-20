@@ -223,6 +223,27 @@ int Scheduler::select_dp_worker_for_routing(Sequence& seq)
         }
         return best_idx;
     }
+    else if (routing_strategy == RoutingStrategy::VLLMLoadBalance) {
+        // vLLM-style load balancing: score = waiting * 4 + running
+        // This matches vLLM's load balancing algorithm in DPLBAsyncMPClient
+        int best_idx = 0;
+        int min_score = std::numeric_limits<int>::max();
+        
+        for (int i = 0; i < attention_dp_; ++i) {
+            int waiting = worker_state[i]->get_waiting_queue_size();
+            int running = worker_state[i]->num_running_seqs();
+            
+            // vLLM formula: score = waiting * 4 + running
+            // waiting has 4x weight compared to running
+            int score = waiting * 4 + running;
+            
+            if (score < min_score) {
+                min_score = score;
+                best_idx = i;
+            }
+        }
+        return best_idx;
+    }
     return 0;
 }
 

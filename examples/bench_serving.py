@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument("--segment-size", type=int, default=65536, help="Segment size for SP.")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
-                        choices=["RoundRobin", "LeastBatch", "LeastCache"],
+                        choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
                         help="Routing strategy.")
     parser.add_argument("--scheduler-mode", type=str, default="centralized",
                         choices=["centralized", "decentralized"],
