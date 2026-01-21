@@ -420,7 +420,22 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         pad_len = 0
         if attn_tp_size > 1:
             total_tokens = hidden_states.shape[0]
-            if total_tokens % attn_tp_size != 0:
+            if total_tokens == 0:
+                # Handle empty hidden_states: create a dummy token for each TP rank
+                # This ensures all TP ranks participate in all_gather to avoid deadlock
+                # Get hidden_dim from hidden_states shape or use self.hidden_size
+                if len(hidden_states.shape) > 1:
+                    hidden_dim = hidden_states.shape[1]
+                else:
+                    hidden_dim = self.hidden_size
+                hidden_states = torch.zeros(
+                    attn_tp_size, hidden_dim,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device
+                )
+                total_tokens = attn_tp_size
+                pad_len = attn_tp_size
+            elif total_tokens % attn_tp_size != 0:
                 pad_len = attn_tp_size - (total_tokens % attn_tp_size)
                 # Use replication padding instead of zero padding to avoid routing issues
                 if total_tokens > 0:
@@ -546,7 +561,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             final_hidden_states = torch.cat(gathered, dim=0)
             
             if pad_len > 0:
-                final_hidden_states = final_hidden_states[:-pad_len]
+                # Remove padding: if pad_len == attn_tp_size, it means all tokens were padding
+                if pad_len == attn_tp_size:
+                    # All tokens were dummy padding, return empty tensor with correct shape
+                    hidden_dim = final_hidden_states.shape[1]
+                    final_hidden_states = torch.zeros(
+                        0, hidden_dim,
+                        dtype=final_hidden_states.dtype,
+                        device=final_hidden_states.device
+                    )
+                else:
+                    final_hidden_states = final_hidden_states[:-pad_len]
 
         if len(orig_shape) == 3:
             final_hidden_states = final_hidden_states.view(orig_shape)
