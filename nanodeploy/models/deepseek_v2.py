@@ -77,7 +77,12 @@ class DeepseekV2MoE(nn.Module):
         self.moe_intermediate_size = config.moe_intermediate_size
         self.num_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
-        self.distribution = "uniform"
+        
+        # Distribution parameter for perfect EPLB simulation
+        # "uniform" for perfect_eplb=True, "normal" for perfect_eplb=False
+        from nanodeploy.worker.runner_config import get_runner_config
+        perfect_eplb = get_runner_config().perfect_eplb
+        self.distribution = "uniform" if perfect_eplb else "normal"
 
         # Use optimized Linear layer for gate
         # For gate, we don't need quantization, so use standard Linear
@@ -166,6 +171,12 @@ class DeepseekV2MoE(nn.Module):
                 chunk_size=16 * 1024,
             )
         self.shared_experts = None
+        
+        # Cache MoE objects for prefill and decode to avoid rebuilding on each forward
+        # This matches vLLM's approach where self.experts is created once in __init__
+        self._moe_prefill = None
+        self._moe_decode = None
+        
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV2MLP(
@@ -217,37 +228,51 @@ class DeepseekV2MoE(nn.Module):
             hidden_states = hidden_states.view(-1, hidden_dim)
 
             context = get_context()
-            moe = self.fusedmoe_build(not context.is_prefill)
             
-            # Optimized gate computation: use F.linear for better performance
-            # F.linear is more efficient than nn.Linear forward for inference
-            router_logits = F.linear(hidden_states, self.gate.weight, None)
-
-            # Optimized softmax: use torch.softmax instead of F.softmax with dtype conversion
-            # This avoids unnecessary type conversion and is more efficient
-            # torch.softmax automatically handles numerical stability
-            routing_weights = torch.softmax(router_logits, dim=-1)
+            # Cache MoE objects to avoid rebuilding on each forward (performance optimization)
+            # This matches vLLM's approach where self.experts is created once in __init__
+            if context.is_prefill:
+                if self._moe_prefill is None:
+                    self._moe_prefill = self.fusedmoe_build(low_latency_mode=False)
+                moe = self._moe_prefill
+            else:
+                if self._moe_decode is None:
+                    self._moe_decode = self.fusedmoe_build(low_latency_mode=True)
+                moe = self._moe_decode
             
-            # Optimized topk: use sorted=False for better performance when order doesn't matter
-            # In decode phase, we typically don't need sorted results
-            sorted_topk = context.is_prefill if hasattr(context, 'is_prefill') else True
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1, sorted=sorted_topk
-            )
-
+            # Apply distribution-based routing for perfect EPLB simulation
+            # This matches vLLM's RoutingSimulator behavior:
+            # - uniform: Skip fused_topk and router_logits computation entirely
+            # - normal: Use fused_topk with real router_logits
             if self.distribution == "uniform":
-                # Uniform random sampling
+                # Uniform random sampling for perfect load balancing
+                # Skip fused_topk computation (matches vLLM's RoutingSimulator)
+                routing_weights = torch.ones(
+                    (hidden_states.shape[0], self.top_k),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
                 selected_experts = torch.randint(
                     low=0,
                     high=self.num_experts,
                     size=(hidden_states.shape[0], self.top_k),
-                    dtype=selected_experts.dtype,
+                    dtype=torch.int32,
                     device=hidden_states.device,
                 )
-            elif get_runner_config().perfect_eplb:
-                ep_size = get_dist_context().ffn_ep_world_size
-                selected_experts = compute_topk_ids(
-                    selected_experts, ep_size, self.num_experts
+            else:
+                # Normal distribution routing: use real router logits
+                # Optimized gate computation: use F.linear for better performance
+                # F.linear is more efficient than nn.Linear forward for inference
+                router_logits = F.linear(hidden_states, self.gate.weight, None)
+
+                # Use fused_topk instead of separate softmax + topk
+                # This matches vLLM's implementation and avoids aten::softmax and aten::topk
+                from nanodeploy.models.qwen3_moe import fused_topk
+                routing_weights, selected_experts = fused_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    topk=self.top_k,
+                    renormalize=True,
                 )
             final_hidden_states = moe.forward(
                 hidden_states,

@@ -25,6 +25,75 @@ from transformers import Qwen3MoeConfig
 
 from .quant_config import QuantizationConfig
 
+# Try to import vLLM ops for fused topk
+try:
+    from vllm import _custom_ops as ops
+    HAS_VLLM_OPS = True
+except ImportError:
+    HAS_VLLM_OPS = False
+
+
+def vllm_topk_softmax(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """vLLM's fused topk-softmax kernel."""
+    if HAS_VLLM_OPS:
+        ops.topk_softmax(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+        )
+        return topk_weights, topk_indices
+    else:
+        # Fallback to PyTorch implementation
+        # This matches vLLM's fused_topk_bias fallback behavior
+        scores = torch.softmax(gating_output, dim=-1)
+        topk_weights, topk_indices = torch.topk(scores, k=topk_weights.shape[1], dim=-1)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        return topk_weights.to(torch.float32), topk_indices.to(torch.int32)
+
+
+def fused_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool = True,
+    indices_type: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused topk-softmax operation, similar to vLLM's implementation.
+    This replaces the separate softmax + topk operations with a single fused kernel.
+    """
+    assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
+    
+    M, _ = hidden_states.size()
+    
+    topk_weights = torch.empty(
+        M, topk, dtype=torch.float32, device=hidden_states.device
+    )
+    topk_ids = torch.empty(
+        M,
+        topk,
+        dtype=torch.int32 if indices_type is None else indices_type,
+        device=hidden_states.device,
+    )
+    token_expert_indices = torch.empty(
+        M, topk, dtype=torch.int32, device=hidden_states.device
+    )
+    
+    topk_weights, topk_ids = vllm_topk_softmax(
+        topk_weights, topk_ids, token_expert_indices, gating_output, renormalize
+    )
+    
+    return topk_weights, topk_ids
+
 
 class Qwen3MoeAttention(nn.Module):
 
@@ -165,29 +234,6 @@ class Qwen3MoeMLP(nn.Module):
         return x
 
 
-def compute_topk_ids(topk_ids, ranks, num_experts):
-    shape = topk_ids.shape
-    step = num_experts // ranks
-    topk_ids = (
-        (
-            torch.arange(
-                0, topk_ids.numel(), dtype=topk_ids.dtype, device=topk_ids.device
-            )
-            // ranks
-        )
-        % step
-        + (
-            torch.arange(
-                0, topk_ids.numel(), dtype=topk_ids.dtype, device=topk_ids.device
-            )
-            % ranks
-        )
-        * step
-    ) % num_experts
-    topk_ids = topk_ids.reshape(shape)
-    return topk_ids
-
-
 class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def __init__(
@@ -312,6 +358,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.act_fn = config.hidden_act
 
+        # Distribution parameter for perfect EPLB simulation
+        # "uniform" for perfect_eplb=True, "normal" for perfect_eplb=False
+        perfect_eplb = get_runner_config().perfect_eplb
+        self.distribution = "uniform" if perfect_eplb else "normal"
+
+        # Cache MoE objects for prefill and decode to avoid rebuilding on each forward
+        # This matches vLLM's approach where self.experts is created once in __init__
+        self._moe_prefill = None
+        self._moe_decode = None
+
     def fusedmoe_build(self, low_latency_mode):
         fusedmoe = build_deepep_moe(
             low_latency_mode=low_latency_mode,
@@ -348,19 +404,51 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 self.quantization_config.quant_method == "fp8"
             ), "Only FP8 EP is supported by now"
             context = get_context()
-            moe = self.fusedmoe_build(not context.is_prefill)
-            router_logits = self.gate(hidden_states)
-
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1
-            )
-
-            if get_runner_config().perfect_eplb:
-                ep_size = get_dist_context().ffn_ep_world_size
-                selected_experts = compute_topk_ids(
-                    selected_experts, ep_size, self.num_experts
+            
+            # Cache MoE objects to avoid rebuilding on each forward (performance optimization)
+            # This matches vLLM's approach where self.experts is created once in __init__
+            if context.is_prefill:
+                if self._moe_prefill is None:
+                    self._moe_prefill = self.fusedmoe_build(low_latency_mode=False)
+                moe = self._moe_prefill
+            else:
+                if self._moe_decode is None:
+                    self._moe_decode = self.fusedmoe_build(low_latency_mode=True)
+                moe = self._moe_decode
+            
+            # Apply distribution-based routing for perfect EPLB simulation
+            # This matches vLLM's RoutingSimulator behavior:
+            # - uniform: Skip fused_topk and router_logits computation entirely
+            # - normal: Use fused_topk with real router_logits
+            if self.distribution == "uniform":
+                # Uniform random sampling for perfect load balancing
+                # Skip fused_topk computation (matches vLLM's RoutingSimulator)
+                routing_weights = torch.ones(
+                    (hidden_states.shape[0], self.top_k),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
                 )
+                selected_experts = torch.randint(
+                    low=0,
+                    high=self.num_experts,
+                    size=(hidden_states.shape[0], self.top_k),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
+            else:
+                # Normal distribution routing: use real router logits
+                # Optimized gate computation: use F.linear for better performance
+                router_logits = F.linear(hidden_states, self.gate.weight, None)
+
+                # Use fused_topk instead of separate softmax + topk
+                # This matches vLLM's implementation and avoids aten::softmax and aten::topk
+                routing_weights, selected_experts = fused_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    topk=self.top_k,
+                    renormalize=True,
+                )
+
             final_hidden_states = moe.forward(
                 hidden_states,
                 routing_weights,
