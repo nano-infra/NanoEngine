@@ -568,17 +568,17 @@ class ModelRunner:
         sp_rank = get_dist_context().attn_sp_rank
         
         # Log from all TP ranks to see which one is stuck
-        logger.info(f"[run_model-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: Enter, input_shape={input_ids.shape}")
+        # logger.info(f"[run_model-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: Enter, input_shape={input_ids.shape}")
         
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             context = get_context()
-            logger.info(f"[run_model-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: Before model.forward")
+            # logger.info(f"[run_model-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: Before model.forward")
             hidden_states = self.model(input_ids, positions)
-            logger.info(f"[run_model-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: After model.forward, hidden_shape={hidden_states.shape}")
+            # logger.info(f"[run_model-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: After model.forward, hidden_shape={hidden_states.shape}")
             logits = self.model.compute_logits(hidden_states)
             # In TP mode, only TP rank 0 returns logits, others return None
             logits_shape = logits.shape if logits is not None else None
-            logger.info(f"[run_model-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: After compute_logits, logits_shape={logits_shape}")
+            # logger.info(f"[run_model-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: After compute_logits, logits_shape={logits_shape}")
             return logits
         else:
             bs = input_ids.size(0)
@@ -670,8 +670,8 @@ class ModelRunner:
         sp_rank = get_dist_context().attn_sp_rank
         
         # Only log from TP rank 0 to avoid too many logs
-        if tp_rank == 0:
-            logger.info(f"[ModelRunner-{phase}] Rank {self.rank} SP{sp_rank}: Enter run(), seqs={len(dp_seqs)}")
+        # if tp_rank == 0:
+        #     logger.info(f"[ModelRunner-{phase}] Rank {self.rank} SP{sp_rank}: Enter run(), seqs={len(dp_seqs)}")
 
         if enable_rpc:
             dp_seqs = self.endpoint.recv_seqs()
@@ -747,16 +747,16 @@ class ModelRunner:
                     )
 
             # Log before model forward (only first iteration or every 10 iterations)
-            if tp_rank == 0 and (i == 0 or (not is_prefill and i % 10 == 0)):
-                logger.info(f"[ModelRunner-{phase}] Rank {self.rank} SP{sp_rank}: Before run_model, loop={i}, input_shape={input_ids.shape}")
+            # if tp_rank == 0 and (i == 0 or (not is_prefill and i % 10 == 0)):
+            #     logger.info(f"[ModelRunner-{phase}] Rank {self.rank} SP{sp_rank}: Before run_model, loop={i}, input_shape={input_ids.shape}")
 
             logits = self.run_model(input_ids, positions, is_prefill)
 
             # Log after model forward
             # In TP mode, only TP rank 0 returns logits, others return None
-            if tp_rank == 0 and (i == 0 or (not is_prefill and i % 10 == 0)):
-                logits_shape = logits.shape if logits is not None else None
-                logger.info(f"[ModelRunner-{phase}] Rank {self.rank} SP{sp_rank}: After run_model, loop={i}, logits_shape={logits_shape}")
+            # if tp_rank == 0 and (i == 0 or (not is_prefill and i % 10 == 0)):
+            #     logits_shape = logits.shape if logits is not None else None
+            #     logger.info(f"[ModelRunner-{phase}] Rank {self.rank} SP{sp_rank}: After run_model, loop={i}, logits_shape={logits_shape}")
 
             if tp_rank == 0:
                 temperatures = (
@@ -777,14 +777,14 @@ class ModelRunner:
             
             # Log before all_reduce (critical communication point)
             # Log from all TP ranks to see which one is stuck
-            if i == 0 or (not is_prefill and i % 10 == 0):
-                logger.info(f"[ModelRunner-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: Before all_reduce, loop={i}, TP_size={tp_size}, input_ids_shape={input_ids.shape}")
+            # if i == 0 or (not is_prefill and i % 10 == 0):
+            #     logger.info(f"[ModelRunner-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: Before all_reduce, loop={i}, TP_size={tp_size}, input_ids_shape={input_ids.shape}")
             
             dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
             
             # Log after all_reduce (critical communication point)
-            if i == 0 or (not is_prefill and i % 10 == 0):
-                logger.info(f"[ModelRunner-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: After all_reduce, loop={i}")
+            # if i == 0 or (not is_prefill and i % 10 == 0):
+            #     logger.info(f"[ModelRunner-{phase}] Rank {self.rank} TP{tp_rank} SP{sp_rank}: After all_reduce, loop={i}")
 
             update_seqs_inner_loop(sp_seqs, sp_rank)
 
@@ -891,8 +891,8 @@ class ModelRunner:
         loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
         reset_context()
 
-        if tp_rank == 0:
-            logger.info(f"[ModelRunner-{phase}] Rank {self.rank} SP{sp_rank}: Exit run(), completed {loop_count} loops")
+        # if tp_rank == 0:
+        #     logger.info(f"[ModelRunner-{phase}] Rank {self.rank} SP{sp_rank}: Exit run(), completed {loop_count} loops")
 
         return loop_count_token_ids
 

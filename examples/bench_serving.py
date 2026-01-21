@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
     parser.add_argument("--segment-size", type=int, default=65536, help="Segment size for SP.")
+    parser.add_argument("--kvcache-block-size", type=int, default=256, help="KV Cache block size (must be multiple of 256 for non-DeepseekV3 models).")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache"],
@@ -387,7 +388,7 @@ def main():
         loop_count=args.loop_count,
         routing_strategy=args.routing_strategy,
         segment_size=args.segment_size,
-        kvcache_block_size=64,
+        kvcache_block_size=args.kvcache_block_size,
         max_num_recv_seqs=48,
         enable_profiler=args.enable_profiler,
         profiler_start_step=args.profiler_start_step,
@@ -401,7 +402,9 @@ def main():
     print_model_config(engine)
 
     # Run Warmup
-    world_size = args.ep
+    # world_size should be attention_dp * attention_sp * attention_tp
+    # which should equal ffn_dp * ffn_ep * ffn_tp
+    world_size = args.dp * args.sp * args.tp
     run_warmup(engine, args.max_num_seqs, world_size)
 
     # Prepare Data
