@@ -163,6 +163,14 @@ int Sequence::last_block_num_tokens(BlockContextSlot slot, int sp_idx)
     return n_tokens - (num_blocks(slot, sp_idx) - 1) * block_size;
 }
 
+int Sequence::slot_mapping_idx(BlockContextSlot slot, int sp_idx, int token_idx)
+{
+    if (token_idx == -1)
+        token_idx = (block_ctx(slot).num_dispatched_tokens[sp_idx] - 1);
+
+    return block_ctx(slot).sp_block_table[sp_idx][(token_idx / block_size)] * block_size + (token_idx % block_size);
+}
+
 std::pair<const int*, size_t> Sequence::block_view(int i, BlockContextSlot slot, int sp_idx) const
 {
     int n_blocks = const_cast<Sequence*>(this)->num_blocks(slot, sp_idx);

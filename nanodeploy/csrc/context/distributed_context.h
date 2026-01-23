@@ -73,6 +73,7 @@ public:
         return config_.attention_sp;
     }
     int attention_tp_rank() const;
+    int attention_sp_rank() const;
     int attention_dp_rank() const;
 
     // FFN/MoE parallelism

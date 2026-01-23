@@ -22,13 +22,22 @@ public:
                                             torch::Tensor down_weights,
                                             int           hidden_size);
 
-    // FP8 Overload
+    // FP8 Overload (input is BF16, quantizes internally)
     static torch::Tensor compute_contiguous(torch::Tensor                           input,
                                             torch::Tensor                           topk_idx,
                                             torch::Tensor                           topk_weights,
                                             std::pair<torch::Tensor, torch::Tensor> gate_up,
                                             std::pair<torch::Tensor, torch::Tensor> down,
                                             int                                     hidden_size);
+
+    // FP8 with pre-quantized input (receives FP8+scales from dispatch, skips quantization)
+    static torch::Tensor compute_contiguous_fp8(torch::Tensor                           input_fp8,
+                                                torch::Tensor                           input_scales,
+                                                torch::Tensor                           topk_idx,
+                                                torch::Tensor                           topk_weights,
+                                                std::pair<torch::Tensor, torch::Tensor> gate_up,
+                                                std::pair<torch::Tensor, torch::Tensor> down,
+                                                int                                     hidden_size);
 
     /**
      * Compute experts using masked grouped GEMM

@@ -42,6 +42,15 @@ struct DispatchResult {
     DispatchHandle               handle;
 };
 
+// Result of dispatch_normal_fp8 (FP8 data + scales)
+struct DispatchResultFP8 {
+    torch::Tensor                recv_x;         // FP8 tensor
+    torch::Tensor                recv_x_scales;  // scales for FP8 data
+    std::optional<torch::Tensor> recv_topk_idx;
+    std::optional<torch::Tensor> recv_topk_weights;
+    DispatchHandle               handle;
+};
+
 // Handle for Low Latency mode combine
 struct LowLatencyDispatchHandle {
     torch::Tensor topk_idx;
@@ -66,30 +75,34 @@ struct LowLatencyDispatchResult {
  */
 class DeepEpOps {
 public:
-    // Normal mode dispatch
-    static DispatchResult dispatch_normal(deep_ep::Buffer* buffer,
-                                          torch::Tensor    hidden_states,
-                                          torch::Tensor    topk_ids,
-                                          torch::Tensor    topk_weights,
-                                          int              num_experts,
-                                          int              expert_alignment = 128);
+    // Normal mode dispatch (BF16)
+    static DispatchResult dispatch_normal(torch::Tensor hidden_states,
+                                          torch::Tensor topk_ids,
+                                          torch::Tensor topk_weights,
+                                          int           num_experts,
+                                          int           expert_alignment = 128);
+
+    // Normal mode dispatch (FP8 + scales) - reduces bandwidth by 50%
+    static DispatchResultFP8 dispatch_normal_fp8(torch::Tensor x_fp8,
+                                                 torch::Tensor x_scales,
+                                                 torch::Tensor topk_ids,
+                                                 torch::Tensor topk_weights,
+                                                 int           num_experts,
+                                                 int           expert_alignment = 128);
 
     // Normal mode combine
-    static torch::Tensor
-    combine_normal(deep_ep::Buffer* buffer, torch::Tensor expert_output, const DispatchHandle& handle);
+    static torch::Tensor combine_normal(torch::Tensor expert_output, const DispatchHandle& handle);
 
     // Low Latency mode dispatch
-    static LowLatencyDispatchResult dispatch_low_latency(deep_ep::Buffer* buffer,
-                                                         torch::Tensor    hidden_states,
-                                                         torch::Tensor    topk_ids,
-                                                         torch::Tensor    topk_weights,
-                                                         int              num_max_dispatch_tokens_per_rank,
-                                                         int              num_experts,
-                                                         int              ep_world_size = 0);
+    static LowLatencyDispatchResult dispatch_low_latency(torch::Tensor hidden_states,
+                                                         torch::Tensor topk_ids,
+                                                         torch::Tensor topk_weights,
+                                                         int           num_max_dispatch_tokens_per_rank,
+                                                         int           num_experts,
+                                                         int           ep_world_size = 0);
 
     // Low Latency mode combine
-    static torch::Tensor
-    combine_low_latency(deep_ep::Buffer* buffer, torch::Tensor expert_output, const LowLatencyDispatchHandle& handle);
+    static torch::Tensor combine_low_latency(torch::Tensor expert_output, const LowLatencyDispatchHandle& handle);
 };
 
 }  // namespace ops

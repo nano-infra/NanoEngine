@@ -142,21 +142,11 @@ size_t serialize_sequences(uintptr_t                                     data_pt
         write_raw(data_ptr, off, buffer_size, seq.num_cached_tokens);
 
         // token_ids
-        if (is_prefill) {
-            // Prefill 阶段：传输完整的 token_ids
-            size_t tid_count = seq.token_ids.size();
-            write_raw(data_ptr, off, buffer_size, tid_count);
-            write_bytes(data_ptr, off, buffer_size, seq.token_ids.data(), tid_count * sizeof(int));
-        }
-        else {
-            // Decode 阶段：仅传输最后一个 token (用于输入)
-            size_t tid_count = seq.token_ids.empty() ? 0 : 1;
-            write_raw(data_ptr, off, buffer_size, tid_count);
-            if (tid_count > 0) {
-                int last_token = seq.token_ids.back();
-                write_bytes(data_ptr, off, buffer_size, &last_token, sizeof(int));
-            }
-        }
+        // token_ids
+        // Always transmit full token_ids to support repetition penalty in ModelRunner
+        size_t tid_count = seq.token_ids.size();
+        write_raw(data_ptr, off, buffer_size, tid_count);
+        write_bytes(data_ptr, off, buffer_size, seq.token_ids.data(), tid_count * sizeof(int));
 
         // Slots (BlockContexts)
         for (size_t i = 0; i < (size_t)BlockContextSlot::_COUNT; ++i) {

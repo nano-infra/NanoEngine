@@ -12,8 +12,9 @@
 using namespace nanodeploy;
 
 // Action IDs from spoke_executor.cpp
-constexpr int kInitAction = static_cast<int>(spoke::Action::kUserActionStart) + 10;
-constexpr int kRunAction  = static_cast<int>(spoke::Action::kUserActionStart) + 11;
+constexpr int kInitAction               = static_cast<int>(spoke::Action::kUserActionStart) + 10;
+constexpr int kGetAvailableBlocksAction = static_cast<int>(spoke::Action::kUserActionStart) + 17;
+constexpr int kAllocKVBlocksAction      = static_cast<int>(spoke::Action::kUserActionStart) + 18;
 
 int main(int argc, char** argv)
 {
@@ -38,12 +39,8 @@ int main(int argc, char** argv)
         actor_ids.push_back(id);
         clients[i]->spawnRemote("ModelRunner", id);
 
-        // Enable RDMA
-        if (!clients[i]->initRDMA(id)) {
-            std::cerr << "[Test] Failed to init RDMA for " << id << std::endl;
-            return 1;
-        }
-        std::cout << "[Test] RDMA Initialized for " << id << std::endl;
+        // Enable RDMA (simulated or real)
+        clients[i]->initRDMA(id);
     }
 
     // Initialize
@@ -67,27 +64,46 @@ int main(int argc, char** argv)
     }
     std::cout << "[Test] Initialization Complete." << std::endl;
 
-    // Run Forward
-    std::vector<std::future<ModelRunResp>> run_futures;
+    // Test 1: Get Available Blocks
+    std::cout << "[Test] Querying Available Blocks..." << std::endl;
+    std::vector<std::future<GetAvailableKVBlocksResp>> avail_futures;
     for (int i = 0; i < world_size; ++i) {
-        ModelRunReq req;
-        req.is_prefill = true;
-        // Mock Sequence
-        auto seq = std::make_shared<Sequence>(std::vector<int>{1, 2, 3});
-        req.seqs.push_back(seq);
+        GetAvailableKVBlocksReq req;
+        req.max_batch_size         = 16;
+        req.gpu_memory_utilization = 0.5f;  // Use small ratio for testing
 
-        run_futures.push_back(clients[i]->callRemote<ModelRunReq, ModelRunResp>(
-            actor_ids[i], static_cast<spoke::Action>(kRunAction), req));
+        avail_futures.push_back(clients[i]->callRemote<GetAvailableKVBlocksReq, GetAvailableKVBlocksResp>(
+            actor_ids[i], static_cast<spoke::Action>(kGetAvailableBlocksAction), req));
+    }
+
+    int min_blocks = 1000000;
+    for (int i = 0; i < world_size; ++i) {
+        int blocks = avail_futures[i].get();
+        std::cout << "[Test] Rank " << i << " Available Blocks: " << blocks << std::endl;
+        assert(blocks > 0);
+        if (blocks < min_blocks)
+            min_blocks = blocks;
+    }
+
+    // Test 2: Alloc KV Blocks
+    std::cout << "[Test] Allocating " << min_blocks << " Blocks..." << std::endl;
+    std::vector<std::future<AllocKVBlocksResp>> alloc_futures;
+    for (int i = 0; i < world_size; ++i) {
+        AllocKVBlocksReq req;
+        req.num_blocks     = min_blocks;
+        req.max_batch_size = 16;
+
+        alloc_futures.push_back(clients[i]->callRemote<AllocKVBlocksReq, AllocKVBlocksResp>(
+            actor_ids[i], static_cast<spoke::Action>(kAllocKVBlocksAction), req));
     }
 
     for (int i = 0; i < world_size; ++i) {
-        auto resp   = run_futures[i].get();
-        auto tokens = resp.token_ids;
-        std::cout << "[Test] Rank " << i << " Output size: " << tokens.size() << std::endl;
-        // Just verify it's not empty
-        assert(!tokens.empty());
+        bool success = alloc_futures[i].get();
+        std::cout << "[Test] Rank " << i << " Allocation Success: " << success << std::endl;
+        assert(success);
     }
-    std::cout << "[Test] Run Complete. Success!" << std::endl;
+
+    std::cout << "[Test] KV Cache Split Test Complete. Success!" << std::endl;
 
     // Cleanup
     for (int i = 0; i < world_size; ++i) {

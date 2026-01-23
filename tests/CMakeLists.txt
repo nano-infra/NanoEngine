@@ -41,6 +41,25 @@ target_include_directories(test_model_runner
 )
 
 
+add_executable(test_slot_mapping test_slot_mapping.cpp)
+target_link_libraries(test_slot_mapping
+    PRIVATE
+    Spoke::core
+    torch
+    torch_cpu
+    c10
+    _nanodeploy_sequence
+    GTest::gtest_main
+)
+target_include_directories(test_slot_mapping
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nanodeploy/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/Spoke
+)
+
+
+
+
 
 if (NANODEPLOY_BUILD_CUDA)
 add_executable(test_flashinfer_ops test_flashinfer_ops.cpp)
@@ -125,6 +144,26 @@ target_link_libraries(test_deepgemm_fp8
     GTest::gtest_main
 )
 target_include_directories(test_deepgemm_fp8
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nanodeploy/csrc
+)
+
+# MoeExpertOps Test (GTest)
+add_executable(test_moe_expert_ops test_moe_expert_ops.cpp)
+target_link_libraries(test_moe_expert_ops
+    PUBLIC
+    _nanodeploy_ops
+    nanodeploy_core
+    torch
+    torch_cpu
+    torch_cuda
+    c10
+    c10_cuda
+    GTest::gtest_main
+    CUDA::nvrtc
+    CUDA::cuda_driver
+)
+target_include_directories(test_moe_expert_ops
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../nanodeploy/csrc
 )

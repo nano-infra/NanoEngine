@@ -35,7 +35,7 @@ struct ModelInitReq {
 };
 
 struct ModelRunResp {
-    torch::Tensor tensor;
+    std::vector<int> token_ids;
 };
 using ModelInitResp = bool;
 
@@ -67,6 +67,18 @@ struct GraphCaptureReq {
     bool warmup_only   = false;  // If true, only run warmup passes, don't capture graphs
 };
 using GraphCaptureResp = bool;
+
+struct GetAvailableKVBlocksReq {
+    int   max_batch_size;
+    float gpu_memory_utilization = 0.90f;
+};
+using GetAvailableKVBlocksResp = int;
+
+struct AllocKVBlocksReq {
+    int num_blocks;
+    int max_batch_size;
+};
+using AllocKVBlocksResp = bool;
 
 }  // namespace nanodeploy
 
@@ -125,39 +137,43 @@ struct Serializer<nanodeploy::ModelRunReq> {
     }
 };
 
-// === ModelRunResp (Tensor) ===
-// Reuse the logic from dummy_runner_ipc for Tensor, or redefine here if compatible.
-// Since Serialize<torch::Tensor> isn't specialized, we specialize nanodeploy::RunResp which is Tensor.
-// Here we specialize nanodeploy::ModelRunResp which is also Tensor.
-
+// === ModelRunResp (Token IDs) ===
 template<>
 struct Serializer<nanodeploy::ModelRunResp> {
+    static size_t size(const nanodeploy::ModelRunResp& data)
+    {
+        return sizeof(size_t) + data.token_ids.size() * sizeof(int);
+    }
+
+    static void packTo(const nanodeploy::ModelRunResp& data, char* buf)
+    {
+        char* ptr     = buf;
+        *(size_t*)ptr = data.token_ids.size();
+        ptr += sizeof(size_t);
+        memcpy(ptr, data.token_ids.data(), data.token_ids.size() * sizeof(int));
+    }
+
+    static nanodeploy::ModelRunResp unpackFrom(const char* buf, size_t)
+    {
+        nanodeploy::ModelRunResp resp;
+        const char*              ptr   = buf;
+        size_t                   count = *(size_t*)ptr;
+        ptr += sizeof(size_t);
+        resp.token_ids.resize(count);
+        memcpy(resp.token_ids.data(), ptr, count * sizeof(int));
+        return resp;
+    }
+
     static std::string pack(const nanodeploy::ModelRunResp& data)
     {
-        std::vector<char> buffer = torch::pickle_save(data.tensor);
-        return std::string(buffer.begin(), buffer.end());
+        std::string s;
+        s.resize(size(data));
+        packTo(data, s.data());
+        return s;
     }
     static nanodeploy::ModelRunResp unpack(const std::string& data)
     {
-        std::vector<char> buf(data.begin(), data.end());
-        torch::IValue     ivalue = torch::pickle_load(buf);
-        return {ivalue.toTensor()};
-    }
-    static size_t size(const nanodeploy::ModelRunResp& data)
-    {
-        std::vector<char> buffer = torch::pickle_save(data.tensor);
-        return buffer.size();
-    }
-    static void packTo(const nanodeploy::ModelRunResp& data, char* buf)
-    {
-        std::vector<char> buffer = torch::pickle_save(data.tensor);
-        std::memcpy(buf, buffer.data(), buffer.size());
-    }
-    static nanodeploy::ModelRunResp unpackFrom(const char* buf, size_t len)
-    {
-        std::vector<char> vec(buf, buf + len);
-        torch::IValue     ivalue = torch::pickle_load(vec);
-        return {ivalue.toTensor()};
+        return unpackFrom(data.data(), data.size());
     }
 };
 
@@ -474,6 +490,70 @@ struct Serializer<nanodeploy::GraphCaptureReq> {
         return s;
     }
     static nanodeploy::GraphCaptureReq unpack(const std::string& data)
+    {
+        return unpackFrom(data.data(), data.size());
+    }
+};
+
+// === GetAvailableKVBlocksReq ===
+template<>
+struct Serializer<nanodeploy::GetAvailableKVBlocksReq> {
+    static size_t size(const nanodeploy::GetAvailableKVBlocksReq& /*data*/)
+    {
+        return sizeof(int) + sizeof(float);
+    }
+    static void packTo(const nanodeploy::GetAvailableKVBlocksReq& data, char* buf)
+    {
+        *(int*)buf                   = data.max_batch_size;
+        *(float*)(buf + sizeof(int)) = data.gpu_memory_utilization;
+    }
+    static nanodeploy::GetAvailableKVBlocksReq unpackFrom(const char* buf, size_t)
+    {
+        nanodeploy::GetAvailableKVBlocksReq req;
+        req.max_batch_size         = *(const int*)buf;
+        req.gpu_memory_utilization = *(const float*)(buf + sizeof(int));
+        return req;
+    }
+    static std::string pack(const nanodeploy::GetAvailableKVBlocksReq& data)
+    {
+        std::string s(size(data), 0);
+        packTo(data, s.data());
+        return s;
+    }
+    static nanodeploy::GetAvailableKVBlocksReq unpack(const std::string& data)
+    {
+        return unpackFrom(data.data(), data.size());
+    }
+};
+
+// === AllocKVBlocksReq ===
+template<>
+struct Serializer<nanodeploy::AllocKVBlocksReq> {
+    static size_t size(const nanodeploy::AllocKVBlocksReq& /*data*/)
+    {
+        return sizeof(int) * 2;
+    }
+    static void packTo(const nanodeploy::AllocKVBlocksReq& data, char* buf)
+    {
+        int* ptr = (int*)buf;
+        ptr[0]   = data.num_blocks;
+        ptr[1]   = data.max_batch_size;
+    }
+    static nanodeploy::AllocKVBlocksReq unpackFrom(const char* buf, size_t)
+    {
+        nanodeploy::AllocKVBlocksReq req;
+        const int*                   ptr = (const int*)buf;
+        req.num_blocks                   = ptr[0];
+        req.max_batch_size               = ptr[1];
+        return req;
+    }
+    static std::string pack(const nanodeploy::AllocKVBlocksReq& data)
+    {
+        std::string s(size(data), 0);
+        packTo(data, s.data());
+        return s;
+    }
+    static nanodeploy::AllocKVBlocksReq unpack(const std::string& data)
     {
         return unpackFrom(data.data(), data.size());
     }

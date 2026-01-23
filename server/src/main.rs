@@ -14,6 +14,8 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
+mod config;
+use config::Config;
 
 // ================== Spoke Protocol & Structs ==================
 
@@ -374,17 +376,27 @@ async fn main() -> Result<(), BoxError> {
     let mut runtime_conn = SpokeConnection::connect(agent_addr).await?;
 
     // Parse Arguments
-    let args: Vec<String> = std::env::args().collect();
-    let enable_cuda_graph = args.iter().any(|a| a == "--enable-cuda-graph");
-    println!("[Rust] CUDA Graph Enabled: {}", enable_cuda_graph);
+    let config = Config::parse();
+    println!("[Rust] Configurations: {:?}", config);
 
     // Init Engine (One-off via runtime connection)
     println!("[Rust] Initializing Engine...");
     let init_req = EngineInitReq {
-        config_path: string_to_bytes("/models/model--Qwen--Qwen3-30B-A3B-FP8/config.json"), // Hardcoded for convenience
-        tp: 1, pp: 1, dp: 1, hub_ip: string_to_bytes("127.0.0.1"), hub_port: 8888,
-        attention_tp: 1, attention_dp: 8, attention_sp: 1, ffn_tp: 1, ffn_dp: 1, ffn_ep: 8,
-        enable_rdma: true, enable_cuda_graph: enable_cuda_graph, _padding: [0; 2],
+        config_path: string_to_bytes(&config.model_config_path),
+        tp: 1,
+        pp: config.pp,
+        dp: 1,
+        hub_ip: string_to_bytes("127.0.0.1"),
+        hub_port: 8888,
+        attention_tp: config.attention_tp,
+        attention_dp: config.attention_dp,
+        attention_sp: config.attention_sp,
+        ffn_tp: config.ffn_tp,
+        ffn_dp: config.ffn_dp,
+        ffn_ep: config.ffn_ep,
+        enable_rdma: config.enable_rdma,
+        enable_cuda_graph: config.enable_cuda_graph,
+        _padding: [0; 2],
     };
     let init_bytes = unsafe { std::slice::from_raw_parts(&init_req as *const _ as *const u8, std::mem::size_of::<EngineInitReq>()) };
     runtime_conn.send_req(17, 3, "EngineActor_0", "", init_bytes).await?;
@@ -407,7 +419,63 @@ async fn main() -> Result<(), BoxError> {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     println!("[Rust] Server listening on http://0.0.0.0:3000");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(agent_addr.to_string()))
+        .await?;
 
     Ok(())
+}
+
+async fn shutdown_signal(agent_addr: String) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    println!("\n[Rust] Received shutdown signal. Cleaning up...");
+
+    // Release EngineActor Resouces
+    println!("[Rust] Sending Release to EngineActor...");
+    match SpokeConnection::connect(&agent_addr).await {
+        Ok(mut conn) => {
+            // Action 21 = Release. Body = int(0)
+            let body = [0u8; 4];
+            if let Err(e) = conn.send_req(21, 9999, "EngineActor_0", "", &body).await {
+                eprintln!("[Rust] Failed to send release request: {}", e);
+            } else {
+                match conn.read_msg().await {
+                    Ok((meta, _)) => {
+                        if meta.status > 0 {
+                            println!("[Rust] EngineActor released successfully.");
+                        } else {
+                            eprintln!("[Rust] EngineActor release failed (remote error).");
+                        }
+                    }
+                    Err(e) => eprintln!("[Rust] Failed to receive release ack: {}", e),
+                }
+            }
+        }
+        Err(e) => {
+             eprintln!("[Rust] Failed to connect to agent for clean shutdown: {}", e);
+        }
+    }
+
+    println!("[Rust] Shutdown complete.");
 }

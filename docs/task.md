@@ -49,3 +49,10 @@
 - [x] Usability: Client-side Actor Shutdown
   - [x] Implement `stopRemote` in `Client`
   - [x] Call `stopRemote` in `test_dummy_runner.cpp`
+
+# Phase 3: Rust Server Enhancements
+
+- [x] Implement Dynamic Configuration
+  - [x] Create `server/src/config.rs`
+  - [x] Add CLI argument parsing for model and parallelization params
+  - [x] Integrate with `EngineInitReq` in `main.rs`

@@ -2,7 +2,9 @@
 #include "nanodeploy/csrc/core/common.h"
 #include "nanodeploy/csrc/core/module.h"
 #include "nanodeploy/csrc/ops/deep_gemm_ops.h"
+#include <iostream>
 #include <torch/torch.h>
+#include <torch/types.h>
 
 namespace nanodeploy {
 namespace layers {
@@ -87,11 +89,6 @@ public:
         //
         // Python does NOT transpose weight_scale_inv, so we shouldn't either!
 
-        // Debug prints
-        std::cout << "[Linear::forward] Input: " << input_fp8.sizes() << " Scale: " << input_scale.sizes()
-                  << " (contiguous=" << input_scale.is_contiguous() << ")" << std::endl;
-        std::cout << "[Linear::forward] Weight: " << weight.sizes() << " Scale: " << weight_scale_inv.sizes()
-                  << " (contiguous=" << weight_scale_inv.is_contiguous() << ")" << std::endl;
         ops::DeepGemmOps::fp8_gemm_nt({input_fp8, input_scale}, {weight, weight_scale_inv}, output);
 
         // Slice output back to original M

@@ -16,7 +16,13 @@ namespace nanodeploy {
 
 class DeepEpContext {
 public:
-    DeepEpContext(int rank, int world_size);
+    // Singleton accessor
+    static DeepEpContext& instance()
+    {
+        static DeepEpContext instance;
+        return instance;
+    }
+    DeepEpContext() = default;
     ~DeepEpContext();
 
     // Initialize DeepEP buffer based on config
@@ -27,6 +33,11 @@ public:
     deep_ep::Buffer* get_buffer() const
     {
         return buffer_.get();
+    }
+
+    deep_ep::Config* get_config() const
+    {
+        return dep_config_.get();
     }
 #else
     void* get_buffer() const
@@ -40,12 +51,16 @@ public:
     DeepEpInfoResp get_info();
 
 private:
-    int rank_;
-    int world_size_;
-
 #ifdef DEEPSEEK_MOE
     std::unique_ptr<deep_ep::Buffer> buffer_;
+    std::unique_ptr<deep_ep::Config> dep_config_{};
 #endif
 };
+
+// Global accessor function (for compatibility)
+inline DeepEpContext& get_deep_ep_context()
+{
+    return DeepEpContext::instance();
+}
 
 }  // namespace nanodeploy

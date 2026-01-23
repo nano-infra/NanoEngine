@@ -96,10 +96,12 @@ void test_single_token_decode_correctness()
     block_table_host[0] = 0;
     block_table_host[1] = 1;
 
-    auto block_tables = torch::tensor(block_table_host, torch::TensorOptions().dtype(torch::kInt32).device(device));
-    block_tables      = block_tables.unsqueeze(0);  // [1, MaxBlocks]
+    auto block_tables = torch::tensor(
+        block_table_host, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
+    block_tables = block_tables.unsqueeze(0);  // [1, MaxBlocks]
 
-    auto seq_lens = torch::tensor({seq_len}, torch::TensorOptions().dtype(torch::kInt32).device(device));  // [1]
+    auto seq_lens = torch::tensor(
+        {seq_len}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));  // [1]
 
     std::cout << "[Test] Running begin_forward..." << std::endl;
     // Run Forward
@@ -168,10 +170,215 @@ void test_single_token_decode_correctness()
     }
 }
 
+void test_prefill_correctness()
+{
+    if (!torch::cuda::is_available()) {
+        std::cerr << "CUDA not available, skipping test." << std::endl;
+        return;
+    }
+    torch::Device device(torch::kCUDA);
+    torch::manual_seed(42);
+
+    std::cout << "[Test] Starting PrefillCorrectness..." << std::endl;
+
+    // Config
+    int batch_size   = 2;
+    int num_heads    = 16;
+    int num_kv_heads = 8;
+    int head_dim     = 128;
+    int page_size    = 16;
+
+    // Seq lengths: 17, 33
+    // Total tokens: 50
+    std::vector<int> seq_lens_host = {17, 33};
+    std::vector<int> q_indptr_host = {0, 17, 50};
+    int              total_tokens  = 50;
+
+    // Max blocks per seq
+    // 17 -> 2 blocks
+    // 33 -> 3 blocks
+    int max_num_blocks = 3;
+
+    // Handler
+    auto handler = std::make_unique<ops::FlashInferOps>(1, num_heads, num_kv_heads, head_dim, page_size, device);
+
+    // Data (BF16)
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+
+    // Q: [TotalTokens, H, D]
+    auto q = torch::randn({total_tokens, num_heads, head_dim}, opts);
+
+    // KV Cache
+    // Total blocks needed = 2 + 3 = 5.
+    // Let's allocate 16 blocks to be safe.
+    int  total_blocks = 16;
+    auto k_cache      = torch::randn({total_blocks, num_kv_heads, page_size, head_dim}, opts);
+    auto v_cache      = torch::randn({total_blocks, num_kv_heads, page_size, head_dim}, opts);
+
+    // Block Tables
+    // Seq 0: [0, 1]
+    // Seq 1: [2, 3, 4]
+    std::vector<int> block_tables_host = {0, 1, 0, 2, 3, 4};  // [Batch, MaxBlocks] -> [2, 3] flattened?
+    // Wait, begin_forward_prefill expects raw pointer.
+    // Assuming row-major [Batch, MaxBlocks] where MaxBlocks is passed.
+
+    auto block_tables = torch::tensor(block_tables_host,
+                                      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));  // Host tensor
+    auto q_indptr =
+        torch::tensor(q_indptr_host, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));  // Host tensor
+
+    // Seq 0: 17 tokens, page 16 -> last page len 1
+    // Seq 1: 33 tokens, page 16 -> last page len 1
+    std::vector<int> last_page_lens_host = {1, 1};
+    auto             last_page_lens =
+        torch::tensor(last_page_lens_host, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+
+    std::cout << "[Test] Running begin_forward_prefill..." << std::endl;
+    handler->begin_forward_prefill(q_indptr.data_ptr<int>(),
+                                   block_tables.data_ptr<int>(),
+                                   last_page_lens.data_ptr<int>(),
+                                   batch_size,
+                                   max_num_blocks,
+                                   num_heads,
+                                   num_kv_heads,
+                                   head_dim,
+                                   page_size);
+
+    std::cout << "[Test] Running prefill kernel..." << std::endl;
+    auto output = handler->prefill(q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), total_tokens);
+
+    // -----------------------------------------------------------------
+    // Reference Check
+    // -----------------------------------------------------------------
+    std::cout << "[Test] Computing reference..." << std::endl;
+
+    auto k_cpu = k_cache.to(torch::kCPU);  // [TotalBlocks, KV, Page, D]
+    auto v_cpu = v_cache.to(torch::kCPU);
+    auto q_cpu = q.to(torch::kCPU);  // [TotalTokens, H, D]
+
+    // Split Q and Compute for each sequence
+    // Result Accumulator
+    auto ref_out = torch::zeros_like(q_cpu);
+
+    // Helper to reconstruct Contiguous K/V from blocks
+    auto reconstruct_kv = [&](const std::vector<int>& blocks, int seq_len) {
+        std::vector<torch::Tensor> k_parts, v_parts;
+        int                        remaining = seq_len;
+        for (int b_idx : blocks) {
+            int valid = std::min(remaining, page_size);
+            if (valid <= 0)
+                break;
+            // blocks are [KV, Page, D]. Need [Page, KV, D] for processing logic usually?
+            // manual_ref expects [Seq, KV, D].
+            // cache is [KV, Page, D] (HND).
+            auto k_blk = k_cpu[b_idx].permute({1, 0, 2}).slice(0, 0, valid);  // [Page, KV, D] sliced
+            auto v_blk = v_cpu[b_idx].permute({1, 0, 2}).slice(0, 0, valid);
+            k_parts.push_back(k_blk);
+            v_parts.push_back(v_blk);
+            remaining -= valid;
+        }
+        return std::make_pair(torch::cat(k_parts, 0), torch::cat(v_parts, 0));
+    };
+
+    // Seq 0
+    {
+        int  start = 0;
+        int  len   = 17;
+        auto q_seq = q_cpu.slice(0, start, start + len).unsqueeze(0);  // [1, Seq, H, D]
+        // Manual ref expects q: [1, H, D] ?? No, manual_attention_ref expects single token Q?
+        // My manual_attention_ref implementation (line 17) takes q [1, H, D].
+        // It does: q_.view({B, H, Sq, D}). If Sq > 1, it handles it!
+        // Line 40: Sq=1 hardcoded in comments but `Sq` variable logic?
+        // Let's check `manual_attention_ref` again.
+        // Line 25: `int64_t Sq = 1;`
+        // Line 40: `q_ = q.view({B, H, Sq, D});`
+        // If I pass q with Sq > 1, `q.view` will fail or misfit if q is [1, H, S, D].
+        // If q is [1, H, D] (from arguments q size), Sq is inferred as D size??
+        // `q.size(1)` is H. `q.size(2)` is D.
+        // It assumes input is [1, H, D].
+
+        // I need to update `manual_attention_ref` to support sequence Q?
+        // Or loop tokens in verification.
+        // Let's loop tokens for verification to reuse existing ref.
+
+        auto kv_pair = reconstruct_kv({0, 1}, len);
+        auto k_cont  = kv_pair.first;
+        auto v_cont  = kv_pair.second;
+
+        // Causal Masking is tricky with manual ref?
+        // manual_ref computes `scores`. It does NOT apply causal mask.
+        // FlashInfer prefill IS CAUSAL.
+        // So I must mask `scores` in manual calculation.
+        // Since `manual_attention_ref` doesn't support causal mask, I must verify token-by-token.
+        // For token i (0..16), it attends to 0..i.
+
+        for (int i = 0; i < len; ++i) {
+            auto q_tok = q_seq.slice(1, i, i + 1).squeeze(1);  // [1, H, D]
+            auto k_ctx = k_cont.slice(0, 0, i + 1);            // [i+1, KV, D]
+            auto v_ctx = v_cont.slice(0, 0, i + 1);
+
+            auto out_tok       = manual_attention_ref(q_tok, k_ctx, v_ctx);  // [1, H, D]
+            ref_out[start + i] = out_tok.squeeze(0);
+        }
+    }
+
+    // Seq 1
+    {
+        int  start   = 17;
+        int  len     = 33;
+        auto q_seq   = q_cpu.slice(0, start, start + len).unsqueeze(0);
+        auto kv_pair = reconstruct_kv({2, 3, 4}, len);
+        auto k_cont  = kv_pair.first;
+        auto v_cont  = kv_pair.second;
+
+        for (int i = 0; i < len; ++i) {
+            auto q_tok = q_seq.slice(1, i, i + 1).squeeze(1);
+            auto k_ctx = k_cont.slice(0, 0, i + 1);
+            auto v_ctx = v_cont.slice(0, 0, i + 1);
+
+            auto out_tok       = manual_attention_ref(q_tok, k_ctx, v_ctx);
+            ref_out[start + i] = out_tok.squeeze(0);
+        }
+    }
+
+    // Compare
+    auto out_cpu = output.to(torch::kCPU).to(torch::kFloat32);
+
+    float diff = (out_cpu - ref_out).abs().max().item<float>();
+    std::cout << "Max Diff: " << diff << std::endl;
+    // BF16 precision is low, especially for accumulation.
+    // 1e-2 might be tight?
+    // Usually < 0.5 for large values, but for attention (softmax 0..1) -> values are weighted sums of V.
+    // V is random normal (mean 0 var 1).
+    bool passed = diff < 0.1;  // Relaxed for BF16/accumulation
+
+    if (passed) {
+        std::cout << "[Test] PASSED! Outputs match." << std::endl;
+    }
+    else {
+        std::cerr << "[Test] FAILED! Outputs mismatch." << std::endl;
+        // Find first mismatch
+        auto diff_t    = (out_cpu - ref_out).abs();
+        auto flat_diff = diff_t.view({-1});
+        auto flat_out  = out_cpu.view({-1});
+        auto flat_ref  = ref_out.view({-1});
+        for (int i = 0; i < flat_diff.numel(); ++i) {
+            if (flat_diff[i].item<float>() > 0.5) {  // Threshold
+                std::cerr << "Mismatch at flat index " << i << ": Ref=" << flat_ref[i].item<float>()
+                          << " Out=" << flat_out[i].item<float>() << " Diff=" << flat_diff[i].item<float>()
+                          << std::endl;
+                break;
+            }
+        }
+        exit(1);
+    }
+}
+
 int main()
 {
     try {
         test_single_token_decode_correctness();
+        test_prefill_correctness();
     }
     catch (const std::exception& e) {
         std::cerr << "Exception: " << e.what() << std::endl;

@@ -59,7 +59,7 @@ public:
               bool               enable_cuda_graph = false)
     {
         // 1. Connect to Spoke Hub
-        std::cout << "[SimpleEngine] Connecting to Spoke Hub at " << ip << ":" << port << std::endl;
+        NANODEPLOY_LOG_INFO("[SimpleEngine] Connecting to Spoke Hub at ", ip, ":", port);
         client_ = std::make_shared<spoke::Client>(ip, port, /*is_hub_mode=*/true);
 
         tp_           = tp;
@@ -96,7 +96,7 @@ public:
             throw std::runtime_error("Invalid world_size");
 
         // 2. Resource Allocation (Gang Scheduling)
-        std::cout << "[SimpleEngine] Requesting Gang Allocation for " << world_size << " actors..." << std::endl;
+        NANODEPLOY_LOG_INFO("[SimpleEngine] Requesting Gang Allocation for ", world_size, " actors...");
         spoke::ResourceSpec res;
         res.num_gpus = 1;
 
@@ -106,7 +106,7 @@ public:
         int num_nodes = (world_size + actors_per_node - 1) / actors_per_node;
 
         std::string my_ip = get_local_ip();
-        std::cout << "[SimpleEngine] My IP is " << my_ip << ". Requesting affinity." << std::endl;
+        NANODEPLOY_LOG_INFO("[SimpleEngine] My IP is ", my_ip, ". Requesting affinity.");
 
         auto alloc_fut  = client_->gangAllocate(num_nodes, actors_per_node, res, /*strict_pack=*/true, my_ip);
         auto alloc_resp = alloc_fut.get();
@@ -114,12 +114,13 @@ public:
         if (strlen(alloc_resp.ticket_id) == 0) {
             throw std::runtime_error("Gang Allocation Failed!");
         }
-        std::cout << "[SimpleEngine] Allocation Success! Ticket: " << alloc_resp.ticket_id << std::endl;
+        ticket_id_ = alloc_resp.ticket_id;
+        NANODEPLOY_LOG_INFO("[SimpleEngine] Allocation Success! Ticket: ", ticket_id_);
 
         // 3. Launch Actors (Parallel)
         actor_ids_.clear();
         std::vector<std::future<void>> launch_futs;
-        std::string                    ticket = alloc_resp.ticket_id;
+        std::string                    ticket = ticket_id_;
 
         for (int i = 0; i < world_size; ++i) {
             std::string id = "ModelRunner_" + std::to_string(i);
@@ -133,11 +134,11 @@ public:
         for (auto& f : launch_futs)
             f.get();
 
-        std::cout << "[SimpleEngine] Waiting for actors to start..." << std::endl;
+        NANODEPLOY_LOG_INFO("[SimpleEngine] Waiting for actors to start...");
         std::this_thread::sleep_for(std::chrono::seconds(2));
 
         // 4. Initialize All Actors (Parallel)
-        std::cout << "[SimpleEngine] Initializing remote models (Parallel)..." << std::endl;
+        NANODEPLOY_LOG_INFO("[SimpleEngine] Initializing remote models (Parallel)...");
         constexpr int kInitAction = static_cast<int>(spoke::Action::kUserActionStart) + 10;
 
         std::vector<std::future<ModelInitResp>> init_futs;
@@ -170,34 +171,35 @@ public:
         for (auto& f : init_futs) {
             f.get();
         }
-        std::cout << "[SimpleEngine] All actors initialized." << std::endl;
+        NANODEPLOY_LOG_INFO("[SimpleEngine] All actors initialized.");
 
-        // 5. Initialize KV Cache on all actors (Parallel)
-        std::cout << "[SimpleEngine] Initializing KV Cache on all actors..." << std::endl;
-        constexpr int kInitKvCacheAction = static_cast<int>(spoke::Action::kUserActionStart) + 14;
+        // 5. Initialize KV Cache on all actors (Parallel) - 2 Step Process
+        // Step 5a: Get Available Blocks from all ranks
+        NANODEPLOY_LOG_INFO("[SimpleEngine] Querying available KV blocks from all workers...");
+        constexpr int kGetAvailableBlocksAction = static_cast<int>(spoke::Action::kUserActionStart) + 17;
+        constexpr int kAllocKVBlocksAction      = static_cast<int>(spoke::Action::kUserActionStart) + 18;
 
         // TODO: Make these configurable via EngineInitReq
-        int max_batch_size    = 256;  // Default max batch size
-        int req_num_kv_blocks = -1;   // Auto calculate using gpu_memory_utilization
+        int   max_batch_size         = 256;  // Default max batch size
+        float gpu_memory_utilization = 0.90f;
 
-        std::vector<std::future<KvCacheInitResp>> kv_futs;
+        std::vector<std::future<int>> avail_futs;
         for (int i = 0; i < world_size; ++i) {
-            kv_futs.push_back(
+            avail_futs.push_back(
                 std::async(std::launch::async,
-                           [this, i, max_batch_size, req_num_kv_blocks, kInitKvCacheAction]() -> KvCacheInitResp {
-                               KvCacheInitReq req;
+                           [this, i, max_batch_size, gpu_memory_utilization, kGetAvailableBlocksAction]() -> int {
+                               GetAvailableKVBlocksReq req;
                                req.max_batch_size         = max_batch_size;
-                               req.num_blocks             = req_num_kv_blocks;
-                               req.gpu_memory_utilization = 0.90f;  // Default 0.9
+                               req.gpu_memory_utilization = gpu_memory_utilization;
 
-                               auto f = client_->callRemote<KvCacheInitReq, KvCacheInitResp>(
-                                   actor_ids_[i], static_cast<spoke::Action>(kInitKvCacheAction), req);
+                               auto f = client_->callRemote<GetAvailableKVBlocksReq, GetAvailableKVBlocksResp>(
+                                   actor_ids_[i], static_cast<spoke::Action>(kGetAvailableBlocksAction), req);
                                return f.get();
                            }));
         }
 
         int min_actual_blocks = std::numeric_limits<int>::max();
-        for (auto& f : kv_futs) {
+        for (auto& f : avail_futs) {
             int blocks = f.get();
             if (blocks > 0 && blocks < min_actual_blocks) {
                 min_actual_blocks = blocks;
@@ -205,13 +207,38 @@ public:
         }
 
         if (min_actual_blocks == std::numeric_limits<int>::max()) {
-            // Fallback if all failed or returned 0 (should not happen if exception logic works)
-            std::cout << "[SimpleEngine] WARNING: Failed to get valid block count. Defaulting to 1024." << std::endl;
+            NANODEPLOY_LOG_WARN("[SimpleEngine] WARNING: Failed to get valid block count. Defaulting to 1024.");
             min_actual_blocks = 1024;
         }
 
-        std::cout << "[SimpleEngine] KV Cache initialized on all actors. Negotiated Blocks: " << min_actual_blocks
-                  << std::endl;
+        NANODEPLOY_LOG_INFO("[SimpleEngine] Negotiated Block Count: ", min_actual_blocks, ". Allocating...");
+
+        // Step 5b: Allocate KV Blocks on all ranks
+        std::vector<std::future<bool>> alloc_futs;
+        for (int i = 0; i < world_size; ++i) {
+            alloc_futs.push_back(std::async(
+                std::launch::async, [this, i, min_actual_blocks, max_batch_size, kAllocKVBlocksAction]() -> bool {
+                    AllocKVBlocksReq req;
+                    req.num_blocks     = min_actual_blocks;
+                    req.max_batch_size = max_batch_size;
+
+                    auto f = client_->callRemote<AllocKVBlocksReq, AllocKVBlocksResp>(
+                        actor_ids_[i], static_cast<spoke::Action>(kAllocKVBlocksAction), req);
+                    return f.get();
+                }));
+        }
+
+        bool all_alloc_success = true;
+        for (auto& f : alloc_futs) {
+            if (!f.get())
+                all_alloc_success = false;
+        }
+
+        if (!all_alloc_success) {
+            throw std::runtime_error("KV Cache Allocation Failed on some ranks!");
+        }
+
+        NANODEPLOY_LOG_INFO("[SimpleEngine] KV Cache initialized on all actors.");
 
         // 5b. Capture CUDA Graphs for Decode (Optional but highly recommended for latency)
         // Static buffers now use random/valid values to avoid DeepGemm issues.
@@ -219,7 +246,7 @@ public:
         // 6. DeepEP Synchronization (MUST happen before Graph Capture Warmup)
         // Warmup calls moe_model->forward() which requires DeepEP handles to be ready.
         if (ffn_ep_ > 1) {
-            std::cout << "[SimpleEngine] Syncing DeepEP buffers..." << std::endl;
+            NANODEPLOY_LOG_DEBUG("[SimpleEngine] Syncing DeepEP buffers...");
             syncDeepEpBuffers(world_size);
         }
 
@@ -231,16 +258,26 @@ public:
             constexpr int kCaptureGraphAction = static_cast<int>(spoke::Action::kUserActionStart) + 15;
             int           warm_up_steps       = 3;  // Default warmup iterations
 
-            // Step 1: Warmup MoE on rank 0 first (triggers JIT compilation sequentially)
+            // Step 1: Warmup MoE on ALL ranks (triggers DeepGEMM JIT compilation per process)
+            // NOTE: Must run on all ranks because DeepGEMM JIT is process-local.
             if (ffn_ep_ > 0) {
-                std::cout << "[SimpleEngine] Warming up MoE on rank 0 (triggers DeepGemm JIT)..." << std::endl;
-                auto f = client_->callRemote<int, bool>(actor_ids_[0], static_cast<spoke::Action>(kWarmupMoeAction), 0);
-                f.get();  // Wait for rank 0 warmup to complete
-                std::cout << "[SimpleEngine] Rank 0 MoE warmup complete." << std::endl;
+                NANODEPLOY_LOG_INFO("[SimpleEngine] Warming up MoE on all ranks (triggers DeepGemm JIT)...");
+                std::vector<std::future<bool>> warmup_futs;
+                for (int i = 0; i < world_size; ++i) {
+                    warmup_futs.push_back(std::async(std::launch::async, [this, i, kWarmupMoeAction]() -> bool {
+                        auto f = client_->callRemote<int, bool>(
+                            actor_ids_[i], static_cast<spoke::Action>(kWarmupMoeAction), 0);
+                        return f.get();
+                    }));
+                }
+                for (auto& f : warmup_futs) {
+                    f.get();
+                }
+                NANODEPLOY_LOG_INFO("[SimpleEngine] MoE warmup complete on all ranks.");
             }
 
             // Step 2: Now all ranks can capture (JIT already compiled)
-            std::cout << "[SimpleEngine] Capturing CUDA Graphs on all actors..." << std::endl;
+            NANODEPLOY_LOG_INFO("[SimpleEngine] Capturing CUDA Graphs on all actors...");
             std::vector<std::future<GraphCaptureResp>> graph_futs;
             for (int i = 0; i < world_size; ++i) {
                 graph_futs.push_back(
@@ -258,29 +295,29 @@ public:
             for (auto& f : graph_futs) {
                 f.get();
             }
-            std::cout << "[SimpleEngine] CUDA Graphs captured on all actors." << std::endl;
+            NANODEPLOY_LOG_INFO("[SimpleEngine] CUDA Graphs captured on all actors.");
         }
 
         // 7. Configure RDMA for all actors (Direct Connection)
         if (enable_rdma) {
-            std::cout << "[SimpleEngine] Configuring RDMA for all actors (" << world_size_ << ")..." << std::endl;
+            NANODEPLOY_LOG_INFO("[SimpleEngine] Configuring RDMA for all actors (", world_size_, ")...");
             for (const auto& id : actor_ids_) {
                 try {
                     // Try to init RDMA, but gracefully fall back to socket if it fails
                     if (client_->initRDMA(id)) {
-                        std::cout << "[SimpleEngine] RDMA Configured with " << id << "." << std::endl;
+                        NANODEPLOY_LOG_DEBUG("[SimpleEngine] RDMA Configured with ", id, ".");
                     }
                     else {
-                        std::cout << "[SimpleEngine] RDMA Config failed for " << id << ", using TCP." << std::endl;
+                        NANODEPLOY_LOG_INFO("[SimpleEngine] RDMA Config failed for ", id, ", using TCP.");
                     }
                 }
                 catch (const std::exception& e) {
-                    std::cout << "[SimpleEngine] RDMA Init Exception for " << id << ": " << e.what() << std::endl;
+                    NANODEPLOY_LOG_ERROR("[SimpleEngine] RDMA Init Exception for ", id, ": ", e.what());
                 }
             }
         }
         else {
-            std::cout << "[SimpleEngine] RDMA Config disabled." << std::endl;
+            NANODEPLOY_LOG_INFO("[SimpleEngine] RDMA Config disabled.");
         }
 
         // 8. Initialize Scheduler
@@ -300,14 +337,27 @@ public:
     void shutdown()
     {
         if (client_) {
-            std::cout << "[SimpleEngine] Shutting down client..." << std::endl;
+            NANODEPLOY_LOG_INFO("[SimpleEngine] Shutting down client...");
             client_.reset();
+        }
+    }
+
+    void release_resources()
+    {
+        if (client_ && !ticket_id_.empty()) {
+            NANODEPLOY_LOG_INFO("[SimpleEngine] Releasing Gang Resources for ticket: ", ticket_id_);
+            // Assuming gangRelease takes the ticket ID string
+            // We use ticket_id_.c_str() just in case it expects const char*
+            // Since I don't see the header, I assume gangRelease exists as requested.
+            // If the user meant "release" as a concept, I hope this method exists.
+            // However, typical Spoke client has gangRelease(ticket).
+            client_->gangRelease(ticket_id_.c_str());
         }
     }
 
     std::shared_ptr<Sequence> add_request(const std::vector<int>& prompt_ids, int max_new_tokens)
     {
-        std::cout << "[SimpleEngine] Adding Request..." << std::endl;
+        NANODEPLOY_LOG_DEBUG("[SimpleEngine] Adding Request...");
         auto seq = std::make_shared<Sequence>(prompt_ids, 1.0, prompt_ids.size() + max_new_tokens);
         scheduler_->add(seq);
         return seq;
@@ -348,6 +398,15 @@ public:
                 break;
             requests[i].is_prefill = sched_res.is_prefill;
             requests[i].seqs       = sched_res.dp_sp_seqs[i];
+
+            // Debug: Print outgoing tokens
+            if (sched_res.is_prefill && !requests[i].seqs.empty()) {
+                std::cout << "[Engine] Sending Prefill Seq " << requests[i].seqs[0]->seq_id << " to Rank " << i
+                          << " Tokens: ";
+                for (int id : requests[i].seqs[0]->token_ids)
+                    std::cout << id << " ";
+                std::cout << std::endl;
+            }
         }
 
         // Launch all calls in parallel
@@ -369,23 +428,22 @@ public:
             auto& seqs = sched_res.dp_sp_seqs[i];
             dp_sp_token_ids[i].resize(seqs.size());
 
-            if (resp.tensor.numel() > 0) {
-                auto logits = resp.tensor;
-                if (logits.dim() == 3)
-                    logits = logits.squeeze(1);
-                auto next_tokens = torch::argmax(logits, -1).cpu();
-                auto access      = next_tokens.accessor<int64_t, 1>();
+            if (!resp.token_ids.empty()) {
+                const auto& new_tokens = resp.token_ids;
 
-                for (int j = 0; j < (int)seqs.size(); ++j) {
-                    if (j < next_tokens.size(0)) {
-                        int token = (int)access[j];
+                for (size_t j = 0; j < seqs.size(); ++j) {
+                    if (j < new_tokens.size()) {
+                        int token = new_tokens[j];
+
+                        // Debug: Warn if token 0 is sampled (likely indicates corrupted logits)
+                        if (token == 0) {
+                            std::cerr << "[Engine] WARNING: Seq " << seqs[j]->seq_id
+                                      << " sampled token 0! This may indicate corrupted logits." << std::endl;
+                        }
+
                         dp_sp_token_ids[i][j].push_back(token);
 
                         // Collect for stream result
-                        // Note: If multiple ranks return tokens for same sequence (e.g. SP),
-                        // this logic needs de-duplication. Assuming DP means distinct sequences per rank.
-                        // For SP, usually only last stage returns tokens or all ranks return partial?
-                        // SimpleEngine assumes basic DP for now.
                         bool found = false;
                         for (auto& p : result.new_tokens) {
                             if (p.first == seqs[j]->seq_id) {
@@ -459,7 +517,7 @@ public:
 private:
     void syncDeepEpBuffers(int world_size)
     {
-        std::cout << "[SimpleEngine] Starting DeepEP synchronization for " << world_size << " ranks..." << std::endl;
+        NANODEPLOY_LOG_DEBUG("[SimpleEngine] Starting DeepEP synchronization for ", world_size, " ranks...");
 
         constexpr int kGetInfoAction = static_cast<int>(spoke::Action::kUserActionStart) + 12;
         constexpr int kSyncAction    = static_cast<int>(spoke::Action::kUserActionStart) + 13;
@@ -483,9 +541,14 @@ private:
 
         // Log collected info
         for (int i = 0; i < world_size; ++i) {
-            std::cout << "[SimpleEngine] Rank " << i << " DeepEP info: device_id=" << all_info[i].device_id
-                      << " num_rdma_ranks=" << all_info[i].num_rdma_ranks
-                      << " ipc_handle_size=" << all_info[i].ipc_handle.size() << std::endl;
+            NANODEPLOY_LOG_DEBUG("[SimpleEngine] Rank ",
+                                 i,
+                                 " DeepEP info: device_id=",
+                                 all_info[i].device_id,
+                                 " num_rdma_ranks=",
+                                 all_info[i].num_rdma_ranks,
+                                 " ipc_handle_size=",
+                                 all_info[i].ipc_handle.size());
         }
 
         // Find root rank for NVSHMEM (if needed)
@@ -493,7 +556,7 @@ private:
         for (int i = 0; i < world_size; ++i) {
             if (!all_info[i].nvshmem_unique_id.empty()) {
                 root_nvshmem_id = all_info[i].nvshmem_unique_id;
-                std::cout << "[SimpleEngine] Found NVSHMEM root at rank " << i << std::endl;
+                NANODEPLOY_LOG_DEBUG("[SimpleEngine] Found NVSHMEM root at rank ", i);
                 break;
             }
         }
@@ -522,13 +585,13 @@ private:
         for (int i = 0; i < world_size; ++i) {
             bool result = sync_futs[i].get();
             if (!result) {
-                std::cerr << "[SimpleEngine] DeepEP sync failed for rank " << i << std::endl;
+                NANODEPLOY_LOG_ERROR("[SimpleEngine] DeepEP sync failed for rank ", i);
                 all_synced = false;
             }
         }
 
         if (all_synced) {
-            std::cout << "[SimpleEngine] DeepEP synchronization completed successfully." << std::endl;
+            NANODEPLOY_LOG_DEBUG("[SimpleEngine] DeepEP synchronization completed successfully.");
         }
         else {
             throw std::runtime_error("DeepEP synchronization failed!");
@@ -543,6 +606,8 @@ private:
     int attention_tp_ = 1, attention_dp_ = 1, attention_sp_ = 1;
     int ffn_tp_ = 1, ffn_dp_ = 1, ffn_ep_ = 1;
     int world_size_ = 1;
+
+    std::string ticket_id_;
 };
 
 }  // namespace nanodeploy

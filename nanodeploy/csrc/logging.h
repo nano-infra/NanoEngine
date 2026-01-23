@@ -33,7 +33,15 @@ inline std::mutex& get_console_mutex()
 
 inline int& get_log_level()
 {
-    static int level = 0;  // Default to INFO (1)
+    static int level = []() {
+        if (const char* env_p = std::getenv("NANODEPLOY_ENGINE_LOG_LEVEL")) {
+            return std::atoi(env_p);
+        }
+        if (const char* env_p = std::getenv("NANODEPLOY_RUNNER_LOG_LEVEL")) {
+            return std::atoi(env_p);
+        }
+        return 0;  // Default to ERROR (0). INFO is 1, DEBUG is 2.
+    }();
     return level;
 }
 
@@ -126,28 +134,13 @@ inline void print_stack_trace()
 // Macro Helpers (Variadic Argument Handling)
 // -----------------------------------------------------------------------------
 
-#define STREAM_VAR_ARGS1(a) << a
-#define STREAM_VAR_ARGS2(a, b) << a << b
-#define STREAM_VAR_ARGS3(a, b, c) << a << b << c
-#define STREAM_VAR_ARGS4(a, b, c, d) << a << b << c << d
-#define STREAM_VAR_ARGS5(a, b, c, d, e) << a << b << c << d << e
-#define STREAM_VAR_ARGS6(a, b, c, d, e, f) << a << b << c << d << e << f
-#define STREAM_VAR_ARGS7(a, b, c, d, e, f, g) << a << b << c << d << e << f << g
-#define STREAM_VAR_ARGS8(a, b, c, d, e, f, g, h) << a << b << c << d << e << f << g << h
-
-#define GET_MACRO(_1, _2, _3, _4, _5, _6, _7, _8, NAME, ...) NAME
-
-#define STREAM_VAR_ARGS(...)                                                                                           \
-    GET_MACRO(__VA_ARGS__,                                                                                             \
-              STREAM_VAR_ARGS8,                                                                                        \
-              STREAM_VAR_ARGS7,                                                                                        \
-              STREAM_VAR_ARGS6,                                                                                        \
-              STREAM_VAR_ARGS5,                                                                                        \
-              STREAM_VAR_ARGS4,                                                                                        \
-              STREAM_VAR_ARGS3,                                                                                        \
-              STREAM_VAR_ARGS2,                                                                                        \
-              STREAM_VAR_ARGS1)                                                                                        \
-    (__VA_ARGS__)
+namespace detail {
+template<typename... Args>
+inline void stream_all(std::ostream& os, Args&&... args)
+{
+    (os << ... << std::forward<Args>(args));
+}
+}  // namespace detail
 
 // -----------------------------------------------------------------------------
 // Assertions
@@ -160,7 +153,9 @@ inline void print_stack_trace()
             std::cerr << "\033[1;91m"                                                                                  \
                       << "[Assertion Failed]"                                                                          \
                       << "\033[m " << __FILE__ << ":" << __LINE__ << ": " << __FUNCTION__ << ", Expected: " << #Expr   \
-                      << ". Error msg: " << Msg __VA_OPT__(STREAM_VAR_ARGS(__VA_ARGS__)) << std::endl;                 \
+                      << ". Error msg: " << Msg;                                                                       \
+            __VA_OPT__(::nanodeploy::detail::stream_all(std::cerr, __VA_ARGS__);)                                      \
+            std::cerr << std::endl;                                                                                    \
             nanodeploy::print_stack_trace(); /* Dump stack before aborting */                                          \
             abort();                                                                                                   \
         }                                                                                                              \
@@ -175,10 +170,12 @@ inline void print_stack_trace()
 
 #define NANODEPLOY_ABORT(Msg, ...)                                                                                     \
     {                                                                                                                  \
+        NANODEPLOY_CONSOLE_LOCK                                                                                        \
         std::cerr << "\033[1;91m"                                                                                      \
                   << "[Fatal]"                                                                                         \
-                  << "\033[m " << __FILE__ << ":" << __LINE__ << ": " << __FUNCTION__ << ": "                          \
-                  << Msg __VA_OPT__(STREAM_VAR_ARGS(__VA_ARGS__)) << std::endl;                                        \
+                  << "\033[m " << __FILE__ << ":" << __LINE__ << ": " << __FUNCTION__ << ": " << Msg;                  \
+        __VA_OPT__(::nanodeploy::detail::stream_all(std::cerr, __VA_ARGS__);)                                          \
+        std::cerr << std::endl;                                                                                        \
         nanodeploy::print_stack_trace();                                                                               \
         abort();                                                                                                       \
     }
@@ -190,14 +187,17 @@ inline void print_stack_trace()
 #define NANODEPLOY_LOG_LEVEL(MsgType, FlagFormat, Level, ...)                                                          \
     {                                                                                                                  \
         if (get_log_level() >= Level) {                                                                                \
+            NANODEPLOY_CONSOLE_LOCK                                                                                    \
             auto    now   = std::chrono::system_clock::now();                                                          \
             auto    ms    = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;      \
             auto    timer = std::chrono::system_clock::to_time_t(now);                                                 \
-            std::tm bt    = *std::localtime(&timer);                                                                   \
+            std::tm bt    = {};                                                                                        \
+            localtime_r(&timer, &bt);                                                                                  \
             std::cerr << "[" << std::put_time(&bt, "%H:%M:%S") << "." << std::setfill('0') << std::setw(3)             \
                       << ms.count() << "] " << FlagFormat << "[" << MsgType << "]"                                     \
-                      << "\033[m " << __FILE__ << ":" << __LINE__ << ": " << __FUNCTION__                              \
-                      << ": " __VA_OPT__(STREAM_VAR_ARGS(__VA_ARGS__)) << std::endl;                                   \
+                      << "\033[m " << __FILE__ << ":" << __LINE__ << ": " << __FUNCTION__ << ": ";                     \
+            __VA_OPT__(::nanodeploy::detail::stream_all(std::cerr, __VA_ARGS__);)                                      \
+            std::cerr << std::endl;                                                                                    \
         }                                                                                                              \
     }
 

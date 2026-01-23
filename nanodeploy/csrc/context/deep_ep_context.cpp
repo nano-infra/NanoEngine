@@ -7,8 +7,6 @@
 
 namespace nanodeploy {
 
-DeepEpContext::DeepEpContext(int rank, int world_size): rank_(rank), world_size_(world_size) {}
-
 DeepEpContext::~DeepEpContext() = default;
 
 void DeepEpContext::init(const core::ModelConfig& config, int ffn_ep_world_size, int ffn_ep_rank)
@@ -32,10 +30,15 @@ void DeepEpContext::init(const core::ModelConfig& config, int ffn_ep_world_size,
         int current_device;
         cudaGetDevice(&current_device);
         cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, current_device);
-        if (num_sms <= 0)
-            num_sms = 132;  // H100/H200 default
+        num_sms = 20;
 
-        int64_t hidden_size_bytes = hidden_size * 2;  // BF16
+        int64_t hidden_size_bytes;
+        if (config.quant_method == "fp8") {
+            hidden_size_bytes = hidden_size;  // FP8_E4M3FN
+        }
+        else {
+            hidden_size_bytes = hidden_size * 2;  // BF16
+        }
 
         // Use recommended configs from DeepEP
         int nvl_chunk_send  = 6;
@@ -43,15 +46,16 @@ void DeepEpContext::init(const core::ModelConfig& config, int ffn_ep_world_size,
         int rdma_chunk_send = 6;
         int rdma_chunk_recv = 128;
 
-        deep_ep::Config dep_config(num_sms, nvl_chunk_send, nvl_chunk_recv, rdma_chunk_send, rdma_chunk_recv);
+        dep_config_ = std::make_unique<deep_ep::Config>(
+            num_sms, nvl_chunk_send, nvl_chunk_recv, rdma_chunk_send, rdma_chunk_recv);
 
         // NVL buffer for Normal mode
         // NOTE: FP8 mode requires extra space for scale buffers, multiply by 2x as safety margin
-        int64_t num_nvl_bytes = dep_config.get_nvl_buffer_size_hint(hidden_size_bytes, ep_size) * 2;
+        int64_t num_nvl_bytes = dep_config_->get_nvl_buffer_size_hint(hidden_size_bytes, ep_size);
 
         // RDMA buffer: max of Normal and Low Latency requirements
         int     num_max_dispatch_tokens_per_rank = 256;  // Typical decode batch size
-        int64_t normal_rdma_bytes                = dep_config.get_rdma_buffer_size_hint(hidden_size_bytes, ep_size);
+        int64_t normal_rdma_bytes                = dep_config_->get_rdma_buffer_size_hint(hidden_size_bytes, ep_size);
         // For low latency mode, we use hidden_size_bytes to ensure sufficient buffer
         // NOTE: There may be a mismatch with LowLatencyLayout which uses dimension,
         // but using bytes here provides larger allocation which is safer
@@ -62,7 +66,7 @@ void DeepEpContext::init(const core::ModelConfig& config, int ffn_ep_world_size,
 
         NANODEPLOY_LOG_INFO("DeepEP Buffer params: ep_size=", ep_size, " hidden=", hidden_size, " num_sms=", num_sms);
 
-        buffer_ = std::make_unique<deep_ep::Buffer>(rank_,
+        buffer_ = std::make_unique<deep_ep::Buffer>(ffn_ep_rank,
                                                     ep_size,
                                                     num_nvl_bytes,
                                                     num_rdma_bytes,
@@ -84,7 +88,7 @@ void DeepEpContext::init(const core::ModelConfig& config, int ffn_ep_world_size,
 
 DeepEpInfoResp DeepEpContext::get_info()
 {
-    DeepEpInfoResp resp;
+    DeepEpInfoResp resp{};
 #ifdef DEEPSEEK_MOE
     if (buffer_) {
         resp.device_id      = buffer_->get_local_device_id();
@@ -133,7 +137,6 @@ bool DeepEpContext::sync(const DeepEpSyncReq& req)
 
     try {
         buffer_->sync(req.device_ids, all_handles, root_unique_id);
-        NANODEPLOY_LOG_INFO("DeepEP sync completed for rank ", rank_);
         return true;
     }
     catch (const std::exception& e) {

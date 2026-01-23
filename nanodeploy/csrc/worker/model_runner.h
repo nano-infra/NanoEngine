@@ -59,9 +59,11 @@ public:
     bool           syncDeepEp(DeepEpSyncReq req);
 
     // Initializer Extensions (Multi-Stage)
-    KvCacheInitResp  init_kv_cache(KvCacheInitReq req);
-    bool             warmup_moe();  // Standalone MoE/DeepGemm warmup
-    GraphCaptureResp capture_decode_graphs(GraphCaptureReq req);
+    KvCacheInitResp          init_kv_cache(KvCacheInitReq req);
+    GetAvailableKVBlocksResp getNumAvailableKVBlocks(GetAvailableKVBlocksReq req);
+    AllocKVBlocksResp        allocKVBlocks(AllocKVBlocksReq req);
+    bool                     warmup_moe();  // Standalone MoE/DeepGemm warmup
+    GraphCaptureResp         capture_decode_graphs(GraphCaptureReq req);
 
 private:
     void init_internal(const std::string& config_path, int rank);
@@ -77,8 +79,6 @@ private:
     std::unique_ptr<core::ModelConfig> config_;
     std::unique_ptr<WeightManager>     weight_manager_;
 
-    // Contexts
-    std::unique_ptr<DeepEpContext>    deep_ep_ctx_;
     std::unique_ptr<AttentionContext> attn_ctx_;
     std::unique_ptr<DeepGemmContext>  gemm_ctx_;
 

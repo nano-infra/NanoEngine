@@ -31,6 +31,11 @@ public:
                      static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 4),
                      int,
                      EngineGetFinishedResp);
+        SPOKE_METHOD(EngineActor,
+                     release,
+                     static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 5),
+                     int,
+                     bool);
     }
 
     ~EngineActor()
@@ -42,7 +47,7 @@ public:
 
     bool init(EngineInitReq req)
     {
-        std::cout << "[EngineActor] Initializing SimpleEngine..." << std::endl;
+        NANODEPLOY_LOG_INFO("[EngineActor] Initializing SimpleEngine...");
         engine_ = std::make_unique<SimpleEngine>();
         try {
             engine_->init(req.config_path,
@@ -66,7 +71,7 @@ public:
             return true;
         }
         catch (const std::exception& e) {
-            std::cerr << "[EngineActor] Init failed: " << e.what() << std::endl;
+            NANODEPLOY_LOG_ERROR("[EngineActor] Init failed: ", e.what());
             return false;
         }
     }
@@ -76,8 +81,12 @@ public:
         if (!engine_)
             return false;
 
-        std::cout << "[EngineActor] Adding request with slot_id=" << req.slot_id << " Prompts=" << req.prompt_ids.size()
-                  << " First=" << (req.prompt_ids.empty() ? -1 : req.prompt_ids[0]) << std::endl;
+        NANODEPLOY_LOG_DEBUG("[EngineActor] Adding request with slot_id=",
+                             req.slot_id,
+                             " Prompts=",
+                             req.prompt_ids.size(),
+                             " First=",
+                             (req.prompt_ids.empty() ? -1 : req.prompt_ids[0]));
         auto seq = engine_->add_request(req.prompt_ids, req.max_new_tokens);
 
         // Map seq_id to client slot_id for streaming
@@ -96,6 +105,18 @@ public:
     EngineGetFinishedResp get_finished(int)
     {
         return {};
+    }
+
+    bool release(int)
+    {
+        NANODEPLOY_LOG_INFO("[EngineActor] Received Release Request. Releasing resources...");
+        if (engine_) {
+            engine_->release_resources();
+            engine_->shutdown();
+            engine_.reset();
+        }
+        stop_loop_ = true;
+        return true;
     }
 
 private:
@@ -152,7 +173,7 @@ private:
 
                     std::string body = spoke::Pack(st);
                     pushToClient(slot_id, body);
-                    std::cout << "[EngineActor] Pushed finish for seq " << seq_id << " slot " << slot_id << std::endl;
+                    NANODEPLOY_LOG_DEBUG("[EngineActor] Pushed finish for seq ", seq_id, " slot ", slot_id);
                 }
             }
         }

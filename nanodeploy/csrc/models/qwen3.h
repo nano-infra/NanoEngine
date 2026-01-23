@@ -178,22 +178,35 @@ public:
                 attn_output = output_fi.unsqueeze(2);
             }
             else {
-                // --- SDPA Path (Prefill) ---
+                // --- FlashInfer Path (Prefill) ---
 
-                // For prefill, K/V are simply the current input's K/V (full sequence)
-                auto k_sdpa = k;
-                auto v_sdpa = v;
+                // q is [batch, heads, seq, dim] (Note: batch=1, seq=total_tokens when flattened)
+                // Flatten to [total_tokens, heads, dim]
+                auto q_cont = q.transpose(1, 2).contiguous().view({-1, num_heads, head_dim});
 
-                // GQA Repeat
-                if (num_heads > num_kv_heads) {
-                    int n_rep = num_heads / num_kv_heads;
-                    k_sdpa    = k_sdpa.repeat_interleave(n_rep, 1);
-                    v_sdpa    = v_sdpa.repeat_interleave(n_rep, 1);
+                // Ensure BF16 for FlashInfer
+                if (q_cont.scalar_type() != torch::kBFloat16) {
+                    q_cont = q_cont.to(torch::kBFloat16);
                 }
 
-                // Causal Masking for Prefill
-                bool is_causal = true;
-                attn_output    = torch::scaled_dot_product_attention(q, k_sdpa, v_sdpa, {}, 0.0, is_causal);
+                auto k_cache_tensor = kv_cache->k_caches[layer_idx];
+                auto v_cache_tensor = kv_cache->v_caches[layer_idx];
+
+                // Run Prefill
+                auto output_fi = handler->prefill(q_cont.data_ptr(),
+                                                  k_cache_tensor.data_ptr(),
+                                                  v_cache_tensor.data_ptr(),
+                                                  q_cont.size(0),  // total_tokens
+                                                  layer_idx);
+
+                // FlashInfer returns [total_tokens, heads, dim].
+                // Reshape to [batch, heads, seq, dim] matches attn_output usage.
+                // Since batch=1, seq=total, we unsqueeze(0).
+                attn_output =
+                    output_fi.unsqueeze(0).transpose(1, 2);  // [1, total, heads, dim] -> [1, heads, total, dim]
+                // Wait, output_fi is [total, heads, dim].
+                // unsqueeze(0) -> [1, total, heads, dim].
+                // transpose(1, 2) -> [1, heads, total, dim]. Correct.
             }
         }
         else {

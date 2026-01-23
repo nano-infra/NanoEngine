@@ -7,6 +7,7 @@
 
 #include "scheduler_utils.h"
 
+#include "nanodeploy/csrc/logging.h"
 #include "scheduler.h"
 
 namespace nanodeploy {
@@ -130,13 +131,13 @@ ScheduleResult Scheduler::schedule()
     // Add dummy sequences for DP ranks with no work when other ranks have work
     // This ensures all ranks participate in collective operations (e.g., DeepEP)
     if (has_any_work) {
-        std::cout << "[Scheduler] has_any_work=true, checking for empty ranks. dp_seqs.size()=" << dp_seqs.size()
-                  << std::endl;
+        NANODEPLOY_LOG_DEBUG("[Scheduler] has_any_work=true, checking for empty ranks. dp_seqs.size()=",
+                             dp_seqs.size());
         for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-            std::cout << "[Scheduler]   dp_seqs[" << dp_idx << "].size()=" << dp_seqs[dp_idx].size() << std::endl;
+            NANODEPLOY_LOG_DEBUG("[Scheduler]   dp_seqs[", dp_idx, "].size()=", dp_seqs[dp_idx].size());
             if (dp_seqs[dp_idx].empty()) {
                 // Add a dummy sequence for this DP rank (use sp_idx=0's dummy)
-                std::cout << "[Scheduler]   Adding dummy sequence for dp_idx=" << dp_idx << std::endl;
+                NANODEPLOY_LOG_DEBUG("[Scheduler]   Adding dummy sequence for dp_idx=", dp_idx);
                 dp_seqs[dp_idx].push_back(worker_state[dp_idx]->dummy_seqs[0]);
             }
         }

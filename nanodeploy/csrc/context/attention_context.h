@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "nanodeploy/csrc/core/config.h"
+#include "nanodeploy/csrc/logging.h"
 #include "nanodeploy/csrc/ops/flashinfer_ops.h"
 #include "nanodeploy/csrc/sequence/sequence.h"
 
@@ -23,16 +24,16 @@ public:
         // Calculate and log tensor shape before allocation
         size_t per_tensor_bytes = (size_t)num_blocks * num_kv_heads * block_size * head_dim * 2;  // BF16 = 2 bytes
         size_t total_bytes      = per_tensor_bytes * num_layers * 2;  // K + V for each layer
-        std::cout << "[KvCache] Shape: [" << num_blocks << ", " << num_kv_heads << ", " << block_size << ", "
-                  << head_dim << "]" << std::endl;
-        std::cout << "[KvCache] Layers: " << num_layers << ", Per-tensor: " << per_tensor_bytes / 1024 / 1024 << " MB"
-                  << std::endl;
-        std::cout << "[KvCache] Total: " << total_bytes / 1024 / 1024 / 1024 << " GB (" << num_layers * 2 << " tensors)"
-                  << std::endl;
+        NANODEPLOY_LOG_INFO(
+            "[KvCache] Shape: [", num_blocks, ", ", num_kv_heads, ", ", block_size, ", ", head_dim, "]");
+        NANODEPLOY_LOG_INFO("[KvCache] Layers: ", num_layers, ", Per-tensor: ", per_tensor_bytes / 1024 / 1024, " MB");
+        NANODEPLOY_LOG_INFO(
+            "[KvCache] Total: ", total_bytes / 1024 / 1024 / 1024, " GB (", num_layers * 2, " tensors)");
 
         for (int i = 0; i < num_layers; ++i) {
-            k_caches.push_back(torch::empty({num_blocks, num_kv_heads, block_size, head_dim}, options));
-            v_caches.push_back(torch::empty({num_blocks, num_kv_heads, block_size, head_dim}, options));
+            // Use zeros instead of empty to avoid uninitialized memory issues
+            k_caches.push_back(torch::zeros({num_blocks, num_kv_heads, block_size, head_dim}, options));
+            v_caches.push_back(torch::zeros({num_blocks, num_kv_heads, block_size, head_dim}, options));
         }
     }
 
@@ -58,6 +59,33 @@ public:
             slot_mapping = slot_mapping.to(device);
 
         int64_t block_size = k_caches[layer_idx].size(2);
+        int64_t head_dim   = k_caches[layer_idx].size(3);
+
+        // Checker: [num_blocks, num_kv_heads, block_size, head_dim]
+        // k, v shape: [batch, num_kv_heads, head_dim] (flattened?)
+        // Actually `AttentionContext` calls `view({-1, num_kv_heads, head_dim})`
+        // So k, v are [total_tokens, num_kv_heads, head_dim]
+
+        // Let's verify K/V last dim matches head_dim
+        if (k.size(-1) != head_dim || v.size(-1) != head_dim) {
+            NANODEPLOY_LOG_WARN("KvCache::set_kv: Dimension mismatch! Expected HeadDim=",
+                                head_dim,
+                                " Got K=",
+                                k.size(-1),
+                                " V=",
+                                v.size(-1));
+        }
+
+        // Verify num_kv_heads
+        int64_t num_kv_heads = k_caches[layer_idx].size(1);
+        if (k.size(-2) != num_kv_heads || v.size(-2) != num_kv_heads) {
+            NANODEPLOY_LOG_WARN("KvCache::set_kv: Head count mismatch! Expected KVHeads=",
+                                num_kv_heads,
+                                " Got K=",
+                                k.size(-2),
+                                " V=",
+                                v.size(-2));
+        }
 
         // Vectorized indexing on GPU
         auto block_indices  = slot_mapping.div(block_size, "trunc");
@@ -78,48 +106,6 @@ public:
 
         k_caches[layer_idx].index_put_({block_indices, Slice(), offset_indices, Slice()}, k);
         v_caches[layer_idx].index_put_({block_indices, Slice(), offset_indices, Slice()}, v);
-    }
-
-    std::tuple<torch::Tensor, torch::Tensor>
-    gather_kv(int layer_idx, torch::Tensor block_tables, torch::Tensor seq_lens)
-    {
-        int batch_size  = block_tables.size(0);
-        int max_seq_len = seq_lens.max().item<int>();
-        int num_kv      = k_caches[layer_idx].size(1);
-        int block_size  = k_caches[layer_idx].size(2);
-        int head_dim    = k_caches[layer_idx].size(3);
-
-        auto options = k_caches[layer_idx].options();
-        auto k_out   = torch::zeros({batch_size, num_kv, max_seq_len, head_dim}, options);
-        auto v_out   = torch::zeros({batch_size, num_kv, max_seq_len, head_dim}, options);
-
-        auto block_tables_cpu_t = block_tables.to(torch::kCPU);
-        auto block_tables_cpu   = block_tables_cpu_t.accessor<int, 2>();
-        auto seq_lens_cpu_t     = seq_lens.to(torch::kCPU);
-        auto seq_lens_cpu       = seq_lens_cpu_t.accessor<int, 1>();
-
-        using namespace torch::indexing;
-
-        for (int i = 0; i < batch_size; ++i) {
-            int seq_len    = seq_lens_cpu[i];
-            int num_blocks = (seq_len + block_size - 1) / block_size;
-
-            for (int b = 0; b < num_blocks; ++b) {
-                int block_idx = block_tables_cpu[i][b];
-                int start     = b * block_size;
-                int end       = std::min(start + block_size, seq_len);
-                int len       = end - start;
-
-                if (len <= 0)
-                    break;
-
-                k_out.index_put_({i, Slice(), Slice(start, end), Slice()},
-                                 k_caches[layer_idx].index({block_idx, Slice(), Slice(0, len), Slice()}));
-                v_out.index_put_({i, Slice(), Slice(start, end), Slice()},
-                                 v_caches[layer_idx].index({block_idx, Slice(), Slice(0, len), Slice()}));
-            }
-        }
-        return {k_out, v_out};
     }
 };
 

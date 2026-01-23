@@ -1,4 +1,5 @@
 #include "block_manager.h"
+#include "nanodeploy/csrc/logging.h"
 #include <algorithm>
 #include <array>
 #include <iostream>
@@ -164,17 +165,21 @@ bool BlockManager::may_append(Sequence& seq, int num_tokens)
 
         int current_dispatched = seq.block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_idx_];
 
-        std::cerr << "[BlockManager] may_append: current_dispatched=" << current_dispatched << " idx=" << idx
-                  << " block_size=" << block_size_ << " check=" << ((current_dispatched + idx) % block_size_)
-                  << " num_blocks=" << table.size() << std::endl;
+        NANODEPLOY_LOG_DEBUG("[BlockManager] may_append: current_dispatched=",
+                             current_dispatched,
+                             " idx=",
+                             idx,
+                             " block_size=",
+                             block_size_);
+        NANODEPLOY_LOG_DEBUG("    check=", ((current_dispatched + idx) % block_size_), " num_blocks=", table.size());
 
         if ((current_dispatched + idx) % block_size_ == 0) {
             if (free_block_ids_.empty()) {
-                std::cerr << "[BlockManager] ERROR: No free blocks!" << std::endl;
+                NANODEPLOY_LOG_ERROR("[BlockManager] ERROR: No free blocks!");
                 return false;
             }
             int block_id = free_block_ids_.front();
-            std::cerr << "[BlockManager] Allocating block " << block_id << " for seq " << seq.seq_id << std::endl;
+            NANODEPLOY_LOG_DEBUG("[BlockManager] Allocating block ", block_id, " for seq ", seq.seq_id);
             seq.block_ctx(BlockContextSlot::ACTIVE).block_location.emplace_back(sp_idx_, block_id);
             allocate_block(block_id);
             table.push_back(block_id);

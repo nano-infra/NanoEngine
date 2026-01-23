@@ -24,10 +24,10 @@ def main():
         "--prompt", type=str, default="Hello, who are you?", help="Prompt to send"
     )
     parser.add_argument(
-        "--max_tokens", type=int, default=128, help="Maximum tokens to generate"
+        "--max_tokens", type=int, default=32, help="Maximum tokens to generate"
     )
     parser.add_argument(
-        "--chat", action="store_true", default=True, help="Use chat template"
+        "--chat", action="store_true", default=False, help="Use chat template"
     )
 
     args = parser.parse_args()

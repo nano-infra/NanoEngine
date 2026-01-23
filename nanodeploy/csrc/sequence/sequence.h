@@ -103,7 +103,9 @@ struct OptionalStringHash {
 
 class Sequence {
 public:
-    static constexpr int block_size = 64;  // Smaller for FlashInfer shared memory limits
+    // Note: block_size > 16 may cause issues with certain FlashInfer configurations
+    // Try 16 if experiencing abnormal token generation
+    static constexpr int block_size = 64;  // Reduced from 256 for testing
 
     Sequence(const std::vector<int>& token_ids,
              double                  temperature = 1.0,
@@ -143,6 +145,8 @@ public:
     int num_blocks(BlockContextSlot slot, int sp_idx);
     int last_block_page_id(BlockContextSlot slot, int sp_idx);
     int last_block_num_tokens(BlockContextSlot slot, int sp_idx);
+
+    int slot_mapping_idx(BlockContextSlot slot, int sp_idx, int token_idx = -1);
     // Returns a pointer/size view into the internal token storage for block `i`.
     // The returned pointer is valid only as long as the underlying storage is not
     // modified in a way that can reallocate or invalidate the buffer (e.g., appending

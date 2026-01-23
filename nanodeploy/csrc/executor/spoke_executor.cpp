@@ -147,6 +147,28 @@ public:
         return runner_.warmup_moe();
     }
 
+    // GetAvailableKVBlocks
+    SPOKE_METHOD(ModelRunnerActor,
+                 getNumAvailableKVBlocks,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 17),
+                 nanodeploy::GetAvailableKVBlocksReq,
+                 nanodeploy::GetAvailableKVBlocksResp)
+    {
+        NANODEPLOY_LOG_INFO("[Executor] Received GetAvailableKVBlocks Request");
+        return runner_.getNumAvailableKVBlocks(val);
+    }
+
+    // AllocKVBlocks
+    SPOKE_METHOD(ModelRunnerActor,
+                 allocKVBlocks,
+                 static_cast<spoke::Action>(static_cast<int>(spoke::Action::kUserActionStart) + 18),
+                 nanodeploy::AllocKVBlocksReq,
+                 nanodeploy::AllocKVBlocksResp)
+    {
+        NANODEPLOY_LOG_INFO("[Executor] Received AllocKVBlocks Request");
+        return runner_.allocKVBlocks(val);
+    }
+
 private:
     nanodeploy::ModelRunner runner_;
 };

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <iostream>
 #include <torch/torch.h>
+#include <unordered_set>
 
 namespace nanodeploy {
 
@@ -96,8 +97,6 @@ void HostModelRunner::init_internal(const std::string& config_path_str, int rank
 
     std::filesystem::path config_path(config_path_str);
     auto                  model_dir = config_path.parent_path();
-
-    nanodeploy::get_log_level() = 2;
 
     NANODEPLOY_LOG_INFO("[HostRunner] Loading config from ", config_path);
     config_ = std::make_unique<core::ModelConfig>(core::ModelConfig::load_hf(config_path.string()));
@@ -224,7 +223,83 @@ ModelRunResp HostModelRunner::run(ModelRunReq req)
         logits = model_->compute_logits(hidden_states);
     }
 
-    return ModelRunResp{logits};
+    // --- Sampling Implementation ---
+    // Logits are already on CPU
+    auto logits_cpu = logits.to(torch::kFloat32);  // [batch, vocab]
+    if (logits_cpu.dim() == 3) {
+        logits_cpu = logits_cpu.squeeze(1);
+    }
+
+    std::vector<int> result_token_ids;
+    result_token_ids.reserve(batch_size);
+
+    float repetition_penalty = 1.1f;
+    float temperature        = 0.6f;
+    float top_p              = 0.9f;
+
+    for (int j = 0; j < batch_size; ++j) {
+        auto  seq_logits = logits_cpu[j];  // View
+        auto& seq        = req.seqs[j];
+
+        // Apply Repetition Penalty
+        auto                    generated_tokens = seq->completion_token_ids();
+        std::unordered_set<int> seen(generated_tokens.begin(), generated_tokens.end());
+
+        for (int token_id : seen) {
+            if (token_id < seq_logits.size(0)) {
+                float score = seq_logits[token_id].item<float>();
+                if (score < 0) {
+                    seq_logits[token_id] = score * repetition_penalty;
+                }
+                else {
+                    seq_logits[token_id] = score / repetition_penalty;
+                }
+            }
+        }
+
+        // Temperature & Top-P Sampling
+        int next_token = -1;
+
+        if (temperature > 0.0f) {
+            // Temperature Scaling
+            seq_logits /= temperature;
+            auto probs = torch::softmax(seq_logits, -1);
+
+            // Top-P (Nucleus) Sampling
+            if (top_p < 1.0f && top_p > 0.0f) {
+                auto sorted_tuple   = torch::sort(probs, -1, true);
+                auto sorted_probs   = std::get<0>(sorted_tuple);
+                auto sorted_indices = std::get<1>(sorted_tuple);
+
+                auto cumulative_probs = torch::cumsum(sorted_probs, -1);
+
+                // Remove tokens with cumulative probability above the threshold
+                auto sorted_indices_to_remove = cumulative_probs > top_p;
+
+                // Shift the indices to the right to keep also the first token above the threshold
+                sorted_indices_to_remove.slice(0, 1, sorted_indices_to_remove.size(0))
+                    .copy_(sorted_indices_to_remove.slice(0, 0, sorted_indices_to_remove.size(0) - 1).clone());
+                sorted_indices_to_remove[0] = false;
+
+                // Scatter sorted_indices_to_remove to original indices
+                auto indices_to_remove = torch::zeros_like(sorted_indices_to_remove, torch::kBool)
+                                             .scatter_(0, sorted_indices, sorted_indices_to_remove);
+
+                probs.masked_fill_(indices_to_remove, 0.0f);
+                probs = probs / probs.sum();  // Re-normalize
+            }
+
+            next_token = torch::multinomial(probs, 1).item<long>();
+        }
+        else {
+            // Greedy
+            next_token = torch::argmax(seq_logits, -1).item<long>();
+        }
+
+        result_token_ids.push_back(next_token);
+    }
+
+    return ModelRunResp{result_token_ids};
 }
 
 void HostModelRunner::load_weights(const std::string&)
