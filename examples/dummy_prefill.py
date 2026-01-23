@@ -1,7 +1,6 @@
 import os
 
 import numpy as np
-
 from nanodeploy import LLM, SamplingParams
 from nanodeploy.engine.sequence import Sequence
 from transformers import AutoTokenizer
@@ -10,7 +9,9 @@ from transformers import AutoTokenizer
 def main():
     path = os.path.expanduser("/models/qwen3-235B-Instruct-2507-FP8")
 
-    decode = LLM(
+    from nanodeploy.config import Config
+
+    config = Config(
         path,
         enforce_eager=False,
         attention_dp=8,
@@ -29,11 +30,16 @@ def main():
         max_model_len=200_000,
         max_num_batched_tokens=200_000,
         loop_count=48,
+        # max_num_send_seqs=128, # Not standard config args, checking if Config supports them or if they go into kwargs of Config. Config definition has them.
+        # max_num_recv_seqs=130,
+        # kvcache_block_size=256,
+        # enable_profiler=False,
         max_num_send_seqs=128,
         max_num_recv_seqs=130,
         kvcache_block_size=256,
         enable_profiler=False,
     )
+    decode = LLM(config)
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=256, ignore_eos=True)
 

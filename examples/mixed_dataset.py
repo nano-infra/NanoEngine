@@ -21,7 +21,10 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # 初始化LLM（保留dummy_prefill=True）
-    decode = LLM(
+    from nanodeploy.config import Config
+
+    # 初始化LLM（保留dummy_prefill=True）
+    config = Config(
         model_path,
         enforce_eager=False,
         attention_dp=32,
@@ -41,6 +44,7 @@ def main():
         dummy_weight=True,
         perfect_eplb=True,
     )
+    decode = LLM(config)
 
     base_sampling_params = SamplingParams(temperature=0.1, ignore_eos=True)
 

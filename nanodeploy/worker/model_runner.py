@@ -5,7 +5,8 @@ import ray
 import torch
 import torch.distributed as dist
 import torch.profiler as profiler
-import flash_mla
+
+# import flash_mla
 
 
 from nanodeploy._cpp import (
@@ -19,7 +20,8 @@ from nanodeploy.endpoint.rpc_endpoint import RPCClientEndpoint
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger
-from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+# from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.cache import get_cache_context, set_cache_context
@@ -39,7 +41,7 @@ logger = get_logger()
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
-    "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
+    # "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
 }
 
 
@@ -52,6 +54,39 @@ class ModelRunner:
         self.enforce_eager = config.enforce_eager
         self.world_size = config.attn_world_size
         self.rank = rank
+
+        self.rank = rank
+
+        # Helper to setup CPATH for DeepGEMM/CUTLASS in Ray worker
+        # Attempt to locate DeepGEMM relative to NanoDeploy location or CWD
+        import os
+
+        # Try to find DeepGEMM in common locations
+        candidates = [
+            os.path.abspath(os.path.join(os.getcwd(), "../DeepGEMM")),
+            "/mnt/nvme1n1/ml_research/majinming/src/DeepGEMM",
+        ]
+
+        cutlass_include = None
+        for path in candidates:
+            candidate_include = os.path.join(path, "third-party/cutlass/include")
+            if os.path.exists(candidate_include):
+                cutlass_include = candidate_include
+                break
+
+        if cutlass_include:
+            current_cpath = os.environ.get("CPATH", "")
+            if cutlass_include not in current_cpath:
+                logger.info(f"Adding CUTLASS include path to CPATH: {cutlass_include}")
+                os.environ["CPATH"] = (
+                    f"{cutlass_include}:{current_cpath}"
+                    if current_cpath
+                    else cutlass_include
+                )
+        else:
+            logger.warning(
+                "DeepGEMM/CUTLASS include path not found. DeepGEMM JIT might fail."
+            )
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -220,6 +255,9 @@ class ModelRunner:
             seq = Sequence(
                 list(np.random.randint(low=0, high=10000, size=max_model_len))
             )
+            # seq = Sequence(
+            #     list(np.zeros(max_model_len, dtype=int))
+            # )
             seq.active(self.engine_id, sp_size, 1)
             seq.block_ctx().master_sp_idx = sp_rank
 
@@ -344,11 +382,15 @@ class ModelRunner:
         )
 
         if len(meta.block_tables_flat) == 0:
-            block_tables = torch.empty((0, 0), dtype=torch.int32).cuda(non_blocking=True)
+            block_tables = torch.empty((0, 0), dtype=torch.int32).cuda(
+                non_blocking=True
+            )
         else:
-            block_tables = torch.tensor(
-                meta.block_tables_flat, dtype=torch.int32, pin_memory=True
-            ).reshape(-1, meta.max_num_blocks).cuda(non_blocking=True)
+            block_tables = (
+                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
+                .reshape(-1, meta.max_num_blocks)
+                .cuda(non_blocking=True)
+            )
 
         logger.info(f"ModelRunner block_tables.shape: {block_tables.shape}")
 
@@ -430,7 +472,7 @@ class ModelRunner:
             meta.q_offsets, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
         attention_compute_bs = context_lens_for_attn.numel()
-        
+
         config = self.config
         hf_config = config.hf_config
         if hf_config.num_key_value_heads == 1:
@@ -530,6 +572,15 @@ class ModelRunner:
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
+        # [DEBUG] Log input_ids for verification (len > 10)
+        mask = positions > 9
+        if mask.any():
+            subset_ids = input_ids[mask]
+            subset_pos = positions[mask]
+            print(
+                f"[DEBUG] Python Input IDs (len > 10): IDs={subset_ids[:20].tolist()}, Pos={subset_pos[:20].tolist()}"
+            )
+
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             context = get_context()
             return self.model.compute_logits(self.model(input_ids, positions))
@@ -537,12 +588,12 @@ class ModelRunner:
             bs = input_ids.size(0)
             context = get_context()
             master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
-            
+
             ac_bs = context.attention_compute_bs
             if ac_bs is None:
                 ac_bs = bs
             attn_bs = next(x for x in self.graph_attn_compute_bs if x >= ac_bs)
-            
+
             graph = self.graphs[(master_bs, attn_bs)]
 
             graph_vars = self.graph_vars
@@ -571,10 +622,9 @@ class ModelRunner:
                 # graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
                 # graph_vars["num_splits"][:context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
 
-
             graph_vars["context_lens_for_attn"].zero_()
             graph_vars["context_lens_for_attn"][: context.context_lens_for_attn.shape[0]].copy_(context.context_lens_for_attn)  # type: ignore
-            
+
             graph_vars["q_slice_get"].fill_(-1)
             graph_vars["q_slice_fill"].fill_(-1)
             graph_vars["q_copy_mask"].zero_()
@@ -621,7 +671,8 @@ class ModelRunner:
         is_dummy = False
         if num_sp_seqs == 0:
             is_dummy = True
-            seq = Sequence([np.random.randint(self.config.hf_config.vocab_size - 1)])
+            # seq = Sequence([np.random.randint(self.config.hf_config.vocab_size - 1)])
+            seq = Sequence([0])  # Zero init for determinism
             seq.block_ctx().reset(self.engine_id, sp_size, 1)
             seq.block_ctx().master_sp_idx = sp_rank
             dp_seqs.append(seq)
@@ -659,6 +710,15 @@ class ModelRunner:
                     if tp_rank == 0
                     else [None] * len(sp_seqs)
                 )
+
+                # Logging Logits
+                if len(dp_seqs) > 0 and len(dp_seqs[0].token_ids) > 0:
+                    # Log first sequence's logits stats
+                    log_logits = logits[0]
+                    logger.info(
+                        f"Python Logits: [{log_logits[:10].tolist()}...], Max: {log_logits.max().item()}, Max Index: {log_logits.argmax().item()}, Sum: {log_logits.sum().item()}"
+                    )
+
                 input_ids = self.sampler(logits, temperatures)
             else:
                 input_ids = torch.zeros_like(input_ids)
@@ -699,9 +759,7 @@ class ModelRunner:
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens_for_attn = torch.zeros(
-            max_attention_comp_seqs, dtype=torch.int32
-        )
+        context_lens_for_attn = torch.zeros(max_attention_comp_seqs, dtype=torch.int32)
         context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
         q_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)

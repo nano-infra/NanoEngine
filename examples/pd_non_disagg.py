@@ -1,17 +1,18 @@
 import os
 
 from nanodeploy import LLM, SamplingParams
+from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
-
 from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("/models/qwen3-235B-Instruct-2507-FP8")
+
+    path = os.path.expanduser("/models/model--Qwen--Qwen3-30B-A3B-FP8")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(
+    config = Config(
         path,
-        enforce_eager=False,
+        enforce_eager=True,
         attention_dp=8,
         attention_sp=1,
         attention_tp=1,
@@ -25,18 +26,12 @@ def main():
         max_num_batched_tokens=4096,
         gpu_memory_utilization=0.9,
     )
+    llm = LLM(config)
 
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=128, ignore_eos=False)
+    sampling_params = SamplingParams(temperature=0, max_tokens=128, ignore_eos=False)
     prompts = [
-        "你好",
-        "how to bake a chocolate cake from scratch",
-        "what are the benefits of meditation",
-        "list 5 famous scientists and their contributions",
-        "explain quantum computing in simple terms",
-        "how to bake a chocolate cake from scratch",
-        "what are the benefits of meditation",
-        "list 5 famous scientists and their contributions",
-    ] * 256
+        "Help me write a script for oh-my-zsh install configuration.",
+    ]
 
     seqs = [
         Sequence(
