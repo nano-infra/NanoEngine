@@ -13,7 +13,6 @@ class Config:
     loop_count: int = 16
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 256
-    max_num_send_seqs: int = 16
     max_num_recv_seqs: int = 32
     max_model_len: int = 16384
     gpu_memory_utilization: float = 0.9
@@ -55,6 +54,9 @@ class Config:
 
     # performance optimization
     use_dlslime_rpc: bool = True
+
+    # logging config
+    log_level: str = "CRITICAL"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

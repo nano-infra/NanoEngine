@@ -54,7 +54,6 @@ void bind_model_runner_utils(py::module_& m)
           py::arg("sp_rank"),
           py::arg("sp_size"),
           py::arg("block_size"),
-          py::arg("max_num_seqs"),
-          py::arg("max_num_send_recv_seqs"));
+          py::arg("max_num_seqs"));
     m.def("update_seqs_inner_loop", &update_seqs_inner_loop, py::arg("dp_seqs"), py::arg("sp_rank"));
 }

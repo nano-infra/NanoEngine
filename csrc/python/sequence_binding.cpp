@@ -191,6 +191,7 @@ void bind_sequence(py::module_& m)
         .def_readwrite("ignore_eos", &Sequence::ignore_eos)
 
         .def_property_readonly("is_finished", &Sequence::is_finished)
+        .def_property_readonly("is_to_be_migrated", &Sequence::is_to_be_migrated)
         .def_property_readonly("num_completed_tokens", &Sequence::num_completed_tokens)
         .def_property_readonly("num_generated_tokens_since_checkpoint",
                                &Sequence::num_generated_tokens_since_checkpoint)
@@ -227,60 +228,51 @@ void bind_sequence(py::module_& m)
 
         .def(py::pickle(
             [](const Sequence& p) {  // __getstate__
-                // (num_tokens, num_checkpointed_tokens, num_cached_tokens, backup_engine_id, active_engine_id,
-                // block_ctx_map, temperature, token_ids/last_token)
-                std::vector<int> last_element;
-                if (p.num_generated_tokens_since_checkpoint() == 0) {
-                    last_element = p.token_ids;
-                }
-                else {
-                    last_element = {p.last_token};
-                }
-
+                // Always serialize full token_ids to ensure correct state recovery during migration
                 return std::make_tuple(p.num_tokens,
                                        p.num_checkpointed_tokens,
                                        p.num_cached_tokens,
                                        p.slots_,
                                        p.temperature,
-                                       last_element);
+                                       p.token_ids,
+                                       p.status,
+                                       p.seq_id,
+                                       p.num_prompt_tokens,
+                                       p.max_tokens,
+                                       p.ignore_eos);
             },
             [](const std::tuple<int,
                                 int,
                                 int,
                                 std::array<BlockContext, (size_t)BlockContextSlot::_COUNT>,
                                 double,
-                                std::vector<int>>& t) {  // __setstate__
-                // We need to reconstruct the object.
-                // Since we don't have a constructor that takes all these, we create a dummy one and fill it.
-                // Or we can use the existing constructor and then overwrite fields.
-                // But the existing constructor requires token_ids.
+                                std::vector<int>,
+                                SequenceStatus,
+                                uint64_t,
+                                int,
+                                int,
+                                bool>& t) {  // __setstate__
+                // Extract token_ids (always present now)
+                std::vector<int> token_ids = std::get<5>(t);
 
-                // Let's extract token_ids from the last element if possible.
-                std::vector<int> last_element = std::get<5>(t);
-                std::vector<int> initial_tokens;
+                // Reconstruct Sequence with full token history
+                auto seq = std::make_shared<Sequence>(token_ids);
 
-                // If num_generated_tokens_since_checkpoint == 0, last_element is token_ids.
-                // We can check num_tokens vs num_checkpointed_tokens.
-                int num_tokens              = std::get<0>(t);
-                int num_checkpointed_tokens = std::get<1>(t);
-
-                if (num_tokens - num_checkpointed_tokens == 0) {
-                    initial_tokens = last_element;
-                }
-
-                auto seq                     = std::make_shared<Sequence>(initial_tokens);
+                // Restore other fields
                 seq->num_tokens              = std::get<0>(t);
                 seq->num_checkpointed_tokens = std::get<1>(t);
                 seq->num_cached_tokens       = std::get<2>(t);
+                seq->slots_                  = std::move(std::get<3>(t));
+                seq->temperature             = std::get<4>(t);
+                seq->status                  = std::get<6>(t);
+                seq->seq_id                  = std::get<7>(t);
+                seq->num_prompt_tokens       = std::get<8>(t);
+                seq->max_tokens              = std::get<9>(t);
+                seq->ignore_eos              = std::get<10>(t);
 
-                seq->slots_ = std::move(std::get<3>(t));
-
-                seq->temperature = std::get<4>(t);
-
-                if (num_tokens - num_checkpointed_tokens != 0) {
-                    if (!last_element.empty()) {
-                        seq->last_token = last_element[0];
-                    }
+                // Ensure last_token is consistent if token_ids is not empty
+                if (!seq->token_ids.empty()) {
+                    seq->last_token = seq->token_ids.back();
                 }
 
                 return seq;

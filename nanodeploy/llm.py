@@ -7,7 +7,6 @@ from nanodeploy.engine.ray_utils import get_available_nodes_with_master_first
 
 class LLM(LLMEngine):
     @classmethod
-    @classmethod
     def as_remote(cls, config):
         ray_address = getattr(config, "ray_address", "127.0.0.1:6379")
         master_address = getattr(config, "master_address", "127.0.0.1:6006")

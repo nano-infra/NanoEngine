@@ -190,6 +190,24 @@ def get_logger(
     return LoggerManager.get_logger(name, use_relative_path)
 
 
+def set_log_level(level: str | int) -> None:
+    """
+    Set the log level for the NANODEPLOY logger.
+    Args:
+        level: "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL" or logging level integer.
+    """
+    logger = LoggerManager.get_logger("NANODEPLOY")
+    if isinstance(level, str):
+        level = level.upper()
+        numeric_level = getattr(logging, level, None)
+        if not isinstance(numeric_level, int):
+            logger.warning(f"Invalid log level: {level}")
+            return
+        logger.setLevel(numeric_level)
+    elif isinstance(level, int):
+        logger.setLevel(level)
+
+
 # =============================================================================
 # Example Usage
 # =============================================================================

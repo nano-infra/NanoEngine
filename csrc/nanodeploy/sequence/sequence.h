@@ -162,6 +162,13 @@ public:
     {
         return status == SequenceStatus::FINISHED;
     }
+
+    // Properties
+    bool is_to_be_migrated() const
+    {
+        return status == SequenceStatus::TO_BE_MIGRATED;
+    }
+
     int num_completed_tokens() const
     {
         return num_tokens - num_prompt_tokens;

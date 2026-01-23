@@ -1,5 +1,6 @@
 import os
 
+import ray
 from nanodeploy import LLM, SamplingParams
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
@@ -30,7 +31,7 @@ def main():
         max_num_batched_tokens=4096,
         dummy_weight=False,
     )
-    decode = LLM(decode_config)
+    decode = LLM.as_remote(decode_config)
 
     prefill_config = Config(
         path,
@@ -50,22 +51,41 @@ def main():
         max_num_batched_tokens=4096,
         dummy_weight=False,
     )
-    prefill = LLM(prefill_config)
+    prefill = LLM.as_remote(prefill_config)
 
-    prefill_endpoints_info = prefill.p2p_init(
-        decode.engine_id,
-        decode.config.num_kvcache_blocks,
-        decode.config.attn_world_size,
+    # Use ray.get to fetch necessary info internally or via new getters I will add
+    # Assuming I will add get_engine_id, get_num_kv_blocks, get_attn_world_size to LLMEngine
+
+    decode_engine_id = ray.get(decode.get_engine_id.remote())
+    decode_num_kv_blocks = ray.get(decode.get_num_kv_blocks.remote())
+    decode_attn_world_size = ray.get(decode.get_attn_world_size.remote())
+
+    prefill_engine_id = ray.get(prefill.get_engine_id.remote())
+    prefill_num_kv_blocks = ray.get(prefill.get_num_kv_blocks.remote())
+    prefill_attn_world_size = ray.get(prefill.get_attn_world_size.remote())
+
+    prefill_endpoints_info = ray.get(
+        prefill.p2p_init.remote(
+            decode_engine_id,
+            decode_num_kv_blocks,
+            decode_attn_world_size,
+        )
     )
 
-    decode_endpoints_info = decode.p2p_init(
-        prefill.engine_id,
-        prefill.config.num_kvcache_blocks,
-        prefill.config.attn_world_size,
+    decode_endpoints_info = ray.get(
+        decode.p2p_init.remote(
+            prefill_engine_id,
+            prefill_num_kv_blocks,
+            prefill_attn_world_size,
+        )
     )
 
-    prefill.p2p_connect(decode.engine_id, decode_endpoints_info)
-    decode.p2p_connect(prefill.engine_id, prefill_endpoints_info)
+    ray.get(
+        [
+            prefill.p2p_connect.remote(decode_engine_id, decode_endpoints_info),
+            decode.p2p_connect.remote(prefill_engine_id, prefill_endpoints_info),
+        ]
+    )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=512, ignore_eos=False)
     prompts = ["""
@@ -101,18 +121,47 @@ def main():
         for prompt in prompts
     ]
 
-    prefill.add_request(seqs)
-    prefill.generate()
+    ray.get(prefill.add_request.remote(seqs))
+    migrated_seqs = ray.get(prefill.generate.remote())
 
-    decode.add_request(seqs)
-    decode.generate()
+    print("\n" + "=" * 50)
+    print(f"DEBUG: Prefill GENERATE returned {len(migrated_seqs)} sequences.")
+    for i, s in enumerate(migrated_seqs):
+        print(f"  [{i}] Seq ID: {s.seq_id}")
+        print(f"      Status: {s.status}")
+        print(f"      Num Tokens: {s.num_tokens} (Prompt: {s.num_prompt_tokens})")
+        print(f"      Is Finished: {s.is_finished}")
+        print(f"      Is To Be Migrated: {s.is_to_be_migrated}")
+        print(f"      Token IDs (First 10): {s.token_ids[:10]}")
+        print(f"      Token IDs (Last 10): {s.token_ids[-10:] if s.token_ids else []}")
+    print("=" * 50 + "\n")
 
-    prefill.free_to_be_migrated(seqs)
+    if not migrated_seqs:
+        print("DEBUG: No sequences migrated from prefill. Exiting.")
+        return
 
-    for prompt, seq in zip(prompts, seqs):
+    # Use the migrated_seqs (which contain updated state from prefill) for decode
+    ray.get(decode.add_request.remote(migrated_seqs))
+
+    # decode.generate() now returns List[Sequence]
+    finished_seqs = ray.get(decode.generate.remote())
+
+    print("\n" + "=" * 50)
+    print(f"DEBUG: Decode GENERATE returned {len(finished_seqs)} sequences.")
+    for i, s in enumerate(finished_seqs):
+        print(f"  [{i}] Seq ID: {s.seq_id}")
+        print(f"      Status: {s.status}")
+        print(f"      Is Finished: {s.is_finished}")
+        print(f"      Completion Token IDs Len: {len(s.completion_token_ids)}")
+    print("=" * 50 + "\n")
+
+    # Free the migrated sequences in prefill engine
+    ray.get(prefill.free_to_be_migrated.remote(migrated_seqs))
+
+    for seq in finished_seqs:
         token_ids = seq.completion_token_ids
         output = {"text": tokenizer.decode(token_ids), "token_ids": token_ids}
-        print(f"Prompt: {prompt!r}")
+        print(f"Seq ID: {seq.seq_id}")
         print(f"Completion: {output['text']!r}")
 
 

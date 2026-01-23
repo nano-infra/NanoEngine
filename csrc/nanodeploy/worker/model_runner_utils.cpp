@@ -168,8 +168,7 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
                                   int                           sp_rank,
                                   int                           sp_size,
                                   int                           block_size,
-                                  int                           max_num_seqs,
-                                  int                           max_num_send_recv_seqs)
+                                  int                           max_num_seqs)
 {
     DecodeMetadata meta;
 
@@ -303,19 +302,6 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
 
     // res_to_buffer_input_mask
     meta.res_to_buffer_input_mask.assign(meta.res_slice_get_to_buffer_input.size(), 1);
-
-    // Padding for input buffers
-    while (meta.res_slice_get_to_buffer_input.size() < (size_t)max_num_send_recv_seqs) {
-        meta.res_slice_get_to_buffer_input.push_back(-1);
-        meta.res_slice_fill_to_buffer_input.push_back(-1);
-        meta.res_to_buffer_input_mask.push_back(0);
-    }
-    // Safety truncate
-    if (meta.res_slice_get_to_buffer_input.size() > (size_t)max_num_send_recv_seqs) {
-        meta.res_slice_get_to_buffer_input.resize(max_num_send_recv_seqs);
-        meta.res_slice_fill_to_buffer_input.resize(max_num_send_recv_seqs);
-        meta.res_to_buffer_input_mask.resize(max_num_send_recv_seqs);
-    }
 
     // q_offsets (cumsum of sp_valid_request_counts)
     meta.q_offsets.resize(sp_size + 1);

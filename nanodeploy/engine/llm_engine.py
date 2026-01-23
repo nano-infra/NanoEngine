@@ -13,8 +13,8 @@ from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.config import Config
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
-from nanodeploy.engine.sequence import Sequence
-from nanodeploy.logging import get_logger
+from nanodeploy.engine.sequence import Sequence, SequenceStatus
+from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.metrics import MetricsManager
 
 logger = get_logger()
@@ -26,6 +26,11 @@ class LLMEngine:
 
         self.config = config
         self.config.engine_id = self.engine_id
+
+        # Set log level globally first
+        if self.config.log_level:
+            set_log_level(self.config.log_level)
+
         self.ps = []
         self.events = []
 
@@ -47,6 +52,15 @@ class LLMEngine:
     def update_num_kvcache_blocks(self):
         self.config.num_kvcache_blocks = self.executor.update_kvcache_blocks()
         self.executor.init_rpc_endpoint()
+
+    def get_engine_id(self):
+        return self.engine_id
+
+    def get_num_kv_blocks(self):
+        return self.config.num_kvcache_blocks
+
+    def get_attn_world_size(self):
+        return self.config.attn_world_size
 
     def add_request(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):
@@ -185,10 +199,19 @@ class LLMEngine:
                 else -len(seqs) * self.config.loop_count
             )
             for seq in seqs:
-                if seq.is_finished:
-                    # Complete sequence metric and log
-                    self.metrics_manager.complete_sequence(seq.seq_id)
-                    outputs.append((seq.seq_id, seq.completion_token_ids))
+                # Debug logging for status check
+                print(
+                    f"Seq {seq.seq_id} status: {seq.status}, is_finished: {seq.is_finished}, is_to_be_migrated: {seq.is_to_be_migrated}"
+                )
+
+                if seq.is_finished or seq.is_to_be_migrated:
+                    print(
+                        f"Collecting sequence {seq.seq_id} (Finished: {seq.is_finished}, Migrating: {seq.is_to_be_migrated})"
+                    )
+                    # Complete sequence metric and log ONLY if finished
+                    if seq.is_finished:
+                        self.metrics_manager.complete_sequence(seq.seq_id)
+                    outputs.append(seq)
         return (
             outputs,
             num_tokens,
@@ -216,12 +239,12 @@ class LLMEngine:
         self,
         use_tqdm: bool = True,
         log_metrics_interval: int = 10,
-    ) -> None:
+    ) -> list[Sequence]:
         num_reqs = len(self.scheduler.waiting)
         if use_tqdm:
             pbar = tqdm(total=num_reqs, desc="Generating", dynamic_ncols=True)
 
-        outputs = {}
+        finished_seqs = []
         prefill_throughput = decode_throughput = 0.0
         step_count = 0
 
@@ -250,8 +273,8 @@ class LLMEngine:
                         "post_sch_ovhd": f"{post_sch_latency:.2f}ms",
                     }
                 )
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for seq in output:
+                finished_seqs.append(seq)
                 if use_tqdm:
                     pbar.update(1)
         if use_tqdm:
@@ -267,4 +290,4 @@ class LLMEngine:
                 logger.info(f"  {key}: {value}")
         logger.info("=" * 60)
 
-        return
+        return finished_seqs

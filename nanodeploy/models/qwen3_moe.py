@@ -1,3 +1,4 @@
+import logging
 from typing import Dict
 
 import torch
@@ -14,6 +15,7 @@ from nanodeploy.layers.linear import (
     RowParallelLinear,
 )
 from nanodeploy.layers.rotary_embedding import get_rope
+from nanodeploy.logging import get_logger
 from nanodeploy.worker.context import get_context
 from nanodeploy.worker.distributed import get_dist_context
 from nanodeploy.worker.runner_config import get_runner_config
@@ -21,6 +23,8 @@ from torch import nn
 from transformers import Qwen3MoeConfig
 
 from .quant_config import QuantizationConfig
+
+logger = get_logger()
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -106,75 +110,9 @@ class Qwen3MoeAttention(nn.Module):
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
         v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-        # Q_Norm weight logging
-        if hidden_states.shape[1] > 10:
-            from nanodeploy.logging import get_logger
-
-            logger = get_logger()
-            w = self.q_norm.weight.detach()
-            logger.info(
-                f"[Weight Check] L{self.layer_idx} Q_Norm Weight Mean: {w.mean().item():.5f}, Max: {w.max().item():.5f}"
-            )
-
-        # QK Norm logging
-        if hidden_states.shape[1] > 10:
-            v_log = q.detach()
-            from nanodeploy.logging import get_logger
-
-            logger = get_logger()
-            logger.info(
-                f"[QK Norm Out - Q] Mean: {v_log.mean().item():.4f}, Max: {v_log.max().item():.4f}, Sum: {v_log.sum().item():.4f}"
-            )
-
         q, k = self.rotary_emb(positions, q, k)
 
-        # RoPE logging
-        if hidden_states.shape[1] > 10:
-            v_log = q.detach()
-            from nanodeploy.logging import get_logger
-
-            logger = get_logger()
-            # Log Positions
-            pos_log = positions.detach().float()
-            v_v_log = v.detach()
-            logger.info(
-                f"[Positions] Mean: {pos_log.mean().item():.4f}, Max: {pos_log.max().item():.4f}, Min: {pos_log.min().item():.4f}"
-            )
-            logger.info(
-                f"[RoPE Out - Q] Mean: {v_log.mean().item():.4f}, Max: {v_log.max().item():.4f}, Sum: {v_log.sum().item():.4f}"
-            )
-            logger.info(
-                f"[Value V In] Mean: {v_v_log.mean().item():.4f}, Max: {v_v_log.max().item():.4f}, Sum: {v_v_log.sum().item():.4f}"
-            )
-
-        # Flash Attention Input Logging (Q/K/V elements)
-        if hidden_states.shape[1] > 10 and self.layer_idx == 0:
-            from nanodeploy.logging import get_logger
-
-            logger = get_logger()
-            logger.info(f"[Flash Attn Input] Q shape: {list(q.shape)}")
-            logger.info(
-                f"[Flash Attn Input] Q Mean: {q.mean().item():.6f}, Max: {q.max().item():.4f}, Sum: {q.sum().item():.4f}"
-            )
-            logger.info(
-                f"[Flash Attn Input] Q First 10 (head 0): {q[0, 0, :10].flatten().tolist()}"
-            )
-            logger.info(
-                f"[Flash Attn Input] K Mean: {k.mean().item():.6f}, Max: {k.max().item():.4f}, Sum: {k.sum().item():.4f}"
-            )
-            logger.info(
-                f"[Flash Attn Input] V Mean: {v.mean().item():.6f}, Max: {v.max().item():.4f}, Sum: {v.sum().item():.4f}"
-            )
-
         o = self.attn(q, k, v)
-
-        # Attention Output logging
-        if hidden_states.shape[1] > 10:
-            v_log = o.detach()
-            logger = get_logger()
-            logger.info(
-                f"[Attention Out] Mean: {v_log.mean().item():.4f}, Max: {v_log.max().item():.4f}, Sum: {v_log.sum().item():.4f}"
-            )
 
         output = self.o_proj(o.flatten(1, -1))
         return output
@@ -447,21 +385,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
-            # Debug Logging for MoE internals (first call only)
-            if hidden_states.shape[0] > 10:
-                from nanodeploy.logging import get_logger
-
-                logger = get_logger()
-                logger.info(
-                    f"[MoE Debug] RouterLogits Mean: {router_logits.mean().item():.6f}, Max: {router_logits.max().item():.4f}"
-                )
-                logger.info(
-                    f"[MoE Debug] TopK Weights Mean: {routing_weights.mean().item():.6f}, Max: {routing_weights.max().item():.4f}"
-                )
-                logger.info(
-                    f"[MoE Debug] TopK IDs First 5: {selected_experts[:5].tolist()}"
-                )
-
             # we cast back to the input dtype
             routing_weights = routing_weights.to(hidden_states.dtype)
 
@@ -554,58 +477,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # all_gather
-        # Debug Logging for Layer 0 Norm Out (Input to Attention)
-        if self.layer_idx == 0 and hidden_states.shape[1] > 10:
-            from nanodeploy.logging import get_logger
-
-            logger = get_logger()
-            v = hidden_states.detach()
-            logger.info(
-                f"[Layer 0 Norm Out] Mean: {v.mean().item():.4f}, Max: {v.max().item():.4f}, Sum: {v.sum().item():.4f}"
-            )
-
         hidden_states = self.self_attn(positions, hidden_states)
-        # all_to_all
-
-        # Debug Logging for Attention Output
-        if self.layer_idx == 0 and hidden_states.shape[1] > 10:
-            from nanodeploy.logging import get_logger
-
-            logger = get_logger()
-            # Detach to avoid affecting graph
-            v = hidden_states.detach()
-            logger.info(
-                f"Layer 0 Attn Out: Mean={v.mean().item():.4f}, Max={v.max().item():.4f}, Sum={v.sum().item():.4f}"
-            )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
-        # Debug Logging for MLP Input
-        if self.layer_idx == 0 and hidden_states.shape[1] > 10:
-            from nanodeploy.logging import get_logger
-
-            logger = get_logger()
-            v = hidden_states.detach()
-            w = self.post_attention_layernorm.weight.detach()
-            logger.info(
-                f"[Layer 0 MLP Input] Mean: {v.mean().item():.6f}, Max: {v.max().item():.4f}, Sum: {v.sum().item():.4f}"
-            )
-            logger.info(
-                f"[Post-Attn LayerNorm Weight] Mean: {w.mean().item():.4f}, Max: {w.max().item():.4f}, Min: {w.min().item():.4f}"
-            )
-
         hidden_states = self.mlp(hidden_states)
-
-        # Debug Logging for MLP Output
-        if self.layer_idx == 0 and hidden_states.shape[1] > 10:
-            from nanodeploy.logging import get_logger
-
-            logger = get_logger()
-            v = hidden_states.detach()
-            logger.info(
-                f"Layer 0 MLP Out: Mean={v.mean().item():.4f}, Max={v.max().item():.4f}, Sum={v.sum().item():.4f}"
-            )
 
         return hidden_states, residual
 
@@ -633,16 +509,6 @@ class Qwen3MoeModel(nn.Module):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-
-        # Debug Logging for Embeddings
-        if input_ids.ndim > 1 and input_ids.shape[1] > 10:
-            from nanodeploy.logging import get_logger
-
-            logger = get_logger()
-            v = hidden_states.detach()
-            logger.info(
-                f"[Embedding Out] Mean: {v.mean().item():.4f}, Max: {v.max().item():.4f}, Sum: {v.sum().item():.4f}"
-            )
 
         residual = None
         for layer in self.layers:
