@@ -9,26 +9,14 @@ namespace nanodeploy {
 
 namespace {
 
-// --- Helper Functions for Serialization (Packing) ---
-
 flatbuffers::Offset<nanodeploy::fbs::BlockContext> pack_block_context(flatbuffers::FlatBufferBuilder& builder,
                                                                       const BlockContext&             ctx)
 {
-    // String
     auto engine_id_off = builder.CreateString(ctx.engine_id_);
 
-    // Vector<BlockLocation> (struct)
     std::vector<nanodeploy::fbs::BlockLocation> locs;
-    // Optimization: Skip block_location transmission as requested
-    /*
-    locs.reserve(ctx.block_location.size());
-    for (const auto& p : ctx.block_location) {
-        locs.emplace_back(p.first, p.second);
-    }
-    */
-    auto loc_vec_off = builder.CreateVectorOfStructs(locs);
+    auto                                        loc_vec_off = builder.CreateVectorOfStructs(locs);
 
-    // Vector<int>
     auto disp_vec_off = builder.CreateVector(ctx.num_dispatched_tokens);
 
     // Vector<IntList> (nested vectors for sp_block_table)
@@ -50,8 +38,6 @@ flatbuffers::Offset<nanodeploy::fbs::BlockContext> pack_block_context(flatbuffer
                                                disp_vec_off,
                                                sp_block_table_off);
 }
-
-// --- Helper Functions for Deserialization (Unpacking) ---
 
 void unpack_block_context(const nanodeploy::fbs::BlockContext* fb_ctx, BlockContext& ctx)
 {
@@ -95,8 +81,6 @@ void unpack_block_context(const nanodeploy::fbs::BlockContext* fb_ctx, BlockCont
 
 }  // namespace
 
-// ==================== Public API ====================
-
 size_t serialize_sequences(uintptr_t                                     data_ptr,
                            size_t                                        buffer_size,
                            const std::vector<std::shared_ptr<Sequence>>& seqs,
@@ -120,22 +104,17 @@ size_t serialize_sequences(uintptr_t                                     data_pt
             continue;
         const auto& seq = *seq_ptr;
 
-        // token_ids
         flatbuffers::Offset<flatbuffers::Vector<int>> token_ids_off;
         if (is_prefill) {
             token_ids_off = builder.CreateVector(seq.token_ids);
             total_token_bytes += seq.token_ids.size() * sizeof(int);
         }
         else {
-            // Decode phase: send empty vector
             token_ids_off = builder.CreateVector(std::vector<int>{});
         }
 
-        // --- Stats Accumulation (ACTIVE slot) ---
         const auto& ctx = seq.slots_[(size_t)BlockContextSlot::ACTIVE];
-        // total_block_loc_bytes += ctx.block_location.size() * 2 * sizeof(int);
 
-        // total_engine_id_bytes += ctx.engine_id_.size();
         total_disp_token_bytes += ctx.num_dispatched_tokens.size() * sizeof(int);
         total_inner_lists += ctx.sp_block_table.size();
 
@@ -143,9 +122,7 @@ size_t serialize_sequences(uintptr_t                                     data_pt
             total_block_table_bytes += inner.size() * sizeof(int);
         }
 
-        // slots
         std::vector<flatbuffers::Offset<nanodeploy::fbs::BlockContext>> slot_offsets;
-        // Only serialize ACTIVE slot as requested to save bandwidth
         slot_offsets.push_back(pack_block_context(builder, seq.slots_[(size_t)BlockContextSlot::ACTIVE]));
         auto slots_vec_off = builder.CreateVector(slot_offsets);
 
