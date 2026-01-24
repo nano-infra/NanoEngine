@@ -7,7 +7,10 @@ import torch
 import torch.distributed as dist
 from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.logging import get_logger
 from nanodeploy.worker.distributed import get_dist_context
+
+logger = get_logger("nanodeploy")
 
 
 @dataclasses.dataclass
@@ -40,8 +43,8 @@ class CacheContext:
 
         free, total = torch.cuda.mem_get_info()
         if self.gpu_memory_limit_gb is not None:
-             total = min(total, self.gpu_memory_limit_gb * 1024**3)
-        used = torch.cuda.mem_get_info()[1] - free # real used
+            total = min(total, self.gpu_memory_limit_gb * 1024**3)
+        used = torch.cuda.mem_get_info()[1] - free  # real used
         memory_stats = torch.cuda.memory_stats()
         peak = memory_stats["allocated_bytes.all.peak"]
         current = memory_stats["allocated_bytes.all.current"]
@@ -55,7 +58,7 @@ class CacheContext:
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
-        
+
         block_bytes = (
             self.num_hidden_layers
             * self.block_size
@@ -71,7 +74,7 @@ class CacheContext:
             // block_bytes
         )
 
-        print(
+        logger.info(
             f"Rank{dist.get_rank()} num_local_kvcache_blocks: {self.num_local_kvcache_blocks}"
         )
 
@@ -120,9 +123,9 @@ class CacheContext:
 
     def allocate_kvcache(self, num_kvcache_blocks):
         self.num_local_kvcache_blocks = num_kvcache_blocks
-        
+
         kv_count = 2 if self.mode == "gqa" else 1
-        
+
         self.kv_cache = torch.empty(
             kv_count,
             self.num_hidden_layers,

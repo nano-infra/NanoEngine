@@ -185,4 +185,11 @@ inline void print_stack_trace()
 // Debug
 #define NANODEPLOY_LOG_DEBUG(...) NANODEPLOY_LOG_LEVEL("DEBUG", "\033[1;92m", 2, __VA_ARGS__)
 
+// -----------------------------------------------------------------------------
+// Log Level
+// -----------------------------------------------------------------------------
+
+int  get_log_level();
+void set_log_level(int level);
+
 }  // namespace nanodeploy

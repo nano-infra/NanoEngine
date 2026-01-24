@@ -1,112 +1,95 @@
 #include "nanodeploy/logging.h"
 
+#include "sequence_generated.h"
 #include "serialization.h"
+#include <flatbuffers/flatbuffers.h>
+#include <format>
 
 namespace nanodeploy {
 
 namespace {
 
-// --- Low-level atomic write operations (inlined for performance) ---
-template<typename T>
-inline void write_raw(uintptr_t base, size_t& off, size_t max_size, const T& val)
-{
-    if (off + sizeof(T) > max_size)
-        NANODEPLOY_ABORT("Buffer Overflow");
-    std::memcpy(reinterpret_cast<void*>(base + off), &val, sizeof(T));
-    off += sizeof(T);
-}
+// --- Helper Functions for Serialization (Packing) ---
 
-inline void write_bytes(uintptr_t base, size_t& off, size_t max_size, const void* src, size_t len)
-{
-    if (off + len > max_size)
-        NANODEPLOY_ABORT("Buffer Overflow");
-    if (len > 0) {
-        std::memcpy(reinterpret_cast<void*>(base + off), src, len);
-        off += len;
-    }
-}
-
-template<typename T>
-inline T read_raw(uintptr_t base, size_t& off, size_t max_size)
-{
-    if (off + sizeof(T) > max_size)
-        throw std::runtime_error("Buffer Underflow");
-    T val;
-    std::memcpy(&val, reinterpret_cast<void*>(base + off), sizeof(T));
-    off += sizeof(T);
-    return val;
-}
-
-inline void read_bytes(uintptr_t base, size_t& off, size_t max_size, void* dst, size_t len)
-{
-    if (off + len > max_size)
-        throw std::runtime_error("Buffer Underflow");
-    if (len > 0) {
-        std::memcpy(dst, reinterpret_cast<void*>(base + off), len);
-        off += len;
-    }
-}
-
-// ==================== 对象级逻辑实现 ====================
-
-void serialize_block_context(uintptr_t base, size_t& off, size_t max, const BlockContext& ctx)
+flatbuffers::Offset<nanodeploy::fbs::BlockContext> pack_block_context(flatbuffers::FlatBufferBuilder& builder,
+                                                                      const BlockContext&             ctx)
 {
     // String
-    size_t s_len = ctx.engine_id_.size();
-    write_raw(base, off, max, s_len);
-    write_bytes(base, off, max, ctx.engine_id_.data(), s_len);
+    auto engine_id_off = builder.CreateString(ctx.engine_id_);
 
-    // Primitives
-    write_raw(base, off, max, ctx.dp_idx_);
-    write_raw(base, off, max, ctx.master_sp_idx_);
-    write_raw(base, off, max, ctx.attention_sp_);
-    write_raw(base, off, max, ctx.attention_dp_);
-
-    // Vector<pair<int, int>> - 直接块拷贝
-    size_t loc_count = ctx.block_location.size();
-    write_raw(base, off, max, loc_count);
-    write_bytes(base, off, max, ctx.block_location.data(), loc_count * sizeof(std::pair<int, int>));
+    // Vector<BlockLocation> (struct)
+    std::vector<nanodeploy::fbs::BlockLocation> locs;
+    // Optimization: Skip block_location transmission as requested
+    /*
+    locs.reserve(ctx.block_location.size());
+    for (const auto& p : ctx.block_location) {
+        locs.emplace_back(p.first, p.second);
+    }
+    */
+    auto loc_vec_off = builder.CreateVectorOfStructs(locs);
 
     // Vector<int>
-    size_t disp_count = ctx.num_dispatched_tokens.size();
-    write_raw(base, off, max, disp_count);
-    write_bytes(base, off, max, ctx.num_dispatched_tokens.data(), disp_count * sizeof(int));
+    auto disp_vec_off = builder.CreateVector(ctx.num_dispatched_tokens);
 
-    // Nested Vector<Vector<int>>
-    size_t table_size = ctx.sp_block_table.size();
-    write_raw(base, off, max, table_size);
+    // Vector<IntList> (nested vectors for sp_block_table)
+    std::vector<flatbuffers::Offset<nanodeploy::fbs::IntList>> int_list_offs;
+    int_list_offs.reserve(ctx.sp_block_table.size());
     for (const auto& inner : ctx.sp_block_table) {
-        size_t inner_sz = inner.size();
-        write_raw(base, off, max, inner_sz);
-        write_bytes(base, off, max, inner.data(), inner_sz * sizeof(int));
+        auto inner_vec = builder.CreateVector(inner);
+        int_list_offs.push_back(nanodeploy::fbs::CreateIntList(builder, inner_vec));
     }
+    auto sp_block_table_off = builder.CreateVector(int_list_offs);
+
+    return nanodeploy::fbs::CreateBlockContext(builder,
+                                               engine_id_off,
+                                               ctx.dp_idx_,
+                                               ctx.master_sp_idx_,
+                                               ctx.attention_sp_,
+                                               ctx.attention_dp_,
+                                               loc_vec_off,
+                                               disp_vec_off,
+                                               sp_block_table_off);
 }
 
-void deserialize_block_context(uintptr_t base, size_t& off, size_t max, BlockContext& ctx)
+// --- Helper Functions for Deserialization (Unpacking) ---
+
+void unpack_block_context(const nanodeploy::fbs::BlockContext* fb_ctx, BlockContext& ctx)
 {
-    size_t s_len = read_raw<size_t>(base, off, max);
-    ctx.engine_id_.assign(reinterpret_cast<const char*>(base + off), s_len);
-    off += s_len;
+    if (!fb_ctx)
+        return;
 
-    ctx.dp_idx_        = read_raw<int>(base, off, max);
-    ctx.master_sp_idx_ = read_raw<int>(base, off, max);
-    ctx.attention_sp_  = read_raw<int>(base, off, max);
-    ctx.attention_dp_  = read_raw<int>(base, off, max);
+    if (fb_ctx->engine_id()) {
+        ctx.engine_id_ = fb_ctx->engine_id()->str();
+    }
+    ctx.dp_idx_        = fb_ctx->dp_idx();
+    ctx.master_sp_idx_ = fb_ctx->master_sp_idx();
+    ctx.attention_sp_  = fb_ctx->attention_sp();
+    ctx.attention_dp_  = fb_ctx->attention_dp();
 
-    size_t loc_count = read_raw<size_t>(base, off, max);
-    ctx.block_location.resize(loc_count);
-    read_bytes(base, off, max, ctx.block_location.data(), loc_count * sizeof(std::pair<int, int>));
+    // block_location
+    if (auto locs = fb_ctx->block_location()) {
+        ctx.block_location.clear();
+        ctx.block_location.reserve(locs->size());
+        for (const auto* loc : *locs) {
+            ctx.block_location.emplace_back(loc->first(), loc->second());
+        }
+    }
 
-    size_t disp_count = read_raw<size_t>(base, off, max);
-    ctx.num_dispatched_tokens.resize(disp_count);
-    read_bytes(base, off, max, ctx.num_dispatched_tokens.data(), disp_count * sizeof(int));
+    // num_dispatched_tokens
+    if (auto disps = fb_ctx->num_dispatched_tokens()) {
+        ctx.num_dispatched_tokens.assign(disps->begin(), disps->end());
+    }
 
-    size_t table_size = read_raw<size_t>(base, off, max);
-    ctx.sp_block_table.resize(table_size);
-    for (size_t i = 0; i < table_size; ++i) {
-        size_t inner_sz = read_raw<size_t>(base, off, max);
-        ctx.sp_block_table[i].resize(inner_sz);
-        read_bytes(base, off, max, ctx.sp_block_table[i].data(), inner_sz * sizeof(int));
+    // sp_block_table
+    if (auto table = fb_ctx->sp_block_table()) {
+        ctx.sp_block_table.clear();
+        ctx.sp_block_table.resize(table->size());
+        for (size_t i = 0; i < table->size(); ++i) {
+            const auto* int_list = table->Get(i);
+            if (int_list && int_list->values()) {
+                ctx.sp_block_table[i].assign(int_list->values()->begin(), int_list->values()->end());
+            }
+        }
     }
 }
 
@@ -119,89 +102,141 @@ size_t serialize_sequences(uintptr_t                                     data_pt
                            const std::vector<std::shared_ptr<Sequence>>& seqs,
                            bool                                          is_prefill)
 {
-    size_t off = 0;
+    flatbuffers::FlatBufferBuilder builder(buffer_size);
+    NANODEPLOY_LOG_INFO("serializing seqs, is_prefill=", is_prefill);
 
-    // 写入数量
-    size_t count = seqs.size();
-    write_raw(data_ptr, off, buffer_size, count);
+    std::vector<flatbuffers::Offset<nanodeploy::fbs::Sequence>> seq_offsets;
+    seq_offsets.reserve(seqs.size());
+
+    size_t total_token_bytes       = 0;
+    size_t total_block_loc_bytes   = 0;
+    size_t total_block_table_bytes = 0;
+    size_t total_engine_id_bytes   = 0;
+    size_t total_disp_token_bytes  = 0;
+    size_t total_inner_lists       = 0;
 
     for (const auto& seq_ptr : seqs) {
         if (!seq_ptr)
             continue;
         const auto& seq = *seq_ptr;
 
-        write_raw(data_ptr, off, buffer_size, seq.seq_id);
-        write_raw(data_ptr, off, buffer_size, seq.status);
-        write_raw(data_ptr, off, buffer_size, seq.temperature);
-        write_raw(data_ptr, off, buffer_size, seq.max_tokens);
-        write_raw(data_ptr, off, buffer_size, seq.ignore_eos);
-        write_raw(data_ptr, off, buffer_size, seq.last_token);
-        write_raw(data_ptr, off, buffer_size, seq.num_tokens);
-        write_raw(data_ptr, off, buffer_size, seq.num_prompt_tokens);
-        write_raw(data_ptr, off, buffer_size, seq.num_checkpointed_tokens);
-        write_raw(data_ptr, off, buffer_size, seq.num_cached_tokens);
-
         // token_ids
+        flatbuffers::Offset<flatbuffers::Vector<int>> token_ids_off;
         if (is_prefill) {
-            // Prefill 阶段：传输完整的 token_ids
-            size_t tid_count = seq.token_ids.size();
-            write_raw(data_ptr, off, buffer_size, tid_count);
-            write_bytes(data_ptr, off, buffer_size, seq.token_ids.data(), tid_count * sizeof(int));
+            token_ids_off = builder.CreateVector(seq.token_ids);
+            total_token_bytes += seq.token_ids.size() * sizeof(int);
         }
         else {
-            // Decode 阶段：不传输 token_ids，写入长度 0
-            size_t tid_count = 0;
-            write_raw(data_ptr, off, buffer_size, tid_count);
+            // Decode phase: send empty vector
+            token_ids_off = builder.CreateVector(std::vector<int>{});
         }
 
-        // Slots (BlockContexts)
-        for (size_t i = 0; i < (size_t)BlockContextSlot::_COUNT; ++i) {
-            serialize_block_context(data_ptr, off, buffer_size, seq.slots_[i]);
+        // --- Stats Accumulation (ACTIVE slot) ---
+        const auto& ctx = seq.slots_[(size_t)BlockContextSlot::ACTIVE];
+        // total_block_loc_bytes += ctx.block_location.size() * 2 * sizeof(int);
+
+        // total_engine_id_bytes += ctx.engine_id_.size();
+        total_disp_token_bytes += ctx.num_dispatched_tokens.size() * sizeof(int);
+        total_inner_lists += ctx.sp_block_table.size();
+
+        for (const auto& inner : ctx.sp_block_table) {
+            total_block_table_bytes += inner.size() * sizeof(int);
         }
+
+        // slots
+        std::vector<flatbuffers::Offset<nanodeploy::fbs::BlockContext>> slot_offsets;
+        // Only serialize ACTIVE slot as requested to save bandwidth
+        slot_offsets.push_back(pack_block_context(builder, seq.slots_[(size_t)BlockContextSlot::ACTIVE]));
+        auto slots_vec_off = builder.CreateVector(slot_offsets);
+
+        auto seq_off = nanodeploy::fbs::CreateSequence(builder,
+                                                       seq.seq_id,
+                                                       static_cast<nanodeploy::fbs::SequenceStatus>(seq.status),
+                                                       seq.temperature,
+                                                       seq.max_tokens,
+                                                       seq.ignore_eos,
+                                                       seq.last_token,
+                                                       seq.num_tokens,
+                                                       seq.num_prompt_tokens,
+                                                       seq.num_checkpointed_tokens,
+                                                       seq.num_cached_tokens,
+                                                       token_ids_off,
+                                                       slots_vec_off);
+        seq_offsets.push_back(seq_off);
     }
-    return off;
+
+    NANODEPLOY_LOG_INFO(std::format(
+        "Serialization Breakdown: Tokens={} B, BlockLocs={} B, BlockTables(Content)={} B, BlockTables(Count)={}, EngineID={} B, DispTokens={} B",
+        total_token_bytes,
+        total_block_loc_bytes,
+        total_block_table_bytes,
+        total_inner_lists,
+        total_engine_id_bytes,
+        total_disp_token_bytes));
+
+    auto seq_list_off = nanodeploy::fbs::CreateSequenceList(builder, builder.CreateVector(seq_offsets));
+
+    builder.Finish(seq_list_off);
+
+    // Copy to output
+    size_t size = builder.GetSize();
+    if (size > buffer_size) {
+        NANODEPLOY_ABORT("Buffer Overflow: Serialized size " + std::to_string(size) + " > buffer size "
+                         + std::to_string(buffer_size));
+    }
+
+    std::memcpy(reinterpret_cast<void*>(data_ptr), builder.GetBufferPointer(), size);
+    return size;
 }
 
 std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr, size_t data_len)
 {
-    size_t off   = 0;
-    size_t count = read_raw<size_t>(data_ptr, off, data_len);
+    const uint8_t* buffer = reinterpret_cast<const uint8_t*>(data_ptr);
 
-    std::vector<std::shared_ptr<Sequence>> seqs;
-    seqs.reserve(count);
-
-    for (size_t i = 0; i < count; ++i) {
-        // 先读取基础字段以便构造
-        uint64_t       seq_id = read_raw<uint64_t>(data_ptr, off, data_len);
-        SequenceStatus status = read_raw<SequenceStatus>(data_ptr, off, data_len);
-        double         temp   = read_raw<double>(data_ptr, off, data_len);
-        int            max_t  = read_raw<int>(data_ptr, off, data_len);
-        bool           eos    = read_raw<bool>(data_ptr, off, data_len);
-        int            last   = read_raw<int>(data_ptr, off, data_len);
-        int            num    = read_raw<int>(data_ptr, off, data_len);
-        int            prompt = read_raw<int>(data_ptr, off, data_len);
-        int            check  = read_raw<int>(data_ptr, off, data_len);
-        int            cached = read_raw<int>(data_ptr, off, data_len);
-
-        size_t           tid_count = read_raw<size_t>(data_ptr, off, data_len);
-        std::vector<int> tids(tid_count);
-        read_bytes(data_ptr, off, data_len, tids.data(), tid_count * sizeof(int));
-
-        auto seq                     = std::make_shared<Sequence>(tids, temp, max_t, eos);
-        seq->seq_id                  = seq_id;
-        seq->status                  = status;
-        seq->last_token              = last;
-        seq->num_tokens              = num;
-        seq->num_prompt_tokens       = prompt;
-        seq->num_checkpointed_tokens = check;
-        seq->num_cached_tokens       = cached;
-
-        for (size_t j = 0; j < (size_t)BlockContextSlot::_COUNT; ++j) {
-            deserialize_block_context(data_ptr, off, data_len, seq->slots_[j]);
-        }
-        seqs.push_back(seq);
+    // Verify
+    flatbuffers::Verifier verifier(buffer, data_len);
+    if (!nanodeploy::fbs::VerifySequenceListBuffer(verifier)) {
+        throw std::runtime_error("Invalid FlatBuffer: SequenceList verification failed");
     }
-    return seqs;
+
+    const auto* seq_list  = nanodeploy::fbs::GetSequenceList(buffer);
+    const auto* sequences = seq_list->sequences();
+
+    std::vector<std::shared_ptr<Sequence>> result;
+    if (!sequences)
+        return result;
+
+    result.reserve(sequences->size());
+
+    for (const auto* fb_seq : *sequences) {
+        // Core fields
+        std::vector<int> token_ids;
+        if (auto tids = fb_seq->token_ids()) {
+            token_ids.assign(tids->begin(), tids->end());
+        }
+
+        auto seq =
+            std::make_shared<Sequence>(token_ids, fb_seq->temperature(), fb_seq->max_tokens(), fb_seq->ignore_eos());
+
+        seq->seq_id                  = fb_seq->seq_id();
+        seq->status                  = static_cast<SequenceStatus>(fb_seq->status());
+        seq->last_token              = fb_seq->last_token();
+        seq->num_tokens              = fb_seq->num_tokens();
+        seq->num_prompt_tokens       = fb_seq->num_prompt_tokens();
+        seq->num_checkpointed_tokens = fb_seq->num_checkpointed_tokens();
+        seq->num_cached_tokens       = fb_seq->num_cached_tokens();
+
+        // Slots
+        if (auto slots = fb_seq->slots()) {
+            for (size_t i = 0; i < slots->size() && i < seq->slots_.size(); ++i) {
+                unpack_block_context(slots->Get(i), seq->slots_[i]);
+            }
+        }
+
+        result.push_back(seq);
+    }
+
+    return result;
 }
 
 }  // namespace nanodeploy

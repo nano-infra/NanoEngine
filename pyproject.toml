@@ -16,14 +16,14 @@ license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
 description = "a lightweight LMDeploy implementation built from scratch"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    "torch>=2.4.0",
-    "triton>=3.0.0",
+    # "torch>=2.4.0",
+    # "triton>=3.0.0",
     "transformers>=4.51.0",
     "pydantic",
     "ray",
-    "flash-attn",
+    # "flash-attn",
     "xxhash",
     "dlslime>=0.0.1.post9",
     "dlblas",

@@ -35,7 +35,7 @@ class RayExecutor:
         # 2. 获取所有节点的 NodeID
         nodes = get_available_nodes_with_master_first(config.master_address)
         node_ids = [node["NodeID"] for node in nodes]
-        print(f"find nodes (NodeIDs): {node_ids}")
+        logger.debug(f"find nodes (NodeIDs): {node_ids}")
 
         # 3. 定义每个节点上要运行的 worker 数量
         workers_per_node = 8

@@ -8,7 +8,7 @@ add_library(
     ${CPP_SOURCES}
 )
 
-target_link_libraries(_nanodeploy_worker PUBLIC _nanodeploy_sequence)
+target_link_libraries(_nanodeploy_worker PUBLIC _nanodeploy_sequence nanodeploy_logger)
 
 target_compile_options(_nanodeploy_worker PRIVATE -O3 -Wall -Wextra)
 

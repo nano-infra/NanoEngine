@@ -205,7 +205,21 @@ def set_log_level(level: str | int) -> None:
             return
         logger.setLevel(numeric_level)
     elif isinstance(level, int):
+        numeric_level = level
         logger.setLevel(level)
+
+    try:
+        from nanodeploy import _nanodeploy_cpp
+
+        # Map logging levels to C++ (0=ERROR, 1=INFO/WARN, 2=DEBUG)
+        cpp_level = 0
+        if numeric_level <= logging.DEBUG:
+            cpp_level = 2
+        elif numeric_level <= logging.INFO:
+            cpp_level = 1
+        _nanodeploy_cpp.set_log_level(cpp_level)
+    except ImportError:
+        pass
 
 
 # =============================================================================

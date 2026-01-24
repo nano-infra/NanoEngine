@@ -4,6 +4,10 @@ from typing import Any, Literal
 
 from transformers import AutoConfig
 
+from nanodeploy.logging import get_logger
+
+logger = get_logger("nanodeploy")
+
 
 @dataclass
 class Config:
@@ -59,27 +63,32 @@ class Config:
     log_level: str = "CRITICAL"
 
     def __post_init__(self):
-        assert os.path.isdir(self.model)
-        self.hf_config = AutoConfig.from_pretrained(self.model)
-        if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
-            assert self.kvcache_block_size == 64
-            assert self.attention_tp == 1
-        else:
-            assert self.kvcache_block_size % 256 == 0
-            assert 1 <= self.attention_tp <= 8
-        # self.max_model_len = max(
-        #     self.max_model_len, self.hf_config.max_position_embeddings
-        # )
-        self.hf_config.max_position_embeddings = max(
-            self.max_model_len, self.hf_config.max_position_embeddings
-        )
-        assert self.max_num_batched_tokens >= self.max_model_len
+        try:
+            assert os.path.isdir(self.model)
+            self.hf_config = AutoConfig.from_pretrained(self.model)
+            if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+                assert self.kvcache_block_size == 64
+                assert self.attention_tp == 1
+            else:
+                assert self.kvcache_block_size % 256 == 0
+                assert 1 <= self.attention_tp <= 8
+            # self.max_model_len = max(
+            #     self.max_model_len, self.hf_config.max_position_embeddings
+            # )
+            self.hf_config.max_position_embeddings = max(
+                self.max_model_len, self.hf_config.max_position_embeddings
+            )
+            assert self.max_num_batched_tokens >= self.max_model_len
 
-        if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
-            # MLA requires num_kv_heads == 1
+            if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+                # MLA requires num_kv_heads == 1
 
-            if hasattr(self.hf_config, "num_key_value_heads"):
-                self.hf_config.num_key_value_heads = 1
+                if hasattr(self.hf_config, "num_key_value_heads"):
+                    self.hf_config.num_key_value_heads = 1
+        except:
+            logger.warning(
+                "Failed to load model from config, may cause unexpected behavior."
+            )
 
     @property
     def attn_world_size(self):

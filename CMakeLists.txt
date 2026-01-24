@@ -13,4 +13,5 @@ set(DLSLIME_INSTALL_PATH "lib" CACHE STRING "Library installation directory")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include_directories(csrc)
+add_subdirectory(third_party)
 add_subdirectory(csrc)

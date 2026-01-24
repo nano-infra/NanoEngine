@@ -1,0 +1,50 @@
+namespace nanodeploy.fbs;
+
+enum SequenceStatus : byte {
+  WAITING = 0,
+  RUNNING = 1,
+  FINISHED = 2,
+  TO_BE_MIGRATED = 3,
+}
+
+struct BlockLocation {
+  first: int;
+  second: int;
+}
+
+table IntList {
+  values: [int];
+}
+
+table BlockContext {
+  engine_id: string;
+  dp_idx: int;
+  master_sp_idx: int;
+  attention_sp: int;
+  attention_dp: int;
+  block_location: [BlockLocation];
+  num_dispatched_tokens: [int];
+  sp_block_table: [IntList];
+}
+
+table Sequence {
+  seq_id: uint64;
+  status: SequenceStatus;
+  temperature: double;
+  max_tokens: int;
+  ignore_eos: bool;
+  last_token: int;
+  num_tokens: int;
+  num_prompt_tokens: int;
+  num_checkpointed_tokens: int;
+  num_cached_tokens: int;
+  token_ids: [int];
+  // Slots: 0=ACTIVE, 1=MIGRATE, 2=SWAP
+  slots: [BlockContext];
+}
+
+table SequenceList {
+  sequences: [Sequence];
+}
+
+root_type SequenceList;

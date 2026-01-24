@@ -2,7 +2,7 @@ import dataclasses
 
 import torch
 from dlslime import _slime_c
-from nanodeploy._cpp import deserialize, Sequence, serialize
+from nanodeploy._cpp import BlockContextSlot, deserialize, Sequence, serialize
 from nanodeploy.logging import get_logger
 
 logger = get_logger("NANODEPLOY")
@@ -51,6 +51,25 @@ class RPCServerEndpoint:
             buffer = binding.buffer
             buffer_ptr = buffer.data_ptr() + buffer.storage_offset()
             off = serialize(buffer_ptr, buffer.numel(), dp_seqs[i], is_prefill)
+
+            num_seqs = len(dp_seqs[i])
+            total_tokens = sum(s.num_tokens for s in dp_seqs[i])
+            total_blocks = 0
+            for s in dp_seqs[i]:
+                try:
+                    ctx = s.block_ctx(BlockContextSlot.ACTIVE)
+                    sp_size = ctx.attention_sp
+                    for sp_idx in range(sp_size):
+                        total_blocks += s.num_blocks(BlockContextSlot.ACTIVE, sp_idx)
+                except Exception:
+                    pass
+
+            logger.info(
+                f"Send sequences size: {off} bytes, "
+                f"Total Sequences: {num_seqs}, "
+                f"Total Tokens: {total_tokens}, "
+                f"Total Blocks: {total_blocks}"
+            )
             future = binding.endpoint.write_with_imm(
                 [(buffer_ptr, binding.remote_buffer_ptr, 0, 0, off)], off
             )
@@ -92,6 +111,7 @@ class RPCClientEndpoint:
         future.wait()
         buffer = binding.buffer
         buffer_ptr = buffer.data_ptr() + buffer.storage_offset()
+        logger.info(f"Received sequences size: {future.imm_data()} bytes")
         return deserialize(buffer_ptr, future.imm_data())
 
     def send_tokens(self):

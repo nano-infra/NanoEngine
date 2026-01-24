@@ -9,6 +9,8 @@ add_library(
     ${CPP_SOURCES}
 )
 
+target_link_libraries(_nanodeploy_metrics PRIVATE nanodeploy_logger)
+
 target_compile_options(_nanodeploy_metrics PRIVATE -O3 -Wall -Wextra)
 
 set_target_properties(

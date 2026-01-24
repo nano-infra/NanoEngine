@@ -30,6 +30,7 @@ def main():
         max_model_len=4096,
         max_num_batched_tokens=4096,
         dummy_weight=False,
+        log_level="INFO",
     )
     decode = LLM.as_remote(decode_config)
 
@@ -50,6 +51,7 @@ def main():
         max_model_len=4096,
         max_num_batched_tokens=4096,
         dummy_weight=False,
+        log_level="INFO",
     )
     prefill = LLM.as_remote(prefill_config)
 

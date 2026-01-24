@@ -11,7 +11,6 @@ from transformers import AutoTokenizer
 
 from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.config import Config
-from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence, SequenceStatus
 from nanodeploy.logging import get_logger, set_log_level
@@ -33,6 +32,8 @@ class LLMEngine:
 
         self.ps = []
         self.events = []
+
+        from nanodeploy.engine.ray_executor import RayExecutor
 
         self.executor = RayExecutor(config=config)
         self.update_num_kvcache_blocks()
@@ -199,16 +200,7 @@ class LLMEngine:
                 else -len(seqs) * self.config.loop_count
             )
             for seq in seqs:
-                # Debug logging for status check
-                print(
-                    f"Seq {seq.seq_id} status: {seq.status}, is_finished: {seq.is_finished}, is_to_be_migrated: {seq.is_to_be_migrated}"
-                )
-
                 if seq.is_finished or seq.is_to_be_migrated:
-                    print(
-                        f"Collecting sequence {seq.seq_id} (Finished: {seq.is_finished}, Migrating: {seq.is_to_be_migrated})"
-                    )
-                    # Complete sequence metric and log ONLY if finished
                     if seq.is_finished:
                         self.metrics_manager.complete_sequence(seq.seq_id)
                     outputs.append(seq)
