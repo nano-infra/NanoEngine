@@ -13,7 +13,7 @@
 
 #include "scheduler_utils.h"
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 struct Task {
     std::shared_ptr<Sequence> seq;
@@ -201,4 +201,4 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
     return all_migrations;
 }
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

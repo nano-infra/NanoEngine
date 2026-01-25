@@ -6,7 +6,7 @@
 
 #include "sequence.h"
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 // BlockContext Implementation
 
@@ -201,4 +201,4 @@ std::vector<int> Sequence::completion_token_ids() const
     return std::vector<int>(token_ids.begin() + num_prompt_tokens, token_ids.end());
 }
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

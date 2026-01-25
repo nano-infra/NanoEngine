@@ -1,6 +1,6 @@
-#include "nanodeploy/logging.h"
+#include "nanocommon/logging.h"
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 static int global_log_level = 0;
 
@@ -14,4 +14,4 @@ void set_log_level(int level)
     global_log_level = level;
 }
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

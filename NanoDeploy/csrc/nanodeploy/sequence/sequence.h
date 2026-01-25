@@ -11,7 +11,7 @@
 #include <tuple>
 #include <vector>
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 // Forward declaration
 class SequenceMetric;
@@ -225,4 +225,4 @@ private:
     static std::atomic<uint64_t> next_seq_id_;
 };
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

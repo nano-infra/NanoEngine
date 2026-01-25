@@ -11,7 +11,7 @@
 
 #include "block_manager.h"
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 enum class RoutingStrategy {
     RoundRobin,
@@ -159,4 +159,4 @@ private:
     std::vector<int> num_running_tokens_per_sp_;
 };
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

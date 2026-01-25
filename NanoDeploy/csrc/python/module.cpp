@@ -2,7 +2,7 @@
 
 namespace py = pybind11;
 
-#include "nanodeploy/logging.h"
+#include "nanocommon/logging.h"
 
 void bind_sequence_metric(py::module_& m);
 void bind_sequence(py::module_& m);
@@ -22,5 +22,5 @@ PYBIND11_MODULE(_nanodeploy_cpp, m)
     bind_scheduler_utils(m);
     bind_model_runner_utils(m);
 
-    m.def("set_log_level", &nanodeploy::set_log_level, "Set C++ backend log level");
+    m.def("set_log_level", &nanoinfra::set_log_level, "Set C++ backend log level");
 }

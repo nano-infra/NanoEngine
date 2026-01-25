@@ -12,7 +12,7 @@
 #include "opaque_types.h"
 
 namespace py = pybind11;
-using namespace nanodeploy;
+using namespace nanoinfra;
 
 namespace {
 

@@ -4,7 +4,7 @@
 #include <pybind11/stl.h>
 
 namespace py = pybind11;
-using namespace nanodeploy;
+using namespace nanoinfra;
 
 void bind_sequence_metric(py::module_& m)
 {

@@ -2,7 +2,7 @@
 #include <cmath>
 #include <iostream>
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 SequenceMetric::SequenceMetric(uint64_t seq_id, int num_prompt_tokens):
     seq_id(seq_id), num_prompt_tokens(num_prompt_tokens)
@@ -211,4 +211,4 @@ std::shared_ptr<SequenceMetric> SequenceMetric::setstate(const std::tuple<uint64
     return metric;
 }
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 // -----------------------------------------------------------------------------
 // Stack Trace Utility
@@ -132,33 +132,33 @@ inline void print_stack_trace()
 // Assertions
 // -----------------------------------------------------------------------------
 
-#define NANODEPLOY_ASSERT(Expr, Msg, ...)                                                                              \
+#define NANOINFRA_ASSERT(Expr, Msg, ...)                                                                               \
     {                                                                                                                  \
         if (!(Expr)) {                                                                                                 \
-            NANODEPLOY_CONSOLE_LOCK                                                                                    \
+            NANOINFRA_CONSOLE_LOCK                                                                                     \
             std::cerr << "\033[1;91m"                                                                                  \
                       << "[Assertion Failed]"                                                                          \
                       << "\033[m " << __FILE__ << ":" << __LINE__ << ": " << __FUNCTION__ << ", Expected: " << #Expr   \
                       << ". Error msg: " << Msg __VA_OPT__(STREAM_VAR_ARGS(__VA_ARGS__)) << std::endl;                 \
-            nanodeploy::print_stack_trace(); /* Dump stack before aborting */                                          \
+            nanoinfra::print_stack_trace(); /* Dump stack before aborting */                                           \
             abort();                                                                                                   \
         }                                                                                                              \
     }
 
-#define NANODEPLOY_ASSERT_EQ(A, B, Msg, ...) NANODEPLOY_ASSERT((A) == (B), Msg, __VA_ARGS__)
-#define NANODEPLOY_ASSERT_NE(A, B, Msg, ...) NANODEPLOY_ASSERT((A) != (B), Msg, __VA_ARGS__)
-#define NANODEPLOY_ASSERT_GT(A, B, Msg, ...) NANODEPLOY_ASSERT((A) > (B), Msg, __VA_ARGS__)
-#define NANODEPLOY_ASSERT_GE(A, B, Msg, ...) NANODEPLOY_ASSERT((A) >= (B), Msg, __VA_ARGS__)
-#define NANODEPLOY_ASSERT_LT(A, B, Msg, ...) NANODEPLOY_ASSERT((A) < (B), Msg, __VA_ARGS__)
-#define NANODEPLOY_ASSERT_LE(A, B, Msg, ...) NANODEPLOY_ASSERT((A) <= (B), Msg, __VA_ARGS__)
+#define NANOINFRA_ASSERT_EQ(A, B, Msg, ...) NANOINFRA_ASSERT((A) == (B), Msg, __VA_ARGS__)
+#define NANOINFRA_ASSERT_NE(A, B, Msg, ...) NANOINFRA_ASSERT((A) != (B), Msg, __VA_ARGS__)
+#define NANOINFRA_ASSERT_GT(A, B, Msg, ...) NANOINFRA_ASSERT((A) > (B), Msg, __VA_ARGS__)
+#define NANOINFRA_ASSERT_GE(A, B, Msg, ...) NANOINFRA_ASSERT((A) >= (B), Msg, __VA_ARGS__)
+#define NANOINFRA_ASSERT_LT(A, B, Msg, ...) NANOINFRA_ASSERT((A) < (B), Msg, __VA_ARGS__)
+#define NANOINFRA_ASSERT_LE(A, B, Msg, ...) NANOINFRA_ASSERT((A) <= (B), Msg, __VA_ARGS__)
 
-#define NANODEPLOY_ABORT(Msg, ...)                                                                                     \
+#define NANOINFRA_ABORT(Msg, ...)                                                                                      \
     {                                                                                                                  \
         std::cerr << "\033[1;91m"                                                                                      \
                   << "[Fatal]"                                                                                         \
                   << "\033[m " << __FILE__ << ":" << __LINE__ << ": " << __FUNCTION__ << ": "                          \
                   << Msg __VA_OPT__(STREAM_VAR_ARGS(__VA_ARGS__)) << std::endl;                                        \
-        nanodeploy::print_stack_trace();                                                                               \
+        nanoinfra::print_stack_trace();                                                                                \
         abort();                                                                                                       \
     }
 
@@ -166,7 +166,7 @@ inline void print_stack_trace()
 // Logging
 // -----------------------------------------------------------------------------
 
-#define NANODEPLOY_LOG_LEVEL(MsgType, FlagFormat, Level, ...)                                                          \
+#define NANOINFRA_LOG_LEVEL(MsgType, FlagFormat, Level, ...)                                                           \
     {                                                                                                                  \
         if (get_log_level() >= Level) {                                                                                \
             std::cerr << FlagFormat << "[" << MsgType << "]"                                                           \
@@ -176,14 +176,14 @@ inline void print_stack_trace()
     }
 
 // Error and Warn
-#define NANODEPLOY_LOG_ERROR(...) NANODEPLOY_LOG_LEVEL("ERROR", "\033[1;91m", 0, __VA_ARGS__)
-#define NANODEPLOY_LOG_WARN(...) NANODEPLOY_LOG_LEVEL("WARN", "\033[1;91m", 1, __VA_ARGS__)
+#define NANOINFRA_LOG_ERROR(...) NANOINFRA_LOG_LEVEL("ERROR", "\033[1;91m", 0, __VA_ARGS__)
+#define NANOINFRA_LOG_WARN(...) NANOINFRA_LOG_LEVEL("WARN", "\033[1;91m", 1, __VA_ARGS__)
 
 // Info
-#define NANODEPLOY_LOG_INFO(...) NANODEPLOY_LOG_LEVEL("INFO", "\033[1;92m", 1, __VA_ARGS__)
+#define NANOINFRA_LOG_INFO(...) NANOINFRA_LOG_LEVEL("INFO", "\033[1;92m", 1, __VA_ARGS__)
 
 // Debug
-#define NANODEPLOY_LOG_DEBUG(...) NANODEPLOY_LOG_LEVEL("DEBUG", "\033[1;92m", 2, __VA_ARGS__)
+#define NANOINFRA_LOG_DEBUG(...) NANOINFRA_LOG_LEVEL("DEBUG", "\033[1;92m", 2, __VA_ARGS__)
 
 // -----------------------------------------------------------------------------
 // Log Level
@@ -192,4 +192,4 @@ inline void print_stack_trace()
 int  get_log_level();
 void set_log_level(int level);
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

@@ -4,7 +4,7 @@
 #include "nanodeploy/worker/model_runner_utils.h"
 
 namespace py = pybind11;
-using namespace nanodeploy;
+using namespace nanoinfra;
 
 void bind_model_runner_utils(py::module_& m)
 {

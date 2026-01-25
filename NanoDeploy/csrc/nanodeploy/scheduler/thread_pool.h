@@ -10,7 +10,7 @@
 #include <thread>
 #include <vector>
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 class ThreadPool {
 public:
@@ -88,4 +88,4 @@ inline ThreadPool::~ThreadPool()
         worker.join();
 }
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

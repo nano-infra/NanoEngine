@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 class Block {
 public:
@@ -19,4 +19,4 @@ public:
     std::vector<int> token_ids;
 };
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 class SequenceMetric {
 public:
@@ -77,4 +77,4 @@ private:
     static double current_time();
 };
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

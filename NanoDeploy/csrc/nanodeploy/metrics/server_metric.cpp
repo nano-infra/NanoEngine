@@ -5,7 +5,7 @@
 #include <numeric>
 #include <sstream>
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 double ServerMetric::current_time()
 {
@@ -199,4 +199,4 @@ std::string ServerMetric::get_metric_report(bool include_detailed) const
     return ss.str();
 }
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

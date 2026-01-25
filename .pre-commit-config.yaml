@@ -24,11 +24,20 @@ repos:
           - mdformat-openmmlab
           - mdformat_frontmatter
           - linkify-it-py
+
   - repo: https://github.com/codespell-project/codespell
     rev: v2.1.0
     hooks:
       - id: codespell
-        args: ["--skip=docs/imgs/*,csrc/json.hpp,csrc/python/pybind_json/pybind_json.hpp"]
+        args: ["-L", "CANN,cann"]
+        # 使用 Python 正则表达式语法
+        # (?x) 是开启 verbose 模式，允许换行写正则，更清晰
+        exclude: >
+          (?x)^(
+              .*/docs/imgs/.*|          # 忽略任何目录下的 docs/imgs/ 及其内容
+              .*/json\.hpp|             # 忽略任何目录下的 json.hpp
+              .*/pybind_json\.hpp       # 忽略任何目录下的 pybind_json.hpp
+          )$
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.6
@@ -36,6 +45,7 @@ repos:
       - id: clang-format
         args: ["--style=file"]
         files: \.(cpp|hpp|c|h|cu|cuh)$
+        exclude: '(?i).*(json|jring|dlpack|gloo|ibgda_device\.cuh).*'
 
   # - repo: https://github.com/myint/docformatter
   #   rev: v1.4

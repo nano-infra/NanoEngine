@@ -7,7 +7,7 @@
 
 #include "sp_state_manager.h"
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 SPStateManager::SPStateManager(const std::string& engine_id,
                                int                attention_sp,
@@ -305,4 +305,4 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
     num_running_tokens_per_sp_[master_sp_idx] -= seq.num_tokens;
 }
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra

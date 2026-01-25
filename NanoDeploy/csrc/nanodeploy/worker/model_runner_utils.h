@@ -5,7 +5,7 @@
 
 #include "nanodeploy/sequence/sequence.h"
 
-namespace nanodeploy {
+namespace nanoinfra {
 
 struct PrefillMetadata {
     std::vector<int64_t> input_ids;
@@ -62,4 +62,4 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
 
 void update_seqs_inner_loop(const std::vector<Sequence*>& sp_seqs, int sp_rank);
 
-}  // namespace nanodeploy
+}  // namespace nanoinfra
