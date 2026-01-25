@@ -30,8 +30,6 @@ repos:
     hooks:
       - id: codespell
         args: ["-L", "CANN,cann"]
-        # 使用 Python 正则表达式语法
-        # (?x) 是开启 verbose 模式，允许换行写正则，更清晰
         exclude: >
           (?x)^(
               .*/docs/imgs/.*|          # 忽略任何目录下的 docs/imgs/ 及其内容
