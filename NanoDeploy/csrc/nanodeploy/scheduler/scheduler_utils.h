@@ -10,7 +10,7 @@
 #include "sp_state_manager.h"
 #include "thread_pool.h"
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 // Return type: vector<pair<sequence pointer, target DP index>>
 // Corresponds to Python return type: List[Tuple[Sequence, int]]
@@ -26,4 +26,4 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
                                     bool                                              update_metrics,
                                     ThreadPool*                                       thread_pool = nullptr);
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

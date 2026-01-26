@@ -9,7 +9,7 @@
 
 #include "scheduler.h"
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 Scheduler::Scheduler(const std::string& engine_id,
                      int                loop_count,
@@ -524,4 +524,4 @@ void Scheduler::free_to_be_migrated(const std::vector<std::shared_ptr<Sequence>>
     }
 }
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

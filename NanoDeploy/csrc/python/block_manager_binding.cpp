@@ -5,7 +5,7 @@
 #include "nanodeploy/sequence/sequence.h"
 
 namespace py = pybind11;
-using namespace nanoinfra;
+using namespace nanodeploy;
 
 void bind_block_manager(py::module_& m)
 {

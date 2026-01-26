@@ -14,7 +14,7 @@ add_library(
 
 target_compile_options(_nanodeploy_scheduler PRIVATE -O3 -Wall -Wextra)
 
-target_link_libraries(_nanodeploy_scheduler PRIVATE _nanodeploy_metrics _nanodeploy_sequence nanodeploy_logger)
+target_link_libraries(_nanodeploy_scheduler PRIVATE _nanodeploy_metrics _nanodeploy_sequence nanocommon)
 
 set_target_properties(
     _nanodeploy_scheduler

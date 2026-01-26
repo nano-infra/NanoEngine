@@ -6,7 +6,7 @@
 #include <pybind11/stl_bind.h>
 
 namespace py = pybind11;
-using namespace nanoinfra;
+using namespace nanodeploy;
 
 // Make opaque types for Scheduler's containers
 PYBIND11_MAKE_OPAQUE(std::deque<std::shared_ptr<Sequence>>);

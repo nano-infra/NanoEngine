@@ -22,5 +22,5 @@ PYBIND11_MODULE(_nanodeploy_cpp, m)
     bind_scheduler_utils(m);
     bind_model_runner_utils(m);
 
-    m.def("set_log_level", &nanoinfra::set_log_level, "Set C++ backend log level");
+    m.def("set_log_level", &nanocommon::set_log_level, "Set C++ backend log level");
 }

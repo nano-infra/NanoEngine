@@ -257,7 +257,7 @@ class ModelRunner:
         seqs = []
         for _ in range(num_seqs):
             seq = Sequence(
-                list(np.random.randint(low=0, high=10000, size=max_model_len))
+                list(np.random.randint(low=0, high=10000, size=max_model_len)),
             )
             # seq = Sequence(
             #     list(np.zeros(max_model_len, dtype=int))
@@ -562,7 +562,7 @@ class ModelRunner:
                 seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
                 == get_dist_context().attn_sp_rank
             ):
-                temperatures.append(seq.temperature)
+                temperatures.append(seq.sampling_params.temperature)
         temperatures = torch.tensor(
             temperatures, dtype=torch.float32, pin_memory=True
         ).cuda(non_blocking=True)

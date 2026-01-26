@@ -11,7 +11,7 @@
 #include "block.h"
 #include "nanodeploy/sequence/sequence.h"
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 class Sequence;
 
@@ -60,4 +60,4 @@ private:
     std::unordered_set<int>               used_block_ids_;
 };
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

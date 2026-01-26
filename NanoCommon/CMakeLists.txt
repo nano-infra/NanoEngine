@@ -18,7 +18,7 @@ target_include_directories(nanocommon INTERFACE
 )
 
 target_link_libraries(nanocommon INTERFACE
-    dl_static # if dlopen used in stacktrace?
+    dl # For backtrace/dlopen
 )
 
 # Installation (optional, if valid install prefix)

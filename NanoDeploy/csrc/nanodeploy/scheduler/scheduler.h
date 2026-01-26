@@ -13,7 +13,7 @@
 #include "sp_state_manager.h"
 #include "thread_pool.h"
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 // Forward declaration
 class MetricsManager;
@@ -143,4 +143,4 @@ private:
     std::unique_ptr<ThreadPool> thread_pool_;
 };
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

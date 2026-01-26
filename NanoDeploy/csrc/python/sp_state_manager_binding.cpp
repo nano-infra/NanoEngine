@@ -5,7 +5,7 @@
 #include <pybind11/stl_bind.h>
 
 namespace py = pybind11;
-using namespace nanoinfra;
+using namespace nanodeploy;
 
 // Bind the map and deque types
 PYBIND11_MAKE_OPAQUE(std::unordered_map<int, std::shared_ptr<BlockManager>>);

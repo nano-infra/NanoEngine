@@ -6,7 +6,7 @@
 
 #include "sequence.h"
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 // BlockContext Implementation
 
@@ -82,10 +82,10 @@ BlockContext BlockContext::setstate(const std::tuple<std::string,
 
 std::atomic<uint64_t> Sequence::next_seq_id_{0};
 
-Sequence::Sequence(const std::vector<int>& token_ids, double temperature, int max_tokens, bool ignore_eos):
-    token_ids(token_ids), temperature(temperature), max_tokens(max_tokens), ignore_eos(ignore_eos)
+Sequence::Sequence(const std::vector<int>& token_ids, const SamplingParams& sampling_params):
+    token_ids(token_ids), sampling_params(sampling_params)
 {
-    this->token_ids.reserve(max_tokens);
+    this->token_ids.reserve(sampling_params.max_tokens);
     this->token_ids = token_ids;
 
     seq_id     = next_seq_id_.fetch_add(1);
@@ -201,4 +201,4 @@ std::vector<int> Sequence::completion_token_ids() const
     return std::vector<int>(token_ids.begin() + num_prompt_tokens, token_ids.end());
 }
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

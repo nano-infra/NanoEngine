@@ -40,6 +40,8 @@ class LLMEngine:
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
+        print("eos:", config.eos)
+
         self.scheduler = Scheduler(config)
         logger.info(
             f"Initialized Scheduler with RoutingStrategy: {self.scheduler.routing_strategy}"
@@ -205,6 +207,7 @@ class LLMEngine:
                         self.metrics_manager.complete_sequence(seq.seq_id)
                     outputs.append(seq)
         return (
+            dp_seqs,
             outputs,
             num_tokens,
             sum(len(seqs) for seqs in dp_seqs),
@@ -242,7 +245,7 @@ class LLMEngine:
 
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens, bs, sch_latency, post_sch_latency = self.step()
+            dp_seqs, output, num_tokens, bs, sch_latency, post_sch_latency = self.step()
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)

@@ -3,43 +3,42 @@
 #include "sequence_generated.h"
 #include "serialization.h"
 #include <flatbuffers/flatbuffers.h>
-#include <format>
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 namespace {
 
-flatbuffers::Offset<nanoinfra::fbs::BlockContext> pack_block_context(flatbuffers::FlatBufferBuilder& builder,
-                                                                     const BlockContext&             ctx)
+flatbuffers::Offset<nanodeploy::fbs::BlockContext> pack_block_context(flatbuffers::FlatBufferBuilder& builder,
+                                                                      const BlockContext&             ctx)
 {
     auto engine_id_off = builder.CreateString(ctx.engine_id_);
 
-    std::vector<nanoinfra::fbs::BlockLocation> locs;
-    auto                                       loc_vec_off = builder.CreateVectorOfStructs(locs);
+    std::vector<nanodeploy::fbs::BlockLocation> locs;
+    auto                                        loc_vec_off = builder.CreateVectorOfStructs(locs);
 
     auto disp_vec_off = builder.CreateVector(ctx.num_dispatched_tokens);
 
     // Vector<IntList> (nested vectors for sp_block_table)
-    std::vector<flatbuffers::Offset<nanoinfra::fbs::IntList>> int_list_offs;
+    std::vector<flatbuffers::Offset<nanodeploy::fbs::IntList>> int_list_offs;
     int_list_offs.reserve(ctx.sp_block_table.size());
     for (const auto& inner : ctx.sp_block_table) {
         auto inner_vec = builder.CreateVector(inner);
-        int_list_offs.push_back(nanoinfra::fbs::CreateIntList(builder, inner_vec));
+        int_list_offs.push_back(nanodeploy::fbs::CreateIntList(builder, inner_vec));
     }
     auto sp_block_table_off = builder.CreateVector(int_list_offs);
 
-    return nanoinfra::fbs::CreateBlockContext(builder,
-                                              engine_id_off,
-                                              ctx.dp_idx_,
-                                              ctx.master_sp_idx_,
-                                              ctx.attention_sp_,
-                                              ctx.attention_dp_,
-                                              loc_vec_off,
-                                              disp_vec_off,
-                                              sp_block_table_off);
+    return nanodeploy::fbs::CreateBlockContext(builder,
+                                               engine_id_off,
+                                               ctx.dp_idx_,
+                                               ctx.master_sp_idx_,
+                                               ctx.attention_sp_,
+                                               ctx.attention_dp_,
+                                               loc_vec_off,
+                                               disp_vec_off,
+                                               sp_block_table_off);
 }
 
-void unpack_block_context(const nanoinfra::fbs::BlockContext* fb_ctx, BlockContext& ctx)
+void unpack_block_context(const nanodeploy::fbs::BlockContext* fb_ctx, BlockContext& ctx)
 {
     if (!fb_ctx)
         return;
@@ -87,9 +86,9 @@ size_t serialize_sequences(uintptr_t                                     data_pt
                            bool                                          is_prefill)
 {
     flatbuffers::FlatBufferBuilder builder(buffer_size);
-    NANOINFRA_LOG_INFO("serializing seqs, is_prefill=", is_prefill);
+    // NANOCOMMON_LOG_INFO("serializing seqs, is_prefill=", is_prefill);
 
-    std::vector<flatbuffers::Offset<nanoinfra::fbs::Sequence>> seq_offsets;
+    std::vector<flatbuffers::Offset<nanodeploy::fbs::Sequence>> seq_offsets;
     seq_offsets.reserve(seqs.size());
 
     size_t total_token_bytes       = 0;
@@ -105,13 +104,10 @@ size_t serialize_sequences(uintptr_t                                     data_pt
         const auto& seq = *seq_ptr;
 
         flatbuffers::Offset<flatbuffers::Vector<int>> token_ids_off;
-        if (is_prefill) {
-            token_ids_off = builder.CreateVector(seq.token_ids);
-            total_token_bytes += seq.token_ids.size() * sizeof(int);
-        }
-        else {
-            token_ids_off = builder.CreateVector(std::vector<int>{});
-        }
+        // Always serialize token_ids to ensure downstream consumers (Engine/Workers) have full context
+        // This fixes ZeroDivisionError in quantization kernels which likely derived shapes from token count
+        token_ids_off = builder.CreateVector(seq.token_ids);
+        total_token_bytes += seq.token_ids.size() * sizeof(int);
 
         const auto& ctx = seq.slots_[(size_t)BlockContextSlot::ACTIVE];
 
@@ -122,44 +118,42 @@ size_t serialize_sequences(uintptr_t                                     data_pt
             total_block_table_bytes += inner.size() * sizeof(int);
         }
 
-        std::vector<flatbuffers::Offset<nanoinfra::fbs::BlockContext>> slot_offsets;
+        std::vector<flatbuffers::Offset<nanodeploy::fbs::BlockContext>> slot_offsets;
         slot_offsets.push_back(pack_block_context(builder, seq.slots_[(size_t)BlockContextSlot::ACTIVE]));
         auto slots_vec_off = builder.CreateVector(slot_offsets);
 
-        auto seq_off = nanoinfra::fbs::CreateSequence(builder,
-                                                      seq.seq_id,
-                                                      static_cast<nanoinfra::fbs::SequenceStatus>(seq.status),
-                                                      seq.temperature,
-                                                      seq.max_tokens,
-                                                      seq.ignore_eos,
-                                                      seq.last_token,
-                                                      seq.num_tokens,
-                                                      seq.num_prompt_tokens,
-                                                      seq.num_checkpointed_tokens,
-                                                      seq.num_cached_tokens,
-                                                      token_ids_off,
-                                                      slots_vec_off);
+        auto sampling_params_off = nanodeploy::fbs::CreateSamplingParams(
+            builder, seq.sampling_params.temperature, seq.sampling_params.max_tokens, seq.sampling_params.ignore_eos);
+
+        auto seq_off = nanodeploy::fbs::CreateSequence(builder,
+                                                       seq.seq_id,
+                                                       static_cast<nanodeploy::fbs::SequenceStatus>(seq.status),
+                                                       sampling_params_off,
+                                                       seq.last_token,
+                                                       seq.num_tokens,
+                                                       seq.num_prompt_tokens,
+                                                       seq.num_checkpointed_tokens,
+                                                       seq.num_cached_tokens,
+                                                       token_ids_off,
+                                                       slots_vec_off);
         seq_offsets.push_back(seq_off);
     }
 
-    NANOINFRA_LOG_INFO(std::format(
-        "Serialization Breakdown: Tokens={} B, BlockLocs={} B, BlockTables(Content)={} B, BlockTables(Count)={}, EngineID={} B, DispTokens={} B",
-        total_token_bytes,
-        total_block_loc_bytes,
-        total_block_table_bytes,
-        total_inner_lists,
-        total_engine_id_bytes,
-        total_disp_token_bytes));
+    // NANOCOMMON_LOG_INFO("Serialization Breakdown: Tokens=" + std::to_string(total_token_bytes)
+    //                     + " B, BlockLocs=" + std::to_string(total_block_loc_bytes) + " B, BlockTables(Content)="
+    //                     + std::to_string(total_block_table_bytes) + " B, BlockTables(Count)="
+    //                     + std::to_string(total_inner_lists) + " B, EngineID=" + std::to_string(total_engine_id_bytes)
+    //                     + " B, DispTokens=" + std::to_string(total_disp_token_bytes) + " B");
 
-    auto seq_list_off = nanoinfra::fbs::CreateSequenceList(builder, builder.CreateVector(seq_offsets));
+    auto seq_list_off = nanodeploy::fbs::CreateSequenceList(builder, builder.CreateVector(seq_offsets));
 
     builder.Finish(seq_list_off);
 
     // Copy to output
     size_t size = builder.GetSize();
     if (size > buffer_size) {
-        NANOINFRA_ABORT("Buffer Overflow: Serialized size " + std::to_string(size) + " > buffer size "
-                        + std::to_string(buffer_size));
+        NANOCOMMON_ABORT("Buffer Overflow: Serialized size " + std::to_string(size) + " > buffer size "
+                         + std::to_string(buffer_size));
     }
 
     std::memcpy(reinterpret_cast<void*>(data_ptr), builder.GetBufferPointer(), size);
@@ -172,11 +166,11 @@ std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr,
 
     // Verify
     flatbuffers::Verifier verifier(buffer, data_len);
-    if (!nanoinfra::fbs::VerifySequenceListBuffer(verifier)) {
+    if (!nanodeploy::fbs::VerifySequenceListBuffer(verifier)) {
         throw std::runtime_error("Invalid FlatBuffer: SequenceList verification failed");
     }
 
-    const auto* seq_list  = nanoinfra::fbs::GetSequenceList(buffer);
+    const auto* seq_list  = nanodeploy::fbs::GetSequenceList(buffer);
     const auto* sequences = seq_list->sequences();
 
     std::vector<std::shared_ptr<Sequence>> result;
@@ -192,8 +186,14 @@ std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr,
             token_ids.assign(tids->begin(), tids->end());
         }
 
-        auto seq =
-            std::make_shared<Sequence>(token_ids, fb_seq->temperature(), fb_seq->max_tokens(), fb_seq->ignore_eos());
+        SamplingParams sampling_params;
+        if (auto sp = fb_seq->sampling_params()) {
+            sampling_params.temperature = sp->temperature();
+            sampling_params.max_tokens  = sp->max_tokens();
+            sampling_params.ignore_eos  = sp->ignore_eos();
+        }
+
+        auto seq = std::make_shared<Sequence>(token_ids, sampling_params);
 
         seq->seq_id                  = fb_seq->seq_id();
         seq->status                  = static_cast<SequenceStatus>(fb_seq->status());
@@ -202,6 +202,17 @@ std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr,
         seq->num_prompt_tokens       = fb_seq->num_prompt_tokens();
         seq->num_checkpointed_tokens = fb_seq->num_checkpointed_tokens();
         seq->num_cached_tokens       = fb_seq->num_cached_tokens();
+
+        // Ensure last_token is consistent if token_ids is not empty
+        if (!seq->token_ids.empty()) {
+            seq->last_token = seq->token_ids.back();
+        }
+
+        NANOCOMMON_LOG_DEBUG(
+            "Deserialized Sequence: ID=" + std::to_string(seq->seq_id) + " Status=" + std::to_string((int)seq->status)
+            + " LastToken=" + std::to_string(seq->last_token) + " NumTokens=" + std::to_string(seq->num_tokens)
+            + " NumPrompt=" + std::to_string(seq->num_prompt_tokens) + " NumChpt="
+            + std::to_string(seq->num_checkpointed_tokens) + " NumCached=" + std::to_string(seq->num_cached_tokens));
 
         // Slots
         if (auto slots = fb_seq->slots()) {
@@ -216,4 +227,4 @@ std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr,
     return result;
 }
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

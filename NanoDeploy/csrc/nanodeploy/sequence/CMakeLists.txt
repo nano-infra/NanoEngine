@@ -39,7 +39,7 @@ add_library(
 target_compile_options(_nanodeploy_sequence PRIVATE -O3 -Wall -Wextra)
 
 # Link flatbuffers (header only or static lib)
-target_link_libraries(_nanodeploy_sequence PRIVATE flatbuffers nanodeploy_logger)
+target_link_libraries(_nanodeploy_sequence PRIVATE flatbuffers nanocommon)
 
 # Include generated header directory
 target_include_directories(_nanodeploy_sequence PRIVATE ${GEN_HEADER_DIR})

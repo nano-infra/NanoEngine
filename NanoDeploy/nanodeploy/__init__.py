@@ -1,2 +1,7 @@
-from nanodeploy.llm import LLM
-from nanodeploy.sampling_params import SamplingParams
+from .llm import LLM
+from .sampling_params import SamplingParams
+
+__all__ = [
+    "LLM",
+    "SamplingParams",
+]

@@ -2,16 +2,13 @@
 
 #include <array>
 #include <atomic>
-#include <iomanip>
 #include <memory>
 #include <optional>
-#include <random>
-#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 // Forward declaration
 class SequenceMetric;
@@ -101,14 +98,17 @@ struct OptionalStringHash {
     }
 };
 
+struct SamplingParams {
+    double temperature = 1.0;
+    int    max_tokens  = 256;
+    bool   ignore_eos  = false;
+};
+
 class Sequence {
 public:
     static constexpr int block_size = 256;
 
-    Sequence(const std::vector<int>& token_ids,
-             double                  temperature = 1.0,
-             int                     max_tokens  = 256,
-             bool                    ignore_eos  = false);
+    Sequence(const std::vector<int>& token_ids, const SamplingParams& sampling_params = {});
 
     // Jumping
     int32_t active(const std::string& engine_id, int attention_sp, int attention_dp)
@@ -185,23 +185,17 @@ public:
         return num_cached_tokens / block_size;
     }
 
-    using StateTuple =
-        std::tuple<int,
-                   int,
-                   int,
-                   std::optional<std::string>,
-                   std::optional<std::string>,
-                   std::array<BlockContext, (size_t)BlockContextSlot::_COUNT>,
-                   double,
-                   std::vector<int>,  // We will always return full token_ids for simplicity in C++ or handle the logic
-                   int                // last_token, used if we don't return full token_ids?
-                        // Python logic: if num_generated_tokens_since_checkpoint == 0: token_ids else: last_token
-                        // We can use a variant or just return both and ignore one.
-                        // Let's stick to Python's tuple structure. It returns a tuple where the last element varies.
-                        // In C++, we can't easily return a tuple with varying types.
-                        // We will return a custom struct or handle it in binding.
-                        // Let's define a specific getstate for binding.
-                   >;
+    using StateTuple = std::tuple<int,
+                                  int,
+                                  int,
+                                  std::optional<std::string>,
+                                  std::optional<std::string>,
+                                  std::array<BlockContext, (size_t)BlockContextSlot::_COUNT>,
+                                  double,
+                                  std::vector<int>,
+                                  int,
+                                  int,
+                                  bool>;
 
     // Public members
     uint64_t         seq_id;
@@ -215,9 +209,7 @@ public:
 
     std::shared_ptr<SequenceMetric> metric;
 
-    double temperature;
-    int    max_tokens;
-    bool   ignore_eos;
+    SamplingParams sampling_params;
 
     std::array<BlockContext, (size_t)BlockContextSlot::_COUNT> slots_;
 
@@ -225,4 +217,4 @@ private:
     static std::atomic<uint64_t> next_seq_id_;
 };
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

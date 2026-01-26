@@ -1,6 +1,6 @@
 #include "block.h"
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 Block::Block(int block_id, int block_size): block_id(block_id)
 {
@@ -26,4 +26,4 @@ void Block::reset()
     token_ids.clear();
 }
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

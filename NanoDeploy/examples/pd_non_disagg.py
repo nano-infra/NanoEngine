@@ -11,7 +11,7 @@ def main():
     path = os.path.expanduser("/models/model--Qwen--Qwen3-30B-A3B-FP8")
     tokenizer = AutoTokenizer.from_pretrained(path)
     config = Config(
-        path,
+        model=path,
         enforce_eager=True,
         attention_dp=8,
         attention_sp=1,
@@ -28,7 +28,7 @@ def main():
     )
     llm = LLM(config)
 
-    sampling_params = SamplingParams(temperature=0, max_tokens=128, ignore_eos=False)
+    sampling_params = SamplingParams()
     prompts = [
         "Help me write a script for oh-my-zsh install configuration.",
     ]

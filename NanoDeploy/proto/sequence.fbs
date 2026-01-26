@@ -30,12 +30,16 @@ table BlockContext {
   sp_block_table: [IntList];
 }
 
-table Sequence {
-  seq_id: uint64;
-  status: SequenceStatus;
+table SamplingParams {
   temperature: double;
   max_tokens: int;
   ignore_eos: bool;
+}
+
+table Sequence {
+  seq_id: uint64;
+  status: SequenceStatus;
+  sampling_params: SamplingParams;
   last_token: int;
   num_tokens: int;
   num_prompt_tokens: int;
@@ -48,6 +52,12 @@ table Sequence {
 
 table SequenceList {
   sequences: [Sequence];
+}
+
+table StepOut {
+  seq_id: uint64;
+  token_id: uint;
+  status: SequenceStatus;
 }
 
 root_type SequenceList;

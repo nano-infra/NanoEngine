@@ -7,7 +7,7 @@
 
 #include "block_manager.h"
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 BlockManager::BlockManager(const std::string& engine_id, int sp_idx, int num_blocks, int block_size):
     engine_id_(engine_id), sp_idx_(sp_idx), block_size_(block_size)
@@ -180,4 +180,4 @@ bool BlockManager::may_append(Sequence& seq, int num_tokens)
     return true;
 }
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

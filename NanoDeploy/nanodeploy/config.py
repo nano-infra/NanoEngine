@@ -1,7 +1,7 @@
 import os
-from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
+from pydantic import BaseModel, Field, model_validator
 from transformers import AutoConfig
 
 from nanodeploy.logging import get_logger
@@ -9,9 +9,8 @@ from nanodeploy.logging import get_logger
 logger = get_logger("nanodeploy")
 
 
-@dataclass
-class Config:
-    model: str
+class Config(BaseModel):
+    model: str = Field(..., description="Path to the model")
 
     # scheduler config
     loop_count: int = 16
@@ -20,7 +19,7 @@ class Config:
     max_num_recv_seqs: int = 32
     max_model_len: int = 16384
     gpu_memory_utilization: float = 0.9
-    gpu_memory_limit_gb: float | None = None
+    gpu_memory_limit_gb: Optional[float] = None
     routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
 
     # parallel config
@@ -39,12 +38,14 @@ class Config:
     num_kvcache_blocks: int = 15000
 
     # deployment config
-    engine_id: str | None = None
+    engine_id: Optional[str] = None
     mode: Literal["prefill", "decode", "hybrid"] = "hybrid"
+    host: str = "0.0.0.0"
+    port: int = 5000
 
-    dummy_prefill: bool | None = False
-    dummy_weight: bool | None = False
-    perfect_eplb: bool | None = False
+    dummy_prefill: Optional[bool] = False
+    dummy_weight: Optional[bool] = False
+    perfect_eplb: Optional[bool] = False
 
     # dist config
     master_address: str = "127.0.0.1:6006"
@@ -62,33 +63,41 @@ class Config:
     # logging config
     log_level: str = "CRITICAL"
 
-    def __post_init__(self):
-        try:
-            assert os.path.isdir(self.model)
-            self.hf_config = AutoConfig.from_pretrained(self.model)
-            if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
-                assert self.kvcache_block_size == 64
-                assert self.attention_tp == 1
-            else:
-                assert self.kvcache_block_size % 256 == 0
-                assert 1 <= self.attention_tp <= 8
-            # self.max_model_len = max(
-            #     self.max_model_len, self.hf_config.max_position_embeddings
-            # )
+    @model_validator(mode="after")
+    def validate_config(self) -> "Config":
+        # Remove isdir check to support HF Hub IDs
+        # assert os.path.isdir(self.model)
+
+        self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+
+        if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+            assert self.kvcache_block_size == 64
+            assert self.attention_tp == 1
+        else:
+            assert self.kvcache_block_size % 256 == 0
+            assert 1 <= self.attention_tp <= 8
+
+        if self.attention_sp == 1:
+            self.max_num_recv_seqs = 0
+
+        # Update hf_config max_position_embeddings
+        if hasattr(self.hf_config, "max_position_embeddings"):
             self.hf_config.max_position_embeddings = max(
                 self.max_model_len, self.hf_config.max_position_embeddings
             )
-            assert self.max_num_batched_tokens >= self.max_model_len
+        else:
+            # Fallback if attribute doesn't exist? or set it?
+            # Usually causal LMs have it.
+            self.hf_config.max_position_embeddings = self.max_model_len
 
-            if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
-                # MLA requires num_kv_heads == 1
+        assert self.max_num_batched_tokens >= self.max_model_len
 
-                if hasattr(self.hf_config, "num_key_value_heads"):
-                    self.hf_config.num_key_value_heads = 1
-        except:
-            logger.warning(
-                "Failed to load model from config, may cause unexpected behavior."
-            )
+        if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+            # MLA requires num_kv_heads == 1
+            if hasattr(self.hf_config, "num_key_value_heads"):
+                self.hf_config.num_key_value_heads = 1
+
+        return self
 
     @property
     def attn_world_size(self):

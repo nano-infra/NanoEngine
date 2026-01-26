@@ -29,12 +29,12 @@ repos:
     rev: v2.1.0
     hooks:
       - id: codespell
-        args: ["-L", "CANN,cann"]
+        args: ["-L", "CANN,cann,crate"]
         exclude: >
           (?x)^(
-              .*/docs/imgs/.*|          # 忽略任何目录下的 docs/imgs/ 及其内容
-              .*/json\.hpp|             # 忽略任何目录下的 json.hpp
-              .*/pybind_json\.hpp       # 忽略任何目录下的 pybind_json.hpp
+              .*/docs/imgs/.*|
+              .*/json\.hpp|
+              .*/pybind_json\.hpp
           )$
 
   - repo: https://github.com/pre-commit/mirrors-clang-format

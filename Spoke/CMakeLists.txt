@@ -26,7 +26,11 @@ set(BUILD_BENCH OFF CACHE BOOL "Disable Benchmarks" FORCE)
 # This allows RDMA to work on CPU-only processes (e.g., EngineActor)
 set(USE_CUDA OFF CACHE BOOL "DLSlime: Disable CUDA" FORCE)
 if(NOT TARGET dlslime)
-    add_subdirectory(third_party/DLSlime)
+    add_subdirectory(../DLSlime DLSlime)
+endif()
+
+if(NOT TARGET nanocommon)
+    add_subdirectory(../NanoCommon NanoCommon)
 endif()
 
 # Header files installation
@@ -56,6 +60,14 @@ write_basic_package_version_file(
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
 )
+
+# Include nanocommon in SpokeTargets so that Spoke::core can depend on it in the export
+if(TARGET nanocommon)
+    install(TARGETS nanocommon
+        EXPORT SpokeTargets
+        INCLUDES DESTINATION include
+    )
+endif()
 
 install(EXPORT SpokeTargets
     FILE SpokeTargets.cmake

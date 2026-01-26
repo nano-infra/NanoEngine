@@ -47,7 +47,7 @@ The schema focuses on essential fields required for decoding:
 ### Modern C++ Style
 
 - Updated `logging.h` and usage to support **C++20 `std::format`**.
-- Replaced explicit `std::cout` debugging with `NANODEPLOY_LOG_INFO(std::format(...))` for cleaner code and proper log level control.
+- Replaced explicit `std::cout` debugging with `NANOCOMMON_LOG_INFO(std::format(...))` for cleaner code and proper log level control.
 
 ### Python Integration
 

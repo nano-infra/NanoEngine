@@ -7,7 +7,7 @@
 
 #include "sp_state_manager.h"
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 SPStateManager::SPStateManager(const std::string& engine_id,
                                int                attention_sp,
@@ -40,11 +40,12 @@ void SPStateManager::initialize_dummy_seqs()
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
         std::vector<int> token_ids = {dis(gen)};
 
-        auto dummy_seq = std::make_shared<Sequence>(token_ids,
-                                                    1.0,   // temperature
-                                                    256,   // max_tokens
-                                                    false  // ignore_eos
-        );
+        SamplingParams sp;
+        sp.temperature = 1.0;
+        sp.max_tokens  = 256;
+        sp.ignore_eos  = false;
+
+        auto dummy_seq = std::make_shared<Sequence>(token_ids, sp);
         dummy_seq->active(engine_id_, attention_sp_, 1);
         dummy_seq->block_ctx().master_sp_idx_ = sp_idx;
 
@@ -305,4 +306,4 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
     num_running_tokens_per_sp_[master_sp_idx] -= seq.num_tokens;
 }
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

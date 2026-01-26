@@ -8,7 +8,7 @@
 
 #include "sequence.h"
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 /**
  * @brief 序列化一组 Sequence
@@ -31,4 +31,4 @@ size_t serialize_sequences(uintptr_t                                     data_pt
  */
 std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr, size_t data_len);
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

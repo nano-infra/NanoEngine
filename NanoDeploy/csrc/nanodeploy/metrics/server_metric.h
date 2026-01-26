@@ -6,7 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 class ServerMetric {
 public:
@@ -66,4 +66,4 @@ private:
     static double current_time();
 };
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

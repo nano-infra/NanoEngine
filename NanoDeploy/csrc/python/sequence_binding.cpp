@@ -12,7 +12,7 @@
 #include "opaque_types.h"
 
 namespace py = pybind11;
-using namespace nanoinfra;
+using namespace nanodeploy;
 
 namespace {
 
@@ -148,12 +148,16 @@ void bind_sequence(py::module_& m)
                                             std::vector<std::vector<int>>,
                                             std::vector<int>>& t) { return BlockContext::setstate(t); }));
 
+    py::class_<SamplingParams>(m, "SamplingParams")
+        .def(py::init<>())
+        .def_readwrite("temperature", &SamplingParams::temperature)
+        .def_readwrite("max_tokens", &SamplingParams::max_tokens)
+        .def_readwrite("ignore_eos", &SamplingParams::ignore_eos);
+
     py::class_<Sequence, std::shared_ptr<Sequence>>(m, "Sequence")
-        .def(py::init<const std::vector<int>&, double, int, bool>(),
+        .def(py::init<const std::vector<int>&, const SamplingParams&>(),
              py::arg("token_ids"),
-             py::arg("temperature") = 1.0,
-             py::arg("max_tokens")  = 256,
-             py::arg("ignore_eos")  = false)
+             py::arg("sampling_params") = SamplingParams())
         .def("active", &Sequence::active, py::arg("engine_id"), py::arg("attention_sp"), py::arg("attention_dp"))
         .def("migrate", &Sequence::migrate)
         .def("context_len", &Sequence::context_len, py::arg("engine_id"), py::arg("sp_idx") = std::nullopt)
@@ -186,9 +190,7 @@ void bind_sequence(py::module_& m)
         .def_readwrite("num_checkpointed_tokens", &Sequence::num_checkpointed_tokens)
         .def_readwrite("num_cached_tokens", &Sequence::num_cached_tokens)
         .def_readwrite("metric", &Sequence::metric)
-        .def_readwrite("temperature", &Sequence::temperature)
-        .def_readwrite("max_tokens", &Sequence::max_tokens)
-        .def_readwrite("ignore_eos", &Sequence::ignore_eos)
+        .def_readwrite("sampling_params", &Sequence::sampling_params)
 
         .def_property_readonly("is_finished", &Sequence::is_finished)
         .def_property_readonly("is_to_be_migrated", &Sequence::is_to_be_migrated)
@@ -233,13 +235,13 @@ void bind_sequence(py::module_& m)
                                        p.num_checkpointed_tokens,
                                        p.num_cached_tokens,
                                        p.slots_,
-                                       p.temperature,
+                                       p.sampling_params.temperature,
                                        p.token_ids,
                                        p.status,
                                        p.seq_id,
                                        p.num_prompt_tokens,
-                                       p.max_tokens,
-                                       p.ignore_eos);
+                                       p.sampling_params.max_tokens,
+                                       p.sampling_params.ignore_eos);
             },
             [](const std::tuple<int,
                                 int,
@@ -255,20 +257,23 @@ void bind_sequence(py::module_& m)
                 // Extract token_ids (always present now)
                 std::vector<int> token_ids = std::get<5>(t);
 
+                // Restore SamplingParams
+                SamplingParams sp;
+                sp.temperature = std::get<4>(t);
+                sp.max_tokens  = std::get<9>(t);
+                sp.ignore_eos  = std::get<10>(t);
+
                 // Reconstruct Sequence with full token history
-                auto seq = std::make_shared<Sequence>(token_ids);
+                auto seq = std::make_shared<Sequence>(token_ids, sp);
 
                 // Restore other fields
                 seq->num_tokens              = std::get<0>(t);
                 seq->num_checkpointed_tokens = std::get<1>(t);
                 seq->num_cached_tokens       = std::get<2>(t);
                 seq->slots_                  = std::move(std::get<3>(t));
-                seq->temperature             = std::get<4>(t);
                 seq->status                  = std::get<6>(t);
                 seq->seq_id                  = std::get<7>(t);
                 seq->num_prompt_tokens       = std::get<8>(t);
-                seq->max_tokens              = std::get<9>(t);
-                seq->ignore_eos              = std::get<10>(t);
 
                 // Ensure last_token is consistent if token_ids is not empty
                 if (!seq->token_ids.empty()) {

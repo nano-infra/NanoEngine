@@ -12,7 +12,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(path)
 
     decode_config = Config(
-        path,
+        model=path,
         enforce_eager=False,
         attention_dp=1,
         attention_sp=8,
@@ -35,7 +35,7 @@ def main():
     decode = LLM.as_remote(decode_config)
 
     prefill_config = Config(
-        path,
+        model=path,
         enforce_eager=True,
         loop_count=1,
         attention_dp=8,

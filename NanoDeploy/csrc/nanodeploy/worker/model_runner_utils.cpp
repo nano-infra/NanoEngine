@@ -5,7 +5,7 @@
 
 #include "model_runner_utils.h"
 
-namespace nanoinfra {
+namespace nanodeploy {
 
 static void build_block_tables_packed(const std::vector<Sequence*>& dp_seqs,
                                       int                           sp_rank,
@@ -318,4 +318,4 @@ void update_seqs_inner_loop(const std::vector<Sequence*>& sp_seqs, int sp_rank)
     }
 }
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy

@@ -1,19 +1,16 @@
 
 #include <algorithm>
 #include <exception>
-#include <iostream>
-#include <string>
-#include <thread>
-#include <unordered_set>
 
 #include "nanodeploy/metrics/sequence_metric.h"
+#include "nanodeploy/scheduler/sp_state_manager.h"
 #include "nanodeploy/sequence/sequence.h"
 
 #include "thread_pool.h"
 
-#include "scheduler_utils.h"
+namespace nanodeploy {
 
-namespace nanoinfra {
+using MigrationList = std::vector<std::pair<std::shared_ptr<Sequence>, int>>;
 
 struct Task {
     std::shared_ptr<Sequence> seq;
@@ -74,8 +71,8 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                     }
                 }
 
-                bool finished =
-                    (!seq->ignore_eos && token_id == eos_id) || (seq->num_completed_tokens() == seq->max_tokens);
+                bool finished = (!seq->sampling_params.ignore_eos && token_id == eos_id)
+                                || (seq->num_completed_tokens() == seq->sampling_params.max_tokens);
 
                 if (finished) {
                     seq->status = SequenceStatus::FINISHED;
@@ -85,7 +82,6 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                 else if (is_prefill) {
                     seq->status = SequenceStatus::TO_BE_MIGRATED;
                     seq->migrate();
-                    std::cout << "migrating" << std::endl;
                     result_ctx->migration_candidates.push_back({seq, result_ctx->dp_idx});
                     break;
                 }
@@ -201,4 +197,4 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
     return all_migrations;
 }
 
-}  // namespace nanoinfra
+}  // namespace nanodeploy
