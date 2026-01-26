@@ -15,16 +15,16 @@ namespace gloo {
 namespace transport {
 
 class Address {
-public:
-    // Upper bound for an address' byte representation.
-    static constexpr auto kMaxByteSize = 192;
+ public:
+  // Upper bound for an address' byte representation.
+  static constexpr auto kMaxByteSize = 192;
 
-    virtual ~Address() = 0;
+  virtual ~Address() = 0;
 
-    virtual std::string str() const = 0;
+  virtual std::string str() const = 0;
 
-    virtual std::vector<char> bytes() const = 0;
+  virtual std::vector<char> bytes() const = 0;
 };
 
-}  // namespace transport
-}  // namespace gloo
+} // namespace transport
+} // namespace gloo

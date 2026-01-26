@@ -24,41 +24,45 @@ namespace rendezvous {
 
 class ContextFactory;
 
-class Context: public ::gloo::Context {
-public:
-    Context(int rank, int size, int base = 2);
-    virtual ~Context();
+class Context : public ::gloo::Context {
+ public:
+  Context(int rank, int size, int base = 2);
+  virtual ~Context();
 
-    void connectFullMesh(std::shared_ptr<Store> store, std::shared_ptr<transport::Device>& dev);
+  void connectFullMesh(
+      std::shared_ptr<Store> store,
+      std::shared_ptr<transport::Device>& dev);
 
-protected:
-    friend class ContextFactory;
+ protected:
+  friend class ContextFactory;
 };
 
 class ContextFactory {
-public:
-    static constexpr auto kMaxAddressSize = ::gloo::transport::Address::kMaxByteSize;
+ public:
+  static constexpr auto kMaxAddressSize =
+      ::gloo::transport::Address::kMaxByteSize;
 
-    explicit ContextFactory(std::shared_ptr<::gloo::Context> backingContext);
+  explicit ContextFactory(std::shared_ptr<::gloo::Context> backingContext);
 
-    std::shared_ptr<::gloo::Context> makeContext(std::shared_ptr<transport::Device>& dev);
+  std::shared_ptr<::gloo::Context> makeContext(
+      std::shared_ptr<transport::Device>& dev);
 
-protected:
-    std::shared_ptr<::gloo::Context> backingContext_;
+ protected:
+  std::shared_ptr<::gloo::Context> backingContext_;
 
-    std::vector<std::vector<char>> recvData_;
-    std::vector<std::vector<char>> sendData_;
+  std::vector<std::vector<char>> recvData_;
+  std::vector<std::vector<char>> sendData_;
 
-    std::vector<std::unique_ptr<transport::Buffer>> recvBuffers_;
-    std::vector<std::unique_ptr<transport::Buffer>> sendBuffers_;
+  std::vector<std::unique_ptr<transport::Buffer>> recvBuffers_;
+  std::vector<std::unique_ptr<transport::Buffer>> sendBuffers_;
 
-    std::vector<int>                                recvNotificationData_;
-    std::vector<std::unique_ptr<transport::Buffer>> recvNotificationBuffers_;
+  std::vector<int> recvNotificationData_;
+  std::vector<std::unique_ptr<transport::Buffer>> recvNotificationBuffers_;
 
-    std::vector<int>                                sendNotificationData_;
-    std::vector<std::unique_ptr<transport::Buffer>> sendNotificationBuffers_;
+  std::vector<int> sendNotificationData_;
+  std::vector<std::unique_ptr<transport::Buffer>> sendNotificationBuffers_;
 };
 
-}  // namespace rendezvous
+} // namespace rendezvous
 
-}  // namespace gloo
+} // namespace gloo

@@ -1,4 +1,4 @@
-#include "nanodeploy/scheduler/sp_state_manager.h"
+#include "nanodeploy/csrc/scheduler/sp_state_manager.h"
 #include "opaque_types.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>

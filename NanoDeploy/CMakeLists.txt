@@ -12,10 +12,10 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(DLSLIME_INSTALL_PATH "lib" CACHE STRING "Library installation directory")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-include_directories(csrc)
+include_directories(.)
 add_subdirectory(../third_party third_party)
 add_subdirectory(../NanoCommon NanoCommon)
-add_subdirectory(csrc)
+add_subdirectory(nanodeploy/csrc)
 
 # Python Flatbuffers Generation
 set(PROTO_FILE "${CMAKE_CURRENT_SOURCE_DIR}/proto/sequence.fbs")

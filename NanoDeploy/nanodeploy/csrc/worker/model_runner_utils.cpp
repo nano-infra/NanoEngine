@@ -1,7 +1,7 @@
 #include <algorithm>
 #include <iostream>
 
-#include "nanodeploy/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 #include "model_runner_utils.h"
 

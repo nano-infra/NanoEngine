@@ -2,7 +2,6 @@
 
 # namespace: fbs
 
-
 class SequenceStatus(object):
     INITIALIZING = 0
     WAITING = 1

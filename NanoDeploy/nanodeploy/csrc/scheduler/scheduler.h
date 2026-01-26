@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "nanodeploy/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 #include "sp_state_manager.h"
 #include "thread_pool.h"

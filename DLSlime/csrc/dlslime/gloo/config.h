@@ -12,10 +12,16 @@
 #define GLOO_VERSION_MINOR 5
 #define GLOO_VERSION_PATCH 0
 
-static_assert(GLOO_VERSION_MINOR < 100, "Programming error: you set a minor version that is too big.");
-static_assert(GLOO_VERSION_PATCH < 100, "Programming error: you set a patch version that is too big.");
+static_assert(
+    GLOO_VERSION_MINOR < 100,
+    "Programming error: you set a minor version that is too big.");
+static_assert(
+    GLOO_VERSION_PATCH < 100,
+    "Programming error: you set a patch version that is too big.");
 
-#define GLOO_VERSION (GLOO_VERSION_MAJOR * 10000 + GLOO_VERSION_MINOR * 100 + GLOO_VERSION_PATCH)
+#define GLOO_VERSION                                         \
+  (GLOO_VERSION_MAJOR * 10000 + GLOO_VERSION_MINOR * 100 +   \
+   GLOO_VERSION_PATCH)
 
 #define GLOO_USE_CUDA 0
 #define GLOO_USE_NCCL 0

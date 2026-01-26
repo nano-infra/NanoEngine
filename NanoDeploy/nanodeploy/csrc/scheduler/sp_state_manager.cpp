@@ -3,7 +3,7 @@
 #include <iostream>
 #include <random>
 
-#include "nanodeploy/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 #include "sp_state_manager.h"
 

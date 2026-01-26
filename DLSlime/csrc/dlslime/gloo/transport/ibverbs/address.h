@@ -8,9 +8,9 @@
 
 #pragma once
 
-#include <infiniband/verbs.h>
-
 #include <string>
+
+#include <infiniband/verbs.h>
 
 #include "gloo/transport/address.h"
 
@@ -21,29 +21,29 @@ namespace ibverbs {
 // Forward declaration
 class Pair;
 
-class Address: public ::gloo::transport::Address {
-public:
-    Address();
-    explicit Address(const std::vector<char>&);
-    virtual ~Address() {}
+class Address : public ::gloo::transport::Address {
+ public:
+  Address();
+  explicit Address(const std::vector<char>&);
+  virtual ~Address() {}
 
-    virtual std::vector<char> bytes() const override;
-    virtual std::string       str() const override;
+  virtual std::vector<char> bytes() const override;
+  virtual std::string str() const override;
 
-protected:
-    explicit Address(const Address&) = default;
+ protected:
+  explicit Address(const Address&) = default;
 
-    struct {
-        uint32_t      lid;
-        uint32_t      qpn;
-        uint32_t      psn;
-        union ibv_gid ibv_gid;
-    } addr_;
+  struct {
+    uint32_t lid;
+    uint32_t qpn;
+    uint32_t psn;
+    union ibv_gid ibv_gid;
+  } addr_;
 
-    // Pair can access addr_ directly
-    friend class Pair;
+  // Pair can access addr_ directly
+  friend class Pair;
 };
 
-}  // namespace ibverbs
-}  // namespace transport
-}  // namespace gloo
+} // namespace ibverbs
+} // namespace transport
+} // namespace gloo

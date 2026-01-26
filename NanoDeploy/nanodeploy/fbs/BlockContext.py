@@ -4,12 +4,10 @@
 
 import flatbuffers
 from flatbuffers.compat import import_numpy
-
 np = import_numpy()
 
-
 class BlockContext(object):
-    __slots__ = ["_tab"]
+    __slots__ = ['_tab']
 
     @classmethod
     def GetRootAs(cls, buf, offset=0):
@@ -22,7 +20,6 @@ class BlockContext(object):
     def GetRootAsBlockContext(cls, buf, offset=0):
         """This method is deprecated. Please switch to GetRootAs."""
         return cls.GetRootAs(buf, offset)
-
     # BlockContext
     def Init(self, buf, pos):
         self._tab = flatbuffers.table.Table(buf, pos)
@@ -69,7 +66,6 @@ class BlockContext(object):
             x = self._tab.Vector(o)
             x += flatbuffers.number_types.UOffsetTFlags.py_type(j) * 8
             from nanodeploy.fbs.BlockLocation import BlockLocation
-
             obj = BlockLocation()
             obj.Init(self._tab.Bytes, x)
             return obj
@@ -92,10 +88,7 @@ class BlockContext(object):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(16))
         if o != 0:
             a = self._tab.Vector(o)
-            return self._tab.Get(
-                flatbuffers.number_types.Int32Flags,
-                a + flatbuffers.number_types.UOffsetTFlags.py_type(j * 4),
-            )
+            return self._tab.Get(flatbuffers.number_types.Int32Flags, a + flatbuffers.number_types.UOffsetTFlags.py_type(j * 4))
         return 0
 
     # BlockContext
@@ -125,7 +118,6 @@ class BlockContext(object):
             x += flatbuffers.number_types.UOffsetTFlags.py_type(j) * 4
             x = self._tab.Indirect(x)
             from nanodeploy.fbs.IntList import IntList
-
             obj = IntList()
             obj.Init(self._tab.Bytes, x)
             return obj
@@ -143,114 +135,42 @@ class BlockContext(object):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(18))
         return o == 0
 
-
-def BlockContextStart(builder):
-    builder.StartObject(8)
-
-
+def BlockContextStart(builder): builder.StartObject(8)
 def Start(builder):
     return BlockContextStart(builder)
-
-
-def BlockContextAddEngineId(builder, engineId):
-    builder.PrependUOffsetTRelativeSlot(
-        0, flatbuffers.number_types.UOffsetTFlags.py_type(engineId), 0
-    )
-
-
+def BlockContextAddEngineId(builder, engineId): builder.PrependUOffsetTRelativeSlot(0, flatbuffers.number_types.UOffsetTFlags.py_type(engineId), 0)
 def AddEngineId(builder, engineId):
     return BlockContextAddEngineId(builder, engineId)
-
-
-def BlockContextAddDpIdx(builder, dpIdx):
-    builder.PrependInt32Slot(1, dpIdx, 0)
-
-
+def BlockContextAddDpIdx(builder, dpIdx): builder.PrependInt32Slot(1, dpIdx, 0)
 def AddDpIdx(builder, dpIdx):
     return BlockContextAddDpIdx(builder, dpIdx)
-
-
-def BlockContextAddMasterSpIdx(builder, masterSpIdx):
-    builder.PrependInt32Slot(2, masterSpIdx, 0)
-
-
+def BlockContextAddMasterSpIdx(builder, masterSpIdx): builder.PrependInt32Slot(2, masterSpIdx, 0)
 def AddMasterSpIdx(builder, masterSpIdx):
     return BlockContextAddMasterSpIdx(builder, masterSpIdx)
-
-
-def BlockContextAddAttentionSp(builder, attentionSp):
-    builder.PrependInt32Slot(3, attentionSp, 0)
-
-
+def BlockContextAddAttentionSp(builder, attentionSp): builder.PrependInt32Slot(3, attentionSp, 0)
 def AddAttentionSp(builder, attentionSp):
     return BlockContextAddAttentionSp(builder, attentionSp)
-
-
-def BlockContextAddAttentionDp(builder, attentionDp):
-    builder.PrependInt32Slot(4, attentionDp, 0)
-
-
+def BlockContextAddAttentionDp(builder, attentionDp): builder.PrependInt32Slot(4, attentionDp, 0)
 def AddAttentionDp(builder, attentionDp):
     return BlockContextAddAttentionDp(builder, attentionDp)
-
-
-def BlockContextAddBlockLocation(builder, blockLocation):
-    builder.PrependUOffsetTRelativeSlot(
-        5, flatbuffers.number_types.UOffsetTFlags.py_type(blockLocation), 0
-    )
-
-
+def BlockContextAddBlockLocation(builder, blockLocation): builder.PrependUOffsetTRelativeSlot(5, flatbuffers.number_types.UOffsetTFlags.py_type(blockLocation), 0)
 def AddBlockLocation(builder, blockLocation):
     return BlockContextAddBlockLocation(builder, blockLocation)
-
-
-def BlockContextStartBlockLocationVector(builder, numElems):
-    return builder.StartVector(8, numElems, 4)
-
-
+def BlockContextStartBlockLocationVector(builder, numElems): return builder.StartVector(8, numElems, 4)
 def StartBlockLocationVector(builder, numElems):
     return BlockContextStartBlockLocationVector(builder, numElems)
-
-
-def BlockContextAddNumDispatchedTokens(builder, numDispatchedTokens):
-    builder.PrependUOffsetTRelativeSlot(
-        6, flatbuffers.number_types.UOffsetTFlags.py_type(numDispatchedTokens), 0
-    )
-
-
+def BlockContextAddNumDispatchedTokens(builder, numDispatchedTokens): builder.PrependUOffsetTRelativeSlot(6, flatbuffers.number_types.UOffsetTFlags.py_type(numDispatchedTokens), 0)
 def AddNumDispatchedTokens(builder, numDispatchedTokens):
     return BlockContextAddNumDispatchedTokens(builder, numDispatchedTokens)
-
-
-def BlockContextStartNumDispatchedTokensVector(builder, numElems):
-    return builder.StartVector(4, numElems, 4)
-
-
+def BlockContextStartNumDispatchedTokensVector(builder, numElems): return builder.StartVector(4, numElems, 4)
 def StartNumDispatchedTokensVector(builder, numElems):
     return BlockContextStartNumDispatchedTokensVector(builder, numElems)
-
-
-def BlockContextAddSpBlockTable(builder, spBlockTable):
-    builder.PrependUOffsetTRelativeSlot(
-        7, flatbuffers.number_types.UOffsetTFlags.py_type(spBlockTable), 0
-    )
-
-
+def BlockContextAddSpBlockTable(builder, spBlockTable): builder.PrependUOffsetTRelativeSlot(7, flatbuffers.number_types.UOffsetTFlags.py_type(spBlockTable), 0)
 def AddSpBlockTable(builder, spBlockTable):
     return BlockContextAddSpBlockTable(builder, spBlockTable)
-
-
-def BlockContextStartSpBlockTableVector(builder, numElems):
-    return builder.StartVector(4, numElems, 4)
-
-
+def BlockContextStartSpBlockTableVector(builder, numElems): return builder.StartVector(4, numElems, 4)
 def StartSpBlockTableVector(builder, numElems):
     return BlockContextStartSpBlockTableVector(builder, numElems)
-
-
-def BlockContextEnd(builder):
-    return builder.EndObject()
-
-
+def BlockContextEnd(builder): return builder.EndObject()
 def End(builder):
     return BlockContextEnd(builder)

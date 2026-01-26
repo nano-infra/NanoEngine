@@ -2,9 +2,9 @@
 #include <algorithm>
 #include <exception>
 
-#include "nanodeploy/metrics/sequence_metric.h"
-#include "nanodeploy/scheduler/sp_state_manager.h"
-#include "nanodeploy/sequence/sequence.h"
+#include "nanodeploy/csrc/metrics/sequence_metric.h"
+#include "nanodeploy/csrc/scheduler/sp_state_manager.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 #include "thread_pool.h"
 

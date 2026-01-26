@@ -20,4 +20,4 @@ bool isStoreExtendedApiEnabled();
 
 bool disableConnectionRetries();
 
-}  // namespace gloo
+} // namespace gloo

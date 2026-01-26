@@ -8,45 +8,47 @@
 
 #pragma once
 
+#include "gloo/rendezvous/store.h"
+
 #include <condition_variable>
 #include <mutex>
-
-#include "gloo/rendezvous/store.h"
 
 namespace gloo {
 namespace rendezvous {
 
-class FileStore: public Store {
-public:
-    explicit FileStore(const std::string& path);
-    virtual ~FileStore() {}
+class FileStore : public Store {
+ public:
+  explicit FileStore(const std::string& path);
+  virtual ~FileStore() {}
 
-    virtual void set(const std::string& key, const std::vector<char>& data) override;
+  virtual void set(const std::string& key, const std::vector<char>& data)
+      override;
 
-    virtual std::vector<char> get(const std::string& key) override;
+  virtual std::vector<char> get(const std::string& key) override;
 
-    virtual void wait(const std::vector<std::string>& keys) override
-    {
-        wait(keys, Store::kDefaultTimeout);
-    }
+  virtual void wait(const std::vector<std::string>& keys) override {
+    wait(keys, Store::kDefaultTimeout);
+  }
 
-    virtual void wait(const std::vector<std::string>& keys, const std::chrono::milliseconds& timeout) override;
+  virtual void wait(
+      const std::vector<std::string>& keys,
+      const std::chrono::milliseconds& timeout) override;
 
-    std::vector<std::string> getAllKeyFilePaths();
+  std::vector<std::string> getAllKeyFilePaths();
 
-protected:
-    std::string basePath_;
+ protected:
+  std::string basePath_;
 
-    std::string realPath(const std::string& path);
+  std::string realPath(const std::string& path);
 
-    std::string tmpPath(const std::string& name);
+  std::string tmpPath(const std::string& name);
 
-    std::string objectPath(const std::string& name);
+  std::string objectPath(const std::string& name);
 
-    bool check(const std::vector<std::string>& keys);
+  bool check(const std::vector<std::string>& keys);
 
-    std::vector<std::string> keyFilePaths_;
+  std::vector<std::string> keyFilePaths_;
 };
 
-}  // namespace rendezvous
-}  // namespace gloo
+} // namespace rendezvous
+} // namespace gloo

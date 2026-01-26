@@ -1,7 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "nanodeploy/worker/model_runner_utils.h"
+#include "nanodeploy/csrc/worker/model_runner_utils.h"
 
 namespace py = pybind11;
 using namespace nanodeploy;

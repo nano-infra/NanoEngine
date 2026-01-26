@@ -32,28 +32,26 @@ class UnboundBuffer;
 // send buffer and vice versa. The device abstraction may start a
 // background thread to handle I/O multiplexing (not configurable).
 class Device {
-public:
-    virtual ~Device() = 0;
+ public:
+  virtual ~Device() = 0;
 
-    virtual std::string str() const = 0;
+  virtual std::string str() const = 0;
 
-    virtual const std::string& getPCIBusID() const = 0;
+  virtual const std::string& getPCIBusID() const = 0;
 
-    virtual int getInterfaceSpeed() const
-    {
-        return 0;
-    }
+  virtual int getInterfaceSpeed() const {
+    return 0;
+  }
 
-    virtual bool hasGPUDirect() const
-    {
-        return false;
-    }
+  virtual bool hasGPUDirect() const {
+    return false;
+  }
 
-    // Factory function to create transport context. A single device may
-    // service multiple contexts, with no constraints on this process
-    // its rank or the context size.
-    virtual std::shared_ptr<Context> createContext(int rank, int size) = 0;
+  // Factory function to create transport context. A single device may
+  // service multiple contexts, with no constraints on this process
+  // its rank or the context size.
+  virtual std::shared_ptr<Context> createContext(int rank, int size) = 0;
 };
 
-}  // namespace transport
-}  // namespace gloo
+} // namespace transport
+} // namespace gloo

@@ -2,8 +2,8 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "nanodeploy/metrics/sequence_metric.h"
-#include "nanodeploy/sequence/sequence.h"
+#include "nanodeploy/csrc/metrics/sequence_metric.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 #include "scheduler_utils.h"
 

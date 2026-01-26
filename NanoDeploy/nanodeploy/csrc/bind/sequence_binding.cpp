@@ -4,10 +4,10 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 
-#include "nanodeploy/metrics/sequence_metric.h"
+#include "nanodeploy/csrc/metrics/sequence_metric.h"
 
-#include "nanodeploy/sequence/sequence.h"
-#include "nanodeploy/sequence/serialization.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/serialization.h"
 
 #include "opaque_types.h"
 

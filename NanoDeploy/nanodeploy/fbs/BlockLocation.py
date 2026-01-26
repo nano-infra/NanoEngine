@@ -4,12 +4,10 @@
 
 import flatbuffers
 from flatbuffers.compat import import_numpy
-
 np = import_numpy()
 
-
 class BlockLocation(object):
-    __slots__ = ["_tab"]
+    __slots__ = ['_tab']
 
     @classmethod
     def SizeOf(cls):
@@ -20,19 +18,9 @@ class BlockLocation(object):
         self._tab = flatbuffers.table.Table(buf, pos)
 
     # BlockLocation
-    def First(self):
-        return self._tab.Get(
-            flatbuffers.number_types.Int32Flags,
-            self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(0),
-        )
-
+    def First(self): return self._tab.Get(flatbuffers.number_types.Int32Flags, self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(0))
     # BlockLocation
-    def Second(self):
-        return self._tab.Get(
-            flatbuffers.number_types.Int32Flags,
-            self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(4),
-        )
-
+    def Second(self): return self._tab.Get(flatbuffers.number_types.Int32Flags, self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(4))
 
 def CreateBlockLocation(builder, first, second):
     builder.Prep(4, 8)

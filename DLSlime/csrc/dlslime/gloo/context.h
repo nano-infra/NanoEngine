@@ -8,11 +8,11 @@
 
 #pragma once
 
-#include <gloo/transport/pair.h>
-
 #include <chrono>
 #include <memory>
 #include <vector>
+
+#include <gloo/transport/pair.h>
 
 namespace gloo {
 
@@ -21,39 +21,41 @@ namespace transport {
 class Context;
 class Device;
 class UnboundBuffer;
-}  // namespace transport
+} // namespace transport
 
 class Context {
-public:
-    Context(int rank, int size, int base = 2);
-    ~Context();
+ public:
+  Context(int rank, int size, int base = 2);
+  ~Context();
 
-    const int rank;
-    const int size;
-    int       base;
+  const int rank;
+  const int size;
+  int base;
 
-    std::shared_ptr<transport::Device>& getDevice();
+  std::shared_ptr<transport::Device>& getDevice();
 
-    std::unique_ptr<transport::Pair>& getPair(int i);
+  std::unique_ptr<transport::Pair>& getPair(int i);
 
-    // Factory function to create an unbound buffer for use with the
-    // transport used for this context. Use this function to avoid tying
-    // downstream code to a specific transport.
-    std::unique_ptr<transport::UnboundBuffer> createUnboundBuffer(void* ptr, size_t size);
+  // Factory function to create an unbound buffer for use with the
+  // transport used for this context. Use this function to avoid tying
+  // downstream code to a specific transport.
+  std::unique_ptr<transport::UnboundBuffer> createUnboundBuffer(
+      void* ptr,
+      size_t size);
 
-    int nextSlot(int numToSkip = 1);
+  int nextSlot(int numToSkip = 1);
 
-    void closeConnections();
+  void closeConnections();
 
-    void setTimeout(std::chrono::milliseconds timeout);
+  void setTimeout(std::chrono::milliseconds timeout);
 
-    std::chrono::milliseconds getTimeout() const;
+  std::chrono::milliseconds getTimeout() const;
 
-protected:
-    std::shared_ptr<transport::Device>  device_;
-    std::shared_ptr<transport::Context> transportContext_;
-    int                                 slot_;
-    std::chrono::milliseconds           timeout_;
+ protected:
+  std::shared_ptr<transport::Device> device_;
+  std::shared_ptr<transport::Context> transportContext_;
+  int slot_;
+  std::chrono::milliseconds timeout_;
 };
 
-}  // namespace gloo
+} // namespace gloo

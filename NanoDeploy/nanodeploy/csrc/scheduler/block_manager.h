@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "block.h"
-#include "nanodeploy/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 namespace nanodeploy {
 

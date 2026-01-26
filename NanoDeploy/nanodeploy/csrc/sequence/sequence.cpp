@@ -2,7 +2,7 @@
 #include <memory>
 #include <stdexcept>
 
-#include "nanodeploy/metrics/sequence_metric.h"
+#include "nanodeploy/csrc/metrics/sequence_metric.h"
 
 #include "sequence.h"
 

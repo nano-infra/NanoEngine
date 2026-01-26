@@ -4,12 +4,10 @@
 
 import flatbuffers
 from flatbuffers.compat import import_numpy
-
 np = import_numpy()
 
-
 class StepOut(object):
-    __slots__ = ["_tab"]
+    __slots__ = ['_tab']
 
     @classmethod
     def GetRootAs(cls, buf, offset=0):
@@ -22,7 +20,6 @@ class StepOut(object):
     def GetRootAsStepOut(cls, buf, offset=0):
         """This method is deprecated. Please switch to GetRootAs."""
         return cls.GetRootAs(buf, offset)
-
     # StepOut
     def Init(self, buf, pos):
         self._tab = flatbuffers.table.Table(buf, pos)
@@ -31,18 +28,14 @@ class StepOut(object):
     def SeqId(self):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
         if o != 0:
-            return self._tab.Get(
-                flatbuffers.number_types.Uint64Flags, o + self._tab.Pos
-            )
+            return self._tab.Get(flatbuffers.number_types.Uint64Flags, o + self._tab.Pos)
         return 0
 
     # StepOut
     def TokenId(self):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(6))
         if o != 0:
-            return self._tab.Get(
-                flatbuffers.number_types.Uint32Flags, o + self._tab.Pos
-            )
+            return self._tab.Get(flatbuffers.number_types.Uint32Flags, o + self._tab.Pos)
         return 0
 
     # StepOut
@@ -52,42 +45,18 @@ class StepOut(object):
             return self._tab.Get(flatbuffers.number_types.Int8Flags, o + self._tab.Pos)
         return 0
 
-
-def StepOutStart(builder):
-    builder.StartObject(3)
-
-
+def StepOutStart(builder): builder.StartObject(3)
 def Start(builder):
     return StepOutStart(builder)
-
-
-def StepOutAddSeqId(builder, seqId):
-    builder.PrependUint64Slot(0, seqId, 0)
-
-
+def StepOutAddSeqId(builder, seqId): builder.PrependUint64Slot(0, seqId, 0)
 def AddSeqId(builder, seqId):
     return StepOutAddSeqId(builder, seqId)
-
-
-def StepOutAddTokenId(builder, tokenId):
-    builder.PrependUint32Slot(1, tokenId, 0)
-
-
+def StepOutAddTokenId(builder, tokenId): builder.PrependUint32Slot(1, tokenId, 0)
 def AddTokenId(builder, tokenId):
     return StepOutAddTokenId(builder, tokenId)
-
-
-def StepOutAddStatus(builder, status):
-    builder.PrependInt8Slot(2, status, 0)
-
-
+def StepOutAddStatus(builder, status): builder.PrependInt8Slot(2, status, 0)
 def AddStatus(builder, status):
     return StepOutAddStatus(builder, status)
-
-
-def StepOutEnd(builder):
-    return builder.EndObject()
-
-
+def StepOutEnd(builder): return builder.EndObject()
 def End(builder):
     return StepOutEnd(builder)

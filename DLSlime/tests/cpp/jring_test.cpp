@@ -1,9 +1,8 @@
-#include <cassert>
-#include <cstdio>   // for snprintf
-#include <cstdlib>  // for posix_memalign, free
-#include <cstring>  // for memset, strncpy, strcmp
 #include <iostream>
-
+#include <cassert>
+#include <cstring> // for memset, strncpy, strcmp
+#include <cstdlib> // for posix_memalign, free
+#include <cstdio>  // for snprintf
 #include "dlslime/jring.h"
 
 // --------------------------------------------------------------------------
@@ -15,13 +14,12 @@
 // 3. Uses a fixed-size array for payload to support direct memcpy logic.
 // --------------------------------------------------------------------------
 struct CommPacket {
-    uint32_t seq_num;      // Sequence number to detect ordering issues
-    uint32_t msg_type;     // Message type ID (e.g., 0x01: Data, 0x02: Heartbeat)
-    char     payload[24];  // Fixed-size payload buffer
+    uint32_t seq_num;     // Sequence number to detect ordering issues
+    uint32_t msg_type;    // Message type ID (e.g., 0x01: Data, 0x02: Heartbeat)
+    char     payload[24]; // Fixed-size payload buffer
 };
 
-int main()
-{
+int main() {
     // ----------------------------------------------------------------------
     // 1. Configuration and Memory Allocation
     // ----------------------------------------------------------------------
@@ -53,17 +51,17 @@ int main()
         return -1;
     }
 
-    std::cout << "[Setup] Ring initialized. Capacity: " << r->capacity << ", Element Size: " << ELEM_SIZE << " bytes."
-              << std::endl;
+    std::cout << "[Setup] Ring initialized. Capacity: " << r->capacity
+              << ", Element Size: " << ELEM_SIZE << " bytes." << std::endl;
 
     // ----------------------------------------------------------------------
     // 2. Prepare Test Data (Producer Side)
     // ----------------------------------------------------------------------
-    const int  BATCH_SIZE = 16;
+    const int BATCH_SIZE = 16;
     CommPacket tx_buffer[BATCH_SIZE];
 
     for (int i = 0; i < BATCH_SIZE; ++i) {
-        tx_buffer[i].seq_num  = 1000 + i;
+        tx_buffer[i].seq_num = 1000 + i;
         tx_buffer[i].msg_type = (i % 2 == 0) ? 0xA0 : 0xB0;
 
         // Clear payload and write a dummy string
