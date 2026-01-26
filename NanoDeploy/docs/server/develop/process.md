@@ -20,9 +20,9 @@ This phase transforms the server into a cluster coordinator.
 
 ### Milestone 3.1: Multi-Engine Architecture
 
-- [ ] Refactor `EngineManager` to support a list/map of Engines instead of a single instance.
-- [ ] Implement `EngineRole` (Prefill/Decode) configuration parsing.
-- [ ] Implement **Wait-for-All** logic (Server waits for all configured engines to connect).
+- [x] Refactor `EngineManager` to support a list/map of Engines instead of a single instance.
+- [x] Implement `EngineRole` (Prefill/Decode) configuration parsing (Disaggregated Config).
+- [x] Implement **Wait-for-All** logic (Server waits for all configured engines to connect).
 
 ### Milestone 3.2: P2P Handshake
 
@@ -32,9 +32,9 @@ This phase transforms the server into a cluster coordinator.
 
 ### Milestone 3.3: Scheduler Version 2.0
 
-- [ ] Separate `RequestQueue` into `prefill_queue` and `decode_queue`.
-- [ ] Implement the "Prefill Done" event listener.
-- [ ] Implement the migration trigger logic.
+- [x] Separate `RequestQueue` into `prefill_queue` and `decode_queue`.
+- [x] Implement the "Prefill Done" event listener.
+- [x] Implement the migration trigger logic.
 
 ### Milestone 3.4: Integration & Optimization
 

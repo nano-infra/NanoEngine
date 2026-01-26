@@ -20,10 +20,9 @@ pub struct TokenizerConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
-pub struct EngineGroupConfig {
-    pub count: usize,
-    pub config_path: String,
-    pub tensor_parallel: usize,
+pub struct EngineNode {
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -31,12 +30,12 @@ pub struct EngineGroupConfig {
 #[serde(tag = "mode")]
 pub enum EngineConfig {
     Unified {
-        #[serde(flatten)]
-        config: EngineGroupConfig,
+        host: String,
+        port: u16,
     },
     Disaggregated {
-        prefill: EngineGroupConfig,
-        decode: EngineGroupConfig,
+        prefill: Vec<EngineNode>,
+        decode: Vec<EngineNode>,
     },
 }
 
@@ -85,9 +84,8 @@ mod tests {
 
             [engine]
             mode = "Unified"
-            count = 1
-            config_path = "/tmp/engine_config.py"
-            tensor_parallel = 1
+            host = "127.0.0.1"
+            port = 5000
 
             [scheduler]
             queue_size = 100
@@ -105,10 +103,52 @@ mod tests {
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.model_name, "TestModel");
         match config.engine {
-            EngineConfig::Unified { config } => {
-                assert_eq!(config.count, 1);
+            EngineConfig::Unified { host, port } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 5000);
             }
             _ => panic!("Expected Unified config"),
+        }
+    }
+
+    #[test]
+    fn test_load_disaggregated_config() {
+        let toml_content = r#"
+            [server]
+            host = "0.0.0.0"
+            port = 3000
+            model_name = "Test"
+
+            [tokenizer]
+            path = "tok.json"
+
+            [engine]
+            mode = "Disaggregated"
+
+            [[engine.prefill]]
+            host = "1.1.1.1"
+            port = 6000
+
+            [[engine.decode]]
+            host = "2.2.2.2"
+            port = 7000
+
+            [scheduler]
+            queue_size = 100
+            timeout_ms = 1000
+        "#;
+
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().expect("TempFile");
+        write!(file, "{}", toml_content).expect("Write");
+        let config = AppConfig::load_from_file(file.path()).expect("Load");
+
+        if let EngineConfig::Disaggregated { prefill, decode } = config.engine {
+            assert_eq!(prefill.len(), 1);
+            assert_eq!(prefill[0].host, "1.1.1.1");
+            assert_eq!(decode.len(), 1);
+            assert_eq!(decode[0].port, 7000);
+        } else {
+            panic!("Expected Disaggregated");
         }
     }
 }

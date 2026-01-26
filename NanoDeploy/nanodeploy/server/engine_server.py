@@ -113,7 +113,9 @@ class EngineServer:
             try:
                 conn, addr = self.server_socket.accept()
                 print(f"Accepted connection from {addr}")
-                conn.setblocking(False)
+                # Use blocking mode to ensure sendall() completes without BlockingIOError.
+                # Since we use select() for reading, this is acceptable for this simple server.
+                conn.setblocking(True)
                 self.conn = conn
             except BlockingIOError:
                 pass
@@ -155,6 +157,11 @@ class EngineServer:
                     self.current_header = struct.unpack(HEADER_FMT, header_data)
 
                     magic, meta_size, data_size = self.current_header
+                    print(
+                        f"TRACE: Recv Header: Magic={hex(magic)}, Meta={meta_size}, Payload={data_size}",
+                        flush=True,
+                    )
+
                     if magic != MAGIC:
                         print(f"Invalid Magic: {hex(magic)}. Closing connection.")
                         self.conn.close()
@@ -184,36 +191,191 @@ class EngineServer:
                     break
 
     def handle_message(self, meta: bytes, payload: bytes):
-        # Deserialize SequenceList
+        # Parse Meta (72 bytes)
+        # NetMetaRaw: action(4), seq(4), actor_id(32), actor_type(32)
         try:
-            # Safer way to get pointer: create ctypes buffer copy/reference
-            import ctypes
+            action, seq_id, actor_id, actor_type = struct.unpack("<II32s32s", meta)
+            # print(f"Received msg: action={action}, seq={seq_id}")
+        except struct.error:
+            print("Failed to unpack metadata")
+            return
 
-            # Ensure payload is immutable bytes, copy to a mutable buffer to be safe and aligned?
-            # Actually, just getting address of bytes object data is tricky in pure python without C API.
-            # Best way: create a ctypes string buffer from the bytes.
-            # This involves a copy, but is safe.
-            c_buffer = ctypes.create_string_buffer(payload, len(payload))
-            ptr = ctypes.addressof(c_buffer)
-            length = len(payload)
+        try:
+            if action == 1:  # Add Request (Legacy/Standard)
+                self.handle_add_request(payload)
+            elif action == 2:  # GET_ENGINE_INFO
+                # Return JSON: {id, mode, world_size, num_blocks}
+                import json
 
-            # ptr, length = get_buffer_ptr_len(payload)
-            # deserialize_cpp returns std::vector<std::shared_ptr<Sequence>>
-            # bound to Python as List[nanodeploy._cpp.Sequence]
-            sequences = deserialize_cpp(ptr, length)
+                info = self.engine.get_engine_info()
+                resp_payload = json.dumps(info).encode("utf-8")
 
-            if not sequences:
-                print("Deserialized empty sequence list.")
-                return
+                seq_id_u32 = 0
+                status = 0
+                meta = struct.pack("<III", seq_id_u32, status, action)
+                header = struct.pack(
+                    HEADER_FMT, MAGIC, RESP_META_SIZE, len(resp_payload)
+                )
 
-            print(f"Adding {len(sequences)} sequences to engine.")
-            self.engine.add_request(sequences)
+                try:
+                    self.conn.sendall(header + meta + resp_payload)
+                except (BlockingIOError, BrokenPipeError):
+                    pass
+
+            elif action == 3:  # P2P_INIT
+                # Payload is JSON list of node objects
+                import json
+
+                try:
+                    nodes_list = json.loads(payload.decode("utf-8"))
+                    print(f"Received P2PInit (JSON). Nodes count: {len(nodes_list)}")
+                except json.JSONDecodeError as e:
+                    print(f"Failed to decode P2PInit JSON: {e}")
+                    return
+
+                results = {}
+
+                # Iterate all nodes to setup local endpoints and get info
+                # Iterate all nodes to setup local endpoints and get info
+                for node_info in nodes_list:
+                    remote_id = node_info.get("id")
+                    remote_role = node_info.get("role")
+
+                    # 1. Self-Check (Safety)
+                    if remote_id == self.config.engine_id:
+                        continue
+
+                    # 2. Role-Based Filtering
+                    num_blocks = node_info.get("num_blocks")
+                    ws = node_info.get("world_size")
+
+                    print(
+                        f"Initializing P2P with {remote_id} ({remote_role}) (Blocks={num_blocks}, WS={ws})"
+                    )
+                    try:
+                        # p2p_init returns list[dict[int, dict]] (from RayExecutor)
+                        results[remote_id] = self.engine.p2p_init(
+                            remote_id, num_blocks, ws
+                        )
+                    except Exception as e:
+                        print(f"P2P Init failed for {remote_id}: {e}")
+
+                # Send response (Action=3)
+                resp_payload = json.dumps(results).encode("utf-8")
+
+                # Header + Meta
+                # Meta: seq_id(4), status(4), action(4)
+                seq_id_u32 = 0
+                status = 0
+
+                meta = struct.pack("<III", seq_id_u32, status, action)
+                header = struct.pack(
+                    HEADER_FMT, MAGIC, RESP_META_SIZE, len(resp_payload)
+                )
+
+                try:
+                    self.conn.sendall(header + meta + resp_payload)
+                except (BlockingIOError, BrokenPipeError):
+                    print("Failed to send P2PInit Response")
+                    self.conn.close()
+                    self.conn = None
+
+            elif action == 4:  # P2P_CONNECT
+                # Payload is JSON map of {target_id: info}
+                import json
+
+                try:
+                    target_map = json.loads(payload.decode("utf-8"))
+                    print(f"Received P2PConnect (JSON). Targets: {len(target_map)}")
+                except json.JSONDecodeError as e:
+                    print(f"Failed to decode P2PConnect JSON: {e}")
+                    return
+
+                def convert_keys_to_int(obj):
+                    if isinstance(obj, dict):
+                        new_obj = {}
+                        for k, v in obj.items():
+                            if isinstance(k, str) and k.isdigit():
+                                new_k = int(k)
+                            else:
+                                new_k = k
+                            new_obj[new_k] = convert_keys_to_int(v)
+                        return new_obj
+                    elif isinstance(obj, list):
+                        return [convert_keys_to_int(x) for x in obj]
+                    else:
+                        return obj
+
+                # Convert integer keys back from string (JSON limitation)
+                target_map = convert_keys_to_int(target_map)
+
+                for target_id, info in target_map.items():
+                    # target_id is UUID (string)
+                    # info is Metadata (nested map with string keys)
+                    print(f"Connecting P2P to {target_id}")
+                    try:
+                        self.engine.p2p_connect(target_id, info)
+                    except Exception as e:
+                        print(f"Failed to connect P2P to {target_id}: {e}")
+
+                # Send Response (Success)
+                seq_id_u32 = 0
+                status = 0
+                meta = struct.pack("<III", seq_id_u32, status, action)
+                # Empty payload for success
+                resp_payload = b""
+                header = struct.pack(
+                    HEADER_FMT, MAGIC, RESP_META_SIZE, len(resp_payload)
+                )
+                try:
+                    self.conn.sendall(header + meta + resp_payload)
+                except (BlockingIOError, BrokenPipeError):
+                    pass
+
+                print(f"P2P Connect sequence completed for {len(target_map)} targets.")
+
+            else:
+                print(f"Unknown Action ID: {action}")
 
         except Exception as e:
             print(f"Error handling message: {e}")
             import traceback
 
             traceback.print_exc()
+
+    def handle_add_request(self, payload: bytes):
+        print("TRACE: handle_add_request start", flush=True)
+        # Safer way to get pointer: create ctypes buffer copy/reference
+        import ctypes
+
+        # Ensure payload is immutable bytes, copy to a mutable buffer to be safe and aligned?
+        # Actually, just getting address of bytes object data is tricky in pure python without C API.
+        # Best way: create a ctypes string buffer from the bytes.
+        # This involves a copy, but is safe.
+        c_buffer = ctypes.create_string_buffer(payload, len(payload))
+        ptr = ctypes.addressof(c_buffer)
+        length = len(payload)
+
+        # deserialize_cpp returns std::vector<std::shared_ptr<Sequence>>
+        # bound to Python as List[nanodeploy._cpp.Sequence]
+        print("TRACE: calling deserialize_cpp", flush=True)
+        sequences = deserialize_cpp(ptr, length)
+
+        # DUMMY SEQUENCE GENERATION REMOVED
+
+        if not sequences:
+            print("Deserialized empty sequence list.")
+            return
+
+        print(f"Adding {len(sequences)} sequences to engine.")
+        for s in sequences:
+            print(
+                f"  [Recv Action 1] Seq {s.seq_id}, Tokens: {len(s.token_ids)}, MaxTokens: {s.sampling_params.max_tokens}, Ids: {s.token_ids if len(s.token_ids) < 20 else str(s.token_ids[:10])+'...'}"
+            )
+
+        print("TRACE: calling engine.add_request", flush=True)
+        self.engine.add_request(sequences)
+        print("TRACE: handle_add_request done", flush=True)
 
     def engine_step(self):
         # Run one step of LLMEngine
@@ -246,16 +408,26 @@ class EngineServer:
                         if seq.seq_id < 8:
                             # dummy seq
                             continue
+
+                        # Debug log for Stop Condition
+                        if seq.seq_id == 1000:  # Assuming 1000 is our test seq
+                            pass
+                            # print(f"DEBUG: Seq {seq.seq_id} Len: {seq.num_tokens} / {seq.sampling_params.max_tokens} Finished: {seq.is_finished}")
+
                         if seq.is_finished:
+                            print(f"Seq {seq.seq_id} FINISHED. Reason: {seq.status}")
                             self.send_stepout(
                                 seq.seq_id, seq.token_ids[-1], SequenceStatus.FINISHED
                             )
                         elif seq.is_to_be_migrated:
-                            self.send_stepout(
-                                seq.seq_id, 0, SequenceStatus.TO_BE_MIGRATED
-                            )
+                            self.send_migration(seq)
                         elif len(seq.token_ids) > 0:
                             status_enum = SequenceStatus.RUNNING_DECODE
+                            start_node = max(0, len(seq.token_ids) - num_tokens)
+                            # Just send the last one for now to permit simple streaming
+                            print(
+                                f"Seq {seq.seq_id} RUNNING. Len: {len(seq.token_ids)} Max: {seq.sampling_params.max_tokens}"
+                            )
                             self.send_stepout(
                                 seq.seq_id, seq.token_ids[-1], status_enum
                             )
@@ -265,6 +437,52 @@ class EngineServer:
             import traceback
 
             traceback.print_exc()
+
+    def send_migration(self, seq):
+        if self.conn is None:
+            return
+
+        print(
+            f"Migrating Seq {seq.seq_id}, Tokens: {len(seq.token_ids)}, Ids: {seq.token_ids if len(seq.token_ids) < 20 else str(seq.token_ids[:10])+'...'}"
+        )
+
+        import ctypes
+        import sys
+
+        # Use C++ serialization
+        from nanodeploy._cpp import serialize
+
+        buffer_size = 4096 * 16  # 64KB
+        buffer = ctypes.create_string_buffer(buffer_size)
+        ptr = ctypes.addressof(buffer)
+
+        try:
+            print(f"DEBUG: Serializing Seq {seq.seq_id}...", flush=True)
+            # serialize(data_ptr, buffer_size, seqs_list, is_prefill)
+            payload_size = serialize(ptr, buffer_size, [seq], False)
+            print(f"DEBUG: Serialized size: {payload_size}", flush=True)
+            payload = buffer.raw[:payload_size]
+        except Exception as e:
+            print(f"Serialization failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return
+
+        # Header + Meta
+        action = 1
+        seq_id_u32 = seq.seq_id & 0xFFFFFFFF
+        status = 0
+
+        meta = struct.pack("<III", seq_id_u32, status, action)
+        header = struct.pack(HEADER_FMT, MAGIC, RESP_META_SIZE, payload_size)
+
+        try:
+            self.conn.sendall(header + meta + payload)
+        except (BlockingIOError, BrokenPipeError):
+            print("Failed to send Migration")
+            self.conn.close()
+            self.conn = None
 
     def send_stepout(self, seq_id, token_id, status):
         if self.conn is None:
@@ -296,6 +514,7 @@ from jsonargparse import ActionConfigFile, ArgumentParser
 
 
 def main():
+    print("PYTHON SERVER: Script started (main function entered)...", flush=True)
     parser = ArgumentParser(description="NanoDeploy Engine Server")
     parser.add_argument("--config", action=ActionConfigFile)
     parser.add_class_arguments(Config, fail_untyped=False)

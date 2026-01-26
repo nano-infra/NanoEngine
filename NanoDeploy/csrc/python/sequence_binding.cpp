@@ -137,6 +137,7 @@ void bind_sequence(py::module_& m)
             [](BlockContext& self) -> BlockContext::SpBlockTable& { return self.sp_block_table; },
             [](BlockContext& self, const BlockContext::SpBlockTable& value) { self.sp_block_table = value; },
             py::return_value_policy::reference_internal)
+        .def_readwrite("num_dispatched_tokens", &BlockContext::num_dispatched_tokens)
         .def("reset", &BlockContext::reset, py::arg("engine_id"), py::arg("attention_sp"), py::arg("attention_dp"))
         .def(py::pickle([](const BlockContext& p) { return p.getstate(); },
                         [](const std::tuple<std::string,

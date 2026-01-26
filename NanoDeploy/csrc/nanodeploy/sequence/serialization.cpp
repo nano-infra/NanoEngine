@@ -14,7 +14,11 @@ flatbuffers::Offset<nanodeploy::fbs::BlockContext> pack_block_context(flatbuffer
     auto engine_id_off = builder.CreateString(ctx.engine_id_);
 
     std::vector<nanodeploy::fbs::BlockLocation> locs;
-    auto                                        loc_vec_off = builder.CreateVectorOfStructs(locs);
+    locs.reserve(ctx.block_location.size());
+    for (const auto& loc : ctx.block_location) {
+        locs.emplace_back(loc.first, loc.second);
+    }
+    auto loc_vec_off = builder.CreateVectorOfStructs(locs);
 
     auto disp_vec_off = builder.CreateVector(ctx.num_dispatched_tokens);
 
@@ -119,7 +123,9 @@ size_t serialize_sequences(uintptr_t                                     data_pt
         }
 
         std::vector<flatbuffers::Offset<nanodeploy::fbs::BlockContext>> slot_offsets;
-        slot_offsets.push_back(pack_block_context(builder, seq.slots_[(size_t)BlockContextSlot::ACTIVE]));
+        for (const auto& slot_ctx : seq.slots_) {
+            slot_offsets.push_back(pack_block_context(builder, slot_ctx));
+        }
         auto slots_vec_off = builder.CreateVector(slot_offsets);
 
         auto sampling_params_off = nanodeploy::fbs::CreateSamplingParams(

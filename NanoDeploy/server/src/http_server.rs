@@ -49,7 +49,6 @@ pub struct Choice {
 // App State
 pub struct AppState {
     pub engine_manager: Arc<Mutex<EngineManager>>,
-    pub engine_adapter: Arc<Mutex<EngineAdapter>>,
     pub tokenizer: Arc<TokenizerService>,
     pub next_request_id: AtomicU64,
 }
@@ -61,10 +60,19 @@ async fn chat_completions(
 ) -> Response {
     tracing::info!("Received request: {:?}", req);
 
-    let (adapter, tokenizer) = (state.engine_adapter.clone(), state.tokenizer.clone());
+    let tokenizer = state.tokenizer.clone();
 
     // Generate unique sequence ID
     let seq_id = state.next_request_id.fetch_add(1, Ordering::SeqCst);
+
+    // Get an available engine from manager
+    let adapter = {
+        let mgr = state.engine_manager.lock().await;
+        match mgr.get_next_prefill() {
+            Some(a) => a,
+            None => return (StatusCode::SERVICE_UNAVAILABLE, "No prefill engines available").into_response(),
+        }
+    };
 
     // Acquire lock briefly to send request
     let rx_result = {
@@ -144,6 +152,36 @@ async fn chat_completions(
                          yield Ok(Event::default().event("error").data(e));
                          break;
                     }
+                    StreamEvent::Migrate(payload) => {
+                        tracing::info!("Migration triggered. Routing to Decode Engine...");
+                        let decode_adapter_arc = {
+                            let mgr = state.engine_manager.lock().await;
+                            mgr.get_next_decode()
+                        };
+
+                        if let Some(decode_adapter_arc) = decode_adapter_arc {
+                             let mut decode_adapter = decode_adapter_arc.lock().await;
+                             match decode_adapter.send_raw_request(seq_id, payload).await {
+                                 Ok(new_rx) => {
+                                      // SWAP RX channel transparently
+                                      rx = new_rx;
+                                      tracing::info!("Migration successful. Resuming stream on Decode Engine.");
+                                 },
+                                 Err(e) => {
+                                     tracing::error!("Failed to forward migration: {}", e);
+                                     yield Ok(Event::default().event("error").data("Migration Failed"));
+                                     break;
+                                 }
+                             }
+                        } else {
+                             tracing::error!("No Decode Engine available for migration!");
+                             yield Ok(Event::default().event("error").data("No Decode Nodes"));
+                             break;
+                        }
+                    }
+                    StreamEvent::P2PResponse(_) => {
+                         tracing::error!("Received unexpected P2PResponse in streaming chat request");
+                    }
                 }
             }
         };
@@ -157,6 +195,26 @@ async fn chat_completions(
                 StreamEvent::Token(id) => all_tokens.push(id),
                 StreamEvent::Finished => break,
                 StreamEvent::Error(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Engine error: {}", e)).into_response(),
+                StreamEvent::Migrate(payload) => {
+                    tracing::info!("Migration (Non-Streaming)...");
+                    let decode_adapter_arc = {
+                        let mgr = state.engine_manager.lock().await;
+                        mgr.get_next_decode()
+                    };
+                    if let Some(decode_adapter_arc) = decode_adapter_arc {
+                         let mut decode_adapter = decode_adapter_arc.lock().await;
+                         if let Ok(new_rx) = decode_adapter.send_raw_request(seq_id, payload).await {
+                             rx = new_rx;
+                         } else {
+                             return (StatusCode::INTERNAL_SERVER_ERROR, "Migration Failed").into_response();
+                         }
+                    } else {
+                         return (StatusCode::SERVICE_UNAVAILABLE, "No Decode Nodes").into_response();
+                    }
+                }
+                StreamEvent::P2PResponse(_) => {
+                    tracing::error!("Received unexpected P2PResponse in chat request");
+                }
             }
         }
 
@@ -185,12 +243,10 @@ async fn health() -> &'static str {
 pub async fn start_server(
     port: u16,
     engine_manager: Arc<Mutex<EngineManager>>,
-    engine_adapter: Arc<Mutex<EngineAdapter>>,
     tokenizer: Arc<TokenizerService>
 ) {
     let state = Arc::new(AppState {
         engine_manager,
-        engine_adapter,
         tokenizer,
         next_request_id: AtomicU64::new(1000), // Start from 1000 to avoid engine dummy seqs (<8)
     });

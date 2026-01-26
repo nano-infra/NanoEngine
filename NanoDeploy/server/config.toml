@@ -13,15 +13,13 @@ path = "/home/majinming/models/qwen3-0.6b-local/tokenizer.json"
 [engine]
 mode = "Disaggregated"
 
-[engine.prefill]
-count = 1
-config_path = "/models/configs/prefill.json"
-tensor_parallel = 1
+[[engine.prefill]]
+host = "127.0.0.1"
+port = 6001
 
-[engine.decode]
-count = 2
-config_path = "/models/configs/decode.json"
-tensor_parallel = 2
+[[engine.decode]]
+host = "127.0.0.1"
+port = 6002
 
 [scheduler]
 queue_size = 1000

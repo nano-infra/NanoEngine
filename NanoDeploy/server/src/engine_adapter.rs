@@ -1,4 +1,4 @@
-use crate::fbs::nanodeploy::fbs::nanodeploy::fbs::{SequenceList, SequenceListArgs, Sequence, SequenceArgs, SequenceStatus, StepOut};
+use crate::fbs::nanodeploy::sequence::nanodeploy::fbs::{SequenceList, SequenceListArgs, Sequence, SequenceArgs, SequenceStatus, StepOut};
 use flatbuffers::FlatBufferBuilder;
 use spoke::client::SpokeClient;
 use std::collections::HashMap;
@@ -9,6 +9,9 @@ use tracing::{info, error};
 pub struct EngineAdapter {
     pub client: SpokeClient,
     pub pending_requests: Arc<Mutex<HashMap<u64, RequestState>>>,
+    pub uuid: Option<String>,
+    pub world_size: i32,
+    pub num_blocks: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -16,11 +19,13 @@ pub enum StreamEvent {
     Token(u32),
     Finished,
     Error(String),
+    Migrate(Vec<u8>), // Payload is the full SequenceList FBS
+    P2PResponse(Vec<u8>), // JSON payload
 }
 
 pub struct RequestState {
     pub sender: mpsc::UnboundedSender<StreamEvent>,
-    pub accumulated_tokens: Vec<u32>, // Keep for potential recovery/debug, though streaming removes need
+    pub accumulated_tokens: Vec<u32>,
 }
 
 impl EngineAdapter {
@@ -28,6 +33,9 @@ impl EngineAdapter {
         Self {
             client: SpokeClient::new(id),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            uuid: None,
+            world_size: 0,
+            num_blocks: 0,
         }
     }
 
@@ -40,7 +48,47 @@ impl EngineAdapter {
             info!("EngineAdapter reader loop started.");
             loop {
                 match reader.read_msg().await {
-                    Ok((_meta, body)) => {
+                    Ok((meta, body)) => {
+                        // Action 0: StepOut (Default)
+                        // Action 1: Migration (SequenceList)
+
+                        if meta.action == 1 {
+                             // Migration Event
+                             // We need to peek inside to get seq_id to route it
+                             // Assuming body is SequenceList -> Sequence
+                             use crate::fbs::nanodeploy::sequence::nanodeploy::fbs::root_as_sequence_list;
+                             if let Ok(seq_list) = root_as_sequence_list(&body) {
+                                  if let Some(seqs) = seq_list.sequences() {
+                                      if seqs.len() > 0 {
+                                          let seq = seqs.get(0);
+                                          let seq_id = seq.seq_id();
+                                          info!("Received Action 1 (Migration Candidate) for Seq {}. Payload size: {}", seq_id, body.len());
+                                          let mut map = pending.lock().await;
+                                          if let Some(state) = map.remove(&seq_id) {
+                                              // Send Migrate event with the raw body
+                                              let _ = state.sender.send(StreamEvent::Migrate(body.clone()));
+                                              // We remove from map because this adapter is done with it.
+                                              // The HttpServer will re-add it to the new adapter.
+                                          }
+                                      }
+                                  }
+                             }
+                             continue;
+                        }
+
+                if meta.action == 2 || meta.action == 3 {
+                             // Action 2: GetEngineInfo Response
+                             // Action 3: P2P Init Response
+                             info!("Received Action {} response. Payload size: {}", meta.action, body.len());
+
+                             let mut map = pending.lock().await;
+                             // We use seq_id=0 for control channel responses
+                             if let Some(state) = map.remove(&0) {
+                                  let _ = state.sender.send(StreamEvent::P2PResponse(body.clone()));
+                             }
+                             continue;
+                        }
+
                          if let Ok(step_out) = flatbuffers::root::<StepOut>(&body) {
                              let seq_id = step_out.seq_id();
                              let token_id = step_out.token_id();
@@ -50,7 +98,6 @@ impl EngineAdapter {
                              // Check status logic
                              if status == SequenceStatus::FINISHED {
                                  if let Some(final_state) = map.remove(&seq_id) {
-                                     // Send last token if any
                                      if token_id > 0 {
                                          let _ = final_state.sender.send(StreamEvent::Token(token_id));
                                      }
@@ -77,6 +124,26 @@ impl EngineAdapter {
         Ok(())
     }
 
+    // New method to send raw payload (for forwarding migration)
+    pub async fn send_raw_request(&mut self, seq_id: u64, payload: Vec<u8>) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+        // Register pending request
+        let (tx, rx) = mpsc::unbounded_channel();
+        {
+            let mut map = self.pending_requests.lock().await;
+            map.insert(seq_id, RequestState {
+                sender: tx,
+                accumulated_tokens: Vec::new(),
+            });
+        }
+
+        info!("Sending Raw Request (Migration Forward) for Seq {}. Payload Size: {}", seq_id, payload.len());
+
+        // Action 1: AddRequest (Same as new request, just with populated slots)
+        self.client.send_message(1, seq_id, &payload).await?;
+
+        Ok(rx)
+    }
+
     pub async fn send_add_request(&mut self, seq_id: u64, token_ids: &[u32], max_tokens: i32) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
         // Application layer serialization
         let mut builder = FlatBufferBuilder::new();
@@ -84,9 +151,9 @@ impl EngineAdapter {
         let t_vec = builder.create_vector(&token_ids_i32);
 
         // Create SamplingParams table
-        let sampling_params = crate::fbs::nanodeploy::fbs::nanodeploy::fbs::SamplingParams::create(
+        let sampling_params = crate::fbs::nanodeploy::sequence::nanodeploy::fbs::SamplingParams::create(
             &mut builder,
-            &crate::fbs::nanodeploy::fbs::nanodeploy::fbs::SamplingParamsArgs {
+            &crate::fbs::nanodeploy::sequence::nanodeploy::fbs::SamplingParamsArgs {
                 temperature: 0.1,
                 max_tokens,
                 ignore_eos: false,
@@ -126,9 +193,89 @@ impl EngineAdapter {
             });
         }
 
-        // Delegate to Generic Spoke
+        // Delegate to Generic Spoke (Action 1)
         self.client.send_message(1, seq_id, payload).await?;
 
         Ok(rx)
+    }
+
+    pub async fn send_get_engine_info(&mut self) -> anyhow::Result<serde_json::Value> {
+        // Register pending request for seq_id = 0 (Control Channel)
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        {
+            let mut map = self.pending_requests.lock().await;
+            map.insert(0, RequestState {
+                sender: tx,
+                accumulated_tokens: Vec::new(),
+            });
+        }
+
+        // Action 2: GetEngineInfo
+        self.client.send_message(2, 0, &[]).await?;
+
+        // Wait for response from reader loop
+        if let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::P2PResponse(body) => {
+                     let json: serde_json::Value = serde_json::from_slice(&body)?;
+                     Ok(json)
+                }
+                _ => Err(anyhow::anyhow!("Unexpected response event for GetEngineInfo")),
+            }
+        } else {
+             Err(anyhow::anyhow!("Channel closed while waiting for GetEngineInfo response"))
+        }
+    }
+
+    pub async fn send_p2p_init(&mut self, nodes: Vec<(String, String, u16, String, i32, i32)>) -> anyhow::Result<serde_json::Value> {
+        // Serialize to JSON
+        let nodes_json: Vec<serde_json::Value> = nodes.into_iter().map(|(id, host, port, role, ws, nb)| {
+            serde_json::json!({
+                "id": id,
+                "host": host,
+                "port": port,
+                "role": role,
+                "world_size": ws,
+                "num_blocks": nb
+            })
+        }).collect();
+
+        // P2PInit Payload: List of Node Objects
+        let payload = serde_json::to_vec(&nodes_json)?;
+
+        // Register pending request for seq_id = 0 (Control Channel)
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        {
+            let mut map = self.pending_requests.lock().await;
+            map.insert(0, RequestState {
+                sender: tx,
+                accumulated_tokens: Vec::new(),
+            });
+        }
+
+        // Action 3: P2PInit
+        self.client.send_message(3, 0, &payload).await?;
+
+        // Wait for response from reader loop
+        if let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::P2PResponse(body) => {
+                     let json: serde_json::Value = serde_json::from_slice(&body)?;
+                     Ok(json)
+                }
+                _ => Err(anyhow::anyhow!("Unexpected response event for P2P Init")),
+            }
+        } else {
+             Err(anyhow::anyhow!("Channel closed while waiting for P2P Init response"))
+        }
+    }
+
+    pub async fn send_p2p_connect(&mut self, target_map: HashMap<String, serde_json::Value>) -> anyhow::Result<()> {
+        // P2PConnect Payload: Map of TargetID -> Info
+        let payload = serde_json::to_vec(&target_map)?;
+
+        // Action 4: P2PConnect
+        self.client.send_message(4, 0, &payload).await?;
+        Ok(())
     }
 }

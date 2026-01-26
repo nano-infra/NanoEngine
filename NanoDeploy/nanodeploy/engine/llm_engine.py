@@ -40,7 +40,6 @@ class LLMEngine:
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
-        print("eos:", config.eos)
 
         self.scheduler = Scheduler(config)
         logger.info(
@@ -58,6 +57,14 @@ class LLMEngine:
 
     def get_engine_id(self):
         return self.engine_id
+
+    def get_engine_info(self):
+        return {
+            "id": self.engine_id,
+            "mode": self.config.mode,
+            "world_size": self.config.attn_world_size,
+            "num_blocks": self.config.num_kvcache_blocks,
+        }
 
     def get_num_kv_blocks(self):
         return self.config.num_kvcache_blocks

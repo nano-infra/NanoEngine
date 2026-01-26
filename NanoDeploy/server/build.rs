@@ -12,7 +12,8 @@ fn main() {
         .args(&[
             "--rust",
             "-o", &out_dir,
-            "../../NanoDeploy/proto/sequence.fbs"
+            "../../NanoDeploy/proto/sequence.fbs",
+            "../../NanoDeploy/proto/connection.fbs"
         ])
         .status()
         .expect("Failed to run flatc");

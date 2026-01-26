@@ -74,7 +74,7 @@ Suitable for production with separate Prefill and Decode clusters.
 
 ```bash
 # On Host A (e.g., 192.168.1.10)
-python3 -m nanodeploy.server.engine_entry \
+python3 -m nanodeploy.server.engine_server \
     --mode prefill \
     --port 6000 \
     --model /path/to/model
@@ -84,7 +84,7 @@ python3 -m nanodeploy.server.engine_entry \
 
 ```bash
 # On Host B (e.g., 192.168.1.11)
-python3 -m nanodeploy.server.engine_entry \
+python3 -m nanodeploy.server.engine_server \
     --mode decode \
     --port 7000 \
     --model /path/to/model

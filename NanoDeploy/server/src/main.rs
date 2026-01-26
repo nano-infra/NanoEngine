@@ -9,7 +9,7 @@ use clap::Parser;
 use config::AppConfig;
 use std::path::PathBuf;
 use tracing::{info, error};
-use crate::engine_adapter::EngineAdapter;
+// use crate::engine_adapter::EngineAdapter; // Removed
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -43,42 +43,24 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Configuration loaded.");
 
-    // Phase 1: Engine Manager & Launch
+    // Phase 1: Engine Manager & Connect
     let mut engine_mgr = engine_manager::EngineManager::new();
-    if let Err(e) = engine_mgr.launch_engine(&config.engine).await {
-        error!("Failed to launch engine: {}", e);
+
+    // This replaces launch and manual connect loop
+    info!("Connecting to Engines...");
+    if let Err(e) = engine_mgr.connect_all(&config.engine).await {
+        error!("Failed to connect to engines: {}", e);
         return Err(e);
     }
+    info!("All Engines connected.");
 
-    // Phase 1: Connection (Placeholder IP - in real system, Engine reports IP or we assign port)
-    // For now, assume Engine binds to a known port or we wait for logic.
-    // Spec says: "Rust sends Ping".
-    // We will try to connect to a default port (e.g. 5000) for demo
-
-    info!("Waiting for Engine to startup...");
-    // tokio::time::sleep(std::time::Duration::from_secs(2)).await; // Moved to manager
-
-    // Phase 1: Connect
-    // Phase 1: Connect
-    // Phase 1: Connect
-    let engine_host = config.server.engine_host.unwrap_or_else(|| "127.0.0.1".to_string());
-    let engine_port = config.server.engine_port.unwrap_or(5000);
-    let engine_addr = format!("{}:{}", engine_host, engine_port);
-    info!("Connecting to Engine at {}", engine_addr);
-
-    let mut client = EngineAdapter::new("rust_router".to_string());
-    loop {
-        match client.connect(&engine_addr).await {
-            Ok(_) => {
-                info!("Connected to Engine!");
-                break;
-            }
-            Err(e) => {
-                error!("Failed to connect to Engine: {}. Retrying in 2s...", e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        }
+    // Phase 1.5: P2P Handshake
+    info!("Initializing P2P Mesh...");
+    if let Err(e) = engine_mgr.initialize_p2p_mesh(&config.engine).await {
+         error!("Failed to initialize P2P mesh: {}", e);
+         return Err(e);
     }
+    info!("P2P Mesh Initialized.");
 
     // Phase 2: Tokenizer
     info!("Initializing Tokenizer...");
@@ -91,15 +73,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Phase 3: Start HTTP Server
     let engine_manager = Arc::new(Mutex::new(engine_mgr));
-    let engine_adapter = Arc::new(Mutex::new(client));
     let tokenizer_service_arc = Arc::new(tokenizer_service);
 
     info!("Starting HTTP Server on port {}", config.server.port);
-    http_server::start_server(config.server.port, engine_manager, engine_adapter, tokenizer_service_arc).await;
-
-    // info!("Server is running. Press Ctrl+C to stop.");
-    // tokio::signal::ctrl_c().await?;
-    // info!("Shutting down...");
+    http_server::start_server(config.server.port, engine_manager, tokenizer_service_arc).await;
 
     Ok(())
 }

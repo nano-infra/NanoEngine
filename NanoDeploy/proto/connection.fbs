@@ -1,0 +1,20 @@
+namespace nanodeploy.fbs;
+
+table EngineInfo {
+  id: string;
+  host: string;
+  port: int;
+  role: string; // "prefill" or "decode"
+}
+
+table P2PInit {
+  // Global topology
+  nodes: [EngineInfo];
+}
+
+table P2PConnect {
+  // Instruct this node to connect to these targets
+  target_ids: [string];
+}
+
+root_type P2PInit;
