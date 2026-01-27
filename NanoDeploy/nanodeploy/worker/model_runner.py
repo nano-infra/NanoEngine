@@ -16,6 +16,14 @@ from nanodeploy._cpp import (
     update_seqs_inner_loop,
 )
 from nanodeploy.config import Config
+from nanodeploy.context.cache import get_cache_context, set_cache_context
+from nanodeploy.context.context import get_context, reset_context, set_context
+from nanodeploy.context.distributed import (
+    get_dist_context,
+    get_local_ip,
+    set_dist_context,
+)
+from nanodeploy.context.sp_context import set_sp_context
 from nanodeploy.endpoint.rpc_endpoint import RPCClientEndpoint
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
@@ -24,18 +32,10 @@ from nanodeploy.logging import get_logger, set_log_level
 # from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
-from nanodeploy.worker.cache import get_cache_context, set_cache_context
-from nanodeploy.worker.context import get_context, reset_context, set_context
-from nanodeploy.worker.distributed import (
-    get_dist_context,
-    get_local_ip,
-    set_dist_context,
-)
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
-from nanodeploy.worker.sp_context import set_sp_context
 
-logger = get_logger()
+logger = get_logger("NANODEPLOY")
 
 
 architectures = {
@@ -197,7 +197,7 @@ class ModelRunner:
     def init_rpc_endpoint(self, server_info):
         client_info = self.endpoint.init_client_endpoint()
         self.endpoint.connect(server_info)
-        logger.info("client endpoint initialized")
+        logger.debug("client endpoint initialized")
         return client_info
 
     def num_kvcache_blocks(self):
@@ -391,8 +391,6 @@ class ModelRunner:
                 .reshape(-1, meta.max_num_blocks)
                 .cuda(non_blocking=True)
             )
-
-        logger.info(f"ModelRunner block_tables.shape: {block_tables.shape}")
 
         q_mask = global_context_lens.clone()
         q_mask[sp_rank].fill_(0)
@@ -728,7 +726,7 @@ class ModelRunner:
                     if logger.isEnabledFor(logging.INFO):
                         # Log first sequence's logits stats
                         log_logits = logits[0]
-                        logger.info(
+                        logger.debug(
                             f"Python Logits: [{log_logits[:10].tolist()}...], Max: {log_logits.max().item()}, Max Index: {log_logits.argmax().item()}, Sum: {log_logits.sum().item()}"
                         )
 

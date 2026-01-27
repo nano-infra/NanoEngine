@@ -3,9 +3,9 @@ from typing import List
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.kernels.block_gemm_fp8 import deep_gemm_fp8, quant_fp8_tma
 from nanodeploy.models.quant_config import QuantizationConfig
-from nanodeploy.worker.distributed import get_dist_context
 from torch import nn
 
 

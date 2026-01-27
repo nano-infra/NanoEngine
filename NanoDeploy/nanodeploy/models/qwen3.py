@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -10,7 +11,6 @@ from nanodeploy.layers.linear import (
     RowParallelLinear,
 )
 from nanodeploy.layers.rotary_embedding import get_rope
-from nanodeploy.worker.distributed import get_dist_context
 from torch import nn
 from transformers import Qwen3Config
 

@@ -1,13 +1,13 @@
 # import flash_mla
 import torch
 from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+from nanodeploy.context.context import get_context
+from nanodeploy.context.distributed import get_dist_context
+from nanodeploy.context.sp_context import get_sp_context
 from nanodeploy.kernels.attention import inter_rank_gqa_fwd_batch_decode_combine_kv
 from nanodeploy.kernels.copy import copy_batch_indexed_triton
 from nanodeploy.kernels.kvcache import store_kcache, store_kvcache
 from nanodeploy.logging import get_logger
-from nanodeploy.worker.context import get_context
-from nanodeploy.worker.distributed import get_dist_context
-from nanodeploy.worker.sp_context import get_sp_context
 from torch import nn
 
 logger = get_logger()

@@ -74,12 +74,6 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                 bool finished = (!seq->sampling_params.ignore_eos && token_id == eos_id)
                                 || (seq->num_completed_tokens() >= seq->sampling_params.max_tokens);
 
-                if (seq->seq_id == 1000) {
-                    std::cout << "DEBUG: Seq 1000: prompt=" << seq->num_prompt_tokens << " num=" << seq->num_tokens
-                              << " done=" << seq->num_completed_tokens() << " max=" << seq->sampling_params.max_tokens
-                              << " finished=" << finished << std::endl;
-                }
-
                 if (finished) {
                     seq->status = SequenceStatus::FINISHED;
                     state_manager->deallocate(*seq);

@@ -6,9 +6,9 @@ import dlslime
 import torch
 import torch.distributed as dist
 from nanodeploy._cpp import BlockContextSlot
+from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
-from nanodeploy.worker.distributed import get_dist_context
 
 logger = get_logger("nanodeploy")
 
@@ -147,12 +147,12 @@ class CacheContext:
         self.num_remote_kvcache_blocks[remote_engine_name] = num_kv_blocks
         for i in range(remote_world_size):
             endpoint = dlslime.RDMAEndpoint(device_name=self.selected_nic, num_qp=1)
-            if i == 0:
-                endpoint.register_memory_region(
-                    get_dist_context().rank,
-                    self.kv_cache.data_ptr() + self.kv_cache.storage_offset(),
-                    self.kv_cache.numel() * self.kv_cache.itemsize,
-                )
+            endpoint.register_memory_region(
+                get_dist_context().rank,
+                self.kv_cache.data_ptr(),
+                self.kv_cache.storage_offset(),
+                self.kv_cache.numel() * self.kv_cache.itemsize,
+            )
             endpoint_info = endpoint.endpoint_info()
             endpoints[i] = endpoint
             endpoints_info[i] = endpoint_info

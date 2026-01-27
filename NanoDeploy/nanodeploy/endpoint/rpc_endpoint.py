@@ -30,7 +30,10 @@ class RPCServerEndpoint:
             endpoint = _slime_c.RDMAEndpoint(self.devices[i % len(self.devices)])
             buffer = torch.empty([self.buffer_size], dtype=torch.int8)
             endpoint.register_memory_region(
-                buffer.data_ptr(), buffer.data_ptr(), buffer.numel()
+                buffer.data_ptr(),
+                buffer.data_ptr(),
+                buffer.storage_offset(),
+                buffer.numel(),
             )
             self.server_bindings.append(EndpointBinding(endpoint, buffer, 0))
             endpoint_info.append(
@@ -64,7 +67,7 @@ class RPCServerEndpoint:
                 except Exception:
                     pass
 
-            logger.info(
+            logger.debug(
                 f"Send sequences size: {off} bytes, "
                 f"Total Sequences: {num_seqs}, "
                 f"Total Tokens: {total_tokens}, "
@@ -95,7 +98,10 @@ class RPCClientEndpoint:
             [self.buffer_size], dtype=torch.int8, device="cpu", pin_memory=True
         )
         endpoint.register_memory_region(
-            buffer.data_ptr(), buffer.data_ptr(), buffer.numel()
+            buffer.data_ptr(),
+            buffer.data_ptr(),
+            buffer.storage_offset(),
+            buffer.numel(),
         )
         self.client_binding = EndpointBinding(endpoint, buffer, 0)
 
@@ -111,7 +117,7 @@ class RPCClientEndpoint:
         future.wait()
         buffer = binding.buffer
         buffer_ptr = buffer.data_ptr() + buffer.storage_offset()
-        logger.info(f"Received sequences size: {future.imm_data()} bytes")
+        logger.debug(f"Received sequences size: {future.imm_data()} bytes")
         return deserialize(buffer_ptr, future.imm_data())
 
     def send_tokens(self):

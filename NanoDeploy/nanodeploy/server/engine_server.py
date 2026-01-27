@@ -27,6 +27,9 @@ from nanodeploy.fbs.StepOut import (
     StepOutStart,
 )
 from nanodeploy.llm import LLM
+from nanodeploy.logging import get_logger
+
+logger = get_logger()
 
 # Protocol Constants
 MAGIC = 0x504F4B45
@@ -66,7 +69,7 @@ class EngineServer:
         self.port = config.port
 
         # Initialize Engine
-        print(f"Initializing LLMEngine with config: {config}")
+        logger.info(f"Initializing LLMEngine with config: {config}")
         self.engine = LLM(config)
 
         # Connection state
@@ -86,13 +89,13 @@ class EngineServer:
     # Actually, I can just replace the definition of EngineServer.__init__ and the bottom block.
 
     def run(self):
-        print(f"Engine Server listening on {self.host}:{self.port}")
+        logger.info(f"Engine Server listening on {self.host}:{self.port}")
 
         try:
             while True:
                 self.loop_step()
         except KeyboardInterrupt:
-            print("Shutting down...")
+            logger.info("Shutting down...")
         finally:
             if self.conn:
                 self.conn.close()
@@ -112,7 +115,7 @@ class EngineServer:
         if self.conn is None:
             try:
                 conn, addr = self.server_socket.accept()
-                print(f"Accepted connection from {addr}")
+                logger.info(f"Accepted connection from {addr}")
                 # Use blocking mode to ensure sendall() completes without BlockingIOError.
                 # Since we use select() for reading, this is acceptable for this simple server.
                 conn.setblocking(True)
@@ -131,7 +134,7 @@ class EngineServer:
             if rlist:
                 chunk = self.conn.recv(4096)
                 if not chunk:
-                    print("Connection closed by peer")
+                    logger.info("Connection closed by peer")
                     self.conn.close()
                     self.conn = None
                     self.read_buffer = b""
@@ -141,7 +144,7 @@ class EngineServer:
 
         except (BlockingIOError, ConnectionResetError, BrokenPipeError) as e:
             if isinstance(e, (ConnectionResetError, BrokenPipeError)):
-                print(f"Connection lost: {e}")
+                logger.info(f"Connection lost: {e}")
                 self.conn.close()
                 self.conn = None
                 self.read_buffer = b""
@@ -157,13 +160,12 @@ class EngineServer:
                     self.current_header = struct.unpack(HEADER_FMT, header_data)
 
                     magic, meta_size, data_size = self.current_header
-                    print(
-                        f"TRACE: Recv Header: Magic={hex(magic)}, Meta={meta_size}, Payload={data_size}",
-                        flush=True,
+                    logger.debug(
+                        f"Recv Header: Magic={hex(magic)}, Meta={meta_size}, Payload={data_size}",
                     )
 
                     if magic != MAGIC:
-                        print(f"Invalid Magic: {hex(magic)}. Closing connection.")
+                        logger.info(f"Invalid Magic: {hex(magic)}. Closing connection.")
                         self.conn.close()
                         self.conn = None
                         return
@@ -195,9 +197,8 @@ class EngineServer:
         # NetMetaRaw: action(4), seq(4), actor_id(32), actor_type(32)
         try:
             action, seq_id, actor_id, actor_type = struct.unpack("<II32s32s", meta)
-            # print(f"Received msg: action={action}, seq={seq_id}")
         except struct.error:
-            print("Failed to unpack metadata")
+            logger.error("Failed to unpack metadata")
             return
 
         try:
@@ -228,9 +229,11 @@ class EngineServer:
 
                 try:
                     nodes_list = json.loads(payload.decode("utf-8"))
-                    print(f"Received P2PInit (JSON). Nodes count: {len(nodes_list)}")
+                    logger.info(
+                        f"Received P2PInit (JSON). Nodes count: {len(nodes_list)}"
+                    )
                 except json.JSONDecodeError as e:
-                    print(f"Failed to decode P2PInit JSON: {e}")
+                    logger.error(f"Failed to decode P2PInit JSON: {e}")
                     return
 
                 results = {}
@@ -249,7 +252,7 @@ class EngineServer:
                     num_blocks = node_info.get("num_blocks")
                     ws = node_info.get("world_size")
 
-                    print(
+                    logger.info(
                         f"Initializing P2P with {remote_id} ({remote_role}) (Blocks={num_blocks}, WS={ws})"
                     )
                     try:
@@ -258,7 +261,7 @@ class EngineServer:
                             remote_id, num_blocks, ws
                         )
                     except Exception as e:
-                        print(f"P2P Init failed for {remote_id}: {e}")
+                        logger.error(f"P2P Init failed for {remote_id}: {e}")
 
                 # Send response (Action=3)
                 resp_payload = json.dumps(results).encode("utf-8")
@@ -276,7 +279,7 @@ class EngineServer:
                 try:
                     self.conn.sendall(header + meta + resp_payload)
                 except (BlockingIOError, BrokenPipeError):
-                    print("Failed to send P2PInit Response")
+                    logger.error("Failed to send P2PInit Response")
                     self.conn.close()
                     self.conn = None
 
@@ -286,9 +289,11 @@ class EngineServer:
 
                 try:
                     target_map = json.loads(payload.decode("utf-8"))
-                    print(f"Received P2PConnect (JSON). Targets: {len(target_map)}")
+                    logger.info(
+                        f"Received P2PConnect (JSON). Targets: {len(target_map)}"
+                    )
                 except json.JSONDecodeError as e:
-                    print(f"Failed to decode P2PConnect JSON: {e}")
+                    logger.error(f"Failed to decode P2PConnect JSON: {e}")
                     return
 
                 def convert_keys_to_int(obj):
@@ -312,11 +317,11 @@ class EngineServer:
                 for target_id, info in target_map.items():
                     # target_id is UUID (string)
                     # info is Metadata (nested map with string keys)
-                    print(f"Connecting P2P to {target_id}")
+                    logger.info(f"Connecting P2P to {target_id}")
                     try:
                         self.engine.p2p_connect(target_id, info)
                     except Exception as e:
-                        print(f"Failed to connect P2P to {target_id}: {e}")
+                        logger.error(f"Failed to connect P2P to {target_id}: {e}")
 
                 # Send Response (Success)
                 seq_id_u32 = 0
@@ -332,19 +337,21 @@ class EngineServer:
                 except (BlockingIOError, BrokenPipeError):
                     pass
 
-                print(f"P2P Connect sequence completed for {len(target_map)} targets.")
+                logger.info(
+                    f"P2P Connect sequence completed for {len(target_map)} targets."
+                )
 
             else:
-                print(f"Unknown Action ID: {action}")
+                logger.error(f"Unknown Action ID: {action}")
 
         except Exception as e:
-            print(f"Error handling message: {e}")
+            logger.error(f"Error handling message: {e}")
             import traceback
 
             traceback.print_exc()
 
     def handle_add_request(self, payload: bytes):
-        print("TRACE: handle_add_request start", flush=True)
+        logger.debug("TRACE: handle_add_request start")
         # Safer way to get pointer: create ctypes buffer copy/reference
         import ctypes
 
@@ -358,24 +365,24 @@ class EngineServer:
 
         # deserialize_cpp returns std::vector<std::shared_ptr<Sequence>>
         # bound to Python as List[nanodeploy._cpp.Sequence]
-        print("TRACE: calling deserialize_cpp", flush=True)
+        logger.debug("TRACE: calling deserialize_cpp")
         sequences = deserialize_cpp(ptr, length)
 
         # DUMMY SEQUENCE GENERATION REMOVED
 
         if not sequences:
-            print("Deserialized empty sequence list.")
+            logger.debug("Deserialized empty sequence list.")
             return
 
-        print(f"Adding {len(sequences)} sequences to engine.")
+        logger.debug(f"Adding {len(sequences)} sequences to engine.")
         for s in sequences:
-            print(
+            logger.debug(
                 f"  [Recv Action 1] Seq {s.seq_id}, Tokens: {len(s.token_ids)}, MaxTokens: {s.sampling_params.max_tokens}, Ids: {s.token_ids if len(s.token_ids) < 20 else str(s.token_ids[:10])+'...'}"
             )
 
-        print("TRACE: calling engine.add_request", flush=True)
+        logger.debug("TRACE: calling engine.add_request")
         self.engine.add_request(sequences)
-        print("TRACE: handle_add_request done", flush=True)
+        logger.debug("TRACE: handle_add_request done")
 
     def engine_step(self):
         # Run one step of LLMEngine
@@ -409,13 +416,10 @@ class EngineServer:
                             # dummy seq
                             continue
 
-                        # Debug log for Stop Condition
-                        if seq.seq_id == 1000:  # Assuming 1000 is our test seq
-                            pass
-                            # print(f"DEBUG: Seq {seq.seq_id} Len: {seq.num_tokens} / {seq.sampling_params.max_tokens} Finished: {seq.is_finished}")
-
                         if seq.is_finished:
-                            print(f"Seq {seq.seq_id} FINISHED. Reason: {seq.status}")
+                            logger.info(
+                                f"Seq {seq.seq_id} FINISHED. Reason: {seq.status}"
+                            )
                             self.send_stepout(
                                 seq.seq_id, seq.token_ids[-1], SequenceStatus.FINISHED
                             )
@@ -424,8 +428,7 @@ class EngineServer:
                         elif len(seq.token_ids) > 0:
                             status_enum = SequenceStatus.RUNNING_DECODE
                             start_node = max(0, len(seq.token_ids) - num_tokens)
-                            # Just send the last one for now to permit simple streaming
-                            print(
+                            logger.debug(
                                 f"Seq {seq.seq_id} RUNNING. Len: {len(seq.token_ids)} Max: {seq.sampling_params.max_tokens}"
                             )
                             self.send_stepout(
@@ -433,7 +436,7 @@ class EngineServer:
                             )
 
         except Exception as e:
-            print(f"Error during engine step: {e}")
+            logger.error(f"Error during engine step: {e}")
             import traceback
 
             traceback.print_exc()
@@ -442,7 +445,7 @@ class EngineServer:
         if self.conn is None:
             return
 
-        print(
+        logger.debug(
             f"Migrating Seq {seq.seq_id}, Tokens: {len(seq.token_ids)}, Ids: {seq.token_ids if len(seq.token_ids) < 20 else str(seq.token_ids[:10])+'...'}"
         )
 
@@ -457,13 +460,13 @@ class EngineServer:
         ptr = ctypes.addressof(buffer)
 
         try:
-            print(f"DEBUG: Serializing Seq {seq.seq_id}...", flush=True)
+            logger.debug(f"Serializing Seq {seq.seq_id}...")
             # serialize(data_ptr, buffer_size, seqs_list, is_prefill)
             payload_size = serialize(ptr, buffer_size, [seq], False)
-            print(f"DEBUG: Serialized size: {payload_size}", flush=True)
+            logger.debug(f"Serialized size: {payload_size}")
             payload = buffer.raw[:payload_size]
         except Exception as e:
-            print(f"Serialization failed: {e}")
+            logger.error(f"Serialization failed: {e}")
             import traceback
 
             traceback.print_exc()
@@ -480,7 +483,7 @@ class EngineServer:
         try:
             self.conn.sendall(header + meta + payload)
         except (BlockingIOError, BrokenPipeError):
-            print("Failed to send Migration")
+            logger.error("Failed to send Migration")
             self.conn.close()
             self.conn = None
 
@@ -505,7 +508,7 @@ class EngineServer:
         try:
             self.conn.sendall(header + meta + payload)
         except (BlockingIOError, BrokenPipeError):
-            print("Failed to send StepOut")
+            logger.error("Failed to send StepOut")
             self.conn.close()
             self.conn = None
 
@@ -514,7 +517,7 @@ from jsonargparse import ActionConfigFile, ArgumentParser
 
 
 def main():
-    print("PYTHON SERVER: Script started (main function entered)...", flush=True)
+    logger.info("PYTHON SERVER: Script started (main function entered)")
     parser = ArgumentParser(description="NanoDeploy Engine Server")
     parser.add_argument("--config", action=ActionConfigFile)
     parser.add_class_arguments(Config, fail_untyped=False)
@@ -527,7 +530,7 @@ def main():
     try:
         config = Config(**init_args)
     except Exception as e:
-        print(f"Error initializing Config: {e}")
+        logger.error(f"Error initializing Config: {e}")
         exit(1)
 
     server = EngineServer(config)
