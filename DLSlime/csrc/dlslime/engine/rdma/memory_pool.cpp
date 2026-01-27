@@ -58,6 +58,13 @@ int RDMAMemoryPool::registerRemoteMemoryRegion(const uintptr_t& mr_key, const js
     return 0;
 }
 
+int RDMAMemoryPool::registerRemoteMemoryRegion(const dlslime::fbs::RemoteMr* mr_info)
+{
+    if (!mr_info)
+        return -1;
+    return registerRemoteMemoryRegion(mr_info->mr_key(), mr_info->addr(), mr_info->length(), mr_info->rkey());
+}
+
 int RDMAMemoryPool::unregisterRemoteMemoryRegion(const uintptr_t& mr_key)
 {
     std::unique_lock<std::mutex> lock(remote_mrs_mutex_);
@@ -89,6 +96,21 @@ json RDMAMemoryPool::remote_mr_info()
         mr_info[mr.first] = {{"addr", mr.second.addr}, {"rkey", mr.second.rkey}, {"length", mr.second.length}};
     }
     return mr_info;
+}
+
+flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RemoteMr>>>
+RDMAMemoryPool::pack_mr_info(flatbuffers::FlatBufferBuilder& builder)
+{
+    std::unique_lock<std::mutex>                             lock(mrs_mutex_);
+    std::vector<flatbuffers::Offset<dlslime::fbs::RemoteMr>> mr_offsets;
+    for (auto& mr : mrs_) {
+        mr_offsets.push_back(dlslime::fbs::CreateRemoteMr(builder,
+                                                          (uint64_t)mr.second->addr,
+                                                          (uint64_t)mr.second->length,
+                                                          (uint32_t)mr.second->rkey,
+                                                          (uint64_t)mr.first));
+    }
+    return builder.CreateVector(mr_offsets);
 }
 
 }  // namespace dlslime

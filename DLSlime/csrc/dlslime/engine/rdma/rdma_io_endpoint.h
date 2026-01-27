@@ -73,7 +73,12 @@ public:
                             size_t                          num_qp);
 
     void connect(const json& remote_endpoint_info);
+    void connect(const flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>* remote_info);
+
     json endpointInfo() const;
+
+    flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>>
+         pack(flatbuffers::FlatBufferBuilder& builder) const;
     void cancelAll();
 
     int32_t process();

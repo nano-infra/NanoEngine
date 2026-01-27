@@ -236,6 +236,12 @@ class ModelRunner:
     ):
         return get_cache_context().p2p_connect(remote_engine_id, endpoints_info_list)
 
+    def p2p_disconnect(self, remote_engine_id: str):
+        return get_cache_context().p2p_disconnect(remote_engine_id)
+
+    def get_num_connected_peers(self):
+        return len(get_cache_context().endpoints)
+
     def exit(self):
         if not self.enforce_eager:
             del self.graphs, self.graph_pool

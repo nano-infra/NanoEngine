@@ -1,10 +1,14 @@
 import atexit
+import json
+import threading
 import time
 import uuid
 from dataclasses import fields
 from time import perf_counter
-from typing import Literal
+from typing import Any, Dict, List, Literal, Optional, Set
 
+import etcd3
+import flatbuffers
 import numpy as np
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -13,6 +17,8 @@ from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.config import Config
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence, SequenceStatus
+from nanodeploy.fbs import EngineInfo as EngineInfoModule
+from nanodeploy.fbs.EngineInfo import EngineInfo
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.metrics import MetricsManager
 
@@ -46,7 +52,245 @@ class LLMEngine:
             f"Initialized Scheduler with RoutingStrategy: {self.scheduler.routing_strategy}"
         )
         self.metrics_manager = MetricsManager()
+
+        # Etcd Discovery & Mesh
+        etcd_host, etcd_port = config.etcd_address.split(":")
+        self.etcd = etcd3.client(host=etcd_host, port=int(etcd_port))
+        self.cluster_id = config.cluster_id
+        self.lease = None
+        self.active_p2p_links: Set[str] = set()
+        self.handshake_watches: Dict[str, Any] = {}
+
+        self._setup_etcd()
+        self.discovery_thread = threading.Thread(target=self._watch_loop, daemon=True)
+        self.discovery_thread.start()
+
         atexit.register(self.exit)
+
+    def _setup_etcd(self):
+        """Register node in etcd and start keep-alive."""
+        logger.info(f"Registering node {self.engine_id} in cluster {self.cluster_id}")
+        self.lease = self.etcd.lease(ttl=10)
+
+        builder = flatbuffers.Builder(1024)
+        id_off = builder.CreateString(self.engine_id)
+        role_off = builder.CreateString(self.config.mode)
+        host_off = builder.CreateString(self.config.host)
+        status_off = builder.CreateString("initializing")
+
+        EngineInfoModule.Start(builder)
+        EngineInfoModule.AddId(builder, id_off)
+        EngineInfoModule.AddRole(builder, role_off)
+        EngineInfoModule.AddRank(builder, 0)
+        EngineInfoModule.AddWorldSize(builder, self.config.attn_world_size)
+        EngineInfoModule.AddNumBlocks(builder, self.config.num_kvcache_blocks)
+        EngineInfoModule.AddHost(builder, host_off)
+        EngineInfoModule.AddPort(builder, self.config.port)
+        EngineInfoModule.AddStatus(builder, status_off)
+        info_off = EngineInfoModule.End(builder)
+        builder.Finish(info_off)
+
+        val = bytes(builder.Output())
+        key = f"/nanodeploy/mesh/{self.cluster_id}/nodes/{self.engine_id}"
+        self.etcd.put(key, val, lease=self.lease)
+
+        # Start keep-alive thread
+        def keep_alive():
+            logger.info("Starting etcd lease keep-alive loop")
+            while hasattr(self, "etcd"):
+                try:
+                    self.lease.refresh()
+                    time.sleep(3)  # Refresh every 3s (TTL is 10s)
+                except Exception as e:
+                    logger.error(f"Lease refresh failed: {e}")
+                    time.sleep(1)
+
+        self.ka_thread = threading.Thread(target=keep_alive, daemon=True)
+        self.ka_thread.start()
+
+    def _update_status(self, status: str):
+        """Update node status in etcd."""
+        logger.info(f"Updating node status to {status}")
+        builder = flatbuffers.Builder(1024)
+        id_off = builder.CreateString(self.engine_id)
+        role_off = builder.CreateString(self.config.mode)
+        host_off = builder.CreateString(self.config.host)
+        status_off = builder.CreateString(status)
+
+        EngineInfoModule.Start(builder)
+        EngineInfoModule.AddId(builder, id_off)
+        EngineInfoModule.AddRole(builder, role_off)
+        EngineInfoModule.AddRank(builder, 0)
+        EngineInfoModule.AddWorldSize(builder, self.config.attn_world_size)
+        EngineInfoModule.AddNumBlocks(builder, self.config.num_kvcache_blocks)
+        EngineInfoModule.AddHost(builder, host_off)
+        EngineInfoModule.AddPort(builder, self.config.port)
+        EngineInfoModule.AddStatus(builder, status_off)
+        info_off = EngineInfoModule.End(builder)
+        builder.Finish(info_off)
+
+        val = bytes(builder.Output())
+        key = f"/nanodeploy/mesh/{self.cluster_id}/nodes/{self.engine_id}"
+        self.etcd.put(key, val, lease=self.lease)
+
+    def _watch_loop(self):
+        """Watch for new nodes and handshake events."""
+        node_prefix = f"/nanodeploy/mesh/{self.cluster_id}/nodes/"
+        logger.info(f"Starting discovery scan on prefix: {node_prefix}")
+
+        # 1. Scan for existing nodes
+        try:
+            existing_nodes = self.etcd.get_prefix(node_prefix)
+            count = 0
+            for val, meta in existing_nodes:
+                count += 1
+                key = meta.key.decode("utf-8")
+                peer_id = key.split("/")[-1]
+                logger.info(f"Scan found node: {peer_id} (Key: {key})")
+
+                if peer_id == self.engine_id:
+                    logger.info("Skipping self in scan.")
+                    continue
+
+                logger.info(f"Discovered existing peer: {peer_id}")
+                peer_info = EngineInfo.GetRootAsEngineInfo(val, 0)
+                self._on_peer_online(peer_id, peer_info)
+            logger.info(f"Scan completed. Found {count} nodes.")
+            self._update_status("ready")
+        except Exception as e:
+            logger.error(f"Discovery scan failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+        # 2. Watch for future events
+        logger.info("Entering event watch loop...")
+        events_iterator, cancel = self.etcd.watch_prefix(node_prefix)
+        for event in events_iterator:
+            key = event.key.decode("utf-8")
+            peer_id = key.split("/")[-1]
+            if peer_id == self.engine_id:
+                continue
+            if isinstance(event, etcd3.events.PutEvent):
+                peer_info = EngineInfo.GetRootAsEngineInfo(event.value, 0)
+                self._on_peer_online(peer_id, peer_info)
+            elif isinstance(event, etcd3.events.DeleteEvent):
+                self._on_peer_offline(peer_id)
+
+    def _on_peer_online(self, peer_id: str, peer_info):
+        peer_role = peer_info.Role().decode("utf-8")
+        my_role = self.config.mode
+        if (my_role == "prefill" and peer_role == "decode") or (
+            my_role == "decode" and peer_role == "prefill"
+        ):
+            low_id = min(self.engine_id, peer_id)
+            high_id = max(self.engine_id, peer_id)
+            h_root = f"/nanodeploy/mesh/{self.cluster_id}/handshake/{low_id}/{high_id}"
+            if self.engine_id == low_id:
+                logger.info(f"Initiating handshake with peer {peer_id}")
+                my_meta = self.p2p_init(
+                    peer_id, peer_info.NumBlocks(), peer_info.WorldSize()
+                )
+                self.etcd.put(f"{h_root}/meta_low", json.dumps(my_meta))
+                self._start_handshake_watch(peer_id, f"{h_root}/meta_high", "meta_high")
+            else:
+                logger.info(f"Waiting for handshake from peer {peer_id}")
+                self._start_handshake_watch(peer_id, f"{h_root}/meta_low", "meta_low")
+
+    def _start_handshake_watch(self, peer_id: str, key: str, expected: str):
+        if peer_id in self.handshake_watches:
+            return
+
+        # Use a polling thread instead of relying solely on etcd watches (which seem flaky)
+        logger.info(f"Starting polling for handshake key: {key}")
+
+        def poll_loop():
+            while peer_id not in self.active_p2p_links:
+                # Safety check for shutdown
+                if not hasattr(self, "executor"):
+                    return
+                try:
+                    val, _ = self.etcd.get(key)
+                    if val:
+                        logger.info(f"Polled handshake key {key} found!")
+                        self._handle_handshake_step(
+                            peer_id, expected, val.decode("utf-8")
+                        )
+                        return
+                    time.sleep(0.5)
+                except Exception as e:
+                    # Suppress errors if we are shutting down
+                    if not hasattr(self, "executor"):
+                        return
+                    logger.error(f"Error polling {key}: {e}")
+                    time.sleep(1.0)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+        self.handshake_watches[peer_id] = t
+
+    def _convert_keys_to_int(self, obj):
+        if isinstance(obj, dict):
+            return {
+                (
+                    int(k) if isinstance(k, str) and k.isdigit() else k
+                ): self._convert_keys_to_int(v)
+                for k, v in obj.items()
+            }
+        elif isinstance(obj, list):
+            return [self._convert_keys_to_int(x) for x in obj]
+        return obj
+
+    def _handle_handshake_step(self, peer_id: str, step: str, meta_json: str):
+        # Safety check
+        if not hasattr(self, "executor"):
+            return
+
+        # Idempotency Check:
+        if peer_id in self.active_p2p_links:
+            logger.debug(f"Ignoring handshake step for {peer_id} (already connected)")
+            return
+
+        logger.info(f"Processing handshake step '{step}' from {peer_id}")
+        # ... logic as before ...
+
+        meta = json.loads(meta_json)
+        # Fix JSON integer keys
+        meta = self._convert_keys_to_int(meta)
+
+        if step == "meta_low":
+            node_key = f"/nanodeploy/mesh/{self.cluster_id}/nodes/{peer_id}"
+            val, _ = self.etcd.get(node_key)
+            if not val:
+                logger.error(f"Cannot find node info for {peer_id}")
+                return
+            peer_info = EngineInfo.GetRootAsEngineInfo(val, 0)
+            my_meta = self.p2p_init(
+                peer_id, peer_info.NumBlocks(), peer_info.WorldSize()
+            )
+            low_id, high_id = min(self.engine_id, peer_id), max(self.engine_id, peer_id)
+            self.etcd.put(
+                f"/nanodeploy/mesh/{self.cluster_id}/handshake/{low_id}/{high_id}/meta_high",
+                json.dumps(my_meta),
+            )
+            self.p2p_connect(peer_id, meta)
+            self.active_p2p_links.add(peer_id)
+        elif step == "meta_high":
+            self.p2p_connect(peer_id, meta)
+            self.active_p2p_links.add(peer_id)
+
+        if peer_id in self.handshake_watches:
+            self.etcd.cancel_watch(self.handshake_watches[peer_id])
+            del self.handshake_watches[peer_id]
+
+    def _on_peer_offline(self, peer_id: str):
+        if peer_id in self.active_p2p_links:
+            logger.info(f"Peer {peer_id} offline. Cleaning up DLSlime link.")
+            try:
+                self.executor.p2p_disconnect(peer_id)
+            except:
+                pass
+            self.active_p2p_links.remove(peer_id)
 
     def exit(self):
         del self.executor
@@ -210,7 +454,7 @@ class LLMEngine:
             )
             for seq in seqs:
                 if seq.is_finished or seq.is_to_be_migrated:
-                    if seq.is_finished:
+                    if seq.is_finished or seq.is_to_be_migrated:
                         self.metrics_manager.complete_sequence(seq.seq_id)
                     outputs.append(seq)
         return (
@@ -236,6 +480,21 @@ class LLMEngine:
         self, remote_engine_name: str, remote_endpoints_info: list[list[dict]]
     ):
         return self.executor.p2p_connect(remote_engine_name, remote_endpoints_info)
+
+    def wait_for_mesh(self, expected_peers: int, timeout: float = 60.0):
+        """Wait until the expected number of P2P links are established."""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            # Check number of connected peers in cache context on workers
+            # (assuming all workers have the same view of connected peers)
+            num_connected = self.executor.collective_rpc("get_num_connected_peers")[0]
+            if num_connected >= expected_peers:
+                logger.info(f"Mesh ready! Connected peers: {num_connected}")
+                return True
+            time.sleep(1.0)
+        raise TimeoutError(
+            f"Mesh not ready after {timeout}s. Connected: {num_connected}/{expected_peers}"
+        )
 
     def generate(
         self,

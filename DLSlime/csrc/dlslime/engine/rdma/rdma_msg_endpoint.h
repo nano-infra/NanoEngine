@@ -130,8 +130,17 @@ public:
     ~RDMAMsgEndpoint();
 
     void connect(const json& remote_endpoint_info);
+    void connect(const dlslime::fbs::RdmaEndpointInfo* info);
 
     json endpointInfo() const;
+
+    flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>>
+    pack_meta(flatbuffers::FlatBufferBuilder& builder) const;
+
+    flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>>
+    pack_data(flatbuffers::FlatBufferBuilder& builder) const;
+
+    flatbuffers::Offset<dlslime::fbs::RemoteMr> pack_remote_meta_base(flatbuffers::FlatBufferBuilder& builder) const;
 
     std::shared_ptr<SendFuture> send(const chunk_tuple_t& chunk, void* stream_handler);
 

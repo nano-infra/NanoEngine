@@ -15,9 +15,11 @@
 #include "dlslime/logging.h"
 #include "dlslime/utils.h"
 #include "engine/rdma/memory_pool.h"
+#include "flatbuffers/flatbuffers.h"
 #include "rdma_assignment.h"
 #include "rdma_env.h"
 #include "rdma_future.h"
+#include "rdma_generated.h"
 
 namespace dlslime {
 
@@ -242,6 +244,17 @@ void RDMAIOEndpoint::connect(const json& remote_endpoint_info)
 json RDMAIOEndpoint::endpointInfo() const
 {
     return json{{"data_channel_info", data_channel_->channelInfo()}};
+}
+
+flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>>
+RDMAIOEndpoint::pack(flatbuffers::FlatBufferBuilder& builder) const
+{
+    return data_channel_->pack(builder);
+}
+
+void RDMAIOEndpoint::connect(const flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>* remote_info)
+{
+    data_channel_->connect(remote_info);
 }
 
 // ============================================================

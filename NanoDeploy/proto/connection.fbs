@@ -1,20 +1,34 @@
+include "../../DLSlime/proto/rdma.fbs";
+
 namespace nanodeploy.fbs;
 
 table EngineInfo {
   id: string;
+  role: string; // "prefill" or "decode"
+  rank: int;
+  world_size: int;
+  num_blocks: int;
   host: string;
   port: int;
-  role: string; // "prefill" or "decode"
+  status: string; // "initializing" or "ready"
+}
+
+table Peer {
+  id: string;
+  local_info: [ubyte];  // My endpoint info for this peer (RdmaEndpointInfo)
+  remote_info: [ubyte]; // Peer's endpoint info for me (RdmaEndpointInfo)
 }
 
 table P2PInit {
-  // Global topology
   nodes: [EngineInfo];
 }
 
 table P2PConnect {
-  // Instruct this node to connect to these targets
-  target_ids: [string];
+  peers: [Peer];
+}
+
+table P2PInitResponse {
+  responses: [Peer];
 }
 
 root_type P2PInit;

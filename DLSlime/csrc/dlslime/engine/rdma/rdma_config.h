@@ -12,6 +12,7 @@
 
 #include "dlslime/json.hpp"
 #include "dlslime/logging.h"
+#include "rdma_generated.h"
 
 namespace dlslime {
 
@@ -38,6 +39,28 @@ typedef struct rdma_info {
         qpn                      = json_config["qpn"];
         psn                      = json_config["psn"];
         mtu                      = json_config["mtu"];
+    }
+
+    rdma_info(const dlslime::fbs::RdmaInfo* fb_info)
+    {
+        if (fb_info) {
+            qpn  = fb_info->qpn();
+            gidx = fb_info->gidx();
+            lid  = fb_info->lid();
+            psn  = fb_info->psn();
+            mtu  = fb_info->mtu();
+            if (fb_info->gid()) {
+                memcpy(gid.raw, fb_info->gid()->raw()->data(), 16);
+            }
+        }
+    }
+
+    flatbuffers::Offset<dlslime::fbs::RdmaInfo> pack(flatbuffers::FlatBufferBuilder& builder) const
+    {
+        uint8_t raw_gid[16];
+        memcpy(raw_gid, gid.raw, 16);
+        auto gid_fb = dlslime::fbs::IbvGid(flatbuffers::make_span(raw_gid));
+        return dlslime::fbs::CreateRdmaInfo(builder, qpn, &gid_fb, gidx, lid, psn, mtu);
     }
 
     json to_json() const

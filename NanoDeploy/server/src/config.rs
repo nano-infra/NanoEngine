@@ -1,5 +1,5 @@
-use serde::Deserialize;
 use config::{Config, ConfigError, File};
+use serde::Deserialize;
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -34,7 +34,9 @@ pub enum EngineConfig {
         port: u16,
     },
     Disaggregated {
+        #[serde(default)]
         prefill: Vec<EngineNode>,
+        #[serde(default)]
         decode: Vec<EngineNode>,
     },
 }
@@ -48,11 +50,19 @@ pub struct SchedulerConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
+pub struct EtcdConfig {
+    pub address: String, // "host:port"
+    pub cluster_id: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct AppConfig {
     pub server: ServerConfig,
     pub tokenizer: TokenizerConfig,
     pub engine: EngineConfig,
     pub scheduler: SchedulerConfig,
+    pub etcd: Option<EtcdConfig>,
 }
 
 impl AppConfig {
@@ -138,7 +148,10 @@ mod tests {
             timeout_ms = 1000
         "#;
 
-        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().expect("TempFile");
+        let mut file = tempfile::Builder::new()
+            .suffix(".toml")
+            .tempfile()
+            .expect("TempFile");
         write!(file, "{}", toml_content).expect("Write");
         let config = AppConfig::load_from_file(file.path()).expect("Load");
 

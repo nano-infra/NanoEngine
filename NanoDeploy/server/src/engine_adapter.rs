@@ -1,4 +1,5 @@
 use crate::fbs::nanodeploy::sequence::nanodeploy::fbs::{SequenceList, SequenceListArgs, Sequence, SequenceArgs, SequenceStatus, StepOut};
+use crate::fbs::nanodeploy::connection::nanodeploy::fbs::{EngineInfo, EngineInfoArgs, P2PInit, P2PInitArgs};
 use flatbuffers::FlatBufferBuilder;
 use spoke::client::SpokeClient;
 use std::collections::HashMap;
@@ -227,21 +228,35 @@ impl EngineAdapter {
         }
     }
 
-    pub async fn send_p2p_init(&mut self, nodes: Vec<(String, String, u16, String, i32, i32)>) -> anyhow::Result<serde_json::Value> {
-        // Serialize to JSON
-        let nodes_json: Vec<serde_json::Value> = nodes.into_iter().map(|(id, host, port, role, ws, nb)| {
-            serde_json::json!({
-                "id": id,
-                "host": host,
-                "port": port,
-                "role": role,
-                "world_size": ws,
-                "num_blocks": nb
-            })
-        }).collect();
+    pub async fn send_p2p_init(&mut self, nodes: Vec<(String, String, u16, String, i32, i32)>) -> anyhow::Result<Vec<u8>> {
+        let mut builder = FlatBufferBuilder::new();
 
-        // P2PInit Payload: List of Node Objects
-        let payload = serde_json::to_vec(&nodes_json)?;
+        let mut node_offsets = Vec::new();
+        for (id, host, port, role, ws, nb) in nodes {
+            let id_off = builder.create_string(&id);
+            let role_off = builder.create_string(&role);
+            let host_off = builder.create_string(&host);
+            let status_off = builder.create_string("ready");
+
+            node_offsets.push(EngineInfo::create(&mut builder, &EngineInfoArgs {
+                id: Some(id_off),
+                role: Some(role_off),
+                host: Some(host_off),
+                port: port as i32,
+                world_size: ws,
+                num_blocks: nb,
+                status: Some(status_off),
+                ..Default::default()
+            }));
+        }
+
+        let nodes_vec = builder.create_vector(&node_offsets);
+        let p2p_init = P2PInit::create(&mut builder, &P2PInitArgs {
+            nodes: Some(nodes_vec),
+        });
+
+        builder.finish(p2p_init, None);
+        let payload = builder.finished_data().to_vec();
 
         // Register pending request for seq_id = 0 (Control Channel)
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -260,8 +275,8 @@ impl EngineAdapter {
         if let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::P2PResponse(body) => {
-                     let json: serde_json::Value = serde_json::from_slice(&body)?;
-                     Ok(json)
+                     // Response is now P2PInitResponse (FB)
+                     Ok(body)
                 }
                 _ => Err(anyhow::anyhow!("Unexpected response event for P2P Init")),
             }
@@ -270,12 +285,33 @@ impl EngineAdapter {
         }
     }
 
-    pub async fn send_p2p_connect(&mut self, target_map: HashMap<String, serde_json::Value>) -> anyhow::Result<()> {
-        // P2PConnect Payload: Map of TargetID -> Info
-        let payload = serde_json::to_vec(&target_map)?;
+    pub async fn send_p2p_connect(&mut self, target_map: HashMap<String, Vec<u8>>) -> anyhow::Result<()> {
+        use crate::fbs::nanodeploy::connection::nanodeploy::fbs::{P2PConnect, P2PConnectArgs, Peer, PeerArgs};
+
+        let mut builder = FlatBufferBuilder::new();
+        let mut peer_offsets = Vec::new();
+
+        for (target_id, remote_info_bytes) in target_map {
+            let id_off = builder.create_string(&target_id);
+            let remote_info_off = builder.create_vector(&remote_info_bytes);
+
+            peer_offsets.push(Peer::create(&mut builder, &PeerArgs {
+                id: Some(id_off),
+                remote_info: Some(remote_info_off),
+                ..Default::default()
+            }));
+        }
+
+        let peers_vec = builder.create_vector(&peer_offsets);
+        let p2p_connect = P2PConnect::create(&mut builder, &P2PConnectArgs {
+            peers: Some(peers_vec),
+        });
+
+        builder.finish(p2p_connect, None);
+        let payload = builder.finished_data();
 
         // Action 4: P2PConnect
-        self.client.send_message(4, 0, &payload).await?;
+        self.client.send_message(4, 0, payload).await?;
         Ok(())
     }
 }

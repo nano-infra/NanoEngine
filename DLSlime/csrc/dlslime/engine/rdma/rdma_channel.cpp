@@ -99,6 +99,38 @@ json RDMAChannel::channelInfo() const
     return local_info;
 }
 
+flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>>
+RDMAChannel::pack(flatbuffers::FlatBufferBuilder& builder) const
+{
+    std::vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>> info_offsets;
+    for (const auto& info : local_rdma_info_) {
+        info_offsets.push_back(info.pack(builder));
+    }
+    return builder.CreateVector(info_offsets);
+}
+
+int32_t RDMAChannel::connect(const flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>* remote_info)
+{
+    if (!remote_info)
+        return -1;
+    SLIME_ASSERT(state == RDMAChannelState::Initialized, "Not Initialized or already connected");
+    SLIME_ASSERT_EQ(local_rdma_info_.size(), remote_info->size(), "Peer must have same QP Size.");
+
+    for (int qpi = 0; qpi < local_rdma_info_.size(); qpi++) {
+        remote_rdma_info_[qpi] = rdma_info_t(remote_info->Get(qpi));
+    }
+
+    modify_qp_to_r2r();
+    modify_qp_to_r2s();
+
+    state = RDMAChannelState::Connected;
+    if (ibv_req_notify_cq(ctx_->cq_, 0)) {
+        SLIME_ABORT("Failed to request notify for CQ");
+    }
+    SLIME_LOG_INFO("RDMA exchange (FlatBuffers) done");
+    return 0;
+}
+
 int32_t RDMAChannel::connect(json remote_rdma_info_json)
 {
     SLIME_ASSERT(state == RDMAChannelState::Initialized, "Not Initialized or already connected");

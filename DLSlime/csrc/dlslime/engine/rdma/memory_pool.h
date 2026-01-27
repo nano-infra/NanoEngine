@@ -61,6 +61,8 @@ public:
 
     int registerRemoteMemoryRegion(const uintptr_t& mr_key, const json& mr_info);
 
+    int registerRemoteMemoryRegion(const dlslime::fbs::RemoteMr* mr_info);
+
     int unregisterRemoteMemoryRegion(const uintptr_t& mr_key);
 
     inline struct ibv_mr* get_mr(const uintptr_t& mr_key)
@@ -85,6 +87,9 @@ public:
 
     json mr_info();
     json remote_mr_info();
+
+    flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RemoteMr>>>
+    pack_mr_info(flatbuffers::FlatBufferBuilder& builder);
 
 private:
     ibv_pd* pd_;

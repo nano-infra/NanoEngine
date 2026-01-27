@@ -16,12 +16,14 @@
 #include "dlslime/logging.h"
 #include "dlslime/utils.h"
 #include "engine/rdma/memory_pool.h"
+#include "flatbuffers/flatbuffers.h"
 #include "rdma_assignment.h"
 #include "rdma_channel.h"
 #include "rdma_common.h"
 #include "rdma_context.h"
 #include "rdma_env.h"
 #include "rdma_future.h"
+#include "rdma_generated.h"
 #include "rdma_utils.h"
 
 namespace dlslime {
@@ -146,6 +148,70 @@ json RDMAMsgEndpoint::endpointInfo() const
                               {"data_channel_info", data_channel_->channelInfo()},
                               {"remote_meta_base", {{"addr", base_ptr}, {"rkey", mr->rkey}, {"length", mr->length}}}};
     return endpoint_info;
+}
+
+void RDMAMsgEndpoint::connect(const dlslime::fbs::RdmaEndpointInfo* info)
+{
+    if (!info)
+        return;
+
+    SLIME_LOG_INFO("Establishing RDMA Connection (FlatBuffers)...");
+
+    meta_channel_->connect(info->msg_meta_info());
+    data_channel_->connect(info->msg_data_info());
+
+    // Register Remote Meta Base
+    if (info->remote_meta_base()) {
+        auto base = info->remote_meta_base();
+        memory_pool_->registerRemoteMemoryRegion(base->addr(), base->addr(), base->length(), base->rkey());
+        for (int i = 0; i < SLIME_MAX_MSG_FIFO_DEPTH; ++i) {
+            recv_ctx_pool_[i].remote_meta_key_ = base->addr();
+        }
+    }
+
+    // Pre-post RECV requests
+    for (int i = 0; i < SLIME_MAX_MSG_FIFO_DEPTH; ++i) {
+        SendContext*            send_ctx = &(send_ctx_pool_[i]);
+        std::vector<Assignment> batch{Assignment(reinterpret_cast<uintptr_t>(dummy_), 0, 0, sizeof(int64_t))};
+        send_ctx->meta_recv_assign_.reset(OpCode::RECV, 0, batch, [send_ctx](int32_t status, int32_t imm) {
+            send_ctx->meta_arrived_flag_.val.store(1, std::memory_order_release);
+        });
+        meta_channel_->post_recv_batch(0, &(send_ctx->meta_recv_assign_));
+    }
+
+    for (int i = 0; i < SLIME_MAX_MSG_FIFO_DEPTH; ++i) {
+        RecvContext* recv_ctx = &(recv_ctx_pool_[i]);
+        for (size_t qpi = 0; qpi < num_qp_; ++qpi) {
+            std::vector<Assignment> batch{Assignment(reinterpret_cast<uintptr_t>(dummy_), 0, 0, sizeof(int64_t))};
+            recv_ctx->data_recv_assigns_[qpi].reset(
+                OpCode::RECV, qpi, batch, [recv_ctx, qpi](int32_t status, int32_t imm) {
+                    if (status == 0)
+                        recv_ctx->signal->set_comm_done(qpi);
+                });
+            data_channel_->post_recv_batch(qpi, &(recv_ctx->data_recv_assigns_[qpi]));
+        }
+    }
+    SLIME_LOG_INFO("RDMA Connection (FlatBuffers) Established.");
+}
+
+flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>>
+RDMAMsgEndpoint::pack_meta(flatbuffers::FlatBufferBuilder& builder) const
+{
+    return meta_channel_->pack(builder);
+}
+
+flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>>
+RDMAMsgEndpoint::pack_data(flatbuffers::FlatBufferBuilder& builder) const
+{
+    return data_channel_->pack(builder);
+}
+
+flatbuffers::Offset<dlslime::fbs::RemoteMr>
+RDMAMsgEndpoint::pack_remote_meta_base(flatbuffers::FlatBufferBuilder& builder) const
+{
+    auto           base_ptr = reinterpret_cast<uintptr_t>(send_ctx_pool_);
+    struct ibv_mr* mr       = memory_pool_->get_mr(base_ptr);
+    return dlslime::fbs::CreateRemoteMr(builder, base_ptr, mr->length, mr->rkey, base_ptr);
 }
 
 void RDMAMsgEndpoint::connect(const json& remote_endpoint_info)

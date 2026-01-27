@@ -186,8 +186,25 @@ PYBIND11_MODULE(_slime_c, m)
              py::arg("link_type")   = "RoCE",
              py::arg("num_qp")      = 1,
              py::arg("worker")      = nullptr)
-        .def("connect", &dlslime::RDMAEndpoint::connect, py::call_guard<py::gil_scoped_release>())
+        .def("connect",
+             [](dlslime::RDMAEndpoint& self, py::object info) {
+                 if (py::isinstance<py::bytes>(info)) {
+                     std::string            buf = py::cast<std::string>(info);
+                     py::gil_scoped_release release;
+                     self.connect(buf);
+                 }
+                 else {
+                     json                   j = py::cast<json>(info);
+                     py::gil_scoped_release release;
+                     self.connect(j);
+                 }
+             })
         .def("endpoint_info", &dlslime::RDMAEndpoint::endpointInfo)
+        .def("endpoint_info_fb",
+             [](dlslime::RDMAEndpoint& self) {
+                 auto vec = self.endpointInfoFB();
+                 return py::bytes(reinterpret_cast<const char*>(vec.data()), vec.size());
+             })
 
         .def("register_memory_region",
              &dlslime::RDMAEndpoint::registerOrAccessMemoryRegion,
@@ -197,8 +214,18 @@ PYBIND11_MODULE(_slime_c, m)
              py::arg("length"),
              py::call_guard<py::gil_scoped_release>())
         .def("register_remote_memory_region",
-             &dlslime::RDMAEndpoint::registerOrAccessRemoteMemoryRegion,
-             py::call_guard<py::gil_scoped_release>())
+             [](dlslime::RDMAEndpoint& self, uintptr_t ptr, py::object info) {
+                 if (py::isinstance<py::bytes>(info)) {
+                     std::string            buf = py::cast<std::string>(info);
+                     py::gil_scoped_release release;
+                     return self.registerOrAccessRemoteMemoryRegion(ptr, buf);
+                 }
+                 else {
+                     json                   j = py::cast<json>(info);
+                     py::gil_scoped_release release;
+                     return self.registerOrAccessRemoteMemoryRegion(ptr, j);
+                 }
+             })
 
         // --- Msg Operations ---
         .def("send",
@@ -299,8 +326,8 @@ PYBIND11_MODULE(_slime_c, m)
              &dlslime::AllToAllIntraLLBuffer::allToAllLL2D,
              py::arg("x"),
              py::arg("is_transpose") = false,
-             py::arg("mask") = py::none(),
-             py::arg("offsets") = py::none(),
+             py::arg("mask")         = py::none(),
+             py::arg("offsets")      = py::none(),
              "AllGather with optional mask and offsets");
 #endif
 

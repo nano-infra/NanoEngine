@@ -165,6 +165,14 @@ class CacheContext:
             endpoint_info = endpoints_info[dist.get_rank()]
             self.endpoints[remote_engine_id][i].connect(endpoint_info)
 
+    def p2p_disconnect(self, remote_engine_id: str):
+        if remote_engine_id in self.endpoints:
+            # Just clear by now, as per feedback
+            del self.endpoints[remote_engine_id]
+            if remote_engine_id in self.num_remote_kvcache_blocks:
+                del self.num_remote_kvcache_blocks[remote_engine_id]
+            logger.info(f"P2P Link to {remote_engine_id} disconnected and cleared.")
+
     def migrate(self, seqs: list[Sequence]):
         assigns = defaultdict(lambda: defaultdict(list))
         sp_idx = get_dist_context().attn_sp_rank

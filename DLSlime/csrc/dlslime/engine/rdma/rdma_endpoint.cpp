@@ -6,7 +6,9 @@
 #include <string>
 
 #include "engine/rdma/rdma_channel.h"
+#include "flatbuffers/flatbuffers.h"
 #include "rdma_context_pool.h"
+#include "rdma_generated.h"
 #include "rdma_io_endpoint.h"
 #include "rdma_utils.h"
 #include "rdma_worker.h"
@@ -61,11 +63,73 @@ void RDMAEndpoint::connect(const json& remote_endpoint_info)
     worker_->addEndpoint(shared_from_this());
 }
 
+void RDMAEndpoint::connect(const std::string& buffer)
+{
+    auto verifier = flatbuffers::Verifier((const uint8_t*)buffer.data(), buffer.size());
+    if (!dlslime::fbs::VerifyRdmaEndpointInfoBuffer(verifier)) {
+        SLIME_LOG_ERROR("RDMA Connect: Invalid FlatBuffer");
+        return;
+    }
+
+    auto info = dlslime::fbs::GetRdmaEndpointInfo(buffer.data());
+
+    // Connect Memory Pool
+    if (info->mr_info()) {
+        for (auto mr : *info->mr_info()) {
+            memory_pool_->registerRemoteMemoryRegion(mr);
+        }
+    }
+
+    // Connect Endpoints
+    if (io_endpoint_ && info->io_info()) {
+        io_endpoint_->connect(info->io_info());
+    }
+
+    if (msg_endpoint_) {
+        msg_endpoint_->connect(info);
+    }
+
+    connected_.store(true, std::memory_order_release);
+    worker_->addEndpoint(shared_from_this());
+}
+
 json RDMAEndpoint::endpointInfo() const
 {
     return json{{"mr_info", memory_pool_->mr_info()},
                 {"io_info", io_endpoint_->endpointInfo()},
                 {"msg_info", msg_endpoint_->endpointInfo()}};
+}
+
+std::vector<uint8_t> RDMAEndpoint::endpointInfoFB() const
+{
+    flatbuffers::FlatBufferBuilder builder(2048);
+
+    auto mr_info_off = memory_pool_ ? memory_pool_->pack_mr_info(builder) : 0;
+    auto io_info_off = io_endpoint_ ? io_endpoint_->pack(builder) : 0;
+
+    auto msg_meta_off = msg_endpoint_ ? msg_endpoint_->pack_meta(builder) : 0;
+    auto msg_data_off = msg_endpoint_ ? msg_endpoint_->pack_data(builder) : 0;
+    auto msg_base_off = msg_endpoint_ ? msg_endpoint_->pack_remote_meta_base(builder) : 0;
+
+    auto endpoint_info_off = dlslime::fbs::CreateRdmaEndpointInfo(
+        builder, mr_info_off, io_info_off, msg_meta_off, msg_data_off, msg_base_off);
+
+    builder.Finish(endpoint_info_off);
+
+    uint8_t* buf  = builder.GetBufferPointer();
+    size_t   size = builder.GetSize();
+    return std::vector<uint8_t>(buf, buf + size);
+}
+
+int32_t RDMAEndpoint::registerOrAccessRemoteMemoryRegion(uintptr_t ptr, const std::string& mr_info_fb)
+{
+    auto verifier = flatbuffers::Verifier((const uint8_t*)mr_info_fb.data(), mr_info_fb.size());
+    auto mr_info  = flatbuffers::GetRoot<dlslime::fbs::RemoteMr>(mr_info_fb.data());
+    if (!mr_info->Verify(verifier)) {
+        SLIME_LOG_ERROR("Register Remote MR: Invalid FlatBuffer");
+        return -1;
+    }
+    return memory_pool_->registerRemoteMemoryRegion(mr_info);
 }
 
 void RDMAEndpoint::shutdown()

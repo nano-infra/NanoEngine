@@ -195,3 +195,6 @@ cython_debug/
 .cursorindexingignore
 
 *.pyi
+
+# NanoDeploy generated files
+NanoDeploy/nanodeploy/fbs/

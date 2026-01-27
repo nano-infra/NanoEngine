@@ -63,6 +63,11 @@ class Config(BaseModel):
     # logging config
     log_level: str = "CRITICAL"
 
+    # etcd config
+    # etcd config
+    etcd_address: str = "127.0.0.1:2379"
+    cluster_id: str = "default"
+
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
         # Remove isdir check to support HF Hub IDs

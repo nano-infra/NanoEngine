@@ -31,12 +31,15 @@ public:
                  std::shared_ptr<RDMAWorker> worker    = nullptr);
 
     void connect(const json& remote_endpoint_info);
+    void connect(const std::string& buffer);
 
-    json endpointInfo() const;
-    void shutdown();
+    json                 endpointInfo() const;
+    std::vector<uint8_t> endpointInfoFB() const;
+    void                 shutdown();
 
     int32_t registerOrAccessMemoryRegion(uintptr_t mr_key, uintptr_t ptr, uintptr_t, size_t length);
     int32_t registerOrAccessRemoteMemoryRegion(uintptr_t ptr, json mr_info);
+    int32_t registerOrAccessRemoteMemoryRegion(uintptr_t ptr, const std::string& mr_info_fb);
 
     // TwoSide Primitive
     std::shared_ptr<SendFuture> send(const chunk_tuple_t& chunk, void* stream_handler);

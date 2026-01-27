@@ -1,18 +1,25 @@
 import argparse
 import ctypes
+import json
+import logging
 import select
 import socket
 import struct
+import threading
 import time
 import uuid
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 
+import etcd3
 import flatbuffers
 from nanodeploy._cpp import deserialize as deserialize_cpp
 from nanodeploy.config import Config
 
 # Core NanoDeploy imports
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.fbs.EngineInfo import EngineInfo
+from nanodeploy.fbs.P2PInit import P2PInit
+from nanodeploy.fbs.Peer import Peer
 
 # Import SequenceStatus class directly from the generated file to avoid import errors
 # if __init__.py is empty or overwritten.
@@ -223,54 +230,79 @@ class EngineServer:
                 except (BlockingIOError, BrokenPipeError):
                     pass
 
-            elif action == 3:  # P2P_INIT
-                # Payload is JSON list of node objects
-                import json
+            elif action == 3:  # P2P_INIT (Binary FlatBuffers)
+                from nanodeploy.fbs.P2PInit import P2PInit as FbsP2PInit
+                from nanodeploy.fbs.P2PInitResponse import (
+                    AddResponses as AddRespNodes,
+                    End as EndInitResp,
+                    Start as StartInitResp,
+                    StartResponsesVector as StartNodesVec,
+                )
+                from nanodeploy.fbs.Peer import (
+                    AddId as AddPeerId,
+                    AddLocalInfo as AddPeerLocalInfo,
+                    End as EndPeer,
+                    Start as StartPeer,
+                    StartLocalInfoVector as StartInfoVec,
+                )
 
                 try:
-                    nodes_list = json.loads(payload.decode("utf-8"))
-                    logger.info(
-                        f"Received P2PInit (JSON). Nodes count: {len(nodes_list)}"
-                    )
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to decode P2PInit JSON: {e}")
+                    p2p_init_fbs = FbsP2PInit.GetRootAs(payload, 0)
+                except Exception as e:
+                    logger.error(f"Failed to parse P2PInit FlatBuffers: {e}")
                     return
 
-                results = {}
+                peers_offsets = []
+                builder = flatbuffers.Builder(4096)
 
-                # Iterate all nodes to setup local endpoints and get info
-                # Iterate all nodes to setup local endpoints and get info
-                for node_info in nodes_list:
-                    remote_id = node_info.get("id")
-                    remote_role = node_info.get("role")
+                for i in range(p2p_init_fbs.NodesLength()):
+                    node = p2p_init_fbs.Nodes(i)
+                    remote_id = node.Id().decode("utf-8")
+                    remote_role = node.Role().decode("utf-8")
+                    num_blocks = node.NumBlocks()
+                    ws = node.WorldSize()
 
-                    # 1. Self-Check (Safety)
                     if remote_id == self.config.engine_id:
                         continue
-
-                    # 2. Role-Based Filtering
-                    num_blocks = node_info.get("num_blocks")
-                    ws = node_info.get("world_size")
 
                     logger.info(
                         f"Initializing P2P with {remote_id} ({remote_role}) (Blocks={num_blocks}, WS={ws})"
                     )
                     try:
-                        # p2p_init returns list[dict[int, dict]] (from RayExecutor)
-                        results[remote_id] = self.engine.p2p_init(
-                            remote_id, num_blocks, ws
-                        )
+                        # Returns list[dict[int, dict/bytes]]
+                        my_info = self.engine.p2p_init(remote_id, num_blocks, ws)
+
+                        # Encode my_info as JSON-binary for now to keep nested structure
+                        # In the future, this should be a vector of RdmaEndpointInfo
+                        info_blob = json.dumps(my_info).encode("utf-8")
+
+                        # Build Peer object
+                        id_off = builder.CreateString(remote_id)
+                        info_off = builder.CreateByteVector(info_blob)
+
+                        StartPeer(builder)
+                        AddPeerId(builder, id_off)
+                        AddPeerLocalInfo(builder, info_off)
+                        peers_offsets.append(EndPeer(builder))
                     except Exception as e:
                         logger.error(f"P2P Init failed for {remote_id}: {e}")
 
-                # Send response (Action=3)
-                resp_payload = json.dumps(results).encode("utf-8")
+                # Build P2PInitResponse
+                StartNodesVec(builder, len(peers_offsets))
+                for off in reversed(peers_offsets):
+                    builder.PrependUOffsetTRelative(off)
+                nodes_vec = builder.EndVector()
 
-                # Header + Meta
-                # Meta: seq_id(4), status(4), action(4)
+                StartInitResp(builder)
+                AddRespNodes(builder, nodes_vec)
+                resp_off = EndInitResp(builder)
+                builder.Finish(resp_off)
+
+                resp_payload = bytes(builder.Output())
+
+                # Send response
                 seq_id_u32 = 0
                 status = 0
-
                 meta = struct.pack("<III", seq_id_u32, status, action)
                 header = struct.pack(
                     HEADER_FMT, MAGIC, RESP_META_SIZE, len(resp_payload)
@@ -283,43 +315,48 @@ class EngineServer:
                     self.conn.close()
                     self.conn = None
 
-            elif action == 4:  # P2P_CONNECT
-                # Payload is JSON map of {target_id: info}
-                import json
+            elif action == 4:  # P2P_CONNECT (Binary FlatBuffers)
+                from nanodeploy.fbs.P2PConnect import P2PConnect as FbsP2PConnect
 
                 try:
-                    target_map = json.loads(payload.decode("utf-8"))
-                    logger.info(
-                        f"Received P2PConnect (JSON). Targets: {len(target_map)}"
-                    )
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to decode P2PConnect JSON: {e}")
+                    p2p_connect_fbs = FbsP2PConnect.GetRootAs(payload, 0)
+                except Exception as e:
+                    logger.error(f"Failed to parse P2PConnect FlatBuffers: {e}")
                     return
 
-                def convert_keys_to_int(obj):
-                    if isinstance(obj, dict):
-                        new_obj = {}
-                        for k, v in obj.items():
-                            if isinstance(k, str) and k.isdigit():
-                                new_k = int(k)
-                            else:
-                                new_k = k
-                            new_obj[new_k] = convert_keys_to_int(v)
-                        return new_obj
-                    elif isinstance(obj, list):
-                        return [convert_keys_to_int(x) for x in obj]
-                    else:
-                        return obj
+                for i in range(p2p_connect_fbs.PeersLength()):
+                    peer = p2p_connect_fbs.Peers(i)
+                    target_id = peer.Id().decode("utf-8")
 
-                # Convert integer keys back from string (JSON limitation)
-                target_map = convert_keys_to_int(target_map)
+                    remote_info_bytes = peer.RemoteInfoAsNumpy()
+                    if isinstance(remote_info_bytes, int):  # FB returns 0 if None/Empty
+                        logger.error(f"Empty remote_info for target {target_id}")
+                        continue
 
-                for target_id, info in target_map.items():
-                    # target_id is UUID (string)
-                    # info is Metadata (nested map with string keys)
-                    logger.info(f"Connecting P2P to {target_id}")
                     try:
-                        self.engine.p2p_connect(target_id, info)
+                        remote_info = json.loads(
+                            bytes(remote_info_bytes).decode("utf-8")
+                        )
+
+                        # Fix JSON integer keys
+                        def convert_keys_to_int(obj):
+                            if isinstance(obj, dict):
+                                return {
+                                    (
+                                        int(k)
+                                        if isinstance(k, str) and k.isdigit()
+                                        else k
+                                    ): convert_keys_to_int(v)
+                                    for k, v in obj.items()
+                                }
+                            elif isinstance(obj, list):
+                                return [convert_keys_to_int(x) for x in obj]
+                            return obj
+
+                        remote_info = convert_keys_to_int(remote_info)
+
+                        logger.info(f"Connecting P2P to {target_id}")
+                        self.engine.p2p_connect(target_id, remote_info)
                     except Exception as e:
                         logger.error(f"Failed to connect P2P to {target_id}: {e}")
 
@@ -327,7 +364,6 @@ class EngineServer:
                 seq_id_u32 = 0
                 status = 0
                 meta = struct.pack("<III", seq_id_u32, status, action)
-                # Empty payload for success
                 resp_payload = b""
                 header = struct.pack(
                     HEADER_FMT, MAGIC, RESP_META_SIZE, len(resp_payload)
@@ -337,9 +373,7 @@ class EngineServer:
                 except (BlockingIOError, BrokenPipeError):
                     pass
 
-                logger.info(
-                    f"P2P Connect sequence completed for {len(target_map)} targets."
-                )
+                logger.info("P2P Connect sequence completed.")
 
             else:
                 logger.error(f"Unknown Action ID: {action}")

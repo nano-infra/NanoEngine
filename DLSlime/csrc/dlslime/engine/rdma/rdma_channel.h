@@ -2,7 +2,10 @@
 
 #include "dlslime/engine/rdma/memory_pool.h"
 #include "dlslime/json.hpp"
+#include "flatbuffers/flatbuffers.h"
+#include "rdma_config.h"
 #include "rdma_context.h"
+#include "rdma_generated.h"
 
 namespace dlslime {
 
@@ -27,8 +30,11 @@ public:
 
     int32_t init(std::shared_ptr<RDMAContext> ctx, size_t num_qp, int32_t inline_size);
     int32_t connect(json channel_info);
+    int32_t connect(const flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>* remote_info);
 
     json channelInfo() const;
+    flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<dlslime::fbs::RdmaInfo>>>
+    pack(flatbuffers::FlatBufferBuilder& builder) const;
 
     /* Async RDMA SendRecv */
     int64_t post_send_batch(int qpi, RDMAAssign* assign);

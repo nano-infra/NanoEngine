@@ -245,10 +245,17 @@ pub async fn start_server(
     engine_manager: Arc<Mutex<EngineManager>>,
     tokenizer: Arc<TokenizerService>
 ) {
+    // Use timestamp as start ID to avoid collisions on server restart
+    // Must fit in u32 for legacy engine protocol
+    let start_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs(); // u64, but guarantees < u32::MAX until 2106
+
     let state = Arc::new(AppState {
         engine_manager,
         tokenizer,
-        next_request_id: AtomicU64::new(1000), // Start from 1000 to avoid engine dummy seqs (<8)
+        next_request_id: AtomicU64::new(start_id),
     });
 
     let app = Router::new()

@@ -174,6 +174,9 @@ class RayExecutor:
     def p2p_connect(self, remote_name: str, remote_endpoint_infos: list[list[dict]]):
         return self.collective_rpc("p2p_connect", (remote_name, remote_endpoint_infos))
 
+    def p2p_disconnect(self, remote_name: str):
+        return self.collective_rpc("p2p_disconnect", (remote_name,))
+
     def gather_free_mem(self):
         """Get free memory."""
         return self.collective_rpc("get_free_mem")
