@@ -1,13 +1,15 @@
 use nanodeploy_server::config::{EngineConfig, EngineNode};
 use nanodeploy_server::engine_manager::EngineManager;
-use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
 use tokio::time::sleep;
 
 async fn start_mock_engine_p2p(port: u16) -> tokio::task::JoinHandle<()> {
     let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await.expect("Failed to bind mock engine");
+    let listener = TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind mock engine");
 
     tokio::spawn(async move {
         if let Ok((mut socket, _)) = listener.accept().await {
@@ -15,7 +17,9 @@ async fn start_mock_engine_p2p(port: u16) -> tokio::task::JoinHandle<()> {
             loop {
                 // Read Header (12 bytes)
                 let mut head = [0u8; 12];
-                if socket.read_exact(&mut head).await.is_err() { break; }
+                if socket.read_exact(&mut head).await.is_err() {
+                    break;
+                }
 
                 // Parse Header
                 // Layout: Magic(4), MetaSize(4), DataSize(4)
@@ -23,18 +27,24 @@ async fn start_mock_engine_p2p(port: u16) -> tokio::task::JoinHandle<()> {
                 let meta_size = u32::from_le_bytes(head[4..8].try_into().unwrap());
                 let data_size = u32::from_le_bytes(head[8..12].try_into().unwrap());
 
-                if magic != 0x504F4B45 { break; }
+                if magic != 0x504F4B45 {
+                    break;
+                }
 
                 // Read Meta
                 let mut meta = vec![0u8; meta_size as usize];
-                if socket.read_exact(&mut meta).await.is_err() { break; }
+                if socket.read_exact(&mut meta).await.is_err() {
+                    break;
+                }
 
                 // Read Action from Meta (first 4 bytes)
                 let action = u32::from_le_bytes(meta[0..4].try_into().unwrap());
 
                 // Read Body
                 let mut body = vec![0u8; data_size as usize];
-                if socket.read_exact(&mut body).await.is_err() { break; }
+                if socket.read_exact(&mut body).await.is_err() {
+                    break;
+                }
 
                 println!("MockEngine {} Received Action: {}", port, action);
 

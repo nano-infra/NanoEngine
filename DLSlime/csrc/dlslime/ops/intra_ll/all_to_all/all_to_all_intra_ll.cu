@@ -55,9 +55,10 @@ __global__ __launch_bounds__(1024, 1) void all_to_all_intra_ll_kernel(int8_t*  x
         if (offsets) {
             // Source-dependent count: each rank sends its own 'counts[rank]' to everyone
             int my_count = offsets[rank + 1] - offsets[rank];
-            x_ptr = x_ptr + dst_rank * my_count * num_msg_per_warp;
-            bs = my_count;
-        } else {
+            x_ptr        = x_ptr + dst_rank * my_count * num_msg_per_warp;
+            bs           = my_count;
+        }
+        else {
             x_ptr = x_ptr + dst_rank * total_q_size;
             bs    = max_bs;
         }
@@ -70,7 +71,8 @@ __global__ __launch_bounds__(1024, 1) void all_to_all_intra_ll_kernel(int8_t*  x
         int buffer_idx;
         if (offsets) {
             buffer_idx = (offsets[rank] + msg_idx) * num_msg_per_warp;
-        } else {
+        }
+        else {
             buffer_idx = rank * total_q_size + msg_idx * num_msg_per_warp;
         }
 

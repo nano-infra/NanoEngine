@@ -10,7 +10,7 @@ fn main() {
 
     // Invoke flatc
     let status = Command::new("flatc")
-        .args(&[
+        .args([
             "--rust",
             "-o",
             &out_dir,

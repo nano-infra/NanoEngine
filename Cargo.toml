@@ -1,0 +1,5 @@
+[workspace]
+resolver = "2"
+members = ["NanoDeploy/server", "Spoke/spoke-rust"]
+
+exclude = ["third_party/flatbuffers/tests/*"]

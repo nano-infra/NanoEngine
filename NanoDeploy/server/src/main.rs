@@ -1,8 +1,9 @@
 mod config;
-mod engine_manager;
-mod tokenizer;
 mod engine_adapter;
+mod engine_manager;
 mod fbs;
+mod tokenizer;
+#[allow(warnings)]
 pub mod rdma_generated {
     include!(concat!(env!("OUT_DIR"), "/rdma_generated.rs"));
 }
@@ -11,7 +12,7 @@ mod http_server;
 use clap::Parser;
 use config::AppConfig;
 use std::path::PathBuf;
-use tracing::{info, error};
+use tracing::{error, info};
 // use crate::engine_adapter::EngineAdapter; // Removed
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -102,8 +103,8 @@ async fn main() -> anyhow::Result<()> {
     // Phase 1.5: P2P Handshake
     info!("Initializing P2P Mesh...");
     if let Err(e) = engine_mgr.initialize_p2p_mesh(&config.engine).await {
-         error!("Failed to initialize P2P mesh: {}", e);
-         return Err(e);
+        error!("Failed to initialize P2P mesh: {}", e);
+        return Err(e);
     }
     info!("P2P Mesh Initialized.");
 

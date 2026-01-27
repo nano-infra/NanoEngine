@@ -1,12 +1,14 @@
 use nanodeploy_server::config::{AppConfig, EngineConfig, EngineNode};
 use nanodeploy_server::engine_manager::EngineManager;
-use tokio::net::TcpListener;
 use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::time::sleep;
 
 async fn start_mock_engine(port: u16) {
     let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await.expect("Failed to bind mock engine");
+    let listener = TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind mock engine");
     tokio::spawn(async move {
         loop {
             // Accept and drop, just to keep port open and allow connect
@@ -40,7 +42,11 @@ async fn test_multi_engine_connect() {
     let mut manager = EngineManager::new();
     let result = manager.connect_all(&config).await;
 
-    assert!(result.is_ok(), "Failed to connect to engines: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to connect to engines: {:?}",
+        result.err()
+    );
 
     // 4. Verify internal state (requires public access or specific method, for now assume OK result implies success)
     // We can add a method to manager to get counts if needed, but connect_all returns error if any fail.

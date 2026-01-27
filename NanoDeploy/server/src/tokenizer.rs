@@ -1,10 +1,10 @@
-use tokenizers::Tokenizer;
-use std::sync::Arc;
-use tracing::info;
-use serde::Serialize;
-use std::path::Path;
 use minijinja::Environment;
-use serde_json::Value;
+use serde::Serialize;
+
+use std::path::Path;
+use std::sync::Arc;
+use tokenizers::Tokenizer;
+use tracing::info;
 
 pub struct TokenizerService {
     path: String,
@@ -24,17 +24,17 @@ impl TokenizerService {
         }
     }
 
-
     pub async fn load(&mut self) -> anyhow::Result<()> {
         let path_str = self.path.clone();
-        let path = Path::new(&path_str);
+        let _path = Path::new(&path_str);
 
         info!("Loading tokenizer from {}", path_str);
 
         let path_clone = path_str.clone();
         let tokenizer = tokio::task::spawn_blocking(move || {
             Tokenizer::from_file(&path_clone).map_err(|e| anyhow::anyhow!(e))
-        }).await??;
+        })
+        .await??;
 
         self.tokenizer = Arc::new(Some(tokenizer));
 
@@ -62,15 +62,17 @@ impl TokenizerService {
         Ok(())
     }
 
-
-
+    #[allow(dead_code)]
     pub async fn encode(&self, text: String) -> anyhow::Result<Vec<u32>> {
         let t = self.tokenizer.clone();
         if let Some(tokenizer) = t.as_ref() {
             let tokenizer_ref = tokenizer.clone();
             let encoding = tokio::task::spawn_blocking(move || {
-                tokenizer_ref.encode(text, true).map_err(|e| anyhow::anyhow!(e))
-            }).await??;
+                tokenizer_ref
+                    .encode(text, true)
+                    .map_err(|e| anyhow::anyhow!(e))
+            })
+            .await??;
 
             Ok(encoding.get_ids().to_vec())
         } else {
@@ -78,7 +80,10 @@ impl TokenizerService {
         }
     }
 
-    pub async fn encode_messages<T: Serialize + Send + Sync + 'static>(&self, messages: T) -> anyhow::Result<Vec<u32>> {
+    pub async fn encode_messages<T: Serialize + Send + Sync + 'static>(
+        &self,
+        messages: T,
+    ) -> anyhow::Result<Vec<u32>> {
         // Render template first
         let formatted_text = if let Some(env) = self.template_env.as_ref() {
             let tmpl = env.get_template("chat").map_err(|e| anyhow::anyhow!(e))?;
@@ -91,7 +96,8 @@ impl TokenizerService {
                 "eos_token": "<|im_end|>",
                 "tools": [], // Default empty tools
             });
-            tmpl.render(ctx).map_err(|e| anyhow::anyhow!("Template render error: {}", e))?
+            tmpl.render(ctx)
+                .map_err(|e| anyhow::anyhow!("Template render error: {}", e))?
         } else {
             // Fallback: Just join simple content (not right for Qwen but fail-safe)
             // Or error?
@@ -104,8 +110,11 @@ impl TokenizerService {
         if let Some(tokenizer) = t.as_ref() {
             let tokenizer_ref = tokenizer.clone();
             let encoding = tokio::task::spawn_blocking(move || {
-                tokenizer_ref.encode(formatted_text, true).map_err(|e| anyhow::anyhow!(e))
-            }).await??;
+                tokenizer_ref
+                    .encode(formatted_text, true)
+                    .map_err(|e| anyhow::anyhow!(e))
+            })
+            .await??;
 
             Ok(encoding.get_ids().to_vec())
         } else {
@@ -118,8 +127,11 @@ impl TokenizerService {
         if let Some(tokenizer) = t.as_ref() {
             let tokenizer_ref = tokenizer.clone();
             let decoded = tokio::task::spawn_blocking(move || {
-                tokenizer_ref.decode(&ids, true).map_err(|e| anyhow::anyhow!(e))
-            }).await??;
+                tokenizer_ref
+                    .decode(&ids, true)
+                    .map_err(|e| anyhow::anyhow!(e))
+            })
+            .await??;
             Ok(decoded)
         } else {
             Err(anyhow::anyhow!("Tokenizer not loaded"))

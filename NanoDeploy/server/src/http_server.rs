@@ -1,18 +1,18 @@
+use crate::engine_adapter::StreamEvent;
+use crate::engine_manager::EngineManager;
+use crate::tokenizer::TokenizerService;
+use axum::http::StatusCode;
+use axum::response::{sse::Event, IntoResponse, Response, Sse};
 use axum::{
-    extract::{State, Json},
-    routing::{post, get},
+    extract::{Json, State},
+    routing::{get, post},
     Router,
 };
-use axum::response::{Sse, sse::Event, IntoResponse, Response};
-use axum::http::StatusCode;
-use tower_http::trace::TraceLayer;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::engine_manager::EngineManager;
-use crate::engine_adapter::{EngineAdapter, StreamEvent};
-use crate::tokenizer::TokenizerService;
-use std::sync::atomic::{AtomicU64, Ordering};
+use tower_http::trace::TraceLayer;
 
 // Request Payload (Simplified OpenAI)
 #[derive(Deserialize, Debug)]
@@ -70,7 +70,13 @@ async fn chat_completions(
         let mgr = state.engine_manager.lock().await;
         match mgr.get_next_prefill() {
             Some(a) => a,
-            None => return (StatusCode::SERVICE_UNAVAILABLE, "No prefill engines available").into_response(),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No prefill engines available",
+                )
+                    .into_response()
+            }
         }
     };
 
@@ -82,18 +88,30 @@ async fn chat_completions(
         let token_ids = match tokenizer.encode_messages(req.messages.clone()).await {
             Ok(ids) => ids,
             Err(e) => {
-                 tracing::error!("Encoding error: {}", e);
-                 return (StatusCode::INTERNAL_SERVER_ERROR, format!("Encoding error: {}", e)).into_response();
+                tracing::error!("Encoding error: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Encoding error: {}", e),
+                )
+                    .into_response();
             }
         };
 
         let max_tokens = req.max_tokens.unwrap_or(16) as i32;
-        adapter_guard.send_add_request(seq_id, &token_ids, max_tokens).await
+        adapter_guard
+            .send_add_request(seq_id, &token_ids, max_tokens)
+            .await
     };
 
     let mut rx = match rx_result {
         Ok(rx) => rx,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Engine error: {}", e)).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Engine error: {}", e),
+            )
+                .into_response()
+        }
     };
 
     if req.stream.unwrap_or(false) {
@@ -186,7 +204,9 @@ async fn chat_completions(
             }
         };
 
-        Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()).into_response()
+        Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response()
     } else {
         // Non-streaming: accumulate
         let mut all_tokens = Vec::new();
@@ -194,7 +214,13 @@ async fn chat_completions(
             match event {
                 StreamEvent::Token(id) => all_tokens.push(id),
                 StreamEvent::Finished => break,
-                StreamEvent::Error(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Engine error: {}", e)).into_response(),
+                StreamEvent::Error(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Engine error: {}", e),
+                    )
+                        .into_response()
+                }
                 StreamEvent::Migrate(payload) => {
                     tracing::info!("Migration (Non-Streaming)...");
                     let decode_adapter_arc = {
@@ -202,14 +228,16 @@ async fn chat_completions(
                         mgr.get_next_decode()
                     };
                     if let Some(decode_adapter_arc) = decode_adapter_arc {
-                         let mut decode_adapter = decode_adapter_arc.lock().await;
-                         if let Ok(new_rx) = decode_adapter.send_raw_request(seq_id, payload).await {
-                             rx = new_rx;
-                         } else {
-                             return (StatusCode::INTERNAL_SERVER_ERROR, "Migration Failed").into_response();
-                         }
+                        let mut decode_adapter = decode_adapter_arc.lock().await;
+                        if let Ok(new_rx) = decode_adapter.send_raw_request(seq_id, payload).await {
+                            rx = new_rx;
+                        } else {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "Migration Failed")
+                                .into_response();
+                        }
                     } else {
-                         return (StatusCode::SERVICE_UNAVAILABLE, "No Decode Nodes").into_response();
+                        return (StatusCode::SERVICE_UNAVAILABLE, "No Decode Nodes")
+                            .into_response();
                     }
                 }
                 StreamEvent::P2PResponse(_) => {
@@ -219,7 +247,7 @@ async fn chat_completions(
         }
 
         let text = tokenizer.decode(all_tokens).await.unwrap_or_default();
-         Json(ChatCompletionResponse {
+        Json(ChatCompletionResponse {
             id: "chatcmpl-123".to_string(),
             object: "chat.completion".to_string(),
             created: 1234567890,
@@ -232,7 +260,8 @@ async fn chat_completions(
                 },
                 finish_reason: "stop".to_string(),
             }],
-        }).into_response()
+        })
+        .into_response()
     }
 }
 
@@ -243,7 +272,7 @@ async fn health() -> &'static str {
 pub async fn start_server(
     port: u16,
     engine_manager: Arc<Mutex<EngineManager>>,
-    tokenizer: Arc<TokenizerService>
+    tokenizer: Arc<TokenizerService>,
 ) {
     // Use timestamp as start ID to avoid collisions on server restart
     // Must fit in u32 for legacy engine protocol

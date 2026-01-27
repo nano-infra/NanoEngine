@@ -1,13 +1,14 @@
 use bytes::{Buf, BufMut, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use std::error::Error;
 use std::io::Cursor;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
+#[allow(dead_code)]
 struct NetHeader {
     magic: u32,
     meta_size: u32,
@@ -47,7 +48,9 @@ pub struct SpokeWriter {
 
 impl SpokeConnection {
     pub async fn connect(addr: &str) -> Result<Self, BoxError> {
-        let stream = TcpStream::connect(addr).await.map_err(|e| Box::new(e) as BoxError)?;
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)?;
         stream.set_nodelay(true)?;
         Ok(Self { stream })
     }
@@ -67,7 +70,14 @@ impl SpokeWriter {
         buf
     }
 
-    pub async fn send_req(&mut self, action: u32, seq: u32, actor_id: &str, actor_type: &str, body: &[u8]) -> Result<(), BoxError> {
+    pub async fn send_req(
+        &mut self,
+        action: u32,
+        seq: u32,
+        actor_id: &str,
+        actor_type: &str,
+        body: &[u8],
+    ) -> Result<(), BoxError> {
         let meta = NetMetaRaw {
             action,
             seq_id: seq,
@@ -82,7 +92,12 @@ impl SpokeWriter {
         head_buf.put_u32_le(body.len() as u32);
 
         // Serialize Meta
-        let meta_bytes = unsafe { std::slice::from_raw_parts(&meta as *const _ as *const u8, std::mem::size_of::<NetMetaRaw>()) };
+        let meta_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &meta as *const _ as *const u8,
+                std::mem::size_of::<NetMetaRaw>(),
+            )
+        };
 
         self.stream.write_all(&head_buf).await?;
         self.stream.write_all(meta_bytes).await?;

@@ -37,6 +37,13 @@ repos:
               .*/pybind_json\.hpp
           )$
 
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+      - id: cargo-check
+      - id: clippy
+
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.6
     hooks:
