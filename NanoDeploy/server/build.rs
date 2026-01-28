@@ -12,9 +12,10 @@ fn main() {
     let status = Command::new("flatc")
         .args([
             "--rust",
+            "--gen-object-api",
+            "--gen-all",
             "-o",
             &out_dir,
-            "../../DLSlime/proto/rdma.fbs",
             "../proto/sequence.fbs",
             "../proto/connection.fbs",
         ])

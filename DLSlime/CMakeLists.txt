@@ -46,11 +46,7 @@ if (BUILD_NVSHMEM OR BUILD_NVLINK OR BUILD_INTRA_OPS OR BUILD_INTER_OPS)
 endif()
 
 if (BUILD_PYTHON)
-    if(SKBUILD_PROJECT_NAME)
-        set(DLSLIME_INSTALL_PATH "${SKBUILD_PROJECT_NAME}")
-    else()
-        set(DLSLIME_INSTALL_PATH "dlslime")
-    endif()
+    set(DLSLIME_INSTALL_PATH "${SKBUILD_PROJECT_NAME}")
     set(DLSLIME_CONFIG_DEST "${DLSLIME_INSTALL_PATH}/share/cmake/dlslime")
 else()
     set(DLSLIME_INSTALL_PATH "lib")
@@ -61,20 +57,7 @@ if (BUILD_TORCH_PLUGIN OR BUILD_INTRA_OPS OR BUILD_INTER_OPS)
     include(${CMAKE_CURRENT_LIST_DIR}/cmake/torch.cmake)
 endif()
 
-# --- Dependencies ---
-# Define NanoInfra root path
-if(NOT DEFINED NANOINFRA_DIR)
-    set(NANOINFRA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
-endif()
-message(STATUS "NanoInfra Root Path: ${NANOINFRA_DIR}")
-
-# FlatBuffers
-set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "Disable flatbuffers tests")
-set(FLATBUFFERS_INSTALL OFF CACHE BOOL "Disable flatbuffers installation")
-add_subdirectory(${NANOINFRA_DIR}/third_party/flatbuffers ${CMAKE_CURRENT_BINARY_DIR}/flatbuffers EXCLUDE_FROM_ALL)
-
 include_directories(csrc)
-add_subdirectory(proto)
 add_subdirectory(csrc)
 
 # Define global imported target for external consumers (e.g. NanoDeploy, Spoke)

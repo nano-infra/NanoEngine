@@ -1,8 +1,6 @@
 use crate::config::{EngineConfig, EtcdConfig};
 use crate::engine_adapter::EngineAdapter;
-// Fix import path for flatbuffers generated code
-// Hierarchy: fbs.rs (mod nanodeploy -> mod connection) -> include!(...) -> mod nanodeploy -> mod fbs
-use crate::fbs::nanodeploy::connection::nanodeploy::fbs::EngineInfo;
+use crate::fbs::{EngineInfo, PeerT};
 use etcd_client::{Client, EventType, GetOptions, WatchOptions};
 
 use futures::stream::StreamExt; // For WatchStream iteration
@@ -170,18 +168,18 @@ impl EngineManager {
             // 1. Send P2PInit to ALL nodes & Collect Info
             info!("Broadcasting P2PInit to all {} nodes...", all_nodes.len());
 
-            let mut node_responses: HashMap<String, Vec<u8>> = HashMap::new();
+            let mut node_responses: HashMap<String, HashMap<String, PeerT>> = HashMap::new();
 
             for engine in &self.prefill_engines {
                 let mut adapter = engine.lock().await;
                 let my_uuid = adapter.uuid.clone().unwrap_or_default();
-                let resp = adapter.send_p2p_init(all_nodes.clone()).await?;
+                let resp: HashMap<String, PeerT> = adapter.send_p2p_init(all_nodes.clone()).await?;
                 node_responses.insert(my_uuid, resp);
             }
             for engine in &self.decode_engines {
                 let mut adapter = engine.lock().await;
                 let my_uuid = adapter.uuid.clone().unwrap_or_default();
-                let resp = adapter.send_p2p_init(all_nodes.clone()).await?;
+                let resp: HashMap<String, PeerT> = adapter.send_p2p_init(all_nodes.clone()).await?;
                 node_responses.insert(my_uuid, resp);
             }
 
@@ -195,33 +193,21 @@ impl EngineManager {
                     let adapter = engine.lock().await;
                     adapter.uuid.clone().unwrap_or_default()
                 };
-                let mut target_map = HashMap::new();
+                let mut peers_to_send = Vec::new();
 
                 for target_uuid in &decode_uuids {
-                    if let Some(target_resp_bytes) = node_responses.get(target_uuid) {
-                        use crate::fbs::nanodeploy::connection::nanodeploy::fbs::P2PInitResponse;
-                        if let Ok(p2p_resp) =
-                            flatbuffers::root::<P2PInitResponse>(target_resp_bytes)
-                        {
-                            if let Some(peers) = p2p_resp.responses() {
-                                for i in 0..peers.len() {
-                                    let peer = peers.get(i);
-                                    if peer.id() == Some(my_uuid.as_str()) {
-                                        if let Some(local_info) = peer.local_info() {
-                                            target_map
-                                                .insert(target_uuid.clone(), local_info.to_vec());
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
+                    if let Some(responses) = node_responses.get(target_uuid) {
+                        if let Some(peer_t) = responses.get(&my_uuid) {
+                            let mut peer_t: PeerT = peer_t.clone();
+                            peer_t.remote_id = Some(target_uuid.clone());
+                            peers_to_send.push(peer_t);
                         }
                     }
                 }
 
-                if !target_map.is_empty() {
+                if !peers_to_send.is_empty() {
                     let mut adapter = engine.lock().await;
-                    adapter.send_p2p_connect(target_map).await?;
+                    adapter.send_p2p_connect(peers_to_send).await?;
                 }
             }
 
@@ -235,33 +221,21 @@ impl EngineManager {
                     let adapter = engine.lock().await;
                     adapter.uuid.clone().unwrap_or_default()
                 };
-                let mut target_map = HashMap::new();
+                let mut peers_to_send = Vec::new();
 
                 for target_uuid in &prefill_uuids {
-                    if let Some(target_resp_bytes) = node_responses.get(target_uuid) {
-                        use crate::fbs::nanodeploy::connection::nanodeploy::fbs::P2PInitResponse;
-                        if let Ok(p2p_resp) =
-                            flatbuffers::root::<P2PInitResponse>(target_resp_bytes)
-                        {
-                            if let Some(peers) = p2p_resp.responses() {
-                                for i in 0..peers.len() {
-                                    let peer = peers.get(i);
-                                    if peer.id() == Some(my_uuid.as_str()) {
-                                        if let Some(local_info) = peer.local_info() {
-                                            target_map
-                                                .insert(target_uuid.clone(), local_info.to_vec());
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
+                    if let Some(responses) = node_responses.get(target_uuid) {
+                        if let Some(peer_t) = responses.get(&my_uuid) {
+                            let mut peer_t: PeerT = peer_t.clone();
+                            peer_t.remote_id = Some(target_uuid.clone());
+                            peers_to_send.push(peer_t);
                         }
                     }
                 }
 
-                if !target_map.is_empty() {
+                if !peers_to_send.is_empty() {
                     let mut adapter = engine.lock().await;
-                    adapter.send_p2p_connect(target_map).await?;
+                    adapter.send_p2p_connect(peers_to_send).await?;
                 }
             }
         }

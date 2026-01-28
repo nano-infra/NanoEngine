@@ -28,9 +28,11 @@ set(SEQUENCE_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/proto/sequence.fbs")
 set(CONNECTION_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/proto/connection.fbs")
 set(FBS_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nanodeploy/fbs")
 
-# Create output directory
+# Create output directory and ensure it has an __init__.py
 file(MAKE_DIRECTORY ${FBS_OUTPUT_DIR})
-file(WRITE "${FBS_OUTPUT_DIR}/__init__.py" "")
+if(NOT EXISTS "${FBS_OUTPUT_DIR}/__init__.py")
+    file(WRITE "${FBS_OUTPUT_DIR}/__init__.py" "")
+endif()
 
 # Find flatc (target from third_party)
 if(NOT TARGET flatc)
@@ -38,11 +40,14 @@ if(NOT TARGET flatc)
 endif()
 
 add_custom_command(
-    OUTPUT "${FBS_OUTPUT_DIR}/StepOut.py" "${FBS_OUTPUT_DIR}/SequenceStatus.py" "${FBS_OUTPUT_DIR}/Sequence.py" "${FBS_OUTPUT_DIR}/EngineInfo.py" "${FBS_OUTPUT_DIR}/P2PInit.py" "${FBS_OUTPUT_DIR}/P2PConnect.py"
-    COMMAND flatc --python -o "${CMAKE_CURRENT_SOURCE_DIR}" ${SEQUENCE_PROTO} ${CONNECTION_PROTO}
-    DEPENDS flatc ${SEQUENCE_PROTO} ${CONNECTION_PROTO}
-    COMMENT "Generating Python Flatbuffers from sequence.fbs and connection.fbs"
+    OUTPUT "${FBS_OUTPUT_DIR}/Peer.py" "${FBS_OUTPUT_DIR}/RdmaEndpointInfo.py"
+    COMMAND ${CMAKE_COMMAND} -E remove_directory "${FBS_OUTPUT_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${FBS_OUTPUT_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E touch "${FBS_OUTPUT_DIR}/__init__.py"
+    COMMAND flatc --python --gen-object-api -o "${CMAKE_CURRENT_SOURCE_DIR}" ${SEQUENCE_PROTO} ${CONNECTION_PROTO} "${NANOINFRA_DIR}/DLSlime/proto/rdma.fbs"
+    DEPENDS flatc ${SEQUENCE_PROTO} ${CONNECTION_PROTO} "${NANOINFRA_DIR}/DLSlime/proto/rdma.fbs"
+    COMMENT "Generating Python Flatbuffers from sequence.fbs, connection.fbs, and rdma.fbs (Unified Namespace)"
 )
 
 # Add a custom target to ensure it runs
-add_custom_target(gen_python_fbs ALL DEPENDS "${FBS_OUTPUT_DIR}/StepOut.py")
+add_custom_target(gen_python_fbs ALL DEPENDS "${FBS_OUTPUT_DIR}/Peer.py")

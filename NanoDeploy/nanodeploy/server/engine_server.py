@@ -33,8 +33,8 @@ from nanodeploy.fbs.StepOut import (
     StepOutEnd,
     StepOutStart,
 )
-from nanodeploy.llm import LLM
 from nanodeploy.logging import get_logger
+from nanodeploy.server.llm_component import LLMComponent
 
 logger = get_logger()
 
@@ -77,7 +77,7 @@ class EngineServer:
 
         # Initialize Engine
         logger.info(f"Initializing LLMEngine with config: {config}")
-        self.engine = LLM(config)
+        self.engine = LLMComponent(config)
 
         # Connection state
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -212,11 +212,8 @@ class EngineServer:
             if action == 1:  # Add Request (Legacy/Standard)
                 self.handle_add_request(payload)
             elif action == 2:  # GET_ENGINE_INFO
-                # Return JSON: {id, mode, world_size, num_blocks}
-                import json
-
-                info = self.engine.get_engine_info()
-                resp_payload = json.dumps(info).encode("utf-8")
+                # Return EngineInfo as FlatBuffers
+                resp_payload = self.engine.get_engine_info()
 
                 seq_id_u32 = 0
                 status = 0
@@ -231,75 +228,101 @@ class EngineServer:
                     pass
 
             elif action == 3:  # P2P_INIT (Binary FlatBuffers)
-                from nanodeploy.fbs.P2PInit import P2PInit as FbsP2PInit
-                from nanodeploy.fbs.P2PInitResponse import (
-                    AddResponses as AddRespNodes,
-                    End as EndInitResp,
-                    Start as StartInitResp,
-                    StartResponsesVector as StartNodesVec,
+                import flatbuffers
+                from nanodeploy.fbs.nanodeploy.fbs.EngineInfo import (
+                    EngineInfo,
+                    EngineInfoT,
                 )
-                from nanodeploy.fbs.Peer import (
-                    AddId as AddPeerId,
-                    AddLocalInfo as AddPeerLocalInfo,
-                    End as EndPeer,
-                    Start as StartPeer,
-                    StartLocalInfoVector as StartInfoVec,
+                from nanodeploy.fbs.nanodeploy.fbs.P2PInit import (
+                    P2PInit as FbsP2PInit,
+                    P2PInitT,
                 )
+                from nanodeploy.fbs.nanodeploy.fbs.P2PInitResponse import (
+                    P2PInitResponse,
+                    P2PInitResponseT,
+                )
+                from nanodeploy.fbs.nanodeploy.fbs.Peer import Peer, PeerT
 
                 try:
-                    p2p_init_fbs = FbsP2PInit.GetRootAs(payload, 0)
+                    # Decode P2PInit using Object API
+                    p2p_init_view = FbsP2PInit.GetRootAs(payload, 0)
+                    p2p_init_obj = P2PInitT.InitFromObj(p2p_init_view)
                 except Exception as e:
                     logger.error(f"Failed to parse P2PInit FlatBuffers: {e}")
                     return
 
-                peers_offsets = []
-                builder = flatbuffers.Builder(4096)
+                # Prepare args for parallel execution
+                init_args_list = []
+                if p2p_init_obj.nodes:
+                    for node_t in p2p_init_obj.nodes:
+                        remote_id = (
+                            node_t.id.decode("utf-8")
+                            if isinstance(node_t.id, bytes)
+                            else node_t.id
+                        )
+                        remote_role = (
+                            node_t.role.decode("utf-8")
+                            if isinstance(node_t.role, bytes)
+                            else node_t.role
+                        )
 
-                for i in range(p2p_init_fbs.NodesLength()):
-                    node = p2p_init_fbs.Nodes(i)
-                    remote_id = node.Id().decode("utf-8")
-                    remote_role = node.Role().decode("utf-8")
-                    num_blocks = node.NumBlocks()
-                    ws = node.WorldSize()
+                        if remote_id == self.config.engine_id:
+                            continue
 
-                    if remote_id == self.config.engine_id:
-                        continue
+                        # Serialize NodeT to bytes to pass to p2p_init
+                        # This satisfies "input args just input bytes"
+                        node_builder = flatbuffers.Builder(1024)
+                        node_off = node_t.Pack(node_builder)
+                        node_builder.Finish(node_off)
+                        node_bytes = bytes(node_builder.Output())
 
-                    logger.info(
-                        f"Initializing P2P with {remote_id} ({remote_role}) (Blocks={num_blocks}, WS={ws})"
-                    )
+                        init_args_list.append((remote_id, remote_role, node_bytes))
+
+                # Parallel Init
+                import concurrent.futures
+
+                results = []
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future_to_remote = {
+                        executor.submit(self.engine.p2p_init, node_bytes): (
+                            remote_id,
+                            remote_role,
+                        )
+                        for remote_id, remote_role, node_bytes in init_args_list
+                    }
+
+                    for future in concurrent.futures.as_completed(future_to_remote):
+                        remote_id, remote_role = future_to_remote[future]
+                        try:
+                            # Returns bytes (Serialized Peer table)
+                            peer_bytes = future.result()
+                            logger.info(
+                                f"P2P Init Success for {remote_id} ({remote_role})"
+                            )
+                            results.append(peer_bytes)
+                        except Exception as e:
+                            logger.error(f"P2P Init failed for {remote_id}: {e}")
+
+                # Build Response from results
+                # results is list[bytes] where each bytes is a serialized Peer table
+
+                response_t = P2PInitResponseT()
+                response_t.responses = []
+
+                for peer_bytes in results:
                     try:
-                        # Returns list[dict[int, dict/bytes]]
-                        my_info = self.engine.p2p_init(remote_id, num_blocks, ws)
-
-                        # Encode my_info as JSON-binary for now to keep nested structure
-                        # In the future, this should be a vector of RdmaEndpointInfo
-                        info_blob = json.dumps(my_info).encode("utf-8")
-
-                        # Build Peer object
-                        id_off = builder.CreateString(remote_id)
-                        info_off = builder.CreateByteVector(info_blob)
-
-                        StartPeer(builder)
-                        AddPeerId(builder, id_off)
-                        AddPeerLocalInfo(builder, info_off)
-                        peers_offsets.append(EndPeer(builder))
+                        # 1. Deserialize View
+                        peer_view = Peer.GetRootAs(peer_bytes, 0)
+                        # 2. Unpack to T
+                        peer_t = PeerT.InitFromObj(peer_view)
+                        response_t.responses.append(peer_t)
                     except Exception as e:
-                        logger.error(f"P2P Init failed for {remote_id}: {e}")
+                        logger.error(f"Failed to unpack Peer bytes: {e}")
 
-                # Build P2PInitResponse
-                StartNodesVec(builder, len(peers_offsets))
-                for off in reversed(peers_offsets):
-                    builder.PrependUOffsetTRelative(off)
-                nodes_vec = builder.EndVector()
-
-                StartInitResp(builder)
-                AddRespNodes(builder, nodes_vec)
-                resp_off = EndInitResp(builder)
+                builder = flatbuffers.Builder(4096)
+                resp_off = response_t.Pack(builder)
                 builder.Finish(resp_off)
-
                 resp_payload = bytes(builder.Output())
-
                 # Send response
                 seq_id_u32 = 0
                 status = 0
@@ -316,49 +339,52 @@ class EngineServer:
                     self.conn = None
 
             elif action == 4:  # P2P_CONNECT (Binary FlatBuffers)
-                from nanodeploy.fbs.P2PConnect import P2PConnect as FbsP2PConnect
+                from nanodeploy.fbs.nanodeploy.fbs.P2PConnect import (
+                    P2PConnect,
+                    P2PConnectT,
+                )
 
                 try:
-                    p2p_connect_fbs = FbsP2PConnect.GetRootAs(payload, 0)
+                    p2p_connect_view = P2PConnect.GetRootAs(payload, 0)
+                    p2p_connect_obj = P2PConnectT.InitFromObj(p2p_connect_view)
                 except Exception as e:
                     logger.error(f"Failed to parse P2PConnect FlatBuffers: {e}")
                     return
 
-                for i in range(p2p_connect_fbs.PeersLength()):
-                    peer = p2p_connect_fbs.Peers(i)
-                    target_id = peer.Id().decode("utf-8")
-
-                    remote_info_bytes = peer.RemoteInfoAsNumpy()
-                    if isinstance(remote_info_bytes, int):  # FB returns 0 if None/Empty
-                        logger.error(f"Empty remote_info for target {target_id}")
-                        continue
-
-                    try:
-                        remote_info = json.loads(
-                            bytes(remote_info_bytes).decode("utf-8")
+                # Prepare args for parallel execution
+                connect_args = []
+                if p2p_connect_obj.peers:
+                    for peer_t in p2p_connect_obj.peers:
+                        target_id = (
+                            peer_t.remoteId.decode("utf-8")
+                            if isinstance(peer_t.remoteId, bytes)
+                            else peer_t.remoteId
                         )
 
-                        # Fix JSON integer keys
-                        def convert_keys_to_int(obj):
-                            if isinstance(obj, dict):
-                                return {
-                                    (
-                                        int(k)
-                                        if isinstance(k, str) and k.isdigit()
-                                        else k
-                                    ): convert_keys_to_int(v)
-                                    for k, v in obj.items()
-                                }
-                            elif isinstance(obj, list):
-                                return [convert_keys_to_int(x) for x in obj]
-                            return obj
+                        # Serialize PeerT to bytes to pass to p2p_connect
+                        builder = flatbuffers.Builder(1024)
+                        off = peer_t.Pack(builder)
+                        builder.Finish(off)
+                        peer_bytes = bytes(builder.Output())
 
-                        remote_info = convert_keys_to_int(remote_info)
+                        connect_args.append((target_id, peer_bytes))
 
-                        logger.info(f"Connecting P2P to {target_id}")
-                        self.engine.p2p_connect(target_id, remote_info)
-                    except Exception as e:
-                        logger.error(f"Failed to connect P2P to {target_id}: {e}")
+                # Parallel Connect
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future_to_target = {
+                        executor.submit(self.engine.p2p_connect, peer_bytes): target_id
+                        for target_id, peer_bytes in connect_args
+                    }
+
+                    for future in concurrent.futures.as_completed(future_to_target):
+                        target_id = future_to_target[future]
+                        try:
+                            future.result()
+                            logger.info(f"P2P Connect Success for {target_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to connect P2P to {target_id}: {e}")
 
                 # Send Response (Success)
                 seq_id_u32 = 0
@@ -419,25 +445,6 @@ class EngineServer:
         logger.debug("TRACE: handle_add_request done")
 
     def engine_step(self):
-        # Run one step of LLMEngine
-        # LLMEngine.step() returns (outputs, num_tokens, ...)
-        # outputs contains FINISHED or MIGRATED sequences.
-
-        # We need to detect NEWLY generated tokens for ALL active sequences to stream StepOut.
-        # However, LLMEngine.step currently only returns finished sequences.
-
-        # We need to manually inspect active sequences or modify LLMEngine.
-        # Since I cannot easily modify LLMEngine interface right now without breaking things,
-        # let's look at how to get active sequences.
-
-        # self.engine.scheduler.running contains list of sequences.
-        # We can track their 'num_completed_tokens' (or check last added token).
-
-        # For efficiency, we can assume that every active sequence in 'running' that is in RUNNING state
-        # generated one token if step() was successful and is_prefill=False.
-
-        # Let's call step()
-
         try:
             if not self.engine.scheduler.is_finished():
                 dp_seqs, outputs, num_tokens, total_running, sch_lat, post_lat = (

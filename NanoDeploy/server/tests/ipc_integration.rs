@@ -54,7 +54,7 @@ async fn test_mock_engine_ipc() {
     // Send an application-specific request (Add Sequence)
     let tokens = vec![1, 2, 3];
     client
-        .send_add_request(999, &tokens)
+        .send_add_request(999, &tokens, 20)
         .await
         .expect("Send failed");
 

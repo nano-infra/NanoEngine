@@ -1,3 +1,4 @@
+import concurrent.futures
 import dataclasses
 from collections import defaultdict
 from typing import Literal
@@ -139,13 +140,13 @@ class CacheContext:
 
     def p2p_init(
         self, remote_engine_name: str, num_kv_blocks: int, remote_world_size: int
-    ) -> dict[int, dict]:
+    ) -> list[list[dict]]:
         # init endpoint
         # register memory region
         endpoints = self.endpoints[remote_engine_name] = {}
-        endpoints_info = {}
         self.num_remote_kvcache_blocks[remote_engine_name] = num_kv_blocks
-        for i in range(remote_world_size):
+
+        def create_endpoint(i):
             endpoint = dlslime.RDMAEndpoint(device_name=self.selected_nic, num_qp=1)
             endpoint.register_memory_region(
                 get_dist_context().rank,
@@ -154,16 +155,26 @@ class CacheContext:
                 self.kv_cache.numel() * self.kv_cache.itemsize,
             )
             endpoint_info = endpoint.endpoint_info()
+            return i, endpoint, endpoint_info
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = executor.map(create_endpoint, range(remote_world_size))
+
+        endpoints_info = []
+        for i, endpoint, endpoint_info in results:
             endpoints[i] = endpoint
-            endpoints_info[i] = endpoint_info
+            endpoints_info.append(endpoint_info)
+
         return endpoints_info
 
-    def p2p_connect(
-        self, remote_engine_id: str, endpoints_info_list: list[dict[int, dict]]
-    ):
-        for i, endpoints_info in enumerate(endpoints_info_list):
+    def p2p_connect(self, remote_engine_id: str, endpoints_info_list: list[list[dict]]):
+        def connect_endpoint(args):
+            i, endpoints_info = args
             endpoint_info = endpoints_info[dist.get_rank()]
             self.endpoints[remote_engine_id][i].connect(endpoint_info)
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            list(executor.map(connect_endpoint, enumerate(endpoints_info_list)))
 
     def p2p_disconnect(self, remote_engine_id: str):
         if remote_engine_id in self.endpoints:

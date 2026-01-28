@@ -64,7 +64,7 @@ class Config(BaseModel):
     log_level: str = "CRITICAL"
 
     # etcd config
-    # etcd config
+    enable_etcd: bool = False
     etcd_address: str = "127.0.0.1:2379"
     cluster_id: str = "default"
 

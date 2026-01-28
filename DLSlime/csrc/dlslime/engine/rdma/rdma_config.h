@@ -12,63 +12,39 @@
 
 #include "dlslime/json.hpp"
 #include "dlslime/logging.h"
-#include "rdma_generated.h"
 
 namespace dlslime {
 
 using json = nlohmann::json;
 typedef struct rdma_info {
-    uint32_t      qpn;
-    union ibv_gid gid;
-    int64_t       gidx;
-    uint16_t      lid;
-    uint64_t      psn;
-    uint64_t      mtu;
-    rdma_info() {}
-    rdma_info(uint32_t qpn, union ibv_gid gid, int64_t gidx, uint16_t lid, uint64_t psn, uint64_t mtu):
-        qpn(qpn), gid(gid), gidx(gidx), lid(lid), psn(psn), mtu(mtu)
-    {
-    }
+  uint32_t qpn;
+  union ibv_gid gid;
+  int64_t gidx;
+  uint16_t lid;
+  uint64_t psn;
+  uint64_t mtu;
+  rdma_info() {}
+  rdma_info(uint32_t qpn, union ibv_gid gid, int64_t gidx, uint16_t lid,
+            uint64_t psn, uint64_t mtu)
+      : qpn(qpn), gid(gid), gidx(gidx), lid(lid), psn(psn), mtu(mtu) {}
 
-    rdma_info(json json_config)
-    {
-        gid.global.subnet_prefix = json_config["gid"]["subnet_prefix"];
-        gid.global.interface_id  = json_config["gid"]["interface_id"];
-        gidx                     = json_config["gidx"];
-        lid                      = json_config["lid"];
-        qpn                      = json_config["qpn"];
-        psn                      = json_config["psn"];
-        mtu                      = json_config["mtu"];
-    }
+  rdma_info(json json_config) {
+    gid.global.subnet_prefix = json_config["gid"]["subnet_prefix"];
+    gid.global.interface_id = json_config["gid"]["interface_id"];
+    gidx = json_config["gidx"];
+    lid = json_config["lid"];
+    qpn = json_config["qpn"];
+    psn = json_config["psn"];
+    mtu = json_config["mtu"];
+  }
 
-    rdma_info(const dlslime::fbs::RdmaInfo* fb_info)
-    {
-        if (fb_info) {
-            qpn  = fb_info->qpn();
-            gidx = fb_info->gidx();
-            lid  = fb_info->lid();
-            psn  = fb_info->psn();
-            mtu  = fb_info->mtu();
-            if (fb_info->gid()) {
-                memcpy(gid.raw, fb_info->gid()->raw()->data(), 16);
-            }
-        }
-    }
-
-    flatbuffers::Offset<dlslime::fbs::RdmaInfo> pack(flatbuffers::FlatBufferBuilder& builder) const
-    {
-        uint8_t raw_gid[16];
-        memcpy(raw_gid, gid.raw, 16);
-        auto gid_fb = dlslime::fbs::IbvGid(flatbuffers::make_span(raw_gid));
-        return dlslime::fbs::CreateRdmaInfo(builder, qpn, &gid_fb, gidx, lid, psn, mtu);
-    }
-
-    json to_json() const
-    {
-        json gid_config{{"subnet_prefix", gid.global.subnet_prefix}, {"interface_id", gid.global.interface_id}};
-        return json{{"gid", gid_config}, {"gidx", gidx}, {"lid", lid}, {"qpn", qpn}, {"psn", psn}, {"mtu", mtu}};
-    }
+  json to_json() const {
+    json gid_config{{"subnet_prefix", gid.global.subnet_prefix},
+                    {"interface_id", gid.global.interface_id}};
+    return json{{"gid", gid_config}, {"gidx", gidx}, {"lid", lid},
+                {"qpn", qpn},        {"psn", psn},   {"mtu", mtu}};
+  }
 
 } rdma_info_t;
 
-}  // namespace dlslime
+} // namespace dlslime

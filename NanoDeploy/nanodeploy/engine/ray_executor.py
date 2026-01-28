@@ -171,7 +171,7 @@ class RayExecutor:
             "p2p_init", (remote_name, num_kv_blocks, remote_world_size)
         )
 
-    def p2p_connect(self, remote_name: str, remote_endpoint_infos: list[list[dict]]):
+    def p2p_connect(self, remote_name: str, remote_endpoint_infos: list[bytes]):
         return self.collective_rpc("p2p_connect", (remote_name, remote_endpoint_infos))
 
     def p2p_disconnect(self, remote_name: str):

@@ -35,7 +35,7 @@ add_library(
     rdma_worker.cpp
 )
 
-target_link_libraries(_slime_rdma PUBLIC _slime_device _slime_engine numa ibverbs dlslime_proto)
+target_link_libraries(_slime_rdma PUBLIC _slime_device _slime_engine numa ibverbs)
 
 set_target_properties(
     _slime_rdma

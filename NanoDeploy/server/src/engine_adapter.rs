@@ -1,8 +1,7 @@
-use crate::fbs::nanodeploy::connection::nanodeploy::fbs::{
-    EngineInfo, EngineInfoArgs, P2PInit, P2PInitArgs,
-};
-use crate::fbs::nanodeploy::sequence::nanodeploy::fbs::{
-    Sequence, SequenceArgs, SequenceList, SequenceListArgs, SequenceStatus, StepOut,
+use crate::fbs::{
+    EngineInfo, EngineInfoArgs, P2PInit, P2PInitArgs, P2PInitResponse, PeerT, SamplingParams,
+    SamplingParamsArgs, Sequence, SequenceArgs, SequenceList, SequenceListArgs, SequenceStatus,
+    StepOut,
 };
 use flatbuffers::FlatBufferBuilder;
 use spoke::client::SpokeClient;
@@ -25,8 +24,8 @@ pub enum StreamEvent {
     Finished,
     #[allow(dead_code)]
     Error(String),
-    Migrate(Vec<u8>),     // Payload is the full SequenceList FBS
-    P2PResponse(Vec<u8>), // JSON payload
+    Migrate(Vec<u8>),
+    P2PResponse(Vec<u8>),
 }
 
 pub struct RequestState {
@@ -62,22 +61,26 @@ impl EngineAdapter {
                             // Migration Event
                             // We need to peek inside to get seq_id to route it
                             // Assuming body is SequenceList -> Sequence
-                            use crate::fbs::nanodeploy::sequence::nanodeploy::fbs::root_as_sequence_list;
 
-                            let seq_id = root_as_sequence_list(&body)
+                            let seq_id = flatbuffers::root::<SequenceList>(&body)
                                 .ok()
-                                .and_then(|sl| sl.sequences())
-                                .filter(|seqs| !seqs.is_empty())
-                                .map(|seqs| seqs.get(0).seq_id());
+                                .and_then(|sl: SequenceList| sl.sequences())
+                                .filter(
+                                    |seqs: &flatbuffers::Vector<
+                                        flatbuffers::ForwardsUOffset<Sequence>,
+                                    >| !seqs.is_empty(),
+                                )
+                                .map(
+                                    |seqs: flatbuffers::Vector<
+                                        flatbuffers::ForwardsUOffset<Sequence>,
+                                    >| seqs.get(0).seq_id(),
+                                );
 
                             if let Some(seq_id) = seq_id {
                                 info!("Received Action 1 (Migration Candidate) for Seq {}. Payload size: {}", seq_id, body.len());
                                 let mut map = pending.lock().await;
                                 if let Some(state) = map.remove(&seq_id) {
-                                    // Send Migrate event with the raw body
                                     let _ = state.sender.send(StreamEvent::Migrate(body.clone()));
-                                    // We remove from map because this adapter is done with it.
-                                    // The HttpServer will re-add it to the new adapter.
                                 }
                             }
                             continue;
@@ -177,15 +180,14 @@ impl EngineAdapter {
         let t_vec = builder.create_vector(&token_ids_i32);
 
         // Create SamplingParams table
-        let sampling_params =
-            crate::fbs::nanodeploy::sequence::nanodeploy::fbs::SamplingParams::create(
-                &mut builder,
-                &crate::fbs::nanodeploy::sequence::nanodeploy::fbs::SamplingParamsArgs {
-                    temperature: 0.1,
-                    max_tokens,
-                    ignore_eos: false,
-                },
-            );
+        let sampling_params = SamplingParams::create(
+            &mut builder,
+            &SamplingParamsArgs {
+                temperature: 0.1,
+                max_tokens,
+                ignore_eos: false,
+            },
+        );
 
         let num_tokens = token_ids.len() as i32;
         let last_token = if num_tokens > 0 {
@@ -260,8 +262,21 @@ impl EngineAdapter {
         if let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::P2PResponse(body) => {
-                    let json: serde_json::Value = serde_json::from_slice(&body)?;
-                    Ok(json)
+                    let info = flatbuffers::root::<EngineInfo>(&body)?;
+
+                    use serde_json::json;
+                    let json_val = json!({
+                        "id": info.id(),
+                        "role": info.role(),
+                        "rank": info.rank(),
+                        "world_size": info.world_size(),
+                        "num_blocks": info.num_blocks(),
+                        "host": info.host(),
+                        "port": info.port(),
+                        "status": info.status()
+                    });
+
+                    Ok(json_val)
                 }
                 _ => Err(anyhow::anyhow!(
                     "Unexpected response event for GetEngineInfo"
@@ -277,7 +292,7 @@ impl EngineAdapter {
     pub async fn send_p2p_init(
         &mut self,
         nodes: Vec<(String, String, u16, String, i32, i32)>,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> anyhow::Result<HashMap<String, PeerT>> {
         let mut builder = FlatBufferBuilder::new();
 
         let mut node_offsets = Vec::new();
@@ -333,8 +348,18 @@ impl EngineAdapter {
         if let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::P2PResponse(body) => {
-                    // Response is now P2PInitResponse (FB)
-                    Ok(body)
+                    let p2p_resp = flatbuffers::root::<P2PInitResponse>(&body)
+                        .map_err(|e| anyhow::anyhow!("FlatBuffer Error: {:?}", e))?;
+                    let mut result: HashMap<String, PeerT> = HashMap::new();
+                    if let Some(peers) = p2p_resp.responses() {
+                        for i in 0..peers.len() {
+                            let peer = peers.get(i);
+                            if let Some(id) = peer.remote_id() {
+                                result.insert(id.to_string(), peer.unpack());
+                            }
+                        }
+                    }
+                    Ok(result)
                 }
                 _ => Err(anyhow::anyhow!("Unexpected response event for P2P Init")),
             }
@@ -345,29 +370,14 @@ impl EngineAdapter {
         }
     }
 
-    pub async fn send_p2p_connect(
-        &mut self,
-        target_map: HashMap<String, Vec<u8>>,
-    ) -> anyhow::Result<()> {
-        use crate::fbs::nanodeploy::connection::nanodeploy::fbs::{
-            P2PConnect, P2PConnectArgs, Peer, PeerArgs,
-        };
+    pub async fn send_p2p_connect(&mut self, peers: Vec<PeerT>) -> anyhow::Result<()> {
+        use crate::fbs::{P2PConnect, P2PConnectArgs};
 
         let mut builder = FlatBufferBuilder::new();
         let mut peer_offsets = Vec::new();
 
-        for (target_id, remote_info_bytes) in target_map {
-            let id_off = builder.create_string(&target_id);
-            let remote_info_off = builder.create_vector(&remote_info_bytes);
-
-            peer_offsets.push(Peer::create(
-                &mut builder,
-                &PeerArgs {
-                    id: Some(id_off),
-                    remote_info: Some(remote_info_off),
-                    ..Default::default()
-                },
-            ));
+        for peer_t in peers {
+            peer_offsets.push(peer_t.pack(&mut builder));
         }
 
         let peers_vec = builder.create_vector(&peer_offsets);

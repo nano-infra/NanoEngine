@@ -1,5 +1,3 @@
-include "../../DLSlime/proto/rdma.fbs";
-
 namespace nanodeploy.fbs;
 
 table EngineInfo {
@@ -13,10 +11,17 @@ table EngineInfo {
   status: string; // "initializing" or "ready"
 }
 
+table EndpointBytes {
+  data: [ubyte];
+}
+
+table EndpointInfoList {
+  endpoints: [EndpointBytes];
+}
+
 table Peer {
-  id: string;
-  local_info: [ubyte];  // My endpoint info for this peer (RdmaEndpointInfo)
-  remote_info: [ubyte]; // Peer's endpoint info for me (RdmaEndpointInfo)
+  remote_id: string;
+  remote_info: [EndpointInfoList];
 }
 
 table P2PInit {
