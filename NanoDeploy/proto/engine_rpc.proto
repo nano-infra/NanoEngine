@@ -1,0 +1,13 @@
+syntax = "proto3";
+package nanodeploy;
+
+service EngineService {
+  // Bi-directional streaming for full-duplex communication
+  rpc Interact (stream StreamPacket) returns (stream StreamPacket);
+}
+
+message StreamPacket {
+  uint64 seq_id = 1;
+  uint32 action = 2; // Maps to the legacy "Action ID" (1=Add, 2=Info, etc.)
+  bytes payload = 3; // Contains the FlatBuffer binary
+}

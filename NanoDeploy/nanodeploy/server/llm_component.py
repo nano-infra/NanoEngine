@@ -24,12 +24,13 @@ class LLMComponent(LLMEngine):
 
         if config.enable_etcd:
             etcd_host, etcd_port = config.etcd_address.split(":")
-            self.etcd = etcd3.client(host=etcd_host, port=int(etcd_port))
+            self.etcd = etcd3.Client(host=etcd_host, port=int(etcd_port))
             self.cluster_id = config.cluster_id
             self.lease = None
             self.active_p2p_links: Set[str] = set()
             self.handshake_watches: Dict[str, Any] = {}
 
+            logger.info(f"LLMComponent init: Node={self.engine_id}, Mode={self.config.mode}, Cluster={self.cluster_id}")
             self._setup_etcd()
             self.discovery_thread = threading.Thread(
                 target=self._watch_loop, daemon=True
@@ -129,11 +130,12 @@ class LLMComponent(LLMEngine):
     def _setup_etcd(self):
         """Register node in etcd and start keep-alive."""
         logger.info(f"Registering node {self.engine_id} in cluster {self.cluster_id}")
-        self.lease = self.etcd.lease(ttl=10)
+        self.lease = self.etcd.Lease(ttl=10)
 
         val = self.get_engine_info(status="initializing")
         key = f"/nanodeploy/mesh/{self.cluster_id}/nodes/{self.engine_id}"
-        self.etcd.put(key, val, lease=self.lease)
+        # Use lease ID (int) instead of object
+        self.etcd.put(key, val, lease=self.lease.ID)
 
         # Start keep-alive thread
         def keep_alive():
@@ -154,99 +156,167 @@ class LLMComponent(LLMEngine):
         logger.info(f"Updating node status to {status}")
         val = self.get_engine_info(status=status)
         key = f"/nanodeploy/mesh/{self.cluster_id}/nodes/{self.engine_id}"
-        self.etcd.put(key, val, lease=self.lease)
+        self.etcd.put(key, val, lease=self.lease.ID)
 
     def _watch_loop(self):
         """Watch for new nodes and handshake events."""
         node_prefix = f"/nanodeploy/mesh/{self.cluster_id}/nodes/"
-        logger.info(f"Starting discovery scan on prefix: {node_prefix}")
+        
+        while True:
+            try:
+                logger.info(f"Starting discovery session on prefix: {node_prefix}")
+                
+                # 1. Start Watch FIRST to catch everything from this point on
+                # etcd3-py watch_create returns the stream response object (iterator) directly.
+                events_iterator = self.etcd.watch_create(node_prefix, prefix=True)
+                logger.info(f"Watch created on {node_prefix}")
 
-        # 1. Scan for existing nodes
-        try:
-            existing_nodes = self.etcd.get_prefix(node_prefix)
-            count = 0
-            for val, meta in existing_nodes:
-                count += 1
-                key = meta.key.decode("utf-8")
-                peer_id = key.split("/")[-1]
-                logger.info(f"Scan found node: {peer_id} (Key: {key})")
+                # 2. Scan for existing nodes (captures anything that happened before watch)
+                resp = self.etcd.range(node_prefix, prefix=True)
+                kvs = resp.kvs if hasattr(resp, "kvs") else resp
 
-                if peer_id == self.engine_id:
-                    logger.info("Skipping self in scan.")
-                    continue
+                count = 0
+                for kv in kvs:
+                    if not hasattr(kv, "key"):
+                        continue
+                    count += 1
+                    key = kv.key.decode("utf-8")
+                    val = kv.value
+                    peer_id = key.split("/")[-1]
+                    if peer_id == self.engine_id:
+                        continue
 
-                logger.info(f"Discovered existing peer: {peer_id}")
-                peer_info = EngineInfo.EngineInfo.GetRootAsEngineInfo(val, 0)
-                self._on_peer_online(
-                    peer_id, peer_info, peer_info_bytes=val, is_initiator=True
-                )
-            logger.info(f"Scan completed. Found {count} nodes.")
-            self._update_status("ready")
-        except Exception as e:
-            logger.error(f"Discovery scan failed: {e}")
-            import traceback
+                    logger.info(f"Initial scan discovered peer: {peer_id} (Key: {key})")
+                    try:
+                        peer_info = EngineInfo.EngineInfo.GetRootAsEngineInfo(val, 0)
+                        self._on_peer_online(peer_id, peer_info, peer_info_bytes=val)
+                    except Exception as e:
+                        logger.error(f"Failed to parse info for peer {peer_id}: {e}")
 
-            traceback.print_exc()
+                logger.info(f"Initial scan completed. Found {count} total nodes (including self).")
 
-        logger.info("Entering event watch loop...")
-        events_iterator, cancel = self.etcd.watch_prefix(node_prefix)
+                # 3. Update own status to 'ready'
+                self._update_status("ready")
 
-        for event in events_iterator:
-            key = event.key.decode("utf-8")
-            peer_id = key.split("/")[-1]
-            if peer_id == self.engine_id:
-                continue
-            if isinstance(event, etcd3.events.PutEvent):
-                peer_info = EngineInfo.EngineInfo.GetRootAsEngineInfo(event.value, 0)
-                self._on_peer_online(
-                    peer_id, peer_info, peer_info_bytes=event.value, is_initiator=False
-                )
-            elif isinstance(event, etcd3.events.DeleteEvent):
-                self._on_peer_offline(peer_id)
+                # 4. Consume events from watch
+                logger.info("Entering event watch loop processing...")
+                for response in events_iterator:
+                    # Handle WatchResponse (contains list of events)
+                    if hasattr(response, "events"):
+                        events = response.events if response.events is not None else []
+                    else:
+                        events = [response]
+
+                    for event in events:
+                        if not hasattr(event, "kv") or not event.kv:
+                            continue
+
+                        kv = event.kv
+                        key = kv.key.decode("utf-8")
+                        peer_id = key.split("/")[-1]
+                        if peer_id == self.engine_id:
+                            continue
+
+                        # Robust event type detection
+                        is_put = False
+                        is_delete = False
+                        if hasattr(event, "type"):
+                            etype = str(event.type).upper()
+                            if etype in ("PUT", "0", "PUTEVENT"):
+                                is_put = True
+                            elif etype in ("DELETE", "1", "DELETEEVENT"):
+                                is_delete = True
+                        if not is_delete and kv.value:
+                            is_put = True
+
+                        if is_put:
+                            logger.info(f"Watch discovered peer online/updated: {peer_id}")
+                            try:
+                                peer_info = EngineInfo.EngineInfo.GetRootAsEngineInfo(kv.value, 0)
+                                self._on_peer_online(peer_id, peer_info, peer_info_bytes=kv.value)
+                            except Exception as e:
+                                logger.error(f"Failed to parse peer info from watch: {e}")
+                        elif is_delete:
+                            logger.info(f"Watch discovered peer offline: {peer_id}")
+                            self._on_peer_offline(peer_id)
+                
+                logger.warning("Watch stream ended unexpectedly, restarting discovery...")
+            except Exception as e:
+                logger.error(f"Discovery loop encountered error: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(5)
 
     def _on_peer_online(
         self,
         peer_id: str,
         peer_info,
         peer_info_bytes: bytes,
-        is_initiator: bool = False,
     ):
-        # Determine paths based on initiator status
-        if is_initiator:
-            initiator = self.engine_id
-            terminator = peer_id
-            path_root = (
-                f"/nanodeploy/mesh/{self.cluster_id}/handshake/{initiator}/{terminator}"
-            )
+        # Prevent multiple handshakes for same peer if already connected or in progress
+        if peer_id in self.active_p2p_links:
+            return
+        if peer_id in self.handshake_watches:
+            logger.debug(f"[Handshake] Task for {peer_id} already in progress, skipping redundant trigger")
+            return
 
-            logger.info(f"Initiating handshake with peer {peer_id} (I am Initiator)")
-            my_init_bytes = self.p2p_init(peer_info_bytes)
-            self.etcd.put(f"{path_root}/init", my_init_bytes)
-            self._start_handshake_watch(
-                peer_id, f"{path_root}/resp", "resp", is_initiator=True
-            )
+        # Log Role
+        role = "unknown"
+        if hasattr(peer_info, "Role") and peer_info.Role():
+            role = peer_info.Role().decode("utf-8")
 
-        else:
-            initiator = peer_id
-            terminator = self.engine_id
-            path_root = (
-                f"/nanodeploy/mesh/{self.cluster_id}/handshake/{initiator}/{terminator}"
-            )
+        logger.info(f"Peer Online: {peer_id} (Role: {role})")
 
-            logger.info(f"Waiting for handshake from peer {peer_id} (I am Responder)")
+        def _handshake_task():
+            try:
+                # Deterministic Initiator Election
+                is_initiator = self.engine_id < peer_id
+                
+                initiator = self.engine_id if is_initiator else peer_id
+                terminator = peer_id if is_initiator else self.engine_id
+                path_root = (
+                    f"/nanodeploy/mesh/{self.cluster_id}/handshake/{initiator}/{terminator}"
+                )
 
-            self._start_handshake_watch(
-                peer_id, f"{path_root}/init", "init", is_initiator=False
-            )
+                if is_initiator:
+                    logger.info(f"[Handshake] Initiating with {peer_id}. Target init key: {path_root}/init")
+                    try:
+                        start_init = time.perf_counter()
+                        my_init_bytes = self.p2p_init(peer_info_bytes)
+                        duration = time.perf_counter() - start_init
+                        logger.info(f"[Handshake] p2p_init success for {peer_id} ({len(my_init_bytes)} bytes) in {duration:.3f}s")
+                    except Exception as e:
+                        logger.error(f"[Handshake] p2p_init FAILED for {peer_id}: {e}")
+                        return
+
+                    logger.info(f"[Handshake] Writing /init key to etcd for {peer_id}")
+                    self.etcd.put(f"{path_root}/init", my_init_bytes)
+                    
+                    logger.info(f"[Handshake] Starting poll for /resp from {peer_id}")
+                    self._start_handshake_watch(
+                        peer_id, f"{path_root}/resp", "resp"
+                    )
+                else:
+                    logger.info(f"[Handshake] Responder role for {peer_id}. Waiting for {path_root}/init")
+                    self._start_handshake_watch(
+                        peer_id, f"{path_root}/init", "init"
+                    )
+            except Exception as e:
+                logger.error(f"Handshake Error for {peer_id}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        threading.Thread(target=_handshake_task, daemon=True).start()
 
     def _start_handshake_watch(
-        self, peer_id: str, key: str, expected_step: str, is_initiator: bool
+        self, peer_id: str, key: str, expected_step: str
     ):
         if peer_id in self.handshake_watches:
             return
-
+        
+        is_initiator = self.engine_id < peer_id
         logger.info(
-            f"Starting polling for handshake key: {key} (expecting {expected_step})"
+            f"Starting polling for handshake key: {key} (expecting {expected_step}, I am {'Initiator' if is_initiator else 'Responder'})"
         )
 
         def poll_loop():
@@ -256,14 +326,27 @@ class LLMComponent(LLMEngine):
                     return
 
                 try:
-                    val, _ = self.etcd.get(key)
+                    # etcd3-py uses range, returns RangeResponse
+                    resp = self.etcd.range(key)
+                    kvs = resp.kvs if hasattr(resp, 'kvs') else resp
+                    val = None
+                    if kvs:
+                        val = kvs[0].value
+                    
                     if val:
-                        logger.info(f"Polled handshake key {key} found!")
+                        logger.info(f"Polled handshake key {key} found! Payload size: {len(val)}")
                         self._handle_handshake_step(
-                            peer_id, expected_step, val, is_initiator
+                            peer_id, expected_step, val
                         )
                         return
-                    time.sleep(0.5)
+                    
+                    if time.time() - start_time > 120:
+                        logger.warning(f"Handshake poll timeout for {peer_id} (key: {key}). Peer might be dead.")
+                        if peer_id in self.handshake_watches:
+                            del self.handshake_watches[peer_id]
+                        return
+
+                    time.sleep(1.0)
                 except Exception as e:
                     if not hasattr(self, "executor"):
                         return
@@ -275,7 +358,7 @@ class LLMComponent(LLMEngine):
         self.handshake_watches[peer_id] = t
 
     def _handle_handshake_step(
-        self, peer_id: str, step: str, payload_bytes: bytes, is_initiator: bool
+        self, peer_id: str, step: str, payload_bytes: bytes
     ):
         # Safety check
         if not hasattr(self, "executor"):
@@ -286,35 +369,57 @@ class LLMComponent(LLMEngine):
             logger.debug(f"Ignoring handshake step for {peer_id} (already connected)")
             return
 
-        logger.info(f"Processing handshake step '{step}' from {peer_id}")
+        logger.info(f"Processing handshake step '{step}' from {peer_id} (payload {len(payload_bytes)} bytes)")
 
-        if step == "init":
-            node_key = f"/nanodeploy/mesh/{self.cluster_id}/nodes/{peer_id}"
-            val, _ = self.etcd.get(node_key)
-            if not val:
-                logger.error(
-                    f"Cannot find node info for {peer_id} during handshake response"
+        try:
+            if step == "init":
+                node_key = f"/nanodeploy/mesh/{self.cluster_id}/nodes/{peer_id}"
+                
+                # Get peer info for local p2p_init call
+                resp = self.etcd.range(node_key)
+                kvs = resp.kvs if hasattr(resp, 'kvs') else resp
+                val = None
+                if kvs:
+                    val = kvs[0].value
+
+                if not val:
+                    logger.error(
+                        f"Cannot find node info for {peer_id} to generate handshake response"
+                    )
+                    return
+
+                # Initialize my endpoints and connect to remote ones
+                logger.info(f"Handshake step 'init': Calling p2p_init & p2p_connect for {peer_id}")
+                
+                start_op = time.perf_counter()
+                my_resp_bytes = self.p2p_init(val)
+                self.p2p_connect(payload_bytes)
+                duration = time.perf_counter() - start_op
+                logger.info(f"Handshake step 'init': p2p_ops success for {peer_id} in {duration:.3f}s")
+
+                initiator = peer_id
+                terminator = self.engine_id
+                path_root = (
+                    f"/nanodeploy/mesh/{self.cluster_id}/handshake/{initiator}/{terminator}"
                 )
-                return
 
-            # Initialize my endpoints first (creates self.endpoints[peer_id])
-            my_resp_bytes = self.p2p_init(val)
+                logger.info(f"Handshake step 'init': Writing /resp key for {peer_id}")
+                self.etcd.put(f"{path_root}/resp", my_resp_bytes)
+                self.active_p2p_links.add(peer_id)
+                logger.info(f"P2P Link established with {peer_id} (as Responder)")
 
-            # Then connect to remote endpoints
-            self.p2p_connect(payload_bytes)
-
-            initiator = peer_id
-            terminator = self.engine_id
-            path_root = (
-                f"/nanodeploy/mesh/{self.cluster_id}/handshake/{initiator}/{terminator}"
-            )
-
-            self.etcd.put(f"{path_root}/resp", my_resp_bytes)
-            self.active_p2p_links.add(peer_id)
-
-        elif step == "resp":
-            self.p2p_connect(payload_bytes)
-            self.active_p2p_links.add(peer_id)
+            elif step == "resp":
+                logger.info(f"Handshake step 'resp': Calling p2p_connect for {peer_id}")
+                start_op = time.perf_counter()
+                self.p2p_connect(payload_bytes)
+                duration = time.perf_counter() - start_op
+                logger.info(f"Handshake step 'resp': p2p_connect success for {peer_id} in {duration:.3f}s")
+                self.active_p2p_links.add(peer_id)
+                logger.info(f"P2P Link established with {peer_id} (as Initiator)")
+        except Exception as e:
+            logger.error(f"Error handling handshake step '{step}' for {peer_id}: {e}")
+            import traceback
+            traceback.print_exc()
 
         if peer_id in self.handshake_watches:
             # Clean up watch

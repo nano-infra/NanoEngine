@@ -1,28 +1,41 @@
 use std::env;
 use std::process::Command;
 
-fn main() {
-    println!("cargo:rerun-if-changed=../proto/sequence.fbs");
-    println!("cargo:rerun-if-changed=../proto/connection.fbs");
-    println!("cargo:rerun-if-changed=build.rs");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = env::var("OUT_DIR")?;
 
-    let out_dir = env::var("OUT_DIR").unwrap();
+    // Generate FlatBuffers
+    // We assume 'flatc' is in CACHE or PATH.
+    // Since the user is running flatc manually in the shell, it should be available.
+    let fbs_files = ["../proto/sequence.fbs", "../proto/connection.fbs"];
 
-    // Invoke flatc
-    let status = Command::new("flatc")
-        .args([
-            "--rust",
-            "--gen-object-api",
-            "--gen-all",
-            "-o",
-            &out_dir,
-            "../proto/sequence.fbs",
-            "../proto/connection.fbs",
-        ])
-        .status()
-        .expect("Failed to run flatc");
+    for fbs in &fbs_files {
+        println!("cargo:rerun-if-changed={}", fbs);
+        let status = Command::new("flatc")
+            .arg("--rust")
+            .arg("--gen-object-api")
+            .arg("-o")
+            .arg(&out_dir)
+            .arg(fbs)
+            .status();
 
-    if !status.success() {
-        panic!("flatc failed with status: {}", status);
+        match status {
+            Ok(s) => {
+                if !s.success() {
+                    // It's possible flatc is not in path or failed.
+                    // But we proceed and let logic fail if files are missing.
+                    eprintln!("flatc command failed for {}", fbs);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to execute flatc: {}", e);
+            }
+        }
     }
+
+    // Generate gRPC/Protobuf
+    println!("cargo:rerun-if-changed=../proto/engine_rpc.proto");
+    tonic_build::compile_protos("../proto/engine_rpc.proto")?;
+
+    Ok(())
 }

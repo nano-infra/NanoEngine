@@ -14,6 +14,11 @@ pub mod fbs {
     pub use self::connection_generated::nanodeploy::fbs::*;
     pub use self::sequence_generated::nanodeploy::fbs::*;
 }
+
+pub mod engine_rpc {
+    tonic::include_proto!("nanodeploy");
+}
+
 mod engine_adapter;
 mod http_server;
 mod tokenizer;

@@ -1,21 +1,29 @@
+use crate::engine_rpc::{engine_service_client::EngineServiceClient, StreamPacket};
 use crate::fbs::{
     EngineInfo, EngineInfoArgs, P2PInit, P2PInitArgs, P2PInitResponse, PeerT, SamplingParams,
     SamplingParamsArgs, Sequence, SequenceArgs, SequenceList, SequenceListArgs, SequenceStatus,
     StepOut,
 };
 use flatbuffers::FlatBufferBuilder;
-use spoke::client::SpokeClient;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::Endpoint;
+use tonic::Request;
 use tracing::{error, info};
 
 pub struct EngineAdapter {
-    pub client: SpokeClient,
+    // We send requests via this channel, which pipes into the gRPC stream
+    pub request_tx: Option<mpsc::Sender<StreamPacket>>,
+
     pub pending_requests: Arc<Mutex<HashMap<u64, RequestState>>>,
     pub uuid: Option<String>,
     pub world_size: i32,
     pub num_blocks: i32,
+    pub next_seq_id: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -34,107 +42,125 @@ pub struct RequestState {
 }
 
 impl EngineAdapter {
-    pub fn new(id: String) -> Self {
+    pub fn new(_id: String) -> Self {
         Self {
-            client: SpokeClient::new(id),
+            request_tx: None,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             uuid: None,
             world_size: 0,
             num_blocks: 0,
+            next_seq_id: AtomicU64::new(1),
         }
     }
 
     pub async fn connect(&mut self, addr: &str) -> anyhow::Result<()> {
-        let mut reader = self.client.connect(addr).await?;
+        let uri = format!("http://{}", addr);
+        info!("Connecting to gRPC Engine at {}", uri);
+
+        let endpoint = Endpoint::from_shared(uri)?
+            .tcp_keepalive(Some(Duration::from_secs(20)))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(10));
+
+        let channel = endpoint.connect().await?;
+        let mut client = EngineServiceClient::new(channel);
+
+        // Create bi-directional stream
+        let (tx, rx) = mpsc::channel(128);
+        self.request_tx = Some(tx);
+        let request_stream = ReceiverStream::new(rx);
+
+        let response = client.interact(Request::new(request_stream)).await?;
+        let mut response_stream = response.into_inner();
 
         // Spawn background reader task
         let pending = self.pending_requests.clone();
         tokio::spawn(async move {
             info!("EngineAdapter reader loop started.");
-            loop {
-                match reader.read_msg().await {
-                    Ok((meta, body)) => {
-                        // Action 0: StepOut (Default)
-                        // Action 1: Migration (SequenceList)
+            while let Ok(Some(packet)) = response_stream.message().await {
+                let action = packet.action;
+                let payload = packet.payload;
+                let seq_id = packet.seq_id;
 
-                        if meta.action == 1 {
-                            // Migration Event
-                            // We need to peek inside to get seq_id to route it
-                            // Assuming body is SequenceList -> Sequence
+                // Dispatch Logic (Identical to legacy)
 
-                            let seq_id = flatbuffers::root::<SequenceList>(&body)
-                                .ok()
-                                .and_then(|sl: SequenceList| sl.sequences())
-                                .filter(
-                                    |seqs: &flatbuffers::Vector<
-                                        flatbuffers::ForwardsUOffset<Sequence>,
-                                    >| !seqs.is_empty(),
-                                )
-                                .map(
-                                    |seqs: flatbuffers::Vector<
-                                        flatbuffers::ForwardsUOffset<Sequence>,
-                                    >| seqs.get(0).seq_id(),
-                                );
+                // Action 1: Migration
+                if action == 1 {
+                    // Migration Event (Payload is SequenceList serialization)
+                    // We need to peek inside to get seq_id
+                    let extracted_seq_id = flatbuffers::root::<SequenceList>(&payload)
+                        .ok()
+                        .and_then(|sl: SequenceList| sl.sequences())
+                        .filter(|seqs| !seqs.is_empty())
+                        .map(|seqs| seqs.get(0).seq_id());
 
-                            if let Some(seq_id) = seq_id {
-                                info!("Received Action 1 (Migration Candidate) for Seq {}. Payload size: {}", seq_id, body.len());
-                                let mut map = pending.lock().await;
-                                if let Some(state) = map.remove(&seq_id) {
-                                    let _ = state.sender.send(StreamEvent::Migrate(body.clone()));
-                                }
-                            }
-                            continue;
-                        }
+                    // Prefer extracted ID for migration as it's data plane,
+                    // but packet.seq_id should match if python server is correct.
+                    let effective_id = extracted_seq_id.unwrap_or(seq_id);
 
-                        if meta.action == 2 || meta.action == 3 {
-                            // Action 2: GetEngineInfo Response
-                            // Action 3: P2P Init Response
-                            info!(
-                                "Received Action {} response. Payload size: {}",
-                                meta.action,
-                                body.len()
-                            );
-
-                            let mut map = pending.lock().await;
-                            // We use seq_id=0 for control channel responses
-                            if let Some(state) = map.remove(&0) {
-                                let _ = state.sender.send(StreamEvent::P2PResponse(body.clone()));
-                            }
-                            continue;
-                        }
-
-                        if let Ok(step_out) = flatbuffers::root::<StepOut>(&body) {
-                            let seq_id = step_out.seq_id();
-                            let token_id = step_out.token_id();
-                            let status = step_out.status();
-
-                            let mut map = pending.lock().await;
-                            // Check status logic
-                            if status == SequenceStatus::FINISHED {
-                                if let Some(final_state) = map.remove(&seq_id) {
-                                    if token_id > 0 {
-                                        let _ =
-                                            final_state.sender.send(StreamEvent::Token(token_id));
-                                    }
-                                    let _ = final_state.sender.send(StreamEvent::Finished);
-                                }
-                            } else if status == SequenceStatus::RUNNING_DECODE && token_id > 0 {
-                                if let Some(state) = map.get_mut(&seq_id) {
-                                    state.accumulated_tokens.push(token_id);
-                                    let _ = state.sender.send(StreamEvent::Token(token_id));
-                                }
-                            }
+                    if effective_id > 0 {
+                        let mut map = pending.lock().await;
+                        if let Some(state) = map.remove(&effective_id) {
+                            let _ = state.sender.send(StreamEvent::Migrate(payload));
                         }
                     }
-                    Err(e) => {
-                        error!("Reader connection error: {}", e);
-                        break;
+                    continue;
+                }
+
+                if action == 2 || action == 3 || action == 4 {
+                    // Control Responses
+                    let mut map = pending.lock().await;
+                    if let Some(state) = map.remove(&seq_id) {
+                        let _ = state.sender.send(StreamEvent::P2PResponse(payload));
+                    }
+                    continue;
+                }
+
+                if action == 0 {
+                    // StepOut (Token)
+                    if let Ok(step_out) = flatbuffers::root::<StepOut>(&payload) {
+                        let seq_id = step_out.seq_id();
+                        let token_id = step_out.token_id();
+                        let status = step_out.status();
+
+                        let mut map = pending.lock().await;
+                        if status == SequenceStatus::FINISHED {
+                            if let Some(final_state) = map.remove(&seq_id) {
+                                if token_id > 0 {
+                                    let _ = final_state.sender.send(StreamEvent::Token(token_id));
+                                }
+                                let _ = final_state.sender.send(StreamEvent::Finished);
+                            }
+                        } else if status == SequenceStatus::RUNNING_DECODE && token_id > 0 {
+                            if let Some(state) = map.get_mut(&seq_id) {
+                                state.accumulated_tokens.push(token_id);
+                                let _ = state.sender.send(StreamEvent::Token(token_id));
+                            }
+                        }
                     }
                 }
             }
+            info!("EngineAdapter reader loop ended (Stream closed).");
         });
 
         Ok(())
+    }
+
+    // Internal helper to send Generic Packet
+    async fn send_packet(&self, action: u32, seq_id: u64, payload: Vec<u8>) -> anyhow::Result<()> {
+        if let Some(tx) = &self.request_tx {
+            let packet = StreamPacket {
+                seq_id,
+                action,
+                payload,
+            };
+            tx.send(packet)
+                .await
+                .map_err(|_| anyhow::anyhow!("Request Stream Closed"))?;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Not connected"))
+        }
     }
 
     // New method to send raw payload (for forwarding migration)
@@ -162,8 +188,8 @@ impl EngineAdapter {
             payload.len()
         );
 
-        // Action 1: AddRequest (Same as new request, just with populated slots)
-        self.client.send_message(1, seq_id, &payload).await?;
+        // Action 1: AddRequest
+        self.send_packet(1, seq_id, payload).await?;
 
         Ok(rx)
     }
@@ -220,7 +246,7 @@ impl EngineAdapter {
         );
 
         builder.finish(root, None);
-        let payload = builder.finished_data();
+        let payload = builder.finished_data().to_vec();
 
         // Register pending request
         let (tx, rx) = mpsc::unbounded_channel();
@@ -235,19 +261,22 @@ impl EngineAdapter {
             );
         }
 
-        // Delegate to Generic Spoke (Action 1)
-        self.client.send_message(1, seq_id, payload).await?;
+        // Action 1: Add Request
+        self.send_packet(1, seq_id, payload).await?;
 
         Ok(rx)
     }
 
     pub async fn send_get_engine_info(&mut self) -> anyhow::Result<serde_json::Value> {
-        // Register pending request for seq_id = 0 (Control Channel)
+        // Unique Seq ID
+        let seq_id = self.next_seq_id.fetch_add(1, Ordering::Relaxed);
+
+        // Register pending request
         let (tx, mut rx) = mpsc::unbounded_channel();
         {
             let mut map = self.pending_requests.lock().await;
             map.insert(
-                0,
+                seq_id,
                 RequestState {
                     sender: tx,
                     accumulated_tokens: Vec::new(),
@@ -256,7 +285,7 @@ impl EngineAdapter {
         }
 
         // Action 2: GetEngineInfo
-        self.client.send_message(2, 0, &[]).await?;
+        self.send_packet(2, seq_id, vec![]).await?;
 
         // Wait for response from reader loop
         if let Some(event) = rx.recv().await {
@@ -328,12 +357,15 @@ impl EngineAdapter {
         builder.finish(p2p_init, None);
         let payload = builder.finished_data().to_vec();
 
-        // Register pending request for seq_id = 0 (Control Channel)
+        // Unique Seq ID
+        let seq_id = self.next_seq_id.fetch_add(1, Ordering::Relaxed);
+
+        // Register pending request
         let (tx, mut rx) = mpsc::unbounded_channel();
         {
             let mut map = self.pending_requests.lock().await;
             map.insert(
-                0,
+                seq_id,
                 RequestState {
                     sender: tx,
                     accumulated_tokens: Vec::new(),
@@ -342,7 +374,7 @@ impl EngineAdapter {
         }
 
         // Action 3: P2PInit
-        self.client.send_message(3, 0, &payload).await?;
+        self.send_packet(3, seq_id, payload).await?;
 
         // Wait for response from reader loop
         if let Some(event) = rx.recv().await {
@@ -389,10 +421,37 @@ impl EngineAdapter {
         );
 
         builder.finish(p2p_connect, None);
-        let payload = builder.finished_data();
+        let payload = builder.finished_data().to_vec();
+
+        // Unique Seq ID
+        let seq_id = self.next_seq_id.fetch_add(1, Ordering::Relaxed);
+
+        // Register pending request
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        {
+            let mut map = self.pending_requests.lock().await;
+            map.insert(
+                seq_id,
+                RequestState {
+                    sender: tx,
+                    accumulated_tokens: Vec::new(),
+                },
+            );
+        }
 
         // Action 4: P2PConnect
-        self.client.send_message(4, 0, payload).await?;
-        Ok(())
+        self.send_packet(4, seq_id, payload).await?;
+
+        // Wait for Ack
+        if let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::P2PResponse(_) => Ok(()),
+                _ => Err(anyhow::anyhow!("Unexpected response event for P2P Connect")),
+            }
+        } else {
+            Err(anyhow::anyhow!(
+                "Channel closed waiting for P2P Connect Ack"
+            ))
+        }
     }
 }

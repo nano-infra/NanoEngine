@@ -362,19 +362,22 @@ impl EngineManager {
 
         // 2. Manage Routing Lists based on Status
         if status == "ready" {
-            if role == "prefill" {
+            let mut matched = false;
+            if role == "prefill" || role == "hybrid" {
+                matched = true;
                 // Check if already in list
-                let exists = mgr.prefill_engines.iter().any(|a| {
-                    // We can't easily check UUID without locking.
-                    // But we have the Arc pointer equality!
-                    // If we inserted the SAME Arc from known_nodes, PtrEq works.
-                    Arc::ptr_eq(a, &adapter_arc)
-                });
+                let exists = mgr
+                    .prefill_engines
+                    .iter()
+                    .any(|a| Arc::ptr_eq(a, &adapter_arc));
                 if !exists {
                     info!("Node {} is ready. Adding to Prefill pool.", uuid);
-                    mgr.prefill_engines.push(adapter_arc);
+                    mgr.prefill_engines.push(adapter_arc.clone());
                 }
-            } else if role == "decode" {
+            }
+
+            if role == "decode" || role == "hybrid" {
+                matched = true;
                 let exists = mgr
                     .decode_engines
                     .iter()
@@ -383,6 +386,13 @@ impl EngineManager {
                     info!("Node {} is ready. Adding to Decode pool.", uuid);
                     mgr.decode_engines.push(adapter_arc);
                 }
+            }
+
+            if !matched {
+                warn!(
+                    "Node {} has unrecognized role '{}'. Not added to any pool.",
+                    uuid, role
+                );
             }
         } else {
             // Remove from pool if present (e.g. went back to initializing or unhealthy)

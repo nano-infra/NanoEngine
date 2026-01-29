@@ -7,7 +7,6 @@ from dataclasses import fields
 from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional, Set
 
-import etcd3
 import flatbuffers
 import numpy as np
 from tqdm.auto import tqdm
