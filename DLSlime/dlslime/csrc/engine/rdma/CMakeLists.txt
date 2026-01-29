@@ -1,0 +1,63 @@
+function(install_system_library LIB_NAME INSTALL_DIR)
+    find_library(${LIB_NAME}_LIB NAMES ${LIB_NAME})
+    if(NOT ${LIB_NAME}_LIB)
+        message(FATAL_ERROR "${LIB_NAME} library not found. Please install ${LIB_NAME}-dev or ${LIB_NAME}-devel.")
+    endif()
+
+    get_filename_component(${LIB_NAME}_REAL_PATH ${${LIB_NAME}_LIB} REALPATH)
+    get_filename_component(${LIB_NAME}_DIR ${${LIB_NAME}_LIB} DIRECTORY)
+    file(GLOB ${LIB_NAME}_LINKS "${${LIB_NAME}_DIR}/lib${LIB_NAME}.so*")
+
+    install(
+        FILES ${${LIB_NAME}_REAL_PATH} ${${LIB_NAME}_LINKS}
+        DESTINATION ${INSTALL_DIR}
+        PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+    )
+
+    message(STATUS "Found ${LIB_NAME} library: ${${LIB_NAME}_REAL_PATH}")
+    message(STATUS "Will install ${LIB_NAME} to: ${INSTALL_DIR}")
+endfunction()
+
+install_system_library(numa ${DLSLIME_INSTALL_PATH})
+
+set(RDMA_SOURCES
+    ibv_helper.cpp
+    memory_pool.cpp
+    rdma_assignment.cpp
+    rdma_channel.cpp
+    rdma_context.cpp
+    rdma_endpoint.cpp
+    rdma_future.cpp
+    rdma_io_endpoint.cpp
+    rdma_msg_endpoint.cpp
+    rdma_worker.cpp
+)
+if(BUILD_RDMA_RENDEZVOUS_ZMQ)
+  list(APPEND RDMA_SOURCES rdma_rendezvous_zmq.cpp rdma_lazy_peer.cpp rdma_broker.cpp)
+endif()
+add_library(_slime_rdma SHARED ${RDMA_SOURCES})
+
+target_link_libraries(_slime_rdma PUBLIC _slime_device _slime_engine numa ibverbs)
+if(BUILD_RDMA_RENDEZVOUS_ZMQ)
+  target_link_libraries(_slime_rdma PUBLIC libzmq dlslime_rendezvous)
+  target_compile_definitions(_slime_rdma PUBLIC BUILD_RDMA_RENDEZVOUS_ZMQ)
+endif()
+
+set_target_properties(
+    _slime_rdma
+    PROPERTIES
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "\${ORIGIN}"
+)
+
+target_include_directories(_slime_rdma PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../..>
+    $<INSTALL_INTERFACE:include/dlslime>
+)
+
+install(
+    TARGETS
+    _slime_rdma
+    EXPORT dlslimeTargets
+    LIBRARY DESTINATION ${DLSLIME_INSTALL_PATH}
+)

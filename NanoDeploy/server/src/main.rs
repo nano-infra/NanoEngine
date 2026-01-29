@@ -1,4 +1,6 @@
 mod config;
+mod peer_type;
+pub use peer_type::{peer_from_table, PeerT};
 mod engine_manager;
 #[allow(warnings)]
 pub mod fbs {

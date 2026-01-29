@@ -40,13 +40,13 @@ if(NOT TARGET flatc)
 endif()
 
 add_custom_command(
-    OUTPUT "${FBS_OUTPUT_DIR}/Peer.py" "${FBS_OUTPUT_DIR}/RdmaEndpointInfo.py"
+    OUTPUT "${FBS_OUTPUT_DIR}/Peer.py"
     COMMAND ${CMAKE_COMMAND} -E remove_directory "${FBS_OUTPUT_DIR}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${FBS_OUTPUT_DIR}"
     COMMAND ${CMAKE_COMMAND} -E touch "${FBS_OUTPUT_DIR}/__init__.py"
-    COMMAND flatc --python --gen-object-api -o "${CMAKE_CURRENT_SOURCE_DIR}" ${SEQUENCE_PROTO} ${CONNECTION_PROTO} "${NANOINFRA_DIR}/DLSlime/proto/rdma.fbs"
-    DEPENDS flatc ${SEQUENCE_PROTO} ${CONNECTION_PROTO} "${NANOINFRA_DIR}/DLSlime/proto/rdma.fbs"
-    COMMENT "Generating Python Flatbuffers from sequence.fbs, connection.fbs, and rdma.fbs (Unified Namespace)"
+    COMMAND flatc --python --gen-object-api -o "${CMAKE_CURRENT_SOURCE_DIR}" ${SEQUENCE_PROTO} ${CONNECTION_PROTO}
+    DEPENDS flatc ${SEQUENCE_PROTO} ${CONNECTION_PROTO}
+    COMMENT "Generating Python Flatbuffers from sequence.fbs and connection.fbs"
 )
 
 # Add a custom target to ensure it runs

@@ -236,6 +236,11 @@ class ModelRunner:
     ):
         return get_cache_context().p2p_connect(remote_engine_id, endpoints_info_list)
 
+    def ensure_p2p_connected(
+        self, peer_id: str, addrs: list[str], num_blocks: int
+    ) -> None:
+        return get_cache_context().ensure_p2p_connected(peer_id, addrs, num_blocks)
+
     def p2p_disconnect(self, remote_engine_id: str):
         return get_cache_context().p2p_disconnect(remote_engine_id)
 
@@ -299,6 +304,8 @@ class ModelRunner:
             device=torch.get_default_device(),
             dtype=torch.get_default_dtype(),
             mode=mode,
+            broker_host=config.host,
+            broker_base_port=config.port,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 

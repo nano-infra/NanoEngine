@@ -198,3 +198,5 @@ cython_debug/
 
 # NanoDeploy generated files
 NanoDeploy/nanodeploy/fbs/
+NanoDeploy/engine_rpc_pb2.py
+NanoDeploy/engine_rpc_pb2_grpc.py

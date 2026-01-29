@@ -162,6 +162,18 @@ class LLMEngine:
         if is_prefill and self.config.mode == "decode":
             if not self.config.dummy_prefill:
                 logger.debug("perform migration")
+                target_engine_ids = set()
+                for seqs in dp_sp_seqs:
+                    for seq in seqs:
+                        if getattr(seq, "is_to_be_migrated", False):
+                            ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
+                            eid = getattr(ctx, "engine_id", None)
+                            if eid:
+                                target_engine_ids.add(eid)
+                ensure_p2p = getattr(self, "ensure_p2p_connected", None)
+                if callable(ensure_p2p):
+                    for eid in target_engine_ids:
+                        ensure_p2p(eid)
                 for seqs in filtered_dp_sp_seqs:
                     for seq in seqs:
                         logger.debug(

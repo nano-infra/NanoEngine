@@ -6,8 +6,8 @@
 #include <zmq.hpp>
 
 #include "acl/acl.h"
-#include "dlslime/engine/ascend_direct/ascend_direct_transport.h"
-#include "dlslime/logging.h"
+#include "dlslime/csrc/engine/ascend_direct/ascend_direct_transport.h"
+#include "dlslime/csrc/logging.h"
 
 DEFINE_string(localhost, "100.97.164.197", "local IP");
 DEFINE_int32(local_port, 16777, "Port number");

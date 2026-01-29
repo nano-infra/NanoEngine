@@ -1,6 +1,7 @@
 use crate::config::{EngineConfig, EtcdConfig};
 use crate::engine_adapter::EngineAdapter;
-use crate::fbs::{EngineInfo, PeerT};
+use crate::fbs::EngineInfo;
+use crate::PeerT;
 use etcd_client::{Client, EventType, GetOptions, WatchOptions};
 
 use futures::stream::StreamExt; // For WatchStream iteration
@@ -197,8 +198,8 @@ impl EngineManager {
 
                 for target_uuid in &decode_uuids {
                     if let Some(responses) = node_responses.get(target_uuid) {
-                        if let Some(peer_t) = responses.get(&my_uuid) {
-                            let mut peer_t: PeerT = peer_t.clone();
+                        if let Some(peer_t) = responses.get(&my_uuid).cloned() {
+                            let mut peer_t: PeerT = peer_t;
                             peer_t.remote_id = Some(target_uuid.clone());
                             peers_to_send.push(peer_t);
                         }
@@ -225,8 +226,8 @@ impl EngineManager {
 
                 for target_uuid in &prefill_uuids {
                     if let Some(responses) = node_responses.get(target_uuid) {
-                        if let Some(peer_t) = responses.get(&my_uuid) {
-                            let mut peer_t: PeerT = peer_t.clone();
+                        if let Some(peer_t) = responses.get(&my_uuid).cloned() {
+                            let mut peer_t: PeerT = peer_t;
                             peer_t.remote_id = Some(target_uuid.clone());
                             peers_to_send.push(peer_t);
                         }
@@ -317,14 +318,8 @@ impl EngineManager {
     }
 
     async fn handle_node_update(manager: &Arc<Mutex<EngineManager>>, val: &[u8]) {
-        // Parse FlatBuffer
-        let info = match flatbuffers::root::<EngineInfo>(val) {
-            Ok(i) => i,
-            Err(e) => {
-                error!("Failed to parse EngineInfo from Etcd: {}", e);
-                return;
-            }
-        };
+        // Parse FlatBuffer (unchecked: we trust Etcd payload)
+        let info = unsafe { flatbuffers::root_unchecked::<EngineInfo>(val) };
         let uuid = info.id().unwrap_or_default();
         let role = info.role().unwrap_or_default();
         let host = info.host().unwrap_or_default();

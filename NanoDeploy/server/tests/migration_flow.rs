@@ -4,7 +4,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
-// use byteorder::{ByteOrder, LittleEndian}; // Removed, use u32::from_le_bytes
 
 async fn start_mock_engine_with_role(port: u16, is_prefill: bool) -> tokio::task::JoinHandle<()> {
     let addr = format!("127.0.0.1:{}", port);

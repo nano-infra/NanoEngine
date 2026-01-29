@@ -1,6 +1,5 @@
 pub mod config;
 
-pub mod engine_manager;
 #[allow(warnings)]
 pub mod fbs {
     #[allow(clippy::all)]
@@ -15,6 +14,10 @@ pub mod fbs {
     pub use self::connection_generated::nanodeploy::fbs::*;
     pub use self::sequence_generated::nanodeploy::fbs::*;
 }
+
+pub mod peer_type;
+pub use peer_type::{peer_from_table, PeerT};
+pub mod engine_manager;
 
 pub mod engine_rpc {
     tonic::include_proto!("nanodeploy");

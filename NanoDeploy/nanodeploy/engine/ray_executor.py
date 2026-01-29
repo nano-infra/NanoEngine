@@ -174,6 +174,10 @@ class RayExecutor:
     def p2p_connect(self, remote_name: str, remote_endpoint_infos: list[bytes]):
         return self.collective_rpc("p2p_connect", (remote_name, remote_endpoint_infos))
 
+    def ensure_p2p_connected(self, peer_id: str, addrs: list[str], num_blocks: int):
+        """Ensure P2P link to peer (lazy connect by broker addr). Idempotent."""
+        return self.collective_rpc("ensure_p2p_connected", (peer_id, addrs, num_blocks))
+
     def p2p_disconnect(self, remote_name: str):
         return self.collective_rpc("p2p_disconnect", (remote_name,))
 

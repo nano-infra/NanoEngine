@@ -1,7 +1,7 @@
 import concurrent.futures
 import dataclasses
 from collections import defaultdict
-from typing import Literal
+from typing import Any, Literal
 
 import dlslime
 import torch
@@ -12,6 +12,9 @@ from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 
 logger = get_logger("nanodeploy")
+
+# Broker path: RDMALazyPeer uses (local_mr_key, remote_mr_key, target_off, source_off, length)
+_KV_CACHE_BUFFER_ID = "kv_cache"
 
 
 @dataclasses.dataclass
@@ -30,11 +33,15 @@ class CacheContext:
     num_remote_kvcache_blocks: dict[str, int] = None
     kv_cache: torch.Tensor = None
     selected_nic: str | None = None
-    endpoints: dict[str, dict[int, dlslime.RDMAEndpoint]] = None
+    endpoints: dict[str, dict[int, Any]] = None  # RDMAEndpoint or RDMALazyPeer
 
     # used for MLA mode
     kv_lora_rank: int = 0
     qk_rope_head_dim: int = 0
+
+    # Broker path: optional, set when ensure_p2p_connected is used
+    broker_host: str | None = None
+    broker_base_port: int | None = None
 
     @property
     def num_local_kv_heads(self):
@@ -88,6 +95,19 @@ class CacheContext:
 
         self.endpoints = {}
         self.num_remote_kvcache_blocks = {}
+        self.peer_addrs: dict[str, list[str]] = {}  # peer_id -> addrs for Broker path
+        self._broker = None
+        self._accept_channel = None  # created at allocate_kvcache for accepting
+        start_broker_fn = getattr(dlslime, "start_broker", None)
+        if (
+            self.broker_base_port is not None
+            and self.broker_host is not None
+            and callable(start_broker_fn)
+        ):
+            rank = dist.get_rank()
+            bind_addr = f"{self.broker_host}:{self.broker_base_port + rank}"
+            self._broker = start_broker_fn(bind_addr)
+            logger.info(f"Broker started on {bind_addr}")
 
     def block_stride(self, block_idx: int):
         return (
@@ -137,6 +157,16 @@ class CacheContext:
             dtype=self.dtype,
             device=self.device,
         )
+        # Broker path: create one peer for accepting connections (responder side)
+        if self._broker is not None:
+            self._accept_channel = self._broker.peer(device_name=self.selected_nic)
+            kv_size = self.kv_cache.numel() * self.kv_cache.itemsize
+            self._accept_channel.register_buffer(
+                _KV_CACHE_BUFFER_ID,
+                self.kv_cache.data_ptr(),
+                kv_size,
+            )
+            logger.info("Accept channel created for Broker (responder)")
 
     def p2p_init(
         self, remote_engine_name: str, num_kv_blocks: int, remote_world_size: int
@@ -176,12 +206,44 @@ class CacheContext:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             list(executor.map(connect_endpoint, enumerate(endpoints_info_list)))
 
+    def ensure_p2p_connected(
+        self, peer_id: str, addrs: list[str], num_blocks: int
+    ) -> None:
+        """Ensure P2P link to peer via broker addrs (lazy connect). Idempotent."""
+        if peer_id in self.endpoints:
+            return
+        if self._broker is None:
+            raise RuntimeError(
+                "ensure_p2p_connected requires Broker; set broker_host and broker_base_port in set_cache_context and build dlslime with BUILD_RDMA_RENDEZVOUS_ZMQ"
+            )
+        self.num_remote_kvcache_blocks[peer_id] = num_blocks
+        self.peer_addrs[peer_id] = addrs
+        endpoints = self.endpoints[peer_id] = {}
+        kv_size = (
+            self.kv_cache.numel() * self.kv_cache.itemsize
+            if self.kv_cache is not None
+            else 0
+        )
+        if kv_size == 0:
+            raise RuntimeError("ensure_p2p_connected called before allocate_kvcache")
+        for r, addr in enumerate(addrs):
+            channel = self._broker.peer(device_name=self.selected_nic)
+            channel.connect(addr)
+            channel.register_buffer(
+                _KV_CACHE_BUFFER_ID,
+                self.kv_cache.data_ptr(),
+                kv_size,
+            )
+            endpoints[r] = channel
+        logger.info(f"P2P link ensured to {peer_id} ({len(addrs)} ranks)")
+
     def p2p_disconnect(self, remote_engine_id: str):
         if remote_engine_id in self.endpoints:
-            # Just clear by now, as per feedback
             del self.endpoints[remote_engine_id]
             if remote_engine_id in self.num_remote_kvcache_blocks:
                 del self.num_remote_kvcache_blocks[remote_engine_id]
+            if remote_engine_id in self.peer_addrs:
+                del self.peer_addrs[remote_engine_id]
             logger.info(f"P2P Link to {remote_engine_id} disconnected and cleared.")
 
     def migrate(self, seqs: list[Sequence]):
@@ -221,9 +283,19 @@ class CacheContext:
             futures = []
             for endpoint_key, endpoint_assign_batch in assigns.items():
                 for replica_key, assign_batch in endpoint_assign_batch.items():
-                    futures.append(
-                        self.endpoints[endpoint_key][replica_key].read(assign_batch)
-                    )
+                    channel = self.endpoints[endpoint_key][replica_key]
+                    if hasattr(channel, "get_remote_mr_key"):
+                        # Broker path: RDMALazyPeer uses (local_mr_key, remote_mr_key, target_off, source_off, length)
+                        addr = self.peer_addrs[endpoint_key][replica_key]
+                        local_mr = channel.get_local_mr_key(addr, _KV_CACHE_BUFFER_ID)
+                        remote_mr = channel.get_remote_mr_key(addr, _KV_CACHE_BUFFER_ID)
+                        converted = [
+                            (local_mr, remote_mr, a[3], a[2], a[4])
+                            for a in assign_batch
+                        ]
+                        futures.append(channel.read(addr, converted))
+                    else:
+                        futures.append(channel.read(assign_batch))
 
             [future.wait() for future in futures]
 
@@ -248,6 +320,8 @@ def set_cache_context(
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     mode: Literal["gqa", "mla"] = "gqa",
+    broker_host: str | None = None,
+    broker_base_port: int | None = None,
 ):
     global _CACHE_CONTEXT
     _CACHE_CONTEXT = CacheContext(
@@ -263,5 +337,7 @@ def set_cache_context(
         device=device,
         dtype=dtype,
         mode=mode,
+        broker_host=broker_host,
+        broker_base_port=broker_base_port,
     )
     return _CACHE_CONTEXT

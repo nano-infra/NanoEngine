@@ -33,7 +33,6 @@ dashmap = "5.5"
 flatbuffers = "2.1"
 
 # Tokenizers
-# Tokenizers
 tokenizers = { version = "0.21", features = ["onig"] }
 
 # Error Handling

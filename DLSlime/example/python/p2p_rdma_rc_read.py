@@ -12,14 +12,14 @@ initiator = RDMAEndpoint(device_name=devices[0], ib_port=1, link_type="RoCE")
 target = RDMAEndpoint(device_name=devices[-1], ib_port=1, link_type="RoCE")
 
 # Register local GPU memory with RDMA subsystem
-local_tensor = torch.zeros([16], device="cuda:0", dtype=torch.uint8)
+local_tensor = torch.zeros([16], device="cpu", dtype=torch.uint8)
 initiator.register_memory_region(
     local_tensor.data_ptr(),
     local_tensor.data_ptr(),
     int(local_tensor.storage_offset()),
     local_tensor.numel() * local_tensor.itemsize,
 )
-remote_tensor = torch.ones([16], device="cuda", dtype=torch.uint8)
+remote_tensor = torch.ones([16], device="cpu", dtype=torch.uint8)
 target.register_memory_region(
     remote_tensor.data_ptr(),
     remote_tensor.data_ptr(),

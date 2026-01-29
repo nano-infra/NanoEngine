@@ -1,9 +1,10 @@
 use crate::engine_rpc::{engine_service_client::EngineServiceClient, StreamPacket};
 use crate::fbs::{
-    EngineInfo, EngineInfoArgs, P2PInit, P2PInitArgs, P2PInitResponse, PeerT, SamplingParams,
+    EngineInfo, EngineInfoArgs, P2PInit, P2PInitArgs, P2PInitResponse, SamplingParams,
     SamplingParamsArgs, Sequence, SequenceArgs, SequenceList, SequenceListArgs, SequenceStatus,
     StepOut,
 };
+use crate::{peer_from_table, PeerT};
 use flatbuffers::FlatBufferBuilder;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +14,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Endpoint;
 use tonic::Request;
-use tracing::{error, info};
+use tracing::info;
 
 pub struct EngineAdapter {
     // We send requests via this channel, which pipes into the gRPC stream
@@ -88,11 +89,14 @@ impl EngineAdapter {
                 if action == 1 {
                     // Migration Event (Payload is SequenceList serialization)
                     // We need to peek inside to get seq_id
-                    let extracted_seq_id = flatbuffers::root::<SequenceList>(&payload)
-                        .ok()
-                        .and_then(|sl: SequenceList| sl.sequences())
-                        .filter(|seqs| !seqs.is_empty())
-                        .map(|seqs| seqs.get(0).seq_id());
+                    let sl = unsafe { flatbuffers::root_unchecked::<SequenceList>(&payload) };
+                    let extracted_seq_id = sl.sequences().and_then(|seqs| {
+                        if seqs.is_empty() {
+                            None
+                        } else {
+                            Some(seqs.get(0).seq_id())
+                        }
+                    });
 
                     // Prefer extracted ID for migration as it's data plane,
                     // but packet.seq_id should match if python server is correct.
@@ -118,7 +122,8 @@ impl EngineAdapter {
 
                 if action == 0 {
                     // StepOut (Token)
-                    if let Ok(step_out) = flatbuffers::root::<StepOut>(&payload) {
+                    let step_out = unsafe { flatbuffers::root_unchecked::<StepOut>(&payload) };
+                    {
                         let seq_id = step_out.seq_id();
                         let token_id = step_out.token_id();
                         let status = step_out.status();
@@ -291,7 +296,7 @@ impl EngineAdapter {
         if let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::P2PResponse(body) => {
-                    let info = flatbuffers::root::<EngineInfo>(&body)?;
+                    let info = unsafe { flatbuffers::root_unchecked::<EngineInfo>(&body) };
 
                     use serde_json::json;
                     let json_val = json!({
@@ -380,14 +385,13 @@ impl EngineAdapter {
         if let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::P2PResponse(body) => {
-                    let p2p_resp = flatbuffers::root::<P2PInitResponse>(&body)
-                        .map_err(|e| anyhow::anyhow!("FlatBuffer Error: {:?}", e))?;
+                    let p2p_resp = unsafe { flatbuffers::root_unchecked::<P2PInitResponse>(&body) };
                     let mut result: HashMap<String, PeerT> = HashMap::new();
                     if let Some(peers) = p2p_resp.responses() {
                         for i in 0..peers.len() {
                             let peer = peers.get(i);
                             if let Some(id) = peer.remote_id() {
-                                result.insert(id.to_string(), peer.unpack());
+                                result.insert(id.to_string(), peer_from_table(peer));
                             }
                         }
                     }

@@ -6,6 +6,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
 # Slime options for transfer engine
 slime_option(BUILD_RDMA                "Build RDMA"                        ON)
+slime_option(BUILD_RDMA_RENDEZVOUS_ZMQ "Build RDMA rendezvous over ZMQ"    ON)
 
 slime_option(USE_CUDA                  "USE in CUDA Platform"             OFF)
 slime_option(USE_MACA                  "USE in MACA Platform"             OFF)
@@ -57,8 +58,36 @@ if (BUILD_TORCH_PLUGIN OR BUILD_INTRA_OPS OR BUILD_INTER_OPS)
     include(${CMAKE_CURRENT_LIST_DIR}/cmake/torch.cmake)
 endif()
 
-include_directories(csrc)
-add_subdirectory(csrc)
+# --- Dependencies ---
+# Define NanoInfra root path (for third_party when building from NanoInfra)
+if(NOT DEFINED NANOINFRA_DIR)
+  set(NANOINFRA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
+endif()
+message(STATUS "NanoInfra Root Path: ${NANOINFRA_DIR}")
+
+add_subdirectory(${NANOINFRA_DIR}/NanoCommon NanoCommon)
+
+# libzmq (source build from third_party, for RDMA rendezvous ZMQ)
+# Wire format: JSON; C++ uses nlohmann/json. No flatbuffers.
+if(BUILD_RDMA AND BUILD_RDMA_RENDEZVOUS_ZMQ)
+  set(BUILD_TESTS OFF CACHE BOOL "Disable libzmq tests")
+  set(ENABLE_DRAFTS OFF CACHE BOOL "Disable libzmq drafts")
+  add_subdirectory(${NANOINFRA_DIR}/third_party/libzmq ${CMAKE_CURRENT_BINARY_DIR}/libzmq EXCLUDE_FROM_ALL)
+
+  if (BUILD_PYTHON)
+      set_target_properties(libzmq PROPERTIES INSTALL_RPATH "$ORIGIN")
+  endif()
+
+  install(TARGETS libzmq
+      EXPORT dlslimeTargets
+      LIBRARY DESTINATION ${DLSLIME_INSTALL_PATH}
+      ARCHIVE DESTINATION ${DLSLIME_INSTALL_PATH}
+      RUNTIME DESTINATION ${DLSLIME_INSTALL_PATH}
+  )
+endif()
+
+include_directories(${CMAKE_CURRENT_SOURCE_DIR} dlslime/csrc ${NANOINFRA_DIR}/NanoCommon/include)
+add_subdirectory(dlslime/csrc)
 
 # Define global imported target for external consumers (e.g. NanoDeploy, Spoke)
 if(TARGET _slime_rdma AND NOT TARGET dlslime::dlslime)
