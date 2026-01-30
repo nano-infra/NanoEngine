@@ -203,5 +203,6 @@ NanoDeploy/engine_rpc_pb2.py
 NanoDeploy/engine_rpc_pb2_grpc.py
 
 # rust
+.cargo/
 .target/
 target/
