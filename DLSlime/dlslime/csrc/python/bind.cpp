@@ -42,8 +42,8 @@
 #include "dlslime/csrc/engine/rdma/rdma_utils.h"
 #include "dlslime/csrc/engine/rdma/rdma_worker.h"
 #ifdef BUILD_RDMA_RENDEZVOUS_ZMQ
-#include "dlslime/csrc/engine/rdma/rdma_broker.h"
 #include "dlslime/csrc/engine/rdma/rdma_lazy_peer.h"
+#include "dlslime/csrc/engine/rdma/rdma_peer_agent.h"
 #include "dlslime/csrc/engine/rdma/rdma_rendezvous_zmq.h"
 #endif
 #endif
@@ -371,23 +371,20 @@ PYBIND11_MODULE(_slime_c, m)
              py::arg("timeout_sec") = 30.0)
         .def("close", &dlslime::ZmqRendezvousStub::close);
 
-    py::class_<dlslime::RdmaBroker, std::unique_ptr<dlslime::RdmaBroker>>(m, "Broker")
+    py::class_<dlslime::RdmaPeerAgent, std::shared_ptr<dlslime::RdmaPeerAgent>>(m, "RdmaPeerAgent")
         .def(py::init<const std::string&>(), py::arg("bind_addr") = "0.0.0.0:50051")
-        .def(
-            "connect",
-            [](dlslime::RdmaBroker& self,
-               const std::string&   remote_broker_addr,
-               const std::string&   device_name,
-               int32_t              ib_port,
-               const std::string&   link_type) { self.Connect(remote_broker_addr, device_name, ib_port, link_type); },
-            py::arg("remote_broker_addr"),
-            py::arg("device_name") = "",
-            py::arg("ib_port")     = 1,
-            py::arg("link_type")   = "RoCE",
-            py::call_guard<py::gil_scoped_release>())
+        .def("connect",
+             &dlslime::RdmaPeerAgent::Connect,
+             py::arg("remote_broker_addr"),
+             py::arg("device_name")        = "",
+             py::arg("ib_port")            = 1,
+             py::arg("link_type")          = "RoCE",
+             py::arg("timeout_ms")         = 1000,
+             py::arg("skip_remote_ensure") = false)
+        .def("get_endpoint", &dlslime::RdmaPeerAgent::GetEndpoint)
         .def(
             "register_buffer",
-            [](dlslime::RdmaBroker& self, const std::string& buffer_id, uintptr_t ptr, size_t size) {
+            [](dlslime::RdmaPeerAgent& self, const std::string& buffer_id, uintptr_t ptr, size_t size) {
                 self.RegisterBuffer(buffer_id, reinterpret_cast<void*>(ptr), size);
             },
             py::arg("buffer_id"),
@@ -395,52 +392,26 @@ PYBIND11_MODULE(_slime_c, m)
             py::arg("size"))
         .def(
             "alloc_and_register_buffer",
-            [](dlslime::RdmaBroker& self, const std::string& buffer_id, size_t size) {
+            [](dlslime::RdmaPeerAgent& self, const std::string& buffer_id, size_t size) {
                 auto p = self.AllocAndRegisterBuffer(buffer_id, size);
                 return py::make_tuple(reinterpret_cast<uintptr_t>(p.first), p.second);
             },
             py::arg("buffer_id"),
             py::arg("size"))
-        .def(
-            "get_local_mr_key", &dlslime::RdmaBroker::GetLocalMrKey, py::arg("remote_id_or_addr"), py::arg("buffer_id"))
-        .def("get_remote_mr_key",
-             &dlslime::RdmaBroker::GetRemoteMrKey,
-             py::arg("remote_id_or_addr"),
-             py::arg("buffer_id"),
-             py::call_guard<py::gil_scoped_release>())
-        .def("read",
-             &dlslime::RdmaBroker::read,
-             py::arg("remote_id_or_addr"),
-             py::arg("assign"),
-             py::arg("stream") = nullptr,
-             py::call_guard<py::gil_scoped_release>())
-        .def("write",
-             &dlslime::RdmaBroker::write,
-             py::arg("remote_id_or_addr"),
-             py::arg("assign"),
-             py::arg("stream") = nullptr,
-             py::call_guard<py::gil_scoped_release>())
-        .def("close", &dlslime::RdmaBroker::Close)
-        .def(
-            "peer",
-            [](dlslime::RdmaBroker& self,
-               const std::string&   my_id,
-               const std::string&   device_name,
-               int32_t              ib_port,
-               const std::string&   link_type) { return self.peer(my_id, device_name, ib_port, link_type); },
-            py::arg("my_id")       = "",
-            py::arg("device_name") = "",
-            py::arg("ib_port")     = 1,
-            py::arg("link_type")   = "RoCE",
-            py::return_value_policy::reference)
-        .def("stop", &dlslime::RdmaBroker::stop)
-        .def_property_readonly("client_addr", &dlslime::RdmaBroker::client_addr);
+        .def("get_local_mr_key", &dlslime::RdmaPeerAgent::GetLocalMrKey)
+        .def("get_remote_mr_key", &dlslime::RdmaPeerAgent::GetRemoteMrKey, py::call_guard<py::gil_scoped_release>())
+        .def("read", &dlslime::RdmaPeerAgent::read, py::call_guard<py::gil_scoped_release>())
+        .def("write", &dlslime::RdmaPeerAgent::write, py::call_guard<py::gil_scoped_release>())
+        .def("close", &dlslime::RdmaPeerAgent::Close)
+        .def("stop", &dlslime::RdmaPeerAgent::stop)
+        .def_property_readonly("client_addr", &dlslime::RdmaPeerAgent::client_addr);
 
     m.def(
-        "start_broker",
-        [](const std::string& addr) { return std::make_unique<dlslime::RdmaBroker>(addr); },
-        py::arg("addr") = "0.0.0.0:50051",
-        py::return_value_policy::take_ownership);
+        "start_peer_agent",
+        [](const std::string& addr) -> std::shared_ptr<dlslime::RdmaPeerAgent> {
+            return std::make_shared<dlslime::RdmaPeerAgent>(addr);
+        },
+        py::arg("addr") = "0.0.0.0:50051");
 
     py::class_<dlslime::RdmaLazyPeer>(m, "RDMALazyPeer")
         .def(py::init<const std::string&, const std::string&, const std::string&, int32_t, const std::string&>(),

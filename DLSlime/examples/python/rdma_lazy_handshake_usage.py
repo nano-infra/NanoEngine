@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-惰性建链示例：通过中心 Broker 按需建立 RDMA 连接。
+惰性建链示例：通过中心 PeerAgent 按需建立 RDMA 连接。
 发起方先登记「我要连对端」+ 自己的 endpoint_info；
 对端从 Broker 拉取待处理请求，创建 endpoint 并连到发起方，再回写自己的 endpoint_info；
 发起方取回对端 endpoint_info 后完成连接。
@@ -24,19 +24,19 @@ from dlslime import (
     ZmqRendezvousStub,
 )
 
-BROKER_PORT = 50051
+AGENT_PORT = 50051
 
 
 def main():
     devices = available_nic()
     assert devices, "No RDMA devices."
 
-    # 中心 Broker：无 endpoint，仅做惰性建链路由
-    broker_backend = RdmaRendezvousBackend(None)
-    broker_server = ZmqRendezvousServer(broker_backend, f"0.0.0.0:{BROKER_PORT}")
-    broker_server.start()
+    # 中心 PeerAgent：无 endpoint，仅做惰性建链路由
+    agent_backend = RdmaRendezvousBackend(None)
+    agent_server = ZmqRendezvousServer(agent_backend, f"0.0.0.0:{AGENT_PORT}")
+    agent_server.start()
 
-    stub = ZmqRendezvousStub(f"127.0.0.1:{BROKER_PORT}")
+    stub = ZmqRendezvousStub(f"127.0.0.1:{AGENT_PORT}")
 
     # 发起方 A、对端 B 各创建一个 endpoint（惰性：仅在需要时建链）
     initiator_ep = RDMAEndpoint(device_name=devices[0], ib_port=1, link_type="RoCE")
@@ -55,10 +55,10 @@ def main():
     # 3) 对端 B：先连到发起方 A
     peer_ep.connect(initiator_info)
 
-    # 4) 对端 B：把 B 的 endpoint_info 回写给 Broker，供 A 取用
+    # 4) 对端 B：把 B 的 endpoint_info 回写给 PeerAgent，供 A 取用
     stub.respond_lazy_handshake(initiator_id, "B", peer_ep.endpoint_info())
 
-    # 5) 发起方 A：从 Broker 取回 B 的 endpoint_info（阻塞直到 B 已 respond 或超时）
+    # 5) 发起方 A：从 PeerAgent 取回 B 的 endpoint_info（阻塞直到 B 已 respond 或超时）
     peer_info = stub.get_lazy_handshake_response("A", "B", timeout_sec=30.0)
     assert peer_info, "get_lazy_handshake_response timed out or returned empty"
 
@@ -66,7 +66,7 @@ def main():
     initiator_ep.connect(peer_info)
 
     stub.close()
-    broker_server.stop()
+    agent_server.stop()
 
     print("Lazy handshake done: A <-> B connected.")
 

@@ -99,7 +99,6 @@ void RdmaLazyPeer::EnsureConnect(const std::string& remote_id, const std::string
     size_t idx   = (static_cast<size_t>(std::hash<std::string>{}(my_id_ + remote_id)) % n_dev);
     dev          = devices[idx];
 
-    // Symmetric connect: no initiator/target. Both sides register with remote's broker, then wait for remote's info on
     // my broker.
     ep = std::make_shared<RDMAEndpoint>(dev, ib_port_, link_type_);
     stub_remote->RegisterConnectRequest(my_id_, remote_id, ep->endpointInfo());
@@ -229,9 +228,21 @@ uintptr_t RdmaLazyPeer::GetLocalMrKey(const std::string& remote_id_or_addr, cons
     if (lit == local_buffers_.end())
         throw std::runtime_error("RdmaLazyPeer: local buffer not registered: " + buffer_id);
     auto pit = lit->second.mr_key_per_peer.find(remote_id);
-    if (pit == lit->second.mr_key_per_peer.end() || pit->second == 0)
-        throw std::runtime_error("RdmaLazyPeer: local buffer not registered on endpoint to peer " + remote_id);
+    if (pit == lit->second.mr_key_per_peer.end() || pit->second == 0) {
+        SLIME_LOG_ERROR("RdmaLazyPeer: local buffer not registered on endpoint to peer {}", remote_id);
+        return (uintptr_t)nullptr;
+    }
     return pit->second;
+}
+
+std::shared_ptr<RDMAEndpoint> RdmaLazyPeer::GetEndpoint(const std::string& remote_id_or_addr)
+{
+    std::string                 remote_id = ResolveRemoteId(remote_id_or_addr);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto                        it = endpoints_.find(remote_id);
+    if (it != endpoints_.end())
+        return it->second;
+    return nullptr;
 }
 
 uintptr_t RdmaLazyPeer::GetRemoteMrKey(const std::string& remote_id_or_addr, const std::string& buffer_id)

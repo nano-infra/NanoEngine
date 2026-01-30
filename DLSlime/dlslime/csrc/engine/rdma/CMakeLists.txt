@@ -33,7 +33,7 @@ set(RDMA_SOURCES
     rdma_worker.cpp
 )
 if(BUILD_RDMA_RENDEZVOUS_ZMQ)
-  list(APPEND RDMA_SOURCES rdma_rendezvous_zmq.cpp rdma_lazy_peer.cpp rdma_broker.cpp)
+  list(APPEND RDMA_SOURCES rdma_rendezvous_zmq.cpp rdma_lazy_peer.cpp rdma_peer_agent.cpp)
 endif()
 add_library(_slime_rdma SHARED ${RDMA_SOURCES})
 

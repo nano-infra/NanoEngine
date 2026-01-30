@@ -3,7 +3,7 @@
 Benchmark: N 个端点做 full mesh（N(N-1)/2 条链路）的建链时间，使用惰性建链。
 
 每个节点 i 有 (N-1) 个 endpoint，分别连到其他节点 j；共 N*(N-1) 个 endpoint，N*(N-1)/2 条链路。
-协议：对每对 (i,j) 且 i<j，节点 i 为发起方、节点 j 为对端；经中心 Broker 完成惰性建链。
+协议：对每对 (i,j) 且 i<j，节点 i 为发起方、节点 j 为对端；经中心 PeerAgent 完成惰性建链。
 
 若出现 ibv_reg_mr failed errno=12：
   - 先提高 ulimit -l（脚本会打印当前 memlock）。
@@ -30,13 +30,13 @@ from dlslime import (
     ZmqRendezvousStub,
 )
 
-BROKER_PORT = 50051
+AGENT_PORT = 50051
 LAZY_TIMEOUT_SEC = 60.0
 
 
-def run_node(i, N, broker_addr, barrier, devices, n_dev, timing):
+def run_node(i, N, agent_addr, barrier, devices, n_dev, timing):
     """Node i: create (N-1) endpoints, then do lazy handshake phases."""
-    stub = ZmqRendezvousStub(broker_addr)
+    stub = ZmqRendezvousStub(agent_addr)
     # endpoints[i][j] = endpoint at node i for connection to node j (j != i)
     endpoints = {}
     for j in range(N):
@@ -117,10 +117,10 @@ def main():
     assert devices, "No RDMA devices."
     n_dev = len(devices)
 
-    broker_backend = RdmaRendezvousBackend(None)
-    broker_server = ZmqRendezvousServer(broker_backend, "0.0.0.0:%d" % BROKER_PORT)
-    broker_server.start()
-    broker_addr = "127.0.0.1:%d" % BROKER_PORT
+    agent_backend = RdmaRendezvousBackend(None)
+    agent_server = ZmqRendezvousServer(agent_backend, "0.0.0.0:%d" % AGENT_PORT)
+    agent_server.start()
+    agent_addr = "127.0.0.1:%d" % AGENT_PORT
 
     barrier = threading.Barrier(N)
     timing = [None, None]
@@ -129,7 +129,7 @@ def main():
 
     def worker(i):
         try:
-            run_node(i, N, broker_addr, barrier, devices, n_dev, timing)
+            run_node(i, N, agent_addr, barrier, devices, n_dev, timing)
         except Exception as e:
             with lock:
                 errors.append((i, e))
@@ -142,7 +142,7 @@ def main():
         t.join()
     t1 = time.perf_counter()
 
-    broker_server.stop()
+    agent_server.stop()
 
     if errors:
         print("Errors: %d/%d" % (len(errors), N))

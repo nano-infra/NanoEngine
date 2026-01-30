@@ -107,7 +107,7 @@ private:
 /** ZMQ REQ client stub: GetEndpointInfo, Handshake, RegisterSharedBuffer, GetLocalBuffer, lazy handshake. JSON. */
 class ZmqRendezvousStub {
 public:
-    explicit ZmqRendezvousStub(const std::string& remote_addr);
+    explicit ZmqRendezvousStub(const std::string& remote_addr, int timeout_ms = 1000);
     ~ZmqRendezvousStub();
     json GetEndpointInfo();
     json Handshake(const json& endpoint_info);

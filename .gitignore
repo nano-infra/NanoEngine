@@ -73,6 +73,7 @@ docs/_build/
 
 # PyBuilder
 .pybuilder/
+.target/
 target/
 
 # Jupyter Notebook
@@ -200,3 +201,7 @@ cython_debug/
 NanoDeploy/nanodeploy/fbs/
 NanoDeploy/engine_rpc_pb2.py
 NanoDeploy/engine_rpc_pb2_grpc.py
+
+# rust
+.target/
+target/

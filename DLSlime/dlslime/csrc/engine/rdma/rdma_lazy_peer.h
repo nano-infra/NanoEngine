@@ -45,6 +45,8 @@ public:
     /** Get remote mr_key for buffer_id. remote 可为 remote_id 或 remote_broker_addr. */
     uintptr_t GetRemoteMrKey(const std::string& remote_id_or_addr, const std::string& buffer_id);
 
+    std::shared_ptr<RDMAEndpoint> GetEndpoint(const std::string& remote_id_or_addr);
+
     /** RDMA read from remote. remote 可为 remote_id 或 remote_broker_addr. */
     std::shared_ptr<ReadWriteFuture>
     read(const std::string& remote_id_or_addr, const std::vector<assign_tuple_t>& assign, void* stream = nullptr);

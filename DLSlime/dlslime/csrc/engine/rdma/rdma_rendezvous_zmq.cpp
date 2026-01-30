@@ -101,8 +101,10 @@ std::pair<std::string, std::string> recv_multipart(void* socket)
     size_t      size = zmq_msg_size(&msg);
     method.assign(data, size);
     zmq_msg_close(&msg);
-    if (!more)
+    if (!more) {
+        // SLIME_LOG_DEBUG("recv method: {}", method);
         return {method, ""};
+    }
     zmq_msg_init(&msg);
     if (zmq_msg_recv(&msg, socket, 0) < 0) {
         zmq_msg_close(&msg);
@@ -112,6 +114,7 @@ std::pair<std::string, std::string> recv_multipart(void* socket)
     size = zmq_msg_size(&msg);
     body.assign(data, size);
     zmq_msg_close(&msg);
+    // SLIME_LOG_DEBUG("recv body len: {}", body.size());
     return {method, body};
 }
 
@@ -542,7 +545,8 @@ void ZmqRendezvousServer::run()
 // ZmqRendezvousStub
 // ---------------------------------------------------------------------------
 
-ZmqRendezvousStub::ZmqRendezvousStub(const std::string& remote_addr): remote_addr_(ensure_tcp_addr(remote_addr))
+ZmqRendezvousStub::ZmqRendezvousStub(const std::string& remote_addr, int timeout_ms):
+    remote_addr_(ensure_tcp_addr(remote_addr))
 {
     zmq_ctx_    = zmq_ctx_new();
     zmq_socket_ = zmq_socket(zmq_ctx_, ZMQ_REQ);
@@ -551,6 +555,15 @@ ZmqRendezvousStub::ZmqRendezvousStub(const std::string& remote_addr): remote_add
         zmq_ctx_ = nullptr;
         throw std::runtime_error("ZMQ REQ socket create failed");
     }
+
+    // Set socket options BEFORE connect for ZMQ_IMMEDIATE to take effect
+    if (timeout_ms > 0) {
+        zmq_setsockopt(zmq_socket_, ZMQ_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
+        zmq_setsockopt(zmq_socket_, ZMQ_SNDTIMEO, &timeout_ms, sizeof(timeout_ms));
+        int immediate = 1;
+        zmq_setsockopt(zmq_socket_, ZMQ_IMMEDIATE, &immediate, sizeof(immediate));
+    }
+
     if (zmq_connect(zmq_socket_, remote_addr_.c_str()) != 0) {
         zmq_close(zmq_socket_);
         zmq_ctx_term(zmq_ctx_);
