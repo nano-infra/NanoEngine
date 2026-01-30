@@ -230,7 +230,7 @@ uintptr_t RdmaLazyPeer::GetLocalMrKey(const std::string& remote_id_or_addr, cons
     auto pit = lit->second.mr_key_per_peer.find(remote_id);
     if (pit == lit->second.mr_key_per_peer.end() || pit->second == 0) {
         SLIME_LOG_ERROR("RdmaLazyPeer: local buffer not registered on endpoint to peer {}", remote_id);
-        return (uintptr_t)nullptr;
+        return (uintptr_t) nullptr;
     }
     return pit->second;
 }
