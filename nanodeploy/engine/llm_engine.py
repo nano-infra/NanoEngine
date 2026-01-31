@@ -189,6 +189,8 @@ class LLMEngine:
                 {
                     "mode": "prefill" if is_prefill else "decode",
                     "itl": f"{itl:.2f}ms",
+                    "sch_ovhd": f"{(sch_end - sch_begin) * 1000:.2f}ms",
+                    "post_sch_ovhd": f"{(post_sch_end - post_sch_begin) * 1000:.2f}ms",
                     "waiting_reqs": total_waiting,
                     "sp_seq_lens": sp_seq_lens,  # Per-GPU seq lens
                     # "dp_batch_sizes": dp_batch_sizes,

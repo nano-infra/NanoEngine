@@ -49,6 +49,8 @@ def parse_args():
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
     parser.add_argument("--segment-size", type=int, default=65536, help="Segment size for SP.")
+    parser.add_argument("--disable-non-uniform-split", action="store_true", 
+                        help="Disable non-uniform KVCache partitioning for load balancing (enabled by default).")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache"],
@@ -394,7 +396,8 @@ def main():
         profiling_step=args.profiling_step,
         profiler_dir=args.profiler_dir,
         profiler_start_time=args.profiler_start_time,
-        profiling_duration=args.profiling_duration
+        profiling_duration=args.profiling_duration,
+        enable_non_uniform_split=not args.disable_non_uniform_split
     )
     
     # Print Config
