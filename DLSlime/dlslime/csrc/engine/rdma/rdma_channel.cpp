@@ -1,5 +1,7 @@
 #include "rdma_channel.h"
 
+#include "memory_pool.h"
+
 namespace dlslime {
 int32_t RDMAChannel::init(std::shared_ptr<RDMAContext> ctx, size_t num_qp, int32_t max_inline_data)
 {
@@ -45,7 +47,7 @@ int32_t RDMAChannel::init(std::shared_ptr<RDMAContext> ctx, size_t num_qp, int32
         qp_init_attr.cap.max_recv_sge = 1;
         qp_init_attr.sq_sig_all       = false;
 
-        qp_[qpi] = ibv_create_qp(memory_pool_->pd_, &qp_init_attr);
+        qp_[qpi] = ibv_create_qp(local_pool_->pd_, &qp_init_attr);
         if (!qp_[qpi]) {
             SLIME_LOG_ERROR(
                 "[" << ctx_->device_name_ << "] Failed to create QP " << qp_[qpi]->qp_num, ": ", strerror(errno));
@@ -216,16 +218,22 @@ int64_t RDMAChannel::post_send_batch(int qpi, RDMAAssign* assign)
     for (size_t i = 0; i < batch_size; ++i) {
 
         Assignment&    subassign = assign->batch_[i];
-        struct ibv_mr* mr        = memory_pool_->get_mr(subassign.mr_key);
-        sge[i].addr              = (uintptr_t)mr->addr + subassign.source_offset;
-        sge[i].length            = subassign.length;
-        sge[i].lkey              = mr->lkey;
-        wr[i].wr_id              = (i == batch_size - 1) ? (uintptr_t)(assign) : 0;
-        wr[i].opcode             = ASSIGN_OP_2_IBV_WR_OP.at(assign->opcode_);
-        wr[i].sg_list            = &sge[i];
-        wr[i].num_sge            = 1;
-        wr[i].imm_data           = (i == batch_size - 1) ? assign->imm_data_ : UNDEFINED_IMM_DATA;
-        wr[i].send_flags         = (i == batch_size - 1) ? IBV_SEND_SIGNALED : 0;
+        struct ibv_mr* mr;
+        if (subassign.mr_key < 1000000) {
+            mr = local_pool_->get_mr_fast((int32_t)subassign.mr_key);
+        }
+        else {
+            mr = local_pool_->get_mr(subassign.mr_key);
+        }
+        sge[i].addr      = (uintptr_t)mr->addr + subassign.source_offset;
+        sge[i].length    = subassign.length;
+        sge[i].lkey      = mr->lkey;
+        wr[i].wr_id      = (i == batch_size - 1) ? (uintptr_t)(assign) : 0;
+        wr[i].opcode     = ASSIGN_OP_2_IBV_WR_OP.at(assign->opcode_);
+        wr[i].sg_list    = &sge[i];
+        wr[i].num_sge    = 1;
+        wr[i].imm_data   = (i == batch_size - 1) ? assign->imm_data_ : UNDEFINED_IMM_DATA;
+        wr[i].send_flags = (i == batch_size - 1) ? IBV_SEND_SIGNALED : 0;
         if (assign->is_inline_)
             wr[i].send_flags |= IBV_SEND_INLINE;
         wr[i].next = (i == batch_size - 1) ? nullptr : &wr[i + 1];
@@ -247,14 +255,20 @@ int64_t RDMAChannel::post_recv_batch(int qpi, RDMAAssign* assign)
     for (size_t i = 0; i < batch_size; ++i) {
 
         Assignment&    subassign = assign->batch_[i];
-        struct ibv_mr* mr        = memory_pool_->get_mr(subassign.mr_key);
-        sge[i].addr              = (uintptr_t)mr->addr + subassign.source_offset;
-        sge[i].length            = subassign.length;
-        sge[i].lkey              = mr->lkey;
-        wr[i].wr_id              = (i == batch_size - 1) ? (uintptr_t)(assign) : 0;
-        wr[i].sg_list            = &sge[i];
-        wr[i].num_sge            = 1;
-        wr[i].next               = (i == batch_size - 1) ? nullptr : &wr[i + 1];
+        struct ibv_mr* mr;
+        if (subassign.mr_key < 1000000) {
+            mr = local_pool_->get_mr_fast((int32_t)subassign.mr_key);
+        }
+        else {
+            mr = local_pool_->get_mr(subassign.mr_key);
+        }
+        sge[i].addr   = (uintptr_t)mr->addr + subassign.source_offset;
+        sge[i].length = subassign.length;
+        sge[i].lkey   = mr->lkey;
+        wr[i].wr_id   = (i == batch_size - 1) ? (uintptr_t)(assign) : 0;
+        wr[i].sg_list = &sge[i];
+        wr[i].num_sge = 1;
+        wr[i].next    = (i == batch_size - 1) ? nullptr : &wr[i + 1];
     }
     ret = ibv_post_recv(qp_[qpi], wr, &bad_wr);
     if (ret) {
@@ -273,18 +287,17 @@ int64_t RDMAChannel::post_rc_oneside_batch(int qpi, RDMAAssign* assign)
     std::vector<struct ibv_sge>     sge(batch_size);
 
     for (size_t i = 0; i < batch_size; ++i) {
-        Assignment     subassign   = assign->batch_[i];
-        struct ibv_mr* mr          = memory_pool_->get_mr(subassign.mr_key);
-        remote_mr_t    remote_mr   = memory_pool_->get_remote_mr(subassign.remote_mr_key);
-        uint64_t       remote_addr = remote_mr.addr;
-        uint32_t       remote_rkey = remote_mr.rkey;
-        sge[i].addr                = (uint64_t)mr->addr + subassign.source_offset;
-        sge[i].length              = subassign.length;
-        sge[i].lkey                = mr->lkey;
-        wr[i].wr_id                = (i == batch_size - 1) ? (uintptr_t)(assign) : 0;
+        Assignment&    subassign = assign->batch_[i];
+        struct ibv_mr* mr        = local_pool_->get_mr_fast((int32_t)subassign.mr_key);
+        remote_mr_t    remote_mr = remote_pool_->get_remote_mr_fast((int32_t)subassign.remote_mr_key);
 
+        sge[i].addr   = (uintptr_t)mr->addr + subassign.source_offset;
+        sge[i].length = subassign.length;
+        sge[i].lkey   = mr->lkey;
+
+        wr[i].wr_id  = (i == batch_size - 1) ? (uintptr_t)(assign) : 0;
         wr[i].opcode = ASSIGN_OP_2_IBV_WR_OP.at(assign->opcode_);
-        if (wr[i].opcode == IBV_WR_RDMA_WRITE_WITH_IMM and (i != batch_size - 1)) {
+        if (wr[i].opcode == IBV_WR_RDMA_WRITE_WITH_IMM && (i != batch_size - 1)) {
             wr[i].opcode = IBV_WR_RDMA_WRITE;
         }
 
@@ -294,9 +307,11 @@ int64_t RDMAChannel::post_rc_oneside_batch(int qpi, RDMAAssign* assign)
         wr[i].send_flags = (i % 32 == 0 || i == batch_size - 1) ? IBV_SEND_SIGNALED : 0;
         if (assign->is_inline_)
             wr[i].send_flags |= IBV_SEND_INLINE;
-        wr[i].wr.rdma.remote_addr = remote_addr + assign->batch_[i].target_offset;
-        wr[i].wr.rdma.rkey        = remote_rkey;
-        wr[i].next                = (i == batch_size - 1) ? NULL : &wr[i + 1];
+
+        wr[i].wr.rdma.remote_addr = remote_mr.addr + subassign.target_offset;
+        wr[i].wr.rdma.rkey        = remote_mr.rkey;
+
+        wr[i].next = (i == batch_size - 1) ? NULL : &wr[i + 1];
     }
     int ret = 0;
     {

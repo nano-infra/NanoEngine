@@ -70,6 +70,10 @@ class LLMEngine:
     def get_attn_world_size(self):
         return self.config.attn_world_size
 
+    def get_peer_agent_addrs(self) -> list[str]:
+        """Get peer agent addresses from all workers."""
+        return self.executor.get_peer_agent_addrs()
+
     def add_request(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):
             seqs = [seqs]
@@ -180,7 +184,14 @@ class LLMEngine:
                             f"{seq.block_ctx().block_location}, "
                             f"{seq.block_ctx(BlockContextSlot.MIGRATE).block_location}"
                         )
-                self.executor.migrate(dp_sp_seqs)
+                # Build peer_endpoints dict from _peer_info if available
+                peer_endpoints = {}
+                if hasattr(self, "_peer_info"):
+                    for engine_id, info in self._peer_info.items():
+                        peer_addrs = info.get("peer_addrs", [])
+                        if peer_addrs:
+                            peer_endpoints[engine_id] = peer_addrs
+                self.executor.migrate(dp_sp_seqs, peer_endpoints=peer_endpoints)
             else:
                 for dp_idx, seqs in enumerate(dp_seqs):
                     for seq in seqs:

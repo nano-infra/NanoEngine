@@ -20,6 +20,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     max_num_seqs_(max_num_seqs),
     max_num_batched_tokens_(max_num_batched_tokens),
     kvcache_block_size_(kvcache_block_size),
+    num_kvcache_blocks_(num_kvcache_blocks),
     num_running_seqs_per_sp_(attention_sp, 0),
     num_running_tokens_per_sp_(attention_sp, 0)
 {
@@ -46,7 +47,7 @@ void SPStateManager::initialize_dummy_seqs()
         sp.ignore_eos  = false;
 
         auto dummy_seq = std::make_shared<Sequence>(token_ids, sp);
-        dummy_seq->active(engine_id_, attention_sp_, 1);
+        dummy_seq->active(engine_id_, attention_sp_, 1, num_kvcache_blocks_);
         dummy_seq->block_ctx().master_sp_idx_ = sp_idx;
 
         dummy_seq->append_token(dis(gen), BlockContextSlot::ACTIVE, sp_idx);

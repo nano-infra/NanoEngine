@@ -25,9 +25,11 @@ table BlockContext {
   master_sp_idx: int;
   attention_sp: int;
   attention_dp: int;
+  num_kvcache_blocks: int;
   block_location: [BlockLocation];
   num_dispatched_tokens: [int];
   sp_block_table: [IntList];
+  endpoints: [string];
 }
 
 table SamplingParams {
@@ -46,7 +48,6 @@ table Sequence {
   num_checkpointed_tokens: int;
   num_cached_tokens: int;
   token_ids: [int];
-  // Slots: 0=ACTIVE, 1=MIGRATE, 2=SWAP
   slots: [BlockContext];
 }
 

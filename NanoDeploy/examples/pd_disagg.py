@@ -1,9 +1,10 @@
 import os
 
 import ray
-from nanodeploy import LLM, SamplingParams
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.sampling_params import SamplingParams
+from nanodeploy.server.llm_component import LLMComponent
 from transformers import AutoTokenizer
 
 
@@ -13,7 +14,7 @@ def main():
 
     decode_config = Config(
         model=path,
-        enforce_eager=False,
+        enforce_eager=True,
         attention_dp=1,
         attention_sp=8,
         attention_tp=1,
@@ -32,7 +33,7 @@ def main():
         dummy_weight=False,
         log_level="INFO",
     )
-    decode = LLM.as_remote(decode_config)
+    decode = LLMComponent.as_remote(decode_config)
 
     prefill_config = Config(
         model=path,
@@ -53,41 +54,16 @@ def main():
         dummy_weight=False,
         log_level="INFO",
     )
-    prefill = LLM.as_remote(prefill_config)
+    prefill = LLMComponent.as_remote(prefill_config)
 
-    # Use ray.get to fetch necessary info internally or via new getters I will add
-    # Assuming I will add get_engine_id, get_num_kv_blocks, get_attn_world_size to LLMEngine
+    # New simplified flow: engine_info includes peer_addrs
+    # Migration will lazily connect to peers using addresses from BlockContext.endpoints
+    prefill_info = ray.get(prefill.get_engine_info.remote())
+    decode_info = ray.get(decode.get_engine_info.remote())
 
-    decode_engine_id = ray.get(decode.get_engine_id.remote())
-    decode_num_kv_blocks = ray.get(decode.get_num_kv_blocks.remote())
-    decode_attn_world_size = ray.get(decode.get_attn_world_size.remote())
-
-    prefill_engine_id = ray.get(prefill.get_engine_id.remote())
-    prefill_num_kv_blocks = ray.get(prefill.get_num_kv_blocks.remote())
-    prefill_attn_world_size = ray.get(prefill.get_attn_world_size.remote())
-
-    prefill_endpoints_info = ray.get(
-        prefill.p2p_init.remote(
-            decode_engine_id,
-            decode_num_kv_blocks,
-            decode_attn_world_size,
-        )
-    )
-
-    decode_endpoints_info = ray.get(
-        decode.p2p_init.remote(
-            prefill_engine_id,
-            prefill_num_kv_blocks,
-            prefill_attn_world_size,
-        )
-    )
-
-    ray.get(
-        [
-            prefill.p2p_connect.remote(decode_engine_id, decode_endpoints_info),
-            decode.p2p_connect.remote(prefill_engine_id, prefill_endpoints_info),
-        ]
-    )
+    # Store peer info for migration (will be embedded in BlockContext.endpoints)
+    ray.get(prefill.set_peer_info.remote(decode_info))
+    ray.get(decode.set_peer_info.remote(prefill_info))
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=512, ignore_eos=False)
     prompts = ["""

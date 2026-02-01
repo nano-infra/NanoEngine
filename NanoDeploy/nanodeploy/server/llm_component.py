@@ -11,14 +11,18 @@ import nanodeploy.fbs.EngineInfo as EngineInfo
 import nanodeploy.fbs.Peer as Peer
 from nanodeploy.config import Config
 from nanodeploy.engine.llm_engine import LLMEngine
+from nanodeploy.llm import LLM
 from nanodeploy.logging import get_logger
 
 logger = get_logger("nanodeploy")
 
 
-class LLMComponent(LLMEngine):
+class LLMComponent(LLM):
     def __init__(self, config: Config):
         super().__init__(config)
+
+        # peer_engine_id -> dict(num_blocks, world_size, peer_addrs) for lazy migration
+        self._peer_info: dict[str, dict] = {}
 
         if config.enable_etcd:
             etcd_host, etcd_port = config.etcd_address.split(":")
@@ -26,8 +30,6 @@ class LLMComponent(LLMEngine):
             self.cluster_id = config.cluster_id
             self.lease = None
             self.active_p2p_links: Set[str] = set()
-            # peer_id -> (addrs: list[str], num_blocks: int) for ensure_p2p_connected
-            self._peer_info: dict[str, Tuple[List[str], int]] = {}
 
             logger.info(
                 f"LLMComponent init: Node={self.engine_id}, Mode={self.config.mode}, Cluster={self.cluster_id}"
@@ -46,6 +48,20 @@ class LLMComponent(LLMEngine):
         host_off = builder.CreateString(self.config.host)
         status_off = builder.CreateString(status)
 
+        # Get peer_agent addresses from all workers
+        peer_addrs = (
+            self.executor.get_peer_agent_addrs()
+            if hasattr(self.executor, "get_peer_agent_addrs")
+            else []
+        )
+        peer_addrs_offs = [builder.CreateString(addr) for addr in peer_addrs if addr]
+
+        # Create peer_addrs vector
+        EngineInfo.StartPeerAddrsVector(builder, len(peer_addrs_offs))
+        for off in reversed(peer_addrs_offs):
+            builder.PrependUOffsetTRelative(off)
+        peer_addrs_vec = builder.EndVector()
+
         EngineInfo.Start(builder)
         EngineInfo.AddId(builder, id_off)
         EngineInfo.AddRole(builder, role_off)
@@ -55,6 +71,7 @@ class LLMComponent(LLMEngine):
         EngineInfo.AddHost(builder, host_off)
         EngineInfo.AddPort(builder, self.config.port)
         EngineInfo.AddStatus(builder, status_off)
+        EngineInfo.AddPeerAddrs(builder, peer_addrs_vec)
 
         info_off = EngineInfo.End(builder)
         builder.Finish(info_off)
@@ -87,6 +104,36 @@ class LLMComponent(LLMEngine):
         peer_offset = peer_t.Pack(builder)
         builder.Finish(peer_offset)
         return bytes(builder.Output())
+
+    def set_peer_info(self, remote_engine_info_bytes: bytes) -> None:
+        """Store remote engine info including peer_addrs for lazy migration.
+
+        This method parses the remote engine's info and stores it so that during
+        migration, the endpoints can be embedded in BlockContext.endpoints for
+        lazy P2P connection.
+        """
+        info = EngineInfo.EngineInfo.GetRootAsEngineInfo(remote_engine_info_bytes, 0)
+        remote_engine_id = info.Id().decode("utf-8") if info.Id() else ""
+        num_kv_blocks = info.NumBlocks()
+
+        # Extract peer_addrs from EngineInfo
+        peer_addrs = []
+        for i in range(info.PeerAddrsLength()):
+            addr = info.PeerAddrs(i)
+            if addr:
+                peer_addrs.append(
+                    addr.decode("utf-8") if isinstance(addr, bytes) else addr
+                )
+
+        # Store in engine for use during migration
+        self._peer_info[remote_engine_id] = {
+            "num_blocks": num_kv_blocks,
+            "world_size": info.WorldSize(),
+            "peer_addrs": peer_addrs,
+        }
+        logger.info(
+            f"Stored peer info for {remote_engine_id}: {len(peer_addrs)} addresses"
+        )
 
     def p2p_connect(self, peer_bytes: bytes):
         """Legacy RPC: connect using Peer payload. Used by engine_server."""

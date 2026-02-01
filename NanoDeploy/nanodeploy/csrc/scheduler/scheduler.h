@@ -136,6 +136,9 @@ private:
     int         eos_;
     int         attention_dp_;
     int         attention_sp_;
+
+    int num_kvcache_blocks_;
+
     std::string mode_;
 
     int dp_rr_counter_ = 0;

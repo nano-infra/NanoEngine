@@ -47,6 +47,8 @@ struct alignas(64) RDMAAssign {
     friend class RDMAContext;
     friend class RDMAChannel;
     friend class RDMAIOEndpoint;
+    friend class RDMAMsgEndpoint;
+    friend class RDMAEndpoint;
     friend std::ostream& operator<<(std::ostream& os, const RDMAAssign& assignment);
 
 public:

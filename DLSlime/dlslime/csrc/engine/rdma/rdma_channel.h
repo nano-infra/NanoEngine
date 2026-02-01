@@ -1,10 +1,14 @@
 #pragma once
 
-#include "dlslime/csrc/engine/rdma/memory_pool.h"
-#include "nanocommon/json.hpp"
+#include <vector>
+
+#include "dlslime/csrc/engine/rdma/remote_memory_pool.h"
+#include "rdma_config.h"
 #include "rdma_context.h"
 
 namespace dlslime {
+
+class RDMAMemoryPool;
 
 enum RDMAChannelState {
     Initialized,
@@ -18,7 +22,13 @@ class RDMAChannel {
 
 public:
     RDMAChannel() = delete;
-    RDMAChannel(std::shared_ptr<RDMAMemoryPool> pool): memory_pool_(pool) {}
+    RDMAChannel(std::shared_ptr<RDMAMemoryPool> local_pool, std::shared_ptr<RDMARemoteMemoryPool> remote_pool):
+        local_pool_(local_pool), remote_pool_(remote_pool)
+    {
+    }
+
+    // Legacy/Convenience constructor for local-only? Or maybe default remote pool?
+    // Let's force providing both.
 
     ~RDMAChannel()
     {
@@ -60,8 +70,9 @@ private:
     std::vector<std::vector<ibv_sge>>     send_sge_pool_;
     std::vector<std::vector<ibv_sge>>     recv_sge_pool_;
 
-    std::shared_ptr<RDMAContext>    ctx_{};
-    std::shared_ptr<RDMAMemoryPool> memory_pool_{};
+    std::shared_ptr<RDMAContext>          ctx_{};
+    std::shared_ptr<RDMAMemoryPool>       local_pool_{};
+    std::shared_ptr<RDMARemoteMemoryPool> remote_pool_{};
 
     RDMAChannelState state{RDMAChannelState::Destroyed};
 };

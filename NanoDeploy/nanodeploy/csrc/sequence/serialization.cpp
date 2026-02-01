@@ -37,6 +37,7 @@ flatbuffers::Offset<nanodeploy::fbs::BlockContext> pack_block_context(flatbuffer
                                                ctx.master_sp_idx_,
                                                ctx.attention_sp_,
                                                ctx.attention_dp_,
+                                               ctx.num_kvcache_blocks_,
                                                loc_vec_off,
                                                disp_vec_off,
                                                sp_block_table_off);
@@ -54,6 +55,8 @@ void unpack_block_context(const nanodeploy::fbs::BlockContext* fb_ctx, BlockCont
     ctx.master_sp_idx_ = fb_ctx->master_sp_idx();
     ctx.attention_sp_  = fb_ctx->attention_sp();
     ctx.attention_dp_  = fb_ctx->attention_dp();
+
+    ctx.num_kvcache_blocks_ = fb_ctx->num_kvcache_blocks();
 
     // block_location
     if (auto locs = fb_ctx->block_location()) {

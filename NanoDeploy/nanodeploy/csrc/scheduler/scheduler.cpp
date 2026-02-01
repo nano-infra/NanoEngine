@@ -28,6 +28,7 @@ Scheduler::Scheduler(const std::string& engine_id,
     eos_(eos),
     attention_dp_(attention_dp),
     attention_sp_(attention_sp),
+    num_kvcache_blocks_(num_kvcache_blocks),
     mode_(mode)
 {
     // Initialize worker states for each DP rank
@@ -42,7 +43,7 @@ Scheduler::Scheduler(const std::string& engine_id,
 
 void Scheduler::add(std::shared_ptr<Sequence> seq)
 {
-    seq->active(engine_id_, attention_sp_, attention_dp_);
+    seq->active(engine_id_, attention_sp_, attention_dp_, num_kvcache_blocks_);
 
     if (seq->metric) {
         seq->metric->record_arrival();

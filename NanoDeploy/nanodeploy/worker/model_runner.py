@@ -241,6 +241,10 @@ class ModelRunner:
     ) -> None:
         return get_cache_context().ensure_p2p_connected(peer_id, addrs, num_blocks)
 
+    def get_peer_agent_addr(self) -> str | None:
+        """Return the peer agent address for this rank."""
+        return get_cache_context().get_peer_agent_addr()
+
     def p2p_disconnect(self, remote_engine_id: str):
         return get_cache_context().p2p_disconnect(remote_engine_id)
 
@@ -273,7 +277,9 @@ class ModelRunner:
             # seq = Sequence(
             #     list(np.zeros(max_model_len, dtype=int))
             # )
-            seq.active(self.engine_id, sp_size, 1)
+            seq.active(
+                self.engine_id, sp_size, 1, get_cache_context().num_local_kvcache_blocks
+            )
             seq.block_ctx().master_sp_idx = sp_rank
 
         self.run(seqs, True)
@@ -304,8 +310,8 @@ class ModelRunner:
             device=torch.get_default_device(),
             dtype=torch.get_default_dtype(),
             mode=mode,
-            broker_host=config.host,
-            broker_base_port=config.port,
+            peer_agent_host=config.host,
+            peer_agent_base_port=config.port,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
@@ -672,8 +678,10 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def migrate(self, seqs: list[Sequence]) -> None:
-        get_cache_context().migrate(seqs=seqs)
+    def migrate(
+        self, seqs: list[Sequence], peer_endpoints: dict[str, list[str]] = None
+    ) -> None:
+        get_cache_context().migrate(seqs=seqs, peer_endpoints=peer_endpoints)
 
     def run(
         self, dp_seqs: list[Sequence], is_prefill: bool, enable_rpc: bool = False
@@ -694,7 +702,9 @@ class ModelRunner:
             is_dummy = True
             # seq = Sequence([np.random.randint(self.config.hf_config.vocab_size - 1)])
             seq = Sequence([0])  # Zero init for determinism
-            seq.block_ctx().reset(self.engine_id, sp_size, 1)
+            seq.block_ctx().reset(
+                self.engine_id, sp_size, 1, get_cache_context().num_local_kvcache_blocks
+            )
             seq.block_ctx().master_sp_idx = sp_rank
             dp_seqs.append(seq)
 

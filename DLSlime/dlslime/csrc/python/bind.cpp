@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include "dlslime/csrc/engine/assignment.h"
 #include "dlslime/csrc/engine/dlpack.h"
@@ -29,22 +30,12 @@
 
 #ifdef BUILD_RDMA
 #include "dlslime/csrc/engine/rdma/rdma_assignment.h"
-#include "dlslime/csrc/engine/rdma/rdma_config.h"
 #include "dlslime/csrc/engine/rdma/rdma_context.h"
-// Include the new Unified Endpoint
 #include "dlslime/csrc/engine/rdma/rdma_endpoint.h"
-// We still need these headers if UnifiedRDMAEndpoint implementation depends on
-// them being complete types, or if we expose them directly (which we are
-// phasing out).
 #include "dlslime/csrc/engine/rdma/rdma_future.h"
-#include "dlslime/csrc/engine/rdma/rdma_io_endpoint.h"
-#include "dlslime/csrc/engine/rdma/rdma_msg_endpoint.h"
 #include "dlslime/csrc/engine/rdma/rdma_utils.h"
 #include "dlslime/csrc/engine/rdma/rdma_worker.h"
 #ifdef BUILD_RDMA_RENDEZVOUS_ZMQ
-#include "dlslime/csrc/engine/rdma/rdma_lazy_peer.h"
-#include "dlslime/csrc/engine/rdma/rdma_peer_agent.h"
-#include "dlslime/csrc/engine/rdma/rdma_rendezvous_zmq.h"
 #endif
 #endif
 
@@ -188,7 +179,28 @@ PYBIND11_MODULE(_slime_c, m)
     py::class_<dlslime::ImmRecvFuture, std::shared_ptr<dlslime::ImmRecvFuture>>(m, "SlimeImmRecvFuture")
         .def("wait", &dlslime::ImmRecvFuture::wait, py::call_guard<py::gil_scoped_release>())
         .def("imm_data", &dlslime::ImmRecvFuture::immData, py::call_guard<py::gil_scoped_release>());
+    py::class_<dlslime::RDMAMemoryPool, std::shared_ptr<dlslime::RDMAMemoryPool>>(m, "RDMAMemoryPool")
+        .def(py::init<std::shared_ptr<dlslime::RDMAContext>>(), py::arg("context"))
+        .def(
+            "register_memory_region",
+            [](dlslime::RDMAMemoryPool& self, uintptr_t data_ptr, uint64_t length, py::object name_obj) {
+                std::optional<std::string> name = std::nullopt;
+                if (!name_obj.is_none()) {
+                    name = name_obj.cast<std::string>();
+                }
+                return self.registerMemoryRegion(data_ptr, length, name);
+            },
+            py::arg("data_ptr"),
+            py::arg("length"),
+            py::arg("name") = py::none())
+        .def("get_handle",
+             static_cast<int32_t (dlslime::RDMAMemoryPool::*)(const std::string&)>(
+                 &dlslime::RDMAMemoryPool::get_mr_handle));
     py::class_<dlslime::RDMAEndpoint, std::shared_ptr<dlslime::RDMAEndpoint>>(m, "RDMAEndpoint")
+        .def(py::init<std::shared_ptr<dlslime::RDMAMemoryPool>, size_t, std::shared_ptr<dlslime::RDMAWorker>>(),
+             py::arg("pool"),
+             py::arg("num_qp") = 1,
+             py::arg("worker") = nullptr)
         .def(py::init<std::shared_ptr<dlslime::RDMAContext>, size_t, std::shared_ptr<dlslime::RDMAWorker>>(),
              py::arg("context"),
              py::arg("num_qp") = 1,
@@ -199,18 +211,29 @@ PYBIND11_MODULE(_slime_c, m)
              py::arg("link_type")   = "RoCE",
              py::arg("num_qp")      = 1,
              py::arg("worker")      = nullptr)
+
         .def("connect", &dlslime::RDMAEndpoint::connect, py::call_guard<py::gil_scoped_release>())
         .def("endpoint_info", &dlslime::RDMAEndpoint::endpointInfo)
+        .def("get_pool", &dlslime::RDMAEndpoint::get_local_pool)
 
         .def("register_memory_region",
-             &dlslime::RDMAEndpoint::registerOrAccessMemoryRegion,
+             py::overload_cast<uintptr_t, uintptr_t, uintptr_t, size_t>(
+                 &dlslime::RDMAEndpoint::registerOrAccessMemoryRegion),
              py::arg("mr_key"),
              py::arg("data_ptr"),
              py::arg("offset"),
              py::arg("length"),
              py::call_guard<py::gil_scoped_release>())
+        .def("register_memory_region",
+             py::overload_cast<const std::string&, uintptr_t, size_t>(
+                 &dlslime::RDMAEndpoint::registerOrAccessMemoryRegion),
+             py::arg("name"),
+             py::arg("data_ptr"),
+             py::arg("length"),
+             py::call_guard<py::gil_scoped_release>())
+
         .def("register_remote_memory_region",
-             &dlslime::RDMAEndpoint::registerOrAccessRemoteMemoryRegion,
+             py::overload_cast<const std::string&, json>(&dlslime::RDMAEndpoint::registerOrAccessRemoteMemoryRegion),
              py::call_guard<py::gil_scoped_release>())
 
         // --- Msg Operations ---
@@ -265,206 +288,6 @@ PYBIND11_MODULE(_slime_c, m)
     m.def("available_nic", &dlslime::available_nic);
     m.def("socket_id", &dlslime::socketId);
 
-#ifdef BUILD_RDMA_RENDEZVOUS_ZMQ
-    // ZMQ RDMA rendezvous: backend + REP server + REQ stub (JSON wire format)
-    py::class_<dlslime::RdmaRendezvousBackend, std::shared_ptr<dlslime::RdmaRendezvousBackend>>(m,
-                                                                                                "RdmaRendezvousBackend")
-        .def(py::init([](py::object endpoint_obj) {
-                 std::shared_ptr<dlslime::RDMAEndpoint> ep =
-                     endpoint_obj.is_none() ? nullptr : endpoint_obj.cast<std::shared_ptr<dlslime::RDMAEndpoint>>();
-                 return std::make_shared<dlslime::RdmaRendezvousBackend>(ep);
-             }),
-             py::arg("endpoint"))
-        .def("get_endpoint_info", &dlslime::RdmaRendezvousBackend::get_endpoint_info)
-        .def("handshake_request", &dlslime::RdmaRendezvousBackend::handshake_request, py::arg("req"))
-        .def("register_shared_buffer", &dlslime::RdmaRendezvousBackend::register_shared_buffer, py::arg("req"))
-        .def("get_local_buffer", &dlslime::RdmaRendezvousBackend::get_local_buffer, py::arg("req"))
-        .def("register_local_buffer",
-             &dlslime::RdmaRendezvousBackend::register_local_buffer,
-             py::arg("buffer_id"),
-             py::arg("mr_info"))
-        .def(
-            "get_pending_shared_buffer",
-            [](dlslime::RdmaRendezvousBackend& self, py::object buffer_id_obj, double timeout_sec) {
-                std::string* bid_ptr = nullptr;
-                std::string  bid_opt;
-                if (!buffer_id_obj.is_none()) {
-                    bid_opt = buffer_id_obj.cast<std::string>();
-                    bid_ptr = &bid_opt;
-                }
-                auto result = self.get_pending_shared_buffer(bid_ptr, timeout_sec);
-                if (result.first.empty() && result.second.empty())
-                    return py::make_tuple(py::none(), py::none());
-                return py::make_tuple(py::cast(result.first), py::cast(result.second));
-            },
-            py::arg("buffer_id")   = py::none(),
-            py::arg("timeout_sec") = 30.0)
-        .def("lazy_handshake_request",
-             &dlslime::RdmaRendezvousBackend::lazy_handshake_request,
-             py::arg("initiator_id"),
-             py::arg("peer_id"),
-             py::arg("my_endpoint_info"),
-             py::arg("initiator_broker_addr"))
-        .def("get_pending_lazy_handshakes",
-             &dlslime::RdmaRendezvousBackend::get_pending_lazy_handshakes,
-             py::arg("peer_id"))
-        .def("lazy_handshake_response",
-             &dlslime::RdmaRendezvousBackend::lazy_handshake_response,
-             py::arg("initiator_id"),
-             py::arg("peer_id"),
-             py::arg("my_endpoint_info"))
-        .def("get_lazy_handshake_response",
-             &dlslime::RdmaRendezvousBackend::get_lazy_handshake_response,
-             py::arg("initiator_id"),
-             py::arg("peer_id"),
-             py::arg("timeout_sec") = 30.0)
-        .def("register_buffer",
-             &dlslime::RdmaRendezvousBackend::register_buffer,
-             py::arg("endpoint_id"),
-             py::arg("buffer_id"),
-             py::arg("mr_info"))
-        .def("get_remote_buffer",
-             &dlslime::RdmaRendezvousBackend::get_remote_buffer,
-             py::arg("remote_endpoint_id"),
-             py::arg("buffer_id"),
-             py::arg("timeout_sec") = 30.0);
-
-    py::class_<dlslime::ZmqRendezvousServer, std::shared_ptr<dlslime::ZmqRendezvousServer>>(m, "ZmqRendezvousServer")
-        .def(py::init<std::shared_ptr<dlslime::RdmaRendezvousBackend>, const std::string&>(),
-             py::arg("backend"),
-             py::arg("addr"))
-        .def("start", &dlslime::ZmqRendezvousServer::start)
-        .def("stop", &dlslime::ZmqRendezvousServer::stop);
-
-    py::class_<dlslime::ZmqRendezvousStub, std::shared_ptr<dlslime::ZmqRendezvousStub>>(m, "ZmqRendezvousStub")
-        .def(py::init<const std::string&>(), py::arg("remote_addr"))
-        .def("get_endpoint_info", &dlslime::ZmqRendezvousStub::GetEndpointInfo)
-        .def("handshake", &dlslime::ZmqRendezvousStub::Handshake, py::arg("endpoint_info"))
-        .def("register_shared_buffer", &dlslime::ZmqRendezvousStub::RegisterSharedBuffer, py::arg("req"))
-        .def("get_local_buffer", &dlslime::ZmqRendezvousStub::GetLocalBuffer, py::arg("buffer_id"))
-        .def("request_lazy_handshake",
-             &dlslime::ZmqRendezvousStub::RequestLazyHandshake,
-             py::arg("initiator_id"),
-             py::arg("peer_id"),
-             py::arg("my_endpoint_info"),
-             py::arg("initiator_broker_addr"))
-        .def("get_pending_lazy_handshakes", &dlslime::ZmqRendezvousStub::GetPendingLazyHandshakes, py::arg("peer_id"))
-        .def("respond_lazy_handshake",
-             &dlslime::ZmqRendezvousStub::RespondLazyHandshake,
-             py::arg("initiator_id"),
-             py::arg("peer_id"),
-             py::arg("my_endpoint_info"))
-        .def("get_lazy_handshake_response",
-             &dlslime::ZmqRendezvousStub::GetLazyHandshakeResponse,
-             py::arg("initiator_id"),
-             py::arg("peer_id"),
-             py::arg("timeout_sec") = 30.0)
-        .def("register_buffer",
-             &dlslime::ZmqRendezvousStub::RegisterBuffer,
-             py::arg("endpoint_id"),
-             py::arg("buffer_id"),
-             py::arg("mr_info"))
-        .def("get_remote_buffer",
-             &dlslime::ZmqRendezvousStub::GetRemoteBuffer,
-             py::arg("remote_endpoint_id"),
-             py::arg("buffer_id"),
-             py::arg("timeout_sec") = 30.0)
-        .def("close", &dlslime::ZmqRendezvousStub::close);
-
-    py::class_<dlslime::RdmaPeerAgent, std::shared_ptr<dlslime::RdmaPeerAgent>>(m, "RdmaPeerAgent")
-        .def(py::init<const std::string&>(), py::arg("bind_addr") = "0.0.0.0:50051")
-        .def("connect",
-             &dlslime::RdmaPeerAgent::Connect,
-             py::arg("remote_broker_addr"),
-             py::arg("device_name")        = "",
-             py::arg("ib_port")            = 1,
-             py::arg("link_type")          = "RoCE",
-             py::arg("timeout_ms")         = 1000,
-             py::arg("skip_remote_ensure") = false)
-        .def("get_endpoint", &dlslime::RdmaPeerAgent::GetEndpoint)
-        .def(
-            "register_buffer",
-            [](dlslime::RdmaPeerAgent& self, const std::string& buffer_id, uintptr_t ptr, size_t size) {
-                self.RegisterBuffer(buffer_id, reinterpret_cast<void*>(ptr), size);
-            },
-            py::arg("buffer_id"),
-            py::arg("ptr"),
-            py::arg("size"))
-        .def(
-            "alloc_and_register_buffer",
-            [](dlslime::RdmaPeerAgent& self, const std::string& buffer_id, size_t size) {
-                auto p = self.AllocAndRegisterBuffer(buffer_id, size);
-                return py::make_tuple(reinterpret_cast<uintptr_t>(p.first), p.second);
-            },
-            py::arg("buffer_id"),
-            py::arg("size"))
-        .def("get_local_mr_key", &dlslime::RdmaPeerAgent::GetLocalMrKey)
-        .def("get_remote_mr_key", &dlslime::RdmaPeerAgent::GetRemoteMrKey, py::call_guard<py::gil_scoped_release>())
-        .def("read", &dlslime::RdmaPeerAgent::read, py::call_guard<py::gil_scoped_release>())
-        .def("write", &dlslime::RdmaPeerAgent::write, py::call_guard<py::gil_scoped_release>())
-        .def("close", &dlslime::RdmaPeerAgent::Close)
-        .def("stop", &dlslime::RdmaPeerAgent::stop)
-        .def_property_readonly("client_addr", &dlslime::RdmaPeerAgent::client_addr);
-
-    m.def(
-        "start_peer_agent",
-        [](const std::string& addr) -> std::shared_ptr<dlslime::RdmaPeerAgent> {
-            return std::make_shared<dlslime::RdmaPeerAgent>(addr);
-        },
-        py::arg("addr") = "0.0.0.0:50051");
-
-    py::class_<dlslime::RdmaLazyPeer>(m, "RDMALazyPeer")
-        .def(py::init<const std::string&, const std::string&, const std::string&, int32_t, const std::string&>(),
-             py::arg("my_broker_addr"),
-             py::arg("my_id"),
-             py::arg("device_name") = "",
-             py::arg("ib_port")     = 1,
-             py::arg("link_type")   = "RoCE")
-        .def("connect",
-             py::overload_cast<const std::string&, const std::string&>(&dlslime::RdmaLazyPeer::Connect),
-             py::arg("remote_id"),
-             py::arg("remote_broker_addr"),
-             py::call_guard<py::gil_scoped_release>())
-        .def("connect",
-             py::overload_cast<const std::string&>(&dlslime::RdmaLazyPeer::Connect),
-             py::arg("remote_broker_addr"),
-             py::call_guard<py::gil_scoped_release>())
-        .def(
-            "register_buffer",
-            [](dlslime::RdmaLazyPeer& self, const std::string& buffer_id, uintptr_t ptr, size_t size) {
-                self.RegisterBuffer(buffer_id, reinterpret_cast<void*>(ptr), size);
-            },
-            py::arg("buffer_id"),
-            py::arg("ptr"),
-            py::arg("size"))
-        .def(
-            "alloc_and_register_buffer",
-            [](dlslime::RdmaLazyPeer& self, const std::string& buffer_id, size_t size) {
-                auto p = self.AllocAndRegisterBuffer(buffer_id, size);
-                return py::make_tuple(reinterpret_cast<uintptr_t>(p.first), p.second);
-            },
-            py::arg("buffer_id"),
-            py::arg("size"))
-        .def("get_local_mr_key", &dlslime::RdmaLazyPeer::GetLocalMrKey, py::arg("remote_id"), py::arg("buffer_id"))
-        .def("get_remote_mr_key",
-             &dlslime::RdmaLazyPeer::GetRemoteMrKey,
-             py::arg("remote_id"),
-             py::arg("buffer_id"),
-             py::call_guard<py::gil_scoped_release>())
-        .def("read",
-             &dlslime::RdmaLazyPeer::read,
-             py::arg("remote_id"),
-             py::arg("assign"),
-             py::arg("stream") = nullptr,
-             py::call_guard<py::gil_scoped_release>())
-        .def("write",
-             &dlslime::RdmaLazyPeer::write,
-             py::arg("remote_id"),
-             py::arg("assign"),
-             py::arg("stream") = nullptr,
-             py::call_guard<py::gil_scoped_release>())
-        .def("close", &dlslime::RdmaLazyPeer::Close);
-#endif
 #endif
 
 #ifdef BUILD_NVSHMEM

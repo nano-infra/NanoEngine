@@ -3,8 +3,7 @@
 #include <stdexcept>
 
 #include "dlslime/csrc/device/signal.h"
-#include "rdma_io_endpoint.h"
-#include "rdma_msg_endpoint.h"
+#include "rdma_endpoint.h"
 
 namespace dlslime {
 

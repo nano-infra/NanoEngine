@@ -151,6 +151,7 @@ private:
     int         max_num_batched_tokens_;
 
     int kvcache_block_size_;
+    int num_kvcache_blocks_;
 
     int              sp_rr_counter_      = 0;
     int              num_running_seqs_   = 0;

@@ -13,7 +13,7 @@ from nanodeploy.logging import get_logger
 
 logger = get_logger("nanodeploy")
 
-# Broker path: RDMALazyPeer uses (local_mr_key, remote_mr_key, target_off, source_off, length)
+# PeerAgent path: buffer ID for kv_cache registration
 _KV_CACHE_BUFFER_ID = "kv_cache"
 
 
@@ -39,9 +39,9 @@ class CacheContext:
     kv_lora_rank: int = 0
     qk_rope_head_dim: int = 0
 
-    # Broker path: optional, set when ensure_p2p_connected is used
-    broker_host: str | None = None
-    broker_base_port: int | None = None
+    # PeerAgent: host and base port for RDMA peer agent
+    peer_agent_host: str | None = None
+    peer_agent_base_port: int | None = None
 
     @property
     def num_local_kv_heads(self):
@@ -95,19 +95,9 @@ class CacheContext:
 
         self.endpoints = {}
         self.num_remote_kvcache_blocks = {}
-        self.peer_addrs: dict[str, list[str]] = {}  # peer_id -> addrs for Broker path
-        self._broker = None
-        self._accept_channel = None  # created at allocate_kvcache for accepting
-        start_broker_fn = getattr(dlslime, "start_broker", None)
-        if (
-            self.broker_base_port is not None
-            and self.broker_host is not None
-            and callable(start_broker_fn)
-        ):
-            rank = dist.get_rank()
-            bind_addr = f"{self.broker_host}:{self.broker_base_port + rank}"
-            self._broker = start_broker_fn(bind_addr)
-            logger.info(f"Broker started on {bind_addr}")
+        self._peer_agent = None
+        self._peer_agent_addr: str | None = None
+        self._connected_peers: set[str] = set()  # track connected peer addresses
 
     def block_stride(self, block_idx: int):
         return (
@@ -157,16 +147,27 @@ class CacheContext:
             dtype=self.dtype,
             device=self.device,
         )
-        # Broker path: create one peer for accepting connections (responder side)
-        if self._broker is not None:
-            self._accept_channel = self._broker.peer(device_name=self.selected_nic)
-            kv_size = self.kv_cache.numel() * self.kv_cache.itemsize
-            self._accept_channel.register_buffer(
-                _KV_CACHE_BUFFER_ID,
-                self.kv_cache.data_ptr(),
-                kv_size,
-            )
-            logger.info("Accept channel created for Broker (responder)")
+        # PeerAgent path: initialize RdmaPeerAgent and register kv_cache buffer
+        if self.peer_agent_host is not None and self.peer_agent_base_port is not None:
+            start_peer_agent_fn = getattr(dlslime, "start_peer_agent", None)
+            if callable(start_peer_agent_fn):
+                rank = dist.get_rank()
+                bind_addr = f"{self.peer_agent_host}:{self.peer_agent_base_port + rank}"
+                self._peer_agent = start_peer_agent_fn(bind_addr)
+                self._peer_agent_addr = self._peer_agent.client_addr
+                kv_size = self.kv_cache.numel() * self.kv_cache.itemsize
+                self._peer_agent.register_buffer(
+                    _KV_CACHE_BUFFER_ID,
+                    self.kv_cache.data_ptr(),
+                    kv_size,
+                )
+                logger.info(
+                    f"PeerAgent started on {bind_addr}, registered kv_cache buffer"
+                )
+
+    def get_peer_agent_addr(self) -> str | None:
+        """Return the local peer agent address for this rank."""
+        return self._peer_agent_addr
 
     def p2p_init(
         self, remote_engine_name: str, num_kv_blocks: int, remote_world_size: int
@@ -242,62 +243,141 @@ class CacheContext:
             del self.endpoints[remote_engine_id]
             if remote_engine_id in self.num_remote_kvcache_blocks:
                 del self.num_remote_kvcache_blocks[remote_engine_id]
-            if remote_engine_id in self.peer_addrs:
-                del self.peer_addrs[remote_engine_id]
             logger.info(f"P2P Link to {remote_engine_id} disconnected and cleared.")
 
-    def migrate(self, seqs: list[Sequence]):
+    def migrate(
+        self, seqs: list[Sequence], peer_endpoints: dict[str, list[str]] = None
+    ):
+        """Migrate KV cache blocks from local to remote engine using PeerAgent.
+
+        This method uses lazy connection: it will connect to remote peer
+        on-demand based on peer_endpoints dict (engine_id -> list of peer_agent addresses).
+
+        Args:
+            seqs: List of sequences to migrate
+            peer_endpoints: dict mapping engine_id to list of peer addresses per rank
+        """
+        if self._peer_agent is None:
+            logger.error("migrate called but PeerAgent not initialized")
+            return
+
+        if peer_endpoints is None:
+            peer_endpoints = {}
+
         assigns = defaultdict(lambda: defaultdict(list))
         sp_idx = get_dist_context().attn_sp_rank
+
+        # Collect all unique remote endpoints from peer_endpoints dict and ensure connections
+        remote_endpoints_to_connect: dict[str, str] = {}  # remote_addr -> engine_id
         for seq in seqs:
+            migrate_ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
+            engine_id = migrate_ctx.engine_id
+            endpoints = peer_endpoints.get(engine_id, [])
+            if endpoints:
+                for addr in endpoints:
+                    if addr and addr not in self._connected_peers:
+                        self.num_remote_kvcache_blocks[engine_id] = (
+                            migrate_ctx.num_kvcache_blocks
+                        )
+                        remote_endpoints_to_connect[addr] = engine_id
+
+        # Lazy connect to all required remote peers
+        for remote_addr, engine_id in remote_endpoints_to_connect.items():
+            try:
+                logger.info(
+                    f"Lazy connecting to peer {remote_addr} for engine {engine_id}"
+                )
+                self._peer_agent.connect(remote_addr, self.selected_nic)
+                self._connected_peers.add(remote_addr)
+                logger.info(f"Connected to peer {remote_addr}")
+            except Exception as e:
+                logger.error(f"Failed to connect to peer {remote_addr}: {e}")
+                raise
+
+        # Build assignment list for each remote endpoint
+        for seq in seqs:
+            migrate_ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
+            active_ctx = seq.block_ctx(BlockContextSlot.ACTIVE)
+            engine_id = migrate_ctx.engine_id
+            endpoints = peer_endpoints.get(engine_id, [])
+            if not endpoints:
+                logger.warning(
+                    f"Sequence {seq.seq_id} has no endpoints for engine {engine_id}"
+                )
+                continue
+
             for remote_block_idx, source_block_idx in zip(
-                seq.block_ctx(BlockContextSlot.MIGRATE).block_location,
-                seq.block_ctx(BlockContextSlot.ACTIVE).block_location,
+                migrate_ctx.block_location,
+                active_ctx.block_location,
             ):
                 for kv_idx in range(self.kv_cache.size(0)):
                     for layer_idx in range(self.num_hidden_layers):
                         if source_block_idx[0] == sp_idx:
                             remote_rank = (
                                 seq.dp_idx(BlockContextSlot.MIGRATE)
-                                * seq.block_ctx(BlockContextSlot.MIGRATE).attention_sp
+                                * migrate_ctx.attention_sp
                                 + remote_block_idx[0]
                             )
+                            # Get remote peer address for this rank
+                            if remote_rank < len(endpoints):
+                                remote_addr = endpoints[remote_rank]
+                            else:
+                                logger.error(
+                                    f"remote_rank {remote_rank} >= len(endpoints) {len(endpoints)}"
+                                )
+                                continue
+
                             assignment = (
-                                get_dist_context().rank,
-                                remote_rank,
-                                self.remote_kv_stride(
-                                    kv_idx,
-                                    layer_idx,
-                                    remote_block_idx[1],
-                                    seq.block_ctx(BlockContextSlot.MIGRATE).engine_id,
-                                ),
-                                self.local_kv_stride(
-                                    kv_idx, layer_idx, source_block_idx[1]
-                                ),
-                                self.block_stride(1),
+                                remote_addr,
+                                kv_idx,
+                                layer_idx,
+                                remote_block_idx[1],
+                                source_block_idx[1],
                             )
-                            assigns[seq.block_ctx(BlockContextSlot.MIGRATE).engine_id][
-                                remote_rank
-                            ].append(assignment)
+                            assigns[engine_id][remote_addr].append(assignment)
 
-            futures = []
-            for endpoint_key, endpoint_assign_batch in assigns.items():
-                for replica_key, assign_batch in endpoint_assign_batch.items():
-                    channel = self.endpoints[endpoint_key][replica_key]
-                    if hasattr(channel, "get_remote_mr_key"):
-                        # Broker path: RDMALazyPeer uses (local_mr_key, remote_mr_key, target_off, source_off, length)
-                        addr = self.peer_addrs[endpoint_key][replica_key]
-                        local_mr = channel.get_local_mr_key(addr, _KV_CACHE_BUFFER_ID)
-                        remote_mr = channel.get_remote_mr_key(addr, _KV_CACHE_BUFFER_ID)
-                        converted = [
-                            (local_mr, remote_mr, a[3], a[2], a[4])
-                            for a in assign_batch
-                        ]
-                        futures.append(channel.read(addr, converted))
-                    else:
-                        futures.append(channel.read(assign_batch))
+        # Execute RDMA reads using PeerAgent
+        futures = []
+        stream = torch.cuda.current_stream()
+        for engine_id, addr_assigns in assigns.items():
+            for remote_addr, assign_batch in addr_assigns.items():
+                # PeerAgent uses (local_mr_key, remote_mr_key, local_off, remote_off, length)
+                local_mr = self._peer_agent.get_local_mr_key(
+                    remote_addr, _KV_CACHE_BUFFER_ID
+                )
+                remote_mr = self._peer_agent.get_remote_mr_key(
+                    remote_addr, _KV_CACHE_BUFFER_ID
+                )
 
-            [future.wait() for future in futures]
+                rdma_assigns = []
+                for (
+                    addr,
+                    kv_idx,
+                    layer_idx,
+                    remote_block_idx,
+                    source_block_idx,
+                ) in assign_batch:
+                    local_off = self.local_kv_stride(
+                        kv_idx, layer_idx, source_block_idx
+                    )
+                    remote_off = self.remote_kv_stride(
+                        kv_idx, layer_idx, remote_block_idx, engine_id
+                    )
+                    print(
+                        f"{kv_idx=}, {layer_idx=}, {remote_block_idx=}, {source_block_idx=}, {local_off=}, {remote_off=}, {self.block_stride(1)=}"
+                    )
+                    length = self.block_stride(1)
+                    rdma_assigns.append(
+                        (local_mr, remote_mr, remote_off, local_off, length)
+                    )
+
+                print(f"{self.num_remote_kvcache_blocks[engine_id]=}")
+                future = self._peer_agent.read(remote_addr, rdma_assigns)
+                futures.append(future)
+
+        # Wait for all RDMA operations to complete
+        for future in futures:
+            future.wait()
 
 
 _CACHE_CONTEXT: CacheContext
@@ -320,8 +400,8 @@ def set_cache_context(
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     mode: Literal["gqa", "mla"] = "gqa",
-    broker_host: str | None = None,
-    broker_base_port: int | None = None,
+    peer_agent_host: str | None = None,
+    peer_agent_base_port: int | None = None,
 ):
     global _CACHE_CONTEXT
     _CACHE_CONTEXT = CacheContext(
@@ -337,7 +417,7 @@ def set_cache_context(
         device=device,
         dtype=dtype,
         mode=mode,
-        broker_host=broker_host,
-        broker_base_port=broker_base_port,
+        peer_agent_host=peer_agent_host,
+        peer_agent_base_port=peer_agent_base_port,
     )
     return _CACHE_CONTEXT

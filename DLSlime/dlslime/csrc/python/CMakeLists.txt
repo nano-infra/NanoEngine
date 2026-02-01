@@ -21,9 +21,7 @@ endif()
 if (BUILD_RDMA)
     target_compile_definitions(_slime_c PRIVATE -DBUILD_RDMA)
     list(APPEND _slime_c_link_libraries _slime_rdma)
-    if (BUILD_RDMA_RENDEZVOUS_ZMQ)
-        target_compile_definitions(_slime_c PRIVATE -DBUILD_RDMA_RENDEZVOUS_ZMQ)
-    endif()
+
 endif()
 
 if (BUILD_NVSHMEM)

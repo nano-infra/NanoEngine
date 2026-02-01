@@ -7,88 +7,104 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <unordered_map>
 
 #include "dlslime/csrc/logging.h"
 
 namespace dlslime {
 
-int RDMAMemoryPool::registerMemoryRegion(const uintptr_t& mr_key, uintptr_t data_ptr, uint64_t length)
+int32_t RDMAMemoryPool::registerMemoryRegion(uintptr_t data_ptr, uint64_t length, std::optional<std::string> name)
 {
-    std::unique_lock<std::mutex> lock(mrs_mutex_);
-    if (mrs_.count(mr_key)) {
-        SLIME_LOG_DEBUG("mr_key ", mr_key, " has already been registered.");
-        ibv_dereg_mr(mrs_[mr_key]);
-    }
-    /* MemoryRegion Access Right = 777 */
-    const static int access_rights = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
-    ibv_mr*          mr            = ibv_reg_mr(pd_, (void*)data_ptr, length, access_rights);
-    SLIME_ASSERT(mr, " Failed to register memory " << data_ptr);
-    SLIME_LOG_DEBUG("Memory region: " << mr_key << ", " << (void*)data_ptr << " -- " << (void*)(data_ptr + length)
-                                      << ", Device name: " << pd_->context->device->dev_name << ", Length: " << length
-                                      << " (" << length / 1024 / 1024 << " MB)"
-                                      << ", Permission: " << access_rights << ", LKey: " << mr->lkey
-                                      << ", RKey: " << mr->rkey);
+    std::unique_lock<std::mutex> lock(name_mutex_);
 
-    mrs_[mr_key] = mr;
-    return 0;
+    // Check if pointer is already registered
+    if (ptr_to_handle_.count(data_ptr)) {
+        int32_t handle = ptr_to_handle_[data_ptr];
+        if (name.has_value()) {
+            if (name_to_id_.count(name.value()) && name_to_id_[name.value()] != handle) {
+                SLIME_LOG_ERROR("Name ", name.value(), " registered to diff handle.");
+                return -1;
+            }
+            name_to_id_[name.value()] = handle;
+        }
+        return handle;
+    }
+
+    // New Registration
+    int     access_rights = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+    ibv_mr* mr            = ibv_reg_mr(pd_, (void*)data_ptr, length, access_rights);
+    SLIME_ASSERT(mr, " Failed to register memory " << data_ptr);
+
+    int32_t handle = id_to_mr_.size();
+    id_to_mr_.push_back(mr);
+    ptr_to_handle_[data_ptr] = handle;
+
+    if (name.has_value()) {
+        if (name_to_id_.count(name.value())) {
+            SLIME_LOG_ERROR("Name ", name.value(), " exists but ptr mismatch.");
+            return -1;
+        }
+        name_to_id_[name.value()] = handle;
+    }
+
+    // SLIME_LOG_DEBUG("Registered MR: Handle=", handle, ", Ptr=", (void*)data_ptr, ", Name=", (name.has_value() ?
+    // name.value() : "None"));
+    if (name.has_value()) {
+        SLIME_LOG_INFO("Registered Local MR: Name=", name.value(), ", Handle=", handle, ", Ptr=", (void*)data_ptr);
+    }
+    else {
+        SLIME_LOG_INFO("Registered Local MR: Handle=", handle, ", Ptr=", (void*)data_ptr);
+    }
+    return handle;
+}
+
+int32_t RDMAMemoryPool::get_mr_handle(const std::string& name)
+{
+    std::unique_lock<std::mutex> lock(name_mutex_);
+    auto                         it = name_to_id_.find(name);
+    if (it != name_to_id_.end()) {
+        SLIME_LOG_INFO("Lookup Local MR Name=", name, " -> Handle=", it->second);
+        return it->second;
+    }
+    SLIME_LOG_WARN("Lookup Local MR Name=", name, " FAILED");
+    return -1;
+}
+
+int32_t RDMAMemoryPool::get_mr_handle(uintptr_t data_ptr)
+{
+    std::unique_lock<std::mutex> lock(name_mutex_);
+    if (ptr_to_handle_.count(data_ptr)) {
+        return ptr_to_handle_[data_ptr];
+    }
+    return -1;
 }
 
 int RDMAMemoryPool::unregisterMemoryRegion(const uintptr_t& mr_key)
 {
     std::unique_lock<std::mutex> lock(mrs_mutex_);
-    ibv_dereg_mr(mrs_[mr_key]);
-    mrs_.erase(mr_key);
-    return 0;
-}
-
-int RDMAMemoryPool::registerRemoteMemoryRegion(const uintptr_t& mr_key, uintptr_t addr, size_t length, uint32_t rkey)
-{
-    std::unique_lock<std::mutex> lock(remote_mrs_mutex_);
-    remote_mrs_[mr_key] = remote_mr_t(addr, length, rkey);
-    SLIME_LOG_DEBUG("Remote memory region registered: " << mr_key << ", " << addr << ", " << length << ", " << rkey
-                                                        << ".");
-    return 0;
-}
-
-int RDMAMemoryPool::registerRemoteMemoryRegion(const uintptr_t& mr_key, const json& mr_info)
-{
-    std::unique_lock<std::mutex> lock(remote_mrs_mutex_);
-    remote_mrs_[mr_key] =
-        remote_mr_t(mr_info["addr"].get<uintptr_t>(), mr_info["length"].get<size_t>(), mr_info["rkey"].get<uint32_t>());
-    SLIME_LOG_DEBUG("Remote memory region registered: " << mr_key << ", " << mr_info << ".");
-    return 0;
-}
-
-int RDMAMemoryPool::unregisterRemoteMemoryRegion(const uintptr_t& mr_key)
-{
-    std::unique_lock<std::mutex> lock(remote_mrs_mutex_);
-    remote_mrs_.erase(mr_key);
+    if (mrs_.count(mr_key)) {
+        ibv_dereg_mr(mrs_[mr_key]);
+        mrs_.erase(mr_key);
+    }
+    // Note: We don't currently support unregistering by name or cleaning up id_to_mr_ easily
+    // without leaving holes, but for this use case (static topology) it's likely fine.
     return 0;
 }
 
 json RDMAMemoryPool::mr_info()
 {
-    std::unique_lock<std::mutex> lock(mrs_mutex_);
+    std::unique_lock<std::mutex> lock(name_mutex_);
     json                         mr_info;
-    for (auto& mr : mrs_) {
-        SLIME_LOG_INFO("mr_info: ", mr_info.dump())
-        mr_info[std::to_string(mr.first)] = {
-            {"mr_key", (uintptr_t)mr.first},
-            {"addr", (uintptr_t)mr.second->addr},
-            {"rkey", mr.second->rkey},
-            {"length", mr.second->length},
+    for (auto const& [name, handle] : name_to_id_) {
+        struct ibv_mr* mr = id_to_mr_[handle];
+        mr_info[name]     = {
+            {"handle", handle},
+            {"addr", (uintptr_t)mr->addr},
+            {"rkey", mr->rkey},
+            {"length", mr->length},
         };
-    }
-    return mr_info;
-}
-
-json RDMAMemoryPool::remote_mr_info()
-{
-    std::unique_lock<std::mutex> lock(remote_mrs_mutex_);
-    json                         mr_info;
-    for (auto& mr : remote_mrs_) {
-        mr_info[mr.first] = {{"addr", mr.second.addr}, {"rkey", mr.second.rkey}, {"length", mr.second.length}};
+        SLIME_LOG_INFO("Exporting MR Info: Name=", name, ", Handle=", handle, ", RKey=", mr->rkey);
     }
     return mr_info;
 }

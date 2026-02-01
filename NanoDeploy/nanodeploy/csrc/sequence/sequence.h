@@ -32,10 +32,12 @@ enum class BlockContextSlot : int {
 
 struct BlockContext {
     std::string engine_id_;
-    int         dp_idx_        = -1;
-    int         master_sp_idx_ = 0;
-    int         attention_sp_  = 1;
-    int         attention_dp_  = 1;
+
+    int dp_idx_{-1};
+    int master_sp_idx_{0};
+    int attention_sp_{1};
+    int attention_dp_{1};
+    int num_kvcache_blocks_{-1};
 
     // Wrapper container types.
     //
@@ -63,10 +65,11 @@ struct BlockContext {
     std::vector<int> num_dispatched_tokens;
 
     BlockContext() = default;
-    BlockContext(const std::string& engine_id, int attention_sp, int attention_dp);
+    BlockContext(const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks);
 
     // For pickle
     std::tuple<std::string,
+               int,
                int,
                int,
                int,
@@ -81,11 +84,12 @@ struct BlockContext {
                                                   int,
                                                   int,
                                                   int,
+                                                  int,
                                                   std::vector<std::pair<int, int>>,
                                                   std::vector<std::vector<int>>,
                                                   std::vector<int>>& state);
 
-    void reset(const std::string& engine_id, int attention_sp, int attention_dp);
+    void reset(const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks);
 };
 
 struct OptionalStringHash {
@@ -111,9 +115,9 @@ public:
     Sequence(const std::vector<int>& token_ids, const SamplingParams& sampling_params = {});
 
     // Jumping
-    int32_t active(const std::string& engine_id, int attention_sp, int attention_dp)
+    int32_t active(const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks)
     {
-        slots_[(size_t)BlockContextSlot::ACTIVE].reset(engine_id, attention_sp, attention_dp);
+        slots_[(size_t)BlockContextSlot::ACTIVE].reset(engine_id, attention_sp, attention_dp, num_kvcache_blocks);
         return 0;
     }
 

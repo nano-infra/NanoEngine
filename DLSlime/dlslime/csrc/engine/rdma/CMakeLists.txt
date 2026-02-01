@@ -28,20 +28,12 @@ set(RDMA_SOURCES
     rdma_context.cpp
     rdma_endpoint.cpp
     rdma_future.cpp
-    rdma_io_endpoint.cpp
-    rdma_msg_endpoint.cpp
     rdma_worker.cpp
 )
-if(BUILD_RDMA_RENDEZVOUS_ZMQ)
-  list(APPEND RDMA_SOURCES rdma_rendezvous_zmq.cpp rdma_lazy_peer.cpp rdma_peer_agent.cpp)
-endif()
 add_library(_slime_rdma SHARED ${RDMA_SOURCES})
 
 target_link_libraries(_slime_rdma PUBLIC _slime_device _slime_engine numa ibverbs)
-if(BUILD_RDMA_RENDEZVOUS_ZMQ)
-  target_link_libraries(_slime_rdma PUBLIC libzmq dlslime_rendezvous)
-  target_compile_definitions(_slime_rdma PUBLIC BUILD_RDMA_RENDEZVOUS_ZMQ)
-endif()
+target_link_libraries(_slime_rdma PUBLIC dlslime_rendezvous hiredis)
 
 set_target_properties(
     _slime_rdma
@@ -53,6 +45,7 @@ set_target_properties(
 target_include_directories(_slime_rdma PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../..>
     $<INSTALL_INTERFACE:include/dlslime>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../../../../third_party/hiredis>
 )
 
 install(

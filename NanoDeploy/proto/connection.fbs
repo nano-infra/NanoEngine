@@ -9,6 +9,7 @@ table EngineInfo {
   host: string;
   port: int;
   status: string; // "initializing" or "ready"
+  peer_addrs: [string];  // peer_agent 地址列表，每个 rank 一个
 }
 
 table EndpointBytes {

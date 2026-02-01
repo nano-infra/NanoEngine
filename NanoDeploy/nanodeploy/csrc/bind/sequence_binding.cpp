@@ -127,6 +127,7 @@ void bind_sequence(py::module_& m)
         .def_readwrite("master_sp_idx", &BlockContext::master_sp_idx_)
         .def_readwrite("attention_sp", &BlockContext::attention_sp_)
         .def_readwrite("attention_dp", &BlockContext::attention_dp_)
+        .def_readwrite("num_kvcache_blocks", &BlockContext::num_kvcache_blocks_)
         .def_property(
             "block_location",
             [](BlockContext& self) -> BlockContext::BlockLocationList& { return self.block_location; },
@@ -138,9 +139,15 @@ void bind_sequence(py::module_& m)
             [](BlockContext& self, const BlockContext::SpBlockTable& value) { self.sp_block_table = value; },
             py::return_value_policy::reference_internal)
         .def_readwrite("num_dispatched_tokens", &BlockContext::num_dispatched_tokens)
-        .def("reset", &BlockContext::reset, py::arg("engine_id"), py::arg("attention_sp"), py::arg("attention_dp"))
+        .def("reset",
+             &BlockContext::reset,
+             py::arg("engine_id"),
+             py::arg("attention_sp"),
+             py::arg("attention_dp"),
+             py::arg("num_kvcache_blocks"))
         .def(py::pickle([](const BlockContext& p) { return p.getstate(); },
                         [](const std::tuple<std::string,
+                                            int,
                                             int,
                                             int,
                                             int,
@@ -159,7 +166,12 @@ void bind_sequence(py::module_& m)
         .def(py::init<const std::vector<int>&, const SamplingParams&>(),
              py::arg("token_ids"),
              py::arg("sampling_params") = SamplingParams())
-        .def("active", &Sequence::active, py::arg("engine_id"), py::arg("attention_sp"), py::arg("attention_dp"))
+        .def("active",
+             &Sequence::active,
+             py::arg("engine_id"),
+             py::arg("attention_sp"),
+             py::arg("attention_dp"),
+             py::arg("num_kvcache_blocks"))
         .def("migrate", &Sequence::migrate)
         .def("context_len", &Sequence::context_len, py::arg("engine_id"), py::arg("sp_idx") = std::nullopt)
         .def("append_token",

@@ -10,24 +10,28 @@ namespace nanodeploy {
 
 // BlockContext Implementation
 
-BlockContext::BlockContext(const std::string& engine_id, int attention_sp, int attention_dp)
+BlockContext::BlockContext(const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks)
 {
-    reset(engine_id, attention_sp, attention_dp);
+    reset(engine_id, attention_sp, attention_dp, num_kvcache_blocks);
 }
 
-void BlockContext::reset(const std::string& engine_id, int attention_sp, int attention_dp)
+void BlockContext::reset(const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks)
 {
-    engine_id_     = engine_id;
+    engine_id_ = engine_id;
+
     dp_idx_        = 0;
     master_sp_idx_ = 0;
     attention_sp_  = attention_sp;
     attention_dp_  = attention_dp;
+
+    num_kvcache_blocks_ = num_kvcache_blocks;
 
     sp_block_table.resize(attention_sp, {});
     num_dispatched_tokens.resize(attention_sp, 0);
 }
 
 std::tuple<std::string,
+           int,
            int,
            int,
            int,
@@ -48,6 +52,7 @@ BlockContext::getstate() const
                            master_sp_idx_,
                            attention_sp_,
                            attention_dp_,
+                           num_kvcache_blocks_,
                            std::vector<std::pair<int, int>>(block_location.begin(), block_location.end()),
                            std::move(sp_block_table_state),
                            num_dispatched_tokens);
@@ -58,25 +63,27 @@ BlockContext BlockContext::setstate(const std::tuple<std::string,
                                                      int,
                                                      int,
                                                      int,
+                                                     int,
                                                      std::vector<std::pair<int, int>>,
                                                      std::vector<std::vector<int>>,
                                                      std::vector<int>>& state)
 {
     BlockContext ctx;
-    ctx.engine_id_     = std::get<0>(state);
-    ctx.dp_idx_        = std::get<1>(state);
-    ctx.master_sp_idx_ = std::get<2>(state);
-    ctx.attention_sp_  = std::get<3>(state);
-    ctx.attention_dp_  = std::get<4>(state);
-    ctx.block_location = BlockContext::BlockLocationList(std::get<5>(state).begin(), std::get<5>(state).end());
+    ctx.engine_id_          = std::get<0>(state);
+    ctx.dp_idx_             = std::get<1>(state);
+    ctx.master_sp_idx_      = std::get<2>(state);
+    ctx.attention_sp_       = std::get<3>(state);
+    ctx.attention_dp_       = std::get<4>(state);
+    ctx.num_kvcache_blocks_ = std::get<5>(state);
+    ctx.block_location      = BlockContext::BlockLocationList(std::get<6>(state).begin(), std::get<6>(state).end());
 
-    auto block_table = std::get<6>(state);
+    auto block_table = std::get<7>(state);
     ctx.sp_block_table.resize(block_table.size(), {});
     for (size_t i = 0; i < block_table.size(); ++i) {
         ctx.sp_block_table[i] = BlockContext::BlockIdList(block_table[i].begin(), block_table[i].end());
     }
 
-    ctx.num_dispatched_tokens = std::get<7>(state);
+    ctx.num_dispatched_tokens = std::get<8>(state);
     return ctx;
 }
 

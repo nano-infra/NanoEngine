@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -19,20 +20,12 @@ namespace dlslime {
 
 using json = nlohmann::json;
 
-typedef struct remote_mr {
-    remote_mr() = default;
-    remote_mr(uintptr_t addr, size_t length, uint32_t rkey): addr(addr), length(length), rkey(rkey) {}
-
-    uintptr_t addr{(uintptr_t) nullptr};
-    size_t    length{0};
-    uint32_t  rkey{0};
-} remote_mr_t;
-
+// RDMAMemoryPool handles Local Memory Region management.
 class RDMAMemoryPool {
     friend class RDMAChannel;
 
 public:
-    RDMAMemoryPool(std::shared_ptr<RDMAContext> ctx)
+    RDMAMemoryPool(std::shared_ptr<RDMAContext> ctx): ctx_(ctx)
     {
         SLIME_LOG_DEBUG("init memory Pool");
         /* Alloc Protected Domain (PD) */
@@ -41,6 +34,11 @@ public:
             SLIME_LOG_ERROR("Failed to allocate PD");
         }
     };
+
+    std::shared_ptr<RDMAContext> context() const
+    {
+        return ctx_;
+    }
 
     ~RDMAMemoryPool()
     {
@@ -53,46 +51,71 @@ public:
             ibv_dealloc_pd(pd_);
     }
 
-    int registerMemoryRegion(const uintptr_t& mr_key, uintptr_t data_ptr, uint64_t length);
+    // Register a memory region with a name (Slow Path)
+    // Return: handle (int32_t) to be used in fast path
+    // Unified Registration (Fast Path)
+    // Returns: handle (int32_t)
+    // Unified Registration (Fast Path)
+    // Returns: handle (int32_t)
+    int32_t registerMemoryRegion(uintptr_t data_ptr, uint64_t length, std::optional<std::string> name = std::nullopt);
 
-    int unregisterMemoryRegion(const uintptr_t& mr_key);
+    int32_t get_mr_handle(const std::string& name);
+    int32_t get_mr_handle(uintptr_t data_ptr);
 
-    int registerRemoteMemoryRegion(const uintptr_t& mr_key, uintptr_t addr, size_t length, uint32_t rkey);
-
-    int registerRemoteMemoryRegion(const uintptr_t& mr_key, const json& mr_info);
-
-    int unregisterRemoteMemoryRegion(const uintptr_t& mr_key);
-
-    inline struct ibv_mr* get_mr(const uintptr_t& mr_key)
+    // Fast path: get MR by handle
+    inline struct ibv_mr* get_mr_fast(int32_t handle)
     {
-        std::unique_lock<std::mutex> lock(mrs_mutex_);
-        if (mrs_.find(mr_key) != mrs_.end()) {
-            return mrs_[mr_key];
+        if (handle >= 0 && handle < id_to_mr_.size()) {
+            return id_to_mr_[handle];
         }
-        SLIME_LOG_DEBUG("mr_key: ", mr_key, " not found in mrs_");
         return nullptr;
     }
 
-    inline remote_mr_t get_remote_mr(const uintptr_t& mr_key)
+    // Legacy method: get_mr by pointer key (slow check in a map or we can deprecate it)
+    // We retain it for existing code compatibility, but we should probably encourage handle usage.
+    // However, existing code uses `get_mr` heavily. We will keep `mrs_` map for now.
+    inline struct ibv_mr* get_mr(const uintptr_t& mr_key)
     {
-        std::unique_lock<std::mutex> lock(remote_mrs_mutex_);
-        if (remote_mrs_.find(mr_key) != remote_mrs_.end()) {
-            return remote_mrs_[mr_key];
+        {
+            std::unique_lock<std::mutex> lock(mrs_mutex_);
+            if (mrs_.find(mr_key) != mrs_.end()) {
+                return mrs_[mr_key];
+            }
         }
-        SLIME_LOG_DEBUG("mr_key: ", mr_key, " not found in remote_mrs_");
-        return remote_mr_t();
+
+        // Fallback to new logic: ptr -> handle -> mr
+        {
+            std::unique_lock<std::mutex> lock(name_mutex_);
+            if (ptr_to_handle_.count(mr_key)) {
+                int32_t handle = ptr_to_handle_[mr_key];
+                if (handle >= 0 && handle < id_to_mr_.size()) {
+                    return id_to_mr_[handle];
+                }
+            }
+        }
+
+        SLIME_LOG_DEBUG("mr_key: ", mr_key, " not found in mrs_ or by handle");
+        return nullptr;
     }
 
+    int unregisterMemoryRegion(const uintptr_t& mr_key);
+
     json mr_info();
-    json remote_mr_info();
 
 private:
-    ibv_pd* pd_;
+    ibv_pd*                      pd_;
+    std::shared_ptr<RDMAContext> ctx_;
 
     std::mutex mrs_mutex_;
-    std::mutex remote_mrs_mutex_;
 
+    // Legacy map: Key -> MR
     std::unordered_map<uintptr_t, struct ibv_mr*> mrs_;
-    std::unordered_map<uintptr_t, remote_mr_t>    remote_mrs_;
+
+    // New: Name -> Handle
+    std::mutex                               name_mutex_;  // Maps
+    std::unordered_map<std::string, int32_t> name_to_id_;
+    std::unordered_map<uintptr_t, int32_t>   ptr_to_handle_;
+
+    std::vector<struct ibv_mr*> id_to_mr_;
 };
 }  // namespace dlslime

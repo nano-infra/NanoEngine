@@ -3,24 +3,13 @@
 #include <infiniband/verbs.h>
 
 #include <cstdint>
-#include <functional>
-#include <future>
 #include <memory>
-#include <mutex>
-#include <queue>
-#include <stdexcept>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
-#include "dlslime/csrc/engine/assignment.h"
-#include "dlslime/csrc/jring.h"
-#include "dlslime/csrc/logging.h"
 #include "nanocommon/json.hpp"
 #include "rdma_assignment.h"
-#include "rdma_config.h"
-#include "rdma_env.h"
 
 namespace dlslime {
 

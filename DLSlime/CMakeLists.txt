@@ -6,7 +6,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
 # Slime options for transfer engine
 slime_option(BUILD_RDMA                "Build RDMA"                        ON)
-slime_option(BUILD_RDMA_RENDEZVOUS_ZMQ "Build RDMA rendezvous over ZMQ"    ON)
+
 
 slime_option(USE_CUDA                  "USE in CUDA Platform"             OFF)
 slime_option(USE_MACA                  "USE in MACA Platform"             OFF)
@@ -69,16 +69,15 @@ add_subdirectory(${NANOINFRA_DIR}/NanoCommon NanoCommon)
 
 # libzmq (source build from third_party, for RDMA rendezvous ZMQ)
 # Wire format: JSON; C++ uses nlohmann/json. No flatbuffers.
-if(BUILD_RDMA AND BUILD_RDMA_RENDEZVOUS_ZMQ)
-  set(BUILD_TESTS OFF CACHE BOOL "Disable libzmq tests")
-  set(ENABLE_DRAFTS OFF CACHE BOOL "Disable libzmq drafts")
-  add_subdirectory(${NANOINFRA_DIR}/third_party/libzmq ${CMAKE_CURRENT_BINARY_DIR}/libzmq EXCLUDE_FROM_ALL)
+if(BUILD_RDMA)
+  # hiredis (for Redis rendezvous)
+  add_subdirectory(${NANOINFRA_DIR}/third_party/hiredis ${CMAKE_CURRENT_BINARY_DIR}/hiredis EXCLUDE_FROM_ALL)
 
   if (BUILD_PYTHON)
-      set_target_properties(libzmq PROPERTIES INSTALL_RPATH "$ORIGIN")
+      set_target_properties(hiredis PROPERTIES INSTALL_RPATH "$ORIGIN")
   endif()
 
-  install(TARGETS libzmq
+  install(TARGETS hiredis
       EXPORT dlslimeTargets
       LIBRARY DESTINATION ${DLSLIME_INSTALL_PATH}
       ARCHIVE DESTINATION ${DLSLIME_INSTALL_PATH}
