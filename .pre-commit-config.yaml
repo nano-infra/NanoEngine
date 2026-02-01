@@ -41,8 +41,34 @@ repos:
     rev: v1.0
     hooks:
       - id: fmt
+      # Run cargo check per package. NanoDeploy uses scripts/cargo-check-with-protoc.sh (auto-finds scripts/.bin/protoc)
       - id: cargo-check
+        name: cargo check (NanoDeploy)
+        entry: bash -c 'B="$(pwd)/scripts/.bin"; [[ -d "$B" ]] && export PATH="$B:$PATH"; [[ -x "$B/protoc" ]] && export PROTOC="$B/protoc"; exec cargo check'
+        args: ["--manifest-path", "NanoDeploy/server/Cargo.toml"]
+        files: ^NanoDeploy/
+        language: system
+        pass_filenames: false
+      - id: cargo-check
+        args: ["--manifest-path", "Spoke/spoke-rust/Cargo.toml"]
+        files: ^Spoke/
       - id: clippy
+        name: clippy (NanoDeploy)
+        entry: bash -c 'B="$(pwd)/scripts/.bin"; [[ -d "$B" ]] && export PATH="$B:$PATH"; [[ -x "$B/protoc" ]] && export PROTOC="$B/protoc"; exec cargo clippy'
+        args: ["--manifest-path", "NanoDeploy/server/Cargo.toml", "--", "-D", "warnings"]
+        files: ^NanoDeploy/
+        language: system
+        pass_filenames: false
+      - id: clippy
+        args: ["--manifest-path", "Spoke/spoke-rust/Cargo.toml", "--", "-D", "warnings"]
+        files: ^Spoke/
+      # DLSlime nanoctrl (standalone, no protoc)
+      - id: cargo-check
+        args: ["--manifest-path", "DLSlime/nanoctrl-rust/Cargo.toml"]
+        files: ^DLSlime/nanoctrl-rust/
+      - id: clippy
+        args: ["--manifest-path", "DLSlime/nanoctrl-rust/Cargo.toml", "--", "-D", "warnings"]
+        files: ^DLSlime/nanoctrl-rust/
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.6

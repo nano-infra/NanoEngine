@@ -206,3 +206,6 @@ NanoDeploy/engine_rpc_pb2_grpc.py
 .cargo/
 .target/
 target/
+
+# Local protoc (scripts/setup-protoc.sh downloads here)
+scripts/.bin/

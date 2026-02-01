@@ -195,7 +195,8 @@ PYBIND11_MODULE(_slime_c, m)
             py::arg("name") = py::none())
         .def("get_handle",
              static_cast<int32_t (dlslime::RDMAMemoryPool::*)(const std::string&)>(
-                 &dlslime::RDMAMemoryPool::get_mr_handle));
+                 &dlslime::RDMAMemoryPool::get_mr_handle))
+        .def("mr_info", &dlslime::RDMAMemoryPool::mr_info);
     py::class_<dlslime::RDMAEndpoint, std::shared_ptr<dlslime::RDMAEndpoint>>(m, "RDMAEndpoint")
         .def(py::init<std::shared_ptr<dlslime::RDMAMemoryPool>, size_t, std::shared_ptr<dlslime::RDMAWorker>>(),
              py::arg("pool"),

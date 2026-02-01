@@ -10,6 +10,7 @@ This guide explains how to deploy NanoDeploy in a **Disaggregated** configuratio
 
 - **Etcd**: Version 3.4+.
 - **Rust**: For the API Server (`cargo` installed).
+- **protoc**: For building (etcd-client). Install: `apt install protobuf-compiler` or `bash scripts/setup-protoc.sh`
 - **Python 3.9+**: For the Engine nodes.
 - **FlatBuffers**: Used for high-efficiency internal communication.
 

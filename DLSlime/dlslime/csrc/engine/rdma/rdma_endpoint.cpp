@@ -78,6 +78,11 @@ void RDMAEndpoint::init(std::shared_ptr<RDMAWorker> worker)
     SLIME_ASSERT(64 > SLIME_QP_NUM, "QP NUM must less than 64");
 
     // ============================================================
+    // Initialize meta_pool (per-endpoint, sys buffers, borrows PD from local_pool_)
+    // ============================================================
+    meta_pool_ = std::make_shared<RDMAMemoryPool>(local_pool_);
+
+    // ============================================================
     // Initialize IO Endpoint Components
     // ============================================================
 
@@ -128,7 +133,7 @@ void RDMAEndpoint::init(std::shared_ptr<RDMAWorker> worker)
     io_dummy_ = (int64_t*)io_dummy_mem;
 
     io_dummy_handle_ =
-        local_pool_->registerMemoryRegion(reinterpret_cast<uintptr_t>(io_dummy_), sizeof(int64_t), "sys.io_dummy");
+        meta_pool_->registerMemoryRegion(reinterpret_cast<uintptr_t>(io_dummy_), sizeof(int64_t), "sys.io_dummy");
 
     // ============================================================
     // Initialize Msg Endpoint Components
@@ -169,13 +174,13 @@ void RDMAEndpoint::init(std::shared_ptr<RDMAWorker> worker)
         recv_future_pool_.push_back(std::make_shared<RecvFuture>(&(recv_ctx_pool_[i])));
     }
 
-    // Register Memory Regions (MR) upfront.
+    // Register Memory Regions (MR) upfront on meta_pool_
     msg_dummy_handle_ =
-        local_pool_->registerMemoryRegion(reinterpret_cast<uintptr_t>(msg_dummy_), sizeof(int64_t), "sys.msg_dummy");
+        meta_pool_->registerMemoryRegion(reinterpret_cast<uintptr_t>(msg_dummy_), sizeof(int64_t), "sys.msg_dummy");
 
     // Register the single large block
     send_ctx_handle_ =
-        local_pool_->registerMemoryRegion(reinterpret_cast<uintptr_t>(send_ctx_pool_), total_size, "sys.send_ctx");
+        meta_pool_->registerMemoryRegion(reinterpret_cast<uintptr_t>(send_ctx_pool_), total_size, "sys.send_ctx");
 
     // Calculate offset of remote_meta_info_ at runtime
     send_ctx_meta_offset_ = reinterpret_cast<uintptr_t>(&(send_ctx_pool_[0].remote_meta_info_))
@@ -240,9 +245,7 @@ RDMAEndpoint::~RDMAEndpoint()
 
 void RDMAEndpoint::connect(const json& remote_endpoint_info)
 {
-    for (auto& item : remote_endpoint_info["mr_info"].items()) {
-        remote_pool_->registerRemoteMemoryRegion(item.key(), item.value());
-    }
+    // User MRs: manual registration via get_mr_info + register_remote_memory_region
 
     // Connect IO Endpoint
     if (remote_endpoint_info.contains("io_info")) {
@@ -279,7 +282,7 @@ void RDMAEndpoint::connect(const json& remote_endpoint_info)
             send_ctx->meta_recv_assign_.reset(OpCode::RECV, 0, batch, [send_ctx](int32_t status, int32_t imm) {
                 send_ctx->meta_arrived_flag_.val.store(1, std::memory_order_release);
             });
-            meta_channel_->post_recv_batch(0, &(send_ctx->meta_recv_assign_));
+            meta_channel_->post_recv_batch(0, &(send_ctx->meta_recv_assign_), meta_pool_);
         }
 
         // Pre-post RECV requests for Data Channel
@@ -298,7 +301,7 @@ void RDMAEndpoint::connect(const json& remote_endpoint_info)
                             SLIME_LOG_ERROR("Data Recv Failed during pre-post");
                         }
                     });
-                msg_data_channel_->post_recv_batch(qpi, &(recv_ctx->data_recv_assigns_[qpi]));
+                msg_data_channel_->post_recv_batch(qpi, &(recv_ctx->data_recv_assigns_[qpi]), meta_pool_);
             }
         }
 
@@ -317,10 +320,10 @@ json RDMAEndpoint::endpointInfo() const
     // IO endpoint info
     json io_info = json{{"data_channel_info", io_data_channel_->channelInfo()}};
 
-    // Msg endpoint info
+    // Msg endpoint info (send_ctx is in meta_pool_)
     auto           base_ptr = reinterpret_cast<uintptr_t>(send_ctx_pool_);
-    int32_t        handle   = local_pool_->get_mr_handle(base_ptr);
-    struct ibv_mr* mr       = local_pool_->get_mr_fast(handle);
+    int32_t        handle   = meta_pool_->get_mr_handle(base_ptr);
+    struct ibv_mr* mr       = meta_pool_->get_mr_fast(handle);
     SLIME_ASSERT(mr, "Send Context Pool MR not found");
 
     json msg_info = json{{"meta_channel_info", meta_channel_->channelInfo()},
@@ -645,7 +648,7 @@ int32_t RDMAEndpoint::readWriteProcess()
 
         for (size_t qpi = 0; qpi < num_qp_; ++qpi) {
             token_bucket_[qpi].fetch_sub(ctx->assigns_[qpi].batch_.size(), std::memory_order_release);
-            io_data_channel_->post_rc_oneside_batch(qpi, &(ctx->assigns_[qpi]));
+            io_data_channel_->post_rc_oneside_batch(qpi, &(ctx->assigns_[qpi]), local_pool_);
         }
 
         ctx->state_ = IOContextState::POSTED;
@@ -681,7 +684,7 @@ int32_t RDMAEndpoint::immRecvProcess()
         dummyReset(ctx);
 
         for (size_t qpi = 0; qpi < num_qp_; ++qpi) {
-            io_data_channel_->post_recv_batch(qpi, &(ctx->assigns_[qpi]));
+            io_data_channel_->post_recv_batch(qpi, &(ctx->assigns_[qpi]), meta_pool_);
         }
         ctx->state_ = IOContextState::POSTED;
 
@@ -739,7 +742,7 @@ int32_t RDMAEndpoint::sendProcess()
                         OpCode::RECV, 0, meta_batch, [this, s_ctx](int32_t status, int32_t imm) {
                             s_ctx->meta_arrived_flag_.val.store(1, std::memory_order_release);
                         });
-                    meta_channel_->post_recv_batch(0, &(s_ctx->meta_recv_assign_));
+                    meta_channel_->post_recv_batch(0, &(s_ctx->meta_recv_assign_), meta_pool_);
 
                     s_ctx->state_ = SendContextState::POST_DATA_SEND;
 
@@ -778,7 +781,7 @@ int32_t RDMAEndpoint::sendProcess()
                             [s_ctx, qpi](int32_t stat, int32_t imm_data) { s_ctx->signal->set_comm_done(qpi); },
                             false);
 
-                        msg_data_channel_->post_rc_oneside_batch(qpi, &(s_ctx->data_send_assigns_[qpi]));
+                        msg_data_channel_->post_rc_oneside_batch(qpi, &(s_ctx->data_send_assigns_[qpi]), meta_pool_);
                     }
 
                     task_completed = true;
@@ -839,7 +842,7 @@ int32_t RDMAEndpoint::recvProcess()
                                 SLIME_LOG_ERROR("Data Recv Failed during completion");
                             }
                         });
-                    msg_data_channel_->post_recv_batch(qpi, &(r_ctx->data_recv_assigns_[qpi]));
+                    msg_data_channel_->post_recv_batch(qpi, &(r_ctx->data_recv_assigns_[qpi]), meta_pool_);
                 }
 
                 int slot = r_ctx->slot_id;
@@ -855,7 +858,7 @@ int32_t RDMAEndpoint::recvProcess()
                 AssignmentBatch assign_batch{assign};
 
                 r_ctx->meta_send_assign_.reset(OpCode::WRITE_WITH_IMM, 0, assign_batch, nullptr, true);
-                meta_channel_->post_rc_oneside_batch(0, &(r_ctx->meta_send_assign_));
+                meta_channel_->post_rc_oneside_batch(0, &(r_ctx->meta_send_assign_), meta_pool_);
 
                 r_ctx->state_  = RecvContextState::WAIT_GPU_BUF;
                 task_completed = true;

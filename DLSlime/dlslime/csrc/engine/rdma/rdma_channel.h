@@ -2,6 +2,7 @@
 
 #include <vector>
 
+#include "dlslime/csrc/engine/rdma/memory_pool.h"
 #include "dlslime/csrc/engine/rdma/remote_memory_pool.h"
 #include "rdma_config.h"
 #include "rdma_context.h"
@@ -40,12 +41,12 @@ public:
 
     json channelInfo() const;
 
-    /* Async RDMA SendRecv */
-    int64_t post_send_batch(int qpi, RDMAAssign* assign);
-    int64_t post_recv_batch(int qpi, RDMAAssign* assign);
+    /* Async RDMA SendRecv - local_pool injected at call site (meta_pool or user_pool) */
+    int64_t post_send_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> local_pool);
+    int64_t post_recv_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> local_pool);
 
-    /* Async RDMA Read */
-    int64_t post_rc_oneside_batch(int qpi, RDMAAssign* assign);
+    /* Async RDMA Read - local_pool injected at call site */
+    int64_t post_rc_oneside_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> local_pool);
 
     int32_t reset();
 

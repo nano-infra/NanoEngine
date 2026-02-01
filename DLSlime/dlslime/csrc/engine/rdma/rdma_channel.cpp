@@ -208,7 +208,7 @@ int32_t RDMAChannel::reset()
     return 0;
 }
 
-int64_t RDMAChannel::post_send_batch(int qpi, RDMAAssign* assign)
+int64_t RDMAChannel::post_send_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> local_pool)
 {
     int                 ret        = 0;
     size_t              batch_size = assign->batch_size();
@@ -220,10 +220,10 @@ int64_t RDMAChannel::post_send_batch(int qpi, RDMAAssign* assign)
         Assignment&    subassign = assign->batch_[i];
         struct ibv_mr* mr;
         if (subassign.mr_key < 1000000) {
-            mr = local_pool_->get_mr_fast((int32_t)subassign.mr_key);
+            mr = local_pool->get_mr_fast((int32_t)subassign.mr_key);
         }
         else {
-            mr = local_pool_->get_mr(subassign.mr_key);
+            mr = local_pool->get_mr(subassign.mr_key);
         }
         sge[i].addr      = (uintptr_t)mr->addr + subassign.source_offset;
         sge[i].length    = subassign.length;
@@ -245,7 +245,7 @@ int64_t RDMAChannel::post_send_batch(int qpi, RDMAAssign* assign)
     return 0;
 }
 
-int64_t RDMAChannel::post_recv_batch(int qpi, RDMAAssign* assign)
+int64_t RDMAChannel::post_recv_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> local_pool)
 {
     int64_t             ret        = 0;
     size_t              batch_size = assign->batch_size();
@@ -257,10 +257,10 @@ int64_t RDMAChannel::post_recv_batch(int qpi, RDMAAssign* assign)
         Assignment&    subassign = assign->batch_[i];
         struct ibv_mr* mr;
         if (subassign.mr_key < 1000000) {
-            mr = local_pool_->get_mr_fast((int32_t)subassign.mr_key);
+            mr = local_pool->get_mr_fast((int32_t)subassign.mr_key);
         }
         else {
-            mr = local_pool_->get_mr(subassign.mr_key);
+            mr = local_pool->get_mr(subassign.mr_key);
         }
         sge[i].addr   = (uintptr_t)mr->addr + subassign.source_offset;
         sge[i].length = subassign.length;
@@ -279,7 +279,7 @@ int64_t RDMAChannel::post_recv_batch(int qpi, RDMAAssign* assign)
     return 0;
 }
 
-int64_t RDMAChannel::post_rc_oneside_batch(int qpi, RDMAAssign* assign)
+int64_t RDMAChannel::post_rc_oneside_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> local_pool)
 {
     size_t                          batch_size = assign->batch_size();
     struct ibv_send_wr*             bad_wr     = NULL;
@@ -288,9 +288,10 @@ int64_t RDMAChannel::post_rc_oneside_batch(int qpi, RDMAAssign* assign)
 
     for (size_t i = 0; i < batch_size; ++i) {
         Assignment&    subassign = assign->batch_[i];
-        struct ibv_mr* mr        = local_pool_->get_mr_fast((int32_t)subassign.mr_key);
+        struct ibv_mr* mr        = local_pool->get_mr_fast((int32_t)subassign.mr_key);
         remote_mr_t    remote_mr = remote_pool_->get_remote_mr_fast((int32_t)subassign.remote_mr_key);
 
+        // RDMA: target=远端, source=本地. SGE=local(source), wr.rdma=remote(target)
         sge[i].addr   = (uintptr_t)mr->addr + subassign.source_offset;
         sge[i].length = subassign.length;
         sge[i].lkey   = mr->lkey;

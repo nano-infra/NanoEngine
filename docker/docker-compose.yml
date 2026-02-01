@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - redis-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: redisinsight
+    ports:
+      - "8001:8001"
+    volumes:
+      - redisinsight-data:/data
+    networks:
+      - redis-network
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - RI_APP_PORT=8001
+      - RITRUSTEDORIGINS=http://localhost:8001,http://127.0.0.1:8001
+
+volumes:
+  redis-data:
+    driver: local
+  redisinsight-data:
+    driver: local
+
+networks:
+  redis-network:
+    driver: bridge

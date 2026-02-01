@@ -25,7 +25,7 @@ class RDMAMemoryPool {
     friend class RDMAChannel;
 
 public:
-    RDMAMemoryPool(std::shared_ptr<RDMAContext> ctx): ctx_(ctx)
+    RDMAMemoryPool(std::shared_ptr<RDMAContext> ctx): ctx_(ctx), owns_pd_(true)
     {
         SLIME_LOG_DEBUG("init memory Pool");
         /* Alloc Protected Domain (PD) */
@@ -33,7 +33,14 @@ public:
         if (!pd_) {
             SLIME_LOG_ERROR("Failed to allocate PD");
         }
-    };
+    }
+
+    // Borrow PD from parent pool (same PD, no allocation)
+    RDMAMemoryPool(std::shared_ptr<RDMAMemoryPool> parent_pool):
+        pd_(parent_pool->pd_), ctx_(parent_pool->ctx_), owns_pd_(false)
+    {
+        SLIME_LOG_DEBUG("init meta memory Pool (borrowed PD)");
+    }
 
     std::shared_ptr<RDMAContext> context() const
     {
@@ -47,7 +54,7 @@ public:
                 ibv_dereg_mr(mr.second);
         }
         mrs_.clear();
-        if (pd_)
+        if (pd_ && owns_pd_)
             ibv_dealloc_pd(pd_);
     }
 
@@ -105,6 +112,7 @@ public:
 private:
     ibv_pd*                      pd_;
     std::shared_ptr<RDMAContext> ctx_;
+    bool                         owns_pd_;
 
     std::mutex mrs_mutex_;
 

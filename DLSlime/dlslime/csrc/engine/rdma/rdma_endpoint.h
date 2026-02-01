@@ -269,7 +269,8 @@ private:
     std::atomic<bool>    connected_{false};
 
     std::shared_ptr<RDMAContext>          ctx_;
-    std::shared_ptr<RDMAMemoryPool>       local_pool_;
+    std::shared_ptr<RDMAMemoryPool>       local_pool_;  // user_pool (shared when from PeerAgent)
+    std::shared_ptr<RDMAMemoryPool>       meta_pool_;   // per-endpoint, sys buffers (borrows PD from local_pool_)
     std::shared_ptr<RDMARemoteMemoryPool> remote_pool_;
 
     std::shared_ptr<RDMAWorker> worker_;

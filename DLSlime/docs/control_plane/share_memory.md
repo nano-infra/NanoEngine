@@ -94,3 +94,34 @@ RDMAEndpoint(std::shared_ptr<RDMAMemoryPool> ctx,
              size_t                          num_qp,
              std::shared_ptr<RDMAWorker>     worker      = nullptr);
 ```
+
+## 4. PeerAgent 实现 (Python)
+
+PeerAgent 在创建时**预先分配**共享 MemoryPool，所有 Endpoint 创建时传入该 pool：
+
+```python
+# __init__: 预先分配共享 MemoryPool
+self._rdma_context = RDMAContext()
+self._rdma_context.init(self.device, self.ib_port, self.link_type)
+self._memory_pool = RDMAMemoryPool(self._rdma_context)
+
+# 创建 Endpoint 时传入共享 pool
+endpoint = RDMAEndpoint(pool=self._memory_pool, num_qp=qp_num)
+
+# register_memory_region 直接使用共享 pool
+handler = self._memory_pool.register_memory_region(ptr, length, mr_name)
+mr_info = self._memory_pool.mr_info()[mr_name]
+```
+
+## 5. 双池设计 (meta_pool + user_pool)
+
+- **meta_pool** (per-endpoint): sys 缓冲区 (`io_dummy`, `msg_dummy`, `send_ctx`)，不可共享。从 user_pool 借用 PD。
+- **user_pool** (shared): 用户 MR，由 `register_memory_region` 注册。
+- **Same PD**: meta_pool 通过 `RDMAMemoryPool(parent_pool)` 构造，复用 user_pool 的 PD。
+- **RDMAChannel post\_**\*: 调用时直接注入 pool (meta_pool 或 user_pool)，不做双池查找。
+
+## 6. connect 语义
+
+- connect 只交换 meta 信息 (io_info, msg_info)，**不**自动注册 remote MR。
+- 用户 MR 需手动: `get_mr_info()` (control plane) + `register_remote_memory_region()`。
+- 推荐流程: init -> connect -> register_memory_region -> get_mr_info -> register_remote_memory_region -> read/write

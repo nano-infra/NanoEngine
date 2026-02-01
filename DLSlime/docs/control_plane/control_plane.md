@@ -75,10 +75,10 @@ peer_agent_0.connect("B")
 这个时候创建内存并通知 rust server 端更新数据库
 """
 A_tensor = torch.tensor(...)
-peer_agent_0.register_memory_region("B", "KVCACHE", A_tensor.data_ptr(), A_tensor.storage_offset(), A_tensor.numel() * A_tensor.itemsize)
+peer_agent_0.register_memory_region("KVCACHE", A_tensor.data_ptr(), A_tensor.storage_offset(), A_tensor.numel() * A_tensor.itemsize)
 
 B_tensor = torch.tensor(...)
-peer_agent_1.register_memory_region("A", "KVCACHE", B_tensor.data_ptr(), B_tensor.storage_offset(), B_tensor.numel() * B_tensor.itemsize)
+peer_agent_1.register_memory_region("KVCACHE", B_tensor.data_ptr(), B_tensor.storage_offset(), B_tensor.numel() * B_tensor.itemsize)
 
 """
 首先 Query 远端内存的句柄
