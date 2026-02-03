@@ -2,16 +2,13 @@ mod models;
 mod state;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-// chrono::Utc is no longer needed since timestamp is set in Lua script
-// Script is no longer needed, we use EVAL directly
 use serde_json::json;
 use std::net::SocketAddr;
-use tokio::sync::oneshot;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -41,14 +38,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(root))
         .route("/start_peer_agent", post(start_peer_agent))
         .route("/query", post(query))
-        .route("/init", post(init))
-        .route("/connect", post(connect))
+        .route("/v1/desired_topology/:agent_id", post(set_desired_topology))
         .route("/register_mr", post(register_mr))
         .route("/get_mr_info", post(get_mr_info))
-        .route("/get_endpoint_info", post(get_endpoint_info))
-        .route("/ack_init", post(ack_init))
-        .route("/ack_connect", post(ack_connect))
-        .route("/update_endpoint_info", post(update_endpoint_info))
         .route("/cleanup", post(cleanup))
         .route("/get_redis_address", post(get_redis_address))
         .route("/register_engine", post(register_engine))
@@ -270,359 +262,99 @@ async fn start_peer_agent(
 }
 
 // Helper function to get server's IP address for a remote client
-// This is a simplified implementation - in production, you might want to use a library
-// like `local_ipaddress` or inspect network interfaces directly
 fn get_server_ip_for_client(_client_ip: &str) -> Option<String> {
-    // For now, we require REDIS_PUBLIC_ADDRESS to be set
-    // In the future, we could inspect network interfaces to find the server's IP
     None
 }
 
-async fn init(State(state): State<AppState>, Json(body): Json<InitBody>) -> impl IntoResponse {
-    let (low, high) = if body.src < body.dst {
-        (body.src.clone(), body.dst.clone())
-    } else {
-        (body.dst.clone(), body.src.clone())
+/// Declarative topology endpoint: save desired topology spec to Redis.
+/// Returns 200 OK immediately. PeerAgents reconcile via their own loops.
+async fn set_desired_topology(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(spec): Json<DesiredTopologySpec>,
+) -> impl IntoResponse {
+    let key = format!("spec:topology:{}", agent_id);
+    let spec_json = match serde_json::to_string(&spec) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to serialize topology spec: {}", e);
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"status": "error", "message": format!("Invalid spec: {}", e)})),
+            );
+        }
     };
-
-    let conn_key = format!("conn:{}:{}", low, high);
-    let lock = state.get_lock(conn_key.clone()).await;
-    let _guard = lock.lock().await;
 
     let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
         Ok(conn) => conn,
         Err(e) => {
             tracing::error!("Failed to get Redis connection: {}", e);
-            return Json(InitResponse {
-                status: "error".to_string(),
-                message: format!("Failed to connect to Redis: {}", e),
-            });
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": format!("Redis: {}", e)})),
+            );
         }
     };
 
-    // Check if connection already initialized or in progress
-    let status: Option<String> = redis::cmd("HGET")
-        .arg(&conn_key)
-        .arg("status")
-        .query_async(&mut conn)
+    if let Err(e) = redis::cmd("SET")
+        .arg(&key)
+        .arg(&spec_json)
+        .query_async::<()>(&mut conn)
         .await
-        .unwrap_or(None);
-
-    if let Some(s) = status {
-        if s == "initialized" || s == "connected" {
-            tracing::info!(
-                "Connection {} <-> {} already initialized, returning immediately",
-                low,
-                high
-            );
-            return Json(InitResponse {
-                status: "ok".to_string(),
-                message: "Already initialized".to_string(),
-            });
-        }
-        // If status is "initializing", another init is in progress, wait for it
-        if s == "initializing" {
-            tracing::info!(
-                "Connection {} <-> {} is already initializing, waiting for completion",
-                low,
-                high
-            );
-            // Wait for the existing init to complete by checking status periodically
-            let mut retries = 100; // 10 seconds
-            while retries > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                let current_status: Option<String> = redis::cmd("HGET")
-                    .arg(&conn_key)
-                    .arg("status")
-                    .query_async(&mut conn)
-                    .await
-                    .unwrap_or(None);
-                if let Some(cs) = current_status {
-                    if cs == "initialized" || cs == "connected" {
-                        tracing::info!(
-                            "Connection {} <-> {} initialized by another request",
-                            low,
-                            high
-                        );
-                        return Json(InitResponse {
-                            status: "ok".to_string(),
-                            message: "Initialized by another request".to_string(),
-                        });
-                    }
-                }
-                retries -= 1;
-            }
-            tracing::warn!(
-                "Connection {} <-> {} still initializing after waiting, returning timeout",
-                low,
-                high
-            );
-            return Json(InitResponse {
-                status: "timeout".to_string(),
-                message: "Timeout waiting for concurrent init to complete".to_string(),
-            });
-        }
-    }
-
-    // Set status to initializing
-    let _: () = redis::cmd("HSET")
-        .arg(&conn_key)
-        .arg("status")
-        .arg("initializing")
-        .arg("qp_num")
-        .arg(body.qp_num.to_string())
-        .query_async(&mut conn)
-        .await
-        .unwrap_or_default();
-
-    // Publish init event to both agents' mailboxes (level-triggered)
-    // In level-triggered mode, server publishes events and waits for ACKs from both sides
-    let event_low = json!({
-        "type": "init",
-        "src": body.src.clone(),
-        "dst": body.dst.clone(),
-        "qp_num": body.qp_num,
-    });
-    let event_high = json!({
-        "type": "init",
-        "src": body.src.clone(),
-        "dst": body.dst.clone(),
-        "qp_num": body.qp_num,
-    });
-
-    let low_inbox = format!("inbox:{}", low);
-    let high_inbox = format!("inbox:{}", high);
-
-    let low_result: Result<(), _> = redis::cmd("LPUSH")
-        .arg(&low_inbox)
-        .arg(event_low.to_string())
-        .query_async(&mut conn)
-        .await;
-
-    let high_result: Result<(), _> = redis::cmd("LPUSH")
-        .arg(&high_inbox)
-        .arg(event_high.to_string())
-        .query_async(&mut conn)
-        .await;
-
-    tracing::info!(
-        "Pushed init events: {} -> {} (inbox:{}), {} -> {} (inbox:{}), results: low={:?}, high={:?}",
-        body.src,
-        body.dst,
-        low_inbox,
-        body.src,
-        body.dst,
-        high_inbox,
-        low_result.is_ok(),
-        high_result.is_ok()
-    );
-
-    tracing::info!(
-        "Published init events for connection {} <-> {} (level-triggered, waiting for ACKs). Events sent to inbox:{} and inbox:{}",
-        low,
-        high,
-        low,
-        high
-    );
-
-    // Level-triggered: create event futures and await ACKs from both agents
-    // Create oneshot channels for async ACK waiting
-    let (low_tx, low_rx) = oneshot::channel();
-    let (high_tx, high_rx) = oneshot::channel();
-
-    // Store senders in state for ack_init to signal
     {
-        let mut futures = state.init_futures.lock().await;
-        futures.insert(conn_key.clone(), (Some(low_tx), Some(high_tx)));
-        tracing::info!(
-            "Stored init futures for connection {} <-> {} (waiting for ACKs from {} and {})",
-            low,
-            high,
-            low,
-            high
+        tracing::error!("Failed to save topology spec to Redis: {}", e);
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "message": format!("Redis: {}", e)})),
         );
     }
 
-    // Await both ACKs in parallel with timeout
-    let timeout = tokio::time::Duration::from_secs(10);
-    match tokio::time::timeout(timeout, async {
-        let (low_result, high_result) = tokio::join!(low_rx, high_rx);
-        // Both channels should receive signals (ignore errors if channel was closed)
-        let _ = low_result;
-        let _ = high_result;
-    })
-    .await
-    {
-        Ok(_) => {
-            // Both ACKs received, mark as initialized
-            let _: () = redis::cmd("HSET")
-                .arg(&conn_key)
-                .arg("status")
-                .arg("initialized")
+    // Symmetric: merge this agent_id into each target peer's spec so both sides want each other
+    if spec.symmetric {
+        for target_peer in &spec.target_peers {
+            let peer_key = format!("spec:topology:{}", target_peer);
+            let existing_str: Option<String> = redis::cmd("GET")
+                .arg(&peer_key)
                 .query_async(&mut conn)
                 .await
-                .unwrap_or_default();
-
-            // Clean up futures
-            {
-                let mut futures = state.init_futures.lock().await;
-                futures.remove(&conn_key);
+                .ok()
+                .flatten();
+            let mut peer_targets: Vec<String> = if let Some(s) = existing_str {
+                serde_json::from_str::<DesiredTopologySpec>(&s)
+                    .map(|p| p.target_peers)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if !peer_targets.contains(&agent_id) {
+                peer_targets.push(agent_id.clone());
             }
-
-            tracing::info!(
-                "Init completed for connection {} <-> {} (both ACKs received)",
-                low,
-                high
-            );
-            Json(InitResponse {
-                status: "ok".to_string(),
-                message: "Initialized successfully".to_string(),
-            })
-        }
-        Err(_) => {
-            // Timeout: clean up futures
-            {
-                let mut futures = state.init_futures.lock().await;
-                futures.remove(&conn_key);
+            let peer_spec = DesiredTopologySpec {
+                target_peers: peer_targets,
+                min_bw: None,
+                symmetric: false, // Don't recurse
+            };
+            if let Ok(peer_json) = serde_json::to_string(&peer_spec) {
+                let _: Result<(), _> = redis::cmd("SET")
+                    .arg(&peer_key)
+                    .arg(&peer_json)
+                    .query_async(&mut conn)
+                    .await;
             }
-
-            tracing::warn!(
-                "Init timeout for connection {} <-> {} (waiting for ACKs)",
-                low,
-                high
-            );
-            Json(InitResponse {
-                status: "timeout".to_string(),
-                message: "Timeout waiting for init ACK".to_string(),
-            })
         }
+        tracing::info!(
+            "Symmetric: merged {} into {} target peer(s) spec",
+            agent_id,
+            spec.target_peers.len()
+        );
     }
-}
-
-async fn connect(
-    State(state): State<AppState>,
-    Json(body): Json<ConnectBody>,
-) -> impl IntoResponse {
-    let (low, high) = if body.src < body.dst {
-        (body.src.clone(), body.dst.clone())
-    } else {
-        (body.dst.clone(), body.src.clone())
-    };
-
-    let conn_key = format!("conn:{}:{}", low, high);
-    let lock = state.get_lock(conn_key.clone()).await;
-    let _guard = lock.lock().await;
-
-    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => conn,
-        Err(e) => {
-            tracing::error!("Failed to get Redis connection: {}", e);
-            return Json(ConnectResponse {
-                status: "error".to_string(),
-                message: format!("Failed to connect to Redis: {}", e),
-            });
-        }
-    };
-
-    // Check if already connected
-    let status: Option<String> = redis::cmd("HGET")
-        .arg(&conn_key)
-        .arg("status")
-        .query_async(&mut conn)
-        .await
-        .unwrap_or(None);
-
-    if let Some(s) = status {
-        if s == "connected" {
-            return Json(ConnectResponse {
-                status: "ok".to_string(),
-                message: "Already connected".to_string(),
-            });
-        }
-    }
-
-    // Set status to connecting
-    let _: () = redis::cmd("HSET")
-        .arg(&conn_key)
-        .arg("status")
-        .arg("connecting")
-        .query_async(&mut conn)
-        .await
-        .unwrap_or_default();
-
-    // Publish connect event (level-triggered)
-    // In level-triggered mode, server publishes events and waits for connection to complete
-    let event_low = json!({
-        "type": "connect",
-        "src": body.src.clone(),
-        "dst": body.dst.clone(),
-    });
-    let event_high = json!({
-        "type": "connect",
-        "src": body.src.clone(),
-        "dst": body.dst.clone(),
-    });
-
-    let _: () = redis::cmd("LPUSH")
-        .arg(format!("inbox:{}", low))
-        .arg(event_low.to_string())
-        .query_async(&mut conn)
-        .await
-        .unwrap_or_default();
-
-    let _: () = redis::cmd("LPUSH")
-        .arg(format!("inbox:{}", high))
-        .arg(event_high.to_string())
-        .query_async(&mut conn)
-        .await
-        .unwrap_or_default();
 
     tracing::info!(
-        "Published connect events for connection {} <-> {} (level-triggered, waiting for connection)",
-        low,
-        high
+        "Saved desired topology for agent {}: {} peer(s)",
+        agent_id,
+        spec.target_peers.len()
     );
-
-    // Level-triggered: create event future and await connection ACK
-    let (tx, rx) = oneshot::channel();
-
-    // Store sender in state for ack_connect to signal
-    {
-        let mut futures = state.connect_futures.lock().await;
-        futures.insert(conn_key.clone(), tx);
-    }
-
-    // Await connection ACK with timeout
-    let timeout = tokio::time::Duration::from_secs(5);
-    match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(_)) => {
-            // Connection ACK received
-            // Clean up future
-            {
-                let mut futures = state.connect_futures.lock().await;
-                futures.remove(&conn_key);
-            }
-
-            tracing::info!("Connect completed for connection {} <-> {}", low, high);
-            Json(ConnectResponse {
-                status: "ok".to_string(),
-                message: "Connected successfully".to_string(),
-            })
-        }
-        Ok(Err(_)) | Err(_) => {
-            // Timeout or channel closed: clean up future
-            {
-                let mut futures = state.connect_futures.lock().await;
-                futures.remove(&conn_key);
-            }
-
-            tracing::warn!("Connect timeout for connection {} <-> {}", low, high);
-            Json(ConnectResponse {
-                status: "timeout".to_string(),
-                message: "Timeout waiting for connect ACK".to_string(),
-            })
-        }
-    }
+    (axum::http::StatusCode::OK, Json(json!({"status": "ok"})))
 }
 
 async fn register_mr(
@@ -740,292 +472,6 @@ async fn get_mr_info(
     Json(response)
 }
 
-async fn get_endpoint_info(
-    State(state): State<AppState>,
-    Json(body): Json<GetEndpointInfoBody>,
-) -> impl IntoResponse {
-    let (low, high) = if body.src < body.dst {
-        (body.src.clone(), body.dst.clone())
-    } else {
-        (body.dst.clone(), body.src.clone())
-    };
-
-    let conn_key = format!("conn:{}:{}", low, high);
-    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => conn,
-        Err(e) => {
-            tracing::error!("Failed to get Redis connection: {}", e);
-            return Json(GetEndpointInfoResponse {
-                endpoint_info: None,
-            });
-        }
-    };
-
-    // Determine which endpoint info to get
-    // body.src is the requester, body.dst is whose endpoint info we want
-    // If body.dst == low, we want low_endpoint_info
-    // If body.dst == high, we want high_endpoint_info
-    let field_name = if body.dst == low {
-        "low_endpoint_info"
-    } else {
-        "high_endpoint_info"
-    };
-
-    tracing::info!(
-        "Getting endpoint info: src={}, dst={}, conn_key={}, field_name={}",
-        body.src,
-        body.dst,
-        conn_key,
-        field_name
-    );
-
-    let endpoint_info_str: Option<String> = redis::cmd("HGET")
-        .arg(&conn_key)
-        .arg(field_name)
-        .query_async(&mut conn)
-        .await
-        .unwrap_or(None);
-
-    if let Some(s) = endpoint_info_str {
-        if let Ok(endpoint_info) = serde_json::from_str::<serde_json::Value>(&s) {
-            tracing::info!("Found endpoint info for {} -> {}", body.src, body.dst);
-            return Json(GetEndpointInfoResponse {
-                endpoint_info: Some(endpoint_info),
-            });
-        } else {
-            tracing::warn!(
-                "Failed to parse endpoint info JSON for {} -> {}",
-                body.src,
-                body.dst
-            );
-        }
-    } else {
-        tracing::warn!(
-            "Endpoint info not found for {} -> {} (conn_key={}, field_name={})",
-            body.src,
-            body.dst,
-            conn_key,
-            field_name
-        );
-    }
-
-    Json(GetEndpointInfoResponse {
-        endpoint_info: None,
-    })
-}
-
-async fn ack_init(
-    State(state): State<AppState>,
-    Json(body): Json<AckInitBody>,
-) -> impl IntoResponse {
-    let (low, high) = if body.src < body.dst {
-        (body.src.clone(), body.dst.clone())
-    } else {
-        (body.dst.clone(), body.src.clone())
-    };
-
-    let conn_key = format!("conn:{}:{}", low, high);
-    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => conn,
-        Err(e) => {
-            tracing::error!("Failed to get Redis connection: {}", e);
-            return Json(AckResponse {
-                status: "error".to_string(),
-            });
-        }
-    };
-
-    // Store endpoint info
-    let field_name = if body.src == low {
-        "low_endpoint_info"
-    } else {
-        "high_endpoint_info"
-    };
-
-    let _: () = redis::cmd("HSET")
-        .arg(&conn_key)
-        .arg(field_name)
-        .arg(body.endpoint_info.to_string())
-        .query_async(&mut conn)
-        .await
-        .unwrap_or_default();
-
-    // Signal the init future that this ACK was received
-    let mut futures = state.init_futures.lock().await;
-    if let Some((low_tx, high_tx)) = futures.get_mut(&conn_key) {
-        let _ack_sent = if body.src == low {
-            // Low agent sent ACK
-            if let Some(tx) = low_tx.take() {
-                let result = tx.send(());
-                tracing::info!(
-                    "Received init ACK from low agent {} for connection {} <-> {} (channel send: {})",
-                    body.src,
-                    low,
-                    high,
-                    if result.is_ok() { "ok" } else { "error" }
-                );
-                result.is_ok()
-            } else {
-                tracing::warn!(
-                    "Received duplicate init ACK from low agent {} for connection {} <-> {}",
-                    body.src,
-                    low,
-                    high
-                );
-                false
-            }
-        } else {
-            // High agent sent ACK
-            if let Some(tx) = high_tx.take() {
-                let result = tx.send(());
-                tracing::info!(
-                    "Received init ACK from high agent {} for connection {} <-> {} (channel send: {})",
-                    body.src,
-                    low,
-                    high,
-                    if result.is_ok() { "ok" } else { "error" }
-                );
-                result.is_ok()
-            } else {
-                tracing::warn!(
-                    "Received duplicate init ACK from high agent {} for connection {} <-> {}",
-                    body.src,
-                    low,
-                    high
-                );
-                false
-            }
-        };
-
-        // Check if both ACKs have been sent (both senders are None)
-        if low_tx.is_none() && high_tx.is_none() {
-            // Both ACKs received, can clean up (but keep for status check)
-            tracing::info!(
-                "Both init ACKs received for connection {} <-> {}",
-                low,
-                high
-            );
-        }
-    } else {
-        tracing::warn!(
-            "Received init ACK from {} for connection {} <-> {} but no future found (may have timed out or already completed)",
-            body.src,
-            low,
-            high
-        );
-    }
-
-    Json(AckResponse {
-        status: "ok".to_string(),
-    })
-}
-
-async fn ack_connect(
-    State(state): State<AppState>,
-    Json(body): Json<AckConnectBody>,
-) -> impl IntoResponse {
-    let (low, high) = if body.src < body.dst {
-        (body.src.clone(), body.dst.clone())
-    } else {
-        (body.dst.clone(), body.src.clone())
-    };
-
-    let conn_key = format!("conn:{}:{}", low, high);
-    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => conn,
-        Err(e) => {
-            tracing::error!("Failed to get Redis connection: {}", e);
-            return Json(AckResponse {
-                status: "error".to_string(),
-            });
-        }
-    };
-
-    // Track ACKs: use a counter or check if both sides have ACKed
-    // For simplicity, we'll use a counter in Redis
-    let ack_field = if body.src == low {
-        "low_connect_ack"
-    } else {
-        "high_connect_ack"
-    };
-
-    let _: () = redis::cmd("HSET")
-        .arg(&conn_key)
-        .arg(ack_field)
-        .arg("1")
-        .query_async(&mut conn)
-        .await
-        .unwrap_or_default();
-
-    // Check if both ACKs received
-    let low_ack: Option<String> = redis::cmd("HGET")
-        .arg(&conn_key)
-        .arg("low_connect_ack")
-        .query_async(&mut conn)
-        .await
-        .unwrap_or(None);
-    let high_ack: Option<String> = redis::cmd("HGET")
-        .arg(&conn_key)
-        .arg("high_connect_ack")
-        .query_async(&mut conn)
-        .await
-        .unwrap_or(None);
-
-    if low_ack.is_some() && high_ack.is_some() {
-        // Both ACKs received, mark as connected and signal the future
-        let _: () = redis::cmd("HSET")
-            .arg(&conn_key)
-            .arg("status")
-            .arg("connected")
-            .query_async(&mut conn)
-            .await
-            .unwrap_or_default();
-
-        // Signal the connect future
-        let mut futures = state.connect_futures.lock().await;
-        if let Some(tx) = futures.remove(&conn_key) {
-            let _ = tx.send(());
-            tracing::info!(
-                "Both connect ACKs received for connection {} <-> {}",
-                low,
-                high
-            );
-        }
-    }
-
-    Json(AckResponse {
-        status: "ok".to_string(),
-    })
-}
-
-async fn update_endpoint_info(
-    State(state): State<AppState>,
-    Json(body): Json<UpdateEndpointInfoBody>,
-) -> impl IntoResponse {
-    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => conn,
-        Err(e) => {
-            tracing::error!("Failed to get Redis connection: {}", e);
-            return Json(AckResponse {
-                status: "error".to_string(),
-            });
-        }
-    };
-
-    let key = format!("agent:{}", body.agent_name);
-    let _: () = redis::cmd("HSET")
-        .arg(&key)
-        .arg("endpoint_info")
-        .arg(body.endpoint_info.to_string())
-        .query_async(&mut conn)
-        .await
-        .unwrap_or_default();
-
-    Json(AckResponse {
-        status: "ok".to_string(),
-    })
-}
-
 async fn cleanup(
     State(state): State<AppState>,
     Json(body): Json<CleanupBody>,
@@ -1044,7 +490,46 @@ async fn cleanup(
     let agent_name = body.agent_name;
     tracing::info!("Cleaning up agent: {}", agent_name);
 
-    // 1. Delete agent registration
+    // 1. Get peers to notify (from spec) BEFORE deleting anything
+    let mut peers_to_notify = std::collections::HashSet::new();
+    let spec_key = format!("spec:topology:{}", agent_name);
+    if let Ok(Some(spec_str)) = redis::cmd("GET")
+        .arg(&spec_key)
+        .query_async::<Option<String>>(&mut conn)
+        .await
+    {
+        if let Ok(spec) = serde_json::from_str::<DesiredTopologySpec>(&spec_str) {
+            for p in spec.target_peers {
+                peers_to_notify.insert(p);
+            }
+        }
+    }
+    // Also scan all specs to find agents that had us as a target
+    let spec_keys_all: Vec<String> = redis::cmd("KEYS")
+        .arg("spec:topology:*")
+        .query_async(&mut conn)
+        .await
+        .unwrap_or_default();
+    for key in &spec_keys_all {
+        if key == &spec_key {
+            continue;
+        }
+        if let Ok(Some(s)) = redis::cmd("GET")
+            .arg(key)
+            .query_async::<Option<String>>(&mut conn)
+            .await
+        {
+            if let Ok(spec) = serde_json::from_str::<DesiredTopologySpec>(&s) {
+                if spec.target_peers.contains(&agent_name) {
+                    if let Some(other) = key.strip_prefix("spec:topology:") {
+                        peers_to_notify.insert(other.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Delete agent registration
     let agent_key = format!("agent:{}", agent_name);
     let _: () = redis::cmd("DEL")
         .arg(&agent_key)
@@ -1052,7 +537,43 @@ async fn cleanup(
         .await
         .unwrap_or_default();
 
-    // 2. Delete agent's inbox
+    // 3. Delete agent's desired topology spec
+    let _: () = redis::cmd("DEL")
+        .arg(&spec_key)
+        .query_async(&mut conn)
+        .await
+        .unwrap_or_default();
+
+    // 4. Delete exchange info (QP info) published by this agent
+    let exchange_pattern = format!("exchange:{}:*", agent_name);
+    let exchange_keys: Vec<String> = redis::cmd("KEYS")
+        .arg(&exchange_pattern)
+        .query_async(&mut conn)
+        .await
+        .unwrap_or_default();
+    for k in &exchange_keys {
+        let _: () = redis::cmd("DEL")
+            .arg(k)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_default();
+    }
+    // Delete exchange info where this agent is the receiver
+    let exchange_pattern2 = format!("exchange:*:{}", agent_name);
+    let exchange_keys2: Vec<String> = redis::cmd("KEYS")
+        .arg(&exchange_pattern2)
+        .query_async(&mut conn)
+        .await
+        .unwrap_or_default();
+    for k in &exchange_keys2 {
+        let _: () = redis::cmd("DEL")
+            .arg(k)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_default();
+    }
+
+    // 5. Delete agent's inbox (for legacy cleanup event delivery)
     let inbox_key = format!("inbox:{}", agent_name);
     let _: () = redis::cmd("DEL")
         .arg(&inbox_key)
@@ -1060,7 +581,7 @@ async fn cleanup(
         .await
         .unwrap_or_default();
 
-    // 3. Delete all MRs for this agent
+    // 6. Delete all MRs for this agent
     let mr_pattern = format!("mr:{}:*", agent_name);
     let mr_keys: Vec<String> = redis::cmd("KEYS")
         .arg(&mr_pattern)
@@ -1075,47 +596,7 @@ async fn cleanup(
             .unwrap_or_default();
     }
 
-    // 4. Find and clean up connections involving this agent
-    // Also notify peer agents to clean up their side
-    let conn_pattern = "conn:*";
-    let conn_keys: Vec<String> = redis::cmd("KEYS")
-        .arg(conn_pattern)
-        .query_async(&mut conn)
-        .await
-        .unwrap_or_default();
-
-    let mut peers_to_notify = std::collections::HashSet::new();
-
-    for conn_key in &conn_keys {
-        // Format: conn:{low}:{high}
-        let parts: Vec<&str> = conn_key.split(':').collect();
-        if parts.len() == 3 {
-            let low = parts[1];
-            let high = parts[2];
-
-            if low == agent_name {
-                // This agent is the low side, notify high side
-                peers_to_notify.insert(high.to_string());
-                // Delete the connection
-                let _: () = redis::cmd("DEL")
-                    .arg(conn_key)
-                    .query_async(&mut conn)
-                    .await
-                    .unwrap_or_default();
-            } else if high == agent_name {
-                // This agent is the high side, notify low side
-                peers_to_notify.insert(low.to_string());
-                // Delete the connection
-                let _: () = redis::cmd("DEL")
-                    .arg(conn_key)
-                    .query_async(&mut conn)
-                    .await
-                    .unwrap_or_default();
-            }
-        }
-    }
-
-    // 5. Notify peer agents to clean up their side (对等清理)
+    // 7. Notify peer agents to clean up their side (对等清理)
     for peer in peers_to_notify {
         let cleanup_event = json!({
             "type": "cleanup",

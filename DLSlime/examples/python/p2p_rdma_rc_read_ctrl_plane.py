@@ -1,8 +1,10 @@
 """
-Example: P2P RDMA RC Read using Control Plane for centralized connection setup.
+Example: P2P RDMA RC Read using Control Plane (Declarative Topology).
 
-This example demonstrates how to use the control plane to establish RDMA connections
-without manual endpoint_info exchange.
+Uses the declarative model:
+- set_desired_topology(target_peers=[...]) to declare desired connections
+- TopologyReconciler converges Actual State to Desired State (Symmetric Rendezvous)
+- wait_for_peers() blocks until connections are established
 """
 
 import torch
@@ -31,37 +33,16 @@ target_agent = start_peer_agent(
 # Query available peers
 print("Available peers:", initiator_agent.query())
 
-# Initialize connection (both sides)
-print("Initializing connection...")
-# Both agents need to call init, but we can do it in parallel or with a small delay
-import threading
+# Declarative: set desired topology (both sides want to connect to each other)
+print("Setting desired topology...")
+initiator_agent.set_desired_topology(target_peers=["target"])
+target_agent.set_desired_topology(target_peers=["initiator"])
 
-
-def init_async(agent, peer):
-    agent.init(peer, qp_num=1)
-
-
-t1 = threading.Thread(target=init_async, args=(initiator_agent, "target"))
-t2 = threading.Thread(target=init_async, args=(target_agent, "initiator"))
-t1.start()
-t2.start()
-t1.join()
-t2.join()
-
-# Connect (both sides)
-print("Connecting...")
-
-
-def connect_async(agent, peer):
-    agent.connect(peer)
-
-
-t1 = threading.Thread(target=connect_async, args=(initiator_agent, "target"))
-t2 = threading.Thread(target=connect_async, args=(target_agent, "initiator"))
-t1.start()
-t2.start()
-t1.join()
-t2.join()
+# Wait for reconciliation to establish connections
+print("Waiting for connections...")
+initiator_agent.wait_for_peers(["target"])
+target_agent.wait_for_peers(["initiator"])
+print("Connections established.")
 
 # Get endpoints
 initiator = initiator_agent.get_endpoint("target")

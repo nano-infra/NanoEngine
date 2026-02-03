@@ -41,6 +41,15 @@ repos:
     rev: v1.0
     hooks:
       - id: fmt
+        name: fmt (NanoCtrl)
+        args: ["--manifest-path", "NanoCtrl/Cargo.toml"]
+        files: ^NanoCtrl/
+        pass_filenames: false
+      - id: fmt
+        name: fmt (NanoRoute)
+        args: ["--manifest-path", "NanoRoute/Cargo.toml"]
+        files: ^NanoRoute/
+        pass_filenames: false
       # NanoCtrl
       - id: cargo-check
         name: cargo check (NanoCtrl)

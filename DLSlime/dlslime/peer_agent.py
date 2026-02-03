@@ -1,11 +1,17 @@
 """
 PeerAgent: Control plane client for DLSlime RDMA connection management.
+
+Refactored to use a Declarative Horizontal model (Symmetric Rendezvous):
+- NanoCtrl stores "Desired Topology" in Redis (spec:topology:{agent_id})
+- PeerAgent runs a TopologyReconciler loop to converge Actual State to Desired State
+- QP info exchange via Redis (exchange:{sender}:{receiver})
 """
 
 import json
 import threading
 import time
-from typing import Any, Dict, Optional
+from concurrent.futures import as_completed, ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Set
 
 try:
     import redis
@@ -19,8 +25,133 @@ except ImportError as e:
 from dlslime import available_nic, RDMAContext, RDMAEndpoint, RDMAMemoryPool
 
 
+class TopologyReconciler:
+    """
+    Background reconciliation loop: converges Actual State to Desired State.
+    Implements Symmetric Rendezvous via Redis exchange keys.
+    """
+
+    def __init__(
+        self,
+        agent: "PeerAgent",
+        reconcile_interval_sec: float = 1.0,
+    ):
+        self._agent = agent
+        self._interval = reconcile_interval_sec
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        """Start the reconcile loop in a background thread."""
+
+        def run():
+            while not self._stop_event.is_set():
+                try:
+                    self._reconcile_once()
+                except Exception as e:
+                    print(
+                        f"TopologyReconciler {self._agent.alias}: Error in reconcile: {e}"
+                    )
+                    import traceback
+
+                    traceback.print_exc()
+                self._stop_event.wait(self._interval)
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+        print(
+            f"TopologyReconciler {self._agent.alias}: Started (interval={self._interval}s)"
+        )
+
+    def stop(self) -> None:
+        """Stop the reconcile loop."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        print(f"TopologyReconciler {self._agent.alias}: Stopped")
+
+    def _reconcile_once(self) -> None:
+        """Single reconciliation pass: diff desired vs actual, act on delta."""
+        # 1. Get Desired State from Redis
+        spec_key = f"spec:topology:{self._agent.alias}"
+        spec_str = self._agent.redis_client.get(spec_key)
+        if spec_str is None:
+            return  # No desired topology, nothing to do
+
+        try:
+            spec = json.loads(spec_str)
+            target_peers: List[str] = spec.get("target_peers", [])
+        except (json.JSONDecodeError, TypeError):
+            return
+
+        desired = set(target_peers)
+        if not desired:
+            return
+
+        # 2. Get Actual State (peers we've successfully connected to)
+        actual: Set[str] = self._agent.get_connected_peers()
+
+        # 3. Diff
+        to_connect = desired - actual
+
+        # 4. Act (Symmetric Rendezvous) - parallel connection attempts
+        if not to_connect:
+            return
+        max_workers = min(32, len(to_connect))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._try_connect_peer, peer): peer
+                for peer in to_connect
+            }
+            for future in as_completed(futures):
+                peer = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    print(
+                        f"TopologyReconciler {self._agent.alias}: Failed to connect to {peer}: {e}"
+                    )
+
+    def _try_connect_peer(self, peer: str) -> None:
+        """
+        Attempt Symmetric Rendezvous with peer.
+        Idempotent: safe to call multiple times.
+        Non-blocking: if peer info not in Redis, skip and retry next loop.
+        """
+        # A. Idempotent QP/Endpoint creation
+        endpoint = self._agent.ensure_local_endpoint_created(peer)
+        my_qp_info = endpoint.endpoint_info()
+
+        # B. Publish our info to Redis (exchange:{sender}:{receiver})
+        exchange_key_out = f"exchange:{self._agent.alias}:{peer}"
+        self._agent.redis_client.set(
+            exchange_key_out,
+            json.dumps(my_qp_info, default=str),
+        )
+
+        # C. Try to fetch peer's info (non-blocking, short timeout)
+        exchange_key_in = f"exchange:{peer}:{self._agent.alias}"
+        peer_qp_info_str = self._agent.redis_client.get(exchange_key_in)
+
+        if peer_qp_info_str is None:
+            # Peer hasn't published yet; skip, retry next loop
+            return
+
+        try:
+            peer_qp_info = json.loads(peer_qp_info_str)
+        except json.JSONDecodeError:
+            return
+
+        # D. Handshake: modify QP to RTR/RTS (via endpoint.connect)
+        if self._agent.is_peer_connected(peer):
+            return  # Already connected, idempotent
+        endpoint.connect(peer_qp_info)
+        self._agent.mark_peer_connected(peer)
+        print(f"Link Established: {self._agent.alias} <-> {peer}")
+
+
 class PeerAgent:
-    """PeerAgent manages RDMA connections through a centralized control plane."""
+    """PeerAgent manages RDMA connections via declarative topology reconciliation."""
 
     def __init__(
         self,
@@ -31,18 +162,20 @@ class PeerAgent:
         ib_port: int = 1,
         link_type: str = "RoCE",
         qp_num: int = 1,
+        reconcile_interval_sec: float = 1.0,
     ):
         """
         Initialize a PeerAgent.
 
         Args:
             alias: Unique name for this agent
-            server_url: URL of the control plane server
+            server_url: URL of the control plane server (NanoCtrl)
             redis_address: Redis server address (host:port)
             device: RDMA device name (e.g., "mlx5_0"), if None, auto-select
             ib_port: InfiniBand port number
             link_type: Link type ("RoCE", "InfiniBand", etc.)
-            qp_num: Number of queue pairs
+            qp_num: Number of queue pairs per endpoint
+            reconcile_interval_sec: Topology reconciliation loop interval
         """
         self.alias = alias
         self.server_url = server_url
@@ -52,60 +185,66 @@ class PeerAgent:
         self.link_type = link_type
         self.qp_num = qp_num
 
-        # Get local IP address (simplified)
         import socket
 
         hostname = socket.gethostname()
         local_ip = socket.gethostbyname(hostname)
         self.address = local_ip
 
-        # Initialize RDMA device
+        # RDMA
         if self.device is None:
             devices = available_nic()
             if not devices:
                 raise RuntimeError("No RDMA devices available")
             self.device = devices[0]
 
-        # Pre-allocate shared MemoryPool (see docs/control_plane/share_memory.md)
-        # All endpoints share this pool for local MR registration
         self._rdma_context = RDMAContext()
         self._rdma_context.init(self.device, self.ib_port, self.link_type)
         self._memory_pool = RDMAMemoryPool(self._rdma_context)
 
-        self._endpoints: Dict[str, RDMAEndpoint] = {}  # peer_alias -> endpoint
+        self._endpoints: Dict[str, RDMAEndpoint] = {}
+        self._endpoints_lock = (
+            threading.Lock()
+        )  # Protects _endpoints for concurrent reconcile
+        self._connected_peers: Set[str] = set()
+        self._connected_peers_lock = threading.Lock()
 
-        # get_mr_info cache: (peer_alias, mr_name) -> (cached_at, mr_info), TTL 60s
+        # MR cache
         self._mr_info_cache: Dict[tuple, tuple] = {}
         self._mr_info_cache_ttl_secs = 60
         self._mr_info_cache_lock = threading.Lock()
 
-        # Redis connection for event listening
+        # Redis
         redis_host, redis_port = redis_address.split(":")
         self.redis_client = redis.Redis(
             host=redis_host, port=int(redis_port), decode_responses=True
         )
 
-        # Start event listener thread
-        self._event_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._shutdown_called = False  # Track if shutdown has been called
+        self._shutdown_called = False
+
+        # Event listener for cleanup only (legacy inbox)
+        self._event_thread: Optional[threading.Thread] = None
 
         # Register with control plane
         self._register()
 
-        # Start event listener
-        self._start_event_listener()
+        # Start TopologyReconciler
+        self._reconciler = TopologyReconciler(self, reconcile_interval_sec)
+        self._reconciler.start()
 
-        # Give event listener thread time to start
+        # Start cleanup event listener
+        self._start_cleanup_listener()
+
         time.sleep(0.1)
 
-    def _register(self):
+    def _register(self) -> None:
         """Register this agent with the control plane."""
         max_retries = 5
-        retry_delay = 1.0  # seconds
+        retry_delay = 1.0
 
         print(
-            f"PeerAgent {self.alias}: Attempting to register with control plane at {self.server_url}"
+            f"PeerAgent {self.alias}: Registering with control plane at {self.server_url}"
         )
 
         for attempt in range(max_retries):
@@ -119,226 +258,125 @@ class PeerAgent:
                         "link_type": self.link_type,
                         "address": self.address,
                     },
-                    timeout=10,  # Increased timeout
+                    timeout=10,
                 )
                 response.raise_for_status()
                 result = response.json()
-                # Update redis_address from server response if available
                 if "redis_address" in result:
                     server_redis_address = result["redis_address"]
                     if server_redis_address != self.redis_address:
-                        # Update redis_address and reconnect if different
                         self.redis_address = server_redis_address
                         redis_host, redis_port = self.redis_address.split(":")
                         self.redis_client = redis.Redis(
                             host=redis_host, port=int(redis_port), decode_responses=True
                         )
-                print(
-                    f"PeerAgent {self.alias} registered with control plane at {self.server_url}"
-                )
-                return  # Success, exit retry loop
-            except requests.exceptions.ConnectionError as e:
+                print(f"PeerAgent {self.alias} registered at {self.server_url}")
+                return
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.HTTPError,
+            ) as e:
                 if attempt < max_retries - 1:
-                    wait_time = retry_delay * (2**attempt)  # Exponential backoff
+                    wait_time = retry_delay * (2**attempt)
                     print(
-                        f"PeerAgent {self.alias} registration failed (attempt {attempt + 1}/{max_retries}): ConnectionError to {self.server_url}: {e}. Retrying in {wait_time:.1f}s..."
+                        f"PeerAgent {self.alias} registration failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time:.1f}s..."
                     )
                     time.sleep(wait_time)
                 else:
-                    # Last attempt failed
                     print(
-                        f"PeerAgent {self.alias} registration failed after {max_retries} attempts: Cannot connect to {self.server_url}: {e}"
-                    )
-                    raise
-            except requests.exceptions.Timeout as e:
-                if attempt < max_retries - 1:
-                    wait_time = retry_delay * (2**attempt)  # Exponential backoff
-                    print(
-                        f"PeerAgent {self.alias} registration failed (attempt {attempt + 1}/{max_retries}): Timeout connecting to {self.server_url}: {e}. Retrying in {wait_time:.1f}s..."
-                    )
-                    time.sleep(wait_time)
-                else:
-                    # Last attempt failed
-                    print(
-                        f"PeerAgent {self.alias} registration failed after {max_retries} attempts: Timeout connecting to {self.server_url}: {e}"
-                    )
-                    raise
-            except requests.exceptions.HTTPError as e:
-                if attempt < max_retries - 1:
-                    wait_time = retry_delay * (2**attempt)  # Exponential backoff
-                    print(
-                        f"PeerAgent {self.alias} registration failed (attempt {attempt + 1}/{max_retries}): HTTP error from {self.server_url}: {e} (status: {response.status_code if 'response' in locals() else 'N/A'}). Retrying in {wait_time:.1f}s..."
-                    )
-                    time.sleep(wait_time)
-                else:
-                    # Last attempt failed
-                    print(
-                        f"PeerAgent {self.alias} registration failed after {max_retries} attempts: HTTP error from {self.server_url}: {e}"
+                        f"PeerAgent {self.alias} registration failed after {max_retries} attempts"
                     )
                     raise
 
-    def _start_event_listener(self):
-        """Start listening for events from Redis mailbox."""
+    def _start_cleanup_listener(self) -> None:
+        """Listen for cleanup events from peers (NanoCtrl pushes to inbox)."""
 
         def event_loop():
             inbox_key = f"inbox:{self.alias}"
-            print(
-                f"PeerAgent {self.alias}: Event listener started, listening to {inbox_key}"
-            )
-            event_count = 0
             while not self._stop_event.is_set():
                 try:
-                    # Blocking pop from mailbox
                     result = self.redis_client.blpop(inbox_key, timeout=1)
                     if result:
                         _, event_str = result
                         event = json.loads(event_str)
-                        event_count += 1
-                        print(
-                            f"PeerAgent {self.alias}: Received event #{event_count} from {inbox_key}: {event.get('type', 'unknown')} (src={event.get('src', 'N/A')}, dst={event.get('dst', 'N/A')})"
-                        )
-                        self._handle_event(event)
-                    # Log every 10 seconds to show listener is alive
-                    elif event_count == 0:
-                        # Only log if no events received yet (to avoid spam)
-                        pass
-                except redis.exceptions.ConnectionError as e:
-                    print(
-                        f"PeerAgent {self.alias}: Redis connection error in event loop: {e}"
-                    )
+                        if event.get("type") == "cleanup":
+                            peer = event.get("peer")
+                            print(f"PeerAgent {self.alias}: Cleanup from peer {peer}")
+                            with self._endpoints_lock:
+                                if peer in self._endpoints:
+                                    with self._connected_peers_lock:
+                                        self._connected_peers.discard(peer)
+                                    del self._endpoints[peer]
+                                    print(
+                                        f"PeerAgent {self.alias}: Removed endpoint for {peer}"
+                                    )
+                except redis.exceptions.ConnectionError:
                     time.sleep(0.1)
                 except Exception as e:
-                    print(f"PeerAgent {self.alias}: Error in event loop: {e}")
-                    import traceback
-
-                    traceback.print_exc()
+                    print(f"PeerAgent {self.alias}: Cleanup listener error: {e}")
                     time.sleep(0.1)
-            print(
-                f"PeerAgent {self.alias}: Event listener stopped (processed {event_count} events)"
-            )
 
         self._event_thread = threading.Thread(target=event_loop, daemon=True)
         self._event_thread.start()
 
-    def _handle_event(self, event: Dict[str, Any]):
-        """Handle an event from the control plane."""
-        event_type = event.get("type")
+    def ensure_local_endpoint_created(self, peer_alias: str) -> RDMAEndpoint:
+        """
+        Idempotent: create endpoint for peer if not exists.
+        Returns the endpoint (existing or newly created). Thread-safe.
+        """
+        with self._endpoints_lock:
+            if peer_alias not in self._endpoints:
+                endpoint = RDMAEndpoint(
+                    pool=self._memory_pool,
+                    num_qp=self.qp_num,
+                )
+                self._endpoints[peer_alias] = endpoint
+            return self._endpoints[peer_alias]
 
-        if event_type == "init":
-            self._handle_init_event(event)
-        elif event_type == "connect":
-            self._handle_connect_event(event)
-        elif event_type == "cleanup":
-            self._handle_cleanup_event(event)
-        else:
-            print(f"Unknown event type: {event_type}")
+    def get_connected_peers(self) -> Set[str]:
+        """Return set of peer aliases we've successfully connected to."""
+        with self._connected_peers_lock:
+            return set(self._connected_peers)
 
-    def _handle_init_event(self, event: Dict[str, Any]):
-        """Handle init event: create RDMA endpoint."""
-        src = event["src"]
-        dst = event["dst"]
-        qp_num = event.get("qp_num", self.qp_num)
+    def is_peer_connected(self, peer_alias: str) -> bool:
+        with self._connected_peers_lock:
+            return peer_alias in self._connected_peers
 
-        # Determine which peer we should create endpoint for
-        # If we are src, create endpoint for dst; if we are dst, create endpoint for src
-        if src == self.alias:
-            peer_alias = dst
-        elif dst == self.alias:
-            peer_alias = src
-        else:
-            return  # Not for us
+    def mark_peer_connected(self, peer_alias: str) -> None:
+        with self._connected_peers_lock:
+            self._connected_peers.add(peer_alias)
 
-        print(
-            f"PeerAgent {self.alias}: Received init event, creating endpoint for {peer_alias}"
-        )
+    def set_desired_topology(
+        self,
+        target_peers: List[str],
+        min_bw: Optional[str] = None,
+        symmetric: bool = False,
+    ) -> None:
+        """
+        Set desired topology via control plane. NanoCtrl saves to Redis.
+        Reconciler will converge to this state.
 
-        # Create endpoint if not exists (use shared MemoryPool)
-        if peer_alias not in self._endpoints:
-            endpoint = RDMAEndpoint(
-                pool=self._memory_pool,
-                num_qp=qp_num,
-            )
-            self._endpoints[peer_alias] = endpoint
-
-        # Send ACK with endpoint info
-        endpoint = self._endpoints[peer_alias]
-        endpoint_info = endpoint.endpoint_info()
-
+        Args:
+            target_peers: List of peer agent aliases to connect to
+            min_bw: Optional min bandwidth hint (e.g. "100Gbps"), reserved
+            symmetric: If True, NanoCtrl also merges this agent into each target's spec.
+                Required when only one side initiates (e.g. decode -> prefill migration).
+        """
+        spec: Dict[str, Any] = {"target_peers": target_peers}
+        if min_bw is not None:
+            spec["min_bw"] = min_bw
+        if symmetric:
+            spec["symmetric"] = True
         response = requests.post(
-            f"{self.server_url}/ack_init",
-            json={
-                "src": self.alias,
-                "dst": peer_alias,
-                "endpoint_info": endpoint_info,
-            },
+            f"{self.server_url}/v1/desired_topology/{self.alias}",
+            json=spec,
             timeout=5,
         )
         response.raise_for_status()
-
-    def _handle_connect_event(self, event: Dict[str, Any]):
-        """Handle connect event: establish RDMA connection."""
-        src = event["src"]
-        dst = event["dst"]
-
-        # Determine which peer we should connect to
-        if src == self.alias:
-            peer_alias = dst
-        elif dst == self.alias:
-            peer_alias = src
-        else:
-            return  # Not for us
-
-        # Get remote endpoint info from server
-        # We need the endpoint info of the remote peer
-        response = requests.post(
-            f"{self.server_url}/get_endpoint_info",
-            json={"src": self.alias, "dst": peer_alias},
-            timeout=5,
-        )
-        if response.status_code == 200:
-            data = response.json()
-            remote_info = data.get("endpoint_info")
-        else:
-            print(
-                f"PeerAgent {self.alias}: Cannot get remote endpoint info for {peer_alias}"
-            )
-            return
-
-        if remote_info is None:
-            print(
-                f"PeerAgent {self.alias}: Remote endpoint info is None for {peer_alias}"
-            )
-            return
-
-        # Connect
-        if peer_alias in self._endpoints:
-            endpoint = self._endpoints[peer_alias]
-            endpoint.connect(remote_info)
-            print(f"PeerAgent {self.alias}: Connected to {peer_alias}")
-        else:
-            print(f"PeerAgent {self.alias}: Endpoint for {peer_alias} not found")
-            return
-
-        # Send ACK
-        response = requests.post(
-            f"{self.server_url}/ack_connect",
-            json={
-                "src": self.alias,
-                "dst": peer_alias,
-            },
-            timeout=5,
-        )
-        response.raise_for_status()
-
-    def _handle_cleanup_event(self, event: Dict[str, Any]):
-        """Handle cleanup event from peer agent."""
-        peer = event.get("peer")
-        print(f"PeerAgent {self.alias}: Received cleanup event from {peer}")
-
-        # Remove endpoint for this peer
-        if peer in self._endpoints:
-            del self._endpoints[peer]
-            print(f"PeerAgent {self.alias}: Removed endpoint for {peer}")
+        result = response.json()
+        if result.get("status") != "ok":
+            raise RuntimeError(f"set_desired_topology failed: {result}")
 
     def query(self) -> Dict[str, Dict[str, Any]]:
         """Query all registered peer agents."""
@@ -351,117 +389,33 @@ class PeerAgent:
         agents = response.json()
         return {agent["name"]: agent for agent in agents}
 
-    def init(self, peer_alias: str, qp_num: Optional[int] = None) -> None:
-        """
-        Initialize connection with a peer.
-
-        Level-triggered (水平触发): server publishes init event to BOTH sides.
-        Endpoint is created in _handle_init_event when event is received,
-        not here.
-
-        Args:
-            peer_alias: Alias of the peer agent
-            qp_num: Number of queue pairs (defaults to self.qp_num)
-        """
-        if qp_num is None:
-            qp_num = self.qp_num
-
-        response = requests.post(
-            f"{self.server_url}/init",
-            json={
-                "src": self.alias,
-                "dst": peer_alias,
-                "qp_num": qp_num,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        result = response.json()
-        if result.get("status") != "ok":
-            raise RuntimeError(f"Init failed: {result.get('message')}")
-
-    def connect(self, peer_alias: str) -> None:
-        """
-        Connect to a peer (after init).
-
-        Args:
-            peer_alias: Alias of the peer agent
-        """
-        response = requests.post(
-            f"{self.server_url}/connect",
-            json={
-                "src": self.alias,
-                "dst": peer_alias,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        result = response.json()
-        if result.get("status") != "ok":
-            raise RuntimeError(f"Connect failed: {result.get('message')}")
-
     def register_memory_region(
         self,
         mr_name: str,
         ptr: int,
         length: int,
     ) -> int:
-        """
-        Register a local memory region and report to the control plane.
-
-        Uses the pre-allocated shared MemoryPool. Registers our own MR and
-        reports it to the control plane so remote peers can connect via
-        get_mr_info().
-
-        Args:
-            mr_name: Name of the memory region
-            ptr: Pointer to memory
-            length: Length in bytes
-
-        Returns:
-            Memory region handler/key
-        """
-        # Register on shared MemoryPool (see docs/control_plane/share_memory.md)
+        """Register local memory region and report to control plane."""
         handler = self._memory_pool.register_memory_region(ptr, length, mr_name)
-
-        # Get MR info from pool
         mr_info = self._memory_pool.mr_info()[mr_name]
-
-        # Register with control plane
-        # Note: mr_info contains "handle", "addr", "rkey", "length" (no lkey)
-        # lkey is local-only and not needed for control plane, but we need to send it
         request_data = {
             "agent_name": self.alias,
             "mr_name": mr_name,
-            "addr": int(mr_info["addr"]),  # Ensure it's an integer
-            "length": int(mr_info["length"]),  # Ensure it's an integer
-            "rkey": int(mr_info["rkey"]),  # Ensure it's an integer
-            "lkey": 0,  # lkey is not in mr_info, use 0 as default
+            "addr": int(mr_info["addr"]),
+            "length": int(mr_info["length"]),
+            "rkey": int(mr_info["rkey"]),
+            "lkey": 0,
         }
-        print(f"Registering MR with data: {request_data}")
         response = requests.post(
             f"{self.server_url}/register_mr",
             json=request_data,
             timeout=5,
         )
-        if response.status_code != 200:
-            print(f"Error registering MR: {response.status_code} - {response.text}")
         response.raise_for_status()
-
         return handler
 
     def get_mr_info(self, peer_alias: str, mr_name: str) -> Optional[Dict[str, Any]]:
-        """
-        Get remote memory region info.
-        Cached for 60 seconds to reduce HTTP calls to control plane.
-
-        Args:
-            peer_alias: Alias of the peer
-            mr_name: Name of the memory region
-
-        Returns:
-            MR info dict or None if not found
-        """
+        """Get remote memory region info (cached)."""
         cache_key = (peer_alias, mr_name)
         with self._mr_info_cache_lock:
             if cache_key in self._mr_info_cache:
@@ -493,94 +447,85 @@ class PeerAgent:
         mr_name: str,
         mr_info: Dict[str, Any],
     ) -> int:
-        """
-        Register a remote memory region.
-
-        Args:
-            peer_alias: Alias of the peer
-            mr_name: Name of the memory region
-            mr_info: MR info dict from get_mr_info
-
-        Returns:
-            Remote MR handler
-        """
-        if peer_alias not in self._endpoints:
-            raise RuntimeError(f"Endpoint for {peer_alias} not initialized")
-
-        endpoint = self._endpoints[peer_alias]
+        """Register remote memory region."""
+        with self._endpoints_lock:
+            if peer_alias not in self._endpoints:
+                raise RuntimeError(f"Endpoint for {peer_alias} not initialized")
+            endpoint = self._endpoints[peer_alias]
         return endpoint.register_remote_memory_region(mr_name, mr_info)
 
     def get_endpoint(self, peer_alias: str) -> RDMAEndpoint:
-        """Get the RDMA endpoint for a peer."""
-        if peer_alias not in self._endpoints:
-            raise RuntimeError(f"Endpoint for {peer_alias} not initialized")
-        return self._endpoints[peer_alias]
+        """Get RDMA endpoint for peer (must be connected)."""
+        with self._endpoints_lock:
+            if peer_alias not in self._endpoints:
+                raise RuntimeError(
+                    f"Endpoint for {peer_alias} not found. "
+                    "Ensure set_desired_topology([...]) includes this peer and wait for reconciliation."
+                )
+            return self._endpoints[peer_alias]
 
-    def shutdown(self):
-        """Shutdown the peer agent and clean up Redis data via control plane."""
-        # Prevent multiple shutdown calls
+    def wait_for_peers(self, peers: List[str], timeout_sec: float = 60.0) -> None:
+        """
+        Block until all specified peers are connected.
+        Useful for tests / sync points after set_desired_topology.
+        """
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            connected = self.get_connected_peers()
+            missing = [p for p in peers if p not in connected]
+            if not missing:
+                return
+            time.sleep(0.5)
+        raise TimeoutError(
+            f"Timeout waiting for peers {peers}. "
+            f"Connected: {self.get_connected_peers()}"
+        )
+
+    def shutdown(self) -> None:
+        """Shutdown and clean up."""
         if self._shutdown_called:
             return
         self._shutdown_called = True
 
-        print(f"PeerAgent {self.alias}: Shutting down and cleaning up connections...")
+        print(f"PeerAgent {self.alias}: Shutting down...")
 
-        # Stop event listener
         self._stop_event.set()
+        self._reconciler.stop()
+
         if self._event_thread:
             self._event_thread.join(timeout=1)
 
-        # Clean up all endpoints (disconnect all connections)
-        if self._endpoints:
-            print(
-                f"PeerAgent {self.alias}: Cleaning up {len(self._endpoints)} endpoint(s)..."
-            )
-            for peer_alias in list(self._endpoints.keys()):
-                try:
-                    # Note: RDMAEndpoint doesn't expose explicit disconnect() in Python bindings
-                    # Clearing the endpoint will trigger cleanup
-                    print(f"PeerAgent {self.alias}: Removing endpoint for {peer_alias}")
-                except Exception as e:
-                    print(
-                        f"PeerAgent {self.alias}: Warning: Error cleaning up endpoint for {peer_alias}: {e}"
-                    )
+        with self._endpoints_lock:
             self._endpoints.clear()
+        with self._connected_peers_lock:
+            self._connected_peers.clear()
 
-        # Call service-side cleanup API (对等清理)
         try:
             response = requests.post(
                 f"{self.server_url}/cleanup",
-                json={
-                    "agent_name": self.alias,
-                },
+                json={"agent_name": self.alias},
                 timeout=5,
             )
             response.raise_for_status()
-            result = response.json()
-            print(f"PeerAgent {self.alias}: Cleanup response: {result.get('message')}")
+            print(f"PeerAgent {self.alias}: Cleanup OK")
         except Exception as e:
-            print(f"PeerAgent {self.alias}: Warning: Failed to call cleanup API: {e}")
+            print(f"PeerAgent {self.alias}: Cleanup API warning: {e}")
 
         print(f"PeerAgent {self.alias}: Shutdown complete")
 
-    def __enter__(self):
-        """Context manager entry."""
+    def __enter__(self) -> "PeerAgent":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - automatically shutdown on exit."""
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
         self.shutdown()
-        return False  # Don't suppress exceptions
+        return False
 
-    def __del__(self):
-        """Destructor - automatically shutdown when object is destroyed."""
-        # Only shutdown if not already called (safety check)
+    def __del__(self) -> None:
         if not self._shutdown_called:
             try:
                 self.shutdown()
             except Exception as e:
-                # Suppress exceptions in destructor to avoid issues during garbage collection
-                print(f"PeerAgent {self.alias}: Warning: Error in __del__: {e}")
+                print(f"PeerAgent {self.alias}: Warning in __del__: {e}")
 
 
 def start_peer_agent(
@@ -595,22 +540,9 @@ def start_peer_agent(
     """
     Start a peer agent (convenience function).
 
-    Args:
-        alias: Unique name for this agent
-        server_url: URL of the control plane server
-        address: Redis address (host:port). If None, will be fetched from server.
-        device: RDMA device name
-        ib_port: InfiniBand port number
-        link_type: Link type
-        qp_num: Number of queue pairs
-
-    Returns:
-        PeerAgent instance
+    Use set_desired_topology(target_peers=[...]) to declare which peers to connect to.
     """
-    # If address is not provided, use a default and let _register() update it from server response
-    # We need a valid address format for PeerAgent initialization
     redis_address = address if address is not None else "127.0.0.1:6379"
-
     return PeerAgent(
         alias=alias,
         server_url=server_url,

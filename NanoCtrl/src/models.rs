@@ -23,17 +23,17 @@ pub struct StartPeerAgentBody {
     pub address: String, // IP address
 }
 
-#[derive(Debug, Deserialize)]
-pub struct InitBody {
-    pub src: String,
-    pub dst: String,
-    pub qp_num: u32,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ConnectBody {
-    pub src: String,
-    pub dst: String,
+/// Desired topology spec for declarative connection management.
+/// Stored in Redis at spec:topology:{agent_id}
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DesiredTopologySpec {
+    pub target_peers: Vec<String>,
+    #[serde(default)]
+    pub min_bw: Option<String>, // e.g. "100Gbps", reserved for future use
+    /// When true, also update each target_peer's spec to include this agent_id.
+    /// Required for Symmetric Rendezvous when only one side (e.g. decode) initiates.
+    #[serde(default)]
+    pub symmetric: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -63,29 +63,6 @@ pub struct GetMrInfoBody {
     pub mr_name: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct GetEndpointInfoBody {
-    pub src: String,
-    pub dst: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct GetEndpointInfoResponse {
-    pub endpoint_info: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct InitResponse {
-    pub status: String,
-    pub message: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ConnectResponse {
-    pub status: String,
-    pub message: String,
-}
-
 #[derive(Debug, Serialize)]
 pub struct RegisterMrResponse {
     pub status: String,
@@ -100,30 +77,6 @@ pub struct StartPeerAgentResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct GetMrInfoResponse {
     pub mr_info: Option<MrInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AckInitBody {
-    pub src: String,
-    pub dst: String,
-    pub endpoint_info: serde_json::Value,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AckConnectBody {
-    pub src: String,
-    pub dst: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateEndpointInfoBody {
-    pub agent_name: String,
-    pub endpoint_info: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AckResponse {
-    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]

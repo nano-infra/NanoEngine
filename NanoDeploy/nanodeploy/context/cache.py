@@ -314,50 +314,24 @@ class CacheContext:
                         )
                         remote_peers_to_connect[peer_alias] = engine_id
 
-        # Lazy connect to all required remote peers using control plane API
-        # Optimized: batch init and connect to reduce O(N) to O(1) wait time
+        # Declarative: set desired topology and wait for reconciliation
+        # TopologyReconciler converges Actual State to Desired State (Symmetric Rendezvous)
         if remote_peers_to_connect:
-            logger.info(
-                f"Batch connecting to {len(remote_peers_to_connect)} peers: {list(remote_peers_to_connect.keys())}"
+            new_peers = list(remote_peers_to_connect.keys())
+            logger.info(f"Batch connecting to {len(new_peers)} peers: {new_peers}")
+
+            # Merge with existing desired peers (set_desired_topology replaces entire spec)
+            all_desired = set(self._connected_peers) | set(new_peers)
+            # symmetric=True: NanoCtrl propagates our alias to each target's spec so both sides reconcile
+            self._peer_agent.set_desired_topology(
+                target_peers=list(all_desired), symmetric=True
             )
 
-            # Step 1: Batch send init requests (non-blocking)
-            for peer_alias, engine_id in remote_peers_to_connect.items():
-                try:
-                    logger.debug(
-                        f"Sending init to peer {peer_alias} for engine {engine_id}"
-                    )
-                    # Initialize connection (as in reference example)
-                    # Level-triggered: init() returns immediately after publishing events
-                    self._peer_agent.init(peer_alias, qp_num=1)
-                except Exception as e:
-                    logger.error(f"Failed to init peer {peer_alias}: {e}")
-                    raise
+            # Wait for new peers to be connected by TopologyReconciler
+            self._peer_agent.wait_for_peers(new_peers, timeout_sec=30)
 
-            # Step 2: Unified wait for all init events to be processed (single wait instead of N waits)
-            # Note: Removed sleep as per user requirement - relying on level-triggered event processing
-
-            # Step 3: Batch send connect requests (non-blocking)
-            for peer_alias, engine_id in remote_peers_to_connect.items():
-                try:
-                    logger.debug(
-                        f"Sending connect to peer {peer_alias} for engine {engine_id}"
-                    )
-                    # Connect
-                    # Level-triggered: connect() returns immediately after publishing events
-                    self._peer_agent.connect(peer_alias)
-                except Exception as e:
-                    logger.error(f"Failed to connect to peer {peer_alias}: {e}")
-                    raise
-
-            # Step 4: Unified wait for all connect events to be processed (single wait instead of N waits)
-            # Note: Removed sleep as per user requirement - relying on level-triggered event processing
-
-            # Update connected peers set
-            self._connected_peers.update(remote_peers_to_connect.keys())
-            logger.info(
-                f"Batch connection completed for {len(remote_peers_to_connect)} peers"
-            )
+            self._connected_peers.update(new_peers)
+            logger.info(f"Batch connection completed for {len(new_peers)} peers")
 
         # Build assignment list for each remote endpoint
         for seq in seqs:

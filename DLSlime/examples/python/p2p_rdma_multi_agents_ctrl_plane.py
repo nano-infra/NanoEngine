@@ -1,7 +1,8 @@
 """
-Example: Multiple Peer Agents using Control Plane for centralized connection setup.
+Example: Multiple Peer Agents using Control Plane (Declarative Topology).
 
 8 agents, mesh network (each agent connects to all others). Measures timing.
+Uses set_desired_topology() and TopologyReconciler for declarative connection setup.
 """
 
 import contextlib
@@ -69,48 +70,33 @@ with contextlib.ExitStack() as stack:
         if verbose:
             print(f"{alias} sees: {list(peers.keys())}")
 
-    # Initialize connections: create a mesh network (each agent connects to all others)
+    # Declarative: set desired topology (mesh - each agent connects to all others)
     print("\n" + "=" * 60)
-    print("Initializing connections (mesh network)...")
+    print("Setting desired topology (mesh)...")
     print("=" * 60)
 
-    def init_connections(agent_alias, agent):
-        """Initialize connections from one agent to all others."""
-        for peer_alias in agents.keys():
-            if peer_alias != agent_alias:
-                try:
-                    agent.init(peer_alias, qp_num=1)
-                    if verbose:
-                        print(f"  {agent_alias} -> {peer_alias}: init OK")
-                except Exception as e:
-                    print(f"  {agent_alias} -> {peer_alias}: init FAILED - {e}")
+    def set_topology(agent_alias, agent):
+        target_peers = [p for p in agents.keys() if p != agent_alias]
+        agent.set_desired_topology(target_peers=target_peers)
+        if verbose:
+            print(f"  {agent_alias}: target_peers={target_peers}")
 
-    with time_measure("init"):
-        run_parallel(agents, init_connections)
+    with time_measure("set_desired_topology"):
+        run_parallel(agents, set_topology)
 
-    # Brief wait for init events to be processed
-    time.sleep(0.5)
-
+    # Wait for TopologyReconciler to establish all connections
     print("\n" + "=" * 60)
-    print("Connecting...")
+    print("Waiting for connections (reconciliation)...")
     print("=" * 60)
 
-    def connect_to_peers(agent_alias, agent):
-        """Connect from one agent to all others."""
-        for peer_alias in agents.keys():
-            if peer_alias != agent_alias:
-                try:
-                    agent.connect(peer_alias)
-                    if verbose:
-                        print(f"  {agent_alias} -> {peer_alias}: connect OK")
-                except Exception as e:
-                    print(f"  {agent_alias} -> {peer_alias}: connect FAILED - {e}")
+    def wait_for_peers(agent_alias, agent):
+        target_peers = [p for p in agents.keys() if p != agent_alias]
+        agent.wait_for_peers(target_peers, timeout_sec=30)
+        if verbose:
+            print(f"  {agent_alias}: all peers connected")
 
-    with time_measure("connect"):
-        run_parallel(agents, connect_to_peers)
-
-    # Brief wait for connect events
-    time.sleep(0.3)
+    with time_measure("wait_for_peers"):
+        run_parallel(agents, wait_for_peers)
 
     # Register memory regions for each agent
     print("\n" + "=" * 60)

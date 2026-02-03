@@ -46,12 +46,12 @@ def test_rdma_read_offset_order():
 
     print("   Agents started")
 
-    # Initialize connection
-    print("\n2. Initializing connection...")
-    agent1.init("test_agent_2", qp_num=1)
-    time.sleep(0.5)
-    agent1.connect("test_agent_2")
-    time.sleep(0.3)
+    # Declarative connection
+    print("\n2. Setting desired topology and waiting for connection...")
+    agent1.set_desired_topology(target_peers=["test_agent_2"])
+    agent2.set_desired_topology(target_peers=["test_agent_1"])
+    agent1.wait_for_peers(["test_agent_2"])
+    agent2.wait_for_peers(["test_agent_1"])
     print("   Connection established")
 
     # Register local buffers
@@ -174,8 +174,8 @@ def test_rdma_read_offset_order():
 
     # Cleanup
     print("\n9. Cleaning up...")
-    agent1.close()
-    agent2.close()
+    agent1.shutdown()
+    agent2.shutdown()
     print("   Done")
 
 

@@ -61,12 +61,12 @@ def test_peer_agent_rdma_read():
         print(f"   ✗ Failed to start agents: {e}")
         return False
 
-    print("\n2. Initializing connection...")
+    print("\n2. Setting desired topology and waiting for connection...")
     try:
-        agent1.init("test_agent_2", qp_num=1)
-        time.sleep(0.5)
-        agent1.connect("test_agent_2")
-        time.sleep(0.3)
+        agent1.set_desired_topology(target_peers=["test_agent_2"])
+        agent2.set_desired_topology(target_peers=["test_agent_1"])
+        agent1.wait_for_peers(["test_agent_2"])
+        agent2.wait_for_peers(["test_agent_1"])
         print("   ✓ Connection initialized")
     except Exception as e:
         print(f"   ✗ Failed to initialize connection: {e}")
