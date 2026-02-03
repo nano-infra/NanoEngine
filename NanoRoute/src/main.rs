@@ -1,5 +1,6 @@
 mod config;
 mod engine_manager;
+mod engine_watcher;
 mod zmq_packet;
 #[allow(warnings)]
 pub mod fbs {
@@ -59,27 +60,77 @@ async fn main() -> anyhow::Result<()> {
     info!("Configuration loaded.");
 
     // Phase 1: Engine Manager & Connect
-    let mut engine_mgr = engine_manager::EngineManager::new();
+    // Get NanoCtrl address from config (required for dynamic discovery)
+    let nanoctrl_address = match &config.engine {
+        config::EngineConfig::Unified {
+            nanoctrl_address, ..
+        } => nanoctrl_address.clone(),
+        config::EngineConfig::Disaggregated {
+            nanoctrl_address, ..
+        } => nanoctrl_address.clone(),
+    };
 
-    // This replaces launch and manual connect loop
-    info!("Connecting to Engines (Manual Config)...");
-    match engine_mgr.connect_all(&config.engine).await {
-        Ok(_) => {
-            info!("Engine connection completed.");
+    let nanoctrl_address = match nanoctrl_address {
+        Some(addr) => addr,
+        None => {
+            error!("nanoctrl_address is required for dynamic service discovery");
+            return Err(anyhow::anyhow!(
+                "nanoctrl_address must be configured in config.toml"
+            ));
+        }
+    };
+
+    info!("Using NanoCtrl at: {}", nanoctrl_address);
+
+    // Get Redis URL from NanoCtrl
+    let engine_mgr = engine_manager::EngineManager::new();
+    let redis_url = match engine_mgr
+        .get_redis_url_from_nanoctrl(&nanoctrl_address)
+        .await
+    {
+        Ok(url) => {
+            info!("Retrieved Redis URL from NanoCtrl: {}", url);
+            url
         }
         Err(e) => {
-            error!("Failed to connect to engines: {}", e);
-            warn!("Continuing without engines - HTTP server will start but requests may fail");
+            error!("Failed to get Redis URL from NanoCtrl: {}", e);
+            return Err(anyhow::anyhow!(
+                "Failed to get Redis URL from NanoCtrl: {}. Make sure NanoCtrl is running and accessible.",
+                e
+            ));
         }
-    }
+    };
 
-    // Log engine counts
-    let prefill_count = engine_mgr.prefill_engines.len();
-    let decode_count = engine_mgr.decode_engines.len();
+    // Start dynamic service discovery (only mode)
     info!(
-        "Connected engines: {} prefill, {} decode",
-        prefill_count, decode_count
+        "Starting dynamic service discovery with Redis: {}",
+        redis_url
     );
+    let engine_manager = match engine_mgr
+        .start_dynamic_discovery(redis_url, Some(nanoctrl_address.clone()))
+        .await
+    {
+        Ok(manager_arc) => {
+            info!("Dynamic service discovery started successfully.");
+            // Log engine counts
+            let manager = manager_arc.lock().await;
+            let prefill_count = manager.prefill_engines.len();
+            let decode_count = manager.decode_engines.len();
+            drop(manager);
+            info!(
+                "Connected engines: {} prefill, {} decode",
+                prefill_count, decode_count
+            );
+            manager_arc
+        }
+        Err(e) => {
+            error!("Failed to start dynamic service discovery: {}", e);
+            return Err(anyhow::anyhow!(
+                "Failed to start dynamic service discovery: {}. Please check Redis connection and NanoCtrl status.",
+                e
+            ));
+        }
+    };
 
     // P2P mesh is handled by NanoCtrl microservice
 
@@ -93,7 +144,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Phase 3: Start HTTP Server
-    let engine_manager = Arc::new(Mutex::new(engine_mgr));
     let tokenizer_service_arc = Arc::new(tokenizer_service);
 
     info!("Starting HTTP Server on port {}", config.server.port);

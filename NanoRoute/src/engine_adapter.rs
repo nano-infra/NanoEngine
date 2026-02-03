@@ -19,6 +19,8 @@ pub struct EngineAdapter {
     pub world_size: i32,
     pub num_blocks: i32,
     pub next_seq_id: AtomicU64,
+    // Shutdown signal: when dropped, closes the channel to stop reader loop
+    pub shutdown_tx: Option<tokio_mpsc::UnboundedSender<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +47,7 @@ impl EngineAdapter {
             world_size: 0,
             num_blocks: 0,
             next_seq_id: AtomicU64::new(1),
+            shutdown_tx: None,
         }
     }
 
@@ -64,19 +67,26 @@ impl EngineAdapter {
 
         let (recv_tx, mut recv_rx) = tokio_mpsc::unbounded_channel::<ZmqPacket>();
 
+        // Create shutdown channel to gracefully stop reader loop
+        let (shutdown_tx, mut shutdown_rx) = tokio_mpsc::unbounded_channel::<()>();
+        let shutdown_tx_for_storage = shutdown_tx.clone();
+        self.shutdown_tx = Some(shutdown_tx_for_storage);
+
         let pending = self.pending_requests.clone();
         let addr_for_log = addr.to_string();
         let addr_for_reader = addr_for_log.clone();
 
         // Single I/O thread: recv with timeout, drain send channel. ZMQ sockets are not thread-safe.
         socket.set_rcvtimeo(100)?; // 100ms timeout for poll loop
+        let recv_tx_for_io = recv_tx.clone();
         thread::spawn(move || {
             loop {
                 // Try recv (returns EAGAIN after timeout if no data)
                 match socket.recv_bytes(0) {
                     Ok(data) => {
                         if let Ok(packet) = ZmqPacket::decode(&data) {
-                            if recv_tx.send(packet).is_err() {
+                            if recv_tx_for_io.send(packet).is_err() {
+                                // Channel closed, reader loop stopped
                                 break;
                             }
                         }
@@ -95,12 +105,23 @@ impl EngineAdapter {
                     }
                 }
             }
+            info!("ZMQ I/O thread ended for {}", addr_for_log);
         });
 
         // Spawn async reader that processes received packets
         tokio::spawn(async move {
             info!("EngineAdapter reader loop started for {}", addr_for_reader);
-            while let Some(packet) = recv_rx.recv().await {
+            loop {
+                tokio::select! {
+                    packet_opt = recv_rx.recv() => {
+                        let packet = match packet_opt {
+                            Some(p) => p,
+                            None => {
+                                // Channel closed, exit loop
+                                info!("EngineAdapter reader loop: recv channel closed for {}", addr_for_reader);
+                                break;
+                            }
+                        };
                 let action = packet.action;
                 let payload = packet.payload;
                 let seq_id = packet.seq_id;
@@ -152,6 +173,13 @@ impl EngineAdapter {
                             state.accumulated_tokens.push(token_id);
                             let _ = state.sender.send(StreamEvent::Token(token_id));
                         }
+                    }
+                }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        // Shutdown signal received, exit loop
+                        info!("EngineAdapter reader loop: shutdown signal received for {}", addr_for_reader);
+                        break;
                     }
                 }
             }

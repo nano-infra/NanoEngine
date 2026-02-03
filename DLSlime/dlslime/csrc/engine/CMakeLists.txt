@@ -31,10 +31,6 @@ if (BUILD_ASCEND_DIRECT)
     add_subdirectory(ascend_direct)
 endif()
 
-if (BUILD_NVSHMEM)
-    add_subdirectory(nvshmem)
-endif()
-
 if (BUILD_RDMA)
     add_subdirectory(rdma)
 endif()

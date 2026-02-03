@@ -51,5 +51,8 @@ minijinja = { version = "1.0", features = ["json", "loader"] }
 # ZMQ (async engine protocol)
 zmq = "0.10"
 
+# Redis for dynamic service discovery
+redis = { version = "0.27", features = ["tokio-comp", "aio", "streams"] }
+
 [dev-dependencies]
 tempfile = "3.10"

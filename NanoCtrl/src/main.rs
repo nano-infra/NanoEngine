@@ -7,6 +7,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+// chrono::Utc is no longer needed since timestamp is set in Lua script
+// Script is no longer needed, we use EVAL directly
 use serde_json::json;
 use std::net::SocketAddr;
 use tokio::sync::oneshot;
@@ -15,7 +17,9 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::models::*;
-use crate::state::AppState;
+use crate::state::{
+    AppState, HEARTBEAT_ENGINE_SCRIPT, REGISTER_ENGINE_SCRIPT, UNREGISTER_ENGINE_SCRIPT,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -48,9 +52,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/cleanup", post(cleanup))
         .route("/get_redis_address", post(get_redis_address))
         .route("/register_engine", post(register_engine))
+        .route("/unregister_engine", post(unregister_engine))
+        .route("/heartbeat_engine", post(heartbeat_engine))
         .route("/get_engine_info", post(get_engine_info))
         .route("/list_engines", post(list_engines))
-        .route("/unregister_engine", post(unregister_engine))
         .layer(
             ServiceBuilder::new().layer(
                 TraceLayer::new_for_http()
@@ -103,11 +108,13 @@ async fn query(
     Json(_body): Json<QueryBody>,
 ) -> Json<Vec<PeerAgent>> {
     // Basic implementation: Scan for agent:* keys
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to get Redis connection: {}", e);
+            return Json(Vec::new());
+        }
+    };
     let keys: Vec<String> = redis::cmd("KEYS")
         .arg("agent:*")
         .query_async(&mut conn)
@@ -158,19 +165,9 @@ async fn start_peer_agent(
     );
 
     let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => {
-            tracing::debug!(
-                "Successfully obtained Redis connection for agent: {}",
-                body.alias
-            );
-            conn
-        }
+        Ok(conn) => conn,
         Err(e) => {
-            tracing::error!(
-                "Failed to get Redis connection for agent {}: {}",
-                body.alias,
-                e
-            );
+            tracing::error!("Failed to get Redis connection: {}", e);
             return Json(StartPeerAgentResponse {
                 status: "error".to_string(),
                 redis_address: "".to_string(),
@@ -292,11 +289,16 @@ async fn init(State(state): State<AppState>, Json(body): Json<InitBody>) -> impl
     let lock = state.get_lock(conn_key.clone()).await;
     let _guard = lock.lock().await;
 
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to get Redis connection: {}", e);
+            return Json(InitResponse {
+                status: "error".to_string(),
+                message: format!("Failed to connect to Redis: {}", e),
+            });
+        }
+    };
 
     // Check if connection already initialized or in progress
     let status: Option<String> = redis::cmd("HGET")
@@ -511,11 +513,16 @@ async fn connect(
     let lock = state.get_lock(conn_key.clone()).await;
     let _guard = lock.lock().await;
 
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to get Redis connection: {}", e);
+            return Json(ConnectResponse {
+                status: "error".to_string(),
+                message: format!("Failed to connect to Redis: {}", e),
+            });
+        }
+    };
 
     // Check if already connected
     let status: Option<String> = redis::cmd("HGET")
@@ -632,11 +639,15 @@ async fn register_mr(
         body.lkey
     );
 
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to get Redis connection: {}", e);
+            return Json(RegisterMrResponse {
+                status: "error".to_string(),
+            });
+        }
+    };
 
     let mr_key = format!("mr:{}:{}", body.agent_name, body.mr_name);
     let mr_info = json!({
@@ -679,11 +690,13 @@ async fn get_mr_info(
         }
     }
 
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to get Redis connection: {}", e);
+            return Json(GetMrInfoResponse { mr_info: None });
+        }
+    };
 
     let mr_key = format!("mr:{}:{}", body.dst, body.mr_name);
     let mr_info_str: Option<String> = redis::cmd("GET")
@@ -738,11 +751,15 @@ async fn get_endpoint_info(
     };
 
     let conn_key = format!("conn:{}:{}", low, high);
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to get Redis connection: {}", e);
+            return Json(GetEndpointInfoResponse {
+                endpoint_info: None,
+            });
+        }
+    };
 
     // Determine which endpoint info to get
     // body.src is the requester, body.dst is whose endpoint info we want
@@ -808,11 +825,15 @@ async fn ack_init(
     };
 
     let conn_key = format!("conn:{}:{}", low, high);
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to get Redis connection: {}", e);
+            return Json(AckResponse {
+                status: "error".to_string(),
+            });
+        }
+    };
 
     // Store endpoint info
     let field_name = if body.src == low {
@@ -910,11 +931,15 @@ async fn ack_connect(
     };
 
     let conn_key = format!("conn:{}:{}", low, high);
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to get Redis connection: {}", e);
+            return Json(AckResponse {
+                status: "error".to_string(),
+            });
+        }
+    };
 
     // Track ACKs: use a counter or check if both sides have ACKed
     // For simplicity, we'll use a counter in Redis
@@ -977,11 +1002,15 @@ async fn update_endpoint_info(
     State(state): State<AppState>,
     Json(body): Json<UpdateEndpointInfoBody>,
 ) -> impl IntoResponse {
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to get Redis connection: {}", e);
+            return Json(AckResponse {
+                status: "error".to_string(),
+            });
+        }
+    };
 
     let key = format!("agent:{}", body.agent_name);
     let _: () = redis::cmd("HSET")
@@ -1001,11 +1030,16 @@ async fn cleanup(
     State(state): State<AppState>,
     Json(body): Json<CleanupBody>,
 ) -> impl IntoResponse {
-    let mut conn = state
-        .redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to get Redis connection: {}", e);
+            return Json(CleanupResponse {
+                status: "error".to_string(),
+                message: format!("Failed to connect to Redis: {}", e),
+            });
+        }
+    };
 
     let agent_name = body.agent_name;
     tracing::info!("Cleaning up agent: {}", agent_name);
@@ -1111,32 +1145,12 @@ async fn get_redis_address(
     State(state): State<AppState>,
     Json(_body): Json<GetRedisAddressBody>,
 ) -> impl IntoResponse {
-    // Extract host:port from redis_url (format: "redis://host:port" or "redis://127.0.0.1:6379")
-    let redis_address = if state.redis_url.starts_with("redis://") {
-        let addr = state
-            .redis_url
-            .strip_prefix("redis://")
-            .unwrap_or(&state.redis_url);
-        // If Redis is on localhost, check if we should use public address
-        if addr.starts_with("127.0.0.1") || addr.starts_with("localhost") {
-            // Use environment variable REDIS_PUBLIC_ADDRESS if set
-            if let Ok(public_addr) = std::env::var("REDIS_PUBLIC_ADDRESS") {
-                tracing::info!("Using REDIS_PUBLIC_ADDRESS={}", public_addr);
-                public_addr
-            } else {
-                addr.to_string()
-            }
-        } else {
-            addr.to_string()
-        }
-    } else {
-        state.redis_url.clone()
-    };
-
-    tracing::info!("Returning Redis address: {}", redis_address);
+    // Return the full Redis URL (e.g., "redis://127.0.0.1:6379")
+    // This allows NanoRouter to connect to Redis for dynamic service discovery
+    tracing::info!("Returning Redis URL: {}", state.redis_url);
     Json(GetRedisAddressResponse {
         status: "ok".to_string(),
-        redis_address,
+        redis_address: state.redis_url.clone(), // Return full URL, not just host:port
     })
 }
 
@@ -1156,29 +1170,35 @@ async fn register_engine(
     );
 
     let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => {
-            tracing::debug!(
-                "Successfully obtained Redis connection for engine: {}",
-                body.engine_id
-            );
-            conn
-        }
+        Ok(conn) => conn,
         Err(e) => {
-            tracing::error!(
-                "Failed to get Redis connection for engine {}: {}",
-                body.engine_id,
-                e
-            );
+            tracing::error!("Failed to get Redis connection: {}", e);
             return Json(RegisterEngineResponse {
                 status: "error".to_string(),
                 message: format!("Failed to connect to Redis: {}", e),
             });
         }
     };
+    let engine_key = format!("engine:{}", body.engine_id);
+    let revision_key = "nano_meta:engine_revision";
+    let channel = "nano_events:engine_update";
 
-    let key = format!("engine:{}", body.engine_id);
-    tracing::debug!("Storing engine info in Redis with key: {}", key);
+    tracing::debug!("Storing engine info in Redis with key: {}", engine_key);
 
+    // Prepare payload JSON (for Lua script's cjson.decode)
+    let zmq_address = format!("tcp://{}:{}", body.host, body.port);
+    let payload = json!({
+        "id": body.engine_id,
+        "role": body.role,
+        "host": body.host,
+        "port": body.port,
+        "zmq_address": zmq_address,
+        "world_size": body.world_size,
+        "num_blocks": body.num_blocks,
+        "peer_addrs": body.peer_addrs,
+    });
+
+    // Prepare engine info JSON (for Redis hash storage)
     let engine_info = json!({
         "id": body.engine_id,
         "role": body.role,
@@ -1189,36 +1209,35 @@ async fn register_engine(
         "peer_addrs": body.peer_addrs,
     });
 
-    match redis::cmd("HSET")
-        .arg(&key)
-        .arg("id")
+    // Use Lua script to atomically: HSET + EXPIRE + INCR + PUBLISH
+    // Note: Using EVAL directly since MultiplexedConnection doesn't implement ConnectionLike for Script
+    let _revision: i64 = match redis::cmd("EVAL")
+        .arg(REGISTER_ENGINE_SCRIPT)
+        .arg(3) // number of keys
+        .arg(&engine_key)
+        .arg(revision_key)
+        .arg(channel)
         .arg(&body.engine_id)
-        .arg("role")
         .arg(&body.role)
-        .arg("world_size")
-        .arg(body.world_size.to_string())
-        .arg("num_blocks")
-        .arg(body.num_blocks.to_string())
-        .arg("host")
         .arg(&body.host)
-        .arg("port")
         .arg(body.port.to_string())
-        .arg("peer_addrs")
+        .arg(body.world_size.to_string())
+        .arg(body.num_blocks.to_string())
         .arg(serde_json::to_string(&body.peer_addrs).unwrap_or_default())
-        .arg("info")
         .arg(engine_info.to_string())
-        .query_async::<()>(&mut conn)
+        .arg(payload.to_string()) // Event payload JSON
+        .arg(state::ENGINE_TTL_SECS.to_string()) // TTL
+        .query_async::<i64>(&mut conn)
         .await
     {
-        Ok(_) => {
+        Ok(rev) => {
             tracing::info!(
-                "Successfully registered engine: {} in Redis",
-                body.engine_id
+                "Successfully registered engine: {} in Redis (revision: {}, TTL: {}s). Event published atomically.",
+                body.engine_id,
+                rev,
+                state::ENGINE_TTL_SECS
             );
-            Json(RegisterEngineResponse {
-                status: "ok".to_string(),
-                message: format!("Engine {} registered successfully", body.engine_id),
-            })
+            rev
         }
         Err(e) => {
             tracing::error!(
@@ -1226,12 +1245,17 @@ async fn register_engine(
                 body.engine_id,
                 e
             );
-            Json(RegisterEngineResponse {
+            return Json(RegisterEngineResponse {
                 status: "error".to_string(),
                 message: format!("Failed to register engine: {}", e),
-            })
+            });
         }
-    }
+    };
+
+    Json(RegisterEngineResponse {
+        status: "ok".to_string(),
+        message: format!("Engine {} registered successfully", body.engine_id),
+    })
 }
 
 async fn get_engine_info(
@@ -1241,19 +1265,9 @@ async fn get_engine_info(
     tracing::info!("Querying engine info for: {}", body.engine_id);
 
     let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => {
-            tracing::debug!(
-                "Successfully obtained Redis connection for engine: {}",
-                body.engine_id
-            );
-            conn
-        }
+        Ok(conn) => conn,
         Err(e) => {
-            tracing::error!(
-                "Failed to get Redis connection for engine {}: {}",
-                body.engine_id,
-                e
-            );
+            tracing::error!("Failed to get Redis connection: {}", e);
             return Json(GetEngineInfoResponse {
                 status: "error".to_string(),
                 engine_info: None,
@@ -1296,12 +1310,9 @@ async fn list_engines(
     tracing::info!("Listing all registered engines");
 
     let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => {
-            tracing::debug!("Successfully obtained Redis connection for listing engines");
-            conn
-        }
+        Ok(conn) => conn,
         Err(e) => {
-            tracing::error!("Failed to get Redis connection for listing engines: {}", e);
+            tracing::error!("Failed to get Redis connection: {}", e);
             return Json(ListEnginesResponse {
                 status: "error".to_string(),
                 engines: Vec::new(),
@@ -1350,49 +1361,45 @@ async fn unregister_engine(
     tracing::info!("Unregistering engine: {}", body.engine_id);
 
     let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => {
-            tracing::debug!(
-                "Successfully obtained Redis connection for engine: {}",
-                body.engine_id
-            );
-            conn
-        }
+        Ok(conn) => conn,
         Err(e) => {
-            tracing::error!(
-                "Failed to get Redis connection for engine {}: {}",
-                body.engine_id,
-                e
-            );
+            tracing::error!("Failed to get Redis connection: {}", e);
             return Json(UnregisterEngineResponse {
                 status: "error".to_string(),
                 message: format!("Failed to connect to Redis: {}", e),
             });
         }
     };
+    let engine_key = format!("engine:{}", body.engine_id);
+    let revision_key = "nano_meta:engine_revision";
+    let channel = "nano_events:engine_update";
 
-    let key = format!("engine:{}", body.engine_id);
-    match redis::cmd("DEL")
-        .arg(&key)
-        .query_async::<i32>(&mut conn)
+    // Use Lua script to atomically: DEL + INCR + PUBLISH
+    // Note: MultiplexedConnection doesn't implement ConnectionLike, so we use EVAL directly
+    match redis::cmd("EVAL")
+        .arg(UNREGISTER_ENGINE_SCRIPT)
+        .arg(3) // number of keys
+        .arg(&engine_key)
+        .arg(revision_key)
+        .arg(channel)
+        .arg(&body.engine_id)
+        .query_async::<i64>(&mut conn)
         .await
     {
-        Ok(deleted) => {
-            if deleted > 0 {
-                tracing::info!(
-                    "Successfully unregistered engine: {} from Redis",
-                    body.engine_id
-                );
-                Json(UnregisterEngineResponse {
-                    status: "ok".to_string(),
-                    message: format!("Engine {} unregistered successfully", body.engine_id),
-                })
-            } else {
+        Ok(rev) => {
+            if rev == 0 {
+                // Engine not found
                 tracing::warn!("Engine {} not found in Redis", body.engine_id);
-                Json(UnregisterEngineResponse {
+                return Json(UnregisterEngineResponse {
                     status: "not_found".to_string(),
                     message: format!("Engine {} not found in Redis", body.engine_id),
-                })
+                });
             }
+            tracing::info!(
+                "Successfully unregistered engine: {} from Redis (revision: {}). Event published atomically.",
+                body.engine_id,
+                rev
+            );
         }
         Err(e) => {
             tracing::error!(
@@ -1400,9 +1407,73 @@ async fn unregister_engine(
                 body.engine_id,
                 e
             );
-            Json(UnregisterEngineResponse {
+            return Json(UnregisterEngineResponse {
                 status: "error".to_string(),
                 message: format!("Failed to unregister engine: {}", e),
+            });
+        }
+    };
+
+    Json(UnregisterEngineResponse {
+        status: "ok".to_string(),
+        message: format!("Engine {} unregistered successfully", body.engine_id),
+    })
+}
+
+async fn heartbeat_engine(
+    State(state): State<AppState>,
+    Json(body): Json<HeartbeatEngineBody>,
+) -> impl IntoResponse {
+    tracing::debug!("Heartbeat for engine: {}", body.engine_id);
+
+    let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Failed to get Redis connection: {}", e);
+            return Json(HeartbeatEngineResponse {
+                status: "error".to_string(),
+                message: format!("Failed to connect to Redis: {}", e),
+            });
+        }
+    };
+
+    let engine_key = format!("engine:{}", body.engine_id);
+
+    // Use Lua script to refresh TTL only (no event, no revision increment)
+    match redis::cmd("EVAL")
+        .arg(HEARTBEAT_ENGINE_SCRIPT)
+        .arg(1) // number of keys
+        .arg(&engine_key)
+        .arg(state::ENGINE_TTL_SECS.to_string()) // TTL
+        .query_async::<i64>(&mut conn)
+        .await
+    {
+        Ok(result) => {
+            if result == 1 {
+                tracing::debug!(
+                    "Heartbeat successful for engine: {} (TTL refreshed)",
+                    body.engine_id
+                );
+                Json(HeartbeatEngineResponse {
+                    status: "ok".to_string(),
+                    message: format!("Heartbeat successful for engine {}", body.engine_id),
+                })
+            } else {
+                tracing::warn!("Engine {} not found in Redis for heartbeat", body.engine_id);
+                Json(HeartbeatEngineResponse {
+                    status: "not_found".to_string(),
+                    message: format!(
+                        "Engine {} not found. Please register first.",
+                        body.engine_id
+                    ),
+                })
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to refresh TTL for engine {}: {}", body.engine_id, e);
+            Json(HeartbeatEngineResponse {
+                status: "error".to_string(),
+                message: format!("Failed to refresh TTL: {}", e),
             })
         }
     }

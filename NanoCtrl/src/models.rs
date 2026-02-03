@@ -197,3 +197,14 @@ pub struct ListEnginesResponse {
     pub status: String,
     pub engines: Vec<serde_json::Value>, // List of engine info as JSON
 }
+
+#[derive(Debug, Deserialize)]
+pub struct HeartbeatEngineBody {
+    pub engine_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HeartbeatEngineResponse {
+    pub status: String,
+    pub message: String,
+}

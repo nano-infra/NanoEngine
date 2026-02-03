@@ -178,10 +178,8 @@ class CacheContext:
                     ) and not server_url.startswith("https://"):
                         server_url = f"http://{server_url}"
 
-                    # Add small delay to avoid all workers registering simultaneously
-                    # This helps prevent connection issues when many workers start at once
-                    delay = random.uniform(0.0, 0.5) * rank  # Stagger by rank
-                    time.sleep(delay)
+                    # Removed delay/sleep as per user requirement
+                    # Note: Control plane should handle concurrent registrations gracefully
 
                     try:
                         self._peer_agent = start_peer_agent_fn(
@@ -317,26 +315,49 @@ class CacheContext:
                         remote_peers_to_connect[peer_alias] = engine_id
 
         # Lazy connect to all required remote peers using control plane API
-        for peer_alias, engine_id in remote_peers_to_connect.items():
-            try:
-                logger.info(
-                    f"Lazy connecting to peer {peer_alias} for engine {engine_id}"
-                )
-                # Initialize connection (as in reference example)
-                # Level-triggered: init() returns immediately after publishing events
-                self._peer_agent.init(peer_alias, qp_num=1)
-                # Wait for init events to be processed by both sides (as in reference example)
-                time.sleep(0.5)  # Increased wait time for level-triggered events
-                # Connect
-                # Level-triggered: connect() returns immediately after publishing events
-                self._peer_agent.connect(peer_alias)
-                # Wait for connect events to be processed (as in reference example)
-                time.sleep(0.3)  # Wait for connect events to be processed
-                self._connected_peers.add(peer_alias)
-                logger.info(f"Connected to peer {peer_alias}")
-            except Exception as e:
-                logger.error(f"Failed to connect to peer {peer_alias}: {e}")
-                raise
+        # Optimized: batch init and connect to reduce O(N) to O(1) wait time
+        if remote_peers_to_connect:
+            logger.info(
+                f"Batch connecting to {len(remote_peers_to_connect)} peers: {list(remote_peers_to_connect.keys())}"
+            )
+
+            # Step 1: Batch send init requests (non-blocking)
+            for peer_alias, engine_id in remote_peers_to_connect.items():
+                try:
+                    logger.debug(
+                        f"Sending init to peer {peer_alias} for engine {engine_id}"
+                    )
+                    # Initialize connection (as in reference example)
+                    # Level-triggered: init() returns immediately after publishing events
+                    self._peer_agent.init(peer_alias, qp_num=1)
+                except Exception as e:
+                    logger.error(f"Failed to init peer {peer_alias}: {e}")
+                    raise
+
+            # Step 2: Unified wait for all init events to be processed (single wait instead of N waits)
+            # Note: Removed sleep as per user requirement - relying on level-triggered event processing
+
+            # Step 3: Batch send connect requests (non-blocking)
+            for peer_alias, engine_id in remote_peers_to_connect.items():
+                try:
+                    logger.debug(
+                        f"Sending connect to peer {peer_alias} for engine {engine_id}"
+                    )
+                    # Connect
+                    # Level-triggered: connect() returns immediately after publishing events
+                    self._peer_agent.connect(peer_alias)
+                except Exception as e:
+                    logger.error(f"Failed to connect to peer {peer_alias}: {e}")
+                    raise
+
+            # Step 4: Unified wait for all connect events to be processed (single wait instead of N waits)
+            # Note: Removed sleep as per user requirement - relying on level-triggered event processing
+
+            # Update connected peers set
+            self._connected_peers.update(remote_peers_to_connect.keys())
+            logger.info(
+                f"Batch connection completed for {len(remote_peers_to_connect)} peers"
+            )
 
         # Build assignment list for each remote endpoint
         for seq in seqs:
@@ -503,9 +524,6 @@ class CacheContext:
                     logger.error(f"No valid RDMA ops for {peer_alias}, skipping")
                     continue
 
-                logger.info(
-                    f"Executing batch RDMA read from {peer_alias}: {len(rdma_ops)} operations"
-                )
                 try:
                     slot = endpoint.read(rdma_ops, None)
                     if slot is None:

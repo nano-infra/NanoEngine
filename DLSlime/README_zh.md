@@ -162,7 +162,6 @@ mkdir -p DLSlime/build && cmake -DFLAG=<ON|OFF> ..
 | `BUILD_RDMA`          | 构建 RDMA 传输引擎                  | Hetero |     ON |
 | `BUILD_PYTHON`        | 构建 Python 封装                    | Hetero |     ON |
 | `BUILD_NVLINK`        | 构建 NVLINK 传输引擎                | GPGPU  |    OFF |
-| `BUILD_NVSHMEM`       | 构建 NVShmem 传输引擎               | NVIDIA |    OFF |
 | `BUILD_ASCEND_DIRECT` | 构建 Ascend 直连传输                | ASCEND |    OFF |
 | `BUILD_TORCH_PLUGIN`  | 构建 DLSlime 为 Torch 后端          | Hetero |    OFF |
 | `USE_GLOO_BACKEND`    | 使用 GLOO RDMA Send/Recv Torch 后端 | Hetero |    OFF |

@@ -212,3 +212,6 @@ scripts/.bin/
 
 # etcd
 **/default.etcd/*
+
+# vibe-codinig
+.claude

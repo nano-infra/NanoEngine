@@ -156,7 +156,6 @@ The `FLAG` can be
 | `BUILD_RDMA`          | Build RDMA Transfer Engine            | Hetero   |      ON |
 | `BUILD_PYTHON`        | Build Python wrapper                  | Hetero   |      ON |
 | `BUILD_NVLINK`        | Build NVLINK Transfer Engine          | GPGPU    |     OFF |
-| `BUILD_NVSHMEM`       | Build NVShmem Transfer Engine         | NVIDIA   |     OFF |
 | `BUILD_ASCEND_DIRECT` | Build Ascend direct transport         | ASCEND   |     OFF |
 | `BUILD_TORCH_PLUGIN`  | Build DLSlime as a torch backend      | Hetero   |     OFF |
 | `USE_GLOO_BACKEND`    | Use GLOO RDMA Send/Recv torch backend | Hetero   |     OFF |

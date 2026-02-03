@@ -24,11 +24,6 @@ if (BUILD_RDMA)
 
 endif()
 
-if (BUILD_NVSHMEM)
-    target_compile_definitions(_slime_c PRIVATE -DBUILD_NVSHMEM)
-    list(APPEND _slime_c_link_libraries _slime_nvshmem)
-endif()
-
 if (BUILD_INTRA_OPS OR BUILD_INTER_OPS)
     if (BUILD_INTRA_OPS)
         target_compile_definitions(_slime_c PRIVATE -DBUILD_INTRA_OPS)

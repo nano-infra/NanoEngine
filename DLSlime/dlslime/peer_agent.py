@@ -274,7 +274,6 @@ class PeerAgent:
             timeout=5,
         )
         response.raise_for_status()
-        print(f"PeerAgent {self.alias}: Sent init ACK for {peer_alias}")
 
     def _handle_connect_event(self, event: Dict[str, Any]):
         """Handle connect event: establish RDMA connection."""

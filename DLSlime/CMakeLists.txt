@@ -12,7 +12,6 @@ slime_option(USE_CUDA                  "USE in CUDA Platform"             OFF)
 slime_option(USE_MACA                  "USE in MACA Platform"             OFF)
 
 slime_option(BUILD_NVLINK              "Build NVLINK"                     OFF)
-slime_option(BUILD_NVSHMEM             "Build NVSHMEM"                    OFF)
 slime_option(BUILD_ASCEND_DIRECT       "Build Ascend direct transport"    OFF)
 
 # Slime options for ops
@@ -38,7 +37,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(DLSLIME_INSTALL_PATH "lib" CACHE STRING "Library installation directory")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if (BUILD_NVSHMEM OR BUILD_NVLINK OR BUILD_INTRA_OPS OR BUILD_INTER_OPS)
+if (BUILD_NVLINK OR BUILD_INTRA_OPS OR BUILD_INTER_OPS)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_ARCHITECTURES "90")

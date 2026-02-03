@@ -17,6 +17,7 @@ pub mod fbs {
 
 pub mod engine_adapter;
 pub mod engine_manager;
+pub mod engine_watcher;
 pub mod http_server;
 pub mod tokenizer;
 mod zmq_packet;

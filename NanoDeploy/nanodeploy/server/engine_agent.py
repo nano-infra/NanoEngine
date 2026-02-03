@@ -1,5 +1,6 @@
 """Engine Agent Plugin for registering engine info with NanoCtrl control plane."""
 
+import asyncio
 import json
 from typing import Optional
 
@@ -18,6 +19,10 @@ class EngineAgent:
         self.engine = engine_component
         self.nanoctrl_address = config.nanoctrl_address
         self.redis_address: Optional[str] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._heartbeat_stop_event = asyncio.Event()
+        self._engine_id: Optional[str] = None
+        self._registered = False
 
     async def get_redis_address(self) -> Optional[str]:
         """Query NanoCtrl for Redis address."""
@@ -74,9 +79,13 @@ class EngineAgent:
                 response.raise_for_status()
                 data = response.json()
                 if data.get("status") == "ok":
+                    self._engine_id = payload["engine_id"]
+                    self._registered = True
                     logger.info(
                         f"Successfully registered engine {payload['engine_id']} with NanoCtrl"
                     )
+                    # Start heartbeat task after successful registration
+                    self._start_heartbeat()
                     return True
                 else:
                     logger.error(
@@ -105,3 +114,110 @@ class EngineAgent:
             logger.warning("EngineAgent startup completed with warnings")
 
         return success
+
+    def _start_heartbeat(self):
+        """Start heartbeat task to keep engine registration alive."""
+        if not self.nanoctrl_address or not self._registered or not self._engine_id:
+            return
+
+        # Stop existing heartbeat task if any
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
+            return
+
+        self._heartbeat_stop_event.clear()
+
+        async def heartbeat_loop():
+            """Heartbeat loop: send heartbeat every 15 seconds."""
+            try:
+                while not self._heartbeat_stop_event.is_set():
+                    await asyncio.sleep(15.0)
+                    if self._heartbeat_stop_event.is_set():
+                        break
+                    try:
+                        await self._heartbeat_to_nanoctrl()
+                    except Exception as e:
+                        logger.error(f"Error in heartbeat loop: {e}", exc_info=True)
+            except asyncio.CancelledError:
+                logger.info("Heartbeat task cancelled")
+            except Exception as e:
+                logger.error(f"Fatal error in heartbeat loop: {e}", exc_info=True)
+
+        self._heartbeat_task = asyncio.create_task(heartbeat_loop())
+        logger.info(
+            f"Started heartbeat task for engine {self._engine_id} (interval: 15s)"
+        )
+
+    async def _heartbeat_to_nanoctrl(self):
+        """Send heartbeat to NanoCtrl to refresh TTL."""
+        if not self.nanoctrl_address or not self._engine_id:
+            return
+
+        try:
+            payload = {"engine_id": self._engine_id}
+            url = f"http://{self.nanoctrl_address}/heartbeat_engine"
+
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+
+                if data.get("status") == "ok":
+                    logger.debug(f"Heartbeat successful for engine {self._engine_id}")
+                elif data.get("status") == "not_found":
+                    # Engine not found, re-register
+                    logger.warning(
+                        f"Engine {self._engine_id} not found in NanoCtrl, re-registering..."
+                    )
+                    self._registered = False
+                    await self.register_engine()
+                else:
+                    logger.warning(
+                        f"Heartbeat failed for engine {self._engine_id}: {data.get('message', 'Unknown error')}"
+                    )
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error in heartbeat: {e}")
+        except Exception as e:
+            logger.error(f"Error sending heartbeat: {e}", exc_info=True)
+
+    async def unregister_engine(self) -> bool:
+        """Unregister engine from NanoCtrl control plane."""
+        if not self.nanoctrl_address or not self._engine_id:
+            return False
+
+        # Stop heartbeat task
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
+            self._heartbeat_stop_event.set()
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        try:
+            payload = {"engine_id": self._engine_id}
+            url = f"http://{self.nanoctrl_address}/unregister_engine"
+            logger.info(f"Unregistering engine {self._engine_id} from NanoCtrl")
+
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("status") == "ok":
+                    logger.info(
+                        f"Successfully unregistered engine {self._engine_id} from NanoCtrl"
+                    )
+                    self._registered = False
+                    return True
+                else:
+                    logger.warning(
+                        f"Failed to unregister engine: {data.get('message', 'Unknown error')}"
+                    )
+                    return False
+        except Exception as e:
+            logger.error(f"Error unregistering engine from NanoCtrl: {e}")
+            return False
+
+    async def shutdown(self):
+        """Shutdown hook: stop heartbeat and unregister engine."""
+        logger.info("EngineAgent shutdown: stopping heartbeat and unregistering engine")
+        await self.unregister_engine()
