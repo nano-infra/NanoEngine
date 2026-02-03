@@ -1,7 +1,6 @@
 use crate::config::EngineConfig;
 use crate::engine_adapter::EngineAdapter;
 use crate::engine_watcher::{EngineEvent, EnginePayload, EngineWatcher};
-use redis;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -28,6 +27,7 @@ impl EngineManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn connect_all(&mut self, config: &EngineConfig) -> anyhow::Result<()> {
         match config {
             EngineConfig::Unified {

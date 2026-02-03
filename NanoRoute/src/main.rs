@@ -24,10 +24,9 @@ mod tokenizer;
 use clap::Parser;
 use config::AppConfig;
 use std::path::PathBuf;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 // use crate::engine_adapter::EngineAdapter; // Removed
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

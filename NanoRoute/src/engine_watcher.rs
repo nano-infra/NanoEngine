@@ -1,11 +1,8 @@
-use crate::engine_adapter::EngineAdapter;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
 /// Engine event types
@@ -137,10 +134,12 @@ impl EngineWatcher {
 
     async fn run_subscription_loop(&mut self) -> anyhow::Result<()> {
         use futures::StreamExt;
-        use redis::AsyncCommands;
 
         let client = redis::Client::open(self.redis_url.as_str())?;
-        let mut conn = client.get_async_connection().await?;
+        // Note: For Pub/Sub, we need a dedicated connection (not multiplexed)
+        // get_async_connection is deprecated but still needed for pubsub
+        #[allow(deprecated)]
+        let conn = client.get_async_connection().await?;
         let mut pubsub = conn.into_pubsub();
 
         // Subscribe to channel
