@@ -78,8 +78,8 @@ if (BUILD_INTER_OPS)
             POSITION_INDEPENDENT_CODE ON
             CXX_STANDARD_REQUIRED ON
             CUDA_STANDARD_REQUIRED ON
-            CXX_STANDARD 17
-            CUDA_STANDARD 17
+            CXX_STANDARD 20
+            CUDA_STANDARD 20
             CUDA_SEPARABLE_COMPILATION ON
     )
 endif()

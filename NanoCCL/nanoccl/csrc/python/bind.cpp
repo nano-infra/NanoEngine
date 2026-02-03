@@ -24,8 +24,8 @@
 #endif
 
 #include "nanocommon/json.hpp"
+#include "nanocommon/logging.h"
 #include "nanocommon/pybind_json/pybind_json.hpp"
-#include "ops/logging.h"
 
 using json = nlohmann::json;
 
