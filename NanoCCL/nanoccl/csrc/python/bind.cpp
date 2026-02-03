@@ -23,9 +23,9 @@
 
 #endif
 
-#include "dlslime/csrc/logging.h"
 #include "nanocommon/json.hpp"
 #include "nanocommon/pybind_json/pybind_json.hpp"
+#include "ops/logging.h"
 
 using json = nlohmann::json;
 
@@ -51,15 +51,15 @@ PYBIND11_MODULE(_nanoccl_c, m)
     EXPOSE_BUILD_FLAG(m, BUILD_INTER_OPS);
 
 #ifdef BUILD_INTRA_OPS
-    py::class_<dlslime::AllToAllIntraLLBuffer>(m, "AllToAllIntraLLBuffer")
+    py::class_<nanoccl::AllToAllIntraLLBuffer>(m, "AllToAllIntraLLBuffer")
         .def(py::init<int32_t, int32_t, int32_t, int32_t, int64_t>())
-        .def("buffer_info", &dlslime::AllToAllIntraLLBuffer::buffer_info)
-        .def("connect_full_mesh", &dlslime::AllToAllIntraLLBuffer::connectFullMesh)
-        .def("get_local_buffer", &dlslime::AllToAllIntraLLBuffer::getLocalBuffer)
-        .def("get_buffer_size_hint", &dlslime::AllToAllIntraLLBuffer::get_buffer_size_hint)
-        .def("set_max_bs", &dlslime::AllToAllIntraLLBuffer::setMaxBs)
+        .def("buffer_info", &nanoccl::AllToAllIntraLLBuffer::buffer_info)
+        .def("connect_full_mesh", &nanoccl::AllToAllIntraLLBuffer::connectFullMesh)
+        .def("get_local_buffer", &nanoccl::AllToAllIntraLLBuffer::getLocalBuffer)
+        .def("get_buffer_size_hint", &nanoccl::AllToAllIntraLLBuffer::get_buffer_size_hint)
+        .def("set_max_bs", &nanoccl::AllToAllIntraLLBuffer::setMaxBs)
         .def("all_to_all_ll",
-             &dlslime::AllToAllIntraLLBuffer::allToAllLL2D,
+             &nanoccl::AllToAllIntraLLBuffer::allToAllLL2D,
              py::arg("x"),
              py::arg("is_transpose") = false,
              py::arg("mask")         = py::none(),
@@ -68,12 +68,12 @@ PYBIND11_MODULE(_nanoccl_c, m)
 #endif
 
 #ifdef BUILD_INTER_OPS
-    py::class_<dlslime::AllGatherInterLLBuffer>(m, "AllGatherInterLLBuffer")
+    py::class_<nanoccl::AllGatherInterLLBuffer>(m, "AllGatherInterLLBuffer")
         .def(py::init<int64_t, int64_t, torch::Dtype, int64_t, int64_t, int64_t>())
         .def(py::init<int64_t, int64_t, torch::Dtype, int64_t, int64_t, int64_t, bool>())
-        .def("buffer_info", &dlslime::AllGatherInterLLBuffer::bufferInfo)
-        .def("connect_full_mesh", &dlslime::AllGatherInterLLBuffer::connectFullMesh)
-        .def("all_gather_ll", &dlslime::AllGatherInterLLBuffer::allGatherLL)
-        .def("all_gather_ll_hook", &dlslime::AllGatherInterLLBuffer::allGatherLLHook);
+        .def("buffer_info", &nanoccl::AllGatherInterLLBuffer::bufferInfo)
+        .def("connect_full_mesh", &nanoccl::AllGatherInterLLBuffer::connectFullMesh)
+        .def("all_gather_ll", &nanoccl::AllGatherInterLLBuffer::allGatherLL)
+        .def("all_gather_ll_hook", &nanoccl::AllGatherInterLLBuffer::allGatherLLHook);
 #endif
 }

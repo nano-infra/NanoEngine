@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-namespace dlslime {
+namespace nanoccl {
 
 void all_to_all_intra_ll(torch::Tensor                buffer_ori,
                          int8_t**                     ipc_buffer_ptr,
@@ -18,4 +18,4 @@ void all_to_all_intra_ll(torch::Tensor                buffer_ori,
                          c10::optional<torch::Tensor> mask,
                          c10::optional<torch::Tensor> offsets);
 
-}  // namespace dlslime
+}  // namespace nanoccl

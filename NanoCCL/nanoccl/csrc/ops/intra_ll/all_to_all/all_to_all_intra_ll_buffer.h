@@ -15,7 +15,7 @@
 
 using json = nlohmann::json;
 
-namespace dlslime {
+namespace nanoccl {
 
 class AllToAllIntraLLBuffer {
 
@@ -63,4 +63,4 @@ private:
 
     int64_t local_buffer_size_;
 };
-}  // namespace dlslime
+}  // namespace nanoccl

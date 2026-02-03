@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dlslime {
+namespace nanoccl {
 namespace nvshmem_api {
 
 std::vector<uint8_t> get_unique_id();
@@ -19,4 +19,4 @@ void free(void* ptr);
 void barrier();
 
 }  // namespace nvshmem_api
-}  // namespace dlslime
+}  // namespace nanoccl

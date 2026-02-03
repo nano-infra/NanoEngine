@@ -6,10 +6,10 @@
 #include <stdexcept>
 
 #include "all_gather_inter_ll.h"
-#include "dlslime/csrc/logging.h"
+#include "ops/logging.h"
 #include "ops/nvshmem_api.cuh"
 
-namespace dlslime {
+namespace nanoccl {
 
 AllGatherInterLLBuffer::AllGatherInterLLBuffer(
     int64_t max_bs, int64_t msg_size, torch::Dtype dtype, int64_t world_size, int64_t rank, int64_t num_concurrency):
@@ -21,7 +21,7 @@ AllGatherInterLLBuffer::AllGatherInterLLBuffer(
     num_concurrency_(num_concurrency)
 {
     cudaSetDevice(localRank());
-    SLIME_ASSERT((msg_size * itemsize()) % 16 == 0, "By now, msg size must be divided by 16");
+    NANOCCL_ASSERT((msg_size * itemsize()) % 16 == 0, "By now, msg size must be divided by 16");
 }
 
 AllGatherInterLLBuffer::AllGatherInterLLBuffer(int64_t      max_bs,
@@ -58,10 +58,10 @@ int AllGatherInterLLBuffer::allocSymBuffer()
     size_t buffer_size = getBufferSize();
 
     sym_buffer_ = reinterpret_cast<int8_t*>(nvshmem_api::alloc(buffer_size, nvshmem_alignment));
-    SLIME_ASSERT(sym_buffer_ != NULL, "failure of symbuffer allocation!");
+    NANOCCL_ASSERT(sym_buffer_ != NULL, "failure of symbuffer allocation!");
     nvshmem_api::barrier();
     sym_signal_ = reinterpret_cast<int*>(nvshmem_api::alloc(world_size_ * sizeof(int), nvshmem_alignment));
-    SLIME_ASSERT(sym_signal_ != NULL, "failure of symsignal allocation!");
+    NANOCCL_ASSERT(sym_signal_ != NULL, "failure of symsignal allocation!");
     nvshmem_api::barrier();
     cudaMemset(sym_buffer_, 0, buffer_size);
     cudaMemset(sym_signal_, 0, world_size_ * sizeof(int));
@@ -84,14 +84,14 @@ int AllGatherInterLLBuffer::connectFullMesh(std::vector<json> all_buffer_info)
     nvshmem_api::barrier();
     allocSymBuffer();
     nvshmem_api::barrier();
-    SLIME_ASSERT(nvshmem_rank == rank_, "nvshmem_rank != rank_");
+    NANOCCL_ASSERT(nvshmem_rank == rank_, "nvshmem_rank != rank_");
     return 0;
 }
 
 std::tuple<torch::Tensor, std::function<void()>> AllGatherInterLLBuffer::allGatherLLHook(torch::Tensor q, int32_t tag)
 {
 
-    SLIME_ASSERT(q.dtype() == dtype_, "unmatched data type!");
+    NANOCCL_ASSERT(q.dtype() == dtype_, "unmatched data type!");
 
     auto launcher = [=](int phase) {
         all_gather_inter_ll(
@@ -114,8 +114,8 @@ std::tuple<torch::Tensor, std::function<void()>> AllGatherInterLLBuffer::allGath
 torch::Tensor AllGatherInterLLBuffer::allGatherLL(torch::Tensor q, int32_t tag)
 {
 
-    SLIME_ASSERT(q.dtype() == dtype_, "unmatched data type!");
-    SLIME_ASSERT(tag < num_concurrency_, "tag (" << tag << ") < num_concurrency (" << num_concurrency_ << ") failed");
+    NANOCCL_ASSERT(q.dtype() == dtype_, "unmatched data type!");
+    NANOCCL_ASSERT(tag < num_concurrency_, "tag (", tag, ") < num_concurrency (", num_concurrency_, ") failed");
 
     all_gather_inter_ll(q,
                         sym_buffer_,
@@ -136,4 +136,4 @@ torch::Tensor AllGatherInterLLBuffer::allGatherLL(torch::Tensor q, int32_t tag)
                             options);
 }
 
-}  // namespace dlslime
+}  // namespace nanoccl

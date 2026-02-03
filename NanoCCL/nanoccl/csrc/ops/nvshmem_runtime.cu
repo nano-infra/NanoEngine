@@ -12,7 +12,7 @@
 #include "nvshmem_common.cuh"
 #include "utils.cuh"
 
-namespace dlslime {
+namespace nanoccl {
 namespace nvshmem_api {
 
 int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks)
@@ -51,4 +51,4 @@ void barrier()
 }
 
 }  // namespace nvshmem_api
-}  // namespace dlslime
+}  // namespace nanoccl

@@ -5,8 +5,8 @@ project(nanoccl C CXX)
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
 # NanoCCL options for ops
-slime_option(BUILD_INTRA_OPS           "Build intra LL collective ops"    OFF)
-slime_option(BUILD_INTER_OPS           "Build inter LL collective ops"    OFF)
+nanoccl_option(BUILD_INTRA_OPS           "Build intra LL collective ops"    OFF)
+nanoccl_option(BUILD_INTER_OPS           "Build inter LL collective ops"    OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -34,15 +34,15 @@ message(STATUS "NanoInfra Root Path: ${NANOINFRA_DIR}")
 
 add_subdirectory(${NANOINFRA_DIR}/NanoCommon NanoCommon)
 
-# Include DLSlime for logging (if needed)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR} nanoccl/csrc ${NANOINFRA_DIR}/NanoCommon/include ${NANOINFRA_DIR}/DLSlime)
+# Include NanoCommon for logging
+include_directories(${CMAKE_CURRENT_SOURCE_DIR} nanoccl/csrc ${NANOINFRA_DIR}/NanoCommon/include)
 
 if (BUILD_INTRA_OPS OR BUILD_INTER_OPS)
     add_subdirectory(nanoccl/csrc/ops)
 endif()
 
 # Python bindings
-slime_option(BUILD_PYTHON              "Build python wrapper"             OFF)
+nanoccl_option(BUILD_PYTHON              "Build python wrapper"             OFF)
 
 if (BUILD_PYTHON)
     add_subdirectory(nanoccl/csrc/python)

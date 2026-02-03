@@ -16,7 +16,7 @@
 #include "ops/nvshmem_api.cuh"
 #include "ops/utils.cuh"
 
-namespace dlslime {
+namespace nanoccl {
 
 #define MAX_SMS                                                                                                        \
     int64_t                                                                                                            \
@@ -180,4 +180,4 @@ void all_gather_inter_ll(torch::Tensor q,
     return;
 }
 
-}  // namespace dlslime
+}  // namespace nanoccl

@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-namespace dlslime {
+namespace nanoccl {
 
 #define ALL_GATHER_LL_SEND_PHASE 0b01
 #define ALL_GATHER_LL_RECV_PHASE 0b10
@@ -22,4 +22,4 @@ void all_gather_inter_ll(torch::Tensor q,
                          int64_t       tag,
                          bool          allow_nvlink);
 
-}  // namespace dlslime
+}  // namespace nanoccl

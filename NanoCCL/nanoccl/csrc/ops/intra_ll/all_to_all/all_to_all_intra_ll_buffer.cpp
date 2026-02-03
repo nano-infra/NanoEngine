@@ -3,9 +3,9 @@
 #include <torch/torch.h>
 
 #include "c10/core/ScalarType.h"
-#include "dlslime/csrc/logging.h"
+#include "ops/logging.h"
 
-namespace dlslime {
+namespace nanoccl {
 
 AllToAllIntraLLBuffer::AllToAllIntraLLBuffer(
     int32_t max_dispatch_per_msg, int32_t max_bs, int32_t rank, int32_t world_size, int64_t local_buffer_size):
@@ -15,18 +15,15 @@ AllToAllIntraLLBuffer::AllToAllIntraLLBuffer(
     world_size_(world_size),
     local_buffer_size_(local_buffer_size)
 {
-    SLIME_LOG_INFO("Initialize AllToAll Intra LL Buffer. "
-                   "local_buffer_size="
-                   << local_buffer_size
-                   << " bytes, "
-                      "max_bs="
-                   << max_bs
-                   << ", "
-                      "rank="
-                   << rank
-                   << ", "
-                      "world_size="
-                   << world_size << ".");
+    NANOCCL_LOG_INFO("Initialize AllToAll Intra LL Buffer. local_buffer_size=",
+                     local_buffer_size,
+                     " bytes, max_bs=",
+                     max_bs,
+                     ", rank=",
+                     rank,
+                     ", world_size=",
+                     world_size,
+                     ".");
     allocBuffer(local_buffer_size);
 }
 
@@ -43,7 +40,7 @@ int AllToAllIntraLLBuffer::allocBuffer(std::optional<int64_t> local_buffer_size_
     CUDA_CHECK(cudaMalloc(&buffer_ptrs_, sizeof(int8_t*) * world_size_));
     CUDA_CHECK(cudaMalloc(&signal_ptrs_, sizeof(int*) * world_size_));
 
-    SLIME_ASSERT(local_buffer_size_opt.has_value(), "null default value is forbidden");
+    NANOCCL_ASSERT(local_buffer_size_opt.has_value(), "null default value is forbidden");
     int64_t buffer_size = local_buffer_size_opt.value();
 
     CUDA_CHECK(cudaMalloc(&local_buffer_, buffer_size));
@@ -114,9 +111,9 @@ torch::Tensor AllToAllIntraLLBuffer::allToAllLL2D(torch::Tensor                x
 {
 
     auto shape = x.sizes();
-    SLIME_ASSERT(shape.size() == 2, "Input must be a 2D tensor");
+    NANOCCL_ASSERT(shape.size() == 2, "Input must be a 2D tensor");
     auto msg_size = shape[1];
-    SLIME_ASSERT(msg_size * x.itemsize() % 16 == 0, "msg_size must be divided by 16");
+    NANOCCL_ASSERT(msg_size * x.itemsize() % 16 == 0, "msg_size must be divided by 16");
 
     all_to_all_intra_ll(
         x, buffer_ptrs_, signal_ptrs_, max_dispatch_per_msg_, max_bs_, rank_, world_size_, is_transpose, mask, offsets);
@@ -129,20 +126,30 @@ torch::Tensor AllToAllIntraLLBuffer::allToAllLL2D(torch::Tensor                x
         int32_t total_messages = 0;
         if (!offsets_tensor.is_cuda()) {
             int32_t total_messages = offsets_tensor.data_ptr<int32_t>()[world_size_];
-            SLIME_ASSERT(total_messages <= world_size_ * max_bs_,
-                         "offsets total_messages (" << total_messages << ") exceeds buffer capacity ("
-                                                    << (world_size_ * max_bs_) << ").");
+            NANOCCL_ASSERT(total_messages <= world_size_ * max_bs_,
+                           "offsets total_messages (",
+                           total_messages,
+                           ") exceeds buffer capacity (",
+                           (world_size_ * max_bs_),
+                           ").");
         }
         return torch::from_blob(reinterpret_cast<void*>(local_buffer_), {world_size_, max_bs_, msg_size}, options);
     }
 
-    SLIME_ASSERT(world_size_ * max_bs_ * shape[1] * x.itemsize() <= local_buffer_size_,
-                 "local_buffer_size_ (" << local_buffer_size_ << "), demand components: "
-                                        << "world_size_=" << world_size_ << ", "
-                                        << "max_bs_=" << max_bs_ << ", "
-                                        << "shape[1]=" << shape[1] << ", "
-                                        << "x.itemsize()=" << x.itemsize() << ", "
-                                        << "total demand=" << (world_size_ * max_bs_ * shape[1] * x.itemsize()) << ".");
+    NANOCCL_ASSERT(world_size_ * max_bs_ * shape[1] * x.itemsize() <= local_buffer_size_,
+                   "local_buffer_size_ (",
+                   local_buffer_size_,
+                   "), demand components: world_size_=",
+                   world_size_,
+                   ", max_bs_=",
+                   max_bs_,
+                   ", shape[1]=",
+                   shape[1],
+                   ", x.itemsize()=",
+                   x.itemsize(),
+                   ", total demand=",
+                   (world_size_ * max_bs_ * shape[1] * x.itemsize()),
+                   ".");
 
     return torch::from_blob(reinterpret_cast<void*>(local_buffer_), {world_size_, max_bs_, msg_size}, options);
 }
@@ -154,4 +161,4 @@ torch::Tensor AllToAllIntraLLBuffer::getLocalBuffer()
     return torch::from_blob(reinterpret_cast<void*>(local_buffer_), {local_buffer_size_}, options);
 }
 
-}  // namespace dlslime
+}  // namespace nanoccl

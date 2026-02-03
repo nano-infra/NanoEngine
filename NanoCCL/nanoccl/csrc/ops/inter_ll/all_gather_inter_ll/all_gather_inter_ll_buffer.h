@@ -12,7 +12,7 @@
 #include "ops/nvshmem_common.cuh"
 #include "torch/types.h"
 
-namespace dlslime {
+namespace nanoccl {
 
 using json = nlohmann::json;
 
@@ -68,4 +68,4 @@ private:
     bool allow_nvlink_{false};
 };
 
-}  // namespace dlslime
+}  // namespace nanoccl
