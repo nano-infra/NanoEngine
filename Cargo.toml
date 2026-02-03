@@ -1,5 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["NanoRoute", "NanoCtrl"]
-
-exclude = ["third_party/flatbuffers/tests/*"]

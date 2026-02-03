@@ -35,22 +35,23 @@
 #endif
 #endif
 
-#if defined(BUILD_INTRA_OPS) || defined(BUILD_INTER_OPS)
-#include <torch/torch.h>
-
-#ifdef BUILD_INTRA_OPS
-#include "ops/intra_ll/all_to_all/all_to_all_intra_ll_buffer.h"
-#endif
-
-#ifdef BUILD_INTER_OPS
-#include "ops/inter_ll/all_gather_inter_ll/all_gather_inter_ll_buffer.h"
-#endif
-
-#endif
+// Ops moved to NanoCCL - these includes are commented out
+// #if defined(BUILD_INTRA_OPS) || defined(BUILD_INTER_OPS)
+// #include <torch/torch.h>
+//
+// #ifdef BUILD_INTRA_OPS
+// #include "nanoccl/csrc/ops/intra_ll/all_to_all/all_to_all_intra_ll_buffer.h"
+// #endif
+//
+// #ifdef BUILD_INTER_OPS
+// #include "nanoccl/csrc/ops/inter_ll/all_gather_inter_ll/all_gather_inter_ll_buffer.h"
+// #endif
+//
+// #endif
 
 #include "dlslime/csrc/logging.h"
 #include "nanocommon/json.hpp"
-#include "pybind_json/pybind_json.hpp"
+#include "nanocommon/pybind_json/pybind_json.hpp"
 
 using json = nlohmann::json;
 
@@ -68,17 +69,9 @@ namespace py = pybind11;
 #define BUILD_NVLINK_ENABLED false
 #endif
 
-#ifdef BUILD_INTRA_OPS
-#define BUILD_INTRA_OPS_ENABLED true
-#else
+// Ops moved to NanoCCL
 #define BUILD_INTRA_OPS_ENABLED false
-#endif
-
-#ifdef BUILD_INTER_OPS
-#define BUILD_INTER_OPS_ENABLED true
-#else
 #define BUILD_INTER_OPS_ENABLED false
-#endif
 
 #ifdef BUILD_RDMA_RENDEZVOUS_ZMQ
 #define BUILD_RDMA_RENDEZVOUS_ZMQ_ENABLED true
@@ -265,30 +258,31 @@ PYBIND11_MODULE(_slime_c, m)
              py::call_guard<py::gil_scoped_release>());
 #endif
 
-#ifdef BUILD_INTRA_OPS
-    py::class_<dlslime::AllToAllIntraLLBuffer>(m, "AllToAllIntraLLBuffer")
-        .def(py::init<int32_t, int32_t, int32_t, int32_t, int64_t>())
-        .def("buffer_info", &dlslime::AllToAllIntraLLBuffer::buffer_info)
-        .def("connect_full_mesh", &dlslime::AllToAllIntraLLBuffer::connectFullMesh)
-        .def("get_local_buffer", &dlslime::AllToAllIntraLLBuffer::getLocalBuffer)
-        .def("get_buffer_size_hint", &dlslime::AllToAllIntraLLBuffer::get_buffer_size_hint)
-        .def("set_max_bs", &dlslime::AllToAllIntraLLBuffer::setMaxBs)
-        .def("all_to_all_ll",
-             &dlslime::AllToAllIntraLLBuffer::allToAllLL2D,
-             py::arg("x"),
-             py::arg("is_transpose") = false,
-             py::arg("mask")         = py::none(),
-             py::arg("offsets")      = py::none(),
-             "AllGather with optional mask and offsets");
-#endif
-
-#ifdef BUILD_INTER_OPS
-    py::class_<dlslime::AllGatherInterLLBuffer>(m, "AllGatherInterLLBuffer")
-        .def(py::init<int32_t, int32_t, torch::Dtype, int32_t, int32_t, int32_t>())
-        .def(py::init<int32_t, int32_t, torch::Dtype, int32_t, int32_t, int32_t, bool>())
-        .def("buffer_info", &dlslime::AllGatherInterLLBuffer::bufferInfo)
-        .def("connect_full_mesh", &dlslime::AllGatherInterLLBuffer::connectFullMesh)
-        .def("all_gather_ll", &dlslime::AllGatherInterLLBuffer::allGatherLL)
-        .def("all_gather_ll_hook", &dlslime::AllGatherInterLLBuffer::allGatherLLHook);
-#endif
+    // Ops moved to NanoCCL - Python bindings should be in NanoCCL's Python module
+    // #ifdef BUILD_INTRA_OPS
+    //     py::class_<dlslime::AllToAllIntraLLBuffer>(m, "AllToAllIntraLLBuffer")
+    //         .def(py::init<int32_t, int32_t, int32_t, int32_t, int64_t>())
+    //         .def("buffer_info", &dlslime::AllToAllIntraLLBuffer::buffer_info)
+    //         .def("connect_full_mesh", &dlslime::AllToAllIntraLLBuffer::connectFullMesh)
+    //         .def("get_local_buffer", &dlslime::AllToAllIntraLLBuffer::getLocalBuffer)
+    //         .def("get_buffer_size_hint", &dlslime::AllToAllIntraLLBuffer::get_buffer_size_hint)
+    //         .def("set_max_bs", &dlslime::AllToAllIntraLLBuffer::setMaxBs)
+    //         .def("all_to_all_ll",
+    //              &dlslime::AllToAllIntraLLBuffer::allToAllLL2D,
+    //              py::arg("x"),
+    //              py::arg("is_transpose") = false,
+    //              py::arg("mask")         = py::none(),
+    //              py::arg("offsets")      = py::none(),
+    //              "AllGather with optional mask and offsets");
+    // #endif
+    //
+    // #ifdef BUILD_INTER_OPS
+    //     py::class_<dlslime::AllGatherInterLLBuffer>(m, "AllGatherInterLLBuffer")
+    //         .def(py::init<int32_t, int32_t, torch::Dtype, int32_t, int32_t, int32_t>())
+    //         .def(py::init<int32_t, int32_t, torch::Dtype, int32_t, int32_t, int32_t, bool>())
+    //         .def("buffer_info", &dlslime::AllGatherInterLLBuffer::bufferInfo)
+    //         .def("connect_full_mesh", &dlslime::AllGatherInterLLBuffer::connectFullMesh)
+    //         .def("all_gather_ll", &dlslime::AllGatherInterLLBuffer::allGatherLL)
+    //         .def("all_gather_ll_hook", &dlslime::AllGatherInterLLBuffer::allGatherLLHook);
+    // #endif
 }

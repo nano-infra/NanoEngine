@@ -1,13 +1,5 @@
 import os
 
-# Set environment variables BEFORE importing ray and other modules
-# These need to be set in the main process so they are inherited by all Ray workers
-os.environ["KVCACHE_EXPORT_ENABLED"] = "1"
-os.environ["KVCACHE_EXPORT_DIR"] = (
-    "/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoDeploy/"
-)
-os.environ["KVCACHE_VERIFY_ENABLED"] = "1"
-
 import ray
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence

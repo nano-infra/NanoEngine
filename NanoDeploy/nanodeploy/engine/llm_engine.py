@@ -1,15 +1,6 @@
-import os
-
-# Set KV cache export/verify environment variables for LLMComponent process
-# These need to be set here because ModelRunner is a different process
-os.environ.setdefault("KVCACHE_EXPORT_ENABLED", "1")
-os.environ.setdefault(
-    "KVCACHE_EXPORT_DIR", "/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoDeploy/"
-)
-os.environ.setdefault("KVCACHE_VERIFY_ENABLED", "1")
-
 import atexit
 import json
+import os
 import threading
 import time
 import uuid

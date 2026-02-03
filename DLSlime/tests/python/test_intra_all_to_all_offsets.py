@@ -2,7 +2,7 @@ import os
 
 import torch
 import torch.distributed as dist
-from dlslime.buffer.intra.all_to_all_intra_ll_buffer import AllToAllIntraLLBuffer
+from nanoccl.buffer.intra.all_to_all_intra_ll_buffer import AllToAllIntraLLBuffer
 
 # 配置信息
 MAX_BS = 128

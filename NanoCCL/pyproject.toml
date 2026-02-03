@@ -21,8 +21,8 @@ classifiers = [
   "Topic :: System :: Networking",
   "Topic :: System :: Systems Administration",
 ]
-description = "DLSlime Transfer Engine"
-name = "dlslime"
+description = "NanoCCL"
+name = "nanoccl"
 readme = "README.md"
 requires-python = ">=3.8"
 version = "0.0.2.post1"
@@ -31,22 +31,13 @@ dependencies = [
   "pydantic>=2.0",
   "pyzmq>=25.0",
   "protobuf>=4.0",
-  "nanoccl>=0.0.2",
   # for --build-no-isolation
   "scikit-build-core>=0.10",
   "pybind11>=2.12",
 ]
 
-[project.urls]
-Homepage = "https://github.com/DeepLink-org/DLSlime.git"
-Repository = "https://github.com/DeepLink-org/DLSlime.git"
-
 [tool.scikit-build]
-# optional env variable:
-# BUILD_TORCH_PLUGIN: OFF
-# BUILD_NVLINK: OFF
-# USE_MACA: OFF
-cmake.args = ["-G Ninja", "-DDLSLIME_INSTALL_PATH=dlslime", "-DBUILD_PYTHON=ON"]
+cmake.args = ["-G Ninja", "-DNANOCCL_INSTALL_PATH=nanoccl", "-DBUILD_PYTHON=ON"]
 cmake.build-type = "Release"
 
 build-dir = "build"

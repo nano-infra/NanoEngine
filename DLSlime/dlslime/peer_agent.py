@@ -288,10 +288,6 @@ class PeerAgent:
         else:
             return  # Not for us
 
-        print(
-            f"PeerAgent {self.alias}: Received connect event, connecting to {peer_alias}"
-        )
-
         # Get remote endpoint info from server
         # We need the endpoint info of the remote peer
         response = requests.post(

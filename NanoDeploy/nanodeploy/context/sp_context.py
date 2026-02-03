@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 import torch
-from dlslime.buffer.intra.all_to_all_intra_ll_buffer import AllToAllIntraLLBuffer
+from nanoccl.buffer.intra.all_to_all_intra_ll_buffer import AllToAllIntraLLBuffer
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.logging import get_logger
 

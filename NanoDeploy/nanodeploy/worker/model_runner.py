@@ -59,44 +59,6 @@ class ModelRunner:
         self.world_size = config.attn_world_size
         self.rank = rank
 
-        self.rank = rank
-
-        # Helper to setup CPATH for DeepGEMM/CUTLASS in Ray worker
-        # Attempt to locate DeepGEMM relative to NanoDeploy location or CWD
-        import os
-
-        # Try to find DeepGEMM in common locations
-        candidates = [
-            os.path.abspath(os.path.join(os.getcwd(), "../DeepGEMM")),
-            "/mnt/nvme1n1/ml_research/majinming/src/DeepGEMM",
-        ]
-        os.environ["KVCACHE_EXPORT_ENABLED"] = "1"
-        os.environ["KVCACHE_EXPORT_DIR"] = (
-            "/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoDeploy/"
-        )
-        os.environ["KVCACHE_VERIFY_ENABLED"] = "1"
-
-        cutlass_include = None
-        for path in candidates:
-            candidate_include = os.path.join(path, "third-party/cutlass/include")
-            if os.path.exists(candidate_include):
-                cutlass_include = candidate_include
-                break
-
-        if cutlass_include:
-            current_cpath = os.environ.get("CPATH", "")
-            if cutlass_include not in current_cpath:
-                logger.info(f"Adding CUTLASS include path to CPATH: {cutlass_include}")
-                os.environ["CPATH"] = (
-                    f"{cutlass_include}:{current_cpath}"
-                    if current_cpath
-                    else cutlass_include
-                )
-        else:
-            logger.warning(
-                "DeepGEMM/CUTLASS include path not found. DeepGEMM JIT might fail."
-            )
-
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
         set_runner_config(
@@ -194,10 +156,9 @@ class ModelRunner:
         dist.barrier()
 
         self.sampler = Sampler()
-        # self.warmup_model()
         self.preallocate_kvcache()
 
-        self.endpoint = RPCClientEndpoint(32_000_000, get_dist_context().rank)
+        self.endpoint = RPCClientEndpoint(320_000_000, get_dist_context().rank)
 
     def init_rpc_endpoint(self, server_info):
         client_info = self.endpoint.init_client_endpoint()
@@ -230,6 +191,7 @@ class ModelRunner:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(self.default_dtype)
+        self.warmup_model()
 
     def ensure_p2p_connected(
         self, peer_id: str, addrs: list[str], num_blocks: int

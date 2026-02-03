@@ -26,6 +26,7 @@ dependencies = [
     # "flash-attn",
     "xxhash",
     "dlslime>=0.0.1.post9",
+    "nanoccl>=0.0.2",
     "dlblas",
     "httpx",
 ]
