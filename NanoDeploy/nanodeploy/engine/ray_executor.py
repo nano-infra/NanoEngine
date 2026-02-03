@@ -169,14 +169,6 @@ class RayExecutor:
         self.collective_rpc("allocate_kvcache", (num_cache_blocks,))
         return num_cache_blocks
 
-    def p2p_init(self, remote_name: str, num_kv_blocks: int, remote_world_size: int):
-        return self.collective_rpc(
-            "p2p_init", (remote_name, num_kv_blocks, remote_world_size)
-        )
-
-    def p2p_connect(self, remote_name: str, remote_endpoint_infos: list[bytes]):
-        return self.collective_rpc("p2p_connect", (remote_name, remote_endpoint_infos))
-
     def get_peer_agent_addrs(self) -> list[str]:
         """Get peer agent addresses from all workers."""
         return self.collective_rpc("get_peer_agent_addr")

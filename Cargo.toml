@@ -1,5 +1,5 @@
 [workspace]
 resolver = "2"
-members = ["NanoDeploy/server", "Spoke/spoke-rust"]
+members = ["NanoRoute", "NanoCtrl"]
 
 exclude = ["third_party/flatbuffers/tests/*"]

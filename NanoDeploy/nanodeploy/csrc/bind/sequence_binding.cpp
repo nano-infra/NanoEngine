@@ -243,7 +243,7 @@ void bind_sequence(py::module_& m)
 
         .def(py::pickle(
             [](const Sequence& p) {  // __getstate__
-                // Always serialize full token_ids to ensure correct state recovery during migration
+                // Always serialize full token_ids and last_token to ensure correct state recovery
                 return std::make_tuple(p.num_tokens,
                                        p.num_checkpointed_tokens,
                                        p.num_cached_tokens,
@@ -254,7 +254,8 @@ void bind_sequence(py::module_& m)
                                        p.seq_id,
                                        p.num_prompt_tokens,
                                        p.sampling_params.max_tokens,
-                                       p.sampling_params.ignore_eos);
+                                       p.sampling_params.ignore_eos,
+                                       p.last_token);  // Added: explicitly serialize last_token
             },
             [](const std::tuple<int,
                                 int,
@@ -266,7 +267,8 @@ void bind_sequence(py::module_& m)
                                 uint64_t,
                                 int,
                                 int,
-                                bool>& t) {  // __setstate__
+                                bool,
+                                int>& t) {  // __setstate__ - added int for last_token
                 // Extract token_ids (always present now)
                 std::vector<int> token_ids = std::get<5>(t);
 
@@ -288,10 +290,8 @@ void bind_sequence(py::module_& m)
                 seq->seq_id                  = std::get<7>(t);
                 seq->num_prompt_tokens       = std::get<8>(t);
 
-                // Ensure last_token is consistent if token_ids is not empty
-                if (!seq->token_ids.empty()) {
-                    seq->last_token = seq->token_ids.back();
-                }
+                // Use the explicitly serialized last_token (not token_ids.back())
+                seq->last_token = std::get<11>(t);
 
                 return seq;
             }))

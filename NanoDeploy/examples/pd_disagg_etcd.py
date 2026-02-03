@@ -38,7 +38,6 @@ def main():
         max_num_batched_tokens=4096,
         dummy_weight=False,
         log_level="INFO",
-        etcd_address="10.102.97.179:2379",
     )
 
     prefill_config = Config(
@@ -59,7 +58,6 @@ def main():
         max_num_batched_tokens=4096,
         dummy_weight=False,
         log_level="INFO",
-        etcd_address="10.102.97.179:2379",
     )
 
     # We start decode node first

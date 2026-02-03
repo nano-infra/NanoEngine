@@ -13,7 +13,6 @@ from dlslime import start_peer_agent
 initiator_agent = start_peer_agent(
     alias="initiator",
     server_url="http://127.0.0.1:3000",
-    address="127.0.0.1:6379",
     device=None,  # Auto-select
     ib_port=1,
     link_type="RoCE",
@@ -23,7 +22,6 @@ initiator_agent = start_peer_agent(
 target_agent = start_peer_agent(
     alias="target",
     server_url="http://127.0.0.1:3000",
-    address="127.0.0.1:6379",
     device=None,  # Auto-select (will use same device if only one available)
     ib_port=1,
     link_type="RoCE",

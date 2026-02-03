@@ -1,3 +1,13 @@
+import os
+
+# Set KV cache export/verify environment variables for LLMComponent process
+# These need to be set here because ModelRunner is a different process
+os.environ.setdefault("KVCACHE_EXPORT_ENABLED", "1")
+os.environ.setdefault(
+    "KVCACHE_EXPORT_DIR", "/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoDeploy/"
+)
+os.environ.setdefault("KVCACHE_VERIFY_ENABLED", "1")
+
 import atexit
 import json
 import threading
@@ -7,7 +17,12 @@ from dataclasses import fields
 from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional, Set
 
+# Cache TTL for peer_endpoints from NanoCtrl (seconds)
+# Engine registration rarely changes, use longer TTL to reduce list_engines calls
+_PEER_ENDPOINTS_CACHE_TTL = 60.0
+
 import flatbuffers
+import httpx
 import numpy as np
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -52,10 +67,162 @@ class LLMEngine:
         )
         self.metrics_manager = MetricsManager()
 
+        # Register engine with NanoCtrl if configured
+        # Delay registration until executor is fully initialized
+        self._nanoctrl_registered = False
+        self._peer_endpoints_cache: Optional[tuple[float, Dict[str, List[str]]]] = None
+        if config.nanoctrl_address:
+            # Register after executor is ready (peer_addrs will be available)
+            self._register_with_nanoctrl()
+
         atexit.register(self.exit)
 
     def exit(self):
+        # Unregister from NanoCtrl before exiting
+        if hasattr(self, "_nanoctrl_registered") and self._nanoctrl_registered:
+            self._unregister_from_nanoctrl()
         del self.executor
+
+    def _register_with_nanoctrl(self):
+        """Register engine information with NanoCtrl control plane."""
+        if not self.config.nanoctrl_address:
+            return
+
+        try:
+            # Get peer agent addresses (may be empty initially, but that's ok)
+            peer_addrs = self.get_peer_agent_addrs()
+            logger.info(
+                f"Registering engine {self.engine_id} with {len(peer_addrs)} peer addresses"
+            )
+
+            # Get engine info
+            engine_info = {
+                "id": self.engine_id,
+                "role": self.config.mode,
+                "rank": 0,
+                "world_size": self.config.attn_world_size,
+                "num_blocks": self.config.num_kvcache_blocks,
+                "host": self.config.host,
+                "port": self.config.port,
+                "status": "ready",
+                "peer_addrs": peer_addrs,
+            }
+
+            # Prepare registration payload
+            payload = {
+                "engine_id": engine_info["id"],
+                "role": engine_info["role"],
+                "world_size": engine_info["world_size"],
+                "num_blocks": engine_info["num_blocks"],
+                "host": engine_info["host"],
+                "port": engine_info["port"],
+                "peer_addrs": engine_info["peer_addrs"],
+            }
+
+            url = f"http://{self.config.nanoctrl_address}/register_engine"
+            logger.info(
+                f"Registering engine with NanoCtrl at {url}, payload: {payload}"
+            )
+
+            # Use sync client since this is called during init
+            # Disable proxy to avoid SOCKS proxy issues
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("status") == "ok":
+                    self._nanoctrl_registered = True
+                    logger.info(
+                        f"Successfully registered engine {payload['engine_id']} with NanoCtrl"
+                    )
+                else:
+                    logger.error(
+                        f"Failed to register engine: {data.get('message', 'Unknown error')}"
+                    )
+                    logger.error(f"Response data: {data}")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error registering engine with NanoCtrl: {e}")
+            logger.error(
+                f"Response: {e.response.text if e.response else 'No response'}"
+            )
+        except Exception as e:
+            logger.error(f"Error registering engine with NanoCtrl: {e}", exc_info=True)
+            # Don't raise - allow engine to continue even if registration fails
+
+    def _unregister_from_nanoctrl(self):
+        """Unregister engine from NanoCtrl control plane."""
+        if not self.config.nanoctrl_address:
+            return
+
+        try:
+            payload = {"engine_id": self.engine_id}
+            url = f"http://{self.config.nanoctrl_address}/unregister_engine"
+            logger.info(f"Unregistering engine {self.engine_id} from NanoCtrl")
+
+            # Disable proxy to avoid SOCKS proxy issues
+            with httpx.Client(timeout=5.0) as client:
+                response = client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("status") == "ok":
+                    logger.info(
+                        f"Successfully unregistered engine {self.engine_id} from NanoCtrl"
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to unregister engine: {data.get('message', 'Unknown error')}"
+                    )
+        except Exception as e:
+            logger.error(f"Error unregistering engine from NanoCtrl: {e}")
+            # Don't raise - exit should continue even if unregistration fails
+
+    def _fetch_peer_endpoints_from_nanoctrl(self) -> Dict[str, List[str]]:
+        """Query peer_endpoints (engine_id -> peer_addrs) from NanoCtrl list_engines, with caching."""
+        now = time.time()
+        if self._peer_endpoints_cache is not None:
+            cached_at, cached = self._peer_endpoints_cache
+            if now - cached_at < _PEER_ENDPOINTS_CACHE_TTL:
+                logger.debug(
+                    f"Using cached peer_endpoints (age={now - cached_at:.1f}s)"
+                )
+                return cached
+
+        if not self.config.nanoctrl_address:
+            logger.warning(
+                "nanoctrl_address not configured, peer_endpoints will be empty"
+            )
+            return {}
+
+        try:
+            url = f"http://{self.config.nanoctrl_address}/list_engines"
+            with httpx.Client(timeout=5.0) as client:
+                response = client.post(url, json={})
+                response.raise_for_status()
+                data = response.json()
+                if data.get("status") != "ok":
+                    logger.warning(
+                        f"list_engines returned status: {data.get('status')}"
+                    )
+                    return {}
+
+                engines = data.get("engines", [])
+                peer_endpoints: Dict[str, List[str]] = {}
+                for eng in engines:
+                    engine_id = eng.get("id")
+                    peer_addrs = eng.get("peer_addrs", [])
+                    if engine_id and peer_addrs:
+                        peer_endpoints[engine_id] = peer_addrs
+
+                self._peer_endpoints_cache = (now, peer_endpoints)
+                logger.info(
+                    f"Fetched peer_endpoints from NanoCtrl: {list(peer_endpoints.keys())}"
+                )
+                return peer_endpoints
+        except Exception as e:
+            logger.error(f"Error fetching peer_endpoints from NanoCtrl: {e}")
+            if self._peer_endpoints_cache is not None:
+                return self._peer_endpoints_cache[1]
+            return {}
 
     def update_num_kvcache_blocks(self):
         self.config.num_kvcache_blocks = self.executor.update_kvcache_blocks()
@@ -78,6 +245,11 @@ class LLMEngine:
         if isinstance(seqs, Sequence):
             seqs = [seqs]
         for seq in seqs:
+            # Debug: log received sequence info
+            if self.config.mode == "decode":
+                logger.info(
+                    f"[DEBUG] Decode engine received seq {seq.seq_id}: last_token={seq.last_token}, num_tokens={seq.num_tokens}, token_ids_len={len(seq.token_ids)}, token_ids_last10={seq.token_ids[-10:] if seq.token_ids else []}"
+                )
             seq.metric = self.metrics_manager.create_sequence_metric(
                 seq.seq_id, seq.num_prompt_tokens
             )
@@ -96,7 +268,6 @@ class LLMEngine:
         is_prefill = sch_res.is_prefill
         dp_sp_seqs = sch_res.dp_sp_seqs
         filtered_dp_sp_seqs = sch_res.filtered_dp_sp_seqs
-
         total_running = sum(len(seqs) for seqs in dp_seqs)
         total_waiting = len(self.scheduler.waiting)
         total_waiting_migration = len(self.scheduler.waiting_migration)
@@ -163,57 +334,47 @@ class LLMEngine:
         sch_end = time.time()
         post_sch_begin = 0
         post_sch_end = 0
-        if is_prefill and self.config.mode == "decode":
-            if not self.config.dummy_prefill:
-                logger.debug("perform migration")
-                target_engine_ids = set()
-                for seqs in dp_sp_seqs:
-                    for seq in seqs:
-                        if getattr(seq, "is_to_be_migrated", False):
-                            ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
-                            eid = getattr(ctx, "engine_id", None)
-                            if eid:
-                                target_engine_ids.add(eid)
-                ensure_p2p = getattr(self, "ensure_p2p_connected", None)
-                if callable(ensure_p2p):
-                    for eid in target_engine_ids:
-                        ensure_p2p(eid)
-                for seqs in filtered_dp_sp_seqs:
-                    for seq in seqs:
-                        logger.debug(
-                            f"{seq.block_ctx().block_location}, "
-                            f"{seq.block_ctx(BlockContextSlot.MIGRATE).block_location}"
-                        )
-                # Build peer_endpoints dict from _peer_info if available
-                peer_endpoints = {}
-                if hasattr(self, "_peer_info"):
-                    for engine_id, info in self._peer_info.items():
-                        peer_addrs = info.get("peer_addrs", [])
-                        if peer_addrs:
-                            peer_endpoints[engine_id] = peer_addrs
-                self.executor.migrate(dp_sp_seqs, peer_endpoints=peer_endpoints)
-            else:
-                for dp_idx, seqs in enumerate(dp_seqs):
-                    for seq in seqs:
-                        if not self.scheduler.worker_state[dp_idx].may_append(seq, 1):
-                            logger.error(
-                                "Failed to allocate block for sequence %s during dummy prefill; skipping token append.",
-                                getattr(seq, "seq_id", "<unknown>"),
-                            )
-                            continue
-                        seq.append_token(0, BlockContextSlot.ACTIVE)
-                for seqs in dp_seqs:
-                    for seq in seqs:
-                        if seq.metric and seq.metric.num_generated_tokens == 0:
-                            seq.metric.record_first_token()
-                            seq.metric.num_generated_tokens = 1
-        else:
+
+        # Run prefill to populate KV cache (or skip for decode engine receiving prefill request)
+        if not (is_prefill and self.config.mode == "decode"):
+            # Normal execution: prefill engine runs prefill, or decode engine runs decode
             token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
             post_sch_begin = time.time()
             self.scheduler.postprocess(
                 filtered_dp_sp_seqs, token_ids, self.metrics_manager
             )
             post_sch_end = time.time()
+
+        else:
+            # PD disaggregation: decode engine receives prefill request
+            # DO NOT run prefill on decode engine - KV cache will be migrated from prefill engine
+            logger.info(
+                f"Decode engine receiving prefill request, skipping local prefill execution"
+            )
+            post_sch_begin = time.time()
+            post_sch_end = time.time()
+
+            # Perform migration from prefill engine
+            logger.info(f"Performing migration from prefill engine")
+            target_engine_ids = set()
+            for seqs in dp_sp_seqs:
+                for seq in seqs:
+                    if getattr(seq, "is_to_be_migrated", False):
+                        ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
+                        eid = getattr(ctx, "engine_id", None)
+                        if eid:
+                            target_engine_ids.add(eid)
+            logger.info(f"Target engine IDs for migration: {target_engine_ids}")
+            ensure_p2p = getattr(self, "ensure_p2p_connected", None)
+            if callable(ensure_p2p):
+                for eid in target_engine_ids:
+                    ensure_p2p(eid)
+            # Query peer_endpoints from NanoCtrl (Redis) and cache
+            peer_endpoints = self._fetch_peer_endpoints_from_nanoctrl()
+            logger.info(
+                f"Calling executor.migrate with peer_endpoints: {peer_endpoints}"
+            )
+            self.executor.migrate(dp_sp_seqs, peer_endpoints=peer_endpoints)
         outputs = []
         num_tokens = 0
 

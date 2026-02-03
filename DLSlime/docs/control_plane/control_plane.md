@@ -129,6 +129,11 @@ async fn release_memory_region(State(state): State<AppState>, Json(body): <Relea
 
 async fn get_mr_info(State(state): State<AppState>, Json(body): <GetMrInfoBody>) -> Impl IntoResponse {
     // 获取 mr_info 的信息
+}
+
+// redis 消息队列，收到消息然后 handle event future。
+
+```
 
 ## 和 DLSlime 的交互与改进
 

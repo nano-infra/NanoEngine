@@ -212,10 +212,9 @@ std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr,
         seq->num_checkpointed_tokens = fb_seq->num_checkpointed_tokens();
         seq->num_cached_tokens       = fb_seq->num_cached_tokens();
 
-        // Ensure last_token is consistent if token_ids is not empty
-        if (!seq->token_ids.empty()) {
-            seq->last_token = seq->token_ids.back();
-        }
+        // NOTE: Do NOT override last_token with token_ids.back() here!
+        // In decode mode, last_token may be updated (e.g., by postprocess) without
+        // appending to token_ids. The serialized last_token is authoritative.
 
         NANOCOMMON_LOG_DEBUG(
             "Deserialized Sequence: ID=" + std::to_string(seq->seq_id) + " Status=" + std::to_string((int)seq->status)

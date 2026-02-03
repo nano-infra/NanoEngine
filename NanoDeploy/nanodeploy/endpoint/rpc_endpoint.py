@@ -13,6 +13,8 @@ class EndpointBinding:
     endpoint: _slime_c.RDMAEndpoint
     buffer: torch.Tensor
     remote_buffer_ptr: int
+    local_mr_handler: int = None  # Handler for local buffer MR
+    remote_mr_handler: int = None  # Handler for remote buffer MR
 
 
 class RPCServerEndpoint:
@@ -29,13 +31,15 @@ class RPCServerEndpoint:
         for i in range(self.world_size):
             endpoint = _slime_c.RDMAEndpoint(self.devices[i % len(self.devices)])
             buffer = torch.empty([self.buffer_size], dtype=torch.int8)
-            endpoint.register_memory_region(
-                buffer.data_ptr(),
-                buffer.data_ptr(),
-                buffer.storage_offset(),
+            # Register local buffer MR with a name (as in control plane API)
+            local_handler = endpoint.register_memory_region(
+                "rpc_buffer",  # MR name
+                buffer.data_ptr() + buffer.storage_offset(),
                 buffer.numel(),
             )
-            self.server_bindings.append(EndpointBinding(endpoint, buffer, 0))
+            self.server_bindings.append(
+                EndpointBinding(endpoint, buffer, 0, local_mr_handler=local_handler)
+            )
             endpoint_info.append(
                 (endpoint.endpoint_info(), buffer.data_ptr() + buffer.storage_offset())
             )
@@ -43,8 +47,31 @@ class RPCServerEndpoint:
 
     def connect(self, client_info):
         for i, info in enumerate(client_info):
-            self.server_bindings[i].endpoint.connect(info[0])
+            remote_endpoint_info = info[0]  # JSON endpoint info
+            self.server_bindings[i].endpoint.connect(remote_endpoint_info)
             self.server_bindings[i].remote_buffer_ptr = info[1]
+
+            # Register remote buffer MR from endpoint_info (as in control plane API)
+            # remote_endpoint_info contains "mr_info" with MR information
+            if (
+                "mr_info" in remote_endpoint_info
+                and "rpc_buffer" in remote_endpoint_info["mr_info"]
+            ):
+                remote_mr_info = remote_endpoint_info["mr_info"]["rpc_buffer"]
+                remote_handler = self.server_bindings[
+                    i
+                ].endpoint.register_remote_memory_region(
+                    "rpc_buffer",
+                    remote_mr_info,
+                )
+                self.server_bindings[i].remote_mr_handler = remote_handler
+                logger.debug(
+                    f"Registered remote MR for server binding {i}: handler={remote_handler}"
+                )
+            else:
+                logger.warning(
+                    f"Remote MR info not found in endpoint_info for server binding {i}"
+                )
 
     def send_seqs(self, dp_seqs: list[list[Sequence]], is_prefill: bool):
         assert len(dp_seqs) == self.world_size
@@ -73,9 +100,22 @@ class RPCServerEndpoint:
                 f"Total Tokens: {total_tokens}, "
                 f"Total Blocks: {total_blocks}"
             )
-            future = binding.endpoint.write_with_imm(
-                [(buffer_ptr, binding.remote_buffer_ptr, 0, 0, off)], off
-            )
+            # Use handler-based API if available, otherwise fall back to pointer-based API
+            if (
+                binding.local_mr_handler is not None
+                and binding.remote_mr_handler is not None
+            ):
+                # New API: use handlers (as in control plane API)
+                # Format: (local_handler, remote_handler, local_off, remote_off, length)
+                future = binding.endpoint.write_with_imm(
+                    [(binding.local_mr_handler, binding.remote_mr_handler, 0, 0, off)],
+                    off,
+                )
+            else:
+                # Fallback to old API: use pointers
+                future = binding.endpoint.write_with_imm(
+                    [(buffer_ptr, binding.remote_buffer_ptr, 0, 0, off)], off
+                )
             futures.append(future)
         [future.wait() for future in futures]
 
@@ -97,19 +137,42 @@ class RPCClientEndpoint:
         buffer = torch.empty(
             [self.buffer_size], dtype=torch.int8, device="cpu", pin_memory=True
         )
-        endpoint.register_memory_region(
-            buffer.data_ptr(),
-            buffer.data_ptr(),
-            buffer.storage_offset(),
+        # Register local buffer MR with a name (as in control plane API)
+        local_handler = endpoint.register_memory_region(
+            "rpc_buffer",  # MR name
+            buffer.data_ptr() + buffer.storage_offset(),
             buffer.numel(),
         )
-        self.client_binding = EndpointBinding(endpoint, buffer, 0)
+        self.client_binding = EndpointBinding(
+            endpoint, buffer, 0, local_mr_handler=local_handler
+        )
 
         return (endpoint.endpoint_info(), buffer.data_ptr() + buffer.storage_offset())
 
     def connect(self, server_info):
-        self.client_binding.endpoint.connect(server_info[self.rank][0])
+        remote_endpoint_info = server_info[self.rank][0]  # JSON endpoint info
+        self.client_binding.endpoint.connect(remote_endpoint_info)
         self.client_binding.remote_buffer_ptr = server_info[self.rank][1]
+
+        # Register remote buffer MR from endpoint_info (as in control plane API)
+        # remote_endpoint_info contains "mr_info" with MR information
+        if (
+            "mr_info" in remote_endpoint_info
+            and "rpc_buffer" in remote_endpoint_info["mr_info"]
+        ):
+            remote_mr_info = remote_endpoint_info["mr_info"]["rpc_buffer"]
+            remote_handler = self.client_binding.endpoint.register_remote_memory_region(
+                "rpc_buffer",
+                remote_mr_info,
+            )
+            self.client_binding.remote_mr_handler = remote_handler
+            logger.debug(
+                f"Registered remote MR for client binding: handler={remote_handler}"
+            )
+        else:
+            logger.warning(
+                f"Remote MR info not found in endpoint_info for client binding"
+            )
 
     def recv_seqs(self):
         binding = self.client_binding

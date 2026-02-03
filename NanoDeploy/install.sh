@@ -1,8 +1,8 @@
 #!/bin/bash
-
-export
-
 set -e
+
+# Proxy for downloads
+export https_proxy=http://127.0.0.1:17897 http_proxy=http://127.0.0.1:17897 all_proxy=socks5://127.0.0.1:17897
 
 # Parse command line arguments
 TARGET="$1"  # Optional target parameter

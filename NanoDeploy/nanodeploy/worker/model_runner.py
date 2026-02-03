@@ -70,6 +70,11 @@ class ModelRunner:
             os.path.abspath(os.path.join(os.getcwd(), "../DeepGEMM")),
             "/mnt/nvme1n1/ml_research/majinming/src/DeepGEMM",
         ]
+        os.environ["KVCACHE_EXPORT_ENABLED"] = "1"
+        os.environ["KVCACHE_EXPORT_DIR"] = (
+            "/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoDeploy/"
+        )
+        os.environ["KVCACHE_VERIFY_ENABLED"] = "1"
 
         cutlass_include = None
         for path in candidates:
@@ -226,16 +231,6 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(self.default_dtype)
 
-    def p2p_init(self, remote_engine_id, num_kv_blocks, remote_engine_world_size):
-        return get_cache_context().p2p_init(
-            remote_engine_id, num_kv_blocks, remote_engine_world_size
-        )
-
-    def p2p_connect(
-        self, remote_engine_id: str, endpoints_info_list: list[dict[int, dict]]
-    ):
-        return get_cache_context().p2p_connect(remote_engine_id, endpoints_info_list)
-
     def ensure_p2p_connected(
         self, peer_id: str, addrs: list[str], num_blocks: int
     ) -> None:
@@ -297,6 +292,13 @@ class ModelRunner:
             hf_config.qk_rope_head_dim if hasattr(hf_config, "qk_rope_head_dim") else 0
         )
 
+        # If nanoctrl_address is provided, fetch engine_id from NanoCtrl
+        engine_id = config.engine_id
+        if config.nanoctrl_address and not engine_id:
+            engine_id = _get_engine_id_from_nanoctrl(
+                config.nanoctrl_address, config.host, config.port
+            )
+
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
@@ -310,8 +312,8 @@ class ModelRunner:
             device=torch.get_default_device(),
             dtype=torch.get_default_dtype(),
             mode=mode,
-            peer_agent_host=config.host,
-            peer_agent_base_port=config.port,
+            nanoctrl_address=config.nanoctrl_address,
+            engine_id=engine_id,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
@@ -589,6 +591,13 @@ class ModelRunner:
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
+        # [DEBUG] Log decode input for the first few tokens
+        if not is_prefill and self.rank == 0 and self.run_count < 3:
+            context = get_context()
+            logger.info(
+                f"[DEBUG DECODE] run_count={self.run_count}, input_ids={input_ids[:5].tolist()}, positions={positions[:5].tolist()}, slot_mapping={context.slot_mapping[:5].tolist() if context.slot_mapping is not None and len(context.slot_mapping) >= 5 else 'N/A'}"
+            )
+
         # [DEBUG] Log input_ids for verification (len > 10)
         mask = positions > 9
         if mask.any():
@@ -689,6 +698,7 @@ class ModelRunner:
 
         if enable_rpc:
             dp_seqs = self.endpoint.recv_seqs()
+
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
 

@@ -1,5 +1,13 @@
 import os
 
+# Set environment variables BEFORE importing ray and other modules
+# These need to be set in the main process so they are inherited by all Ray workers
+os.environ["KVCACHE_EXPORT_ENABLED"] = "1"
+os.environ["KVCACHE_EXPORT_DIR"] = (
+    "/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoDeploy/"
+)
+os.environ["KVCACHE_VERIFY_ENABLED"] = "1"
+
 import ray
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
@@ -14,9 +22,9 @@ def main():
 
     decode_config = Config(
         model=path,
-        enforce_eager=True,
-        attention_dp=1,
-        attention_sp=8,
+        enforce_eager=False,
+        attention_dp=8,
+        attention_sp=1,
         attention_tp=1,
         ffn_dp=1,
         ffn_ep=8,
@@ -25,9 +33,10 @@ def main():
         loop_count=16,
         master_address="10.102.97.179:6006",
         ray_address="10.102.97.179:7078",
+        nanoctrl_address="10.102.97.179:3000",
         dummy_prefill=False,
         max_num_seqs=128,
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=0.3,
         max_model_len=4096,
         max_num_batched_tokens=4096,
         dummy_weight=False,
@@ -37,7 +46,7 @@ def main():
 
     prefill_config = Config(
         model=path,
-        enforce_eager=True,
+        enforce_eager=False,
         loop_count=1,
         attention_dp=8,
         attention_sp=1,
@@ -48,7 +57,8 @@ def main():
         mode="prefill",
         master_address="10.102.97.183:6006",
         ray_address="10.102.97.179:7078",
-        gpu_memory_utilization=0.5,
+        nanoctrl_address="10.102.97.179:3000",
+        gpu_memory_utilization=0.3,
         max_model_len=4096,
         max_num_batched_tokens=4096,
         dummy_weight=False,
@@ -56,12 +66,13 @@ def main():
     )
     prefill = LLMComponent.as_remote(prefill_config)
 
-    # New simplified flow: engine_info includes peer_addrs
-    # Migration will lazily connect to peers using addresses from BlockContext.endpoints
+    # New simplified flow: engine_info includes peer_addrs (agent aliases in format EngineName:rank)
+    # Migration will lazily connect to peers using control plane API
+    # peer_addrs contains agent aliases like "engine_id:0", "engine_id:1", etc.
     prefill_info = ray.get(prefill.get_engine_info.remote())
     decode_info = ray.get(decode.get_engine_info.remote())
 
-    # Store peer info for migration (will be embedded in BlockContext.endpoints)
+    # Store peer info for migration (peer_addrs are agent aliases for control plane)
     ray.get(prefill.set_peer_info.remote(decode_info))
     ray.get(decode.set_peer_info.remote(prefill_info))
 
@@ -114,6 +125,7 @@ def main():
         print(f"      Is To Be Migrated: {s.is_to_be_migrated}")
         print(f"      Token IDs (First 10): {s.token_ids[:10]}")
         print(f"      Token IDs (Last 10): {s.token_ids[-10:] if s.token_ids else []}")
+        print(f"      Last Tokens: {s.last_token}")
     print("=" * 50 + "\n")
 
     if not migrated_seqs:

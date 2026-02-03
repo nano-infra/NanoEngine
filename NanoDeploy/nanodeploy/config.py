@@ -50,6 +50,7 @@ class Config(BaseModel):
     # dist config
     master_address: str = "127.0.0.1:6006"
     ray_address: str = "127.0.0.1:6379"
+    nanoctrl_address: Optional[str] = None  # Control plane server address (host:port)
 
     # profiler
     enable_profiler: bool = False
@@ -62,11 +63,6 @@ class Config(BaseModel):
 
     # logging config
     log_level: str = "CRITICAL"
-
-    # etcd config
-    enable_etcd: bool = False
-    etcd_address: str = "127.0.0.1:2379"
-    cluster_id: str = "default"
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
