@@ -209,3 +209,6 @@ target/
 
 # Local protoc (scripts/setup-protoc.sh downloads here)
 scripts/.bin/
+
+# etcd
+**/default.etcd/*
