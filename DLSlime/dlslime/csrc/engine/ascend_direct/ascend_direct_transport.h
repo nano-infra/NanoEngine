@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -21,7 +22,7 @@ public:
 
     int read_batch(AssignmentBatch& batch, const std::string& host, int port);
 
-    int register_memory_region(const std::string& location, uintptr_t addr, size_t length);
+    int register_memory_region(uintptr_t, uintptr_t addr, size_t length);
 
     int unregister_memory_region(uintptr_t addr);
 

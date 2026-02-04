@@ -78,19 +78,10 @@ int AscendDirectContext::read_batch(AssignmentBatch& batch, const std::string& h
     return 0;
 }
 
-int AscendDirectContext::register_memory_region(const std::string& location, uintptr_t addr, size_t length)
+int AscendDirectContext::register_memory_region(uintptr_t key, uintptr_t addr, size_t length)
 {
     adxl::MemType mem_type;
-    if (location.substr(0, 3) == "cpu") {
-        mem_type = adxl::MEM_HOST;
-    }
-    else if (location.substr(0, 3) == "npu") {
-        mem_type = adxl::MEM_DEVICE;
-    }
-    else {
-        SLIME_LOG_ERROR("Unsupported adxl memory location type");
-        return -1;
-    }
+    mem_type = adxl::MEM_DEVICE;
 
     adxl::MemDesc mem_desc{};
     mem_desc.addr = static_cast<uint64_t>(addr);
