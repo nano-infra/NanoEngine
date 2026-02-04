@@ -25,3 +25,9 @@ link_directories(/usr/local/Ascend/ascend-toolkit/latest/lib64
 
 add_library(ascend_direct SHARED ${ASCEND_SOURCES})
 target_link_libraries(ascend_direct PUBLIC _slime_engine ascendcl metadef llm_datadist)
+
+# Install the library when BUILD_PYTHON is ON
+install(TARGETS ascend_direct
+        LIBRARY DESTINATION ${DLSLIME_INSTALL_PATH}
+        ARCHIVE DESTINATION ${DLSLIME_INSTALL_PATH}
+        RUNTIME DESTINATION ${DLSLIME_INSTALL_PATH})

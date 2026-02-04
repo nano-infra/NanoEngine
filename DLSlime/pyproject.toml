@@ -31,7 +31,6 @@ dependencies = [
   "pydantic>=2.0",
   "pyzmq>=25.0",
   "protobuf>=4.0",
-  "nanoccl>=0.0.2",
   "redis>=4.0",
   "requests>=2.0",
   # for --build-no-isolation

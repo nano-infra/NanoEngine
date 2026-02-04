@@ -21,7 +21,28 @@ endif()
 if (BUILD_RDMA)
     target_compile_definitions(_slime_c PRIVATE -DBUILD_RDMA)
     list(APPEND _slime_c_link_libraries _slime_rdma)
+endif()
 
+if (BUILD_ASCEND_DIRECT)
+    target_compile_definitions(_slime_c PRIVATE -DBUILD_ASCEND_DIRECT)
+    list(APPEND _slime_c_link_libraries ascend_direct)
+
+    # Add Ascend include directories
+    file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+    set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
+    target_include_directories(_slime_c PRIVATE
+        ${ASCEND_INCLUDE_DIR}
+        ${ASCEND_INCLUDE_DIR}/hccl
+        ${ASCEND_INCLUDE_DIR}/experiment
+        /usr/local/Ascend/ascend-toolkit/latest/acllib/include/
+    )
+
+    # Add Ascend library directories for linking
+    target_link_directories(_slime_c PRIVATE
+        /usr/local/Ascend/ascend-toolkit/latest/lib64
+        /usr/local/Ascend/ascend-toolkit/latest/acllib/lib64/
+        /usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/devlib/
+    )
 endif()
 
 # Ops moved to NanoCCL - link to NanoCCL if needed

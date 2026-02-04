@@ -19,7 +19,13 @@
 #include "dlslime/csrc/engine/nvlink/memory_pool.h"
 #include "dlslime/csrc/engine/nvlink/nvlink_endpoint.h"
 #include "dlslime/csrc/engine/nvlink/nvlink_future.h"
+#endif
 
+#ifdef BUILD_ASCEND_DIRECT
+#include "dlslime/csrc/engine/ascend_direct/ascend_direct_endpoint.h"
+#include "dlslime/csrc/engine/ascend_direct/ascend_future.h"
+#include "dlslime/csrc/engine/ascend_direct/ascend_local_memory_pool.h"
+#include "dlslime/csrc/engine/ascend_direct/ascend_remote_memory_pool.h"
 #endif
 
 #include "dlslime/csrc/device/signal.h"
@@ -256,6 +262,53 @@ PYBIND11_MODULE(_slime_c, m)
              py::arg("assign"),
              py::arg("stream") = nullptr,
              py::call_guard<py::gil_scoped_release>());
+#endif
+
+#ifdef BUILD_ASCEND_DIRECT
+    // =========================================================================
+    // Ascend Direct (NPU P2P Transfer)
+    // =========================================================================
+    py::class_<dlslime::AscendFuture, std::shared_ptr<dlslime::AscendFuture>>(m, "SlimeAscendFuture")
+        .def("wait", &dlslime::AscendFuture::wait, py::call_guard<py::gil_scoped_release>());
+
+    py::class_<dlslime::AscendDirectEndpoint, std::shared_ptr<dlslime::AscendDirectEndpoint>>(m, "AscendDirectEndpoint")
+        .def(py::init<>())
+        .def("init",
+             &dlslime::AscendDirectEndpoint::init,
+             py::arg("host"),
+             py::arg("port"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Initialize AscendDirectEndpoint with host and port")
+        .def("register_memory_region",
+             &dlslime::AscendDirectEndpoint::register_memory_region,
+             py::arg("mr_key"),
+             py::arg("addr"),
+             py::arg("offset"),
+             py::arg("length"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Register local memory region")
+        .def("register_remote_memory_region",
+             &dlslime::AscendDirectEndpoint::register_remote_memory_region,
+             py::arg("remote_mr_key"),
+             py::arg("name"),
+             py::arg("mr_info"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Register remote memory region (metadata)")
+        .def("endpoint_info",
+             &dlslime::AscendDirectEndpoint::endpoint_info,
+             py::call_guard<py::gil_scoped_release>(),
+             "Get endpoint info as JSON for exchange")
+        .def("connect",
+             &dlslime::AscendDirectEndpoint::connect,
+             py::arg("remote_info"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Connect to remote endpoint")
+        .def("read",
+             &dlslime::AscendDirectEndpoint::read,
+             py::arg("assign"),
+             py::arg("stream") = nullptr,
+             py::call_guard<py::gil_scoped_release>(),
+             "Read data from remote endpoint");
 #endif
 
     // Ops moved to NanoCCL - Python bindings should be in NanoCCL's Python module

@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "dlslime/csrc/device/device_future.h"
+
 namespace dlslime {
 
 struct SendContext;
@@ -10,7 +12,12 @@ struct RecvContext;
 struct ReadWriteContext;
 struct ImmRecvContext;
 
-class RDMAFuture {
+/**
+ * @brief Base class for RDMA futures, inherits from DeviceFuture
+ *
+ * Provides consistent interface with other device types (Ascend, NVLink)
+ */
+class RDMAFuture : public DeviceFuture {
 public:
     virtual ~RDMAFuture() = default;
 
