@@ -1,6 +1,5 @@
 #pragma once
 
-#include <immintrin.h>
 #include <infiniband/verbs.h>
 #include <numa.h>
 
@@ -13,6 +12,7 @@
 #include "dlslime/csrc/engine/rdma/ibv_helper.h"
 #include "dlslime/csrc/engine/rdma/rdma_env.h"
 #include "dlslime/csrc/logging.h"
+#include "dlslime/csrc/pause.h"
 
 namespace dlslime {
 
@@ -56,7 +56,7 @@ static inline int bindToSocket(int socket_id)
 
 inline void cpu_relax()
 {
-    _mm_pause();
+    machnet_pause();
 }
 
 inline std::vector<std::string> available_nic()

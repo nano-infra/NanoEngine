@@ -1,6 +1,5 @@
 #include "rdma_endpoint.h"
 
-#include <emmintrin.h>
 #include <stdlib.h>
 #include <sys/types.h>
 
@@ -19,6 +18,7 @@
 #include "dlslime/csrc/device/device_api.h"
 #include "dlslime/csrc/engine/assignment.h"
 #include "dlslime/csrc/logging.h"
+#include "dlslime/csrc/pause.h"
 #include "dlslime/csrc/utils.h"
 #include "engine/rdma/memory_pool.h"
 #include "engine/rdma/rdma_channel.h"
@@ -495,7 +495,7 @@ RDMAEndpoint::dispatchTask(OpCode op_code, const std::vector<assign_tuple_t>& as
         ctx->signal->record_gpu_ready();
 
         while (jring_enqueue_burst(read_write_buffer_ring_, (void**)&ctx, 1, nullptr) == 0) {
-            _mm_pause();
+            machnet_pause();
         }
     }
 

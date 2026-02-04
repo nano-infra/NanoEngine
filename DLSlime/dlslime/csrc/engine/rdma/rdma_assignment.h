@@ -1,6 +1,5 @@
 #pragma once
 
-#include <emmintrin.h>
 #include <infiniband/verbs.h>
 
 #include <algorithm>

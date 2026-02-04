@@ -1,11 +1,10 @@
 #include "rdma_worker.h"
 
 // Include full definition of UnifiedRDMAEndpoint
-#include <emmintrin.h>  // for _mm_pause
-
 #include <iterator>  // for std::make_move_iterator
 
 #include "dlslime/csrc/logging.h"  // SLIME_LOG_INFO
+#include "dlslime/csrc/pause.h"
 #include "rdma_endpoint.h"
 #include "rdma_utils.h"  // socketId(), bindToSocket()
 
@@ -112,7 +111,7 @@ void RDMAWorker::workerLoop()
         }
 
         if (total_work_done == 0) {
-            _mm_pause();
+            machnet_pause();
         }
     }
 }

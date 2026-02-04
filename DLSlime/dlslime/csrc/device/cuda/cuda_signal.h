@@ -1,7 +1,6 @@
 #pragma once
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <immintrin.h>  // for _mm_pause
 
 #include <atomic>
 #include <stdexcept>
@@ -9,6 +8,7 @@
 #include "dlslime/csrc/device/signal.h"
 #include "dlslime/csrc/engine/rdma/rdma_env.h"
 #include "dlslime/csrc/logging.h"
+#include "dlslime/csrc/pause.h"
 #include "nvtx_helper.h"
 
 namespace dlslime {
@@ -90,7 +90,7 @@ public:
                 uint32_t val = __atomic_load_n(&host_ptr_->comm_done, __ATOMIC_ACQUIRE);
                 if (val == target_mask)
                     break;
-                _mm_pause();
+                machnet_pause();
             }
         }
         else {

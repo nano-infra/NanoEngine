@@ -1,10 +1,9 @@
 #pragma once
-#include <immintrin.h>
-
 #include <atomic>
 
 #include "dlslime/csrc/device/signal.h"
 #include "dlslime/csrc/logging.h"
+#include "dlslime/csrc/pause.h"
 
 namespace dlslime {
 namespace device {
@@ -65,7 +64,7 @@ public:
     void wait_comm_done_cpu(uint32_t target_mask) override
     {
         while ((flags_->comm_done.load(std::memory_order_acquire) & target_mask) != target_mask) {
-            _mm_pause();
+            machnet_pause();
         }
     }
 

@@ -1,6 +1,5 @@
 #include "rdma_context.h"
 
-#include <emmintrin.h>
 #include <infiniband/verbs.h>
 #include <numa.h>
 #include <poll.h>
@@ -31,6 +30,7 @@
 #include "dlslime/csrc/engine/rdma/rdma_utils.h"
 #include "dlslime/csrc/jring.h"
 #include "dlslime/csrc/logging.h"
+#include "dlslime/csrc/pause.h"
 
 namespace dlslime {
 
@@ -242,7 +242,7 @@ int64_t RDMAContext::cq_poll_handle()
             }
             else if (nr_poll == 0) {
                 spin_count++;
-                _mm_pause();
+                machnet_pause();
             }
             else {
                 SLIME_LOG_ERROR("Poll CQ failed in busy loop");
