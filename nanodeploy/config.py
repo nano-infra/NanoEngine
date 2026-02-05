@@ -78,6 +78,10 @@ class Config:
     # Debug mode for SP allocation (uses simplified RoundRobin + segment-based allocation)
     sp_debug: bool = False
 
+    # Fixed number of SP segments per request (overrides segment_size calculation)
+    # When set to a value > 0, all requests will be split into exactly this many segments
+    fixed_sp_segments: int = 0
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         self.hf_config = AutoConfig.from_pretrained(self.model)

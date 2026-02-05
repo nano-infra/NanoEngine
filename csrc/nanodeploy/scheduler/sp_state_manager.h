@@ -40,7 +40,8 @@ public:
                    bool               enable_dynamic_sp_size,
                    bool               enable_non_uniform_split,
                    const std::string& sp_master_selector,
-                   bool               sp_debug = false);
+                   bool               sp_debug = false,
+                   int                fixed_sp_segments = 0);
 
     void set_dp_idx(int dp_idx)
     {
@@ -165,6 +166,7 @@ private:
     bool enable_dynamic_sp_size_;
     bool enable_non_uniform_split_;
     bool sp_debug_;
+    int  fixed_sp_segments_;
 
     SPMasterSelector master_selector_;
     std::vector<int> master_seq_counts_;

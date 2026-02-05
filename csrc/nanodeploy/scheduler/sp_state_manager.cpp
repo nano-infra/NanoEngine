@@ -21,7 +21,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                bool               enable_dynamic_sp_size,
                                bool               enable_non_uniform_split,
                                const std::string& sp_master_selector,
-                               bool               sp_debug) :
+                               bool               sp_debug,
+                               int                fixed_sp_segments) :
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
@@ -33,7 +34,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     num_recv_seqs_per_sp_(attention_sp, 0),
     enable_dynamic_sp_size_(enable_dynamic_sp_size),
     enable_non_uniform_split_(enable_non_uniform_split),
-    sp_debug_(sp_debug)
+    sp_debug_(sp_debug),
+    fixed_sp_segments_(fixed_sp_segments)
 {
     // Initialize Strategy
     if (sp_master_selector == "LeastBatch") {
@@ -56,7 +58,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     std::cerr << "[SPStateManager] Initialized with attention_sp=" << attention_sp_ 
               << ", kvcache_block_size=" << kvcache_block_size_
               << ", reserved_blocks_per_req=" << reserved_blocks_per_req_ 
-              << ", segment_size=" << segment_size_ << std::endl;
+              << ", segment_size=" << segment_size_
+              << ", fixed_sp_segments=" << fixed_sp_segments_ << std::endl;
 
     if (attention_sp_ <= 0) {
         throw std::runtime_error("attention_sp must be positive to prevent division by zero");
@@ -272,7 +275,8 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
         
         int num_tokens            = seq.num_tokens;
-        int num_segments          = (num_tokens + segment_size_ - 1) / segment_size_;
+        // Use fixed_sp_segments if set, otherwise calculate based on segment_size
+        int num_segments          = (fixed_sp_segments_ > 0) ? fixed_sp_segments_ : (num_tokens + segment_size_ - 1) / segment_size_;
         int num_segments_per_rank = (num_segments + attention_sp_ - 1) / attention_sp_;
         int initial_num_ranks     = (num_segments + num_segments_per_rank - 1) / num_segments_per_rank;
 
@@ -465,7 +469,8 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
 
         int num_tokens            = seq.num_tokens;
-        int num_segments          = (num_tokens + segment_size_ - 1) / segment_size_;
+        // Use fixed_sp_segments if set, otherwise calculate based on segment_size
+        int num_segments          = (fixed_sp_segments_ > 0) ? fixed_sp_segments_ : (num_tokens + segment_size_ - 1) / segment_size_;
         int num_segments_per_rank = (num_segments + attention_sp_ - 1) / attention_sp_;
         int num_ranks             = (num_segments + num_segments_per_rank - 1) / num_segments_per_rank;
 

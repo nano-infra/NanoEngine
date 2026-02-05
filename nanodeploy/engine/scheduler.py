@@ -41,6 +41,7 @@ class Scheduler(_CppScheduler):
             config.enable_non_uniform_split,
             config.sp_master_selector,
             config.sp_debug,
+            config.fixed_sp_segments,
             config.scheduler_mode
         )
         # Store config for compatibility

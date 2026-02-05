@@ -29,6 +29,7 @@ Scheduler::Scheduler(const std::string& engine_id,
                      bool               enable_non_uniform_split,
                      const std::string& sp_master_selector,
                      bool               sp_debug,
+                     int                fixed_sp_segments,
                      const std::string& scheduler_mode) :
     engine_id_(engine_id),
     loop_count_(loop_count),
@@ -55,7 +56,7 @@ Scheduler::Scheduler(const std::string& engine_id,
             max_num_seqs_, max_num_batched_tokens_, max_num_recv_seqs_,
             reserved_blocks_per_req_, segment_size_, enable_dynamic_sp_size_, 
             enable_non_uniform_split,
-            sp_master_selector, sp_debug_);
+            sp_master_selector, sp_debug_, fixed_sp_segments);
         
         sp_manager->set_dp_idx(dp_idx);
         worker_state.push_back(sp_manager);
@@ -68,6 +69,7 @@ Scheduler::Scheduler(const std::string& engine_id,
     }
     
     std::cerr << "[Scheduler] Initialized with segment_size=" << segment_size_ 
+              << ", fixed_sp_segments=" << fixed_sp_segments
               << ", scheduler_mode=" << (scheduler_mode_ == SchedulerMode::DECENTRALIZED ? "decentralized" : "centralized")
               << std::endl;
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);

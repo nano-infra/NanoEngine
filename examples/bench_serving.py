@@ -51,6 +51,8 @@ def parse_args():
     parser.add_argument("--segment-size", type=int, default=65536, help="Segment size for SP.")
     parser.add_argument("--disable-non-uniform-split", action="store_true", 
                         help="Disable non-uniform KVCache partitioning for load balancing (enabled by default).")
+    parser.add_argument("--fixed-sp-segments", type=int, default=0,
+                        help="Fixed number of SP segments per request (0 = disabled, use segment-size).")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
@@ -402,7 +404,8 @@ def main():
         profiler_dir=args.profiler_dir,
         profiler_start_time=args.profiler_start_time,
         profiling_duration=args.profiling_duration,
-        enable_non_uniform_split=not args.disable_non_uniform_split
+        enable_non_uniform_split=not args.disable_non_uniform_split,
+        fixed_sp_segments=args.fixed_sp_segments
     )
     
     # Print Config

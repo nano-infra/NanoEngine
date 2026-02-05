@@ -93,6 +93,7 @@ public:
               bool               enable_non_uniform_split,
               const std::string& sp_master_selector,
               bool               sp_debug,
+              int                fixed_sp_segments,
               const std::string& scheduler_mode = "centralized");
 
     // Queue management
