@@ -141,5 +141,8 @@ void bind_sp_state_manager(py::module_& m)
         .def_readwrite("block_manager", &SPStateManager::block_manager)
         .def_readwrite("running", &SPStateManager::running)
         .def_readwrite("dummy_seqs", &SPStateManager::dummy_seqs)
-        .def_readwrite("routing_strategy", &SPStateManager::routing_strategy);
+        .def_readwrite("routing_strategy", &SPStateManager::routing_strategy)
+        // Expose waiting queues for decentralized scheduler mode (per-rank control)
+        .def_readwrite("waiting", &SPStateManager::waiting)
+        .def_readwrite("waiting_migration", &SPStateManager::waiting_migration);
 }
