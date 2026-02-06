@@ -18,7 +18,7 @@ public:
     void update_waiting_migration_requests(int count);
     void add_completed_request();
 
-    void update_waiting_blocks(int head_blocks, int total_blocks);
+    void update_waiting_blocks(const std::vector<int>& head_blocks, const std::vector<int>& total_blocks);
 
     void add_tokens(long long num_prompt = 0, long long num_generated = 0);
 
@@ -51,8 +51,8 @@ public:
     int num_waiting_migration_requests = 0;
     int num_completed_requests         = 0;
 
-    int num_waiting_head_blocks        = 0;
-    int num_waiting_total_blocks       = 0;
+    std::vector<int> num_waiting_head_blocks;
+    std::vector<int> num_waiting_total_blocks;
 
     std::vector<double>                prefill_throughput_samples;
     std::vector<double>                decode_throughput_samples;

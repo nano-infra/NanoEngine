@@ -408,21 +408,24 @@ ScheduleResult Scheduler::schedule()
         }
     }
 
-    // Calculate waiting queue block metrics
+    // Calculate waiting queue block metrics (centralized: replicate global values to all DPs)
     auto& wait_queue = (mode_ != "decode") ? waiting : waiting_migration;
-
+    
+    int head_blocks = 0;
+    int total_blocks = 0;
+    
     if (!wait_queue.empty()) {
         auto head_seq = wait_queue.front();
-        // Calculate blocks for head sequence: ceil(num_tokens / block_size)
-        // Note: We use Sequence::block_size which is static constexpr int block_size = 256;
-        result.waiting_head_blocks = (head_seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+        head_blocks = (head_seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
     }
-
-    int total_blocks = 0;
+    
     for (const auto& seq : wait_queue) {
         total_blocks += (seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
     }
-    result.waiting_total_blocks = total_blocks;
+    
+    // Replicate to all DP workers (centralized has shared global queue)
+    result.waiting_head_blocks.resize(attention_dp_, head_blocks);
+    result.waiting_total_blocks.resize(attention_dp_, total_blocks);
 
     return result;
 }
@@ -848,24 +851,23 @@ ScheduleResult Scheduler::_schedule_decentralized()
         }
     }
 
-    // Calculate waiting queue block metrics (aggregate across all workers)
-    int total_waiting_head_blocks = 0;
-    int total_waiting_blocks = 0;
+    // Calculate waiting queue block metrics (per-DP)
+    result.waiting_head_blocks.resize(attention_dp_, 0);
+    result.waiting_total_blocks.resize(attention_dp_, 0);
+    
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
         auto& worker = worker_state[dp_idx];
         auto& wait_queue = (mode_ != "decode") ? worker->waiting : worker->waiting_migration;
         
         if (!wait_queue.empty()) {
             auto head_seq = wait_queue.front();
-            total_waiting_head_blocks += (head_seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+            result.waiting_head_blocks[dp_idx] = (head_seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
         }
         
         for (const auto& seq : wait_queue) {
-            total_waiting_blocks += (seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+            result.waiting_total_blocks[dp_idx] += (seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
         }
     }
-    result.waiting_head_blocks = total_waiting_head_blocks;
-    result.waiting_total_blocks = total_waiting_blocks;
 
     return result;
 }

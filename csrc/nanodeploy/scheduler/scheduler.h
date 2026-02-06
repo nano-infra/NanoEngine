@@ -69,9 +69,9 @@ struct ScheduleResult {
     // Value: Number of Res requests sent from participant_sp_rank to master_sp_rank.
     // std::vector<std::vector<std::vector<int>>> sp_res_matrix;
 
-    // Metrics for waiting queue blocks
-    int waiting_head_blocks  = 0;
-    int waiting_total_blocks = 0;
+    // Metrics for waiting queue blocks (per DP worker)
+    std::vector<int> waiting_head_blocks;
+    std::vector<int> waiting_total_blocks;
 };
 
 class Scheduler {

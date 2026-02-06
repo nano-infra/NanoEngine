@@ -38,7 +38,7 @@ void ServerMetric::add_completed_request()
     num_completed_requests++;
 }
 
-void ServerMetric::update_waiting_blocks(int head_blocks, int total_blocks)
+void ServerMetric::update_waiting_blocks(const std::vector<int>& head_blocks, const std::vector<int>& total_blocks)
 {
     num_waiting_head_blocks  = head_blocks;
     num_waiting_total_blocks = total_blocks;
