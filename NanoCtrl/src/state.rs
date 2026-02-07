@@ -134,18 +134,37 @@ pub struct AppState {
     /// Redis client (MultiplexedConnection is Clone and handles connection pooling)
     pub redis_client: Client,
     pub redis_url: String,
+    /// Redis key prefix for data isolation (scope per NanoCtrl instance)
+    pub redis_key_prefix: String,
     /// Cache for get_mr_info: key "dst:mr_name" -> (cached_at, response)
     pub mr_info_cache: Arc<Mutex<HashMap<String, (Instant, crate::models::GetMrInfoResponse)>>>,
 }
 
 impl AppState {
-    pub fn new(redis_url: &str) -> anyhow::Result<Self> {
+    pub fn new(redis_url: &str, redis_key_prefix: Option<String>) -> anyhow::Result<Self> {
         let client = Client::open(redis_url)?;
+        let prefix = redis_key_prefix.unwrap_or_else(|| "".to_string());
         // Client can be cloned and get_multiplexed_async_connection() is efficient
         Ok(Self {
             redis_client: client,
             redis_url: redis_url.to_string(),
+            redis_key_prefix: prefix,
             mr_info_cache: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Generate scoped engine key
+    pub fn engine_key(&self, engine_id: &str) -> String {
+        format!("{}:engine:{}", self.redis_key_prefix, engine_id)
+    }
+
+    /// Generate scoped revision key
+    pub fn revision_key(&self) -> String {
+        format!("{}:nano_meta:engine_revision", self.redis_key_prefix)
+    }
+
+    /// Generate scoped events channel
+    pub fn events_channel(&self) -> String {
+        format!("{}:nano_events:engine_update", self.redis_key_prefix)
     }
 }

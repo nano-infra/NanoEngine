@@ -1433,6 +1433,7 @@ dependencies = [
  "flatbuffers",
  "futures",
  "minijinja",
+ "nanosequence-rs",
  "redis",
  "reqwest",
  "serde",
@@ -1448,6 +1449,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zmq",
+]
+
+[[package]]
+name = "nanosequence-rs"
+version = "0.2.0"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]

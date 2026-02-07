@@ -1,7 +1,6 @@
 from typing import Literal, TYPE_CHECKING
 
 from nanodeploy._cpp import (
-    DefaultIntDict as _CppDefaultIntDict,
     postprocess_sequences as _cpp_postprocess_sequences,
     RoutingStrategy as _CppRoutingStrategy,
     Scheduler as _CppScheduler,

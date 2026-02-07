@@ -21,9 +21,7 @@ pub fn serialize_sequences_for_transmission(
 }
 
 /// Helper function to deserialize sequences from received data
-pub fn deserialize_sequences_from_transmission(
-    buffer: &[u8],
-) -> Result<Vec<Sequence>, String> {
+pub fn deserialize_sequences_from_transmission(buffer: &[u8]) -> Result<Vec<Sequence>, String> {
     nanosequence_rs::deserialize_sequences(buffer)
 }
 

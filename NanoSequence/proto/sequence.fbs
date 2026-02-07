@@ -48,7 +48,7 @@ table Sequence {
   num_checkpointed_tokens: int;
   num_cached_tokens: int;
   token_ids: [int];
-  slots: [BlockContext];
+  slots: [BlockContext];  // Direct vector - size enforced in C++ code
 }
 
 table SequenceList {

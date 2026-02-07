@@ -19,11 +19,10 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from nanodeploy._cpp import BlockContextSlot
+
 from nanodeploy.config import Config
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence, SequenceStatus
-from nanodeploy.fbs import EngineInfo as EngineInfoModule
-from nanodeploy.fbs.EngineInfo import EngineInfo
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.metrics import MetricsManager
 
@@ -91,7 +90,7 @@ class LLMEngine:
             # Get peer agent addresses (may be empty initially, but that's ok)
             peer_addrs = self.get_peer_agent_addrs()
             logger.info(
-                f"Registering engine {self.engine_id} with {len(peer_addrs)} peer addresses"
+                f"Registering engine {self.engine_id} with {len(peer_addrs)} peer addresses: {peer_addrs}"
             )
 
             # Get engine info
@@ -271,13 +270,18 @@ class LLMEngine:
                 for eng in engines:
                     engine_id = eng.get("id")
                     peer_addrs = eng.get("peer_addrs", [])
-                    if engine_id and peer_addrs:
+                    # Include all engines, even if peer_addrs is empty
+                    if engine_id:
                         peer_endpoints[engine_id] = peer_addrs
+                        logger.debug(
+                            f"  Engine {engine_id}: {len(peer_addrs)} peer addresses"
+                        )
 
                 self._peer_endpoints_cache = (now, peer_endpoints)
                 logger.info(
                     f"Fetched peer_endpoints from NanoCtrl: {list(peer_endpoints.keys())}"
                 )
+                logger.info(f"Peer endpoints details: {peer_endpoints}")
                 return peer_endpoints
         except Exception as e:
             logger.error(f"Error fetching peer_endpoints from NanoCtrl: {e}")
@@ -472,7 +476,8 @@ class LLMEngine:
         self,
         use_tqdm: bool = True,
         log_metrics_interval: int = 10,
-    ) -> list[Sequence]:
+        return_serialized: bool = False,
+    ) -> list[Sequence] | list[bytes]:
         num_reqs = len(self.scheduler.waiting)
         if use_tqdm:
             pbar = tqdm(total=num_reqs, desc="Generating", dynamic_ncols=True)
@@ -522,5 +527,40 @@ class LLMEngine:
             if value is not None:
                 logger.info(f"  {key}: {value}")
         logger.info("=" * 60)
+
+        # Workaround for SIGSEGV during Ray serialization of migrated sequences
+        # Use FlatBuffers serialization directly to avoid pickle issues
+        if return_serialized:
+            logger.info(
+                "Serializing sequences using FlatBuffers to avoid Ray pickle issues..."
+            )
+            import numpy as np
+
+            from nanodeploy._cpp import deserialize, serialize
+
+            serialized_seqs = []
+            for seq in finished_seqs:
+                try:
+                    # Allocate buffer for serialization
+                    buffer_size = 1024 * 1024  # 1MB should be enough
+                    buffer = np.zeros(buffer_size, dtype=np.uint8)
+                    data_ptr = buffer.ctypes.data
+
+                    # Serialize using FlatBuffers
+                    actual_size = serialize(data_ptr, buffer_size, [seq], False)
+
+                    # Extract the used portion
+                    serialized_bytes = bytes(buffer[:actual_size])
+                    serialized_seqs.append(serialized_bytes)
+                    logger.debug(
+                        f"Serialized sequence {seq.seq_id} ({actual_size} bytes)"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to serialize sequence {seq.seq_id}: {e}", exc_info=True
+                    )
+                    raise
+            logger.info(f"Successfully serialized {len(serialized_seqs)} sequences")
+            return serialized_seqs
 
         return finished_seqs

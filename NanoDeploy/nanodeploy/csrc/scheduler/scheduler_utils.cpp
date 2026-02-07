@@ -2,9 +2,10 @@
 #include <algorithm>
 #include <exception>
 
-#include "nanodeploy/csrc/metrics/sequence_metric.h"
 #include "nanodeploy/csrc/scheduler/sp_state_manager.h"
-#include "nanodeploy/csrc/sequence/sequence.h"
+#include "nanosequence/csrc/metrics/sequence_metric.h"
+#include "nanosequence/csrc/sequence/sequence.h"
+#include "sequence_generated.h"
 
 #include "thread_pool.h"
 
@@ -51,11 +52,11 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
 
             for (int token_id : *task.tokens) {
 
-                int master_sp_idx = seq->block_ctx().master_sp_idx_;
+                int master_sp_idx = seq->block_ctx().master_sp_idx;
                 if (task.sp_idx != master_sp_idx) {
                     throw std::runtime_error("sp_idx mismatch: task.sp_idx=" + std::to_string(task.sp_idx)
                                              + " != master_sp_idx=" + std::to_string(master_sp_idx)
-                                             + " for seq_id=" + std::to_string(seq->seq_id));
+                                             + " for seq_id=" + std::to_string(seq->seq_id()));
                 }
 
                 seq->append_token(token_id, BlockContextSlot::ACTIVE, task.sp_idx);
@@ -71,16 +72,16 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                     }
                 }
 
-                bool finished = (!seq->sampling_params.ignore_eos && token_id == eos_id)
-                                || (seq->num_completed_tokens() >= seq->sampling_params.max_tokens);
+                bool finished = (!seq->sampling_params().ignore_eos && token_id == eos_id)
+                                || (seq->num_completed_tokens() >= seq->sampling_params().max_tokens);
 
                 if (finished) {
-                    seq->status = SequenceStatus::FINISHED;
+                    seq->set_status(SequenceStatus::FINISHED);
                     state_manager->deallocate(*seq);
                     break;
                 }
                 else if (is_prefill) {
-                    seq->status = SequenceStatus::TO_BE_MIGRATED;
+                    seq->set_status(SequenceStatus::TO_BE_MIGRATED);
                     seq->migrate();
                     result_ctx->migration_candidates.push_back({seq, result_ctx->dp_idx});
                     break;
@@ -93,8 +94,8 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
             running.erase(std::remove_if(running.begin(),
                                          running.end(),
                                          [](const std::shared_ptr<Sequence>& s) {
-                                             return s->status == SequenceStatus::FINISHED
-                                                    || s->status == SequenceStatus::TO_BE_MIGRATED;
+                                             return s->status() == SequenceStatus::FINISHED
+                                                    || s->status() == SequenceStatus::TO_BE_MIGRATED;
                                          }),
                           running.end());
         }

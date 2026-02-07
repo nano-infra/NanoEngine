@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-#include "nanodeploy/csrc/sequence/sequence.h"
+#include "nanosequence/csrc/sequence/sequence.h"
 
 namespace nanodeploy {
 

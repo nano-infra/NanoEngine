@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "nanodeploy/csrc/sequence/sequence.h"
+#include "nanosequence/csrc/sequence/sequence.h"
 
 #include "block_manager.h"
 

@@ -31,7 +31,14 @@ async fn main() -> anyhow::Result<()> {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     tracing::info!("Using Redis URL: {}", redis_url);
-    let state = AppState::new(&redis_url)?;
+
+    // Redis key prefix for data isolation: disabled for now (use empty prefix)
+    let redis_key_prefix = std::env::var("REDIS_KEY_PREFIX").ok();
+    if let Some(ref prefix) = redis_key_prefix {
+        tracing::info!("Using Redis key prefix: {} (for data isolation)", prefix);
+    }
+
+    let state = AppState::new(&redis_url, redis_key_prefix)?;
     let app_state = state.clone();
 
     let app = Router::new()
@@ -273,7 +280,7 @@ async fn set_desired_topology(
     Path(agent_id): Path<String>,
     Json(spec): Json<DesiredTopologySpec>,
 ) -> impl IntoResponse {
-    let key = format!("spec:topology:{}", agent_id);
+    let key = format!("{}:spec:topology:{}", state.redis_key_prefix, agent_id);
     let spec_json = match serde_json::to_string(&spec) {
         Ok(s) => s,
         Err(e) => {
@@ -312,7 +319,7 @@ async fn set_desired_topology(
     // Symmetric: merge this agent_id into each target peer's spec so both sides want each other
     if spec.symmetric {
         for target_peer in &spec.target_peers {
-            let peer_key = format!("spec:topology:{}", target_peer);
+            let peer_key = format!("{}:spec:topology:{}", state.redis_key_prefix, target_peer);
             let existing_str: Option<String> = redis::cmd("GET")
                 .arg(&peer_key)
                 .query_async(&mut conn)
@@ -492,7 +499,7 @@ async fn cleanup(
 
     // 1. Get peers to notify (from spec) BEFORE deleting anything
     let mut peers_to_notify = std::collections::HashSet::new();
-    let spec_key = format!("spec:topology:{}", agent_name);
+    let spec_key = format!("{}:spec:topology:{}", state.redis_key_prefix, agent_name);
     if let Ok(Some(spec_str)) = redis::cmd("GET")
         .arg(&spec_key)
         .query_async::<Option<String>>(&mut conn)
@@ -504,9 +511,10 @@ async fn cleanup(
             }
         }
     }
-    // Also scan all specs to find agents that had us as a target
+    // Also scan all specs to find agents that had us as a target (with scoped prefix)
+    let spec_pattern = format!("{}:spec:topology:*", state.redis_key_prefix);
     let spec_keys_all: Vec<String> = redis::cmd("KEYS")
-        .arg("spec:topology:*")
+        .arg(&spec_pattern)
         .query_async(&mut conn)
         .await
         .unwrap_or_default();
@@ -521,7 +529,8 @@ async fn cleanup(
         {
             if let Ok(spec) = serde_json::from_str::<DesiredTopologySpec>(&s) {
                 if spec.target_peers.contains(&agent_name) {
-                    if let Some(other) = key.strip_prefix("spec:topology:") {
+                    let prefix = format!("{}:spec:topology:", state.redis_key_prefix);
+                    if let Some(other) = key.strip_prefix(&prefix) {
                         peers_to_notify.insert(other.to_string());
                     }
                 }
@@ -544,8 +553,8 @@ async fn cleanup(
         .await
         .unwrap_or_default();
 
-    // 4. Delete exchange info (QP info) published by this agent
-    let exchange_pattern = format!("exchange:{}:*", agent_name);
+    // 4. Delete exchange info (QP info) published by this agent (with scoped prefix)
+    let exchange_pattern = format!("{}:exchange:{}:*", state.redis_key_prefix, agent_name);
     let exchange_keys: Vec<String> = redis::cmd("KEYS")
         .arg(&exchange_pattern)
         .query_async(&mut conn)
@@ -558,8 +567,8 @@ async fn cleanup(
             .await
             .unwrap_or_default();
     }
-    // Delete exchange info where this agent is the receiver
-    let exchange_pattern2 = format!("exchange:*:{}", agent_name);
+    // Delete exchange info where this agent is the receiver (with scoped prefix)
+    let exchange_pattern2 = format!("{}:exchange:*:{}", state.redis_key_prefix, agent_name);
     let exchange_keys2: Vec<String> = redis::cmd("KEYS")
         .arg(&exchange_pattern2)
         .query_async(&mut conn)
@@ -573,8 +582,8 @@ async fn cleanup(
             .unwrap_or_default();
     }
 
-    // 5. Delete agent's inbox (for legacy cleanup event delivery)
-    let inbox_key = format!("inbox:{}", agent_name);
+    // 5. Delete agent's inbox (for legacy cleanup event delivery, with scoped prefix)
+    let inbox_key = format!("{}:inbox:{}", state.redis_key_prefix, agent_name);
     let _: () = redis::cmd("DEL")
         .arg(&inbox_key)
         .query_async(&mut conn)
@@ -603,7 +612,7 @@ async fn cleanup(
             "peer": agent_name,
         });
         let _: () = redis::cmd("LPUSH")
-            .arg(format!("inbox:{}", peer))
+            .arg(format!("{}:inbox:{}", state.redis_key_prefix, peer))
             .arg(cleanup_event.to_string())
             .query_async(&mut conn)
             .await
@@ -660,11 +669,14 @@ async fn register_engine(
             });
         }
     };
-    let engine_key = format!("engine:{}", body.engine_id);
-    let revision_key = "nano_meta:engine_revision";
-    let channel = "nano_events:engine_update";
+    let engine_key = state.engine_key(&body.engine_id);
+    let revision_key = state.revision_key();
+    let channel = state.events_channel();
 
-    tracing::debug!("Storing engine info in Redis with key: {}", engine_key);
+    tracing::debug!(
+        "Storing engine info in Redis with scoped key: {}",
+        engine_key
+    );
 
     // Prepare payload JSON (for Lua script's cjson.decode)
     let zmq_address = format!("tcp://{}:{}", body.host, body.port);
@@ -696,8 +708,8 @@ async fn register_engine(
         .arg(REGISTER_ENGINE_SCRIPT)
         .arg(3) // number of keys
         .arg(&engine_key)
-        .arg(revision_key)
-        .arg(channel)
+        .arg(&revision_key)
+        .arg(&channel)
         .arg(&body.engine_id)
         .arg(&body.role)
         .arg(&body.host)
@@ -756,7 +768,7 @@ async fn get_engine_info(
         }
     };
 
-    let key = format!("engine:{}", body.engine_id);
+    let key = state.engine_key(&body.engine_id);
     let engine_info_str: Option<String> = redis::cmd("HGET")
         .arg(&key)
         .arg("info")
@@ -801,17 +813,19 @@ async fn list_engines(
         }
     };
 
-    // Get all engine keys
+    // Get all engine keys with scoped prefix
+    let pattern = format!("{}:engine:*", state.redis_key_prefix);
     let keys: Vec<String> = redis::cmd("KEYS")
-        .arg("engine:*")
+        .arg(&pattern)
         .query_async(&mut conn)
         .await
         .unwrap_or_default();
 
     let mut engines = Vec::new();
+    let engine_prefix = format!("{}:engine:", state.redis_key_prefix);
     for key in keys {
-        // Extract engine_id from key (format: "engine:{engine_id}")
-        if let Some(_engine_id) = key.strip_prefix("engine:") {
+        // Extract engine_id from key (format: "{redis_key_prefix}:engine:{engine_id}")
+        if let Some(_engine_id) = key.strip_prefix(&engine_prefix) {
             // Get the info field
             let engine_info_str: Option<String> = redis::cmd("HGET")
                 .arg(&key)
@@ -851,9 +865,9 @@ async fn unregister_engine(
             });
         }
     };
-    let engine_key = format!("engine:{}", body.engine_id);
-    let revision_key = "nano_meta:engine_revision";
-    let channel = "nano_events:engine_update";
+    let engine_key = state.engine_key(&body.engine_id);
+    let revision_key = state.revision_key();
+    let channel = state.events_channel();
 
     // Use Lua script to atomically: DEL + INCR + PUBLISH
     // Note: MultiplexedConnection doesn't implement ConnectionLike, so we use EVAL directly
@@ -861,8 +875,8 @@ async fn unregister_engine(
         .arg(UNREGISTER_ENGINE_SCRIPT)
         .arg(3) // number of keys
         .arg(&engine_key)
-        .arg(revision_key)
-        .arg(channel)
+        .arg(&revision_key)
+        .arg(&channel)
         .arg(&body.engine_id)
         .query_async::<i64>(&mut conn)
         .await
@@ -918,7 +932,7 @@ async fn heartbeat_engine(
         }
     };
 
-    let engine_key = format!("engine:{}", body.engine_id);
+    let engine_key = state.engine_key(&body.engine_id);
 
     // Use Lua script to refresh TTL only (no event, no revision increment)
     match redis::cmd("EVAL")

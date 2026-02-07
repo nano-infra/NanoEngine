@@ -4,168 +4,181 @@
 
 #include "nanosequence/csrc/metrics/sequence_metric.h"
 #include "sequence.h"
+#include "sequence_generated.h"
 
 namespace nanodeploy {
 
-// BlockContext Implementation
+// BlockContext free functions
 
-BlockContext::BlockContext(const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks)
+std::unique_ptr<BlockContext>
+make_block_context(const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks)
 {
-    reset(engine_id, attention_sp, attention_dp, num_kvcache_blocks);
-}
-
-void BlockContext::reset(const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks)
-{
-    engine_id_ = engine_id;
-
-    dp_idx_        = 0;
-    master_sp_idx_ = 0;
-    attention_sp_  = attention_sp;
-    attention_dp_  = attention_dp;
-
-    num_kvcache_blocks_ = num_kvcache_blocks;
-
-    sp_block_table.resize(attention_sp, {});
-    num_dispatched_tokens.resize(attention_sp, 0);
-}
-
-std::tuple<std::string,
-           int,
-           int,
-           int,
-           int,
-           int,
-           std::vector<std::pair<int, int>>,
-           std::vector<std::vector<int>>,
-           std::vector<int>>
-BlockContext::getstate() const
-{
-    std::vector<std::vector<int>> sp_block_table_state;
-    sp_block_table_state.reserve(sp_block_table.size());
-    for (const auto& pair : sp_block_table) {
-        sp_block_table_state.emplace_back(std::vector<int>(pair.begin(), pair.end()));
-    }
-
-    return std::make_tuple(engine_id_,
-                           dp_idx_,
-                           master_sp_idx_,
-                           attention_sp_,
-                           attention_dp_,
-                           num_kvcache_blocks_,
-                           std::vector<std::pair<int, int>>(block_location.begin(), block_location.end()),
-                           std::move(sp_block_table_state),
-                           num_dispatched_tokens);
-}
-
-BlockContext BlockContext::setstate(const std::tuple<std::string,
-                                                     int,
-                                                     int,
-                                                     int,
-                                                     int,
-                                                     int,
-                                                     std::vector<std::pair<int, int>>,
-                                                     std::vector<std::vector<int>>,
-                                                     std::vector<int>>& state)
-{
-    BlockContext ctx;
-    ctx.engine_id_          = std::get<0>(state);
-    ctx.dp_idx_             = std::get<1>(state);
-    ctx.master_sp_idx_      = std::get<2>(state);
-    ctx.attention_sp_       = std::get<3>(state);
-    ctx.attention_dp_       = std::get<4>(state);
-    ctx.num_kvcache_blocks_ = std::get<5>(state);
-    ctx.block_location      = BlockContext::BlockLocationList(std::get<6>(state).begin(), std::get<6>(state).end());
-
-    auto block_table = std::get<7>(state);
-    ctx.sp_block_table.resize(block_table.size(), {});
-    for (size_t i = 0; i < block_table.size(); ++i) {
-        ctx.sp_block_table[i] = BlockContext::BlockIdList(block_table[i].begin(), block_table[i].end());
-    }
-
-    ctx.num_dispatched_tokens = std::get<8>(state);
+    auto ctx = std::make_unique<BlockContext>();
+    reset_block_context(*ctx, engine_id, attention_sp, attention_dp, num_kvcache_blocks);
     return ctx;
+}
+
+void reset_block_context(
+    BlockContext& ctx, const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks)
+{
+    ctx.engine_id = engine_id;
+
+    ctx.dp_idx        = 0;
+    ctx.master_sp_idx = 0;
+    ctx.attention_sp  = attention_sp;
+    ctx.attention_dp  = attention_dp;
+
+    ctx.num_kvcache_blocks = num_kvcache_blocks;
+
+    // Initialize sp_block_table and num_dispatched_tokens
+    ctx.sp_block_table.clear();
+    ctx.sp_block_table.resize(attention_sp);
+    for (auto& list : ctx.sp_block_table) {
+        list = std::make_unique<fbs::IntListT>();
+    }
+    ctx.num_dispatched_tokens.clear();
+    ctx.num_dispatched_tokens.resize(attention_sp, 0);
+    ctx.block_location.clear();
 }
 
 std::atomic<uint64_t> Sequence::next_seq_id_{0};
 
-Sequence::Sequence(const std::vector<int>& token_ids, const SamplingParams& sampling_params):
-    token_ids(token_ids), sampling_params(sampling_params)
+Sequence::Sequence(const std::vector<int>& token_ids, const SamplingParams& sampling_params)
 {
-    this->token_ids.reserve(sampling_params.max_tokens);
-    this->token_ids = token_ids;
+    data_ = std::make_unique<SequenceT>();
 
-    seq_id     = next_seq_id_.fetch_add(1);
-    status     = SequenceStatus::WAITING;
-    num_tokens = static_cast<int>(token_ids.size());
+    data_->token_ids = token_ids;
+    data_->token_ids.reserve(sampling_params.max_tokens);
+
+    data_->seq_id     = next_seq_id_.fetch_add(1);
+    data_->status     = fbs::SequenceStatus::WAITING;
+    data_->num_tokens = static_cast<int>(token_ids.size());
     if (!token_ids.empty()) {
-        last_token = token_ids.back();
+        data_->last_token = token_ids.back();
     }
     else {
-        last_token = -1;  // Should not happen based on usage
+        data_->last_token = -1;  // Should not happen based on usage
     }
-    num_prompt_tokens       = num_tokens;
-    num_checkpointed_tokens = num_tokens;
-    num_cached_tokens       = 0;
+    data_->num_prompt_tokens       = data_->num_tokens;
+    data_->num_checkpointed_tokens = data_->num_tokens;
+    data_->num_cached_tokens       = 0;
+
+    // Initialize sampling_params
+    data_->sampling_params  = std::make_unique<SamplingParamsT>();
+    *data_->sampling_params = sampling_params.to_flatbuffers();
+
+    // Initialize slots - pre-allocate all slots to avoid nulls
+    data_->slots.resize((size_t)BlockContextSlot::_COUNT);
+    for (size_t i = 0; i < (size_t)BlockContextSlot::_COUNT; ++i) {
+        data_->slots[i] = std::make_unique<BlockContext>();
+    }
+}
+
+std::shared_ptr<Sequence> Sequence::from_data(std::unique_ptr<SequenceT> data)
+{
+    auto seq   = std::make_shared<Sequence>(std::vector<int>{}, SamplingParams());
+    seq->data_ = std::move(data);
+
+    // Ensure all slots are allocated (handle deserialized data that may have nulls)
+    if (seq->data_->slots.size() < (size_t)BlockContextSlot::_COUNT) {
+        seq->data_->slots.resize((size_t)BlockContextSlot::_COUNT);
+    }
+    for (size_t i = 0; i < (size_t)BlockContextSlot::_COUNT; ++i) {
+        if (!seq->data_->slots[i]) {
+            seq->data_->slots[i] = std::make_unique<BlockContext>();
+        }
+    }
+
+    return seq;
 }
 
 BlockContext& Sequence::block_ctx(BlockContextSlot slot)
 {
-    return slots_[(size_t)slot];
+    ensure_slot(slot);
+    return *get_slot(slot);
 }
 
 const BlockContext& Sequence::block_ctx(BlockContextSlot slot) const
 {
-    return slots_[(size_t)slot];
+    ensure_slot(slot);
+    return *get_slot(slot);
 }
 
 int Sequence::dp_idx(BlockContextSlot slot)
 {
-    return block_ctx(slot).dp_idx_;
+    return block_ctx(slot).dp_idx;
 }
 
-BlockContext::BlockIdList& Sequence::block_table(BlockContextSlot slot, int sp_idx)
+std::vector<int>& Sequence::block_table(BlockContextSlot slot, int sp_idx)
 {
-    return block_ctx(slot).sp_block_table[sp_idx];
+    auto& ctx = block_ctx(slot);
+    if (sp_idx >= static_cast<int>(ctx.sp_block_table.size())) {
+        ctx.sp_block_table.resize(sp_idx + 1);
+    }
+    if (!ctx.sp_block_table[sp_idx]) {
+        ctx.sp_block_table[sp_idx] = std::make_unique<fbs::IntListT>();
+    }
+    // Return a reference to the values vector directly
+    return ctx.sp_block_table[sp_idx]->values;
 }
 
 int Sequence::context_len(BlockContextSlot slot, std::optional<int> sp_idx)
 {
     auto& ctx = block_ctx(slot);
-    int   idx = sp_idx.has_value() ? sp_idx.value() : ctx.master_sp_idx_;
+    int   idx = sp_idx.has_value() ? sp_idx.value() : ctx.master_sp_idx;
+    if (idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
+        return 0;
+    }
     return ctx.num_dispatched_tokens[idx];
 }
 
 void Sequence::append_token(int token_id, BlockContextSlot slot, std::optional<int> sp_idx)
 {
     auto& ctx = block_ctx(slot);
-    int   idx = sp_idx.has_value() ? sp_idx.value() : ctx.master_sp_idx_;
+    int   idx = sp_idx.has_value() ? sp_idx.value() : ctx.master_sp_idx;
 
-    token_ids.push_back(token_id);
-    last_token = token_id;
-    num_tokens++;
+    data_->token_ids.push_back(token_id);
+    data_->last_token = token_id;
+    data_->num_tokens++;
+    if (idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
+        ctx.num_dispatched_tokens.resize(idx + 1, 0);
+    }
     ctx.num_dispatched_tokens[idx]++;
 }
 
 int Sequence::num_blocks(BlockContextSlot slot, int sp_idx)
 {
-    int n_tokens = block_ctx(slot).num_dispatched_tokens[sp_idx];
+    auto& ctx = block_ctx(slot);
+    if (sp_idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
+        return 0;
+    }
+    int n_tokens = ctx.num_dispatched_tokens[sp_idx];
     return (n_tokens + block_size - 1) / block_size;
 }
 
 int Sequence::last_block_page_id(BlockContextSlot slot, int sp_idx)
 {
-    int   n_tokens       = block_ctx(slot).num_dispatched_tokens[sp_idx];
-    int   last_block_idx = (n_tokens - 1) / block_size;
-    auto& table          = block_table(slot, sp_idx);
-    if (last_block_idx >= static_cast<int>(table.size())) {
+    auto& ctx = block_ctx(slot);
+    if (sp_idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
+        throw std::out_of_range("SP index out of range");
+    }
+    int n_tokens       = ctx.num_dispatched_tokens[sp_idx];
+    int last_block_idx = (n_tokens - 1) / block_size;
+
+    if (sp_idx >= static_cast<int>(ctx.sp_block_table.size()) || !ctx.sp_block_table[sp_idx]
+        || last_block_idx >= static_cast<int>(ctx.sp_block_table[sp_idx]->values.size())) {
         throw std::out_of_range("Block index out of range");
     }
-    return table[last_block_idx];
+    return ctx.sp_block_table[sp_idx]->values[last_block_idx];
 }
 
 int Sequence::last_block_num_tokens(BlockContextSlot slot, int sp_idx)
 {
-    int n_tokens = block_ctx(slot).num_dispatched_tokens[sp_idx];
+    auto& ctx = block_ctx(slot);
+    if (sp_idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
+        return 0;
+    }
+    int n_tokens = ctx.num_dispatched_tokens[sp_idx];
     return n_tokens - (num_blocks(slot, sp_idx) - 1) * block_size;
 }
 
@@ -177,12 +190,12 @@ std::pair<const int*, size_t> Sequence::block_view(int i, BlockContextSlot slot,
     }
 
     int start = i * block_size;
-    int end   = std::min((i + 1) * block_size, static_cast<int>(token_ids.size()));
+    int end   = std::min((i + 1) * block_size, static_cast<int>(data_->token_ids.size()));
 
-    if (start >= static_cast<int>(token_ids.size())) {
+    if (start >= static_cast<int>(data_->token_ids.size())) {
         return {nullptr, 0};
     }
-    return {&token_ids[start], static_cast<size_t>(end - start)};
+    return {&data_->token_ids[start], static_cast<size_t>(end - start)};
 }
 
 std::vector<int> Sequence::block(int i, BlockContextSlot slot, int sp_idx)
@@ -195,16 +208,16 @@ std::vector<int> Sequence::block(int i, BlockContextSlot slot, int sp_idx)
 
 std::vector<int> Sequence::prompt_token_ids() const
 {
-    if (num_prompt_tokens > static_cast<int>(token_ids.size()))
-        return token_ids;
-    return std::vector<int>(token_ids.begin(), token_ids.begin() + num_prompt_tokens);
+    if (data_->num_prompt_tokens > static_cast<int>(data_->token_ids.size()))
+        return data_->token_ids;
+    return std::vector<int>(data_->token_ids.begin(), data_->token_ids.begin() + data_->num_prompt_tokens);
 }
 
 std::vector<int> Sequence::completion_token_ids() const
 {
-    if (num_prompt_tokens >= static_cast<int>(token_ids.size()))
+    if (data_->num_prompt_tokens >= static_cast<int>(data_->token_ids.size()))
         return {};
-    return std::vector<int>(token_ids.begin() + num_prompt_tokens, token_ids.end());
+    return std::vector<int>(data_->token_ids.begin() + data_->num_prompt_tokens, data_->token_ids.end());
 }
 
 }  // namespace nanodeploy

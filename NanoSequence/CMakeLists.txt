@@ -48,7 +48,6 @@ endif()
 include_directories(.)
 add_subdirectory(nanosequence/csrc/metrics)
 add_subdirectory(nanosequence/csrc/sequence)
-add_subdirectory(nanosequence/csrc/ffi)
 
 # Add Python bindings if building standalone (not as subdirectory)
 # When included as subdirectory, bindings are handled by parent project

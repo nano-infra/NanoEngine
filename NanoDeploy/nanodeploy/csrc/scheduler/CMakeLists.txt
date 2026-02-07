@@ -14,7 +14,12 @@ add_library(
 
 target_compile_options(_nanodeploy_scheduler PRIVATE -O3 -Wall -Wextra)
 
-target_link_libraries(_nanodeploy_scheduler PRIVATE _nanodeploy_metrics _nanodeploy_sequence nanocommon)
+# Link _nanosequence as PUBLIC to propagate include directories to consumers
+# Other dependencies can be PRIVATE since scheduler's headers don't expose them
+target_link_libraries(_nanodeploy_scheduler
+    PRIVATE _nanodeploy_metrics
+    PUBLIC _nanosequence _nanosequence_metrics nanocommon
+)
 
 set_target_properties(
     _nanodeploy_scheduler

@@ -3,7 +3,7 @@ set(CPP_SOURCES
     serialization.cpp
 )
 
-# --- FlatBuffers Generation ---
+# --- FlatBuffers Generation with gen-object-api ---
 # Note: FLATC_EXECUTABLE target is available from add_subdirectory(third_party/flatbuffers)
 if(TARGET flatc)
     set(FLATC_EXECUTABLE $<TARGET_FILE:flatc>)
@@ -21,11 +21,12 @@ add_custom_command(
     COMMAND ${FLATC_EXECUTABLE}
             --cpp
             --scoped-enums
+            --gen-object-api
             -o ${GEN_HEADER_DIR}
             ${FBS_SOURCE}
     DEPENDS ${FBS_SOURCE}
             flatc
-    COMMENT "Generating FlatBuffers header for Sequence"
+    COMMENT "Generating FlatBuffers header for Sequence with gen-object-api"
 )
 
 # --- Target Definition ---
@@ -53,16 +54,21 @@ set_target_properties(_nanosequence PROPERTIES
 target_compile_options(_nanosequence PRIVATE -O3 -Wall -Wextra)
 
 # Link flatbuffers (header only or static lib) and metrics
-target_link_libraries(_nanosequence PRIVATE flatbuffers nanocommon _nanosequence_metrics)
+# Use PUBLIC for flatbuffers to propagate its include directories to consumers
+target_link_libraries(_nanosequence PUBLIC flatbuffers PRIVATE nanocommon _nanosequence_metrics)
 
 # Include generated header directory
-target_include_directories(_nanosequence PRIVATE ${GEN_HEADER_DIR})
+target_include_directories(_nanosequence PRIVATE ${GEN_HEADER_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
 # Include directories for headers
 # The PUBLIC include directory should point to NanoSequence root so that
 # consumers can include headers as "nanosequence/csrc/sequence/sequence.h"
+# Also include the generated header directory so consumers can access sequence_generated.h
+# Also include flatbuffers include directory so generated headers can find flatbuffers/flatbuffers.h
 target_include_directories(_nanosequence PUBLIC
     $<BUILD_INTERFACE:${NANOINFRA_DIR}/NanoSequence>
+    $<BUILD_INTERFACE:${GEN_HEADER_DIR}>
+    $<BUILD_INTERFACE:${NANOINFRA_DIR}/third_party/flatbuffers/include>
     $<INSTALL_INTERFACE:include>
 )
 

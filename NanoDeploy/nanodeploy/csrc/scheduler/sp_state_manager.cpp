@@ -3,7 +3,8 @@
 #include <iostream>
 #include <random>
 
-#include "nanodeploy/csrc/sequence/sequence.h"
+#include "nanosequence/csrc/sequence/sequence.h"
+#include "sequence_generated.h"
 
 #include "sp_state_manager.h"
 
@@ -48,7 +49,7 @@ void SPStateManager::initialize_dummy_seqs()
 
         auto dummy_seq = std::make_shared<Sequence>(token_ids, sp);
         dummy_seq->active(engine_id_, attention_sp_, 1, num_kvcache_blocks_);
-        dummy_seq->block_ctx().master_sp_idx_ = sp_idx;
+        dummy_seq->block_ctx().master_sp_idx = sp_idx;
 
         dummy_seq->append_token(dis(gen), BlockContextSlot::ACTIVE, sp_idx);
 
@@ -66,7 +67,7 @@ int SPStateManager::next_sp_idx()
 
 bool SPStateManager::can_append(Sequence& seq, int num_tokens)
 {
-    int master_sp_idx = seq.block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+    int master_sp_idx = seq.block_ctx(BlockContextSlot::ACTIVE).master_sp_idx;
     if (block_manager.find(master_sp_idx) == block_manager.end()) {
         return false;
     }
@@ -75,7 +76,7 @@ bool SPStateManager::can_append(Sequence& seq, int num_tokens)
 
 bool SPStateManager::may_append(Sequence& seq, int num_tokens)
 {
-    int master_sp_idx = seq.block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+    int master_sp_idx = seq.block_ctx(BlockContextSlot::ACTIVE).master_sp_idx;
     if (block_manager.find(master_sp_idx) != block_manager.end()) {
         return block_manager[master_sp_idx]->may_append(seq, num_tokens);
     }
@@ -87,7 +88,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
                                   const std::unordered_map<int, int>& num_batched_tokens)
 {
     // Step 1: Determine min required ranks (Initial SP Size)
-    int num_tokens           = seq.num_tokens;
+    int num_tokens           = seq.num_tokens();
     int num_segments         = (num_tokens + segment_size - 1) / segment_size;
     int initial_ranks_needed = std::max(1, std::min(attention_sp_, num_segments));
 
@@ -242,8 +243,8 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             std::min_element(participants.begin(), participants.end(), [](const RankStatus& a, const RankStatus& b) {
                 return a.current_batch_load < b.current_batch_load;
             });
-        int master_rank          = min_batch_it->id;
-        block_ctx.master_sp_idx_ = master_rank;
+        int master_rank         = min_batch_it->id;
+        block_ctx.master_sp_idx = master_rank;
 
         // 3. Final physical check
         if (min_batch_it->current_batch_load + 1 > max_num_seqs_) {
@@ -274,7 +275,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
 void SPStateManager::allocate(Sequence& seq)
 {
     auto& block_ctx     = seq.block_ctx(BlockContextSlot::ACTIVE);
-    int   master_sp_idx = block_ctx.master_sp_idx_;
+    int   master_sp_idx = block_ctx.master_sp_idx;
 
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
         if (sp_idx != master_sp_idx) {
@@ -284,9 +285,9 @@ void SPStateManager::allocate(Sequence& seq)
     block_manager[master_sp_idx]->allocate(seq);
 
     num_running_seqs_++;
-    num_running_tokens_ += seq.num_tokens;
+    num_running_tokens_ += seq.num_tokens();
     num_running_seqs_per_sp_[master_sp_idx]++;
-    num_running_tokens_per_sp_[master_sp_idx] += seq.num_tokens;
+    num_running_tokens_per_sp_[master_sp_idx] += seq.num_tokens();
 }
 
 void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
@@ -296,15 +297,15 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
     }
 
     auto& block_ctx     = seq.block_ctx(BlockContextSlot::ACTIVE);
-    int   master_sp_idx = block_ctx.master_sp_idx_;
+    int   master_sp_idx = block_ctx.master_sp_idx;
     block_ctx.sp_block_table.clear();
     block_ctx.block_location.clear();
     std::fill(block_ctx.num_dispatched_tokens.begin(), block_ctx.num_dispatched_tokens.end(), 0);
 
     num_running_seqs_--;
-    num_running_tokens_ -= seq.num_tokens;
+    num_running_tokens_ -= seq.num_tokens();
     num_running_seqs_per_sp_[master_sp_idx]--;
-    num_running_tokens_per_sp_[master_sp_idx] -= seq.num_tokens;
+    num_running_tokens_per_sp_[master_sp_idx] -= seq.num_tokens();
 }
 
 }  // namespace nanodeploy

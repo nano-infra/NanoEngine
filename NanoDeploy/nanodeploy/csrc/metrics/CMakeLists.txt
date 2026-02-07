@@ -1,5 +1,4 @@
 set(CPP_SOURCES
-    sequence_metric.cpp
     server_metric.cpp
 )
 

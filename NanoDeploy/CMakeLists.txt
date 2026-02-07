@@ -21,11 +21,11 @@ message(STATUS "NanoInfra Root Path: ${NANOINFRA_DIR}")
 include_directories(.)
 add_subdirectory(${NANOINFRA_DIR}/third_party third_party)
 add_subdirectory(${NANOINFRA_DIR}/NanoCommon NanoCommon)
+add_subdirectory(${NANOINFRA_DIR}/NanoSequence NanoSequence)
 add_subdirectory(nanodeploy/csrc)
 
 # Python Flatbuffers Generation
-set(SEQUENCE_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/proto/sequence.fbs")
-set(CONNECTION_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/proto/connection.fbs")
+set(SEQUENCE_PROTO "${NANOINFRA_DIR}/NanoSequence/proto/sequence.fbs")
 set(FBS_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nanodeploy/fbs")
 
 # Create output directory and ensure it has an __init__.py
@@ -46,8 +46,5 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E touch "${FBS_OUTPUT_DIR}/__init__.py"
     COMMAND flatc --python --gen-object-api -o "${CMAKE_CURRENT_SOURCE_DIR}" ${SEQUENCE_PROTO} ${CONNECTION_PROTO}
     DEPENDS flatc ${SEQUENCE_PROTO} ${CONNECTION_PROTO}
-    COMMENT "Generating Python Flatbuffers from sequence.fbs and connection.fbs"
+    COMMENT "Generating Python Flatbuffers from sequence.fbs"
 )
-
-# Add a custom target to ensure it runs
-add_custom_target(gen_python_fbs ALL DEPENDS "${FBS_OUTPUT_DIR}/Peer.py")

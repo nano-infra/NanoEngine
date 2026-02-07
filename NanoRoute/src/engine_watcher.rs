@@ -78,12 +78,14 @@ pub struct EngineWatcher {
     initial_revision: i64,
     event_tx: mpsc::UnboundedSender<EngineEvent>,
     deduplicator: Arc<Mutex<EventDeduplicator>>,
+    redis_key_prefix: String,
 }
 
 impl EngineWatcher {
     pub fn new(
         redis_url: String,
         initial_revision: i64,
+        redis_key_prefix: String,
     ) -> (Self, mpsc::UnboundedReceiver<EngineEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
@@ -92,6 +94,7 @@ impl EngineWatcher {
                 initial_revision,
                 event_tx: tx,
                 deduplicator: Arc::new(Mutex::new(EventDeduplicator::new(1000))),
+                redis_key_prefix,
             },
             rx,
         )
@@ -142,9 +145,9 @@ impl EngineWatcher {
         let conn = client.get_async_connection().await?;
         let mut pubsub = conn.into_pubsub();
 
-        // Subscribe to channel
-        let channel = "nano_events:engine_update";
-        pubsub.subscribe(channel).await?;
+        // Subscribe to channel with scoped prefix
+        let channel = format!("{}:nano_events:engine_update", self.redis_key_prefix);
+        pubsub.subscribe(&channel).await?;
         info!("Subscribed to {}", channel);
 
         // Get current revision at subscription time (before converting to stream)
@@ -308,8 +311,9 @@ impl EngineWatcher {
         // Get current revision using a separate connection
         let client = redis::Client::open(self.redis_url.as_str())?;
         let mut conn = client.get_multiplexed_async_connection().await?;
+        let revision_key = format!("{}:nano_meta:engine_revision", self.redis_key_prefix);
         let revision: Option<i64> = redis::cmd("GET")
-            .arg("nano_meta:engine_revision")
+            .arg(&revision_key)
             .query_async(&mut conn)
             .await?;
         let revision = revision.unwrap_or(0);

@@ -1,5 +1,6 @@
 #include <utility>
 
+#include <flatbuffers/flatbuffers.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
@@ -7,6 +8,7 @@
 #include "nanosequence/csrc/metrics/sequence_metric.h"
 #include "nanosequence/csrc/sequence/sequence.h"
 #include "nanosequence/csrc/sequence/serialization.h"
+#include "sequence_generated.h"
 
 #include "nanosequence/csrc/bind/opaque_types.h"
 
@@ -15,9 +17,9 @@ using namespace nanodeploy;
 
 namespace {
 
-BlockContext::BlockIdList block_id_list_from_iterable(const py::iterable& it)
+BlockIdList block_id_list_from_iterable(const py::iterable& it)
 {
-    BlockContext::BlockIdList out;
+    BlockIdList out;
     for (auto item : it) {
         out.push_back(item.cast<int>());
     }
@@ -30,11 +32,22 @@ void bind_sequence(py::module_& m)
 {
     // Bind wrapper containers used for mutable proxy views.
     // These are intentionally distinct from std::vector<int> used by token_ids.
-    auto block_id_list = py::bind_vector<BlockContext::BlockIdList>(m, "BlockIdList");
+    auto block_id_list = py::bind_vector<BlockIdList>(m, "BlockIdList");
     block_id_list.def(py::init<>()).def(py::init([](py::iterable it) { return block_id_list_from_iterable(it); }));
-    py::implicitly_convertible<py::list, BlockContext::BlockIdList>();
+    py::implicitly_convertible<py::list, BlockIdList>();
 
-    py::bind_vector<BlockContext::BlockLocationList>(m, "BlockLocationList").def(py::init<>());
+    py::bind_vector<BlockLocationList>(m, "BlockLocationList").def(py::init<>());
+
+    // Bind FlatBuffers BlockLocation struct (read-only)
+    py::class_<fbs::BlockLocation>(m, "BlockLocation")
+        .def(py::init<>())
+        .def(py::init<int, int>())
+        .def_property_readonly("first", [](const fbs::BlockLocation& bl) { return bl.first(); })
+        .def_property_readonly("second", [](const fbs::BlockLocation& bl) { return bl.second(); })
+        .def("__repr__", [](const fbs::BlockLocation& bl) {
+            return "BlockLocation(first=" + std::to_string(bl.first()) +
+                   ", second=" + std::to_string(bl.second()) + ")";
+        });
 
     // Directly accepts address and size
     m.def("serialize",
@@ -47,18 +60,17 @@ void bind_sequence(py::module_& m)
     m.def("deserialize", &deserialize_sequences, py::arg("data_ptr"), py::arg("data_len"));
 
     // Wrapper class for sp_block_table to provide defaultdict(list) behavior.
-    py::class_<BlockContext::SpBlockTable>(m, "DefaultListDict")
+    py::class_<SpBlockTable>(m, "DefaultListDict")
         .def(py::init<>())
         .def(
             "__getitem__",
-            [](BlockContext::SpBlockTable& self, int key) -> BlockContext::BlockIdList& {
+            [](SpBlockTable& self, int key) -> BlockIdList& {
                 // Mimic defaultdict(list): create empty list for missing keys.
                 return self[key];
             },
             py::return_value_policy::reference_internal)
-        .def("__setitem__", [](BlockContext::SpBlockTable& self, int key, py::iterable value) {
-            self[key] = block_id_list_from_iterable(value);
-        });
+        .def("__setitem__",
+             [](SpBlockTable& self, int key, py::iterable value) { self[key] = block_id_list_from_iterable(value); });
 
     py::enum_<SequenceStatus>(m, "SequenceStatus")
         .value("WAITING", SequenceStatus::WAITING)
@@ -121,39 +133,67 @@ void bind_sequence(py::module_& m)
 
     py::class_<BlockContext>(m, "BlockContext")
         .def(py::init<>())
-        .def_readwrite("engine_id", &BlockContext::engine_id_)
-        .def_readwrite("dp_idx", &BlockContext::dp_idx_)
-        .def_readwrite("master_sp_idx", &BlockContext::master_sp_idx_)
-        .def_readwrite("attention_sp", &BlockContext::attention_sp_)
-        .def_readwrite("attention_dp", &BlockContext::attention_dp_)
-        .def_readwrite("num_kvcache_blocks", &BlockContext::num_kvcache_blocks_)
+        .def_readwrite("engine_id", &BlockContext::engine_id)
+        .def_readwrite("dp_idx", &BlockContext::dp_idx)
+        .def_readwrite("master_sp_idx", &BlockContext::master_sp_idx)
+        .def_readwrite("attention_sp", &BlockContext::attention_sp)
+        .def_readwrite("attention_dp", &BlockContext::attention_dp)
+        .def_readwrite("num_kvcache_blocks", &BlockContext::num_kvcache_blocks)
         .def_property(
             "block_location",
-            [](BlockContext& self) -> BlockContext::BlockLocationList& { return self.block_location; },
-            [](BlockContext& self, const BlockContext::BlockLocationList& value) { self.block_location = value; },
+            [](BlockContext& self) -> std::vector<fbs::BlockLocation>& { return self.block_location; },
+            [](BlockContext& self, const std::vector<fbs::BlockLocation>& value) { self.block_location = value; },
             py::return_value_policy::reference_internal)
         .def_property(
             "sp_block_table",
-            [](BlockContext& self) -> BlockContext::SpBlockTable& { return self.sp_block_table; },
-            [](BlockContext& self, const BlockContext::SpBlockTable& value) { self.sp_block_table = value; },
+            [](BlockContext& self) -> std::vector<std::unique_ptr<fbs::IntListT>>& { return self.sp_block_table; },
+            [](BlockContext& self, const std::vector<std::unique_ptr<fbs::IntListT>>& value) {
+                self.sp_block_table.clear();
+                for (const auto& item : value) {
+                    if (item) {
+                        auto new_item    = std::make_unique<fbs::IntListT>();
+                        new_item->values = item->values;
+                        self.sp_block_table.push_back(std::move(new_item));
+                    }
+                    else {
+                        self.sp_block_table.push_back(std::make_unique<fbs::IntListT>());
+                    }
+                }
+            },
             py::return_value_policy::reference_internal)
         .def_readwrite("num_dispatched_tokens", &BlockContext::num_dispatched_tokens)
-        .def("reset",
-             &BlockContext::reset,
-             py::arg("engine_id"),
-             py::arg("attention_sp"),
-             py::arg("attention_dp"),
-             py::arg("num_kvcache_blocks"))
-        .def(py::pickle([](const BlockContext& p) { return p.getstate(); },
-                        [](const std::tuple<std::string,
-                                            int,
-                                            int,
-                                            int,
-                                            int,
-                                            int,
-                                            std::vector<std::pair<int, int>>,
-                                            std::vector<std::vector<int>>,
-                                            std::vector<int>>& t) { return BlockContext::setstate(t); }));
+        .def(
+            "reset",
+            [](BlockContext&      self,
+               const std::string& engine_id,
+               int                attention_sp,
+               int                attention_dp,
+               int                num_kvcache_blocks) {
+                reset_block_context(self, engine_id, attention_sp, attention_dp, num_kvcache_blocks);
+            },
+            py::arg("engine_id"),
+            py::arg("attention_sp"),
+            py::arg("attention_dp"),
+            py::arg("num_kvcache_blocks"))
+        .def(py::pickle(
+            [](const BlockContext& ctx) -> py::bytes {
+                flatbuffers::FlatBufferBuilder builder(256);
+                auto                           offset = fbs::BlockContext::Pack(builder, &ctx);
+                builder.Finish(offset);
+                return py::bytes(reinterpret_cast<const char*>(builder.GetBufferPointer()), builder.GetSize());
+            },
+            [](py::bytes bytes) -> std::unique_ptr<BlockContext> {
+                py::buffer_info info(py::buffer(bytes).request());
+                const uint8_t*  buffer = static_cast<const uint8_t*>(info.ptr);
+
+                flatbuffers::Verifier verifier(buffer, info.size);
+                if (!verifier.VerifyBuffer<fbs::BlockContext>()) {
+                    throw std::runtime_error("Invalid flatbuffer data in BlockContext pickle");
+                }
+
+                auto fb_ctx = flatbuffers::GetRoot<fbs::BlockContext>(buffer);
+                return std::unique_ptr<BlockContext>(fb_ctx->UnPack());
+            }));
 
     py::class_<SamplingParams>(m, "SamplingParams")
         .def(py::init<>())
@@ -193,16 +233,21 @@ void bind_sequence(py::module_& m)
         .def("last_block_num_tokens", &Sequence::last_block_num_tokens, py::arg("slot"), py::arg("sp_idx"))
         .def("block", &Sequence::block, py::arg("i"), py::arg("slot"), py::arg("sp_idx"))
 
-        .def_readwrite("seq_id", &Sequence::seq_id)
-        .def_readwrite("status", &Sequence::status)
-        .def_readwrite("token_ids", &Sequence::token_ids)
-        .def_readwrite("last_token", &Sequence::last_token)
-        .def_readwrite("num_tokens", &Sequence::num_tokens)
-        .def_readwrite("num_prompt_tokens", &Sequence::num_prompt_tokens)
-        .def_readwrite("num_checkpointed_tokens", &Sequence::num_checkpointed_tokens)
-        .def_readwrite("num_cached_tokens", &Sequence::num_cached_tokens)
+        .def_property("seq_id", &Sequence::seq_id, &Sequence::set_seq_id)
+        .def_property("status", &Sequence::status, &Sequence::set_status)
+        .def_property(
+            "token_ids",
+            [](Sequence& s) -> std::vector<int>& { return s.token_ids(); },
+            [](Sequence& s, const std::vector<int>& v) { s.token_ids() = v; },
+            py::return_value_policy::reference_internal)
+        .def_property("last_token", &Sequence::last_token, &Sequence::set_last_token)
+        .def_property("num_tokens", &Sequence::num_tokens, &Sequence::set_num_tokens)
+        .def_property("num_prompt_tokens", &Sequence::num_prompt_tokens, &Sequence::set_num_prompt_tokens)
+        .def_property(
+            "num_checkpointed_tokens", &Sequence::num_checkpointed_tokens, &Sequence::set_num_checkpointed_tokens)
+        .def_property("num_cached_tokens", &Sequence::num_cached_tokens, &Sequence::set_num_cached_tokens)
         .def_readwrite("metric", &Sequence::metric)
-        .def_readwrite("sampling_params", &Sequence::sampling_params)
+        .def_property("sampling_params", &Sequence::sampling_params, &Sequence::set_sampling_params)
 
         .def_property_readonly("is_finished", &Sequence::is_finished)
         .def_property_readonly("is_to_be_migrated", &Sequence::is_to_be_migrated)
@@ -213,19 +258,20 @@ void bind_sequence(py::module_& m)
         .def_property_readonly("completion_token_ids", &Sequence::completion_token_ids)
         .def_property_readonly("num_cached_blocks", &Sequence::num_cached_blocks)
 
-        .def("__len__", [](const Sequence& s) { return s.num_tokens; })
+        .def("__len__", [](const Sequence& s) { return s.num_tokens(); })
         .def("__getitem__",
              [](const Sequence& s, py::object key) -> py::object {
+                 const auto& token_ids = s.token_ids();
                  if (py::isinstance<py::slice>(key)) {
                      py::slice slice_obj = key.cast<py::slice>();
                      size_t    start, stop, step, slicelength;
-                     if (!slice_obj.compute(s.token_ids.size(), &start, &stop, &step, &slicelength)) {
+                     if (!slice_obj.compute(token_ids.size(), &start, &stop, &step, &slicelength)) {
                          throw py::error_already_set();
                      }
                      std::vector<int> result;
                      result.reserve(slicelength);
                      for (size_t i = 0; i < slicelength; ++i) {
-                         result.push_back(s.token_ids[start]);
+                         result.push_back(token_ids[start]);
                          start += step;
                      }
                      return py::cast(result);
@@ -233,66 +279,52 @@ void bind_sequence(py::module_& m)
                  else {
                      int idx = key.cast<int>();
                      if (idx < 0)
-                         idx += s.token_ids.size();
-                     if (idx < 0 || idx >= static_cast<int>(s.token_ids.size()))
+                         idx += token_ids.size();
+                     if (idx < 0 || idx >= static_cast<int>(token_ids.size()))
                          throw py::index_error();
-                     return py::cast(s.token_ids[idx]);
+                     return py::cast(token_ids[idx]);
                  }
              })
 
         .def(py::pickle(
-            [](const Sequence& p) {  // __getstate__
-                // Always serialize full token_ids and last_token to ensure correct state recovery
-                return std::make_tuple(p.num_tokens,
-                                       p.num_checkpointed_tokens,
-                                       p.num_cached_tokens,
-                                       p.slots_,
-                                       p.sampling_params.temperature,
-                                       p.token_ids,
-                                       p.status,
-                                       p.seq_id,
-                                       p.num_prompt_tokens,
-                                       p.sampling_params.max_tokens,
-                                       p.sampling_params.ignore_eos,
-                                       p.last_token);  // Added: explicitly serialize last_token
+            [](const Sequence& seq) -> py::bytes {  // __getstate__
+                // Safety check: ensure data_ is valid before serialization
+                if (!seq.data_) {
+                    throw std::runtime_error("Cannot pickle Sequence: data_ pointer is null");
+                }
+
+                // Simplified: Use Pack() directly
+                flatbuffers::FlatBufferBuilder builder(1024);
+                auto                           offset = fbs::Sequence::Pack(builder, seq.data_.get());
+                builder.Finish(offset);
+                return py::bytes(reinterpret_cast<const char*>(builder.GetBufferPointer()), builder.GetSize());
             },
-            [](const std::tuple<int,
-                                int,
-                                int,
-                                std::array<BlockContext, (size_t)BlockContextSlot::_COUNT>,
-                                double,
-                                std::vector<int>,
-                                SequenceStatus,
-                                uint64_t,
-                                int,
-                                int,
-                                bool,
-                                int>& t) {  // __setstate__ - added int for last_token
-                // Extract token_ids (always present now)
-                std::vector<int> token_ids = std::get<5>(t);
+            [](py::bytes bytes) -> std::shared_ptr<Sequence> {  // __setstate__
+                // Simplified: Use UnPack() directly
+                try {
+                    py::buffer_info info(py::buffer(bytes).request());
+                    const uint8_t*  buffer = static_cast<const uint8_t*>(info.ptr);
 
-                // Restore SamplingParams
-                SamplingParams sp;
-                sp.temperature = std::get<4>(t);
-                sp.max_tokens  = std::get<9>(t);
-                sp.ignore_eos  = std::get<10>(t);
+                    if (!buffer || info.size == 0) {
+                        throw std::runtime_error("Invalid buffer: null or empty");
+                    }
 
-                // Reconstruct Sequence with full token history
-                auto seq = std::make_shared<Sequence>(token_ids, sp);
+                    flatbuffers::Verifier verifier(buffer, info.size);
+                    if (!verifier.VerifyBuffer<fbs::Sequence>()) {
+                        throw std::runtime_error("Invalid flatbuffer data in Sequence pickle");
+                    }
 
-                // Restore other fields
-                seq->num_tokens              = std::get<0>(t);
-                seq->num_checkpointed_tokens = std::get<1>(t);
-                seq->num_cached_tokens       = std::get<2>(t);
-                seq->slots_                  = std::move(std::get<3>(t));
-                seq->status                  = std::get<6>(t);
-                seq->seq_id                  = std::get<7>(t);
-                seq->num_prompt_tokens       = std::get<8>(t);
+                    auto fb_seq   = flatbuffers::GetRoot<fbs::Sequence>(buffer);
+                    auto unpacked = fb_seq->UnPack();
+                    if (!unpacked) {
+                        throw std::runtime_error("Failed to unpack Sequence from flatbuffer");
+                    }
 
-                // Use the explicitly serialized last_token (not token_ids.back())
-                seq->last_token = std::get<11>(t);
-
-                return seq;
+                    return Sequence::from_data(std::unique_ptr<fbs::SequenceT>(unpacked));
+                }
+                catch (const std::exception& e) {
+                    throw std::runtime_error(std::string("Sequence deserialization failed: ") + e.what());
+                }
             }))
 
         .def_readonly_static("block_size", &Sequence::block_size);

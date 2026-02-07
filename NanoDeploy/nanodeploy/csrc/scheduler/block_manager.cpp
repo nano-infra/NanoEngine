@@ -2,7 +2,8 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "nanodeploy/csrc/sequence/sequence.h"
+#include "nanosequence/csrc/sequence/sequence.h"
+#include "sequence_generated.h"
 #include "xxhash.hpp"
 
 #include "block_manager.h"
@@ -144,7 +145,7 @@ void BlockManager::deallocate(Sequence& seq, BlockContextSlot slot)
             deallocate_block(block_id);
         }
     }
-    seq.num_cached_tokens = 0;
+    seq.set_num_cached_tokens(0);
     table.clear();
 }
 

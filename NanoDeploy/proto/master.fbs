@@ -1,5 +1,3 @@
-include "../../DLSlime/proto/rdma.fbs";
-include "sequence.fbs";
-include "connection.fbs";
+include "../../NanoSequence/proto/sequence.fbs";
 
 namespace nanodeploy.fbs;

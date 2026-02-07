@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 
-#include "nanodeploy/csrc/sequence/sequence.h"
+#include "nanosequence/csrc/sequence/sequence.h"
 
 #include "sp_state_manager.h"
 #include "thread_pool.h"

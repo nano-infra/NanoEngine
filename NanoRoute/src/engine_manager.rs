@@ -11,6 +11,7 @@ pub struct EngineManager {
     // We share adapters via Arc<Mutex> because multiple threads (http server) might access them
     pub prefill_engines: Vec<Arc<Mutex<EngineAdapter>>>,
     pub decode_engines: Vec<Arc<Mutex<EngineAdapter>>>,
+    redis_key_prefix: String,
 }
 
 impl Default for EngineManager {
@@ -24,7 +25,19 @@ impl EngineManager {
         Self {
             prefill_engines: Vec::new(),
             decode_engines: Vec::new(),
+            redis_key_prefix: "default".to_string(),
         }
+    }
+
+    /// Create Redis key prefix from NanoCtrl address for data isolation
+    /// Format: sanitize nanoctrl_address by replacing special chars with underscores
+    pub fn create_redis_prefix(nanoctrl_address: &str) -> String {
+        // Remove protocol prefix (http://, https://) and sanitize
+        let sanitized = nanoctrl_address
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .replace([':', '/', '.', '-'], "_");
+        format!("nano_{}", sanitized)
     }
 
     #[allow(dead_code)]
@@ -392,8 +405,9 @@ impl EngineManager {
     async fn get_current_revision(&self, redis_url: &str) -> anyhow::Result<i64> {
         let client = redis::Client::open(redis_url)?;
         let mut conn = client.get_multiplexed_async_connection().await?;
+        let revision_key = format!("{}:nano_meta:engine_revision", self.redis_key_prefix);
         let revision: Option<i64> = redis::cmd("GET")
-            .arg("nano_meta:engine_revision")
+            .arg(&revision_key)
             .query_async(&mut conn)
             .await?;
         let revision = revision.unwrap_or(0);
@@ -405,9 +419,10 @@ impl EngineManager {
         let client = redis::Client::open(redis_url)?;
         let mut conn = client.get_multiplexed_async_connection().await?;
 
-        // Scan all engine:* keys
+        // Scan all engine:* keys with scope prefix
+        let pattern = format!("{}:engine:*", self.redis_key_prefix);
         let keys: Vec<String> = redis::cmd("KEYS")
-            .arg("engine:*")
+            .arg(&pattern)
             .query_async(&mut conn)
             .await?;
 
@@ -502,6 +517,14 @@ impl EngineManager {
         redis_url: String,
         nanoctrl_address: Option<String>,
     ) -> anyhow::Result<Arc<Mutex<Self>>> {
+        // Set Redis key prefix based on nanoctrl_address for data isolation
+        if let Some(ref addr) = nanoctrl_address {
+            self.redis_key_prefix = Self::create_redis_prefix(addr);
+            info!(
+                "Using Redis key prefix: {} (isolated scope for {})",
+                self.redis_key_prefix, addr
+            );
+        }
         // Step 1: Load snapshot (full sync)
         // Strategy: Load from both Redis and NanoCtrl API, merge results
         // This ensures we get all engines even if some have expired TTL in Redis
@@ -591,9 +614,10 @@ impl EngineManager {
             initial_revision
         );
 
-        // Step 2: Start watcher
+        // Step 2: Start watcher with scoped prefix
+        let redis_prefix = self.redis_key_prefix.clone();
         let (watcher, mut event_rx): (EngineWatcher, mpsc::UnboundedReceiver<EngineEvent>) =
-            EngineWatcher::new(redis_url.clone(), initial_revision);
+            EngineWatcher::new(redis_url.clone(), initial_revision, redis_prefix);
         let watcher_handle = tokio::spawn(async move {
             if let Err(e) = watcher.start().await {
                 error!("Watcher task error: {}", e);

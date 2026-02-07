@@ -14,7 +14,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(path)
     config = Config(
         model=path,
-        enforce_eager=True,
+        enforce_eager=False,
         attention_dp=8,
         attention_sp=1,
         attention_tp=1,
@@ -27,10 +27,11 @@ def main():
         max_model_len=4096,
         max_num_batched_tokens=4096,
         gpu_memory_utilization=0.9,
+        log_level="DEBUG",
     )
     llm = LLM(config)
 
-    sampling_params = SamplingParams()
+    sampling_params = SamplingParams(max_tokens=1024)
     prompts = [
         "Help me write a script for oh-my-zsh install configuration.",
     ]

@@ -1,7 +1,8 @@
 #include <algorithm>
 #include <iostream>
 
-#include "nanodeploy/csrc/sequence/sequence.h"
+#include "nanosequence/csrc/sequence/sequence.h"
+#include "sequence_generated.h"
 
 #include "model_runner_utils.h"
 
@@ -16,7 +17,7 @@ static void build_block_tables_packed(const std::vector<Sequence*>& dp_seqs,
     // 1. Group sequences
     std::vector<std::vector<Sequence*>> dp_sp_seqs(sp_size);
     for (auto* seq : dp_seqs) {
-        int m_sp = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+        int m_sp = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx;
         if (m_sp >= 0 && m_sp < sp_size) {
             dp_sp_seqs[m_sp].push_back(seq);
         }
@@ -68,7 +69,7 @@ static void build_block_tables_dense(const std::vector<Sequence*>& dp_seqs,
     // 1. Group sequences by master_sp_idx
     std::vector<std::vector<Sequence*>> dp_sp_seqs(sp_size);
     for (auto* seq : dp_seqs) {
-        int m_sp = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+        int m_sp = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx;
         if (m_sp >= 0 && m_sp < sp_size) {
             dp_sp_seqs[m_sp].push_back(seq);
         }
@@ -116,16 +117,16 @@ prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size
     meta.slot_mapping.reserve(est_tokens);
 
     for (auto* seq : seqs) {
-        if (seq->block_ctx().master_sp_idx_ != sp_rank) {
+        if (seq->block_ctx().master_sp_idx != sp_rank) {
             continue;
         }
 
-        int seqlen     = seq->num_tokens;
-        int num_cached = seq->num_cached_tokens;
+        int seqlen     = seq->num_tokens();
+        int num_cached = seq->num_cached_tokens();
         int seqlen_q   = seqlen - num_cached;
         int seqlen_k   = seqlen;
 
-        const auto& full_tokens = seq->token_ids;
+        const auto& full_tokens = seq->token_ids();
         for (int i = num_cached; i < seqlen; ++i) {
             meta.input_ids.push_back(full_tokens[i]);
             meta.positions.push_back(i);
@@ -171,9 +172,9 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
 
     // 1. Prepare input_ids, positions, slot_mapping
     for (auto* seq : dp_seqs) {
-        if (seq->block_ctx().master_sp_idx_ == sp_rank) {
-            meta.input_ids.push_back(seq->last_token);
-            meta.positions.push_back(seq->num_tokens - 1);
+        if (seq->block_ctx().master_sp_idx == sp_rank) {
+            meta.input_ids.push_back(seq->last_token());
+            meta.positions.push_back(seq->num_tokens() - 1);
 
             int page_id = seq->last_block_page_id(BlockContextSlot::ACTIVE, sp_rank);
             int offset  = seq->last_block_num_tokens(BlockContextSlot::ACTIVE, sp_rank);
@@ -184,7 +185,7 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
     // Group sequences
     std::vector<std::vector<Sequence*>> sp_seqs(sp_size);
     for (auto* seq : dp_seqs) {
-        int m_sp = seq->block_ctx().master_sp_idx_;
+        int m_sp = seq->block_ctx().master_sp_idx;
         if (m_sp >= 0 && m_sp < sp_size) {
             sp_seqs[m_sp].push_back(seq);
         }
@@ -313,7 +314,7 @@ prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_si
 void update_seqs_inner_loop(const std::vector<Sequence*>& sp_seqs, int sp_rank)
 {
     for (auto seq : sp_seqs) {
-        seq->num_tokens += 1;
+        seq->set_num_tokens(seq->num_tokens() + 1);
         seq->block_ctx().num_dispatched_tokens[sp_rank] += 1;
     }
 }

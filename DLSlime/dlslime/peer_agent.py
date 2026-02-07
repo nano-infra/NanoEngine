@@ -25,6 +25,20 @@ except ImportError as e:
 from dlslime import available_nic, RDMAContext, RDMAEndpoint, RDMAMemoryPool
 
 
+def create_redis_prefix(server_url: str) -> str:
+    """Create Redis key prefix from NanoCtrl server URL for data isolation."""
+    # Remove protocol and sanitize (e.g., http://10.102.97.179:3000 -> nano_10_102_97_179_3000)
+    sanitized = (
+        server_url.replace("http://", "")
+        .replace("https://", "")
+        .replace(":", "_")
+        .replace("/", "_")
+        .replace(".", "_")
+        .replace("-", "_")
+    )
+    return f"nano_{sanitized}"
+
+
 class TopologyReconciler:
     """
     Background reconciliation loop: converges Actual State to Desired State.
@@ -72,8 +86,8 @@ class TopologyReconciler:
 
     def _reconcile_once(self) -> None:
         """Single reconciliation pass: diff desired vs actual, act on delta."""
-        # 1. Get Desired State from Redis
-        spec_key = f"spec:topology:{self._agent.alias}"
+        # 1. Get Desired State from Redis (with scoped prefix)
+        spec_key = f"{self._agent.redis_key_prefix}:spec:topology:{self._agent.alias}"
         spec_str = self._agent.redis_client.get(spec_key)
         if spec_str is None:
             return  # No desired topology, nothing to do
@@ -122,15 +136,19 @@ class TopologyReconciler:
         endpoint = self._agent.ensure_local_endpoint_created(peer)
         my_qp_info = endpoint.endpoint_info()
 
-        # B. Publish our info to Redis (exchange:{sender}:{receiver})
-        exchange_key_out = f"exchange:{self._agent.alias}:{peer}"
+        # B. Publish our info to Redis (exchange:{sender}:{receiver} with scope prefix)
+        exchange_key_out = (
+            f"{self._agent.redis_key_prefix}:exchange:{self._agent.alias}:{peer}"
+        )
         self._agent.redis_client.set(
             exchange_key_out,
             json.dumps(my_qp_info, default=str),
         )
 
-        # C. Try to fetch peer's info (non-blocking, short timeout)
-        exchange_key_in = f"exchange:{peer}:{self._agent.alias}"
+        # C. Try to fetch peer's info (non-blocking, short timeout, with scope prefix)
+        exchange_key_in = (
+            f"{self._agent.redis_key_prefix}:exchange:{peer}:{self._agent.alias}"
+        )
         peer_qp_info_str = self._agent.redis_client.get(exchange_key_in)
 
         if peer_qp_info_str is None:
@@ -184,6 +202,9 @@ class PeerAgent:
         self.ib_port = ib_port
         self.link_type = link_type
         self.qp_num = qp_num
+
+        # Use empty prefix for now (no scoping)
+        self.redis_key_prefix = ""
 
         import socket
 
@@ -293,7 +314,7 @@ class PeerAgent:
         """Listen for cleanup events from peers (NanoCtrl pushes to inbox)."""
 
         def event_loop():
-            inbox_key = f"inbox:{self.alias}"
+            inbox_key = f"{self.redis_key_prefix}:inbox:{self.alias}"
             while not self._stop_event.is_set():
                 try:
                     result = self.redis_client.blpop(inbox_key, timeout=1)

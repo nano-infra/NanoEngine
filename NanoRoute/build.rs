@@ -89,10 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = env::var("OUT_DIR")?;
     let flatc = find_or_build_flatc()?;
 
-    let fbs_files = [
-        "../NanoDeploy/proto/sequence.fbs",
-        "../NanoDeploy/proto/connection.fbs",
-    ];
+    let fbs_files = ["../NanoSequence/proto/sequence.fbs"];
 
     for fbs in &fbs_files {
         println!("cargo:rerun-if-changed={}", fbs);
@@ -109,6 +106,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     patch_generated_flatbuffers(&out_dir)?;
+
+    // Link against NanoSequence libraries
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR")?;
+    let nanosequence_dir = Path::new(&manifest_dir).join("../NanoSequence");
+
+    // Try to find the library in common build locations
+    let possible_lib_paths = vec![
+        nanosequence_dir.join("build").join("lib"),
+        nanosequence_dir
+            .join("build")
+            .join("nanosequence")
+            .join("csrc")
+            .join("sequence"),
+        PathBuf::from("/opt/conda/lib/python3.11/site-packages/nanosequence"),
+    ];
+
+    for lib_path in possible_lib_paths {
+        if lib_path.exists() {
+            println!("cargo:rustc-link-search=native={}", lib_path.display());
+        }
+    }
+
+    // Link against the required libraries
+    println!("cargo:rustc-link-lib=dylib=nanosequence");
+    println!("cargo:rustc-link-lib=dylib=nanosequence_metrics");
+    println!("cargo:rustc-link-lib=static=nanosequence_ffi");
 
     Ok(())
 }

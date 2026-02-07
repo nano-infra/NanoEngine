@@ -2,8 +2,9 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "nanodeploy/csrc/metrics/sequence_metric.h"
-#include "nanodeploy/csrc/sequence/sequence.h"
+#include "nanosequence/csrc/metrics/sequence_metric.h"
+#include "nanosequence/csrc/sequence/sequence.h"
+#include "sequence_generated.h"
 
 #include "scheduler_utils.h"
 
@@ -135,7 +136,7 @@ ScheduleResult Scheduler::schedule()
             // filtered_dp_sp_seqs is dp_seqs[dp_idx] filtered by master_sp_idx
             std::vector<std::shared_ptr<Sequence>> filtered;
             for (const auto& seq : dp_seqs[dp_idx]) {
-                if (seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_ == sp_idx) {
+                if (seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx == sp_idx) {
                     filtered.push_back(seq);
                 }
             }
@@ -227,7 +228,7 @@ ScheduleResult Scheduler::schedule()
 
             // Only count if SP is truly enabled (distributed across > 1 ranks)
             if (active_ranks > 1) {
-                int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+                int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx;
 
                 // For each participating rank:
                 for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
@@ -255,12 +256,12 @@ ScheduleResult Scheduler::schedule()
         auto head_seq = wait_queue.front();
         // Calculate blocks for head sequence: ceil(num_tokens / block_size)
         // Note: We use Sequence::block_size which is static constexpr int block_size = 256;
-        result.waiting_head_blocks = (head_seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+        result.waiting_head_blocks = (head_seq->num_tokens() + Sequence::block_size - 1) / Sequence::block_size;
     }
 
     int total_blocks = 0;
     for (const auto& seq : wait_queue) {
-        total_blocks += (seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+        total_blocks += (seq->num_tokens() + Sequence::block_size - 1) / Sequence::block_size;
     }
     result.waiting_total_blocks = total_blocks;
 
@@ -320,14 +321,14 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
                 // Update tracking
                 auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
-                block_ctx.dp_idx_ = selected_dp_idx;
-                int master_sp_idx = block_ctx.master_sp_idx_;
+                block_ctx.dp_idx  = selected_dp_idx;
+                int master_sp_idx = block_ctx.master_sp_idx;
 
                 num_seqs[selected_dp_idx][master_sp_idx] += 1;
-                num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens - seq->num_cached_tokens);
+                num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens() - seq->num_cached_tokens());
 
                 // Update sequence status
-                seq->status = SequenceStatus::RUNNING;
+                seq->set_status(SequenceStatus::RUNNING);
 
                 // Add to scheduled and running queues
                 waiting_queue.pop_front();
@@ -370,13 +371,13 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                 dp_load_set.insert({new_load, selected_dp_idx});
 
                 auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
-                block_ctx.dp_idx_ = selected_dp_idx;
-                int master_sp_idx = block_ctx.master_sp_idx_;
+                block_ctx.dp_idx  = selected_dp_idx;
+                int master_sp_idx = block_ctx.master_sp_idx;
 
                 num_seqs[selected_dp_idx][master_sp_idx] += 1;
-                num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens - seq->num_cached_tokens);
+                num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens() - seq->num_cached_tokens());
 
-                seq->status = SequenceStatus::RUNNING;
+                seq->set_status(SequenceStatus::RUNNING);
 
                 waiting_queue.pop_front();
                 worker_state[selected_dp_idx]->running.push_back(seq);
@@ -421,7 +422,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
             auto seq = running_queue.front();
             running_queue.pop_front();
 
-            int master_rank = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+            int master_rank = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx;
 
             // Check if we've reached the max sequences for this SP rank
             if (num_seqs[master_rank] >= max_num_seqs_) {
@@ -459,7 +460,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
                 }
                 else {
                     scheduled_seqs[selected_dp_idx].push_back(seq);
-                    sp_lens[master_rank] += seq->num_tokens;
+                    sp_lens[master_rank] += seq->num_tokens();
                 }
             }
         }
@@ -485,10 +486,10 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
 
 void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
 {
-    std::cerr << "Preemption happens for seq_id=" << seq->seq_id << std::endl;
-    seq->status = SequenceStatus::WAITING;
+    std::cerr << "Preemption happens for seq_id=" << seq->seq_id() << std::endl;
+    seq->set_status(SequenceStatus::WAITING);
     worker_state[dp_idx]->deallocate(*seq);
-    seq->num_checkpointed_tokens = static_cast<int>(seq->token_ids.size());
+    seq->set_num_checkpointed_tokens(static_cast<int>(seq->token_ids().size()));
     waiting.push_front(seq);
 }
 
@@ -502,15 +503,15 @@ void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequen
 
     // Store migrations
     for (const auto& [seq_shared, dp_idx] : migrations) {
-        to_be_migrated[seq_shared->seq_id] = {seq_shared, dp_idx};
+        to_be_migrated[seq_shared->seq_id()] = {seq_shared, dp_idx};
     }
 }
 
 void Scheduler::free_to_be_migrated(std::shared_ptr<Sequence> seq)
 {
-    auto it = to_be_migrated.find(seq->seq_id);
+    auto it = to_be_migrated.find(seq->seq_id());
     if (it == to_be_migrated.end()) {
-        throw std::runtime_error("Sequence " + std::to_string(seq->seq_id) + " not found in to_be_migrated");
+        throw std::runtime_error("Sequence " + std::to_string(seq->seq_id()) + " not found in to_be_migrated");
     }
 
     int selected_dp_idx = it->second.second;

@@ -12,6 +12,7 @@ def main():
     path = os.path.expanduser("/models/qwen3-235B-Instruct-2507-FP8")
     tokenizer = AutoTokenizer.from_pretrained(path)
 
+    # Engines will auto-register with NanoCtrl when nanoctrl_address is set
     decode_config = Config(
         model=path,
         enforce_eager=False,
@@ -58,15 +59,9 @@ def main():
     )
     prefill = LLMComponent.as_remote(prefill_config)
 
-    # New simplified flow: engine_info includes peer_addrs (agent aliases in format EngineName:rank)
-    # Migration will lazily connect to peers using control plane API
-    # peer_addrs contains agent aliases like "engine_id:0", "engine_id:1", etc.
-    prefill_info = ray.get(prefill.get_engine_info.remote())
-    decode_info = ray.get(decode.get_engine_info.remote())
-
-    # Store peer info for migration (peer_addrs are agent aliases for control plane)
-    ray.get(prefill.set_peer_info.remote(decode_info))
-    ray.get(decode.set_peer_info.remote(prefill_info))
+    # Engines automatically register with NanoCtrl and discover each other
+    # No manual set_peer_info() needed - engines query NanoCtrl during migration
+    print("\nEngines registered with NanoCtrl - automatic peer discovery enabled\n")
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=512, ignore_eos=False)
     prompts = [
@@ -105,10 +100,36 @@ def main():
     ]
 
     ray.get(prefill.add_request.remote(seqs))
-    migrated_seqs = ray.get(prefill.generate.remote())
+
+    # Use return_serialized=True to avoid SIGSEGV during Ray pickle of migrated sequences
+    serialized_seqs = ray.get(prefill.generate.remote(return_serialized=True))
 
     print("\n" + "=" * 50)
-    print(f"DEBUG: Prefill GENERATE returned {len(migrated_seqs)} sequences.")
+    print(
+        f"DEBUG: Prefill GENERATE returned {len(serialized_seqs)} serialized sequences."
+    )
+
+    import numpy as np
+
+    # Deserialize the sequences
+    from nanodeploy._cpp import deserialize
+
+    migrated_seqs = []
+    for i, serialized_bytes in enumerate(serialized_seqs):
+        try:
+            # Convert bytes to numpy array for deserialization
+            buffer = np.frombuffer(serialized_bytes, dtype=np.uint8)
+            data_ptr = buffer.ctypes.data
+            deserialized = deserialize(data_ptr, len(buffer))
+            migrated_seqs.extend(deserialized)
+            print(
+                f"  [{i}] Deserialized {len(deserialized)} sequence(s) from {len(serialized_bytes)} bytes"
+            )
+        except Exception as e:
+            print(f"  [{i}] ERROR: Failed to deserialize: {e}")
+            raise
+
+    print(f"DEBUG: Total deserialized sequences: {len(migrated_seqs)}")
     for i, s in enumerate(migrated_seqs):
         print(f"  [{i}] Seq ID: {s.seq_id}")
         print(f"      Status: {s.status}")
@@ -117,7 +138,7 @@ def main():
         print(f"      Is To Be Migrated: {s.is_to_be_migrated}")
         print(f"      Token IDs (First 10): {s.token_ids[:10]}")
         print(f"      Token IDs (Last 10): {s.token_ids[-10:] if s.token_ids else []}")
-        print(f"      Last Tokens: {s.last_token}")
+        print(f"      Last Token: {s.last_token}")
     print("=" * 50 + "\n")
 
     if not migrated_seqs:

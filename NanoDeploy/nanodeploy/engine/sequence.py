@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
-    from nanodeploy.metrics import SequenceMetric
+    from nanodeploy._cpp import SequenceMetric
 
 from nanodeploy._cpp import (
     BlockContext as _CppBlockContext,
@@ -13,6 +13,7 @@ from nanodeploy._cpp import (
     Sequence as _CppSequence,
     SequenceStatus as _CppSequenceStatus,
 )
+
 from nanodeploy.sampling_params import SamplingParams
 
 Sequence = _CppSequence

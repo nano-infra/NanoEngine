@@ -369,9 +369,9 @@ class CacheContext:
             ):
                 for kv_idx in range(self.kv_cache.size(0)):
                     for layer_idx in range(self.num_hidden_layers):
-                        # Only process blocks where source_block_idx[0] matches this rank's sp_idx
+                        # Only process blocks where source_block_idx.first matches this rank's sp_idx
                         # This ensures each block is only processed by the correct rank
-                        if source_block_idx[0] != sp_idx:
+                        if source_block_idx.first != sp_idx:
                             # Skip blocks that don't belong to this rank
                             continue
 
@@ -379,7 +379,7 @@ class CacheContext:
                         remote_rank = (
                             seq.dp_idx(BlockContextSlot.MIGRATE)
                             * migrate_ctx.attention_sp
-                            + remote_block_idx[0]
+                            + remote_block_idx.first
                         )
 
                         # Get remote peer alias for this rank (format: EngineName:rank)
@@ -395,15 +395,10 @@ class CacheContext:
                             peer_alias,
                             kv_idx,
                             layer_idx,
-                            remote_block_idx[1],
-                            source_block_idx[1],
+                            remote_block_idx.second,
+                            source_block_idx.second,
                         )
                         assigns[engine_id][peer_alias].append(assignment)
-                        logger.info(
-                            f"Sequence {seq.seq_id}, block_pos={block_pos}, kv_idx={kv_idx}, layer_idx={layer_idx}: "
-                            f"remote_block_idx={remote_block_idx}, source_block_idx={source_block_idx}, "
-                            f"remote_rank={remote_rank}, peer_alias={peer_alias}"
-                        )
 
         # Execute RDMA reads using PeerAgent control plane API
         # Cache remote MR handlers to avoid re-registering (as in reference example)

@@ -1,9 +1,7 @@
 import json
 from typing import List, Set, Tuple
 
-import nanodeploy.fbs.EngineInfo as EngineInfo
 from nanodeploy.config import Config
-from nanodeploy.engine.llm_engine import LLMEngine
 from nanodeploy.llm import LLM
 from nanodeploy.logging import get_logger
 
@@ -51,39 +49,7 @@ class LLMComponent(LLM):
         Args:
             remote_engine_info: JSON string or FlatBuffers bytes (for backward compatibility)
         """
-        # Try to parse as JSON first
-        if isinstance(remote_engine_info, bytes):
-            try:
-                # Try JSON first
-                remote_engine_info = remote_engine_info.decode("utf-8")
-                info_dict = json.loads(remote_engine_info)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                # Fall back to FlatBuffers for backward compatibility
-                info = EngineInfo.EngineInfo.GetRootAsEngineInfo(remote_engine_info, 0)
-                remote_engine_id = info.Id().decode("utf-8") if info.Id() else ""
-                num_kv_blocks = info.NumBlocks()
-
-                # Extract peer_addrs from EngineInfo
-                peer_addrs = []
-                for i in range(info.PeerAddrsLength()):
-                    addr = info.PeerAddrs(i)
-                    if addr:
-                        peer_addrs.append(
-                            addr.decode("utf-8") if isinstance(addr, bytes) else addr
-                        )
-
-                # Store in engine for use during migration
-                self._peer_info[remote_engine_id] = {
-                    "num_blocks": num_kv_blocks,
-                    "world_size": info.WorldSize(),
-                    "peer_addrs": peer_addrs,
-                }
-                logger.info(
-                    f"Stored peer info for {remote_engine_id}: {len(peer_addrs)} addresses"
-                )
-                return
-        else:
-            info_dict = json.loads(remote_engine_info)
+        info_dict = json.loads(remote_engine_info)
 
         # Parse JSON format
         remote_engine_id = info_dict.get("id", "")
