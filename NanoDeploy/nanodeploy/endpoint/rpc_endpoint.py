@@ -184,7 +184,9 @@ class RPCClientEndpoint:
         logger.debug(f"Received sequences size: {size} bytes")
 
         if size <= 0 or size > buffer.numel():
-            raise RuntimeError(f"Invalid FlatBuffer size: {size} (buffer capacity: {buffer.numel()})")
+            raise RuntimeError(
+                f"Invalid FlatBuffer size: {size} (buffer capacity: {buffer.numel()})"
+            )
 
         return deserialize(buffer_ptr, size)
 

@@ -45,8 +45,8 @@ void bind_sequence(py::module_& m)
         .def_property_readonly("first", [](const fbs::BlockLocation& bl) { return bl.first(); })
         .def_property_readonly("second", [](const fbs::BlockLocation& bl) { return bl.second(); })
         .def("__repr__", [](const fbs::BlockLocation& bl) {
-            return "BlockLocation(first=" + std::to_string(bl.first()) +
-                   ", second=" + std::to_string(bl.second()) + ")";
+            return "BlockLocation(first=" + std::to_string(bl.first()) + ", second=" + std::to_string(bl.second())
+                   + ")";
         });
 
     // Directly accepts address and size
