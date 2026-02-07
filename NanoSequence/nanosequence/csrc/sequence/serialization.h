@@ -29,6 +29,6 @@ size_t serialize_sequences(uintptr_t                                     data_pt
  * @param data_len 有效数据长度
  * @return std::vector<std::shared_ptr<Sequence>> 还原出的对象列表
  */
-std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr, size_t data_len)
+std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr, size_t data_len);
 
 }  // namespace nanodeploy
