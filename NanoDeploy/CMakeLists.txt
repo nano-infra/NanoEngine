@@ -28,23 +28,33 @@ add_subdirectory(nanodeploy/csrc)
 set(SEQUENCE_PROTO "${NANOINFRA_DIR}/NanoSequence/proto/sequence.fbs")
 set(FBS_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nanodeploy/fbs")
 
-# Create output directory and ensure it has an __init__.py
-file(MAKE_DIRECTORY ${FBS_OUTPUT_DIR})
-if(NOT EXISTS "${FBS_OUTPUT_DIR}/__init__.py")
-    file(WRITE "${FBS_OUTPUT_DIR}/__init__.py" "")
-endif()
-
 # Find flatc (target from third_party)
 if(NOT TARGET flatc)
     message(FATAL_ERROR "flatc target not found. Ensure third_party/flatbuffers is included.")
 endif()
 
+# List all expected generated Python files from sequence.fbs
+set(FBS_GENERATED_FILES
+    "${FBS_OUTPUT_DIR}/SequenceStatus.py"
+    "${FBS_OUTPUT_DIR}/BlockLocation.py"
+    "${FBS_OUTPUT_DIR}/IntList.py"
+    "${FBS_OUTPUT_DIR}/BlockContext.py"
+    "${FBS_OUTPUT_DIR}/SamplingParams.py"
+    "${FBS_OUTPUT_DIR}/Sequence.py"
+    "${FBS_OUTPUT_DIR}/SequenceList.py"
+    "${FBS_OUTPUT_DIR}/StepOut.py"
+    "${FBS_OUTPUT_DIR}/__init__.py"
+)
+
 add_custom_command(
-    OUTPUT "${FBS_OUTPUT_DIR}/Peer.py"
+    OUTPUT ${FBS_GENERATED_FILES}
     COMMAND ${CMAKE_COMMAND} -E remove_directory "${FBS_OUTPUT_DIR}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${FBS_OUTPUT_DIR}"
     COMMAND ${CMAKE_COMMAND} -E touch "${FBS_OUTPUT_DIR}/__init__.py"
-    COMMAND flatc --python --gen-object-api -o "${CMAKE_CURRENT_SOURCE_DIR}" ${SEQUENCE_PROTO} ${CONNECTION_PROTO}
-    DEPENDS flatc ${SEQUENCE_PROTO} ${CONNECTION_PROTO}
-    COMMENT "Generating Python Flatbuffers from sequence.fbs"
+    COMMAND $<TARGET_FILE:flatc> --python --gen-object-api -o "${CMAKE_CURRENT_SOURCE_DIR}" ${SEQUENCE_PROTO}
+    DEPENDS flatc ${SEQUENCE_PROTO}
+    COMMENT "Generating Python FlatBuffers bindings from sequence.fbs"
 )
+
+# Create a custom target that depends on the generated files
+add_custom_target(generate_flatbuffers ALL DEPENDS ${FBS_GENERATED_FILES})

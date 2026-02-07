@@ -25,19 +25,8 @@ impl EngineManager {
         Self {
             prefill_engines: Vec::new(),
             decode_engines: Vec::new(),
-            redis_key_prefix: "default".to_string(),
+            redis_key_prefix: "".to_string(), // Empty prefix to match NanoCtrl default
         }
-    }
-
-    /// Create Redis key prefix from NanoCtrl address for data isolation
-    /// Format: sanitize nanoctrl_address by replacing special chars with underscores
-    pub fn create_redis_prefix(nanoctrl_address: &str) -> String {
-        // Remove protocol prefix (http://, https://) and sanitize
-        let sanitized = nanoctrl_address
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .replace([':', '/', '.', '-'], "_");
-        format!("nano_{}", sanitized)
     }
 
     #[allow(dead_code)]
@@ -517,14 +506,13 @@ impl EngineManager {
         redis_url: String,
         nanoctrl_address: Option<String>,
     ) -> anyhow::Result<Arc<Mutex<Self>>> {
-        // Set Redis key prefix based on nanoctrl_address for data isolation
-        if let Some(ref addr) = nanoctrl_address {
-            self.redis_key_prefix = Self::create_redis_prefix(addr);
-            info!(
-                "Using Redis key prefix: {} (isolated scope for {})",
-                self.redis_key_prefix, addr
-            );
-        }
+        // Redis key prefix: Use empty prefix to match NanoCtrl default behavior
+        // The automatic prefix generation was removed to fix key mismatch issues
+        // See: TROUBLESHOOTING_GUIDE.md Issue #3 - Mangled Redis Prefix
+        info!(
+            "Using Redis key prefix: '{}' (matches NanoCtrl default)",
+            self.redis_key_prefix
+        );
         // Step 1: Load snapshot (full sync)
         // Strategy: Load from both Redis and NanoCtrl API, merge results
         // This ensures we get all engines even if some have expired TTL in Redis

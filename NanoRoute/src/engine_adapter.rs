@@ -1,6 +1,6 @@
 use crate::fbs::{
-    EngineInfo, SamplingParams, SamplingParamsArgs, Sequence, SequenceArgs, SequenceList,
-    SequenceListArgs, SequenceStatus, StepOut,
+    SamplingParams, SamplingParamsArgs, Sequence, SequenceArgs, SequenceList, SequenceListArgs,
+    SequenceStatus, StepOut,
 };
 use crate::zmq_packet::ZmqPacket;
 use flatbuffers::FlatBufferBuilder;
@@ -316,24 +316,16 @@ impl EngineAdapter {
         if let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::P2PResponse(body) => {
+                    // Parse engine info as JSON
                     if let Ok(json_str) = std::str::from_utf8(&body) {
                         if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(json_str) {
                             return Ok(json_val);
                         }
                     }
-                    let info = unsafe { flatbuffers::root_unchecked::<EngineInfo>(&body) };
-                    use serde_json::json;
-                    let json_val = json!({
-                        "id": info.id(),
-                        "role": info.role(),
-                        "rank": info.rank(),
-                        "world_size": info.world_size(),
-                        "num_blocks": info.num_blocks(),
-                        "host": info.host(),
-                        "port": info.port(),
-                        "status": info.status()
-                    });
-                    Ok(json_val)
+                    // If not JSON, return error
+                    Err(anyhow::anyhow!(
+                        "Failed to parse engine info response as JSON"
+                    ))
                 }
                 _ => Err(anyhow::anyhow!(
                     "Unexpected response event for GetEngineInfo"

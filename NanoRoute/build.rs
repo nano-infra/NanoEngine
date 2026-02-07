@@ -5,26 +5,23 @@ use std::process::Command;
 
 /// Post-process flatbuffers-generated Rust for flatbuffers 2.x API compatibility.
 fn patch_generated_flatbuffers(out_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
-    for filename in &["sequence_generated.rs", "connection_generated.rs"] {
-        let path = Path::new(out_dir).join(filename);
-        if !path.exists() {
-            continue;
-        }
-        let mut content = fs::read_to_string(&path)?;
-
-        if *filename == "sequence_generated.rs" {
-            content = content.replace(
-                "flatbuffers::read_scalar_at::<Self>(buf, loc)",
-                "unsafe { flatbuffers::read_scalar_at::<Self>(buf, loc) }",
-            );
-            content = content.replace(
-                "flatbuffers::emplace_scalar::<SequenceStatus>(dst, *self)",
-                "unsafe { flatbuffers::emplace_scalar::<SequenceStatus>(dst, *self) }",
-            );
-        }
-
-        fs::write(&path, content)?;
+    let filename = "sequence_generated.rs";
+    let path = Path::new(out_dir).join(filename);
+    if !path.exists() {
+        return Ok(());
     }
+
+    let mut content = fs::read_to_string(&path)?;
+    content = content.replace(
+        "flatbuffers::read_scalar_at::<Self>(buf, loc)",
+        "unsafe { flatbuffers::read_scalar_at::<Self>(buf, loc) }",
+    );
+    content = content.replace(
+        "flatbuffers::emplace_scalar::<SequenceStatus>(dst, *self)",
+        "unsafe { flatbuffers::emplace_scalar::<SequenceStatus>(dst, *self) }",
+    );
+    fs::write(&path, content)?;
+
     Ok(())
 }
 
@@ -106,32 +103,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     patch_generated_flatbuffers(&out_dir)?;
-
-    // Link against NanoSequence libraries
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR")?;
-    let nanosequence_dir = Path::new(&manifest_dir).join("../NanoSequence");
-
-    // Try to find the library in common build locations
-    let possible_lib_paths = vec![
-        nanosequence_dir.join("build").join("lib"),
-        nanosequence_dir
-            .join("build")
-            .join("nanosequence")
-            .join("csrc")
-            .join("sequence"),
-        PathBuf::from("/opt/conda/lib/python3.11/site-packages/nanosequence"),
-    ];
-
-    for lib_path in possible_lib_paths {
-        if lib_path.exists() {
-            println!("cargo:rustc-link-search=native={}", lib_path.display());
-        }
-    }
-
-    // Link against the required libraries
-    println!("cargo:rustc-link-lib=dylib=nanosequence");
-    println!("cargo:rustc-link-lib=dylib=nanosequence_metrics");
-    println!("cargo:rustc-link-lib=static=nanosequence_ffi");
 
     Ok(())
 }

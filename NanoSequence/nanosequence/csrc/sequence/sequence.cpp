@@ -39,6 +39,7 @@ void reset_block_context(
     ctx.num_dispatched_tokens.clear();
     ctx.num_dispatched_tokens.resize(attention_sp, 0);
     ctx.block_location.clear();
+    ctx.endpoints.clear();  // Initialize endpoints to empty vector
 }
 
 std::atomic<uint64_t> Sequence::next_seq_id_{0};
@@ -70,7 +71,19 @@ Sequence::Sequence(const std::vector<int>& token_ids, const SamplingParams& samp
     // Initialize slots - pre-allocate all slots to avoid nulls
     data_->slots.resize((size_t)BlockContextSlot::_COUNT);
     for (size_t i = 0; i < (size_t)BlockContextSlot::_COUNT; ++i) {
-        data_->slots[i] = std::make_unique<BlockContext>();
+        auto ctx = std::make_unique<BlockContext>();
+        // Initialize all fields to safe defaults
+        ctx->engine_id          = "";
+        ctx->dp_idx             = 0;
+        ctx->master_sp_idx      = 0;
+        ctx->attention_sp       = 0;
+        ctx->attention_dp       = 0;
+        ctx->num_kvcache_blocks = 0;
+        ctx->block_location.clear();
+        ctx->num_dispatched_tokens.clear();
+        ctx->sp_block_table.clear();
+        ctx->endpoints.clear();
+        data_->slots[i] = std::move(ctx);
     }
 }
 
@@ -85,7 +98,19 @@ std::shared_ptr<Sequence> Sequence::from_data(std::unique_ptr<SequenceT> data)
     }
     for (size_t i = 0; i < (size_t)BlockContextSlot::_COUNT; ++i) {
         if (!seq->data_->slots[i]) {
-            seq->data_->slots[i] = std::make_unique<BlockContext>();
+            auto ctx = std::make_unique<BlockContext>();
+            // Initialize all fields to safe defaults
+            ctx->engine_id          = "";
+            ctx->dp_idx             = 0;
+            ctx->master_sp_idx      = 0;
+            ctx->attention_sp       = 0;
+            ctx->attention_dp       = 0;
+            ctx->num_kvcache_blocks = 0;
+            ctx->block_location.clear();
+            ctx->num_dispatched_tokens.clear();
+            ctx->sp_block_table.clear();
+            ctx->endpoints.clear();
+            seq->data_->slots[i] = std::move(ctx);
         }
     }
 

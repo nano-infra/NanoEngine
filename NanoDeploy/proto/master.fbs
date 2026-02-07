@@ -1,3 +1,0 @@
-include "../../NanoSequence/proto/sequence.fbs";
-
-namespace nanodeploy.fbs;

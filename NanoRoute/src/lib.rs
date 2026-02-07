@@ -6,12 +6,7 @@ pub mod fbs {
     mod sequence_generated {
         include!(concat!(env!("OUT_DIR"), "/sequence_generated.rs"));
     }
-    #[allow(clippy::all)]
-    mod connection_generated {
-        include!(concat!(env!("OUT_DIR"), "/connection_generated.rs"));
-    }
 
-    pub use self::connection_generated::nanodeploy::fbs::*;
     pub use self::sequence_generated::nanodeploy::fbs::*;
 }
 
