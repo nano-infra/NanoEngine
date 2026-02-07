@@ -90,7 +90,7 @@ class LLMEngine:
             # Get peer agent addresses (may be empty initially, but that's ok)
             peer_addrs = self.get_peer_agent_addrs()
             logger.info(
-                f"Registering engine {self.engine_id} with {len(peer_addrs)} peer addresses: {peer_addrs}"
+                f"Registering engine {self.engine_id} with {len(peer_addrs)} peer addresses"
             )
 
             # Get engine info
@@ -270,18 +270,13 @@ class LLMEngine:
                 for eng in engines:
                     engine_id = eng.get("id")
                     peer_addrs = eng.get("peer_addrs", [])
-                    # Include all engines, even if peer_addrs is empty
                     if engine_id:
                         peer_endpoints[engine_id] = peer_addrs
-                        logger.debug(
-                            f"  Engine {engine_id}: {len(peer_addrs)} peer addresses"
-                        )
 
                 self._peer_endpoints_cache = (now, peer_endpoints)
-                logger.info(
-                    f"Fetched peer_endpoints from NanoCtrl: {list(peer_endpoints.keys())}"
+                logger.debug(
+                    f"Fetched {len(peer_endpoints)} peer endpoints from NanoCtrl"
                 )
-                logger.info(f"Peer endpoints details: {peer_endpoints}")
                 return peer_endpoints
         except Exception as e:
             logger.error(f"Error fetching peer_endpoints from NanoCtrl: {e}")
