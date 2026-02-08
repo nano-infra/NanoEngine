@@ -3,7 +3,7 @@ import os
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
 
-from nanodeploy.llm import LLM
+from nanodeploy.llm_component import LLM
 from nanodeploy.sampling_params import SamplingParams
 from transformers import AutoTokenizer
 

@@ -136,7 +136,7 @@ Applied validation:
 **Fix:**
 
 ```python
-# NanoDeploy/nanodeploy/server/llm_component.py:119
+# NanoDeploy/nanodeploy/llm_component.py:119
 # For ZMQ connection: use 127.0.0.1 if host is 0.0.0.0 (localhost mode),
 # otherwise use the specified host IP (distributed mode)
 zmq_host = "127.0.0.1" if self.config.host == "0.0.0.0" else self.config.host
@@ -262,7 +262,7 @@ WAITING → RUNNING_PREFILL → RUNNING_DECODE → FINISHED
 
 ### NanoDeploy (Python)
 
-- `NanoDeploy/nanodeploy/server/llm_component.py`
+- `NanoDeploy/nanodeploy/llm_component.py`
 
   - Lines 45, 119: Use `127.0.0.1` if host is `0.0.0.0`, else use specified IP
   - Applied to both `_register_with_nanoctrl()` and `get_engine_info()`

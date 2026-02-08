@@ -19,8 +19,8 @@ from nanodeploy.fbs.StepOut import (
     StepOutEnd,
     StepOutStart,
 )
+from nanodeploy.llm_component import LLMComponent
 from nanodeploy.logging import get_logger
-from nanodeploy.server.llm_component import LLMComponent
 from nanodeploy.server.zmq_protocol import decode_packet, encode_packet
 
 logger = get_logger()
@@ -100,7 +100,7 @@ class EngineService:
         step_count = 0
         while True:
             try:
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(0.00001)
 
                 if self.engine.scheduler.is_finished():
                     continue

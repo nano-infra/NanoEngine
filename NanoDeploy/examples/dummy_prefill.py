@@ -1,8 +1,9 @@
 import os
 
 import numpy as np
-from nanodeploy import LLM, SamplingParams
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.llm_component import LLM
+from nanodeploy.sampling_params import SamplingParams
 from transformers import AutoTokenizer
 
 
@@ -12,7 +13,7 @@ def main():
     from nanodeploy.config import Config
 
     config = Config(
-        path,
+        model=path,
         enforce_eager=False,
         attention_dp=8,
         attention_sp=1,
@@ -38,6 +39,7 @@ def main():
         max_num_recv_seqs=130,
         kvcache_block_size=256,
         enable_profiler=False,
+        log_level="INFO",
     )
     decode = LLM(config)
 

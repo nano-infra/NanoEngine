@@ -294,7 +294,7 @@ Heavy endpoint that returns all engines - no longer used for migration.
 
 - `NanoDeploy/nanodeploy/context/cache.py` - Main caching implementation
 - `NanoDeploy/nanodeploy/engine/llm_engine.py` - Simplified migration call
-- `NanoDeploy/nanodeploy/server/llm_component.py` - Lifecycle management
+- `NanoDeploy/nanodeploy/llm_component.py` - Lifecycle management
 - `NanoDeploy/nanodeploy/worker/model_runner.py` - Parameter removal
 - `NanoDeploy/nanodeploy/engine/ray_executor.py` - Parameter removal
 

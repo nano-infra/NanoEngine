@@ -3,8 +3,8 @@ import os
 import ray
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.llm_component import LLMComponent
 from nanodeploy.sampling_params import SamplingParams
-from nanodeploy.server.llm_component import LLMComponent
 from transformers import AutoTokenizer
 
 

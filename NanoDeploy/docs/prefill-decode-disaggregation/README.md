@@ -133,7 +133,7 @@ Read this to migrate existing code:
 ### Core Implementation
 
 - `nanodeploy/engine/llm_engine.py` - Added `_fetch_peer_endpoints_from_nanoctrl()`
-- `nanodeploy/server/llm_component.py` - Pass `nanoctrl_address` to engine
+- `nanodeploy/llm_component.py` - Pass `nanoctrl_address` to engine
 - `nanodeploy/endpoint/rpc_endpoint.py` - FlatBuffers serialization/validation
 - `nanodeploy/context/cache.py` - BlockLocation property access
 

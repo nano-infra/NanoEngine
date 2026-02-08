@@ -4,15 +4,49 @@ import threading
 from typing import List, Optional, Set, Tuple
 
 import httpx
+import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nanodeploy.config import Config
-from nanodeploy.llm import LLM
+from nanodeploy.engine.llm_engine import LLMEngine
+from nanodeploy.engine.ray_utils import get_available_nodes_with_master_first
 from nanodeploy.logging import get_logger
 
 logger = get_logger("nanodeploy")
 
 
+class LLM(LLMEngine):
+    """LLM class with Ray remote execution support."""
+
+    @classmethod
+    def as_remote(cls, config):
+        ray_address = getattr(config, "ray_address", "127.0.0.1:6379")
+        master_address = getattr(config, "master_address", "127.0.0.1:6006")
+        ray.init(address=ray_address, ignore_reinit_error=True)
+
+        nodes = get_available_nodes_with_master_first(master_address)
+        target_node_id = nodes[0]["NodeID"]
+
+        return (
+            ray.remote(num_cpus=1, num_gpus=0)(cls)
+            .options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=target_node_id, soft=False
+                )
+            )
+            .remote(config)
+        )
+
+
 class LLMComponent(LLM):
+    """LLM component with lifecycle management and service discovery integration.
+
+    This class extends LLM with:
+    - NanoCtrl service registration and heartbeat
+    - Peer engine information management for distributed serving
+    - Automatic resource cleanup on shutdown
+    """
+
     def __init__(self, config: Config):
         super().__init__(config)
 
