@@ -38,6 +38,35 @@ std::shared_ptr<Sequence> deserialize_sequence(const uint8_t* buffer, size_t siz
     return sequence_from_data(std::unique_ptr<fbs::SequenceT>(fb_seq->UnPack()));
 }
 
+// Helper: Validate and fix BlockContext before serialization
+static void validate_block_context(fbs::BlockContextT& ctx)
+{
+    // Ensure engine_id is valid (initialize if empty)
+    if (ctx.engine_id.empty()) {
+        ctx.engine_id = "";
+    }
+
+    // Ensure vectors are initialized (not null)
+    // block_location should be a valid vector (can be empty)
+    // num_dispatched_tokens should match attention_sp size
+    if (ctx.num_dispatched_tokens.size() != static_cast<size_t>(ctx.attention_sp)) {
+        ctx.num_dispatched_tokens.resize(ctx.attention_sp, 0);
+    }
+
+    // Ensure sp_block_table matches attention_sp size and has no null pointers
+    if (ctx.sp_block_table.size() != static_cast<size_t>(ctx.attention_sp)) {
+        ctx.sp_block_table.resize(ctx.attention_sp);
+    }
+    for (size_t i = 0; i < ctx.sp_block_table.size(); ++i) {
+        if (!ctx.sp_block_table[i]) {
+            ctx.sp_block_table[i] = std::make_unique<fbs::IntListT>();
+        }
+    }
+
+    // Ensure endpoints vector is initialized (can be empty)
+    // No action needed for endpoints, it's a std::vector<std::string>
+}
+
 size_t serialize_sequences(uintptr_t                                     data_ptr,
                            size_t                                        buffer_size,
                            const std::vector<std::shared_ptr<Sequence>>& seqs,
@@ -52,7 +81,32 @@ size_t serialize_sequences(uintptr_t                                     data_pt
     for (const auto& seq_ptr : seqs) {
         if (!seq_ptr)
             continue;
-        seq_offsets.push_back(fbs::Sequence::Pack(builder, seq_ptr->data_.get()));
+
+        try {
+            // Validate all BlockContexts in slots before serialization
+            for (size_t slot_idx = 0; slot_idx < seq_ptr->data_->slots.size(); ++slot_idx) {
+                auto& slot = seq_ptr->data_->slots[slot_idx];
+                if (slot) {
+                    validate_block_context(*slot);
+                }
+                else {
+                    // Initialize null slot with safe defaults
+                    slot                     = std::make_unique<fbs::BlockContextT>();
+                    slot->engine_id          = "";
+                    slot->dp_idx             = 0;
+                    slot->master_sp_idx      = 0;
+                    slot->attention_sp       = 0;
+                    slot->attention_dp       = 0;
+                    slot->num_kvcache_blocks = 0;
+                }
+            }
+
+            seq_offsets.push_back(fbs::Sequence::Pack(builder, seq_ptr->data_.get()));
+        }
+        catch (const std::exception& e) {
+            NANOCOMMON_ABORT("Failed to serialize sequence " + std::to_string(seq_ptr->seq_id()) + ": "
+                             + std::string(e.what()));
+        }
     }
 
     auto seq_list_off = fbs::CreateSequenceList(builder, builder.CreateVector(seq_offsets));
@@ -90,6 +144,13 @@ std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr,
     // Simplified: Use UnPack() directly
     for (const auto* fb_seq : *sequences) {
         auto seq = sequence_from_data(std::unique_ptr<fbs::SequenceT>(fb_seq->UnPack()));
+
+        // Validate all BlockContexts after deserialization
+        for (auto& slot : seq->data_->slots) {
+            if (slot) {
+                validate_block_context(*slot);
+            }
+        }
 
         NANOCOMMON_LOG_DEBUG("Deserialized Sequence: ID=" + std::to_string(seq->seq_id()) + " Status="
                              + std::to_string((int)seq->status()) + " LastToken=" + std::to_string(seq->last_token())

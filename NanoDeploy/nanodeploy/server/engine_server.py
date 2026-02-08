@@ -39,16 +39,22 @@ class EngineService:
             self._send_queue.put_nowait(data)
 
     def _handle_add_request(self, payload: bytes):
+        logger.info(f"Handling ADD request, payload size: {len(payload)}")
         c_buffer = ctypes.create_string_buffer(payload, len(payload))
         ptr = ctypes.addressof(c_buffer)
         length = len(payload)
 
         sequences = deserialize_cpp(ptr, length)
+        logger.info(f"Deserialized {len(sequences) if sequences else 0} sequences")
         if not sequences:
+            logger.warning("No sequences after deserialization")
             return
 
-        logger.debug(f"Adding {len(sequences)} sequences.")
+        logger.info(
+            f"Adding {len(sequences)} sequences to engine. First seq_id: {sequences[0].seq_id if sequences else 'N/A'}"
+        )
         self.engine.add_request(sequences)
+        logger.info(f"Sequences added to engine successfully")
 
     def _handle_get_info(self, req_seq_id: int):
         resp_payload = self.engine.get_engine_info().encode("utf-8")
@@ -91,6 +97,7 @@ class EngineService:
 
     async def engine_loop(self):
         logger.info("Engine Loop Started")
+        step_count = 0
         while True:
             try:
                 await asyncio.sleep(0.001)
@@ -98,8 +105,18 @@ class EngineService:
                 if self.engine.scheduler.is_finished():
                     continue
 
+                step_count += 1
+                if step_count % 100 == 0:
+                    logger.info(
+                        f"Engine loop step {step_count}, scheduler not finished"
+                    )
+
                 dp_seqs, outputs, num_tokens, total_running, sch_lat, post_lat = (
                     self.engine.step()
+                )
+
+                logger.info(
+                    f"Engine step completed: {total_running} running sequences, {num_tokens} tokens"
                 )
 
                 for seqs in dp_seqs:
@@ -138,16 +155,49 @@ class EngineServer:
         listen_addr = f"tcp://*:{self.config.port}"
         socket.bind(listen_addr)
 
-        logger.info(f"Starting ZMQ Engine Server on {listen_addr}...")
+        # Determine ZMQ connection host for registration
+        zmq_host = "127.0.0.1" if self.config.host == "0.0.0.0" else self.config.host
+
+        logger.info("=" * 80)
+        logger.info("Engine Server Started - Configuration Summary")
+        logger.info("=" * 80)
+        logger.info(f"Engine ID:       {self.engine.engine_id}")
+        logger.info(f"Mode:            {self.config.mode}")
+        logger.info(f"Model:           {self.config.model}")
+        logger.info(f"Bind Address:    {listen_addr} (listening on all interfaces)")
+        logger.info(f"ZMQ Connect:     tcp://{zmq_host}:{self.config.port}")
+        logger.info(f"World Size:      {self.config.attn_world_size}")
+        logger.info(
+            f"Attention:       DP={self.config.attention_dp}, SP={self.config.attention_sp}, TP={self.config.attention_tp}"
+        )
+        logger.info(
+            f"FFN:             DP={self.config.ffn_dp}, EP={self.config.ffn_ep}, TP={self.config.ffn_tp}"
+        )
+        logger.info(
+            f"KV Cache:        {self.config.num_kvcache_blocks} blocks x {self.config.kvcache_block_size} tokens"
+        )
+        logger.info(
+            f"Max Tokens:      {self.config.max_num_batched_tokens} batched, {self.config.max_model_len} model length"
+        )
+        logger.info(
+            f"NanoCtrl:        {self.config.nanoctrl_address or 'Not configured'}"
+        )
+        logger.info(f"Ray Address:     {self.config.ray_address}")
+        logger.info("=" * 80)
 
         send_queue: asyncio.Queue = asyncio.Queue()
         self.service._send_queue = send_queue
 
         async def recv_loop():
+            logger.info("Recv loop started, waiting for packets...")
             while True:
                 try:
                     data = await socket.recv()
+                    logger.info(f"Received ZMQ packet: {len(data)} bytes")
                     seq_id, action, payload = decode_packet(bytes(data))
+                    logger.info(
+                        f"Decoded packet: seq_id={seq_id}, action={action}, payload_size={len(payload)}"
+                    )
                     self.service._handle_packet(seq_id, action, payload)
                 except zmq.ZMQError as e:
                     if e.errno != zmq.ETERM:
@@ -176,7 +226,9 @@ class EngineServer:
 
 
 def main():
-    logger.info("PYTHON ZMQ ENGINE SERVER STARTING")
+    logger.info("=" * 80)
+    logger.info("NanoDeploy Engine Server")
+    logger.info("=" * 80)
 
     from jsonargparse import ActionConfigFile, ArgumentParser
 
@@ -186,6 +238,7 @@ def main():
     args = parser.parse_args()
     init_args = {k: v for k, v in vars(args).items() if k != "config"}
 
+    logger.info("Initializing configuration...")
     try:
         config = Config(**init_args)
     except Exception as e:

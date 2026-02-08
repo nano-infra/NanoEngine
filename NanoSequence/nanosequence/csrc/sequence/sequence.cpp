@@ -138,7 +138,12 @@ std::vector<int>& Sequence::block_table(BlockContextSlot slot, int sp_idx)
 {
     auto& ctx = block_ctx(slot);
     if (sp_idx >= static_cast<int>(ctx.sp_block_table.size())) {
+        size_t old_size = ctx.sp_block_table.size();
         ctx.sp_block_table.resize(sp_idx + 1);
+        // Initialize all new elements to avoid null pointers
+        for (size_t i = old_size; i < ctx.sp_block_table.size(); ++i) {
+            ctx.sp_block_table[i] = std::make_unique<fbs::IntListT>();
+        }
     }
     if (!ctx.sp_block_table[sp_idx]) {
         ctx.sp_block_table[sp_idx] = std::make_unique<fbs::IntListT>();

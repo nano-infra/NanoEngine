@@ -40,13 +40,17 @@ class LLMComponent(LLM):
             else []
         )
 
+        # For ZMQ connection: use 127.0.0.1 if host is 0.0.0.0 (localhost mode),
+        # otherwise use the specified host IP (distributed mode)
+        zmq_host = "127.0.0.1" if self.config.host == "0.0.0.0" else self.config.host
+
         engine_info = {
             "id": self.engine_id,
             "role": self.config.mode,
             "rank": 0,
             "world_size": self.config.attn_world_size,
             "num_blocks": self.config.num_kvcache_blocks,
-            "host": self.config.host,
+            "host": zmq_host,
             "port": self.config.port,
             "status": status,
             "peer_addrs": peer_addrs,
@@ -110,12 +114,18 @@ class LLMComponent(LLM):
             )
 
             # Prepare registration payload
+            # For ZMQ connection: use 127.0.0.1 if host is 0.0.0.0 (localhost mode),
+            # otherwise use the specified host IP (distributed mode)
+            zmq_host = (
+                "127.0.0.1" if self.config.host == "0.0.0.0" else self.config.host
+            )
+
             payload = {
                 "engine_id": self.engine_id,
                 "role": self.config.mode,
                 "world_size": self.config.attn_world_size,
                 "num_blocks": self.config.num_kvcache_blocks,
-                "host": self.config.host,
+                "host": zmq_host,
                 "port": self.config.port,
                 "peer_addrs": peer_addrs,
             }

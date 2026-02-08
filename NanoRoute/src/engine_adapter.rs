@@ -100,9 +100,17 @@ impl EngineAdapter {
                 // Drain send channel
                 while let Ok(packet) = send_rx.try_recv() {
                     let data = packet.encode();
-                    if socket.send(&data, 0).is_err() {
+                    info!(
+                        "ZMQ I/O thread sending packet: action={}, seq_id={}, size={}",
+                        packet.action,
+                        packet.seq_id,
+                        data.len()
+                    );
+                    if let Err(e) = socket.send(&data, 0) {
+                        warn!("ZMQ send error for {}: {}", addr_for_log, e);
                         break;
                     }
+                    info!("ZMQ packet sent successfully");
                 }
             }
             info!("ZMQ I/O thread ended for {}", addr_for_log);
@@ -125,6 +133,8 @@ impl EngineAdapter {
                 let action = packet.action;
                 let payload = packet.payload;
                 let seq_id = packet.seq_id;
+
+                info!("Received packet: action={}, seq_id={}, payload_size={}", action, seq_id, payload.len());
 
                 if action == 1 {
                     let sl = unsafe { flatbuffers::root_unchecked::<SequenceList>(&payload) };
@@ -160,19 +170,25 @@ impl EngineAdapter {
                     let token_id = step_out.token_id();
                     let status = step_out.status();
 
+                    info!("Received StepOut: seq_id={}, token_id={}, status={:?}", seq_id, token_id, status);
+
                     let mut map = pending.lock().await;
                     if status == SequenceStatus::FINISHED {
+                        info!("Sequence {} finished", seq_id);
                         if let Some(final_state) = map.remove(&seq_id) {
                             if token_id > 0 {
                                 let _ = final_state.sender.send(StreamEvent::Token(token_id));
                             }
                             let _ = final_state.sender.send(StreamEvent::Finished);
                         }
-                    } else if status == SequenceStatus::RUNNING_DECODE && token_id > 0 {
+                    } else if (status == SequenceStatus::RUNNING_PREFILL || status == SequenceStatus::RUNNING_DECODE) && token_id > 0 {
                         if let Some(state) = map.get_mut(&seq_id) {
                             state.accumulated_tokens.push(token_id);
                             let _ = state.sender.send(StreamEvent::Token(token_id));
                         }
+                    } else if token_id > 0 {
+                        // Log unhandled status with token
+                        warn!("Received token {} for seq {} with unhandled status {:?}", token_id, seq_id, status);
                     }
                 }
                     }
@@ -292,6 +308,10 @@ impl EngineAdapter {
                 },
             );
         }
+        info!(
+            "Sending ADD request for seq {} with {} tokens, max_tokens={}",
+            seq_id, num_tokens, max_tokens
+        );
         self.send_packet(1, seq_id, payload).await?;
         Ok(rx)
     }
