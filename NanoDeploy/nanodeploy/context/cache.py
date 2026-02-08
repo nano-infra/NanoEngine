@@ -21,6 +21,11 @@ logger = get_logger("nanodeploy")
 # PeerAgent path: buffer ID for kv_cache registration
 _KV_CACHE_BUFFER_ID = "kv_cache"
 
+# Cache TTL for engine_info from NanoCtrl (seconds)
+# Engine registration rarely changes, cache forever by default (inf means never expire)
+# To refresh, call invalidate_engine_info_cache() or restart the engine
+_ENGINE_INFO_CACHE_TTL = float("inf")
+
 
 @dataclasses.dataclass
 class CacheContext:
@@ -107,6 +112,9 @@ class CacheContext:
         self._peer_agent_addr: str | None = None
         self._connected_peers: set[str] = set()  # track connected peer addresses
         self._local_mr_handler: int | None = None  # local MR handler for kv_cache
+        self._engine_info_cache: tuple[float, dict[str, dict]] | None = (
+            None  # (timestamp, engine_id -> engine_info_dict)
+        )
 
     def block_stride(self, block_idx: int):
         return (
@@ -160,10 +168,6 @@ class CacheContext:
         # Use control plane API if nanoctrl_address is provided
         # If engine_id is not provided, fetch it from NanoCtrl
         if self.nanoctrl_address is not None:
-            # Fetch engine_id from NanoCtrl if not provided
-            if self.engine_id is None:
-                self.engine_id = self._get_engine_id_from_nanoctrl()
-
             if self.engine_id is not None:
                 start_peer_agent_fn = getattr(dlslime, "start_peer_agent", None)
                 if callable(start_peer_agent_fn):
@@ -178,7 +182,6 @@ class CacheContext:
                     ) and not server_url.startswith("https://"):
                         server_url = f"http://{server_url}"
 
-                    # Removed delay/sleep as per user requirement
                     # Note: Control plane should handle concurrent registrations gracefully
 
                     try:
@@ -215,97 +218,152 @@ class CacheContext:
         """Return the local peer agent address for this rank."""
         return self._peer_agent_addr
 
-    def _get_engine_id_from_nanoctrl(self) -> str | None:
-        """Get engine_id from NanoCtrl control plane.
+    def invalidate_engine_info_cache(self):
+        """Invalidate the engine_info cache to force a refresh on next fetch."""
+        self._engine_info_cache = None
+        logger.info("Invalidated engine_info cache")
 
-        This method queries NanoCtrl to find the engine_id for this worker.
-        Note: This is a simplified implementation. In production, engine_id should
-        be set during engine initialization (by LLMEngine).
+    def _fetch_engine_info_from_nanoctrl(self, engine_ids: set[str]) -> dict[str, dict]:
+        """Get engine_info for specified engine_ids (cache + fetch if needed).
+
+        This method handles all caching logic: checks cache, identifies missing IDs,
+        fetches only missing ones from NanoCtrl, and updates cache.
+
+        Uses the lightweight /get_engine_info endpoint instead of /list_engines.
+
+        Args:
+            engine_ids: Set of engine_ids to get info for.
+
+        Returns:
+            dict mapping engine_id to engine_info dict containing:
+                - id, role, world_size, num_blocks, host, port, peer_addrs, etc.
         """
+        import httpx
+
+        if not engine_ids:
+            return {}
+
+        # Check cache and identify missing IDs
+        engine_info_map = {}
+        missing_ids = engine_ids
+
+        if self._engine_info_cache is not None:
+            cached_at, cached = self._engine_info_cache
+            if time.time() - cached_at < _ENGINE_INFO_CACHE_TTL:
+                # Get cached results
+                engine_info_map = {
+                    eid: info for eid, info in cached.items() if eid in engine_ids
+                }
+                missing_ids = engine_ids - cached.keys()
+
+                if not missing_ids:
+                    logger.debug(
+                        f"All {len(engine_ids)} engines found in cache, no fetch needed"
+                    )
+                    return engine_info_map
+                else:
+                    logger.debug(
+                        f"Cache hit for {len(engine_info_map)} engines, fetching {len(missing_ids)} missing: {missing_ids}"
+                    )
+
+        # Fetch missing engines from NanoCtrl
         if not self.nanoctrl_address:
-            return None
-
-        # For now, return None - engine_id should be set by LLMEngine during initialization
-        # This method is a placeholder for future enhancement if needed
-        logger.warning(
-            "engine_id not provided and cannot be automatically determined from NanoCtrl. "
-            "Please ensure engine_id is set in config (it should be set by LLMEngine during initialization)."
-        )
-        return None
-
-    def ensure_p2p_connected(
-        self, peer_id: str, addrs: list[str], num_blocks: int
-    ) -> None:
-        """Ensure P2P link to peer via PeerAgent (lazy connect). Idempotent.
-
-        Note: This method is deprecated. P2P connections are now established
-        automatically during migration via PeerAgent control plane.
-        """
-        if peer_id in self.endpoints:
-            return
-
-        # Store remote KV cache blocks info
-        self.num_remote_kvcache_blocks[peer_id] = num_blocks
-
-        # If using PeerAgent (control plane), connections are established lazily during migrate()
-        # We just need to store the peer info here
-        if self._peer_agent is not None:
-            logger.info(
-                f"ensure_p2p_connected called for {peer_id} with {len(addrs)} addresses. "
-                f"Connections will be established lazily during migration via PeerAgent."
-            )
-            # Store peer aliases for later use in migrate()
-            # addrs format: list of peer_agent aliases (e.g., ["EngineName:0", "EngineName:1", ...])
-            if not hasattr(self, "_peer_addrs"):
-                self._peer_addrs = {}
-            self._peer_addrs[peer_id] = addrs
-        else:
             logger.warning(
-                f"ensure_p2p_connected called for {peer_id} but PeerAgent not initialized. "
-                f"This method is deprecated - connections should be established via migrate() using PeerAgent."
+                "nanoctrl_address not configured, returning cached results only"
             )
+            return engine_info_map
 
-    def p2p_disconnect(self, remote_engine_id: str):
-        if remote_engine_id in self.endpoints:
-            del self.endpoints[remote_engine_id]
-            if remote_engine_id in self.num_remote_kvcache_blocks:
-                del self.num_remote_kvcache_blocks[remote_engine_id]
-            logger.info(f"P2P Link to {remote_engine_id} disconnected and cleared.")
+        fetched_map: dict[str, dict] = {}
+        url = f"http://{self.nanoctrl_address}/get_engine_info"
 
-    def migrate(
-        self, seqs: list[Sequence], peer_endpoints: dict[str, list[str]] = None
-    ):
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                for engine_id in missing_ids:
+                    try:
+                        response = client.post(url, json={"engine_id": engine_id})
+                        response.raise_for_status()
+                        data = response.json()
+
+                        if data.get("status") == "ok":
+                            engine_info = data.get("engine_info", {})
+                            if engine_info:
+                                fetched_map[engine_id] = engine_info
+                        else:
+                            logger.warning(
+                                f"get_engine_info for {engine_id} returned status: {data.get('status')}"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error fetching engine_info for {engine_id}: {e}")
+                        continue
+
+            # Update cache with newly fetched data
+            if fetched_map:
+                now = time.time()
+                if self._engine_info_cache is not None:
+                    cached_data = self._engine_info_cache[1]
+                    cached_data.update(fetched_map)
+                    self._engine_info_cache = (now, cached_data)
+                else:
+                    self._engine_info_cache = (now, fetched_map)
+
+                logger.debug(
+                    f"Fetched and cached {len(fetched_map)} engine_info: {list(fetched_map.keys())}"
+                )
+
+            # Return combined results
+            engine_info_map.update(fetched_map)
+            return engine_info_map
+
+        except Exception as e:
+            logger.error(f"Error fetching engine_info from NanoCtrl: {e}")
+            # Return whatever we have from cache
+            return engine_info_map
+
+    def migrate(self, seqs: list[Sequence]):
         """Migrate KV cache blocks from local to remote engine using PeerAgent.
 
         This method uses lazy connection: it will connect to remote peer
-        on-demand based on peer_endpoints dict (engine_id -> list of peer_agent addresses).
+        on-demand based on engine_info fetched from NanoCtrl.
+
+        Engine info is fetched on-demand (only when needed) and cached forever by default.
+        Call invalidate_engine_info_cache() to force a refresh.
 
         Args:
             seqs: List of sequences to migrate
-            peer_endpoints: dict mapping engine_id to list of peer addresses per rank
         """
-        logger.debug(
-            f"migrate called with {len(seqs)} sequences, peer_endpoints: {peer_endpoints}"
-        )
+        logger.debug(f"migrate called with {len(seqs)} sequences")
 
         if self._peer_agent is None:
             logger.error("migrate called but PeerAgent not initialized")
             return
 
-        if peer_endpoints is None:
-            peer_endpoints = {}
-            logger.warning("migrate called with None peer_endpoints")
+        # First, collect target engine_ids from sequences (truly on-demand)
+        target_engine_ids = set()
+        for seq in seqs:
+            migrate_ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
+            engine_id = migrate_ctx.engine_id
+            if engine_id:
+                target_engine_ids.add(engine_id)
+
+        # Only get engine_info if we have target engines (truly on-demand)
+        if not target_engine_ids:
+            logger.debug("No target engine_ids found, skipping migration")
+            return
+
+        # Get engine_info (handles caching internally)
+        engine_info_map = self._fetch_engine_info_from_nanoctrl(target_engine_ids)
 
         assigns = defaultdict(lambda: defaultdict(list))
         sp_idx = get_dist_context().attn_sp_rank
 
-        # Collect all unique remote peer aliases from peer_endpoints dict and ensure connections
-        # peer_endpoints format: engine_id -> list of peer_agent aliases (EngineName:rank)
+        # Collect all unique remote peer aliases from engine_info and ensure connections
+        # engine_info format: engine_id -> {peer_addrs: [list of peer_agent aliases], ...}
         remote_peers_to_connect: dict[str, str] = {}  # peer_alias -> engine_id
         for seq in seqs:
             migrate_ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
             engine_id = migrate_ctx.engine_id
-            peer_aliases = peer_endpoints.get(engine_id, [])
+            engine_info = engine_info_map.get(engine_id, {})
+            peer_aliases = engine_info.get("peer_addrs", [])
             if peer_aliases:
                 for peer_alias in peer_aliases:
                     if peer_alias and peer_alias not in self._connected_peers:
@@ -338,10 +396,11 @@ class CacheContext:
             migrate_ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
             active_ctx = seq.block_ctx(BlockContextSlot.ACTIVE)
             engine_id = migrate_ctx.engine_id
-            endpoints = peer_endpoints.get(engine_id, [])
-            if not endpoints:
+            engine_info = engine_info_map.get(engine_id, {})
+            peer_addrs = engine_info.get("peer_addrs", [])
+            if not peer_addrs:
                 logger.warning(
-                    f"Sequence {seq.seq_id} has no endpoints for engine {engine_id}"
+                    f"Sequence {seq.seq_id} has no peer_addrs for engine {engine_id}"
                 )
                 continue
 
@@ -383,11 +442,11 @@ class CacheContext:
                         )
 
                         # Get remote peer alias for this rank (format: EngineName:rank)
-                        if remote_rank < len(endpoints):
-                            peer_alias = endpoints[remote_rank]
+                        if remote_rank < len(peer_addrs):
+                            peer_alias = peer_addrs[remote_rank]
                         else:
                             logger.error(
-                                f"remote_rank {remote_rank} >= len(endpoints) {len(endpoints)}"
+                                f"remote_rank {remote_rank} >= len(peer_addrs) {len(peer_addrs)}"
                             )
                             continue
 

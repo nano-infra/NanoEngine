@@ -193,11 +193,6 @@ class ModelRunner:
         torch.set_default_dtype(self.default_dtype)
         self.warmup_model()
 
-    def ensure_p2p_connected(
-        self, peer_id: str, addrs: list[str], num_blocks: int
-    ) -> None:
-        return get_cache_context().ensure_p2p_connected(peer_id, addrs, num_blocks)
-
     def get_peer_agent_addr(self) -> str | None:
         """Return the peer agent address for this rank."""
         return get_cache_context().get_peer_agent_addr()
@@ -649,10 +644,8 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def migrate(
-        self, seqs: list[Sequence], peer_endpoints: dict[str, list[str]] = None
-    ) -> None:
-        get_cache_context().migrate(seqs=seqs, peer_endpoints=peer_endpoints)
+    def migrate(self, seqs: list[Sequence]) -> None:
+        get_cache_context().migrate(seqs=seqs)
 
     def run(
         self, dp_seqs: list[Sequence], is_prefill: bool, enable_rpc: bool = False

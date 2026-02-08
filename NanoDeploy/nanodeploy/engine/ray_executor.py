@@ -120,12 +120,11 @@ class RayExecutor:
     def migrate(
         self,
         dp_seqs: List[List[Sequence]],
-        peer_endpoints: dict[str, list[str]] = None,
         timeout: float | None = None,
     ) -> list[int]:
         return ray.get(
             [
-                getattr(worker, "migrate").remote(seqs, peer_endpoints)
+                getattr(worker, "migrate").remote(seqs)
                 for seqs, worker in zip(dp_seqs, self.workers)
             ],
             timeout=timeout,

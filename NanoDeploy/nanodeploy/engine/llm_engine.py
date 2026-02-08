@@ -1,19 +1,13 @@
 import atexit
 import json
 import os
-import threading
 import time
 import uuid
 from dataclasses import fields
 from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional, Set
 
-# Cache TTL for peer_endpoints from NanoCtrl (seconds)
-# Engine registration rarely changes, use longer TTL to reduce list_engines calls
-_PEER_ENDPOINTS_CACHE_TTL = 60.0
-
 import flatbuffers
-import httpx
 import numpy as np
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -57,232 +51,11 @@ class LLMEngine:
         )
         self.metrics_manager = MetricsManager()
 
-        # Register engine with NanoCtrl if configured
-        # Delay registration until executor is fully initialized
-        self._nanoctrl_registered = False
-        self._heartbeat_stop_event = threading.Event()
-        self._heartbeat_thread: Optional[threading.Thread] = None
-        self._peer_endpoints_cache: Optional[tuple[float, Dict[str, List[str]]]] = None
-        if config.nanoctrl_address:
-            # Register after executor is ready (peer_addrs will be available)
-            self._register_with_nanoctrl()
-
         atexit.register(self.exit)
 
     def exit(self):
-        # Stop heartbeat thread
-        if hasattr(self, "_heartbeat_stop_event"):
-            self._heartbeat_stop_event.set()
-        if hasattr(self, "_heartbeat_thread") and self._heartbeat_thread is not None:
-            self._heartbeat_thread.join(timeout=2.0)
-
-        # Unregister from NanoCtrl before exiting
-        if hasattr(self, "_nanoctrl_registered") and self._nanoctrl_registered:
-            self._unregister_from_nanoctrl()
+        """Cleanup engine resources."""
         del self.executor
-
-    def _register_with_nanoctrl(self):
-        """Register engine information with NanoCtrl control plane."""
-        if not self.config.nanoctrl_address:
-            return
-
-        try:
-            # Get peer agent addresses (may be empty initially, but that's ok)
-            peer_addrs = self.get_peer_agent_addrs()
-            logger.info(
-                f"Registering engine {self.engine_id} with {len(peer_addrs)} peer addresses"
-            )
-
-            # Get engine info
-            engine_info = {
-                "id": self.engine_id,
-                "role": self.config.mode,
-                "rank": 0,
-                "world_size": self.config.attn_world_size,
-                "num_blocks": self.config.num_kvcache_blocks,
-                "host": self.config.host,
-                "port": self.config.port,
-                "status": "ready",
-                "peer_addrs": peer_addrs,
-            }
-
-            # Prepare registration payload
-            payload = {
-                "engine_id": engine_info["id"],
-                "role": engine_info["role"],
-                "world_size": engine_info["world_size"],
-                "num_blocks": engine_info["num_blocks"],
-                "host": engine_info["host"],
-                "port": engine_info["port"],
-                "peer_addrs": engine_info["peer_addrs"],
-            }
-
-            url = f"http://{self.config.nanoctrl_address}/register_engine"
-            logger.info(
-                f"Registering engine with NanoCtrl at {url}, payload: {payload}"
-            )
-
-            # Use sync client since this is called during init
-            # Disable proxy to avoid SOCKS proxy issues
-            with httpx.Client(timeout=10.0) as client:
-                response = client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                if data.get("status") == "ok":
-                    self._nanoctrl_registered = True
-                    logger.info(
-                        f"Successfully registered engine {payload['engine_id']} with NanoCtrl"
-                    )
-                    # Start heartbeat thread after successful registration
-                    self._start_heartbeat()
-                else:
-                    logger.error(
-                        f"Failed to register engine: {data.get('message', 'Unknown error')}"
-                    )
-                    logger.error(f"Response data: {data}")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error registering engine with NanoCtrl: {e}")
-            logger.error(
-                f"Response: {e.response.text if e.response else 'No response'}"
-            )
-        except Exception as e:
-            logger.error(f"Error registering engine with NanoCtrl: {e}", exc_info=True)
-            # Don't raise - allow engine to continue even if registration fails
-
-    def _unregister_from_nanoctrl(self):
-        """Unregister engine from NanoCtrl control plane."""
-        if not self.config.nanoctrl_address:
-            return
-
-        try:
-            payload = {"engine_id": self.engine_id}
-            url = f"http://{self.config.nanoctrl_address}/unregister_engine"
-            logger.info(f"Unregistering engine {self.engine_id} from NanoCtrl")
-
-            # Disable proxy to avoid SOCKS proxy issues
-            with httpx.Client(timeout=5.0) as client:
-                response = client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                if data.get("status") == "ok":
-                    logger.info(
-                        f"Successfully unregistered engine {self.engine_id} from NanoCtrl"
-                    )
-                else:
-                    logger.warning(
-                        f"Failed to unregister engine: {data.get('message', 'Unknown error')}"
-                    )
-        except Exception as e:
-            logger.error(f"Error unregistering engine from NanoCtrl: {e}")
-            # Don't raise - exit should continue even if unregistration fails
-
-    def _start_heartbeat(self):
-        """Start heartbeat thread to keep engine registration alive."""
-        if not self.config.nanoctrl_address or not self._nanoctrl_registered:
-            return
-
-        # Stop existing heartbeat thread if any
-        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
-            return
-
-        self._heartbeat_stop_event.clear()
-
-        def heartbeat_loop():
-            """Heartbeat loop: send heartbeat every 15 seconds."""
-            while not self._heartbeat_stop_event.wait(15.0):
-                try:
-                    self._heartbeat_to_nanoctrl()
-                except Exception as e:
-                    logger.error(f"Error in heartbeat loop: {e}", exc_info=True)
-
-        self._heartbeat_thread = threading.Thread(
-            target=heartbeat_loop, name=f"heartbeat-{self.engine_id}", daemon=True
-        )
-        self._heartbeat_thread.start()
-        logger.info(
-            f"Started heartbeat thread for engine {self.engine_id} (interval: 15s)"
-        )
-
-    def _heartbeat_to_nanoctrl(self):
-        """Send heartbeat to NanoCtrl to refresh TTL."""
-        if not self.config.nanoctrl_address:
-            return
-
-        try:
-            payload = {"engine_id": self.engine_id}
-            url = f"http://{self.config.nanoctrl_address}/heartbeat_engine"
-
-            # Use sync client with short timeout
-            with httpx.Client(timeout=5.0) as client:
-                response = client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-
-                if data.get("status") == "ok":
-                    logger.debug(f"Heartbeat successful for engine {self.engine_id}")
-                elif data.get("status") == "not_found":
-                    # Engine not found, re-register
-                    logger.warning(
-                        f"Engine {self.engine_id} not found in NanoCtrl, re-registering..."
-                    )
-                    self._nanoctrl_registered = False
-                    self._register_with_nanoctrl()
-                else:
-                    logger.warning(
-                        f"Heartbeat failed for engine {self.engine_id}: {data.get('message', 'Unknown error')}"
-                    )
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error in heartbeat: {e}")
-        except Exception as e:
-            logger.error(f"Error sending heartbeat: {e}", exc_info=True)
-
-    def _fetch_peer_endpoints_from_nanoctrl(self) -> Dict[str, List[str]]:
-        """Query peer_endpoints (engine_id -> peer_addrs) from NanoCtrl list_engines, with caching."""
-        now = time.time()
-        if self._peer_endpoints_cache is not None:
-            cached_at, cached = self._peer_endpoints_cache
-            if now - cached_at < _PEER_ENDPOINTS_CACHE_TTL:
-                logger.debug(
-                    f"Using cached peer_endpoints (age={now - cached_at:.1f}s)"
-                )
-                return cached
-
-        if not self.config.nanoctrl_address:
-            logger.warning(
-                "nanoctrl_address not configured, peer_endpoints will be empty"
-            )
-            return {}
-
-        try:
-            url = f"http://{self.config.nanoctrl_address}/list_engines"
-            with httpx.Client(timeout=5.0) as client:
-                response = client.post(url, json={})
-                response.raise_for_status()
-                data = response.json()
-                if data.get("status") != "ok":
-                    logger.warning(
-                        f"list_engines returned status: {data.get('status')}"
-                    )
-                    return {}
-
-                engines = data.get("engines", [])
-                peer_endpoints: Dict[str, List[str]] = {}
-                for eng in engines:
-                    engine_id = eng.get("id")
-                    peer_addrs = eng.get("peer_addrs", [])
-                    if engine_id:
-                        peer_endpoints[engine_id] = peer_addrs
-
-                self._peer_endpoints_cache = (now, peer_endpoints)
-                logger.debug(
-                    f"Fetched {len(peer_endpoints)} peer endpoints from NanoCtrl"
-                )
-                return peer_endpoints
-        except Exception as e:
-            logger.error(f"Error fetching peer_endpoints from NanoCtrl: {e}")
-            if self._peer_endpoints_cache is not None:
-                return self._peer_endpoints_cache[1]
-            return {}
 
     def update_num_kvcache_blocks(self):
         self.config.num_kvcache_blocks = self.executor.update_kvcache_blocks()
@@ -425,16 +198,8 @@ class LLMEngine:
                         if eid:
                             target_engine_ids.add(eid)
             logger.info(f"Target engine IDs for migration: {target_engine_ids}")
-            ensure_p2p = getattr(self, "ensure_p2p_connected", None)
-            if callable(ensure_p2p):
-                for eid in target_engine_ids:
-                    ensure_p2p(eid)
-            # Query peer_endpoints from NanoCtrl (Redis) and cache
-            peer_endpoints = self._fetch_peer_endpoints_from_nanoctrl()
-            logger.info(
-                f"Calling executor.migrate with peer_endpoints: {peer_endpoints}"
-            )
-            self.executor.migrate(dp_sp_seqs, peer_endpoints=peer_endpoints)
+            # peer_endpoints will be fetched by CacheContext from NanoCtrl
+            self.executor.migrate(dp_sp_seqs)
         outputs = []
         num_tokens = 0
 
