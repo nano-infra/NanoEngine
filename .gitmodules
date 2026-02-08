@@ -10,12 +10,3 @@
 [submodule "third_party/cpp-httplib"]
 	path = third_party/cpp-httplib
 	url = https://github.com/yhirose/cpp-httplib.git
-[submodule "third_party/tvm-ffi"]
-	path = third_party/tvm-ffi
-	url = https://github.com/apache/tvm-ffi.git
-[submodule "third_party/protobuf"]
-	path = third_party/protobuf
-	url = https://github.com/protocolbuffers/protobuf
-[submodule "third_party/pybind11_protobuf"]
-	path = third_party/pybind11_protobuf
-	url = https://github.com/pybind/pybind11_protobuf.git
