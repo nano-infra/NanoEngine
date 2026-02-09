@@ -2,9 +2,10 @@
 #include <iostream>
 #include <stdexcept>
 
+#include "nanocommon/xxhash.hpp"
 #include "nanosequence/csrc/sequence/sequence.h"
+
 #include "sequence_generated.h"
-#include "xxhash.hpp"
 
 #include "block_manager.h"
 
