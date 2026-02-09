@@ -164,7 +164,6 @@ mkdir -p DLSlime/build && cmake -DFLAG=<ON|OFF> ..
 | `BUILD_NVLINK`        | 构建 NVLINK 传输引擎                | GPGPU  |    OFF |
 | `BUILD_ASCEND_DIRECT` | 构建 Ascend 直连传输                | ASCEND |    OFF |
 | `BUILD_TORCH_PLUGIN`  | 构建 DLSlime 为 Torch 后端          | Hetero |    OFF |
-| `USE_GLOO_BACKEND`    | 使用 GLOO RDMA Send/Recv Torch 后端 | Hetero |    OFF |
 | `BUILD_INTRA_OPS`     | 使用 INTRA Collective OPS (节点内)  | GPGPU  |    OFF |
 | `BUILD_INTER_OPS`     | 使用 INTER Collective OPS (NVSHMEM) | NVIDIA |    OFF |
 

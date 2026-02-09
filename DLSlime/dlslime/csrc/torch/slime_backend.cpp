@@ -34,7 +34,7 @@ void logAndThrow(const std::string& logMessage, const std::string& errorMessage)
 static at::Tensor& checkSingleTensor(std::vector<at::Tensor>& tensors)
 {
     if (tensors.size() != 1) {
-        TORCH_CHECK(false, "ProcessGroupGloo::send takes a single tensor");
+        TORCH_CHECK(false, "ProcessGroupDLSlime::send takes a single tensor");
     }
     auto& tensor = tensors[0];
     if (!tensor.is_contiguous()) {

@@ -18,7 +18,6 @@ slime_option(BUILD_ASCEND_DIRECT       "Build Ascend direct transport"    OFF)
 slime_option(BUILD_PYTHON              "Build python wrapper"             OFF)
 
 # Slime options for torch plugin
-slime_option(USE_GLOO_BACKEND          "Build gloo backend"               OFF)
 slime_option(BUILD_TORCH_PLUGIN        "Build torch plugin"               OFF)
 
 # Slime options for test

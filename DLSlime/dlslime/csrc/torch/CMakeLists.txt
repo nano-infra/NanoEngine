@@ -1,13 +1,8 @@
 # Python Wrapper
 slime_option(USE_MACA "USE in MACA Platform" OFF)
 
-if (USE_GLOO_BACKEND)
-    set(BACKEND_SRC gloo_backend.cpp)
-    set(ENGINE_LIBRARIES _slime_gloo)
-else ()
-    set(BACKEND_SRC slime_backend.cpp)
-    set(ENGINE_LIBRARIES _slime_engine _slime_rdma)
-endif ()
+set(BACKEND_SRC slime_backend.cpp)
+set(ENGINE_LIBRARIES _slime_engine _slime_rdma)
 
 pybind11_add_module(
     _slime_torch
