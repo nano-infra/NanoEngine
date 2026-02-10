@@ -32,7 +32,7 @@ class AllToAllIntraLLBuffer:
     @staticmethod
     def get_buffer_size_hint(max_dispatch_per_msg, max_bs, max_msg_size, itemsize):
         return _nanoccl_c.AllToAllIntraLLBuffer.get_buffer_size_hint(
-            max_bs, max_msg_size, itemsize, max_dispatch_per_msg
+            max_bs, max_dispatch_per_msg, max_msg_size, itemsize
         )
 
     @property

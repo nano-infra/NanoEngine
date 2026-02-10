@@ -230,6 +230,10 @@ def main():
     logger.info("NanoDeploy Engine Server")
     logger.info("=" * 80)
 
+    import uvloop
+
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
     from jsonargparse import ActionConfigFile, ArgumentParser
 
     parser = ArgumentParser(description="NanoDeploy Engine Server")

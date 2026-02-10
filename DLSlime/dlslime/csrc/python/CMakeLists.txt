@@ -14,17 +14,17 @@ set(_slime_c_link_libraries "")
 set(BIND_INSTALL_RPATH "\${ORIGIN}")
 
 if (BUILD_NVLINK)
-    target_compile_definitions(_slime_c PRIVATE -DBUILD_NVLINK)
+    target_compile_definitions(_slime_c PRIVATE BUILD_NVLINK)
     list(APPEND _slime_c_link_libraries _slime_nvlink CUDA::cudart)
 endif()
 
 if (BUILD_RDMA)
-    target_compile_definitions(_slime_c PRIVATE -DBUILD_RDMA)
+    target_compile_definitions(_slime_c PRIVATE BUILD_RDMA)
     list(APPEND _slime_c_link_libraries _slime_rdma)
 endif()
 
 if (BUILD_ASCEND_DIRECT)
-    target_compile_definitions(_slime_c PRIVATE -DBUILD_ASCEND_DIRECT)
+    target_compile_definitions(_slime_c PRIVATE BUILD_ASCEND_DIRECT)
     list(APPEND _slime_c_link_libraries ascend_direct)
 
     # Add Ascend include directories

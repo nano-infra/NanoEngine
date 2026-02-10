@@ -17,8 +17,8 @@ include_directories(${CUDAToolkit_INCLUDE_DIRS})
 target_compile_definitions(_slime_torch PRIVATE "SLIME_USE_CUDA")
 endif()
 
-target_compile_definitions(_slime_torch PRIVATE "-DTORCH_API_INCLUDE_EXTENSION_H")
-target_compile_definitions(_slime_torch PRIVATE "-DTORCH_EXTENSION_NAME=_slime_torch")
+target_compile_definitions(_slime_torch PRIVATE TORCH_API_INCLUDE_EXTENSION_H)
+target_compile_definitions(_slime_torch PRIVATE TORCH_EXTENSION_NAME=_slime_torch)
 
 target_link_options(_slime_torch PRIVATE "-Wl,--no-as-needed")
 target_link_libraries(

@@ -29,6 +29,7 @@ dependencies = [
     "nanoccl>=0.0.2",
     "dlblas",
     "httpx",
+    "uvloop>=0.21.0",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

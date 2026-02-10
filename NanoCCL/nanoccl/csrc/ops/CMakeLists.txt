@@ -84,8 +84,8 @@ if (BUILD_INTER_OPS)
     )
 endif()
 
-target_compile_definitions(_nanoccl_ops PRIVATE "-DTORCH_API_INCLUDE_EXTENSION_H")
-target_compile_definitions(_nanoccl_ops PRIVATE "-DTORCH_EXTENSION_NAME=_nanoccl_ops")
+target_compile_definitions(_nanoccl_ops PRIVATE TORCH_API_INCLUDE_EXTENSION_H)
+target_compile_definitions(_nanoccl_ops PRIVATE TORCH_EXTENSION_NAME=_nanoccl_ops)
 
 target_include_directories(_nanoccl_ops PUBLIC ${OPS_INCLUDE_DIRS})
 

@@ -32,8 +32,27 @@ T get_env(const char* name, T default_value)
         }
         return result;
     }
+    else if constexpr (std::is_same_v<T, std::string>) {
+        return std::string(val);
+    }
+    else if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
+        long long parsed = std::stoll(val);
+        return static_cast<T>(parsed);
+    }
+    else if constexpr (std::is_integral_v<T> && std::is_unsigned_v<T>) {
+        unsigned long long parsed = std::stoull(val);
+        return static_cast<T>(parsed);
+    }
+    else if constexpr (std::is_floating_point_v<T>) {
+        long double parsed = std::stold(val);
+        return static_cast<T>(parsed);
+    }
+    else if constexpr (std::is_enum_v<T>) {
+        long long parsed = std::stoll(val);
+        return static_cast<T>(parsed);
+    }
     else {
-        return std::stoi(val);
+        static_assert(!sizeof(T), "Unsupported type for get_env");
     }
 }
 

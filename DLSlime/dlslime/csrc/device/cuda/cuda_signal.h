@@ -88,7 +88,7 @@ public:
         if (SLIME_BYPASS_DEVICE_SIGNAL) {
             while (true) {
                 uint32_t val = __atomic_load_n(&host_ptr_->comm_done, __ATOMIC_ACQUIRE);
-                if (val == target_mask)
+                if ((val & target_mask) == target_mask)
                     break;
                 machnet_pause();
             }
