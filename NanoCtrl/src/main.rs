@@ -1,3 +1,4 @@
+mod config;
 mod models;
 mod state;
 
@@ -7,16 +8,26 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use clap::Parser;
 use serde_json::json;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::config::AppConfig;
 use crate::models::*;
 use crate::state::{
     AppState, HEARTBEAT_ENGINE_SCRIPT, REGISTER_ENGINE_SCRIPT, UNREGISTER_ENGINE_SCRIPT,
 };
+
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Args {
+    #[arg(short, long, default_value = "config.toml")]
+    config: PathBuf,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,18 +38,26 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Redis URL: REDIS_URL env (e.g. redis://host:6379) or default localhost
-    let redis_url =
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    tracing::info!("Using Redis URL: {}", redis_url);
+    let args = Args::parse();
+    tracing::info!("Loading configuration from {:?}", args.config);
+    let mut config = AppConfig::load_from_file(&args.config)?;
 
-    // Redis key prefix for data isolation: disabled for now (use empty prefix)
-    let redis_key_prefix = std::env::var("REDIS_KEY_PREFIX").ok();
+    // Env overrides for Redis (optional)
+    if let Ok(url) = std::env::var("REDIS_URL") {
+        config.redis.url = url;
+    }
+    if let Ok(prefix) = std::env::var("REDIS_KEY_PREFIX") {
+        config.redis.key_prefix = Some(prefix);
+    }
+
+    let redis_url = &config.redis.url;
+    let redis_key_prefix = config.redis.key_prefix.clone();
+    tracing::info!("Using Redis URL: {}", redis_url);
     if let Some(ref prefix) = redis_key_prefix {
         tracing::info!("Using Redis key prefix: {} (for data isolation)", prefix);
     }
 
-    let state = AppState::new(&redis_url, redis_key_prefix)?;
+    let state = AppState::new(redis_url, redis_key_prefix)?;
 
     // Warm up Redis connection to avoid first request hang
     {
@@ -78,16 +97,16 @@ async fn main() -> anyhow::Result<()> {
                         )
                     })
                     .on_request(|request: &axum::http::Request<_>, _span: &tracing::Span| {
-                        tracing::info!("Incoming request: {} {}", request.method(), request.uri());
+                        tracing::debug!("Incoming request: {} {}", request.method(), request.uri());
                     })
                     .on_response(
                         |response: &axum::http::Response<_>,
                          latency: std::time::Duration,
                          _span: &tracing::Span| {
                             tracing::info!(
-                                "Response sent: status={}, latency={:?}",
-                                response.status(),
-                                latency
+                                status = %response.status(),
+                                latency_us = latency.as_micros(),
+                                "api done"
                             );
                         },
                     )
@@ -102,7 +121,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(app_state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port)
+        .parse()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid server address {}:{}: {}",
+                config.server.host,
+                config.server.port,
+                e
+            )
+        })?;
     tracing::info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -761,7 +789,7 @@ async fn get_redis_address(
 ) -> impl IntoResponse {
     // Return the full Redis URL (e.g., "redis://127.0.0.1:6379")
     // This allows NanoRouter to connect to Redis for dynamic service discovery
-    tracing::info!("Returning Redis URL: {}", state.redis_url);
+    tracing::debug!("Returning Redis URL: {}", state.redis_url);
     Json(GetRedisAddressResponse {
         status: "ok".to_string(),
         redis_address: state.redis_url.clone(), // Return full URL, not just host:port
@@ -926,7 +954,7 @@ async fn list_engines(
     State(state): State<AppState>,
     Json(_body): Json<ListEnginesBody>,
 ) -> impl IntoResponse {
-    tracing::info!("Listing all registered engines");
+    tracing::debug!("Listing all registered engines");
 
     let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
         Ok(conn) => conn,
@@ -968,7 +996,7 @@ async fn list_engines(
         }
     }
 
-    tracing::info!("Found {} registered engines", engines.len());
+    tracing::debug!("Found {} registered engines", engines.len());
     Json(ListEnginesResponse {
         status: "ok".to_string(),
         engines,

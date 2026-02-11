@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
-use tracing::info;
+use tracing::debug;
 
 pub struct TokenizerService {
     path: String,
@@ -28,7 +28,7 @@ impl TokenizerService {
         let path_str = self.path.clone();
         let _path = Path::new(&path_str);
 
-        info!("Loading tokenizer from {}", path_str);
+        debug!("Loading tokenizer from {}", path_str);
 
         let path_clone = path_str.clone();
         let tokenizer = tokio::task::spawn_blocking(move || {
@@ -58,7 +58,7 @@ impl TokenizerService {
         // ... (removed)
         */
 
-        info!("Tokenizer service ready with simplified ChatML template.");
+        debug!("Tokenizer service ready with simplified ChatML template.");
         Ok(())
     }
 

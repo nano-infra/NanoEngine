@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Engine event types
 #[derive(Debug, Clone)]
@@ -148,14 +148,14 @@ impl EngineWatcher {
         // Subscribe to channel with scoped prefix
         let channel = format!("{}:nano_events:engine_update", self.redis_key_prefix);
         pubsub.subscribe(&channel).await?;
-        info!("Subscribed to {}", channel);
+        debug!("Subscribed to {}", channel);
 
         // Get current revision at subscription time (before converting to stream)
         let subscription_revision = self.get_current_revision_direct().await?;
         let mut last_seen_revision = self.initial_revision;
         let mut first_message = true;
 
-        info!(
+        debug!(
             "Subscription established: initial_revision={}, subscription_revision={}",
             self.initial_revision, subscription_revision
         );

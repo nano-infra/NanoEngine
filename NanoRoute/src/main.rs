@@ -19,7 +19,7 @@ mod tokenizer;
 use clap::Parser;
 use config::AppConfig;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 // use crate::engine_adapter::EngineAdapter; // Removed
 use std::sync::Arc;
 
@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
         config.tokenizer.path = tp;
     }
 
-    info!("Configuration loaded.");
+    debug!("Configuration loaded.");
 
     // Phase 1: Engine Manager & Connect
     // Get NanoCtrl address from config (required for dynamic discovery)
@@ -74,16 +74,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    info!("Using NanoCtrl at: {}", nanoctrl_address);
+    debug!("Using NanoCtrl at: {}", nanoctrl_address);
 
-    // Get Redis URL from NanoCtrl
+    // Get Redis URL from NanoCtrl (once per process; if you see 3x in NanoCtrl log, check for 3 router instances)
     let engine_mgr = engine_manager::EngineManager::new();
     let redis_url = match engine_mgr
         .get_redis_url_from_nanoctrl(&nanoctrl_address)
         .await
     {
         Ok(url) => {
-            info!("Retrieved Redis URL from NanoCtrl: {}", url);
+            debug!("Retrieved Redis URL from NanoCtrl: {}", url);
             url
         }
         Err(e) => {
@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Start dynamic service discovery (only mode)
-    info!(
+    debug!(
         "Starting dynamic service discovery with Redis: {}",
         redis_url
     );
@@ -105,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
         .await
     {
         Ok(manager_arc) => {
-            info!("Dynamic service discovery started successfully.");
+            debug!("Dynamic service discovery started successfully.");
             // Log engine counts
             let manager = manager_arc.lock().await;
             let prefill_count = manager.prefill_engines.len();
@@ -129,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
     // P2P mesh is handled by NanoCtrl microservice
 
     // Phase 2: Tokenizer
-    info!("Initializing Tokenizer...");
+    debug!("Initializing Tokenizer...");
     let mut tokenizer_service = tokenizer::TokenizerService::new(&config.tokenizer.path);
     if let Err(e) = tokenizer_service.load().await {
         error!("Failed to load tokenizer: {}", e);

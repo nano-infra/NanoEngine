@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct EngineManager {
     // We share adapters via Arc<Mutex> because multiple threads (http server) might access them
@@ -380,7 +380,7 @@ impl EngineManager {
                 if status == "ok" {
                     if let Some(engines) = result.get("engines").and_then(|e| e.as_array()) {
                         let engines: Vec<serde_json::Value> = engines.clone();
-                        info!("Found {} engines from NanoCtrl", engines.len());
+                        debug!("Found {} engines from NanoCtrl", engines.len());
                         return Ok(engines);
                     }
                 }
@@ -509,7 +509,7 @@ impl EngineManager {
         // Redis key prefix: Use empty prefix to match NanoCtrl default behavior
         // The automatic prefix generation was removed to fix key mismatch issues
         // See: TROUBLESHOOTING_GUIDE.md Issue #3 - Mangled Redis Prefix
-        info!(
+        debug!(
             "Using Redis key prefix: '{}' (matches NanoCtrl default)",
             self.redis_key_prefix
         );
@@ -525,7 +525,7 @@ impl EngineManager {
             Ok(rev) => {
                 initial_revision = rev;
                 redis_engines = self.prefill_engines.len() + self.decode_engines.len();
-                info!(
+                debug!(
                     "Loaded {} engines from Redis snapshot (revision={})",
                     redis_engines, rev
                 );
@@ -535,11 +535,11 @@ impl EngineManager {
             }
         }
 
-        // Then, if NanoCtrl address is provided, also query from API and merge
+        // Then, if NanoCtrl address is provided, also query from API and merge (bootstrap: 1x list_engines per router start)
         if let Some(addr) = &nanoctrl_address {
             match self.list_engines_from_nanoctrl(addr).await {
                 Ok(api_engines) => {
-                    info!(
+                    debug!(
                         "NanoCtrl API reports {} engines, Redis snapshot has {} engines",
                         api_engines.len(),
                         redis_engines
@@ -595,7 +595,7 @@ impl EngineManager {
             }
         }
 
-        info!(
+        debug!(
             "Snapshot loaded: {} prefill engines, {} decode engines, revision={}",
             self.prefill_engines.len(),
             self.decode_engines.len(),
