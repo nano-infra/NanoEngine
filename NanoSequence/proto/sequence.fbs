@@ -57,8 +57,14 @@ table SequenceList {
 
 table StepOut {
   seq_id: uint64;
-  token_id: uint;
+  token_id: uint;  // Deprecated: kept for backward compatibility
+  token_ids: [uint];  // New field: supports multiple tokens
   status: SequenceStatus;
+}
+
+table FreeSequences {
+  seq_ids: [uint64];
+  source_engine_id: string;
 }
 
 root_type SequenceList;

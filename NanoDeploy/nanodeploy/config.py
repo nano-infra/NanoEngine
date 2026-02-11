@@ -58,9 +58,6 @@ class Config(BaseModel):
     profiling_step: int = 16
     profiler_dir: str = "/mnt/nvme1n1/ml_research/linbinbin1/profiler_res"
 
-    # performance optimization
-    use_dlslime_rpc: bool = True
-
     # logging config
     log_level: str = "CRITICAL"
 

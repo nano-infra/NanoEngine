@@ -21,6 +21,12 @@ pub struct EngineAdapter {
     pub next_seq_id: AtomicU64,
     // Shutdown signal: when dropped, closes the channel to stop reader loop
     pub shutdown_tx: Option<tokio_mpsc::UnboundedSender<()>>,
+    // Reader task handle: must be properly awaited during shutdown
+    pub reader_handle: Option<tokio::task::JoinHandle<()>>,
+    // Keep recv_tx alive to prevent channel from closing prematurely
+    pub recv_tx_keepalive: Option<tokio_mpsc::UnboundedSender<ZmqPacket>>,
+    // I/O thread handle: must be properly joined during shutdown
+    pub io_thread_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +54,9 @@ impl EngineAdapter {
             num_blocks: 0,
             next_seq_id: AtomicU64::new(1),
             shutdown_tx: None,
+            reader_handle: None,
+            recv_tx_keepalive: None,
+            io_thread_handle: None,
         }
     }
 
@@ -57,15 +66,22 @@ impl EngineAdapter {
 
         let ctx = zmq::Context::new();
         let socket = ctx.socket(zmq::DEALER)?;
-        socket.set_linger(0)?;
-        socket.set_rcvtimeo(5000)?;
-        socket.set_sndtimeo(5000)?;
+
+        // Set essential socket options
+        socket.set_linger(0)?; // Don't wait on close
+        socket.set_sndtimeo(5000)?; // 5s send timeout
+        socket.set_reconnect_ivl(100)?; // Reconnect after 100ms
+
         socket.connect(&endpoint)?;
+        info!("ZMQ socket connected to {}", endpoint);
 
         let (send_tx, send_rx) = mpsc::sync_channel::<ZmqPacket>(256);
         self.request_tx = Some(send_tx);
 
         let (recv_tx, mut recv_rx) = tokio_mpsc::unbounded_channel::<ZmqPacket>();
+
+        // Store recv_tx to keep the channel alive (even if I/O thread exits)
+        self.recv_tx_keepalive = Some(recv_tx.clone());
 
         // Create shutdown channel to gracefully stop reader loop
         let (shutdown_tx, mut shutdown_rx) = tokio_mpsc::unbounded_channel::<()>();
@@ -79,46 +95,71 @@ impl EngineAdapter {
         // Single I/O thread: recv with timeout, drain send channel. ZMQ sockets are not thread-safe.
         socket.set_rcvtimeo(100)?; // 100ms timeout for poll loop
         let recv_tx_for_io = recv_tx.clone();
-        thread::spawn(move || {
+        let io_thread_handle = thread::spawn(move || {
             loop {
                 // Try recv (returns EAGAIN after timeout if no data)
                 match socket.recv_bytes(0) {
                     Ok(data) => {
                         if let Ok(packet) = ZmqPacket::decode(&data) {
                             if recv_tx_for_io.send(packet).is_err() {
-                                // Channel closed, reader loop stopped
+                                // Channel closed, reader loop stopped - this is a clean shutdown
+                                info!(
+                                    "ZMQ I/O thread: receiver channel closed for {}",
+                                    addr_for_log
+                                );
                                 break;
                             }
                         }
                     }
-                    Err(zmq::Error::EAGAIN) => {}
+                    Err(zmq::Error::EAGAIN) => {
+                        // Timeout is normal, continue polling
+                    }
+                    Err(zmq::Error::ETERM) => {
+                        // Context terminated - clean shutdown
+                        info!("ZMQ I/O thread: context terminated for {}", addr_for_log);
+                        break;
+                    }
                     Err(e) => {
                         warn!("ZMQ recv error for {}: {}", addr_for_log, e);
                         break;
                     }
                 }
+
                 // Drain send channel
                 while let Ok(packet) = send_rx.try_recv() {
                     let data = packet.encode();
-                    info!(
-                        "ZMQ I/O thread sending packet: action={}, seq_id={}, size={}",
-                        packet.action,
-                        packet.seq_id,
-                        data.len()
-                    );
+                    // Only log important packets (ADD/migration=1, engine_info=2)
+                    if packet.action != 0 {
+                        info!(
+                            "Sending ZMQ packet: action={}, seq_id={}, size={}",
+                            packet.action,
+                            packet.seq_id,
+                            data.len()
+                        );
+                    }
                     if let Err(e) = socket.send(&data, 0) {
-                        warn!("ZMQ send error for {}: {}", addr_for_log, e);
+                        if matches!(e, zmq::Error::ETERM) {
+                            info!(
+                                "ZMQ I/O thread: context terminated during send for {}",
+                                addr_for_log
+                            );
+                        } else {
+                            warn!("ZMQ send error for {}: {}", addr_for_log, e);
+                        }
                         break;
                     }
-                    info!("ZMQ packet sent successfully");
                 }
             }
             info!("ZMQ I/O thread ended for {}", addr_for_log);
         });
 
+        // Store the I/O thread handle so it can be properly joined during shutdown
+        self.io_thread_handle = Some(io_thread_handle);
+
         // Spawn async reader that processes received packets
-        tokio::spawn(async move {
+        let reader_handle = tokio::spawn(async move {
             info!("EngineAdapter reader loop started for {}", addr_for_reader);
+
             loop {
                 tokio::select! {
                     packet_opt = recv_rx.recv() => {
@@ -134,7 +175,10 @@ impl EngineAdapter {
                 let payload = packet.payload;
                 let seq_id = packet.seq_id;
 
-                info!("Received packet: action={}, seq_id={}, payload_size={}", action, seq_id, payload.len());
+                // Only log migration (action=1) and engine info (action=2) packets
+                if action != 0 {
+                    info!("Received packet: action={}, seq_id={}, payload_size={}", action, seq_id, payload.len());
+                }
 
                 if action == 1 {
                     let sl = unsafe { flatbuffers::root_unchecked::<SequenceList>(&payload) };
@@ -148,8 +192,18 @@ impl EngineAdapter {
                     let effective_id = extracted_seq_id.unwrap_or(seq_id);
                     if effective_id > 0 {
                         let mut map = pending.lock().await;
+                        let map_size = map.len();
                         if let Some(state) = map.remove(&effective_id) {
-                            let _ = state.sender.send(StreamEvent::Migrate(payload));
+                            match state.sender.send(StreamEvent::Migrate(payload)) {
+                                Ok(_) => {
+                                    info!("[DIAG] Migration event sent OK for seq_id={}, pending_map_size={}", effective_id, map_size - 1);
+                                }
+                                Err(_) => {
+                                    warn!("[DIAG] Migration event SEND FAILED (rx dropped = client disconnected) for seq_id={}, pending_map_size={}", effective_id, map_size - 1);
+                                }
+                            }
+                        } else {
+                            warn!("[DIAG] Migration response for seq_id={} but NOT FOUND in pending_requests (map_size={}). header_seq_id={}, extracted_seq_id={:?}", effective_id, map_size, seq_id, extracted_seq_id);
                         }
                     }
                     continue;
@@ -167,28 +221,55 @@ impl EngineAdapter {
                 if action == 0 {
                     let step_out = unsafe { flatbuffers::root_unchecked::<StepOut>(&payload) };
                     let seq_id = step_out.seq_id();
-                    let token_id = step_out.token_id();
                     let status = step_out.status();
 
-                    info!("Received StepOut: seq_id={}, token_id={}, status={:?}", seq_id, token_id, status);
+                    // Extract tokens: prefer token_ids vector over single token_id
+                    let tokens: Vec<u32> = step_out.token_ids()
+                        .map(|ids| ids.iter().collect())
+                        .unwrap_or_else(|| {
+                            let token_id = step_out.token_id();
+                            if token_id > 0 { vec![token_id] } else { vec![] }
+                        });
 
                     let mut map = pending.lock().await;
                     if status == SequenceStatus::FINISHED {
-                        info!("Sequence {} finished", seq_id);
                         if let Some(final_state) = map.remove(&seq_id) {
-                            if token_id > 0 {
-                                let _ = final_state.sender.send(StreamEvent::Token(token_id));
+                            // Log finish with total token count
+                            let total_tokens = final_state.accumulated_tokens.len() + tokens.len();
+                            info!("Sequence {} finished: {} tokens generated, pending_map_size={}", seq_id, total_tokens, map.len());
+
+                            for token_id in &tokens {
+                                if final_state.sender.send(StreamEvent::Token(*token_id)).is_err() {
+                                    warn!("[DIAG] Sequence {} FINISH token send failed (client disconnected)", seq_id);
+                                    break;
+                                }
                             }
-                            let _ = final_state.sender.send(StreamEvent::Finished);
+                            if final_state.sender.send(StreamEvent::Finished).is_err() {
+                                warn!("[DIAG] Sequence {} FINISHED event send failed (client disconnected)", seq_id);
+                            }
+                        } else {
+                            warn!("[DIAG] Sequence {} FINISHED but NOT FOUND in pending_requests (map_size={})", seq_id, map.len());
                         }
-                    } else if (status == SequenceStatus::RUNNING_PREFILL || status == SequenceStatus::RUNNING_DECODE) && token_id > 0 {
+                    } else if matches!(status, SequenceStatus::RUNNING_PREFILL | SequenceStatus::RUNNING_DECODE) {
                         if let Some(state) = map.get_mut(&seq_id) {
-                            state.accumulated_tokens.push(token_id);
-                            let _ = state.sender.send(StreamEvent::Token(token_id));
+                            // Only log at the beginning (first token)
+                            let is_first = state.accumulated_tokens.is_empty();
+
+                            for token_id in tokens {
+                                state.accumulated_tokens.push(token_id);
+                                if state.sender.send(StreamEvent::Token(token_id)).is_err() {
+                                    warn!("[DIAG] Sequence {} token send failed (client disconnected), accumulated={}", seq_id, state.accumulated_tokens.len());
+                                    break;
+                                }
+                            }
+
+                            if is_first {
+                                info!("Sequence {} started generation", seq_id);
+                            }
+                        } else {
+                            // Only warn for the first occurrence to avoid log spam
+                            warn!("[DIAG] Sequence {} token received but NOT FOUND in pending_requests (map_size={})", seq_id, map.len());
                         }
-                    } else if token_id > 0 {
-                        // Log unhandled status with token
-                        warn!("Received token {} for seq {} with unhandled status {:?}", token_id, seq_id, status);
                     }
                 }
                     }
@@ -199,8 +280,12 @@ impl EngineAdapter {
                     }
                 }
             }
+
             info!("EngineAdapter reader loop ended for {}", addr_for_reader);
         });
+
+        // Store the reader handle so it can be properly awaited during shutdown
+        self.reader_handle = Some(reader_handle);
 
         Ok(())
     }

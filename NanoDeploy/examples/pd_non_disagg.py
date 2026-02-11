@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 
 def main():
 
-    path = os.path.expanduser("/models/model--Qwen--Qwen3-30B-A3B-FP8")
+    path = os.path.expanduser("/models/qwen3-235B-Instruct-2507-FP8")
     tokenizer = AutoTokenizer.from_pretrained(path)
     config = Config(
         model=path,
@@ -27,7 +27,7 @@ def main():
         max_model_len=4096,
         max_num_batched_tokens=4096,
         gpu_memory_utilization=0.9,
-        log_level="DEBUG",
+        log_level="INFO",
     )
     llm = LLM(config)
 

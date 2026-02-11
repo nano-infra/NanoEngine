@@ -43,6 +43,7 @@ set(FBS_GENERATED_FILES
     "${FBS_OUTPUT_DIR}/Sequence.py"
     "${FBS_OUTPUT_DIR}/SequenceList.py"
     "${FBS_OUTPUT_DIR}/StepOut.py"
+    "${FBS_OUTPUT_DIR}/FreeSequences.py"
     "${FBS_OUTPUT_DIR}/__init__.py"
 )
 

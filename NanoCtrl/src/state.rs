@@ -1,11 +1,4 @@
 use redis::Client;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::Mutex;
-
-/// Cache TTL for get_mr_info (seconds)
-pub const MR_INFO_CACHE_TTL_SECS: u64 = 10;
 
 /// Engine TTL in seconds (for heartbeat mechanism)
 /// Engine must send heartbeat every 15 seconds to keep alive
@@ -136,20 +129,17 @@ pub struct AppState {
     pub redis_url: String,
     /// Redis key prefix for data isolation (scope per NanoCtrl instance)
     pub redis_key_prefix: String,
-    /// Cache for get_mr_info: key "dst:mr_name" -> (cached_at, response)
-    pub mr_info_cache: Arc<Mutex<HashMap<String, (Instant, crate::models::GetMrInfoResponse)>>>,
 }
 
 impl AppState {
     pub fn new(redis_url: &str, redis_key_prefix: Option<String>) -> anyhow::Result<Self> {
         let client = Client::open(redis_url)?;
-        let prefix = redis_key_prefix.unwrap_or_else(|| "".to_string());
+        let prefix = redis_key_prefix.unwrap_or_default();
         // Client can be cloned and get_multiplexed_async_connection() is efficient
         Ok(Self {
             redis_client: client,
             redis_url: redis_url.to_string(),
             redis_key_prefix: prefix,
-            mr_info_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 

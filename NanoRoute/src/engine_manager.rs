@@ -712,6 +712,14 @@ impl EngineManager {
         if let Err(e) = self.handle_remove_engine(&payload.id).await {
             // It's ok if engine doesn't exist, just log
             info!("No existing engine {} to remove: {}", payload.id, e);
+        } else {
+            // Give ZMQ time to fully clean up the old socket before reconnecting
+            // This prevents "Address already in use" and connection state issues
+            info!(
+                "Waiting 500ms for ZMQ socket cleanup before reconnecting to {}",
+                payload.id
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
         // Handle host "0.0.0.0" -> "127.0.0.1" conversion
@@ -788,8 +796,52 @@ impl EngineManager {
         unreachable!()
     }
 
+    /// Helper function to cleanup an adapter's resources
+    fn cleanup_adapter(
+        adapter_guard: &mut EngineAdapter,
+        engine_id: &str,
+    ) -> (
+        Option<tokio::task::JoinHandle<()>>,
+        Option<std::thread::JoinHandle<()>>,
+    ) {
+        // Step 1: Close recv channel to stop async reader
+        drop(adapter_guard.recv_tx_keepalive.take());
+
+        // Step 2: Close request channel to stop I/O thread
+        drop(adapter_guard.request_tx.take());
+
+        // Step 3: Cleanup pending requests
+        let pending = adapter_guard.pending_requests.clone();
+        futures::executor::block_on(async {
+            let mut map = pending.lock().await;
+            for (_seq_id, state) in map.drain() {
+                let _ = state
+                    .sender
+                    .send(crate::engine_adapter::StreamEvent::Error(format!(
+                        "Engine {} disconnected",
+                        engine_id
+                    )));
+            }
+        });
+
+        // Step 4: Send shutdown signal to stop reader loop
+        if let Some(shutdown_tx) = &adapter_guard.shutdown_tx {
+            let _ = shutdown_tx.send(());
+        }
+
+        // Step 5: Extract handles for later cleanup
+        (
+            adapter_guard.reader_handle.take(),
+            adapter_guard.io_thread_handle.take(),
+        )
+    }
+
     async fn handle_remove_engine(&mut self, engine_id: &str) -> anyhow::Result<()> {
         info!("Removing engine: {}", engine_id);
+
+        // Collect reader handles and I/O thread handles to await after retain
+        let mut reader_handles = Vec::new();
+        let mut io_thread_handles = Vec::new();
 
         // Remove from prefill_engines and cleanup pending requests
         let prefill_before = self.prefill_engines.len();
@@ -799,36 +851,14 @@ impl EngineManager {
             let should_keep = adapter_guard.uuid.as_deref() != Some(engine_id);
             if !should_keep {
                 removed_prefill = true;
-                info!(
-                    "Removed prefill engine: {} (cleaning up and shutting down)",
-                    engine_id
-                );
-
-                // Step 1: Close request channel to stop I/O thread
-                drop(adapter_guard.request_tx.take());
-
-                // Step 2: Cleanup pending requests
-                let pending = adapter_guard.pending_requests.clone();
-                futures::executor::block_on(async {
-                    let mut map = pending.lock().await;
-                    for (seq_id, state) in map.drain() {
-                        let _ =
-                            state
-                                .sender
-                                .send(crate::engine_adapter::StreamEvent::Error(format!(
-                                    "Engine {} disconnected",
-                                    engine_id
-                                )));
-                        info!(
-                            "Cleaned up pending request seq_id={} for removed engine {}",
-                            seq_id, engine_id
-                        );
-                    }
-                });
-
-                // Step 3: Send shutdown signal to stop reader loop
-                if let Some(shutdown_tx) = &adapter_guard.shutdown_tx {
-                    let _ = shutdown_tx.send(());
+                info!("Removing prefill engine: {}", engine_id);
+                let (reader_handle, io_handle) =
+                    Self::cleanup_adapter(&mut adapter_guard, engine_id);
+                if let Some(h) = reader_handle {
+                    reader_handles.push(h);
+                }
+                if let Some(h) = io_handle {
+                    io_thread_handles.push(h);
                 }
             }
             should_keep
@@ -843,41 +873,34 @@ impl EngineManager {
             let should_keep = adapter_guard.uuid.as_deref() != Some(engine_id);
             if !should_keep {
                 removed_decode = true;
-                info!(
-                    "Removed decode engine: {} (cleaning up and shutting down)",
-                    engine_id
-                );
-
-                // Step 1: Close request channel to stop I/O thread
-                drop(adapter_guard.request_tx.take());
-
-                // Step 2: Cleanup pending requests
-                let pending = adapter_guard.pending_requests.clone();
-                futures::executor::block_on(async {
-                    let mut map = pending.lock().await;
-                    for (seq_id, state) in map.drain() {
-                        let _ =
-                            state
-                                .sender
-                                .send(crate::engine_adapter::StreamEvent::Error(format!(
-                                    "Engine {} disconnected",
-                                    engine_id
-                                )));
-                        info!(
-                            "Cleaned up pending request seq_id={} for removed engine {}",
-                            seq_id, engine_id
-                        );
-                    }
-                });
-
-                // Step 3: Send shutdown signal to stop reader loop
-                if let Some(shutdown_tx) = &adapter_guard.shutdown_tx {
-                    let _ = shutdown_tx.send(());
+                info!("Removing decode engine: {}", engine_id);
+                let (reader_handle, io_handle) =
+                    Self::cleanup_adapter(&mut adapter_guard, engine_id);
+                if let Some(h) = reader_handle {
+                    reader_handles.push(h);
+                }
+                if let Some(h) = io_handle {
+                    io_thread_handles.push(h);
                 }
             }
             should_keep
         });
         let decode_after = self.decode_engines.len();
+
+        // Await all reader tasks
+        for handle in reader_handles {
+            if let Err(e) = tokio::time::timeout(Duration::from_secs(2), handle).await {
+                warn!("Reader task timeout for engine {}: {:?}", engine_id, e);
+            }
+        }
+
+        // Await all I/O threads
+        for handle in io_thread_handles {
+            let join_result = tokio::task::spawn_blocking(move || handle.join()).await;
+            if let Err(e) = join_result {
+                warn!("I/O thread join failed for engine {}: {:?}", engine_id, e);
+            }
+        }
 
         if removed_prefill || removed_decode {
             info!(

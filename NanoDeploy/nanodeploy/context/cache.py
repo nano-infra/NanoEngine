@@ -112,6 +112,9 @@ class CacheContext:
         self._peer_agent_addr: str | None = None
         self._connected_peers: set[str] = set()  # track connected peer addresses
         self._local_mr_handler: int | None = None  # local MR handler for kv_cache
+        # NOTE: Remote MR handler caching removed from app layer
+        # PeerAgent handles MR info caching via pubsub (mr_update events)
+        # register_remote_memory_region is idempotent at endpoint layer
         self._engine_info_cache: tuple[float, dict[str, dict]] | None = (
             None  # (timestamp, engine_id -> engine_info_dict)
         )
@@ -460,8 +463,8 @@ class CacheContext:
                         assigns[engine_id][peer_alias].append(assignment)
 
         # Execute RDMA reads using PeerAgent control plane API
-        # Cache remote MR handlers to avoid re-registering (as in reference example)
-        remote_mr_handlers = {}  # (peer_alias, mr_name) -> handler
+        # MR info is cached at PeerAgent layer (via pubsub mr_update events)
+        # register_remote_memory_region is idempotent at endpoint layer
 
         for engine_id, peer_assigns in assigns.items():
             for peer_alias, assign_batch in peer_assigns.items():
@@ -470,30 +473,24 @@ class CacheContext:
                     logger.error(f"Peer {peer_alias} not connected, skipping")
                     continue
 
-                # Get or cache remote MR handler
-                cache_key = (peer_alias, _KV_CACHE_BUFFER_ID)
-                if cache_key not in remote_mr_handlers:
-                    # Get remote MR info from control plane (as in reference example)
-                    remote_mr_info = self._peer_agent.get_mr_info(
-                        peer_alias, _KV_CACHE_BUFFER_ID
-                    )
-                    if remote_mr_info is None:
-                        logger.error(f"Failed to get MR info for {peer_alias}")
-                        continue
+                # Get remote MR info (cached in PeerAgent via pubsub)
+                remote_mr_info = self._peer_agent.get_mr_info(
+                    peer_alias, _KV_CACHE_BUFFER_ID
+                )
+                if remote_mr_info is None:
+                    logger.error(f"Failed to get MR info for {peer_alias}")
+                    continue
 
-                    # Register remote memory region (as in reference example)
-                    remote_mr_handler = self._peer_agent.register_remote_memory_region(
-                        peer_alias,
-                        _KV_CACHE_BUFFER_ID,
-                        remote_mr_info,
-                    )
-                    remote_mr_handlers[cache_key] = remote_mr_handler
-                    logger.info(
-                        f"Registered remote MR for {peer_alias}: handler={remote_mr_handler}, "
-                        f"local_handler={self._local_mr_handler}, cache_key={cache_key}"
-                    )
-                else:
-                    remote_mr_handler = remote_mr_handlers[cache_key]
+                # Register remote memory region (idempotent at endpoint layer)
+                remote_mr_handler = self._peer_agent.register_remote_memory_region(
+                    peer_alias,
+                    _KV_CACHE_BUFFER_ID,
+                    remote_mr_info,
+                )
+                logger.debug(
+                    f"Remote MR for {peer_alias}: handler={remote_mr_handler}, "
+                    f"local_handler={self._local_mr_handler}"
+                )
 
                 # Get local MR handler (stored during allocate_kvcache)
                 if self._local_mr_handler is None:

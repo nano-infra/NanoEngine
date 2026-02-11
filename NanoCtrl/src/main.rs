@@ -39,6 +39,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = AppState::new(&redis_url, redis_key_prefix)?;
+
+    // Warm up Redis connection to avoid first request hang
+    {
+        tracing::info!("Warming up Redis connection...");
+        let mut conn = state
+            .redis_client
+            .get_multiplexed_async_connection()
+            .await?;
+        let _: String = redis::cmd("PING").query_async(&mut conn).await?;
+        tracing::info!("Redis connection established successfully");
+    }
+
     let app_state = state.clone();
 
     let app = Router::new()
@@ -154,27 +166,75 @@ async fn start_peer_agent(
     State(state): State<AppState>,
     Json(body): Json<StartPeerAgentBody>,
 ) -> impl IntoResponse {
-    tracing::info!(
-        "Received registration request for agent: {} (device={}, ib_port={}, link_type={}, address={})",
-        body.alias,
-        body.device,
-        body.ib_port,
-        body.link_type,
-        body.address
-    );
-
     let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
         Ok(conn) => conn,
         Err(e) => {
             tracing::error!("Failed to get Redis connection: {}", e);
             return Json(StartPeerAgentResponse {
                 status: "error".to_string(),
+                name: "".to_string(),
                 redis_address: "".to_string(),
             });
         }
     };
 
-    let key = format!("agent:{}", body.alias);
+    // Allocate name if not provided (single atomic operation)
+    let agent_name = if let Some(alias) = body.alias {
+        // Check if provided name already exists
+        let key = format!("agent:{}", alias);
+        let exists: bool = match redis::cmd("EXISTS").arg(&key).query_async(&mut conn).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("Failed to check agent existence: {}", e);
+                return Json(StartPeerAgentResponse {
+                    status: "error".to_string(),
+                    name: "".to_string(),
+                    redis_address: "".to_string(),
+                });
+            }
+        };
+
+        if exists {
+            tracing::error!("Agent {} already registered - names must be unique", alias);
+            return Json(StartPeerAgentResponse {
+                status: "error: agent name already exists".to_string(),
+                name: "".to_string(),
+                redis_address: "".to_string(),
+            });
+        }
+        alias
+    } else {
+        // Auto-generate unique name using atomic counter
+        let counter_key = format!("{}:agent_name_counter", state.redis_key_prefix);
+        let counter: i64 = match redis::cmd("INCR")
+            .arg(&counter_key)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to increment agent counter: {}", e);
+                return Json(StartPeerAgentResponse {
+                    status: "error".to_string(),
+                    name: "".to_string(),
+                    redis_address: "".to_string(),
+                });
+            }
+        };
+        format!("{}-{:x}", body.name_prefix, counter)
+    };
+
+    tracing::info!(
+        "Registering agent: {} (device={}, ib_port={}, link_type={}, address={})",
+        agent_name,
+        body.device,
+        body.ib_port,
+        body.link_type,
+        body.address
+    );
+
+    let key = format!("agent:{}", agent_name);
+
     tracing::debug!("Storing agent info in Redis with key: {}", key);
     match redis::cmd("HSET")
         .arg(&key)
@@ -192,13 +252,14 @@ async fn start_peer_agent(
         Ok(_) => {
             tracing::info!(
                 "Successfully registered peer agent: {} in Redis",
-                body.alias
+                agent_name
             );
         }
         Err(e) => {
-            tracing::error!("Failed to register agent {} in Redis: {}", body.alias, e);
+            tracing::error!("Failed to register agent {} in Redis: {}", agent_name, e);
             return Json(StartPeerAgentResponse {
                 status: "error".to_string(),
+                name: agent_name.clone(),
                 redis_address: "".to_string(),
             });
         }
@@ -257,13 +318,14 @@ async fn start_peer_agent(
 
     tracing::info!(
         "Sending response for agent {}: status=ok, redis_address={} (client address: {})",
-        body.alias,
+        agent_name,
         redis_address,
         body.address
     );
 
     Json(StartPeerAgentResponse {
         status: "ok".to_string(),
+        name: agent_name,
         redis_address,
     })
 }
@@ -316,6 +378,50 @@ async fn set_desired_topology(
         );
     }
 
+    // Push connect_peer messages to agent's stream mailbox
+    let stream_key = if state.redis_key_prefix.is_empty() {
+        format!("stream:{}", agent_id)
+    } else {
+        format!("{}:stream:{}", state.redis_key_prefix, agent_id)
+    };
+    for target_peer in &spec.target_peers {
+        let timestamp = format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64()
+        );
+        let message = vec![
+            ("type", "connect_peer"),
+            ("peer", target_peer.as_str()),
+            ("timestamp", timestamp.as_str()),
+        ];
+
+        if let Err(e) = redis::cmd("XADD")
+            .arg(&stream_key)
+            .arg("MAXLEN")
+            .arg("~")
+            .arg("1000")
+            .arg("*")
+            .arg(&message)
+            .query_async::<String>(&mut conn)
+            .await
+        {
+            tracing::warn!(
+                "Failed to push connect_peer message to stream {}: {}",
+                stream_key,
+                e
+            );
+        } else {
+            tracing::debug!(
+                "Pushed connect_peer message: {} -> {}",
+                agent_id,
+                target_peer
+            );
+        }
+    }
+
     // Symmetric: merge this agent_id into each target peer's spec so both sides want each other
     if spec.symmetric {
         for target_peer in &spec.target_peers {
@@ -347,6 +453,42 @@ async fn set_desired_topology(
                     .arg(&peer_json)
                     .query_async(&mut conn)
                     .await;
+
+                // Also push connect_peer message to target peer's stream
+                let peer_stream_key = if state.redis_key_prefix.is_empty() {
+                    format!("stream:{}", target_peer)
+                } else {
+                    format!("{}:stream:{}", state.redis_key_prefix, target_peer)
+                };
+                let timestamp = format!(
+                    "{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64()
+                );
+                let message = vec![
+                    ("type", "connect_peer"),
+                    ("peer", agent_id.as_str()),
+                    ("timestamp", timestamp.as_str()),
+                ];
+
+                if let Err(e) = redis::cmd("XADD")
+                    .arg(&peer_stream_key)
+                    .arg("MAXLEN")
+                    .arg("~")
+                    .arg("1000")
+                    .arg("*")
+                    .arg(&message)
+                    .query_async::<String>(&mut conn)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to push symmetric connect_peer message to stream {}: {}",
+                        peer_stream_key,
+                        e
+                    );
+                }
             }
         }
         tracing::info!(
@@ -417,18 +559,6 @@ async fn get_mr_info(
     State(state): State<AppState>,
     Json(body): Json<GetMrInfoBody>,
 ) -> impl IntoResponse {
-    let cache_key = format!("{}:{}", body.dst, body.mr_name);
-
-    // Check cache first
-    {
-        let cache = state.mr_info_cache.lock().await;
-        if let Some((cached_at, cached)) = cache.get(&cache_key) {
-            if cached_at.elapsed().as_secs() < state::MR_INFO_CACHE_TTL_SECS {
-                return Json(cached.clone());
-            }
-        }
-    }
-
     let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
         Ok(conn) => conn,
         Err(e) => {
@@ -469,12 +599,6 @@ async fn get_mr_info(
     } else {
         GetMrInfoResponse { mr_info: None }
     };
-
-    // Store in cache
-    {
-        let mut cache = state.mr_info_cache.lock().await;
-        cache.insert(cache_key, (std::time::Instant::now(), response.clone()));
-    }
 
     Json(response)
 }
@@ -700,6 +824,8 @@ async fn register_engine(
         "host": body.host,
         "port": body.port,
         "peer_addrs": body.peer_addrs,
+        "p2p_host": body.p2p_host.unwrap_or_default(),
+        "p2p_port": body.p2p_port.unwrap_or(0),
     });
 
     // Use Lua script to atomically: HSET + EXPIRE + INCR + PUBLISH

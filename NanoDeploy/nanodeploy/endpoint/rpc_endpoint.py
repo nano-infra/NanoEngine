@@ -80,7 +80,16 @@ class RPCServerEndpoint:
             binding = self.server_bindings[i]
             buffer = binding.buffer
             buffer_ptr = buffer.data_ptr() + buffer.storage_offset()
+
+            # Serialize sequences to FlatBuffer
             off = serialize(buffer_ptr, buffer.numel(), dp_seqs[i], is_prefill)
+
+            # Validate serialized size
+            if off <= 0:
+                logger.error(
+                    f"Serialize returned invalid size: {off} for {len(dp_seqs[i])} sequences"
+                )
+                raise RuntimeError(f"Invalid serialization size: {off}")
 
             num_seqs = len(dp_seqs[i])
             total_tokens = sum(s.num_tokens for s in dp_seqs[i])
@@ -188,7 +197,21 @@ class RPCClientEndpoint:
                 f"Invalid FlatBuffer size: {size} (buffer capacity: {buffer.numel()})"
             )
 
-        return deserialize(buffer_ptr, size)
+        # Minimum valid FlatBuffer is ~20 bytes (headers + empty list)
+        # If size is too small, return empty list instead of trying to deserialize
+        if size < 16:
+            logger.warning(
+                f"Received suspiciously small FlatBuffer size: {size} bytes, returning empty list"
+            )
+            return []
+
+        try:
+            return deserialize(buffer_ptr, size)
+        except RuntimeError as e:
+            logger.error(f"FlatBuffer deserialization failed (size={size}): {e}")
+            logger.error(f"Buffer content (first 100 bytes): {buffer[:100].tolist()}")
+            # Return empty list instead of crashing
+            return []
 
     def send_tokens(self):
         pass

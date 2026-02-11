@@ -14,30 +14,6 @@ std::shared_ptr<Sequence> sequence_from_data(std::unique_ptr<SequenceT> data)
     return seq;
 }
 
-// Simplified: Use FlatBuffers Pack() directly
-std::vector<uint8_t> serialize_sequence(const Sequence& seq)
-{
-    flatbuffers::FlatBufferBuilder builder(1024);
-    auto                           offset = fbs::Sequence::Pack(builder, seq.data_.get());
-    builder.Finish(offset);
-
-    const uint8_t* buf  = builder.GetBufferPointer();
-    size_t         size = builder.GetSize();
-    return std::vector<uint8_t>(buf, buf + size);
-}
-
-// Simplified: Use FlatBuffers UnPack() directly
-std::shared_ptr<Sequence> deserialize_sequence(const uint8_t* buffer, size_t size)
-{
-    flatbuffers::Verifier verifier(buffer, size);
-    if (!verifier.VerifyBuffer<fbs::Sequence>()) {
-        throw std::runtime_error("Invalid FlatBuffer: Sequence verification failed");
-    }
-
-    auto fb_seq = flatbuffers::GetRoot<fbs::Sequence>(buffer);
-    return sequence_from_data(std::unique_ptr<fbs::SequenceT>(fb_seq->UnPack()));
-}
-
 // Helper: Validate and fix BlockContext before serialization
 static void validate_block_context(fbs::BlockContextT& ctx)
 {
@@ -65,6 +41,47 @@ static void validate_block_context(fbs::BlockContextT& ctx)
 
     // Ensure endpoints vector is initialized (can be empty)
     // No action needed for endpoints, it's a std::vector<std::string>
+}
+
+// Simplified: Use FlatBuffers Pack() directly
+std::vector<uint8_t> serialize_sequence(const Sequence& seq)
+{
+    // Validate all BlockContexts in slots before serialization (same as serialize_sequences)
+    for (size_t slot_idx = 0; slot_idx < seq.data_->slots.size(); ++slot_idx) {
+        auto& slot = seq.data_->slots[slot_idx];
+        if (slot) {
+            validate_block_context(*slot);
+        }
+        else {
+            slot                     = std::make_unique<fbs::BlockContextT>();
+            slot->engine_id          = "";
+            slot->dp_idx             = 0;
+            slot->master_sp_idx      = 0;
+            slot->attention_sp       = 0;
+            slot->attention_dp       = 0;
+            slot->num_kvcache_blocks = 0;
+        }
+    }
+
+    flatbuffers::FlatBufferBuilder builder(64 * 1024);  // 64KB initial
+    auto                           offset = fbs::Sequence::Pack(builder, seq.data_.get());
+    builder.Finish(offset);
+
+    const uint8_t* buf  = builder.GetBufferPointer();
+    size_t         size = builder.GetSize();
+    return std::vector<uint8_t>(buf, buf + size);
+}
+
+// Simplified: Use FlatBuffers UnPack() directly
+std::shared_ptr<Sequence> deserialize_sequence(const uint8_t* buffer, size_t size)
+{
+    flatbuffers::Verifier verifier(buffer, size);
+    if (!verifier.VerifyBuffer<fbs::Sequence>()) {
+        throw std::runtime_error("Invalid FlatBuffer: Sequence verification failed");
+    }
+
+    auto fb_seq = flatbuffers::GetRoot<fbs::Sequence>(buffer);
+    return sequence_from_data(std::unique_ptr<fbs::SequenceT>(fb_seq->UnPack()));
 }
 
 size_t serialize_sequences(uintptr_t                                     data_ptr,

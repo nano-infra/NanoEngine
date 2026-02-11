@@ -1,10 +1,12 @@
 """
 PeerAgent: Control plane client for DLSlime RDMA connection management.
 
-Refactored to use a Declarative Horizontal model (Symmetric Rendezvous):
-- NanoCtrl stores "Desired Topology" in Redis (spec:topology:{agent_id})
-- PeerAgent runs a TopologyReconciler loop to converge Actual State to Desired State
+Event-driven architecture using Redis Streams:
+- Each agent has a stream mailbox: stream:{agent_id}
+- NanoCtrl pushes connection commands to agent streams
+- Agent listens to stream and initiates p2p bootstrap
 - QP info exchange via Redis (exchange:{sender}:{receiver})
+- No polling, pure message-driven
 """
 
 import json
@@ -39,130 +41,180 @@ def create_redis_prefix(server_url: str) -> str:
     return f"nano_{sanitized}"
 
 
-class TopologyReconciler:
+class StreamMailbox:
     """
-    Background reconciliation loop: converges Actual State to Desired State.
-    Implements Symmetric Rendezvous via Redis exchange keys.
+    Redis Streams-based mailbox for receiving connection commands from NanoCtrl.
+    Pure event-driven, no polling. Listens to stream:{agent_alias}.
     """
 
-    def __init__(
-        self,
-        agent: "PeerAgent",
-        reconcile_interval_sec: float = 1.0,
-    ):
+    def __init__(self, agent: "PeerAgent", stream_block_ms: int = 100):
+        """
+        Args:
+            agent: PeerAgent instance
+            stream_block_ms: XREAD block timeout in milliseconds (default 100ms)
+        """
         self._agent = agent
-        self._interval = reconcile_interval_sec
+        self._stream_block_ms = stream_block_ms
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
-        """Start the reconcile loop in a background thread."""
-
-        def run():
-            while not self._stop_event.is_set():
-                try:
-                    self._reconcile_once()
-                except Exception as e:
-                    print(
-                        f"TopologyReconciler {self._agent.alias}: Error in reconcile: {e}"
-                    )
-                    import traceback
-
-                    traceback.print_exc()
-                self._stop_event.wait(self._interval)
-
-        self._thread = threading.Thread(target=run, daemon=True)
+        """Start the stream listener thread."""
+        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._thread.start()
         print(
-            f"TopologyReconciler {self._agent.alias}: Started (interval={self._interval}s)"
+            f"StreamMailbox {self._agent.alias}: Started listening to stream "
+            f"(block={self._stream_block_ms}ms)"
         )
 
     def stop(self) -> None:
-        """Stop the reconcile loop."""
+        """Stop the stream listener."""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=2)
-        print(f"TopologyReconciler {self._agent.alias}: Stopped")
+        print(f"StreamMailbox {self._agent.alias}: Stopped")
 
-    def _reconcile_once(self) -> None:
-        """Single reconciliation pass: diff desired vs actual, act on delta."""
-        # 1. Get Desired State from Redis (with scoped prefix)
-        spec_key = f"{self._agent.redis_key_prefix}:spec:topology:{self._agent.alias}"
-        spec_str = self._agent.redis_client.get(spec_key)
-        if spec_str is None:
-            return  # No desired topology, nothing to do
+    def _listen_loop(self) -> None:
+        """Main event loop: blocking XREAD on agent's stream mailbox."""
+        prefix = (
+            f"{self._agent.redis_key_prefix}:" if self._agent.redis_key_prefix else ""
+        )
+        stream_key = f"{prefix}stream:{self._agent.alias}"
 
-        try:
-            spec = json.loads(spec_str)
-            target_peers: List[str] = spec.get("target_peers", [])
-        except (json.JSONDecodeError, TypeError):
-            return
+        # Start from beginning (0-0 = all messages in stream)
+        # Safe because cleanup removes stream on shutdown
+        last_id = "0-0"
 
-        desired = set(target_peers)
-        if not desired:
-            return
+        print(
+            f"StreamMailbox {self._agent.alias}: Listening to {stream_key} (from beginning)"
+        )
 
-        # 2. Get Actual State (peers we've successfully connected to)
-        actual: Set[str] = self._agent.get_connected_peers()
+        while not self._stop_event.is_set():
+            try:
+                # XREAD with blocking
+                result = self._agent.redis_client.xread(
+                    {stream_key: last_id},
+                    block=self._stream_block_ms,
+                    count=100,  # Batch up to 100 messages
+                )
 
-        # 3. Diff
-        to_connect = desired - actual
+                if not result:
+                    continue  # Timeout, no messages
 
-        # 4. Act (Symmetric Rendezvous) - parallel connection attempts
-        if not to_connect:
-            return
-        max_workers = min(32, len(to_connect))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self._try_connect_peer, peer): peer
-                for peer in to_connect
-            }
-            for future in as_completed(futures):
-                peer = futures[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    print(
-                        f"TopologyReconciler {self._agent.alias}: Failed to connect to {peer}: {e}"
-                    )
+                # Process messages
+                for _, messages in result:
+                    for msg_id, fields in messages:
+                        try:
+                            self._handle_message(fields)
+                        except Exception as e:
+                            print(
+                                f"StreamMailbox {self._agent.alias}: Error handling message: {e}"
+                            )
+                            import traceback
+
+                            traceback.print_exc()
+                        last_id = msg_id
+
+            except redis.exceptions.ConnectionError:
+                time.sleep(0.1)
+            except Exception as e:
+                print(f"StreamMailbox {self._agent.alias}: Error in listen loop: {e}")
+                import traceback
+
+                traceback.print_exc()
+                time.sleep(0.1)
+
+    def _handle_message(self, fields: Dict[str, str]) -> None:
+        """Handle incoming stream message."""
+        msg_type = fields.get("type")
+
+        if msg_type == "connect_peer":
+            # Command from NanoCtrl: connect to specific peer
+            peer = fields.get("peer")
+            if peer:
+                print(
+                    f"StreamMailbox {self._agent.alias}: Received connect_peer -> {peer}"
+                )
+                self._try_connect_peer(peer)
+            else:
+                print(
+                    f"StreamMailbox {self._agent.alias}: connect_peer missing 'peer' field"
+                )
+
+        elif msg_type == "qp_ready":
+            # Notification from peer: their QP info is ready
+            peer = fields.get("peer")
+            if peer:
+                print(
+                    f"StreamMailbox {self._agent.alias}: Received qp_ready from {peer}"
+                )
+                self._try_connect_peer(peer)
+            else:
+                print(
+                    f"StreamMailbox {self._agent.alias}: qp_ready missing 'peer' field"
+                )
+
+        else:
+            print(
+                f"StreamMailbox {self._agent.alias}: Unknown message type: {msg_type}"
+            )
 
     def _try_connect_peer(self, peer: str) -> None:
         """
-        Attempt Symmetric Rendezvous with peer.
+        Attempt symmetric rendezvous with peer.
         Idempotent: safe to call multiple times.
-        Non-blocking: if peer info not in Redis, skip and retry next loop.
         """
-        # A. Idempotent QP/Endpoint creation
+        # Skip if already connected
+        if self._agent.is_peer_connected(peer):
+            return
+
+        # A. Create local endpoint and get QP info
         endpoint = self._agent.ensure_local_endpoint_created(peer)
         my_qp_info = endpoint.endpoint_info()
 
-        # B. Publish our info to Redis (exchange:{sender}:{receiver} with scope prefix)
-        exchange_key_out = (
-            f"{self._agent.redis_key_prefix}:exchange:{self._agent.alias}:{peer}"
+        # B. Publish our QP info to exchange key
+        prefix = (
+            f"{self._agent.redis_key_prefix}:" if self._agent.redis_key_prefix else ""
         )
+        exchange_key_out = f"{prefix}exchange:{self._agent.alias}:{peer}"
         self._agent.redis_client.set(
             exchange_key_out,
             json.dumps(my_qp_info, default=str),
         )
 
-        # C. Try to fetch peer's info (non-blocking, short timeout, with scope prefix)
-        exchange_key_in = (
-            f"{self._agent.redis_key_prefix}:exchange:{peer}:{self._agent.alias}"
-        )
+        # C. Notify peer via their stream that our QP info is ready
+        peer_stream_key = f"{prefix}stream:{peer}"
+        try:
+            self._agent.redis_client.xadd(
+                peer_stream_key,
+                {
+                    "type": "qp_ready",
+                    "peer": self._agent.alias,
+                    "timestamp": str(time.time()),
+                },
+                maxlen=1000,
+                approximate=True,
+            )
+        except Exception as e:
+            print(f"StreamMailbox {self._agent.alias}: Failed to notify {peer}: {e}")
+
+        # D. Try to fetch peer's QP info (non-blocking)
+        exchange_key_in = f"{prefix}exchange:{peer}:{self._agent.alias}"
         peer_qp_info_str = self._agent.redis_client.get(exchange_key_in)
 
         if peer_qp_info_str is None:
-            # Peer hasn't published yet; skip, retry next loop
+            # Peer hasn't published yet; they will notify us when ready
             return
 
         try:
             peer_qp_info = json.loads(peer_qp_info_str)
         except json.JSONDecodeError:
+            print(
+                f"StreamMailbox {self._agent.alias}: Failed to parse QP info from {peer}"
+            )
             return
 
-        # D. Handshake: modify QP to RTR/RTS (via endpoint.connect)
-        if self._agent.is_peer_connected(peer):
-            return  # Already connected, idempotent
+        # E. Complete RDMA handshake
         endpoint.connect(peer_qp_info)
         self._agent.mark_peer_connected(peer)
         print(f"Link Established: {self._agent.alias} <-> {peer}")
@@ -173,31 +225,32 @@ class PeerAgent:
 
     def __init__(
         self,
-        alias: str,
+        alias: Optional[str] = None,
         server_url: str = "http://127.0.0.1:3000",
         redis_address: str = "127.0.0.1:6379",
         device: Optional[str] = None,
         ib_port: int = 1,
         link_type: str = "RoCE",
         qp_num: int = 1,
-        reconcile_interval_sec: float = 1.0,
+        name_prefix: str = "agent",
     ):
         """
         Initialize a PeerAgent.
 
         Args:
-            alias: Unique name for this agent
+            alias: (Optional) Agent name. If None, requests unique name from NanoCtrl.
             server_url: URL of the control plane server (NanoCtrl)
             redis_address: Redis server address (host:port)
             device: RDMA device name (e.g., "mlx5_0"), if None, auto-select
             ib_port: InfiniBand port number
             link_type: Link type ("RoCE", "InfiniBand", etc.)
             qp_num: Number of queue pairs per endpoint
-            reconcile_interval_sec: Topology reconciliation loop interval
+            name_prefix: Prefix for auto-generated names (default: "agent")
         """
-        self.alias = alias
         self.server_url = server_url
         self.redis_address = redis_address
+        self.alias = alias  # May be None, will be set during registration
+        self.name_prefix = name_prefix
         self.device = device
         self.ib_port = ib_port
         self.link_type = link_type
@@ -230,9 +283,10 @@ class PeerAgent:
         self._connected_peers: Set[str] = set()
         self._connected_peers_lock = threading.Lock()
 
-        # MR cache
-        self._mr_info_cache: Dict[tuple, tuple] = {}
-        self._mr_info_cache_ttl_secs = 60
+        # MR info cache (persistent, no TTL - MR info is immutable after registration)
+        # Architecture: Redis (source of truth) → PeerAgent (cache) → endpoint
+        # Zero overhead in hot path after warm-up
+        self._mr_info_cache: Dict[tuple, dict] = {}
         self._mr_info_cache_lock = threading.Lock()
 
         # Redis
@@ -250,9 +304,9 @@ class PeerAgent:
         # Register with control plane
         self._register()
 
-        # Start TopologyReconciler
-        self._reconciler = TopologyReconciler(self, reconcile_interval_sec)
-        self._reconciler.start()
+        # Start StreamMailbox (event-driven connection management)
+        self._mailbox = StreamMailbox(self, stream_block_ms=100)
+        self._mailbox.start()
 
         # Start cleanup event listener
         self._start_cleanup_listener()
@@ -260,29 +314,45 @@ class PeerAgent:
         time.sleep(0.1)
 
     def _register(self) -> None:
-        """Register this agent with the control plane."""
+        """Register this agent with the control plane (also allocates name if not provided)."""
         max_retries = 5
         retry_delay = 1.0
 
-        print(
-            f"PeerAgent {self.alias}: Registering with control plane at {self.server_url}"
-        )
+        print(f"PeerAgent: Registering with control plane at {self.server_url}")
 
         for attempt in range(max_retries):
             try:
+                # Build request - omit alias if None (NanoCtrl will generate)
+                request_data = {
+                    "device": self.device,
+                    "ib_port": self.ib_port,
+                    "link_type": self.link_type,
+                    "address": self.address,
+                    "name_prefix": self.name_prefix,
+                }
+                if self.alias is not None:
+                    request_data["alias"] = self.alias
+
                 response = requests.post(
                     f"{self.server_url}/start_peer_agent",
-                    json={
-                        "alias": self.alias,
-                        "device": self.device,
-                        "ib_port": self.ib_port,
-                        "link_type": self.link_type,
-                        "address": self.address,
-                    },
+                    json=request_data,
                     timeout=10,
                 )
                 response.raise_for_status()
                 result = response.json()
+
+                # Extract allocated name from response
+                if "name" in result:
+                    self.alias = result["name"]
+                    if request_data.get("alias"):
+                        print(f"PeerAgent: Registered with provided name: {self.alias}")
+                    else:
+                        print(
+                            f"PeerAgent: Registered with allocated name: {self.alias}"
+                        )
+                else:
+                    raise RuntimeError("NanoCtrl did not return agent name")
+
                 if "redis_address" in result:
                     server_redis_address = result["redis_address"]
                     if server_redis_address != self.redis_address:
@@ -291,7 +361,6 @@ class PeerAgent:
                         self.redis_client = redis.Redis(
                             host=redis_host, port=int(redis_port), decode_responses=True
                         )
-                print(f"PeerAgent {self.alias} registered at {self.server_url}")
                 return
             except (
                 requests.exceptions.ConnectionError,
@@ -416,10 +485,15 @@ class PeerAgent:
         ptr: int,
         length: int,
     ) -> int:
-        """Register local memory region and report to control plane."""
+        """Register local memory region (p2p via Redis, no control plane)."""
         handler = self._memory_pool.register_memory_region(ptr, length, mr_name)
         mr_info = self._memory_pool.mr_info()[mr_name]
-        request_data = {
+
+        # Write directly to Redis (p2p, no HTTP)
+        prefix = f"{self.redis_key_prefix}:" if self.redis_key_prefix else ""
+        mr_key = f"{prefix}mr:{self.alias}:{mr_name}"
+
+        mr_data = {
             "agent_name": self.alias,
             "mr_name": mr_name,
             "addr": int(mr_info["addr"]),
@@ -427,38 +501,39 @@ class PeerAgent:
             "rkey": int(mr_info["rkey"]),
             "lkey": 0,
         }
-        response = requests.post(
-            f"{self.server_url}/register_mr",
-            json=request_data,
-            timeout=5,
-        )
-        response.raise_for_status()
+
+        self.redis_client.set(mr_key, json.dumps(mr_data))
         return handler
 
     def get_mr_info(self, peer_alias: str, mr_name: str) -> Optional[Dict[str, Any]]:
-        """Get remote memory region info (cached)."""
+        """Get remote memory region info (p2p via Redis, persistent cache).
+
+        MR info is immutable after registration, so cache never expires.
+        Architecture: Redis (source of truth) → PeerAgent cache (0µs hot path).
+        """
         cache_key = (peer_alias, mr_name)
+
+        # Check cache first (fast path: 0µs)
         with self._mr_info_cache_lock:
             if cache_key in self._mr_info_cache:
-                cached_at, cached = self._mr_info_cache[cache_key]
-                if time.time() - cached_at < self._mr_info_cache_ttl_secs:
-                    return cached
+                return self._mr_info_cache[cache_key]
 
-        response = requests.post(
-            f"{self.server_url}/get_mr_info",
-            json={
-                "src": self.alias,
-                "dst": peer_alias,
-                "mr_name": mr_name,
-            },
-            timeout=5,
-        )
-        response.raise_for_status()
-        result = response.json()
-        mr_info = result.get("mr_info")
+        # Cache miss: read directly from Redis (p2p, no HTTP)
+        prefix = f"{self.redis_key_prefix}:" if self.redis_key_prefix else ""
+        mr_key = f"{prefix}mr:{peer_alias}:{mr_name}"
+        mr_info_str = self.redis_client.get(mr_key)
 
+        if not mr_info_str:
+            return None
+
+        try:
+            mr_info = json.loads(mr_info_str)
+        except json.JSONDecodeError:
+            return None
+
+        # Store in cache (persistent, no expiration)
         with self._mr_info_cache_lock:
-            self._mr_info_cache[cache_key] = (time.time(), mr_info)
+            self._mr_info_cache[cache_key] = mr_info
 
         return mr_info
 
@@ -511,15 +586,48 @@ class PeerAgent:
         print(f"PeerAgent {self.alias}: Shutting down...")
 
         self._stop_event.set()
-        self._reconciler.stop()
+        self._mailbox.stop()
 
         if self._event_thread:
             self._event_thread.join(timeout=1)
 
+        # Clean up exchange keys to prevent stale QP info
+        prefix = f"{self.redis_key_prefix}:" if self.redis_key_prefix else ""
         with self._endpoints_lock:
+            for peer in list(self._endpoints.keys()):
+                exchange_key_out = f"{prefix}exchange:{self.alias}:{peer}"
+                exchange_key_in = f"{prefix}exchange:{peer}:{self.alias}"
+                try:
+                    self.redis_client.delete(exchange_key_out, exchange_key_in)
+                except Exception as e:
+                    print(f"PeerAgent {self.alias}: Exchange key cleanup warning: {e}")
             self._endpoints.clear()
+
         with self._connected_peers_lock:
             self._connected_peers.clear()
+
+        # Clean up stream mailbox
+        stream_key = f"{prefix}stream:{self.alias}"
+        try:
+            self.redis_client.delete(stream_key)
+        except Exception as e:
+            print(f"PeerAgent {self.alias}: Stream cleanup warning: {e}")
+
+        # Clean up topology spec
+        spec_key = f"{prefix}spec:topology:{self.alias}"
+        try:
+            self.redis_client.delete(spec_key)
+        except Exception as e:
+            print(f"PeerAgent {self.alias}: Spec cleanup warning: {e}")
+
+        # Clean up MR keys (all memory regions registered by this agent)
+        mr_pattern = f"{prefix}mr:{self.alias}:*"
+        try:
+            mr_keys = list(self.redis_client.scan_iter(match=mr_pattern, count=100))
+            if mr_keys:
+                self.redis_client.delete(*mr_keys)
+        except Exception as e:
+            print(f"PeerAgent {self.alias}: MR cleanup warning: {e}")
 
         try:
             response = requests.post(
@@ -550,16 +658,30 @@ class PeerAgent:
 
 
 def start_peer_agent(
-    alias: str,
+    alias: Optional[str] = None,
     server_url: str = "http://127.0.0.1:3000",
     address: Optional[str] = None,
     device: Optional[str] = None,
     ib_port: int = 1,
     link_type: str = "RoCE",
     qp_num: int = 1,
+    name_prefix: str = "agent",
 ) -> PeerAgent:
     """
     Start a peer agent (convenience function).
+
+    Args:
+        alias: (Optional) Agent name. If None, requests unique name from NanoCtrl.
+        server_url: Control plane URL
+        address: Redis address
+        device: RDMA device
+        ib_port: InfiniBand port
+        link_type: Link type
+        qp_num: Number of queue pairs
+        name_prefix: Prefix for auto-generated names (default: "agent")
+
+    Returns:
+        PeerAgent instance
 
     Use set_desired_topology(target_peers=[...]) to declare which peers to connect to.
     """
@@ -572,4 +694,5 @@ def start_peer_agent(
         ib_port=ib_port,
         link_type=link_type,
         qp_num=qp_num,
+        name_prefix=name_prefix,
     )

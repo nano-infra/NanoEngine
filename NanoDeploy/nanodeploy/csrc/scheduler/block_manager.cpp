@@ -74,9 +74,8 @@ bool BlockManager::can_allocate(Sequence& seq) const
 
 void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
 {
-    (void)token_idx_from;  // Unused
-    (void)token_idx_to;    // Unused
-
+    (void)token_idx_from;
+    (void)token_idx_to;
     auto& table = seq.block_table(BlockContextSlot::ACTIVE, sp_idx_);
     if (!table.empty()) {
         throw std::runtime_error("Block table is not empty");
@@ -161,11 +160,9 @@ bool BlockManager::can_append(Sequence& seq, int num_tokens) const
 
 bool BlockManager::may_append(Sequence& seq, int num_tokens)
 {
+    int current_dispatched = seq.block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_idx_];
+
     for (int idx = 0; idx < num_tokens; ++idx) {
-        auto& table = seq.block_table(BlockContextSlot::ACTIVE, sp_idx_);
-
-        int current_dispatched = seq.block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_idx_];
-
         if ((current_dispatched + idx) % block_size_ == 0) {
             if (free_block_ids_.empty()) {
                 return false;
@@ -173,7 +170,8 @@ bool BlockManager::may_append(Sequence& seq, int num_tokens)
             int block_id = free_block_ids_.front();
             seq.block_ctx(BlockContextSlot::ACTIVE).block_location.emplace_back(sp_idx_, block_id);
             allocate_block(block_id);
-            table.push_back(block_id);
+            // Get table reference just before pushing to avoid stale reference
+            seq.block_table(BlockContextSlot::ACTIVE, sp_idx_).push_back(block_id);
         }
         else if ((current_dispatched + idx - 1) % block_size_ == 0) {
             // Logic for updating hash of the previous block (commented out in Python)

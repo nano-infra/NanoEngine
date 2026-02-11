@@ -16,11 +16,18 @@ pub struct QueryBody {
 
 #[derive(Debug, Deserialize)]
 pub struct StartPeerAgentBody {
-    pub alias: String,
+    #[serde(default)]
+    pub alias: Option<String>, // Optional: if None, NanoCtrl generates unique name
     pub device: String,
     pub ib_port: u32,
     pub link_type: String,
     pub address: String, // IP address
+    #[serde(default = "default_name_prefix")]
+    pub name_prefix: String, // Prefix for auto-generated names
+}
+
+fn default_name_prefix() -> String {
+    "agent".to_string()
 }
 
 /// Desired topology spec for declarative connection management.
@@ -71,6 +78,7 @@ pub struct RegisterMrResponse {
 #[derive(Debug, Serialize)]
 pub struct StartPeerAgentResponse {
     pub status: String,
+    pub name: String,          // Assigned agent name (generated or provided)
     pub redis_address: String, // Redis address in format "host:port"
 }
 
@@ -110,6 +118,10 @@ pub struct RegisterEngineBody {
     pub host: String,
     pub port: u32,
     pub peer_addrs: Vec<String>, // Peer agent addresses
+    #[serde(default)]
+    pub p2p_host: Option<String>, // P2P free instruction host
+    #[serde(default)]
+    pub p2p_port: Option<u32>, // P2P free instruction port
 }
 
 #[derive(Debug, Serialize)]

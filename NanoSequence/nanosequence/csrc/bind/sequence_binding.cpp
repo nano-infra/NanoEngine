@@ -237,9 +237,11 @@ void bind_sequence(py::module_& m)
         .def_property("status", &Sequence::status, &Sequence::set_status)
         .def_property(
             "token_ids",
-            [](Sequence& s) -> std::vector<int>& { return s.token_ids(); },
-            [](Sequence& s, const std::vector<int>& v) { s.token_ids() = v; },
-            py::return_value_policy::reference_internal)
+            [](const Sequence& s) -> std::vector<int> {
+                // Return by value (copy) to avoid aliasing issues during serialization
+                return s.token_ids();
+            },
+            [](Sequence& s, const std::vector<int>& v) { s.token_ids() = v; })
         .def_property("last_token", &Sequence::last_token, &Sequence::set_last_token)
         .def_property("num_tokens", &Sequence::num_tokens, &Sequence::set_num_tokens)
         .def_property("num_prompt_tokens", &Sequence::num_prompt_tokens, &Sequence::set_num_prompt_tokens)
@@ -288,16 +290,65 @@ void bind_sequence(py::module_& m)
 
         .def(py::pickle(
             [](const Sequence& seq) -> py::bytes {  // __getstate__
-                // Safety check: ensure data_ is valid before serialization
-                if (!seq.data_) {
-                    throw std::runtime_error("Cannot pickle Sequence: data_ pointer is null");
-                }
+                try {
+                    // Safety check: ensure data_ is valid before serialization
+                    if (!seq.data_) {
+                        throw std::runtime_error("Cannot pickle Sequence: data_ pointer is null");
+                    }
 
-                // Simplified: Use Pack() directly
-                flatbuffers::FlatBufferBuilder builder(1024);
-                auto                           offset = fbs::Sequence::Pack(builder, seq.data_.get());
-                builder.Finish(offset);
-                return py::bytes(reinterpret_cast<const char*>(builder.GetBufferPointer()), builder.GetSize());
+                    // Full validation matching serialize_sequences() in serialization.cpp
+                    for (size_t i = 0; i < seq.data_->slots.size(); ++i) {
+                        auto& slot = seq.data_->slots[i];
+                        if (slot) {
+                            // Ensure engine_id is valid
+                            // (no-op if already set, but guards against uninitialized memory)
+
+                            // Ensure num_dispatched_tokens matches attention_sp
+                            if (slot->num_dispatched_tokens.size() != static_cast<size_t>(slot->attention_sp)) {
+                                std::cerr << "  slot[" << i << "]: fixing num_dispatched_tokens size "
+                                          << slot->num_dispatched_tokens.size() << " -> " << slot->attention_sp
+                                          << std::endl;
+                                slot->num_dispatched_tokens.resize(slot->attention_sp, 0);
+                            }
+
+                            // Ensure sp_block_table matches attention_sp and has no null pointers
+                            if (slot->sp_block_table.size() != static_cast<size_t>(slot->attention_sp)) {
+                                std::cerr << "  slot[" << i << "]: fixing sp_block_table size "
+                                          << slot->sp_block_table.size() << " -> " << slot->attention_sp << std::endl;
+                                slot->sp_block_table.resize(slot->attention_sp);
+                            }
+                            for (size_t j = 0; j < slot->sp_block_table.size(); ++j) {
+                                if (!slot->sp_block_table[j]) {
+                                    std::cerr << "  slot[" << i << "]: fixing null sp_block_table[" << j << "]"
+                                              << std::endl;
+                                    slot->sp_block_table[j] = std::make_unique<fbs::IntListT>();
+                                }
+                            }
+                        }
+                        else {
+                            // Initialize null slot with safe defaults (matches serialize_sequences)
+                            slot                     = std::make_unique<fbs::BlockContextT>();
+                            slot->engine_id          = "";
+                            slot->dp_idx             = 0;
+                            slot->master_sp_idx      = 0;
+                            slot->attention_sp       = 0;
+                            slot->attention_dp       = 0;
+                            slot->num_kvcache_blocks = 0;
+                        }
+                    }
+
+                    flatbuffers::FlatBufferBuilder builder(64 * 1024);  // 64KB initial
+                    auto                           offset = fbs::Sequence::Pack(builder, seq.data_.get());
+                    builder.Finish(offset);
+
+                    return py::bytes(reinterpret_cast<const char*>(builder.GetBufferPointer()), builder.GetSize());
+                }
+                catch (const std::exception& e) {
+                    std::cerr << "=== PICKLE EXCEPTION seq_id=" << seq.seq_id() << ": " << e.what()
+                              << " ===" << std::endl;
+                    throw std::runtime_error(std::string("Sequence pickle failed for seq_id=")
+                                             + std::to_string(seq.seq_id()) + ": " + e.what());
+                }
             },
             [](py::bytes bytes) -> std::shared_ptr<Sequence> {  // __setstate__
                 // Simplified: Use UnPack() directly

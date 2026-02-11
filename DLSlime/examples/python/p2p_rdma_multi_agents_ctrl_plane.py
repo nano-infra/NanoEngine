@@ -48,18 +48,22 @@ with contextlib.ExitStack() as stack:
     agents = {}
     with time_measure("start"):
         for i in range(num_agents):
-            alias = f"agent_{i}"
+            # NanoCtrl auto-generates unique name (no alias parameter)
             agent = start_peer_agent(
-                alias=alias,
+                # alias=None (default) - NanoCtrl will auto-generate unique name
+                name_prefix="agent",  # Prefix for generated names (e.g., "agent-1a", "agent-2b")
                 server_url="http://127.0.0.1:3000",
                 device=None,  # Auto-select
                 ib_port=1,
                 link_type="RoCE",
                 qp_num=1,
             )
-            agents[alias] = stack.enter_context(agent)  # Auto-cleanup on exit
+            stack.enter_context(agent)  # Auto-cleanup on exit
+            # Use allocated name as key
+            allocated_name = agent.alias
+            agents[allocated_name] = agent
             if verbose:
-                print(f"Started {alias}")
+                print(f"Started {allocated_name}")
 
     # Query available peers
     print("\n" + "=" * 60)
@@ -111,8 +115,9 @@ with contextlib.ExitStack() as stack:
     recv_handlers = {}  # (reader_alias, peer_alias) -> handler
 
     with time_measure("register"):
-        for alias, agent in agents.items():
-            agent_id = int(alias.split("_")[1])
+        for idx, (alias, agent) in enumerate(agents.items()):
+            # Use enumeration index instead of parsing alias
+            agent_id = idx
             tensor = torch.full([32], agent_id, device="cpu", dtype=torch.uint8)
             source_tensors[alias] = tensor
 
@@ -149,7 +154,9 @@ with contextlib.ExitStack() as stack:
 
     def perform_reads(agent_alias, agent):
         """Agent reads from all other agents."""
-        for peer_alias in agents.keys():
+        # Get our index to know what value we expect
+        agent_list = list(agents.keys())
+        for peer_alias in agent_list:
             if peer_alias != agent_alias:
                 try:
                     remote_mr_info = agent.get_mr_info(peer_alias, "data")
@@ -176,7 +183,8 @@ with contextlib.ExitStack() as stack:
                     )
                     slot.wait()
 
-                    expected_value = int(peer_alias.split("_")[1])
+                    # Use index from agent_list instead of parsing alias
+                    expected_value = agent_list.index(peer_alias)
                     read_value = recv_buffers[(agent_alias, peer_alias)][0].item()
 
                     if verbose:

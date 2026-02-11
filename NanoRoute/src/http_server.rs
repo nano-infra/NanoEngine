@@ -9,24 +9,66 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 
-// Request Payload (Simplified OpenAI)
-#[derive(Deserialize, Debug)]
+// Request Payload (OpenAI-compatible)
+#[derive(Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
     pub max_tokens: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
     pub stream: Option<bool>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+// Custom Debug implementation: truncate long messages to first few words
+impl ChatCompletionRequest {
+    /// Resolve effective max_tokens: max_completion_tokens takes precedence (newer OpenAI field),
+    /// falls back to max_tokens (legacy field), then default.
+    pub fn effective_max_tokens(&self, default: u32) -> u32 {
+        self.max_completion_tokens
+            .or(self.max_tokens)
+            .unwrap_or(default)
+    }
+}
+
+impl fmt::Debug for ChatCompletionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChatCompletionRequest")
+            .field("model", &self.model)
+            .field("messages", &self.messages)
+            .field("max_tokens", &self.max_tokens)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("stream", &self.stream)
+            .finish()
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone)]
 pub struct Message {
     pub role: String,
     pub content: String,
+}
+
+// Custom Debug implementation: truncate long content to first 8 words
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let truncated = if self.content.len() > 50 {
+            let words: Vec<&str> = self.content.split_whitespace().take(8).collect();
+            format!("{}...", words.join(" "))
+        } else {
+            self.content.clone()
+        };
+
+        f.debug_struct("Message")
+            .field("role", &self.role)
+            .field("content", &truncated)
+            .finish()
+    }
 }
 
 // Response Payload (Simplified)
@@ -62,8 +104,9 @@ async fn chat_completions(
 
     let tokenizer = state.tokenizer.clone();
 
-    // Generate unique sequence ID
+    // Generate unique sequence ID and request ID
     let seq_id = state.next_request_id.fetch_add(1, Ordering::SeqCst);
+    let request_id = format!("chatcmpl-{}", seq_id);
 
     // Get an available engine from manager
     let adapter = {
@@ -81,7 +124,7 @@ async fn chat_completions(
     };
 
     // Acquire lock briefly to send request
-    let rx_result = {
+    let (rx_result, num_prompt_tokens) = {
         let mut adapter_guard = adapter.lock().await;
 
         // Use chat template encoding
@@ -97,10 +140,12 @@ async fn chat_completions(
             }
         };
 
-        let max_tokens = req.max_tokens.unwrap_or(16) as i32;
-        adapter_guard
+        let num_prompt_tokens = token_ids.len();
+        let max_tokens = req.effective_max_tokens(16) as i32;
+        let rx = adapter_guard
             .send_add_request(seq_id, &token_ids, max_tokens)
-            .await
+            .await;
+        (rx, num_prompt_tokens)
     };
 
     let mut rx = match rx_result {
@@ -117,41 +162,54 @@ async fn chat_completions(
     if req.stream.unwrap_or(false) {
         let model_name = req.model.clone();
         let tokenizer = tokenizer.clone();
+        let request_id = request_id.clone();
 
         // Use async-stream macros for clean generator syntax
         let stream = async_stream::stream! {
             let mut all_tokens = Vec::new();
+            let mut generated_tokens = Vec::new();
             let mut last_text_len = 0;
+            let stream_start = std::time::Instant::now();
+
+            tracing::info!("[DIAG] SSE stream STARTED for seq_id={}", seq_id);
 
             while let Some(event) = rx.recv().await {
                 match event {
                     StreamEvent::Token(id) => {
                         all_tokens.push(id);
-                        // Incremental decoding: decode all and take diff
-                        if let Ok(full_text) = tokenizer.decode(all_tokens.clone()).await {
-                             let new_len = full_text.len();
-                             if new_len > last_text_len {
-                                 let delta = full_text[last_text_len..].to_string();
-                                 last_text_len = new_len;
+                        // Skip prompt tokens, only decode generated tokens
+                        if all_tokens.len() > num_prompt_tokens {
+                            generated_tokens.push(id);
+                            // Incremental decoding: decode all generated tokens and take diff
+                            if let Ok(full_text) = tokenizer.decode(generated_tokens.clone()).await {
+                                 let new_len = full_text.len();
+                                 if new_len > last_text_len {
+                                     // Use safe slicing to handle UTF-8 character boundaries
+                                     if let Some(delta_str) = full_text.get(last_text_len..) {
+                                         let delta = delta_str.to_string();
+                                         last_text_len = new_len;
 
-                                 let chunk = serde_json::json!({
-                                     "id": "chatcmpl-stream",
-                                     "object": "chat.completion.chunk",
-                                     "created": 1234567890,
-                                     "model": model_name,
-                                     "choices": [{
-                                         "index": 0,
-                                         "delta": { "content": delta },
-                                         "finish_reason": null
-                                     }]
-                                 });
-                                 yield Ok::<_, std::io::Error>(Event::default().data(chunk.to_string()));
-                             }
+                                         let chunk = serde_json::json!({
+                                             "id": request_id,
+                                             "object": "chat.completion.chunk",
+                                             "created": 1234567890,
+                                             "model": model_name,
+                                             "choices": [{
+                                                 "index": 0,
+                                                 "delta": { "content": delta },
+                                                 "finish_reason": null
+                                             }]
+                                         });
+                                         yield Ok::<_, std::io::Error>(Event::default().data(chunk.to_string()));
+                                     }
+                                 }
+                            }
                         }
                     },
                     StreamEvent::Finished => {
+                        tracing::info!("[DIAG] SSE stream FINISHED normally for seq_id={}, elapsed={:.1}s, generated_tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
                         let chunk = serde_json::json!({
-                            "id": "chatcmpl-stream",
+                            "id": request_id,
                             "object": "chat.completion.chunk",
                             "created": 1234567890,
                             "model": model_name,
@@ -166,12 +224,12 @@ async fn chat_completions(
                         break;
                     },
                     StreamEvent::Error(e) => {
-                        tracing::error!("Stream error: {}", e);
+                        tracing::error!("[DIAG] SSE stream ERROR for seq_id={}: {}", seq_id, e);
                          yield Ok(Event::default().event("error").data(e));
                          break;
                     }
                     StreamEvent::Migrate(payload) => {
-                        tracing::info!("Migration triggered. Routing to Decode Engine...");
+                        tracing::info!("[DIAG] Migration triggered for seq_id={}, elapsed={:.1}s. Routing to Decode Engine...", seq_id, stream_start.elapsed().as_secs_f64());
                         let decode_adapter_arc = {
                             let mgr = state.engine_manager.lock().await;
                             mgr.get_next_decode()
@@ -183,16 +241,16 @@ async fn chat_completions(
                                  Ok(new_rx) => {
                                       // SWAP RX channel transparently
                                       rx = new_rx;
-                                      tracing::info!("Migration successful. Resuming stream on Decode Engine.");
+                                      tracing::info!("[DIAG] Migration successful for seq_id={}. Resuming stream on Decode Engine.", seq_id);
                                  },
                                  Err(e) => {
-                                     tracing::error!("Failed to forward migration: {}", e);
+                                     tracing::error!("[DIAG] Failed to forward migration for seq_id={}: {}", seq_id, e);
                                      yield Ok(Event::default().event("error").data("Migration Failed"));
                                      break;
                                  }
                              }
                         } else {
-                             tracing::error!("No Decode Engine available for migration!");
+                             tracing::error!("[DIAG] No Decode Engine available for migration! seq_id={}", seq_id);
                              yield Ok(Event::default().event("error").data("No Decode Nodes"));
                              break;
                         }
@@ -202,11 +260,12 @@ async fn chat_completions(
                     }
                 }
             }
+
+            // If we reach here via rx channel closing (None), the client likely disconnected
+            tracing::warn!("[DIAG] SSE stream ENDED for seq_id={}, elapsed={:.1}s, all_tokens={}, generated_tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), all_tokens.len(), generated_tokens.len());
         };
 
-        Sse::new(stream)
-            .keep_alive(axum::response::sse::KeepAlive::default())
-            .into_response()
+        Sse::new(stream).into_response()
     } else {
         // Non-streaming: accumulate
         let mut all_tokens = Vec::new();
@@ -246,9 +305,11 @@ async fn chat_completions(
             }
         }
 
-        let text = tokenizer.decode(all_tokens).await.unwrap_or_default();
+        // Skip prompt tokens, only decode generated tokens
+        let generated_tokens: Vec<u32> = all_tokens.into_iter().skip(num_prompt_tokens).collect();
+        let text = tokenizer.decode(generated_tokens).await.unwrap_or_default();
         Json(ChatCompletionResponse {
-            id: "chatcmpl-123".to_string(),
+            id: request_id,
             object: "chat.completion".to_string(),
             created: 1234567890,
             model: req.model,

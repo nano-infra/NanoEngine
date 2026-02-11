@@ -59,7 +59,6 @@ class LLMEngine:
 
     def update_num_kvcache_blocks(self):
         self.config.num_kvcache_blocks = self.executor.update_kvcache_blocks()
-        self.executor.init_rpc_endpoint()
 
     def get_engine_id(self):
         return self.engine_id
@@ -142,7 +141,7 @@ class LLMEngine:
             waiting_head_blocks, waiting_total_blocks
         )
 
-        logger.debug(
+        logger.info(
             {
                 "mode": "prefill" if is_prefill else "decode",
                 # "dp_batch_sizes": dp_batch_sizes,
@@ -186,19 +185,6 @@ class LLMEngine:
             )
             post_sch_begin = time.time()
             post_sch_end = time.time()
-
-            # Perform migration from prefill engine
-            logger.info(f"Performing migration from prefill engine")
-            target_engine_ids = set()
-            for seqs in dp_sp_seqs:
-                for seq in seqs:
-                    if getattr(seq, "is_to_be_migrated", False):
-                        ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
-                        eid = getattr(ctx, "engine_id", None)
-                        if eid:
-                            target_engine_ids.add(eid)
-            logger.info(f"Target engine IDs for migration: {target_engine_ids}")
-            # peer_endpoints will be fetched by CacheContext from NanoCtrl
             self.executor.migrate(dp_sp_seqs)
         outputs = []
         num_tokens = 0

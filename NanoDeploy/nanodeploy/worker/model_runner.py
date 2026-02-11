@@ -24,7 +24,6 @@ from nanodeploy.context.distributed import (
     set_dist_context,
 )
 from nanodeploy.context.sp_context import set_sp_context
-from nanodeploy.endpoint.rpc_endpoint import RPCClientEndpoint
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
@@ -157,14 +156,6 @@ class ModelRunner:
 
         self.sampler = Sampler()
         self.preallocate_kvcache()
-
-        self.endpoint = RPCClientEndpoint(320_000_000, get_dist_context().rank)
-
-    def init_rpc_endpoint(self, server_info):
-        client_info = self.endpoint.init_client_endpoint()
-        self.endpoint.connect(server_info)
-        logger.debug("client endpoint initialized")
-        return client_info
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
@@ -327,13 +318,44 @@ class ModelRunner:
         sp_size = get_dist_context().attn_sp_world_size
         block_size = self.config.kvcache_block_size
 
-        meta = prepare_decode_cpp(
-            dp_seqs,
-            sp_rank,
-            sp_size,
-            block_size,
-            self.config.max_num_seqs,
-        )
+        try:
+            meta = prepare_decode_cpp(
+                dp_seqs,
+                sp_rank,
+                sp_size,
+                block_size,
+                self.config.max_num_seqs,
+            )
+        except (IndexError, ValueError, RuntimeError) as e:
+            # C++ std::out_of_range often surfaces as IndexError; log context
+            err_msg = str(e)
+            logger.error(
+                "prepare_decode_cpp failed: %s (sp_rank=%s sp_size=%s block_size=%s max_num_seqs=%s num_seqs=%s)",
+                err_msg,
+                sp_rank,
+                sp_size,
+                block_size,
+                self.config.max_num_seqs,
+                len(dp_seqs),
+            )
+            for idx, seq in enumerate(dp_seqs):
+                try:
+                    ntok = getattr(seq, "num_tokens", None)
+                    tok_ids = getattr(seq, "token_ids", None)
+                    ntok_len = len(tok_ids) if tok_ids is not None else None
+                    logger.error(
+                        "  dp_seqs[%s]: seq_id=%s num_tokens=%s len(token_ids)=%s status=%s",
+                        idx,
+                        getattr(seq, "seq_id", "?"),
+                        ntok,
+                        ntok_len,
+                        getattr(seq, "status", "?"),
+                    )
+                except Exception as log_err:
+                    logger.error(
+                        "  dp_seqs[%s]: %s (log failed: %s)", idx, seq, log_err
+                    )
+            raise
 
         input_ids = torch.tensor(
             meta.input_ids, dtype=torch.int64, pin_memory=True
@@ -647,12 +669,8 @@ class ModelRunner:
     def migrate(self, seqs: list[Sequence]) -> None:
         get_cache_context().migrate(seqs=seqs)
 
-    def run(
-        self, dp_seqs: list[Sequence], is_prefill: bool, enable_rpc: bool = False
-    ) -> list[list[int]]:
-
-        if enable_rpc:
-            dp_seqs = self.endpoint.recv_seqs()
+    def run(self, dp_seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
+        # Sequences are always passed directly via pickle (Ray's default serialization)
 
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size

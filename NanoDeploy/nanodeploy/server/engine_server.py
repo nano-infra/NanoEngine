@@ -16,8 +16,10 @@ from nanodeploy.fbs.StepOut import (
     StepOutAddSeqId,
     StepOutAddStatus,
     StepOutAddTokenId,
+    StepOutAddTokenIds,
     StepOutEnd,
     StepOutStart,
+    StepOutStartTokenIdsVector,
 )
 from nanodeploy.llm_component import LLMComponent
 from nanodeploy.logging import get_logger
@@ -32,6 +34,10 @@ class EngineService:
     def __init__(self, engine_component: LLMComponent):
         self.engine = engine_component
         self._send_queue: Optional[asyncio.Queue] = None
+        self._p2p_queue: Optional[asyncio.Queue] = None
+        # Track sequences for early free migration
+        self._previous_running_seqs: set[int] = set()
+        self._freed_sequences: set[int] = set()
 
     def _send_response(self, action: int, payload: bytes, seq_id: int = 0):
         if self._send_queue:
@@ -66,17 +72,77 @@ class EngineService:
                 self._handle_add_request(payload)
             elif action == 2:  # Get Engine Info
                 self._handle_get_info(seq_id)
+            elif action == 3:  # Free Sequences (P2P)
+                self._handle_free_sequences(payload)
             else:
                 logger.warning(f"Unknown Action: {action}")
         except Exception as e:
             logger.error(f"Error handling packet action {action}: {e}")
             traceback.print_exc()
 
-    def _send_stepout(self, seq_id, token_id, status):
-        builder = flatbuffers.Builder(128)
+    def _handle_free_sequences(self, payload: bytes):
+        """Handle P2P free sequence request."""
+        try:
+            from nanodeploy.fbs.FreeSequences import FreeSequences
+
+            free_req = FreeSequences.GetRootAs(payload, 0)
+
+            seq_ids = []
+            seq_ids_length = free_req.SeqIdsLength()
+            if seq_ids_length > 0:
+                seq_ids = [free_req.SeqIds(i) for i in range(seq_ids_length)]
+
+            source_engine_id = (
+                free_req.SourceEngineId().decode("utf-8")
+                if free_req.SourceEngineId()
+                else ""
+            )
+
+            logger.info(
+                f"Received P2P free request from {source_engine_id} for {len(seq_ids)} sequences: {seq_ids}"
+            )
+
+            # Free sequences from scheduler
+            from nanodeploy.engine.sequence import Sequence
+
+            for seq_id in seq_ids:
+                try:
+                    # Create minimal sequence object with just seq_id for lookup
+                    seq = Sequence([])
+                    seq.seq_id = seq_id
+                    self.engine.free_to_be_migrated(seq)
+                except Exception as e:
+                    logger.warning(f"Failed to free sequence {seq_id}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error handling free sequences: {e}")
+            traceback.print_exc()
+
+    def _send_stepout(self, seq_id, token_ids, status):
+        """Send step output with one or more tokens.
+
+        Args:
+            seq_id: Sequence ID
+            token_ids: Single token ID (int) or list of token IDs
+            status: SequenceStatus
+        """
+        # Normalize to list
+        if isinstance(token_ids, int):
+            token_ids = [token_ids]
+
+        builder = flatbuffers.Builder(256)
+
+        # Build token_ids vector
+        StepOutStartTokenIdsVector(builder, len(token_ids))
+        for token_id in reversed(token_ids):  # FlatBuffers builds vectors in reverse
+            builder.PrependUint32(token_id)
+        token_ids_vector = builder.EndVector()
+
         StepOutStart(builder)
         StepOutAddSeqId(builder, seq_id)
-        StepOutAddTokenId(builder, token_id)
+        if token_ids:
+            StepOutAddTokenId(builder, token_ids[-1])  # Backward compatibility
+        StepOutAddTokenIds(builder, token_ids_vector)
         StepOutAddStatus(builder, status)
         step_out = StepOutEnd(builder)
         builder.Finish(step_out)
@@ -95,48 +161,105 @@ class EngineService:
         except Exception as e:
             logger.error(f"Migration Serialize Error: {e}")
 
+    def _send_p2p_free_if_migrated(self, seq):
+        """Send P2P free instruction to source engine if sequence was migrated."""
+        # Skip if already freed (prevents duplicate free requests)
+        if seq.seq_id in self._freed_sequences:
+            return
+
+        try:
+            # Check if sequence has MIGRATE slot with BlockContext
+            from nanodeploy._cpp import BlockContextSlot
+
+            migrate_ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
+            if migrate_ctx and migrate_ctx.engine_id:
+                source_engine_id = migrate_ctx.engine_id
+                logger.info(
+                    f"Sequence {seq.seq_id} sending P2P free to source engine {source_engine_id}"
+                )
+                self.engine.send_free_sequences(source_engine_id, [seq.seq_id])
+                # Mark as freed to prevent duplicates
+                self._freed_sequences.add(seq.seq_id)
+            else:
+                logger.debug(
+                    f"Sequence {seq.seq_id} has no MIGRATE context (not migrated)"
+                )
+        except Exception as e:
+            logger.error(f"Error sending P2P free for seq {seq.seq_id}: {e}")
+            traceback.print_exc()
+
     async def engine_loop(self):
         logger.info("Engine Loop Started")
-        step_count = 0
         while True:
             try:
-                await asyncio.sleep(0.00001)
+                # Yield control to event loop to allow async I/O (ZMQ recv, send)
+                await asyncio.sleep(0.000001)
 
                 if self.engine.scheduler.is_finished():
                     continue
-
-                step_count += 1
-                if step_count % 100 == 0:
-                    logger.info(
-                        f"Engine loop step {step_count}, scheduler not finished"
-                    )
 
                 dp_seqs, outputs, num_tokens, total_running, sch_lat, post_lat = (
                     self.engine.step()
                 )
 
-                logger.info(
-                    f"Engine step completed: {total_running} running sequences, {num_tokens} tokens"
+                # Note: num_tokens is negative for decode (represents capacity usage)
+                logger.debug(
+                    f"Engine step completed: {total_running} running sequences"
                 )
+
+                # Single-pass optimization: merge all sequence processing into one loop
+                current_running_seqs = set()
+                newly_appeared_seqs = (
+                    []
+                )  # Store newly appeared sequences for early free
 
                 for seqs in dp_seqs:
                     for seq in seqs:
+                        current_running_seqs.add(seq.seq_id)
+
+                        # Skip system sequences
                         if seq.seq_id < 8:
                             continue
 
+                        # Track newly appeared sequences for early free (decode only)
+                        if (
+                            self.engine.config.mode == "decode"
+                            and seq.seq_id not in self._previous_running_seqs
+                        ):
+                            newly_appeared_seqs.append(seq)
+
+                        # Send stepout/migration based on sequence state
                         if seq.is_finished:
                             self._send_stepout(
                                 seq.seq_id, seq.token_ids[-1], SequenceStatus.FINISHED
                             )
+                            # Clean up tracking to prevent memory leak
+                            self._freed_sequences.discard(seq.seq_id)
                         elif seq.is_to_be_migrated:
                             self._send_migration(seq)
                         elif len(seq.token_ids) > 0:
-                            start_node = max(0, len(seq.token_ids) - num_tokens)
+                            # Send last token for all running sequences (1 token per step in decode)
+                            # Note: num_checkpointed_tokens is for preemption tracking, not token sending
                             self._send_stepout(
                                 seq.seq_id,
                                 seq.token_ids[-1],
                                 SequenceStatus.RUNNING_DECODE,
                             )
+
+                # Early free: Process only newly appeared sequences (much faster than full iteration)
+                if newly_appeared_seqs:
+                    from nanodeploy._cpp import BlockContextSlot
+
+                    for seq in newly_appeared_seqs:
+                        migrate_ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
+                        if migrate_ctx and migrate_ctx.engine_id:
+                            logger.info(
+                                f"Early free: seq {seq.seq_id} migrated from {migrate_ctx.engine_id}"
+                            )
+                            self._send_p2p_free_if_migrated(seq)
+
+                # Update tracking for next step
+                self._previous_running_seqs = current_running_seqs
 
             except Exception as e:
                 logger.error(f"Engine Loop Error: {e}")
@@ -155,6 +278,20 @@ class EngineServer:
         listen_addr = f"tcp://*:{self.config.port}"
         socket.bind(listen_addr)
 
+        # Create P2P socket for receiving free instructions (dynamic port)
+        p2p_socket = ctx.socket(zmq.DEALER)
+        p2p_socket.bind("tcp://*:0")  # Bind to OS-assigned port
+        p2p_endpoint = p2p_socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        # Extract port from endpoint like "tcp://0.0.0.0:12345"
+        p2p_port = int(p2p_endpoint.split(":")[-1])
+        self.engine.p2p_port = p2p_port
+        self.engine.p2p_socket = p2p_socket
+        logger.info(f"P2P socket bound to port {p2p_port}")
+
+        # Register engine with NanoCtrl now that P2P port is set
+        if self.config.nanoctrl_address and not self.engine._nanoctrl_registered:
+            self.engine._register_with_nanoctrl()
+
         # Determine ZMQ connection host for registration
         zmq_host = "127.0.0.1" if self.config.host == "0.0.0.0" else self.config.host
 
@@ -166,6 +303,7 @@ class EngineServer:
         logger.info(f"Model:           {self.config.model}")
         logger.info(f"Bind Address:    {listen_addr} (listening on all interfaces)")
         logger.info(f"ZMQ Connect:     tcp://{zmq_host}:{self.config.port}")
+        logger.info(f"P2P Connect:     tcp://{zmq_host}:{p2p_port}")
         logger.info(f"World Size:      {self.config.attn_world_size}")
         logger.info(
             f"Attention:       DP={self.config.attention_dp}, SP={self.config.attention_sp}, TP={self.config.attention_tp}"
@@ -218,9 +356,30 @@ class EngineServer:
                     logger.error(f"Send loop error: {e}")
                     break
 
+        async def p2p_recv_loop():
+            """P2P recv loop for free instructions."""
+            logger.info("P2P recv loop started, waiting for free instructions...")
+            while True:
+                try:
+                    data = await p2p_socket.recv()
+                    logger.info(f"Received P2P packet: {len(data)} bytes")
+                    seq_id, action, payload = decode_packet(bytes(data))
+                    logger.info(
+                        f"Decoded P2P packet: seq_id={seq_id}, action={action}, payload_size={len(payload)}"
+                    )
+                    self.service._handle_packet(seq_id, action, payload)
+                except zmq.ZMQError as e:
+                    if e.errno != zmq.ETERM:
+                        logger.error(f"ZMQ P2P recv error: {e}")
+                    break
+                except Exception as e:
+                    logger.error(f"P2P recv loop error: {e}")
+                    traceback.print_exc()
+
         await asyncio.gather(
             recv_loop(),
             send_loop(),
+            p2p_recv_loop(),
             self.service.engine_loop(),
         )
 

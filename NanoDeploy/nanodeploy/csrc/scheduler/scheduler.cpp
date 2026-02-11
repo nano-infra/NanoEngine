@@ -514,8 +514,12 @@ void Scheduler::free_to_be_migrated(std::shared_ptr<Sequence> seq)
         throw std::runtime_error("Sequence " + std::to_string(seq->seq_id()) + " not found in to_be_migrated");
     }
 
-    int selected_dp_idx = it->second.second;
-    worker_state[selected_dp_idx]->deallocate(*seq, BlockContextSlot::MIGRATE);
+    // IMPORTANT: Use the ORIGINAL sequence from the map, not the passed-in seq.
+    // The caller (engine_server.py) creates a minimal Sequence with only seq_id set
+    // and empty block tables. Deallocating that would be a no-op, leaking all KV blocks.
+    auto& original_seq    = it->second.first;
+    int   selected_dp_idx = it->second.second;
+    worker_state[selected_dp_idx]->deallocate(*original_seq, BlockContextSlot::MIGRATE);
     to_be_migrated.erase(it);
 }
 

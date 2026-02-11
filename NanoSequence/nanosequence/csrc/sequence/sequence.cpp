@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 #include "nanosequence/csrc/metrics/sequence_metric.h"
 #include "sequence.h"
@@ -190,14 +191,24 @@ int Sequence::last_block_page_id(BlockContextSlot slot, int sp_idx)
 {
     auto& ctx = block_ctx(slot);
     if (sp_idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
-        throw std::out_of_range("SP index out of range");
+        throw std::out_of_range("SP index out of range (last_block_page_id): seq_id=" + std::to_string(data_->seq_id)
+                                + " sp_idx=" + std::to_string(sp_idx)
+                                + " num_dispatched_tokens.size()=" + std::to_string(ctx.num_dispatched_tokens.size()));
     }
     int n_tokens       = ctx.num_dispatched_tokens[sp_idx];
     int last_block_idx = (n_tokens - 1) / block_size;
 
     if (sp_idx >= static_cast<int>(ctx.sp_block_table.size()) || !ctx.sp_block_table[sp_idx]
         || last_block_idx >= static_cast<int>(ctx.sp_block_table[sp_idx]->values.size())) {
-        throw std::out_of_range("Block index out of range");
+        int table_size  = static_cast<int>(ctx.sp_block_table.size());
+        int values_size = (sp_idx >= 0 && sp_idx < table_size && ctx.sp_block_table[sp_idx]) ?
+                              static_cast<int>(ctx.sp_block_table[sp_idx]->values.size()) :
+                              -1;
+        throw std::out_of_range("Block index out of range (last_block_page_id): seq_id=" + std::to_string(data_->seq_id)
+                                + " sp_idx=" + std::to_string(sp_idx) + " last_block_idx="
+                                + std::to_string(last_block_idx) + " num_dispatched_tokens=" + std::to_string(n_tokens)
+                                + " sp_block_table.size()=" + std::to_string(table_size)
+                                + " sp_block_table[sp_idx].values.size()=" + std::to_string(values_size));
     }
     return ctx.sp_block_table[sp_idx]->values[last_block_idx];
 }
@@ -216,7 +227,10 @@ std::pair<const int*, size_t> Sequence::block_view(int i, BlockContextSlot slot,
 {
     int n_blocks = const_cast<Sequence*>(this)->num_blocks(slot, sp_idx);
     if (i < 0 || i >= n_blocks) {
-        throw std::out_of_range("Block index out of range");
+        throw std::out_of_range("Block index out of range (block_view): seq_id=" + std::to_string(data_->seq_id)
+                                + " slot=" + std::to_string(static_cast<int>(slot))
+                                + " sp_idx=" + std::to_string(sp_idx) + " block_index=" + std::to_string(i)
+                                + " n_blocks=" + std::to_string(n_blocks));
     }
 
     int start = i * block_size;
