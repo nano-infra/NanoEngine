@@ -1,6 +1,9 @@
 //! NanoCtrl: Control plane server for NanoInfra
 //!
-//! All Redis keys use scope prefix (from NANOCTRL_SCOPE env var) for partitioning:
+//! NanoCtrl is stateless and supports multiple scopes sharing the same instance.
+//! Scope is determined by clients (NanoRoute, EngineServer, peer_agent) via NANOCTRL_SCOPE env var.
+//!
+//! All Redis keys use key_prefix (from config or REDIS_KEY_PREFIX env var) for partitioning:
 //! - agent:* - Peer agent registration info
 //! - stream:* - Agent stream mailboxes (Redis Streams)
 //! - exchange:* - QP info exchange (sender:receiver)
@@ -10,6 +13,8 @@
 //! - engine:* - Engine registration info
 //! - nano_meta:engine_revision - Engine revision counter
 //! - nano_events:engine_update - Engine update pub/sub channel
+//!
+//! Clients should build their key prefix as: {scope}:{key_prefix} (if scope is set)
 
 mod config;
 mod models;
@@ -64,18 +69,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let redis_url = &config.redis.url;
-    // Get scope from environment variable only
-    let scope = std::env::var("NANOCTRL_SCOPE").ok();
-    // Build key prefix: if scope is provided, use scope:key_prefix, otherwise use key_prefix
-    let redis_key_prefix = if let Some(ref scope) = scope {
-        if let Some(ref prefix) = config.redis.key_prefix {
-            format!("{}:{}", scope, prefix)
-        } else {
-            scope.clone()
-        }
-    } else {
-        config.redis.key_prefix.clone().unwrap_or_default()
-    };
+    // NanoCtrl is stateless: only use key_prefix from config, not scope
+    // Scope is determined by clients (NanoRoute, EngineServer, peer_agent)
+    // Clients should build their key prefix as: {scope}:{key_prefix} (if scope is set)
+    let redis_key_prefix = config.redis.key_prefix.clone().unwrap_or_default();
     tracing::info!("Using Redis URL: {}", redis_url);
     if !redis_key_prefix.is_empty() {
         tracing::info!(
@@ -176,10 +173,7 @@ async fn root() -> &'static str {
     "NanoCtrl Server Running"
 }
 
-async fn query(
-    State(state): State<AppState>,
-    Json(_body): Json<QueryBody>,
-) -> Json<Vec<PeerAgent>> {
+async fn query(State(state): State<AppState>, Json(body): Json<QueryBody>) -> Json<Vec<PeerAgent>> {
     // Basic implementation: Scan for agent:* keys
     let mut conn = match state.redis_client.get_multiplexed_async_connection().await {
         Ok(conn) => conn,
@@ -188,10 +182,11 @@ async fn query(
             return Json(Vec::new());
         }
     };
-    let agent_pattern = if state.redis_key_prefix.is_empty() {
+    let key_prefix = state.build_key_prefix(body.scope.as_deref());
+    let agent_pattern = if key_prefix.is_empty() {
         "agent:*".to_string()
     } else {
-        format!("{}:agent:*", state.redis_key_prefix)
+        format!("{}:agent:*", key_prefix)
     };
     let keys: Vec<String> = redis::cmd("KEYS")
         .arg(&agent_pattern)
@@ -210,10 +205,10 @@ async fn query(
         // Currently just constructing minimal info
         if let (Some(dev), Some(ip)) = (agent_data.get("device"), agent_data.get("addr")) {
             // Extract agent name from key (handle scoped prefix)
-            let agent_prefix = if state.redis_key_prefix.is_empty() {
+            let agent_prefix = if key_prefix.is_empty() {
                 "agent:"
             } else {
-                &format!("{}:agent:", state.redis_key_prefix)
+                &format!("{}:agent:", key_prefix)
             };
             let name = key.strip_prefix(agent_prefix).unwrap_or(&key).to_string();
             agents.push(PeerAgent {
@@ -250,13 +245,15 @@ async fn start_peer_agent(
         }
     };
 
+    let key_prefix = state.build_key_prefix(body.scope.as_deref());
+
     // Allocate name if not provided (single atomic operation)
     let agent_name = if let Some(alias) = body.alias {
         // Check if provided name already exists
-        let key = if state.redis_key_prefix.is_empty() {
+        let key = if key_prefix.is_empty() {
             format!("agent:{}", alias)
         } else {
-            format!("{}:agent:{}", state.redis_key_prefix, alias)
+            format!("{}:agent:{}", key_prefix, alias)
         };
         let exists: bool = match redis::cmd("EXISTS").arg(&key).query_async(&mut conn).await {
             Ok(e) => e,
@@ -281,7 +278,11 @@ async fn start_peer_agent(
         alias
     } else {
         // Auto-generate unique name using atomic counter
-        let counter_key = format!("{}:agent_name_counter", state.redis_key_prefix);
+        let counter_key = if key_prefix.is_empty() {
+            "agent_name_counter".to_string()
+        } else {
+            format!("{}:agent_name_counter", key_prefix)
+        };
         let counter: i64 = match redis::cmd("INCR")
             .arg(&counter_key)
             .query_async(&mut conn)
@@ -309,10 +310,10 @@ async fn start_peer_agent(
         body.address
     );
 
-    let key = if state.redis_key_prefix.is_empty() {
+    let key = if key_prefix.is_empty() {
         format!("agent:{}", agent_name)
     } else {
-        format!("{}:agent:{}", state.redis_key_prefix, agent_name)
+        format!("{}:agent:{}", key_prefix, agent_name)
     };
 
     tracing::debug!("Storing agent info in Redis with key: {}", key);
@@ -422,7 +423,12 @@ async fn set_desired_topology(
     Path(agent_id): Path<String>,
     Json(spec): Json<DesiredTopologySpec>,
 ) -> impl IntoResponse {
-    let key = format!("{}:spec:topology:{}", state.redis_key_prefix, agent_id);
+    let key_prefix = state.build_key_prefix(spec.scope.as_deref());
+    let key = if key_prefix.is_empty() {
+        format!("spec:topology:{}", agent_id)
+    } else {
+        format!("{}:spec:topology:{}", key_prefix, agent_id)
+    };
     let spec_json = match serde_json::to_string(&spec) {
         Ok(s) => s,
         Err(e) => {
@@ -459,10 +465,10 @@ async fn set_desired_topology(
     }
 
     // Push connect_peer messages to agent's stream mailbox
-    let stream_key = if state.redis_key_prefix.is_empty() {
+    let stream_key = if key_prefix.is_empty() {
         format!("stream:{}", agent_id)
     } else {
-        format!("{}:stream:{}", state.redis_key_prefix, agent_id)
+        format!("{}:stream:{}", key_prefix, agent_id)
     };
     for target_peer in &spec.target_peers {
         let timestamp = format!(
@@ -505,7 +511,11 @@ async fn set_desired_topology(
     // Symmetric: merge this agent_id into each target peer's spec so both sides want each other
     if spec.symmetric {
         for target_peer in &spec.target_peers {
-            let peer_key = format!("{}:spec:topology:{}", state.redis_key_prefix, target_peer);
+            let peer_key = if key_prefix.is_empty() {
+                format!("spec:topology:{}", target_peer)
+            } else {
+                format!("{}:spec:topology:{}", key_prefix, target_peer)
+            };
             let existing_str: Option<String> = redis::cmd("GET")
                 .arg(&peer_key)
                 .query_async(&mut conn)
@@ -525,7 +535,8 @@ async fn set_desired_topology(
             let peer_spec = DesiredTopologySpec {
                 target_peers: peer_targets,
                 min_bw: None,
-                symmetric: false, // Don't recurse
+                symmetric: false,          // Don't recurse
+                scope: spec.scope.clone(), // Preserve scope
             };
             if let Ok(peer_json) = serde_json::to_string(&peer_spec) {
                 let _: Result<(), _> = redis::cmd("SET")
@@ -535,10 +546,10 @@ async fn set_desired_topology(
                     .await;
 
                 // Also push connect_peer message to target peer's stream
-                let peer_stream_key = if state.redis_key_prefix.is_empty() {
+                let peer_stream_key = if key_prefix.is_empty() {
                     format!("stream:{}", target_peer)
                 } else {
-                    format!("{}:stream:{}", state.redis_key_prefix, target_peer)
+                    format!("{}:stream:{}", key_prefix, target_peer)
                 };
                 let timestamp = format!(
                     "{}",
@@ -610,13 +621,11 @@ async fn register_mr(
         }
     };
 
-    let mr_key = if state.redis_key_prefix.is_empty() {
+    let key_prefix = state.build_key_prefix(body.scope.as_deref());
+    let mr_key = if key_prefix.is_empty() {
         format!("mr:{}:{}", body.agent_name, body.mr_name)
     } else {
-        format!(
-            "{}:mr:{}:{}",
-            state.redis_key_prefix, body.agent_name, body.mr_name
-        )
+        format!("{}:mr:{}:{}", key_prefix, body.agent_name, body.mr_name)
     };
     let mr_info = json!({
         "addr": body.addr,
@@ -654,13 +663,11 @@ async fn get_mr_info(
         }
     };
 
-    let mr_key = if state.redis_key_prefix.is_empty() {
+    let key_prefix = state.build_key_prefix(body.scope.as_deref());
+    let mr_key = if key_prefix.is_empty() {
         format!("mr:{}:{}", body.dst, body.mr_name)
     } else {
-        format!(
-            "{}:mr:{}:{}",
-            state.redis_key_prefix, body.dst, body.mr_name
-        )
+        format!("{}:mr:{}:{}", key_prefix, body.dst, body.mr_name)
     };
     let mr_info_str: Option<String> = redis::cmd("GET")
         .arg(&mr_key)
@@ -712,12 +719,17 @@ async fn cleanup(
         }
     };
 
+    let key_prefix = state.build_key_prefix(body.scope.as_deref());
     let agent_name = body.agent_name;
     tracing::info!("Cleaning up agent: {}", agent_name);
 
     // 1. Get peers to notify (from spec) BEFORE deleting anything
     let mut peers_to_notify = std::collections::HashSet::new();
-    let spec_key = format!("{}:spec:topology:{}", state.redis_key_prefix, agent_name);
+    let spec_key = if key_prefix.is_empty() {
+        format!("spec:topology:{}", agent_name)
+    } else {
+        format!("{}:spec:topology:{}", key_prefix, agent_name)
+    };
     if let Ok(Some(spec_str)) = redis::cmd("GET")
         .arg(&spec_key)
         .query_async::<Option<String>>(&mut conn)
@@ -730,7 +742,11 @@ async fn cleanup(
         }
     }
     // Also scan all specs to find agents that had us as a target (with scoped prefix)
-    let spec_pattern = format!("{}:spec:topology:*", state.redis_key_prefix);
+    let spec_pattern = if key_prefix.is_empty() {
+        "spec:topology:*".to_string()
+    } else {
+        format!("{}:spec:topology:*", key_prefix)
+    };
     let spec_keys_all: Vec<String> = redis::cmd("KEYS")
         .arg(&spec_pattern)
         .query_async(&mut conn)
@@ -747,7 +763,11 @@ async fn cleanup(
         {
             if let Ok(spec) = serde_json::from_str::<DesiredTopologySpec>(&s) {
                 if spec.target_peers.contains(&agent_name) {
-                    let prefix = format!("{}:spec:topology:", state.redis_key_prefix);
+                    let prefix = if key_prefix.is_empty() {
+                        "spec:topology:".to_string()
+                    } else {
+                        format!("{}:spec:topology:", key_prefix)
+                    };
                     if let Some(other) = key.strip_prefix(&prefix) {
                         peers_to_notify.insert(other.to_string());
                     }
@@ -757,10 +777,10 @@ async fn cleanup(
     }
 
     // 2. Delete agent registration
-    let agent_key = if state.redis_key_prefix.is_empty() {
+    let agent_key = if key_prefix.is_empty() {
         format!("agent:{}", agent_name)
     } else {
-        format!("{}:agent:{}", state.redis_key_prefix, agent_name)
+        format!("{}:agent:{}", key_prefix, agent_name)
     };
     let _: () = redis::cmd("DEL")
         .arg(&agent_key)
@@ -776,7 +796,11 @@ async fn cleanup(
         .unwrap_or_default();
 
     // 4. Delete exchange info (QP info) published by this agent (with scoped prefix)
-    let exchange_pattern = format!("{}:exchange:{}:*", state.redis_key_prefix, agent_name);
+    let exchange_pattern = if key_prefix.is_empty() {
+        format!("exchange:{}:*", agent_name)
+    } else {
+        format!("{}:exchange:{}:*", key_prefix, agent_name)
+    };
     let exchange_keys: Vec<String> = redis::cmd("KEYS")
         .arg(&exchange_pattern)
         .query_async(&mut conn)
@@ -790,7 +814,11 @@ async fn cleanup(
             .unwrap_or_default();
     }
     // Delete exchange info where this agent is the receiver (with scoped prefix)
-    let exchange_pattern2 = format!("{}:exchange:*:{}", state.redis_key_prefix, agent_name);
+    let exchange_pattern2 = if key_prefix.is_empty() {
+        format!("exchange:*:{}", agent_name)
+    } else {
+        format!("{}:exchange:*:{}", key_prefix, agent_name)
+    };
     let exchange_keys2: Vec<String> = redis::cmd("KEYS")
         .arg(&exchange_pattern2)
         .query_async(&mut conn)
@@ -805,7 +833,11 @@ async fn cleanup(
     }
 
     // 5. Delete agent's inbox (for legacy cleanup event delivery, with scoped prefix)
-    let inbox_key = format!("{}:inbox:{}", state.redis_key_prefix, agent_name);
+    let inbox_key = if key_prefix.is_empty() {
+        format!("inbox:{}", agent_name)
+    } else {
+        format!("{}:inbox:{}", key_prefix, agent_name)
+    };
     let _: () = redis::cmd("DEL")
         .arg(&inbox_key)
         .query_async(&mut conn)
@@ -813,10 +845,10 @@ async fn cleanup(
         .unwrap_or_default();
 
     // 6. Delete all MRs for this agent
-    let mr_pattern = if state.redis_key_prefix.is_empty() {
+    let mr_pattern = if key_prefix.is_empty() {
         format!("mr:{}:*", agent_name)
     } else {
-        format!("{}:mr:{}:*", state.redis_key_prefix, agent_name)
+        format!("{}:mr:{}:*", key_prefix, agent_name)
     };
     let mr_keys: Vec<String> = redis::cmd("KEYS")
         .arg(&mr_pattern)
@@ -837,8 +869,13 @@ async fn cleanup(
             "type": "cleanup",
             "peer": agent_name,
         });
+        let peer_inbox_key = if key_prefix.is_empty() {
+            format!("inbox:{}", peer)
+        } else {
+            format!("{}:inbox:{}", key_prefix, peer)
+        };
         let _: () = redis::cmd("LPUSH")
-            .arg(format!("{}:inbox:{}", state.redis_key_prefix, peer))
+            .arg(&peer_inbox_key)
             .arg(cleanup_event.to_string())
             .query_async(&mut conn)
             .await
@@ -895,9 +932,10 @@ async fn register_engine(
             });
         }
     };
-    let engine_key = state.engine_key(&body.engine_id);
-    let revision_key = state.revision_key();
-    let channel = state.events_channel();
+    let scope = body.scope.as_deref();
+    let engine_key = state.engine_key(&body.engine_id, scope);
+    let revision_key = state.revision_key(scope);
+    let channel = state.events_channel(scope);
 
     tracing::debug!(
         "Storing engine info in Redis with scoped key: {}",
@@ -996,7 +1034,7 @@ async fn get_engine_info(
         }
     };
 
-    let key = state.engine_key(&body.engine_id);
+    let key = state.engine_key(&body.engine_id, body.scope.as_deref());
     let engine_info_str: Option<String> = redis::cmd("HGET")
         .arg(&key)
         .arg("info")
@@ -1026,7 +1064,7 @@ async fn get_engine_info(
 
 async fn list_engines(
     State(state): State<AppState>,
-    Json(_body): Json<ListEnginesBody>,
+    Json(body): Json<ListEnginesBody>,
 ) -> impl IntoResponse {
     tracing::debug!("Listing all registered engines");
 
@@ -1041,8 +1079,13 @@ async fn list_engines(
         }
     };
 
+    let key_prefix = state.build_key_prefix(body.scope.as_deref());
     // Get all engine keys with scoped prefix
-    let pattern = format!("{}:engine:*", state.redis_key_prefix);
+    let pattern = if key_prefix.is_empty() {
+        "engine:*".to_string()
+    } else {
+        format!("{}:engine:*", key_prefix)
+    };
     let keys: Vec<String> = redis::cmd("KEYS")
         .arg(&pattern)
         .query_async(&mut conn)
@@ -1050,7 +1093,11 @@ async fn list_engines(
         .unwrap_or_default();
 
     let mut engines = Vec::new();
-    let engine_prefix = format!("{}:engine:", state.redis_key_prefix);
+    let engine_prefix = if key_prefix.is_empty() {
+        "engine:".to_string()
+    } else {
+        format!("{}:engine:", key_prefix)
+    };
     for key in keys {
         // Extract engine_id from key (format: "{redis_key_prefix}:engine:{engine_id}")
         if let Some(_engine_id) = key.strip_prefix(&engine_prefix) {
@@ -1093,9 +1140,10 @@ async fn unregister_engine(
             });
         }
     };
-    let engine_key = state.engine_key(&body.engine_id);
-    let revision_key = state.revision_key();
-    let channel = state.events_channel();
+    let scope = body.scope.as_deref();
+    let engine_key = state.engine_key(&body.engine_id, scope);
+    let revision_key = state.revision_key(scope);
+    let channel = state.events_channel(scope);
 
     // Use Lua script to atomically: DEL + INCR + PUBLISH
     // Note: MultiplexedConnection doesn't implement ConnectionLike, so we use EVAL directly
@@ -1160,7 +1208,7 @@ async fn heartbeat_engine(
         }
     };
 
-    let engine_key = state.engine_key(&body.engine_id);
+    let engine_key = state.engine_key(&body.engine_id, body.scope.as_deref());
 
     // Use Lua script to refresh TTL only (no event, no revision increment)
     match redis::cmd("EVAL")

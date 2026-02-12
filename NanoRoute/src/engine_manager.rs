@@ -380,7 +380,10 @@ impl EngineManager {
         let client = reqwest::Client::new();
         let url = format!("{}/list_engines", nanoctrl_address);
 
-        let body = serde_json::json!({});
+        let mut body = serde_json::json!({});
+        if !self.redis_key_prefix.is_empty() {
+            body["scope"] = serde_json::Value::String(self.redis_key_prefix.clone());
+        }
 
         let response = client.post(&url).json(&body).send().await?;
 

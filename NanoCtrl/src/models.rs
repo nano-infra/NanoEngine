@@ -11,7 +11,8 @@ pub struct PeerAgent {
 
 #[derive(Debug, Deserialize)]
 pub struct QueryBody {
-    // Add query parameters if needed
+    #[serde(default)]
+    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
 
 #[derive(Debug, Deserialize)]
@@ -24,6 +25,8 @@ pub struct StartPeerAgentBody {
     pub address: String, // IP address
     #[serde(default = "default_name_prefix")]
     pub name_prefix: String, // Prefix for auto-generated names
+    #[serde(default)]
+    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
 
 fn default_name_prefix() -> String {
@@ -41,6 +44,8 @@ pub struct DesiredTopologySpec {
     /// Required for Symmetric Rendezvous when only one side (e.g. decode) initiates.
     #[serde(default)]
     pub symmetric: bool,
+    #[serde(default)]
+    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -60,6 +65,8 @@ pub struct RegisterMrBody {
     pub rkey: u32,
     #[serde(default)]
     pub lkey: u32, // Optional, local key (not needed for remote access)
+    #[serde(default)]
+    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +75,8 @@ pub struct GetMrInfoBody {
     pub src: String, // Who is asking
     pub dst: String, // Whose MR to get
     pub mr_name: String,
+    #[serde(default)]
+    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +99,8 @@ pub struct GetMrInfoResponse {
 #[derive(Debug, Deserialize)]
 pub struct CleanupBody {
     pub agent_name: String,
+    #[serde(default)]
+    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +133,8 @@ pub struct RegisterEngineBody {
     pub p2p_host: Option<String>, // P2P free instruction host
     #[serde(default)]
     pub p2p_port: Option<u32>, // P2P free instruction port
+    #[serde(default)]
+    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
 
 #[derive(Debug, Serialize)]
@@ -133,6 +146,8 @@ pub struct RegisterEngineResponse {
 #[derive(Debug, Deserialize)]
 pub struct GetEngineInfoBody {
     pub engine_id: String,
+    #[serde(default)]
+    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
 
 #[derive(Debug, Serialize)]
@@ -144,6 +159,8 @@ pub struct GetEngineInfoResponse {
 #[derive(Debug, Deserialize)]
 pub struct UnregisterEngineBody {
     pub engine_id: String,
+    #[serde(default)]
+    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
 
 #[derive(Debug, Serialize)]
@@ -154,7 +171,8 @@ pub struct UnregisterEngineResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct ListEnginesBody {
-    // Empty body, just need to query
+    #[serde(default)]
+    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +184,8 @@ pub struct ListEnginesResponse {
 #[derive(Debug, Deserialize)]
 pub struct HeartbeatEngineBody {
     pub engine_id: String,
+    #[serde(default)]
+    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
 
 #[derive(Debug, Serialize)]

@@ -127,34 +127,64 @@ pub struct AppState {
     /// Redis client (MultiplexedConnection is Clone and handles connection pooling)
     pub redis_client: Client,
     pub redis_url: String,
-    /// Redis key prefix for data isolation (scope per NanoCtrl instance)
-    pub redis_key_prefix: String,
+    /// Base Redis key prefix from config (without scope)
+    /// Scope is provided by clients and combined with this prefix
+    pub base_key_prefix: String,
 }
 
 impl AppState {
-    pub fn new(redis_url: &str, redis_key_prefix: Option<String>) -> anyhow::Result<Self> {
+    pub fn new(redis_url: &str, base_key_prefix: Option<String>) -> anyhow::Result<Self> {
         let client = Client::open(redis_url)?;
-        let prefix = redis_key_prefix.unwrap_or_default();
+        let prefix = base_key_prefix.unwrap_or_default();
         // Client can be cloned and get_multiplexed_async_connection() is efficient
         Ok(Self {
             redis_client: client,
             redis_url: redis_url.to_string(),
-            redis_key_prefix: prefix,
+            base_key_prefix: prefix,
         })
     }
 
+    /// Build Redis key prefix from scope (provided by client)
+    /// Format: {scope}:{base_key_prefix} or just {scope} if base_key_prefix is empty
+    pub fn build_key_prefix(&self, scope: Option<&str>) -> String {
+        if let Some(scope) = scope {
+            if self.base_key_prefix.is_empty() {
+                scope.to_string()
+            } else {
+                format!("{}:{}", scope, self.base_key_prefix)
+            }
+        } else {
+            self.base_key_prefix.clone()
+        }
+    }
+
     /// Generate scoped engine key
-    pub fn engine_key(&self, engine_id: &str) -> String {
-        format!("{}:engine:{}", self.redis_key_prefix, engine_id)
+    pub fn engine_key(&self, engine_id: &str, scope: Option<&str>) -> String {
+        let prefix = self.build_key_prefix(scope);
+        if prefix.is_empty() {
+            format!("engine:{}", engine_id)
+        } else {
+            format!("{}:engine:{}", prefix, engine_id)
+        }
     }
 
     /// Generate scoped revision key
-    pub fn revision_key(&self) -> String {
-        format!("{}:nano_meta:engine_revision", self.redis_key_prefix)
+    pub fn revision_key(&self, scope: Option<&str>) -> String {
+        let prefix = self.build_key_prefix(scope);
+        if prefix.is_empty() {
+            "nano_meta:engine_revision".to_string()
+        } else {
+            format!("{}:nano_meta:engine_revision", prefix)
+        }
     }
 
     /// Generate scoped events channel
-    pub fn events_channel(&self) -> String {
-        format!("{}:nano_events:engine_update", self.redis_key_prefix)
+    pub fn events_channel(&self, scope: Option<&str>) -> String {
+        let prefix = self.build_key_prefix(scope);
+        if prefix.is_empty() {
+            "nano_events:engine_update".to_string()
+        } else {
+            format!("{}:nano_events:engine_update", prefix)
+        }
     }
 }

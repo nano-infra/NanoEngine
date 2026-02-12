@@ -149,6 +149,8 @@ class LLMComponent(LLM):
         try:
             url = f"http://{self.config.nanoctrl_address}/get_engine_info"
             payload = {"engine_id": target_engine_id}
+            if self.config.scope:
+                payload["scope"] = self.config.scope
 
             with httpx.Client(timeout=5.0) as client:
                 response = client.post(url, json=payload)
@@ -325,6 +327,9 @@ class LLMComponent(LLM):
                 "p2p_host": zmq_host,
                 "p2p_port": self.p2p_port if self.p2p_port else 0,
             }
+            # Add scope if configured
+            if self.config.scope:
+                payload["scope"] = self.config.scope
 
             url = f"http://{self.config.nanoctrl_address}/register_engine"
             logger.info(
@@ -364,6 +369,8 @@ class LLMComponent(LLM):
 
         try:
             payload = {"engine_id": self.engine_id}
+            if self.config.scope:
+                payload["scope"] = self.config.scope
             url = f"http://{self.config.nanoctrl_address}/unregister_engine"
             logger.info(f"Unregistering engine {self.engine_id} from NanoCtrl")
 
@@ -417,6 +424,8 @@ class LLMComponent(LLM):
 
         try:
             payload = {"engine_id": self.engine_id}
+            if self.config.scope:
+                payload["scope"] = self.config.scope
             url = f"http://{self.config.nanoctrl_address}/heartbeat_engine"
 
             # Use sync client with short timeout

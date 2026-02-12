@@ -337,6 +337,8 @@ class PeerAgent:
                 }
                 if self.alias is not None:
                     request_data["alias"] = self.alias
+                if self.redis_key_prefix:
+                    request_data["scope"] = self.redis_key_prefix
 
                 response = requests.post(
                     f"{self.server_url}/start_peer_agent",
@@ -463,6 +465,8 @@ class PeerAgent:
             spec["min_bw"] = min_bw
         if symmetric:
             spec["symmetric"] = True
+        if self.redis_key_prefix:
+            spec["scope"] = self.redis_key_prefix
         response = requests.post(
             f"{self.server_url}/v1/desired_topology/{self.alias}",
             json=spec,
@@ -475,9 +479,12 @@ class PeerAgent:
 
     def query(self) -> Dict[str, Dict[str, Any]]:
         """Query all registered peer agents."""
+        query_data = {}
+        if self.redis_key_prefix:
+            query_data["scope"] = self.redis_key_prefix
         response = requests.post(
             f"{self.server_url}/query",
-            json={},
+            json=query_data,
             timeout=5,
         )
         response.raise_for_status()
@@ -635,9 +642,12 @@ class PeerAgent:
             print(f"PeerAgent {self.alias}: MR cleanup warning: {e}")
 
         try:
+            cleanup_data = {"agent_name": self.alias}
+            if self.redis_key_prefix:
+                cleanup_data["scope"] = self.redis_key_prefix
             response = requests.post(
                 f"{self.server_url}/cleanup",
-                json={"agent_name": self.alias},
+                json=cleanup_data,
                 timeout=5,
             )
             response.raise_for_status()
