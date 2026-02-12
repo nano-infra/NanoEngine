@@ -29,6 +29,14 @@ impl EngineManager {
         }
     }
 
+    pub fn with_scope(scope: Option<String>) -> Self {
+        Self {
+            prefill_engines: Vec::new(),
+            decode_engines: Vec::new(),
+            redis_key_prefix: scope.unwrap_or_default(),
+        }
+    }
+
     #[allow(dead_code)]
     pub async fn connect_all(&mut self, config: &EngineConfig) -> anyhow::Result<()> {
         match config {
@@ -37,6 +45,7 @@ impl EngineManager {
                 port,
                 nanoctrl_address,
                 redis_url: _,
+                scope: _,
             } => {
                 if let Some(nanoctrl_addr) = nanoctrl_address {
                     // Query engines from NanoCtrl
@@ -160,6 +169,7 @@ impl EngineManager {
                 decode,
                 nanoctrl_address,
                 redis_url: _,
+                scope: _,
             } => {
                 if let Some(nanoctrl_addr) = nanoctrl_address {
                     // Query engines from NanoCtrl

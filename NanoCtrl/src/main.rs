@@ -1,3 +1,16 @@
+//! NanoCtrl: Control plane server for NanoInfra
+//!
+//! All Redis keys use scope prefix (from NANOCTRL_SCOPE env var) for partitioning:
+//! - agent:* - Peer agent registration info
+//! - stream:* - Agent stream mailboxes (Redis Streams)
+//! - exchange:* - QP info exchange (sender:receiver)
+//! - spec:topology:* - Desired topology specifications
+//! - inbox:* - Legacy inbox for cleanup events
+//! - mr:* - Memory Region (MR) information
+//! - engine:* - Engine registration info
+//! - nano_meta:engine_revision - Engine revision counter
+//! - nano_events:engine_update - Engine update pub/sub channel
+
 mod config;
 mod models;
 mod state;
@@ -43,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let mut config = AppConfig::load_from_file(&args.config)?;
 
     // Env overrides for Redis (optional)
-    if let Ok(url) = std::env::var("REDIS_URL") {
+    if let Ok(url) = std::env::var("NANOCTRL_REDIS_URL") {
         config.redis.url = url;
     }
     if let Ok(prefix) = std::env::var("REDIS_KEY_PREFIX") {
@@ -51,13 +64,34 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let redis_url = &config.redis.url;
-    let redis_key_prefix = config.redis.key_prefix.clone();
+    // Get scope from environment variable only
+    let scope = std::env::var("NANOCTRL_SCOPE").ok();
+    // Build key prefix: if scope is provided, use scope:key_prefix, otherwise use key_prefix
+    let redis_key_prefix = if let Some(ref scope) = scope {
+        if let Some(ref prefix) = config.redis.key_prefix {
+            format!("{}:{}", scope, prefix)
+        } else {
+            scope.clone()
+        }
+    } else {
+        config.redis.key_prefix.clone().unwrap_or_default()
+    };
     tracing::info!("Using Redis URL: {}", redis_url);
-    if let Some(ref prefix) = redis_key_prefix {
-        tracing::info!("Using Redis key prefix: {} (for data isolation)", prefix);
+    if !redis_key_prefix.is_empty() {
+        tracing::info!(
+            "Using Redis key prefix: {} (for data isolation)",
+            redis_key_prefix
+        );
     }
 
-    let state = AppState::new(redis_url, redis_key_prefix)?;
+    let state = AppState::new(
+        redis_url,
+        if redis_key_prefix.is_empty() {
+            None
+        } else {
+            Some(redis_key_prefix)
+        },
+    )?;
 
     // Warm up Redis connection to avoid first request hang
     {
@@ -154,8 +188,13 @@ async fn query(
             return Json(Vec::new());
         }
     };
+    let agent_pattern = if state.redis_key_prefix.is_empty() {
+        "agent:*".to_string()
+    } else {
+        format!("{}:agent:*", state.redis_key_prefix)
+    };
     let keys: Vec<String> = redis::cmd("KEYS")
-        .arg("agent:*")
+        .arg(&agent_pattern)
         .query_async(&mut conn)
         .await
         .unwrap_or_default();
@@ -170,8 +209,13 @@ async fn query(
         // Parse agent_data to PeerAgent, simplified for now
         // Currently just constructing minimal info
         if let (Some(dev), Some(ip)) = (agent_data.get("device"), agent_data.get("addr")) {
-            // Assuming key format agent:{name}
-            let name = key.strip_prefix("agent:").unwrap_or(&key).to_string();
+            // Extract agent name from key (handle scoped prefix)
+            let agent_prefix = if state.redis_key_prefix.is_empty() {
+                "agent:"
+            } else {
+                &format!("{}:agent:", state.redis_key_prefix)
+            };
+            let name = key.strip_prefix(agent_prefix).unwrap_or(&key).to_string();
             agents.push(PeerAgent {
                 name,
                 device: dev.clone(),
@@ -209,7 +253,11 @@ async fn start_peer_agent(
     // Allocate name if not provided (single atomic operation)
     let agent_name = if let Some(alias) = body.alias {
         // Check if provided name already exists
-        let key = format!("agent:{}", alias);
+        let key = if state.redis_key_prefix.is_empty() {
+            format!("agent:{}", alias)
+        } else {
+            format!("{}:agent:{}", state.redis_key_prefix, alias)
+        };
         let exists: bool = match redis::cmd("EXISTS").arg(&key).query_async(&mut conn).await {
             Ok(e) => e,
             Err(e) => {
@@ -261,7 +309,11 @@ async fn start_peer_agent(
         body.address
     );
 
-    let key = format!("agent:{}", agent_name);
+    let key = if state.redis_key_prefix.is_empty() {
+        format!("agent:{}", agent_name)
+    } else {
+        format!("{}:agent:{}", state.redis_key_prefix, agent_name)
+    };
 
     tracing::debug!("Storing agent info in Redis with key: {}", key);
     match redis::cmd("HSET")
@@ -558,7 +610,14 @@ async fn register_mr(
         }
     };
 
-    let mr_key = format!("mr:{}:{}", body.agent_name, body.mr_name);
+    let mr_key = if state.redis_key_prefix.is_empty() {
+        format!("mr:{}:{}", body.agent_name, body.mr_name)
+    } else {
+        format!(
+            "{}:mr:{}:{}",
+            state.redis_key_prefix, body.agent_name, body.mr_name
+        )
+    };
     let mr_info = json!({
         "addr": body.addr,
         "length": body.length,
@@ -595,7 +654,14 @@ async fn get_mr_info(
         }
     };
 
-    let mr_key = format!("mr:{}:{}", body.dst, body.mr_name);
+    let mr_key = if state.redis_key_prefix.is_empty() {
+        format!("mr:{}:{}", body.dst, body.mr_name)
+    } else {
+        format!(
+            "{}:mr:{}:{}",
+            state.redis_key_prefix, body.dst, body.mr_name
+        )
+    };
     let mr_info_str: Option<String> = redis::cmd("GET")
         .arg(&mr_key)
         .query_async(&mut conn)
@@ -691,7 +757,11 @@ async fn cleanup(
     }
 
     // 2. Delete agent registration
-    let agent_key = format!("agent:{}", agent_name);
+    let agent_key = if state.redis_key_prefix.is_empty() {
+        format!("agent:{}", agent_name)
+    } else {
+        format!("{}:agent:{}", state.redis_key_prefix, agent_name)
+    };
     let _: () = redis::cmd("DEL")
         .arg(&agent_key)
         .query_async(&mut conn)
@@ -743,7 +813,11 @@ async fn cleanup(
         .unwrap_or_default();
 
     // 6. Delete all MRs for this agent
-    let mr_pattern = format!("mr:{}:*", agent_name);
+    let mr_pattern = if state.redis_key_prefix.is_empty() {
+        format!("mr:{}:*", agent_name)
+    } else {
+        format!("{}:mr:{}:*", state.redis_key_prefix, agent_name)
+    };
     let mr_keys: Vec<String> = redis::cmd("KEYS")
         .arg(&mr_pattern)
         .query_async(&mut conn)

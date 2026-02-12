@@ -36,6 +36,9 @@ pub enum EngineConfig {
         nanoctrl_address: Option<String>, // e.g., "http://127.0.0.1:3000"
         #[serde(default)]
         redis_url: Option<String>, // e.g., "redis://127.0.0.1:6379"
+        #[serde(default)]
+        #[allow(dead_code)] // Deprecated: scope now read from NANOCTRL_SCOPE env var only
+        scope: Option<String>, // Deprecated: scope now read from NANOCTRL_SCOPE env var only
     },
     Disaggregated {
         #[serde(default)]
@@ -46,6 +49,9 @@ pub enum EngineConfig {
         nanoctrl_address: Option<String>, // e.g., "http://127.0.0.1:3000"
         #[serde(default)]
         redis_url: Option<String>, // e.g., "redis://127.0.0.1:6379"
+        #[serde(default)]
+        #[allow(dead_code)] // Deprecated: scope now read from NANOCTRL_SCOPE env var only
+        scope: Option<String>, // Deprecated: scope now read from NANOCTRL_SCOPE env var only
     },
 }
 
@@ -79,7 +85,6 @@ impl AppConfig {
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn test_load_config() {
@@ -113,7 +118,7 @@ mod tests {
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.model_name, "TestModel");
         match config.engine {
-            EngineConfig::Unified { host, port } => {
+            EngineConfig::Unified { host, port, .. } => {
                 assert_eq!(host, "127.0.0.1");
                 assert_eq!(port, 5000);
             }
@@ -155,7 +160,10 @@ mod tests {
         write!(file, "{}", toml_content).expect("Write");
         let config = AppConfig::load_from_file(file.path()).expect("Load");
 
-        if let EngineConfig::Disaggregated { prefill, decode } = config.engine {
+        if let EngineConfig::Disaggregated {
+            prefill, decode, ..
+        } = config.engine
+        {
             assert_eq!(prefill.len(), 1);
             assert_eq!(prefill[0].host, "1.1.1.1");
             assert_eq!(decode.len(), 1);

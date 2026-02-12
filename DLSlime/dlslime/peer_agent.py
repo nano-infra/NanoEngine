@@ -233,6 +233,7 @@ class PeerAgent:
         link_type: str = "RoCE",
         qp_num: int = 1,
         name_prefix: str = "agent",
+        scope: Optional[str] = None,
     ):
         """
         Initialize a PeerAgent.
@@ -246,6 +247,7 @@ class PeerAgent:
             link_type: Link type ("RoCE", "InfiniBand", etc.)
             qp_num: Number of queue pairs per endpoint
             name_prefix: Prefix for auto-generated names (default: "agent")
+            scope: (Deprecated) Scope is now read from NANOCTRL_SCOPE environment variable
         """
         self.server_url = server_url
         self.redis_address = redis_address
@@ -256,8 +258,11 @@ class PeerAgent:
         self.link_type = link_type
         self.qp_num = qp_num
 
-        # Use empty prefix for now (no scoping)
-        self.redis_key_prefix = ""
+        # Build Redis key prefix from scope
+        # Get scope from environment variable only (ignore parameter if provided)
+        import os
+
+        self.redis_key_prefix = os.getenv("NANOCTRL_SCOPE", "")
 
         import socket
 
@@ -666,6 +671,7 @@ def start_peer_agent(
     link_type: str = "RoCE",
     qp_num: int = 1,
     name_prefix: str = "agent",
+    scope: Optional[str] = None,
 ) -> PeerAgent:
     """
     Start a peer agent (convenience function).
@@ -679,6 +685,7 @@ def start_peer_agent(
         link_type: Link type
         qp_num: Number of queue pairs
         name_prefix: Prefix for auto-generated names (default: "agent")
+        scope: (Deprecated) Scope is now read from NANOCTRL_SCOPE environment variable
 
     Returns:
         PeerAgent instance
@@ -695,4 +702,5 @@ def start_peer_agent(
         link_type=link_type,
         qp_num=qp_num,
         name_prefix=name_prefix,
+        scope=scope,
     )

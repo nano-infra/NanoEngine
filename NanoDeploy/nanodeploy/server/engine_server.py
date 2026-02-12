@@ -321,6 +321,9 @@ class EngineServer:
             f"NanoCtrl:        {self.config.nanoctrl_address or 'Not configured'}"
         )
         logger.info(f"Ray Address:     {self.config.ray_address}")
+        logger.info(
+            f"Redis Scope:      {self.config.scope or 'Not set (using NanoCtrl default)'}"
+        )
         logger.info("=" * 80)
 
         send_queue: asyncio.Queue = asyncio.Queue()

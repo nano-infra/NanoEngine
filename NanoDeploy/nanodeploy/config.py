@@ -51,6 +51,10 @@ class Config(BaseModel):
     master_address: str = "127.0.0.1:6006"
     ray_address: str = "127.0.0.1:6379"
     nanoctrl_address: Optional[str] = None  # Control plane server address (host:port)
+    scope: Optional[str] = Field(
+        default=None,
+        description="(Deprecated) Scope is now read from NANOCTRL_SCOPE environment variable only",
+    )
 
     # profiler
     enable_profiler: bool = False
@@ -65,6 +69,9 @@ class Config(BaseModel):
     def validate_config(self) -> "Config":
         # Remove isdir check to support HF Hub IDs
         # assert os.path.isdir(self.model)
+
+        # Get scope from environment variable only (ignore config value)
+        self.scope = os.getenv("NANOCTRL_SCOPE")
 
         self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
 

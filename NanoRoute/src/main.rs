@@ -77,7 +77,9 @@ async fn main() -> anyhow::Result<()> {
     debug!("Using NanoCtrl at: {}", nanoctrl_address);
 
     // Get Redis URL from NanoCtrl (once per process; if you see 3x in NanoCtrl log, check for 3 router instances)
-    let engine_mgr = engine_manager::EngineManager::new();
+    // Get scope from environment variable only
+    let redis_scope = std::env::var("NANOCTRL_SCOPE").ok();
+    let engine_mgr = engine_manager::EngineManager::with_scope(redis_scope);
     let redis_url = match engine_mgr
         .get_redis_url_from_nanoctrl(&nanoctrl_address)
         .await
