@@ -1,6 +1,7 @@
 """Cleanup utilities for NanoOps."""
 
 import logging
+import os
 import subprocess
 from typing import List, Optional
 
@@ -75,17 +76,20 @@ def cleanup_redis_keys(
 
 
 def cleanup_all(
-    redis_url: str = "redis://10.102.97.179:6379",
+    redis_url: Optional[str] = None,
     sessions: Optional[List[str]] = None,
     kill_processes_flag: bool = True,
 ) -> None:
     """Clean up all NanoOps resources.
 
     Args:
-        redis_url: Redis connection URL
+        redis_url: Redis connection URL. Falls back to ``NANOCTRL_REDIS_URL``
+                   env var, then ``redis://localhost:6379``.
         sessions: List of session IDs to clean (default: common test sessions)
         kill_processes_flag: Whether to kill stale processes
     """
+    if redis_url is None:
+        redis_url = os.getenv("NANOCTRL_REDIS_URL", "redis://localhost:6379")
     logger.info("Starting NanoOps cleanup...")
 
     # Default sessions to clean

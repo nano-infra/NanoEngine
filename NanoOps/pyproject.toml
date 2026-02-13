@@ -17,6 +17,7 @@ dependencies = [
     "rich>=13.0.0",            # Terminal formatting
     "pyyaml>=6.0",             # YAML generation
     "tqdm>=4.66.0",            # Progress bars
+    "toml>=0.10.0",            # TOML config parsing
 ]
 
 [project.optional-dependencies]

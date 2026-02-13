@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shutil
 import time
 from typing import Optional
 
@@ -60,15 +61,16 @@ class RayJobManager:
         session_id: str,
         component_type: str,
         num_gpus: int,
-        gpus_per_bundle: int = 8,
     ) -> str:
         """Create STRICT_PACK placement group for gang scheduling.
+
+        Each bundle requests 1 GPU so that ``num_gpus`` bundles are created
+        and packed onto the same node.
 
         Args:
             session_id: Session identifier
             component_type: Component type (prefill, decode)
             num_gpus: Total number of GPUs needed
-            gpus_per_bundle: GPUs per bundle (default 8)
 
         Returns:
             Placement group ID (hex string)
@@ -90,11 +92,9 @@ class RayJobManager:
                     if saved_ray_addr is not None:
                         os.environ["RAY_ADDRESS"] = saved_ray_addr
 
-            num_bundles = (num_gpus + gpus_per_bundle - 1) // gpus_per_bundle
-
             logger.info(
                 f"Creating placement group for {component_type}: "
-                f"{num_gpus} GPUs across {num_bundles} bundles"
+                f"{num_gpus} GPUs ({num_gpus} bundles, STRICT_PACK)"
             )
 
             pg = placement_group(
@@ -143,17 +143,7 @@ class RayJobManager:
         try:
             # Build entrypoint command
             if component_type == "route":
-                # Use absolute path to NanoRoute binary
-                import os
-
-                nanoroute_bin = "/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoRoute/target/release/nanoroute"
-
-                if not os.path.exists(nanoroute_bin):
-                    raise ValueError(
-                        f"NanoRoute binary not found at {nanoroute_bin}. "
-                        "Build it with: cd NanoRoute && cargo build --release"
-                    )
-
+                nanoroute_bin = self._find_nanoroute_binary()
                 entrypoint = f"{nanoroute_bin} --config {config_path}"
             elif component_type in ["prefill", "decode"]:
                 entrypoint = f"python -m nanodeploy.server.engine_server --config {config_path} --log_level INFO"
@@ -263,3 +253,36 @@ class RayJobManager:
             return ray.is_initialized()
         except Exception:
             return False
+
+    @staticmethod
+    def _find_nanoroute_binary() -> str:
+        """Locate the NanoRoute binary.
+
+        Lookup order:
+        1. System PATH (``which nanoroute``)
+        2. ``NANOCTRL_NANOROUTE_PATH`` environment variable
+
+        Returns:
+            Absolute path to the nanoroute binary.
+
+        Raises:
+            RayJobError: If the binary cannot be found.
+        """
+        # 1. System PATH
+        path_bin = shutil.which("nanoroute")
+        if path_bin:
+            logger.debug(f"Found nanoroute in PATH: {path_bin}")
+            return path_bin
+
+        # 2. Environment variable
+        env_path = os.getenv("NANOCTRL_NANOROUTE_PATH")
+        if env_path and os.path.isfile(env_path) and os.access(env_path, os.X_OK):
+            logger.debug(f"Found nanoroute via NANOCTRL_NANOROUTE_PATH: {env_path}")
+            return env_path
+
+        raise RayJobError(
+            "NanoRoute binary not found. Either:\n"
+            "  1. Install nanoroute so it is available in PATH, or\n"
+            "  2. Set NANOCTRL_NANOROUTE_PATH to the binary path\n"
+            "  Build: cd NanoRoute && cargo build --release"
+        )
