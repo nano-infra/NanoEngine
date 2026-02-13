@@ -162,7 +162,7 @@ The `FLAG` can be
 | `BUILD_INTER_OPS`     | Use INTER Collective OPS (NVSHMEM) | NVIDIA   |     OFF |
 
 > \[!Note\]
-> Please enable `USE_MECA` when using DLSlime as a torch backend in Metax platform.
+> Please enable `USE_MACA` when using DLSlime as a torch backend in Metax platform.
 
 ## Benchmark
 

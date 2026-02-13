@@ -168,7 +168,7 @@ mkdir -p DLSlime/build && cmake -DFLAG=<ON|OFF> ..
 | `BUILD_INTER_OPS`     | 使用 INTER Collective OPS (NVSHMEM) | NVIDIA |    OFF |
 
 > \[!Note\]
-> 在 Metax 平台上使用 DLSlime 作为 Torch 后端时，请启用 `USE_MECA`。
+> 在 Metax 平台上使用 DLSlime 作为 Torch 后端时，请启用 `USE_MACA`。
 
 ## 基准测试 (Benchmark)
 

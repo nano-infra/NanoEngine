@@ -1,5 +1,7 @@
 #pragma once
+
 #include <nvtx3/nvToolsExt.h>
+#include <pthread.h>
 
 #include <string>
 

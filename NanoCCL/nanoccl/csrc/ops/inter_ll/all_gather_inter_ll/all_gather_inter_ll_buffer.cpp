@@ -79,8 +79,9 @@ json AllGatherInterLLBuffer::bufferInfo()
 
 int AllGatherInterLLBuffer::connectFullMesh(std::vector<json> all_buffer_info)
 {
-    auto unique_ids   = all_buffer_info[root_rank]["nvshmem_info"]["unique_id"];
-    int  nvshmem_rank = nvshmem_api::init(unique_ids, rank_, world_size_);
+    auto                 unique_ids_json = all_buffer_info[root_rank]["nvshmem_info"]["unique_id"];
+    std::vector<uint8_t> unique_ids      = unique_ids_json.get<std::vector<uint8_t>>();
+    int                  nvshmem_rank    = nvshmem_api::init(unique_ids, rank_, world_size_);
     nvshmem_api::barrier();
     allocSymBuffer();
     nvshmem_api::barrier();
