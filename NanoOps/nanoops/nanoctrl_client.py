@@ -76,38 +76,8 @@ class NanoCtrlClient:
         """
         # Check if already running
         if self.is_healthy():
-            # Verify Redis URL matches — if NanoCtrl was started with a
-            # different (e.g. localhost) Redis URL, clients on remote nodes
-            # will get an unreachable address.  Kill and restart in that case.
-            try:
-                resp = self.client.post(f"{self.address}/get_redis_address", json={})
-                if resp.status_code == 200:
-                    reported_url = resp.json().get("redis_address", "")
-
-                    # Normalise for comparison (strip redis:// prefix)
-                    def _strip(u: str) -> str:
-                        return (
-                            u.replace("redis://", "")
-                            .replace("rediss://", "")
-                            .strip("/")
-                        )
-
-                    if _strip(reported_url) != _strip(self.redis_url):
-                        logger.warning(
-                            f"NanoCtrl Redis URL mismatch: running={reported_url}, "
-                            f"expected={self.redis_url}. Restarting NanoCtrl..."
-                        )
-                        self._kill_nanoctrl()
-                        # Fall through to auto-start below
-                    else:
-                        logger.info(f"NanoCtrl already running at {self.address}")
-                        return {"status": "already_running", "address": self.address}
-                else:
-                    logger.info(f"NanoCtrl already running at {self.address}")
-                    return {"status": "already_running", "address": self.address}
-            except Exception:
-                logger.info(f"NanoCtrl already running at {self.address}")
-                return {"status": "already_running", "address": self.address}
+            logger.info(f"NanoCtrl already running at {self.address}")
+            return {"status": "already_running", "address": self.address}
 
         # Check if port is occupied by something else
         if check_port_listening(self.host, self.port):
@@ -125,28 +95,6 @@ class NanoCtrlClient:
         # Start NanoCtrl
         logger.info(f"Starting NanoCtrl on {self.host}:{self.port}")
         return self._start_nanoctrl(config_path, binary_path)
-
-    def _kill_nanoctrl(self):
-        """Kill any NanoCtrl process listening on our port."""
-        try:
-            # Find PID listening on the port
-            result = subprocess.run(
-                ["lsof", "-ti", f"tcp:{self.port}"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                for pid in result.stdout.strip().split("\n"):
-                    pid = pid.strip()
-                    if pid:
-                        logger.info(
-                            f"Killing NanoCtrl process PID {pid} on port {self.port}"
-                        )
-                        subprocess.run(["kill", "-9", pid], timeout=5)
-                time.sleep(1)  # Wait for port to be released
-        except Exception as e:
-            logger.warning(f"Failed to kill NanoCtrl: {e}")
 
     def _start_nanoctrl(
         self,

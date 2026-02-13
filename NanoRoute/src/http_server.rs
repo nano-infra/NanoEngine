@@ -124,7 +124,7 @@ async fn chat_completions(
     };
 
     // Acquire lock briefly to send request
-    let (rx_result, num_prompt_tokens) = {
+    let rx_result = {
         let mut adapter_guard = adapter.lock().await;
 
         // Use chat template encoding
@@ -140,12 +140,10 @@ async fn chat_completions(
             }
         };
 
-        let num_prompt_tokens = token_ids.len();
         let max_tokens = req.effective_max_tokens(16) as i32;
-        let rx = adapter_guard
+        adapter_guard
             .send_add_request(seq_id, &token_ids, max_tokens)
-            .await;
-        (rx, num_prompt_tokens)
+            .await
     };
 
     let mut rx = match rx_result {
@@ -166,8 +164,7 @@ async fn chat_completions(
 
         // Use async-stream macros for clean generator syntax
         let stream = async_stream::stream! {
-            let mut all_tokens = Vec::new();
-            let mut generated_tokens = Vec::new();
+            let mut generated_tokens: Vec<u32> = Vec::new();
             let mut last_text_len = 0;
             let stream_start = std::time::Instant::now();
 
@@ -176,34 +173,32 @@ async fn chat_completions(
             while let Some(event) = rx.recv().await {
                 match event {
                     StreamEvent::Token(id) => {
-                        all_tokens.push(id);
-                        // Skip prompt tokens, only decode generated tokens
-                        if all_tokens.len() > num_prompt_tokens {
-                            generated_tokens.push(id);
-                            // Incremental decoding: decode all generated tokens and take diff
-                            if let Ok(full_text) = tokenizer.decode(generated_tokens.clone()).await {
-                                 let new_len = full_text.len();
-                                 if new_len > last_text_len {
-                                     // Use safe slicing to handle UTF-8 character boundaries
-                                     if let Some(delta_str) = full_text.get(last_text_len..) {
-                                         let delta = delta_str.to_string();
-                                         last_text_len = new_len;
+                        // Engine only sends generated tokens (token_ids[-1] per step),
+                        // never prompt echoes.  Every token here is real output.
+                        generated_tokens.push(id);
+                        // Incremental decoding: decode all generated tokens and take diff
+                        if let Ok(full_text) = tokenizer.decode(generated_tokens.clone()).await {
+                             let new_len = full_text.len();
+                             if new_len > last_text_len {
+                                 // Use safe slicing to handle UTF-8 character boundaries
+                                 if let Some(delta_str) = full_text.get(last_text_len..) {
+                                     let delta = delta_str.to_string();
+                                     last_text_len = new_len;
 
-                                         let chunk = serde_json::json!({
-                                             "id": request_id,
-                                             "object": "chat.completion.chunk",
-                                             "created": 1234567890,
-                                             "model": model_name,
-                                             "choices": [{
-                                                 "index": 0,
-                                                 "delta": { "content": delta },
-                                                 "finish_reason": null
-                                             }]
-                                         });
-                                         yield Ok::<_, std::io::Error>(Event::default().data(chunk.to_string()));
-                                     }
+                                     let chunk = serde_json::json!({
+                                         "id": request_id,
+                                         "object": "chat.completion.chunk",
+                                         "created": 1234567890,
+                                         "model": model_name,
+                                         "choices": [{
+                                             "index": 0,
+                                             "delta": { "content": delta },
+                                             "finish_reason": null
+                                         }]
+                                     });
+                                     yield Ok::<_, std::io::Error>(Event::default().data(chunk.to_string()));
                                  }
-                            }
+                             }
                         }
                     },
                     StreamEvent::Finished => {
@@ -229,6 +224,12 @@ async fn chat_completions(
                          break;
                     }
                     StreamEvent::Migrate(payload) => {
+                        // Reset decode state for new engine — any tokens already
+                        // streamed came from the previous engine; the new decode
+                        // engine will continue generating fresh tokens.
+                        generated_tokens.clear();
+                        last_text_len = 0;
+
                         tracing::info!("[DIAG] Migration triggered for seq_id={}, elapsed={:.1}s. Routing to Decode Engine...", seq_id, stream_start.elapsed().as_secs_f64());
                         let decode_adapter_arc = {
                             let mgr = state.engine_manager.lock().await;
@@ -262,16 +263,16 @@ async fn chat_completions(
             }
 
             // If we reach here via rx channel closing (None), the client likely disconnected
-            tracing::warn!("[DIAG] SSE stream ENDED for seq_id={}, elapsed={:.1}s, all_tokens={}, generated_tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), all_tokens.len(), generated_tokens.len());
+            tracing::warn!("[DIAG] SSE stream ENDED for seq_id={}, elapsed={:.1}s, generated_tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
         };
 
         Sse::new(stream).into_response()
     } else {
-        // Non-streaming: accumulate
-        let mut all_tokens = Vec::new();
+        // Non-streaming: accumulate all generated tokens
+        let mut generated_tokens: Vec<u32> = Vec::new();
         while let Some(event) = rx.recv().await {
             match event {
-                StreamEvent::Token(id) => all_tokens.push(id),
+                StreamEvent::Token(id) => generated_tokens.push(id),
                 StreamEvent::Finished => break,
                 StreamEvent::Error(e) => {
                     return (
@@ -282,6 +283,7 @@ async fn chat_completions(
                 }
                 StreamEvent::Migrate(payload) => {
                     tracing::info!("Migration (Non-Streaming)...");
+                    generated_tokens.clear();
                     let decode_adapter_arc = {
                         let mgr = state.engine_manager.lock().await;
                         mgr.get_next_decode()
@@ -305,8 +307,7 @@ async fn chat_completions(
             }
         }
 
-        // Skip prompt tokens, only decode generated tokens
-        let generated_tokens: Vec<u32> = all_tokens.into_iter().skip(num_prompt_tokens).collect();
+        // Engine only sends generated tokens, no prompt echo to skip
         let text = tokenizer.decode(generated_tokens).await.unwrap_or_default();
         Json(ChatCompletionResponse {
             id: request_id,
