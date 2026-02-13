@@ -1,4 +1,5 @@
 import threading
+import time
 from typing import Any, Dict, List, Tuple
 
 from urllib.parse import urlparse
@@ -165,7 +166,7 @@ class RayExecutor:
                 self.workers.append(worker)
 
         self.endpoint = RPCServerEndpoint(
-            2*32_000_000, 
+            4*32_000_000, 
             self.config.attn_world_size,
             self.config.attention_sp,
             self.config.attention_tp,
@@ -232,24 +233,48 @@ class RayExecutor:
         is_prefill: bool,
         timeout: float | None = None,
     ) -> list[list[list[int]]]:
-
+        # start = time.perf_counter()
+        send_timestamp = time.time()
         if self.config.use_dlslime_rpc:
             # When using dlslime RPC, sequences are delivered via the endpoint.
             ray_futures = [
-                getattr(worker, "run").remote([], is_prefill, True)
+                getattr(worker, "run").remote([], is_prefill, True, send_timestamp)
                 for _, worker in zip(dp_seqs, self.workers)
             ]
             self.endpoint.send_seqs(dp_seqs, is_prefill)
+            # trans_type = "DLSlime"
         else:
             # When not using dlslime RPC, pass sequences directly to workers.
             ray_futures = [
-                getattr(worker, "run").remote(seqs, is_prefill, False)
+                getattr(worker, "run").remote(seqs, is_prefill, False, send_timestamp)
                 for seqs, worker in zip(dp_seqs, self.workers)
             ]
-        return ray.get(
+            # trans_type = "Ray"
+
+        # duration = (time.perf_counter() - start) * 1000
+        # logger.info(f"[METRIC] Use DLSlime: {self.config.use_dlslime_rpc}, Duration: {duration:.4f} ms")
+
+        results = ray.get(
             ray_futures,
             timeout=timeout,
         )
+        recv_timestamp = time.time()
+
+        token_ids_list = []
+        worker_end_times = []
+        for res in results:
+            if isinstance(res, tuple) and len(res) == 2:
+                token_ids_list.append(res[0])
+                worker_end_times.append(res[1])
+            else:
+                token_ids_list.append(res)
+        
+        if worker_end_times:
+            # Output Transfer Latency = Driver Recv Time - Max Worker Finish Time
+            output_transfer_latency = (recv_timestamp - max(worker_end_times)) * 1000
+            logger.info(f"[METRIC] Output Transfer Latency: {output_transfer_latency:.4f} ms")
+
+        return token_ids_list
 
     def init_rpc_endpoint(self):
         info = self.endpoint.init_server_endpoint()

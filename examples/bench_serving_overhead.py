@@ -209,38 +209,32 @@ def run_benchmark(engine, request_generator, arrival_times, num_requests):
     """Runs the main benchmark loop."""
     seq_map = {}
     requests_sent = 0
-    start_time = time.perf_counter()
     completed_latencies = []
 
-    # Prefetch the first request to avoid generator delay at t=0
-    # or handle naturally in the loop. 
-    # With numpy generation, delay is negligible.
+    # Add all requests to the queue at once
+    print(f"Adding {num_requests} requests to engine...")
+    for _ in range(num_requests):
+        try:
+            prompt, sp = next(request_generator)
+        except StopIteration:
+            break
 
-    with tqdm(total=num_requests, desc="Processing Requests") as pbar:
-        while requests_sent < num_requests or not engine.is_finished():
-            current_time = time.perf_counter()
-            elapsed = current_time - start_time
+        seq = Sequence(token_ids=prompt, sampling_params=sp)
+        engine.add_request(seq)
+        seq_map[seq.seq_id] = seq
+        requests_sent += 1
+    
+    print(f"Added {requests_sent} requests.")
+    
+    start_time = time.perf_counter()
 
-            # Send requests
-            while (requests_sent < num_requests and 
-                   elapsed >= arrival_times[requests_sent]):
-                
-                try:
-                    prompt, sp = next(request_generator)
-                except StopIteration:
-                    break
-
-                seq = Sequence(token_ids=prompt, sampling_params=sp)
-                engine.add_request(seq)
-                seq_map[seq.seq_id] = seq
-                requests_sent += 1
-
+    with tqdm(total=requests_sent, desc="Processing Requests") as pbar:
+        while not engine.is_finished():
             # Engine step
             if not engine.is_finished():
                 outputs, _, _, _, _ = engine.step()
                 
                 # Update progress bar with latency info
-                updated = False
                 for seq_id, _ in outputs:
                     if seq_id in seq_map:
                         seq = seq_map[seq_id]
@@ -248,7 +242,6 @@ def run_benchmark(engine, request_generator, arrival_times, num_requests):
                             completed_latencies.append(seq.metric.e2e_latency / 1000)
                             avg_lat = np.mean(completed_latencies)
                             pbar.set_postfix({"Avg Latency": f"{avg_lat:.2f}s"})
-                            updated = True
                         pbar.update(1)
             else:
                 time.sleep(0.001)

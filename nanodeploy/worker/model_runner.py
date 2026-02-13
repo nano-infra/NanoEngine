@@ -192,7 +192,7 @@ class ModelRunner:
         # self.warmup_model()
         self.preallocate_kvcache()
 
-        self.endpoint = RPCClientEndpoint(2*32_000_000, get_dist_context().rank)
+        self.endpoint = RPCClientEndpoint(4*32_000_000, get_dist_context().rank)
 
     def init_rpc_endpoint(self, server_info):
         client_info = self.endpoint.init_client_endpoint()
@@ -648,11 +648,15 @@ class ModelRunner:
         get_cache_context().migrate(seqs=seqs)
 
     def run(
-        self, dp_seqs: list[Sequence], is_prefill: bool, enable_rpc: bool = False
+        self, dp_seqs: list[Sequence], is_prefill: bool, enable_rpc: bool = False, send_timestamp: float = 0.0
     ) -> list[list[int]]:
 
         if enable_rpc:
             dp_seqs = self.endpoint.recv_seqs()
+
+        if send_timestamp > 0:
+            latency = (time.time() - send_timestamp) * 1000
+            logger.info(f"[METRIC] Rank {self.rank} Input Transfer Latency: {latency:.4f} ms")
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
 
@@ -843,8 +847,9 @@ class ModelRunner:
 
         loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
         reset_context()
+        worker_end_time = time.time()
 
-        return loop_count_token_ids
+        return loop_count_token_ids, worker_end_time
 
     @torch.inference_mode()
     def capture_cudagraph(self):
