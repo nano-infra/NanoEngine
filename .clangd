@@ -1,9 +1,8 @@
 CompileFlags:
-  CompilationDatabase: NanoDeploy/build
+  CompilationDatabase: .
 
 Diagnostics:
   UnusedIncludes: None
-  MissingIncludes: Strict
 
 Index:
   Background: Build
