@@ -34,13 +34,6 @@ pub struct RedisConfig {
     /// Redis URL (e.g. "redis://127.0.0.1:6379")
     #[serde(default = "default_redis_url")]
     pub url: String,
-    /// Optional key prefix for data isolation
-    #[serde(default)]
-    pub key_prefix: Option<String>,
-    /// Scope for partitioning (deprecated: now read from NANOCTRL_SCOPE env var only)
-    #[serde(default)]
-    #[allow(dead_code)] // Deprecated, kept for backward compatibility
-    pub scope: Option<String>,
 }
 
 fn default_redis_url() -> String {
@@ -51,8 +44,6 @@ impl Default for RedisConfig {
     fn default() -> Self {
         Self {
             url: default_redis_url(),
-            key_prefix: None,
-            scope: None,
         }
     }
 }
@@ -74,8 +65,6 @@ impl Default for AppConfig {
             },
             redis: RedisConfig {
                 url: default_redis_url(),
-                key_prefix: None,
-                scope: None,
             },
         }
     }

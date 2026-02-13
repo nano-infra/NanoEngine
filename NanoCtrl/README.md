@@ -1,6 +1,13 @@
 # NanoCtrl Control Plane
 
-Control plane server for DLSlime RDMA connection management.
+Control plane server for NanoInfra distributed LLM inference. NanoCtrl is stateless and supports multiple scopes sharing the same instance for service discovery and engine management.
+
+## Features
+
+- **Stateless Design**: Supports multiple scopes (sessions) sharing the same instance
+- **Engine Management**: Register, heartbeat, and discover prefill/decode engines
+- **RDMA Connection Management**: Manage peer agents and RDMA connections for KV cache migration
+- **Redis-backed**: All state stored in Redis for scalability
 
 ## Prerequisites
 
@@ -14,44 +21,148 @@ cd NanoCtrl
 cargo build --release
 ```
 
+## Configuration
+
+NanoCtrl supports configuration via `config.toml` file:
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 3000
+
+[redis]
+url = "redis://127.0.0.1:6379"
+```
+
+Configuration can be overridden by environment variables:
+
+- `NANOCTRL_REDIS_URL` - Redis connection URL (overrides config.toml)
+- `NANOCTRL_RUST_LOG` - Log level (default: `info`)
+
 ## Running
 
 ```bash
-# Default: Redis at 127.0.0.1:6379
+# Default: uses config.toml, Redis at 127.0.0.1:6379
 cargo run --release
 
-# Or specify Redis URL via env (required for distributed deployment)
-export REDIS_URL=redis://your-redis-host:6379
+# Or specify custom config file
+cargo run --release -- --config /path/to/config.toml
+
+# Or override via environment variables
+export NANOCTRL_REDIS_URL=redis://your-redis-host:6379
 cargo run --release
 ```
 
 The server will listen on `http://0.0.0.0:3000` by default.
 
-**Distributed deployment**: When ModelRunner/PeerAgent runs on remote nodes (e.g. 10.102.97.183), they need to connect to Redis. If Redis runs on the master node, set:
+**Distributed deployment**: When engines run on remote nodes, they need to connect to Redis. If Redis runs on the master node, set:
 
 ```bash
-export REDIS_URL=redis://127.0.0.1:6379   # NanoCtrl connects to local Redis
+export NANOCTRL_REDIS_URL=redis://127.0.0.1:6379   # NanoCtrl connects to local Redis
 export REDIS_PUBLIC_ADDRESS=10.102.97.1   # IP that remote workers use to reach Redis (master node IP)
 ```
 
+## Scope Support
+
+NanoCtrl is stateless and supports multiple scopes (sessions) sharing the same instance. Scope is determined by clients via `NANOCTRL_SCOPE` environment variable or passed in API requests.
+
+- **Scope isolation**: Each scope has its own Redis key namespace (`{scope}:*`)
+- **Multi-tenancy**: Multiple sessions can coexist without interference
+- **Client-side scope**: Clients (NanoRoute, EngineServer, peer_agent) set scope via `NANOCTRL_SCOPE` env var
+
 ## API Endpoints
 
-- `POST /start_peer_agent` - Register a peer agent
+### Engine Management
+
+- `POST /register_engine` - Register a new engine (prefill/decode/hybrid)
+- `POST /unregister_engine` - Unregister an engine
+- `POST /heartbeat_engine` - Refresh engine TTL (heartbeat)
+- `POST /get_engine_info` - Get engine information by ID
+- `POST /list_engines` - List all registered engines (optionally filtered by scope)
+
+### RDMA Connection Management
+
+- `POST /start_peer_agent` - Register a peer agent for RDMA connections
 - `POST /query` - Query all registered peer agents
-- `POST /init` - Initialize RDMA connection between two agents
-- `POST /connect` - Establish RDMA connection
+- `POST /v1/desired_topology/:agent_id` - Set desired topology for declarative connection management
 - `POST /register_mr` - Register a memory region
 - `POST /get_mr_info` - Get remote memory region info
-- `POST /get_endpoint_info` - Get remote endpoint info
-- `POST /ack_init` - Acknowledge init completion
-- `POST /ack_connect` - Acknowledge connect completion
-- `POST /update_endpoint_info` - Update endpoint info
+- `POST /cleanup` - Cleanup agent resources
+
+### Utility
+
+- `POST /get_redis_address` - Get Redis address (resolves localhost to public IP for remote clients)
+- `GET /` - Health check endpoint
+
+## API Details
+
+### Register Engine
+
+```bash
+POST /register_engine
+Content-Type: application/json
+
+{
+  "engine_id": "prefill-0",
+  "role": "prefill",  # "prefill", "decode", or "hybrid"
+  "world_size": 8,
+  "num_blocks": 15000,
+  "host": "127.0.0.1",
+  "port": 6001,
+  "peer_addrs": ["10.102.97.1:5000"],
+  "p2p_host": "127.0.0.1",  # optional
+  "p2p_port": 5000,         # optional
+  "scope": "my-session"      # optional, for multi-tenant isolation
+}
+```
+
+### List Engines
+
+```bash
+POST /list_engines
+Content-Type: application/json
+
+{
+  "scope": "my-session"  # optional, filter by scope
+}
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "engines": [
+    {
+      "id": "prefill-0",
+      "role": "prefill",
+      "world_size": 8,
+      "num_blocks": 15000,
+      "host": "127.0.0.1",
+      "port": 6001,
+      "zmq_address": "tcp://127.0.0.1:6001"
+    }
+  ]
+}
+```
+
+### Heartbeat Engine
+
+```bash
+POST /heartbeat_engine
+Content-Type: application/json
+
+{
+  "engine_id": "prefill-0",
+  "scope": "my-session"  # optional
+}
+```
 
 ## Environment Variables
 
-- `RUST_LOG` - Log level (default: `info`)
-- `REDIS_URL` - Redis connection URL (default: `redis://127.0.0.1:6379`)
-- `REDIS_PUBLIC_ADDRESS` - For distributed setup: IP:port that remote workers use to reach Redis (e.g. master node IP)
+- `NANOCTRL_RUST_LOG` - Log level (default: `info`)
+- `NANOCTRL_REDIS_URL` - Redis connection URL (default: from config.toml)
+- `REDIS_PUBLIC_ADDRESS` - For distributed setup: IP:port that remote workers use to reach Redis
 
 ## Python Client
 
@@ -68,3 +179,19 @@ agent = start_peer_agent(
     address="127.0.0.1:6379",
 )
 ```
+
+## Redis Key Structure
+
+NanoCtrl uses the following Redis key patterns (with optional scope prefix):
+
+- `{scope}:agent:*` - Peer agent registration info
+- `{scope}:stream:*` - Agent stream mailboxes (Redis Streams)
+- `{scope}:exchange:*` - QP info exchange (sender:receiver)
+- `{scope}:spec:topology:*` - Desired topology specifications
+- `{scope}:inbox:*` - Legacy inbox for cleanup events
+- `{scope}:mr:*` - Memory Region (MR) information
+- `{scope}:engine:*` - Engine registration info
+- `{scope}:nano_meta:engine_revision` - Engine revision counter
+- `{scope}:nano_events:engine_update` - Engine update pub/sub channel
+
+If no scope is provided, keys are used without prefix (e.g., `engine:*` instead of `{scope}:engine:*`).
