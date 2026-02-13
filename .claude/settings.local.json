@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ninja:*)",
+      "Bash(cmake:*)",
+      "Bash(cargo build:*)",
+      "Bash(python -m pip install:*)"
+    ]
+  }
+}

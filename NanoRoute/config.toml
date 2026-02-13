@@ -1,0 +1,15 @@
+[server]
+host = "0.0.0.0"
+port = 3001               # Use a free port
+model_name = "qwen3-235B"
+
+[tokenizer]
+path = "/models/Qwen3-235B-A22B-Instruct-2507/tokenizer.json"
+
+[engine]
+mode = "Disaggregated"
+nanoctrl_address = "http://10.102.97.179:3000"
+
+[scheduler]
+queue_size = 1000
+timeout_ms = 30000

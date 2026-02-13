@@ -73,6 +73,7 @@ docs/_build/
 
 # PyBuilder
 .pybuilder/
+.target/
 target/
 
 # Jupyter Notebook
@@ -193,3 +194,24 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+*.pyi
+
+# NanoDeploy generated files
+NanoDeploy/nanodeploy/fbs/
+NanoDeploy/engine_rpc_pb2.py
+NanoDeploy/engine_rpc_pb2_grpc.py
+
+# rust
+.cargo/
+.target/
+target/
+
+# Local protoc (scripts/setup-protoc.sh downloads here)
+scripts/.bin/
+
+# etcd
+**/default.etcd/*
+
+# vibe-codinig
+.claude

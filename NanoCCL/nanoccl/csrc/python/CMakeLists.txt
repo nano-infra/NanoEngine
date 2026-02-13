@@ -1,0 +1,41 @@
+# Python Wrapper
+set(PYBIND11_FINDPYTHON ON)
+run_python("pybind11_DIR" "import pybind11; print(pybind11.__file__.rsplit(\"/\", 1)[0])" "Cannot find pybind11 DIR")
+find_package(pybind11 REQUIRED PATHS ${pybind11_DIR})
+
+set(PYTHON_SUPPORTED_VERSIONS "3.8" "3.9" "3.10" "3.11" "3.12")
+
+pybind11_add_module(
+    _nanoccl_c
+    bind.cpp
+)
+
+set(_nanoccl_c_link_libraries "")
+
+if (BUILD_INTRA_OPS OR BUILD_INTER_OPS)
+    if (BUILD_INTRA_OPS)
+        target_compile_definitions(_nanoccl_c PRIVATE BUILD_INTRA_OPS)
+    endif()
+    if (BUILD_INTER_OPS)
+        target_compile_definitions(_nanoccl_c PRIVATE BUILD_INTER_OPS)
+    endif()
+    target_compile_definitions(_nanoccl_c PRIVATE TORCH_API_INCLUDE_EXTENSION_H)
+    target_compile_definitions(_nanoccl_c PRIVATE TORCH_EXTENSION_NAME=_nanoccl_c)
+    list(APPEND _nanoccl_c_link_libraries ${_nanoccl_c_link_libraries} _nanoccl_ops ${TORCH_LIBRARIES})
+    set(BIND_INSTALL_RPATH "\${ORIGIN}:${Torch_DIR}/lib")
+endif()
+
+target_link_libraries(_nanoccl_c PRIVATE ${_nanoccl_c_link_libraries})
+
+set_target_properties(
+    _nanoccl_c
+    PROPERTIES
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH ${BIND_INSTALL_RPATH}
+)
+
+install(
+    TARGETS
+    _nanoccl_c
+    LIBRARY DESTINATION ${NANOCCL_INSTALL_PATH}
+)
