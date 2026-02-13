@@ -1407,7 +1407,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nanodeploy-server"
+name = "nanoroute"
 version = "0.1.0"
 dependencies = [
  "anyhow",

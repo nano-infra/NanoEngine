@@ -53,6 +53,4 @@ Connection settings are read from environment variables when not passed via CLI:
 | `nanoctrl job stop/rm/logs/status <job_id>`         | Manage Ray jobs for the session                    |
 | `nanoctrl cleanup`                                  | Clean stale processes and Redis keys               |
 
-## Design
-
-For architecture, session model, Redis key layout, orchestrator, and backend clients, see **[DESIGN.md](DESIGN.md)**.
+See [docs/DESIGN.md](docs/DESIGN.md) for architecture and internals.
