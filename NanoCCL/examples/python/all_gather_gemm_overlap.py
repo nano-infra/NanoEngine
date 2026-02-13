@@ -13,7 +13,7 @@ local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
 master_addr = os.environ["MASTER_ADDR"]
 master_port = os.environ["MASTER_PORT"]
 
-os.environ["NVSHMEM_SYMMETRIC_SIZE "] = "1g"
+os.environ["NVSHMEM_SYMMETRIC_SIZE"] = "1g"
 
 
 bs = 16
