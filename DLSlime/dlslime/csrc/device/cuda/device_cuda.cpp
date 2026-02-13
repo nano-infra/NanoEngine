@@ -17,10 +17,5 @@ std::shared_ptr<DeviceSignal> createSignal(bool bypass)
 #endif
 }
 
-void* get_current_stream_handle()
-{
-    return nullptr;
-}
-
 }  // namespace device
 }  // namespace dlslime

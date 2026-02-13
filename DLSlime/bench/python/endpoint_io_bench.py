@@ -53,9 +53,9 @@ def run_benchmark(device_type="cuda", num_qp=1, iterations=200):
         # ---------------------------------------------------------
         if device_type == "cuda":
             send_tensor = torch.randint(
-                0, 255, (size,), dtype=torch.uint8, device="cuda:0"
+                0, 255, (size,), dtype=torch.uint8, device="cpu"
             )
-            recv_tensor = torch.zeros((size,), dtype=torch.uint8, device="cuda:1")
+            recv_tensor = torch.zeros((size,), dtype=torch.uint8, device="cpu")
             torch.cuda.synchronize()
         else:
             send_tensor = torch.randint(

@@ -30,16 +30,7 @@ AscendDirectEndpoint::AscendDirectEndpoint(std::shared_ptr<AscendLocalMemoryPool
     SLIME_LOG_DEBUG("AscendDirectEndpoint created with shared pools");
 }
 
-AscendDirectEndpoint::~AscendDirectEndpoint()
-{
-    // WORKAROUND: Intentionally leak adxl_ to avoid heap corruption in AdxlEngine's destructor
-    // The crash happens during program shutdown in AdxlEngine's internal cleanup
-    // Since this only affects shutdown (not runtime), leaking is acceptable
-    // Test functionality is correct - data transfers work properly
-    if (adxl_) {
-        adxl_.release();  // Release ownership without calling destructor
-    }
-}
+AscendDirectEndpoint::~AscendDirectEndpoint() {}
 
 int AscendDirectEndpoint::init(const std::string& host, int port)
 {
@@ -188,8 +179,8 @@ void AscendDirectEndpoint::unregister_memory_region(uint64_t mr_key)
 }
 
 void AscendDirectEndpoint::register_remote_memory_region(uint64_t           remote_mr_key,
-                                                          const std::string& name,
-                                                          const json&        mr_info)
+                                                         const std::string& name,
+                                                         const json&        mr_info)
 {
     // For Ascend, we don't use the 'name' parameter (kept for API compatibility)
     // Register remote memory region in the REMOTE pool (metadata only)

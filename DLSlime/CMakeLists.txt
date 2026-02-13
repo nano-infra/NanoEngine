@@ -24,7 +24,7 @@ slime_option(BUILD_TORCH_PLUGIN        "Build torch plugin"               OFF)
 slime_option(BUILD_BENCH               "Build transfer engine benchmark"  OFF)
 slime_option(BUILD_TEST                "Build test"                       OFF)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)

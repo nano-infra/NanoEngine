@@ -13,10 +13,5 @@ std::shared_ptr<DeviceSignal> createSignal(bool bypass)
     return std::make_shared<HostOnlySignal>();
 }
 
-void* get_current_stream_handle()
-{
-    return nullptr;
-}
-
 }  // namespace device
 }  // namespace dlslime
