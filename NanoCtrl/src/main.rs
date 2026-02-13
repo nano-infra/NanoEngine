@@ -3,7 +3,7 @@
 //! NanoCtrl is stateless and supports multiple scopes sharing the same instance.
 //! Scope is determined by clients (NanoRoute, EngineServer, peer_agent) via NANOCTRL_SCOPE env var.
 //!
-//! All Redis keys use key_prefix (from config or REDIS_KEY_PREFIX env var) for partitioning:
+//! All Redis keys use scope (provided by clients in API requests) for partitioning:
 //! - agent:* - Peer agent registration info
 //! - stream:* - Agent stream mailboxes (Redis Streams)
 //! - exchange:* - QP info exchange (sender:receiver)
@@ -14,7 +14,7 @@
 //! - nano_meta:engine_revision - Engine revision counter
 //! - nano_events:engine_update - Engine update pub/sub channel
 //!
-//! Clients should build their key prefix as: {scope}:{key_prefix} (if scope is set)
+//! Clients pass scope in API requests; NanoCtrl uses {scope}:key for Redis key namespacing
 
 mod config;
 mod models;
@@ -51,7 +51,7 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+            std::env::var("NANOCTRL_RUST_LOG").unwrap_or_else(|_| "info".into()),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -60,35 +60,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Loading configuration from {:?}", args.config);
     let mut config = AppConfig::load_from_file(&args.config)?;
 
-    // Env overrides for Redis (optional)
+    // Env override for Redis URL (optional)
     if let Ok(url) = std::env::var("NANOCTRL_REDIS_URL") {
         config.redis.url = url;
     }
-    if let Ok(prefix) = std::env::var("REDIS_KEY_PREFIX") {
-        config.redis.key_prefix = Some(prefix);
-    }
 
     let redis_url = &config.redis.url;
-    // NanoCtrl is stateless: only use key_prefix from config, not scope
-    // Scope is determined by clients (NanoRoute, EngineServer, peer_agent)
-    // Clients should build their key prefix as: {scope}:{key_prefix} (if scope is set)
-    let redis_key_prefix = config.redis.key_prefix.clone().unwrap_or_default();
     tracing::info!("Using Redis URL: {}", redis_url);
-    if !redis_key_prefix.is_empty() {
-        tracing::info!(
-            "Using Redis key prefix: {} (for data isolation)",
-            redis_key_prefix
-        );
-    }
 
-    let state = AppState::new(
-        redis_url,
-        if redis_key_prefix.is_empty() {
-            None
-        } else {
-            Some(redis_key_prefix)
-        },
-    )?;
+    let state = AppState::new(redis_url)?;
 
     // Warm up Redis connection to avoid first request hang
     {
