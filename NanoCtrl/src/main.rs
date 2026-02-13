@@ -378,15 +378,17 @@ async fn start_peer_agent(
                 // For simplicity, we'll use the server's IP from the client's subnet
                 // This is a heuristic: server IP should be on the same network as client
                 // We'll try to find a non-loopback interface on the same subnet
-                let server_ip = get_server_ip_for_client(&body.address).unwrap_or_else(|| {
-                    tracing::warn!(
-                        "Cannot determine server IP for remote client {}. \
-                        Please set REDIS_PUBLIC_ADDRESS environment variable. \
-                        Falling back to 127.0.0.1 (may not work for remote clients).",
-                        body.address
-                    );
-                    "127.0.0.1".to_string()
-                });
+                let server_ip = get_server_ip_for_client(&body.address)
+                    .or_else(get_local_public_ip)
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            "Cannot determine server IP for remote client {}. \
+                            Please set REDIS_PUBLIC_ADDRESS environment variable. \
+                            Falling back to 127.0.0.1 (may not work for remote clients).",
+                            body.address
+                        );
+                        "127.0.0.1".to_string()
+                    });
                 format!("{}:{}", server_ip, port)
             }
         } else {
@@ -411,9 +413,19 @@ async fn start_peer_agent(
     })
 }
 
-// Helper function to get server's IP address for a remote client
-fn get_server_ip_for_client(_client_ip: &str) -> Option<String> {
-    None
+// Helper function to get server's IP address for a remote client.
+// Uses the UDP socket trick: "connecting" a UDP socket (no data sent)
+// to the client IP causes the OS to select the correct local interface.
+fn get_server_ip_for_client(client_ip: &str) -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect(format!("{}:80", client_ip)).ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    let ip = local_addr.ip().to_string();
+    if ip == "0.0.0.0" || ip == "127.0.0.1" {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 /// Declarative topology endpoint: save desired topology spec to Redis.
@@ -898,13 +910,60 @@ async fn get_redis_address(
     State(state): State<AppState>,
     Json(_body): Json<GetRedisAddressBody>,
 ) -> impl IntoResponse {
-    // Return the full Redis URL (e.g., "redis://127.0.0.1:6379")
-    // This allows NanoRouter to connect to Redis for dynamic service discovery
-    tracing::debug!("Returning Redis URL: {}", state.redis_url);
+    // If Redis URL uses localhost/127.0.0.1, replace with the server's
+    // detected public IP so that remote clients (NanoRoute on worker nodes)
+    // can reach Redis.
+    let redis_address = resolve_public_redis_url(&state.redis_url);
+    tracing::debug!(
+        "Returning Redis URL: {} (original: {})",
+        redis_address,
+        state.redis_url
+    );
     Json(GetRedisAddressResponse {
         status: "ok".to_string(),
-        redis_address: state.redis_url.clone(), // Return full URL, not just host:port
+        redis_address,
     })
+}
+
+/// Replace 127.0.0.1/localhost in a Redis URL with the host's detected
+/// non-loopback IP (via UDP socket trick).  Falls back to the original
+/// URL if detection fails or the URL already uses a public address.
+fn resolve_public_redis_url(url: &str) -> String {
+    if let Some(stripped) = url.strip_prefix("redis://") {
+        if stripped.starts_with("127.0.0.1") || stripped.starts_with("localhost") {
+            // Try NANOCTRL_REDIS_URL env var first (set by NanoOps)
+            if let Ok(env_url) = std::env::var("NANOCTRL_REDIS_URL") {
+                if !env_url.is_empty()
+                    && !env_url.contains("127.0.0.1")
+                    && !env_url.contains("localhost")
+                {
+                    return env_url;
+                }
+            }
+            // Fallback: detect local IP via UDP socket
+            if let Some(public_ip) = get_local_public_ip() {
+                let port_part = stripped
+                    .find(':')
+                    .map(|pos| &stripped[pos..])
+                    .unwrap_or(":6379");
+                return format!("redis://{}{}", public_ip, port_part);
+            }
+        }
+    }
+    url.to_string()
+}
+
+/// Detect a non-loopback local IP by connecting a UDP socket to 8.8.8.8.
+fn get_local_public_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    let ip = local_addr.ip().to_string();
+    if ip == "0.0.0.0" || ip == "127.0.0.1" {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 async fn register_engine(

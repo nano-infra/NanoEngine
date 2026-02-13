@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanoops"
+version = "0.1.0"
+description = "Operations CLI for NanoInfra distributed LLM inference"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "typer[all]>=0.9.0",      # CLI framework with rich support
+    "redis>=5.0.0",            # Redis client
+    "ray[default]>=2.9.0",     # Ray with job submission
+    "httpx>=0.27.0",           # HTTP client
+    "pydantic>=2.0.0",         # Config validation
+    "rich>=13.0.0",            # Terminal formatting
+    "pyyaml>=6.0",             # YAML generation
+    "tqdm>=4.66.0",            # Progress bars
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-mock>=3.12",
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+nanoctrl = "nanoops.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nanoops*"]
+
+[tool.ruff]
+line-length = 100

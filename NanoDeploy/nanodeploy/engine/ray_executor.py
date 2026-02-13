@@ -31,8 +31,71 @@ class RayExecutor:
         self.placement_groups = []
         assert config.attn_world_size == config.ffn_world_size
 
+        # Check if running under NanoOps orchestration
+        import os
+
+        nanoops_pg_id = os.getenv("NANOOPS_PLACEMENT_GROUP_ID")
+
+        if nanoops_pg_id:
+            # NanoOps orchestration mode: use pre-created placement group
+            logger.info(
+                f"Using pre-created placement group from NanoOps: {nanoops_pg_id}"
+            )
+            self._init_with_existing_pg(nanoops_pg_id)
+            self.external_pg = True  # Mark as externally managed
+        else:
+            # Manual launch mode: create placement groups as before
+            logger.info("Creating placement groups (manual launch mode)")
+            self._init_with_new_pg()
+            self.external_pg = False
+
+        logger.info("All workers scheduled successfully.")
+
+    def _init_with_existing_pg(self, pg_id_hex: str):
+        """Initialize workers using pre-created placement group from NanoOps.
+
+        When running inside a Ray job with placement_group_id in runtime_env,
+        all tasks are automatically scheduled to that placement group.
+        We don't need to explicitly pass the PG to workers.
+
+        Args:
+            pg_id_hex: Placement group ID in hex format
+        """
+        logger.info(
+            f"Scheduling {self.config.attn_world_size} workers using Ray job's placement group"
+        )
+
+        # --- Phase 1: create all workers with deferred dist init ----------
+        # The master_address from config points to the Ray head node, but
+        # workers may be on a different node.  We create them with
+        # defer_dist_init=True so they skip dist.init_process_group().
+        for rank in range(self.config.attn_world_size):
+            worker = ModelRunner.remote(self.config, rank, defer_dist_init=True)
+            self.workers.append(worker)
+
+        # --- Phase 2: probe worker[0] for actual node IP + free port ------
+        worker_ip, free_port = ray.get(self.workers[0].get_node_info.remote())
+        master_address = f"{worker_ip}:{free_port}"
+        logger.info(
+            f"Probed worker node: master_address = {master_address} "
+            f"(was {self.config.master_address})"
+        )
+        self.config.master_address = master_address
+
+        # --- Phase 3: trigger dist init on ALL workers simultaneously -----
+        # dist.init_process_group is a collective call; all ranks must
+        # enter it together.
+        init_futures = [w.init_dist.remote(master_address) for w in self.workers]
+        ray.get(init_futures)
+        logger.info("All workers completed distributed init.")
+
+        # No placement group object to store - managed by Ray job runtime
+        self.placement_groups = []
+
+    def _init_with_new_pg(self):
+        """Initialize workers by creating new placement groups (existing logic)."""
         # 2. 获取所有节点的 NodeID
-        nodes = get_available_nodes_with_master_first(config.master_address)
+        nodes = get_available_nodes_with_master_first(self.config.master_address)
         node_ids = [node["NodeID"] for node in nodes]
         logger.debug(f"find nodes (NodeIDs): {node_ids}")
 
@@ -41,7 +104,7 @@ class RayExecutor:
 
         # 4. 计算需要多少个节点
         num_nodes_needed = (
-            config.attn_world_size + workers_per_node - 1
+            self.config.attn_world_size + workers_per_node - 1
         ) // workers_per_node
         if num_nodes_needed > len(node_ids):
             raise ValueError(
@@ -65,13 +128,13 @@ class RayExecutor:
             self.placement_groups.append(pg)
 
             start_rank = node_idx * workers_per_node
-            end_rank = min(start_rank + workers_per_node, config.attn_world_size)
+            end_rank = min(start_rank + workers_per_node, self.config.attn_world_size)
 
             for rank in range(start_rank, end_rank):
-                worker = ModelRunner.options(placement_group=pg).remote(config, rank)
+                worker = ModelRunner.options(placement_group=pg).remote(
+                    self.config, rank
+                )
                 self.workers.append(worker)
-
-        logger.info("All workers scheduled successfully.")
 
     def __del__(self):
         if hasattr(self, "workers") and self.workers:
@@ -84,12 +147,18 @@ class RayExecutor:
                     logger.warning(f"Failed to terminate worker {worker}: {e}")
             del self.workers
 
+        # Only remove placement groups if we created them (not externally managed)
         if hasattr(self, "placement_groups") and self.placement_groups:
-            for pg in self.placement_groups:
-                try:
-                    remove_placement_group(pg)
-                except Exception as e:
-                    logger.error(f"Warning: Failed to remove Placement Group: {e}")
+            if hasattr(self, "external_pg") and self.external_pg:
+                logger.info(
+                    "Skipping placement group removal (externally managed by NanoOps)"
+                )
+            else:
+                for pg in self.placement_groups:
+                    try:
+                        remove_placement_group(pg)
+                    except Exception as e:
+                        logger.error(f"Warning: Failed to remove Placement Group: {e}")
 
         logger.debug("Ray Executor deconstructed")
 

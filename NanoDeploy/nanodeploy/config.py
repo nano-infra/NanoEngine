@@ -13,7 +13,7 @@ class Config(BaseModel):
     model: str = Field(..., description="Path to the model")
 
     # scheduler config
-    loop_count: int = 16
+    loop_count: int = 1
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 256
     max_num_recv_seqs: int = 32

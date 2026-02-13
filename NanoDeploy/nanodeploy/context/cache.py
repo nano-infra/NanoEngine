@@ -188,6 +188,9 @@ class CacheContext:
                     # Note: Control plane should handle concurrent registrations gracefully
 
                     try:
+                        # Pass scope explicitly to ensure agent is registered
+                        # under the correct session namespace in Redis.
+                        agent_scope = os.getenv("NANOCTRL_SCOPE", None)
                         self._peer_agent = start_peer_agent_fn(
                             alias=agent_alias,
                             server_url=server_url,
@@ -195,6 +198,7 @@ class CacheContext:
                             ib_port=1,
                             link_type="RoCE",
                             qp_num=1,
+                            scope=agent_scope,
                         )
                         # Store agent alias as peer_agent_addr (for control plane, alias is the identifier)
                         self._peer_agent_addr = agent_alias
@@ -279,11 +283,21 @@ class CacheContext:
         fetched_map: dict[str, dict] = {}
         url = f"http://{self.nanoctrl_address}/get_engine_info"
 
+        # Get scope from environment variable
+        import os
+
+        scope = os.getenv("NANOCTRL_SCOPE", "")
+
         try:
             with httpx.Client(timeout=5.0) as client:
                 for engine_id in missing_ids:
                     try:
-                        response = client.post(url, json={"engine_id": engine_id})
+                        # Build request payload with scope
+                        request_payload = {"engine_id": engine_id}
+                        if scope:
+                            request_payload["scope"] = scope
+
+                        response = client.post(url, json=request_payload)
                         response.raise_for_status()
                         data = response.json()
 

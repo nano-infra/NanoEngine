@@ -46,7 +46,7 @@ architectures = {
 
 @ray.remote(num_cpus=0.1, num_gpus=1)
 class ModelRunner:
-    def __init__(self, config: Config, rank: int):
+    def __init__(self, config: Config, rank: int, defer_dist_init: bool = False):
         # Set log level
         if config.log_level:
             set_log_level(config.log_level)
@@ -57,6 +57,16 @@ class ModelRunner:
         self.enforce_eager = config.enforce_eager
         self.world_size = config.attn_world_size
         self.rank = rank
+        self._dist_initialized = False
+
+        # Propagate scope to actor environment: the Config object carries
+        # scope from the driver (set from NANOCTRL_SCOPE env var), but
+        # actor processes may not inherit the job's env vars.  Libraries
+        # like dlslime read NANOCTRL_SCOPE from os.environ, so we must
+        # set it here to ensure correct scoped registration in Redis.
+        if config.scope and not os.getenv("NANOCTRL_SCOPE"):
+            os.environ["NANOCTRL_SCOPE"] = config.scope
+            logger.info(f"Set NANOCTRL_SCOPE={config.scope} in actor environment")
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -66,12 +76,55 @@ class ModelRunner:
             perfect_eplb=config.perfect_eplb,
         )
 
+        if defer_dist_init:
+            # NanoOps mode: skip heavy init here; caller will invoke
+            # init_dist(master_address) after probing the worker node IP.
+            logger.info(f"Deferring dist init for rank {rank} (NanoOps mode)")
+            return
+
+        self._complete_dist_init()
+
+    # ------------------------------------------------------------------
+    # Node probing (called before dist init in NanoOps mode)
+    # ------------------------------------------------------------------
+
+    def get_node_info(self):
+        """Return (ip, free_port) of the node this worker runs on."""
+        import socket
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
+            s2.bind(("", 0))
+            port = s2.getsockname()[1]
+        return ip, port
+
+    def init_dist(self, master_address: str):
+        """Complete deferred distributed initialization.
+
+        Called by RayExecutor after probing the worker-node IP.
+        Must be invoked on ALL ranks simultaneously (collective call).
+        """
+        self.config.master_address = master_address
+        self._complete_dist_init()
+
+    # ------------------------------------------------------------------
+
+    def _complete_dist_init(self):
+        """Phase-2 init: process group, contexts, CUDA, model, etc."""
+        config = self.config
+        hf_config = config.hf_config
+        rank = self.rank
+
         dist.init_process_group(
             "cpu:gloo,cuda:nccl",
             f"tcp://{config.master_address}",
             world_size=self.world_size,
             rank=rank,
         )
+        self._dist_initialized = True
 
         set_dist_context(
             rank=rank,
@@ -101,12 +154,11 @@ class ModelRunner:
         if sp_size > 1:
             sp_rank = get_dist_context().attn_sp_rank
             max_head_dim = 0
-            if self.config.hf_config.num_key_value_heads > 1:
-                max_head_dim = self.config.hf_config.head_dim
+            if config.hf_config.num_key_value_heads > 1:
+                max_head_dim = config.hf_config.head_dim
             else:
                 max_head_dim = (
-                    self.config.hf_config.kv_lora_rank
-                    + self.config.hf_config.qk_rope_head_dim
+                    config.hf_config.kv_lora_rank + config.hf_config.qk_rope_head_dim
                 )
             set_sp_context(
                 config.max_num_seqs,
@@ -135,7 +187,7 @@ class ModelRunner:
                 schedule=None,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
                     dir_name=profiler_dir,
-                    worker_name=f"{self.engine_id}_rank_{self.rank}",
+                    worker_name=f"{self.engine_id}_rank_{rank}",
                     use_gzip=False,
                 ),
                 record_shapes=True,

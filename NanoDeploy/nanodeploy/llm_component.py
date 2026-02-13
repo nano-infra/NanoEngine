@@ -310,11 +310,15 @@ class LLMComponent(LLM):
             )
 
             # Prepare registration payload
-            # For ZMQ connection: use 127.0.0.1 if host is 0.0.0.0 (localhost mode),
-            # otherwise use the specified host IP (distributed mode)
-            zmq_host = (
-                "127.0.0.1" if self.config.host == "0.0.0.0" else self.config.host
-            )
+            # For ZMQ connection: use the actual node IP so that route (which
+            # may be on a different node) can reach us.  Only fall back to
+            # 127.0.0.1 if we really only bind to loopback.
+            if self.config.host in ("0.0.0.0", ""):
+                from nanodeploy.context.distributed import get_local_ip
+
+                zmq_host = get_local_ip()
+            else:
+                zmq_host = self.config.host
 
             payload = {
                 "engine_id": self.engine_id,
