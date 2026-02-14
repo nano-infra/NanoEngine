@@ -5,44 +5,10 @@ from typing import Optional
 
 
 # =============================================================================
-# Color Definitions
-# =============================================================================
-class AnsiColors:
-    """ANSI escape codes for terminal colors and formatting."""
-
-    RESET = "\033[0m"
-    BLACK = "\033[30m"
-    RED = "\033[31m"
-    GREEN = "\033[32m"
-    YELLOW = "\033[33m"
-    BLUE = "\033[34m"
-    MAGENTA = "\033[35m"
-    CYAN = "\033[36m"
-    WHITE = "\033[37m"
-    # Bright colors
-    BRIGHT_RED = "\033[91m"
-    BRIGHT_GREEN = "\033[92m"
-    BRIGHT_YELLOW = "\033[93m"
-    BRIGHT_BLUE = "\033[94m"
-    BRIGHT_MAGENTA = "\033[95m"
-    BRIGHT_CYAN = "\033[96m"
-    BRIGHT_WHITE = "\033[97m"
-
-
-# =============================================================================
 # Custom Formatter
 # =============================================================================
 class ColoredFormatter(logging.Formatter):
-    """A custom log formatter that adds color to log levels and includes contextual information."""
-
-    # Map log levels to their corresponding ANSI color codes
-    LEVEL_COLORS = {
-        logging.DEBUG: AnsiColors.BRIGHT_BLUE,
-        logging.INFO: AnsiColors.BRIGHT_GREEN,
-        logging.WARNING: AnsiColors.BRIGHT_YELLOW,
-        logging.ERROR: AnsiColors.BRIGHT_RED,
-        logging.CRITICAL: AnsiColors.RED,
-    }
+    """A custom log formatter that includes contextual information."""
 
     def __init__(self, use_relative_path: bool = True):
         """
@@ -72,7 +38,7 @@ class ColoredFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         """
-        Format the specified log record as text with color and context.
+        Format the specified log record as text with context.
 
         Args:
             record (logging.LogRecord): The log record to format.
@@ -80,9 +46,6 @@ class ColoredFormatter(logging.Formatter):
         Returns:
             str: The formatted log message string.
         """
-        # Get the color for the current log level
-        color = self.LEVEL_COLORS.get(record.levelno, AnsiColors.WHITE)
-
         # Get the file path
         file_path = record.pathname
         if self.use_relative_path and self.project_root:
@@ -93,24 +56,24 @@ class ColoredFormatter(logging.Formatter):
                 pass
 
         # Define the log format string. This includes:
-        # - Timestamp (cyan)
-        # - Logger name/namespace (magenta)
-        # - Log level (color-coded)
-        # - File path and line number (yellow) - VS Code recognizable format
-        # - Function name (yellow)
+        # - Timestamp
+        # - Logger name/namespace
+        # - Log level
+        # - File path and line number (VS Code recognizable format)
+        # - Function name
         # - Log message
         log_format = (
-            f"{AnsiColors.CYAN}[%(asctime)s]{AnsiColors.RESET} "
-            f"{AnsiColors.MAGENTA}[%(name)s]{AnsiColors.RESET} "
-            f"{color}[%(levelname)s]{AnsiColors.RESET} "
-            f"{AnsiColors.YELLOW}{file_path}:%(lineno)d{AnsiColors.RESET} "
-            f"{AnsiColors.BRIGHT_WHITE}%(funcName)s{AnsiColors.RESET} - "
-            f"%(message)s"
+            "[%(asctime)s] "
+            "[%(name)s] "
+            "[%(levelname)s] "
+            f"{file_path}:%(lineno)d "
+            "%(funcName)s - "
+            "%(message)s"
         )
 
         # If an exception is associated with the record, ensure the traceback is included
         if record.exc_info:
-            log_format += f"\n{AnsiColors.BRIGHT_RED}%(exc_text)s{AnsiColors.RESET}"
+            log_format += "\n%(exc_text)s"
 
         # Create a Formatter instance with our format string and apply it
         formatter = logging.Formatter(log_format, datefmt="%Y-%m-%d %H:%M:%S")
@@ -159,7 +122,7 @@ class LoggerManager:
             console_handler = logging.StreamHandler(sys.stdout)
             console_handler.setLevel(logging.DEBUG)
 
-            # Apply our custom colored formatter to the console handler
+            # Apply our custom formatter to the console handler
             formatter = ColoredFormatter(use_relative_path=use_relative_path)
             console_handler.setFormatter(formatter)
 

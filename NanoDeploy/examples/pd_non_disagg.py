@@ -28,6 +28,7 @@ def main():
         max_num_batched_tokens=4096,
         gpu_memory_utilization=0.9,
         log_level="INFO",
+        kvcache_block_size=256,
     )
     llm = LLM(config)
 
