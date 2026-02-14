@@ -5,7 +5,6 @@ use crate::fbs::{
 use crate::zmq_packet::ZmqPacket;
 use flatbuffers::FlatBufferBuilder;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -18,7 +17,6 @@ pub struct EngineAdapter {
     pub uuid: Option<String>,
     pub world_size: i32,
     pub num_blocks: i32,
-    pub next_seq_id: AtomicU64,
     // Shutdown signal: when dropped, closes the channel to stop reader loop
     pub shutdown_tx: Option<tokio_mpsc::UnboundedSender<()>>,
     // Reader task handle: must be properly awaited during shutdown
@@ -27,6 +25,8 @@ pub struct EngineAdapter {
     pub recv_tx_keepalive: Option<tokio_mpsc::UnboundedSender<ZmqPacket>>,
     // I/O thread handle: must be properly joined during shutdown
     pub io_thread_handle: Option<std::thread::JoinHandle<()>>,
+    // Dedicated channel for GetEngineInfo responses (no seq_id needed)
+    engine_info_tx: Arc<Mutex<Option<tokio_mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,7 +36,6 @@ pub enum StreamEvent {
     #[allow(dead_code)]
     Error(String),
     Migrate(Vec<u8>),
-    P2PResponse(Vec<u8>),
 }
 
 pub struct RequestState {
@@ -52,11 +51,11 @@ impl EngineAdapter {
             uuid: None,
             world_size: 0,
             num_blocks: 0,
-            next_seq_id: AtomicU64::new(1),
             shutdown_tx: None,
             reader_handle: None,
             recv_tx_keepalive: None,
             io_thread_handle: None,
+            engine_info_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -89,6 +88,7 @@ impl EngineAdapter {
         self.shutdown_tx = Some(shutdown_tx_for_storage);
 
         let pending = self.pending_requests.clone();
+        let engine_info_tx = self.engine_info_tx.clone();
         let addr_for_log = addr.to_string();
         let addr_for_reader = addr_for_log.clone();
 
@@ -131,9 +131,8 @@ impl EngineAdapter {
                     // Only log important packets (ADD/migration=1, engine_info=2)
                     if packet.action != 0 {
                         info!(
-                            "Sending ZMQ packet: action={}, seq_id={}, size={}",
+                            "Sending ZMQ packet: action={}, size={}",
                             packet.action,
-                            packet.seq_id,
                             data.len()
                         );
                     }
@@ -173,51 +172,55 @@ impl EngineAdapter {
                         };
                 let action = packet.action;
                 let payload = packet.payload;
-                let seq_id = packet.seq_id;
 
                 // Only log migration (action=1) and engine info (action=2) packets
                 if action != 0 {
-                    info!("Received packet: action={}, seq_id={}, payload_size={}", action, seq_id, payload.len());
+                    info!("Received packet: action={}, payload_size={}", action, payload.len());
                 }
 
+                // Action 1: Migration response (SequenceList payload)
                 if action == 1 {
                     let sl = unsafe { flatbuffers::root_unchecked::<SequenceList>(&payload) };
-                    let extracted_seq_id = sl.sequences().and_then(|seqs| {
+                    let seq_id = sl.sequences().and_then(|seqs| {
                         if seqs.is_empty() {
                             None
                         } else {
                             Some(seqs.get(0).seq_id())
                         }
                     });
-                    let effective_id = extracted_seq_id.unwrap_or(seq_id);
-                    if effective_id > 0 {
-                        let mut map = pending.lock().await;
-                        let map_size = map.len();
-                        if let Some(state) = map.remove(&effective_id) {
-                            match state.sender.send(StreamEvent::Migrate(payload)) {
-                                Ok(_) => {
-                                    info!("[DIAG] Migration event sent OK for seq_id={}, pending_map_size={}", effective_id, map_size - 1);
+                    if let Some(seq_id) = seq_id {
+                        if seq_id > 0 {
+                            let mut map = pending.lock().await;
+                            let map_size = map.len();
+                            if let Some(state) = map.remove(&seq_id) {
+                                match state.sender.send(StreamEvent::Migrate(payload)) {
+                                    Ok(_) => {
+                                        info!("[DIAG] Migration event sent OK for seq_id={}, pending_map_size={}", seq_id, map_size - 1);
+                                    }
+                                    Err(_) => {
+                                        warn!("[DIAG] Migration event SEND FAILED (rx dropped = client disconnected) for seq_id={}, pending_map_size={}", seq_id, map_size - 1);
+                                    }
                                 }
-                                Err(_) => {
-                                    warn!("[DIAG] Migration event SEND FAILED (rx dropped = client disconnected) for seq_id={}, pending_map_size={}", effective_id, map_size - 1);
-                                }
+                            } else {
+                                warn!("[DIAG] Migration response for seq_id={} but NOT FOUND in pending_requests (map_size={})", seq_id, map_size);
                             }
-                        } else {
-                            warn!("[DIAG] Migration response for seq_id={} but NOT FOUND in pending_requests (map_size={}). header_seq_id={}, extracted_seq_id={:?}", effective_id, map_size, seq_id, extracted_seq_id);
                         }
+                    } else {
+                        warn!("[DIAG] Migration response with no seq_id in SequenceList");
                     }
                     continue;
                 }
 
-                // Action 2: GetEngineInfo response
+                // Action 2: GetEngineInfo response — deliver via dedicated channel
                 if action == 2 {
-                    let mut map = pending.lock().await;
-                    if let Some(state) = map.remove(&seq_id) {
-                        let _ = state.sender.send(StreamEvent::P2PResponse(payload));
+                    let guard = engine_info_tx.lock().await;
+                    if let Some(tx) = guard.as_ref() {
+                        let _ = tx.send(payload);
                     }
                     continue;
                 }
 
+                // Action 0: StepOut (token streaming)
                 if action == 0 {
                     let step_out = unsafe { flatbuffers::root_unchecked::<StepOut>(&payload) };
                     let seq_id = step_out.seq_id();
@@ -290,13 +293,9 @@ impl EngineAdapter {
         Ok(())
     }
 
-    async fn send_packet(&self, action: u32, seq_id: u64, payload: Vec<u8>) -> anyhow::Result<()> {
+    fn send_packet(&self, action: u32, payload: Vec<u8>) -> anyhow::Result<()> {
         if let Some(tx) = &self.request_tx {
-            let packet = ZmqPacket {
-                seq_id,
-                action,
-                payload,
-            };
+            let packet = ZmqPacket { action, payload };
             tx.send(packet)
                 .map_err(|_| anyhow::anyhow!("Request channel closed"))?;
             Ok(())
@@ -326,7 +325,7 @@ impl EngineAdapter {
             seq_id,
             payload.len()
         );
-        self.send_packet(1, seq_id, payload).await?;
+        self.send_packet(1, payload)?;
         Ok(rx)
     }
 
@@ -397,45 +396,34 @@ impl EngineAdapter {
             "Sending ADD request for seq {} with {} tokens, max_tokens={}",
             seq_id, num_tokens, max_tokens
         );
-        self.send_packet(1, seq_id, payload).await?;
+        self.send_packet(1, payload)?;
         Ok(rx)
     }
 
     pub async fn send_get_engine_info(&mut self) -> anyhow::Result<serde_json::Value> {
-        let seq_id = self.next_seq_id.fetch_add(1, Ordering::Relaxed);
-
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         {
-            let mut map = self.pending_requests.lock().await;
-            map.insert(
-                seq_id,
-                RequestState {
-                    sender: tx,
-                    accumulated_tokens: Vec::new(),
-                },
-            );
+            let mut guard = self.engine_info_tx.lock().await;
+            *guard = Some(tx);
         }
 
-        self.send_packet(2, seq_id, vec![]).await?;
+        self.send_packet(2, vec![])?;
 
-        if let Some(event) = rx.recv().await {
-            match event {
-                StreamEvent::P2PResponse(body) => {
-                    // Parse engine info as JSON
-                    if let Ok(json_str) = std::str::from_utf8(&body) {
-                        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                            return Ok(json_val);
-                        }
-                    }
-                    // If not JSON, return error
-                    Err(anyhow::anyhow!(
-                        "Failed to parse engine info response as JSON"
-                    ))
-                }
-                _ => Err(anyhow::anyhow!(
-                    "Unexpected response event for GetEngineInfo"
-                )),
+        if let Some(body) = rx.recv().await {
+            // Clear the channel after receiving
+            {
+                let mut guard = self.engine_info_tx.lock().await;
+                *guard = None;
             }
+            // Parse engine info as JSON
+            if let Ok(json_str) = std::str::from_utf8(&body) {
+                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    return Ok(json_val);
+                }
+            }
+            Err(anyhow::anyhow!(
+                "Failed to parse engine info response as JSON"
+            ))
         } else {
             Err(anyhow::anyhow!(
                 "Channel closed while waiting for GetEngineInfo response"

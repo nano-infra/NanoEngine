@@ -251,7 +251,7 @@ class LLMComponent(LLM):
         payload = bytes(builder.Output())
 
         # Send via P2P (Action 3)
-        packet = encode_packet(seq_id=0, action=3, payload=payload)
+        packet = encode_packet(action=3, payload=payload)
 
         try:
             client_socket.send(packet, zmq.NOBLOCK)
