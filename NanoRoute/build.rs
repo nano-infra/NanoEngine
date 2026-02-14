@@ -4,22 +4,31 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Post-process flatbuffers-generated Rust for flatbuffers 2.x API compatibility.
-fn patch_generated_flatbuffers(out_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let filename = "sequence_generated.rs";
+fn patch_generated_flatbuffers(
+    out_dir: &str,
+    filename: &str,
+    enum_names: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(out_dir).join(filename);
     if !path.exists() {
         return Ok(());
     }
 
     let mut content = fs::read_to_string(&path)?;
+    // Wrap read_scalar_at calls that aren't already inside unsafe blocks
     content = content.replace(
         "flatbuffers::read_scalar_at::<Self>(buf, loc)",
         "unsafe { flatbuffers::read_scalar_at::<Self>(buf, loc) }",
     );
-    content = content.replace(
-        "flatbuffers::emplace_scalar::<SequenceStatus>(dst, *self)",
-        "unsafe { flatbuffers::emplace_scalar::<SequenceStatus>(dst, *self) }",
-    );
+    // Wrap emplace_scalar calls for all enum types
+    for enum_name in enum_names {
+        let from = format!("flatbuffers::emplace_scalar::<{}>(dst, *self)", enum_name);
+        let to = format!(
+            "unsafe {{ flatbuffers::emplace_scalar::<{}>(dst, *self) }}",
+            enum_name
+        );
+        content = content.replace(&from, &to);
+    }
     fs::write(&path, content)?;
 
     Ok(())
@@ -86,7 +95,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = env::var("OUT_DIR")?;
     let flatc = find_or_build_flatc()?;
 
-    let fbs_files = ["../NanoSequence/proto/sequence.fbs"];
+    let fbs_files = [
+        "../NanoSequence/proto/sequence.fbs",
+        "../NanoSequence/proto/packet.fbs",
+    ];
 
     for fbs in &fbs_files {
         println!("cargo:rerun-if-changed={}", fbs);
@@ -102,7 +114,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    patch_generated_flatbuffers(&out_dir)?;
+    patch_generated_flatbuffers(&out_dir, "sequence_generated.rs", &["SequenceStatus"])?;
+    patch_generated_flatbuffers(&out_dir, "packet_generated.rs", &["Action"])?;
 
     Ok(())
 }

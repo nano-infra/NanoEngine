@@ -256,9 +256,6 @@ async fn chat_completions(
                              break;
                         }
                     }
-                    StreamEvent::P2PResponse(_) => {
-                         tracing::error!("Received unexpected P2PResponse in streaming chat request");
-                    }
                 }
             }
 
@@ -300,9 +297,6 @@ async fn chat_completions(
                         return (StatusCode::SERVICE_UNAVAILABLE, "No Decode Nodes")
                             .into_response();
                     }
-                }
-                StreamEvent::P2PResponse(_) => {
-                    tracing::error!("Received unexpected P2PResponse in chat request");
                 }
             }
         }

@@ -1,6 +1,5 @@
 import asyncio
 import ctypes
-import struct
 import traceback
 from typing import Optional
 
@@ -39,9 +38,9 @@ class EngineService:
         self._previous_running_seqs: set[int] = set()
         self._freed_sequences: set[int] = set()
 
-    def _send_response(self, action: int, payload: bytes, seq_id: int = 0):
+    def _send_response(self, action: int, payload: bytes):
         if self._send_queue:
-            data = encode_packet(seq_id, action, payload)
+            data = encode_packet(action, payload)
             self._send_queue.put_nowait(data)
 
     def _handle_add_request(self, payload: bytes):
@@ -62,16 +61,16 @@ class EngineService:
         self.engine.add_request(sequences)
         logger.info(f"Sequences added to engine successfully")
 
-    def _handle_get_info(self, req_seq_id: int):
+    def _handle_get_info(self):
         resp_payload = self.engine.get_engine_info().encode("utf-8")
-        self._send_response(action=2, payload=resp_payload, seq_id=req_seq_id)
+        self._send_response(action=2, payload=resp_payload)
 
-    def _handle_packet(self, seq_id: int, action: int, payload: bytes):
+    def _handle_packet(self, action: int, payload: bytes):
         try:
             if action == 1:  # Add Request
                 self._handle_add_request(payload)
             elif action == 2:  # Get Engine Info
-                self._handle_get_info(seq_id)
+                self._handle_get_info()
             elif action == 3:  # Free Sequences (P2P)
                 self._handle_free_sequences(payload)
             else:
@@ -147,7 +146,7 @@ class EngineService:
         step_out = StepOutEnd(builder)
         builder.Finish(step_out)
         payload = builder.Output()
-        self._send_response(action=0, payload=payload, seq_id=seq_id)
+        self._send_response(action=0, payload=payload)
 
     def _send_migration(self, seq):
         buffer_size = 4096 * 16
@@ -157,7 +156,7 @@ class EngineService:
         try:
             payload_size = serialize(ptr, buffer_size, [seq], False)
             payload = buffer.raw[:payload_size]
-            self._send_response(action=1, payload=payload, seq_id=seq.seq_id)
+            self._send_response(action=1, payload=payload)
         except Exception as e:
             logger.error(f"Migration Serialize Error: {e}")
 
@@ -335,11 +334,11 @@ class EngineServer:
                 try:
                     data = await socket.recv()
                     logger.info(f"Received ZMQ packet: {len(data)} bytes")
-                    seq_id, action, payload = decode_packet(bytes(data))
+                    action, payload = decode_packet(bytes(data))
                     logger.info(
-                        f"Decoded packet: seq_id={seq_id}, action={action}, payload_size={len(payload)}"
+                        f"Decoded packet: action={action}, payload_size={len(payload)}"
                     )
-                    self.service._handle_packet(seq_id, action, payload)
+                    self.service._handle_packet(action, payload)
                 except zmq.ZMQError as e:
                     if e.errno != zmq.ETERM:
                         logger.error(f"ZMQ recv error: {e}")
@@ -366,11 +365,11 @@ class EngineServer:
                 try:
                     data = await p2p_socket.recv()
                     logger.info(f"Received P2P packet: {len(data)} bytes")
-                    seq_id, action, payload = decode_packet(bytes(data))
+                    action, payload = decode_packet(bytes(data))
                     logger.info(
-                        f"Decoded P2P packet: seq_id={seq_id}, action={action}, payload_size={len(payload)}"
+                        f"Decoded P2P packet: action={action}, payload_size={len(payload)}"
                     )
-                    self.service._handle_packet(seq_id, action, payload)
+                    self.service._handle_packet(action, payload)
                 except zmq.ZMQError as e:
                     if e.errno != zmq.ETERM:
                         logger.error(f"ZMQ P2P recv error: {e}")

@@ -7,6 +7,12 @@ pub mod fbs {
         include!(concat!(env!("OUT_DIR"), "/sequence_generated.rs"));
     }
 
+    #[allow(clippy::all)]
+    mod packet_generated {
+        include!(concat!(env!("OUT_DIR"), "/packet_generated.rs"));
+    }
+
+    pub use self::packet_generated::nanodeploy::fbs::*;
     pub use self::sequence_generated::nanodeploy::fbs::*;
 }
 

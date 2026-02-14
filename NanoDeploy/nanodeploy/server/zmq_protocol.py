@@ -1,24 +1,39 @@
-"""Binary packet format for ZMQ engine protocol (replaces protobuf StreamPacket).
-Layout: seq_id(u64) | action(u32) | payload_len(u32) | payload[payload_len]
+"""ZMQ packet encode/decode using FlatBuffers (schema: NanoSequence/proto/packet.fbs).
+The entire ZMQ message is a single FlatBuffers buffer containing a ZmqPacket table.
 """
 
-import struct
+import flatbuffers
 
-HEADER_SIZE = 16  # 8 + 4 + 4
+from nanodeploy.fbs.ZmqPacket import (
+    ZmqPacket,
+    ZmqPacketAddAction,
+    ZmqPacketAddPayload,
+    ZmqPacketEnd,
+    ZmqPacketStart,
+)
 
 
-def encode_packet(seq_id: int, action: int, payload: bytes) -> bytes:
-    return struct.pack("<QII", seq_id, action, len(payload)) + payload
+def encode_packet(action: int, payload: bytes) -> bytes:
+    builder = flatbuffers.Builder(64 + len(payload))
+    payload_vec = builder.CreateByteVector(payload)
+
+    ZmqPacketStart(builder)
+    ZmqPacketAddAction(builder, action)
+    ZmqPacketAddPayload(builder, payload_vec)
+    packet = ZmqPacketEnd(builder)
+
+    builder.Finish(packet)
+    return bytes(builder.Output())
 
 
-def decode_packet(data: bytes) -> tuple[int, int, bytes]:
-    if len(data) < HEADER_SIZE:
-        raise ValueError(f"Packet too short: {len(data)} bytes")
-    seq_id, action, payload_len = struct.unpack("<QII", data[:HEADER_SIZE])
-    if len(data) < HEADER_SIZE + payload_len:
-        raise ValueError(
-            f"Payload truncated: need {payload_len} bytes, "
-            f"have {len(data) - HEADER_SIZE}"
-        )
-    payload = data[HEADER_SIZE : HEADER_SIZE + payload_len]
-    return seq_id, action, payload
+def decode_packet(data: bytes) -> tuple[int, bytes]:
+    packet = ZmqPacket.GetRootAs(data, 0)
+    action = packet.Action()
+
+    payload_len = packet.PayloadLength()
+    if payload_len > 0:
+        payload = bytes(packet.PayloadAsNumpy())
+    else:
+        payload = b""
+
+    return action, payload
