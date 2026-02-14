@@ -1,4 +1,3 @@
-use crate::config::EngineConfig;
 use crate::engine_adapter::EngineAdapter;
 use crate::engine_watcher::{EngineEvent, EnginePayload, EngineWatcher};
 use std::sync::Arc;
@@ -12,6 +11,15 @@ pub struct EngineManager {
     pub prefill_engines: Vec<Arc<Mutex<EngineAdapter>>>,
     pub decode_engines: Vec<Arc<Mutex<EngineAdapter>>>,
     redis_key_prefix: String,
+}
+
+/// Parsed fields from an engine info JSON value.
+struct ParsedEngineInfo {
+    engine_id: String,
+    role: String,
+    connect_addr: String,
+    world_size: i32,
+    num_blocks: i32,
 }
 
 impl Default for EngineManager {
@@ -37,293 +45,68 @@ impl EngineManager {
         }
     }
 
-    #[allow(dead_code)]
-    pub async fn connect_all(&mut self, config: &EngineConfig) -> anyhow::Result<()> {
-        match config {
-            EngineConfig::Unified {
-                host,
-                port,
-                nanoctrl_address,
-                redis_url: _,
-                scope: _,
-            } => {
-                if let Some(nanoctrl_addr) = nanoctrl_address {
-                    // Query engines from NanoCtrl
-                    info!("Querying engines from NanoCtrl at {}", nanoctrl_addr);
-                    match self.list_engines_from_nanoctrl(nanoctrl_addr).await {
-                        Ok(engines) => {
-                            let engines_count = engines.len();
-                            info!("Found {} engines from NanoCtrl", engines_count);
-                            let mut connected_count = 0;
-                            for engine_info in engines {
-                                // Parse port - could be u64 or string
-                                let port_num = engine_info["port"]
-                                    .as_u64()
-                                    .or_else(|| {
-                                        engine_info["port"]
-                                            .as_str()
-                                            .and_then(|s| s.parse::<u64>().ok())
-                                    })
-                                    .unwrap_or(0);
+    // ─── Helpers ──────────────────────────────────────────────────────
 
-                                if let (Some(host_str), Some(role)) =
-                                    (engine_info["host"].as_str(), engine_info["role"].as_str())
-                                {
-                                    if port_num == 0 {
-                                        warn!(
-                                            "Skipping engine with invalid port: {:?}",
-                                            engine_info
-                                        );
-                                        continue;
-                                    }
-                                    // Handle 0.0.0.0 host - use localhost instead
-                                    let connect_host = if host_str == "0.0.0.0" {
-                                        "127.0.0.1"
-                                    } else {
-                                        host_str
-                                    };
-                                    let addr = format!("{}:{}", connect_host, port_num);
-                                    let engine_id = engine_info["id"].as_str().unwrap_or("unknown");
-                                    info!(
-                                        "Attempting to connect to {} engine {} at {}",
-                                        role, engine_id, addr
-                                    );
-                                    let mut adapter = EngineAdapter::new(engine_id.to_string());
+    /// Parse engine info JSON into structured fields.
+    /// Handles port as u64 or string, and rewrites 0.0.0.0 → 127.0.0.1.
+    fn parse_engine_info(info: &serde_json::Value) -> anyhow::Result<ParsedEngineInfo> {
+        let port_num = info["port"]
+            .as_u64()
+            .or_else(|| info["port"].as_str().and_then(|s| s.parse::<u64>().ok()))
+            .unwrap_or(0);
 
-                                    match adapter.connect(&addr).await {
-                                        Ok(_) => {
-                                            if let Some(id) = engine_info["id"].as_str() {
-                                                adapter.uuid = Some(id.to_string());
-                                            }
-                                            if let Some(ws) = engine_info["world_size"].as_u64() {
-                                                adapter.world_size = ws as i32;
-                                            }
-                                            if let Some(nb) = engine_info["num_blocks"].as_u64() {
-                                                adapter.num_blocks = nb as i32;
-                                            }
+        let host_str = info["host"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing host"))?;
+        let role = info["role"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing role"))?;
 
-                                            let adapter = Arc::new(Mutex::new(adapter));
-                                            if role == "prefill" {
-                                                self.prefill_engines.push(adapter);
-                                                info!(
-                                                    "Connected to prefill engine {} at {}:{}",
-                                                    engine_id, connect_host, port_num
-                                                );
-                                                connected_count += 1;
-                                            } else if role == "decode" {
-                                                self.decode_engines.push(adapter);
-                                                info!(
-                                                    "Connected to decode engine {} at {}:{}",
-                                                    engine_id, connect_host, port_num
-                                                );
-                                                connected_count += 1;
-                                            } else {
-                                                // Unified or hybrid
-                                                self.prefill_engines.push(adapter.clone());
-                                                self.decode_engines.push(adapter);
-                                                info!(
-                                                    "Connected to {} engine {} at {}:{}",
-                                                    role, engine_id, connect_host, port_num
-                                                );
-                                                connected_count += 1;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to connect to {} engine {} at {}: {}",
-                                                role, engine_id, addr, e
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    warn!(
-                                        "Skipping engine with missing host or role: {:?}",
-                                        engine_info
-                                    );
-                                }
-                            }
-                            info!(
-                                "Successfully connected to {}/{} engines from NanoCtrl",
-                                connected_count, engines_count
-                            );
-                        }
-                        Err(e) => {
-                            error!("Failed to query engines from NanoCtrl: {}", e);
-                            anyhow::bail!("Failed to query engines from NanoCtrl: {}", e);
-                        }
-                    }
-                } else {
-                    // Fallback to static config
-                    info!("Connecting to Unified Engine at {}:{}", host, port);
-                    let addr = format!("{}:{}", host, port);
-                    let mut adapter = EngineAdapter::new(format!("unified-{}", port));
-                    adapter.connect(&addr).await?;
+        if port_num == 0 {
+            return Err(anyhow::anyhow!("Invalid port"));
+        }
 
-                    let adapter = Arc::new(Mutex::new(adapter));
-                    self.prefill_engines.push(adapter.clone());
-                    self.decode_engines.push(adapter);
-                }
+        let connect_host = if host_str == "0.0.0.0" {
+            "127.0.0.1"
+        } else {
+            host_str
+        };
+
+        Ok(ParsedEngineInfo {
+            engine_id: info["id"].as_str().unwrap_or("unknown").to_string(),
+            role: role.to_string(),
+            connect_addr: format!("{}:{}", connect_host, port_num),
+            world_size: info["world_size"].as_u64().unwrap_or(0) as i32,
+            num_blocks: info["num_blocks"].as_u64().unwrap_or(0) as i32,
+        })
+    }
+
+    /// Insert an adapter into the correct engine pool based on role.
+    fn insert_engine_by_role(
+        &mut self,
+        adapter: Arc<Mutex<EngineAdapter>>,
+        role: &str,
+        engine_id: &str,
+    ) {
+        match role {
+            "prefill" => {
+                self.prefill_engines.push(adapter);
+                info!("Added prefill engine: {} (total: {})", engine_id, self.prefill_engines.len());
             }
-            EngineConfig::Disaggregated {
-                prefill,
-                decode,
-                nanoctrl_address,
-                redis_url: _,
-                scope: _,
-            } => {
-                if let Some(nanoctrl_addr) = nanoctrl_address {
-                    // Query engines from NanoCtrl
-                    info!("Querying engines from NanoCtrl at {}", nanoctrl_addr);
-                    match self.list_engines_from_nanoctrl(nanoctrl_addr).await {
-                        Ok(engines) => {
-                            let engines_count = engines.len();
-                            info!("Found {} engines from NanoCtrl", engines_count);
-                            let mut connected_count = 0;
-                            for engine_info in engines {
-                                // Parse port - could be u64 or string
-                                let port_num = engine_info["port"]
-                                    .as_u64()
-                                    .or_else(|| {
-                                        engine_info["port"]
-                                            .as_str()
-                                            .and_then(|s| s.parse::<u64>().ok())
-                                    })
-                                    .unwrap_or(0);
-
-                                if let (Some(host_str), Some(role)) =
-                                    (engine_info["host"].as_str(), engine_info["role"].as_str())
-                                {
-                                    if port_num == 0 {
-                                        warn!(
-                                            "Skipping engine with invalid port: {:?}",
-                                            engine_info
-                                        );
-                                        continue;
-                                    }
-                                    // Handle 0.0.0.0 host - use localhost instead
-                                    let connect_host = if host_str == "0.0.0.0" {
-                                        "127.0.0.1"
-                                    } else {
-                                        host_str
-                                    };
-                                    let addr = format!("{}:{}", connect_host, port_num);
-                                    let engine_id = engine_info["id"].as_str().unwrap_or("unknown");
-                                    info!(
-                                        "Attempting to connect to {} engine {} at {}",
-                                        role, engine_id, addr
-                                    );
-                                    let mut adapter = EngineAdapter::new(engine_id.to_string());
-
-                                    match adapter.connect(&addr).await {
-                                        Ok(_) => {
-                                            if let Some(id) = engine_info["id"].as_str() {
-                                                adapter.uuid = Some(id.to_string());
-                                            }
-                                            if let Some(ws) = engine_info["world_size"].as_u64() {
-                                                adapter.world_size = ws as i32;
-                                            }
-                                            if let Some(nb) = engine_info["num_blocks"].as_u64() {
-                                                adapter.num_blocks = nb as i32;
-                                            }
-
-                                            let adapter = Arc::new(Mutex::new(adapter));
-                                            if role == "prefill" {
-                                                self.prefill_engines.push(adapter);
-                                                info!(
-                                                    "Connected to prefill engine {} at {}:{}",
-                                                    engine_id, connect_host, port_num
-                                                );
-                                                connected_count += 1;
-                                            } else if role == "decode" {
-                                                self.decode_engines.push(adapter);
-                                                info!(
-                                                    "Connected to decode engine {} at {}:{}",
-                                                    engine_id, connect_host, port_num
-                                                );
-                                                connected_count += 1;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to connect to {} engine {} at {}: {}",
-                                                role, engine_id, addr, e
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    warn!(
-                                        "Skipping engine with missing host or role: {:?}",
-                                        engine_info
-                                    );
-                                }
-                            }
-                            info!(
-                                "Successfully connected to {}/{} engines from NanoCtrl",
-                                connected_count, engines_count
-                            );
-                        }
-                        Err(e) => {
-                            error!("Failed to query engines from NanoCtrl: {}", e);
-                            anyhow::bail!("Failed to query engines from NanoCtrl: {}", e);
-                        }
-                    }
-                } else {
-                    // Fallback to static config
-                    for (i, node) in prefill.iter().enumerate() {
-                        info!(
-                            "Connecting to Prefill Engine #{} at {}:{}",
-                            i, node.host, node.port
-                        );
-                        let addr = format!("{}:{}", node.host, node.port);
-                        let mut adapter = EngineAdapter::new(format!("prefill-{}", i));
-                        adapter.connect(&addr).await?;
-
-                        // Fetch real UUID and specs
-                        if let Ok(info) = adapter.send_get_engine_info().await {
-                            if let Some(id) = info["id"].as_str() {
-                                adapter.uuid = Some(id.to_string());
-                                info!("Prefill Engine #{} UUID: {}", i, id);
-                            }
-                            if let Some(ws) = info["world_size"].as_i64() {
-                                adapter.world_size = ws as i32;
-                            }
-                            if let Some(nb) = info["num_blocks"].as_i64() {
-                                adapter.num_blocks = nb as i32;
-                            }
-                        }
-
-                        self.prefill_engines.push(Arc::new(Mutex::new(adapter)));
-                    }
-
-                    for (i, node) in decode.iter().enumerate() {
-                        info!(
-                            "Connecting to Decode Engine #{} at {}:{}",
-                            i, node.host, node.port
-                        );
-                        let addr = format!("{}:{}", node.host, node.port);
-                        let mut adapter = EngineAdapter::new(format!("decode-{}", i));
-                        adapter.connect(&addr).await?;
-
-                        // Fetch real UUID and specs
-                        if let Ok(info) = adapter.send_get_engine_info().await {
-                            if let Some(id) = info["id"].as_str() {
-                                adapter.uuid = Some(id.to_string());
-                                info!("Decode Engine #{} UUID: {}", i, id);
-                            }
-                            if let Some(ws) = info["world_size"].as_i64() {
-                                adapter.world_size = ws as i32;
-                            }
-                            if let Some(nb) = info["num_blocks"].as_i64() {
-                                adapter.num_blocks = nb as i32;
-                            }
-                        }
-
-                        self.decode_engines.push(Arc::new(Mutex::new(adapter)));
-                    }
-                }
+            "decode" => {
+                self.decode_engines.push(adapter);
+                info!("Added decode engine: {} (total: {})", engine_id, self.decode_engines.len());
+            }
+            _ => {
+                // hybrid or unified — add to both pools
+                self.prefill_engines.push(adapter.clone());
+                self.decode_engines.push(adapter);
+                info!(
+                    "Added {} engine: {} (total prefill: {}, decode: {})",
+                    role, engine_id, self.prefill_engines.len(), self.decode_engines.len()
+                );
             }
         }
-        Ok(())
     }
 
     // Helper to get a round-robin engine (simplest scheduler)
@@ -334,6 +117,8 @@ impl EngineManager {
     pub fn get_next_decode(&self) -> Option<Arc<Mutex<EngineAdapter>>> {
         self.decode_engines.first().cloned()
     }
+
+    // ─── NanoCtrl API ────────────────────────────────────────────────
 
     /// Get Redis URL from NanoCtrl API
     pub async fn get_redis_url_from_nanoctrl(
@@ -403,6 +188,8 @@ impl EngineManager {
         Err(anyhow::anyhow!("Failed to list engines from NanoCtrl"))
     }
 
+    // ─── Redis snapshot ──────────────────────────────────────────────
+
     /// Get current revision from Redis
     async fn get_current_revision(&self, redis_url: &str) -> anyhow::Result<i64> {
         let client = redis::Client::open(redis_url)?;
@@ -449,92 +236,36 @@ impl EngineManager {
         Ok(revision)
     }
 
+    // ─── Engine lifecycle ────────────────────────────────────────────
+
     /// Add engine from engine info JSON
     async fn add_engine_from_info(&mut self, engine_info: serde_json::Value) -> anyhow::Result<()> {
-        let port_num = engine_info["port"]
-            .as_u64()
-            .or_else(|| {
-                engine_info["port"]
-                    .as_str()
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .unwrap_or(0);
+        let parsed = Self::parse_engine_info(&engine_info)?;
 
-        if let (Some(host_str), Some(role)) =
-            (engine_info["host"].as_str(), engine_info["role"].as_str())
-        {
-            if port_num == 0 {
-                return Err(anyhow::anyhow!("Invalid port"));
-            }
+        let mut adapter = EngineAdapter::new(parsed.engine_id.clone());
+        adapter.connect(&parsed.connect_addr).await?;
+        adapter.uuid = Some(parsed.engine_id.clone());
+        adapter.world_size = parsed.world_size;
+        adapter.num_blocks = parsed.num_blocks;
 
-            let connect_host = if host_str == "0.0.0.0" {
-                "127.0.0.1"
-            } else {
-                host_str
-            };
-            let addr = format!("{}:{}", connect_host, port_num);
-            let engine_id = engine_info["id"].as_str().unwrap_or("unknown");
-
-            let mut adapter = EngineAdapter::new(engine_id.to_string());
-
-            adapter.connect(&addr).await?;
-
-            if let Some(id) = engine_info["id"].as_str() {
-                adapter.uuid = Some(id.to_string());
-            }
-            if let Some(ws) = engine_info["world_size"].as_u64() {
-                adapter.world_size = ws as i32;
-            }
-            if let Some(nb) = engine_info["num_blocks"].as_u64() {
-                adapter.num_blocks = nb as i32;
-            }
-
-            let adapter = Arc::new(Mutex::new(adapter));
-
-            match role {
-                "prefill" => {
-                    self.prefill_engines.push(adapter);
-                    info!("Added prefill engine {} from snapshot", engine_id);
-                }
-                "decode" => {
-                    self.decode_engines.push(adapter);
-                    info!("Added decode engine {} from snapshot", engine_id);
-                }
-                _ => {
-                    // hybrid or unified
-                    self.prefill_engines.push(adapter.clone());
-                    self.decode_engines.push(adapter);
-                    info!("Added {} engine {} from snapshot", role, engine_id);
-                }
-            }
-        }
+        let adapter = Arc::new(Mutex::new(adapter));
+        self.insert_engine_by_role(adapter, &parsed.role, &parsed.engine_id);
 
         Ok(())
     }
 
-    /// Start dynamic service discovery
-    /// Note: This method consumes self and returns Arc<Mutex<Self>> for concurrent access
-    pub async fn start_dynamic_discovery(
-        mut self,
-        redis_url: String,
-        nanoctrl_address: Option<String>,
-    ) -> anyhow::Result<Arc<Mutex<Self>>> {
-        // Redis key prefix: Use empty prefix to match NanoCtrl default behavior
-        // The automatic prefix generation was removed to fix key mismatch issues
-        // See: TROUBLESHOOTING_GUIDE.md Issue #3 - Mangled Redis Prefix
-        debug!(
-            "Using Redis key prefix: '{}' (matches NanoCtrl default)",
-            self.redis_key_prefix
-        );
-        // Step 1: Load snapshot (full sync)
-        // Strategy: Load from both Redis and NanoCtrl API, merge results
-        // This ensures we get all engines even if some have expired TTL in Redis
-
+    /// Load initial engine set from Redis snapshot + NanoCtrl API merge.
+    /// Returns the initial revision number for the watcher.
+    async fn load_initial_engines(
+        &mut self,
+        redis_url: &str,
+        nanoctrl_address: Option<&str>,
+    ) -> anyhow::Result<i64> {
         let mut initial_revision = 0i64;
         let mut redis_engines = 0;
 
         // First, try to load from Redis
-        match self.load_snapshot_from_redis(&redis_url).await {
+        match self.load_snapshot_from_redis(redis_url).await {
             Ok(rev) => {
                 initial_revision = rev;
                 redis_engines = self.prefill_engines.len() + self.decode_engines.len();
@@ -548,8 +279,9 @@ impl EngineManager {
             }
         }
 
-        // Then, if NanoCtrl address is provided, also query from API and merge (bootstrap: 1x list_engines per router start)
-        if let Some(addr) = &nanoctrl_address {
+        // Then, if NanoCtrl address is provided, also query from API and merge
+        // (bootstrap: 1x list_engines per router start)
+        if let Some(addr) = nanoctrl_address {
             match self.list_engines_from_nanoctrl(addr).await {
                 Ok(api_engines) => {
                     debug!(
@@ -558,7 +290,7 @@ impl EngineManager {
                         redis_engines
                     );
 
-                    // Collect existing engine IDs from snapshot (use async lock)
+                    // Collect existing engine IDs from snapshot
                     let mut existing_ids = std::collections::HashSet::new();
                     for adapter in &self.prefill_engines {
                         let guard = adapter.lock().await;
@@ -595,7 +327,7 @@ impl EngineManager {
                     }
 
                     // Update revision from Redis if API query succeeded
-                    if let Ok(rev) = self.get_current_revision(&redis_url).await {
+                    if let Ok(rev) = self.get_current_revision(redis_url).await {
                         initial_revision = rev;
                     }
                 }
@@ -609,11 +341,33 @@ impl EngineManager {
         }
 
         debug!(
-            "Snapshot loaded: {} prefill engines, {} decode engines, revision={}",
+            "Initial engines loaded: {} prefill, {} decode, revision={}",
             self.prefill_engines.len(),
             self.decode_engines.len(),
             initial_revision
         );
+
+        Ok(initial_revision)
+    }
+
+    // ─── Dynamic discovery ───────────────────────────────────────────
+
+    /// Start dynamic service discovery
+    /// Note: This method consumes self and returns Arc<Mutex<Self>> for concurrent access
+    pub async fn start_dynamic_discovery(
+        mut self,
+        redis_url: String,
+        nanoctrl_address: Option<String>,
+    ) -> anyhow::Result<Arc<Mutex<Self>>> {
+        debug!(
+            "Using Redis key prefix: '{}' (matches NanoCtrl default)",
+            self.redis_key_prefix
+        );
+
+        // Step 1: Load snapshot + merge API data
+        let initial_revision = self
+            .load_initial_engines(&redis_url, nanoctrl_address.as_deref())
+            .await?;
 
         // Step 2: Start watcher with scoped prefix
         let redis_prefix = self.redis_key_prefix.clone();
@@ -712,6 +466,8 @@ impl EngineManager {
         Ok(manager_arc)
     }
 
+    // ─── Event handlers ──────────────────────────────────────────────
+
     async fn handle_add_engine(&mut self, payload: EnginePayload) -> anyhow::Result<()> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY: Duration = std::time::Duration::from_secs(2);
@@ -756,37 +512,7 @@ impl EngineManager {
                     adapter.num_blocks = payload.num_blocks as i32;
 
                     let adapter = Arc::new(Mutex::new(adapter));
-
-                    match payload.role.as_str() {
-                        "prefill" => {
-                            self.prefill_engines.push(adapter);
-                            info!(
-                                "Added prefill engine: {} (total prefill: {})",
-                                payload.id,
-                                self.prefill_engines.len()
-                            );
-                        }
-                        "decode" => {
-                            self.decode_engines.push(adapter);
-                            info!(
-                                "Added decode engine: {} (total decode: {})",
-                                payload.id,
-                                self.decode_engines.len()
-                            );
-                        }
-                        _ => {
-                            // hybrid or unified
-                            self.prefill_engines.push(adapter.clone());
-                            self.decode_engines.push(adapter);
-                            info!(
-                                "Added {} engine: {} (total prefill: {}, decode: {})",
-                                payload.role,
-                                payload.id,
-                                self.prefill_engines.len(),
-                                self.decode_engines.len()
-                            );
-                        }
-                    }
+                    self.insert_engine_by_role(adapter, &payload.role, &payload.id);
                     return Ok(());
                 }
                 Err(e) => {

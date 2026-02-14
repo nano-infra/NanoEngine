@@ -400,6 +400,7 @@ impl EngineAdapter {
         Ok(rx)
     }
 
+    #[allow(dead_code)]
     pub async fn send_get_engine_info(&mut self) -> anyhow::Result<serde_json::Value> {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         {
