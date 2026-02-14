@@ -1,13 +1,12 @@
 import os
 
+import flash_mla
+
 import numpy as np
 import ray
 import torch
 import torch.distributed as dist
 import torch.profiler as profiler
-
-# import flash_mla
-
 
 from nanodeploy._cpp import (
     BlockContextSlot,
@@ -28,7 +27,7 @@ from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
 
-# from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
+from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.loader import load_model
@@ -40,7 +39,7 @@ logger = get_logger("NANODEPLOY")
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
-    # "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
+    "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
 }
 
 
@@ -58,6 +57,11 @@ class ModelRunner:
         self.world_size = config.attn_world_size
         self.rank = rank
         self._dist_initialized = False
+
+        # Sync C++ Sequence.block_size with Python kvcache_block_size
+        from nanodeploy.engine.sequence import Sequence as _Seq
+
+        _Seq.set_block_size(config.kvcache_block_size)
 
         # Propagate scope to actor environment: the Config object carries
         # scope from the driver (set from NANOCTRL_SCOPE env var), but
@@ -284,7 +288,8 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
 
-        mode = "gqa" if hf_config.num_key_value_heads > 1 else "mla"
+        # Detect MLA by presence of kv_lora_rank
+        mode = "mla" if getattr(hf_config, "kv_lora_rank", 0) > 0 else "gqa"
         kv_lora_rank = (
             hf_config.kv_lora_rank if hasattr(hf_config, "kv_lora_rank") else 0
         )
@@ -525,13 +530,14 @@ class ModelRunner:
 
         config = self.config
         hf_config = config.hf_config
-        if hf_config.num_key_value_heads == 1:
-            # new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
-            #     context_lens_for_attn.view(-1),
-            #     hf_config.num_attention_heads // hf_config.num_key_value_heads,
-            #     hf_config.num_key_value_heads,
-            # )
-            new_tile_scheduler_metadata, new_num_splits = None, None
+        is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
+        if is_mla:
+            mla_num_kv_heads = 1
+            new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
+                context_lens_for_attn.view(-1),
+                hf_config.num_attention_heads // mla_num_kv_heads,
+                mla_num_kv_heads,
+            )
         else:
             new_tile_scheduler_metadata, new_num_splits = None, None
 
@@ -622,22 +628,6 @@ class ModelRunner:
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
-        # [DEBUG] Log decode input for the first few tokens
-        if not is_prefill and self.rank == 0 and self.run_count < 3:
-            context = get_context()
-            logger.info(
-                f"[DEBUG DECODE] run_count={self.run_count}, input_ids={input_ids[:5].tolist()}, positions={positions[:5].tolist()}, slot_mapping={context.slot_mapping[:5].tolist() if context.slot_mapping is not None and len(context.slot_mapping) >= 5 else 'N/A'}"
-            )
-
-        # [DEBUG] Log input_ids for verification (len > 10)
-        mask = positions > 9
-        if mask.any():
-            subset_ids = input_ids[mask]
-            subset_pos = positions[mask]
-            # print(
-            #     f"[DEBUG] Python Input IDs (len > 10): IDs={subset_ids[:20].tolist()}, Pos={subset_pos[:20].tolist()}"
-            # )
-
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             context = get_context()
             return self.model.compute_logits(self.model(input_ids, positions))
@@ -683,11 +673,12 @@ class ModelRunner:
 
             config = self.config
             hf_config = config.hf_config
-            if hf_config.num_key_value_heads == 1:
+            is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
+            if is_mla:
                 graph_vars["tile_scheduler_metadata"].zero_()
                 graph_vars["num_splits"].zero_()
-                # graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
-                # graph_vars["num_splits"][:context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
+                graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
+                graph_vars["num_splits"][: context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
 
             graph_vars["context_lens_for_attn"].zero_()
             graph_vars["context_lens_for_attn"][: context.context_lens_for_attn.shape[0]].copy_(context.context_lens_for_attn)  # type: ignore
@@ -854,14 +845,16 @@ class ModelRunner:
         q_offsets = torch.zeros(sp_world_size + 1, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
-        if hf_config.num_key_value_heads == 1:
+        is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
+        if is_mla:
+            mla_num_kv_heads = 1
             tile_scheduler_metadata_buffer, num_splits_buffer = (
                 flash_mla.get_mla_metadata(
                     torch.ones(
                         max_attention_comp_seqs, dtype=torch.int32, device="cuda"
                     ),
-                    hf_config.num_attention_heads // hf_config.num_key_value_heads,
-                    hf_config.num_key_value_heads,
+                    hf_config.num_attention_heads // mla_num_kv_heads,
+                    mla_num_kv_heads,
                 )
             )
         else:

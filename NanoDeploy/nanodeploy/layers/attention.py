@@ -1,4 +1,4 @@
-# import flash_mla
+import flash_mla
 import torch
 from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanodeploy.context.context import get_context
@@ -234,10 +234,21 @@ class FlashMLAImpl:
         if k_cache.numel() and not get_context().is_dummy:
             store_kcache(k, k_cache, context.slot_mapping)
 
+        # --- DEBUG removed (too noisy with 61 layers) ---
+
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
 
-        if not context.is_prefill:  # decode
+        if context.is_prefill:
+            # NOTE: MLA prefill is handled directly in DeepseekV2Attention.forward
+            # using the non-absorbed approach (expanded K/V). This path should not
+            # be reached for MLA models.
+            raise RuntimeError(
+                "FlashMLAImpl.forward should not be called during prefill. "
+                "MLA prefill is handled in DeepseekV2Attention.forward."
+            )
+
+        else:  # decode
             bs, num_head, head_dim = q.shape
             if sp_size > 1:
                 max_num_seqs = get_sp_context().max_num_seqs
@@ -264,22 +275,27 @@ class FlashMLAImpl:
                     : context.attention_compute_bs
                 ]
                 block_tables = context.block_tables[: context.attention_compute_bs]
-                # tile_scheduler_metadata = context.tile_scheduler_metadata
-                # num_splits = context.num_splits[: context.attention_compute_bs + 1]
             else:
                 q = q[: context.attention_compute_bs]
                 context_lens = context.context_lens_for_attn[
                     : context.attention_compute_bs
                 ]
                 block_tables = context.block_tables[: context.attention_compute_bs]
-                # tile_scheduler_metadata = context.tile_scheduler_metadata
-                # num_splits = context.num_splits[: context.attention_compute_bs + 1]
 
-            tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
-                context_lens,
-                self.num_heads // self.num_kv_heads,
-                self.num_kv_heads,
-            )
+            batch_size = q.shape[0]
+
+            if context.tile_scheduler_metadata is not None:
+                # Use precomputed metadata from prepare_decode (CUDA graph compatible)
+                tile_scheduler_metadata = context.tile_scheduler_metadata
+                # num_splits must have shape (batch_size + 1); slice buffer to match
+                num_splits = context.num_splits[: batch_size + 1]
+            else:
+                # Fallback: compute inline
+                tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
+                    context_lens,
+                    self.num_heads // self.num_kv_heads,
+                    self.num_kv_heads,
+                )
 
             o, lse = flash_mla.flash_mla_with_kvcache(
                 q.unsqueeze(1),

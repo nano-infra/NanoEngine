@@ -96,7 +96,11 @@ struct SamplingParams {
 
 class Sequence {
 public:
-    static constexpr int block_size = 256;
+    static int  block_size;
+    static void set_block_size(int bs)
+    {
+        block_size = bs;
+    }
 
     Sequence(const std::vector<int>& token_ids, const SamplingParams& sampling_params = {});
 

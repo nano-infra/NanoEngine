@@ -255,7 +255,6 @@ ScheduleResult Scheduler::schedule()
     if (!wait_queue.empty()) {
         auto head_seq = wait_queue.front();
         // Calculate blocks for head sequence: ceil(num_tokens / block_size)
-        // Note: We use Sequence::block_size which is static constexpr int block_size = 256;
         result.waiting_head_blocks = (head_seq->num_tokens() + Sequence::block_size - 1) / Sequence::block_size;
     }
 

@@ -378,5 +378,6 @@ void bind_sequence(py::module_& m)
                 }
             }))
 
-        .def_readonly_static("block_size", &Sequence::block_size);
+        .def_readwrite_static("block_size", &Sequence::block_size)
+        .def_static("set_block_size", &Sequence::set_block_size, py::arg("block_size"));
 }

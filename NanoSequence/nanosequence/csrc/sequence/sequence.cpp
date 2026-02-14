@@ -43,6 +43,7 @@ void reset_block_context(
     ctx.endpoints.clear();  // Initialize endpoints to empty vector
 }
 
+int                   Sequence::block_size = 256;
 std::atomic<uint64_t> Sequence::next_seq_id_{0};
 
 Sequence::Sequence(const std::vector<int>& token_ids, const SamplingParams& sampling_params)

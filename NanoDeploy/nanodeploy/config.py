@@ -73,13 +73,24 @@ class Config(BaseModel):
         # Get scope from environment variable only (ignore config value)
         self.scope = os.getenv("NANOCTRL_SCOPE")
 
-        self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+        # Prefer built-in transformers config classes over custom remote code.
+        # Custom auto_map in config.json causes 'transformers_modules' import
+        # errors in Ray actors where the cached module is not available.
+        try:
+            self.hf_config = AutoConfig.from_pretrained(
+                self.model, trust_remote_code=False
+            )
+        except ValueError:
+            # Fallback for models that truly require custom code
+            self.hf_config = AutoConfig.from_pretrained(
+                self.model, trust_remote_code=True
+            )
 
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             assert self.kvcache_block_size == 64
             assert self.attention_tp == 1
         else:
-            assert self.kvcache_block_size % 256 == 0
+            assert self.kvcache_block_size % 64 == 0
             assert 1 <= self.attention_tp <= 8
 
         if self.attention_sp == 1:

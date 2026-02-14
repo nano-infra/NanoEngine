@@ -54,7 +54,7 @@ class LLMComponent(LLM):
         self._peer_info: dict[str, dict] = {}
         self.active_p2p_links: Set[str] = set()
 
-        # P2P ZMQ socket for receiving free instructions (dynamically assigned port)
+        # P2P ZMQ socket for receiving free instructions (set by engine_server.py)
         self.p2p_socket = None
         self.p2p_port = None
 
@@ -67,8 +67,12 @@ class LLMComponent(LLM):
         self._heartbeat_stop_event = threading.Event()
         self._heartbeat_thread: Optional[threading.Thread] = None
 
-        # Note: Registration deferred until P2P socket is bound in engine_server
-        # This ensures p2p_port is set before registration
+        # Register with NanoCtrl if configured.
+        # engine_server.py will re-register after binding its own P2P socket
+        # (replacing p2p_port), but for direct LLMComponent usage (e.g.
+        # deepseek_v3_disagg.py) this is the only registration point.
+        if self.config.nanoctrl_address:
+            self._register_with_nanoctrl()
 
         atexit.register(self.shutdown)
 
