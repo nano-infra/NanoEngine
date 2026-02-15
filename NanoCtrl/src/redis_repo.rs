@@ -238,8 +238,7 @@ impl RedisRepo {
         redis::cmd("DEL")
             .arg(&agent_key)
             .query_async::<()>(&mut *conn)
-            .await
-            .ok();
+            .await?;
 
         // 3. Delete topology spec
         redis::cmd("DEL")
