@@ -158,8 +158,7 @@ impl RedisRepo {
             let data: std::collections::HashMap<String, String> = redis::cmd("HGETALL")
                 .arg(&key)
                 .query_async(&mut *conn)
-                .await
-                .unwrap_or_default();
+                .await?;
 
             if let (Some(dev), Some(ip)) = (data.get("device"), data.get("addr")) {
                 let name = key
