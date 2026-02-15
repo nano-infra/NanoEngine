@@ -181,7 +181,7 @@ deadpool-redis = "0.18"   # Connection pool for Redis
 ### Build Verification
 
 ```bash
-cd /mnt/d/src/deeplink/NanoInfra/NanoCtrl
+cd NanoCtrl
 cargo build
 ```
 
