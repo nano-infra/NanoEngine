@@ -1,19 +1,19 @@
 version: '3.8'
 
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: redis
+  valkey:
+    image: valkey/valkey:9.0.2-alpine
+    container_name: valkey
     ports:
       - "6379:6379"
     volumes:
-      - redis-data:/data
-    command: redis-server --appendonly yes
+      - valkey-data:/data
+    command: valkey-server --appendonly yes
     networks:
-      - redis-network
+      - valkey-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -26,21 +26,21 @@ services:
     volumes:
       - redisinsight-data:/data
     networks:
-      - redis-network
+      - valkey-network
     restart: unless-stopped
     depends_on:
-      redis:
+      valkey:
         condition: service_healthy
     environment:
       - RI_APP_PORT=8001
       - RITRUSTEDORIGINS=http://localhost:8001,http://127.0.0.1:8001
 
 volumes:
-  redis-data:
+  valkey-data:
     driver: local
   redisinsight-data:
     driver: local
 
 networks:
-  redis-network:
+  valkey-network:
     driver: bridge
