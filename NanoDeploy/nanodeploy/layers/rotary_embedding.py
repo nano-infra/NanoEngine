@@ -51,14 +51,45 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
+def _get_rope_impl(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling: dict | tuple | None = None,
+):
+    # assert rope_scaling is None
+    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    return rotary_emb
+
+
 @lru_cache(1)
+def _get_rope_cached(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling_hash: tuple | None = None,
+):
+    # Convert hashable tuple back to dict if needed (currently not used)
+    rope_scaling = dict(rope_scaling_hash) if rope_scaling_hash else None
+    return _get_rope_impl(head_size, rotary_dim, max_position, base, rope_scaling)
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
     max_position: int,
     base: float,
-    rope_scaling: dict | None = None,
+    rope_scaling: dict | tuple | None = None,
 ):
-    # assert rope_scaling is None
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return rotary_emb
+    # Convert dict to hashable tuple for caching
+    if rope_scaling is None:
+        rope_scaling_hash = None
+    elif isinstance(rope_scaling, dict):
+        rope_scaling_hash = tuple(sorted(rope_scaling.items()))
+    else:
+        rope_scaling_hash = rope_scaling
+    return _get_rope_cached(
+        head_size, rotary_dim, max_position, base, rope_scaling_hash
+    )
