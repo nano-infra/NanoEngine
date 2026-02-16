@@ -1,4 +1,5 @@
 import math
+from functools import lru_cache
 
 import torch
 from torch import nn
@@ -152,7 +153,38 @@ def _yarn_get_mscale(scale=1, mscale=1):
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-_rope_cache = {}
+@lru_cache(1)
+def _get_rope_cached(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling_hash: tuple | None = None,
+):
+    # Convert hashable tuple back to dict if needed
+    rope_scaling = dict(rope_scaling_hash) if rope_scaling_hash else None
+
+    if rope_scaling is not None:
+        rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+        if rope_type == "yarn":
+            rotary_emb = YarnRotaryEmbedding(
+                rotary_dim=rotary_dim,
+                max_position_embeddings=max_position,
+                base=base,
+                scaling_factor=rope_scaling.get("factor", 1.0),
+                original_max_position_embeddings=rope_scaling.get(
+                    "original_max_position_embeddings", 4096
+                ),
+                beta_fast=rope_scaling.get("beta_fast", 32.0),
+                beta_slow=rope_scaling.get("beta_slow", 1.0),
+                mscale=rope_scaling.get("mscale", 1.0),
+                mscale_all_dim=rope_scaling.get("mscale_all_dim", 0.0),
+            )
+        else:
+            rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    else:
+        rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    return rotary_emb
 
 
 def get_rope(
@@ -160,36 +192,16 @@ def get_rope(
     rotary_dim: int,
     max_position: int,
     base: float,
-    rope_scaling: dict | None = None,
+    rope_scaling: dict | tuple | None = None,
 ):
-    # dicts are not hashable, so we build a hashable key
-    key = (
-        head_size,
-        rotary_dim,
-        max_position,
-        base,
-        tuple(sorted(rope_scaling.items())) if rope_scaling else None,
-    )
-    if key in _rope_cache:
-        return _rope_cache[key]
-    rope_type = (rope_scaling or {}).get("rope_type") or (rope_scaling or {}).get(
-        "type"
-    )
-    if rope_scaling is not None and rope_type == "yarn":
-        rotary_emb = YarnRotaryEmbedding(
-            rotary_dim=rotary_dim,
-            max_position_embeddings=max_position,
-            base=base,
-            scaling_factor=rope_scaling.get("factor", 1.0),
-            original_max_position_embeddings=rope_scaling.get(
-                "original_max_position_embeddings", 4096
-            ),
-            beta_fast=rope_scaling.get("beta_fast", 32.0),
-            beta_slow=rope_scaling.get("beta_slow", 1.0),
-            mscale=rope_scaling.get("mscale", 1.0),
-            mscale_all_dim=rope_scaling.get("mscale_all_dim", 0.0),
-        )
+    # Convert dict to hashable tuple for caching
+    if rope_scaling is None:
+        rope_scaling_hash = None
+    elif isinstance(rope_scaling, dict):
+        rope_scaling_hash = tuple(sorted(rope_scaling.items()))
     else:
-        rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    _rope_cache[key] = rotary_emb
-    return rotary_emb
+        rope_scaling_hash = rope_scaling
+
+    return _get_rope_cached(
+        head_size, rotary_dim, max_position, base, rope_scaling_hash
+    )
