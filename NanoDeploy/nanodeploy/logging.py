@@ -7,7 +7,7 @@ from typing import Optional
 # =============================================================================
 # Custom Formatter
 # =============================================================================
-class ColoredFormatter(logging.Formatter):
+class ContextualFormatter(logging.Formatter):
     """A custom log formatter that includes contextual information."""
 
     def __init__(self, use_relative_path: bool = True):
@@ -123,7 +123,7 @@ class LoggerManager:
             console_handler.setLevel(logging.DEBUG)
 
             # Apply our custom formatter to the console handler
-            formatter = ColoredFormatter(use_relative_path=use_relative_path)
+            formatter = ContextualFormatter(use_relative_path=use_relative_path)
             console_handler.setFormatter(formatter)
 
             # Add the handler to the logger
