@@ -1,12 +1,14 @@
 """Disaggregated (prefill-decode) LLM inference example.
 
-Shared fields (model, ray_address, nanoctrl_address) are specified once;
-per-role overrides use --prefill.xxx / --decode.xxx scoping.
-
-RAY_ADDRESS and NANOCTRL_ADDRESS are read from environment variables.
+Common config is set at top-level; per-role overrides use
+--prefill.xxx / --decode.xxx scoping (overlay on top of common).
 
 Usage:
     python disagg.py --model /models/deepseek-v3 \\
+        --ray_address 10.102.97.179:7078 \\
+        --nanoctrl_address 10.102.97.179:3000 \\
+        --kvcache_block_size 64 \\
+        --attention_dp 8 --ffn_ep 8 \\
         --prefill.master_address 10.102.97.183:6006 \\
         --decode.master_address 10.102.97.179:6006 \\
         --decode.loop_count 16
@@ -26,28 +28,20 @@ from nanodeploy.llm_component import LLMComponent
 from nanodeploy.sampling_params import SamplingParams
 from transformers import AutoTokenizer
 
-# Fields that are shared across prefill/decode and should not appear in scoped groups.
-_SHARED_FIELDS = {"model", "ray_address", "nanoctrl_address"}
-
 
 def main():
     parser = ArgumentParser(description="Disaggregated LLM inference example")
     parser.add_argument("--config", action=ActionConfigFile)
 
-    # Shared args (top-level, written once)
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="Path to model directory (shared by prefill & decode)",
-    )
+    # Common config (top-level): shared by both prefill & decode
+    parser.add_class_arguments(Config, fail_untyped=False)
 
-    # Per-role scoped args: --prefill.xxx / --decode.xxx
+    # Per-role overrides: --prefill.xxx / --decode.xxx overlay on common
     parser.add_class_arguments(
-        Config, nested_key="prefill", skip=_SHARED_FIELDS, fail_untyped=False
+        Config, nested_key="prefill", skip={"model"}, fail_untyped=False
     )
     parser.add_class_arguments(
-        Config, nested_key="decode", skip=_SHARED_FIELDS, fail_untyped=False
+        Config, nested_key="decode", skip={"model"}, fail_untyped=False
     )
 
     # Generation args
@@ -56,26 +50,26 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.1)
 
     args = parser.parse_args()
+    defaults = parser.get_defaults()
 
-    # Read shared addresses from env vars
-    ray_address = os.environ.get("RAY_ADDRESS", "127.0.0.1:6379")
-    nanoctrl_address = os.environ.get("NANOCTRL_ADDRESS")
+    # Build common config dict (excluding non-Config fields)
+    extra_keys = {"config", "prompt", "max_tokens", "temperature", "prefill", "decode"}
+    common = {k: v for k, v in vars(args).items() if k not in extra_keys}
 
-    # Build per-role Configs by injecting shared fields
-    extra = ("config", "prompt", "max_tokens", "temperature")
+    def build_config(ns, default_ns, mode: str) -> Config:
+        """Merge common config with per-role overrides.
 
-    def build_config(ns, mode: str) -> Config:
-        role_args = {k: v for k, v in vars(ns).items() if k not in extra}
-        role_args.update(
-            model=args.model,
-            ray_address=ray_address,
-            nanoctrl_address=nanoctrl_address,
-            mode=mode,
-        )
-        return Config(**role_args)
+        Only values explicitly set by the user (differing from parser defaults)
+        override the common config.
+        """
+        overrides = {
+            k: v for k, v in vars(ns).items() if v != getattr(default_ns, k, v)
+        }
+        merged = {**common, **overrides, "mode": mode}
+        return Config(**merged)
 
-    prefill_config = build_config(args.prefill, "prefill")
-    decode_config = build_config(args.decode, "decode")
+    prefill_config = build_config(args.prefill, defaults.prefill, "prefill")
+    decode_config = build_config(args.decode, defaults.decode, "decode")
 
     # Launch engines
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -84,11 +78,9 @@ def main():
 
     print("\nEngines registered with NanoCtrl - automatic peer discovery enabled\n")
 
-    # Build prompts & sequences
+    # Build sequences
     sampling_params = SamplingParams(
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-        ignore_eos=False,
+        temperature=args.temperature, max_tokens=args.max_tokens, ignore_eos=False
     )
     seqs = [
         Sequence(

@@ -28,35 +28,29 @@ python examples/non_disagg.py --config config.yaml
 ## `disagg.py` — Disaggregated (Prefill-Decode) Inference
 
 Two engines (prefill + decode) with automatic NanoCtrl peer discovery.
-Uses scoped args for per-role config overrides.
+Common config is set at top-level; per-role overrides use `--prefill.xxx` / `--decode.xxx` scoping.
 
-### Shared vs Scoped Config
+### Common Config + Per-Role Overlay
 
-| Scope                  | How to set          | Examples                                 |
-| ---------------------- | ------------------- | ---------------------------------------- |
-| **Shared** (top-level) | `--model`, env vars | `--model /models/deepseek-v3`            |
-| **Prefill-only**       | `--prefill.xxx`     | `--prefill.master_address 10.0.0.2:6006` |
-| **Decode-only**        | `--decode.xxx`      | `--decode.loop_count 16`                 |
+| Scope                  | How to set      | Examples                                                 |
+| ---------------------- | --------------- | -------------------------------------------------------- |
+| **Common** (top-level) | `--xxx`         | `--model /models/deepseek-v3`, `--kvcache_block_size 64` |
+| **Prefill-only**       | `--prefill.xxx` | `--prefill.master_address 10.0.0.2:6006`                 |
+| **Decode-only**        | `--decode.xxx`  | `--decode.loop_count 16`                                 |
 
-### Environment Variables
-
-| Variable           | Description                    | Default          |
-| ------------------ | ------------------------------ | ---------------- |
-| `RAY_ADDRESS`      | Ray cluster address            | `127.0.0.1:6379` |
-| `NANOCTRL_ADDRESS` | NanoCtrl control plane address | *(none)*         |
+Common values apply to both roles unless explicitly overridden by a scoped arg.
 
 ### Usage
 
 ```bash
-export RAY_ADDRESS=10.102.97.179:7078
-export NANOCTRL_ADDRESS=10.102.97.179:3000
-
 python examples/disagg.py \
     --model /models/deepseek-v3 \
+    --ray_address 10.102.97.179:7078 \
+    --nanoctrl_address 10.102.97.179:3000 \
+    --kvcache_block_size 64 \
+    --attention_dp 8 --ffn_ep 8 \
     --prefill.master_address 10.102.97.183:6006 \
-    --prefill.attention_dp 8 --prefill.ffn_ep 8 \
     --decode.master_address 10.102.97.179:6006 \
-    --decode.attention_dp 8 --decode.ffn_ep 8 \
     --decode.loop_count 16 \
     --max_tokens 256 --temperature 0.1 \
     --prompt "What is 1+1?"
@@ -64,9 +58,8 @@ python examples/disagg.py \
 
 ### Design Notes
 
-- `model` is shared: specified once at top-level, injected into both prefill and decode `Config`.
-- `ray_address` and `nanoctrl_address` are read from environment variables (`RAY_ADDRESS` / `NANOCTRL_ADDRESS`), not CLI args, since they are typically cluster-wide settings.
-- Per-role `Config` fields use `jsonargparse` nested groups (`nested_key="prefill"` / `nested_key="decode"`), giving natural `--prefill.xxx` / `--decode.xxx` scoping.
+- `model`, `ray_address`, `nanoctrl_address`, `kvcache_block_size`, etc. are **common config** — set once at top-level, applied to both roles.
+- Per-role `--prefill.xxx` / `--decode.xxx` values **overlay** on top of common config. Only explicitly set values override; unset scoped args inherit from common.
 - Both scripts support `--config config.yaml` for file-based configuration via `ActionConfigFile`.
 
 ## History

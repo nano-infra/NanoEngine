@@ -77,16 +77,15 @@ python examples/non_disagg.py \
 > **Prerequisite:** Start NanoCtrl before running this example (see [Deployment Guide](../docs/deployment.md) Step 1).
 
 ```bash
-# examples/disagg.py
-export RAY_ADDRESS=10.102.97.179:7078
-export NANOCTRL_ADDRESS=10.102.97.179:3000
-
+# examples/disagg.py — common config + per-role overlay
 python examples/disagg.py \
     --model /models/deepseek-v3 \
+    --ray_address 10.102.97.179:7078 \
+    --nanoctrl_address 10.102.97.179:3000 \
+    --attention_dp 8 --ffn_ep 8 \
+    --kvcache_block_size 64 \
     --prefill.master_address 10.0.0.2:6006 \
-    --prefill.attention_dp 8 --prefill.ffn_ep 8 \
     --decode.master_address 10.0.0.1:6006 \
-    --decode.attention_dp 8 --decode.ffn_ep 8 \
     --decode.loop_count 16
 ```
 
