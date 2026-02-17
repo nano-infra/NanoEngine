@@ -25,8 +25,6 @@ pub struct EngineAdapter {
     pub recv_tx_keepalive: Option<tokio_mpsc::UnboundedSender<ZmqPacket>>,
     // I/O thread handle: must be properly joined during shutdown
     pub io_thread_handle: Option<std::thread::JoinHandle<()>>,
-    // Dedicated channel for GetEngineInfo responses (no seq_id needed)
-    engine_info_tx: Arc<Mutex<Option<tokio_mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +53,6 @@ impl EngineAdapter {
             reader_handle: None,
             recv_tx_keepalive: None,
             io_thread_handle: None,
-            engine_info_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -88,7 +85,7 @@ impl EngineAdapter {
         self.shutdown_tx = Some(shutdown_tx_for_storage);
 
         let pending = self.pending_requests.clone();
-        let engine_info_tx = self.engine_info_tx.clone();
+
         let addr_for_log = addr.to_string();
         let addr_for_reader = addr_for_log.clone();
 
@@ -211,14 +208,7 @@ impl EngineAdapter {
                     continue;
                 }
 
-                // Action 2: GetEngineInfo response — deliver via dedicated channel
-                if action == 2 {
-                    let guard = engine_info_tx.lock().await;
-                    if let Some(tx) = guard.as_ref() {
-                        let _ = tx.send(payload);
-                    }
-                    continue;
-                }
+
 
                 // Action 0: StepOut (token streaming)
                 if action == 0 {
@@ -398,37 +388,5 @@ impl EngineAdapter {
         );
         self.send_packet(1, payload)?;
         Ok(rx)
-    }
-
-    #[allow(dead_code)]
-    pub async fn send_get_engine_info(&mut self) -> anyhow::Result<serde_json::Value> {
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        {
-            let mut guard = self.engine_info_tx.lock().await;
-            *guard = Some(tx);
-        }
-
-        self.send_packet(2, vec![])?;
-
-        if let Some(body) = rx.recv().await {
-            // Clear the channel after receiving
-            {
-                let mut guard = self.engine_info_tx.lock().await;
-                *guard = None;
-            }
-            // Parse engine info as JSON
-            if let Ok(json_str) = std::str::from_utf8(&body) {
-                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    return Ok(json_val);
-                }
-            }
-            Err(anyhow::anyhow!(
-                "Failed to parse engine info response as JSON"
-            ))
-        } else {
-            Err(anyhow::anyhow!(
-                "Channel closed while waiting for GetEngineInfo response"
-            ))
-        }
     }
 }

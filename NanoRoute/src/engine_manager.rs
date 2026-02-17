@@ -91,11 +91,19 @@ impl EngineManager {
         match role {
             "prefill" => {
                 self.prefill_engines.push(adapter);
-                info!("Added prefill engine: {} (total: {})", engine_id, self.prefill_engines.len());
+                info!(
+                    "Added prefill engine: {} (total: {})",
+                    engine_id,
+                    self.prefill_engines.len()
+                );
             }
             "decode" => {
                 self.decode_engines.push(adapter);
-                info!("Added decode engine: {} (total: {})", engine_id, self.decode_engines.len());
+                info!(
+                    "Added decode engine: {} (total: {})",
+                    engine_id,
+                    self.decode_engines.len()
+                );
             }
             _ => {
                 // hybrid or unified — add to both pools
@@ -103,7 +111,10 @@ impl EngineManager {
                 self.decode_engines.push(adapter);
                 info!(
                     "Added {} engine: {} (total prefill: {}, decode: {})",
-                    role, engine_id, self.prefill_engines.len(), self.decode_engines.len()
+                    role,
+                    engine_id,
+                    self.prefill_engines.len(),
+                    self.decode_engines.len()
                 );
             }
         }
