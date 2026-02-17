@@ -62,50 +62,32 @@ pip install ray redis zmq flatbuffers httpx pydantic jsonargparse
 
 ### Single-Node Example (Non-Disaggregated)
 
-```python
-# examples/deepseek_v3_non_disagg.py
-from nanodeploy.config import Config
-from nanodeploy.engine.llm_engine import LLM
-
-config = Config(
-    model="/models/deepseek-v3",
-    attention_dp=8, attention_sp=1, attention_tp=1,
-    ffn_dp=1, ffn_ep=8, ffn_tp=1,
-    kvcache_block_size=64,
-    max_model_len=4096,
-    max_num_batched_tokens=4096,
-)
-llm = LLM(config)
-# ... add requests and generate
+```bash
+# examples/non_disagg.py
+python examples/non_disagg.py \
+    --model /models/deepseek-v3 \
+    --attention_dp 8 --ffn_ep 8 \
+    --kvcache_block_size 64 \
+    --max_tokens 64 --temperature 0.1 \
+    --prompt "What is 1+1?"
 ```
 
 ### PD Disaggregated Example
 
 > **Prerequisite:** Start NanoCtrl before running this example (see [Deployment Guide](../docs/deployment.md) Step 1).
 
-```python
-# examples/deepseek_v3_disagg.py
-from nanodeploy.config import Config
-from nanodeploy.llm_component import LLMComponent
+```bash
+# examples/disagg.py
+export RAY_ADDRESS=10.102.97.179:7078
+export NANOCTRL_ADDRESS=10.102.97.179:3000
 
-prefill_config = Config(
-    model="/models/deepseek-v3",
-    mode="prefill",
-    nanoctrl_address="10.0.0.1:3000",
-    master_address="10.0.0.2:6006",
-    # ... parallelism config
-)
-decode_config = Config(
-    model="/models/deepseek-v3",
-    mode="decode",
-    nanoctrl_address="10.0.0.1:3000",
-    master_address="10.0.0.1:6006",
-    # ... parallelism config
-)
-
-prefill = LLMComponent.as_remote(prefill_config)
-decode = LLMComponent.as_remote(decode_config)
-# ... prefill generates, KV cache migrates via RDMA, decode continues
+python examples/disagg.py \
+    --model /models/deepseek-v3 \
+    --prefill.master_address 10.0.0.2:6006 \
+    --prefill.attention_dp 8 --prefill.ffn_ep 8 \
+    --decode.master_address 10.0.0.1:6006 \
+    --decode.attention_dp 8 --decode.ffn_ep 8 \
+    --decode.loop_count 16
 ```
 
 ## Configuration Reference
@@ -130,4 +112,5 @@ decode = LLMComponent.as_remote(decode_config)
 
 ## References
 
+- [Example Scripts Guide](../ai_docs/NanoDeploy/examples.md)
 - [DeepSeek-V3 Development Notes](../ai_docs/NanoDeploy/deepseek_v3_support.md)

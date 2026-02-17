@@ -19,6 +19,7 @@ docs/
 ├── engine_discovery_design.md         # Engine discovery design
 ├── README_ENGINE_DISCOVERY.md         # Engine discovery overview
 ├── CHANGELOG_DYNAMIC_DISCOVERY.md     # Discovery system changelog
+├── examples.md                        # Example scripts usage guide
 └── serialization_and_logging.md       # Serialization & logging notes
 ```
 
@@ -35,6 +36,10 @@ docs/
 
 - [Pickle Migration](serialization/pickle-migration.md)
 - [Simplification](serialization/simplification.md)
+
+### Example Scripts
+
+- [Example Scripts Guide](examples.md) — Usage for `non_disagg.py` and `disagg.py`
 
 ### Engine Discovery
 
