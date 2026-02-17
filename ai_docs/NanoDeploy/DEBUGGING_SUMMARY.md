@@ -372,6 +372,81 @@ Ray Address:     10.1.16.1:6379
 
 5. **Operational Visibility**: Startup summary logs significantly improve debugging and operational confidence in distributed systems.
 
+### 6. CUDA Error: Device-Side Assert in Engine Server Prefill (Token ID Out of Range)
+
+**Symptom:**
+
+- `engine_server` mode (prefill) crashes with `Exception: Failed to encode tensor map: 710`
+- Followed by `torch.AcceleratorError: CUDA error: device-side assert triggered`
+- Error occurs in `deep_gemm_fp8` → `gemm_fp8_fp8_bf16_nt` → `make_2d_tma_a_desc` during the first decoder layer's `q_a_proj`
+- The same model runs fine in `example` mode (`deepseek_v3_disagg.py`)
+
+**Investigation:**
+
+1. Added debug logging before `run_model()` in `model_runner.py` to print sequence info, token IDs, and context metadata
+2. Compared the debug output between working `example` mode and failing `engine_server` mode:
+
+|               | Example (✅ works)                          | Engine Server (❌ fails)                                                     |
+| ------------- | ------------------------------------------- | ---------------------------------------------------------------------------- |
+| Token IDs     | `[0, 128803, 79938, 353, 7405, 16, 128804]` | `[151644, 872, 198, 1072, 47845, 6133, 13, 151645, 198, 151644, 77091, 198]` |
+| Max Token ID  | 128804                                      | **151645**                                                                   |
+| Context/Shape | Identical structure                         | Identical structure                                                          |
+
+3. Confirmed model vocab_size from `/models/deepseek-v3/config.json`: **vocab_size = 129280**
+4. Token IDs 151644 (`<|im_start|>`) and 151645 (`<|im_end|>`) are **Qwen tokenizer** special tokens, exceeding the model's vocab range
+
+**Root Cause:**
+
+The upstream API proxy/gateway (NanoRoute) was using a **Qwen tokenizer** (vocab ~152K) to tokenize chat completion requests, but the model is **DeepSeek-V3** (vocab 129280). Token IDs like 151644 and 151645 exceed the embedding table size, causing:
+
+1. `embed_tokens(input_ids)` performs an **out-of-bounds access** on the embedding table (size 129280)
+2. CUDA triggers a **device-side assert** (error 710 = `CUDA_ERROR_ASSERT`)
+3. The assert is reported **asynchronously** — it surfaces at the next CUDA API call, which happens to be the TMA descriptor creation in `deep_gemm`'s FP8 GEMM kernel
+4. This makes the error appear to come from `q_a_proj` (the first linear layer), not from the embedding
+
+**Fix:**
+
+Ensure the tokenizer used by the API proxy matches the model:
+
+- The proxy/NanoRoute must load the tokenizer from the same model path (`/models/deepseek-v3`)
+- DeepSeek-V3 special tokens: `<｜begin▁of▁sentence｜>` = 0, `<｜User｜>` = 128803, `<｜Assistant｜>` = 128804
+- NOT Qwen special tokens: `<|im_start|>` = 151644, `<|im_end|>` = 151645
+
+**Verification:**
+
+After fixing the tokenizer, the engine_server mode works correctly:
+
+```bash
+curl -X POST http://127.0.0.1:3001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "/models/", "stream":false,
+       "messages": [{"role": "user", "content": "Introduce yourself."}],
+       "max_tokens": 2048}'
+# Response: "I'm DeepSeek-V3, an artificial intelligence assistant created by DeepSeek."
+```
+
+### 7. CUDA Graph Capture: graph_master_rank_bs Exceeding max_bs
+
+**Symptom:**
+
+- Potential silent corruption during CUDA graph capture when `graph_master_rank_bs` contains batch sizes larger than `max_bs`
+- Could cause inconsistent `attention_compute_bs` values during graph replay
+
+**Root Cause:**
+
+- Original code: `self.graph_master_rank_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))`
+- When `max_bs < 16`, the list `[1, 2, 4, 8]` could contain values exceeding `max_bs`
+- During capture, input tensors were silently sliced to `max_bs`, but `attention_compute_bs` in context remained at the larger value
+
+**Fix:**
+
+```python
+# NanoDeploy/nanodeploy/worker/model_runner.py:858
+self.graph_master_rank_bs = [x for x in [1, 2, 4, 8] if x <= max_bs] + list(range(16, max_bs + 1, 16))
+```
+
+This ensures all batch sizes in the capture list are within the valid range.
+
 ## Future Improvements
 
 1. **Error Handling**: Add more robust error handling for ZMQ communication failures
@@ -379,6 +454,8 @@ Ray Address:     10.1.16.1:6379
 3. **Health Checks**: Add periodic health checks for engine connectivity
 4. **Metrics**: Add Prometheus metrics for request latency, token throughput
 5. **Configuration Validation**: Add pre-flight checks to validate distributed configuration before startup
+6. **Tokenizer Consistency**: In disaggregated serving, the tokenizer used by the API proxy/gateway MUST match the model's tokenizer. A mismatch produces out-of-range token IDs that cause CUDA device-side asserts — errors that appear asynchronous and misleading (e.g., surfacing in deep_gemm TMA descriptors rather than the embedding layer).
+7. **CUDA Graph Batch Size Validation**: When building batch size lists for CUDA graph capture, always clamp values to the actual `max_bs` to prevent silent tensor slicing mismatches.
 
 ## References
 

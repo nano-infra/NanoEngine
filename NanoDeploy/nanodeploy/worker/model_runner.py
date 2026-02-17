@@ -268,20 +268,9 @@ class ModelRunner:
         )
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
+        # empty for warmup
         seqs = []
-        for _ in range(num_seqs):
-            seq = Sequence(
-                list(np.random.randint(low=0, high=10000, size=max_model_len)),
-            )
-            # seq = Sequence(
-            #     list(np.zeros(max_model_len, dtype=int))
-            # )
-            seq.active(
-                self.engine_id, sp_size, 1, get_cache_context().num_local_kvcache_blocks
-            )
-            seq.block_ctx().master_sp_idx = sp_rank
-
-        self.run(seqs, True)
+        self.run([], True)
         torch.cuda.empty_cache()
 
     def preallocate_kvcache(self):
@@ -860,7 +849,9 @@ class ModelRunner:
         else:
             tile_scheduler_metadata_buffer, num_splits_buffer = None, None
 
-        self.graph_master_rank_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_master_rank_bs = [x for x in [1, 2, 4, 8] if x <= max_bs] + list(
+            range(16, max_bs + 1, 16)
+        )
         self.graphs = {}
         self.graph_pool = None
         self.graph_map = {}  # store master_bs -> [available_attn_bs...]
