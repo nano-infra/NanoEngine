@@ -32,6 +32,7 @@ class Config(BaseModel):
 
     # runner config
     enforce_eager: bool = False
+    trust_remote_code: bool = False
     hf_config: Any = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -50,41 +51,23 @@ class Config(BaseModel):
     # dist config
     master_address: str = "127.0.0.1:6006"
     ray_address: str = "127.0.0.1:6379"
-    nanoctrl_address: Optional[str] = None  # Control plane server address (host:port)
-    scope: Optional[str] = Field(
-        default=None,
-        description="(Deprecated) Scope is now read from NANOCTRL_SCOPE environment variable only",
-    )
 
     # profiler
     enable_profiler: bool = False
     profiler_start_step: int = 40
     profiling_step: int = 16
-    profiler_dir: str = "/mnt/nvme1n1/ml_research/linbinbin1/profiler_res"
+    profiler_dir: str = "./profiler_res"
 
     # logging config
     log_level: str = "CRITICAL"
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
-        # Remove isdir check to support HF Hub IDs
-        # assert os.path.isdir(self.model)
-
-        # Get scope from environment variable only (ignore config value)
         self.scope = os.getenv("NANOCTRL_SCOPE")
 
-        # Prefer built-in transformers config classes over custom remote code.
-        # Custom auto_map in config.json causes 'transformers_modules' import
-        # errors in Ray actors where the cached module is not available.
-        try:
-            self.hf_config = AutoConfig.from_pretrained(
-                self.model, trust_remote_code=False
-            )
-        except ValueError:
-            # Fallback for models that truly require custom code
-            self.hf_config = AutoConfig.from_pretrained(
-                self.model, trust_remote_code=True
-            )
+        self.hf_config = AutoConfig.from_pretrained(
+            self.model, trust_remote_code=self.trust_remote_code
+        )
 
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             assert self.kvcache_block_size == 64
@@ -96,20 +79,16 @@ class Config(BaseModel):
         if self.attention_sp == 1:
             self.max_num_recv_seqs = 0
 
-        # Update hf_config max_position_embeddings
         if hasattr(self.hf_config, "max_position_embeddings"):
             self.hf_config.max_position_embeddings = max(
                 self.max_model_len, self.hf_config.max_position_embeddings
             )
         else:
-            # Fallback if attribute doesn't exist? or set it?
-            # Usually causal LMs have it.
             self.hf_config.max_position_embeddings = self.max_model_len
 
         assert self.max_num_batched_tokens >= self.max_model_len
 
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
-            # MLA requires num_kv_heads == 1
             if hasattr(self.hf_config, "num_key_value_heads"):
                 self.hf_config.num_key_value_heads = 1
 
