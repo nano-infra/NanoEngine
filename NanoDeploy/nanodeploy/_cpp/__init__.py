@@ -26,7 +26,6 @@ __all__ = [
     "deserialize",  # renamed from deserialize_sequences for convenience
     "serialize",  # renamed from serialize for convenience
     "BlockIdList",
-    "BlockLocationList",
     "DefaultIntDict",
     "DefaultListDict",
 ]

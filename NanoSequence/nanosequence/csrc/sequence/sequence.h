@@ -18,14 +18,8 @@ namespace nanodeploy {
 // Forward declaration
 class SequenceMetric;
 
-enum class SequenceStatus {
-    WAITING,
-    RUNNING,
-    FINISHED,
-    TO_BE_MIGRATED,
-
-    _COUNT
-};
+// Use flatbuffer generated SequenceStatus enum directly
+using SequenceStatus = fbs::SequenceStatus;
 
 enum class BlockContextSlot : int {
     ACTIVE,
@@ -33,16 +27,6 @@ enum class BlockContextSlot : int {
     SWAP,
 
     _COUNT
-};
-
-struct BlockLocationList: public std::vector<std::pair<int, int>> {
-    using std::vector<std::pair<int, int>>::vector;
-};
-struct BlockIdList: public std::vector<int> {
-    using std::vector<int>::vector;
-};
-struct SpBlockTable: public std::vector<BlockIdList> {
-    using std::vector<BlockIdList>::vector;
 };
 
 // Use flatbuffer generated BlockContextT type
@@ -54,45 +38,10 @@ std::unique_ptr<BlockContext>
 void reset_block_context(
     BlockContext& ctx, const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks);
 
-struct OptionalStringHash {
-    std::size_t operator()(const std::optional<std::string>& s) const
-    {
-        if (!s.has_value()) {
-            return 0;
-        }
-        return std::hash<std::string>{}(*s);
-    }
-};
-
 // Use flatbuffer generated types
 using SequenceT       = fbs::SequenceT;
 using SamplingParamsT = fbs::SamplingParamsT;
-
-// Legacy SamplingParams for backward compatibility (maps to SamplingParamsT)
-struct SamplingParams {
-    double temperature = 1.0;
-    int    max_tokens  = 256;
-    bool   ignore_eos  = false;
-
-    // Conversion to/from flatbuffers type
-    SamplingParamsT to_flatbuffers() const
-    {
-        auto params         = std::make_unique<SamplingParamsT>();
-        params->temperature = temperature;
-        params->max_tokens  = max_tokens;
-        params->ignore_eos  = ignore_eos;
-        return *params;
-    }
-
-    static SamplingParams from_flatbuffers(const SamplingParamsT& params)
-    {
-        SamplingParams result;
-        result.temperature = params.temperature;
-        result.max_tokens  = params.max_tokens;
-        result.ignore_eos  = params.ignore_eos;
-        return result;
-    }
-};
+using SamplingParams  = SamplingParamsT;
 
 class Sequence {
 public:
@@ -171,13 +120,13 @@ public:
     // Properties
     bool is_finished() const
     {
-        return static_cast<SequenceStatus>(data_->status) == SequenceStatus::FINISHED;
+        return data_->status == SequenceStatus::FINISHED;
     }
 
     // Properties
     bool is_to_be_migrated() const
     {
-        return static_cast<SequenceStatus>(data_->status) == SequenceStatus::TO_BE_MIGRATED;
+        return data_->status == SequenceStatus::TO_BE_MIGRATED;
     }
 
     int num_completed_tokens() const
@@ -207,11 +156,11 @@ public:
 
     SequenceStatus status() const
     {
-        return static_cast<SequenceStatus>(data_->status);
+        return data_->status;
     }
     void set_status(SequenceStatus s)
     {
-        data_->status = static_cast<fbs::SequenceStatus>(s);
+        data_->status = s;
     }
 
     std::vector<int>& token_ids()
@@ -271,7 +220,7 @@ public:
     SamplingParams sampling_params() const
     {
         if (data_->sampling_params) {
-            return SamplingParams::from_flatbuffers(*data_->sampling_params);
+            return *data_->sampling_params;
         }
         return SamplingParams();
     }
@@ -280,20 +229,8 @@ public:
         if (!data_->sampling_params) {
             data_->sampling_params = std::make_unique<SamplingParamsT>();
         }
-        *data_->sampling_params = params.to_flatbuffers();
+        *data_->sampling_params = params;
     }
-
-    using StateTuple = std::tuple<int,
-                                  int,
-                                  int,
-                                  std::optional<std::string>,
-                                  std::optional<std::string>,
-                                  std::array<std::unique_ptr<BlockContext>, (size_t)BlockContextSlot::_COUNT>,
-                                  double,
-                                  std::vector<int>,
-                                  int,
-                                  int,
-                                  bool>;
 
     // Access to flatbuffers data
     std::unique_ptr<SequenceT> data_;

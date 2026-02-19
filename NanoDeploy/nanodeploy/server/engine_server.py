@@ -242,7 +242,7 @@ class EngineService:
                             self._send_stepout(
                                 seq.seq_id,
                                 seq.token_ids[-1],
-                                SequenceStatus.RUNNING_DECODE,
+                                SequenceStatus.RUNNING,
                             )
 
                 # Early free: Process only newly appeared sequences (much faster than full iteration)

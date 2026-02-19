@@ -36,8 +36,6 @@ void bind_sequence(py::module_& m)
     block_id_list.def(py::init<>()).def(py::init([](py::iterable it) { return block_id_list_from_iterable(it); }));
     py::implicitly_convertible<py::list, BlockIdList>();
 
-    py::bind_vector<BlockLocationList>(m, "BlockLocationList").def(py::init<>());
-
     // Bind FlatBuffers BlockLocation struct (read-only)
     py::class_<fbs::BlockLocation>(m, "BlockLocation")
         .def(py::init<>())
