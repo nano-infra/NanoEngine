@@ -242,7 +242,7 @@ class EngineService:
                             self._send_stepout(
                                 seq.seq_id,
                                 seq.token_ids[-1],
-                                SequenceStatus.RUNNING_DECODE,
+                                SequenceStatus.RUNNING,
                             )
 
                 # Early free: Process only newly appeared sequences (much faster than full iteration)
@@ -281,14 +281,14 @@ class EngineServer:
         p2p_socket = ctx.socket(zmq.DEALER)
         p2p_socket.bind("tcp://*:0")  # Bind to OS-assigned port
         p2p_endpoint = p2p_socket.getsockopt_string(zmq.LAST_ENDPOINT)
-        # Extract port from endpoint like "tcp://0.0.0.0:12345"
         p2p_port = int(p2p_endpoint.split(":")[-1])
         self.engine.p2p_port = p2p_port
         self.engine.p2p_socket = p2p_socket
         logger.info(f"P2P socket bound to port {p2p_port}")
 
-        # Register engine with NanoCtrl now that P2P port is set
-        if self.config.nanoctrl_address and not self.engine._nanoctrl_registered:
+        # Re-register engine with NanoCtrl now that P2P port is set
+        # (LLMComponent.__init__ already registered, but p2p_port was 0)
+        if self.config.nanoctrl_address:
             self.engine._register_with_nanoctrl()
 
         # Determine ZMQ connection host for registration

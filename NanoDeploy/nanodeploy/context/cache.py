@@ -281,7 +281,7 @@ class CacheContext:
             return engine_info_map
 
         fetched_map: dict[str, dict] = {}
-        url = f"http://{self.nanoctrl_address}/get_engine_info"
+        url = f"{self.nanoctrl_address}/get_engine_info"
 
         # Get scope from environment variable
         import os

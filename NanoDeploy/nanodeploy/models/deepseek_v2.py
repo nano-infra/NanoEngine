@@ -1,12 +1,10 @@
 import math
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from dlblas.layers.moe.ep_moe import build_deepep_moe
-from lmdeploy.pytorch.nn import build_rotary_embedding, RopeType
-from lmdeploy.pytorch.nn.rotary_embedding import YarnParameters
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
@@ -33,6 +31,20 @@ def yarn_get_mscale(scale=1, mscale=1):
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def _interleaved_to_half(x: torch.Tensor) -> torch.Tensor:
+    """Convert RoPE dims from interleaved to half format.
+
+    Interleaved pairs: (d0,d1), (d2,d3), ...
+    Half pairs:        (d0,d32), (d1,d33), ... (first half paired with second half)
+
+    This is needed because DeepseekV3 checkpoints use rope_interleave=True,
+    meaning projection weights produce PE dims in interleaved layout, but
+    our apply_rotary_emb uses the half-rotation layout.
+    """
+    *leading, d = x.shape
+    return x.unflatten(-1, (-1, 2)).transpose(-1, -2).contiguous().flatten(-2)
 
 
 def compute_topk_ids(topk_ids, ranks, num_experts):
@@ -62,7 +74,7 @@ def compute_topk_ids(topk_ids, ranks, num_experts):
 
 
 class DeepseekV2MoE(nn.Module):
-    """Deepseek v2 MoE."""
+    """Deepseek v2/v3 MoE."""
 
     def __init__(
         self, config: DeepseekV3Config, quantization_config: QuantizationConfig
@@ -76,11 +88,23 @@ class DeepseekV2MoE(nn.Module):
         self.num_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
 
+        # Routing config
+        self.n_group = getattr(config, "n_group", 1)
+        self.topk_group = getattr(config, "topk_group", 1)
+        self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.scoring_func = getattr(config, "scoring_func", "sigmoid")
+
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        # e_score_correction_bias: loaded from safetensors, registered as param for easy loading
+        self.gate.e_score_correction_bias = nn.Parameter(
+            torch.zeros(self.num_experts, dtype=torch.float32, device="cuda"),
+            requires_grad=False,
+        )
 
         weight_dtype = quantization_config.dtype or config.dtype
 
-        # global parameter for DeepGEMM
+        # Global parameter for DeepGEMM (combined expert weights)
 
         self.gate_up_proj = nn.Parameter(
             torch.ones(
@@ -129,13 +153,32 @@ class DeepseekV2MoE(nn.Module):
                 if quantization_config.quant_method == "fp8"
                 else None
             )
+
+        local_expert_id = lambda i: i - self.expert_list_this_rank[0]
+        is_local_expert = lambda i: i in self.expert_list_this_rank
+
+        def _get_data_for_expert(i, t):
+            return t[local_expert_id(i)] if is_local_expert(i) else None
+
         self.experts = nn.ModuleList(
             [
                 DeepseekV2MLP(
                     hidden_size=config.hidden_size,
                     intermediate_size=config.moe_intermediate_size,
                     hidden_act=config.hidden_act,
-                    meta=True,
+                    meta=not is_local_expert(i),
+                    gate_up_proj_tensor=_get_data_for_expert(i, self.gate_up_proj),
+                    down_proj_tensor=_get_data_for_expert(i, self.down_proj),
+                    gate_up_scale_inv_tensor=(
+                        None
+                        if quantization_config.quant_method != "fp8"
+                        else _get_data_for_expert(i, self.gate_up_scale_inv)
+                    ),
+                    down_scale_inv_tensor=(
+                        None
+                        if quantization_config.quant_method != "fp8"
+                        else _get_data_for_expert(i, self.down_scale_inv)
+                    ),
                     config=config,
                     quantization_config=quantization_config,
                 )
@@ -201,29 +244,75 @@ class DeepseekV2MoE(nn.Module):
 
         return list(range(expert_id_begin, expert_id_end))
 
+    def route_tokens_to_experts(self, router_logits: torch.Tensor):
+        """Sigmoid routing with group-limited topk (noaux_tc).
+
+        Returns:
+            topk_indices: (batch, top_k)
+            topk_weights: (batch, top_k)
+        """
+        if self.scoring_func == "sigmoid":
+            scores = router_logits.float().sigmoid()
+        else:
+            scores = F.softmax(router_logits.float(), dim=-1)
+
+        scores_for_choice = scores + self.gate.e_score_correction_bias.float()
+
+        # Group-limited topk selection
+        if self.n_group > 1:
+            group_scores = (
+                scores_for_choice.view(
+                    -1, self.n_group, self.num_experts // self.n_group
+                )
+                .topk(2, dim=-1)[0]
+                .sum(dim=-1)
+            )
+            group_idx = torch.topk(
+                group_scores, k=self.topk_group, dim=-1, sorted=False
+            )[1]
+            group_mask = torch.zeros_like(group_scores)
+            group_mask.scatter_(1, group_idx, 1)
+            score_mask = (
+                group_mask.unsqueeze(-1)
+                .expand(-1, self.n_group, self.num_experts // self.n_group)
+                .reshape(-1, self.num_experts)
+            )
+            scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+
+        topk_indices = torch.topk(
+            scores_for_choice, k=self.top_k, dim=-1, sorted=False
+        )[1]
+        topk_weights = scores.gather(1, topk_indices)
+
+        if self.norm_topk_prob:
+            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weights = topk_weights / denominator
+        topk_weights = topk_weights * self.routed_scaling_factor
+
+        return topk_indices, topk_weights
+
     def forward(self, hidden_states: torch.Tensor):
         """forward."""
+        batch_size, hidden_dim = hidden_states.shape
+        residual = hidden_states
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        router_logits = self.gate(hidden_states)
+        selected_experts, routing_weights = self.route_tokens_to_experts(router_logits)
+
+        if get_runner_config().perfect_eplb:
+            ep_size = get_dist_context().ffn_ep_world_size
+            selected_experts = compute_topk_ids(
+                selected_experts, ep_size, self.num_experts
+            )
+
         if self.ep_size > 1:
             assert (
                 self.quantization_config.quant_method == "fp8"
             ), "Only FP8 EP is supported by now"
-            batch_size, hidden_dim = hidden_states.shape
-            hidden_states = hidden_states.view(-1, hidden_dim)
 
             context = get_context()
             moe = self.fusedmoe_build(not context.is_prefill)
-            router_logits = self.gate(hidden_states)
-
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1
-            )
-
-            if get_runner_config().perfect_eplb:
-                ep_size = get_dist_context().ffn_ep_world_size
-                selected_experts = compute_topk_ids(
-                    selected_experts, ep_size, self.num_experts
-                )
             final_hidden_states = moe.forward(
                 hidden_states,
                 routing_weights,
@@ -234,25 +323,46 @@ class DeepseekV2MoE(nn.Module):
                 self.down_scale_inv,
                 expert_list=self.expert_list_this_rank,
             )
-        if self.shared_experts is not None:
-            shared_states = self.shared_experts(final_hidden_states)
-            final_hidden_states += shared_states
-        final_hidden_states = final_hidden_states.reshape(batch_size, -1)
+        else:
+            # Single-rank fallback: iterate over experts
+            final_hidden_states = torch.zeros_like(hidden_states)
+            for i, expert in enumerate(self.experts):
+                if not hasattr(expert.gate_up_proj, "weight"):
+                    continue  # meta expert, not on this rank
+                mask = (selected_experts == i).any(dim=-1)
+                if not mask.any():
+                    continue
+                token_idx = mask.nonzero(as_tuple=True)[0]
+                topk_pos = (selected_experts[token_idx] == i).nonzero(as_tuple=True)
+                current_state = hidden_states[token_idx]
+                current_hidden = expert(current_state)
+                weights = routing_weights[token_idx, topk_pos[1]].unsqueeze(-1)
+                final_hidden_states.index_add_(
+                    0,
+                    token_idx,
+                    (current_hidden * weights).to(final_hidden_states.dtype),
+                )
 
+        if self.shared_experts is not None:
+            shared_states = self.shared_experts(residual)
+            final_hidden_states = final_hidden_states + shared_states
+
+        final_hidden_states = final_hidden_states.reshape(batch_size, -1)
         return final_hidden_states
 
 
-# 已改
-
-
 class DeepseekV2MLP(nn.Module):
-    """Deepseek v2 mlp."""
+    """Deepseek v2/v3 mlp."""
 
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int = None,
         hidden_act: str = "silu",
+        gate_up_proj_tensor: torch.Tensor | None = None,
+        down_proj_tensor: torch.Tensor | None = None,
+        gate_up_scale_inv_tensor: torch.Tensor | None = None,
+        down_scale_inv_tensor: torch.Tensor | None = None,
         meta: bool = False,
         config: DeepseekV3Config | None = None,
         quantization_config: QuantizationConfig | None = None,
@@ -267,6 +377,8 @@ class DeepseekV2MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             meta=meta,
+            weight_tensor=gate_up_proj_tensor,
+            scale_tensor=gate_up_scale_inv_tensor,
             quantization_config=quantization_config,
         )
 
@@ -275,10 +387,10 @@ class DeepseekV2MLP(nn.Module):
             hidden_size,
             bias=False,
             meta=meta,
+            weight_tensor=down_proj_tensor,
+            scale_tensor=down_scale_inv_tensor,
             quantization_config=quantization_config,
         )
-
-        # silu and mul
 
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
@@ -305,8 +417,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.self_attn = DeepseekV2Attention(config, quantization_config)
 
-        # mlp
-
         if (
             config.n_routed_experts is not None
             and layer_idx >= config.first_k_dense_replace
@@ -322,11 +432,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config=config,
                 quantization_config=quantization_config,
             )
-        # build input layer norm
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        # build attention layer norm
 
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -400,6 +507,11 @@ class DeepseekV2Model(nn.Module):
 class DeepseekV2ForCausalLM(nn.Module):
     """Mixture model for causalLM."""
 
+    packed_modules_mapping = {
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
     def __init__(self, config: DeepseekV3Config):
         super().__init__()
         self.config = config
@@ -457,7 +569,8 @@ class DeepseekV2Attention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        num_key_value_heads = getattr(config, "num_key_value_heads", 1)
+        # For MLA, effective num_kv_heads is 1 (single compressed KV representation)
+        num_key_value_heads = 1
 
         if self.q_lora_rank is None:
             self.q_proj = ColumnParallelLinear(
@@ -495,51 +608,37 @@ class DeepseekV2Attention(nn.Module):
             config.kv_lora_rank,
         )
 
-        emb_type = RopeType.LinearScaling
         rope_dim = (
             config.qk_rope_head_dim
             if getattr(config, "use_mla", True)
             else (config.hidden_size // config.num_attention_heads)
         )
-        rope_max_pos_emb = config.max_position_embeddings
-        rope_base = config.rope_theta
-        scaling_factor = 1.0
-        other_params = dict()
-        if config.rope_scaling is not None:
-            scaling_type = config.rope_scaling["type"]
-            scaling_factor = config.rope_scaling["factor"]
-            if scaling_type == "dynamic":
-                emb_type = RopeType.DynamicNTKScaling
-            elif scaling_type == "yarn":
-                emb_type = RopeType.Yarn
-                rope_max_pos_emb = config.rope_scaling.get(
-                    "original_max_position_embeddings", 4096
-                )
-                kwargs = {
-                    key: config.rope_scaling[key]
-                    for key in [
-                        "beta_fast",
-                        "beta_slow",
-                        "mscale",
-                        "mscale_all_dim",
-                    ]
-                    if key in config.rope_scaling
-                }
-                yarn_params = YarnParameters(**kwargs)
-                other_params["yarn_params"] = yarn_params
+
+        # Extract rope_theta and rope_scaling from config.
+        # Built-in DeepseekV3Config stores these inside rope_parameters dict;
+        # older custom configs may have rope_theta / rope_scaling as top-level attrs.
+        rope_params = getattr(config, "rope_parameters", None) or getattr(
+            config, "rope_scaling", None
+        )
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_theta = (rope_params or {}).get(
+                "rope_theta", getattr(config, "default_theta", 10000.0)
+            )
+
         self.rotary_emb = get_rope(
-            config.head_dim,
-            rotary_dim=config.head_dim,
+            rope_dim,
+            rotary_dim=rope_dim,
             max_position=config.max_position_embeddings,
-            base=config.rope_theta,
-            # rope_scaling=config.rope_scaling,
+            base=float(rope_theta),
+            rope_scaling=rope_params,
         )
 
         self.softmax_scale = self.q_head_dim ** (-0.5)
 
-        if config.rope_scaling is not None:
-            mscale_all_dim = config.rope_scaling.get("mscale_all_dim", 0)
-            scaling_factor = config.rope_scaling["factor"]
+        if rope_params is not None:
+            mscale_all_dim = rope_params.get("mscale_all_dim", 0)
+            scaling_factor = rope_params["factor"]
             if mscale_all_dim:
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.softmax_scale = self.softmax_scale * mscale * mscale
@@ -561,9 +660,11 @@ class DeepseekV2Attention(nn.Module):
             quantization_config=quantization_config,
         )
 
-    def _q_proj(self, hidden_states, num_heads: int, nope_size: int, pe_size: int):
-        """Q proj."""
+    def _q_proj_absorbed(self, hidden_states, num_heads: int):
+        """Q proj with W_UK absorption (for decode)."""
         q_len = hidden_states.size(0)
+        nope_size = self.kv_lora_rank  # 512
+        pe_size = self.qk_rope_head_dim  # 64
 
         query_states = hidden_states.new_empty([q_len, num_heads, nope_size + pe_size])
 
@@ -572,73 +673,174 @@ class DeepseekV2Attention(nn.Module):
         else:
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         q = q.view(q_len, num_heads, self.q_head_dim)
-        # q_pe: (q_len, num_heads, qk_rope_head_dim)
 
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
-        # q_nope: (q_len, num_heads, kv_lora_rank)
 
+        # Absorb W_UK: q_nope (q_len, H, D) @ kc (H, D, R) -> (q_len, H, R)
         q_nope_out = query_states[..., :nope_size]
         self.kc(q_nope, q_nope_out)
         return query_states, q_pe
 
-    def _kv_proj(self, hidden_states, nope_size: int):
-        """Kv proj."""
-        # (q_len, 1, nope_size + pe_size)
+    def _q_proj_raw(self, hidden_states, num_heads: int):
+        """Q proj without absorption (for prefill)."""
+        q_len = hidden_states.size(0)
+
+        if self.q_lora_rank is None:
+            q = self.q_proj(hidden_states)
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        q = q.view(q_len, num_heads, self.q_head_dim)
+        # q: (q_len, num_heads, qk_nope_head_dim + qk_rope_head_dim) = (q_len, H, 192)
+
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        return q, q_nope, q_pe
+
+    def _kv_proj(self, hidden_states):
+        """Kv proj: returns compressed KV and k_pe."""
+        nope_size = self.kv_lora_rank
 
         key_states = self.kv_a_proj_with_mqa(hidden_states)
-        # (q_len, 1, pe_size)
+        # key_states: (q_len, kv_lora_rank + qk_rope_head_dim)
 
         k_pe = key_states[..., nope_size:]
-        # kv_a_layernorm
+        # k_pe: (q_len, qk_rope_head_dim)
 
         value_states = key_states[..., :nope_size]
         value_states = self.kv_a_layernorm(value_states)
         key_states[..., :nope_size] = value_states
+        # key_states: (q_len, kv_lora_rank + qk_rope_head_dim) with normalized latent
+        # value_states: (q_len, kv_lora_rank) — normalized compressed latent
         return key_states, value_states, k_pe
-
-    def _qkv_proj(self, hidden_states: torch.Tensor, num_heads: int):
-        """Qkv proj."""
-        nope_size = self.kv_lora_rank
-        pe_size = self.qk_rope_head_dim
-        query_states, q_pe = self._q_proj(hidden_states, num_heads, nope_size, pe_size)
-        key_states, value_states, k_pe = self._kv_proj(hidden_states, nope_size)
-
-        return query_states, key_states, value_states, q_pe, k_pe
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ):
-        """Rewrite of LlamaAttention.forward."""
+        """Forward with separate prefill (non-absorbed) and decode (absorbed) paths."""
         num_heads = self.num_heads
-        nope_size = self.kv_lora_rank
         q_len = hidden_states.size(0)
+        is_prefill = get_context().is_prefill
 
-        # qkv_proj
+        # KV projection (shared between prefill and decode)
+        key_states, compressed_kv, k_pe = self._kv_proj(hidden_states)
+        # key_states: (q_len, kv_lora_rank + qk_rope_head_dim) = (q_len, 576)
+        # compressed_kv: (q_len, kv_lora_rank) = (q_len, 512)
+        # k_pe: (q_len, qk_rope_head_dim) = (q_len, 64)
 
-        query_states, key_states, value_states, q_pe, k_pe = self._qkv_proj(
-            hidden_states, num_heads=num_heads
-        )
+        if is_prefill:
+            # === Non-absorbed prefill path ===
+            # Q: original (not absorbed), shape (q_len, H, qk_nope+qk_rope) = (q_len, H, 192)
+            q_full, q_nope, q_pe = self._q_proj_raw(hidden_states, num_heads)
 
-        key_states = key_states.unsqueeze(1)
-        value_states = value_states.unsqueeze(1)
+            # Convert PE dims from interleaved to half format before RoPE
+            # (DeepseekV3 uses rope_interleave=True; projections produce interleaved layout)
+            q_pe = _interleaved_to_half(q_pe)
+            k_pe_3d = k_pe.unsqueeze(1)  # (q_len, 1, rope_dim)
+            k_pe_3d = _interleaved_to_half(k_pe_3d)
+            q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+            q_full[..., self.qk_nope_head_dim :] = q_pe  # write RoPE'd q_pe back
 
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        # query_states[..., nope_size:] = q_pe
-        # key_states[..., nope_size:] = k_pe
+            # Also write RoPE'd k_pe into key_states for KV cache storage
+            key_states_3d = key_states.unsqueeze(1)  # (q_len, 1, 576)
+            key_states_3d[..., self.kv_lora_rank :] = k_pe_3d
 
-        attn_output = self.attn_fwd(
-            query_states,
-            key_states,
-            value_states,
-        )
+            # Store compressed KV (576 dims) into cache for future decode
+            k_cache = self.attn_fwd.k_cache
+            context = get_context()
+            if (
+                k_cache.numel()
+                and not context.is_dummy
+                and context.slot_mapping is not None
+            ):
+                from nanodeploy.kernels.kvcache import store_kcache
 
-        attn_bmm_out = attn_output.new_empty(q_len, num_heads, self.v_head_dim)
+                slot_mapping = context.slot_mapping
+                if slot_mapping.numel() != key_states_3d.shape[0]:
+                    raise RuntimeError(
+                        f"MLA prefill store_kcache shape mismatch: "
+                        f"key_states_3d.shape={key_states_3d.shape}, "
+                        f"slot_mapping.shape={slot_mapping.shape} "
+                        f"(numel={slot_mapping.numel()}), "
+                        f"is_dummy={context.is_dummy}"
+                    )
+                store_kcache(key_states_3d, k_cache, slot_mapping)
 
-        self.vc(attn_output, attn_bmm_out)
-        attn_output = attn_bmm_out.reshape(attn_bmm_out.size(0), -1)
-        attn_output = self.o_proj(attn_output)
-        return attn_output
+            # Expand K from compressed latent: k_nope = compressed_kv @ kc.weight^T
+            # kc.weight: (H, D, R) -> reshape to (H*D, R) -> transpose to (R, H*D)
+            # compressed_kv: (T, R) @ (R, H*D) -> (T, H*D) -> (T, H, D)
+            kc_t = self.kc.weight.reshape(
+                num_heads * self.qk_nope_head_dim, self.kv_lora_rank
+            ).T  # (R, H*D)
+            k_nope = (compressed_kv @ kc_t).view(
+                q_len, num_heads, self.qk_nope_head_dim
+            )
+
+            # Build full K: [k_nope (H, 128); k_pe broadcast (H, 64)] -> (T, H, 192)
+            k_pe_expanded = k_pe_3d.expand(-1, num_heads, -1)  # (T, H, 64)
+            k_expanded = torch.cat([k_nope, k_pe_expanded], dim=-1)  # (T, H, 192)
+
+            # Expand V from compressed latent: v = compressed_kv @ vc.weight
+            # vc.weight: (H, R, V) -> permute to (R, H, V) -> reshape to (R, H*V)
+            # compressed_kv: (T, R) @ (R, H*V) -> (T, H*V) -> (T, H, V)
+            vc_reshaped = self.vc.weight.permute(1, 0, 2).reshape(
+                self.kv_lora_rank, num_heads * self.v_head_dim
+            )  # (R, H*V)
+            v_expanded = (compressed_kv @ vc_reshaped).view(
+                q_len, num_heads, self.v_head_dim
+            )  # (T, H, 128)
+
+            # Attention: Q (T, H, 192) @ K (T, H, 192) -> output (T, H, 128)
+            # Use FA3 which supports different head dims for QK vs V on SM90+
+            from flash_attn_interface import flash_attn_varlen_func
+
+            context = get_context()
+            attn_output = flash_attn_varlen_func(
+                q_full,  # (T, H, 192)
+                k_expanded,  # (T, H, 192)
+                v_expanded,  # (T, H, 128)
+                cu_seqlens_q=context.cu_seqlens_q,
+                cu_seqlens_k=context.cu_seqlens_k,
+                max_seqlen_q=context.max_seqlen_q,
+                max_seqlen_k=context.max_seqlen_k,
+                softmax_scale=self.softmax_scale,
+                causal=True,
+            )
+            # attn_output: (T, H, v_head_dim=128) — no vc BMM needed
+            attn_output = attn_output.reshape(q_len, -1)  # (T, H*128)
+            attn_output = self.o_proj(attn_output)
+            return attn_output
+
+        else:
+            # === Absorbed decode path ===
+            # Q absorbed: q_nope @ W_UK -> (q_len, H, kv_lora_rank=512), concat with q_pe -> 576
+            query_states, q_pe = self._q_proj_absorbed(hidden_states, num_heads)
+
+            key_states_3d = key_states.unsqueeze(1)  # (q_len, 1, 576)
+            # Convert PE dims from interleaved to half format before RoPE
+            q_pe = _interleaved_to_half(q_pe)
+            k_pe_3d = k_pe.unsqueeze(1)  # (q_len, 1, rope_dim)
+            k_pe_3d = _interleaved_to_half(k_pe_3d)
+            q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+            query_states[..., self.kv_lora_rank :] = q_pe
+            key_states_3d[..., self.kv_lora_rank :] = k_pe_3d
+
+            # value_states for MLA decode: same compressed latent (unused by FlashMLA decode)
+            value_states = compressed_kv.unsqueeze(1)  # (q_len, 1, 512)
+
+            attn_output = self.attn_fwd(
+                query_states,  # (q_len, H, 576)
+                key_states_3d,  # (q_len, 1, 576)
+                value_states,  # (q_len, 1, 512)
+            )
+
+            # Post-multiply by W_UV (vc BMM)
+            attn_bmm_out = attn_output.new_empty(q_len, num_heads, self.v_head_dim)
+            self.vc(attn_output, attn_bmm_out)
+            attn_output = attn_bmm_out.reshape(q_len, -1)
+            attn_output = self.o_proj(attn_output)
+            return attn_output

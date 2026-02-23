@@ -43,6 +43,7 @@ void reset_block_context(
     ctx.endpoints.clear();  // Initialize endpoints to empty vector
 }
 
+int                   Sequence::block_size = 256;
 std::atomic<uint64_t> Sequence::next_seq_id_{0};
 
 Sequence::Sequence(const std::vector<int>& token_ids, const SamplingParams& sampling_params)
@@ -53,7 +54,7 @@ Sequence::Sequence(const std::vector<int>& token_ids, const SamplingParams& samp
     data_->token_ids.reserve(sampling_params.max_tokens);
 
     data_->seq_id     = next_seq_id_.fetch_add(1);
-    data_->status     = fbs::SequenceStatus::WAITING;
+    data_->status     = SequenceStatus::WAITING;
     data_->num_tokens = static_cast<int>(token_ids.size());
     if (!token_ids.empty()) {
         data_->last_token = token_ids.back();
@@ -67,7 +68,7 @@ Sequence::Sequence(const std::vector<int>& token_ids, const SamplingParams& samp
 
     // Initialize sampling_params
     data_->sampling_params  = std::make_unique<SamplingParamsT>();
-    *data_->sampling_params = sampling_params.to_flatbuffers();
+    *data_->sampling_params = sampling_params;
 
     // Initialize slots - pre-allocate all slots to avoid nulls
     data_->slots.resize((size_t)BlockContextSlot::_COUNT);

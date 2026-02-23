@@ -243,7 +243,7 @@ impl EngineAdapter {
                         } else {
                             warn!("[DIAG] Sequence {} FINISHED but NOT FOUND in pending_requests (map_size={})", seq_id, map.len());
                         }
-                    } else if matches!(status, SequenceStatus::RUNNING_PREFILL | SequenceStatus::RUNNING_DECODE) {
+                    } else if matches!(status, SequenceStatus::RUNNING) {
                         if let Some(state) = map.get_mut(&seq_id) {
                             // Only log at the beginning (first token)
                             let is_first = state.accumulated_tokens.is_empty();

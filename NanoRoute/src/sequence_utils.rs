@@ -24,7 +24,7 @@ impl Sequence {
     pub fn new(token_ids: &[i32], seq_id: u64) -> Self {
         Self {
             seq_id,
-            status: SequenceStatus::INITIALIZING,
+            status: SequenceStatus::WAITING,
             last_token: *token_ids.last().unwrap_or(&0),
             num_tokens: token_ids.len() as i32,
             num_prompt_tokens: token_ids.len() as i32,

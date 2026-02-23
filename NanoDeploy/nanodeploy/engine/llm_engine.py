@@ -34,6 +34,9 @@ class LLMEngine:
         if self.config.log_level:
             set_log_level(self.config.log_level)
 
+        # Sync C++ Sequence.block_size with Python kvcache_block_size
+        Sequence.set_block_size(config.kvcache_block_size)
+
         self.ps = []
         self.events = []
 

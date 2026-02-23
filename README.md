@@ -45,6 +45,10 @@ graph TB
     Ops -->|Session Config| Ctrl
 ```
 
+## 📖 Documentation
+
+- [Deployment Guide](./docs/deployment.md) — Step-by-step instructions for deploying with NanoCtrl, NanoRoute, and NanoDeploy
+
 ## 📄 License
 
 See individual component [license](./LICENSE).
