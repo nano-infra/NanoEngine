@@ -321,7 +321,7 @@ class EngineServer:
         )
         logger.info(f"Ray Address:     {self.config.ray_address}")
         logger.info(
-            f"Redis Scope:      {self.config.scope or 'Not set (using NanoCtrl default)'}"
+            f"Redis Scope:      {self.config.nanoctrl_scope or 'Not set (using NanoCtrl default)'}"
         )
         logger.info("=" * 80)
 

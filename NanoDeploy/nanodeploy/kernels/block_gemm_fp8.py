@@ -142,11 +142,16 @@ def deep_gemm_fp8(
     out_dtype: torch.dtype = torch.bfloat16,
 ):
     """Deepgemm fp8."""
-    from deep_gemm import gemm_fp8_fp8_bf16_nt
+    import deep_gemm
 
     M, _ = A.shape
     N, _ = B.shape
     assert out_dtype == torch.bfloat16, "DeepGemm requires bf16 output."
     C = A.new_empty(M, N, dtype=out_dtype)
-    gemm_fp8_fp8_bf16_nt((A, A_scale), (B, B_scale), C)
+    if hasattr(deep_gemm, "fp8_gemm_nt"):
+        deep_gemm.fp8_gemm_nt((A, A_scale), (B, B_scale), C)
+    elif hasattr(deep_gemm, "gemm_fp8_fp8_bf16_nt"):
+        deep_gemm.gemm_fp8_fp8_bf16_nt((A, A_scale), (B, B_scale), C)
+    else:
+        raise RuntimeError("deep_gemm version mismatch")
     return C
