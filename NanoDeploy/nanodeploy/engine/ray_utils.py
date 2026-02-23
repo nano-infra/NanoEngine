@@ -11,9 +11,7 @@ def _clean_and_parse_address(address: str) -> str:
     """
     清理并解析地址，正确处理 'ip:port' 格式。
     """
-    # 如果地址包含 ':' 且不以 'http://' 或 'https://' 开头，我们认为它是 'ip:port' 格式
     if ":" in address and not address.startswith(("http://", "https://")):
-        # 为其添加一个默认的 'http://' 前缀，使其成为一个标准 URL
         address = f"http://{address}"
 
     parsed_url = urlparse(address)
