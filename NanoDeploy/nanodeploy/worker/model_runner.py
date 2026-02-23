@@ -68,9 +68,11 @@ class ModelRunner:
         # actor processes may not inherit the job's env vars.  Libraries
         # like dlslime read NANOCTRL_SCOPE from os.environ, so we must
         # set it here to ensure correct scoped registration in Redis.
-        if config.scope and not os.getenv("NANOCTRL_SCOPE"):
-            os.environ["NANOCTRL_SCOPE"] = config.scope
-            logger.info(f"Set NANOCTRL_SCOPE={config.scope} in actor environment")
+        if config.nanoctrl_scope and not os.getenv("NANOCTRL_SCOPE"):
+            os.environ["NANOCTRL_SCOPE"] = config.nanoctrl_scope
+            logger.info(
+                f"Set NANOCTRL_SCOPE={config.nanoctrl_scope} in actor environment"
+            )
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -152,7 +154,7 @@ class ModelRunner:
         if ep_size > 1:
             import deep_ep
 
-            deep_ep.Buffer.num_sms = 16
+            deep_ep.Buffer.num_sms = 8
             dist.barrier(group=get_dist_context().cuda_world_group)
 
         if sp_size > 1:

@@ -48,9 +48,12 @@ class Config(BaseModel):
     dummy_weight: Optional[bool] = False
     perfect_eplb: Optional[bool] = False
 
+    # control plane config
+    enable_nanoctrl: bool = False
+    nanoctrl_scope: Optional[str] = None
+    nanoctrl_address: Optional[str] = None
+
     # dist config
-    scope: Optional[str] = None
-    nanoctrl_address: str = "127.0.0.1:3000"
     master_address: str = "127.0.0.1:6006"
     ray_address: str = "127.0.0.1:6379"
 
@@ -65,14 +68,18 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
-        # nanoctrl config from environment variables
-        self.scope = os.getenv("NANOCTRL_SCOPE", self.scope)
-        self.nanoctrl_address = os.getenv("NANOCTRL_ADDRESS", self.nanoctrl_address)
+        if self.mode != "hybrid":
+            self.enable_nanoctrl = True
 
-        if not self.nanoctrl_address.startswith(
-            "http://"
-        ) and not self.nanoctrl_address.startswith("https://"):
-            self.nanoctrl_address = f"http://{self.nanoctrl_address}"
+        if self.enable_nanoctrl:
+            # nanoctrl config from environment variables
+            self.nanoctrl_scope = os.getenv("NANOCTRL_SCOPE", self.nanoctrl_scope)
+            self.nanoctrl_address = os.getenv("NANOCTRL_ADDRESS", self.nanoctrl_address)
+
+            if not self.nanoctrl_address.startswith(
+                "http://"
+            ) and not self.nanoctrl_address.startswith("https://"):
+                self.nanoctrl_address = f"http://{self.nanoctrl_address}"
 
         self.hf_config = AutoConfig.from_pretrained(
             self.model, trust_remote_code=self.trust_remote_code
