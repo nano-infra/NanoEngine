@@ -48,6 +48,12 @@ class Context:
     q_offsets: torch.Tensor | None = None
     context_lens_for_attn: torch.Tensor | None = None
 
+    # GatedDeltaNet state buffers (for mixed attention models like Qwen3.5-MoE)
+    # conv_states: [num_layers, max_bs, conv_dim, kernel_size]
+    gdn_conv_states: torch.Tensor | None = None
+    # recurrent_states: [num_layers, max_bs, num_v_heads, head_k_dim, head_v_dim]
+    gdn_recurrent_states: torch.Tensor | None = None
+
 
 _CONTEXT = Context()
 
@@ -84,6 +90,8 @@ def set_context(
     attention_compute_bs: Optional[int] = None,
     q_offsets: Optional[torch.Tensor] = None,
     context_lens_for_attn: Optional[torch.Tensor] = None,
+    gdn_conv_states: Optional[torch.Tensor] = None,
+    gdn_recurrent_states: Optional[torch.Tensor] = None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -114,6 +122,8 @@ def set_context(
         attention_compute_bs=attention_compute_bs,
         q_offsets=q_offsets,
         context_lens_for_attn=context_lens_for_attn,
+        gdn_conv_states=gdn_conv_states,
+        gdn_recurrent_states=gdn_recurrent_states,
     )
 
 

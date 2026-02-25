@@ -1,13 +1,11 @@
 import os
 
 import flash_mla
-
 import numpy as np
 import ray
 import torch
 import torch.distributed as dist
 import torch.profiler as profiler
-
 from nanodeploy._cpp import (
     BlockContextSlot,
     prepare_decode_cpp,
@@ -26,9 +24,9 @@ from nanodeploy.context.sp_context import set_sp_context
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
-
 from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
+from nanodeploy.models.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
@@ -40,6 +38,7 @@ architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
+    "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGeneration,
 }
 
 
@@ -288,6 +287,14 @@ class ModelRunner:
             hf_config.qk_rope_head_dim if hasattr(hf_config, "qk_rope_head_dim") else 0
         )
 
+        # For mixed attention models (Qwen3.5-MoE), only full_attention layers
+        # need KV cache. Count the number of full_attention layers.
+        layer_types = getattr(hf_config, "layer_types", None)
+        if layer_types is not None:
+            num_kv_layers = sum(1 for lt in layer_types if lt == "full_attention")
+        else:
+            num_kv_layers = hf_config.num_hidden_layers
+
         # If nanoctrl_address is provided, fetch engine_id from NanoCtrl
         engine_id = config.engine_id
         if config.nanoctrl_address and not engine_id:
@@ -299,7 +306,7 @@ class ModelRunner:
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
             block_size=config.kvcache_block_size,
-            num_hidden_layers=hf_config.num_hidden_layers,
+            num_hidden_layers=num_kv_layers,
             attention_tp=config.attention_tp,
             gpu_memory_utilization=config.gpu_memory_utilization,
             gpu_memory_limit_gb=config.gpu_memory_limit_gb,
@@ -313,6 +320,55 @@ class ModelRunner:
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
+        # Allocate GDN state buffers for linear_attention layers
+        if layer_types is not None:
+            self._allocate_gdn_states(hf_config, layer_types)
+
+    def _allocate_gdn_states(self, hf_config, layer_types):
+        """Allocate fixed-size GDN state buffers for linear_attention layers."""
+        num_layers = len(layer_types)
+        max_bs = self.config.max_num_seqs
+
+        num_k_heads = getattr(hf_config, "linear_num_key_heads", 0)
+        num_v_heads = getattr(hf_config, "linear_num_value_heads", 0)
+        head_k_dim = getattr(hf_config, "linear_key_head_dim", 0)
+        head_v_dim = getattr(hf_config, "linear_value_head_dim", 0)
+        conv_kernel_size = getattr(hf_config, "linear_conv_kernel_dim", 4)
+        key_dim = num_k_heads * head_k_dim
+        value_dim = num_v_heads * head_v_dim
+        conv_dim = key_dim * 2 + value_dim  # q + k + v
+
+        if num_v_heads == 0:
+            return
+
+        # Conv state: [num_layers, max_bs, conv_dim, kernel_size]
+        self.gdn_conv_states = torch.zeros(
+            num_layers,
+            max_bs,
+            conv_dim,
+            conv_kernel_size,
+            dtype=torch.bfloat16,
+            device=torch.get_default_device(),
+        )
+
+        # Recurrent state: [num_layers, max_bs, num_v_heads, head_k_dim, head_v_dim]
+        self.gdn_recurrent_states = torch.zeros(
+            num_layers,
+            max_bs,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            dtype=torch.float32,
+            device=torch.get_default_device(),
+        )
+
+        logger.info(
+            f"Allocated GDN states: conv={self.gdn_conv_states.shape} "
+            f"({self.gdn_conv_states.element_size() * self.gdn_conv_states.nelement() / 1e9:.2f} GB), "
+            f"recurrent={self.gdn_recurrent_states.shape} "
+            f"({self.gdn_recurrent_states.element_size() * self.gdn_recurrent_states.nelement() / 1e9:.2f} GB)"
+        )
+
     def prepare_prefill(self, seqs: list[Sequence], is_dummy: bool = False):
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
@@ -321,6 +377,25 @@ class ModelRunner:
         meta = prepare_prefill_cpp(
             seqs, sp_rank, sp_size, block_size, self.config.max_num_seqs
         )
+
+        if len(meta.input_ids) == 0:
+            logger.critical(
+                "prepare_prefill_cpp returned empty input_ids! "
+                "is_dummy=%s sp_rank=%s sp_size=%s block_size=%s max_num_seqs=%s "
+                "num_seqs=%s seqs_info=[%s]",
+                is_dummy,
+                sp_rank,
+                sp_size,
+                block_size,
+                self.config.max_num_seqs,
+                len(seqs),
+                ", ".join(
+                    f"(id={getattr(s, 'seq_id', '?')}, "
+                    f"ntok={getattr(s, 'num_tokens', '?')}, "
+                    f"master_sp={getattr(s.block_ctx(), 'master_sp_idx', '?') if hasattr(s, 'block_ctx') else '?'})"
+                    for s in seqs
+                ),
+            )
 
         input_ids = torch.tensor(
             meta.input_ids, dtype=torch.int64, pin_memory=True
@@ -358,6 +433,8 @@ class ModelRunner:
             block_tables,
             None,
             is_dummy=is_dummy,
+            gdn_conv_states=getattr(self, "gdn_conv_states", None),
+            gdn_recurrent_states=getattr(self, "gdn_recurrent_states", None),
         )
         return input_ids, positions
 
@@ -556,6 +633,8 @@ class ModelRunner:
             q_offsets=q_offsets,
             tile_scheduler_metadata=new_tile_scheduler_metadata,
             num_splits=new_num_splits,
+            gdn_conv_states=getattr(self, "gdn_conv_states", None),
+            gdn_recurrent_states=getattr(self, "gdn_recurrent_states", None),
         )
 
         return input_ids, positions
@@ -749,6 +828,19 @@ class ModelRunner:
                         input_ids, positions, dp_seqs
                     )
 
+            if input_ids.numel() == 0:
+                logger.critical(
+                    "EMPTY input_ids before run_model! rank=%s is_prefill=%s "
+                    "is_dummy=%s input_ids.shape=%s positions.shape=%s "
+                    "num_dp_seqs=%s num_sp_seqs=%s",
+                    self.rank,
+                    is_prefill,
+                    is_dummy,
+                    input_ids.shape,
+                    positions.shape,
+                    len(dp_seqs),
+                    num_sp_seqs,
+                )
             logits = self.run_model(input_ids, positions, is_prefill)
 
             tp_rank = get_dist_context().attn_tp_rank

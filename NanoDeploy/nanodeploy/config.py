@@ -63,8 +63,8 @@ class Config(BaseModel):
     profiling_step: int = 16
     profiler_dir: str = "./profiler_res"
 
-    # logging config
-    log_level: str = "CRITICAL"
+    # logging config – override via NANODEPLOY_LOG_LEVEL env var
+    log_level: str = os.getenv("NANODEPLOY_LOG_LEVEL", "INFO")
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
@@ -84,6 +84,24 @@ class Config(BaseModel):
         self.hf_config = AutoConfig.from_pretrained(
             self.model, trust_remote_code=self.trust_remote_code
         )
+
+        # For VLM models with nested text_config (e.g. Qwen3.5-MoE),
+        # flatten text_config attributes into hf_config for uniform access.
+        if hasattr(self.hf_config, "text_config"):
+            text_cfg = self.hf_config.text_config
+            for attr in dir(text_cfg):
+                if attr.startswith("_"):
+                    continue
+                if not hasattr(self.hf_config, attr):
+                    try:
+                        setattr(self.hf_config, attr, getattr(text_cfg, attr))
+                    except Exception:
+                        pass
+            # Explicitly propagate dtype/torch_dtype from text_config
+            # (top-level config may have dtype=None while text_config has bfloat16)
+            if getattr(text_cfg, "dtype", None) is not None:
+                if getattr(self.hf_config, "dtype", None) is None:
+                    self.hf_config.__dict__["dtype"] = text_cfg.dtype
 
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             assert self.kvcache_block_size == 64
