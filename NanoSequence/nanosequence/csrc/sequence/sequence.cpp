@@ -30,6 +30,7 @@ void reset_block_context(
     ctx.attention_dp  = attention_dp;
 
     ctx.num_kvcache_blocks = num_kvcache_blocks;
+    ctx.state_slot         = -1;
 
     // Initialize sp_block_table and num_dispatched_tokens
     ctx.sp_block_table.clear();
@@ -81,6 +82,7 @@ Sequence::Sequence(const std::vector<int>& token_ids, const SamplingParams& samp
         ctx->attention_sp       = 0;
         ctx->attention_dp       = 0;
         ctx->num_kvcache_blocks = 0;
+        ctx->state_slot         = -1;
         ctx->block_location.clear();
         ctx->num_dispatched_tokens.clear();
         ctx->sp_block_table.clear();
@@ -108,6 +110,7 @@ std::shared_ptr<Sequence> Sequence::from_data(std::unique_ptr<SequenceT> data)
             ctx->attention_sp       = 0;
             ctx->attention_dp       = 0;
             ctx->num_kvcache_blocks = 0;
+            ctx->state_slot         = -1;
             ctx->block_location.clear();
             ctx->num_dispatched_tokens.clear();
             ctx->sp_block_table.clear();
@@ -134,6 +137,16 @@ const BlockContext& Sequence::block_ctx(BlockContextSlot slot) const
 int Sequence::dp_idx(BlockContextSlot slot)
 {
     return block_ctx(slot).dp_idx;
+}
+
+int Sequence::state_slot(BlockContextSlot slot) const
+{
+    return block_ctx(slot).state_slot;
+}
+
+void Sequence::set_state_slot(BlockContextSlot slot, int state_slot)
+{
+    block_ctx(slot).state_slot = state_slot;
 }
 
 std::vector<int>& Sequence::block_table(BlockContextSlot slot, int sp_idx)

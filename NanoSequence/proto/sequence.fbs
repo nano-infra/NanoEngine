@@ -23,6 +23,7 @@ table BlockContext {
   attention_sp: int;
   attention_dp: int;
   num_kvcache_blocks: int;
+  state_slot: int = -1;
   block_location: [BlockLocation];
   num_dispatched_tokens: [int];
   sp_block_table: [IntList];

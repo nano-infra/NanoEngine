@@ -137,6 +137,7 @@ void bind_sequence(py::module_& m)
         .def_readwrite("attention_sp", &BlockContext::attention_sp)
         .def_readwrite("attention_dp", &BlockContext::attention_dp)
         .def_readwrite("num_kvcache_blocks", &BlockContext::num_kvcache_blocks)
+        .def_readwrite("state_slot", &BlockContext::state_slot)
         .def_property(
             "block_location",
             [](BlockContext& self) -> std::vector<fbs::BlockLocation>& { return self.block_location; },
@@ -226,6 +227,8 @@ void bind_sequence(py::module_& m)
              py::arg("sp_idx") = 0,
              py::return_value_policy::reference_internal)
         .def("dp_idx", &Sequence::dp_idx, py::arg("slot"))
+        .def("state_slot", &Sequence::state_slot, py::arg("slot") = BlockContextSlot::ACTIVE)
+        .def("set_state_slot", &Sequence::set_state_slot, py::arg("slot"), py::arg("state_slot"))
         .def("num_blocks", &Sequence::num_blocks, py::arg("slot"), py::arg("sp_idx"))
         .def("last_block_page_id", &Sequence::last_block_page_id, py::arg("slot"), py::arg("sp_idx"))
         .def("last_block_num_tokens", &Sequence::last_block_num_tokens, py::arg("slot"), py::arg("sp_idx"))

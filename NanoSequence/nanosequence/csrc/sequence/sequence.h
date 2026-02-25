@@ -117,6 +117,10 @@ public:
 
     int dp_idx(BlockContextSlot slot);
 
+    // State management
+    int  state_slot(BlockContextSlot slot = BlockContextSlot::ACTIVE) const;
+    void set_state_slot(BlockContextSlot slot, int state_slot);
+
     // Properties
     bool is_finished() const
     {
