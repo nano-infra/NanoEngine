@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Literal, Optional, Set
 import flatbuffers
 import numpy as np
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from nanodeploy._cpp import BlockContextSlot
 
@@ -45,7 +45,7 @@ class LLMEngine:
         self.executor = RayExecutor(config=config)
         self.update_num_kvcache_blocks()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
         config.eos = self.tokenizer.eos_token_id
 
         self.scheduler = Scheduler(config)

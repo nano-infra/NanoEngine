@@ -26,7 +26,7 @@ from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.llm_component import LLMComponent
 from nanodeploy.sampling_params import SamplingParams
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerFast
 
 
 def main():
@@ -72,7 +72,7 @@ def main():
     decode_config = build_config(args.decode, defaults.decode, "decode")
 
     # Launch engines
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(args.model)
     prefill = LLMComponent.as_remote(prefill_config)
     decode = LLMComponent.as_remote(decode_config)
 

@@ -13,7 +13,15 @@ from tqdm import tqdm
 logger = get_logger()
 
 # Weight name patterns for MTP / next-token prediction layers (skip these)
-_MTP_PATTERNS = ("eh_proj", "enorm", "hnorm", "shared_head")
+_MTP_PATTERNS = ("eh_proj", "enorm", "hnorm", "shared_head", "mtp.")
+
+# Weight name patterns to always skip (e.g., vision module, rotary cache)
+_SKIP_PATTERNS = (
+    "visual.",
+    "rotary_emb.inv_freq",
+    "rotary_emb.cos_cached",
+    "rotary_emb.sin_cached",
+)
 
 # Regex to parse layer index from weight name
 _LAYER_RE = re.compile(r"layers\.(\d+)\.")
@@ -21,6 +29,84 @@ _LAYER_RE = re.compile(r"layers\.(\d+)\.")
 # Regex to parse expert index from weight name
 # e.g. "model.layers.3.mlp.experts.5.gate_proj.weight" -> expert_idx=5
 _EXPERT_RE = re.compile(r"(.+\.mlp)\.experts\.(\d+)\.(\w+)\.(weight(?:_scale_inv)?)")
+
+# Regex for already-packed 3D expert weights (no per-expert index)
+# e.g. "model.layers.0.mlp.experts.gate_up_proj" -> mlp_prefix, proj_name
+_PACKED_EXPERT_RE = re.compile(r"(.+\.mlp)\.experts\.(gate_up_proj|down_proj)$")
+
+
+def _handle_packed_expert_weight(
+    model: nn.Module, weight_name: str, tensor: torch.Tensor
+) -> bool:
+    """Handle already-packed 3D expert weight (Qwen3.5 format).
+
+    Checkpoint stores experts as combined tensors:
+      experts.gate_up_proj  shape (num_experts, 2*intermediate, hidden)
+      experts.down_proj     shape (num_experts, hidden, intermediate)
+
+    These map to mlp.routed_experts.gate_up_proj / mlp.routed_experts.down_proj,
+    with EP slicing (dim 0) and TP slicing (intermediate dim) applied.
+    """
+    m = _PACKED_EXPERT_RE.match(weight_name)
+    if m is None:
+        return False
+
+    mlp_prefix = m.group(1)  # e.g. "model.layers.0.mlp"
+    proj_name = m.group(2)  # "gate_up_proj" or "down_proj"
+    param_name = f"{mlp_prefix}.routed_experts.{proj_name}"
+
+    try:
+        param = model.get_parameter(param_name)
+    except AttributeError:
+        logger.warning(
+            f"Parameter {param_name} not found for packed expert {weight_name}"
+        )
+        return False
+
+    # --- EP slicing: select only this rank's local experts along dim 0 ---
+    dist_ctx = get_dist_context()
+    ep_world_size = dist_ctx.ffn_ep_world_size
+    ep_rank = dist_ctx.ffn_ep_rank
+    num_total_experts = tensor.shape[0]
+    experts_per_rank = num_total_experts // ep_world_size
+    expert_start = ep_rank * experts_per_rank
+    expert_end = expert_start + experts_per_rank
+    tensor = tensor[expert_start:expert_end]
+
+    # --- TP slicing: slice the intermediate dimension ---
+    tp_world_size = dist_ctx.ffn_tp_world_size
+    tp_rank = dist_ctx.ffn_tp_rank
+    if tp_world_size > 1:
+        if proj_name == "gate_up_proj":
+            # Shape: (local_experts, intermediate*2, hidden)
+            # gate is first half of dim1, up is second half
+            full_inter2 = tensor.shape[1]
+            full_inter = full_inter2 // 2
+            chunk = full_inter // tp_world_size
+            gate_slice = tensor[:, tp_rank * chunk : (tp_rank + 1) * chunk, :]
+            up_slice = tensor[
+                :, full_inter + tp_rank * chunk : full_inter + (tp_rank + 1) * chunk, :
+            ]
+            tensor = torch.cat([gate_slice, up_slice], dim=1)
+        elif proj_name == "down_proj":
+            # Shape: (local_experts, hidden, intermediate)
+            full_inter = tensor.shape[2]
+            chunk = full_inter // tp_world_size
+            tensor = tensor[:, :, tp_rank * chunk : (tp_rank + 1) * chunk]
+
+    if param.data.shape != tensor.shape:
+        logger.warning(
+            f"Shape mismatch for {param_name}: param={list(param.data.shape)} "
+            f"checkpoint={list(tensor.shape)} (after EP/TP slicing)"
+        )
+
+    param.data.copy_(tensor)
+    logger.debug(
+        f"Loaded packed expert weight: {weight_name} -> {param_name} "
+        f"shape={list(tensor.shape)} (ep_rank={ep_rank}/{ep_world_size}, "
+        f"tp_rank={tp_rank}/{tp_world_size})"
+    )
+    return True
 
 
 def default_weight_loader(param, tensor):
@@ -60,9 +146,12 @@ def _dequant_fp8_block(
     return weight_dequant
 
 
-def _is_mtp_weight(weight_name: str, num_hidden_layers: int | None = None) -> bool:
-    """Check if weight belongs to MTP (multi-token prediction) layers."""
+def _should_skip_weight(weight_name: str, num_hidden_layers: int | None = None) -> bool:
+    """Check if weight should be skipped (MTP, vision, rotary cache, etc.)."""
     for pat in _MTP_PATTERNS:
+        if pat in weight_name:
+            return True
+    for pat in _SKIP_PATTERNS:
         if pat in weight_name:
             return True
     # Per-layer embed_tokens (MTP layer)
@@ -74,6 +163,13 @@ def _is_mtp_weight(weight_name: str, num_hidden_layers: int | None = None) -> bo
         if m and int(m.group(1)) >= num_hidden_layers:
             return True
     return False
+
+
+def _strip_vlm_prefix(weight_name: str) -> str:
+    """Strip VLM prefix (e.g. 'model.language_model.' -> 'model.') for text models."""
+    if weight_name.startswith("model.language_model."):
+        return "model." + weight_name[len("model.language_model.") :]
+    return weight_name
 
 
 def _handle_expert_weight(
@@ -104,7 +200,14 @@ def _handle_expert_weight(
     ep_world_size = get_dist_context().ffn_ep_world_size
     ep_group = get_dist_context().ffn_ep_group
     ep_rank = dist.get_rank(group=ep_group) if ep_group is not None else 0
-    num_experts = config.n_routed_experts
+    num_experts = getattr(config, "n_routed_experts", None) or getattr(
+        config, "num_experts", None
+    )
+    if num_experts is None:
+        logger.warning(
+            f"Cannot determine num_experts from config, skipping {weight_name}"
+        )
+        return False
     experts_per_rank = num_experts // ep_world_size
     expert_start = ep_rank * experts_per_rank
     expert_end = expert_start + experts_per_rank
@@ -119,14 +222,25 @@ def _handle_expert_weight(
     if proj_name in ("gate_proj", "up_proj"):
         # Target: gate_up_proj or gate_up_scale_inv
         param_suffix = "gate_up_scale_inv" if is_scale else "gate_up_proj"
-        param_name = f"{mlp_prefix}.{param_suffix}"
+        param_name = f"{mlp_prefix}.routed_experts.{param_suffix}"
         try:
             param = model.get_parameter(param_name)
         except AttributeError:
             logger.warning(f"Parameter {param_name} not found, skipping {weight_name}")
             return True
 
-        # Determine shard offset
+        if is_scale:
+            tensor = tensor.to(torch.float32)
+            if param.data.numel() == 0:
+                combined_shape = (
+                    experts_per_rank,
+                    tensor.shape[0] * 2,
+                    *tensor.shape[1:],
+                )
+                param.data = torch.zeros(
+                    combined_shape, dtype=torch.float32, device=param.data.device
+                )
+
         # gate_up_proj shape: (experts_per_rank, intermediate*2[/bs], hidden[/bs])
         # gate_proj is first half, up_proj is second half along dim 1
         total_dim1 = param.data.shape[1]
@@ -137,12 +251,19 @@ def _handle_expert_weight(
             start, end = half, total_dim1
 
         if is_scale:
-            tensor = tensor.to(torch.float32)
+            if param.data.dim() == 2:
+                param.data[local_idx, start:end].copy_(tensor.view(-1))
+            elif param.data.dim() == 3:
+                param.data[local_idx, start:end, :].copy_(tensor)
+            else:
+                param.data[local_idx, start:end, :].copy_(tensor)  # default fallback
+            return True
+
         param.data[local_idx, start:end, :].copy_(tensor)
 
     elif proj_name == "down_proj":
         param_suffix = "down_scale_inv" if is_scale else "down_proj"
-        param_name = f"{mlp_prefix}.{param_suffix}"
+        param_name = f"{mlp_prefix}.routed_experts.{param_suffix}"
         try:
             param = model.get_parameter(param_name)
         except AttributeError:
@@ -150,7 +271,19 @@ def _handle_expert_weight(
             return True
         if is_scale:
             tensor = tensor.to(torch.float32)
-        param.data[local_idx].copy_(tensor)
+            if param.data.numel() == 0:
+                param.data = torch.zeros(
+                    (experts_per_rank, *tensor.shape),
+                    dtype=torch.float32,
+                    device=param.data.device,
+                )
+
+            if param.data.dim() == 2:
+                param.data[local_idx].copy_(tensor.view(-1))
+            else:
+                param.data[local_idx].copy_(tensor)
+        else:
+            param.data[local_idx].copy_(tensor)
 
     else:
         logger.warning(f"Unknown expert proj {proj_name} in {weight_name}")
@@ -262,26 +395,38 @@ def load_model(model: nn.Module, path: str):
 
     skipped_count = 0
     loaded_count = 0
+    not_found_names: list[str] = []  # Track names not found in model
 
     try:
         for file in pbar:
             with safe_open(file, "pt", "cpu") as f:
-                for weight_name in f.keys():
-                    # 1. Skip MTP / nextn prediction weights
-                    if _is_mtp_weight(weight_name, num_hidden_layers):
+                for raw_weight_name in f.keys():
+                    # 0. Strip VLM prefix (e.g. model.language_model. -> model.)
+                    weight_name = _strip_vlm_prefix(raw_weight_name)
+
+                    # 1. Skip MTP / vision / rotary cache weights
+                    if _should_skip_weight(raw_weight_name, num_hidden_layers):
                         skipped_count += 1
                         continue
 
-                    # 2. Handle per-expert weights -> combined 3D tensors
+                    # 2a. Handle already-packed expert weights (Qwen3.5 format)
+                    #     e.g. experts.gate_up_proj [E, 2I, H] -> mlp.gate_up_proj
+                    if "experts." in weight_name:
+                        tensor = f.get_tensor(raw_weight_name)
+                        if _handle_packed_expert_weight(model, weight_name, tensor):
+                            loaded_count += 1
+                            continue
+
+                    # 2b. Handle per-expert weights -> combined 3D tensors
                     if "experts." in weight_name and config is not None:
-                        tensor = f.get_tensor(weight_name)
+                        tensor = f.get_tensor(raw_weight_name)
                         if _handle_expert_weight(model, weight_name, tensor, config):
                             loaded_count += 1
                             continue
 
                     # 3. Handle kv_b_proj decomposition -> kc/vc
                     if "kv_b_proj" in weight_name and config is not None:
-                        tensor = f.get_tensor(weight_name)
+                        tensor = f.get_tensor(raw_weight_name)
                         if _handle_kv_b_proj(
                             model, weight_name, tensor, f, config, block_size
                         ):
@@ -297,14 +442,16 @@ def load_model(model: nn.Module, path: str):
                             try:
                                 param = model.get_parameter(param_name)
                             except AttributeError:
-                                logger.warning(
-                                    f"Packed param {param_name} not found for {weight_name}"
-                                )
-                                matched = True
-                                break
+                                # Key matched but target param doesn't exist
+                                # (e.g. linear_attn.q_proj won't match self_attn.q_proj key)
+                                # Don't mark as matched — let it fall through to default
+                                continue
                             weight_loader = getattr(param, "weight_loader")
                             weight_loader(
-                                param, f.get_tensor(weight_name), shard_id, weight_name
+                                param,
+                                f.get_tensor(raw_weight_name),
+                                shard_id,
+                                weight_name,
                             )
                             matched = True
                             loaded_count += 1
@@ -317,19 +464,34 @@ def load_model(model: nn.Module, path: str):
                     try:
                         param = model.get_parameter(weight_name)
                     except AttributeError:
-                        logger.warning(
-                            f"Parameter {weight_name} not found in model, skipping"
-                        )
+                        not_found_names.append(weight_name)
                         skipped_count += 1
                         continue
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    weight_loader(param, f.get_tensor(weight_name))
+                    weight_loader(param, f.get_tensor(raw_weight_name))
                     loaded_count += 1
     finally:
         pbar.close()
 
-    logger.info(
+    logger.warning(
         f"Weight loading complete: {loaded_count} loaded, {skipped_count} skipped"
     )
+    if not_found_names:
+        # Deduplicate by replacing layer/expert indices
+        unique_patterns = set()
+        for n in not_found_names:
+            pat = re.sub(r"layers\.\d+\.", "layers.N.", n)
+            pat = re.sub(r"experts\.\d+\.", "experts.E.", pat)
+            unique_patterns.add(pat)
+        logger.warning(
+            f"  {len(not_found_names)} weights NOT FOUND in model "
+            f"(unique patterns: {sorted(unique_patterns)})"
+        )
+
+    # Report uninitialized model parameters (no checkpoint weight loaded)
+    model_params = set(name for name, _ in model.named_parameters())
+    # We can't easily track which params were loaded without refactoring,
+    # but we can report total parameter count for sanity
+    logger.warning(f"  Model has {len(model_params)} parameters total")

@@ -74,6 +74,13 @@ def _quant_fp8_launcher(A: Tensor, group_size: int, out: Tensor, scales: Tensor)
     warps_per_sm = props["warps_per_sm"]
     max_ctas = num_sm * warps_per_sm // num_warps
     grid_size1 = min(M_out, max_ctas // num_groups)
+    if grid_size1 == 0:
+        raise ValueError(
+            f"quant_fp8 grid_size1=0: M={M}, K={K}, M_out={M_out}, "
+            f"group_size={group_size}, num_groups={num_groups}, "
+            f"num_sm={num_sm}, warps_per_sm={warps_per_sm}, max_ctas={max_ctas}, "
+            f"A.shape={A.shape}, A.device={A.device}"
+        )
     assert grid_size1 < 65536
     num_stages = min(5, max(1, triton.cdiv(M_out, grid_size1)))
     grid = (num_groups, grid_size1)

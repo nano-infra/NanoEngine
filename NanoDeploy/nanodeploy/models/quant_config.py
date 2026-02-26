@@ -13,6 +13,8 @@ class QuantizationConfig:
     def dtype(self):
         if not self.quant_method:
             return torch.get_default_dtype()
-        elif self.quant_method == "fp8" and self.fmt == "e4m3":
-            return torch.float8_e4m3fn
+        elif self.quant_method == "fp8":
+            # Support both explicit fmt="e4m3" and implicit fp8 (default to e4m3fn)
+            if self.fmt is None or self.fmt == "e4m3":
+                return torch.float8_e4m3fn
         raise AttributeError(f"Unsupported dtype: {self.quant_method=}, {self.fmt=}")

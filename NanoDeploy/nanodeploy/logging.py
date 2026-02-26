@@ -120,7 +120,10 @@ class LoggerManager:
         if not logger.handlers:
             # Create a console handler to output logs to stdout
             console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setLevel(logging.DEBUG)
+            # Allow env var to override handler level as well
+            env_level = os.environ.get("NANODEPLOY_LOG_LEVEL", "").upper()
+            handler_level = getattr(logging, env_level, logging.DEBUG)
+            console_handler.setLevel(handler_level)
 
             # Apply our custom formatter to the console handler
             formatter = ContextualFormatter(use_relative_path=use_relative_path)
@@ -167,9 +170,13 @@ def set_log_level(level: str | int) -> None:
             logger.warning(f"Invalid log level: {level}")
             return
         logger.setLevel(numeric_level)
+        for h in logger.handlers:
+            h.setLevel(numeric_level)
     elif isinstance(level, int):
         numeric_level = level
         logger.setLevel(level)
+        for h in logger.handlers:
+            h.setLevel(level)
 
     try:
         from nanodeploy import _nanodeploy_cpp

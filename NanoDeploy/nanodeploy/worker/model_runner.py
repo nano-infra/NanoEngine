@@ -1,13 +1,11 @@
 import os
 
 import flash_mla
-
 import numpy as np
 import ray
 import torch
 import torch.distributed as dist
 import torch.profiler as profiler
-
 from nanodeploy._cpp import (
     BlockContextSlot,
     prepare_decode_cpp,
@@ -22,13 +20,14 @@ from nanodeploy.context.distributed import (
     get_local_ip,
     set_dist_context,
 )
+from nanodeploy.context.expert_context import ExpertContext
 from nanodeploy.context.sp_context import set_sp_context
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
-
 from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.qwen3 import Qwen3ForCausalLM
+from nanodeploy.models.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
@@ -40,6 +39,7 @@ architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
+    "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGeneration,
 }
 
 
@@ -207,6 +207,30 @@ class ModelRunner:
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
 
+        # Warmup ExpertContext for MoE models
+        num_total_experts = getattr(hf_config, "num_experts", 0) or getattr(
+            hf_config, "n_routed_experts", 0
+        )
+        if num_total_experts > 0:
+            ep_rank = get_dist_context().ffn_ep_rank
+
+            # Check FP8 quantization configs
+            quant_config = getattr(hf_config, "quantization_config", None)
+            is_fp8 = False
+            if quant_config is not None:
+                is_fp8 = quant_config.get("quant_method", "") == "fp8"
+
+            num_local_experts = num_total_experts // ep_size
+            ExpertContext.get_instance().warmup(
+                ep_group=get_dist_context().ffn_ep_group,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                num_local_experts=num_local_experts,
+                hidden_size=hf_config.hidden_size,
+                max_num_sequence=config.max_num_seqs,
+                is_fp8=is_fp8,
+            )
+
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
 
@@ -236,6 +260,11 @@ class ModelRunner:
                 allocated = True
             if allocated:
                 layer_id += 1
+
+        # Start PeerAgent AFTER kv_cache (and GDN states) are allocated,
+        # so that all tensors exist for RDMA memory region registration.
+        cache_context.start_peer_agent()
+
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -288,6 +317,14 @@ class ModelRunner:
             hf_config.qk_rope_head_dim if hasattr(hf_config, "qk_rope_head_dim") else 0
         )
 
+        # For mixed attention models (Qwen3.5-MoE), only full_attention layers
+        # need KV cache. Count the number of full_attention layers.
+        layer_types = getattr(hf_config, "layer_types", None)
+        if layer_types is not None:
+            num_kv_layers = sum(1 for lt in layer_types if lt == "full_attention")
+        else:
+            num_kv_layers = hf_config.num_hidden_layers
+
         # If nanoctrl_address is provided, fetch engine_id from NanoCtrl
         engine_id = config.engine_id
         if config.nanoctrl_address and not engine_id:
@@ -299,7 +336,7 @@ class ModelRunner:
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
             block_size=config.kvcache_block_size,
-            num_hidden_layers=hf_config.num_hidden_layers,
+            num_hidden_layers=num_kv_layers,
             attention_tp=config.attention_tp,
             gpu_memory_utilization=config.gpu_memory_utilization,
             gpu_memory_limit_gb=config.gpu_memory_limit_gb,
@@ -313,6 +350,12 @@ class ModelRunner:
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
+        # Allocate GDN state buffers for linear_attention layers
+        if layer_types is not None:
+            cache_context.allocate_gdn_states(
+                hf_config, layer_types, config.max_num_seqs
+            )
+
     def prepare_prefill(self, seqs: list[Sequence], is_dummy: bool = False):
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
@@ -321,6 +364,25 @@ class ModelRunner:
         meta = prepare_prefill_cpp(
             seqs, sp_rank, sp_size, block_size, self.config.max_num_seqs
         )
+
+        if len(meta.input_ids) == 0:
+            logger.critical(
+                "prepare_prefill_cpp returned empty input_ids! "
+                "is_dummy=%s sp_rank=%s sp_size=%s block_size=%s max_num_seqs=%s "
+                "num_seqs=%s seqs_info=[%s]",
+                is_dummy,
+                sp_rank,
+                sp_size,
+                block_size,
+                self.config.max_num_seqs,
+                len(seqs),
+                ", ".join(
+                    f"(id={getattr(s, 'seq_id', '?')}, "
+                    f"ntok={getattr(s, 'num_tokens', '?')}, "
+                    f"master_sp={getattr(s.block_ctx(), 'master_sp_idx', '?') if hasattr(s, 'block_ctx') else '?'})"
+                    for s in seqs
+                ),
+            )
 
         input_ids = torch.tensor(
             meta.input_ids, dtype=torch.int64, pin_memory=True
@@ -358,6 +420,8 @@ class ModelRunner:
             block_tables,
             None,
             is_dummy=is_dummy,
+            gdn_conv_states=get_cache_context().gdn_conv_states,
+            gdn_recurrent_states=get_cache_context().gdn_recurrent_states,
         )
         return input_ids, positions
 
@@ -483,42 +547,6 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         attention_compute_bs = context_lens_for_attn.numel()
 
-        context_lens_for_attn = torch.tensor(
-            meta.context_lens_for_attn, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        q_slice_get = torch.tensor(
-            meta.q_slice_get, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_slice_fill = torch.tensor(
-            meta.q_slice_fill, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_copy_mask = torch.tensor(
-            meta.q_copy_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_get_to_buffer_output = torch.tensor(
-            meta.res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_fill_to_buffer_output = torch.tensor(
-            meta.res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_to_buffer_output_mask = torch.tensor(
-            meta.res_to_buffer_output_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_get_to_buffer_input = torch.tensor(
-            meta.res_slice_get_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_fill_to_buffer_input = torch.tensor(
-            meta.res_slice_fill_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_to_buffer_input_mask = torch.tensor(
-            meta.res_to_buffer_input_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_offsets = torch.tensor(
-            meta.q_offsets, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        attention_compute_bs = context_lens_for_attn.numel()
-
         config = self.config
         hf_config = config.hf_config
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
@@ -556,6 +584,8 @@ class ModelRunner:
             q_offsets=q_offsets,
             tile_scheduler_metadata=new_tile_scheduler_metadata,
             num_splits=new_num_splits,
+            gdn_conv_states=get_cache_context().gdn_conv_states,
+            gdn_recurrent_states=get_cache_context().gdn_recurrent_states,
         )
 
         return input_ids, positions
@@ -749,6 +779,19 @@ class ModelRunner:
                         input_ids, positions, dp_seqs
                     )
 
+            if input_ids.numel() == 0:
+                logger.critical(
+                    "EMPTY input_ids before run_model! rank=%s is_prefill=%s "
+                    "is_dummy=%s input_ids.shape=%s positions.shape=%s "
+                    "num_dp_seqs=%s num_sp_seqs=%s",
+                    self.rank,
+                    is_prefill,
+                    is_dummy,
+                    input_ids.shape,
+                    positions.shape,
+                    len(dp_seqs),
+                    num_sp_seqs,
+                )
             logits = self.run_model(input_ids, positions, is_prefill)
 
             tp_rank = get_dist_context().attn_tp_rank
@@ -907,6 +950,8 @@ class ModelRunner:
                     q_offsets=q_offsets,
                     tile_scheduler_metadata=tile_scheduler_metadata_buffer,
                     num_splits=num_splits_buffer,
+                    gdn_conv_states=get_cache_context().gdn_conv_states,
+                    gdn_recurrent_states=get_cache_context().gdn_recurrent_states,
                 )
 
                 outputs[:master_bs] = self.model(

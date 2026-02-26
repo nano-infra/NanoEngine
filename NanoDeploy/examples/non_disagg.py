@@ -12,7 +12,7 @@ from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.llm_component import LLM
 from nanodeploy.sampling_params import SamplingParams
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerFast
 
 
 def main():
@@ -32,7 +32,7 @@ def main():
     }
     config = Config(**config_args)
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model)
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
     llm = LLM(config)
 
     sampling_params = SamplingParams(
