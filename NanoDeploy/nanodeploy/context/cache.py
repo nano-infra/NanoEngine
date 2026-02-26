@@ -698,8 +698,6 @@ class CacheContext:
                             length,
                         )
                     )
-
-                print(f"after kv: {len(rdma_ops)=}")
                 # Add GDN RDMA ops to the same operation batch
                 gdn_batch = gdn_assigns[engine_id].get(peer_alias, [])
 
@@ -739,7 +737,7 @@ class CacheContext:
                         logger.warning(
                             f"Failed to get gdn_conv MR info for {peer_alias}"
                         )
-                    print(f"after gdn_conv: {len(rdma_ops)=}")
+
                     # For recurrent state
                     remote_rec_mr_info = self._peer_agent.get_mr_info(
                         peer_alias, "gdn_recurrent"
@@ -764,7 +762,6 @@ class CacheContext:
                         logger.warning(
                             f"Failed to get gdn_recurrent MR info for {peer_alias}"
                         )
-                    print(f"after gdn_recurrent: {len(rdma_ops)=}")
                 if not rdma_ops:
                     logger.error(f"No valid RDMA ops for {peer_alias}, skipping")
                     continue

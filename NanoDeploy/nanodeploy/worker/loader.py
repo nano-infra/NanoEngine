@@ -101,7 +101,7 @@ def _handle_packed_expert_weight(
         )
 
     param.data.copy_(tensor)
-    logger.info(
+    logger.debug(
         f"Loaded packed expert weight: {weight_name} -> {param_name} "
         f"shape={list(tensor.shape)} (ep_rank={ep_rank}/{ep_world_size}, "
         f"tp_rank={tp_rank}/{tp_world_size})"
