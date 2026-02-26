@@ -95,8 +95,8 @@ class Config(BaseModel):
                 if not hasattr(self.hf_config, attr):
                     try:
                         setattr(self.hf_config, attr, getattr(text_cfg, attr))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"Could not flatten attribute '{attr}' from text_config: {e}")
             # Explicitly propagate dtype/torch_dtype from text_config
             # (top-level config may have dtype=None while text_config has bfloat16)
             if getattr(text_cfg, "dtype", None) is not None:
