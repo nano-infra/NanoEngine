@@ -552,8 +552,6 @@ def _deepgemm_grouped_fp8_nt_contiguous(
 # fused_moe_v3 (FP8 path)
 # ---------------------------------------------------------------------------
 
-_fmoe_diag_count = 0
-
 
 def fused_moe_v3(
     hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor],
@@ -563,14 +561,6 @@ def fused_moe_v3(
     w2_weight_fp8: Tuple[torch.Tensor, torch.Tensor],
     num_recv_tokens_per_expert: Optional[List[int]],
 ):
-    import logging
-
-    _logger = logging.getLogger(__name__)
-
-    global _fmoe_diag_count
-    _fmoe_diag_count += 1
-    do_diag = _fmoe_diag_count <= 3
-
     hidden_states_fp8, hidden_states_scale = hidden_states_fp8
     if num_recv_tokens_per_expert is None:
         return hidden_states_fp8.to(torch.bfloat16)
@@ -580,21 +570,6 @@ def fused_moe_v3(
     M, K = hidden_states_fp8.size()
     N = w13_weight_fp8[0].size(1)
     scale_block_size = 128
-
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3 DIAG #%d: M=%d K=%d N=%d all_tokens=%d "
-            "w13_shape=%s w13_scale_shape=%s w2_shape=%s w2_scale_shape=%s",
-            _fmoe_diag_count,
-            M,
-            K,
-            N,
-            all_tokens,
-            list(w13_weight_fp8[0].shape),
-            list(w13_weight_fp8[1].shape),
-            list(w2_weight_fp8[0].shape),
-            list(w2_weight_fp8[1].shape),
-        )
 
     gather_out = torch.empty_like(
         hidden_states_fp8,
@@ -634,17 +609,6 @@ def fused_moe_v3(
         output_index,
     )
 
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3 DIAG #%d AFTER scatter: input_tensor_abs=%.6f "
-            "input_scale_abs=%.6f m_indices=%s output_index=%s",
-            _fmoe_diag_count,
-            input_tensor.float().abs().mean().item(),
-            input_tensor_scale.abs().mean().item(),
-            m_indices[: min(16, all_tokens)].tolist(),
-            output_index[: min(5, M)].tolist(),
-        )
-
     del hidden_states_fp8
     gateup_output = torch.empty(
         (all_tokens, N),
@@ -656,14 +620,6 @@ def fused_moe_v3(
     _deepgemm_grouped_fp8_nt_contiguous(
         [input_tensor, input_tensor_scale], w13_weight_fp8, gateup_output, m_indices
     )
-
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3 DIAG #%d AFTER gate_up GEMM: gateup_abs=%.10f gateup_max=%.6f",
-            _fmoe_diag_count,
-            gateup_output.abs().mean().item(),
-            gateup_output.abs().max().item(),
-        )
 
     down_input = torch.empty(
         (
@@ -683,14 +639,6 @@ def fused_moe_v3(
     )
     silu_and_mul(gateup_output.view(-1, N), down_input)
 
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3 DIAG #%d AFTER silu_and_mul: down_input_abs=%.10f down_input_max=%.6f",
-            _fmoe_diag_count,
-            down_input.abs().mean().item(),
-            down_input.abs().max().item(),
-        )
-
     down_output = torch.empty(
         (all_tokens, K),
         device=gather_out.device,
@@ -708,55 +656,7 @@ def fused_moe_v3(
         m_indices,
     )
 
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3 DIAG #%d AFTER down GEMM: down_out_abs=%.10f down_out_max=%.6f",
-            _fmoe_diag_count,
-            down_output.abs().mean().item(),
-            down_output.abs().max().item(),
-        )
-        # Check actual values at valid output_index positions
-        for tok in range(min(3, M)):
-            for k in range(topk_idx.shape[1]):
-                eid = topk_idx[tok, k].item()
-                if eid >= 0:
-                    oidx = output_index[tok, k].item()
-                    if 0 <= oidx < all_tokens:
-                        row_abs = down_output[oidx].abs().mean().item()
-                        row_max = down_output[oidx].abs().max().item()
-                        wt = (
-                            topk_weights[tok, k].item()
-                            if topk_weights is not None
-                            else -1
-                        )
-                        _logger.warning(
-                            "FMOE_V3 DIAG #%d tok=%d topk=%d expert=%d out_idx=%d "
-                            "row_abs=%.6f row_max=%.6f weight=%.6f",
-                            _fmoe_diag_count,
-                            tok,
-                            k,
-                            eid,
-                            oidx,
-                            row_abs,
-                            row_max,
-                            wt,
-                        )
-
     ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
-
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3 DIAG #%d AFTER gather: gather_out_abs=%.10f gather_out_max=%.6f "
-            "gather_first5=%.6f,%.6f,%.6f,%.6f,%.6f",
-            _fmoe_diag_count,
-            gather_out.abs().mean().item(),
-            gather_out.abs().max().item(),
-            gather_out[0, 0].item(),
-            gather_out[0, 1].item(),
-            gather_out[0, 2].item(),
-            gather_out[0, 3].item(),
-            gather_out[0, 4].item(),
-        )
 
     return gather_out
 
@@ -764,8 +664,6 @@ def fused_moe_v3(
 # ---------------------------------------------------------------------------
 # fused_moe_v3_bf16 (BF16 path — no FP8 quantization)
 # ---------------------------------------------------------------------------
-
-_fmoe_bf16_diag_count = 0
 
 
 def fused_moe_v3_bf16(
@@ -780,14 +678,6 @@ def fused_moe_v3_bf16(
     BF16 fused MoE computation for prefill (normal) mode.
     Uses BF16 scatter + BF16 grouped GEMM + silu_and_mul + gather.
     """
-    import logging
-
-    _logger = logging.getLogger(__name__)
-
-    global _fmoe_bf16_diag_count
-    _fmoe_bf16_diag_count += 1
-    do_diag = _fmoe_bf16_diag_count <= 3
-
     if num_recv_tokens_per_expert is None:
         return hidden_states.to(torch.bfloat16)
     all_tokens = sum(num_recv_tokens_per_expert)
@@ -796,19 +686,6 @@ def fused_moe_v3_bf16(
 
     M, K = hidden_states.size()
     N = w13_weight.size(1)  # intermediate_size * 2
-
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3_BF16 DIAG #%d: M=%d K=%d N=%d all_tokens=%d "
-            "w13_shape=%s w2_shape=%s",
-            _fmoe_bf16_diag_count,
-            M,
-            K,
-            N,
-            all_tokens,
-            list(w13_weight.shape),
-            list(w2_weight.shape),
-        )
 
     # Prepare output buffer (same shape as hidden_states but BF16)
     gather_out = torch.empty(
@@ -843,16 +720,6 @@ def fused_moe_v3_bf16(
         output_index,
     )
 
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3_BF16 DIAG #%d AFTER scatter: input_tensor_abs=%.6f "
-            "m_indices=%s output_index=%s",
-            _fmoe_bf16_diag_count,
-            input_tensor.abs().mean().item(),
-            m_indices[: min(16, all_tokens)].tolist(),
-            output_index[: min(5, M)].tolist(),
-        )
-
     # Gate-Up GEMM (BF16)
     gateup_output = torch.empty(
         (all_tokens, N),
@@ -864,14 +731,6 @@ def fused_moe_v3_bf16(
         input_tensor, w13_weight, gateup_output, m_indices
     )
 
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3_BF16 DIAG #%d AFTER gate_up GEMM: gateup_abs=%.10f gateup_max=%.6f",
-            _fmoe_bf16_diag_count,
-            gateup_output.abs().mean().item(),
-            gateup_output.abs().max().item(),
-        )
-
     # SiLU + mul (BF16, no re-quantization needed)
     down_input = torch.empty(
         (all_tokens, N // 2),
@@ -880,14 +739,6 @@ def fused_moe_v3_bf16(
     )
     silu_and_mul(gateup_output.view(-1, N), down_input)
     del gateup_output
-
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3_BF16 DIAG #%d AFTER silu_and_mul: down_input_abs=%.10f down_input_max=%.6f",
-            _fmoe_bf16_diag_count,
-            down_input.abs().mean().item(),
-            down_input.abs().max().item(),
-        )
 
     # Down GEMM (BF16)
     down_output = torch.empty(
@@ -900,23 +751,7 @@ def fused_moe_v3_bf16(
     )
     del down_input
 
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3_BF16 DIAG #%d AFTER down GEMM: down_out_abs=%.10f down_out_max=%.6f",
-            _fmoe_bf16_diag_count,
-            down_output.abs().mean().item(),
-            down_output.abs().max().item(),
-        )
-
     # Gather: reorder back and apply topk_weights
     ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
-
-    if do_diag:
-        _logger.warning(
-            "FMOE_V3_BF16 DIAG #%d AFTER gather: gather_out_abs=%.10f gather_out_max=%.6f",
-            _fmoe_bf16_diag_count,
-            gather_out.abs().mean().item(),
-            gather_out.abs().max().item(),
-        )
 
     return gather_out
