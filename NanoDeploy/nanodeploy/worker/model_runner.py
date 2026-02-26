@@ -302,6 +302,10 @@ class ModelRunner:
                 config.nanoctrl_address, config.host, config.port
             )
 
+        # Allocate GDN state buffers for linear_attention layers
+        if layer_types is not None:
+            self._allocate_gdn_states(hf_config, layer_types)
+
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
@@ -319,10 +323,6 @@ class ModelRunner:
             engine_id=engine_id,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
-
-        # Allocate GDN state buffers for linear_attention layers
-        if layer_types is not None:
-            self._allocate_gdn_states(hf_config, layer_types)
 
     def _allocate_gdn_states(self, hf_config, layer_types):
         """Allocate fixed-size GDN state buffers for linear_attention layers."""
