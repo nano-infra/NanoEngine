@@ -16,8 +16,6 @@ import torch.distributed as dist
 
 from nanodeploy.context.expert_context import ExpertContext
 
-from nanodeploy.layers.token_dispatcher_base import TokenDispatcherBase
-
 
 class DeepEPMode(Enum):
     NORMAL = "normal"
@@ -25,7 +23,7 @@ class DeepEPMode(Enum):
     AUTO = "auto"
 
 
-class DeepEPTokenDispatcherNormal(TokenDispatcherBase):
+class DeepEPTokenDispatcherNormal:
     """Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
     https://github.com/NVIDIA/Megatron-
     LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py."""
@@ -230,7 +228,7 @@ class DeepEPTokenDispatcherNormal(TokenDispatcherBase):
         return True
 
 
-class DeepEPTokenDispatcherLowLatency(TokenDispatcherBase):
+class DeepEPTokenDispatcherLowLatency:
 
     def __init__(
         self,
