@@ -792,7 +792,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.ep_group = get_dist_context().ffn_ep_group
         self.ep_size = get_dist_context().ffn_ep_world_size
 
-        from nanoexpert.layers.distributed_routed_experts import (
+        from nanodeploy.layers.distributed_routed_experts import (
             DistributedRoutedExperts,
         )
 

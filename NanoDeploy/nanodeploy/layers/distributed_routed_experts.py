@@ -2,7 +2,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from nanoexpert.context.expert_context import ExpertContext
+from nanodeploy.context.expert_context import ExpertContext
 from torch import nn
 
 
@@ -102,16 +102,16 @@ class DistributedRoutedExperts(nn.Module):
         """
         Forward pass for the unified MoE logic.
         """
-        # Handle EPLB mapping if logically enabled globally
-        from nanodeploy.worker.runner_config import get_runner_config
-
         # 0. EPLB (Expert Parallel Load Balancing) Interception
         # If EPLB is globally enabled and mapped, we intercept the logical topk_ids
         # and randomly assign them to physical topk_ids mapped copies.
-        from nanoexpert.layers.eplb import topk_ids_logical_to_physical
+        from nanodeploy.layers.eplb import topk_ids_logical_to_physical
+
+        # Handle EPLB mapping if logically enabled globally
+        from nanodeploy.worker.runner_config import get_runner_config
 
         if get_runner_config().perfect_eplb:
-            import nanoexpert.layers.eplb as eplb
+            import nanodeploy.layers.eplb as eplb
 
             # Assuming info is pre-initialized, or we can fetch if needed
             topk_ids = eplb.topk_ids_logical_to_physical(topk_ids, info=None)
@@ -140,8 +140,8 @@ class DistributedRoutedExperts(nn.Module):
     ):
         # 1. Quantize if needed and compute
         if self.is_fp8:
-            from nanoexpert.kernels.fp8 import per_token_group_quant_fp8
-            from nanoexpert.kernels.fused_moe_v3 import fused_moe_v3
+            from nanodeploy.kernels.fp8 import per_token_group_quant_fp8
+            from nanodeploy.kernels.fused_moe_v3 import fused_moe_v3
 
             x_fp8, x_scales = per_token_group_quant_fp8(hidden_states, 128)
             x_to_compute = (x_fp8, x_scales)
@@ -156,7 +156,7 @@ class DistributedRoutedExperts(nn.Module):
                 None,  # Let fused_moe_v3 count local tokens
             )
         else:
-            from nanoexpert.kernels.fused_moe_v3 import fused_moe_v3_bf16
+            from nanodeploy.kernels.fused_moe_v3 import fused_moe_v3_bf16
 
             out_states = fused_moe_v3_bf16(
                 hidden_states,
@@ -179,7 +179,7 @@ class DistributedRoutedExperts(nn.Module):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        from nanoexpert.layers.token_dispatcher import DeepEPTokenDispatcherNormal
+        from nanodeploy.layers.token_dispatcher import DeepEPTokenDispatcherNormal
 
         ctx = ExpertContext.get_instance()
         ctx.transition_to_normal()
@@ -193,7 +193,7 @@ class DistributedRoutedExperts(nn.Module):
 
         # 1. Dispatch
         if self.is_fp8:
-            from nanoexpert.kernels.fp8 import per_token_group_quant_fp8
+            from nanodeploy.kernels.fp8 import per_token_group_quant_fp8
 
             x_fp8, x_scales = per_token_group_quant_fp8(hidden_states, 128)
             x_to_dispatch = (x_fp8, x_scales)
@@ -206,7 +206,7 @@ class DistributedRoutedExperts(nn.Module):
 
         # 2. Compute
         if self.is_fp8:
-            from nanoexpert.kernels.fused_moe_v3 import fused_moe_v3
+            from nanodeploy.kernels.fused_moe_v3 import fused_moe_v3
 
             gate_up_weight_tup = (self.gate_up_proj, self.gate_up_scale_inv)
             down_weight_tup = (self.down_proj, self.down_scale_inv)
@@ -219,7 +219,7 @@ class DistributedRoutedExperts(nn.Module):
                 recv_expert_count,
             )
         else:
-            from nanoexpert.kernels.fused_moe_v3 import fused_moe_v3_bf16
+            from nanodeploy.kernels.fused_moe_v3 import fused_moe_v3_bf16
 
             down_output = fused_moe_v3_bf16(
                 recv_x,
@@ -242,7 +242,7 @@ class DistributedRoutedExperts(nn.Module):
         topk_weights: torch.Tensor,
     ):
         import deep_gemm
-        from nanoexpert.layers.token_dispatcher import DeepEPTokenDispatcherLowLatency
+        from nanodeploy.layers.token_dispatcher import DeepEPTokenDispatcherLowLatency
 
         ctx = ExpertContext.get_instance()
         ctx.transition_to_low_latency()
@@ -288,7 +288,7 @@ class DistributedRoutedExperts(nn.Module):
             )
 
             # silu_and_mul and re-quantize activation for the next gemm
-            from nanoexpert.kernels.fp8 import silu_and_mul_masked_post_quant_fwd
+            from nanodeploy.kernels.fp8 import silu_and_mul_masked_post_quant_fwd
 
             block_size = 128
             down_input = torch.empty(

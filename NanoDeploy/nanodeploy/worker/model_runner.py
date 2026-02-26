@@ -20,6 +20,7 @@ from nanodeploy.context.distributed import (
     get_local_ip,
     set_dist_context,
 )
+from nanodeploy.context.expert_context import ExpertContext
 from nanodeploy.context.sp_context import set_sp_context
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
@@ -30,7 +31,6 @@ from nanodeploy.models.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
-from nanoexpert.context.expert_context import ExpertContext
 
 logger = get_logger("NANODEPLOY")
 

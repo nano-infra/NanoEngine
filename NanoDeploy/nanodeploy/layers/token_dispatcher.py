@@ -14,9 +14,9 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from nanoexpert.context.expert_context import ExpertContext
+from nanodeploy.context.expert_context import ExpertContext
 
-from nanoexpert.layers.token_dispatcher_base import TokenDispatcherBase
+from nanodeploy.layers.token_dispatcher_base import TokenDispatcherBase
 
 
 class DeepEPMode(Enum):

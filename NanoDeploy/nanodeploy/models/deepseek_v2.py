@@ -101,7 +101,7 @@ class DeepseekV2MoE(nn.Module):
             requires_grad=False,
         )
 
-        from nanoexpert.layers.distributed_routed_experts import (
+        from nanodeploy.layers.distributed_routed_experts import (
             DistributedRoutedExperts,
         )
 
