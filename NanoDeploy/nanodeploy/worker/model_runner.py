@@ -30,6 +30,7 @@ from nanodeploy.models.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
+from nanoexpert.context.expert_context import ExpertContext
 
 logger = get_logger("NANODEPLOY")
 
@@ -206,6 +207,30 @@ class ModelRunner:
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
 
+        # Warmup ExpertContext for MoE models
+        num_total_experts = getattr(hf_config, "num_experts", 0) or getattr(
+            hf_config, "n_routed_experts", 0
+        )
+        if num_total_experts > 0:
+            ep_rank = get_dist_context().ffn_ep_rank
+
+            # Check FP8 quantization configs
+            quant_config = getattr(hf_config, "quantization_config", None)
+            is_fp8 = False
+            if quant_config is not None:
+                is_fp8 = quant_config.get("quant_method", "") == "fp8"
+
+            num_local_experts = num_total_experts // ep_size
+            ExpertContext.get_instance().warmup(
+                ep_group=get_dist_context().ffn_ep_group,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                num_local_experts=num_local_experts,
+                hidden_size=hf_config.hidden_size,
+                max_num_sequence=config.max_num_seqs,
+                is_fp8=is_fp8,
+            )
+
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
 
@@ -235,6 +260,11 @@ class ModelRunner:
                 allocated = True
             if allocated:
                 layer_id += 1
+
+        # Start PeerAgent AFTER kv_cache (and GDN states) are allocated,
+        # so that all tensors exist for RDMA memory region registration.
+        cache_context.start_peer_agent()
+
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -302,10 +332,6 @@ class ModelRunner:
                 config.nanoctrl_address, config.host, config.port
             )
 
-        # Allocate GDN state buffers for linear_attention layers
-        if layer_types is not None:
-            self._allocate_gdn_states(hf_config, layer_types)
-
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
@@ -324,50 +350,11 @@ class ModelRunner:
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
-    def _allocate_gdn_states(self, hf_config, layer_types):
-        """Allocate fixed-size GDN state buffers for linear_attention layers."""
-        num_layers = len(layer_types)
-        max_bs = self.config.max_num_seqs
-
-        num_k_heads = getattr(hf_config, "linear_num_key_heads", 0)
-        num_v_heads = getattr(hf_config, "linear_num_value_heads", 0)
-        head_k_dim = getattr(hf_config, "linear_key_head_dim", 0)
-        head_v_dim = getattr(hf_config, "linear_value_head_dim", 0)
-        conv_kernel_size = getattr(hf_config, "linear_conv_kernel_dim", 4)
-        key_dim = num_k_heads * head_k_dim
-        value_dim = num_v_heads * head_v_dim
-        conv_dim = key_dim * 2 + value_dim  # q + k + v
-
-        if num_v_heads == 0:
-            return
-
-        # Conv state: [num_layers, max_bs, conv_dim, kernel_size]
-        self.gdn_conv_states = torch.zeros(
-            num_layers,
-            max_bs,
-            conv_dim,
-            conv_kernel_size,
-            dtype=torch.bfloat16,
-            device=torch.get_default_device(),
-        )
-
-        # Recurrent state: [num_layers, max_bs, num_v_heads, head_k_dim, head_v_dim]
-        self.gdn_recurrent_states = torch.zeros(
-            num_layers,
-            max_bs,
-            num_v_heads,
-            head_k_dim,
-            head_v_dim,
-            dtype=torch.float32,
-            device=torch.get_default_device(),
-        )
-
-        logger.info(
-            f"Allocated GDN states: conv={self.gdn_conv_states.shape} "
-            f"({self.gdn_conv_states.element_size() * self.gdn_conv_states.nelement() / 1e9:.2f} GB), "
-            f"recurrent={self.gdn_recurrent_states.shape} "
-            f"({self.gdn_recurrent_states.element_size() * self.gdn_recurrent_states.nelement() / 1e9:.2f} GB)"
-        )
+        # Allocate GDN state buffers for linear_attention layers
+        if layer_types is not None:
+            cache_context.allocate_gdn_states(
+                hf_config, layer_types, config.max_num_seqs
+            )
 
     def prepare_prefill(self, seqs: list[Sequence], is_dummy: bool = False):
         sp_rank = get_dist_context().attn_sp_rank
@@ -433,8 +420,8 @@ class ModelRunner:
             block_tables,
             None,
             is_dummy=is_dummy,
-            gdn_conv_states=getattr(self, "gdn_conv_states", None),
-            gdn_recurrent_states=getattr(self, "gdn_recurrent_states", None),
+            gdn_conv_states=get_cache_context().gdn_conv_states,
+            gdn_recurrent_states=get_cache_context().gdn_recurrent_states,
         )
         return input_ids, positions
 
@@ -560,42 +547,6 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         attention_compute_bs = context_lens_for_attn.numel()
 
-        context_lens_for_attn = torch.tensor(
-            meta.context_lens_for_attn, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        q_slice_get = torch.tensor(
-            meta.q_slice_get, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_slice_fill = torch.tensor(
-            meta.q_slice_fill, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_copy_mask = torch.tensor(
-            meta.q_copy_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_get_to_buffer_output = torch.tensor(
-            meta.res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_fill_to_buffer_output = torch.tensor(
-            meta.res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_to_buffer_output_mask = torch.tensor(
-            meta.res_to_buffer_output_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_get_to_buffer_input = torch.tensor(
-            meta.res_slice_get_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_fill_to_buffer_input = torch.tensor(
-            meta.res_slice_fill_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_to_buffer_input_mask = torch.tensor(
-            meta.res_to_buffer_input_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_offsets = torch.tensor(
-            meta.q_offsets, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        attention_compute_bs = context_lens_for_attn.numel()
-
         config = self.config
         hf_config = config.hf_config
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
@@ -633,8 +584,8 @@ class ModelRunner:
             q_offsets=q_offsets,
             tile_scheduler_metadata=new_tile_scheduler_metadata,
             num_splits=new_num_splits,
-            gdn_conv_states=getattr(self, "gdn_conv_states", None),
-            gdn_recurrent_states=getattr(self, "gdn_recurrent_states", None),
+            gdn_conv_states=get_cache_context().gdn_conv_states,
+            gdn_recurrent_states=get_cache_context().gdn_recurrent_states,
         )
 
         return input_ids, positions
@@ -999,6 +950,8 @@ class ModelRunner:
                     q_offsets=q_offsets,
                     tile_scheduler_metadata=tile_scheduler_metadata_buffer,
                     num_splits=num_splits_buffer,
+                    gdn_conv_states=get_cache_context().gdn_conv_states,
+                    gdn_recurrent_states=get_cache_context().gdn_recurrent_states,
                 )
 
                 outputs[:master_bs] = self.model(

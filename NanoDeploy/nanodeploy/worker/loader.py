@@ -44,7 +44,8 @@ def _handle_packed_expert_weight(
       experts.gate_up_proj  shape (num_experts, 2*intermediate, hidden)
       experts.down_proj     shape (num_experts, hidden, intermediate)
 
-    These map directly to mlp.gate_up_proj / mlp.down_proj.
+    These map to mlp.routed_experts.gate_up_proj / mlp.routed_experts.down_proj,
+    with EP slicing (dim 0) and TP slicing (intermediate dim) applied.
     """
     m = _PACKED_EXPERT_RE.match(weight_name)
     if m is None:
@@ -52,7 +53,7 @@ def _handle_packed_expert_weight(
 
     mlp_prefix = m.group(1)  # e.g. "model.layers.0.mlp"
     proj_name = m.group(2)  # "gate_up_proj" or "down_proj"
-    param_name = f"{mlp_prefix}.{proj_name}"
+    param_name = f"{mlp_prefix}.routed_experts.{proj_name}"
 
     try:
         param = model.get_parameter(param_name)
@@ -62,16 +63,48 @@ def _handle_packed_expert_weight(
         )
         return False
 
+    # --- EP slicing: select only this rank's local experts along dim 0 ---
+    dist_ctx = get_dist_context()
+    ep_world_size = dist_ctx.ffn_ep_world_size
+    ep_rank = dist_ctx.ffn_ep_rank
+    num_total_experts = tensor.shape[0]
+    experts_per_rank = num_total_experts // ep_world_size
+    expert_start = ep_rank * experts_per_rank
+    expert_end = expert_start + experts_per_rank
+    tensor = tensor[expert_start:expert_end]
+
+    # --- TP slicing: slice the intermediate dimension ---
+    tp_world_size = dist_ctx.ffn_tp_world_size
+    tp_rank = dist_ctx.ffn_tp_rank
+    if tp_world_size > 1:
+        if proj_name == "gate_up_proj":
+            # Shape: (local_experts, intermediate*2, hidden)
+            # gate is first half of dim1, up is second half
+            full_inter2 = tensor.shape[1]
+            full_inter = full_inter2 // 2
+            chunk = full_inter // tp_world_size
+            gate_slice = tensor[:, tp_rank * chunk : (tp_rank + 1) * chunk, :]
+            up_slice = tensor[
+                :, full_inter + tp_rank * chunk : full_inter + (tp_rank + 1) * chunk, :
+            ]
+            tensor = torch.cat([gate_slice, up_slice], dim=1)
+        elif proj_name == "down_proj":
+            # Shape: (local_experts, hidden, intermediate)
+            full_inter = tensor.shape[2]
+            chunk = full_inter // tp_world_size
+            tensor = tensor[:, :, tp_rank * chunk : (tp_rank + 1) * chunk]
+
     if param.data.shape != tensor.shape:
         logger.warning(
             f"Shape mismatch for {param_name}: param={list(param.data.shape)} "
-            f"checkpoint={list(tensor.shape)}, trying to copy anyway"
+            f"checkpoint={list(tensor.shape)} (after EP/TP slicing)"
         )
 
     param.data.copy_(tensor)
     logger.info(
         f"Loaded packed expert weight: {weight_name} -> {param_name} "
-        f"shape={list(tensor.shape)} abs_mean={tensor.float().abs().mean().item():.6f}"
+        f"shape={list(tensor.shape)} (ep_rank={ep_rank}/{ep_world_size}, "
+        f"tp_rank={tp_rank}/{tp_world_size})"
     )
     return True
 
@@ -189,14 +222,25 @@ def _handle_expert_weight(
     if proj_name in ("gate_proj", "up_proj"):
         # Target: gate_up_proj or gate_up_scale_inv
         param_suffix = "gate_up_scale_inv" if is_scale else "gate_up_proj"
-        param_name = f"{mlp_prefix}.{param_suffix}"
+        param_name = f"{mlp_prefix}.routed_experts.{param_suffix}"
         try:
             param = model.get_parameter(param_name)
         except AttributeError:
             logger.warning(f"Parameter {param_name} not found, skipping {weight_name}")
             return True
 
-        # Determine shard offset
+        if is_scale:
+            tensor = tensor.to(torch.float32)
+            if param.data.numel() == 0:
+                combined_shape = (
+                    experts_per_rank,
+                    tensor.shape[0] * 2,
+                    *tensor.shape[1:],
+                )
+                param.data = torch.zeros(
+                    combined_shape, dtype=torch.float32, device=param.data.device
+                )
+
         # gate_up_proj shape: (experts_per_rank, intermediate*2[/bs], hidden[/bs])
         # gate_proj is first half, up_proj is second half along dim 1
         total_dim1 = param.data.shape[1]
@@ -207,13 +251,19 @@ def _handle_expert_weight(
             start, end = half, total_dim1
 
         if is_scale:
-            tensor = tensor.to(torch.float32)
+            if param.data.dim() == 2:
+                param.data[local_idx, start:end].copy_(tensor.view(-1))
+            elif param.data.dim() == 3:
+                param.data[local_idx, start:end, :].copy_(tensor)
+            else:
+                param.data[local_idx, start:end, :].copy_(tensor)  # default fallback
+            return True
 
         param.data[local_idx, start:end, :].copy_(tensor)
 
     elif proj_name == "down_proj":
         param_suffix = "down_scale_inv" if is_scale else "down_proj"
-        param_name = f"{mlp_prefix}.{param_suffix}"
+        param_name = f"{mlp_prefix}.routed_experts.{param_suffix}"
         try:
             param = model.get_parameter(param_name)
         except AttributeError:
@@ -221,7 +271,19 @@ def _handle_expert_weight(
             return True
         if is_scale:
             tensor = tensor.to(torch.float32)
-        param.data[local_idx].copy_(tensor)
+            if param.data.numel() == 0:
+                param.data = torch.zeros(
+                    (experts_per_rank, *tensor.shape),
+                    dtype=torch.float32,
+                    device=param.data.device,
+                )
+
+            if param.data.dim() == 2:
+                param.data[local_idx].copy_(tensor.view(-1))
+            else:
+                param.data[local_idx].copy_(tensor)
+        else:
+            param.data[local_idx].copy_(tensor)
 
     else:
         logger.warning(f"Unknown expert proj {proj_name} in {weight_name}")

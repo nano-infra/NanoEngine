@@ -2,7 +2,7 @@ import os
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 from nanodeploy.logging import get_logger
 
@@ -96,7 +96,9 @@ class Config(BaseModel):
                     try:
                         setattr(self.hf_config, attr, getattr(text_cfg, attr))
                     except Exception as e:
-                        logger.warning(f"Could not flatten attribute '{attr}' from text_config: {e}")
+                        logger.warning(
+                            f"Could not flatten attribute '{attr}' from text_config: {e}"
+                        )
             # Explicitly propagate dtype/torch_dtype from text_config
             # (top-level config may have dtype=None while text_config has bfloat16)
             if getattr(text_cfg, "dtype", None) is not None:
@@ -125,6 +127,18 @@ class Config(BaseModel):
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             if hasattr(self.hf_config, "num_key_value_heads"):
                 self.hf_config.num_key_value_heads = 1
+
+        # Convert dynamic trust_remote_code config class (from transformers_modules.*)
+        # to a standard PretrainedConfig so Ray can serialize it across workers.
+        if self.trust_remote_code and self.hf_config.__class__.__module__.startswith(
+            "transformers_modules"
+        ):
+            _dtype = getattr(self.hf_config, "dtype", None)
+            config_dict = self.hf_config.to_dict()
+            self.hf_config = PretrainedConfig(**config_dict)
+            # Preserve torch dtype (to_dict() may stringify it)
+            if _dtype is not None:
+                self.hf_config.dtype = _dtype
 
         return self
 

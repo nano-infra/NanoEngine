@@ -4,7 +4,6 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from dlblas.layers.moe.ep_moe import build_deepep_moe
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
@@ -102,106 +101,32 @@ class DeepseekV2MoE(nn.Module):
             requires_grad=False,
         )
 
-        weight_dtype = quantization_config.dtype or config.dtype
-
-        # Global parameter for DeepGEMM (combined expert weights)
-
-        self.gate_up_proj = nn.Parameter(
-            torch.ones(
-                self.num_experts_per_rank,
-                config.moe_intermediate_size * 2,
-                config.hidden_size,
-                dtype=weight_dtype,
-                device="cuda",
-            ),
-        )
-
-        self.down_proj = nn.Parameter(
-            torch.ones(
-                self.num_experts_per_rank,
-                config.hidden_size,
-                config.moe_intermediate_size,
-                dtype=weight_dtype,
-                device="cuda",
-            )
-        )
-
-        if quantization_config.quant_method == "fp8":
-            self.gate_up_scale_inv = nn.Parameter(
-                torch.ones(
-                    self.num_experts_per_rank,
-                    config.moe_intermediate_size
-                    * 2
-                    // quantization_config.block_size[0],
-                    config.hidden_size // quantization_config.block_size[1],
-                    dtype=torch.float32,
-                    device="cuda",
-                )
-            )
-
-            self.down_scale_inv = (
-                nn.Parameter(
-                    torch.ones(
-                        self.num_experts_per_rank,
-                        config.hidden_size // quantization_config.block_size[0],
-                        config.moe_intermediate_size
-                        // quantization_config.block_size[1],
-                        dtype=torch.float32,
-                        device="cuda",
-                    )
-                )
-                if quantization_config.quant_method == "fp8"
-                else None
-            )
-
-        local_expert_id = lambda i: i - self.expert_list_this_rank[0]
-        is_local_expert = lambda i: i in self.expert_list_this_rank
-
-        def _get_data_for_expert(i, t):
-            return t[local_expert_id(i)] if is_local_expert(i) else None
-
-        self.experts = nn.ModuleList(
-            [
-                DeepseekV2MLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.moe_intermediate_size,
-                    hidden_act=config.hidden_act,
-                    meta=not is_local_expert(i),
-                    gate_up_proj_tensor=_get_data_for_expert(i, self.gate_up_proj),
-                    down_proj_tensor=_get_data_for_expert(i, self.down_proj),
-                    gate_up_scale_inv_tensor=(
-                        None
-                        if quantization_config.quant_method != "fp8"
-                        else _get_data_for_expert(i, self.gate_up_scale_inv)
-                    ),
-                    down_scale_inv_tensor=(
-                        None
-                        if quantization_config.quant_method != "fp8"
-                        else _get_data_for_expert(i, self.down_scale_inv)
-                    ),
-                    config=config,
-                    quantization_config=quantization_config,
-                )
-                for i in range(self.num_experts)
-            ]
+        from nanoexpert.layers.distributed_routed_experts import (
+            DistributedRoutedExperts,
         )
 
         self.ep_group = get_dist_context().ffn_ep_group
         self.ep_size = get_dist_context().ffn_ep_world_size
+        self.tp_group = get_dist_context().ffn_tp_group
+        self.tp_size = get_dist_context().ffn_tp_world_size
 
-        if self.ep_size > 1:
-            self.moe = build_deepep_moe(
-                low_latency_mode=True,
-                ep_size=self.ep_size,
-                ep_group=self.ep_group,
-                num_experts=self.num_experts,
-                hidden_dim=self.hidden_size,
-                block_size=self.quantization_config.block_size[0],
-                top_k=self.top_k,
-                out_dtype=torch.bfloat16,
-                layer_idx=0,
-                chunk_size=16 * 1024,
-            )
+        self.routed_experts = DistributedRoutedExperts(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            ep_size=self.ep_size,
+            tp_size=self.tp_size,
+            ep_group=self.ep_group,
+            tp_group=self.tp_group,
+            n_group=self.n_group,
+            topk_group=self.topk_group,
+            norm_topk_prob=self.norm_topk_prob,
+            routed_scaling_factor=self.routed_scaling_factor,
+            scoring_func=self.scoring_func,
+            quantization_config=quantization_config,
+        )
+
         self.shared_experts = None
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -218,31 +143,6 @@ class DeepseekV2MoE(nn.Module):
     def num_experts_per_rank(self):
         ep_world_size = get_dist_context().ffn_ep_world_size
         return self.num_experts // ep_world_size
-
-    def fusedmoe_build(self, low_latency_mode):
-        fusedmoe = build_deepep_moe(
-            low_latency_mode=low_latency_mode,
-            ep_size=self.ep_size,
-            ep_group=self.ep_group,
-            num_experts=self.num_experts,
-            hidden_dim=self.hidden_size,
-            block_size=self.quantization_config.block_size[0],
-            top_k=self.top_k,
-            out_dtype=torch.bfloat16,
-            layer_idx=0,
-            chunk_size=16 * 1024,
-        )
-        return fusedmoe
-
-    @property
-    def expert_list_this_rank(self):
-        ep_group = get_dist_context().ffn_ep_group
-        ep_rank = dist.get_rank(group=ep_group)
-
-        expert_id_begin = ep_rank * self.num_experts_per_rank
-        expert_id_end = (ep_rank + 1) * self.num_experts_per_rank
-
-        return list(range(expert_id_begin, expert_id_end))
 
     def route_tokens_to_experts(self, router_logits: torch.Tensor):
         """Sigmoid routing with group-limited topk (noaux_tc).
@@ -298,54 +198,20 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         router_logits = self.gate(hidden_states)
-        selected_experts, routing_weights = self.route_tokens_to_experts(router_logits)
+        topk_idx, topk_weights = self.route_tokens_to_experts(router_logits)
 
-        if get_runner_config().perfect_eplb:
-            ep_size = get_dist_context().ffn_ep_world_size
-            selected_experts = compute_topk_ids(
-                selected_experts, ep_size, self.num_experts
-            )
+        context = get_context()
+        is_prefill = context.is_prefill
 
-        if self.ep_size > 1:
-            assert (
-                self.quantization_config.quant_method == "fp8"
-            ), "Only FP8 EP is supported by now"
-
-            context = get_context()
-            moe = self.fusedmoe_build(not context.is_prefill)
-            final_hidden_states = moe.forward(
-                hidden_states,
-                routing_weights,
-                selected_experts,
-                self.gate_up_proj,
-                self.gate_up_scale_inv,
-                self.down_proj,
-                self.down_scale_inv,
-                expert_list=self.expert_list_this_rank,
-            )
-        else:
-            # Single-rank fallback: iterate over experts
-            final_hidden_states = torch.zeros_like(hidden_states)
-            for i, expert in enumerate(self.experts):
-                if not hasattr(expert.gate_up_proj, "weight"):
-                    continue  # meta expert, not on this rank
-                mask = (selected_experts == i).any(dim=-1)
-                if not mask.any():
-                    continue
-                token_idx = mask.nonzero(as_tuple=True)[0]
-                topk_pos = (selected_experts[token_idx] == i).nonzero(as_tuple=True)
-                current_state = hidden_states[token_idx]
-                current_hidden = expert(current_state)
-                weights = routing_weights[token_idx, topk_pos[1]].unsqueeze(-1)
-                final_hidden_states.index_add_(
-                    0,
-                    token_idx,
-                    (current_hidden * weights).to(final_hidden_states.dtype),
-                )
+        final_hidden_states = self.routed_experts(
+            hidden_states, topk_idx, topk_weights, is_prefill=is_prefill
+        )
 
         if self.shared_experts is not None:
             shared_states = self.shared_experts(residual)
-            final_hidden_states = final_hidden_states + shared_states
+            final_hidden_states = final_hidden_states + shared_states.view(
+                -1, hidden_dim
+            )
 
         final_hidden_states = final_hidden_states.reshape(batch_size, -1)
         return final_hidden_states

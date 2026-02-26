@@ -42,6 +42,8 @@ class CacheContext:
     num_local_kvcache_blocks = -1
     num_remote_kvcache_blocks: dict[str, int] = None
     kv_cache: torch.Tensor = None
+    gdn_conv_states: torch.Tensor | None = None
+    gdn_recurrent_states: torch.Tensor | None = None
     selected_nic: str | None = None
     endpoints: dict[str, dict[int, Any]] = None  # RDMAEndpoint or RDMALazyPeer
 
@@ -112,6 +114,8 @@ class CacheContext:
         self._peer_agent_addr: str | None = None
         self._connected_peers: set[str] = set()  # track connected peer addresses
         self._local_mr_handler: int | None = None  # local MR handler for kv_cache
+        self._local_gdn_conv_mr_handler: int | None = None
+        self._local_gdn_recurrent_mr_handler: int | None = None
         # NOTE: Remote MR handler caching removed from app layer
         # PeerAgent handles MR info caching via pubsub (mr_update events)
         # register_remote_memory_region is idempotent at endpoint layer
@@ -152,6 +156,31 @@ class CacheContext:
             self.num_hidden_layers, 0, remote_engine_id
         ) * kv_idx + self.remote_layer_stride(layer_idx, block_idx, remote_engine_id)
 
+    def gdn_conv_stride(self, layer_idx: int, slot_idx: int) -> int:
+        if self.gdn_conv_states is None:
+            return -1
+        return (
+            layer_idx * self.gdn_conv_states.stride(0)
+            + slot_idx * self.gdn_conv_states.stride(1)
+        ) * self.gdn_conv_states.element_size()
+
+    def gdn_recurrent_stride(self, layer_idx: int, slot_idx: int) -> int:
+        if self.gdn_recurrent_states is None:
+            return -1
+        return (
+            layer_idx * self.gdn_recurrent_states.stride(0)
+            + slot_idx * self.gdn_recurrent_states.stride(1)
+        ) * self.gdn_recurrent_states.element_size()
+
+    def gdn_conv_slot_num_bytes(self) -> int:
+        return self.gdn_conv_states.stride(1) * self.gdn_conv_states.element_size()
+
+    def gdn_recurrent_slot_num_bytes(self) -> int:
+        return (
+            self.gdn_recurrent_states.stride(1)
+            * self.gdn_recurrent_states.element_size()
+        )
+
     def allocate_kvcache(self, num_kvcache_blocks):
         self.num_local_kvcache_blocks = num_kvcache_blocks
 
@@ -167,59 +196,131 @@ class CacheContext:
             dtype=self.dtype,
             device=self.device,
         )
-        # PeerAgent path: initialize RdmaPeerAgent and register kv_cache buffer
-        # Use control plane API if nanoctrl_address is provided
-        # If engine_id is not provided, fetch it from NanoCtrl
-        if self.nanoctrl_address is not None:
-            if self.engine_id is not None:
-                start_peer_agent_fn = getattr(dlslime, "start_peer_agent", None)
-                if callable(start_peer_agent_fn):
-                    rank = dist.get_rank()
-                    # Agent alias format: EngineName:rank
-                    agent_alias = f"{self.engine_id}:{rank}"
 
-                    # Convert nanoctrl_address to full URL if needed
-                    server_url = self.nanoctrl_address
-                    if not server_url.startswith(
-                        "http://"
-                    ) and not server_url.startswith("https://"):
-                        server_url = f"http://{server_url}"
+    def allocate_gdn_states(self, hf_config, layer_types, max_bs: int):
+        """Allocate fixed-size GDN state buffers for linear_attention layers and register to RDMA."""
+        num_layers = len(layer_types)
+        num_k_heads = getattr(hf_config, "linear_num_key_heads", 0)
+        num_v_heads = getattr(hf_config, "linear_num_value_heads", 0)
+        head_k_dim = getattr(hf_config, "linear_key_head_dim", 0)
+        head_v_dim = getattr(hf_config, "linear_value_head_dim", 0)
+        conv_kernel_size = getattr(hf_config, "linear_conv_kernel_dim", 4)
+        key_dim = num_k_heads * head_k_dim
+        value_dim = num_v_heads * head_v_dim
+        conv_dim = key_dim * 2 + value_dim  # q + k + v
 
-                    # Note: Control plane should handle concurrent registrations gracefully
+        if num_v_heads == 0:
+            return
 
-                    try:
-                        # Pass scope explicitly to ensure agent is registered
-                        # under the correct session namespace in Redis.
-                        agent_scope = os.getenv("NANOCTRL_SCOPE", None)
-                        self._peer_agent = start_peer_agent_fn(
-                            alias=agent_alias,
-                            server_url=server_url,
-                            device=None,  # Auto-select
-                            ib_port=1,
-                            link_type="RoCE",
-                            qp_num=1,
-                            scope=agent_scope,
-                        )
-                        # Store agent alias as peer_agent_addr (for control plane, alias is the identifier)
-                        self._peer_agent_addr = agent_alias
+        # Conv state: [num_layers, max_bs, conv_dim, kernel_size]
+        self.gdn_conv_states = torch.zeros(
+            num_layers,
+            max_bs,
+            conv_dim,
+            conv_kernel_size,
+            dtype=torch.bfloat16,
+            device=torch.get_default_device(),
+        )
 
-                        kv_size = self.kv_cache.numel() * self.kv_cache.itemsize
-                        self._local_mr_handler = (
-                            self._peer_agent.register_memory_region(
-                                _KV_CACHE_BUFFER_ID,
-                                self.kv_cache.data_ptr()
-                                + int(self.kv_cache.storage_offset()),
-                                kv_size,
-                            )
-                        )
-                        logger.info(
-                            f"PeerAgent started with alias {agent_alias} on control plane {server_url}, registered kv_cache buffer (handler={self._local_mr_handler})"
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to start PeerAgent with alias {agent_alias} on control plane {server_url}: {e}"
-                        )
-                        raise
+        # Recurrent state: [num_layers, max_bs, num_v_heads, head_k_dim, head_v_dim]
+        self.gdn_recurrent_states = torch.zeros(
+            num_layers,
+            max_bs,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            dtype=torch.float32,
+            device=torch.get_default_device(),
+        )
+
+        logger.info(
+            f"Allocated GDN states: conv={self.gdn_conv_states.shape} "
+            f"({self.gdn_conv_states.element_size() * self.gdn_conv_states.nelement() / 1e9:.2f} GB), "
+            f"recurrent={self.gdn_recurrent_states.shape} "
+            f"({self.gdn_recurrent_states.element_size() * self.gdn_recurrent_states.nelement() / 1e9:.2f} GB)"
+        )
+
+    def start_peer_agent(self):
+        """Start PeerAgent and register all memory regions (KV cache + GDN states) for RDMA.
+
+        Must be called AFTER allocate_kvcache() and allocate_gdn_states() so that
+        all tensors exist before registration.
+        """
+        if self.nanoctrl_address is None or self.engine_id is None:
+            return
+
+        start_peer_agent_fn = getattr(dlslime, "start_peer_agent", None)
+        if not callable(start_peer_agent_fn):
+            return
+
+        rank = dist.get_rank()
+        agent_alias = f"{self.engine_id}:{rank}"
+
+        server_url = self.nanoctrl_address
+        if not server_url.startswith("http://") and not server_url.startswith(
+            "https://"
+        ):
+            server_url = f"http://{server_url}"
+
+        try:
+            agent_scope = os.getenv("NANOCTRL_SCOPE", None)
+            self._peer_agent = start_peer_agent_fn(
+                alias=agent_alias,
+                server_url=server_url,
+                device=None,
+                ib_port=1,
+                link_type="RoCE",
+                qp_num=1,
+                scope=agent_scope,
+            )
+            self._peer_agent_addr = agent_alias
+
+            # Register KV cache
+            kv_size = self.kv_cache.numel() * self.kv_cache.itemsize
+            self._local_mr_handler = self._peer_agent.register_memory_region(
+                _KV_CACHE_BUFFER_ID,
+                self.kv_cache.data_ptr() + int(self.kv_cache.storage_offset()),
+                kv_size,
+            )
+            logger.info(
+                f"PeerAgent started: alias={agent_alias}, server={server_url}, "
+                f"kv_cache MR handler={self._local_mr_handler}"
+            )
+
+            # Register GDN states (if allocated)
+            if (
+                self.gdn_conv_states is not None
+                and self.gdn_recurrent_states is not None
+            ):
+                conv_size = self.gdn_conv_states.numel() * self.gdn_conv_states.itemsize
+                self._local_gdn_conv_mr_handler = (
+                    self._peer_agent.register_memory_region(
+                        "gdn_conv",
+                        self.gdn_conv_states.data_ptr()
+                        + int(self.gdn_conv_states.storage_offset()),
+                        conv_size,
+                    )
+                )
+                recurrent_size = (
+                    self.gdn_recurrent_states.numel()
+                    * self.gdn_recurrent_states.itemsize
+                )
+                self._local_gdn_recurrent_mr_handler = (
+                    self._peer_agent.register_memory_region(
+                        "gdn_recurrent",
+                        self.gdn_recurrent_states.data_ptr()
+                        + int(self.gdn_recurrent_states.storage_offset()),
+                        recurrent_size,
+                    )
+                )
+                logger.info(
+                    f"Registered GDN MRs: conv={self._local_gdn_conv_mr_handler}, "
+                    f"recurrent={self._local_gdn_recurrent_mr_handler}"
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to start PeerAgent: {e}")
+            raise
 
     def get_peer_agent_addr(self) -> str | None:
         """Return the local peer agent address for this rank."""
@@ -371,6 +472,7 @@ class CacheContext:
         engine_info_map = self._fetch_engine_info_from_nanoctrl(target_engine_ids)
 
         assigns = defaultdict(lambda: defaultdict(list))
+        gdn_assigns = defaultdict(lambda: defaultdict(list))
         sp_idx = get_dist_context().attn_sp_rank
 
         # Collect all unique remote peer aliases from engine_info and ensure connections
@@ -476,6 +578,44 @@ class CacheContext:
                         )
                         assigns[engine_id][peer_alias].append(assignment)
 
+            # Add GDN block assignments
+            if (
+                self.gdn_conv_states is not None
+                and self.gdn_recurrent_states is not None
+            ):
+                remote_state_slot = seq.state_slot(BlockContextSlot.MIGRATE)
+                local_state_slot = seq.state_slot(BlockContextSlot.ACTIVE)
+
+                if remote_state_slot >= 0 and local_state_slot >= 0:
+                    remote_rank = seq.dp_idx(
+                        BlockContextSlot.MIGRATE
+                    ) * migrate_ctx.attention_sp + (migrate_ctx.attention_sp - 1)
+                    if remote_rank < len(peer_addrs):
+                        peer_alias = peer_addrs[remote_rank]
+                        # Use actual GDN state layer count (all model layers),
+                        # NOT self.num_hidden_layers (which is only KV cache layers
+                        # for mixed attention models like Qwen3.5-MoE).
+                        num_gdn_layers = self.gdn_recurrent_states.shape[0]
+                        for layer_idx in range(num_gdn_layers):
+                            gdn_assigns[engine_id][peer_alias].append(
+                                (layer_idx, remote_state_slot, local_state_slot)
+                            )
+                        logger.info(
+                            f"[CACHE_MIGRATE] seq {seq.seq_id} assigned GDN to {peer_alias} (local: {local_state_slot}, remote: {remote_state_slot})"
+                        )
+                    else:
+                        logger.error(
+                            f"GDN remote_rank {remote_rank} >= len(peer_addrs) {len(peer_addrs)}"
+                        )
+                else:
+                    logger.warning(
+                        f"[CACHE_MIGRATE] seq {seq.seq_id} skipped GDN (local: {local_state_slot}, remote: {remote_state_slot})"
+                    )
+            else:
+                logger.warning(
+                    f"[CACHE_MIGRATE] seq {seq.seq_id} skipped GDN (conv: {self.gdn_conv_states is not None}, recurrent: {self.gdn_recurrent_states is not None})"
+                )
+
         # Execute RDMA reads using PeerAgent control plane API
         # MR info is cached at PeerAgent layer (via pubsub mr_update events)
         # register_remote_memory_region is idempotent at endpoint layer
@@ -559,6 +699,72 @@ class CacheContext:
                         )
                     )
 
+                print(f"after kv: {len(rdma_ops)=}")
+                # Add GDN RDMA ops to the same operation batch
+                gdn_batch = gdn_assigns[engine_id].get(peer_alias, [])
+
+                logger.info(
+                    f"[CACHE_MIGRATE] checking GDN ops inclusion: len(gdn_batch)={len(gdn_batch)}, conv is not None={self.gdn_conv_states is not None}, rec is not None={self.gdn_recurrent_states is not None}"
+                )
+
+                if (
+                    gdn_batch
+                    and self.gdn_conv_states is not None
+                    and self.gdn_recurrent_states is not None
+                ):
+                    # For conv state
+                    remote_conv_mr_info = self._peer_agent.get_mr_info(
+                        peer_alias, "gdn_conv"
+                    )
+                    logger.info(
+                        f"[CACHE_MIGRATE] remote_conv_mr_info: {remote_conv_mr_info}"
+                    )
+                    if remote_conv_mr_info:
+                        remote_conv_mr = self._peer_agent.register_remote_memory_region(
+                            peer_alias, "gdn_conv", remote_conv_mr_info
+                        )
+                        local_conv_mr = self._local_gdn_conv_mr_handler
+                        conv_len = self.gdn_conv_slot_num_bytes()
+                        for layer_idx, remote_slot, local_slot in gdn_batch:
+                            rdma_ops.append(
+                                (
+                                    local_conv_mr,
+                                    remote_conv_mr,
+                                    self.gdn_conv_stride(layer_idx, remote_slot),
+                                    self.gdn_conv_stride(layer_idx, local_slot),
+                                    conv_len,
+                                )
+                            )
+                    else:
+                        logger.warning(
+                            f"Failed to get gdn_conv MR info for {peer_alias}"
+                        )
+                    print(f"after gdn_conv: {len(rdma_ops)=}")
+                    # For recurrent state
+                    remote_rec_mr_info = self._peer_agent.get_mr_info(
+                        peer_alias, "gdn_recurrent"
+                    )
+                    if remote_rec_mr_info:
+                        remote_rec_mr = self._peer_agent.register_remote_memory_region(
+                            peer_alias, "gdn_recurrent", remote_rec_mr_info
+                        )
+                        local_rec_mr = self._local_gdn_recurrent_mr_handler
+                        rec_len = self.gdn_recurrent_slot_num_bytes()
+                        for layer_idx, remote_slot, local_slot in gdn_batch:
+                            rdma_ops.append(
+                                (
+                                    local_rec_mr,
+                                    remote_rec_mr,
+                                    self.gdn_recurrent_stride(layer_idx, remote_slot),
+                                    self.gdn_recurrent_stride(layer_idx, local_slot),
+                                    rec_len,
+                                )
+                            )
+                    else:
+                        logger.warning(
+                            f"Failed to get gdn_recurrent MR info for {peer_alias}"
+                        )
+                    print(f"after gdn_recurrent: {len(rdma_ops)=}")
                 if not rdma_ops:
                     logger.error(f"No valid RDMA ops for {peer_alias}, skipping")
                     continue

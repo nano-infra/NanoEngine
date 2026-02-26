@@ -4,7 +4,7 @@ import random
 
 from nanodeploy import LLM, SamplingParams
 from nanodeploy.engine.sequence import Sequence
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerFast
 
 
 def main():
@@ -16,7 +16,7 @@ def main():
     data_path = "/mnt/nvme1n1/ml_research/majinming/dataset/mixed_dataset_50000total_5long_512Ktotal_0.0weight_20251104_084048.csv"
 
     # 加载tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

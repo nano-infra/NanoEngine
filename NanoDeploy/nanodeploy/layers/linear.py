@@ -57,10 +57,10 @@ class LinearBase(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        n_blk_size, k_blk_size = quantization_config.block_size
         if scale_tensor is not None:
             self.weight_scale_inv = nn.Parameter(scale_tensor)
         elif quantization_config.quant_method == "fp8":
+            n_blk_size, k_blk_size = quantization_config.block_size
             self.weight_scale_inv = nn.Parameter(
                 torch.empty(
                     (output_size + n_blk_size - 1) // n_blk_size,
