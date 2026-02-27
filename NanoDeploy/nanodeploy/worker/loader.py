@@ -1,7 +1,7 @@
 import os
 import re
 from glob import glob
-from typing import Generator, Tuple, Callable
+from typing import Callable, Generator, Tuple
 
 import torch
 import torch.distributed as dist
@@ -101,7 +101,7 @@ def _should_skip_weight(weight_name: str, num_hidden_layers: int | None = None) 
 def _strip_vlm_prefix(weight_name: str) -> str:
     """Strip VLM prefix (e.g. 'model.language_model.' -> 'model.') for text models."""
     if weight_name.startswith("model.language_model."):
-        return "model." + weight_name[len("model.language_model."):]
+        return "model." + weight_name[len("model.language_model.") :]
     return weight_name
 
 
