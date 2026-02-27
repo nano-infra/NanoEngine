@@ -23,7 +23,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     kvcache_block_size_(kvcache_block_size),
     num_kvcache_blocks_(num_kvcache_blocks),
     num_running_seqs_per_sp_(attention_sp, 0),
-    num_running_tokens_per_sp_(attention_sp, 0)
+    num_running_tokens_per_sp_(attention_sp, 0),
+    state_manager_(engine_id, 0, max_num_seqs)
 {
     for (int i = 0; i < attention_sp; ++i) {
         block_manager[i] = std::make_shared<BlockManager>(engine_id, i, num_kvcache_blocks, kvcache_block_size);
@@ -284,6 +285,11 @@ void SPStateManager::allocate(Sequence& seq)
     }
     block_manager[master_sp_idx]->allocate(seq);
 
+    // Assign a GDN state slot (index into conv/recurrent state buffers).
+    // state_manager_ is a free-list over [0, max_num_seqs_); slot max_num_seqs_
+    // is the reserved dummy slot and is never allocated here.
+    state_manager_.allocate(seq);
+
     num_running_seqs_++;
     num_running_tokens_ += seq.num_tokens();
     num_running_seqs_per_sp_[master_sp_idx]++;
@@ -295,6 +301,9 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
         block_manager[sp_idx]->deallocate(seq, slot);
     }
+
+    // Free the GDN state slot so it can be reused by future sequences.
+    state_manager_.deallocate(seq, slot);
 
     auto& block_ctx     = seq.block_ctx(BlockContextSlot::ACTIVE);
     int   master_sp_idx = block_ctx.master_sp_idx;

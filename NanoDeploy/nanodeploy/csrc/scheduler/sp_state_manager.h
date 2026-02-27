@@ -10,6 +10,7 @@
 #include "nanosequence/csrc/sequence/sequence.h"
 
 #include "block_manager.h"
+#include "state_manager.h"
 
 namespace nanodeploy {
 
@@ -145,10 +146,11 @@ private:
     void initialize_dummy_seqs();
     int  next_sp_idx();  // Round-robin counter
 
-    std::string engine_id_;
-    int         attention_sp_;
-    int         max_num_seqs_;
-    int         max_num_batched_tokens_;
+    std::string  engine_id_;
+    int          attention_sp_;
+    int          max_num_seqs_;
+    int          max_num_batched_tokens_;
+    StateManager state_manager_;  // GDN state slot free-list (slot = seq's index into GDN buffers)
 
     int kvcache_block_size_;
     int num_kvcache_blocks_;

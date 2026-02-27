@@ -21,7 +21,7 @@ from nanodeploy.worker.runner_config import get_runner_config
 from torch import nn
 from transformers import Qwen3MoeConfig
 
-from .quant_config import QuantizationConfig
+from ..quant_config import QuantizationConfig
 
 logger = get_logger()
 
@@ -385,15 +385,6 @@ class Qwen3MoeModel(nn.Module):
 
 
 class Qwen3MoeForCausalLM(nn.Module):
-    packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-        "gate_scale_inv": ("gate_up_scale_inv", 0),
-        "up_scale_inv": ("gate_up_scale_inv", 1),
-    }
 
     def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
@@ -420,3 +411,9 @@ class Qwen3MoeForCausalLM(nn.Module):
     ) -> torch.Tensor:
         logits = self.lm_head(hidden_states)
         return logits
+
+    def load_weights(self, weights):
+        """Load weights using per-model loader."""
+        from .qwen3_moe_loader import load_weights
+
+        load_weights(self, weights)
