@@ -156,7 +156,7 @@ class LLMComponent(LLM):
             if self.config.nanoctrl_scope:
                 payload["scope"] = self.config.nanoctrl_scope
 
-            with httpx.Client(timeout=5.0) as client:
+            with httpx.Client(timeout=5.0, trust_env=False) as client:
                 response = client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -345,7 +345,7 @@ class LLMComponent(LLM):
             )
 
             # Use sync client since this is called during init
-            with httpx.Client(timeout=10.0) as client:
+            with httpx.Client(timeout=10.0, trust_env=False) as client:
                 response = client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -382,7 +382,7 @@ class LLMComponent(LLM):
             url = f"{self.config.nanoctrl_address}/unregister_engine"
             logger.info(f"Unregistering engine {self.engine_id} from NanoCtrl")
 
-            with httpx.Client(timeout=5.0) as client:
+            with httpx.Client(timeout=5.0, trust_env=False) as client:
                 response = client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -437,7 +437,7 @@ class LLMComponent(LLM):
             url = f"{self.config.nanoctrl_address}/heartbeat_engine"
 
             # Use sync client with short timeout
-            with httpx.Client(timeout=5.0) as client:
+            with httpx.Client(timeout=5.0, trust_env=False) as client:
                 response = client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()

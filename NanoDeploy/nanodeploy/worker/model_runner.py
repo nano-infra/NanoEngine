@@ -151,12 +151,6 @@ class ModelRunner:
         sp_size = get_dist_context().attn_sp_world_size
         ep_size = get_dist_context().ffn_ep_world_size
 
-        if ep_size > 1:
-            import deep_ep
-
-            deep_ep.Buffer.num_sms = 8
-            dist.barrier(group=get_dist_context().cuda_world_group)
-
         if sp_size > 1:
             sp_rank = get_dist_context().attn_sp_rank
             max_head_dim = 0
@@ -408,6 +402,28 @@ class ModelRunner:
                 .cuda(non_blocking=True)
             )
 
+        cache_ctx = get_cache_context()
+        gdn_state_slots = None
+        if cache_ctx.gdn_conv_states is not None:
+            dummy_gdn_slot = cache_ctx.gdn_conv_states.shape[1] - 1
+            sp_seqs_for_gdn = [
+                seq
+                for seq in seqs
+                if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
+            ]
+            gdn_state_slots = torch.tensor(
+                [
+                    (
+                        s
+                        if (s := seq.state_slot(BlockContextSlot.ACTIVE)) >= 0
+                        else dummy_gdn_slot
+                    )
+                    for seq in sp_seqs_for_gdn
+                ],
+                dtype=torch.int64,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+
         set_context(
             True,
             self.config.max_num_seqs,
@@ -420,8 +436,9 @@ class ModelRunner:
             block_tables,
             None,
             is_dummy=is_dummy,
-            gdn_conv_states=get_cache_context().gdn_conv_states,
-            gdn_recurrent_states=get_cache_context().gdn_recurrent_states,
+            gdn_conv_states=cache_ctx.gdn_conv_states,
+            gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
+            gdn_state_slots=gdn_state_slots,
         )
         return input_ids, positions
 
@@ -560,6 +577,28 @@ class ModelRunner:
         else:
             new_tile_scheduler_metadata, new_num_splits = None, None
 
+        cache_ctx = get_cache_context()
+        gdn_state_slots = None
+        if cache_ctx.gdn_conv_states is not None:
+            dummy_gdn_slot = cache_ctx.gdn_conv_states.shape[1] - 1
+            sp_seqs_for_gdn = [
+                seq
+                for seq in dp_seqs
+                if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
+            ]
+            gdn_state_slots = torch.tensor(
+                [
+                    (
+                        s
+                        if (s := seq.state_slot(BlockContextSlot.ACTIVE)) >= 0
+                        else dummy_gdn_slot
+                    )
+                    for seq in sp_seqs_for_gdn
+                ],
+                dtype=torch.int64,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+
         set_context(
             is_prefill=False,
             max_bs=self.config.max_num_seqs,
@@ -584,8 +623,9 @@ class ModelRunner:
             q_offsets=q_offsets,
             tile_scheduler_metadata=new_tile_scheduler_metadata,
             num_splits=new_num_splits,
-            gdn_conv_states=get_cache_context().gdn_conv_states,
-            gdn_recurrent_states=get_cache_context().gdn_recurrent_states,
+            gdn_conv_states=cache_ctx.gdn_conv_states,
+            gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
+            gdn_state_slots=gdn_state_slots,
         )
 
         return input_ids, positions
@@ -727,6 +767,13 @@ class ModelRunner:
 
             graph_vars["q_offsets"].zero_()
             graph_vars["q_offsets"].copy_(context.q_offsets)  # type: ignore
+
+            if graph_vars.get("gdn_state_slots") is not None:
+                dummy_gdn_slot = get_cache_context().gdn_conv_states.shape[1] - 1
+                graph_vars["gdn_state_slots"].fill_(dummy_gdn_slot)
+                if context.gdn_state_slots is not None:
+                    graph_vars["gdn_state_slots"][:bs].copy_(context.gdn_state_slots)
+
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -894,6 +941,15 @@ class ModelRunner:
         else:
             tile_scheduler_metadata_buffer, num_splits_buffer = None, None
 
+        # GDN state slot indices for CUDAGraph (maps batch position -> buffer slot)
+        _cache_ctx = get_cache_context()
+        gdn_state_slots_buf = None
+        if _cache_ctx.gdn_conv_states is not None:
+            dummy_gdn_slot = _cache_ctx.gdn_conv_states.shape[1] - 1
+            gdn_state_slots_buf = torch.full(
+                (max_bs,), dummy_gdn_slot, dtype=torch.int64
+            )
+
         self.graph_master_rank_bs = [x for x in [1, 2, 4, 8] if x <= max_bs] + list(
             range(16, max_bs + 1, 16)
         )
@@ -950,8 +1006,13 @@ class ModelRunner:
                     q_offsets=q_offsets,
                     tile_scheduler_metadata=tile_scheduler_metadata_buffer,
                     num_splits=num_splits_buffer,
-                    gdn_conv_states=get_cache_context().gdn_conv_states,
-                    gdn_recurrent_states=get_cache_context().gdn_recurrent_states,
+                    gdn_conv_states=_cache_ctx.gdn_conv_states,
+                    gdn_recurrent_states=_cache_ctx.gdn_recurrent_states,
+                    gdn_state_slots=(
+                        gdn_state_slots_buf[:master_bs]
+                        if gdn_state_slots_buf is not None
+                        else None
+                    ),
                 )
 
                 outputs[:master_bs] = self.model(
@@ -1000,4 +1061,5 @@ class ModelRunner:
             res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             q_offsets=q_offsets,
+            gdn_state_slots=gdn_state_slots_buf,
         )

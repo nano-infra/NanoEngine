@@ -49,10 +49,12 @@ class Context:
     context_lens_for_attn: torch.Tensor | None = None
 
     # GatedDeltaNet state buffers (for mixed attention models like Qwen3.5-MoE)
-    # conv_states: [num_layers, max_bs, conv_dim, kernel_size]
+    # conv_states: [num_layers, num_slots, conv_dim, kernel_size]
     gdn_conv_states: torch.Tensor | None = None
-    # recurrent_states: [num_layers, max_bs, num_v_heads, head_k_dim, head_v_dim]
+    # recurrent_states: [num_layers, num_slots, num_v_heads, head_k_dim, head_v_dim]
     gdn_recurrent_states: torch.Tensor | None = None
+    # Per-sequence GDN slot indices: [num_seqs], maps batch position i -> slot index
+    gdn_state_slots: torch.Tensor | None = None
 
 
 _CONTEXT = Context()
@@ -92,6 +94,7 @@ def set_context(
     context_lens_for_attn: Optional[torch.Tensor] = None,
     gdn_conv_states: Optional[torch.Tensor] = None,
     gdn_recurrent_states: Optional[torch.Tensor] = None,
+    gdn_state_slots: Optional[torch.Tensor] = None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -124,6 +127,7 @@ def set_context(
         context_lens_for_attn=context_lens_for_attn,
         gdn_conv_states=gdn_conv_states,
         gdn_recurrent_states=gdn_recurrent_states,
+        gdn_state_slots=gdn_state_slots,
     )
 
 

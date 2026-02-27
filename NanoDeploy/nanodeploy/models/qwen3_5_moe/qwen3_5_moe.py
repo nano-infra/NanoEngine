@@ -16,6 +16,8 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch import nn
+
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
@@ -32,7 +34,6 @@ from nanodeploy.layers.linear import (
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.runner_config import get_runner_config
-from torch import nn
 
 from ..quant_config import QuantizationConfig
 
@@ -431,6 +432,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         # Store conv state for future decode
         gdn_conv_states = getattr(context, "gdn_conv_states", None)
+        gdn_state_slots = getattr(context, "gdn_state_slots", None)
         if gdn_conv_states is not None:
             for i in range(num_seqs):
                 start = cu_seqlens[i].item()
@@ -440,8 +442,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 seq_len = end - start
                 # Store the last (kernel_size - 1) tokens as conv state
                 pad_len = min(seq_len, self.conv_kernel_size - 1)
-                gdn_conv_states[self.layer_idx, i, :, :] = 0
-                gdn_conv_states[self.layer_idx, i, :, -pad_len:] = qkv[
+                slot = gdn_state_slots[i].item() if gdn_state_slots is not None else i
+                gdn_conv_states[self.layer_idx, slot, :, :] = 0
+                gdn_conv_states[self.layer_idx, slot, :, -pad_len:] = qkv[
                     end - pad_len : end
                 ].T
 
@@ -464,6 +467,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         # Store conv state
         gdn_conv_states = getattr(context, "gdn_conv_states", None)
+        gdn_state_slots = getattr(context, "gdn_state_slots", None)
         if gdn_conv_states is not None:
             for i in range(num_seqs):
                 start = cu_seqlens[i].item()
@@ -472,8 +476,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     continue
                 seq_len = end - start
                 pad_len = min(seq_len, self.conv_kernel_size - 1)
-                gdn_conv_states[self.layer_idx, i, :, :] = 0
-                gdn_conv_states[self.layer_idx, i, :, -pad_len:] = qkv[
+                slot = gdn_state_slots[i].item() if gdn_state_slots is not None else i
+                gdn_conv_states[self.layer_idx, slot, :, :] = 0
+                gdn_conv_states[self.layer_idx, slot, :, -pad_len:] = qkv[
                     end - pad_len : end
                 ].T
 
@@ -482,12 +487,22 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
     def _conv1d_decode(self, qkv: torch.Tensor, context) -> torch.Tensor:
         """Decode conv1d: single token per sequence, update conv state."""
         gdn_conv_states = getattr(context, "gdn_conv_states", None)
+        gdn_state_slots = getattr(context, "gdn_state_slots", None)
         bs = qkv.shape[0]
 
         if gdn_conv_states is not None and _HAS_CAUSAL_CONV1D:
-            conv_state = gdn_conv_states[self.layer_idx, :bs]  # [bs, conv_dim, ks]
             conv_weight = self.conv1d.weight.squeeze(1)  # [conv_dim, ks]
+            if gdn_state_slots is not None:
+                slots = gdn_state_slots[:bs]
+                conv_state = gdn_conv_states[
+                    self.layer_idx, slots
+                ]  # [bs, conv_dim, ks] copy
+            else:
+                conv_state = gdn_conv_states[
+                    self.layer_idx, :bs
+                ]  # [bs, conv_dim, ks] view
             # causal_conv1d_update expects x: [batch, dim], conv_state: [batch, dim, width]
+            # conv_state is updated in-place by the kernel
             qkv_out = causal_conv1d_update(
                 qkv,  # [bs, conv_dim]
                 conv_state,
@@ -495,18 +510,29 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 bias=None,
                 activation=self.activation,
             )
+            if gdn_state_slots is not None:
+                gdn_conv_states[self.layer_idx, slots] = conv_state
             return qkv_out
         elif gdn_conv_states is not None:
-            conv_state = gdn_conv_states[self.layer_idx, :bs]  # [bs, conv_dim, ks]
+            if gdn_state_slots is not None:
+                slots = gdn_state_slots[:bs]
+                conv_state = gdn_conv_states[
+                    self.layer_idx, slots
+                ].clone()  # [bs, conv_dim, ks] copy
+            else:
+                conv_state = gdn_conv_states[
+                    self.layer_idx, :bs
+                ]  # [bs, conv_dim, ks] view
             # Shift state left, add new token
             conv_state[:, :, :-1] = conv_state[:, :, 1:].clone()
             conv_state[:, :, -1] = qkv
             # Apply conv weights and silu
             conv_weight = self.conv1d.weight.squeeze(1)  # [conv_dim, ks]
             qkv_out = F.silu((conv_state * conv_weight.unsqueeze(0)).sum(-1))
+            if gdn_state_slots is not None:
+                gdn_conv_states[self.layer_idx, slots] = conv_state
             return qkv_out
         else:
-            # No state: fallback (not correct for decode, but won't crash)
             return F.silu(qkv)
 
     def _apply_gdn(
@@ -531,13 +557,13 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         num_seqs = cu_seqlens.shape[0] - 1
 
         # For fresh prefill, always start from zero state.
-        # (Warmup/dummy prefills may have written stale data into the buffer.)
         gdn_recurrent_states = getattr(context, "gdn_recurrent_states", None)
+        gdn_state_slots = getattr(context, "gdn_state_slots", None)
         initial_state = None
         if gdn_recurrent_states is not None:
-            # Zero out the state for sequences being prefilled
-            gdn_recurrent_states[self.layer_idx, :num_seqs].zero_()
-            initial_state = gdn_recurrent_states[self.layer_idx, :num_seqs]
+            initial_state = gdn_recurrent_states.new_zeros(
+                num_seqs, self.num_v_heads, self.head_k_dim, self.head_v_dim
+            )
 
         if self._chunk_fn is not None:
             o, final_state = self._chunk_fn(
@@ -558,9 +584,14 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 q, k, v, g, beta, scale, cu_seqlens
             )
 
-        # Store final recurrent state
+        # Store final recurrent state using actual slot indices
         if gdn_recurrent_states is not None and final_state is not None:
-            gdn_recurrent_states[self.layer_idx, :num_seqs] = final_state
+            if gdn_state_slots is not None:
+                gdn_recurrent_states[self.layer_idx, gdn_state_slots[:num_seqs]] = (
+                    final_state
+                )
+            else:
+                gdn_recurrent_states[self.layer_idx, :num_seqs] = final_state
 
         return o
 
@@ -569,8 +600,14 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         bs = q.shape[0]
 
         gdn_recurrent_states = getattr(context, "gdn_recurrent_states", None)
+        gdn_state_slots = getattr(context, "gdn_state_slots", None)
         if gdn_recurrent_states is not None:
-            initial_state = gdn_recurrent_states[self.layer_idx, :bs]
+            if gdn_state_slots is not None:
+                initial_state = gdn_recurrent_states[
+                    self.layer_idx, gdn_state_slots[:bs]
+                ]  # gather
+            else:
+                initial_state = gdn_recurrent_states[self.layer_idx, :bs]
         else:
             initial_state = q.new_zeros(
                 bs, self.num_v_heads, self.head_k_dim, self.head_v_dim
@@ -596,9 +633,14 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
             )
             o = o.squeeze(1)  # [B, H, V]
-            # Manually write updated state back to buffer
+            # Write updated state back to buffer using actual slot indices
             if gdn_recurrent_states is not None and final_state is not None:
-                gdn_recurrent_states[self.layer_idx, :bs] = final_state
+                if gdn_state_slots is not None:
+                    gdn_recurrent_states[self.layer_idx, gdn_state_slots[:bs]] = (
+                        final_state
+                    )
+                else:
+                    gdn_recurrent_states[self.layer_idx, :bs] = final_state
         else:
             # Naive fallback: returns (output, updated_state_f32)
             # We must write the updated state back to the buffer.
@@ -606,7 +648,12 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 q, k, v, g, beta, scale, initial_state
             )
             if gdn_recurrent_states is not None:
-                gdn_recurrent_states[self.layer_idx, :bs] = updated_state
+                if gdn_state_slots is not None:
+                    gdn_recurrent_states[self.layer_idx, gdn_state_slots[:bs]] = (
+                        updated_state
+                    )
+                else:
+                    gdn_recurrent_states[self.layer_idx, :bs] = updated_state
 
         return o
 

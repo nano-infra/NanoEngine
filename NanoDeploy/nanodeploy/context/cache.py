@@ -198,7 +198,12 @@ class CacheContext:
         )
 
     def allocate_gdn_states(self, hf_config, layer_types, max_bs: int):
-        """Allocate fixed-size GDN state buffers for linear_attention layers and register to RDMA."""
+        """Allocate fixed-size GDN state buffers for linear_attention layers and register to RDMA.
+
+        Allocates max_bs + 1 slots: slots 0..max_bs-1 are for real sequences,
+        slot max_bs is a reserved dummy slot used as a safe write target for
+        CUDAGraph padded positions so they cannot corrupt real sequence states.
+        """
         num_layers = len(layer_types)
         num_k_heads = getattr(hf_config, "linear_num_key_heads", 0)
         num_v_heads = getattr(hf_config, "linear_num_value_heads", 0)
@@ -212,20 +217,23 @@ class CacheContext:
         if num_v_heads == 0:
             return
 
-        # Conv state: [num_layers, max_bs, conv_dim, kernel_size]
+        # Allocate max_bs + 1 slots: 0..max_bs-1 for real seqs, max_bs = dummy slot.
+        num_slots = max_bs + 1
+
+        # Conv state: [num_layers, num_slots, conv_dim, kernel_size]
         self.gdn_conv_states = torch.zeros(
             num_layers,
-            max_bs,
+            num_slots,
             conv_dim,
             conv_kernel_size,
             dtype=torch.bfloat16,
             device=torch.get_default_device(),
         )
 
-        # Recurrent state: [num_layers, max_bs, num_v_heads, head_k_dim, head_v_dim]
+        # Recurrent state: [num_layers, num_slots, num_v_heads, head_k_dim, head_v_dim]
         self.gdn_recurrent_states = torch.zeros(
             num_layers,
-            max_bs,
+            num_slots,
             num_v_heads,
             head_k_dim,
             head_v_dim,
