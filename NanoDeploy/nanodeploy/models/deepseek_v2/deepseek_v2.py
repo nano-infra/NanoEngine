@@ -21,7 +21,7 @@ from nanodeploy.worker.runner_config import get_runner_config
 from torch import nn
 from transformers import DeepseekV3Config
 
-from .quant_config import QuantizationConfig
+from ..quant_config import QuantizationConfig
 
 logger = get_logger()
 
@@ -367,16 +367,8 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
 
-# 已改
-
-
 class DeepseekV2ForCausalLM(nn.Module):
     """Mixture model for causalLM."""
-
-    packed_modules_mapping = {
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
 
     def __init__(self, config: DeepseekV3Config):
         super().__init__()
@@ -398,6 +390,12 @@ class DeepseekV2ForCausalLM(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor):
         """Compute logits of the model output."""
         return self.lm_head(hidden_states)
+
+    def load_weights(self, weights):
+        """Load weights using per-model loader."""
+        from .deepseek_v2_loader import load_weights
+
+        load_weights(self, weights)
 
 
 class DeepseekV2BMM(nn.Module):

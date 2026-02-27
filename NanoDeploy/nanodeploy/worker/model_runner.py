@@ -25,10 +25,10 @@ from nanodeploy.context.sp_context import set_sp_context
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
-from nanodeploy.models.deepseek_v2 import DeepseekV2ForCausalLM
-from nanodeploy.models.qwen3 import Qwen3ForCausalLM
-from nanodeploy.models.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
-from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
+from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
+from nanodeploy.models.qwen3.qwen3 import Qwen3ForCausalLM
+from nanodeploy.models.qwen3_5_moe.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
+from nanodeploy.models.qwen3_moe.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.loader import load_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 

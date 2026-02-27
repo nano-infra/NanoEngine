@@ -190,16 +190,10 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
-    packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
 
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
+        self.config = config
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
@@ -217,3 +211,9 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def load_weights(self, weights):
+        """Load weights using per-model loader."""
+        from .qwen3_loader import load_weights
+
+        load_weights(self, weights)
