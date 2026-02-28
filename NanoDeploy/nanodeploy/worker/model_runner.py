@@ -873,7 +873,7 @@ class ModelRunner:
 
                 input_ids = self.sampler(logits, temperatures)
             else:
-                input_ids = torch.zeros_like(input_ids)
+                input_ids = input_ids.new_zeros([len(sp_seqs)])
             dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
 
             update_seqs_inner_loop(sp_seqs, sp_rank)
