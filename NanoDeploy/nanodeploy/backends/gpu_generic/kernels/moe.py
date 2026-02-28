@@ -5,7 +5,8 @@ from typing import List, Optional
 import torch
 import triton
 import triton.language as tl
-from dlblas.utils.device_utils import get_device_props
+
+from .utils import get_device_props
 
 
 @triton.jit
