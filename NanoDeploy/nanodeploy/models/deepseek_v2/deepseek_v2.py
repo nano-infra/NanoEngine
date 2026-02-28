@@ -17,13 +17,11 @@ from nanodeploy.backends.base_backend import (
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
-from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanodeploy.layers.layernorm import RMSNorm
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.runner_config import get_runner_config
-
 from ..quant_config import QuantizationConfig
 
 logger = get_logger()
@@ -510,7 +508,7 @@ class DeepseekV2Attention(nn.Module):
             if mscale_all_dim:
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.softmax_scale = self.softmax_scale * mscale * mscale
-        self.attn_fwd = Attention(
+        self.attn_fwd = get_backend().get_attention(
             self.num_heads,
             config.kv_lora_rank + self.qk_rope_head_dim,
             scale=self.softmax_scale,
@@ -624,7 +622,9 @@ class DeepseekV2Attention(nn.Module):
                 and not context.is_dummy
                 and context.slot_mapping is not None
             ):
-                from nanodeploy.kernels.kvcache import store_kcache
+                from nanodeploy.backends.gpu_generic.kernels.kv_store import (
+                    store_kcache,
+                )
 
                 slot_mapping = context.slot_mapping
                 if slot_mapping.numel() != key_states_3d.shape[0]:

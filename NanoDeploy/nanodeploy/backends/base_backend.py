@@ -56,6 +56,15 @@ class DistributedRoutedExpertsBase(nn.Module, ABC):
     ) -> torch.Tensor: ...
 
 
+class AttentionBase(nn.Module, ABC):
+    """Abstract base for Attention layer."""
+
+    @abstractmethod
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor: ...
+
+
 class BackendFactory(ABC):
     """Abstract factory for creating hardware-specific layer instances.
 
@@ -142,3 +151,15 @@ class BackendFactory(ABC):
         tp_size: int,
         **kwargs,
     ) -> DistributedRoutedExpertsBase: ...
+
+    @abstractmethod
+    def get_attention(
+        self,
+        num_heads: int,
+        head_dim: int,
+        scale: float,
+        num_kv_heads: int,
+        v_head_dim: int,
+        attention_type: str = "MLA",
+        **kwargs,
+    ) -> AttentionBase: ...

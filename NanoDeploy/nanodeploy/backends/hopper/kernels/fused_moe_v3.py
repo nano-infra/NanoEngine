@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from nanodeploy.kernels.fp8 import per_token_group_quant_fp8
+from nanodeploy.backends.hopper.kernels.fp8 import per_token_group_quant_fp8
 
 try:
     import deep_gemm
