@@ -18,8 +18,11 @@ from nanodeploy.backends.base_backend import (
     ReplicatedLinearBase,
     RowParallelLinearBase,
 )
+from nanodeploy.backends.hopper.kernels.block_gemm_fp8 import (
+    deep_gemm_fp8,
+    quant_fp8_tma,
+)
 from nanodeploy.context.distributed import get_dist_context
-from nanodeploy.kernels.block_gemm_fp8 import deep_gemm_fp8, quant_fp8_tma
 from nanodeploy.models.quant_config import QuantizationConfig
 
 

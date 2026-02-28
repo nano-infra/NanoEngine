@@ -11,7 +11,6 @@ from nanodeploy.backends.base_backend import (
 )
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
-from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanodeploy.layers.layernorm import RMSNorm
 from nanodeploy.layers.rotary_embedding import get_rope
@@ -63,7 +62,7 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        self.attn = Attention(
+        self.attn = get_backend().get_attention(
             self.num_heads,
             self.head_dim,
             self.scaling,

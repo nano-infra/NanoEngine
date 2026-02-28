@@ -1,7 +1,6 @@
 import torch
 import triton
 import triton.language as tl
-
 from dlblas.kernels.moe import quant_fp8
 from dlblas.layers.moe.kernels.activation import silu_and_mul
 from dlblas.layers.moe.kernels.fused_moe import _dlblas_get_sorted_idx

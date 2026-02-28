@@ -4,6 +4,7 @@ Provides FP8 + DeepGEMM + DeepEP implementations for all layer types.
 """
 
 from nanodeploy.backends.base_backend import (
+    AttentionBase,
     BackendFactory,
     ColumnParallelLinearBase,
     DistributedRoutedExpertsBase,
@@ -170,5 +171,27 @@ class HopperBackendFactory(BackendFactory):
             ep_size=ep_size,
             tp_size=tp_size,
             quantization_config=self.quant_config,
+            **kwargs,
+        )
+
+    def get_attention(
+        self,
+        num_heads: int,
+        head_dim: int,
+        scale: float,
+        num_kv_heads: int,
+        v_head_dim: int,
+        attention_type: str = "MLA",
+        **kwargs,
+    ) -> AttentionBase:
+        from .layers.attention import HopperAttention
+
+        return HopperAttention(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            v_head_dim=v_head_dim,
+            attention_type=attention_type,
             **kwargs,
         )

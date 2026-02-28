@@ -5,6 +5,7 @@ Expert parallelism (ep_size > 1) is not supported in this backend.
 """
 
 from nanodeploy.backends.base_backend import (
+    AttentionBase,
     BackendFactory,
     ColumnParallelLinearBase,
     DistributedRoutedExpertsBase,
@@ -159,5 +160,27 @@ class GenericBackendFactory(BackendFactory):
             top_k=top_k,
             ep_size=ep_size,
             tp_size=tp_size,
+            **kwargs,
+        )
+
+    def get_attention(
+        self,
+        num_heads: int,
+        head_dim: int,
+        scale: float,
+        num_kv_heads: int,
+        v_head_dim: int,
+        attention_type: str = "MLA",
+        **kwargs,
+    ) -> AttentionBase:
+        from .layers.attention import GenericAttention
+
+        return GenericAttention(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            v_head_dim=v_head_dim,
+            attention_type=attention_type,
             **kwargs,
         )
