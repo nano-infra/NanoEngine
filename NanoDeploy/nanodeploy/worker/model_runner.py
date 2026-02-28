@@ -791,6 +791,7 @@ class ModelRunner:
     def migrate(self, seqs: list[Sequence]) -> None:
         get_cache_context().migrate(seqs=seqs)
 
+    @torch.inference_mode()
     def run(self, dp_seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
         # Sequences are always passed directly via pickle (Ray's default serialization)
 
@@ -805,7 +806,6 @@ class ModelRunner:
         is_dummy = False
         if num_sp_seqs == 0:
             is_dummy = True
-            # seq = Sequence([np.random.randint(self.config.hf_config.vocab_size - 1)])
             seq = Sequence([0])  # Zero init for determinism
             seq.block_ctx().reset(
                 self.engine_id, sp_size, 1, get_cache_context().num_local_kvcache_blocks
@@ -854,23 +854,7 @@ class ModelRunner:
 
             tp_rank = get_dist_context().attn_tp_rank
             if tp_rank == 0:
-                temperatures = (
-                    self.prepare_sample(dp_seqs)
-                    if tp_rank == 0
-                    else [None] * len(sp_seqs)
-                )
-
-                # Logging Logits
-                if len(dp_seqs) > 0 and len(dp_seqs[0].token_ids) > 0:
-                    import logging
-
-                    if logger.isEnabledFor(logging.INFO):
-                        # Log first sequence's logits stats
-                        log_logits = logits[0]
-                        logger.debug(
-                            f"Python Logits: [{log_logits[:10].tolist()}...], Max: {log_logits.max().item()}, Max Index: {log_logits.argmax().item()}, Sum: {log_logits.sum().item()}"
-                        )
-
+                temperatures = self.prepare_sample(dp_seqs)
                 input_ids = self.sampler(logits, temperatures)
             else:
                 input_ids = input_ids.new_zeros([len(sp_seqs)])

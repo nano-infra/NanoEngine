@@ -1,9 +1,18 @@
 import torch
 import triton
 import triton.language as tl
-from dlblas.kernels.moe import quant_fp8
-from dlblas.layers.moe.kernels.activation import silu_and_mul
-from dlblas.layers.moe.kernels.fused_moe import _dlblas_get_sorted_idx
+
+from nanodeploy.backends.hopper.kernels.block_gemm_fp8 import quant_fp8
+
+from nanodeploy.backends.hopper.kernels.fused_moe_v3 import silu_and_mul
+
+
+def _dlblas_get_sorted_idx(topk_ids: torch.Tensor, num_experts: int):
+    """get sorted idx."""
+    flatten_topk_ids = topk_ids.flatten()
+    sorted_idx = flatten_topk_ids.argsort()
+    exp_start, exp_end = dlblas_get_start_end(flatten_topk_ids, sorted_idx, num_experts)
+    return sorted_idx, exp_start, exp_end
 
 
 def get_cuda_autotune_config():
