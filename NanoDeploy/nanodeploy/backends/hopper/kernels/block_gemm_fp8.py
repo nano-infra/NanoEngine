@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from .utils import get_device_props
+from nanodeploy.backends.gpu_generic.kernels.utils import get_device_props
 
 
 @triton.jit
