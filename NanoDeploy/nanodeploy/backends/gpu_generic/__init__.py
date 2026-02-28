@@ -9,6 +9,7 @@ from nanodeploy.backends.base_backend import (
     BackendFactory,
     ColumnParallelLinearBase,
     DistributedRoutedExpertsBase,
+    GatedDeltaNetBase,
     MergedColumnParallelLinearBase,
     QKVParallelLinearBase,
     ReplicatedLinearBase,
@@ -182,5 +183,26 @@ class GenericBackendFactory(BackendFactory):
             num_kv_heads=num_kv_heads,
             v_head_dim=v_head_dim,
             attention_type=attention_type,
+            **kwargs,
+        )
+
+    # ------------------------------------------------------------------
+    # GatedDeltaNet (Linear Attention) layer
+    # ------------------------------------------------------------------
+
+    def get_gated_delta_net(
+        self,
+        layer_idx: int,
+        config,
+        quantization_config=None,
+        **kwargs,
+    ) -> GatedDeltaNetBase:
+        from .layers.gated_delta_net import GenericGatedDeltaNet
+
+        quant_config = quantization_config or self.quant_config
+        return GenericGatedDeltaNet(
+            layer_idx=layer_idx,
+            config=config,
+            quantization_config=quant_config,
             **kwargs,
         )

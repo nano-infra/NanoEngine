@@ -56,6 +56,10 @@ class DistributedRoutedExpertsBase(nn.Module, ABC):
     ) -> torch.Tensor: ...
 
 
+class GatedDeltaNetBase(nn.Module, ABC):
+    """Abstract base class for GatedDeltaNet linear attention layer."""
+
+
 class AttentionBase(nn.Module, ABC):
     """Abstract base for Attention layer."""
 
@@ -139,6 +143,15 @@ class BackendFactory(ABC):
         scale_tensor: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> ReplicatedLinearBase: ...
+
+    @abstractmethod
+    def get_gated_delta_net(
+        self,
+        layer_idx: int,
+        config,
+        quantization_config: Optional["QuantizationConfig"] = None,
+        **kwargs,
+    ) -> GatedDeltaNetBase: ...
 
     @abstractmethod
     def get_distributed_routed_experts(
