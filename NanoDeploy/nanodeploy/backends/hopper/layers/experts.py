@@ -131,6 +131,18 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         topk_weights: torch.Tensor,
         is_prefill: bool,
     ):
+        valid_topk_ids = topk_ids[topk_ids >= 0]
+        expert_counts = torch.bincount(
+            valid_topk_ids, minlength=self.num_local_experts
+        ).tolist()
+
+        # fused_moe_v3 expects each expert's token count to be padded to BLOCK_E (128)
+        # DeepEP dispatch usually handles this, so we must do it manually for local mode.
+        BLOCK_E = 128
+        padded_expert_counts = [
+            (count + BLOCK_E - 1) // BLOCK_E * BLOCK_E for count in expert_counts
+        ]
+
         if self.is_fp8:
             from nanodeploy.kernels.fp8 import per_token_group_quant_fp8
             from nanodeploy.kernels.fused_moe_v3 import fused_moe_v3
@@ -145,7 +157,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
                 topk_weights,
                 gate_up_weight_tup,
                 down_weight_tup,
-                None,
+                padded_expert_counts,
             )
         else:
             from nanodeploy.kernels.fused_moe_v3 import fused_moe_v3_bf16
@@ -156,7 +168,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
                 topk_weights,
                 self.gate_up_proj,
                 self.down_proj,
-                None,
+                padded_expert_counts,
             )
 
         if self.tp_size > 1 and self.tp_group is not None:
