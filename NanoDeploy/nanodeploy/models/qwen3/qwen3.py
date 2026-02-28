@@ -1,18 +1,20 @@
 import torch
 import torch.distributed as dist
+from torch import nn
+from transformers import Qwen3Config
+
+from nanodeploy.backends import get_backend
+from nanodeploy.backends.base_backend import (
+    MergedColumnParallelLinearBase,
+    QKVParallelLinearBase,
+    RowParallelLinearBase,
+)
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanodeploy.layers.layernorm import RMSNorm
-from nanodeploy.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
 from nanodeploy.layers.rotary_embedding import get_rope
-from torch import nn
-from transformers import Qwen3Config
 
 
 class Qwen3Attention(nn.Module):
@@ -42,14 +44,14 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj: QKVParallelLinearBase = get_backend().get_qkv_parallel_linear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
@@ -97,12 +99,14 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj: (
+            MergedColumnParallelLinearBase
+        ) = get_backend().get_merged_column_parallel_linear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
             intermediate_size,
             hidden_size,
             bias=False,

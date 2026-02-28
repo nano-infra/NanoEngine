@@ -198,6 +198,16 @@ class ModelRunner:
                 f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, duration {self.profiler_steps} steps."
             )
 
+        # Initialise the hardware backend before constructing the model so that
+        # all layer factories are available when model __init__ runs.
+        from nanodeploy.backends import init_backend
+        from nanodeploy.models.quant_config import QuantizationConfig as _QC
+
+        _quant_cfg_dict = getattr(hf_config, "quantization_config", None) or {}
+        if not isinstance(_quant_cfg_dict, dict):
+            _quant_cfg_dict = {}
+        init_backend(quant_config=_QC(**_quant_cfg_dict))
+
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
 

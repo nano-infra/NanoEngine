@@ -16,23 +16,26 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch import nn
+
+from nanodeploy.backends import get_backend
+from nanodeploy.backends.base_backend import (
+    ColumnParallelLinearBase,
+    DistributedRoutedExpertsBase,
+    MergedColumnParallelLinearBase,
+    QKVParallelLinearBase,
+    ReplicatedLinearBase,
+    RowParallelLinearBase,
+)
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanodeploy.layers.layernorm import RMSNorm
-from nanodeploy.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.runner_config import get_runner_config
-from torch import nn
 
 from .quant_config import QuantizationConfig
 
@@ -137,20 +140,18 @@ class Qwen3_5MoeFullAttention(nn.Module):
         # QKV projection (packed)
         # When attn_output_gate=True, q_proj output is doubled (includes gate)
         q_heads_for_proj = self.total_num_heads * (1 + int(self.attn_output_gate))
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj: QKVParallelLinearBase = get_backend().get_qkv_parallel_linear(
             config.hidden_size,
             self.head_dim,
             q_heads_for_proj,
             self.total_num_kv_heads,
             bias=getattr(config, "attention_bias", False),
-            quantization_config=quantization_config,
         )
 
-        self.o_proj = RowParallelLinear(
+        self.o_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=getattr(config, "attention_bias", False),
-            quantization_config=quantization_config,
         )
 
         # RoPE: use rotary_dim as head_size for the rotary embedding
@@ -286,27 +287,24 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         # Fused QKV projection (matches checkpoint: in_proj_qkv)
         # Output: [T, key_dim + key_dim + value_dim] = [T, 12288]
-        self.in_proj_qkv = ReplicatedLinear(
+        self.in_proj_qkv: ReplicatedLinearBase = get_backend().get_replicated_linear(
             self.hidden_size,
             self.key_dim * 2 + self.value_dim,  # 2048 + 2048 + 8192 = 12288
             bias=False,
-            quantization_config=quantization_config,
         )
 
         # Z gating projection (fp8 quantized)
-        self.in_proj_z = ReplicatedLinear(
+        self.in_proj_z: ReplicatedLinearBase = get_backend().get_replicated_linear(
             self.hidden_size,
             self.value_dim,
             bias=False,
-            quantization_config=quantization_config,
         )
 
         # Output projection
-        self.out_proj = RowParallelLinear(
+        self.out_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
             self.value_dim,
             self.hidden_size,
             bias=False,
-            quantization_config=quantization_config,
         )
 
         # Alpha/Beta projections (NOT quantized, small)
@@ -734,24 +732,24 @@ class Qwen3_5MoeMLP(nn.Module):
         super().__init__()
         self.quantization_config = quantization_config
 
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj: (
+            MergedColumnParallelLinearBase
+        ) = get_backend().get_merged_column_parallel_linear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             meta=meta,
             weight_tensor=gate_up_proj_tensor,
             scale_tensor=gate_up_scale_inv_tensor,
-            quantization_config=quantization_config,
         )
 
-        self.down_proj = RowParallelLinear(
+        self.down_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
             intermediate_size,
             hidden_size,
             bias=False,
             meta=meta,
             weight_tensor=down_proj_tensor,
             scale_tensor=down_scale_inv_tensor,
-            quantization_config=quantization_config,
         )
 
         assert hidden_act == "silu"
@@ -792,11 +790,9 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.ep_group = get_dist_context().ffn_ep_group
         self.ep_size = get_dist_context().ffn_ep_world_size
 
-        from nanodeploy.layers.distributed_routed_experts import (
-            DistributedRoutedExperts,
-        )
-
-        self.routed_experts = DistributedRoutedExperts(
+        self.routed_experts: (
+            DistributedRoutedExpertsBase
+        ) = get_backend().get_distributed_routed_experts(
             hidden_size=config.hidden_size,
             intermediate_size=self.moe_intermediate_size,
             num_experts=self.num_experts,
@@ -810,7 +806,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             norm_topk_prob=getattr(config, "norm_topk_prob", True),
             routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
             scoring_func="softmax",
-            quantization_config=quantization_config,
         )
 
         # Shared expert
