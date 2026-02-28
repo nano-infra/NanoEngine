@@ -299,6 +299,18 @@ def load_per_expert_weight(
     local_idx = expert_idx - expert_start
     is_scale = "scale_inv" in suffix
 
+    tp_world_size = get_dist_context().ffn_tp_world_size
+    tp_rank = get_dist_context().ffn_tp_rank
+
+    if tp_world_size > 1:
+        if proj_name in ("gate_proj", "up_proj"):
+            chunk = tensor.shape[0] // tp_world_size
+            tensor = tensor[tp_rank * chunk : (tp_rank + 1) * chunk]
+        elif proj_name == "down_proj":
+            if tensor.dim() >= 2:
+                chunk = tensor.shape[1] // tp_world_size
+                tensor = tensor[:, tp_rank * chunk : (tp_rank + 1) * chunk]
+
     if proj_name in ("gate_proj", "up_proj"):
         # Target: gate_up_proj or gate_up_scale_inv
         param_suffix = "gate_up_scale_inv" if is_scale else "gate_up_proj"
