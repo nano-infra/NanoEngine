@@ -4,22 +4,25 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch import nn
+from transformers import DeepseekV3Config
+
+from nanodeploy.backends import get_backend
+from nanodeploy.backends.base_backend import (
+    ColumnParallelLinearBase,
+    DistributedRoutedExpertsBase,
+    MergedColumnParallelLinearBase,
+    RowParallelLinearBase,
+)
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanodeploy.layers.layernorm import RMSNorm
-from nanodeploy.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    RowParallelLinear,
-)
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.runner_config import get_runner_config
-from torch import nn
-from transformers import DeepseekV3Config
 
 from ..quant_config import QuantizationConfig
 
@@ -101,16 +104,14 @@ class DeepseekV2MoE(nn.Module):
             requires_grad=False,
         )
 
-        from nanodeploy.layers.distributed_routed_experts import (
-            DistributedRoutedExperts,
-        )
-
         self.ep_group = get_dist_context().ffn_ep_group
         self.ep_size = get_dist_context().ffn_ep_world_size
         self.tp_group = get_dist_context().ffn_tp_group
         self.tp_size = get_dist_context().ffn_tp_world_size
 
-        self.routed_experts = DistributedRoutedExperts(
+        self.routed_experts: (
+            DistributedRoutedExpertsBase
+        ) = get_backend().get_distributed_routed_experts(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             num_experts=self.num_experts,
@@ -124,7 +125,6 @@ class DeepseekV2MoE(nn.Module):
             norm_topk_prob=self.norm_topk_prob,
             routed_scaling_factor=self.routed_scaling_factor,
             scoring_func=self.scoring_func,
-            quantization_config=quantization_config,
         )
 
         self.shared_experts = None
@@ -238,24 +238,24 @@ class DeepseekV2MLP(nn.Module):
         self.config = config
         self.quantization_config = quantization_config
 
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj: (
+            MergedColumnParallelLinearBase
+        ) = get_backend().get_merged_column_parallel_linear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             meta=meta,
             weight_tensor=gate_up_proj_tensor,
             scale_tensor=gate_up_scale_inv_tensor,
-            quantization_config=quantization_config,
         )
 
-        self.down_proj = RowParallelLinear(
+        self.down_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
             intermediate_size,
             hidden_size,
             bias=False,
             meta=meta,
             weight_tensor=down_proj_tensor,
             scale_tensor=down_scale_inv_tensor,
-            quantization_config=quantization_config,
         )
 
         assert hidden_act == "silu"
@@ -437,30 +437,34 @@ class DeepseekV2Attention(nn.Module):
         num_key_value_heads = 1
 
         if self.q_lora_rank is None:
-            self.q_proj = ColumnParallelLinear(
+            self.q_proj: (
+                ColumnParallelLinearBase
+            ) = get_backend().get_column_parallel_linear(
                 self.hidden_size,
                 self.num_heads * self.q_head_dim,
-                quantization_config=quantization_config,
             )
         else:
-            self.q_a_proj = ColumnParallelLinear(
+            self.q_a_proj: (
+                ColumnParallelLinearBase
+            ) = get_backend().get_column_parallel_linear(
                 self.hidden_size,
                 config.q_lora_rank,
                 bias=config.attention_bias,
-                quantization_config=quantization_config,
             )
             self.q_a_layernorm = RMSNorm(hidden_size=config.q_lora_rank, eps=1e-6)
-            self.q_b_proj = ColumnParallelLinear(
+            self.q_b_proj: (
+                ColumnParallelLinearBase
+            ) = get_backend().get_column_parallel_linear(
                 config.q_lora_rank,
                 self.num_heads * self.q_head_dim,
                 bias=False,
-                quantization_config=quantization_config,
             )
-        self.kv_a_proj_with_mqa = ColumnParallelLinear(
+        self.kv_a_proj_with_mqa: (
+            ColumnParallelLinearBase
+        ) = get_backend().get_column_parallel_linear(
             self.hidden_size,
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=config.attention_bias,
-            quantization_config=quantization_config,
         )
         self.kv_a_layernorm = RMSNorm(
             config.kv_lora_rank,
@@ -517,11 +521,10 @@ class DeepseekV2Attention(nn.Module):
 
         self.vc = DeepseekV2BMM(self.num_heads, config.kv_lora_rank, self.v_head_dim)
 
-        self.o_proj = RowParallelLinear(
+        self.o_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=config.attention_bias,
-            quantization_config=quantization_config,
         )
 
     def _q_proj_absorbed(self, hidden_states, num_heads: int):
