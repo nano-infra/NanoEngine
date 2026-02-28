@@ -124,6 +124,8 @@ class ModelRunner:
         hf_config = config.hf_config
         rank = self.rank
 
+        torch.cuda.set_device(0)
+
         dist.init_process_group(
             "cpu:gloo,cuda:nccl",
             f"tcp://{config.master_address}",
@@ -143,7 +145,6 @@ class ModelRunner:
             ffn_tp=config.ffn_tp,
         )
 
-        torch.cuda.set_device(0)
         self.default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")

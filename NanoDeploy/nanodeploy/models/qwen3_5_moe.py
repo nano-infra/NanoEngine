@@ -30,13 +30,11 @@ from nanodeploy.backends.base_backend import (
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
-from nanodeploy.layers.attention import Attention
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanodeploy.layers.layernorm import RMSNorm
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.runner_config import get_runner_config
-
 from .quant_config import QuantizationConfig
 
 logger = get_logger()
