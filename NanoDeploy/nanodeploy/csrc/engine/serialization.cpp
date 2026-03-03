@@ -38,8 +38,7 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
             int         num_cached  = seq->num_cached_tokens();
             int         total       = seq->num_tokens();
             if (num_cached < total) {
-                std::vector<int> uncached(full_tokens.begin() + num_cached, full_tokens.begin() + total);
-                token_ids_off = builder.CreateVector(uncached);
+                token_ids_off = builder.CreateVector(full_tokens.data() + num_cached, total - num_cached);
             }
             else {
                 token_ids_off = builder.CreateVector(std::vector<int>{});
