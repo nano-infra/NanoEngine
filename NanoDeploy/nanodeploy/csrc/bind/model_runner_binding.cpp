@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "nanodeploy/csrc/engine/serialization.h"
 #include "nanodeploy/csrc/worker/model_runner_utils.h"
 
 namespace py = pybind11;
@@ -8,6 +9,7 @@ using namespace nanodeploy;
 
 void bind_model_runner_utils(py::module_& m)
 {
+    // ========== Metadata structs ==========
     py::class_<PrefillMetadata>(m, "PrefillMetadata")
         .def_readonly("input_ids", &PrefillMetadata::input_ids)
         .def_readonly("positions", &PrefillMetadata::positions)
@@ -40,20 +42,82 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("res_to_buffer_input_mask", &DecodeMetadata::res_to_buffer_input_mask)
         .def_readonly("q_offsets", &DecodeMetadata::q_offsets);
 
-    m.def("prepare_prefill_cpp",
-          &prepare_prefill_cpp,
-          py::arg("seqs"),
-          py::arg("sp_rank"),
-          py::arg("sp_size"),
-          py::arg("block_size"),
-          py::arg("max_num_seqs"));
+    py::class_<BatchAuxData>(m, "BatchAuxData")
+        .def_readonly("temperatures", &BatchAuxData::temperatures)
+        .def_readonly("state_slots", &BatchAuxData::state_slots)
+        .def_readonly("master_sp_indices", &BatchAuxData::master_sp_indices)
+        .def_readonly("num_sp_seqs", &BatchAuxData::num_sp_seqs);
 
-    m.def("prepare_decode_cpp",
-          &prepare_decode_cpp,
-          py::arg("dp_seqs"),
-          py::arg("sp_rank"),
-          py::arg("sp_size"),
-          py::arg("block_size"),
-          py::arg("max_num_seqs"));
-    m.def("update_seqs_inner_loop", &update_seqs_inner_loop, py::arg("dp_seqs"), py::arg("sp_rank"));
+    py::class_<MigrateSequenceView>(m, "MigrateSequenceView")
+        .def_readonly("seq_id", &MigrateSequenceView::seq_id)
+        .def_readonly("migrate_engine_id", &MigrateSequenceView::migrate_engine_id)
+        .def_readonly("migrate_num_kvcache_blocks", &MigrateSequenceView::migrate_num_kvcache_blocks)
+        .def_readonly("migrate_attention_sp", &MigrateSequenceView::migrate_attention_sp)
+        .def_readonly("migrate_dp_idx", &MigrateSequenceView::migrate_dp_idx)
+        .def_readonly("migrate_block_location", &MigrateSequenceView::migrate_block_location)
+        .def_readonly("migrate_state_slot", &MigrateSequenceView::migrate_state_slot)
+        .def_readonly("active_block_location", &MigrateSequenceView::active_block_location)
+        .def_readonly("active_state_slot", &MigrateSequenceView::active_state_slot);
+
+    // ========== Engine side: serialize → py::bytes ==========
+    m.def(
+        "serialize_run_batch",
+        [](const std::vector<Sequence*>& seqs, bool is_prefill) -> py::bytes {
+            auto buf = serialize_run_batch(seqs, is_prefill);
+            return py::bytes(reinterpret_cast<const char*>(buf.data()), buf.size());
+        },
+        py::arg("seqs"),
+        py::arg("is_prefill"));
+
+    m.def(
+        "serialize_migrate_batch",
+        [](const std::vector<Sequence*>& seqs) -> py::bytes {
+            auto buf = serialize_migrate_batch(seqs);
+            return py::bytes(reinterpret_cast<const char*>(buf.data()), buf.size());
+        },
+        py::arg("seqs"));
+
+    // ========== Runner side: deserialize + prepare ==========
+    m.def(
+        "prepare_prefill_from_bytes",
+        [](py::bytes data, int sp_rank, int sp_size, int block_size, int max_num_seqs) -> PrefillMetadata {
+            std::string_view sv = data;
+            return prepare_prefill_from_bytes(
+                reinterpret_cast<const uint8_t*>(sv.data()), sv.size(), sp_rank, sp_size, block_size, max_num_seqs);
+        },
+        py::arg("data"),
+        py::arg("sp_rank"),
+        py::arg("sp_size"),
+        py::arg("block_size"),
+        py::arg("max_num_seqs"));
+
+    m.def(
+        "prepare_decode_from_bytes",
+        [](py::bytes data, int sp_rank, int sp_size, int block_size, int max_num_seqs) -> DecodeMetadata {
+            std::string_view sv = data;
+            return prepare_decode_from_bytes(
+                reinterpret_cast<const uint8_t*>(sv.data()), sv.size(), sp_rank, sp_size, block_size, max_num_seqs);
+        },
+        py::arg("data"),
+        py::arg("sp_rank"),
+        py::arg("sp_size"),
+        py::arg("block_size"),
+        py::arg("max_num_seqs"));
+
+    m.def(
+        "extract_aux_from_bytes",
+        [](py::bytes data, int sp_rank) -> BatchAuxData {
+            std::string_view sv = data;
+            return extract_aux_from_bytes(reinterpret_cast<const uint8_t*>(sv.data()), sv.size(), sp_rank);
+        },
+        py::arg("data"),
+        py::arg("sp_rank"));
+
+    m.def(
+        "parse_migrate_batch",
+        [](py::bytes data) -> std::vector<MigrateSequenceView> {
+            std::string_view sv = data;
+            return parse_migrate_batch(reinterpret_cast<const uint8_t*>(sv.data()), sv.size());
+        },
+        py::arg("data"));
 }

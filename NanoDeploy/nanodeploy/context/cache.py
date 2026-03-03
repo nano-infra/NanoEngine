@@ -790,6 +790,257 @@ class CacheContext:
                     )
                     raise
 
+    def migrate_from_bytes(self, data: bytes):
+        """Migrate KV cache using lean MigrateBatchInput protocol (no Sequence objects).
+
+        Parses the MigrateBatchInput FlatBuffers bytes to extract minimal migration
+        data (MigrateSequenceView structs) and performs RDMA reads.
+        """
+        from nanodeploy._cpp import parse_migrate_batch
+
+        views = parse_migrate_batch(data)
+
+        logger.debug(f"migrate_from_bytes called with {len(views)} sequences")
+
+        if self._peer_agent is None:
+            logger.error("migrate_from_bytes called but PeerAgent not initialized")
+            return
+
+        # Collect target engine_ids
+        target_engine_ids = set()
+        for v in views:
+            if v.migrate_engine_id:
+                target_engine_ids.add(v.migrate_engine_id)
+
+        if not target_engine_ids:
+            logger.debug("No target engine_ids found, skipping migration")
+            return
+
+        engine_info_map = self._fetch_engine_info_from_nanoctrl(target_engine_ids)
+
+        assigns = defaultdict(lambda: defaultdict(list))
+        gdn_assigns = defaultdict(lambda: defaultdict(list))
+        sp_idx = get_dist_context().attn_sp_rank
+
+        # Ensure connections
+        remote_peers_to_connect: dict[str, str] = {}
+        for v in views:
+            engine_id = v.migrate_engine_id
+            engine_info = engine_info_map.get(engine_id, {})
+            peer_aliases = engine_info.get("peer_addrs", [])
+            if peer_aliases:
+                for peer_alias in peer_aliases:
+                    if peer_alias and peer_alias not in self._connected_peers:
+                        self.num_remote_kvcache_blocks[engine_id] = (
+                            v.migrate_num_kvcache_blocks
+                        )
+                        remote_peers_to_connect[peer_alias] = engine_id
+
+        if remote_peers_to_connect:
+            new_peers = list(remote_peers_to_connect.keys())
+            logger.info(f"Batch connecting to {len(new_peers)} peers: {new_peers}")
+            all_desired = set(self._connected_peers) | set(new_peers)
+            self._peer_agent.set_desired_topology(
+                target_peers=list(all_desired), symmetric=True
+            )
+            self._peer_agent.wait_for_peers(new_peers, timeout_sec=30)
+            self._connected_peers.update(new_peers)
+            logger.info(f"Batch connection completed for {len(new_peers)} peers")
+
+        # Build assignment list
+        for v in views:
+            engine_id = v.migrate_engine_id
+            engine_info = engine_info_map.get(engine_id, {})
+            peer_addrs = engine_info.get("peer_addrs", [])
+            if not peer_addrs:
+                logger.warning(
+                    f"Sequence {v.seq_id} has no peer_addrs for engine {engine_id}"
+                )
+                continue
+
+            if len(v.migrate_block_location) != len(v.active_block_location):
+                logger.error(
+                    f"Sequence {v.seq_id}: block_location length mismatch! "
+                    f"migrate={len(v.migrate_block_location)}, active={len(v.active_block_location)}"
+                )
+                continue
+
+            for remote_bl, source_bl in zip(
+                v.migrate_block_location, v.active_block_location
+            ):
+                remote_sp_idx, remote_block_idx = remote_bl
+                source_sp_idx, source_block_idx = source_bl
+
+                for kv_idx in range(self.kv_cache.size(0)):
+                    for layer_idx in range(self.num_hidden_layers):
+                        if source_sp_idx != sp_idx:
+                            continue
+
+                        remote_rank = (
+                            v.migrate_dp_idx * v.migrate_attention_sp + remote_sp_idx
+                        )
+
+                        if remote_rank < len(peer_addrs):
+                            peer_alias = peer_addrs[remote_rank]
+                        else:
+                            logger.error(
+                                f"remote_rank {remote_rank} >= len(peer_addrs) {len(peer_addrs)}"
+                            )
+                            continue
+
+                        assignment = (
+                            peer_alias,
+                            kv_idx,
+                            layer_idx,
+                            remote_block_idx,
+                            source_block_idx,
+                        )
+                        assigns[engine_id][peer_alias].append(assignment)
+
+            # GDN block assignments
+            if (
+                self.gdn_conv_states is not None
+                and self.gdn_recurrent_states is not None
+            ):
+                remote_state_slot = v.migrate_state_slot
+                local_state_slot = v.active_state_slot
+
+                if remote_state_slot >= 0 and local_state_slot >= 0:
+                    remote_rank = v.migrate_dp_idx * v.migrate_attention_sp + (
+                        v.migrate_attention_sp - 1
+                    )
+                    if remote_rank < len(peer_addrs):
+                        peer_alias = peer_addrs[remote_rank]
+                        num_gdn_layers = self.gdn_recurrent_states.shape[0]
+                        for layer_idx in range(num_gdn_layers):
+                            gdn_assigns[engine_id][peer_alias].append(
+                                (layer_idx, remote_state_slot, local_state_slot)
+                            )
+
+        # Execute RDMA reads (same logic as migrate)
+        for engine_id, peer_assigns in assigns.items():
+            for peer_alias, assign_batch in peer_assigns.items():
+                if peer_alias not in self._connected_peers:
+                    logger.error(f"Peer {peer_alias} not connected, skipping")
+                    continue
+
+                remote_mr_info = self._peer_agent.get_mr_info(
+                    peer_alias, _KV_CACHE_BUFFER_ID
+                )
+                if remote_mr_info is None:
+                    logger.error(f"Failed to get MR info for {peer_alias}")
+                    continue
+
+                remote_mr_handler = self._peer_agent.register_remote_memory_region(
+                    peer_alias,
+                    _KV_CACHE_BUFFER_ID,
+                    remote_mr_info,
+                )
+
+                if self._local_mr_handler is None:
+                    logger.error(
+                        f"Local MR handler not available for {_KV_CACHE_BUFFER_ID}"
+                    )
+                    continue
+                local_mr_handler = self._local_mr_handler
+
+                endpoint = self._peer_agent.get_endpoint(peer_alias)
+                if endpoint is None:
+                    logger.error(f"Failed to get endpoint for {peer_alias}")
+                    continue
+
+                rdma_ops: list[tuple] = []
+                for (
+                    _peer_alias,
+                    kv_idx,
+                    layer_idx,
+                    remote_block_idx,
+                    source_block_idx,
+                ) in assign_batch:
+                    local_off = self.local_kv_stride(
+                        kv_idx, layer_idx, source_block_idx
+                    )
+                    remote_off = self.remote_kv_stride(
+                        kv_idx, layer_idx, remote_block_idx, engine_id
+                    )
+                    length = self.block_stride(1)
+                    rdma_ops.append(
+                        (
+                            local_mr_handler,
+                            remote_mr_handler,
+                            remote_off,
+                            local_off,
+                            length,
+                        )
+                    )
+
+                # GDN ops
+                gdn_batch = gdn_assigns[engine_id].get(peer_alias, [])
+                if (
+                    gdn_batch
+                    and self.gdn_conv_states is not None
+                    and self.gdn_recurrent_states is not None
+                ):
+                    remote_conv_mr_info = self._peer_agent.get_mr_info(
+                        peer_alias, "gdn_conv"
+                    )
+                    if remote_conv_mr_info:
+                        remote_conv_mr = self._peer_agent.register_remote_memory_region(
+                            peer_alias, "gdn_conv", remote_conv_mr_info
+                        )
+                        local_conv_mr = self._local_gdn_conv_mr_handler
+                        conv_len = self.gdn_conv_slot_num_bytes()
+                        for layer_idx, remote_slot, local_slot in gdn_batch:
+                            rdma_ops.append(
+                                (
+                                    local_conv_mr,
+                                    remote_conv_mr,
+                                    self.gdn_conv_stride(layer_idx, remote_slot),
+                                    self.gdn_conv_stride(layer_idx, local_slot),
+                                    conv_len,
+                                )
+                            )
+
+                    remote_rec_mr_info = self._peer_agent.get_mr_info(
+                        peer_alias, "gdn_recurrent"
+                    )
+                    if remote_rec_mr_info:
+                        remote_rec_mr = self._peer_agent.register_remote_memory_region(
+                            peer_alias, "gdn_recurrent", remote_rec_mr_info
+                        )
+                        local_rec_mr = self._local_gdn_recurrent_mr_handler
+                        rec_len = self.gdn_recurrent_slot_num_bytes()
+                        for layer_idx, remote_slot, local_slot in gdn_batch:
+                            rdma_ops.append(
+                                (
+                                    local_rec_mr,
+                                    remote_rec_mr,
+                                    self.gdn_recurrent_stride(layer_idx, remote_slot),
+                                    self.gdn_recurrent_stride(layer_idx, local_slot),
+                                    rec_len,
+                                )
+                            )
+
+                if not rdma_ops:
+                    logger.error(f"No valid RDMA ops for {peer_alias}, skipping")
+                    continue
+
+                try:
+                    slot = endpoint.read(rdma_ops, None)
+                    if slot is None:
+                        logger.error("endpoint.read returned None")
+                        raise RuntimeError("endpoint.read returned None")
+                    slot.wait()
+                    logger.info(
+                        f"Completed batch RDMA read from {peer_alias} ({len(rdma_ops)} operations)"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Batch RDMA read FAILED from {peer_alias}: {len(rdma_ops)} ops, error={e}",
+                        exc_info=True,
+                    )
+                    raise
+
 
 _CACHE_CONTEXT: CacheContext
 
