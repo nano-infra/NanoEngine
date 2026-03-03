@@ -595,22 +595,27 @@ class ModelRunner:
         """Update decode metadata in-place for multi-step decode (no Sequence needed)."""
         positions.add_(1)
         sp_rank = get_dist_context().attn_sp_rank
+        block_size = self.config.kvcache_block_size
         context = get_context()
 
-        # Update context length
+        # Update context length (now reflects the NEW token count)
         context.context_lens[sp_rank][:num_sp_seqs].add_(1)
         # Update global context length
         context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
         # Update context lens for attention
         context.context_lens_for_attn[context.q_slice_fill.long()] += 1
 
-        # Update slot_mapping: slot = page_id * block_size + (new_offset - 1)
-        # After add_(1), context_lens already reflect the new length.
-        # slot_mapping was: page_id * block_size + offset - 1
-        # New offset = old offset + 1, so slot += 1 unless we cross a block boundary.
-        # For simplicity and correctness at block boundaries, recalculate is complex
-        # without block table, so we increment:
-        context.slot_mapping.add_(1)
+        # Recalculate slot_mapping from context_lens and block_tables.
+        # Simply doing slot_mapping.add_(1) is WRONG when a sequence's new
+        # token crosses a block boundary, because the page_id changes.
+        new_ctx = context.context_lens[sp_rank][:num_sp_seqs]  # already incremented
+        block_idx = (new_ctx - 1) // block_size  # which block the new token falls in
+        offset_in_block = (new_ctx - 1) % block_size  # offset within that block
+        # block_tables is packed: first num_sp_seqs rows belong to sp_rank's seqs
+        page_ids = context.block_tables[
+            torch.arange(num_sp_seqs, device=block_idx.device), block_idx.long()
+        ]
+        context.slot_mapping[:num_sp_seqs] = page_ids * block_size + offset_in_block
 
         return input_ids, positions
 
