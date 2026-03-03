@@ -80,29 +80,43 @@ void bind_model_runner_utils(py::module_& m)
     // ========== Runner side: deserialize + prepare ==========
     m.def(
         "prepare_prefill_from_bytes",
-        [](py::bytes data, int sp_rank, int sp_size, int block_size, int max_num_seqs) -> PrefillMetadata {
+        [](py::bytes data, int sp_rank, int sp_size, int block_size, int max_num_seqs, int num_gpu_blocks)
+            -> PrefillMetadata {
             std::string_view sv = data;
-            return prepare_prefill_from_bytes(
-                reinterpret_cast<const uint8_t*>(sv.data()), sv.size(), sp_rank, sp_size, block_size, max_num_seqs);
+            return prepare_prefill_from_bytes(reinterpret_cast<const uint8_t*>(sv.data()),
+                                              sv.size(),
+                                              sp_rank,
+                                              sp_size,
+                                              block_size,
+                                              max_num_seqs,
+                                              num_gpu_blocks);
         },
         py::arg("data"),
         py::arg("sp_rank"),
         py::arg("sp_size"),
         py::arg("block_size"),
-        py::arg("max_num_seqs"));
+        py::arg("max_num_seqs"),
+        py::arg("num_gpu_blocks"));
 
     m.def(
         "prepare_decode_from_bytes",
-        [](py::bytes data, int sp_rank, int sp_size, int block_size, int max_num_seqs) -> DecodeMetadata {
+        [](py::bytes data, int sp_rank, int sp_size, int block_size, int max_num_seqs, int num_gpu_blocks)
+            -> DecodeMetadata {
             std::string_view sv = data;
-            return prepare_decode_from_bytes(
-                reinterpret_cast<const uint8_t*>(sv.data()), sv.size(), sp_rank, sp_size, block_size, max_num_seqs);
+            return prepare_decode_from_bytes(reinterpret_cast<const uint8_t*>(sv.data()),
+                                             sv.size(),
+                                             sp_rank,
+                                             sp_size,
+                                             block_size,
+                                             max_num_seqs,
+                                             num_gpu_blocks);
         },
         py::arg("data"),
         py::arg("sp_rank"),
         py::arg("sp_size"),
         py::arg("block_size"),
-        py::arg("max_num_seqs"));
+        py::arg("max_num_seqs"),
+        py::arg("num_gpu_blocks"));
 
     m.def(
         "extract_aux_from_bytes",

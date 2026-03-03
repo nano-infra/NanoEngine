@@ -11,18 +11,6 @@
 namespace nanodeploy {
 
 // ========================================================================
-// Existing Sequence*-based helpers (unchanged)
-// ========================================================================
-
-void update_seqs_inner_loop(const std::vector<Sequence*>& sp_seqs, int sp_rank)
-{
-    for (auto seq : sp_seqs) {
-        seq->set_num_tokens(seq->num_tokens() + 1);
-        seq->block_ctx().num_dispatched_tokens[sp_rank] += 1;
-    }
-}
-
-// ========================================================================
 // Helper: get context_len from SequenceInput (equivalent to Sequence::context_len)
 // context_len(slot, sp_idx) = num_dispatched_tokens[sp_idx]
 // context_len(slot, nullopt) = num_dispatched_tokens[master_sp_idx]
@@ -173,11 +161,18 @@ build_block_tables_packed_from_si(const flatbuffers::Vector<flatbuffers::Offset<
     }
 }
 
-PrefillMetadata prepare_prefill_from_bytes(
-    const uint8_t* data, size_t data_len, int sp_rank, int sp_size, int block_size, int max_num_seqs)
+PrefillMetadata prepare_prefill_from_bytes(const uint8_t* data,
+                                           size_t         data_len,
+                                           int            sp_rank,
+                                           int            sp_size,
+                                           int            block_size,
+                                           int            max_num_seqs,
+                                           int            num_gpu_blocks)
 {
     flatbuffers::Verifier verifier(data, data_len);
-    (void)verifier;  // available for debug verification
+    if (!verifier.VerifyBuffer<fbs::RunBatchInput>(nullptr)) {
+        throw std::runtime_error("prepare_prefill_from_bytes: invalid FlatBuffers buffer");
+    }
     auto* batch  = flatbuffers::GetRoot<fbs::RunBatchInput>(data);
     auto* si_vec = batch->sequences();
 
@@ -227,10 +222,14 @@ PrefillMetadata prepare_prefill_from_bytes(
 
         for (int b = num_cached_blocks; b < num_blocks; ++b) {
             int block_id = bt->Get(b);
-            int start    = block_id * block_size;
-            int end      = (b != num_blocks - 1) ? start + block_size : start + last_block_tokens;
-            for (int k = start; k < end; ++k) {
-                meta.slot_mapping.push_back(k);
+            if (block_id < 0 || block_id >= num_gpu_blocks) {
+                throw std::runtime_error("prepare_prefill_from_bytes: block_id " + std::to_string(block_id)
+                                         + " out of range [0, " + std::to_string(num_gpu_blocks) + ")");
+            }
+            int64_t start = (int64_t)block_id * block_size;
+            int64_t end   = (b != num_blocks - 1) ? start + block_size : start + last_block_tokens;
+            for (int64_t k = start; k < end; ++k) {
+                meta.slot_mapping.push_back((int)k);
             }
         }
     }
@@ -248,11 +247,18 @@ PrefillMetadata prepare_prefill_from_bytes(
 // New bytes-based API: prepare_decode_from_bytes
 // ========================================================================
 
-DecodeMetadata prepare_decode_from_bytes(
-    const uint8_t* data, size_t data_len, int sp_rank, int sp_size, int block_size, int max_num_seqs)
+DecodeMetadata prepare_decode_from_bytes(const uint8_t* data,
+                                         size_t         data_len,
+                                         int            sp_rank,
+                                         int            sp_size,
+                                         int            block_size,
+                                         int            max_num_seqs,
+                                         int            num_gpu_blocks)
 {
     flatbuffers::Verifier verifier(data, data_len);
-    (void)verifier;  // available for debug verification
+    if (!verifier.VerifyBuffer<fbs::RunBatchInput>(nullptr)) {
+        throw std::runtime_error("prepare_decode_from_bytes: invalid FlatBuffers buffer");
+    }
     auto* batch  = flatbuffers::GetRoot<fbs::RunBatchInput>(data);
     auto* si_vec = batch->sequences();
 
@@ -277,7 +283,11 @@ DecodeMetadata prepare_decode_from_bytes(
 
         int page_id = seq_input_last_block_page_id(si, sp_rank);
         int offset  = seq_input_last_block_num_tokens(si, sp_rank, block_size);
-        meta.slot_mapping.push_back(page_id * block_size + offset - 1);
+        if (page_id < 0 || page_id >= num_gpu_blocks) {
+            throw std::runtime_error("prepare_decode_from_bytes: page_id " + std::to_string(page_id)
+                                     + " out of range [0, " + std::to_string(num_gpu_blocks) + ")");
+        }
+        meta.slot_mapping.push_back((int)((int64_t)page_id * block_size + offset - 1));
     }
 
     // 2. context_lens, global_context_lens
@@ -390,7 +400,9 @@ DecodeMetadata prepare_decode_from_bytes(
 BatchAuxData extract_aux_from_bytes(const uint8_t* data, size_t data_len, int sp_rank)
 {
     flatbuffers::Verifier verifier(data, data_len);
-    (void)verifier;  // available for debug verification
+    if (!verifier.VerifyBuffer<fbs::RunBatchInput>(nullptr)) {
+        throw std::runtime_error("extract_aux_from_bytes: invalid FlatBuffers buffer");
+    }
     auto* batch  = flatbuffers::GetRoot<fbs::RunBatchInput>(data);
     auto* si_vec = batch->sequences();
 
@@ -422,7 +434,9 @@ BatchAuxData extract_aux_from_bytes(const uint8_t* data, size_t data_len, int sp
 std::vector<MigrateSequenceView> parse_migrate_batch(const uint8_t* data, size_t data_len)
 {
     flatbuffers::Verifier verifier(data, data_len);
-    (void)verifier;  // available for debug verification
+    if (!verifier.VerifyBuffer<fbs::MigrateBatchInput>(nullptr)) {
+        throw std::runtime_error("parse_migrate_batch: invalid FlatBuffers buffer");
+    }
     auto* batch   = flatbuffers::GetRoot<fbs::MigrateBatchInput>(data);
     auto* msi_vec = batch->sequences();
 

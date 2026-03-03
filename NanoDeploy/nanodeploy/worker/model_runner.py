@@ -367,7 +367,12 @@ class ModelRunner:
         block_size = self.config.kvcache_block_size
 
         meta = prepare_prefill_from_bytes(
-            data, sp_rank, sp_size, block_size, self.config.max_num_seqs
+            data,
+            sp_rank,
+            sp_size,
+            block_size,
+            self.config.max_num_seqs,
+            self.config.num_kvcache_blocks,
         )
 
         if len(meta.input_ids) == 0:
@@ -410,7 +415,10 @@ class ModelRunner:
         if cache_ctx.gdn_conv_states is not None:
             dummy_gdn_slot = cache_ctx.gdn_conv_states.shape[1] - 1
             gdn_state_slots = torch.tensor(
-                [s if s >= 0 else dummy_gdn_slot for s in aux.state_slots],
+                [
+                    s if 0 <= s < dummy_gdn_slot else dummy_gdn_slot
+                    for s in aux.state_slots
+                ],
                 dtype=torch.int64,
                 pin_memory=True,
             ).cuda(non_blocking=True)
@@ -445,6 +453,7 @@ class ModelRunner:
                 sp_size,
                 block_size,
                 self.config.max_num_seqs,
+                self.config.num_kvcache_blocks,
             )
         except (IndexError, ValueError, RuntimeError) as e:
             logger.error(
@@ -553,7 +562,10 @@ class ModelRunner:
         if cache_ctx.gdn_conv_states is not None:
             dummy_gdn_slot = cache_ctx.gdn_conv_states.shape[1] - 1
             gdn_state_slots = torch.tensor(
-                [s if s >= 0 else dummy_gdn_slot for s in aux.state_slots],
+                [
+                    s if 0 <= s < dummy_gdn_slot else dummy_gdn_slot
+                    for s in aux.state_slots
+                ],
                 dtype=torch.int64,
                 pin_memory=True,
             ).cuda(non_blocking=True)
@@ -611,10 +623,11 @@ class ModelRunner:
         new_ctx = context.context_lens[sp_rank][:num_sp_seqs]  # already incremented
         block_idx = (new_ctx - 1) // block_size  # which block the new token falls in
         offset_in_block = (new_ctx - 1) % block_size  # offset within that block
-        # block_tables is packed: first num_sp_seqs rows belong to sp_rank's seqs
-        page_ids = context.block_tables[
-            torch.arange(num_sp_seqs, device=block_idx.device), block_idx.long()
-        ]
+        # block_tables is packed by sp_rank order; use q_offsets to find the
+        # starting row for this sp_rank's sequences.
+        bt_offset = context.q_offsets[sp_rank]
+        row_indices = bt_offset + torch.arange(num_sp_seqs, device=block_idx.device)
+        page_ids = context.block_tables[row_indices, block_idx.long()]
         context.slot_mapping[:num_sp_seqs] = page_ids * block_size + offset_in_block
 
         return input_ids, positions
