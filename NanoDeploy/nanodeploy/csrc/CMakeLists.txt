@@ -1,4 +1,5 @@
 # ===== Sources =====
+add_subdirectory(engine)
 add_subdirectory(metrics)
 add_subdirectory(scheduler)
 add_subdirectory(worker)

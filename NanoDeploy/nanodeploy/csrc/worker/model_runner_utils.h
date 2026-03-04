@@ -54,12 +54,51 @@ struct DecodeMetadata {
     std::vector<int> q_offsets;
 };
 
-PrefillMetadata
-prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs);
+// ========== Auxiliary data extracted from RunBatchInput ==========
 
-DecodeMetadata
-prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs);
+struct BatchAuxData {
+    std::vector<double> temperatures;       // per master-sp seq
+    std::vector<int>    state_slots;        // per master-sp seq
+    std::vector<int>    master_sp_indices;  // per all seqs
+    int                 num_sp_seqs = 0;    // count where master_sp == sp_rank
+};
 
-void update_seqs_inner_loop(const std::vector<Sequence*>& sp_seqs, int sp_rank);
+// ========== New bytes-based API (Sequence-free on runner side) ==========
+
+// Combined deserialize + prepare: zero Sequence objects created
+PrefillMetadata prepare_prefill_from_bytes(const uint8_t* data,
+                                           size_t         data_len,
+                                           int            sp_rank,
+                                           int            sp_size,
+                                           int            block_size,
+                                           int            max_num_seqs,
+                                           int            num_gpu_blocks);
+
+DecodeMetadata prepare_decode_from_bytes(const uint8_t* data,
+                                         size_t         data_len,
+                                         int            sp_rank,
+                                         int            sp_size,
+                                         int            block_size,
+                                         int            max_num_seqs,
+                                         int            num_gpu_blocks);
+
+// Extract temperatures, state_slots, master_sp_indices from serialized RunBatchInput
+BatchAuxData extract_aux_from_bytes(const uint8_t* data, size_t data_len, int sp_rank);
+
+// ========== Migrate data structures ==========
+
+struct MigrateSequenceView {
+    uint64_t                         seq_id;
+    std::string                      migrate_engine_id;
+    int                              migrate_num_kvcache_blocks;
+    int                              migrate_attention_sp;
+    int                              migrate_dp_idx;
+    std::vector<std::pair<int, int>> migrate_block_location;  // (sp_idx, block_idx)
+    int                              migrate_state_slot;
+    std::vector<std::pair<int, int>> active_block_location;  // (sp_idx, block_idx)
+    int                              active_state_slot;
+};
+
+std::vector<MigrateSequenceView> parse_migrate_batch(const uint8_t* data, size_t data_len);
 
 }  // namespace nanodeploy

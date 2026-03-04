@@ -5,12 +5,23 @@ from urllib.parse import urlparse
 import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 
+from nanodeploy._cpp import serialize_migrate_batch, serialize_run_batch
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.model_runner import ModelRunner
 
 logger = get_logger()
+
+
+def _serialize_run(seqs: list[Sequence], is_prefill: bool) -> bytes:
+    """Serialize sequences into lean RunBatchInput bytes."""
+    return serialize_run_batch(seqs, is_prefill)
+
+
+def _serialize_migrate(seqs: list[Sequence]) -> bytes:
+    """Serialize sequences into lean MigrateBatchInput bytes."""
+    return serialize_migrate_batch(seqs)
 
 
 from nanodeploy.engine.ray_utils import get_available_nodes_with_master_first
@@ -188,10 +199,12 @@ class RayExecutor:
         dp_seqs: List[List[Sequence]],
         timeout: float | None = None,
     ) -> list[int]:
+        # Serialize into lean MigrateBatchInput bytes, send bytes instead of Sequence objects
+        batch_bytes = [_serialize_migrate(seqs) for seqs in dp_seqs]
         return ray.get(
             [
-                getattr(worker, "migrate").remote(seqs)
-                for seqs, worker in zip(dp_seqs, self.workers)
+                getattr(worker, "migrate_from_bytes").remote(b)
+                for b, worker in zip(batch_bytes, self.workers)
             ],
             timeout=timeout,
         )
@@ -202,11 +215,11 @@ class RayExecutor:
         is_prefill: bool,
         timeout: float | None = None,
     ) -> list[list[list[int]]]:
-        # Pass sequences directly to Ray - pickle __getstate__ now validates
-        # before Pack() so cloudpickle serialization should work correctly
+        # Serialize into lean RunBatchInput bytes, send bytes instead of Sequence objects
+        batch_bytes = [_serialize_run(seqs, is_prefill) for seqs in dp_seqs]
         ray_futures = [
-            getattr(worker, "run").remote(seqs, is_prefill)
-            for seqs, worker in zip(dp_seqs, self.workers)
+            getattr(worker, "run_from_bytes").remote(b, is_prefill)
+            for b, worker in zip(batch_bytes, self.workers)
         ]
         return ray.get(
             ray_futures,

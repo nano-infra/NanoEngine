@@ -20,11 +20,11 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
     max_num_batched_tokens_(max_num_batched_tokens),
+    state_manager_(engine_id, 0, max_num_seqs),
     kvcache_block_size_(kvcache_block_size),
     num_kvcache_blocks_(num_kvcache_blocks),
     num_running_seqs_per_sp_(attention_sp, 0),
-    num_running_tokens_per_sp_(attention_sp, 0),
-    state_manager_(engine_id, 0, max_num_seqs)
+    num_running_tokens_per_sp_(attention_sp, 0)
 {
     for (int i = 0; i < attention_sp; ++i) {
         block_manager[i] = std::make_shared<BlockManager>(engine_id, i, num_kvcache_blocks, kvcache_block_size);

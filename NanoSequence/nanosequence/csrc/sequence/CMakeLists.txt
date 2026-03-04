@@ -29,12 +29,30 @@ add_custom_command(
     COMMENT "Generating FlatBuffers header for Sequence with gen-object-api"
 )
 
+# --- FlatBuffers Generation for interface.fbs (lean engine-runner protocol) ---
+set(INTERFACE_FBS_SOURCE "${NANOINFRA_DIR}/NanoSequence/proto/interface.fbs")
+set(INTERFACE_GEN_HEADER "${GEN_HEADER_DIR}/interface_generated.h")
+
+add_custom_command(
+    OUTPUT ${INTERFACE_GEN_HEADER}
+    COMMAND ${FLATC_EXECUTABLE}
+            --cpp
+            --scoped-enums
+            --gen-object-api
+            -o ${GEN_HEADER_DIR}
+            ${INTERFACE_FBS_SOURCE}
+    DEPENDS ${INTERFACE_FBS_SOURCE}
+            flatc
+    COMMENT "Generating FlatBuffers header for interface (engine-runner protocol)"
+)
+
 # --- Target Definition ---
 add_library(
     _nanosequence
     SHARED
     ${CPP_SOURCES}
     ${GEN_HEADER}
+    ${INTERFACE_GEN_HEADER}
 )
 
 # Set output directory to match other NanoDeploy libraries

@@ -123,26 +123,37 @@ impl EngineAdapter {
                 }
 
                 // Drain send channel
-                while let Ok(packet) = send_rx.try_recv() {
-                    let data = packet.encode();
-                    // Only log important packets (ADD/migration=1, engine_info=2)
-                    if packet.action != 0 {
-                        info!(
-                            "Sending ZMQ packet: action={}, size={}",
-                            packet.action,
-                            data.len()
-                        );
-                    }
-                    if let Err(e) = socket.send(&data, 0) {
-                        if matches!(e, zmq::Error::ETERM) {
-                            info!(
-                                "ZMQ I/O thread: context terminated during send for {}",
-                                addr_for_log
-                            );
-                        } else {
-                            warn!("ZMQ send error for {}: {}", addr_for_log, e);
+                loop {
+                    match send_rx.try_recv() {
+                        Ok(packet) => {
+                            let data = packet.encode();
+                            // Only log important packets (ADD/migration=1, engine_info=2)
+                            if packet.action != 0 {
+                                info!(
+                                    "Sending ZMQ packet: action={}, size={}",
+                                    packet.action,
+                                    data.len()
+                                );
+                            }
+                            if let Err(e) = socket.send(&data, 0) {
+                                if matches!(e, zmq::Error::ETERM) {
+                                    info!(
+                                        "ZMQ I/O thread: context terminated during send for {}",
+                                        addr_for_log
+                                    );
+                                } else {
+                                    warn!("ZMQ send error for {}: {}", addr_for_log, e);
+                                }
+                                break;
+                            }
                         }
-                        break;
+                        Err(mpsc::TryRecvError::Empty) => {
+                            break; // Done draining
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            info!("ZMQ I/O thread: send channel closed for {}", addr_for_log);
+                            return; // Exit the I/O thread entirely
+                        }
                     }
                 }
             }

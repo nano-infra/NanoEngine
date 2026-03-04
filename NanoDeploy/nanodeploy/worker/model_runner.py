@@ -7,10 +7,11 @@ import torch
 import torch.distributed as dist
 import torch.profiler as profiler
 from nanodeploy._cpp import (
-    BlockContextSlot,
-    prepare_decode_cpp,
-    prepare_prefill_cpp,
-    update_seqs_inner_loop,
+    extract_aux_from_bytes,
+    parse_migrate_batch,
+    prepare_decode_from_bytes,
+    prepare_prefill_from_bytes,
+    serialize_run_batch,
 )
 from nanodeploy.config import Config
 from nanodeploy.context.cache import get_cache_context, set_cache_context
@@ -22,7 +23,6 @@ from nanodeploy.context.distributed import (
 )
 from nanodeploy.context.expert_context import ExpertContext
 from nanodeploy.context.sp_context import set_sp_context
-from nanodeploy.engine.sequence import Sequence
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
@@ -59,7 +59,7 @@ class ModelRunner:
         self._dist_initialized = False
 
         # Sync C++ Sequence.block_size with Python kvcache_block_size
-        from nanodeploy.engine.sequence import Sequence as _Seq
+        from nanodeploy._cpp import Sequence as _Seq
 
         _Seq.set_block_size(config.kvcache_block_size)
 
@@ -304,9 +304,9 @@ class ModelRunner:
         )
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
-        # empty for warmup
-        seqs = []
-        self.run([], True)
+        # empty for warmup — serialize empty batch into bytes
+        warmup_data = serialize_run_batch([], True)
+        self.run_from_bytes(warmup_data, True)
         torch.cuda.empty_cache()
 
     def preallocate_kvcache(self):
@@ -361,32 +361,29 @@ class ModelRunner:
                 hf_config, layer_types, config.max_num_seqs
             )
 
-    def prepare_prefill(self, seqs: list[Sequence], is_dummy: bool = False):
+    def prepare_prefill_bytes(self, data: bytes, aux, is_dummy: bool = False):
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
         block_size = self.config.kvcache_block_size
 
-        meta = prepare_prefill_cpp(
-            seqs, sp_rank, sp_size, block_size, self.config.max_num_seqs
+        meta = prepare_prefill_from_bytes(
+            data,
+            sp_rank,
+            sp_size,
+            block_size,
+            self.config.max_num_seqs,
+            self.config.num_kvcache_blocks,
         )
 
         if len(meta.input_ids) == 0:
             logger.critical(
-                "prepare_prefill_cpp returned empty input_ids! "
-                "is_dummy=%s sp_rank=%s sp_size=%s block_size=%s max_num_seqs=%s "
-                "num_seqs=%s seqs_info=[%s]",
+                "prepare_prefill_from_bytes returned empty input_ids! "
+                "is_dummy=%s sp_rank=%s sp_size=%s block_size=%s max_num_seqs=%s",
                 is_dummy,
                 sp_rank,
                 sp_size,
                 block_size,
                 self.config.max_num_seqs,
-                len(seqs),
-                ", ".join(
-                    f"(id={getattr(s, 'seq_id', '?')}, "
-                    f"ntok={getattr(s, 'num_tokens', '?')}, "
-                    f"master_sp={getattr(s.block_ctx(), 'master_sp_idx', '?') if hasattr(s, 'block_ctx') else '?'})"
-                    for s in seqs
-                ),
             )
 
         input_ids = torch.tensor(
@@ -417,19 +414,10 @@ class ModelRunner:
         gdn_state_slots = None
         if cache_ctx.gdn_conv_states is not None:
             dummy_gdn_slot = cache_ctx.gdn_conv_states.shape[1] - 1
-            sp_seqs_for_gdn = [
-                seq
-                for seq in seqs
-                if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
-            ]
             gdn_state_slots = torch.tensor(
                 [
-                    (
-                        s
-                        if (s := seq.state_slot(BlockContextSlot.ACTIVE)) >= 0
-                        else dummy_gdn_slot
-                    )
-                    for seq in sp_seqs_for_gdn
+                    s if 0 <= s < dummy_gdn_slot else dummy_gdn_slot
+                    for s in aux.state_slots
                 ],
                 dtype=torch.int64,
                 pin_memory=True,
@@ -453,48 +441,29 @@ class ModelRunner:
         )
         return input_ids, positions
 
-    def prepare_decode(self, dp_seqs: list[Sequence], is_dummy: bool = False):
+    def prepare_decode_bytes(self, data: bytes, aux, is_dummy: bool = False):
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
         block_size = self.config.kvcache_block_size
 
         try:
-            meta = prepare_decode_cpp(
-                dp_seqs,
+            meta = prepare_decode_from_bytes(
+                data,
                 sp_rank,
                 sp_size,
                 block_size,
                 self.config.max_num_seqs,
+                self.config.num_kvcache_blocks,
             )
         except (IndexError, ValueError, RuntimeError) as e:
-            # C++ std::out_of_range often surfaces as IndexError; log context
-            err_msg = str(e)
             logger.error(
-                "prepare_decode_cpp failed: %s (sp_rank=%s sp_size=%s block_size=%s max_num_seqs=%s num_seqs=%s)",
-                err_msg,
+                "prepare_decode_from_bytes failed: %s (sp_rank=%s sp_size=%s block_size=%s max_num_seqs=%s)",
+                str(e),
                 sp_rank,
                 sp_size,
                 block_size,
                 self.config.max_num_seqs,
-                len(dp_seqs),
             )
-            for idx, seq in enumerate(dp_seqs):
-                try:
-                    ntok = getattr(seq, "num_tokens", None)
-                    tok_ids = getattr(seq, "token_ids", None)
-                    ntok_len = len(tok_ids) if tok_ids is not None else None
-                    logger.error(
-                        "  dp_seqs[%s]: seq_id=%s num_tokens=%s len(token_ids)=%s status=%s",
-                        idx,
-                        getattr(seq, "seq_id", "?"),
-                        ntok,
-                        ntok_len,
-                        getattr(seq, "status", "?"),
-                    )
-                except Exception as log_err:
-                    logger.error(
-                        "  dp_seqs[%s]: %s (log failed: %s)", idx, seq, log_err
-                    )
             raise
 
         input_ids = torch.tensor(
@@ -592,19 +561,10 @@ class ModelRunner:
         gdn_state_slots = None
         if cache_ctx.gdn_conv_states is not None:
             dummy_gdn_slot = cache_ctx.gdn_conv_states.shape[1] - 1
-            sp_seqs_for_gdn = [
-                seq
-                for seq in dp_seqs
-                if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
-            ]
             gdn_state_slots = torch.tensor(
                 [
-                    (
-                        s
-                        if (s := seq.state_slot(BlockContextSlot.ACTIVE)) >= 0
-                        else dummy_gdn_slot
-                    )
-                    for seq in sp_seqs_for_gdn
+                    s if 0 <= s < dummy_gdn_slot else dummy_gdn_slot
+                    for s in aux.state_slots
                 ],
                 dtype=torch.int64,
                 pin_memory=True,
@@ -641,58 +601,41 @@ class ModelRunner:
 
         return input_ids, positions
 
-    def update_decode(
-        self, input_ids: torch.Tensor, positions: torch.Tensor, dp_seqs: list[Sequence]
+    def update_decode_inplace(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, num_sp_seqs: int
     ):
-        # update position
+        """Update decode metadata in-place for multi-step decode (no Sequence needed)."""
         positions.add_(1)
-
         sp_rank = get_dist_context().attn_sp_rank
-        num_sp_seqs = sum(
-            1
-            for seq in dp_seqs
-            if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
-        )
-
-        # update slot mapping
-        slot_mapping = []
-        for seq in dp_seqs:
-            if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank:
-                slot_mapping.append(
-                    seq.last_block_page_id(BlockContextSlot.ACTIVE, sp_rank)
-                    * get_cache_context().block_size
-                    + seq.last_block_num_tokens(BlockContextSlot.ACTIVE, sp_rank)
-                    - 1
-                )
-
-        # update context
+        block_size = self.config.kvcache_block_size
         context = get_context()
 
-        context.slot_mapping = torch.tensor(
-            slot_mapping, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        # update context length
+        # Update context length (now reflects the NEW token count)
         context.context_lens[sp_rank][:num_sp_seqs].add_(1)
-
-        # update global context length
+        # Update global context length
         context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
-
-        # update context lens for attention
+        # Update context lens for attention
         context.context_lens_for_attn[context.q_slice_fill.long()] += 1
+
+        # Recalculate slot_mapping from context_lens and block_tables.
+        # Simply doing slot_mapping.add_(1) is WRONG when a sequence's new
+        # token crosses a block boundary, because the page_id changes.
+        new_ctx = context.context_lens[sp_rank][:num_sp_seqs]  # already incremented
+        block_idx = (new_ctx - 1) // block_size  # which block the new token falls in
+        offset_in_block = (new_ctx - 1) % block_size  # offset within that block
+        # block_tables is packed by sp_rank order; use q_offsets to find the
+        # starting row for this sp_rank's sequences.
+        bt_offset = context.q_offsets[sp_rank]
+        row_indices = bt_offset + torch.arange(num_sp_seqs, device=block_idx.device)
+        page_ids = context.block_tables[row_indices, block_idx.long()]
+        context.slot_mapping[:num_sp_seqs] = page_ids * block_size + offset_in_block
 
         return input_ids, positions
 
-    def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = []
-        for seq in seqs:
-            if (
-                seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
-                == get_dist_context().attn_sp_rank
-            ):
-                temperatures.append(seq.sampling_params.temperature)
+    def prepare_sample_from_aux(self, aux):
+        """Build temperature tensor from BatchAuxData (no Sequence needed)."""
         temperatures = torch.tensor(
-            temperatures, dtype=torch.float32, pin_memory=True
+            aux.temperatures, dtype=torch.float32, pin_memory=True
         ).cuda(non_blocking=True)
         return temperatures
 
@@ -788,36 +731,37 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def migrate(self, seqs: list[Sequence]) -> None:
-        get_cache_context().migrate(seqs=seqs)
+    def migrate_from_bytes(self, data: bytes) -> None:
+        """Migrate using lean MigrateBatchInput bytes (no Sequence objects)."""
+        get_cache_context().migrate_from_bytes(data=data)
 
     @torch.inference_mode()
-    def run(self, dp_seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
-        # Sequences are always passed directly via pickle (Ray's default serialization)
-
+    def run_from_bytes(self, data: bytes, is_prefill: bool) -> list[list[int]]:
+        """Run model from lean RunBatchInput bytes (completely Sequence-free)."""
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
 
-        num_sp_seqs = sum(
-            1
-            for seq in dp_seqs
-            if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
-        )
+        # Extract auxiliary data (temperatures, state_slots, master_sp_indices)
+        aux = extract_aux_from_bytes(data, sp_rank)
+        num_sp_seqs = aux.num_sp_seqs
+
         is_dummy = False
         if num_sp_seqs == 0:
             is_dummy = True
-            seq = Sequence([0])  # Zero init for determinism
-            seq.block_ctx().reset(
-                self.engine_id, sp_size, 1, get_cache_context().num_local_kvcache_blocks
-            )
-            seq.block_ctx().master_sp_idx = sp_rank
-            dp_seqs.append(seq)
+            # Create a minimal dummy RunBatchInput with one dummy sequence
+            from nanodeploy._cpp import SamplingParams, Sequence as _Seq
 
-        sp_seqs = [
-            seq
-            for seq in dp_seqs
-            if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
-        ]
+            dummy_seq = _Seq([0], SamplingParams())
+            dummy_seq.block_ctx().reset(
+                self.engine_id,
+                sp_size,
+                1,
+                get_cache_context().num_local_kvcache_blocks,
+            )
+            dummy_seq.block_ctx().master_sp_idx = sp_rank
+            data = serialize_run_batch([dummy_seq], is_prefill)
+            aux = extract_aux_from_bytes(data, sp_rank)
+            num_sp_seqs = aux.num_sp_seqs
 
         loop_count = self.config.loop_count if not is_prefill else 1
         for i in range(loop_count):
@@ -828,39 +772,40 @@ class ModelRunner:
                 )
 
             if is_prefill:
-                input_ids, positions = self.prepare_prefill(dp_seqs, is_dummy)
+                input_ids, positions = self.prepare_prefill_bytes(data, aux, is_dummy)
             else:
                 if i == 0:
-                    input_ids, positions = self.prepare_decode(dp_seqs, is_dummy)
+                    input_ids, positions = self.prepare_decode_bytes(
+                        data, aux, is_dummy
+                    )
                 else:
-                    input_ids, positions = self.update_decode(
-                        input_ids, positions, dp_seqs
+                    input_ids, positions = self.update_decode_inplace(
+                        input_ids, positions, num_sp_seqs
                     )
 
             if input_ids.numel() == 0:
                 logger.critical(
                     "EMPTY input_ids before run_model! rank=%s is_prefill=%s "
                     "is_dummy=%s input_ids.shape=%s positions.shape=%s "
-                    "num_dp_seqs=%s num_sp_seqs=%s",
+                    "num_sp_seqs=%s",
                     self.rank,
                     is_prefill,
                     is_dummy,
                     input_ids.shape,
                     positions.shape,
-                    len(dp_seqs),
                     num_sp_seqs,
                 )
             logits = self.run_model(input_ids, positions, is_prefill)
 
             tp_rank = get_dist_context().attn_tp_rank
             if tp_rank == 0:
-                temperatures = self.prepare_sample(dp_seqs)
+                temperatures = self.prepare_sample_from_aux(aux)
                 input_ids = self.sampler(logits, temperatures)
             else:
-                input_ids = input_ids.new_zeros([len(sp_seqs)])
+                input_ids = input_ids.new_zeros([num_sp_seqs])
             dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
 
-            update_seqs_inner_loop(sp_seqs, sp_rank)
+            # No update_seqs_inner_loop needed — metadata already updated in-place
 
             if self.profiler and self.run_count >= self.profiler_start_step:
                 if self.run_count < self.profiler_end_step:
@@ -872,7 +817,7 @@ class ModelRunner:
                         f"Rank {self.rank}: Profiler stopped and saved at step {self.run_count}"
                     )
 
-            self.run_count += 1  # 每次调用计数+1
+            self.run_count += 1
             get_context().token_ids.append(input_ids[None, ...])
 
         loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()

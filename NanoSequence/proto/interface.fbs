@@ -1,0 +1,52 @@
+// Engine <==> ModelRunner lean communication protocol
+// Only transmits fields actually needed by the runner.
+
+namespace nanodeploy.fbs;
+
+table IntListI {
+  values: [int];
+}
+
+// ========== Run Protocol ==========
+
+table SequenceInput {
+  master_sp_idx: int;
+  num_tokens: int;
+  num_cached_tokens: int;        // prefill only
+  last_token: int;               // decode only
+  token_ids: [int];              // prefill only (uncached portion)
+  sp_block_table: [IntListI];    // block tables per sp rank
+  num_dispatched_tokens: [int];  // context lengths per sp rank
+  state_slot: int = -1;          // GDN state slot
+  temperature: double = 1.0;     // sampling temperature
+}
+
+table RunBatchInput {
+  sequences: [SequenceInput];
+  is_prefill: bool;
+}
+
+// ========== Migrate Protocol ==========
+
+struct BlockLocationPair {
+  sp_idx: int;
+  block_idx: int;
+}
+
+table MigrateSequenceInput {
+  seq_id: uint64;                              // for logging
+  // MIGRATE slot fields
+  migrate_engine_id: string;
+  migrate_num_kvcache_blocks: int;
+  migrate_attention_sp: int;
+  migrate_dp_idx: int;
+  migrate_block_location: [BlockLocationPair];
+  migrate_state_slot: int = -1;
+  // ACTIVE slot fields
+  active_block_location: [BlockLocationPair];
+  active_state_slot: int = -1;
+}
+
+table MigrateBatchInput {
+  sequences: [MigrateSequenceInput];
+}
