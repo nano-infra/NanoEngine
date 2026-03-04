@@ -4,7 +4,7 @@
 
 ## 当前状态概要
 
-NanoDeploy 已支持 DeepSeek-V3 (MLA + MoE + FP8) 和 Qwen3-MoE 的推理，具备 prefill-decode 分离、RDMA KV cache 迁移、EP (Expert Parallelism)、SP (Sequence Parallelism) 等能力。但架构上以 DeepSeek V3 为中心、单体化程度较高，不利于多模型扩展。
+NanoDeploy 已支持 DeepSeek-V3 (MLA + MoE + FP8) 和 Qwen3-MoE 的推理，具备 prefill-decode 分离、RDMA KV cache 迁移、EP (Expert Parallelism)、SP (Sequence Parallelism) 等能力。近期通过引入**基于 FlatBuffers 的 Lean Engine-Runner Protocol**，彻底去除了 Ray 层的 Python Sequence 对象序列化开销，实现了 Engine 与 Worker 间高效、安全的轻量级二进制通信（并附带了严谨的 C++ 内存安全校验）。但在总体架构上，依然以 DeepSeek V3 为中心、单体化程度较高，不利于多模型扩展。
 
 ______________________________________________________________________
 
@@ -21,29 +21,21 @@ ______________________________________________________________________
 - **修复**：`LinearBase` 接受 `parallel_context: Literal["attn", "ffn"]` 参数，按需读取对应 mesh 的 rank/size/group
 - **影响范围**：所有 model 文件中构造 Linear 的地方需传入 `parallel_context`
 
-### 2. `profiler_dir` 硬编码路径
+### 2. `profiler_dir` 硬编码路径 (✅ 已修复)
 
 - `config.py` L63: `profiler_dir` 默认值是开发者个人路径
-- **修复**：改为 `None` 或 `./profiler_output`
+- **修复状态**：已在 `config.py` 中修改为相对路径 `./profiler_res`
 
 ______________________________________________________________________
 
 ## P1 — 架构改进（短期 1-2 月）
 
-### 3. Loader 通用化
+### 3. Loader 通用化 (✅ 已修复)
 
 > \[!IMPORTANT\]
 > 已支持 DeepSeek V3 和 Qwen3 MoE 两个模型，loader 的模型特化逻辑急需拆分。
 
-将 `loader.py` 的模型特定逻辑拆分为 handler 注册模式：
-
-```
-load_model()  — 通用遍历 safetensors + progress bar
-  ├── model.weight_handlers  — 模型注册的 handler 列表
-  │   ├── DeepSeek: _handle_expert_weight, _handle_kv_b_proj, _is_mtp_weight
-  │   └── Qwen3MoE: _handle_qwen_expert_weight
-  └── default handler: packed_modules_mapping + direct load
-```
+**修复状态**：已重构 `loader.py` 中的 `load_model()`，目前优先识别模型自身实现的 `load_weights()` 方法并下发委托。通用处理逻辑已被提炼为 `load_per_expert_weight` 和 `load_packed_expert_weight` 供各模型自有 loader 灵活组合复用。
 
 ### 4. 量化与数据类型体系
 
@@ -141,7 +133,7 @@ ______________________________________________________________________
 
 ## P3 — 新模型架构支持（中长期 3-6 月）
 
-### 14. 线性注意力 / State Space Model 支持
+### 14. 线性注意力 / State Space Model 支持 (✅ 已支持)
 
 下一代模型可能混合使用 softmax attention 和线性注意力（如 Mamba-2、RWKV-6、RetNet）：
 
@@ -151,13 +143,13 @@ ______________________________________________________________________
 - Scheduler 的 block 分配逻辑不适用于固定大小 state
 - Prefill 时线性注意力可用 chunk-wise parallel scan，decode 时需要 recurrent update
 
-**需求**：
+**支持状态**：
 
-- 新增 `StateCache` 管理器（per-layer 固定大小 tensor，不做 paging）
-- `model_runner.py` 支持 mixed cache（部分层用 KV cache，部分层用 state cache）
-- 新的 attention impl：`LinearAttentionImpl`（chunk-wise prefill + recurrent decode）
+- 已新增 `StateManager`，并在 Scheduler 和 `Sequence` 生命周期内分配与释放固定大小的 `state_slot`。
+- Worker 端 `model_runner.py` 内分配统一大小的 `gdn_conv_states` 和 `gdn_recurrent_states` Tensor buffer。
+- 实现了 `GenericGatedDeltaNet` 并对接 `fla` 库的 chunk 预填充和 fused recurrent 解码 kernel。
 
-### 15. 混合注意力 + State 的统一页表
+### 15. 混合注意力 + State 的统一页表 (✅ 已验证)
 
 未来模型可能交替使用 softmax attention 层和 state 层（如 Jamba 架构）：
 
@@ -169,11 +161,10 @@ Layer 3: Mamba SSM → State cache
 ...
 ```
 
-**统一管理方案**：
+**实现方案**：
 
-- 扩展 `BlockAllocator` 支持两种 block 类型：KV block（变长）+ State block（定长）
-- 每个 Sequence 维护 `kv_block_table` + `state_slot_table`
-- Eviction 策略：KV cache 可按 token 粒度 evict，state 只能整个序列 evict
+- 在 Engine-Runner 协议（Lean Protocol）中将 `block_tables`（变长）与 `state_slot`（定长下标）解耦统一传输。
+- State 的驱逐和迁移目前采用整个序列级别的操作，在 `MigrateBatchInput` 中通过 `migrate_state_slot` / `active_state_slot` 实现，比 KV block-wise 迁移更轻量。
 - Prefill-decode 分离时，state transfer 比 KV transfer 简单得多（固定大小 memcpy）
 
 ### 16. Multi-Token Prediction (MTP) / Speculative Decoding
@@ -186,14 +177,14 @@ DeepSeek-V3 本身有 MTP 头（当前 loader 跳过了这些权重）：
 
 ### 17. 更多模型支持
 
-| 模型                     | 难度  | 关键特性                                                       |
-| ------------------------ | ----- | -------------------------------------------------------------- |
-| GLM5                     | 中    | 可能采用新的注意力变体、需要适配 tokenizer 和 chat template    |
-| Qwen3.5 MoE              | 低-中 | 在已有 Qwen3 MoE 基础上适配，关注 expert 数量/routing 策略变化 |
-| Llama 4 (Maverick/Scout) | 中    | MoE + 长上下文、GQA 而非 MLA                                   |
-| Qwen3 Dense              | 低    | 已有 MoE 版，dense 版更简单                                    |
-| Gemma 3                  | 中    | Sliding window attention                                       |
-| 混合架构 (Jamba 等)      | 高    | 需要 State cache 支持 (P3.14)                                  |
+| 模型                     | 难度  | 关键特性                                                        |
+| ------------------------ | ----- | --------------------------------------------------------------- |
+| GLM5                     | 中    | 可能采用新的注意力变体、需要适配 tokenizer 和 chat template     |
+| Qwen3.5 MoE              | 低-中 | **✅ 已支持** (混合注意力 GQA+GDN 线性注意力，带 Shared Expert) |
+| Llama 4 (Maverick/Scout) | 中    | MoE + 长上下文、GQA 而非 MLA                                    |
+| Qwen3 Dense              | 低    | 已有 MoE 版，dense 版更简单                                     |
+| Gemma 3                  | 中    | Sliding window attention                                        |
+| 混合架构 (Jamba 等)      | 高    | **✅ 已通过 Qwen3.5 MoE 验证 State cache 支持 (P3.14)**         |
 
 ______________________________________________________________________
 
