@@ -48,6 +48,7 @@ class HopperBackendFactory(BackendFactory):
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
             quantization_config=self.quant_config,
+            parallel_context=kwargs.get("parallel_context", "attn"),
         )
 
     def get_column_parallel_linear(
@@ -72,6 +73,7 @@ class HopperBackendFactory(BackendFactory):
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
             quantization_config=self.quant_config,
+            parallel_context=kwargs.get("parallel_context", "attn"),
         )
 
     def get_merged_column_parallel_linear(
@@ -96,6 +98,7 @@ class HopperBackendFactory(BackendFactory):
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
             quantization_config=self.quant_config,
+            parallel_context=kwargs.get("parallel_context", "attn"),
         )
 
     def get_qkv_parallel_linear(

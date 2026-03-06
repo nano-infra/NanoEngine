@@ -47,6 +47,7 @@ class GenericBackendFactory(BackendFactory):
             meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
+            parallel_context=kwargs.get("parallel_context", "attn"),
         )
 
     def get_column_parallel_linear(
@@ -69,6 +70,7 @@ class GenericBackendFactory(BackendFactory):
             meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
+            parallel_context=kwargs.get("parallel_context", "attn"),
         )
 
     def get_merged_column_parallel_linear(
@@ -91,6 +93,7 @@ class GenericBackendFactory(BackendFactory):
             meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
+            parallel_context=kwargs.get("parallel_context", "attn"),
         )
 
     def get_qkv_parallel_linear(
@@ -117,7 +120,7 @@ class GenericBackendFactory(BackendFactory):
             meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
-        )
+        )  # QKV always uses attn context
 
     def get_replicated_linear(
         self,
@@ -139,7 +142,7 @@ class GenericBackendFactory(BackendFactory):
             meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
-        )
+        )  # Replicated has no TP sharding
 
     def get_distributed_routed_experts(
         self,
