@@ -314,7 +314,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         ffn_ep = get_dist_context().ffn_ep_world_size
         if attn_tp > 1 and ffn_ep > 1:
             self.attn_to_ffn = AttnToFfnTransition()
-            self.ffn_to_attn = FfnToAttnTransition()
+            self.ffn_to_attn = FfnToAttnTransition(scatter_layer=self.attn_to_ffn)
         else:
             self.attn_to_ffn = nn.Identity()
             self.ffn_to_attn = nn.Identity()
