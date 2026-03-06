@@ -32,6 +32,10 @@ from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanodeploy.layers.layernorm import RMSNorm
+from nanodeploy.layers.parallelism_transition import (
+    AttnToFfnTransition,
+    FfnToAttnTransition,
+)
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.runner_config import get_runner_config
@@ -206,6 +210,7 @@ class Qwen3_5MoeMLP(nn.Module):
             meta=meta,
             weight_tensor=gate_up_proj_tensor,
             scale_tensor=gate_up_scale_inv_tensor,
+            parallel_context="ffn",
         )
 
         self.down_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
@@ -215,6 +220,7 @@ class Qwen3_5MoeMLP(nn.Module):
             meta=meta,
             weight_tensor=down_proj_tensor,
             scale_tensor=down_scale_inv_tensor,
+            parallel_context="ffn",
         )
 
         assert hidden_act == "silu"
@@ -368,6 +374,16 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=True
         )
 
+        # Parallelism transition
+        attn_tp = get_dist_context().attn_tp_world_size
+        ffn_ep = get_dist_context().ffn_ep_world_size
+        if attn_tp > 1 and ffn_ep > 1:
+            self.attn_to_ffn = AttnToFfnTransition()
+            self.ffn_to_attn = FfnToAttnTransition()
+        else:
+            self.attn_to_ffn = nn.Identity()
+            self.ffn_to_attn = nn.Identity()
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -387,7 +403,9 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
+        hidden_states = self.attn_to_ffn(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn_to_attn(hidden_states)
 
         return hidden_states, residual
 
