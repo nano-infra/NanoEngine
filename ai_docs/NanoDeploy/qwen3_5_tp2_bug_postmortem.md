@@ -24,10 +24,10 @@ When transforming from `attn` to `ffn`, the `AttnToFfnTransition` layer takes th
 
 The FFN layer (`Qwen3_5MoeSparseMoeBlock`) consists of two parts: the `routed_experts` and a `shared_expert`.
 The `shared_expert` is a normal MLP instantiated via `Qwen3_5MoeMLP`, which uses our unified `GenericBackendFactory` (and `HopperBackendFactory`) to spawn its native parallel linear layers.
-When `Qwen3_5MoeMLP` initializes its inner linear layers, it explicitly passes `parallel_context="ffn"` so that the linear layers know to use the `ffn_tp_group` (which has size 1) and not the `attn_tp_group` (which has size 2).
+When `Qwen3_5MoeMLP` initializes its inner linear layers, it historically relied on a string tag `parallel_context="ffn"` to select the communication group.
 
-**The Bug:** The underlying Python factories (`get_column_parallel_linear`, `get_row_parallel_linear`, etc.) failed to propagate the `**kwargs` into the linear class constructors. It completely dropped `parallel_context`.
-Because `parallel_context` was dropped, the linear layers inside the `shared_expert` defaulted to `attn`, falling back to using the `attn_tp_group` (size 2).
+**The Bug:** The underlying Python factories (`get_column_parallel_linear`, `get_row_parallel_linear`, etc.) failed to propagate `**kwargs` into the linear class constructors. It completely dropped the configuration.
+Because the context was dropped, the linear layers inside the `shared_expert` defaulted to `attn`, falling back to using the `attn_tp_group` (size 2).
 
 ### The Fatal Collision
 
@@ -37,7 +37,7 @@ The illicit `AllReduce` forcibly summed the real token's output with the padded 
 
 ## Resolution
 
-1. **Fix Factory Kwargs:** Fixed `GenericBackendFactory` and `HopperBackendFactory` in `nanodeploy/backends/` to explicitly extract `kwargs.get("parallel_context", "attn")` and pass it down to `RowParallelLinear`, `ColumnParallelLinear`, and `MergedColumnParallelLinear` constructors.
+1. **Refactor Parallelism Group Passing (`tp_group`):** We replaced the ambiguous string-based `parallel_context` tag with a direct `tp_group` parameter of type `dist.ProcessGroup`. `Qwen3_5MoeMLP` now explicitly passes `tp_group=get_dist_context().ffn_tp_group` to the `GenericBackendFactory` and `HopperBackendFactory`. The factories and the underlying linear layers (`RowParallelLinear`, `ColumnParallelLinear`, etc.) were updated to explicitly accept and utilize this `tp_group` parameter over `**kwargs`.
 2. **Deterministic Fallback (Defense in Depth):** Added `torch.manual_seed(0)` during `_complete_dist_init` in `ModelRunner`. This ensures that any randomly initialized variables not loaded from `safetensors` behave identically across all TP ranks regardless of the degree of parallelism chunking.
 
-With the parallel context properly preserved, the `shared_expert` correctly executes as completely replicated (since `ffn_tp=1`) and refrains from cross-GPU `AllReduce`, isolating the real tokens from padding tokens.
+With the `tp_group` properly passed and preserved, the `shared_expert` correctly executes as completely replicated (since `ffn_tp=1`) and refrains from cross-GPU `AllReduce`, isolating the real tokens from padding tokens.
