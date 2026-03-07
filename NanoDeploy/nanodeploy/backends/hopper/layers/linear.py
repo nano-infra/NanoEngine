@@ -55,19 +55,16 @@ class _HopperLinearMixin:
         bias_tensor: Optional[torch.Tensor],
         scale_tensor: Optional[torch.Tensor],
         quantization_config: QuantizationConfig,
-        parallel_context: str = "attn",
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         self.quantization_config = quantization_config or QuantizationConfig()
         self.tp_dim = tp_dim
-        ctx = get_dist_context()
-        if parallel_context == "ffn":
-            self.tp_rank = ctx.ffn_tp_rank
-            self.tp_size = ctx.ffn_tp_world_size
-            self._tp_group = ctx.ffn_tp_group
-        else:
-            self.tp_rank = ctx.attn_tp_rank
-            self.tp_size = ctx.attn_tp_world_size
-            self._tp_group = ctx.attn_tp_group
+        if tp_group is None:
+            tp_group = get_dist_context().attn_tp_group
+
+        self.tp_rank = dist.get_rank(tp_group)
+        self.tp_size = dist.get_world_size(tp_group)
+        self._tp_group = tp_group
 
         device = torch.get_default_device() if not meta else torch.device("meta")
         weight_dtype = self.quantization_config.dtype
@@ -189,15 +186,12 @@ class HopperColumnParallelLinear(_HopperLinearMixin, ColumnParallelLinearBase):
         bias_tensor: Optional[torch.Tensor] = None,
         scale_tensor: Optional[torch.Tensor] = None,
         quantization_config: Optional[QuantizationConfig] = None,
-        parallel_context: str = "attn",
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         nn.Module.__init__(self)
-        ctx = get_dist_context()
-        tp_size = (
-            ctx.ffn_tp_world_size
-            if parallel_context == "ffn"
-            else ctx.attn_tp_world_size
-        )
+        if tp_group is None:
+            tp_group = get_dist_context().attn_tp_group
+        tp_size = dist.get_world_size(tp_group)
         self._init_weights(
             input_size,
             _divide(output_size, tp_size),
@@ -208,7 +202,7 @@ class HopperColumnParallelLinear(_HopperLinearMixin, ColumnParallelLinearBase):
             bias_tensor,
             scale_tensor,
             quantization_config,
-            parallel_context=parallel_context,
+            tp_group=tp_group,
         )
 
     def weight_loader(
@@ -250,15 +244,12 @@ class HopperMergedColumnParallelLinear(
         bias_tensor: Optional[torch.Tensor] = None,
         scale_tensor: Optional[torch.Tensor] = None,
         quantization_config: Optional[QuantizationConfig] = None,
-        parallel_context: str = "attn",
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         nn.Module.__init__(self)
-        ctx = get_dist_context()
-        tp_size = (
-            ctx.ffn_tp_world_size
-            if parallel_context == "ffn"
-            else ctx.attn_tp_world_size
-        )
+        if tp_group is None:
+            tp_group = get_dist_context().attn_tp_group
+        tp_size = dist.get_world_size(tp_group)
         self.output_sizes = output_sizes
         self._init_weights(
             input_size,
@@ -270,7 +261,7 @@ class HopperMergedColumnParallelLinear(
             bias_tensor,
             scale_tensor,
             quantization_config,
-            parallel_context=parallel_context,
+            tp_group=tp_group,
         )
 
     def weight_loader(
@@ -325,9 +316,12 @@ class HopperQKVParallelLinear(_HopperLinearMixin, QKVParallelLinearBase):
         bias_tensor: Optional[torch.Tensor] = None,
         scale_tensor: Optional[torch.Tensor] = None,
         quantization_config: Optional[QuantizationConfig] = None,
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         nn.Module.__init__(self)
-        tp_size = get_dist_context().attn_tp_world_size
+        if tp_group is None:
+            tp_group = get_dist_context().attn_tp_group
+        tp_size = dist.get_world_size(tp_group)
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
         self.num_heads = _divide(total_num_heads, tp_size)
@@ -402,15 +396,12 @@ class HopperRowParallelLinear(_HopperLinearMixin, RowParallelLinearBase):
         bias_tensor: Optional[torch.Tensor] = None,
         scale_tensor: Optional[torch.Tensor] = None,
         quantization_config: Optional[QuantizationConfig] = None,
-        parallel_context: str = "attn",
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         nn.Module.__init__(self)
-        ctx = get_dist_context()
-        tp_size = (
-            ctx.ffn_tp_world_size
-            if parallel_context == "ffn"
-            else ctx.attn_tp_world_size
-        )
+        if tp_group is None:
+            tp_group = get_dist_context().attn_tp_group
+        tp_size = dist.get_world_size(tp_group)
         self._init_weights(
             _divide(input_size, tp_size),
             output_size,
@@ -421,7 +412,7 @@ class HopperRowParallelLinear(_HopperLinearMixin, RowParallelLinearBase):
             bias_tensor,
             scale_tensor,
             quantization_config,
-            parallel_context=parallel_context,
+            tp_group=tp_group,
         )
 
     def weight_loader(

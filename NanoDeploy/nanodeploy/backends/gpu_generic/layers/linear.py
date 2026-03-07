@@ -43,18 +43,15 @@ class _GenericLinearMixin:
         meta: bool,
         weight_tensor: Optional[torch.Tensor],
         bias_tensor: Optional[torch.Tensor],
-        parallel_context: str = "attn",
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         self.tp_dim = tp_dim
-        ctx = get_dist_context()
-        if parallel_context == "ffn":
-            self.tp_rank = ctx.ffn_tp_rank
-            self.tp_size = ctx.ffn_tp_world_size
-            self._tp_group = ctx.ffn_tp_group
-        else:
-            self.tp_rank = ctx.attn_tp_rank
-            self.tp_size = ctx.attn_tp_world_size
-            self._tp_group = ctx.attn_tp_group
+        if tp_group is None:
+            tp_group = get_dist_context().attn_tp_group
+
+        self.tp_rank = dist.get_rank(tp_group)
+        self.tp_size = dist.get_world_size(tp_group)
+        self._tp_group = tp_group
 
         device = torch.get_default_device() if not meta else torch.device("meta")
 
@@ -121,15 +118,12 @@ class GenericColumnParallelLinear(_GenericLinearMixin, ColumnParallelLinearBase)
         meta: bool = False,
         weight_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
-        parallel_context: str = "attn",
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         nn.Module.__init__(self)
-        ctx = get_dist_context()
-        tp_size = (
-            ctx.ffn_tp_world_size
-            if parallel_context == "ffn"
-            else ctx.attn_tp_world_size
-        )
+        if tp_group is None:
+            tp_group = get_dist_context().attn_tp_group
+        tp_size = dist.get_world_size(tp_group)
         self._init_weights(
             input_size,
             _divide(output_size, tp_size),
@@ -138,7 +132,7 @@ class GenericColumnParallelLinear(_GenericLinearMixin, ColumnParallelLinearBase)
             meta,
             weight_tensor,
             bias_tensor,
-            parallel_context=parallel_context,
+            tp_group=tp_group,
         )
 
     def weight_loader(
@@ -171,15 +165,12 @@ class GenericMergedColumnParallelLinear(
         meta: bool = False,
         weight_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
-        parallel_context: str = "attn",
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         nn.Module.__init__(self)
-        ctx = get_dist_context()
-        tp_size = (
-            ctx.ffn_tp_world_size
-            if parallel_context == "ffn"
-            else ctx.attn_tp_world_size
-        )
+        if tp_group is None:
+            tp_group = get_dist_context().attn_tp_group
+        tp_size = dist.get_world_size(tp_group)
         self.output_sizes = output_sizes
         self._init_weights(
             input_size,
@@ -189,7 +180,7 @@ class GenericMergedColumnParallelLinear(
             meta,
             weight_tensor,
             bias_tensor,
-            parallel_context=parallel_context,
+            tp_group=tp_group,
         )
 
     def weight_loader(
@@ -228,9 +219,12 @@ class GenericQKVParallelLinear(_GenericLinearMixin, QKVParallelLinearBase):
         meta: bool = False,
         weight_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         nn.Module.__init__(self)
-        tp_size = get_dist_context().attn_tp_world_size
+        if tp_group is None:
+            tp_group = get_dist_context().attn_tp_group
+        tp_size = dist.get_world_size(tp_group)
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
         self.num_heads = _divide(total_num_heads, tp_size)
@@ -244,6 +238,7 @@ class GenericQKVParallelLinear(_GenericLinearMixin, QKVParallelLinearBase):
             meta,
             weight_tensor,
             bias_tensor,
+            tp_group=tp_group,
         )
 
     def weight_loader(
@@ -290,15 +285,12 @@ class GenericRowParallelLinear(_GenericLinearMixin, RowParallelLinearBase):
         meta: bool = False,
         weight_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
-        parallel_context: str = "attn",
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         nn.Module.__init__(self)
-        ctx = get_dist_context()
-        tp_size = (
-            ctx.ffn_tp_world_size
-            if parallel_context == "ffn"
-            else ctx.attn_tp_world_size
-        )
+        if tp_group is None:
+            tp_group = get_dist_context().attn_tp_group
+        tp_size = dist.get_world_size(tp_group)
         self._init_weights(
             _divide(input_size, tp_size),
             output_size,
@@ -307,7 +299,7 @@ class GenericRowParallelLinear(_GenericLinearMixin, RowParallelLinearBase):
             meta,
             weight_tensor,
             bias_tensor,
-            parallel_context=parallel_context,
+            tp_group=tp_group,
         )
 
     def weight_loader(

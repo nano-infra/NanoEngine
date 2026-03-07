@@ -210,7 +210,7 @@ class Qwen3_5MoeMLP(nn.Module):
             meta=meta,
             weight_tensor=gate_up_proj_tensor,
             scale_tensor=gate_up_scale_inv_tensor,
-            parallel_context="ffn",
+            tp_group=get_dist_context().ffn_tp_group,
         )
 
         self.down_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
@@ -220,7 +220,7 @@ class Qwen3_5MoeMLP(nn.Module):
             meta=meta,
             weight_tensor=down_proj_tensor,
             scale_tensor=down_scale_inv_tensor,
-            parallel_context="ffn",
+            tp_group=get_dist_context().ffn_tp_group,
         )
 
         assert hidden_act == "silu"

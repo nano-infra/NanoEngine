@@ -87,6 +87,7 @@ class BackendFactory(ABC):
         weight_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
         scale_tensor: Optional[torch.Tensor] = None,
+        tp_group: Optional["dist.ProcessGroup"] = None,
         **kwargs,
     ) -> RowParallelLinearBase: ...
 
@@ -100,6 +101,7 @@ class BackendFactory(ABC):
         weight_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
         scale_tensor: Optional[torch.Tensor] = None,
+        tp_group: Optional["dist.ProcessGroup"] = None,
         **kwargs,
     ) -> ColumnParallelLinearBase: ...
 
@@ -113,6 +115,7 @@ class BackendFactory(ABC):
         weight_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
         scale_tensor: Optional[torch.Tensor] = None,
+        tp_group: Optional["dist.ProcessGroup"] = None,
         **kwargs,
     ) -> MergedColumnParallelLinearBase: ...
 
@@ -128,6 +131,7 @@ class BackendFactory(ABC):
         weight_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
         scale_tensor: Optional[torch.Tensor] = None,
+        tp_group: Optional["dist.ProcessGroup"] = None,
         **kwargs,
     ) -> QKVParallelLinearBase: ...
 
