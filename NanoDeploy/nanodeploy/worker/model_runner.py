@@ -124,6 +124,9 @@ class ModelRunner:
         hf_config = config.hf_config
         rank = self.rank
 
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0)
+
         torch.cuda.set_device(0)
 
         dist.init_process_group(

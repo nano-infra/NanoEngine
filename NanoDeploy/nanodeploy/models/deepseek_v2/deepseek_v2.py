@@ -19,6 +19,10 @@ from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanodeploy.layers.layernorm import RMSNorm
+from nanodeploy.layers.parallelism_transition import (
+    AttnToFfnTransition,
+    FfnToAttnTransition,
+)
 from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.runner_config import get_runner_config
@@ -245,6 +249,7 @@ class DeepseekV2MLP(nn.Module):
             meta=meta,
             weight_tensor=gate_up_proj_tensor,
             scale_tensor=gate_up_scale_inv_tensor,
+            tp_group=get_dist_context().ffn_tp_group,
         )
 
         self.down_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
@@ -254,6 +259,7 @@ class DeepseekV2MLP(nn.Module):
             meta=meta,
             weight_tensor=down_proj_tensor,
             scale_tensor=down_scale_inv_tensor,
+            tp_group=get_dist_context().ffn_tp_group,
         )
 
         assert hidden_act == "silu"
@@ -303,6 +309,16 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # Parallelism transition
+        attn_tp = get_dist_context().attn_tp_world_size
+        ffn_ep = get_dist_context().ffn_ep_world_size
+        if attn_tp > 1 and ffn_ep > 1:
+            self.attn_to_ffn = AttnToFfnTransition()
+            self.ffn_to_attn = FfnToAttnTransition(scatter_layer=self.attn_to_ffn)
+        else:
+            self.attn_to_ffn = nn.Identity()
+            self.ffn_to_attn = nn.Identity()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -321,7 +337,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.attn_to_ffn(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn_to_attn(hidden_states)
 
         outputs = (hidden_states, residual)
         return outputs
@@ -440,6 +458,7 @@ class DeepseekV2Attention(nn.Module):
             ) = get_backend().get_column_parallel_linear(
                 self.hidden_size,
                 self.num_heads * self.q_head_dim,
+                tp_group=get_dist_context().attn_tp_group,
             )
         else:
             self.q_a_proj: (
@@ -448,6 +467,7 @@ class DeepseekV2Attention(nn.Module):
                 self.hidden_size,
                 config.q_lora_rank,
                 bias=config.attention_bias,
+                tp_group=get_dist_context().attn_tp_group,
             )
             self.q_a_layernorm = RMSNorm(hidden_size=config.q_lora_rank, eps=1e-6)
             self.q_b_proj: (
@@ -456,6 +476,7 @@ class DeepseekV2Attention(nn.Module):
                 config.q_lora_rank,
                 self.num_heads * self.q_head_dim,
                 bias=False,
+                tp_group=get_dist_context().attn_tp_group,
             )
         self.kv_a_proj_with_mqa: (
             ColumnParallelLinearBase
@@ -463,6 +484,7 @@ class DeepseekV2Attention(nn.Module):
             self.hidden_size,
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=config.attention_bias,
+            tp_group=get_dist_context().attn_tp_group,
         )
         self.kv_a_layernorm = RMSNorm(
             config.kv_lora_rank,
@@ -523,6 +545,7 @@ class DeepseekV2Attention(nn.Module):
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=config.attention_bias,
+            tp_group=get_dist_context().attn_tp_group,
         )
 
     def _q_proj_absorbed(self, hidden_states, num_heads: int):

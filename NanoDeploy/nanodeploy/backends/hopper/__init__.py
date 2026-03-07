@@ -35,6 +35,7 @@ class HopperBackendFactory(BackendFactory):
         weight_tensor=None,
         bias_tensor=None,
         scale_tensor=None,
+        tp_group=None,
         **kwargs,
     ) -> RowParallelLinearBase:
         from .layers.linear import HopperRowParallelLinear
@@ -48,6 +49,7 @@ class HopperBackendFactory(BackendFactory):
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
             quantization_config=self.quant_config,
+            tp_group=tp_group,
         )
 
     def get_column_parallel_linear(
@@ -59,6 +61,7 @@ class HopperBackendFactory(BackendFactory):
         weight_tensor=None,
         bias_tensor=None,
         scale_tensor=None,
+        tp_group=None,
         **kwargs,
     ) -> ColumnParallelLinearBase:
         from .layers.linear import HopperColumnParallelLinear
@@ -72,6 +75,7 @@ class HopperBackendFactory(BackendFactory):
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
             quantization_config=self.quant_config,
+            tp_group=tp_group,
         )
 
     def get_merged_column_parallel_linear(
@@ -83,6 +87,7 @@ class HopperBackendFactory(BackendFactory):
         weight_tensor=None,
         bias_tensor=None,
         scale_tensor=None,
+        tp_group=None,
         **kwargs,
     ) -> MergedColumnParallelLinearBase:
         from .layers.linear import HopperMergedColumnParallelLinear
@@ -96,6 +101,7 @@ class HopperBackendFactory(BackendFactory):
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
             quantization_config=self.quant_config,
+            tp_group=tp_group,
         )
 
     def get_qkv_parallel_linear(
@@ -109,6 +115,7 @@ class HopperBackendFactory(BackendFactory):
         weight_tensor=None,
         bias_tensor=None,
         scale_tensor=None,
+        tp_group=None,
         **kwargs,
     ) -> QKVParallelLinearBase:
         from .layers.linear import HopperQKVParallelLinear
@@ -124,6 +131,7 @@ class HopperBackendFactory(BackendFactory):
             bias_tensor=bias_tensor,
             scale_tensor=scale_tensor,
             quantization_config=self.quant_config,
+            tp_group=tp_group,
         )
 
     def get_replicated_linear(

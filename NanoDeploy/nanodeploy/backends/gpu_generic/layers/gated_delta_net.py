@@ -10,11 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from nanodeploy.backends import get_backend
-from nanodeploy.backends.base_backend import (
-    GatedDeltaNetBase,
-    ReplicatedLinearBase,
-    RowParallelLinearBase,
-)
+from nanodeploy.backends.base_backend import GatedDeltaNetBase, ReplicatedLinearBase
 from nanodeploy.context.context import get_context
 from nanodeploy.logging import get_logger
 from nanodeploy.models.quant_config import QuantizationConfig
@@ -127,8 +123,8 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             bias=False,
         )
 
-        # Output projection
-        self.out_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
+        # Output projection (replicated: GDN computes same output on all TP ranks)
+        self.out_proj: ReplicatedLinearBase = get_backend().get_replicated_linear(
             self.value_dim,
             self.hidden_size,
             bias=False,

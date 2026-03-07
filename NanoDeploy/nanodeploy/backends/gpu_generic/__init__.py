@@ -36,6 +36,7 @@ class GenericBackendFactory(BackendFactory):
         weight_tensor=None,
         bias_tensor=None,
         scale_tensor=None,
+        tp_group=None,
         **kwargs,
     ) -> RowParallelLinearBase:
         from .layers.linear import GenericRowParallelLinear
@@ -47,6 +48,7 @@ class GenericBackendFactory(BackendFactory):
             meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
+            tp_group=tp_group,
         )
 
     def get_column_parallel_linear(
@@ -58,6 +60,7 @@ class GenericBackendFactory(BackendFactory):
         weight_tensor=None,
         bias_tensor=None,
         scale_tensor=None,
+        tp_group=None,
         **kwargs,
     ) -> ColumnParallelLinearBase:
         from .layers.linear import GenericColumnParallelLinear
@@ -69,6 +72,7 @@ class GenericBackendFactory(BackendFactory):
             meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
+            tp_group=tp_group,
         )
 
     def get_merged_column_parallel_linear(
@@ -80,6 +84,7 @@ class GenericBackendFactory(BackendFactory):
         weight_tensor=None,
         bias_tensor=None,
         scale_tensor=None,
+        tp_group=None,
         **kwargs,
     ) -> MergedColumnParallelLinearBase:
         from .layers.linear import GenericMergedColumnParallelLinear
@@ -91,6 +96,7 @@ class GenericBackendFactory(BackendFactory):
             meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
+            tp_group=tp_group,
         )
 
     def get_qkv_parallel_linear(
@@ -104,6 +110,7 @@ class GenericBackendFactory(BackendFactory):
         weight_tensor=None,
         bias_tensor=None,
         scale_tensor=None,
+        tp_group=None,
         **kwargs,
     ) -> QKVParallelLinearBase:
         from .layers.linear import GenericQKVParallelLinear
@@ -117,6 +124,7 @@ class GenericBackendFactory(BackendFactory):
             meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
+            tp_group=tp_group,
         )
 
     def get_replicated_linear(
@@ -139,7 +147,7 @@ class GenericBackendFactory(BackendFactory):
             meta=meta,
             weight_tensor=weight_tensor,
             bias_tensor=bias_tensor,
-        )
+        )  # Replicated has no TP sharding
 
     def get_distributed_routed_experts(
         self,
