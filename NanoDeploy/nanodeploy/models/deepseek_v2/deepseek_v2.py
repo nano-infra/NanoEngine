@@ -458,6 +458,7 @@ class DeepseekV2Attention(nn.Module):
             ) = get_backend().get_column_parallel_linear(
                 self.hidden_size,
                 self.num_heads * self.q_head_dim,
+                tp_group=get_dist_context().attn_tp_group,
             )
         else:
             self.q_a_proj: (
@@ -466,6 +467,7 @@ class DeepseekV2Attention(nn.Module):
                 self.hidden_size,
                 config.q_lora_rank,
                 bias=config.attention_bias,
+                tp_group=get_dist_context().attn_tp_group,
             )
             self.q_a_layernorm = RMSNorm(hidden_size=config.q_lora_rank, eps=1e-6)
             self.q_b_proj: (
@@ -474,6 +476,7 @@ class DeepseekV2Attention(nn.Module):
                 config.q_lora_rank,
                 self.num_heads * self.q_head_dim,
                 bias=False,
+                tp_group=get_dist_context().attn_tp_group,
             )
         self.kv_a_proj_with_mqa: (
             ColumnParallelLinearBase
@@ -481,6 +484,7 @@ class DeepseekV2Attention(nn.Module):
             self.hidden_size,
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=config.attention_bias,
+            tp_group=get_dist_context().attn_tp_group,
         )
         self.kv_a_layernorm = RMSNorm(
             config.kv_lora_rank,
@@ -541,6 +545,7 @@ class DeepseekV2Attention(nn.Module):
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=config.attention_bias,
+            tp_group=get_dist_context().attn_tp_group,
         )
 
     def _q_proj_absorbed(self, hidden_states, num_heads: int):

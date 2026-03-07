@@ -73,12 +73,14 @@ class Qwen3MoeAttention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
+            tp_group=get_dist_context().attn_tp_group,
         )
 
         self.o_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            tp_group=get_dist_context().attn_tp_group,
         )
 
         self.rotary_emb = get_rope(

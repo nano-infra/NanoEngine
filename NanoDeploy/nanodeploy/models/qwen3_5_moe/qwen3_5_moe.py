@@ -97,12 +97,14 @@ class Qwen3_5MoeFullAttention(nn.Module):
             q_heads_for_proj,
             self.total_num_kv_heads,
             bias=getattr(config, "attention_bias", False),
+            tp_group=get_dist_context().attn_tp_group,
         )
 
         self.o_proj: RowParallelLinearBase = get_backend().get_row_parallel_linear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=getattr(config, "attention_bias", False),
+            tp_group=get_dist_context().attn_tp_group,
         )
 
         # RoPE: use rotary_dim as head_size for the rotary embedding
