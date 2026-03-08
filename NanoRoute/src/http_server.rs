@@ -175,12 +175,14 @@ async fn chat_completions(
         let model_name = req.model.clone();
         let tokenizer = tokenizer.clone();
         let request_id = request_id.clone();
+        let mut active_adapter = adapter.clone();
 
         // Use async-stream macros for clean generator syntax
         let stream = async_stream::stream! {
             let mut generated_tokens: Vec<u32> = Vec::new();
             let mut last_text_len = 0;
             let stream_start = std::time::Instant::now();
+            let mut is_finished = false;
 
             tracing::info!("[DIAG] SSE stream STARTED for seq_id={}", seq_id);
 
@@ -217,6 +219,7 @@ async fn chat_completions(
                     },
                     StreamEvent::Finished => {
                         tracing::info!("[DIAG] SSE stream FINISHED normally for seq_id={}, elapsed={:.1}s, generated_tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
+                        is_finished = true;
                         let chunk = serde_json::json!({
                             "id": request_id,
                             "object": "chat.completion.chunk",
@@ -256,6 +259,10 @@ async fn chat_completions(
                                  Ok(new_rx) => {
                                       // SWAP RX channel transparently
                                       rx = new_rx;
+
+                                      // Update active tracked adapter to route the disconnect signal to the correct place
+                                      active_adapter = decode_adapter_arc.clone();
+
                                       tracing::info!("[DIAG] Migration successful for seq_id={}. Resuming stream on Decode Engine.", seq_id);
                                  },
                                  Err(e) => {
@@ -274,7 +281,13 @@ async fn chat_completions(
             }
 
             // If we reach here via rx channel closing (None), the client likely disconnected
-            tracing::warn!("[DIAG] SSE stream ENDED for seq_id={}, elapsed={:.1}s, generated_tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
+            if !is_finished {
+                 tracing::warn!("[DIAG] Stream ended prematurely (Disconnect/Error) for seq_id={}, elapsed={:.1}s, generated_tokens={}. Sending FREE request to active engine.", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
+                 let mut adapter_guard = active_adapter.lock().await;
+                 let _ = adapter_guard.send_free_request(seq_id).await;
+            } else {
+                 tracing::info!("[DIAG] SSE stream ENDED normally for seq_id={}, elapsed={:.1}s, generated_tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
+            }
         };
 
         Sse::new(stream).into_response()

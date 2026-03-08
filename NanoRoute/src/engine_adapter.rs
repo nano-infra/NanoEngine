@@ -1,6 +1,6 @@
 use crate::fbs::{
-    SamplingParams, SamplingParamsArgs, Sequence, SequenceArgs, SequenceList, SequenceListArgs,
-    SequenceStatus, StepOut,
+    FreeSequences, FreeSequencesArgs, SamplingParams, SamplingParamsArgs, Sequence, SequenceArgs,
+    SequenceList, SequenceListArgs, SequenceStatus, StepOut,
 };
 use crate::zmq_packet::ZmqPacket;
 use flatbuffers::FlatBufferBuilder;
@@ -188,7 +188,13 @@ impl EngineAdapter {
 
                 // Action 1: Migration response (SequenceList payload)
                 if action == 1 {
-                    let sl = unsafe { flatbuffers::root_unchecked::<SequenceList>(&payload) };
+                    let sl = match flatbuffers::root::<SequenceList>(&payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("Failed to safely parse SequenceList flatbuffer: {}", e);
+                            continue;
+                        }
+                    };
                     let seq_id = sl.sequences().and_then(|seqs| {
                         if seqs.is_empty() {
                             None
@@ -223,7 +229,13 @@ impl EngineAdapter {
 
                 // Action 0: StepOut (token streaming)
                 if action == 0 {
-                    let step_out = unsafe { flatbuffers::root_unchecked::<StepOut>(&payload) };
+                    let step_out = match flatbuffers::root::<StepOut>(&payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("Failed to safely parse StepOut flatbuffer: {}", e);
+                            continue;
+                        }
+                    };
                     let seq_id = step_out.seq_id();
                     let status = step_out.status();
 
@@ -401,5 +413,32 @@ impl EngineAdapter {
         );
         self.send_packet(1, payload)?;
         Ok(rx)
+    }
+
+    pub async fn send_free_request(&mut self, seq_id: u64) -> anyhow::Result<()> {
+        let mut builder = FlatBufferBuilder::new();
+        let seq_ids_vec = builder.create_vector(&[seq_id]);
+
+        // source_engine_id: Identify that the router triggered the free
+        let source_id = builder.create_string("router");
+
+        let free_req = FreeSequences::create(
+            &mut builder,
+            &FreeSequencesArgs {
+                seq_ids: Some(seq_ids_vec),
+                source_engine_id: Some(source_id),
+            },
+        );
+        builder.finish(free_req, None);
+        let payload = builder.finished_data().to_vec();
+
+        info!("Sending FREE request for seq {} from router", seq_id);
+        self.send_packet(3, payload)?;
+
+        // Remove from pending completely
+        let mut map = self.pending_requests.lock().await;
+        map.remove(&seq_id);
+
+        Ok(())
     }
 }

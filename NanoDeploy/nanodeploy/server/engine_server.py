@@ -126,7 +126,9 @@ class BackendService:
         self._send_response(action=0, payload=payload)
 
     def _send_migration(self, seq):
-        buffer_size = 4096 * 16
+        buffer_size = (
+            1024 * 1024 * 16
+        )  # 16MB buffer to prevent overflow during large history migrations
         buffer = ctypes.create_string_buffer(buffer_size)
         ptr = ctypes.addressof(buffer)
 
