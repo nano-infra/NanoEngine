@@ -36,8 +36,11 @@ class GenericDistributedRoutedExperts(DistributedRoutedExpertsBase):
         norm_topk_prob: bool = False,
         routed_scaling_factor: float = 1.0,
         scoring_func: str = "softmax",
+        quantization_config=None,
+        layer_idx: int = -1,
     ):
         nn.Module.__init__(self)
+        self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.intermediate_size = intermediate_size
