@@ -79,7 +79,7 @@ class ModelRunner:
         set_runner_config(
             max_num_seqs=config.max_num_seqs,
             dummy_weight=config.dummy_weight,
-            perfect_eplb=config.perfect_eplb,
+            enable_eplb=config.enable_eplb,
         )
 
         if defer_dist_init:
