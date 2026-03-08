@@ -197,14 +197,18 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
             while True:
                 try:
                     action, payload = requests_queue.get_nowait()
-                    if action == 1:
-                        service._handle_add_request(payload)
-                    elif action == 2:
-                        service._handle_get_info()
-                    elif action == 3:
-                        service._handle_free_sequences(payload)
-                    else:
-                        logger.warning(f"Unknown action: {action}")
+                    try:
+                        if action == 1:
+                            service._handle_add_request(payload)
+                        elif action == 2:
+                            service._handle_get_info()
+                        elif action == 3:
+                            service._handle_free_sequences(payload)
+                        else:
+                            logger.warning(f"Unknown action: {action}")
+                    except Exception as e:
+                        logger.error(f"Error handling request action {action}: {e}")
+                        traceback.print_exc()
                 except queue.Empty:
                     break
 
