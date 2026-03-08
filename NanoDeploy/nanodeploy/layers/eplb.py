@@ -358,6 +358,7 @@ class EPLBDispatchInfo:
     partial_logical_to_rank_dispatch_physical_map: torch.Tensor
     partial_logical_to_all_physical_map: torch.Tensor
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
+    dispatch_cursor: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(cls, ep_rank: int, layer_idx: int):
@@ -390,9 +391,76 @@ def _topk_ids_logical_to_physical_random(
     return topk_ids
 
 
+def _topk_ids_logical_to_physical_perfect(
+    topk_ids: torch.Tensor, info: EPLBDispatchInfo
+) -> torch.Tensor:
+    topk_ids_original_shape = topk_ids.shape
+    device = topk_ids.device
+    topk_ids_flat = topk_ids.flatten()
+
+    valid_mask = topk_ids_flat >= 0
+    valid_topk_ids = topk_ids_flat[valid_mask]
+
+    if valid_topk_ids.numel() == 0:
+        return topk_ids
+
+    if getattr(info, "dispatch_cursor", None) is None:
+        info.dispatch_cursor = torch.zeros(
+            info.partial_logical_to_all_physical_map_num_valid.shape,
+            dtype=torch.int32,
+            device=device,
+        )
+
+    # 1. Sort valid_topk_ids to group identical logical experts
+    sorted_topk_ids, sorted_indices = torch.sort(valid_topk_ids)
+
+    # 2. Vectorized rank within group (cumcount)
+    ones = torch.ones_like(sorted_topk_ids)
+    cum_ones = torch.cumsum(ones, dim=0)
+
+    changes = torch.cat(
+        [
+            torch.tensor([True], device=device, dtype=torch.bool),
+            sorted_topk_ids[1:] != sorted_topk_ids[:-1],
+        ]
+    )
+
+    offsets = cum_ones.masked_fill(~changes, 0)
+    offsets_filled = torch.cummax(offsets, dim=0)[0]
+    rank_within_group = cum_ones - offsets_filled
+
+    # 3. Add the per-expert cursor
+    base_cursor = info.dispatch_cursor[sorted_topk_ids]
+    chosen_dispatch_index_sorted = base_cursor + rank_within_group
+
+    # 4. Scatter back to original token positions (only for valid ones)
+    chosen_dispatch_index = torch.empty_like(chosen_dispatch_index_sorted)
+    chosen_dispatch_index[sorted_indices] = chosen_dispatch_index_sorted
+
+    # 5. Update the cursors in info
+    counts = torch.bincount(valid_topk_ids, minlength=info.dispatch_cursor.size(0))
+    info.dispatch_cursor += counts
+
+    # 6. Modulo by valid physical replicas and map to physical expert ID
+    num_valid = info.partial_logical_to_all_physical_map_num_valid[valid_topk_ids]
+    chosen_dispatch_index = chosen_dispatch_index % num_valid
+
+    physical_ids = info.partial_logical_to_all_physical_map[
+        valid_topk_ids, chosen_dispatch_index
+    ]
+
+    result_topk_ids = topk_ids_flat.clone()
+    result_topk_ids[valid_mask] = physical_ids
+    return result_topk_ids.view(topk_ids_original_shape)
+
+
 def topk_ids_logical_to_physical(
-    topk_ids: torch.Tensor, info: Optional[EPLBDispatchInfo] = None
+    topk_ids: torch.Tensor,
+    info: Optional[EPLBDispatchInfo] = None,
+    mode: str = "random",
 ) -> torch.Tensor:
     if info is None:
         return topk_ids
+    if mode == "perfect":
+        return _topk_ids_logical_to_physical_perfect(topk_ids, info)
     return _topk_ids_logical_to_physical_random(topk_ids, info)

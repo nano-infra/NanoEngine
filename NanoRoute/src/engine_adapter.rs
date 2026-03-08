@@ -335,6 +335,8 @@ impl EngineAdapter {
         seq_id: u64,
         token_ids: &[u32],
         max_tokens: i32,
+        temperature: f32,
+        ignore_eos: bool,
     ) -> anyhow::Result<tokio_mpsc::UnboundedReceiver<StreamEvent>> {
         let mut builder = FlatBufferBuilder::new();
         let token_ids_i32: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
@@ -343,9 +345,9 @@ impl EngineAdapter {
         let sampling_params = SamplingParams::create(
             &mut builder,
             &SamplingParamsArgs {
-                temperature: 0.1,
+                temperature: temperature as f64,
                 max_tokens,
-                ignore_eos: false,
+                ignore_eos,
             },
         );
 

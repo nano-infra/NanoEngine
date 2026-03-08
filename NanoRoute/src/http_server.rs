@@ -17,12 +17,17 @@ use tower_http::trace::TraceLayer;
 
 // Request Payload (OpenAI-compatible)
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
     pub max_tokens: Option<u32>,
     pub max_completion_tokens: Option<u32>,
     pub stream: Option<bool>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub ignore_eos: Option<bool>,
 }
 
 // Custom Debug implementation: truncate long messages to first few words
@@ -44,11 +49,14 @@ impl fmt::Debug for ChatCompletionRequest {
             .field("max_tokens", &self.max_tokens)
             .field("max_completion_tokens", &self.max_completion_tokens)
             .field("stream", &self.stream)
+            .field("temperature", &self.temperature)
+            .field("ignore_eos", &self.ignore_eos)
             .finish()
     }
 }
 
 #[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Message {
     pub role: String,
     pub content: String,
@@ -142,7 +150,13 @@ async fn chat_completions(
 
         let max_tokens = req.effective_max_tokens(16) as i32;
         adapter_guard
-            .send_add_request(seq_id, &token_ids, max_tokens)
+            .send_add_request(
+                seq_id,
+                &token_ids,
+                max_tokens,
+                req.temperature.unwrap_or(0.1),
+                req.ignore_eos.unwrap_or(false),
+            )
             .await
     };
 

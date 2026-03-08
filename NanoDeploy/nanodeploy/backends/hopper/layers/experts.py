@@ -39,8 +39,10 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         routed_scaling_factor: float = 1.0,
         scoring_func: str = "softmax",
         quantization_config=None,
+        layer_idx: Optional[int] = None,
     ):
         nn.Module.__init__(self)
+        self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.intermediate_size = intermediate_size
@@ -106,13 +108,24 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         from nanodeploy.layers.eplb import topk_ids_logical_to_physical
         from nanodeploy.worker.runner_config import get_runner_config
 
-        if get_runner_config().perfect_eplb:
-            import nanodeploy.layers.eplb as eplb
-
-            topk_ids = eplb.topk_ids_logical_to_physical(topk_ids, info=None)
-
         ctx = ExpertContext.get_instance()
         buffer = ctx.get_buffer()
+
+        # Use EPLB dispatch if ep_size > 1 and we have layer_idx
+        runner_config = get_runner_config()
+        if (
+            getattr(runner_config, "perfect_eplb", False)
+            and self.ep_size > 1
+            and self.layer_idx is not None
+        ):
+            import nanodeploy.layers.eplb as eplb
+
+            info = eplb.EPLBDispatchInfo.init_new(
+                ep_rank=self.ep_rank, layer_idx=self.layer_idx
+            )
+            topk_ids = eplb.topk_ids_logical_to_physical(
+                topk_ids, info=info, mode="perfect"
+            )
 
         if self.ep_size <= 1:
             return self._compute_local(
