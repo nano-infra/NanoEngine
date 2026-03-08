@@ -11,7 +11,7 @@ logger = get_logger()
 class RunnerConfig:
     max_num_seqs: int | None = None
     dummy_weight: bool = False
-    perfect_eplb: bool = False
+    enable_eplb: bool = False
 
 
 # Singleton instance of RunnerConfig
@@ -25,11 +25,11 @@ def get_runner_config() -> RunnerConfig:
 def set_runner_config(
     max_num_seqs: int | None = None,
     dummy_weight: Optional[bool] = None,
-    perfect_eplb: Optional[bool] = None,
+    enable_eplb: Optional[bool] = None,
 ):
     global _RUNNER_CONFIG
     _RUNNER_CONFIG = RunnerConfig(
-        max_num_seqs=max_num_seqs, dummy_weight=dummy_weight, perfect_eplb=perfect_eplb
+        max_num_seqs=max_num_seqs, dummy_weight=dummy_weight, enable_eplb=enable_eplb
     )
 
 
