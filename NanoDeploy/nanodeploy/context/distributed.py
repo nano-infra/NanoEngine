@@ -122,6 +122,11 @@ class DistContext:
         return self.ffn_device_mesh.get_group("ffn_tp")
 
     @property
+    def local_rank(self):
+        """Get the local rank of the current process"""
+        return dist.get_node_local_rank(self.rank % 8)
+
+    @property
     def cpu_world_rank(self):
         """Get the current process rank in CPU global communication group"""
         return dist.get_rank(self.cpu_world_group)
