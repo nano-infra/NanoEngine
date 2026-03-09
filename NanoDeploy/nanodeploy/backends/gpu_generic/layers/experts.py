@@ -108,20 +108,10 @@ class GenericDistributedRoutedExperts(DistributedRoutedExpertsBase):
 
     def _get_or_create_local_dispatcher(self) -> LocalPaddedDispatcher:
         if self._local_dispatcher is None:
-            from nanodeploy.worker.runner_config import get_runner_config
-
-            max_num_seqs = get_runner_config().max_num_seqs or 512
-            capacity_factor = 2
-            raw_max_m = (
-                max_num_seqs * self.top_k // self.num_local_experts * capacity_factor
-            )
-            max_m = max(raw_max_m, 128)
-            self._local_dispatcher = LocalPaddedDispatcher(
+            self._local_dispatcher = LocalPaddedDispatcher.from_experts(
                 num_local_experts=self.num_local_experts,
-                max_m=max_m,
-                hidden_size=self.hidden_size,
                 top_k=self.top_k,
-                max_num_tokens=max_num_seqs,
+                hidden_size=self.hidden_size,
                 device=self.gate_up_proj.device,
             )
         return self._local_dispatcher

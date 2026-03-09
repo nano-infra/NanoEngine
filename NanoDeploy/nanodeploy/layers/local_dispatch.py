@@ -75,6 +75,33 @@ class LocalPaddedDispatcher:
             max_num_tokens, hidden_size, dtype=torch.bfloat16, device=device
         )
 
+    @classmethod
+    def from_experts(
+        cls,
+        num_local_experts: int,
+        top_k: int,
+        hidden_size: int,
+        device: torch.device,
+    ) -> "LocalPaddedDispatcher":
+        """Create a dispatcher sized for the current RunnerConfig.
+
+        Shared factory used by both Hopper and Generic expert backends.
+        """
+        from nanodeploy.worker.runner_config import get_runner_config
+
+        max_num_seqs = get_runner_config().max_num_seqs or 512
+        capacity_factor = 2
+        raw_max_m = max_num_seqs * top_k // num_local_experts * capacity_factor
+        max_m = max(raw_max_m, 128)
+        return cls(
+            num_local_experts=num_local_experts,
+            max_m=max_m,
+            hidden_size=hidden_size,
+            top_k=top_k,
+            max_num_tokens=max_num_seqs,
+            device=device,
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -83,7 +110,7 @@ class LocalPaddedDispatcher:
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Scatter *hidden_states* into the padded expert buffer.
 
         Returns
@@ -94,6 +121,10 @@ class LocalPaddedDispatcher:
         """
         T, K = hidden_states.shape[0], topk_ids.shape[1]
         assert K == self.K
+        assert T <= self.max_T, (
+            f"dispatch: T={T} exceeds pre-allocated max_num_tokens={self.max_T}. "
+            "Increase max_num_seqs in RunnerConfig."
+        )
 
         # In-place reset (CUDA-Graph safe – no allocation)
         self.masked_m.zero_()
@@ -124,6 +155,11 @@ class LocalPaddedDispatcher:
             TOP_K=K,
         )
 
+        # Clamp to pre-allocated capacity to prevent out-of-bounds access in
+        # subsequent kernels (e.g. DeepGEMM) when a single expert receives
+        # more tokens than max_m.
+        self.masked_m.clamp_(max=self.max_m)
+
         expected_m = min((T * K + self.E - 1) // self.E, self.max_m)
         return self.padded_buf, self.masked_m, expected_m
 
@@ -147,6 +183,10 @@ class LocalPaddedDispatcher:
         -------
         out : ``[T, H_out]``  bf16
         """
+        assert num_tokens <= self.max_T, (
+            f"combine: num_tokens={num_tokens} exceeds pre-allocated "
+            f"max_num_tokens={self.max_T}."
+        )
         H_out = expert_out.shape[-1]
         out = self.out_buf[:num_tokens]
         out.zero_()
