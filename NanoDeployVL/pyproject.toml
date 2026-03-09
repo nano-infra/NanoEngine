@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanodeployvl"
+version = "0.1.0"
+description = "Vision-Language inference engine for NanoInfra"
+requires-python = ">=3.10"
+dependencies = [
+    "nanodeploy",
+    "torch",
+    "transformers>=4.52.0",
+    "Pillow",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+dev = [
+    "qwen-vl-utils",
+]
+
+[tool.setuptools.packages.find]
+include = ["nanodeployvl*"]
