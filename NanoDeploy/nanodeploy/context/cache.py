@@ -269,10 +269,11 @@ class CacheContext:
             server_url = f"http://{server_url}"
 
         try:
-            if len(dlslime.available_nics()) == 0:
+            available_nics = dlslime.available_nic()
+            if not available_nics:
                 raise RuntimeError("No available NICs found")
-            device = dlslime.available_nics()[
-                get_dist_context().local_rank % len(dlslime.available_nics())
+            device = available_nics[
+                get_dist_context().local_rank % len(available_nics)
             ]
             agent_scope = os.getenv("NANOCTRL_SCOPE", None)
             self._peer_agent = start_peer_agent_fn(
