@@ -247,6 +247,79 @@ class ModelRunner:
         self.sampler = Sampler()
         self.preallocate_kvcache()
 
+        # Vision embedding side-channel for VL inference
+        self._vision_embeds: dict[str, torch.Tensor] | None = None
+
+    # ------------------------------------------------------------------
+    # Vision embedding side-channel (VL inference)
+    # ------------------------------------------------------------------
+
+    def set_vision_embeds(self, embeds: dict[str, torch.Tensor]) -> None:
+        """Store vision embeddings for injection during prefill.
+
+        Called by VLEngine via RayExecutor before a prefill step that
+        contains vision tokens.
+
+        Args:
+            embeds: Dict with optional keys ``"image"`` and ``"video"``,
+                each mapping to a CPU tensor of shape ``[num_tokens, hidden]``.
+        """
+        self._vision_embeds = {
+            k: v.to(device="cuda", dtype=torch.get_default_dtype(), non_blocking=True)
+            for k, v in embeds.items()
+        }
+
+    def clear_vision_embeds(self) -> None:
+        """Clear stored vision embeddings after prefill."""
+        self._vision_embeds = None
+
+    def _inject_vision_embeds(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        """Build ``inputs_embeds`` by merging text + vision embeddings.
+
+        If no vision embeddings are stored, returns ``None`` so that the
+        model falls back to its normal ``embed_tokens(input_ids)`` path.
+        """
+        if self._vision_embeds is None:
+            return None
+
+        # Get text embeddings from the model's embedding layer
+        embed_tokens = self.model.model.embed_tokens
+        inputs_embeds = embed_tokens(input_ids)
+
+        hf_config = self.config.hf_config
+
+        # Inject image embeddings
+        if "image" in self._vision_embeds:
+            image_token_id = getattr(hf_config, "image_token_id", None)
+            if image_token_id is not None:
+                image_embeds = self._vision_embeds["image"].to(
+                    dtype=inputs_embeds.dtype
+                )
+                mask = input_ids == image_token_id
+                n_tokens = mask.sum().item()
+                if n_tokens > 0 and n_tokens == image_embeds.shape[0]:
+                    mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
+                    inputs_embeds = inputs_embeds.masked_scatter(
+                        mask_expanded, image_embeds
+                    )
+
+        # Inject video embeddings
+        if "video" in self._vision_embeds:
+            video_token_id = getattr(hf_config, "video_token_id", None)
+            if video_token_id is not None:
+                video_embeds = self._vision_embeds["video"].to(
+                    dtype=inputs_embeds.dtype
+                )
+                mask = input_ids == video_token_id
+                n_tokens = mask.sum().item()
+                if n_tokens > 0 and n_tokens == video_embeds.shape[0]:
+                    mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
+                    inputs_embeds = inputs_embeds.masked_scatter(
+                        mask_expanded, video_embeds
+                    )
+
+        return inputs_embeds
+
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
 
@@ -648,7 +721,13 @@ class ModelRunner:
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             context = get_context()
-            return self.model.compute_logits(self.model(input_ids, positions))
+            # Inject vision embeddings during prefill if available
+            inputs_embeds = None
+            if is_prefill and self._vision_embeds is not None:
+                inputs_embeds = self._inject_vision_embeds(input_ids)
+            return self.model.compute_logits(
+                self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+            )
         else:
             bs = input_ids.size(0)
             context = get_context()

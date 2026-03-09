@@ -58,7 +58,8 @@ class LLMEngine:
 
     def exit(self):
         """Cleanup engine resources."""
-        del self.executor
+        if hasattr(self, "executor"):
+            del self.executor
 
     def update_num_kvcache_blocks(self):
         self.config.num_kvcache_blocks = self.executor.update_kvcache_blocks()

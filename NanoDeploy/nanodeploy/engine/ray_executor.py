@@ -258,3 +258,15 @@ class RayExecutor:
     def capture_cudagraph(self):
         """Capture cuda graph."""
         return self.collective_rpc("capture_cudagraph")
+
+    # ------------------------------------------------------------------
+    # Vision embedding side-channel (VL inference)
+    # ------------------------------------------------------------------
+
+    def set_vision_embeds(self, embeds: dict) -> None:
+        """Broadcast vision embeddings to all workers for prefill injection."""
+        self.collective_rpc("set_vision_embeds", args=(embeds,))
+
+    def clear_vision_embeds(self) -> None:
+        """Clear vision embeddings from all workers."""
+        self.collective_rpc("clear_vision_embeds")
