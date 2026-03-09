@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from nanodeploy.backends.base_backend import DistributedRoutedExpertsBase
+from nanodeploy.layers.local_dispatch import LocalPaddedDispatcher
 
 
 class GenericDistributedRoutedExperts(DistributedRoutedExpertsBase):
@@ -44,6 +45,7 @@ class GenericDistributedRoutedExperts(DistributedRoutedExpertsBase):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.intermediate_size = intermediate_size
+        self.top_k = top_k
         self.ep_size = ep_size
         self.tp_size = tp_size
         self.ep_group = ep_group
@@ -87,6 +89,9 @@ class GenericDistributedRoutedExperts(DistributedRoutedExpertsBase):
         self.gate_up_scale_inv = None
         self.down_scale_inv = None
 
+        # Lazy-init dispatcher for CUDA-Graph-safe EP==1 decode
+        self._local_dispatcher: Optional[LocalPaddedDispatcher] = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -99,9 +104,40 @@ class GenericDistributedRoutedExperts(DistributedRoutedExpertsBase):
                 "Expert parallelism (ep_size > 1) requires the Hopper backend. "
                 "Use NANO_BACKEND=hopper or run on an H100/H200 GPU."
             )
-        return self._compute_local(hidden_states, topk_ids, topk_weights)
+        return self._compute_local(hidden_states, topk_ids, topk_weights, is_prefill)
+
+    def _get_or_create_local_dispatcher(self) -> LocalPaddedDispatcher:
+        if self._local_dispatcher is None:
+            from nanodeploy.worker.runner_config import get_runner_config
+
+            max_num_seqs = get_runner_config().max_num_seqs or 512
+            capacity_factor = 2
+            raw_max_m = (
+                max_num_seqs * self.top_k // self.num_local_experts * capacity_factor
+            )
+            max_m = max(raw_max_m, 128)
+            self._local_dispatcher = LocalPaddedDispatcher(
+                num_local_experts=self.num_local_experts,
+                max_m=max_m,
+                hidden_size=self.hidden_size,
+                top_k=self.top_k,
+                max_num_tokens=max_num_seqs,
+                device=self.gate_up_proj.device,
+            )
+        return self._local_dispatcher
 
     def _compute_local(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        if is_prefill:
+            return self._compute_local_prefill(hidden_states, topk_ids, topk_weights)
+        return self._compute_local_decode(hidden_states, topk_ids, topk_weights)
+
+    def _compute_local_prefill(
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -147,3 +183,31 @@ class GenericDistributedRoutedExperts(DistributedRoutedExpertsBase):
             torch.distributed.all_reduce(output, group=self.tp_group)
 
         return output
+
+    def _compute_local_decode(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode path – CUDA-Graph safe, uses LocalPaddedDispatcher + bmm."""
+        disp = self._get_or_create_local_dispatcher()
+        T = hidden_states.shape[0]
+        padded_buf, masked_m, _ = disp.dispatch(
+            hidden_states, topk_ids
+        )  # [E, max_m, H]
+
+        # Gate-Up: [E, max_m, 2*inter]
+        gateup = torch.bmm(padded_buf, self.gate_up_proj.transpose(-1, -2))
+        gate, up = gateup.chunk(2, dim=-1)
+        down_input = F.silu(gate) * up  # [E, max_m, inter]
+
+        # Down: [E, max_m, H]
+        down_output = torch.bmm(down_input, self.down_proj.transpose(-1, -2))
+
+        out = disp.combine(down_output, topk_ids, topk_weights, T)
+
+        if self.tp_size > 1 and self.tp_group is not None:
+            torch.distributed.all_reduce(out, group=self.tp_group)
+
+        return out
