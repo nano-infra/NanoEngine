@@ -281,7 +281,7 @@ class CacheContext:
                 device=device,
                 ib_port=1,
                 link_type="RoCE",
-                qp_num=1,
+                qp_num=int(os.environ.get("SLIME_QP_NUM", 1)),
                 scope=agent_scope,
             )
             self._peer_agent_addr = agent_alias
