@@ -14,6 +14,7 @@ from torch import nn
 
 from nanodeploy.backends.base_backend import DistributedRoutedExpertsBase
 from nanodeploy.context.expert_context import ExpertContext
+from nanodeploy.layers.local_dispatch import LocalPaddedDispatcher
 
 
 class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
@@ -46,6 +47,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.intermediate_size = intermediate_size
+        self.top_k = top_k
 
         self.ep_size = ep_size
         self.tp_size = tp_size
@@ -74,6 +76,14 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
             config_group = getattr(quantization_config, "quant_method", "")
             self.is_fp8 = config_group == "fp8"
 
+        if self.is_fp8 and tp_size > 1:
+            assert self.local_intermediate_size % 128 == 0, (
+                f"FP8 MoE requires local_intermediate_size ({self.local_intermediate_size}) "
+                f"to be divisible by 128 (FP8 block size). "
+                f"intermediate_size={intermediate_size}, tp_size={tp_size}. "
+                f"Please choose a tp_size that divides intermediate_size into 128-aligned chunks."
+            )
+
         self.gate_up_proj = nn.Parameter(
             torch.empty(
                 self.num_local_experts,
@@ -97,6 +107,9 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         else:
             self.gate_up_scale_inv = None
             self.down_scale_inv = None
+
+        # Lazy-init dispatcher for CUDA-Graph-safe EP==1 decode
+        self._local_dispatcher: Optional[LocalPaddedDispatcher] = None
 
     def forward(
         self,
@@ -130,6 +143,16 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         else:
             return self._compute_decode_ep(hidden_states, topk_ids, topk_weights)
 
+    def _get_or_create_local_dispatcher(self) -> LocalPaddedDispatcher:
+        if self._local_dispatcher is None:
+            self._local_dispatcher = LocalPaddedDispatcher.from_experts(
+                num_local_experts=self.num_local_experts,
+                top_k=self.top_k,
+                hidden_size=self.hidden_size,
+                device=self.gate_up_proj.device,
+            )
+        return self._local_dispatcher
+
     def _compute_local(
         self,
         hidden_states: torch.Tensor,
@@ -137,13 +160,22 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         topk_weights: torch.Tensor,
         is_prefill: bool,
     ):
+        if is_prefill:
+            return self._compute_local_prefill(hidden_states, topk_ids, topk_weights)
+        return self._compute_local_decode(hidden_states, topk_ids, topk_weights)
+
+    def _compute_local_prefill(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        """Prefill path – uses fused_moe_v3 (no CUDA Graph needed)."""
         valid_topk_ids = topk_ids[topk_ids >= 0]
         expert_counts = torch.bincount(
             valid_topk_ids, minlength=self.num_local_experts
         ).tolist()
 
-        # fused_moe_v3 expects each expert's token count to be padded to BLOCK_E (128)
-        # DeepEP dispatch usually handles this, so we must do it manually for local mode.
         BLOCK_E = 128
         padded_expert_counts = [
             (count + BLOCK_E - 1) // BLOCK_E * BLOCK_E for count in expert_counts
@@ -183,6 +215,107 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
             torch.distributed.all_reduce(out_states, group=self.tp_group)
 
         return out_states
+
+    def _compute_local_decode(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        """Decode path – CUDA-Graph safe, uses LocalPaddedDispatcher + masked GEMM."""
+        import deep_gemm
+
+        disp = self._get_or_create_local_dispatcher()
+        T = hidden_states.shape[0]
+        padded_buf, masked_m, expected_m = disp.dispatch(hidden_states, topk_ids)
+
+        E = self.num_local_experts
+        max_m = disp.max_m
+        N = self.gate_up_proj.size(1)  # local_intermediate_size * 2
+        H = self.hidden_size
+
+        if self.is_fp8:
+            from nanodeploy.backends.hopper.kernels.fp8 import (
+                per_token_group_quant_fp8,
+                silu_and_mul_masked_post_quant_fwd,
+            )
+
+            block_size = 128
+            # Quantize padded input to FP8 (static shape, Graph-safe)
+            padded_flat = padded_buf.reshape(E * max_m, H)
+            padded_fp8, padded_scale = per_token_group_quant_fp8(
+                padded_flat, block_size
+            )
+            padded_fp8 = padded_fp8.view(E, max_m, H)
+            padded_scale = padded_scale.view(E, max_m, H // block_size)
+
+            # Gate-Up masked GEMM
+            gateup_output = torch.empty(
+                (E, max_m, N), device=hidden_states.device, dtype=torch.bfloat16
+            )
+            deep_gemm.m_grouped_fp8_gemm_nt_masked(
+                (padded_fp8, padded_scale),
+                (self.gate_up_proj, self.gate_up_scale_inv),
+                gateup_output,
+                masked_m,
+                expected_m,
+            )
+
+            # SiLU + Mul + FP8 post-quant (masked-aware)
+            down_input = torch.empty(
+                (E, max_m, N // 2),
+                device=hidden_states.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            down_input_scale = torch.empty(
+                (E, max_m, N // 2 // block_size),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+            silu_and_mul_masked_post_quant_fwd(
+                gateup_output, down_input, down_input_scale, block_size, masked_m
+            )
+
+            # Down masked GEMM
+            down_output = torch.empty(
+                (E, max_m, H), device=hidden_states.device, dtype=torch.bfloat16
+            )
+            deep_gemm.m_grouped_fp8_gemm_nt_masked(
+                (down_input, down_input_scale),
+                (self.down_proj, self.down_scale_inv),
+                down_output,
+                masked_m,
+                expected_m,
+            )
+        else:
+            import torch.nn.functional as F
+
+            # Gate-Up masked GEMM (BF16)
+            gateup_output = torch.empty(
+                (E, max_m, N), device=hidden_states.device, dtype=torch.bfloat16
+            )
+            deep_gemm.m_grouped_bf16_gemm_nt_masked(
+                padded_buf, self.gate_up_proj, gateup_output, masked_m, expected_m
+            )
+
+            # SiLU + Mul
+            gate, up = gateup_output.chunk(2, dim=-1)
+            down_input = F.silu(gate) * up
+
+            # Down masked GEMM (BF16)
+            down_output = torch.empty(
+                (E, max_m, H), device=hidden_states.device, dtype=torch.bfloat16
+            )
+            deep_gemm.m_grouped_bf16_gemm_nt_masked(
+                down_input, self.down_proj, down_output, masked_m, expected_m
+            )
+
+        out = disp.combine(down_output, topk_ids, topk_weights, T)
+
+        if self.tp_size > 1 and self.tp_group is not None:
+            torch.distributed.all_reduce(out, group=self.tp_group)
+
+        return out
 
     def _compute_prefill_ep(
         self,

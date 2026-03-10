@@ -318,7 +318,7 @@ class HopperQKVParallelLinear(_HopperLinearMixin, QKVParallelLinearBase):
         quantization_config: Optional[QuantizationConfig] = None,
         tp_group: Optional[dist.ProcessGroup] = None,
     ):
-        nn.Module.__init__(self)
+        super().__init__()
         if tp_group is None:
             tp_group = get_dist_context().attn_tp_group
         tp_size = dist.get_world_size(tp_group)
