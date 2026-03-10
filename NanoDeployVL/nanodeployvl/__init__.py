@@ -1,19 +1,22 @@
 """NanoDeployVL – Vision-Language inference engine for NanoInfra.
 
-Provides a separate VL inference pipeline that wraps NanoDeploy's LLM engine
-with a vision encoder front-end.  Currently supports Qwen3.5-MoE VLM models.
+Provides EP-separated (Encoder-Prefill) VL inference pipeline where
+a standalone EncoderEngine runs the vision encoder and delivers
+embeddings to the LLM workers via RDMA.
 """
 
 __version__ = "0.1.0"
 
 from nanodeployvl.config import VLConfig
-from nanodeployvl.engine.vl_engine import VLEngine
+from nanodeployvl.encoder.encoder_config import EncoderConfig
+from nanodeployvl.encoder.encoder_engine import EncoderEngine
 from nanodeployvl.vision.encoder import VisionEncoder
 from nanodeployvl.vision.processor import ImageProcessor
 
 __all__ = [
     "VLConfig",
-    "VLEngine",
+    "EncoderConfig",
+    "EncoderEngine",
     "VisionEncoder",
     "ImageProcessor",
 ]

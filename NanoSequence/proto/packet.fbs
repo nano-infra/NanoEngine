@@ -5,6 +5,7 @@ enum Action : byte {
   AddRequest = 1,
   GetEngineInfo = 2,
   FreeSequences = 3,
+  FreeVisionSlots = 4,
 }
 
 table ZmqPacket {

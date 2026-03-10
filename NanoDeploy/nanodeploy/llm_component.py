@@ -182,6 +182,101 @@ class LLMComponent(LLM):
             )
             return False
 
+    def send_free_vision_slots(
+        self, target_encoder_id: str, slot_indices: List[int]
+    ) -> None:
+        """Send P2P free instruction for vision embedding slots to remote encoder.
+
+        Args:
+            target_encoder_id: Encoder engine ID to send free instruction to
+            slot_indices: List of slot indices to free in the encoder's EmbeddingPool
+        """
+        import flatbuffers
+        import numpy as np
+        import zmq
+
+        from nanodeploy.fbs.FreeVisionSlots import (
+            FreeVisionSlotsAddEncoderEngineId,
+            FreeVisionSlotsAddSlotIndices,
+            FreeVisionSlotsAddSourceEngineId,
+            FreeVisionSlotsEnd,
+            FreeVisionSlotsStart,
+            FreeVisionSlotsStartSlotIndicesVector,
+        )
+        from nanodeploy.server.zmq_protocol import encode_packet
+
+        if not slot_indices:
+            return
+
+        # Get target encoder P2P address
+        if target_encoder_id not in self._peer_info:
+            if not self._fetch_peer_info_from_nanoctrl(target_encoder_id):
+                logger.error(
+                    f"Cannot send vision free: failed to fetch peer info for {target_encoder_id}"
+                )
+                return
+
+        peer_info = self._peer_info[target_encoder_id]
+        p2p_host = peer_info.get("p2p_host")
+        p2p_port = peer_info.get("p2p_port")
+
+        if not p2p_host or not p2p_port:
+            logger.error(
+                f"Cannot send vision free: encoder {target_encoder_id} has no P2P address"
+            )
+            return
+
+        # Get or create P2P client socket
+        if target_encoder_id not in self._p2p_clients:
+            if self._p2p_ctx is None:
+                self._p2p_ctx = zmq.Context()
+
+            client_socket = self._p2p_ctx.socket(zmq.DEALER)
+            client_socket.set(zmq.LINGER, 0)
+            client_socket.set(zmq.SNDTIMEO, 5000)
+            endpoint = f"tcp://{p2p_host}:{p2p_port}"
+            client_socket.connect(endpoint)
+            self._p2p_clients[target_encoder_id] = client_socket
+            logger.info(f"Created P2P client connection to encoder at {endpoint}")
+        else:
+            client_socket = self._p2p_clients[target_encoder_id]
+
+        # Build FreeVisionSlots FlatBuffer
+        builder = flatbuffers.Builder(256)
+        encoder_id_off = builder.CreateString(target_encoder_id)
+        source_id_off = builder.CreateString(self.engine_id)
+
+        FreeVisionSlotsStartSlotIndicesVector(builder, len(slot_indices))
+        for idx in reversed(slot_indices):
+            builder.PrependInt32(idx)
+        slot_vec = builder.EndVector()
+
+        FreeVisionSlotsStart(builder)
+        FreeVisionSlotsAddEncoderEngineId(builder, encoder_id_off)
+        FreeVisionSlotsAddSlotIndices(builder, slot_vec)
+        FreeVisionSlotsAddSourceEngineId(builder, source_id_off)
+        free_req = FreeVisionSlotsEnd(builder)
+        builder.Finish(free_req)
+
+        payload = bytes(builder.Output())
+
+        # Send via P2P (Action 4 = FreeVisionSlots)
+        packet = encode_packet(action=4, payload=payload)
+
+        try:
+            client_socket.send(packet, zmq.NOBLOCK)
+            logger.debug(
+                f"P2P: Sent vision slot free to encoder {target_encoder_id} "
+                f"for {len(slot_indices)} slots: {slot_indices}"
+            )
+        except zmq.ZMQError as e:
+            logger.error(f"P2P: Failed to send vision free instruction: {e}")
+            try:
+                client_socket.close()
+            except Exception:
+                pass
+            del self._p2p_clients[target_encoder_id]
+
     def send_free_sequences(self, target_engine_id: str, seq_ids: List[int]) -> None:
         """Send P2P free instruction directly to remote engine (no NanoRoute).
 

@@ -28,9 +28,8 @@ impl LuaScripts {
     pub fn load() -> Result<Self, AppError> {
         let lua_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua");
         let read = |name: &str| -> Result<String, AppError> {
-            std::fs::read_to_string(lua_dir.join(name)).map_err(|e| {
-                AppError::Internal(format!("Failed to load Lua script {name}: {e}"))
-            })
+            std::fs::read_to_string(lua_dir.join(name))
+                .map_err(|e| AppError::Internal(format!("Failed to load Lua script {name}: {e}")))
         };
         Ok(Self {
             register_engine: read("register_engine.lua")?,
@@ -91,6 +90,7 @@ impl RedisRepo {
     // ─────────────────────── agent ops ─────────────────────────
 
     /// Register a peer agent. Returns the assigned agent name.
+    #[allow(clippy::too_many_arguments)]
     pub async fn register_agent(
         &self,
         scope: Option<&str>,
@@ -161,10 +161,7 @@ impl RedisRepo {
                 .await?;
 
             if let (Some(dev), Some(ip)) = (data.get("device"), data.get("addr")) {
-                let name = key
-                    .strip_prefix(&agent_prefix)
-                    .unwrap_or(&key)
-                    .to_string();
+                let name = key.strip_prefix(&agent_prefix).unwrap_or(&key).to_string();
                 agents.push(PeerAgent {
                     name,
                     device: dev.clone(),
@@ -396,7 +393,8 @@ impl RedisRepo {
             .await?;
 
         if rev == 0 {
-            return Err(AppError::NotFound(format!("Engine {engine_id} not found")));
+            tracing::warn!("Unregister engine: {engine_id} not found (already removed or never registered), treating as success");
+            return Ok(0);
         }
         tracing::info!("Unregistered engine: {engine_id} (revision: {rev})");
         Ok(rev)
@@ -546,7 +544,11 @@ impl RedisRepo {
             "lkey": body.lkey,
         });
         conn.set::<_, _, ()>(&key, mr_info.to_string()).await?;
-        tracing::info!("Registered MR: {} for agent: {}", body.mr_name, body.agent_name);
+        tracing::info!(
+            "Registered MR: {} for agent: {}",
+            body.mr_name,
+            body.agent_name
+        );
         Ok(())
     }
 
@@ -575,12 +577,7 @@ impl RedisRepo {
     // ─────────────────── private helpers ───────────────────────
 
     /// Push a `connect_peer` message to a Redis Stream.
-    async fn push_stream_connect(
-        &self,
-        conn: &mut Connection,
-        stream_key: &str,
-        peer: &str,
-    ) {
+    async fn push_stream_connect(&self, conn: &mut Connection, stream_key: &str, peer: &str) {
         let timestamp = format!(
             "{}",
             std::time::SystemTime::now()

@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.profiler as profiler
 from nanodeploy._cpp import (
     extract_aux_from_bytes,
+    extract_vision_slots_from_bytes,
     parse_migrate_batch,
     prepare_decode_from_bytes,
     prepare_prefill_from_bytes,
@@ -247,31 +248,12 @@ class ModelRunner:
         self.sampler = Sampler()
         self.preallocate_kvcache()
 
-        # Vision embedding side-channel for VL inference
+        # Vision embeddings fetched via RDMA from encoder (EP-separated mode)
         self._vision_embeds: dict[str, torch.Tensor] | None = None
 
     # ------------------------------------------------------------------
-    # Vision embedding side-channel (VL inference)
+    # Vision embedding injection (EP-separated mode)
     # ------------------------------------------------------------------
-
-    def set_vision_embeds(self, embeds: dict[str, torch.Tensor]) -> None:
-        """Store vision embeddings for injection during prefill.
-
-        Called by VLEngine via RayExecutor before a prefill step that
-        contains vision tokens.
-
-        Args:
-            embeds: Dict with optional keys ``"image"`` and ``"video"``,
-                each mapping to a CPU tensor of shape ``[num_tokens, hidden]``.
-        """
-        self._vision_embeds = {
-            k: v.to(device="cuda", dtype=torch.get_default_dtype(), non_blocking=True)
-            for k, v in embeds.items()
-        }
-
-    def clear_vision_embeds(self) -> None:
-        """Clear stored vision embeddings after prefill."""
-        self._vision_embeds = None
 
     def _inject_vision_embeds(self, input_ids: torch.Tensor) -> torch.Tensor | None:
         """Build ``inputs_embeds`` by merging text + vision embeddings.
@@ -319,6 +301,122 @@ class ModelRunner:
                     )
 
         return inputs_embeds
+
+    # ------------------------------------------------------------------
+    # Vision embedding RDMA fetch (EP-separated mode)
+    # ------------------------------------------------------------------
+
+    def _fetch_vision_embeds_rdma(self, vision_slot_views: list) -> None:
+        """RDMA-fetch vision embeddings from remote encoder(s).
+
+        Reads embeddings from encoder EmbeddingPool into a local receive
+        buffer via dlslime, then stores them in ``self._vision_embeds``
+        for injection during model forward.
+
+        Args:
+            vision_slot_views: List of VisionSlotView from
+                ``extract_vision_slots_from_bytes``.
+        """
+        if not vision_slot_views:
+            return
+
+        cache_ctx = get_cache_context()
+        peer_agent = cache_ctx._peer_agent
+        if peer_agent is None:
+            logger.warning("PeerAgent not available, cannot RDMA-fetch vision embeds")
+            return
+
+        # Group vision slots by encoder_engine_id for batched reads
+        from collections import defaultdict
+
+        from nanodeploy.context.embedding_pool import _VISION_EMBED_BUFFER_ID
+
+        by_encoder: dict[str, list] = defaultdict(list)
+        for v in vision_slot_views:
+            by_encoder[v.encoder_engine_id].append(v)
+
+        # Compute total tokens for local receive buffer
+        total_tokens = sum(v.num_tokens for v in vision_slot_views)
+        hidden_size = vision_slot_views[0].hidden_size
+        # Use model's embedding dtype to match encoder EmbeddingPool dtype
+        # (RDMA copies raw bytes, so local buffer dtype must match remote)
+        dtype = self.model.model.embed_tokens.weight.dtype
+        itemsize = torch.tensor([], dtype=dtype).element_size()
+
+        # Allocate local receive buffer on GPU
+        recv_buf = torch.zeros(total_tokens, hidden_size, dtype=dtype, device="cuda")
+        # Register receive buffer as a temporary MR
+        recv_buf_size = recv_buf.nelement() * recv_buf.element_size()
+        recv_mr = peer_agent.register_memory_region(
+            "vision_recv",
+            recv_buf.data_ptr() + int(recv_buf.storage_offset()),
+            recv_buf_size,
+        )
+
+        token_offset = 0
+        for encoder_id, slots in by_encoder.items():
+            # Build peer alias (encoder uses "engine_id:0" as alias)
+            peer_alias = f"{encoder_id}:0"
+
+            # Ensure connection
+            if peer_alias not in cache_ctx._connected_peers:
+                cache_ctx._peer_agent.set_desired_topology(
+                    target_peers=list(cache_ctx._connected_peers | {peer_alias}),
+                    symmetric=True,
+                )
+                cache_ctx._peer_agent.wait_for_peers([peer_alias], timeout_sec=30)
+                cache_ctx._connected_peers.add(peer_alias)
+
+            # Get remote MR info for vision_embed buffer
+            remote_mr_info = peer_agent.get_mr_info(peer_alias, _VISION_EMBED_BUFFER_ID)
+            if remote_mr_info is None:
+                logger.error(
+                    f"Failed to get MR info for vision_embed from {peer_alias}"
+                )
+                continue
+
+            remote_mr = peer_agent.register_remote_memory_region(
+                peer_alias, _VISION_EMBED_BUFFER_ID, remote_mr_info
+            )
+            endpoint = peer_agent.get_endpoint(peer_alias)
+            if endpoint is None:
+                logger.error(f"Failed to get endpoint for {peer_alias}")
+                continue
+
+            # Build RDMA read ops for all slots from this encoder
+            rdma_ops = []
+            for v in slots:
+                # Encoder EmbeddingPool layout: [num_slots, max_tokens_per_slot, hidden_size]
+                # Remote offset for slot = slot_idx * max_tokens_per_slot * hidden_size * itemsize
+                slot_stride = v.max_tokens_per_slot * v.hidden_size * itemsize
+                remote_off = v.slot_idx * slot_stride
+                # Read only num_tokens * hidden_size (actual data, not full slot)
+                read_len = v.num_tokens * v.hidden_size * itemsize
+                # Local offset in recv buffer
+                local_off = token_offset * hidden_size * itemsize
+
+                rdma_ops.append(
+                    (
+                        recv_mr,  # local MR
+                        remote_mr,  # remote MR
+                        remote_off,  # remote offset
+                        local_off,  # local offset
+                        read_len,  # bytes to read
+                    )
+                )
+                token_offset += v.num_tokens
+
+            # Execute batched RDMA reads
+            if rdma_ops:
+                endpoint.read(rdma_ops)
+                logger.debug(
+                    f"RDMA-fetched {len(rdma_ops)} vision slots from encoder "
+                    f"{encoder_id} ({sum(v.num_tokens for v in slots)} tokens)"
+                )
+
+        # Store as vision embeds for _inject_vision_embeds
+        # The recv_buf contains all vision tokens concatenated
+        self._vision_embeds = {"image": recv_buf}
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
@@ -854,6 +952,12 @@ class ModelRunner:
                 )
 
             if is_prefill:
+                # RDMA-fetch vision embeddings from encoder (EP-separated mode)
+                if i == 0 and self._vision_embeds is None:
+                    vision_slots = extract_vision_slots_from_bytes(data)
+                    if vision_slots:
+                        self._fetch_vision_embeds_rdma(vision_slots)
+
                 input_ids, positions = self.prepare_prefill_bytes(data, aux, is_dummy)
             else:
                 if i == 0:
@@ -878,6 +982,10 @@ class ModelRunner:
                     num_sp_seqs,
                 )
             logits = self.run_model(input_ids, positions, is_prefill)
+
+            # Clear RDMA-fetched vision embeddings after prefill forward
+            if is_prefill and self._vision_embeds is not None:
+                self._vision_embeds = None
 
             tp_rank = get_dist_context().attn_tp_rank
             if tp_rank == 0:

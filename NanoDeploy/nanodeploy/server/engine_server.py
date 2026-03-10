@@ -1,6 +1,7 @@
 import asyncio
 import ctypes
 import traceback
+from collections import defaultdict
 from typing import Optional
 
 import flatbuffers
@@ -270,6 +271,28 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                             f"Early free: seq {seq.seq_id} migrated from {migrate_ctx.engine_id}"
                         )
                         service._send_p2p_free_if_migrated(seq)
+
+            # Free vision embedding slots on encoder after prefill consumes them
+            # (EP-separated mode: notify encoder to reclaim EmbeddingPool slots)
+            vision_free_by_encoder: dict[str, list[int]] = defaultdict(list)
+            for seqs in dp_seqs:
+                for seq in seqs:
+                    vs_list = seq.vision_slots
+                    if not vs_list:
+                        continue
+                    for vs in vs_list:
+                        vision_free_by_encoder[vs["encoder_engine_id"]].append(
+                            vs["slot_idx"]
+                        )
+                    seq.clear_vision_slots()
+
+            for encoder_id, slot_indices in vision_free_by_encoder.items():
+                try:
+                    engine.send_free_vision_slots(encoder_id, slot_indices)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to send vision slot free to {encoder_id}: {e}"
+                    )
 
             # Update tracking for next step
             service._previous_running_seqs = current_running_seqs

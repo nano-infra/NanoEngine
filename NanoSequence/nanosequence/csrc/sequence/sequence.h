@@ -239,6 +239,29 @@ public:
     // Access to flatbuffers data
     std::unique_ptr<SequenceT> data_;
 
+    // Vision slot management (EP separated mode)
+    void add_vision_slot(
+        const std::string& encoder_engine_id, int slot_idx, int num_tokens, int hidden_size, int max_tokens_per_slot)
+    {
+        auto vs                 = std::make_unique<fbs::VisionSlotT>();
+        vs->encoder_engine_id   = encoder_engine_id;
+        vs->slot_idx            = slot_idx;
+        vs->num_tokens          = num_tokens;
+        vs->hidden_size         = hidden_size;
+        vs->max_tokens_per_slot = max_tokens_per_slot;
+        data_->vision_slots.push_back(std::move(vs));
+    }
+
+    void clear_vision_slots()
+    {
+        data_->vision_slots.clear();
+    }
+
+    const auto& vision_slots() const
+    {
+        return data_->vision_slots;
+    }
+
     std::shared_ptr<SequenceMetric> metric;
 
 private:

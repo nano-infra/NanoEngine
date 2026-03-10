@@ -63,6 +63,19 @@ struct BatchAuxData {
     int                 num_sp_seqs = 0;    // count where master_sp == sp_rank
 };
 
+// ========== Vision slot refs extracted from RunBatchInput ==========
+
+struct VisionSlotView {
+    std::string encoder_engine_id;
+    int         slot_idx;
+    int         num_tokens;
+    int         hidden_size;
+    int         max_tokens_per_slot;
+    int         seq_index;  // index in the batch (which SequenceInput)
+};
+
+std::vector<VisionSlotView> extract_vision_slots_from_bytes(const uint8_t* data, size_t data_len);
+
 // ========== New bytes-based API (Sequence-free on runner side) ==========
 
 // Combined deserialize + prepare: zero Sequence objects created

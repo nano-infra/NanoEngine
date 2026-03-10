@@ -71,14 +71,16 @@ class Config(BaseModel):
         if self.mode != "hybrid":
             self.enable_nanoctrl = True
 
-        if self.enable_nanoctrl:
-            # nanoctrl config from environment variables
+        # Always read nanoctrl env vars when address is provided or nanoctrl is enabled
+        if self.enable_nanoctrl or self.nanoctrl_address:
             self.nanoctrl_scope = os.getenv("NANOCTRL_SCOPE", self.nanoctrl_scope)
             self.nanoctrl_address = os.getenv("NANOCTRL_ADDRESS", self.nanoctrl_address)
 
-            if not self.nanoctrl_address.startswith(
-                "http://"
-            ) and not self.nanoctrl_address.startswith("https://"):
+            if (
+                self.nanoctrl_address
+                and not self.nanoctrl_address.startswith("http://")
+                and not self.nanoctrl_address.startswith("https://")
+            ):
                 self.nanoctrl_address = f"http://{self.nanoctrl_address}"
 
         self.hf_config = AutoConfig.from_pretrained(

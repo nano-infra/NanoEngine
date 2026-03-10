@@ -394,6 +394,43 @@ DecodeMetadata prepare_decode_from_bytes(const uint8_t* data,
 }
 
 // ========================================================================
+// Extract vision slot refs from RunBatchInput bytes
+// ========================================================================
+
+std::vector<VisionSlotView> extract_vision_slots_from_bytes(const uint8_t* data, size_t data_len)
+{
+    flatbuffers::Verifier verifier(data, data_len);
+    if (!verifier.VerifyBuffer<fbs::RunBatchInput>(nullptr)) {
+        throw std::runtime_error("extract_vision_slots_from_bytes: invalid FlatBuffers buffer");
+    }
+    auto* batch  = flatbuffers::GetRoot<fbs::RunBatchInput>(data);
+    auto* si_vec = batch->sequences();
+
+    std::vector<VisionSlotView> views;
+    if (!si_vec)
+        return views;
+
+    for (size_t i = 0; i < si_vec->size(); ++i) {
+        auto* si = si_vec->Get(i);
+        auto* vs = si->vision_slots();
+        if (!vs)
+            continue;
+        for (size_t j = 0; j < vs->size(); ++j) {
+            auto*          ref = vs->Get(j);
+            VisionSlotView v;
+            v.encoder_engine_id   = ref->encoder_engine_id() ? ref->encoder_engine_id()->str() : "";
+            v.slot_idx            = ref->slot_idx();
+            v.num_tokens          = ref->num_tokens();
+            v.hidden_size         = ref->hidden_size();
+            v.max_tokens_per_slot = ref->max_tokens_per_slot();
+            v.seq_index           = static_cast<int>(i);
+            views.push_back(std::move(v));
+        }
+    }
+    return views;
+}
+
+// ========================================================================
 // Extract auxiliary data from RunBatchInput bytes
 // ========================================================================
 
