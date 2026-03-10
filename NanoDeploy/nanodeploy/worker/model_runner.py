@@ -64,17 +64,6 @@ class ModelRunner:
 
         _Seq.set_block_size(config.kvcache_block_size)
 
-        # Propagate scope to actor environment: the Config object carries
-        # scope from the driver (set from NANOCTRL_SCOPE env var), but
-        # actor processes may not inherit the job's env vars.  Libraries
-        # like dlslime read NANOCTRL_SCOPE from os.environ, so we must
-        # set it here to ensure correct scoped registration in Redis.
-        if config.nanoctrl_scope and not os.getenv("NANOCTRL_SCOPE"):
-            os.environ["NANOCTRL_SCOPE"] = config.nanoctrl_scope
-            logger.info(
-                f"Set NANOCTRL_SCOPE={config.nanoctrl_scope} in actor environment"
-            )
-
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
         set_runner_config(
@@ -442,7 +431,8 @@ class ModelRunner:
 
         # Start PeerAgent AFTER kv_cache (and GDN states) are allocated,
         # so that all tensors exist for RDMA memory region registration.
-        cache_context.start_peer_agent()
+        # Skipped for hybrid mode (no P2P KV transfer).
+        cache_context.start_peer_agent(mode=self.config.mode)
 
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -525,6 +515,7 @@ class ModelRunner:
             dtype=torch.get_default_dtype(),
             mode=mode,
             nanoctrl_address=config.nanoctrl_address,
+            nanoctrl_scope=config.nanoctrl_scope,
             engine_id=engine_id,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
@@ -823,9 +814,11 @@ class ModelRunner:
             inputs_embeds = None
             if is_prefill and self._vision_embeds is not None:
                 inputs_embeds = self._inject_vision_embeds(input_ids)
-            return self.model.compute_logits(
-                self.model(input_ids, positions, inputs_embeds=inputs_embeds)
-            )
+            if inputs_embeds is not None:
+                hidden = self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+            else:
+                hidden = self.model(input_ids, positions)
+            return self.model.compute_logits(hidden)
         else:
             bs = input_ids.size(0)
             context = get_context()

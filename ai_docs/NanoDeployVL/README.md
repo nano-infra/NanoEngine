@@ -70,3 +70,56 @@
 
 - **流式输出**: `generate_vl()` 当前同步，可扩展为 streaming token generation
 - **视频支持**: 框架已预留 `encode_video` 接口，但未做端到端测试
+
+______________________________________________________________________
+
+## Bugfix 记录
+
+### 2026-03-10: NanoCtrl scope 不匹配
+
+**问题**: `Config` 只在 `enable_nanoctrl=True`（非 hybrid 模式）时读取 `NANOCTRL_SCOPE` 环境变量。hybrid 模式下即使显式传入 `nanoctrl_address`，scope 仍为 None，导致 LLMComponent 查 NanoCtrl 时 Redis key 前缀不匹配（encoder 注册在 `JimyMa:engine:xxx`，LLM 查 `engine:xxx`），P2P free 失败。
+
+**修复**: 改为只要有 `nanoctrl_address` 就读取 scope。后续进一步重构：**删除 `enable_nanoctrl` 字段**，有 `nanoctrl_address` 就启用，没有就禁用。
+
+### 2026-03-10: RDMA dtype 不匹配导致乱码输出
+
+**问题**: `_fetch_vision_embeds_rdma()` 使用 `torch.get_default_dtype()` = float32（4 bytes/element），但 EmbeddingPool buffer 是 bfloat16（2 bytes/element）。RDMA 按原始字节拷贝，导致偏移量翻倍、数据解读错误，模型输出全是乱码。
+
+**修复**: 改用 `self.model.model.embed_tokens.weight.dtype` 获取实际模型 dtype。
+
+### 2026-03-10: 移除 NANOCTRL_SCOPE / NANOCTRL_ADDRESS 环境变量读取
+
+**问题**: 多个组件从 `os.getenv("NANOCTRL_SCOPE")` / `os.getenv("NANOCTRL_ADDRESS")` 读取配置，容易在 Ray actor 跨进程场景下出错（子进程不一定继承环境变量），且有隐式覆盖的隐患。
+
+**修复**: 全部改为显式参数传递：
+
+- `NanoDeploy/config.py`: 删除 `enable_nanoctrl` 字段和环境变量读取，纯依赖构造时传参
+- `DLSlime/peer_agent.py`: `scope` 参数恢复为正式参数，不再读 env var
+- `NanoDeploy/context/cache.py`: 新增 `nanoctrl_scope` 字段，通过 `set_cache_context()` 传入
+- `NanoDeploy/worker/model_runner.py`: 删除 `os.environ["NANOCTRL_SCOPE"]` propagation hack
+- `NanoDeployVL/encoder_engine.py`: 删除 `os.getenv("NANOCTRL_SCOPE")` fallback
+- `test_ep_full.py`: 新增 `--nanoctrl_scope` CLI 参数
+
+### 2026-03-10: NanoCtrl unregister_engine 幂等化
+
+**问题**: 引擎 shutdown 时调用 `/unregister_engine`，若引擎已因 TTL 过期被清除或从未成功注册，返回 404 错误，NanoCtrl 日志打出 ERROR。
+
+**修复**: `redis_repo.rs` 中 `unregister_engine` 不再抛 `NotFound`，改为 WARN 日志 + 返回成功（幂等语义）。
+
+### 2026-03-10: Hybrid 模式跳过 PeerAgent 启动
+
+**问题**: `CacheContext.start_peer_agent()` 在 hybrid 模式下也尝试启动 RDMA PeerAgent 并注册 MR，但 hybrid engine 不做 P2P KV 传输，没有 NanoCtrl 地址时导致不必要的初始化失败。
+
+**修复**: `start_peer_agent(mode)` 新增 mode 参数，`mode == "hybrid"` 时直接 return。
+
+### 2026-03-10: set_cache_context NameError
+
+**问题**: `set_cache_context()` 中 `num_hidden_layers=num_kv_layers`，但函数参数名是 `num_hidden_layers`，导致 `NameError: name 'num_kv_layers' is not defined`。
+
+**修复**: 改为 `num_hidden_layers=num_hidden_layers`。
+
+### 2026-03-10: Qwen3Moe inputs_embeds 兼容
+
+**问题**: `run_model()` 中 `self.model(input_ids, positions, inputs_embeds=inputs_embeds)` 始终传 `inputs_embeds` 关键字参数（即使为 None），但 `Qwen3MoeForCausalLM.forward()` 不接受该参数，导致 `TypeError`。
+
+**修复**: 只在 `inputs_embeds is not None` 时传递该参数，否则只传 `input_ids, positions`。

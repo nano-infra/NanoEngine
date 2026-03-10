@@ -53,6 +53,7 @@ class CacheContext:
     nanoctrl_address: str | None = (
         None  # Control plane server URL (e.g., "http://10.102.97.183:3000")
     )
+    nanoctrl_scope: str | None = None  # Scope for multi-tenant isolation
     engine_id: str | None = None  # Engine ID for agent naming (format: EngineName:rank)
     # If nanoctrl_address is provided, engine_id will be fetched from NanoCtrl instead of config
 
@@ -246,12 +247,15 @@ class CacheContext:
             f"({self.gdn_recurrent_states.element_size() * self.gdn_recurrent_states.nelement() / 1e9:.2f} GB)"
         )
 
-    def start_peer_agent(self):
+    def start_peer_agent(self, mode: str = "hybrid"):
         """Start PeerAgent and register all memory regions (KV cache + GDN states) for RDMA.
 
         Must be called AFTER allocate_kvcache() and allocate_gdn_states() so that
         all tensors exist before registration.
+        Skipped for hybrid mode (no P2P KV transfer needed).
         """
+        if mode == "hybrid":
+            return
         if self.nanoctrl_address is None or self.engine_id is None:
             return
 
@@ -272,10 +276,7 @@ class CacheContext:
             available_nics = dlslime.available_nic()
             if not available_nics:
                 raise RuntimeError("No available NICs found")
-            device = available_nics[
-                get_dist_context().local_rank % len(available_nics)
-            ]
-            agent_scope = os.getenv("NANOCTRL_SCOPE", None)
+            device = available_nics[get_dist_context().local_rank % len(available_nics)]
             self._peer_agent = start_peer_agent_fn(
                 alias=agent_alias,
                 server_url=server_url,
@@ -283,7 +284,7 @@ class CacheContext:
                 ib_port=1,
                 link_type="RoCE",
                 qp_num=int(os.environ.get("SLIME_QP_NUM", 1)),
-                scope=agent_scope,
+                scope=self.nanoctrl_scope,
             )
             self._peer_agent_addr = agent_alias
 
@@ -395,11 +396,7 @@ class CacheContext:
 
         fetched_map: dict[str, dict] = {}
         url = f"{self.nanoctrl_address}/get_engine_info"
-
-        # Get scope from environment variable
-        import os
-
-        scope = os.getenv("NANOCTRL_SCOPE", "")
+        scope = self.nanoctrl_scope or ""
 
         try:
             with httpx.Client(timeout=5.0) as client:
@@ -811,6 +808,7 @@ def set_cache_context(
     dtype: torch.dtype = torch.bfloat16,
     mode: Literal["gqa", "mla"] = "gqa",
     nanoctrl_address: str | None = None,
+    nanoctrl_scope: str | None = None,
     engine_id: str | None = None,
 ):
     global _CACHE_CONTEXT
@@ -828,6 +826,7 @@ def set_cache_context(
         dtype=dtype,
         mode=mode,
         nanoctrl_address=nanoctrl_address,
+        nanoctrl_scope=nanoctrl_scope,
         engine_id=engine_id,
     )
     return _CACHE_CONTEXT

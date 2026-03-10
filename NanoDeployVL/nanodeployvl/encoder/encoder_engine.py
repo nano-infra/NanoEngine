@@ -189,7 +189,7 @@ class EncoderEngine:
             if not available_nics:
                 raise RuntimeError("No available NICs for RDMA")
             nic = available_nics[0]
-            scope = self.config.nanoctrl_scope or os.getenv("NANOCTRL_SCOPE")
+            scope = self.config.nanoctrl_scope
 
             self._peer_agent = start_fn(
                 alias=agent_alias,
