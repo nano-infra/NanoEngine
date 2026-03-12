@@ -429,6 +429,7 @@ class LLMComponent(LLM):
                 "peer_addrs": peer_addrs,
                 "p2p_host": zmq_host,
                 "p2p_port": self.p2p_port if self.p2p_port else 0,
+                "max_num_seqs": self.config.max_num_seqs,
             }
             # Add scope if configured
             if self.config.nanoctrl_scope:

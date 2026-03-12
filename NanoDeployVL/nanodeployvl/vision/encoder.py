@@ -114,7 +114,15 @@ class VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import logging
+        import time
+
+        _log = logging.getLogger("nanodeploy")
         target_dtype = self.proj.weight.dtype
+        t0 = time.perf_counter()
+        _log.info(
+            f"[PATCH_EMBED] input: shape={list(x.shape)}, dtype={x.dtype}, device={x.device}, proj.weight: dtype={self.proj.weight.dtype}, device={self.proj.weight.device}"
+        )
         x = x.view(
             -1,
             self.in_channels,
@@ -122,7 +130,20 @@ class VisionPatchEmbed(nn.Module):
             self.patch_size,
             self.patch_size,
         )
-        x = self.proj(x.to(dtype=target_dtype)).view(-1, self.embed_dim)
+        torch.cuda.synchronize(x.device)
+        t1 = time.perf_counter()
+        x = x.to(dtype=target_dtype)
+        torch.cuda.synchronize(x.device)
+        t2 = time.perf_counter()
+        x = self.proj(x)
+        torch.cuda.synchronize(x.device)
+        t3 = time.perf_counter()
+        x = x.view(-1, self.embed_dim)
+        torch.cuda.synchronize(x.device)
+        t4 = time.perf_counter()
+        _log.info(
+            f"[PATCH_EMBED] view={t1-t0:.3f}s to_dtype={t2-t1:.3f}s conv3d={t3-t2:.3f}s reshape={t4-t3:.3f}s TOTAL={t4-t0:.3f}s"
+        )
         return x
 
 
@@ -443,8 +464,16 @@ class VisionModel(nn.Module):
             Merged image embeddings of shape
             ``(total_tokens_after_merge, out_hidden_size)``.
         """
+        import time
+
+        _dev = pixel_values.device
+        t0 = time.perf_counter()
         hidden_states = self.patch_embed(pixel_values)
+        torch.cuda.synchronize(_dev)
+        t1 = time.perf_counter()
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        torch.cuda.synchronize(_dev)
+        t2 = time.perf_counter()
         hidden_states = hidden_states + pos_embeds
 
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
@@ -458,11 +487,23 @@ class VisionModel(nn.Module):
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        torch.cuda.synchronize(_dev)
+        t3 = time.perf_counter()
 
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(hidden_states, cu_seqlens, position_embeddings)
+        torch.cuda.synchronize(_dev)
+        t4 = time.perf_counter()
 
         merged = self.merger(hidden_states)
+        torch.cuda.synchronize(_dev)
+        t5 = time.perf_counter()
+        logger.info(
+            f"[VIT_TIMING] patch_embed={t1-t0:.3f}s pos_embed={t2-t1:.3f}s "
+            f"prep={t3-t2:.3f}s blocks({len(self.blocks)})={t4-t3:.3f}s "
+            f"merger={t5-t4:.3f}s TOTAL={t5-t0:.3f}s "
+            f"pixel_values={list(pixel_values.shape)} grid_thw={grid_thw.tolist()}"
+        )
         return merged
 
 
@@ -507,7 +548,28 @@ class VisionEncoder:
 
         self._load_weights(model_path)
         self.model.eval()
+        self._warmup(vision_config)
         logger.info("VisionEncoder ready on %s (%s)", device, dtype)
+
+    # -- Warmup --
+
+    @torch.inference_mode()
+    def _warmup(self, vision_config) -> None:
+        """Run a dummy forward pass to trigger CUDA kernel JIT compilation."""
+        logger.info("Warming up VisionEncoder …")
+        in_ch = getattr(vision_config, "in_channels", 3)
+        t_patch = getattr(vision_config, "temporal_patch_size", 2)
+        patch = getattr(vision_config, "patch_size", 14)
+        # Minimal input: 1 image, 1 temporal frame, 2×2 patch grid
+        grid_thw = torch.tensor([[1, 2, 2]], device=self.device)
+        n_patches = 1 * 2 * 2  # T * H * W
+        patch_dim = in_ch * t_patch * patch * patch
+        dummy_pv = torch.zeros(
+            n_patches, patch_dim, device=self.device, dtype=self.dtype
+        )
+        self.model(dummy_pv, grid_thw)
+        torch.cuda.synchronize(self.device)
+        logger.info("VisionEncoder warmup done")
 
     # -- Weight loading --
 

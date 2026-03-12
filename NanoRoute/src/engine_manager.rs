@@ -1,3 +1,4 @@
+use crate::encoder_adapter::EncoderAdapter;
 use crate::engine_adapter::EngineAdapter;
 use crate::engine_watcher::{EngineEvent, EnginePayload, EngineWatcher};
 use std::sync::Arc;
@@ -10,6 +11,7 @@ pub struct EngineManager {
     // We share adapters via Arc<Mutex> because multiple threads (http server) might access them
     pub prefill_engines: Vec<Arc<Mutex<EngineAdapter>>>,
     pub decode_engines: Vec<Arc<Mutex<EngineAdapter>>>,
+    pub encoder_engines: Vec<Arc<Mutex<EncoderAdapter>>>,
     redis_key_prefix: String,
 }
 
@@ -33,6 +35,7 @@ impl EngineManager {
         Self {
             prefill_engines: Vec::new(),
             decode_engines: Vec::new(),
+            encoder_engines: Vec::new(),
             redis_key_prefix: "".to_string(), // Empty prefix to match NanoCtrl default
         }
     }
@@ -41,6 +44,7 @@ impl EngineManager {
         Self {
             prefill_engines: Vec::new(),
             decode_engines: Vec::new(),
+            encoder_engines: Vec::new(),
             redis_key_prefix: scope.unwrap_or_default(),
         }
     }
@@ -105,6 +109,13 @@ impl EngineManager {
                     self.decode_engines.len()
                 );
             }
+            "encoder" => {
+                // encoder role handled separately via insert_encoder
+                warn!(
+                    "insert_engine_by_role called for encoder role; use insert_encoder instead. engine_id={}",
+                    engine_id
+                );
+            }
             _ => {
                 // hybrid or unified — add to both pools
                 self.prefill_engines.push(adapter.clone());
@@ -120,6 +131,16 @@ impl EngineManager {
         }
     }
 
+    /// Insert an encoder adapter into the encoder pool.
+    fn insert_encoder(&mut self, adapter: Arc<Mutex<EncoderAdapter>>, engine_id: &str) {
+        self.encoder_engines.push(adapter);
+        info!(
+            "Added encoder engine: {} (total: {})",
+            engine_id,
+            self.encoder_engines.len()
+        );
+    }
+
     // Helper to get a round-robin engine (simplest scheduler)
     pub fn get_next_prefill(&self) -> Option<Arc<Mutex<EngineAdapter>>> {
         self.prefill_engines.first().cloned()
@@ -127,6 +148,10 @@ impl EngineManager {
 
     pub fn get_next_decode(&self) -> Option<Arc<Mutex<EngineAdapter>>> {
         self.decode_engines.first().cloned()
+    }
+
+    pub fn get_next_encoder(&self) -> Option<Arc<Mutex<EncoderAdapter>>> {
+        self.encoder_engines.first().cloned()
     }
 
     // ─── NanoCtrl API ────────────────────────────────────────────────
@@ -253,14 +278,21 @@ impl EngineManager {
     async fn add_engine_from_info(&mut self, engine_info: serde_json::Value) -> anyhow::Result<()> {
         let parsed = Self::parse_engine_info(&engine_info)?;
 
-        let mut adapter = EngineAdapter::new(parsed.engine_id.clone());
-        adapter.connect(&parsed.connect_addr).await?;
-        adapter.uuid = Some(parsed.engine_id.clone());
-        adapter.world_size = parsed.world_size;
-        adapter.num_blocks = parsed.num_blocks;
-
-        let adapter = Arc::new(Mutex::new(adapter));
-        self.insert_engine_by_role(adapter, &parsed.role, &parsed.engine_id);
+        if parsed.role == "encoder" {
+            let mut adapter = EncoderAdapter::new(parsed.engine_id.clone());
+            adapter.connect(&parsed.connect_addr).await?;
+            adapter.uuid = Some(parsed.engine_id.clone());
+            let adapter = Arc::new(Mutex::new(adapter));
+            self.insert_encoder(adapter, &parsed.engine_id);
+        } else {
+            let mut adapter = EngineAdapter::new(parsed.engine_id.clone());
+            adapter.connect(&parsed.connect_addr).await?;
+            adapter.uuid = Some(parsed.engine_id.clone());
+            adapter.world_size = parsed.world_size;
+            adapter.num_blocks = parsed.num_blocks;
+            let adapter = Arc::new(Mutex::new(adapter));
+            self.insert_engine_by_role(adapter, &parsed.role, &parsed.engine_id);
+        }
 
         Ok(())
     }
@@ -279,7 +311,9 @@ impl EngineManager {
         match self.load_snapshot_from_redis(redis_url).await {
             Ok(rev) => {
                 initial_revision = rev;
-                redis_engines = self.prefill_engines.len() + self.decode_engines.len();
+                redis_engines = self.prefill_engines.len()
+                    + self.decode_engines.len()
+                    + self.encoder_engines.len();
                 debug!(
                     "Loaded {} engines from Redis snapshot (revision={})",
                     redis_engines, rev
@@ -314,6 +348,40 @@ impl EngineManager {
                         if let Some(uuid) = &guard.uuid {
                             existing_ids.insert(uuid.clone());
                         }
+                    }
+                    for adapter in &self.encoder_engines {
+                        let guard: tokio::sync::MutexGuard<'_, EncoderAdapter> =
+                            adapter.lock().await;
+                        if let Some(uuid) = &guard.uuid {
+                            existing_ids.insert(uuid.clone());
+                        }
+                    }
+
+                    // Build set of engine IDs reported by NanoCtrl API (source of truth)
+                    let api_ids: std::collections::HashSet<String> = api_engines
+                        .iter()
+                        .filter_map(|e| e["id"].as_str().map(|s| s.to_string()))
+                        .collect();
+
+                    // Remove stale engines from snapshot that are NOT in API
+                    // This handles the race where Redis still had a stale key when
+                    // we took the snapshot, but NanoCtrl has since cleaned it up.
+                    let stale_ids: Vec<String> = existing_ids
+                        .iter()
+                        .filter(|id| !api_ids.contains(*id))
+                        .cloned()
+                        .collect();
+                    for stale_id in &stale_ids {
+                        info!(
+                            "Removing stale engine {} (in Redis snapshot but not in NanoCtrl API)",
+                            stale_id
+                        );
+                        if let Err(e) = self.handle_remove_engine(stale_id).await {
+                            warn!("Failed to remove stale engine {}: {}", stale_id, e);
+                        }
+                    }
+                    if !stale_ids.is_empty() {
+                        info!("Removed {} stale engines from snapshot", stale_ids.len());
                     }
 
                     // Add any engines from API that might be missing from Redis snapshot
@@ -352,9 +420,10 @@ impl EngineManager {
         }
 
         debug!(
-            "Initial engines loaded: {} prefill, {} decode, revision={}",
+            "Initial engines loaded: {} prefill, {} decode, {} encoder, revision={}",
             self.prefill_engines.len(),
             self.decode_engines.len(),
+            self.encoder_engines.len(),
             initial_revision
         );
 
@@ -513,6 +582,36 @@ impl EngineManager {
 
         let addr = zmq_addr.strip_prefix("tcp://").unwrap_or(&zmq_addr);
 
+        // Encoder role uses EncoderAdapter (simpler request-response ZMQ)
+        if payload.role == "encoder" {
+            for attempt in 1..=MAX_RETRIES {
+                let mut adapter = EncoderAdapter::new(payload.id.clone());
+                match adapter.connect(addr).await {
+                    Ok(_) => {
+                        adapter.uuid = Some(payload.id.clone());
+                        let adapter = Arc::new(Mutex::new(adapter));
+                        self.insert_encoder(adapter, &payload.id);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if attempt == MAX_RETRIES {
+                            error!(
+                                "Failed to connect to encoder engine {} after {} attempts: {}",
+                                payload.id, MAX_RETRIES, e
+                            );
+                            return Err(anyhow::anyhow!("Connection failed: {}", e));
+                        }
+                        warn!(
+                            "Failed to connect to encoder engine {} (attempt {}/{}): {}, retrying...",
+                            payload.id, attempt, MAX_RETRIES, e
+                        );
+                        tokio::time::sleep(RETRY_DELAY * attempt).await;
+                    }
+                }
+            }
+            unreachable!()
+        }
+
         for attempt in 1..=MAX_RETRIES {
             let mut adapter = EngineAdapter::new(payload.id.clone());
 
@@ -637,6 +736,23 @@ impl EngineManager {
         });
         let decode_after = self.decode_engines.len();
 
+        // Remove from encoder_engines
+        let encoder_before = self.encoder_engines.len();
+        let mut removed_encoder = false;
+        self.encoder_engines
+            .retain(|adapter: &Arc<Mutex<EncoderAdapter>>| {
+                let adapter_guard = futures::executor::block_on(adapter.lock());
+                let should_keep = adapter_guard.uuid.as_deref() != Some(engine_id);
+                if !should_keep {
+                    removed_encoder = true;
+                    info!("Removing encoder engine: {}", engine_id);
+                    // EncoderAdapter cleanup: drop channels to stop I/O thread
+                    // (handled automatically when adapter is dropped after retain)
+                }
+                should_keep
+            });
+        let encoder_after = self.encoder_engines.len();
+
         // Await all reader tasks
         for handle in reader_handles {
             if let Err(e) = tokio::time::timeout(Duration::from_secs(2), handle).await {
@@ -652,15 +768,15 @@ impl EngineManager {
             }
         }
 
-        if removed_prefill || removed_decode {
+        if removed_prefill || removed_decode || removed_encoder {
             info!(
-                "Engine removal complete: engine_id={}, prefill: {}->{}, decode: {}->{}",
-                engine_id, prefill_before, prefill_after, decode_before, decode_after
+                "Engine removal complete: engine_id={}, prefill: {}->{}, decode: {}->{}, encoder: {}->{}",
+                engine_id, prefill_before, prefill_after, decode_before, decode_after, encoder_before, encoder_after
             );
             Ok(())
         } else {
             Err(anyhow::anyhow!(
-                "Engine {} not found in prefill or decode lists",
+                "Engine {} not found in prefill, decode, or encoder lists",
                 engine_id
             ))
         }
@@ -688,6 +804,7 @@ impl EngineManager {
         // Clear existing connections
         self.prefill_engines.clear();
         self.decode_engines.clear();
+        self.encoder_engines.clear();
 
         // Reload snapshot
         if let Some(addr) = nanoctrl_address {
@@ -702,9 +819,10 @@ impl EngineManager {
         }
 
         info!(
-            "Full sync completed: {} prefill engines, {} decode engines",
+            "Full sync completed: {} prefill engines, {} decode engines, {} encoder engines",
             self.prefill_engines.len(),
-            self.decode_engines.len()
+            self.decode_engines.len(),
+            self.encoder_engines.len()
         );
         Ok(())
     }

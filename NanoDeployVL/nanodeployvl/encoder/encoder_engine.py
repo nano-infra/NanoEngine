@@ -106,6 +106,19 @@ class EncoderEngine:
         self._heartbeat_stop_event = threading.Event()
         self._start_p2p_free_listener()
 
+        # --- ZMQ encode service (NanoRoute connects here) ---
+        self._zmq_port: int = config.zmq_port
+        self._zmq_thread: Optional[threading.Thread] = None
+        self._processor: Optional["ImageProcessor"] = None
+        self._start_zmq_encode_service()
+
+        # --- Warmup ImageProcessor (loads HF tokenizer/processor) ---
+        if self._processor is None:
+            from nanodeployvl.vision.processor import ImageProcessor
+
+            self._processor = ImageProcessor(config.model)
+            logger.info("ImageProcessor pre-loaded during init")
+
         # --- NanoCtrl registration ---
         self._nanoctrl_registered = False
         self._heartbeat_thread: Optional[threading.Thread] = None
@@ -227,6 +240,7 @@ class EncoderEngine:
             "num_slots": self.config.num_slots,
             "hidden_size": self.config.hidden_size,
             "host": host,
+            "port": self._zmq_port,
             "status": "ready",
             "peer_addrs": [self._peer_agent_addr] if self._peer_agent_addr else [],
             "p2p_host": host,
@@ -244,7 +258,7 @@ class EncoderEngine:
                 "world_size": 1,
                 "num_blocks": 0,
                 "host": info["host"],
-                "port": 0,
+                "port": info["port"],
                 "peer_addrs": info["peer_addrs"],
                 "p2p_host": info["p2p_host"],
                 "p2p_port": info["p2p_port"],
@@ -252,7 +266,7 @@ class EncoderEngine:
             if self.config.nanoctrl_scope:
                 payload["scope"] = self.config.nanoctrl_scope
 
-            url = f"{self.config.nanoctrl_address}/register_engine"
+            url = f"http://{self.config.nanoctrl_address}/register_engine"
             with httpx.Client(timeout=10.0, trust_env=False) as client:
                 resp = client.post(url, json=payload)
                 resp.raise_for_status()
@@ -279,7 +293,7 @@ class EncoderEngine:
                     payload = {"engine_id": self.engine_id}
                     if self.config.nanoctrl_scope:
                         payload["scope"] = self.config.nanoctrl_scope
-                    url = f"{self.config.nanoctrl_address}/heartbeat_engine"
+                    url = f"http://{self.config.nanoctrl_address}/heartbeat_engine"
                     with httpx.Client(timeout=5.0, trust_env=False) as client:
                         client.post(url, json=payload)
                 except Exception as e:
@@ -289,6 +303,196 @@ class EncoderEngine:
             target=_loop, name=f"encoder-hb-{self.engine_id}", daemon=True
         )
         self._heartbeat_thread.start()
+
+    # ------------------------------------------------------------------
+    # ZMQ encode service (NanoRoute → EncoderEngine)
+    # ------------------------------------------------------------------
+
+    def _start_zmq_encode_service(self):
+        """Start a ZMQ ROUTER socket to accept encode requests from NanoRoute.
+
+        Protocol (JSON over ZmqPacket):
+        - Request  action=5: {"messages": [...], "image_urls": [...]}
+        - Response action=6: {"input_ids": [...], "vision_slots": [...]}
+        """
+        import zmq
+
+        from nanodeployvl.vision.processor import ImageProcessor
+
+        # Lazy-load processor (shares model path with encoder)
+        self._processor = ImageProcessor(self.config.model)
+
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.ROUTER)
+        if self._zmq_port:
+            sock.bind(f"tcp://{self.config.host}:{self._zmq_port}")
+        else:
+            self._zmq_port = sock.bind_to_random_port(f"tcp://{self.config.host}")
+        logger.info(f"ZMQ encode service on port {self._zmq_port}")
+
+        def _serve_loop():
+            poller = zmq.Poller()
+            poller.register(sock, zmq.POLLIN)
+            while not self._heartbeat_stop_event.is_set():
+                events = dict(poller.poll(timeout=500))
+                if sock in events:
+                    frames = sock.recv_multipart()
+                    if len(frames) >= 2:
+                        identity = frames[0]
+                        reply = self._handle_encode_request(frames[-1])
+                        sock.send_multipart([identity, reply])
+
+        self._zmq_thread = threading.Thread(
+            target=_serve_loop, name=f"encoder-zmq-{self.engine_id}", daemon=True
+        )
+        self._zmq_thread.start()
+
+    def _handle_encode_request(self, raw: bytes) -> bytes:
+        """Process a single encode request and return the response.
+
+        Request (ZmqPacket action=5, JSON payload):
+            {"messages": [{"role": ..., "content": ...}, ...]}
+
+        Response (ZmqPacket action=6, JSON payload):
+            {"input_ids": [...], "vision_slots": [{...}, ...]}
+        """
+        import time
+
+        from nanodeploy.server.zmq_protocol import decode_packet, encode_packet
+
+        t_recv = time.perf_counter()
+        try:
+            action, payload = decode_packet(raw)
+            if action != 5:
+                return self._encode_error_response(f"Unexpected action={action}")
+
+            req = json.loads(payload)
+            messages = req.get("messages", [])
+            t_parse = time.perf_counter()
+            logger.info(
+                f"[ENCODE_TIMING] zmq_recv_to_parse={t_parse-t_recv:.3f}s, payload_bytes={len(raw)}"
+            )
+
+            return self._process_encode(messages)
+
+        except Exception as e:
+            logger.error(f"Encode request error: {e}", exc_info=True)
+            return self._encode_error_response(str(e))
+
+    def _process_encode(self, messages: list[dict]) -> bytes:
+        """Full pipeline: messages → chat template → tokenize → encode → response."""
+        import io
+        import time
+
+        import httpx as _httpx
+        from nanodeploy.server.zmq_protocol import encode_packet
+        from PIL import Image as _Image
+
+        assert self._processor is not None
+        t0 = time.perf_counter()
+
+        # 1. Parse messages into HF format + image URLs
+        hf_messages: list[dict] = []
+        image_urls: list[str] = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                hf_messages.append({"role": msg["role"], "content": content})
+                continue
+            hf_parts: list[dict] = []
+            for part in content:
+                if part.get("type") == "text":
+                    hf_parts.append({"type": "text", "text": part["text"]})
+                elif part.get("type") == "image_url":
+                    image_urls.append(part["image_url"]["url"])
+                    hf_parts.append({"type": "image"})
+            hf_messages.append({"role": msg["role"], "content": hf_parts})
+        t1 = time.perf_counter()
+
+        # 2. Download images (synchronous, in encode service thread)
+        images: list = []
+        if image_urls:
+            with _httpx.Client(timeout=30.0, follow_redirects=True) as client:
+                for url in image_urls:
+                    if url.startswith("data:"):
+                        import base64
+
+                        _, encoded = url.split(",", 1)
+                        data = base64.b64decode(encoded)
+                        images.append(_Image.open(io.BytesIO(data)).convert("RGB"))
+                    elif url.startswith(("http://", "https://")):
+                        resp = client.get(url)
+                        resp.raise_for_status()
+                        images.append(
+                            _Image.open(io.BytesIO(resp.content)).convert("RGB")
+                        )
+                    else:
+                        images.append(_Image.open(url).convert("RGB"))
+        t2 = time.perf_counter()
+        logger.info(
+            f"[ENCODE_TIMING] parse={t1-t0:.3f}s, download/decode={t2-t1:.3f}s, n_images={len(images)}, n_urls={len(image_urls)}"
+        )
+
+        # 3. Apply chat template
+        prompt_text = self._processor.apply_chat_template(
+            hf_messages, add_generation_prompt=True
+        )
+        t3 = time.perf_counter()
+
+        # 4. Tokenize text + preprocess images
+        if images:
+            processed = self._processor.process(text=prompt_text, images=images)
+            input_ids = processed["input_ids"].squeeze(0).tolist()
+            pixel_values = processed["pixel_values"].to(
+                device=self.config.vision_device,
+                dtype=getattr(torch, self.config.vision_dtype),
+            )
+            image_grid_thw = processed["image_grid_thw"].to(
+                device=self.config.vision_device
+            )
+        else:
+            input_ids = self._processor.get_token_ids(prompt_text)
+            pixel_values = None
+            image_grid_thw = None
+        t4 = time.perf_counter()
+        logger.info(
+            f"[ENCODE_TIMING] chat_template={t3-t2:.3f}s, preprocess={t4-t3:.3f}s, n_input_ids={len(input_ids)}, pixel_values={'None' if pixel_values is None else list(pixel_values.shape)}, image_grid_thw={image_grid_thw}"
+        )
+
+        # 5. Encode images → EmbeddingPool slots
+        vision_slots: list[dict] = []
+        if pixel_values is not None:
+            metas = self.encode(pixel_values, image_grid_thw)
+            vision_slots = [
+                {
+                    "encoder_engine_id": m.encoder_engine_id,
+                    "slot_idx": m.slot_idx,
+                    "num_tokens": m.num_tokens,
+                    "hidden_size": m.hidden_size,
+                    "max_tokens_per_slot": m.max_tokens_per_slot,
+                }
+                for m in metas
+            ]
+        t5 = time.perf_counter()
+
+        # 6. Build response
+        resp = json.dumps(
+            {
+                "input_ids": input_ids,
+                "vision_slots": vision_slots,
+            }
+        ).encode()
+        t6 = time.perf_counter()
+        logger.info(
+            f"[ENCODE_TIMING] vit_encode={t5-t4:.3f}s, json_serialize={t6-t5:.3f}s, resp_bytes={len(resp)}, TOTAL={t6-t0:.3f}s"
+        )
+        return encode_packet(action=6, payload=resp)
+
+    def _encode_error_response(self, error_msg: str) -> bytes:
+        from nanodeploy.server.zmq_protocol import encode_packet
+
+        resp = json.dumps({"error": error_msg}).encode()
+        return encode_packet(action=6, payload=resp)
 
     # ------------------------------------------------------------------
     # P2P free listener (ZMQ ROUTER, same pattern as engine_server.py)
@@ -360,6 +564,8 @@ class EncoderEngine:
             self._heartbeat_thread.join(timeout=2.0)
         if self._p2p_thread and self._p2p_thread.is_alive():
             self._p2p_thread.join(timeout=2.0)
+        if self._zmq_thread and self._zmq_thread.is_alive():
+            self._zmq_thread.join(timeout=2.0)
 
         if self._nanoctrl_registered and self.config.nanoctrl_address:
             try:

@@ -28,6 +28,17 @@ VLM（Vision-Language Model）推理中，Vision Encoder（ViT）和 LLM 的计�
 ## 2. 整体架构
 
 ```
+    Client (HTTP /v1/chat/completions)
+        │
+        ▼
+    NanoRoute (HTTP reverse proxy + ZMQ router)
+        ├── 解析多模态消息（text + image_url）
+        ├── 检测图片 → ZMQ Action=5 发给 EncoderEngine
+        ├── 接收 Action=6 响应（input_ids + vision_slots）
+        ├── 构建 FlatBuffer Sequence（含 VisionSlot）
+        ├── ZMQ 发给 LLM Engine
+        └── 流式返回 tokens → Client (SSE/JSON)
+
                     NanoCtrl (Redis + HTTP)
                    ┌──────────────────────┐
                    │  Engine Registry      │
@@ -63,6 +74,8 @@ VLM（Vision-Language Model）推理中，Vision Encoder（ViT）和 LLM 的计�
          │  └────────────┘  │   │    └──────────────┘   │
          └──────────────────┘   └───────────────────────┘
 ```
+
+NanoRoute 通过 NanoCtrl 服务发现获取可用的 EncoderEngine 和 LLM Engine 列表，动态连接并负载均衡。客户端只需与 NanoRoute 交互。
 
 ## 3. 核心组件设计
 
@@ -306,55 +319,65 @@ EP 相关字段：
 User Request (image + prompt)
         │
         ▼
-   ┌─────────┐      ┌──────────────┐      ┌────────────┐
-   │ Scheduler│─────►│ EncoderEngine│      │ LLM Worker │
-   │(NanoCtrl)│      │              │      │ (Ray)      │
-   └─────────┘      │  1. encode() │      │            │
-                     │  pixel_values│      │            │
-                     │      │       │      │            │
-                     │      ▼       │      │            │
-                     │  VisionEncoder      │            │
-                     │  (ViT forward)      │            │
-                     │      │       │      │            │
-                     │      ▼       │      │            │
-                     │  pool.write_slot()  │            │
-                     │  → GPU buffer│      │            │
-                     │      │       │      │            │
-                     │      ▼       │      │            │
-                     │  VisionSlotMeta     │            │
-                     │  (slot_id,   │      │            │
-                     │   remote_addr,      │            │
-                     │   rkey,      │      │            │
-                     │   num_tokens)│      │            │
-                     └──────┬───────┘      │            │
-                            │              │            │
-                     FBS VisionSlot        │            │
-                     in Sequence           │            │
-                            │              │            │
-                            └──────────────┤            │
+   ┌──────────┐     ┌──────────────┐      ┌────────────┐
+   │ NanoRoute │────►│ EncoderEngine│      │ LLM Worker │
+   │(HTTP+ZMQ) │     │              │      │ (Ray)      │
+   └──────────┘     │  1. encode() │      │            │
+        │            │  ZMQ Action=5│      │            │
+        │            │  messages+   │      │            │
+        │            │  image_urls  │      │            │
+        │            │      │       │      │            │
+        │            │      ▼       │      │            │
+        │            │  ImageProcessor     │            │
+        │            │  (chat_template +   │            │
+        │            │   preprocess)       │            │
+        │            │      │       │      │            │
+        │            │      ▼       │      │            │
+        │            │  VisionEncoder      │            │
+        │            │  (ViT forward)      │            │
+        │            │      │       │      │            │
+        │            │      ▼       │      │            │
+        │            │  pool.write_slot()  │            │
+        │            │  → GPU buffer│      │            │
+        │            │      │       │      │            │
+        │            │      ▼       │      │            │
+        │            │  ZMQ Action=6│      │            │
+        │            │  input_ids + │      │            │
+        │            │  vision_slots│      │            │
+        │            └──────┬───────┘      │            │
+        │                   │              │            │
+        │◄──────────────────┘              │            │
+        │                                  │            │
+        │  2. Build FlatBuffer Sequence    │            │
+        │     with VisionSlot metadata     │            │
+        │                                  │            │
+        │  ZMQ → LLM Engine               │            │
+        └──────────────────────────────────┤            │
                                            │            │
-                                    2. run_from_bytes() │
+                                    3. run_from_bytes() │
                                     extract VisionSlots │
                                            │            │
-                                    3. _fetch_vision_   │
+                                    4. _fetch_vision_   │
                                        embeds_rdma()    │
                                     RDMA read ◄─────────┤
                                     (GPU→GPU)  ─────────┤
                                            │            │
-                                    4. _inject_vision_  │
+                                    5. _inject_vision_  │
                                        embeds()         │
                                     masked_scatter      │
                                            │            │
-                                    5. model.forward()  │
+                                    6. model.forward()  │
                                     (prefill)           │
                                            │            │
-                                    6. decode loop      │
+                                    7. decode loop      │
                                     (autoregressive)    │
+                                    tokens → NanoRoute  │
+                                    → Client (SSE)      │
                                            │            │
                      ┌──────────────┐      │            │
                      │ EncoderEngine│◄─────┤            │
                      │              │      │            │
-                     │ 7. P2P free  │  FreeVisionSlots  │
+                     │ 8. P2P free  │  FreeVisionSlots  │
                      │ pool.free()  │  (Action=4)       │
                      └──────────────┘      └────────────┘
 ```

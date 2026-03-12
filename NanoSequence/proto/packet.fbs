@@ -6,6 +6,8 @@ enum Action : byte {
   GetEngineInfo = 2,
   FreeSequences = 3,
   FreeVisionSlots = 4,
+  EncodeRequest = 5,
+  EncodeResponse = 6,
 }
 
 table ZmqPacket {

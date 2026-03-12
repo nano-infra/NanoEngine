@@ -262,16 +262,29 @@ class ModelRunner:
         # Inject image embeddings
         if "image" in self._vision_embeds:
             image_token_id = getattr(hf_config, "image_token_id", None)
+            logger.info(
+                f"[VISION_INJECT] image_token_id={image_token_id}, input_ids.shape={input_ids.shape}, image_embeds.shape={self._vision_embeds['image'].shape}"
+            )
             if image_token_id is not None:
                 image_embeds = self._vision_embeds["image"].to(
                     dtype=inputs_embeds.dtype
                 )
                 mask = input_ids == image_token_id
                 n_tokens = mask.sum().item()
+                logger.info(
+                    f"[VISION_INJECT] n_image_tokens_in_input={n_tokens}, image_embeds_tokens={image_embeds.shape[0]}, match={n_tokens == image_embeds.shape[0]}"
+                )
                 if n_tokens > 0 and n_tokens == image_embeds.shape[0]:
                     mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
                     inputs_embeds = inputs_embeds.masked_scatter(
                         mask_expanded, image_embeds
+                    )
+                    logger.info(
+                        f"[VISION_INJECT] Successfully injected {n_tokens} image tokens"
+                    )
+                else:
+                    logger.warning(
+                        f"[VISION_INJECT] SKIPPED injection: n_tokens={n_tokens} != image_embeds={image_embeds.shape[0]}"
                     )
 
         # Inject video embeddings
@@ -405,6 +418,9 @@ class ModelRunner:
 
         # Store as vision embeds for _inject_vision_embeds
         # The recv_buf contains all vision tokens concatenated
+        logger.info(
+            f"[VISION_RDMA] Stored vision embeds: shape={recv_buf.shape}, dtype={recv_buf.dtype}, norm={recv_buf.norm().item():.4f}, nonzero={recv_buf.count_nonzero().item()}/{recv_buf.numel()}"
+        )
         self._vision_embeds = {"image": recv_buf}
 
     def num_kvcache_blocks(self):
@@ -431,7 +447,7 @@ class ModelRunner:
 
         # Start PeerAgent AFTER kv_cache (and GDN states) are allocated,
         # so that all tensors exist for RDMA memory region registration.
-        # Skipped for hybrid mode (no P2P KV transfer).
+        # In hybrid mode, PeerAgent is started but KV/GDN MR is skipped.
         cache_context.start_peer_agent(mode=self.config.mode)
 
         if not self.enforce_eager:
@@ -813,7 +829,16 @@ class ModelRunner:
             # Inject vision embeddings during prefill if available
             inputs_embeds = None
             if is_prefill and self._vision_embeds is not None:
+                logger.info(
+                    f"[RUN_MODEL] Injecting vision embeds for prefill, input_ids.shape={input_ids.shape}, _vision_embeds keys={list(self._vision_embeds.keys())}"
+                )
                 inputs_embeds = self._inject_vision_embeds(input_ids)
+                # Clear after injection attempt
+                self._vision_embeds = None
+            elif is_prefill:
+                logger.info(
+                    f"[RUN_MODEL] Prefill WITHOUT vision embeds, input_ids.shape={input_ids.shape}"
+                )
             if inputs_embeds is not None:
                 hidden = self.model(input_ids, positions, inputs_embeds=inputs_embeds)
             else:
@@ -948,6 +973,9 @@ class ModelRunner:
                 # RDMA-fetch vision embeddings from encoder (EP-separated mode)
                 if i == 0 and self._vision_embeds is None:
                     vision_slots = extract_vision_slots_from_bytes(data)
+                    logger.info(
+                        f"[RUN_FROM_BYTES] rank={self.rank}, vision_slots={vision_slots}, data_len={len(data) if data else 0}"
+                    )
                     if vision_slots:
                         self._fetch_vision_embeds_rdma(vision_slots)
 

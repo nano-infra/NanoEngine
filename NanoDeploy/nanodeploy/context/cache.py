@@ -109,6 +109,7 @@ class CacheContext:
 
         self.endpoints = {}
         self.num_remote_kvcache_blocks = {}
+        self.remote_max_num_seqs: dict[str, int] = {}  # engine_id -> max_num_seqs
         self._peer_agent = None
         self._peer_agent_addr: str | None = None
         self._connected_peers: set[str] = set()  # track connected peer addresses
@@ -169,6 +170,31 @@ class CacheContext:
         return (
             layer_idx * self.gdn_recurrent_states.stride(0)
             + slot_idx * self.gdn_recurrent_states.stride(1)
+        ) * self.gdn_recurrent_states.element_size()
+
+    def remote_gdn_conv_stride(
+        self, layer_idx: int, slot_idx: int, remote_engine_id: str
+    ) -> int:
+        """Compute GDN conv state offset for a REMOTE engine's tensor layout."""
+        if self.gdn_conv_states is None:
+            return -1
+        remote_num_slots = self.remote_max_num_seqs.get(remote_engine_id, 0) + 1
+        # remote stride(0) = remote_num_slots * local_stride(1)
+        remote_stride0 = remote_num_slots * self.gdn_conv_states.stride(1)
+        return (
+            layer_idx * remote_stride0 + slot_idx * self.gdn_conv_states.stride(1)
+        ) * self.gdn_conv_states.element_size()
+
+    def remote_gdn_recurrent_stride(
+        self, layer_idx: int, slot_idx: int, remote_engine_id: str
+    ) -> int:
+        """Compute GDN recurrent state offset for a REMOTE engine's tensor layout."""
+        if self.gdn_recurrent_states is None:
+            return -1
+        remote_num_slots = self.remote_max_num_seqs.get(remote_engine_id, 0) + 1
+        remote_stride0 = remote_num_slots * self.gdn_recurrent_states.stride(1)
+        return (
+            layer_idx * remote_stride0 + slot_idx * self.gdn_recurrent_states.stride(1)
         ) * self.gdn_recurrent_states.element_size()
 
     def gdn_conv_slot_num_bytes(self) -> int:
@@ -248,14 +274,15 @@ class CacheContext:
         )
 
     def start_peer_agent(self, mode: str = "hybrid"):
-        """Start PeerAgent and register all memory regions (KV cache + GDN states) for RDMA.
+        """Start PeerAgent and register memory regions for RDMA.
 
         Must be called AFTER allocate_kvcache() and allocate_gdn_states() so that
         all tensors exist before registration.
-        Skipped for hybrid mode (no P2P KV transfer needed).
+
+        In hybrid mode the PeerAgent is still started (needed for RDMA-fetching
+        vision embeddings from the encoder), but KV cache / GDN MR registration
+        is skipped because hybrid mode does not perform P2P KV transfer.
         """
-        if mode == "hybrid":
-            return
         if self.nanoctrl_address is None or self.engine_id is None:
             return
 
@@ -287,6 +314,15 @@ class CacheContext:
                 scope=self.nanoctrl_scope,
             )
             self._peer_agent_addr = agent_alias
+
+            # In hybrid mode we only need the PeerAgent alive (for vision
+            # embed RDMA fetch); KV cache / GDN MR registration is not needed.
+            if mode == "hybrid":
+                logger.info(
+                    f"PeerAgent started (hybrid, no KV MR): alias={agent_alias}, "
+                    f"server={server_url}"
+                )
+                return
 
             # Register KV cache
             kv_size = self.kv_cache.numel() * self.kv_cache.itemsize
@@ -451,17 +487,23 @@ class CacheContext:
     # ------------------------------------------------------------------
 
     def _ensure_peer_connections(
-        self, connection_requests: list[tuple[str, str, int]]
+        self, connection_requests: list[tuple[str, str, int, int]]
     ) -> None:
         """Establish connections to remote peers if not already connected.
 
         Args:
-            connection_requests: list of (peer_alias, engine_id, num_kvcache_blocks)
+            connection_requests: list of (peer_alias, engine_id, num_kvcache_blocks, max_num_seqs)
         """
         remote_peers_to_connect: dict[str, str] = {}
-        for peer_alias, engine_id, num_kvcache_blocks in connection_requests:
+        for (
+            peer_alias,
+            engine_id,
+            num_kvcache_blocks,
+            max_num_seqs,
+        ) in connection_requests:
             if peer_alias and peer_alias not in self._connected_peers:
                 self.num_remote_kvcache_blocks[engine_id] = num_kvcache_blocks
+                self.remote_max_num_seqs[engine_id] = max_num_seqs
                 remote_peers_to_connect[peer_alias] = engine_id
 
         if not remote_peers_to_connect:
@@ -527,6 +569,17 @@ class CacheContext:
 
                 # Build KV cache RDMA ops
                 rdma_ops: list[tuple] = []
+                # Log stride info once per peer for diagnostics
+                logger.info(
+                    f"[RDMA_DEBUG] peer={peer_alias}, engine={engine_id}, "
+                    f"num_hidden_layers={self.num_hidden_layers}, "
+                    f"num_local_blocks={self.num_local_kvcache_blocks}, "
+                    f"num_remote_blocks={self.num_remote_kvcache_blocks.get(engine_id, '?')}, "
+                    f"kv_cache_shape={list(self.kv_cache.shape)}, "
+                    f"kv_cache_strides={self.kv_cache.stride()}, "
+                    f"block_stride_1={self.block_stride(1)}, "
+                    f"total_kv_ops={len(assign_batch)}"
+                )
                 for op_idx, (
                     _peer_alias,
                     kv_idx,
@@ -541,6 +594,35 @@ class CacheContext:
                         kv_idx, layer_idx, remote_block_idx, engine_id
                     )
                     length = self.block_stride(1)
+
+                    # Log first few ops per (kv_idx, block) pair for debugging
+                    if layer_idx == 0:
+                        # Also compute expected offset from tensor strides
+                        s = self.kv_cache.stride()
+                        elem = self.kv_cache.element_size()
+                        expected_local = (
+                            kv_idx * s[0] + layer_idx * s[1] + source_block_idx * s[2]
+                        ) * elem
+                        expected_remote_blocks = self.num_remote_kvcache_blocks.get(
+                            engine_id, self.num_local_kvcache_blocks
+                        )
+                        # Remote tensor has same per-element strides except dim2 depends on remote block count
+                        expected_remote = (
+                            kv_idx
+                            * self.num_hidden_layers
+                            * expected_remote_blocks
+                            * s[3]
+                            * s[4]
+                            * s[5]
+                            + layer_idx * expected_remote_blocks * s[3] * s[4] * s[5]
+                            + remote_block_idx * s[3] * s[4] * s[5]
+                        ) * elem
+                        logger.info(
+                            f"[RDMA_DEBUG] op={op_idx}: kv={kv_idx} layer={layer_idx} "
+                            f"remote_blk={remote_block_idx} local_blk={source_block_idx} "
+                            f"local_off={local_off} remote_off={remote_off} len={length} "
+                            f"expected_local={expected_local} expected_remote={expected_remote}"
+                        )
 
                     if local_mr_handler is None or remote_mr_handler is None:
                         logger.error(
@@ -595,7 +677,9 @@ class CacheContext:
                                 (
                                     local_conv_mr,
                                     remote_conv_mr,
-                                    self.gdn_conv_stride(layer_idx, remote_slot),
+                                    self.remote_gdn_conv_stride(
+                                        layer_idx, remote_slot, engine_id
+                                    ),
                                     self.gdn_conv_stride(layer_idx, local_slot),
                                     conv_len,
                                 )
@@ -620,7 +704,9 @@ class CacheContext:
                                 (
                                     local_rec_mr,
                                     remote_rec_mr,
-                                    self.gdn_recurrent_stride(layer_idx, remote_slot),
+                                    self.remote_gdn_recurrent_stride(
+                                        layer_idx, remote_slot, engine_id
+                                    ),
                                     self.gdn_recurrent_stride(layer_idx, local_slot),
                                     rec_len,
                                 )
@@ -640,6 +726,35 @@ class CacheContext:
                         logger.error("endpoint.read returned None")
                         raise RuntimeError("endpoint.read returned None")
                     slot.wait()
+                    # GPUDirect RDMA may bypass CUDA stream ordering.
+                    # Synchronize to ensure migrated KV data is visible to subsequent kernels.
+                    torch.cuda.synchronize()
+
+                    # Verify KV data integrity after migration
+                    kv_ops_in_batch = [op for op in assign_batch]
+                    if kv_ops_in_batch:
+                        # Check a few representative blocks for non-zero data
+                        blocks_checked = set()
+                        for _, kv_idx, layer_idx, _, blk_idx in kv_ops_in_batch:
+                            if (
+                                kv_idx,
+                                blk_idx,
+                            ) not in blocks_checked and layer_idx == 0:
+                                blocks_checked.add((kv_idx, blk_idx))
+                                blk_data = self.kv_cache[kv_idx, 0, blk_idx]
+                                norm_val = blk_data.float().norm().item()
+                                nz = blk_data.count_nonzero().item()
+                                total = blk_data.numel()
+                                logger.info(
+                                    f"[RDMA_VERIFY] kv={kv_idx} layer=0 local_blk={blk_idx}: "
+                                    f"norm={norm_val:.4f}, nonzero={nz}/{total} ({100*nz/total:.1f}%)"
+                                )
+                                if nz == 0:
+                                    logger.error(
+                                        f"[RDMA_VERIFY] ALL ZEROS in kv={kv_idx} layer=0 blk={blk_idx}! "
+                                        f"Migration likely read from wrong offset."
+                                    )
+
                     logger.info(
                         f"Completed batch RDMA read from {peer_alias} ({len(rdma_ops)} operations)"
                     )
@@ -675,13 +790,19 @@ class CacheContext:
         engine_info_map = self._fetch_engine_info_from_nanoctrl(target_engine_ids)
 
         # Ensure connections
-        connection_requests: list[tuple[str, str, int]] = []
+        connection_requests: list[tuple[str, str, int, int]] = []
         for v in views:
             engine_id = v.migrate_engine_id
             engine_info = engine_info_map.get(engine_id, {})
+            remote_max_num_seqs = engine_info.get("max_num_seqs", 0)
             for peer_alias in engine_info.get("peer_addrs", []):
                 connection_requests.append(
-                    (peer_alias, engine_id, v.migrate_num_kvcache_blocks)
+                    (
+                        peer_alias,
+                        engine_id,
+                        v.migrate_num_kvcache_blocks,
+                        remote_max_num_seqs,
+                    )
                 )
         self._ensure_peer_connections(connection_requests)
 
@@ -700,12 +821,33 @@ class CacheContext:
                 )
                 continue
 
-            if len(v.migrate_block_location) != len(v.active_block_location):
+            if len(v.migrate_block_location) > len(v.active_block_location):
                 logger.error(
-                    f"Sequence {v.seq_id}: block_location length mismatch! "
+                    f"Sequence {v.seq_id}: migrate has MORE blocks than active! "
                     f"migrate={len(v.migrate_block_location)}, active={len(v.active_block_location)}"
                 )
                 continue
+            if len(v.migrate_block_location) < len(v.active_block_location):
+                # Expected when prompt_tokens % block_size == 0: prefill serializes N blocks
+                # for prompt KV, but decode allocates N+1 blocks for (prompt+1) total tokens.
+                # zip() below naturally iterates only over the migrate (shorter) side;
+                # the extra active block will be filled during the first decode step.
+                logger.info(
+                    f"Sequence {v.seq_id}: partial migration "
+                    f"(migrate={len(v.migrate_block_location)}, active={len(v.active_block_location)})"
+                )
+
+            logger.info(
+                f"[MIGRATE_DEBUG] seq={v.seq_id}: sp_idx={sp_idx}, "
+                f"migrate_blocks={[(b[0], b[1]) for b in v.migrate_block_location]}, "
+                f"active_blocks={[(b[0], b[1]) for b in v.active_block_location]}, "
+                f"migrate_num_kvcache_blocks={v.migrate_num_kvcache_blocks}, "
+                f"migrate_dp_idx={v.migrate_dp_idx}, "
+                f"migrate_attention_sp={v.migrate_attention_sp}, "
+                f"kv_cache_size0={self.kv_cache.size(0)}, "
+                f"num_hidden_layers={self.num_hidden_layers}, "
+                f"attention_tp={self.attention_tp}"
+            )
 
             for remote_bl, source_bl in zip(
                 v.migrate_block_location, v.active_block_location

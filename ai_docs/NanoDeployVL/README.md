@@ -11,6 +11,20 @@
 ## 架构
 
 ```
+                        NanoCtrl (Redis + HTTP)
+                       ┌──────────────────────┐
+                       │  Engine Registry      │
+                       │  Peer Discovery       │
+                       │  Heartbeat Monitor    │
+                       └──────┬───────┬───────┘
+                              │       │
+                  register    │       │  register
+                              │       │
+    Client ──HTTP──► NanoRoute (HTTP + ZMQ Router)
+                       │                │
+                ZMQ Action=5/6    ZMQ Sequence
+                       │          (FlatBuffer)
+                       ▼                ▼
 ┌───────────────────────┐          RDMA          ┌──────────────────────────┐
 │    EncoderEngine      │  ─────────────────────► │   LLM Worker (Ray)       │
 │                       │  (EmbeddingPool slots)  │                          │
@@ -31,25 +45,29 @@
 
 **数据流**:
 
-1. `EncoderEngine` 从 NanoCtrl 接收 encode 请求（含 `pixel_values` 及 vision slot 分配）
-2. `VisionEncoder` 将 `pixel_values` 编码为 vision embeddings，写入 `EmbeddingPool` 的 slot
-3. LLM worker 的 `ModelRunner.run_from_bytes()` 从 FlatBuffers 中提取 `VisionSlot` 信息
-4. `_fetch_vision_embeds_rdma()` 通过 dlslime PeerAgent RDMA 读取 encoder 的 EmbeddingPool slot
-5. `_inject_vision_embeds()` 在 prefill 阶段用 vision embeddings 替换占位符 token 的 text embedding
-6. Prefill 完成后，LLM 端通过 P2P `FreeVisionSlots`（Action=4）通知 encoder 释放 slot
+1. 客户端发送 HTTP `/v1/chat/completions` 请求（含 `image_url` 多模态消息）到 **NanoRoute**
+2. NanoRoute 检测到图片内容，通过 ZMQ Action=5 将 encode 请求发送给 `EncoderEngine`
+3. `EncoderEngine` 内部：`ImageProcessor` 预处理 → `VisionEncoder` ViT 编码 → 写入 `EmbeddingPool` slot
+4. `EncoderEngine` 返回 ZMQ Action=6 响应（`input_ids` + `vision_slots` 元数据）给 NanoRoute
+5. NanoRoute 构建 FlatBuffer `Sequence`（含 `VisionSlot`），通过 ZMQ 发送给 LLM Engine
+6. LLM worker 的 `ModelRunner` 从 FlatBuffer 提取 `VisionSlot`，通过 `_fetch_vision_embeds_rdma()` RDMA 读取 encoder 的 EmbeddingPool slot
+7. `_inject_vision_embeds()` 在 prefill 阶段用 vision embeddings 替换占位符 token 的 text embedding
+8. NanoRoute 流式返回 LLM 生成的 token 给客户端（SSE / JSON）
+9. Prefill 完成后，LLM 端通过 P2P `FreeVisionSlots`（Action=4）通知 encoder 释放 slot
 
 ## 文件结构
 
 ### NanoDeployVL/
 
-| 文件                                     | 说明                                                                                  |
-| ---------------------------------------- | ------------------------------------------------------------------------------------- |
-| `nanodeployvl/__init__.py`               | 包入口，导出 VLConfig、EncoderConfig、EncoderEngine、VisionEncoder、ImageProcessor    |
-| `nanodeployvl/config.py`                 | `VLConfig` — 继承 NanoDeploy `Config`，提取 vision_config 和特殊 token ID             |
-| `nanodeployvl/encoder/encoder_config.py` | `EncoderConfig` — 独立 encoder 进程配置                                               |
-| `nanodeployvl/encoder/encoder_engine.py` | `EncoderEngine` — 独立 vision encoder 进程，连接 NanoCtrl，管理 EmbeddingPool 及 RDMA |
-| `nanodeployvl/vision/encoder.py`         | `VisionEncoder` + `VisionModel` — Qwen3VL ViT 实现                                    |
-| `nanodeployvl/vision/processor.py`       | `ImageProcessor` — 封装 HF `Qwen3VLProcessor`                                         |
+| 文件                                      | 说明                                                                                  |
+| ----------------------------------------- | ------------------------------------------------------------------------------------- |
+| `nanodeployvl/__init__.py`                | 包入口，导出 VLConfig、EncoderConfig、EncoderEngine、VisionEncoder、ImageProcessor    |
+| `nanodeployvl/config.py`                  | `VLConfig` — 继承 NanoDeploy `Config`，提取 vision_config 和特殊 token ID             |
+| `nanodeployvl/encoder/encoder_config.py`  | `EncoderConfig` — 独立 encoder 进程配置                                               |
+| `nanodeployvl/encoder/encoder_engine.py`  | `EncoderEngine` — 独立 vision encoder 进程，连接 NanoCtrl，管理 EmbeddingPool 及 RDMA |
+| `nanodeployvl/server/vl_engine_server.py` | `VLEngineServer` — Encoder-only 服务入口（health check），客户端请求由 NanoRoute 路由 |
+| `nanodeployvl/vision/encoder.py`          | `VisionEncoder` + `VisionModel` — Qwen3VL ViT 实现                                    |
+| `nanodeployvl/vision/processor.py`        | `ImageProcessor` — 封装 HF `Qwen3VLProcessor`                                         |
 
 ### NanoDeploy/ （EP 模式相关）
 

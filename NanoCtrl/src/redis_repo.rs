@@ -341,6 +341,7 @@ impl RedisRepo {
             "peer_addrs": body.peer_addrs,
             "p2p_host": body.p2p_host.as_deref().unwrap_or_default(),
             "p2p_port": body.p2p_port.unwrap_or(0),
+            "max_num_seqs": body.max_num_seqs.unwrap_or(0),
         });
 
         let rev: i64 = redis::cmd("EVAL")

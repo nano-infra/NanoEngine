@@ -36,20 +36,23 @@ class EncoderConfig(BaseModel):
     nanoctrl_scope : str | None
         NanoCtrl scope for multi-tenant isolation.
     host : str
-        Bind address for the P2P ZMQ socket.
+        Bind address for ZMQ sockets.
     p2p_port : int
         Port for P2P ZMQ free-slot notifications.
+    zmq_port : int
+        Port for the ZMQ encode service (NanoRoute connects here).
     """
 
     model: str
     vision_device: str = "cuda:0"
     vision_dtype: str = "bfloat16"
-    num_slots: int = 16
+    num_slots: int = 64
     max_tokens_per_slot: int = 4096
     nanoctrl_address: str | None = None
     nanoctrl_scope: str | None = None
     host: str = "0.0.0.0"
     p2p_port: int = 0  # 0 = auto-bind
+    zmq_port: int = 0  # 0 = auto-bind; NanoRoute connects to this port
 
     # Populated during validation
     vision_config: Any = Field(default=None, exclude=True)

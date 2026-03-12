@@ -96,6 +96,16 @@ def main():
     ]
 
     # --- Prefill ---
+    print(f"\n[DISAGG] === Before Prefill ===")
+    for seq in seqs:
+        print(f"[DISAGG] {seq.dump()}")
+        sp = seq.sampling_params
+        print(
+            f"[DISAGG] SamplingParams: temperature={sp.temperature}, max_tokens={sp.max_tokens}, ignore_eos={sp.ignore_eos}"
+        )
+        print(
+            f"[DISAGG] num_checkpointed_tokens={seq.num_checkpointed_tokens}, num_cached_tokens={seq.num_cached_tokens}"
+        )
     ray.get(prefill.add_request.remote(seqs))
     serialized_seqs = ray.get(prefill.generate.remote(return_serialized=True))
 
@@ -111,6 +121,20 @@ def main():
     if not migrated_seqs:
         print("No sequences migrated from prefill. Exiting.")
         return
+
+    print(f"\n[DISAGG] === After Prefill (Migration Data) ===")
+    for seq in migrated_seqs:
+        print(f"[DISAGG] {seq.dump()}")
+        sp = seq.sampling_params
+        print(
+            f"[DISAGG] SamplingParams: temperature={sp.temperature}, max_tokens={sp.max_tokens}, ignore_eos={sp.ignore_eos}"
+        )
+        print(
+            f"[DISAGG] num_checkpointed_tokens={seq.num_checkpointed_tokens}, num_cached_tokens={seq.num_cached_tokens}"
+        )
+        print(
+            f"[DISAGG] last_token={seq.last_token}, num_prompt_tokens={seq.num_prompt_tokens}, num_tokens={seq.num_tokens}"
+        )
 
     # --- Decode ---
     ray.get(decode.add_request.remote(migrated_seqs))
