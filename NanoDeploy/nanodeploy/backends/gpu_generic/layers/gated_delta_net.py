@@ -33,7 +33,11 @@ except ImportError:
 
 # Try to import causal_conv1d for optimized depthwise conv
 try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d import (
+        causal_conv1d_fn,
+        causal_conv1d_update,
+        causal_conv1d_varlen_states,
+    )
 
     _HAS_CAUSAL_CONV1D = True
 except ImportError:
@@ -226,43 +230,48 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             return self._conv1d_decode(qkv, context)
 
     def _conv1d_prefill_fast(self, qkv: torch.Tensor, context) -> torch.Tensor:
-        """Prefill conv1d using causal_conv1d_fn (per-sequence)."""
+        """Prefill conv1d using causal_conv1d_fn with seq_idx (single batched kernel)."""
         cu_seqlens = context.cu_seqlens_q
         num_seqs = cu_seqlens.shape[0] - 1
-        qkv_out = torch.empty_like(qkv)
-
         conv_weight = self.conv1d.weight.squeeze(1)
 
-        for i in range(num_seqs):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
-            if end <= start:
-                continue
-            seq_qkv = qkv[start:end].unsqueeze(0).transpose(1, 2)
-            seq_out = causal_conv1d_fn(
-                x=seq_qkv,
+        # Build seq_idx on GPU — no CPU-GPU syncs
+        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+        seq_idx = torch.repeat_interleave(
+            torch.arange(num_seqs, dtype=torch.int32, device=qkv.device),
+            seq_lens,
+        ).unsqueeze(
+            0
+        )  # [1, total_tokens]
+
+        # Single batched kernel call across all sequences
+        qkv_out = (
+            causal_conv1d_fn(
+                x=qkv.T.unsqueeze(0),  # [1, conv_dim, total_tokens]
                 weight=conv_weight,
                 bias=None,
+                seq_idx=seq_idx,
                 activation=self.activation,
             )
-            qkv_out[start:end] = seq_out.squeeze(0).transpose(0, 1)
+            .squeeze(0)
+            .T
+        )  # [total_tokens, conv_dim]
 
-        # Store conv state for future decode
+        # Store conv states for future decode steps — batched extraction, no CPU syncs
         gdn_conv_states = getattr(context, "gdn_conv_states", None)
         gdn_state_slots = getattr(context, "gdn_state_slots", None)
         if gdn_conv_states is not None:
-            for i in range(num_seqs):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
-                if end <= start:
-                    continue
-                seq_len = end - start
-                pad_len = min(seq_len, self.conv_kernel_size - 1)
-                slot = gdn_state_slots[i].item() if gdn_state_slots is not None else i
-                gdn_conv_states[self.layer_idx, slot, :, :] = 0
-                gdn_conv_states[self.layer_idx, slot, :, -pad_len:] = qkv[
-                    end - pad_len : end
-                ].T
+            # [num_seqs, conv_dim, kernel_size-1]
+            states = causal_conv1d_varlen_states(
+                qkv, cu_seqlens, self.conv_kernel_size - 1
+            )
+            if gdn_state_slots is not None:
+                slots = gdn_state_slots[:num_seqs]
+                gdn_conv_states[self.layer_idx, slots, :, 0] = 0
+                gdn_conv_states[self.layer_idx, slots, :, 1:] = states
+            else:
+                gdn_conv_states[self.layer_idx, :num_seqs, :, 0] = 0
+                gdn_conv_states[self.layer_idx, :num_seqs, :, 1:] = states
 
         return qkv_out
 

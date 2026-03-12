@@ -14,6 +14,7 @@ Two roles:
 from __future__ import annotations
 
 import dataclasses
+import heapq
 from typing import Any
 
 import torch
@@ -54,7 +55,7 @@ class EmbeddingPool:
 
     # Runtime state (set in __post_init__)
     buffer: torch.Tensor = dataclasses.field(init=False)
-    _free_slots: list[int] = dataclasses.field(init=False)
+    _free_slots: list[int] = dataclasses.field(init=False)  # min-heap
     _slot_token_counts: dict[int, int] = dataclasses.field(init=False)
 
     # RDMA
@@ -69,7 +70,7 @@ class EmbeddingPool:
             dtype=self.dtype,
             device=self.device,
         )
-        self._free_slots = list(range(self.num_slots))
+        self._free_slots = list(range(self.num_slots))  # already a min-heap (sorted)
         self._slot_token_counts = {}
         logger.info(
             f"EmbeddingPool: {self.num_slots} slots × "
@@ -99,7 +100,7 @@ class EmbeddingPool:
             )
         if not self._free_slots:
             raise RuntimeError("EmbeddingPool: no free slots")
-        slot_idx = self._free_slots.pop(0)
+        slot_idx = heapq.heappop(self._free_slots)  # O(log n)
         self._slot_token_counts[slot_idx] = num_tokens
         return slot_idx
 
@@ -108,13 +109,16 @@ class EmbeddingPool:
         if slot_idx in self._slot_token_counts:
             del self._slot_token_counts[slot_idx]
         if slot_idx not in self._free_slots:
-            self._free_slots.append(slot_idx)
-            self._free_slots.sort()
+            heapq.heappush(self._free_slots, slot_idx)  # O(log n)
 
     def free_many(self, slot_indices: list[int]) -> None:
         """Free multiple slots at once."""
         for idx in slot_indices:
-            self.free(idx)
+            if idx in self._slot_token_counts:
+                del self._slot_token_counts[idx]
+            if idx not in self._free_slots:
+                self._free_slots.append(idx)
+        heapq.heapify(self._free_slots)  # O(n) single heapify vs n × O(log n) pushes
 
     # ------------------------------------------------------------------
     # Tensor access
