@@ -114,37 +114,12 @@ class VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        import logging
-        import time
-
-        _log = logging.getLogger("nanodeploy")
-        target_dtype = self.proj.weight.dtype
-        t0 = time.perf_counter()
-        _log.info(
-            f"[PATCH_EMBED] input: shape={list(x.shape)}, dtype={x.dtype}, device={x.device}, proj.weight: dtype={self.proj.weight.dtype}, device={self.proj.weight.device}"
-        )
-        x = x.view(
-            -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        )
-        torch.cuda.synchronize(x.device)
-        t1 = time.perf_counter()
-        x = x.to(dtype=target_dtype)
-        torch.cuda.synchronize(x.device)
-        t2 = time.perf_counter()
-        x = self.proj(x)
-        torch.cuda.synchronize(x.device)
-        t3 = time.perf_counter()
-        x = x.view(-1, self.embed_dim)
-        torch.cuda.synchronize(x.device)
-        t4 = time.perf_counter()
-        _log.info(
-            f"[PATCH_EMBED] view={t1-t0:.3f}s to_dtype={t2-t1:.3f}s conv3d={t3-t2:.3f}s reshape={t4-t3:.3f}s TOTAL={t4-t0:.3f}s"
-        )
-        return x
+        # kernel_size == stride, so each patch maps to exactly one output position.
+        # Equivalent to Conv3d but expressed as a single matmul — much faster for
+        # large patch counts (e.g. 4800 patches from a 1280×960 image).
+        x = x.to(dtype=self.proj.weight.dtype)
+        w = self.proj.weight.flatten(1)  # [embed_dim, in_ch*t*patch*patch]
+        return F.linear(x, w, self.proj.bias)  # [N, embed_dim]
 
 
 class VisionPatchMerger(nn.Module):
@@ -464,17 +439,8 @@ class VisionModel(nn.Module):
             Merged image embeddings of shape
             ``(total_tokens_after_merge, out_hidden_size)``.
         """
-        import time
-
-        _dev = pixel_values.device
-        t0 = time.perf_counter()
         hidden_states = self.patch_embed(pixel_values)
-        torch.cuda.synchronize(_dev)
-        t1 = time.perf_counter()
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        torch.cuda.synchronize(_dev)
-        t2 = time.perf_counter()
-        hidden_states = hidden_states + pos_embeds
+        hidden_states = hidden_states + self.fast_pos_embed_interpolate(grid_thw)
 
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
         seq_len = hidden_states.size(0)
@@ -487,24 +453,11 @@ class VisionModel(nn.Module):
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        torch.cuda.synchronize(_dev)
-        t3 = time.perf_counter()
 
-        for layer_num, blk in enumerate(self.blocks):
+        for blk in self.blocks:
             hidden_states = blk(hidden_states, cu_seqlens, position_embeddings)
-        torch.cuda.synchronize(_dev)
-        t4 = time.perf_counter()
 
-        merged = self.merger(hidden_states)
-        torch.cuda.synchronize(_dev)
-        t5 = time.perf_counter()
-        logger.info(
-            f"[VIT_TIMING] patch_embed={t1-t0:.3f}s pos_embed={t2-t1:.3f}s "
-            f"prep={t3-t2:.3f}s blocks({len(self.blocks)})={t4-t3:.3f}s "
-            f"merger={t5-t4:.3f}s TOTAL={t5-t0:.3f}s "
-            f"pixel_values={list(pixel_values.shape)} grid_thw={grid_thw.tolist()}"
-        )
-        return merged
+        return self.merger(hidden_states)
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ payload = {
     "model": "/models/",
     "stream": False,
     "ignore_eos": False,
-    "max_tokens": 256,
+    "max_tokens": 64,
     "messages": [
         {
             "role": "user",

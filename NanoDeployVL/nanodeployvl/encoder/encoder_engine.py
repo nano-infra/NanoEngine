@@ -24,11 +24,11 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
-import httpx
 import torch
 
 from nanodeploy.context.embedding_pool import EmbeddingPool
 from nanodeploy.logging import get_logger
+from nanodeploy.server.nanoctrl_client import NanoCtrlClient
 
 from nanodeployvl.encoder.encoder_config import EncoderConfig
 from nanodeployvl.vision.encoder import VisionEncoder
@@ -119,9 +119,8 @@ class EncoderEngine:
             self._processor = ImageProcessor(config.model)
             logger.info("ImageProcessor pre-loaded during init")
 
-        # --- NanoCtrl registration ---
-        self._nanoctrl_registered = False
-        self._heartbeat_thread: Optional[threading.Thread] = None
+        # --- NanoCtrl lifecycle client ---
+        self._nanoctrl: NanoCtrlClient | None = None
         if config.nanoctrl_address:
             self._register_with_nanoctrl()
 
@@ -250,59 +249,26 @@ class EncoderEngine:
     def _register_with_nanoctrl(self):
         if not self.config.nanoctrl_address:
             return
-        try:
-            info = self.get_engine_info()
-            payload = {
-                "engine_id": info["id"],
-                "role": "encoder",
-                "world_size": 1,
-                "num_blocks": 0,
-                "host": info["host"],
-                "port": info["port"],
-                "peer_addrs": info["peer_addrs"],
-                "p2p_host": info["p2p_host"],
-                "p2p_port": info["p2p_port"],
-            }
-            if self.config.nanoctrl_scope:
-                payload["scope"] = self.config.nanoctrl_scope
 
-            url = f"http://{self.config.nanoctrl_address}/register_engine"
-            with httpx.Client(timeout=10.0, trust_env=False) as client:
-                resp = client.post(url, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-                if data.get("status") == "ok":
-                    self._nanoctrl_registered = True
-                    logger.info(
-                        f"Registered encoder engine {self.engine_id} with NanoCtrl"
-                    )
-                    self._start_heartbeat()
-                else:
-                    logger.error(f"NanoCtrl registration failed: {data}")
-        except Exception as e:
-            logger.error(f"Failed to register with NanoCtrl: {e}", exc_info=True)
+        if self._nanoctrl is None:
+            self._nanoctrl = NanoCtrlClient(
+                self.config.nanoctrl_address, self.config.nanoctrl_scope
+            )
 
-    def _start_heartbeat(self):
-        if not self._nanoctrl_registered:
-            return
-        self._heartbeat_stop_event.clear()
-
-        def _loop():
-            while not self._heartbeat_stop_event.wait(15.0):
-                try:
-                    payload = {"engine_id": self.engine_id}
-                    if self.config.nanoctrl_scope:
-                        payload["scope"] = self.config.nanoctrl_scope
-                    url = f"http://{self.config.nanoctrl_address}/heartbeat_engine"
-                    with httpx.Client(timeout=5.0, trust_env=False) as client:
-                        client.post(url, json=payload)
-                except Exception as e:
-                    logger.error(f"Heartbeat error: {e}")
-
-        self._heartbeat_thread = threading.Thread(
-            target=_loop, name=f"encoder-hb-{self.engine_id}", daemon=True
-        )
-        self._heartbeat_thread.start()
+        info = self.get_engine_info()
+        extra = {
+            "role": "encoder",
+            "world_size": 1,
+            "num_blocks": 0,
+            "host": info["host"],
+            "port": info["port"],
+            "peer_addrs": info["peer_addrs"],
+            "p2p_host": info["p2p_host"],
+            "p2p_port": info["p2p_port"],
+        }
+        ok = self._nanoctrl.register(self.engine_id, extra)
+        if ok:
+            self._nanoctrl.start_heartbeat(name=f"encoder-hb-{self.engine_id}")
 
     # ------------------------------------------------------------------
     # ZMQ encode service (NanoRoute → EncoderEngine)
@@ -559,23 +525,15 @@ class EncoderEngine:
     # ------------------------------------------------------------------
 
     def shutdown(self):
+        # Signal zmq/p2p serve loops to exit (they poll this event)
         self._heartbeat_stop_event.set()
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=2.0)
         if self._p2p_thread and self._p2p_thread.is_alive():
             self._p2p_thread.join(timeout=2.0)
         if self._zmq_thread and self._zmq_thread.is_alive():
             self._zmq_thread.join(timeout=2.0)
 
-        if self._nanoctrl_registered and self.config.nanoctrl_address:
-            try:
-                payload = {"engine_id": self.engine_id}
-                if self.config.nanoctrl_scope:
-                    payload["scope"] = self.config.nanoctrl_scope
-                url = f"{self.config.nanoctrl_address}/unregister_engine"
-                with httpx.Client(timeout=5.0, trust_env=False) as client:
-                    client.post(url, json=payload)
-            except Exception:
-                pass
+        # Stop heartbeat thread and unregister from NanoCtrl
+        if self._nanoctrl:
+            self._nanoctrl.stop()
 
         logger.info(f"EncoderEngine {self.engine_id} shut down.")

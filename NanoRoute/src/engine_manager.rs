@@ -543,6 +543,30 @@ impl EngineManager {
             drop(watcher_handle);
         });
 
+        // Step 4: Periodic resync to evict TTL-expired/crashed engines.
+        // Redis key expiry is silent (no Pub/Sub event), so the watcher alone can't detect it.
+        // Every 90s we query NanoCtrl's live list and remove any engine no longer present.
+        // (TTL = 60s, so a crashed engine's key is gone within 60s; 90s gives margin.)
+        if nanoctrl_address.is_some() {
+            let manager_arc_resync = manager_arc.clone();
+            let nanoctrl_addr_resync = nanoctrl_address.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(90));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval.tick().await; // skip the immediate first tick
+                loop {
+                    interval.tick().await;
+                    let mut manager = manager_arc_resync.lock().await;
+                    if let Err(e) = manager
+                        .handle_periodic_sync(nanoctrl_addr_resync.as_deref())
+                        .await
+                    {
+                        warn!("Periodic sync failed: {}", e);
+                    }
+                }
+            });
+        }
+
         Ok(manager_arc)
     }
 
@@ -792,6 +816,68 @@ impl EngineManager {
         // Add new connection
         self.handle_add_engine(payload).await?;
         info!("Updated engine: {}", engine_id);
+        Ok(())
+    }
+
+    /// Periodic sync: diff local pool against NanoCtrl live list and remove stale engines.
+    ///
+    /// This is the only way to detect engines that died without calling /unregister_engine
+    /// (crash, SIGKILL, etc.). Their Redis key expires via TTL, but key expiry does NOT
+    /// publish a REMOVE event — so the Pub/Sub watcher never fires for them.
+    async fn handle_periodic_sync(&mut self, nanoctrl_address: Option<&str>) -> anyhow::Result<()> {
+        let Some(addr) = nanoctrl_address else {
+            return Ok(());
+        };
+
+        let live_engines = self.list_engines_from_nanoctrl(addr).await?;
+        let live_ids: std::collections::HashSet<String> = live_engines
+            .iter()
+            .filter_map(|e| e["id"].as_str().map(|s| s.to_string()))
+            .collect();
+
+        // Collect local engine IDs across all pools
+        let mut local_ids = std::collections::HashSet::new();
+        for adapter in &self.prefill_engines {
+            let g = adapter.lock().await;
+            if let Some(id) = &g.uuid {
+                local_ids.insert(id.clone());
+            }
+        }
+        for adapter in &self.decode_engines {
+            let g = adapter.lock().await;
+            if let Some(id) = &g.uuid {
+                local_ids.insert(id.clone());
+            }
+        }
+        for adapter in &self.encoder_engines {
+            let g = adapter.lock().await;
+            if let Some(id) = &g.uuid {
+                local_ids.insert(id.clone());
+            }
+        }
+
+        // Remove engines present locally but absent from NanoCtrl (TTL-expired or crashed)
+        let stale: Vec<String> = local_ids.difference(&live_ids).cloned().collect();
+        for stale_id in &stale {
+            warn!(
+                "Periodic sync: removing stale engine {} (TTL expired or crashed without unregister)",
+                stale_id
+            );
+            if let Err(e) = self.handle_remove_engine(stale_id).await {
+                warn!("Failed to remove stale engine {}: {}", stale_id, e);
+            }
+        }
+
+        if !stale.is_empty() {
+            info!(
+                "Periodic sync removed {} stale engines (prefill: {}, decode: {}, encoder: {})",
+                stale.len(),
+                self.prefill_engines.len(),
+                self.decode_engines.len(),
+                self.encoder_engines.len(),
+            );
+        }
+
         Ok(())
     }
 
