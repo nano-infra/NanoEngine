@@ -48,8 +48,7 @@ class Config(BaseModel):
     dummy_weight: Optional[bool] = False
     enable_eplb: Optional[bool] = False
 
-    # control plane config
-    enable_nanoctrl: bool = False
+    # control plane config – enabled when nanoctrl_address is provided
     nanoctrl_scope: Optional[str] = None
     nanoctrl_address: Optional[str] = None
 
@@ -68,18 +67,13 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
-        if self.mode != "hybrid":
-            self.enable_nanoctrl = True
-
-        if self.enable_nanoctrl:
-            # nanoctrl config from environment variables
-            self.nanoctrl_scope = os.getenv("NANOCTRL_SCOPE", self.nanoctrl_scope)
-            self.nanoctrl_address = os.getenv("NANOCTRL_ADDRESS", self.nanoctrl_address)
-
-            if not self.nanoctrl_address.startswith(
-                "http://"
-            ) and not self.nanoctrl_address.startswith("https://"):
-                self.nanoctrl_address = f"http://{self.nanoctrl_address}"
+        # Normalise nanoctrl_address (add scheme if missing)
+        if (
+            self.nanoctrl_address
+            and not self.nanoctrl_address.startswith("http://")
+            and not self.nanoctrl_address.startswith("https://")
+        ):
+            self.nanoctrl_address = f"http://{self.nanoctrl_address}"
 
         self.hf_config = AutoConfig.from_pretrained(
             self.model, trust_remote_code=self.trust_remote_code

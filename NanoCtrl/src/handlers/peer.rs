@@ -13,7 +13,10 @@ pub async fn start_peer_agent(
 ) -> Result<impl IntoResponse, AppError> {
     tracing::info!(
         "Registering agent: device={}, ib_port={}, link_type={}, address={}",
-        body.device, body.ib_port, body.link_type, body.address
+        body.device,
+        body.ib_port,
+        body.link_type,
+        body.address
     );
 
     let agent_name = repo
@@ -32,7 +35,9 @@ pub async fn start_peer_agent(
 
     tracing::info!(
         "Sending response for agent {}: status=ok, redis_address={} (client address: {})",
-        agent_name, redis_address, body.address
+        agent_name,
+        redis_address,
+        body.address
     );
 
     Ok(Json(StartPeerAgentResponse {

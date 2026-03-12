@@ -45,6 +45,23 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
             }
         }
 
+        // vision_slots (prefill only, EP mode)
+        flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<fbs::VisionSlotRef>>> vision_slots_off = 0;
+        if (is_prefill && !seq->data_->vision_slots.empty()) {
+            std::vector<flatbuffers::Offset<fbs::VisionSlotRef>> vs_offsets;
+            vs_offsets.reserve(seq->data_->vision_slots.size());
+            for (const auto& vs : seq->data_->vision_slots) {
+                if (!vs)
+                    continue;
+                auto eid_off = builder.CreateString(vs->encoder_engine_id);
+                vs_offsets.push_back(fbs::CreateVisionSlotRef(
+                    builder, eid_off, vs->slot_idx, vs->num_tokens, vs->hidden_size, vs->max_tokens_per_slot));
+            }
+            if (!vs_offsets.empty()) {
+                vision_slots_off = builder.CreateVector(vs_offsets);
+            }
+        }
+
         fbs::SequenceInputBuilder si_builder(builder);
         si_builder.add_master_sp_idx(ctx.master_sp_idx);
         si_builder.add_num_tokens(seq->num_tokens());
@@ -60,6 +77,10 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
         // temperature from sampling_params
         auto sp = seq->sampling_params();
         si_builder.add_temperature(sp.temperature);
+
+        if (vision_slots_off.o != 0) {
+            si_builder.add_vision_slots(vision_slots_off);
+        }
 
         seq_offsets.push_back(si_builder.Finish());
     }

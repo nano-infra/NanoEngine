@@ -63,9 +63,7 @@ pub fn resolve_public_redis_url(url: &str) -> String {
 /// try to resolve to a public IP the client can reach.
 pub fn resolve_redis_for_client(redis_url: &str, client_address: &str) -> String {
     if redis_url.starts_with("redis://") {
-        let addr = redis_url
-            .strip_prefix("redis://")
-            .unwrap_or(redis_url);
+        let addr = redis_url.strip_prefix("redis://").unwrap_or(redis_url);
         // If Redis is on localhost and client is remote
         if (addr.starts_with("127.0.0.1") || addr.starts_with("localhost"))
             && !client_address.starts_with("127.0.0.1")
@@ -81,10 +79,7 @@ pub fn resolve_redis_for_client(redis_url: &str, client_address: &str) -> String
                 return public_addr;
             }
             // Extract port
-            let port = addr
-                .find(':')
-                .map(|pos| &addr[pos + 1..])
-                .unwrap_or("6379");
+            let port = addr.find(':').map(|pos| &addr[pos + 1..]).unwrap_or("6379");
             // Try to get server's IP from the client's perspective
             let server_ip = get_server_ip_for_client(client_address)
                 .or_else(get_local_public_ip)

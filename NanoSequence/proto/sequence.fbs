@@ -36,6 +36,16 @@ table SamplingParams {
   ignore_eos: bool;
 }
 
+// Vision embedding slot reference on the encoder side.
+// Each slot occupies a contiguous region in the encoder's EmbeddingPool buffer.
+table VisionSlot {
+  encoder_engine_id: string;  // Encoder engine that owns this slot
+  slot_idx: int = -1;         // Slot index in the encoder's EmbeddingPool
+  num_tokens: int;            // Number of merged vision tokens in this slot
+  hidden_size: int;           // Hidden dimension of each token embedding
+  max_tokens_per_slot: int;   // Encoder pool slot stride (max tokens per slot)
+}
+
 table Sequence {
   seq_id: uint64;
   status: SequenceStatus;
@@ -47,6 +57,7 @@ table Sequence {
   num_cached_tokens: int;
   token_ids: [int];
   slots: [BlockContext];  // Direct vector - size enforced in C++ code
+  vision_slots: [VisionSlot];  // Vision embedding references (EP separated mode)
 }
 
 table SequenceList {
@@ -63,6 +74,13 @@ table StepOut {
 table FreeSequences {
   seq_ids: [uint64];
   source_engine_id: string;
+}
+
+// P2P message from Prefill to Encoder to release vision embedding slots.
+table FreeVisionSlots {
+  encoder_engine_id: string;   // Target encoder engine
+  slot_indices: [int];         // Slot indices to free
+  source_engine_id: string;    // Prefill engine that consumed the embeddings
 }
 
 root_type SequenceList;

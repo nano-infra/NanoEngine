@@ -1,6 +1,6 @@
 use crate::fbs::{
     FreeSequences, FreeSequencesArgs, SamplingParams, SamplingParamsArgs, Sequence, SequenceArgs,
-    SequenceList, SequenceListArgs, SequenceStatus, StepOut,
+    SequenceList, SequenceListArgs, SequenceStatus, StepOut, VisionSlot, VisionSlotArgs,
 };
 use crate::zmq_packet::ZmqPacket;
 use flatbuffers::FlatBufferBuilder;
@@ -195,6 +195,53 @@ impl EngineAdapter {
                             continue;
                         }
                     };
+                    // Dump migration payload details for debugging PD separation
+                    if let Some(seqs) = sl.sequences() {
+                        for i in 0..seqs.len() {
+                            let s = seqs.get(i);
+                            info!("[MIGRATION_RECV] seq_id={}, status={:?}, num_tokens={}, num_prompt_tokens={}, num_checkpointed_tokens={}, num_cached_tokens={}, last_token={}",
+                                s.seq_id(), s.status(), s.num_tokens(), s.num_prompt_tokens(), s.num_checkpointed_tokens(), s.num_cached_tokens(), s.last_token());
+                            if let Some(sp) = s.sampling_params() {
+                                info!("[MIGRATION_RECV] SamplingParams: temperature={}, max_tokens={}, ignore_eos={}", sp.temperature(), sp.max_tokens(), sp.ignore_eos());
+                            } else {
+                                warn!("[MIGRATION_RECV] SamplingParams: NONE");
+                            }
+                            if let Some(token_ids) = s.token_ids() {
+                                let len = token_ids.len();
+                                if len <= 20 {
+                                    let ids: Vec<i32> = (0..len).map(|j| token_ids.get(j)).collect();
+                                    info!("[MIGRATION_RECV] token_ids({})={:?}", len, ids);
+                                } else {
+                                    let first5: Vec<i32> = (0..5).map(|j| token_ids.get(j)).collect();
+                                    let last5: Vec<i32> = (len-5..len).map(|j| token_ids.get(j)).collect();
+                                    info!("[MIGRATION_RECV] token_ids({})={:?}...{:?}", len, first5, last5);
+                                }
+                            }
+                            if let Some(slots) = s.slots() {
+                                info!("[MIGRATION_RECV] BlockContext slots count={}", slots.len());
+                                for si in 0..slots.len() {
+                                    let ctx = slots.get(si);
+                                    let eid = ctx.engine_id().unwrap_or("(none)");
+                                    if !eid.is_empty() {
+                                        info!("[MIGRATION_RECV]   slot[{}]: engine_id={}, dp_idx={}, attention_sp={}, attention_dp={}, num_kvcache_blocks={}",
+                                            si, eid, ctx.dp_idx(), ctx.attention_sp(), ctx.attention_dp(), ctx.num_kvcache_blocks());
+                                        if let Some(bt) = ctx.sp_block_table() {
+                                            for sp_i in 0..bt.len() {
+                                                if let Some(bl) = bt.get(sp_i).values() {
+                                                    let blocks: Vec<i32> = (0..bl.len().min(10)).map(|j| bl.get(j)).collect();
+                                                    info!("[MIGRATION_RECV]     sp[{}] block_table({})={:?}{}", sp_i, bl.len(), blocks, if bl.len() > 10 { "..." } else { "" });
+                                                }
+                                            }
+                                        }
+                                        if let Some(ndt) = ctx.num_dispatched_tokens() {
+                                            let vals: Vec<i32> = (0..ndt.len()).map(|j| ndt.get(j)).collect();
+                                            info!("[MIGRATION_RECV]     num_dispatched_tokens={:?}", vals);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let seq_id = sl.sequences().and_then(|seqs| {
                         if seqs.is_empty() {
                             None
@@ -350,6 +397,26 @@ impl EngineAdapter {
         temperature: f32,
         ignore_eos: bool,
     ) -> anyhow::Result<tokio_mpsc::UnboundedReceiver<StreamEvent>> {
+        self.send_add_request_with_vision(
+            seq_id,
+            token_ids,
+            max_tokens,
+            temperature,
+            ignore_eos,
+            None,
+        )
+        .await
+    }
+
+    pub async fn send_add_request_with_vision(
+        &mut self,
+        seq_id: u64,
+        token_ids: &[u32],
+        max_tokens: i32,
+        temperature: f32,
+        ignore_eos: bool,
+        vision_slots_info: Option<&[crate::encoder_adapter::VisionSlotInfo]>,
+    ) -> anyhow::Result<tokio_mpsc::UnboundedReceiver<StreamEvent>> {
         let mut builder = FlatBufferBuilder::new();
         let token_ids_i32: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
         let t_vec = builder.create_vector(&token_ids_i32);
@@ -362,6 +429,28 @@ impl EngineAdapter {
                 ignore_eos,
             },
         );
+
+        // Build vision_slots if provided
+        let vision_slots_vec =
+            vision_slots_info.map(|slots: &[crate::encoder_adapter::VisionSlotInfo]| {
+                let vs: Vec<_> = slots
+                    .iter()
+                    .map(|s| {
+                        let eid = builder.create_string(&s.encoder_engine_id);
+                        VisionSlot::create(
+                            &mut builder,
+                            &VisionSlotArgs {
+                                encoder_engine_id: Some(eid),
+                                slot_idx: s.slot_idx as i32,
+                                num_tokens: s.num_tokens as i32,
+                                hidden_size: s.hidden_size as i32,
+                                max_tokens_per_slot: s.max_tokens_per_slot as i32,
+                            },
+                        )
+                    })
+                    .collect();
+                builder.create_vector(&vs)
+            });
 
         let num_tokens = token_ids.len() as i32;
         let last_token = if num_tokens > 0 {
@@ -381,6 +470,7 @@ impl EngineAdapter {
                 num_checkpointed_tokens: num_tokens,
                 last_token,
                 sampling_params: Some(sampling_params),
+                vision_slots: vision_slots_vec,
                 ..Default::default()
             },
         );
@@ -405,6 +495,20 @@ impl EngineAdapter {
                     sender: tx,
                     accumulated_tokens: Vec::new(),
                 },
+            );
+        }
+        info!(
+            "[ADD_REQ_SEND] seq_id={}, num_tokens={}, num_prompt_tokens={}, num_checkpointed_tokens={}, last_token={}, temperature={}, max_tokens={}, ignore_eos={}",
+            seq_id, num_tokens, num_tokens, num_tokens, last_token, temperature, max_tokens, ignore_eos
+        );
+        if num_tokens <= 20 {
+            info!("[ADD_REQ_SEND] token_ids({})={:?}", num_tokens, token_ids);
+        } else {
+            info!(
+                "[ADD_REQ_SEND] token_ids({})={:?}...{:?}",
+                num_tokens,
+                &token_ids[..5],
+                &token_ids[token_ids.len() - 5..]
             );
         }
         info!(

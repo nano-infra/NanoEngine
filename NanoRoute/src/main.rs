@@ -18,6 +18,7 @@ pub mod fbs {
     pub use self::sequence_generated::nanodeploy::fbs::*;
 }
 
+mod encoder_adapter;
 mod engine_adapter;
 mod http_server;
 mod tokenizer;
@@ -83,8 +84,12 @@ async fn main() -> anyhow::Result<()> {
     debug!("Using NanoCtrl at: {}", nanoctrl_address);
 
     // Get Redis URL from NanoCtrl (once per process; if you see 3x in NanoCtrl log, check for 3 router instances)
-    // Get scope from environment variable only
-    let redis_scope = std::env::var("NANOCTRL_SCOPE").ok();
+    // Read scope from config, fall back to NANOCTRL_SCOPE env var
+    let config_scope = match &config.engine {
+        config::EngineConfig::Unified { nanoctrl_scope, .. } => nanoctrl_scope.clone(),
+        config::EngineConfig::Disaggregated { nanoctrl_scope, .. } => nanoctrl_scope.clone(),
+    };
+    let redis_scope = config_scope.or_else(|| std::env::var("NANOCTRL_SCOPE").ok());
     let engine_mgr = engine_manager::EngineManager::with_scope(redis_scope);
     let redis_url = match engine_mgr
         .get_redis_url_from_nanoctrl(&nanoctrl_address)
@@ -118,10 +123,11 @@ async fn main() -> anyhow::Result<()> {
             let manager = manager_arc.lock().await;
             let prefill_count = manager.prefill_engines.len();
             let decode_count = manager.decode_engines.len();
+            let encoder_count = manager.encoder_engines.len();
             drop(manager);
             info!(
-                "Connected engines: {} prefill, {} decode",
-                prefill_count, decode_count
+                "Connected engines: {} prefill, {} decode, {} encoder",
+                prefill_count, decode_count, encoder_count
             );
             manager_arc
         }

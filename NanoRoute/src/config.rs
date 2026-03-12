@@ -37,8 +37,7 @@ pub enum EngineConfig {
         #[serde(default)]
         redis_url: Option<String>, // e.g., "redis://127.0.0.1:6379"
         #[serde(default)]
-        #[allow(dead_code)] // Deprecated: scope now read from NANOCTRL_SCOPE env var only
-        scope: Option<String>, // Deprecated: scope now read from NANOCTRL_SCOPE env var only
+        nanoctrl_scope: Option<String>,
     },
     Disaggregated {
         #[serde(default)]
@@ -50,8 +49,7 @@ pub enum EngineConfig {
         #[serde(default)]
         redis_url: Option<String>, // e.g., "redis://127.0.0.1:6379"
         #[serde(default)]
-        #[allow(dead_code)] // Deprecated: scope now read from NANOCTRL_SCOPE env var only
-        scope: Option<String>, // Deprecated: scope now read from NANOCTRL_SCOPE env var only
+        nanoctrl_scope: Option<String>,
     },
 }
 

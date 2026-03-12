@@ -1,6 +1,7 @@
 import asyncio
 import ctypes
 import traceback
+from collections import defaultdict
 from typing import Optional
 
 import flatbuffers
@@ -51,6 +52,16 @@ class BackendService:
         if not sequences:
             logger.warning("No sequences after deserialization")
             return
+
+        for seq in sequences:
+            logger.info(f"[ADD_REQ] {seq.dump()}")
+            sp = seq.sampling_params
+            logger.info(
+                f"[ADD_REQ] SamplingParams: temperature={sp.temperature}, max_tokens={sp.max_tokens}, ignore_eos={sp.ignore_eos}"
+            )
+            logger.info(
+                f"[ADD_REQ] num_checkpointed_tokens={seq.num_checkpointed_tokens}, num_cached_tokens={seq.num_cached_tokens}"
+            )
 
         logger.info(
             f"Adding {len(sequences)} sequences to engine. First seq_id: {sequences[0].seq_id if sequences else 'N/A'}"
@@ -126,6 +137,19 @@ class BackendService:
         self._send_response(action=0, payload=payload)
 
     def _send_migration(self, seq):
+        logger.debug(f"[MIGRATION] Serializing seq for migration:")
+        logger.debug(f"[MIGRATION] {seq.dump()}")
+        sp = seq.sampling_params
+        logger.debug(
+            f"[MIGRATION] SamplingParams: temperature={sp.temperature}, max_tokens={sp.max_tokens}, ignore_eos={sp.ignore_eos}"
+        )
+        logger.debug(
+            f"[MIGRATION] num_checkpointed_tokens={seq.num_checkpointed_tokens}, num_cached_tokens={seq.num_cached_tokens}"
+        )
+        logger.debug(
+            f"[MIGRATION] last_token={seq.last_token}, num_prompt_tokens={seq.num_prompt_tokens}, num_tokens={seq.num_tokens}"
+        )
+
         buffer_size = (
             1024 * 1024 * 16
         )  # 16MB buffer to prevent overflow during large history migrations
@@ -135,6 +159,7 @@ class BackendService:
         try:
             payload_size = serialize(ptr, buffer_size, [seq], False)
             payload = buffer.raw[:payload_size]
+            logger.info(f"[MIGRATION] Serialized payload size: {payload_size} bytes")
             self._send_response(action=1, payload=payload)
         except Exception as e:
             logger.error(f"Migration Serialize Error: {e}")
@@ -270,6 +295,28 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                             f"Early free: seq {seq.seq_id} migrated from {migrate_ctx.engine_id}"
                         )
                         service._send_p2p_free_if_migrated(seq)
+
+            # Free vision embedding slots on encoder after prefill consumes them
+            # (EP-separated mode: notify encoder to reclaim EmbeddingPool slots)
+            vision_free_by_encoder: dict[str, list[int]] = defaultdict(list)
+            for seqs in dp_seqs:
+                for seq in seqs:
+                    vs_list = seq.vision_slots
+                    if not vs_list:
+                        continue
+                    for vs in vs_list:
+                        vision_free_by_encoder[vs["encoder_engine_id"]].append(
+                            vs["slot_idx"]
+                        )
+                    seq.clear_vision_slots()
+
+            for encoder_id, slot_indices in vision_free_by_encoder.items():
+                try:
+                    engine.send_free_vision_slots(encoder_id, slot_indices)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to send vision slot free to {encoder_id}: {e}"
+                    )
 
             # Update tracking for next step
             service._previous_running_seqs = current_running_seqs
