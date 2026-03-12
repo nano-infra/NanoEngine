@@ -31,7 +31,6 @@ pub struct EngineAdapter {
 pub enum StreamEvent {
     Token(u32),
     Finished,
-    #[allow(dead_code)]
     Error(String),
     Migrate(Vec<u8>),
 }
@@ -195,53 +194,6 @@ impl EngineAdapter {
                             continue;
                         }
                     };
-                    // Dump migration payload details for debugging PD separation
-                    if let Some(seqs) = sl.sequences() {
-                        for i in 0..seqs.len() {
-                            let s = seqs.get(i);
-                            info!("[MIGRATION_RECV] seq_id={}, status={:?}, num_tokens={}, num_prompt_tokens={}, num_checkpointed_tokens={}, num_cached_tokens={}, last_token={}",
-                                s.seq_id(), s.status(), s.num_tokens(), s.num_prompt_tokens(), s.num_checkpointed_tokens(), s.num_cached_tokens(), s.last_token());
-                            if let Some(sp) = s.sampling_params() {
-                                info!("[MIGRATION_RECV] SamplingParams: temperature={}, max_tokens={}, ignore_eos={}", sp.temperature(), sp.max_tokens(), sp.ignore_eos());
-                            } else {
-                                warn!("[MIGRATION_RECV] SamplingParams: NONE");
-                            }
-                            if let Some(token_ids) = s.token_ids() {
-                                let len = token_ids.len();
-                                if len <= 20 {
-                                    let ids: Vec<i32> = (0..len).map(|j| token_ids.get(j)).collect();
-                                    info!("[MIGRATION_RECV] token_ids({})={:?}", len, ids);
-                                } else {
-                                    let first5: Vec<i32> = (0..5).map(|j| token_ids.get(j)).collect();
-                                    let last5: Vec<i32> = (len-5..len).map(|j| token_ids.get(j)).collect();
-                                    info!("[MIGRATION_RECV] token_ids({})={:?}...{:?}", len, first5, last5);
-                                }
-                            }
-                            if let Some(slots) = s.slots() {
-                                info!("[MIGRATION_RECV] BlockContext slots count={}", slots.len());
-                                for si in 0..slots.len() {
-                                    let ctx = slots.get(si);
-                                    let eid = ctx.engine_id().unwrap_or("(none)");
-                                    if !eid.is_empty() {
-                                        info!("[MIGRATION_RECV]   slot[{}]: engine_id={}, dp_idx={}, attention_sp={}, attention_dp={}, num_kvcache_blocks={}",
-                                            si, eid, ctx.dp_idx(), ctx.attention_sp(), ctx.attention_dp(), ctx.num_kvcache_blocks());
-                                        if let Some(bt) = ctx.sp_block_table() {
-                                            for sp_i in 0..bt.len() {
-                                                if let Some(bl) = bt.get(sp_i).values() {
-                                                    let blocks: Vec<i32> = (0..bl.len().min(10)).map(|j| bl.get(j)).collect();
-                                                    info!("[MIGRATION_RECV]     sp[{}] block_table({})={:?}{}", sp_i, bl.len(), blocks, if bl.len() > 10 { "..." } else { "" });
-                                                }
-                                            }
-                                        }
-                                        if let Some(ndt) = ctx.num_dispatched_tokens() {
-                                            let vals: Vec<i32> = (0..ndt.len()).map(|j| ndt.get(j)).collect();
-                                            info!("[MIGRATION_RECV]     num_dispatched_tokens={:?}", vals);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
                     let seq_id = sl.sequences().and_then(|seqs| {
                         if seqs.is_empty() {
                             None
@@ -254,20 +206,15 @@ impl EngineAdapter {
                             let mut map = pending.lock().await;
                             let map_size = map.len();
                             if let Some(state) = map.remove(&seq_id) {
-                                match state.sender.send(StreamEvent::Migrate(payload)) {
-                                    Ok(_) => {
-                                        info!("[DIAG] Migration event sent OK for seq_id={}, pending_map_size={}", seq_id, map_size - 1);
-                                    }
-                                    Err(_) => {
-                                        warn!("[DIAG] Migration event SEND FAILED (rx dropped = client disconnected) for seq_id={}, pending_map_size={}", seq_id, map_size - 1);
-                                    }
+                                if state.sender.send(StreamEvent::Migrate(payload)).is_err() {
+                                    warn!("Migration event send failed (client disconnected) for seq_id={}", seq_id);
                                 }
                             } else {
-                                warn!("[DIAG] Migration response for seq_id={} but NOT FOUND in pending_requests (map_size={})", seq_id, map_size);
+                                warn!("Migration response for seq_id={} not found in pending_requests (map_size={})", seq_id, map_size);
                             }
                         }
                     } else {
-                        warn!("[DIAG] Migration response with no seq_id in SequenceList");
+                        warn!("Migration response with no seq_id in SequenceList");
                     }
                     continue;
                 }
@@ -303,15 +250,15 @@ impl EngineAdapter {
 
                             for token_id in &tokens {
                                 if final_state.sender.send(StreamEvent::Token(*token_id)).is_err() {
-                                    warn!("[DIAG] Sequence {} FINISH token send failed (client disconnected)", seq_id);
+                                    warn!("Sequence {} finish token send failed (client disconnected)", seq_id);
                                     break;
                                 }
                             }
                             if final_state.sender.send(StreamEvent::Finished).is_err() {
-                                warn!("[DIAG] Sequence {} FINISHED event send failed (client disconnected)", seq_id);
+                                warn!("Sequence {} Finished event send failed (client disconnected)", seq_id);
                             }
                         } else {
-                            warn!("[DIAG] Sequence {} FINISHED but NOT FOUND in pending_requests (map_size={})", seq_id, map.len());
+                            warn!("Sequence {} finished but not found in pending_requests (map_size={})", seq_id, map.len());
                         }
                     } else if matches!(status, SequenceStatus::RUNNING) {
                         if let Some(state) = map.get_mut(&seq_id) {
@@ -321,7 +268,7 @@ impl EngineAdapter {
                             for token_id in tokens {
                                 state.accumulated_tokens.push(token_id);
                                 if state.sender.send(StreamEvent::Token(token_id)).is_err() {
-                                    warn!("[DIAG] Sequence {} token send failed (client disconnected), accumulated={}", seq_id, state.accumulated_tokens.len());
+                                    warn!("Sequence {} token send failed (client disconnected)", seq_id);
                                     break;
                                 }
                             }
@@ -330,8 +277,7 @@ impl EngineAdapter {
                                 info!("Sequence {} started generation", seq_id);
                             }
                         } else {
-                            // Only warn for the first occurrence to avoid log spam
-                            warn!("[DIAG] Sequence {} token received but NOT FOUND in pending_requests (map_size={})", seq_id, map.len());
+                            warn!("Sequence {} token received but not found in pending_requests (map_size={})", seq_id, map.len());
                         }
                     }
                 }
@@ -495,20 +441,6 @@ impl EngineAdapter {
                     sender: tx,
                     accumulated_tokens: Vec::new(),
                 },
-            );
-        }
-        info!(
-            "[ADD_REQ_SEND] seq_id={}, num_tokens={}, num_prompt_tokens={}, num_checkpointed_tokens={}, last_token={}, temperature={}, max_tokens={}, ignore_eos={}",
-            seq_id, num_tokens, num_tokens, num_tokens, last_token, temperature, max_tokens, ignore_eos
-        );
-        if num_tokens <= 20 {
-            info!("[ADD_REQ_SEND] token_ids({})={:?}", num_tokens, token_ids);
-        } else {
-            info!(
-                "[ADD_REQ_SEND] token_ids({})={:?}...{:?}",
-                num_tokens,
-                &token_ids[..5],
-                &token_ids[token_ids.len() - 5..]
             );
         }
         info!(

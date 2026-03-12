@@ -262,29 +262,22 @@ class ModelRunner:
         # Inject image embeddings
         if "image" in self._vision_embeds:
             image_token_id = getattr(hf_config, "image_token_id", None)
-            logger.info(
-                f"[VISION_INJECT] image_token_id={image_token_id}, input_ids.shape={input_ids.shape}, image_embeds.shape={self._vision_embeds['image'].shape}"
-            )
             if image_token_id is not None:
                 image_embeds = self._vision_embeds["image"].to(
                     dtype=inputs_embeds.dtype
                 )
                 mask = input_ids == image_token_id
                 n_tokens = mask.sum().item()
-                logger.info(
-                    f"[VISION_INJECT] n_image_tokens_in_input={n_tokens}, image_embeds_tokens={image_embeds.shape[0]}, match={n_tokens == image_embeds.shape[0]}"
-                )
                 if n_tokens > 0 and n_tokens == image_embeds.shape[0]:
                     mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
                     inputs_embeds = inputs_embeds.masked_scatter(
                         mask_expanded, image_embeds
                     )
-                    logger.info(
-                        f"[VISION_INJECT] Successfully injected {n_tokens} image tokens"
-                    )
+                    logger.debug(f"Injected {n_tokens} image tokens")
                 else:
                     logger.warning(
-                        f"[VISION_INJECT] SKIPPED injection: n_tokens={n_tokens} != image_embeds={image_embeds.shape[0]}"
+                        f"Image token count mismatch: input has {n_tokens}, "
+                        f"embeds has {image_embeds.shape[0]} — skipping injection"
                     )
 
         # Inject video embeddings
@@ -355,10 +348,24 @@ class ModelRunner:
             recv_buf_size,
         )
 
+        # Look up peer_addrs for all encoders via NanoCtrl (cached, single request per engine)
+        encoder_info_map = cache_ctx._fetch_engine_info_from_nanoctrl(
+            set(by_encoder.keys())
+        )
+
         token_offset = 0
         for encoder_id, slots in by_encoder.items():
-            # Build peer alias (encoder uses "engine_id:0" as alias)
-            peer_alias = f"{encoder_id}:0"
+            # Resolve peer alias from control plane; fall back to legacy convention
+            encoder_info = encoder_info_map.get(encoder_id, {})
+            peer_addrs = encoder_info.get("peer_addrs", [])
+            if peer_addrs:
+                peer_alias = peer_addrs[0]
+            else:
+                logger.warning(
+                    f"No peer_addrs for encoder {encoder_id} in NanoCtrl, "
+                    "falling back to legacy alias"
+                )
+                peer_alias = f"{encoder_id}:0"
 
             # Ensure connection
             if peer_alias not in cache_ctx._connected_peers:
@@ -973,9 +980,6 @@ class ModelRunner:
                 # RDMA-fetch vision embeddings from encoder (EP-separated mode)
                 if i == 0 and self._vision_embeds is None:
                     vision_slots = extract_vision_slots_from_bytes(data)
-                    logger.info(
-                        f"[RUN_FROM_BYTES] rank={self.rank}, vision_slots={vision_slots}, data_len={len(data) if data else 0}"
-                    )
                     if vision_slots:
                         self._fetch_vision_embeds_rdma(vision_slots)
 

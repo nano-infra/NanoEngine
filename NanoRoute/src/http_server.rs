@@ -318,8 +318,6 @@ async fn chat_completions(
             let stream_start = std::time::Instant::now();
             let mut is_finished = false;
 
-            tracing::info!("[DIAG] SSE stream STARTED for seq_id={}", seq_id);
-
             while let Some(event) = rx.recv().await {
                 match event {
                     StreamEvent::Token(id) => {
@@ -352,7 +350,6 @@ async fn chat_completions(
                         }
                     },
                     StreamEvent::Finished => {
-                        tracing::info!("[DIAG] SSE stream FINISHED normally for seq_id={}, elapsed={:.1}s, generated_tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
                         is_finished = true;
                         let chunk = serde_json::json!({
                             "id": request_id,
@@ -370,7 +367,7 @@ async fn chat_completions(
                         break;
                     },
                     StreamEvent::Error(e) => {
-                        tracing::error!("[DIAG] SSE stream ERROR for seq_id={}: {}", seq_id, e);
+                        tracing::error!("SSE stream error for seq_id={}: {}", seq_id, e);
                          yield Ok(Event::default().event("error").data(e));
                          break;
                     }
@@ -381,7 +378,6 @@ async fn chat_completions(
                         generated_tokens.clear();
                         last_text_len = 0;
 
-                        tracing::info!("[DIAG] Migration triggered for seq_id={}, elapsed={:.1}s. Routing to Decode Engine...", seq_id, stream_start.elapsed().as_secs_f64());
                         let decode_adapter_arc = {
                             let mgr = state.engine_manager.lock().await;
                             mgr.get_next_decode()
@@ -397,16 +393,15 @@ async fn chat_completions(
                                       // Update active tracked adapter to route the disconnect signal to the correct place
                                       active_adapter = decode_adapter_arc.clone();
 
-                                      tracing::info!("[DIAG] Migration successful for seq_id={}. Resuming stream on Decode Engine.", seq_id);
                                  },
                                  Err(e) => {
-                                     tracing::error!("[DIAG] Failed to forward migration for seq_id={}: {}", seq_id, e);
+                                     tracing::error!("Failed to forward migration for seq_id={}: {}", seq_id, e);
                                      yield Ok(Event::default().event("error").data("Migration Failed"));
                                      break;
                                  }
                              }
                         } else {
-                             tracing::error!("[DIAG] No Decode Engine available for migration! seq_id={}", seq_id);
+                             tracing::error!("No Decode Engine available for migration, seq_id={}", seq_id);
                              yield Ok(Event::default().event("error").data("No Decode Nodes"));
                              break;
                         }
@@ -416,11 +411,11 @@ async fn chat_completions(
 
             // If we reach here via rx channel closing (None), the client likely disconnected
             if !is_finished {
-                 tracing::warn!("[DIAG] Stream ended prematurely (Disconnect/Error) for seq_id={}, elapsed={:.1}s, generated_tokens={}. Sending FREE request to active engine.", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
+                 tracing::warn!("SSE stream disconnected for seq_id={}, elapsed={:.1}s, tokens={}. Sending FREE request.", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
                  let mut adapter_guard = active_adapter.lock().await;
                  let _ = adapter_guard.send_free_request(seq_id).await;
             } else {
-                 tracing::info!("[DIAG] SSE stream ENDED normally for seq_id={}, elapsed={:.1}s, generated_tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
+                 tracing::info!("SSE stream ended for seq_id={}, elapsed={:.1}s, tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
             }
         };
 

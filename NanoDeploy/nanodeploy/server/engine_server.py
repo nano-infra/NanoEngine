@@ -53,16 +53,6 @@ class BackendService:
             logger.warning("No sequences after deserialization")
             return
 
-        for seq in sequences:
-            logger.info(f"[ADD_REQ] {seq.dump()}")
-            sp = seq.sampling_params
-            logger.info(
-                f"[ADD_REQ] SamplingParams: temperature={sp.temperature}, max_tokens={sp.max_tokens}, ignore_eos={sp.ignore_eos}"
-            )
-            logger.info(
-                f"[ADD_REQ] num_checkpointed_tokens={seq.num_checkpointed_tokens}, num_cached_tokens={seq.num_cached_tokens}"
-            )
-
         logger.info(
             f"Adding {len(sequences)} sequences to engine. First seq_id: {sequences[0].seq_id if sequences else 'N/A'}"
         )
@@ -137,19 +127,6 @@ class BackendService:
         self._send_response(action=0, payload=payload)
 
     def _send_migration(self, seq):
-        logger.debug(f"[MIGRATION] Serializing seq for migration:")
-        logger.debug(f"[MIGRATION] {seq.dump()}")
-        sp = seq.sampling_params
-        logger.debug(
-            f"[MIGRATION] SamplingParams: temperature={sp.temperature}, max_tokens={sp.max_tokens}, ignore_eos={sp.ignore_eos}"
-        )
-        logger.debug(
-            f"[MIGRATION] num_checkpointed_tokens={seq.num_checkpointed_tokens}, num_cached_tokens={seq.num_cached_tokens}"
-        )
-        logger.debug(
-            f"[MIGRATION] last_token={seq.last_token}, num_prompt_tokens={seq.num_prompt_tokens}, num_tokens={seq.num_tokens}"
-        )
-
         buffer_size = (
             1024 * 1024 * 16
         )  # 16MB buffer to prevent overflow during large history migrations
@@ -159,7 +136,6 @@ class BackendService:
         try:
             payload_size = serialize(ptr, buffer_size, [seq], False)
             payload = buffer.raw[:payload_size]
-            logger.info(f"[MIGRATION] Serialized payload size: {payload_size} bytes")
             self._send_response(action=1, payload=payload)
         except Exception as e:
             logger.error(f"Migration Serialize Error: {e}")
