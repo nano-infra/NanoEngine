@@ -542,12 +542,19 @@ async fn chat_completions(
                                                     }),
                                             },
                                         };
+                                        let delta_call_value = match serde_json::to_value(&delta_call) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                tracing::error!("Failed to serialize DeltaToolCall: {}. Skipping tool call delta.", e);
+                                                continue;
+                                            }
+                                        };
                                         let chunk = serde_json::json!({
                                             "id": request_id,
                                             "object": "chat.completion.chunk",
                                             "created": created_at,
                                             "model": model_name,
-                                            "choices": [{"index": 0, "delta": {"tool_calls": [serde_json::to_value(&delta_call).expect("DeltaToolCall should always be serializable")]}, "finish_reason": null}]
+                                            "choices": [{"index": 0, "delta": {"tool_calls": [delta_call_value]}, "finish_reason": null}]
                                         });
                                         yield Ok::<_, std::io::Error>(Event::default().data(chunk.to_string()));
                                         emitted_tool_calls += 1;

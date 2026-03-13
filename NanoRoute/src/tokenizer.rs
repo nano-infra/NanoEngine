@@ -1,3 +1,4 @@
+use anyhow::Context;
 use minijinja::{Environment, ErrorKind};
 use minijinja_contrib::add_to_environment;
 use serde::Serialize;
@@ -232,9 +233,7 @@ impl TokenizerService {
     ) -> anyhow::Result<Vec<u32>> {
         // Render template first
         let formatted_text = if let Some(env) = self.template_env.as_ref() {
-            let tmpl = env
-                .get_template("chat")
-                .map_err(|e: minijinja::Error| anyhow::anyhow!(e))?;
+            let tmpl = env.get_template("chat")?;
             let ctx = serde_json::json!({
                 "messages": messages,
                 "add_generation_prompt": true,
@@ -242,8 +241,7 @@ impl TokenizerService {
                 "add_vision_id": false,
                 "enable_thinking": serde_json::Value::Null,
             });
-            tmpl.render(ctx)
-                .map_err(|e| anyhow::anyhow!("Template render error: {}", e))?
+            tmpl.render(ctx).context("Template render error")?
         } else {
             return Err(anyhow::anyhow!("Chat template not loaded"));
         };
