@@ -8,7 +8,7 @@ path = "/models/Qwen3-235B-A22B-Instruct-2507/tokenizer.json"
 
 [engine]
 mode = "Disaggregated"
-nanoctrl_scope = "JimyMa"
+nanoctrl_scope = "nanoctrl-0"
 nanoctrl_address = "http://127.0.0.1:3000"
 
 [scheduler]
