@@ -359,6 +359,10 @@ async fn chat_completions(
     // Generate unique sequence ID and request ID
     let seq_id = state.next_request_id.fetch_add(1, Ordering::SeqCst);
     let request_id = format!("chatcmpl-{}", seq_id);
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     // Acquire lock briefly to send request
     let rx_result = {
@@ -498,7 +502,7 @@ async fn chat_completions(
                                             let chunk = serde_json::json!({
                                                 "id": request_id,
                                                 "object": "chat.completion.chunk",
-                                                "created": 1234567890,
+                                                "created": created_at,
                                                 "model": model_name,
                                                 "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
                                             });
@@ -530,7 +534,7 @@ async fn chat_completions(
                                         let chunk = serde_json::json!({
                                             "id": request_id,
                                             "object": "chat.completion.chunk",
-                                            "created": 1234567890,
+                                            "created": created_at,
                                             "model": model_name,
                                             "choices": [{"index": 0, "delta": {"tool_calls": [delta_call]}, "finish_reason": null}]
                                         });
@@ -551,7 +555,7 @@ async fn chat_completions(
                                         let chunk = serde_json::json!({
                                             "id": request_id,
                                             "object": "chat.completion.chunk",
-                                            "created": 1234567890,
+                                            "created": created_at,
                                             "model": model_name,
                                             "choices": [{
                                                 "index": 0,
@@ -571,7 +575,7 @@ async fn chat_completions(
                         let chunk = serde_json::json!({
                             "id": request_id,
                             "object": "chat.completion.chunk",
-                            "created": 1234567890,
+                            "created": created_at,
                             "model": model_name,
                             "choices": [{
                                 "index": 0,
@@ -715,7 +719,7 @@ async fn chat_completions(
         Json(ChatCompletionResponse {
             id: request_id,
             object: "chat.completion".to_string(),
-            created: 1234567890,
+            created: created_at,
             model: req.model,
             choices: vec![Choice {
                 index: 0,
