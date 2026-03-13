@@ -850,6 +850,13 @@ class ModelRunner:
                 hidden = self.model(input_ids, positions, inputs_embeds=inputs_embeds)
             else:
                 hidden = self.model(input_ids, positions)
+            if is_prefill:
+                # Clean low-latency RDMA buffer here, as part of the prefill stream,
+                # so the nvshmemx_barrier_all_block() inside completes before any rank
+                # calls graph.replay().  Calling it right before graph.replay() races:
+                # the barrier's RDMA writes arrive at peer GPUs while they are already
+                # executing the graph, corrupting NVSHMEM symmetric memory → SIGSEGV.
+                ExpertContext.get_instance().transition_to_low_latency()
             return self.model.compute_logits(hidden)
         else:
             bs = input_ids.size(0)
