@@ -102,7 +102,6 @@ pub struct ToolCall {
 
 // ── Streaming delta types ────────────────────────────────────────────
 
-#[allow(dead_code)]
 #[derive(Serialize, Debug)]
 struct DeltaFunctionCall {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,7 +109,6 @@ struct DeltaFunctionCall {
     arguments: String,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize, Debug)]
 struct DeltaToolCall {
     index: u32,
@@ -522,21 +520,22 @@ async fn chat_completions(
                                     let (_, calls) = tool_parser::parse_tool_calls(block);
                                     for tc in calls {
                                         let tc_id = format!("call_{}_{}", seq_id, emitted_tool_calls);
-                                        let delta_call = serde_json::json!({
-                                            "index": emitted_tool_calls,
-                                            "id": tc_id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": tc.name,
-                                                "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default()
-                                            }
-                                        });
+                                        let delta_call = DeltaToolCall {
+                                            index: emitted_tool_calls,
+                                            id: Some(tc_id),
+                                            call_type: Some("function".to_string()),
+                                            function: DeltaFunctionCall {
+                                                name: Some(tc.name),
+                                                arguments: serde_json::to_string(&tc.arguments)
+                                                    .unwrap_or_default(),
+                                            },
+                                        };
                                         let chunk = serde_json::json!({
                                             "id": request_id,
                                             "object": "chat.completion.chunk",
                                             "created": created_at,
                                             "model": model_name,
-                                            "choices": [{"index": 0, "delta": {"tool_calls": [delta_call]}, "finish_reason": null}]
+                                            "choices": [{"index": 0, "delta": {"tool_calls": [serde_json::to_value(&delta_call).unwrap()]}, "finish_reason": null}]
                                         });
                                         yield Ok::<_, std::io::Error>(Event::default().data(chunk.to_string()));
                                         emitted_tool_calls += 1;
