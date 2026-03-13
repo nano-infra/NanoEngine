@@ -4,14 +4,8 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
-    #[allow(dead_code)]
-    pub host: String,
     pub port: u16,
     pub model_name: String,
-    #[allow(dead_code)]
-    pub engine_host: Option<String>,
-    #[allow(dead_code)]
-    pub engine_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
