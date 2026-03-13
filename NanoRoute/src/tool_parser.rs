@@ -53,7 +53,21 @@ fn parse_tool_call_block(block: &str) -> Option<ParsedToolCall> {
     }
     let body = &block[body_start..fn_end_pos];
 
-    // Parse all <parameter=KEY>VALUE</parameter> blocks
+    // Parse all <parameter=KEY>VALUE</parameter> blocks.
+    //
+    // Robustness note: a parameter value may itself contain the substring
+    // `</parameter>` (e.g. an explanation that mentions the tag). Using a plain
+    // `find` from `val_start` would truncate at the first such occurrence.
+    //
+    // To handle this, we bound each value's search region by the position of the
+    // *next* structural delimiter (`<parameter=` or `</function>`), then use
+    // `rfind` within that window so that an embedded `</parameter>` is ignored
+    // and the real closing tag — always the last one before the next delimiter —
+    // is found.
+    //
+    // Residual assumption: parameter values do not themselves contain
+    // `<parameter=` or `</function>`, as those would create structurally
+    // ambiguous output that no parser could resolve without escaping.
     let mut arguments = serde_json::Map::new();
     let mut search = 0;
     while let Some(p_rel) = body[search..].find(PARAM_PREFIX) {
@@ -66,7 +80,21 @@ fn parse_tool_call_block(block: &str) -> Option<ParsedToolCall> {
         let key = body[key_start..key_start + gt_pos].trim().to_string();
 
         let val_start = key_start + gt_pos + 1;
-        let p_end_rel = match body[val_start..].find(PARAM_END) {
+
+        // Bound the search region by the next structural delimiter so that an
+        // embedded `</parameter>` in the value is not mistaken for the closing tag.
+        let region_end = {
+            let next_param = body[val_start..].find(PARAM_PREFIX).map(|p| val_start + p);
+            let func_end = body[val_start..].find(FUNC_END).map(|p| val_start + p);
+            match (next_param, func_end) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => body.len(),
+            }
+        };
+
+        let p_end_rel = match body[val_start..region_end].rfind(PARAM_END) {
             Some(p) => p,
             None => break,
         };
@@ -183,6 +211,45 @@ Paris
         let (content, calls) = parse_tool_calls(text);
         assert_eq!(content, text);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_param_value_containing_end_tag() {
+        // A parameter value that contains </parameter> must not truncate the value.
+        let text = r#"<tool_call>
+<function=explain>
+<parameter=note>
+I think </parameter> is a great tag.
+</parameter>
+</function>
+</tool_call>"#;
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["note"],
+            serde_json::Value::String("I think </parameter> is a great tag.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_multiple_params_one_with_end_tag() {
+        let text = r#"<tool_call>
+<function=search>
+<parameter=query>
+how does </parameter> work
+</parameter>
+<parameter=limit>
+10
+</parameter>
+</function>
+</tool_call>"#;
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["query"],
+            serde_json::Value::String("how does </parameter> work".to_string())
+        );
+        assert_eq!(calls[0].arguments["limit"], serde_json::json!(10));
     }
 
     #[test]
