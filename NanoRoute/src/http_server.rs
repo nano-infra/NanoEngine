@@ -420,10 +420,12 @@ async fn chat_completions(
         } else {
             // ── Text-only path: tokenize locally ──
             let template_messages = build_template_messages(&req.messages);
-            let tools_json = req
-                .tools
-                .as_ref()
-                .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
+            let tools_json = req.tools.as_ref().map(|t| {
+                serde_json::to_value(t).unwrap_or_else(|e| {
+                    tracing::error!("Failed to serialize tools to JSON: {}", e);
+                    serde_json::Value::Null
+                })
+            });
             let token_ids = match tokenizer
                 .encode_messages(template_messages, tools_json)
                 .await
@@ -535,7 +537,7 @@ async fn chat_completions(
                                             "object": "chat.completion.chunk",
                                             "created": created_at,
                                             "model": model_name,
-                                            "choices": [{"index": 0, "delta": {"tool_calls": [serde_json::to_value(&delta_call).unwrap()]}, "finish_reason": null}]
+                                            "choices": [{"index": 0, "delta": {"tool_calls": [serde_json::to_value(&delta_call).expect("DeltaToolCall should always be serializable")]}, "finish_reason": null}]
                                         });
                                         yield Ok::<_, std::io::Error>(Event::default().data(chunk.to_string()));
                                         emitted_tool_calls += 1;
