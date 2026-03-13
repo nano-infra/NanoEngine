@@ -4,7 +4,8 @@ use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
-use tracing::debug;
+use tokio::sync::RwLock;
+use tracing::{debug, error, info};
 
 pub struct TokenizerService {
     path: String,
@@ -22,6 +23,31 @@ impl TokenizerService {
             tokenizer: Arc::new(None),
             template_env: Arc::new(None),
         }
+    }
+
+    /// Spawn a background task to load a tokenizer from `path` into `slot`.
+    ///
+    /// No-op if the slot is already populated (fast-path read lock check,
+    /// then double-checked under the write lock before writing).
+    pub fn spawn_load(slot: Arc<RwLock<Option<Arc<TokenizerService>>>>, path: String) {
+        tokio::spawn(async move {
+            // Fast path: already loaded — avoid spawning unnecessary work.
+            if slot.read().await.is_some() {
+                return;
+            }
+            let mut svc = TokenizerService::new(&path);
+            match svc.load().await {
+                Ok(()) => {
+                    let mut w = slot.write().await;
+                    if w.is_none() {
+                        // Double-check under write lock to handle concurrent loaders.
+                        *w = Some(Arc::new(svc));
+                        info!("Tokenizer loaded from {}", path);
+                    }
+                }
+                Err(e) => error!("Failed to load tokenizer from {}: {}", path, e),
+            }
+        });
     }
 
     pub async fn load(&mut self) -> anyhow::Result<()> {

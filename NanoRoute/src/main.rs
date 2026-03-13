@@ -27,8 +27,6 @@ use clap::Parser;
 use config::AppConfig;
 use std::path::PathBuf;
 use tracing::{debug, error, info};
-// use crate::engine_adapter::EngineAdapter; // Removed
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -150,23 +148,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Optional: pre-load from config fallback if [tokenizer] path is provided
     if let Some(tok_cfg) = &config.tokenizer {
-        let slot = tokenizer_slot.clone();
-        let path = tok_cfg.path.clone();
-        tokio::spawn(async move {
-            let mut svc = tokenizer::TokenizerService::new(&path);
-            if let Ok(()) = svc.load().await {
-                let mut w = slot.write().await;
-                if w.is_none() {
-                    *w = Some(Arc::new(svc));
-                    info!("Tokenizer pre-loaded from config fallback: {}", path);
-                }
-            } else {
-                error!(
-                    "Failed to pre-load tokenizer from config fallback: {}",
-                    path
-                );
-            }
-        });
+        tokenizer::TokenizerService::spawn_load(tokenizer_slot.clone(), tok_cfg.path.clone());
     }
 
     let model_name = config.server.model_name.clone();

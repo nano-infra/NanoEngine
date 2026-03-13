@@ -581,27 +581,9 @@ impl EngineManager {
     /// Spawn a background task to lazily load the tokenizer from an engine's model path.
     /// No-op if tokenizer is already loaded or model_path is None.
     fn maybe_spawn_tokenizer_load(&self, model_path: Option<&str>) {
-        let Some(path) = model_path else { return };
-        let slot = self.tokenizer_slot.clone();
-        let path = path.to_string();
-        tokio::spawn(async move {
-            // Fast path: already loaded
-            if slot.read().await.is_some() {
-                return;
-            }
-            let mut svc = TokenizerService::new(&path);
-            match svc.load().await {
-                Ok(()) => {
-                    let mut w = slot.write().await;
-                    if w.is_none() {
-                        // double-check under write lock
-                        *w = Some(Arc::new(svc));
-                        info!("Tokenizer loaded lazily from {}", path);
-                    }
-                }
-                Err(e) => error!("Failed to load tokenizer from {}: {}", path, e),
-            }
-        });
+        if let Some(path) = model_path {
+            TokenizerService::spawn_load(self.tokenizer_slot.clone(), path.to_string());
+        }
     }
 
     async fn handle_add_engine(&mut self, payload: EnginePayload) -> anyhow::Result<()> {
