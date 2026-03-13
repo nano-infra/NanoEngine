@@ -12,7 +12,8 @@ redis.call('HSET', engine_key,
     'world_size', ARGV[5],
     'num_blocks', ARGV[6],
     'peer_addrs', ARGV[7],
-    'info', ARGV[8]
+    'info', ARGV[8],
+    'model_path', ARGV[11]
 )
 
 -- 2. Set Expiration (Heartbeat mechanism - prevents zombie nodes)

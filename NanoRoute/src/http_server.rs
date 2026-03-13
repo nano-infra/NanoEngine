@@ -158,20 +158,22 @@ pub struct Choice {
 pub struct AppState {
     pub engine_manager: Arc<Mutex<EngineManager>>,
     pub tokenizer: Arc<RwLock<Option<Arc<TokenizerService>>>>,
-    pub model_name: String,
     pub next_request_id: AtomicU64,
 }
 
 // ── Pre-flight helpers ───────────────────────────────────────────────
 
-fn check_model(req_model: &str, served_model: &str) -> Option<Response> {
-    if req_model != served_model {
+fn check_model(req_model: &str, served_model_dir: &str) -> Option<Response> {
+    // Normalize trailing slashes so "/models/Foo/" and "/models/Foo" both match.
+    let req = req_model.trim_end_matches('/');
+    let served = served_model_dir.trim_end_matches('/');
+    if req != served {
         Some(
             (
                 StatusCode::NOT_FOUND,
                 format!(
                     "Model '{}' not found. This router serves '{}'.",
-                    req_model, served_model
+                    req_model, served_model_dir
                 ),
             )
                 .into_response(),
@@ -219,16 +221,16 @@ async fn chat_completions(
 ) -> Response {
     tracing::info!("Received request: {:?}", req);
 
-    // 1. Model check
-    if let Some(err) = check_model(&req.model, &state.model_name) {
-        return err;
-    }
-
-    // 2. Tokenizer (lazy — returns 503 until an engine connects and loads it)
+    // 1. Tokenizer (lazy — returns 503 until an engine connects and loads it)
     let tokenizer = match resolve_tokenizer(&state.tokenizer).await {
         Ok(t) => t,
         Err(e) => return e,
     };
+
+    // 2. Model check against the directory registered by the engine
+    if let Some(err) = check_model(&req.model, tokenizer.model_dir()) {
+        return err;
+    }
 
     // 3. Engine availability pre-flight
     let has_images = req.messages.iter().any(|m| m.content.has_images());
@@ -553,7 +555,6 @@ pub async fn start_server(
     port: u16,
     engine_manager: Arc<Mutex<EngineManager>>,
     tokenizer: Arc<RwLock<Option<Arc<TokenizerService>>>>,
-    model_name: String,
 ) {
     // Use timestamp as start ID to avoid collisions on server restart
     // Must fit in u32 for legacy engine protocol
@@ -565,7 +566,6 @@ pub async fn start_server(
     let state = Arc::new(AppState {
         engine_manager,
         tokenizer,
-        model_name,
         next_request_id: AtomicU64::new(start_id),
     });
 

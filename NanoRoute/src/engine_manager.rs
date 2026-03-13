@@ -265,7 +265,23 @@ impl EngineManager {
                 .await?;
 
             if let Some(info_str) = engine_info_str {
-                if let Ok(engine_info) = serde_json::from_str::<serde_json::Value>(&info_str) {
+                if let Ok(mut engine_info) = serde_json::from_str::<serde_json::Value>(&info_str) {
+                    // `info` JSON may predate the model_path field; read the
+                    // dedicated `model_path` hash field as a direct fallback.
+                    if engine_info["model_path"].is_null() {
+                        let model_path: Option<String> = redis::cmd("HGET")
+                            .arg(&key)
+                            .arg("model_path")
+                            .query_async(&mut conn)
+                            .await
+                            .unwrap_or(None);
+                        if let Some(mp) = model_path {
+                            if !mp.is_empty() {
+                                engine_info["model_path"] = serde_json::Value::String(mp);
+                            }
+                        }
+                    }
+
                     if let Err(e) = self.add_engine_from_info(engine_info).await {
                         warn!("Failed to add engine from snapshot: {}", e);
                     }
@@ -280,9 +296,10 @@ impl EngineManager {
 
     // ─── Engine lifecycle ────────────────────────────────────────────
 
-    /// Add engine from engine info JSON
+    /// Add engine from engine info JSON (used by snapshot and NanoCtrl API paths).
     async fn add_engine_from_info(&mut self, engine_info: serde_json::Value) -> anyhow::Result<()> {
         let parsed = Self::parse_engine_info(&engine_info)?;
+        let model_path = engine_info["model_path"].as_str().map(|s| s.to_string());
 
         if parsed.role == "encoder" {
             let mut adapter = EncoderAdapter::new(parsed.engine_id.clone());
@@ -300,6 +317,7 @@ impl EngineManager {
             self.insert_engine_by_role(adapter, &parsed.role, &parsed.engine_id);
         }
 
+        self.maybe_spawn_tokenizer_load(model_path.as_deref());
         Ok(())
     }
 
@@ -875,8 +893,8 @@ impl EngineManager {
         // Remove engines present locally but absent from NanoCtrl (TTL-expired or crashed)
         let stale: Vec<String> = local_ids.difference(&live_ids).cloned().collect();
         for stale_id in &stale {
-            warn!(
-                "Periodic sync: removing stale engine {} (TTL expired or crashed without unregister)",
+            error!(
+                "Engine heartbeat lost: {} no longer in NanoCtrl (TTL expired or process crashed)",
                 stale_id
             );
             if let Err(e) = self.handle_remove_engine(stale_id).await {
@@ -885,13 +903,21 @@ impl EngineManager {
         }
 
         if !stale.is_empty() {
-            info!(
-                "Periodic sync removed {} stale engines (prefill: {}, decode: {}, encoder: {})",
+            warn!(
+                "Periodic sync evicted {} engine(s) — pool now: {} prefill, {} decode, {} encoder",
                 stale.len(),
                 self.prefill_engines.len(),
                 self.decode_engines.len(),
                 self.encoder_engines.len(),
             );
+            if self.prefill_engines.is_empty() {
+                error!("All prefill engines are gone — router cannot serve any requests");
+            }
+            if self.decode_engines.is_empty() {
+                error!(
+                    "All decode engines are gone — disaggregated requests will fail at migration"
+                );
+            }
         }
 
         Ok(())

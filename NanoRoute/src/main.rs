@@ -151,17 +151,12 @@ async fn main() -> anyhow::Result<()> {
         tokenizer::TokenizerService::spawn_load(tokenizer_slot.clone(), tok_cfg.path.clone());
     }
 
-    let model_name = config.server.model_name.clone();
-
     // Phase 3: Start HTTP Server
-    info!("Starting HTTP Server on port {}", config.server.port);
-    http_server::start_server(
-        config.server.port,
-        engine_manager,
-        tokenizer_slot,
-        model_name,
-    )
-    .await;
+    info!(
+        "Starting HTTP Server on port {} (serving model: {})",
+        config.server.port, config.server.model_name
+    );
+    http_server::start_server(config.server.port, engine_manager, tokenizer_slot).await;
 
     Ok(())
 }
