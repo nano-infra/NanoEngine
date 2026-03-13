@@ -232,8 +232,15 @@ fn build_template_messages(messages: &[Message]) -> Vec<TemplateMessage> {
             let tool_calls = m.tool_calls.as_ref().map(|tcs| {
                 tcs.iter()
                     .map(|tc| {
-                        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                        let args: serde_json::Value =
+                            serde_json::from_str(&tc.function.arguments).unwrap_or_else(|e| {
+                                tracing::warn!(
+                                    "Failed to parse tool call arguments as JSON: {}. Arguments: '{}'",
+                                    e,
+                                    &tc.function.arguments
+                                );
+                                serde_json::Value::Object(serde_json::Map::new())
+                            });
                         serde_json::json!({
                             "name": tc.function.name,
                             "arguments": args,
@@ -529,7 +536,10 @@ async fn chat_completions(
                                             function: DeltaFunctionCall {
                                                 name: Some(tc.name),
                                                 arguments: serde_json::to_string(&tc.arguments)
-                                                    .unwrap_or_default(),
+                                                    .unwrap_or_else(|e| {
+                                                        tracing::warn!("Failed to serialize tool arguments to JSON string in streaming: {}. Defaulting to empty object.", e);
+                                                        "{}".to_string()
+                                                    }),
                                             },
                                         };
                                         let chunk = serde_json::json!({
@@ -704,7 +714,13 @@ async fn chat_completions(
                     call_type: "function".to_string(),
                     function: FunctionCall {
                         name: tc.name,
-                        arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                        arguments: serde_json::to_string(&tc.arguments).unwrap_or_else(|e| {
+                            tracing::warn!(
+                                "Failed to serialize tool arguments to JSON string: {}. Defaulting to empty object.",
+                                e
+                            );
+                            "{}".to_string()
+                        }),
                     },
                 })
                 .collect();

@@ -27,15 +27,19 @@ const PARAM_END: &str = "</parameter>";
 const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";
 
-/// Strip a leading `<think>...</think>` block and return the remaining text.
-fn strip_thinking(text: &str) -> &str {
-    if let Some(start_pos) = text.find(THINK_START) {
-        if let Some(end_rel) = text[start_pos..].find(THINK_END) {
-            let after = &text[start_pos + end_rel + THINK_END.len()..];
-            return after.trim_start();
+/// Strip all `<think>...</think>` blocks from the text, preserving surrounding content.
+fn strip_thinking(text: &str) -> String {
+    let mut result = text.to_string();
+    while let Some(start_pos) = result.find(THINK_START) {
+        if let Some(end_rel) = result[start_pos..].find(THINK_END) {
+            let end_pos = start_pos + end_rel + THINK_END.len();
+            result.replace_range(start_pos..end_pos, "");
+        } else {
+            // Incomplete think block — stop stripping.
+            break;
         }
     }
-    text
+    result
 }
 
 /// Parse a single `<function=NAME>...<parameter=K>V</parameter>...</function>` block.
@@ -117,7 +121,8 @@ fn parse_tool_call_block(block: &str) -> Option<ParsedToolCall> {
 /// - `content_text` is any text before the first `<tool_call>` block (thinking stripped).
 /// - `tool_calls` is empty when no `<tool_call>` was found (pure-text response).
 pub fn parse_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
-    let text = strip_thinking(text);
+    let text_owned = strip_thinking(text);
+    let text = text_owned.as_str();
 
     let mut tool_calls = Vec::new();
     let mut content_end: Option<usize> = None;
