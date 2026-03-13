@@ -42,6 +42,7 @@ anyhow = "1.0"
 futures = "0.3"
 async-stream = "0.3"
 minijinja = { version = "2", features = ["json", "loader", "adjacent_loop_items"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # ZMQ (async engine protocol)
 zmq = "0.10"

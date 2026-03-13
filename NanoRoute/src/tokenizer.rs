@@ -1,4 +1,5 @@
 use minijinja::{Environment, ErrorKind};
+use minijinja_contrib::add_to_environment;
 use serde::Serialize;
 
 use std::path::Path;
@@ -141,9 +142,11 @@ impl TokenizerService {
         };
 
         // Rewrite Python-specific method calls that minijinja does not support.
-        let template_str = normalize_for_minijinja(&template_str);
-
         let mut env = Environment::new();
+
+        // Add Python-compatible string methods (startswith, endswith, split,
+        // upper, lower, rstrip, lstrip, etc.) needed by HuggingFace chat templates.
+        add_to_environment(&mut env);
 
         // raise_exception(msg) — called by the Qwen template for input validation.
         env.add_function(
@@ -152,26 +155,6 @@ impl TokenizerService {
                 Err(minijinja::Error::new(ErrorKind::InvalidOperation, msg))
             },
         );
-
-        // Python string compat: startswith / endswith as global functions.
-        env.add_function("startswith", |s: String, prefix: String| -> bool {
-            s.starts_with(prefix.as_str())
-        });
-        env.add_function("endswith", |s: String, suffix: String| -> bool {
-            s.ends_with(suffix.as_str())
-        });
-
-        // Python string compat: rstrip / lstrip / split as filters.
-        // rstrip/lstrip strip only newline characters (matching Python .rstrip('\n')).
-        env.add_filter("rstrip", |s: String| -> String {
-            s.trim_end_matches('\n').to_string()
-        });
-        env.add_filter("lstrip", |s: String| -> String {
-            s.trim_start_matches('\n').to_string()
-        });
-        env.add_filter("split", |s: String, sep: String| -> Vec<minijinja::Value> {
-            s.split(sep.as_str()).map(minijinja::Value::from).collect()
-        });
 
         env.add_template_owned("chat".to_string(), template_str)?;
         self.template_env = Arc::new(Some(env));
@@ -254,40 +237,4 @@ impl TokenizerService {
             Err(anyhow::anyhow!("Tokenizer not loaded"))
         }
     }
-}
-
-/// Rewrite the subset of Python-only string method calls that appear in Qwen chat
-/// templates into minijinja-compatible function calls or filter chains.
-///
-/// Transformations applied:
-/// - `X.startswith(Y)` → `startswith(X, Y)`  (registered as a global function)
-/// - `X.endswith(Y)`   → `endswith(X, Y)`    (registered as a global function)
-/// - `.split(Y)[0]`    → `| split(Y) | first`
-/// - `.split(Y)[-1]`   → `| split(Y) | last`
-/// - `.rstrip('\n')`   → `| rstrip`
-/// - `.lstrip('\n')`   → `| lstrip`
-fn normalize_for_minijinja(s: &str) -> String {
-    s
-        // ── startswith / endswith ──────────────────────────────────────────────
-        .replace(
-            "content.startswith('<tool_response>')",
-            "startswith(content, '<tool_response>')",
-        )
-        .replace(
-            "content.endswith('</tool_response>')",
-            "endswith(content, '</tool_response>')",
-        )
-        // ── split / rstrip / lstrip chains (Qwen3.5 thinking-content parsing) ─
-        // Line pattern:
-        //   content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')
-        .replace(
-            "content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n')",
-            "(content | split('</think>') | first | rstrip | split('<think>') | last | lstrip)",
-        )
-        // Line pattern:
-        //   content.split('</think>')[-1].lstrip('\n')
-        .replace(
-            "content.split('</think>')[-1].lstrip('\\n')",
-            "(content | split('</think>') | last | lstrip)",
-        )
 }
