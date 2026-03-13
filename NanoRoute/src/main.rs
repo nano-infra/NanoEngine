@@ -22,6 +22,7 @@ mod encoder_adapter;
 mod engine_adapter;
 mod http_server;
 mod tokenizer;
+mod tool_parser;
 
 use clap::Parser;
 use config::AppConfig;
