@@ -4,12 +4,12 @@ port = 3001
 model_name = "qwen3-235B"
 
 [tokenizer]
-path = "/models/models-Qwen-Qwen3.5-35B-A3B/tokenizer.json"
+path = "/models/Qwen3-235B-A22B-Instruct-2507/tokenizer.json"
 
 [engine]
 mode = "Disaggregated"
 nanoctrl_scope = "JimyMa"
-nanoctrl_address = "http://10.102.97.179:3000"
+nanoctrl_address = "http://127.0.0.1:3000"
 
 [scheduler]
 queue_size = 1000
