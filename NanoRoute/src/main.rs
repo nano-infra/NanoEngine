@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(tp) = args.tokenizer_path {
         info!("Overriding tokenizer path with: {}", tp);
-        config.tokenizer.path = tp;
+        config.tokenizer = Some(config::TokenizerConfig { path: tp });
     }
 
     debug!("Configuration loaded.");
@@ -142,20 +142,44 @@ async fn main() -> anyhow::Result<()> {
 
     // P2P mesh is handled by NanoCtrl microservice
 
-    // Phase 2: Tokenizer
-    debug!("Initializing Tokenizer...");
-    let mut tokenizer_service = tokenizer::TokenizerService::new(&config.tokenizer.path);
-    if let Err(e) = tokenizer_service.load().await {
-        error!("Failed to load tokenizer: {}", e);
-        // Continue without tokenizer? Or fail?
-        // For now, let's log and continue, maybe usage will fail gracefully.
+    // Phase 2: Get shared tokenizer slot from engine manager (lazy-loaded when engine connects)
+    let tokenizer_slot = {
+        let mgr = engine_manager.lock().await;
+        mgr.tokenizer_slot.clone()
+    };
+
+    // Optional: pre-load from config fallback if [tokenizer] path is provided
+    if let Some(tok_cfg) = &config.tokenizer {
+        let slot = tokenizer_slot.clone();
+        let path = tok_cfg.path.clone();
+        tokio::spawn(async move {
+            let mut svc = tokenizer::TokenizerService::new(&path);
+            if let Ok(()) = svc.load().await {
+                let mut w = slot.write().await;
+                if w.is_none() {
+                    *w = Some(Arc::new(svc));
+                    info!("Tokenizer pre-loaded from config fallback: {}", path);
+                }
+            } else {
+                error!(
+                    "Failed to pre-load tokenizer from config fallback: {}",
+                    path
+                );
+            }
+        });
     }
 
-    // Phase 3: Start HTTP Server
-    let tokenizer_service_arc = Arc::new(tokenizer_service);
+    let model_name = config.server.model_name.clone();
 
+    // Phase 3: Start HTTP Server
     info!("Starting HTTP Server on port {}", config.server.port);
-    http_server::start_server(config.server.port, engine_manager, tokenizer_service_arc).await;
+    http_server::start_server(
+        config.server.port,
+        engine_manager,
+        tokenizer_slot,
+        model_name,
+    )
+    .await;
 
     Ok(())
 }

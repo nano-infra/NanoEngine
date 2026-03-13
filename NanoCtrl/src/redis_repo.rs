@@ -330,6 +330,7 @@ impl RedisRepo {
             "world_size": body.world_size,
             "num_blocks": body.num_blocks,
             "peer_addrs": body.peer_addrs,
+            "model_path": body.model_path,  // null if not provided (old engine)
         });
         let engine_info = serde_json::json!({
             "id": body.engine_id,

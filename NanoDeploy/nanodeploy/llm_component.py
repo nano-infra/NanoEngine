@@ -391,6 +391,7 @@ class LLMComponent(LLM):
             "p2p_host": zmq_host,
             "p2p_port": self.p2p_port if self.p2p_port else 0,
             "max_num_seqs": self.config.max_num_seqs,
+            "model_path": self.config.model,  # tokenizer directory = model directory
         }
 
         ok = self._nanoctrl.register(self.engine_id, extra)

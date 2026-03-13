@@ -1,10 +1,12 @@
 use crate::encoder_adapter::EncoderAdapter;
 use crate::engine_adapter::EngineAdapter;
 use crate::engine_watcher::{EngineEvent, EnginePayload, EngineWatcher};
+use crate::tokenizer::TokenizerService;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 pub struct EngineManager {
@@ -13,6 +15,8 @@ pub struct EngineManager {
     pub decode_engines: Vec<Arc<Mutex<EngineAdapter>>>,
     pub encoder_engines: Vec<Arc<Mutex<EncoderAdapter>>>,
     redis_key_prefix: String,
+    /// Lazily loaded tokenizer; None until first engine with model_path arrives.
+    pub tokenizer_slot: Arc<RwLock<Option<Arc<TokenizerService>>>>,
 }
 
 /// Parsed fields from an engine info JSON value.
@@ -37,6 +41,7 @@ impl EngineManager {
             decode_engines: Vec::new(),
             encoder_engines: Vec::new(),
             redis_key_prefix: "".to_string(), // Empty prefix to match NanoCtrl default
+            tokenizer_slot: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -46,6 +51,7 @@ impl EngineManager {
             decode_engines: Vec::new(),
             encoder_engines: Vec::new(),
             redis_key_prefix: scope.unwrap_or_default(),
+            tokenizer_slot: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -572,6 +578,32 @@ impl EngineManager {
 
     // ─── Event handlers ──────────────────────────────────────────────
 
+    /// Spawn a background task to lazily load the tokenizer from an engine's model path.
+    /// No-op if tokenizer is already loaded or model_path is None.
+    fn maybe_spawn_tokenizer_load(&self, model_path: Option<&str>) {
+        let Some(path) = model_path else { return };
+        let slot = self.tokenizer_slot.clone();
+        let path = path.to_string();
+        tokio::spawn(async move {
+            // Fast path: already loaded
+            if slot.read().await.is_some() {
+                return;
+            }
+            let mut svc = TokenizerService::new(&path);
+            match svc.load().await {
+                Ok(()) => {
+                    let mut w = slot.write().await;
+                    if w.is_none() {
+                        // double-check under write lock
+                        *w = Some(Arc::new(svc));
+                        info!("Tokenizer loaded lazily from {}", path);
+                    }
+                }
+                Err(e) => error!("Failed to load tokenizer from {}: {}", path, e),
+            }
+        });
+    }
+
     async fn handle_add_engine(&mut self, payload: EnginePayload) -> anyhow::Result<()> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY: Duration = std::time::Duration::from_secs(2);
@@ -615,6 +647,7 @@ impl EngineManager {
                         adapter.uuid = Some(payload.id.clone());
                         let adapter = Arc::new(Mutex::new(adapter));
                         self.insert_encoder(adapter, &payload.id);
+                        self.maybe_spawn_tokenizer_load(payload.model_path.as_deref());
                         return Ok(());
                     }
                     Err(e) => {
@@ -647,6 +680,7 @@ impl EngineManager {
 
                     let adapter = Arc::new(Mutex::new(adapter));
                     self.insert_engine_by_role(adapter, &payload.role, &payload.id);
+                    self.maybe_spawn_tokenizer_load(payload.model_path.as_deref());
                     return Ok(());
                 }
                 Err(e) => {
