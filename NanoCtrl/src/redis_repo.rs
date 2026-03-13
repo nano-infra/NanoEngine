@@ -330,6 +330,7 @@ impl RedisRepo {
             "world_size": body.world_size,
             "num_blocks": body.num_blocks,
             "peer_addrs": body.peer_addrs,
+            "model_path": body.model_path,  // null if not provided (old engine)
         });
         let engine_info = serde_json::json!({
             "id": body.engine_id,
@@ -342,6 +343,7 @@ impl RedisRepo {
             "p2p_host": body.p2p_host.as_deref().unwrap_or_default(),
             "p2p_port": body.p2p_port.unwrap_or(0),
             "max_num_seqs": body.max_num_seqs.unwrap_or(0),
+            "model_path": body.model_path,  // null if not provided (old engine)
         });
 
         let rev: i64 = redis::cmd("EVAL")
@@ -350,16 +352,17 @@ impl RedisRepo {
             .arg(&engine_key)
             .arg(&revision_key)
             .arg(&channel)
-            .arg(&body.engine_id)
-            .arg(&body.role)
-            .arg(&body.host)
-            .arg(body.port.to_string())
-            .arg(body.world_size.to_string())
-            .arg(body.num_blocks.to_string())
-            .arg(serde_json::to_string(&body.peer_addrs).unwrap_or_default())
-            .arg(engine_info.to_string())
-            .arg(payload.to_string())
-            .arg(ENGINE_TTL_SECS.to_string())
+            .arg(&body.engine_id) // ARGV[1]
+            .arg(&body.role) // ARGV[2]
+            .arg(&body.host) // ARGV[3]
+            .arg(body.port.to_string()) // ARGV[4]
+            .arg(body.world_size.to_string()) // ARGV[5]
+            .arg(body.num_blocks.to_string()) // ARGV[6]
+            .arg(serde_json::to_string(&body.peer_addrs).unwrap_or_default()) // ARGV[7]
+            .arg(engine_info.to_string()) // ARGV[8]
+            .arg(payload.to_string()) // ARGV[9]
+            .arg(ENGINE_TTL_SECS.to_string()) // ARGV[10]
+            .arg(body.model_path.as_deref().unwrap_or("")) // ARGV[11]
             .query_async(&mut *conn)
             .await?;
 

@@ -3,13 +3,10 @@ use serde::Deserialize;
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct ServerConfig {
-    pub host: String,
     pub port: u16,
+    #[allow(dead_code)]
     pub model_name: String,
-    pub engine_host: Option<String>,
-    pub engine_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -64,7 +61,8 @@ pub struct SchedulerConfig {
 #[allow(dead_code)]
 pub struct AppConfig {
     pub server: ServerConfig,
-    pub tokenizer: TokenizerConfig,
+    #[serde(default)]
+    pub tokenizer: Option<TokenizerConfig>, // optional; loaded lazily from engine if absent
     pub engine: EngineConfig,
     pub scheduler: SchedulerConfig,
 }

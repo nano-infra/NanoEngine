@@ -27,17 +27,12 @@ use clap::Parser;
 use config::AppConfig;
 use std::path::PathBuf;
 use tracing::{debug, error, info};
-// use crate::engine_adapter::EngineAdapter; // Removed
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
-
-    #[arg(long)]
-    tokenizer_path: Option<String>,
 }
 
 #[tokio::main]
@@ -51,12 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     info!("Loading configuration from {:?}", args.config);
-    let mut config = AppConfig::load_from_file(&args.config)?;
-
-    if let Some(tp) = args.tokenizer_path {
-        info!("Overriding tokenizer path with: {}", tp);
-        config.tokenizer.path = tp;
-    }
+    let config = AppConfig::load_from_file(&args.config)?;
 
     debug!("Configuration loaded.");
 
@@ -121,13 +111,16 @@ async fn main() -> anyhow::Result<()> {
             debug!("Dynamic service discovery started successfully.");
             // Log engine counts
             let manager = manager_arc.lock().await;
-            let prefill_count = manager.prefill_engines.len();
-            let decode_count = manager.decode_engines.len();
-            let encoder_count = manager.encoder_engines.len();
+            let (prefill_count, decode_count, encoder_count) = manager.total_engine_counts();
+            let model_keys: Vec<String> = manager
+                .available_model_keys()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
             drop(manager);
             info!(
-                "Connected engines: {} prefill, {} decode, {} encoder",
-                prefill_count, decode_count, encoder_count
+                "Connected engines: {} prefill, {} decode, {} encoder, models: {:?}",
+                prefill_count, decode_count, encoder_count, model_keys
             );
             manager_arc
         }
@@ -142,20 +135,9 @@ async fn main() -> anyhow::Result<()> {
 
     // P2P mesh is handled by NanoCtrl microservice
 
-    // Phase 2: Tokenizer
-    debug!("Initializing Tokenizer...");
-    let mut tokenizer_service = tokenizer::TokenizerService::new(&config.tokenizer.path);
-    if let Err(e) = tokenizer_service.load().await {
-        error!("Failed to load tokenizer: {}", e);
-        // Continue without tokenizer? Or fail?
-        // For now, let's log and continue, maybe usage will fail gracefully.
-    }
-
-    // Phase 3: Start HTTP Server
-    let tokenizer_service_arc = Arc::new(tokenizer_service);
-
+    // Phase 2: Start HTTP Server
     info!("Starting HTTP Server on port {}", config.server.port);
-    http_server::start_server(config.server.port, engine_manager, tokenizer_service_arc).await;
+    http_server::start_server(config.server.port, engine_manager).await;
 
     Ok(())
 }

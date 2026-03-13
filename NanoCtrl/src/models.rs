@@ -137,6 +137,8 @@ pub struct RegisterEngineBody {
     pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
     #[serde(default)]
     pub max_num_seqs: Option<u32>, // Max batch size (GDN slot count = max_num_seqs + 1)
+    #[serde(default)]
+    pub model_path: Option<String>, // Path to model/tokenizer directory
 }
 
 #[derive(Debug, Serialize)]

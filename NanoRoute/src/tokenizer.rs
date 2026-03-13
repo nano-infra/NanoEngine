@@ -4,33 +4,102 @@ use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
-use tracing::debug;
+use tokio::sync::RwLock;
+use tracing::{debug, error, info};
 
 pub struct TokenizerService {
-    path: String,
+    /// Model directory used for `req.model` comparison (no trailing slash).
+    /// e.g. `/models/Qwen3-235B-A22B-Instruct-2507`
+    model_dir: String,
+    /// Actual tokenizer file passed to `Tokenizer::from_file`.
+    /// e.g. `/models/Qwen3-235B-A22B-Instruct-2507/tokenizer.json`
+    tokenizer_file: String,
     tokenizer: Arc<Option<Tokenizer>>,
-    // Store compiled environment in Arc for thread safety
-    // We use 'static because we will use add_template_owned (if available) or source
-    // Actually minijinja::Environment holds templates.
     template_env: Arc<Option<Environment<'static>>>,
 }
 
 impl TokenizerService {
+    /// Probe a model directory for a loadable tokenizer file.
+    ///
+    /// Tries common names in order; falls back to `tokenizer.json` if none found
+    /// (the subsequent `load()` will then surface a clear "file not found" error).
+    fn find_tokenizer_file(model_dir: &str) -> String {
+        const CANDIDATES: &[&str] = &["tokenizer.json", "tokenizer.model"];
+        for name in CANDIDATES {
+            let candidate = format!("{}/{}", model_dir, name);
+            if Path::new(&candidate).exists() {
+                return candidate;
+            }
+        }
+        format!("{}/tokenizer.json", model_dir)
+    }
+
+    /// Accept either a model directory or an explicit tokenizer file path.
+    ///
+    /// Uses `fs::metadata` to distinguish the two cases reliably — avoids
+    /// false-positives from dots in directory names like `Qwen3.5-35B-A3B`.
+    ///
+    /// - Directory: probes for `tokenizer.json` / `tokenizer.model` inside it.
+    /// - File: uses as-is; `model_dir` is set to the parent directory.
     pub fn new(path: &str) -> Self {
+        let trimmed = path.trim_end_matches('/');
+        let (model_dir, tokenizer_file) = match std::fs::metadata(trimmed) {
+            Ok(meta) if meta.is_dir() => {
+                let dir = trimmed.to_string();
+                let file = Self::find_tokenizer_file(&dir);
+                (dir, file)
+            }
+            _ => {
+                // Explicit file path (or path not yet on disk — treat as file).
+                let dir = Path::new(trimmed)
+                    .parent()
+                    .map(|d| d.to_string_lossy().trim_end_matches('/').to_string())
+                    .unwrap_or_else(|| trimmed.to_string());
+                (dir, trimmed.to_string())
+            }
+        };
         Self {
-            path: path.to_string(),
+            model_dir,
+            tokenizer_file,
             tokenizer: Arc::new(None),
             template_env: Arc::new(None),
         }
     }
 
+    /// Spawn a background task to load a tokenizer from `path` into `slot`.
+    ///
+    /// No-op if the slot is already populated (fast-path read lock check,
+    /// then double-checked under the write lock before writing).
+    pub fn spawn_load(slot: Arc<RwLock<Option<Arc<TokenizerService>>>>, path: String) {
+        tokio::spawn(async move {
+            // Fast path: already loaded — avoid spawning unnecessary work.
+            if slot.read().await.is_some() {
+                return;
+            }
+            let mut svc = TokenizerService::new(&path);
+            match svc.load().await {
+                Ok(()) => {
+                    let mut w = slot.write().await;
+                    if w.is_none() {
+                        // Double-check under write lock to handle concurrent loaders.
+                        *w = Some(Arc::new(svc));
+                        info!("Tokenizer loaded (model_dir: {})", path);
+                    }
+                }
+                Err(e) => error!("Failed to load tokenizer from {}: {}", path, e),
+            }
+        });
+    }
+
     pub async fn load(&mut self) -> anyhow::Result<()> {
-        let path_str = self.path.clone();
-        let _path = Path::new(&path_str);
+        let file = self.tokenizer_file.clone();
 
-        debug!("Loading tokenizer from {}", path_str);
+        debug!(
+            "Loading tokenizer from {} (model_dir: {})",
+            file, self.model_dir
+        );
 
-        let path_clone = path_str.clone();
+        let path_clone = file.clone();
         let tokenizer = tokio::task::spawn_blocking(move || {
             Tokenizer::from_file(&path_clone).map_err(|e| anyhow::anyhow!(e))
         })

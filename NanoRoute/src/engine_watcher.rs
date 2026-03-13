@@ -40,6 +40,8 @@ pub struct EnginePayload {
     pub world_size: u32,
     pub num_blocks: u32,
     pub peer_addrs: Vec<String>,
+    #[serde(default)]
+    pub model_path: Option<String>, // None = old engine without this field
 }
 
 /// Event deduplicator to handle duplicate messages
