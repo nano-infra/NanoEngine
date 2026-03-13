@@ -489,10 +489,10 @@ impl EngineManager {
             }
         }
 
-        let (p, d, e) = self.total_engine_counts();
+        let (p, d, enc) = self.total_engine_counts();
         debug!(
             "Initial engines loaded: {} prefill, {} decode, {} encoder across {} model(s), revision={}",
-            p, d, e, self.model_pools.len(), initial_revision
+            p, d, enc, self.model_pools.len(), initial_revision
         );
 
         Ok(initial_revision)
@@ -1006,10 +1006,10 @@ impl EngineManager {
             self.load_snapshot_from_redis(redis_url).await?;
         }
 
-        let (p, d, e) = self.total_engine_counts();
+        let (p, d, enc) = self.total_engine_counts();
         info!(
             "Full sync completed: {} prefill engines, {} decode engines, {} encoder engines across {} model(s)",
-            p, d, e, self.model_pools.len()
+            p, d, enc, self.model_pools.len()
         );
         Ok(())
     }
