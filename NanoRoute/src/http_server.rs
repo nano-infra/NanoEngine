@@ -1,6 +1,7 @@
 use crate::engine_adapter::StreamEvent;
 use crate::engine_manager::{EngineManager, ModelPool};
 use crate::tokenizer::TokenizerService;
+use crate::tool_parser;
 use axum::http::StatusCode;
 use axum::response::{sse::Event, IntoResponse, Response, Sse};
 use axum::{
@@ -69,6 +70,55 @@ impl MessageContent {
     }
 }
 
+// ── Tool / Function Call Types (OpenAI-compatible) ──────────────────
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // always "function"
+    pub function: FunctionDefinition,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String, // JSON-encoded string (OpenAI spec)
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String, // always "function"
+    pub function: FunctionCall,
+}
+
+// ── Streaming delta types ────────────────────────────────────────────
+
+#[derive(Serialize, Debug)]
+struct DeltaFunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    arguments: String,
+}
+
+#[derive(Serialize, Debug)]
+struct DeltaToolCall {
+    index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    call_type: Option<String>,
+    function: DeltaFunctionCall,
+}
+
 // Request Payload (OpenAI-compatible)
 #[derive(Deserialize)]
 pub struct ChatCompletionRequest {
@@ -81,6 +131,11 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub ignore_eos: Option<bool>,
+    #[serde(default)]
+    pub tools: Option<Vec<Tool>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub tool_choice: Option<serde_json::Value>, // "auto"|"none"|"required"|named obj
 }
 
 // Custom Debug implementation: truncate long messages to first few words
@@ -104,6 +159,10 @@ impl fmt::Debug for ChatCompletionRequest {
             .field("stream", &self.stream)
             .field("temperature", &self.temperature)
             .field("ignore_eos", &self.ignore_eos)
+            .field(
+                "tools",
+                &self.tools.as_ref().map(|t| format!("[{} tools]", t.len())),
+            )
             .finish()
     }
 }
@@ -112,6 +171,12 @@ impl fmt::Debug for ChatCompletionRequest {
 pub struct Message {
     pub role: String,
     pub content: MessageContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>, // assistant → tool_calls
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>, // role="tool" responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl fmt::Debug for Message {
@@ -130,11 +195,69 @@ impl fmt::Debug for Message {
     }
 }
 
-/// Simplified message for template rendering (always text content).
+/// Message passed to the Jinja template renderer.
 #[derive(Serialize)]
 struct TemplateMessage {
     role: String,
-    content: String,
+    content: serde_json::Value, // String or Null (for assistant-with-tool-calls)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<serde_json::Value>>, // [{name, arguments(dict)}]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+/// Response message for the assistant role.
+#[derive(Serialize, Debug)]
+pub struct AssistantMessage {
+    pub role: String,
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// Convert a slice of incoming `Message`s into `TemplateMessage`s for rendering.
+fn build_template_messages(messages: &[Message]) -> Vec<TemplateMessage> {
+    messages
+        .iter()
+        .map(|m| {
+            let content = match m.role.as_str() {
+                "assistant" if m.tool_calls.is_some() => serde_json::Value::Null,
+                _ => serde_json::Value::String(m.content.text()),
+            };
+
+            // tool_calls: [{name, arguments as dict}] — Qwen template expects a dict,
+            // not a JSON-encoded string.
+            let tool_calls = m.tool_calls.as_ref().map(|tcs| {
+                tcs.iter()
+                    .map(|tc| {
+                        let args: serde_json::Value =
+                            serde_json::from_str(&tc.function.arguments).unwrap_or_else(|e| {
+                                tracing::warn!(
+                                    "Failed to parse tool call arguments as JSON: {}. Arguments: '{}'",
+                                    e,
+                                    &tc.function.arguments
+                                );
+                                serde_json::Value::Object(serde_json::Map::new())
+                            });
+                        serde_json::json!({
+                            "name": tc.function.name,
+                            "arguments": args,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            TemplateMessage {
+                role: m.role.clone(),
+                content,
+                tool_calls,
+                tool_call_id: m.tool_call_id.clone(),
+                name: m.name.clone(),
+            }
+        })
+        .collect()
 }
 
 // Response Payload (Simplified)
@@ -150,7 +273,7 @@ pub struct ChatCompletionResponse {
 #[derive(Serialize, Debug)]
 pub struct Choice {
     pub index: u32,
-    pub message: Message,
+    pub message: AssistantMessage,
     pub finish_reason: String,
 }
 
@@ -241,6 +364,10 @@ async fn chat_completions(
     // Generate unique sequence ID and request ID
     let seq_id = state.next_request_id.fetch_add(1, Ordering::SeqCst);
     let request_id = format!("chatcmpl-{}", seq_id);
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     // Acquire lock briefly to send request
     let rx_result = {
@@ -299,15 +426,17 @@ async fn chat_completions(
                 .await
         } else {
             // ── Text-only path: tokenize locally ──
-            let template_messages: Vec<TemplateMessage> = req
-                .messages
-                .iter()
-                .map(|m| TemplateMessage {
-                    role: m.role.clone(),
-                    content: m.content.text(),
+            let template_messages = build_template_messages(&req.messages);
+            let tools_json = req.tools.as_ref().map(|t| {
+                serde_json::to_value(t).unwrap_or_else(|e| {
+                    tracing::error!("Failed to serialize tools to JSON: {}", e);
+                    serde_json::Value::Null
                 })
-                .collect();
-            let token_ids = match tokenizer.encode_messages(template_messages).await {
+            });
+            let token_ids = match tokenizer
+                .encode_messages(template_messages, tools_json)
+                .await
+            {
                 Ok(ids) => ids,
                 Err(e) => {
                     tracing::error!("Encoding error: {}", e);
@@ -355,6 +484,9 @@ async fn chat_completions(
             let mut last_text_len = 0;
             let stream_start = std::time::Instant::now();
             let mut is_finished = false;
+            // Tool call streaming state
+            let mut tool_suppress_from: Option<usize> = None; // byte offset in full_text where suppression started
+            let mut emitted_tool_calls: u32 = 0;
 
             while let Some(event) = rx.recv().await {
                 match event {
@@ -364,40 +496,109 @@ async fn chat_completions(
                         generated_tokens.push(id);
                         // Incremental decoding: decode all generated tokens and take diff
                         if let Ok(full_text) = tokenizer.decode(generated_tokens.clone()).await {
-                             let new_len = full_text.len();
-                             if new_len > last_text_len {
-                                 // Use safe slicing to handle UTF-8 character boundaries
-                                 if let Some(delta_str) = full_text.get(last_text_len..) {
-                                     let delta = delta_str.to_string();
-                                     last_text_len = new_len;
+                            let new_len = full_text.len();
 
-                                     let chunk = serde_json::json!({
-                                         "id": request_id,
-                                         "object": "chat.completion.chunk",
-                                         "created": 1234567890,
-                                         "model": model_name,
-                                         "choices": [{
-                                             "index": 0,
-                                             "delta": { "content": delta },
-                                             "finish_reason": null
-                                         }]
-                                     });
-                                     yield Ok::<_, std::io::Error>(Event::default().data(chunk.to_string()));
-                                 }
-                             }
+                            // Detect start of a <tool_call> block not yet suppressed.
+                            if tool_suppress_from.is_none() {
+                                if let Some(tc_rel) = full_text[last_text_len..].find("<tool_call>") {
+                                    let tc_start_abs = last_text_len + tc_rel;
+                                    // Emit any text before the tool call starts.
+                                    if tc_start_abs > last_text_len {
+                                        if let Some(delta_str) = full_text.get(last_text_len..tc_start_abs) {
+                                            let delta = delta_str.to_string();
+                                            let chunk = serde_json::json!({
+                                                "id": request_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created_at,
+                                                "model": model_name,
+                                                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
+                                            });
+                                            yield Ok::<_, std::io::Error>(Event::default().data(chunk.to_string()));
+                                        }
+                                    }
+                                    last_text_len = tc_start_abs;
+                                    tool_suppress_from = Some(tc_start_abs);
+                                }
+                            }
+
+                            if let Some(suppress_from) = tool_suppress_from {
+                                // In tool-call mode: check whether a complete block has arrived.
+                                let tool_text = &full_text[suppress_from..];
+                                if let Some(end_pos) = tool_parser::find_complete_tool_call_end(tool_text) {
+                                    let block = &full_text[suppress_from..suppress_from + end_pos];
+                                    let (_, calls) = tool_parser::parse_tool_calls(block);
+                                    for tc in calls {
+                                        let tc_id = format!("call_{}_{}", seq_id, emitted_tool_calls);
+                                        let delta_call = DeltaToolCall {
+                                            index: emitted_tool_calls,
+                                            id: Some(tc_id),
+                                            call_type: Some("function".to_string()),
+                                            function: DeltaFunctionCall {
+                                                name: Some(tc.name),
+                                                arguments: serde_json::to_string(&tc.arguments)
+                                                    .unwrap_or_else(|e| {
+                                                        tracing::warn!("Failed to serialize tool arguments to JSON string in streaming: {}. Defaulting to empty object.", e);
+                                                        "{}".to_string()
+                                                    }),
+                                            },
+                                        };
+                                        let delta_call_value = match serde_json::to_value(&delta_call) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                tracing::error!("Failed to serialize DeltaToolCall: {}. Skipping tool call delta.", e);
+                                                continue;
+                                            }
+                                        };
+                                        let chunk = serde_json::json!({
+                                            "id": request_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created_at,
+                                            "model": model_name,
+                                            "choices": [{"index": 0, "delta": {"tool_calls": [delta_call_value]}, "finish_reason": null}]
+                                        });
+                                        yield Ok::<_, std::io::Error>(Event::default().data(chunk.to_string()));
+                                        emitted_tool_calls += 1;
+                                    }
+                                    last_text_len = suppress_from + end_pos;
+                                    tool_suppress_from = None;
+                                }
+                                // else: still accumulating inside a tool call — suppress text.
+                            } else {
+                                // Normal incremental text emission.
+                                if new_len > last_text_len {
+                                    // Use safe slicing to handle UTF-8 character boundaries
+                                    if let Some(delta_str) = full_text.get(last_text_len..) {
+                                        let delta = delta_str.to_string();
+                                        last_text_len = new_len;
+                                        let chunk = serde_json::json!({
+                                            "id": request_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created_at,
+                                            "model": model_name,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": { "content": delta },
+                                                "finish_reason": null
+                                            }]
+                                        });
+                                        yield Ok::<_, std::io::Error>(Event::default().data(chunk.to_string()));
+                                    }
+                                }
+                            }
                         }
                     },
                     StreamEvent::Finished => {
                         is_finished = true;
+                        let finish_reason = if emitted_tool_calls > 0 { "tool_calls" } else { "stop" };
                         let chunk = serde_json::json!({
                             "id": request_id,
                             "object": "chat.completion.chunk",
-                            "created": 1234567890,
+                            "created": created_at,
                             "model": model_name,
                             "choices": [{
                                 "index": 0,
                                 "delta": {},
-                                "finish_reason": "stop"
+                                "finish_reason": finish_reason
                             }]
                         });
                         yield Ok(Event::default().data(chunk.to_string()));
@@ -415,6 +616,8 @@ async fn chat_completions(
                         // engine will continue generating fresh tokens.
                         generated_tokens.clear();
                         last_text_len = 0;
+                        tool_suppress_from = None;
+                        emitted_tool_calls = 0;
 
                         let decode_adapter_arc = {
                             let mgr = state.engine_manager.lock().await;
@@ -498,19 +701,54 @@ async fn chat_completions(
         }
 
         // Engine only sends generated tokens, no prompt echo to skip
-        let text = tokenizer.decode(generated_tokens).await.unwrap_or_default();
+        let raw_text = tokenizer.decode(generated_tokens).await.unwrap_or_default();
+        let (content, tool_calls) = tool_parser::parse_tool_calls(&raw_text);
+        let (assistant_msg, finish_reason) = if tool_calls.is_empty() {
+            (
+                AssistantMessage {
+                    role: "assistant".to_string(),
+                    content: Some(content),
+                    tool_calls: None,
+                },
+                "stop".to_string(),
+            )
+        } else {
+            let oa_calls = tool_calls
+                .into_iter()
+                .enumerate()
+                .map(|(i, tc)| ToolCall {
+                    id: format!("call_{}_{}", seq_id, i),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: tc.name,
+                        arguments: serde_json::to_string(&tc.arguments).unwrap_or_else(|e| {
+                            tracing::warn!(
+                                "Failed to serialize tool arguments to JSON string: {}. Defaulting to empty object.",
+                                e
+                            );
+                            "{}".to_string()
+                        }),
+                    },
+                })
+                .collect();
+            (
+                AssistantMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(oa_calls),
+                },
+                "tool_calls".to_string(),
+            )
+        };
         Json(ChatCompletionResponse {
             id: request_id,
             object: "chat.completion".to_string(),
-            created: 1234567890,
+            created: created_at,
             model: req.model,
             choices: vec![Choice {
                 index: 0,
-                message: Message {
-                    role: "assistant".to_string(),
-                    content: MessageContent::Text(text),
-                },
-                finish_reason: "stop".to_string(),
+                message: assistant_msg,
+                finish_reason,
             }],
         })
         .into_response()
