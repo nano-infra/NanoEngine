@@ -15,9 +15,61 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 
+// ── Multimodal Content Types (OpenAI-compatible) ────────────────────
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ImageUrlValue {
+    pub url: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlValue },
+}
+
+/// Message content: either a plain string or a list of content parts
+/// (text + image_url) following the OpenAI multimodal API.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    /// Extract only the text content, joining all text parts.
+    /// Image parts are silently ignored (handled by VLEngineServer).
+    pub fn text(&self) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    /// Whether this content contains any image parts.
+    pub fn has_images(&self) -> bool {
+        match self {
+            MessageContent::Text(_) => false,
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
+        }
+    }
+}
+
 // Request Payload (OpenAI-compatible)
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -56,27 +108,32 @@ impl fmt::Debug for ChatCompletionRequest {
 }
 
 #[derive(Deserialize, Serialize, Clone)]
-#[serde(deny_unknown_fields)]
 pub struct Message {
     pub role: String,
-    pub content: String,
+    pub content: MessageContent,
 }
 
-// Custom Debug implementation: truncate long content to first 8 words
 impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let truncated = if self.content.len() > 50 {
-            let words: Vec<&str> = self.content.split_whitespace().take(8).collect();
+        let text = self.content.text();
+        let truncated = if text.len() > 50 {
+            let words: Vec<&str> = text.split_whitespace().take(8).collect();
             format!("{}...", words.join(" "))
         } else {
-            self.content.clone()
+            text
         };
-
         f.debug_struct("Message")
             .field("role", &self.role)
             .field("content", &truncated)
             .finish()
     }
+}
+
+/// Simplified message for template rendering (always text content).
+#[derive(Serialize)]
+struct TemplateMessage {
+    role: String,
+    content: String,
 }
 
 // Response Payload (Simplified)
@@ -135,29 +192,106 @@ async fn chat_completions(
     let rx_result = {
         let mut adapter_guard = adapter.lock().await;
 
-        // Use chat template encoding
-        let token_ids = match tokenizer.encode_messages(req.messages.clone()).await {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::error!("Encoding error: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Encoding error: {}", e),
-                )
-                    .into_response();
-            }
-        };
+        // Check if any message contains images (multimodal request)
+        let has_images = req.messages.iter().any(|m| m.content.has_images());
 
-        let max_tokens = req.effective_max_tokens(16) as i32;
-        adapter_guard
-            .send_add_request(
-                seq_id,
-                &token_ids,
-                max_tokens,
-                req.temperature.unwrap_or(0.1),
-                req.ignore_eos.unwrap_or(false),
-            )
-            .await
+        if has_images {
+            // ── Multimodal path: send to EncoderEngine first ──
+            let encoder_adapter = {
+                let mgr = state.engine_manager.lock().await;
+                mgr.get_next_encoder()
+            };
+            let encoder_adapter: Arc<Mutex<crate::encoder_adapter::EncoderAdapter>> =
+                match encoder_adapter {
+                    Some(a) => a,
+                    None => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "No encoder engines available for multimodal request",
+                        )
+                            .into_response()
+                    }
+                };
+
+            // Build encode request JSON (forward original messages)
+            let encode_req = serde_json::json!({ "messages": &req.messages });
+            let encode_json = serde_json::to_vec(&encode_req).unwrap();
+
+            let encode_resp = {
+                let mut enc_guard = encoder_adapter.lock().await;
+                enc_guard.encode(&encode_json).await
+            };
+            let encode_resp = match encode_resp {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("Encoder error: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Encoder error: {}", e),
+                    )
+                        .into_response();
+                }
+            };
+
+            let token_ids: Vec<u32> = encode_resp.input_ids.iter().map(|&x| x as u32).collect();
+            let max_tokens = req.effective_max_tokens(16) as i32;
+
+            tracing::info!(
+                "Encoder returned {} tokens, {} vision_slots for seq_id={}",
+                token_ids.len(),
+                encode_resp.vision_slots.len(),
+                seq_id
+            );
+
+            let vision_slots = if encode_resp.vision_slots.is_empty() {
+                None
+            } else {
+                Some(encode_resp.vision_slots)
+            };
+
+            adapter_guard
+                .send_add_request_with_vision(
+                    seq_id,
+                    &token_ids,
+                    max_tokens,
+                    req.temperature.unwrap_or(0.1),
+                    req.ignore_eos.unwrap_or(false),
+                    vision_slots.as_deref(),
+                )
+                .await
+        } else {
+            // ── Text-only path: tokenize locally ──
+            let template_messages: Vec<TemplateMessage> = req
+                .messages
+                .iter()
+                .map(|m| TemplateMessage {
+                    role: m.role.clone(),
+                    content: m.content.text(),
+                })
+                .collect();
+            let token_ids = match tokenizer.encode_messages(template_messages).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::error!("Encoding error: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Encoding error: {}", e),
+                    )
+                        .into_response();
+                }
+            };
+
+            let max_tokens = req.effective_max_tokens(16) as i32;
+            adapter_guard
+                .send_add_request(
+                    seq_id,
+                    &token_ids,
+                    max_tokens,
+                    req.temperature.unwrap_or(0.1),
+                    req.ignore_eos.unwrap_or(false),
+                )
+                .await
+        }
     };
 
     let mut rx = match rx_result {
@@ -183,8 +317,6 @@ async fn chat_completions(
             let mut last_text_len = 0;
             let stream_start = std::time::Instant::now();
             let mut is_finished = false;
-
-            tracing::info!("[DIAG] SSE stream STARTED for seq_id={}", seq_id);
 
             while let Some(event) = rx.recv().await {
                 match event {
@@ -218,7 +350,6 @@ async fn chat_completions(
                         }
                     },
                     StreamEvent::Finished => {
-                        tracing::info!("[DIAG] SSE stream FINISHED normally for seq_id={}, elapsed={:.1}s, generated_tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
                         is_finished = true;
                         let chunk = serde_json::json!({
                             "id": request_id,
@@ -236,7 +367,7 @@ async fn chat_completions(
                         break;
                     },
                     StreamEvent::Error(e) => {
-                        tracing::error!("[DIAG] SSE stream ERROR for seq_id={}: {}", seq_id, e);
+                        tracing::error!("SSE stream error for seq_id={}: {}", seq_id, e);
                          yield Ok(Event::default().event("error").data(e));
                          break;
                     }
@@ -247,7 +378,6 @@ async fn chat_completions(
                         generated_tokens.clear();
                         last_text_len = 0;
 
-                        tracing::info!("[DIAG] Migration triggered for seq_id={}, elapsed={:.1}s. Routing to Decode Engine...", seq_id, stream_start.elapsed().as_secs_f64());
                         let decode_adapter_arc = {
                             let mgr = state.engine_manager.lock().await;
                             mgr.get_next_decode()
@@ -263,16 +393,15 @@ async fn chat_completions(
                                       // Update active tracked adapter to route the disconnect signal to the correct place
                                       active_adapter = decode_adapter_arc.clone();
 
-                                      tracing::info!("[DIAG] Migration successful for seq_id={}. Resuming stream on Decode Engine.", seq_id);
                                  },
                                  Err(e) => {
-                                     tracing::error!("[DIAG] Failed to forward migration for seq_id={}: {}", seq_id, e);
+                                     tracing::error!("Failed to forward migration for seq_id={}: {}", seq_id, e);
                                      yield Ok(Event::default().event("error").data("Migration Failed"));
                                      break;
                                  }
                              }
                         } else {
-                             tracing::error!("[DIAG] No Decode Engine available for migration! seq_id={}", seq_id);
+                             tracing::error!("No Decode Engine available for migration, seq_id={}", seq_id);
                              yield Ok(Event::default().event("error").data("No Decode Nodes"));
                              break;
                         }
@@ -282,11 +411,11 @@ async fn chat_completions(
 
             // If we reach here via rx channel closing (None), the client likely disconnected
             if !is_finished {
-                 tracing::warn!("[DIAG] Stream ended prematurely (Disconnect/Error) for seq_id={}, elapsed={:.1}s, generated_tokens={}. Sending FREE request to active engine.", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
+                 tracing::warn!("SSE stream disconnected for seq_id={}, elapsed={:.1}s, tokens={}. Sending FREE request.", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
                  let mut adapter_guard = active_adapter.lock().await;
                  let _ = adapter_guard.send_free_request(seq_id).await;
             } else {
-                 tracing::info!("[DIAG] SSE stream ENDED normally for seq_id={}, elapsed={:.1}s, generated_tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
+                 tracing::info!("SSE stream ended for seq_id={}, elapsed={:.1}s, tokens={}", seq_id, stream_start.elapsed().as_secs_f64(), generated_tokens.len());
             }
         };
 
@@ -339,7 +468,7 @@ async fn chat_completions(
                 index: 0,
                 message: Message {
                     role: "assistant".to_string(),
-                    content: text,
+                    content: MessageContent::Text(text),
                 },
                 finish_reason: "stop".to_string(),
             }],

@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.profiler as profiler
 from nanodeploy._cpp import (
     extract_aux_from_bytes,
+    extract_vision_slots_from_bytes,
     parse_migrate_batch,
     prepare_decode_from_bytes,
     prepare_prefill_from_bytes,
@@ -62,17 +63,6 @@ class ModelRunner:
         from nanodeploy._cpp import Sequence as _Seq
 
         _Seq.set_block_size(config.kvcache_block_size)
-
-        # Propagate scope to actor environment: the Config object carries
-        # scope from the driver (set from NANOCTRL_SCOPE env var), but
-        # actor processes may not inherit the job's env vars.  Libraries
-        # like dlslime read NANOCTRL_SCOPE from os.environ, so we must
-        # set it here to ensure correct scoped registration in Redis.
-        if config.nanoctrl_scope and not os.getenv("NANOCTRL_SCOPE"):
-            os.environ["NANOCTRL_SCOPE"] = config.nanoctrl_scope
-            logger.info(
-                f"Set NANOCTRL_SCOPE={config.nanoctrl_scope} in actor environment"
-            )
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -247,6 +237,199 @@ class ModelRunner:
         self.sampler = Sampler()
         self.preallocate_kvcache()
 
+        # Vision embeddings fetched via RDMA from encoder (EP-separated mode)
+        self._vision_embeds: dict[str, torch.Tensor] | None = None
+
+    # ------------------------------------------------------------------
+    # Vision embedding injection (EP-separated mode)
+    # ------------------------------------------------------------------
+
+    def _inject_vision_embeds(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        """Build ``inputs_embeds`` by merging text + vision embeddings.
+
+        If no vision embeddings are stored, returns ``None`` so that the
+        model falls back to its normal ``embed_tokens(input_ids)`` path.
+        """
+        if self._vision_embeds is None:
+            return None
+
+        # Get text embeddings from the model's embedding layer
+        embed_tokens = self.model.model.embed_tokens
+        inputs_embeds = embed_tokens(input_ids)
+
+        hf_config = self.config.hf_config
+
+        # Inject image embeddings
+        if "image" in self._vision_embeds:
+            image_token_id = getattr(hf_config, "image_token_id", None)
+            if image_token_id is not None:
+                image_embeds = self._vision_embeds["image"].to(
+                    dtype=inputs_embeds.dtype
+                )
+                mask = input_ids == image_token_id
+                n_tokens = mask.sum().item()
+                if n_tokens > 0 and n_tokens == image_embeds.shape[0]:
+                    mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
+                    inputs_embeds = inputs_embeds.masked_scatter(
+                        mask_expanded, image_embeds
+                    )
+                    logger.debug(f"Injected {n_tokens} image tokens")
+                else:
+                    logger.warning(
+                        f"Image token count mismatch: input has {n_tokens}, "
+                        f"embeds has {image_embeds.shape[0]} — skipping injection"
+                    )
+
+        # Inject video embeddings
+        if "video" in self._vision_embeds:
+            video_token_id = getattr(hf_config, "video_token_id", None)
+            if video_token_id is not None:
+                video_embeds = self._vision_embeds["video"].to(
+                    dtype=inputs_embeds.dtype
+                )
+                mask = input_ids == video_token_id
+                n_tokens = mask.sum().item()
+                if n_tokens > 0 and n_tokens == video_embeds.shape[0]:
+                    mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
+                    inputs_embeds = inputs_embeds.masked_scatter(
+                        mask_expanded, video_embeds
+                    )
+
+        return inputs_embeds
+
+    # ------------------------------------------------------------------
+    # Vision embedding RDMA fetch (EP-separated mode)
+    # ------------------------------------------------------------------
+
+    def _fetch_vision_embeds_rdma(self, vision_slot_views: list) -> None:
+        """RDMA-fetch vision embeddings from remote encoder(s).
+
+        Reads embeddings from encoder EmbeddingPool into a local receive
+        buffer via dlslime, then stores them in ``self._vision_embeds``
+        for injection during model forward.
+
+        Args:
+            vision_slot_views: List of VisionSlotView from
+                ``extract_vision_slots_from_bytes``.
+        """
+        if not vision_slot_views:
+            return
+
+        cache_ctx = get_cache_context()
+        peer_agent = cache_ctx._peer_agent
+        if peer_agent is None:
+            logger.warning("PeerAgent not available, cannot RDMA-fetch vision embeds")
+            return
+
+        # Group vision slots by encoder_engine_id for batched reads
+        from collections import defaultdict
+
+        from nanodeploy.context.embedding_pool import _VISION_EMBED_BUFFER_ID
+
+        by_encoder: dict[str, list] = defaultdict(list)
+        for v in vision_slot_views:
+            by_encoder[v.encoder_engine_id].append(v)
+
+        # Compute total tokens for local receive buffer
+        total_tokens = sum(v.num_tokens for v in vision_slot_views)
+        hidden_size = vision_slot_views[0].hidden_size
+        # Use model's embedding dtype to match encoder EmbeddingPool dtype
+        # (RDMA copies raw bytes, so local buffer dtype must match remote)
+        dtype = self.model.model.embed_tokens.weight.dtype
+        itemsize = torch.tensor([], dtype=dtype).element_size()
+
+        # Allocate local receive buffer on GPU
+        recv_buf = torch.zeros(total_tokens, hidden_size, dtype=dtype, device="cuda")
+        # Register receive buffer as a temporary MR
+        recv_buf_size = recv_buf.nelement() * recv_buf.element_size()
+        recv_mr = peer_agent.register_memory_region(
+            "vision_recv",
+            recv_buf.data_ptr() + int(recv_buf.storage_offset()),
+            recv_buf_size,
+        )
+
+        # Look up peer_addrs for all encoders via NanoCtrl (cached, single request per engine)
+        encoder_info_map = cache_ctx._fetch_engine_info_from_nanoctrl(
+            set(by_encoder.keys())
+        )
+
+        token_offset = 0
+        for encoder_id, slots in by_encoder.items():
+            # Resolve peer alias from control plane; fall back to legacy convention
+            encoder_info = encoder_info_map.get(encoder_id, {})
+            peer_addrs = encoder_info.get("peer_addrs", [])
+            if peer_addrs:
+                peer_alias = peer_addrs[0]
+            else:
+                logger.warning(
+                    f"No peer_addrs for encoder {encoder_id} in NanoCtrl, "
+                    "falling back to legacy alias"
+                )
+                peer_alias = f"{encoder_id}:0"
+
+            # Ensure connection
+            if peer_alias not in cache_ctx._connected_peers:
+                cache_ctx._peer_agent.set_desired_topology(
+                    target_peers=list(cache_ctx._connected_peers | {peer_alias}),
+                    symmetric=True,
+                )
+                cache_ctx._peer_agent.wait_for_peers([peer_alias], timeout_sec=30)
+                cache_ctx._connected_peers.add(peer_alias)
+
+            # Get remote MR info for vision_embed buffer
+            remote_mr_info = peer_agent.get_mr_info(peer_alias, _VISION_EMBED_BUFFER_ID)
+            if remote_mr_info is None:
+                logger.error(
+                    f"Failed to get MR info for vision_embed from {peer_alias}"
+                )
+                continue
+
+            remote_mr = peer_agent.register_remote_memory_region(
+                peer_alias, _VISION_EMBED_BUFFER_ID, remote_mr_info
+            )
+            endpoint = peer_agent.get_endpoint(peer_alias)
+            if endpoint is None:
+                logger.error(f"Failed to get endpoint for {peer_alias}")
+                continue
+
+            # Build RDMA read ops for all slots from this encoder
+            rdma_ops = []
+            for v in slots:
+                # Encoder EmbeddingPool layout: [num_slots, max_tokens_per_slot, hidden_size]
+                # Remote offset for slot = slot_idx * max_tokens_per_slot * hidden_size * itemsize
+                slot_stride = v.max_tokens_per_slot * v.hidden_size * itemsize
+                remote_off = v.slot_idx * slot_stride
+                # Read only num_tokens * hidden_size (actual data, not full slot)
+                read_len = v.num_tokens * v.hidden_size * itemsize
+                # Local offset in recv buffer
+                local_off = token_offset * hidden_size * itemsize
+
+                rdma_ops.append(
+                    (
+                        recv_mr,  # local MR
+                        remote_mr,  # remote MR
+                        remote_off,  # remote offset
+                        local_off,  # local offset
+                        read_len,  # bytes to read
+                    )
+                )
+                token_offset += v.num_tokens
+
+            # Execute batched RDMA reads
+            if rdma_ops:
+                endpoint.read(rdma_ops)
+                logger.debug(
+                    f"RDMA-fetched {len(rdma_ops)} vision slots from encoder "
+                    f"{encoder_id} ({sum(v.num_tokens for v in slots)} tokens)"
+                )
+
+        # Store as vision embeds for _inject_vision_embeds
+        # The recv_buf contains all vision tokens concatenated
+        logger.info(
+            f"[VISION_RDMA] Stored vision embeds: shape={recv_buf.shape}, dtype={recv_buf.dtype}, norm={recv_buf.norm().item():.4f}, nonzero={recv_buf.count_nonzero().item()}/{recv_buf.numel()}"
+        )
+        self._vision_embeds = {"image": recv_buf}
+
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
 
@@ -271,7 +454,8 @@ class ModelRunner:
 
         # Start PeerAgent AFTER kv_cache (and GDN states) are allocated,
         # so that all tensors exist for RDMA memory region registration.
-        cache_context.start_peer_agent()
+        # In hybrid mode, PeerAgent is started but KV/GDN MR is skipped.
+        cache_context.start_peer_agent(mode=self.config.mode)
 
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -354,6 +538,7 @@ class ModelRunner:
             dtype=torch.get_default_dtype(),
             mode=mode,
             nanoctrl_address=config.nanoctrl_address,
+            nanoctrl_scope=config.nanoctrl_scope,
             engine_id=engine_id,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
@@ -648,7 +833,31 @@ class ModelRunner:
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             context = get_context()
-            return self.model.compute_logits(self.model(input_ids, positions))
+            # Inject vision embeddings during prefill if available
+            inputs_embeds = None
+            if is_prefill and self._vision_embeds is not None:
+                logger.info(
+                    f"[RUN_MODEL] Injecting vision embeds for prefill, input_ids.shape={input_ids.shape}, _vision_embeds keys={list(self._vision_embeds.keys())}"
+                )
+                inputs_embeds = self._inject_vision_embeds(input_ids)
+                # Clear after injection attempt
+                self._vision_embeds = None
+            elif is_prefill:
+                logger.info(
+                    f"[RUN_MODEL] Prefill WITHOUT vision embeds, input_ids.shape={input_ids.shape}"
+                )
+            if inputs_embeds is not None:
+                hidden = self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+            else:
+                hidden = self.model(input_ids, positions)
+            if is_prefill:
+                # Clean low-latency RDMA buffer here, as part of the prefill stream,
+                # so the nvshmemx_barrier_all_block() inside completes before any rank
+                # calls graph.replay().  Calling it right before graph.replay() races:
+                # the barrier's RDMA writes arrive at peer GPUs while they are already
+                # executing the graph, corrupting NVSHMEM symmetric memory → SIGSEGV.
+                ExpertContext.get_instance().transition_to_low_latency()
+            return self.model.compute_logits(hidden)
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -775,6 +984,12 @@ class ModelRunner:
                 )
 
             if is_prefill:
+                # RDMA-fetch vision embeddings from encoder (EP-separated mode)
+                if i == 0 and self._vision_embeds is None:
+                    vision_slots = extract_vision_slots_from_bytes(data)
+                    if vision_slots:
+                        self._fetch_vision_embeds_rdma(vision_slots)
+
                 input_ids, positions = self.prepare_prefill_bytes(data, aux, is_dummy)
             else:
                 if i == 0:
@@ -799,6 +1014,10 @@ class ModelRunner:
                     num_sp_seqs,
                 )
             logits = self.run_model(input_ids, positions, is_prefill)
+
+            # Clear RDMA-fetched vision embeddings after prefill forward
+            if is_prefill and self._vision_embeds is not None:
+                self._vision_embeds = None
 
             tp_rank = get_dist_context().attn_tp_rank
             if tp_rank == 0:

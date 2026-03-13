@@ -9,6 +9,16 @@ table IntListI {
 
 // ========== Run Protocol ==========
 
+// Vision slot reference passed to the model runner during prefill.
+// The runner uses this to RDMA-fetch vision embeddings from the encoder.
+table VisionSlotRef {
+  encoder_engine_id: string;  // Encoder engine that owns the embedding
+  slot_idx: int = -1;         // Slot index in encoder's EmbeddingPool
+  num_tokens: int;            // Number of vision tokens
+  hidden_size: int;           // Hidden dimension per token
+  max_tokens_per_slot: int;   // Encoder pool slot stride (max tokens per slot)
+}
+
 table SequenceInput {
   master_sp_idx: int;
   num_tokens: int;
@@ -19,6 +29,7 @@ table SequenceInput {
   num_dispatched_tokens: [int];  // context lengths per sp rank
   state_slot: int = -1;          // GDN state slot
   temperature: double = 1.0;     // sampling temperature
+  vision_slots: [VisionSlotRef]; // vision embedding refs (prefill only, EP mode)
 }
 
 table RunBatchInput {

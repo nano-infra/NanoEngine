@@ -53,6 +53,7 @@ class CacheContext:
     nanoctrl_address: str | None = (
         None  # Control plane server URL (e.g., "http://10.102.97.183:3000")
     )
+    nanoctrl_scope: str | None = None  # Scope for multi-tenant isolation
     engine_id: str | None = None  # Engine ID for agent naming (format: EngineName:rank)
     # If nanoctrl_address is provided, engine_id will be fetched from NanoCtrl instead of config
 
@@ -108,6 +109,7 @@ class CacheContext:
 
         self.endpoints = {}
         self.num_remote_kvcache_blocks = {}
+        self.remote_max_num_seqs: dict[str, int] = {}  # engine_id -> max_num_seqs
         self._peer_agent = None
         self._peer_agent_addr: str | None = None
         self._connected_peers: set[str] = set()  # track connected peer addresses
@@ -168,6 +170,31 @@ class CacheContext:
         return (
             layer_idx * self.gdn_recurrent_states.stride(0)
             + slot_idx * self.gdn_recurrent_states.stride(1)
+        ) * self.gdn_recurrent_states.element_size()
+
+    def remote_gdn_conv_stride(
+        self, layer_idx: int, slot_idx: int, remote_engine_id: str
+    ) -> int:
+        """Compute GDN conv state offset for a REMOTE engine's tensor layout."""
+        if self.gdn_conv_states is None:
+            return -1
+        remote_num_slots = self.remote_max_num_seqs.get(remote_engine_id, 0) + 1
+        # remote stride(0) = remote_num_slots * local_stride(1)
+        remote_stride0 = remote_num_slots * self.gdn_conv_states.stride(1)
+        return (
+            layer_idx * remote_stride0 + slot_idx * self.gdn_conv_states.stride(1)
+        ) * self.gdn_conv_states.element_size()
+
+    def remote_gdn_recurrent_stride(
+        self, layer_idx: int, slot_idx: int, remote_engine_id: str
+    ) -> int:
+        """Compute GDN recurrent state offset for a REMOTE engine's tensor layout."""
+        if self.gdn_recurrent_states is None:
+            return -1
+        remote_num_slots = self.remote_max_num_seqs.get(remote_engine_id, 0) + 1
+        remote_stride0 = remote_num_slots * self.gdn_recurrent_states.stride(1)
+        return (
+            layer_idx * remote_stride0 + slot_idx * self.gdn_recurrent_states.stride(1)
         ) * self.gdn_recurrent_states.element_size()
 
     def gdn_conv_slot_num_bytes(self) -> int:
@@ -246,11 +273,15 @@ class CacheContext:
             f"({self.gdn_recurrent_states.element_size() * self.gdn_recurrent_states.nelement() / 1e9:.2f} GB)"
         )
 
-    def start_peer_agent(self):
-        """Start PeerAgent and register all memory regions (KV cache + GDN states) for RDMA.
+    def start_peer_agent(self, mode: str = "hybrid"):
+        """Start PeerAgent and register memory regions for RDMA.
 
         Must be called AFTER allocate_kvcache() and allocate_gdn_states() so that
         all tensors exist before registration.
+
+        In hybrid mode the PeerAgent is still started (needed for RDMA-fetching
+        vision embeddings from the encoder), but KV cache / GDN MR registration
+        is skipped because hybrid mode does not perform P2P KV transfer.
         """
         if self.nanoctrl_address is None or self.engine_id is None:
             return
@@ -272,10 +303,7 @@ class CacheContext:
             available_nics = dlslime.available_nic()
             if not available_nics:
                 raise RuntimeError("No available NICs found")
-            device = available_nics[
-                get_dist_context().local_rank % len(available_nics)
-            ]
-            agent_scope = os.getenv("NANOCTRL_SCOPE", None)
+            device = available_nics[get_dist_context().local_rank % len(available_nics)]
             self._peer_agent = start_peer_agent_fn(
                 alias=agent_alias,
                 server_url=server_url,
@@ -283,9 +311,18 @@ class CacheContext:
                 ib_port=1,
                 link_type="RoCE",
                 qp_num=int(os.environ.get("SLIME_QP_NUM", 1)),
-                scope=agent_scope,
+                scope=self.nanoctrl_scope,
             )
             self._peer_agent_addr = agent_alias
+
+            # In hybrid mode we only need the PeerAgent alive (for vision
+            # embed RDMA fetch); KV cache / GDN MR registration is not needed.
+            if mode == "hybrid":
+                logger.info(
+                    f"PeerAgent started (hybrid, no KV MR): alias={agent_alias}, "
+                    f"server={server_url}"
+                )
+                return
 
             # Register KV cache
             kv_size = self.kv_cache.numel() * self.kv_cache.itemsize
@@ -395,11 +432,7 @@ class CacheContext:
 
         fetched_map: dict[str, dict] = {}
         url = f"{self.nanoctrl_address}/get_engine_info"
-
-        # Get scope from environment variable
-        import os
-
-        scope = os.getenv("NANOCTRL_SCOPE", "")
+        scope = self.nanoctrl_scope or ""
 
         try:
             with httpx.Client(timeout=5.0) as client:
@@ -454,17 +487,23 @@ class CacheContext:
     # ------------------------------------------------------------------
 
     def _ensure_peer_connections(
-        self, connection_requests: list[tuple[str, str, int]]
+        self, connection_requests: list[tuple[str, str, int, int]]
     ) -> None:
         """Establish connections to remote peers if not already connected.
 
         Args:
-            connection_requests: list of (peer_alias, engine_id, num_kvcache_blocks)
+            connection_requests: list of (peer_alias, engine_id, num_kvcache_blocks, max_num_seqs)
         """
         remote_peers_to_connect: dict[str, str] = {}
-        for peer_alias, engine_id, num_kvcache_blocks in connection_requests:
+        for (
+            peer_alias,
+            engine_id,
+            num_kvcache_blocks,
+            max_num_seqs,
+        ) in connection_requests:
             if peer_alias and peer_alias not in self._connected_peers:
                 self.num_remote_kvcache_blocks[engine_id] = num_kvcache_blocks
+                self.remote_max_num_seqs[engine_id] = max_num_seqs
                 remote_peers_to_connect[peer_alias] = engine_id
 
         if not remote_peers_to_connect:
@@ -569,12 +608,6 @@ class CacheContext:
                 # Append GDN state RDMA ops
                 gdn_batch = gdn_assigns.get(engine_id, {}).get(peer_alias, [])
 
-                logger.info(
-                    f"[CACHE_MIGRATE] checking GDN ops inclusion: len(gdn_batch)={len(gdn_batch)}, "
-                    f"conv is not None={self.gdn_conv_states is not None}, "
-                    f"rec is not None={self.gdn_recurrent_states is not None}"
-                )
-
                 if (
                     gdn_batch
                     and self.gdn_conv_states is not None
@@ -583,9 +616,6 @@ class CacheContext:
                     # Conv state
                     remote_conv_mr_info = self._peer_agent.get_mr_info(
                         peer_alias, "gdn_conv"
-                    )
-                    logger.info(
-                        f"[CACHE_MIGRATE] remote_conv_mr_info: {remote_conv_mr_info}"
                     )
                     if remote_conv_mr_info:
                         remote_conv_mr = self._peer_agent.register_remote_memory_region(
@@ -598,7 +628,9 @@ class CacheContext:
                                 (
                                     local_conv_mr,
                                     remote_conv_mr,
-                                    self.gdn_conv_stride(layer_idx, remote_slot),
+                                    self.remote_gdn_conv_stride(
+                                        layer_idx, remote_slot, engine_id
+                                    ),
                                     self.gdn_conv_stride(layer_idx, local_slot),
                                     conv_len,
                                 )
@@ -623,7 +655,9 @@ class CacheContext:
                                 (
                                     local_rec_mr,
                                     remote_rec_mr,
-                                    self.gdn_recurrent_stride(layer_idx, remote_slot),
+                                    self.remote_gdn_recurrent_stride(
+                                        layer_idx, remote_slot, engine_id
+                                    ),
                                     self.gdn_recurrent_stride(layer_idx, local_slot),
                                     rec_len,
                                 )
@@ -643,6 +677,10 @@ class CacheContext:
                         logger.error("endpoint.read returned None")
                         raise RuntimeError("endpoint.read returned None")
                     slot.wait()
+                    # GPUDirect RDMA may bypass CUDA stream ordering.
+                    # Synchronize to ensure migrated KV data is visible to subsequent kernels.
+                    torch.cuda.synchronize()
+
                     logger.info(
                         f"Completed batch RDMA read from {peer_alias} ({len(rdma_ops)} operations)"
                     )
@@ -678,13 +716,19 @@ class CacheContext:
         engine_info_map = self._fetch_engine_info_from_nanoctrl(target_engine_ids)
 
         # Ensure connections
-        connection_requests: list[tuple[str, str, int]] = []
+        connection_requests: list[tuple[str, str, int, int]] = []
         for v in views:
             engine_id = v.migrate_engine_id
             engine_info = engine_info_map.get(engine_id, {})
+            remote_max_num_seqs = engine_info.get("max_num_seqs", 0)
             for peer_alias in engine_info.get("peer_addrs", []):
                 connection_requests.append(
-                    (peer_alias, engine_id, v.migrate_num_kvcache_blocks)
+                    (
+                        peer_alias,
+                        engine_id,
+                        v.migrate_num_kvcache_blocks,
+                        remote_max_num_seqs,
+                    )
                 )
         self._ensure_peer_connections(connection_requests)
 
@@ -703,12 +747,21 @@ class CacheContext:
                 )
                 continue
 
-            if len(v.migrate_block_location) != len(v.active_block_location):
+            if len(v.migrate_block_location) > len(v.active_block_location):
                 logger.error(
-                    f"Sequence {v.seq_id}: block_location length mismatch! "
+                    f"Sequence {v.seq_id}: migrate has MORE blocks than active! "
                     f"migrate={len(v.migrate_block_location)}, active={len(v.active_block_location)}"
                 )
                 continue
+            if len(v.migrate_block_location) < len(v.active_block_location):
+                # Expected when prompt_tokens % block_size == 0: prefill serializes N blocks
+                # for prompt KV, but decode allocates N+1 blocks for (prompt+1) total tokens.
+                # zip() below naturally iterates only over the migrate (shorter) side;
+                # the extra active block will be filled during the first decode step.
+                logger.info(
+                    f"Sequence {v.seq_id}: partial migration "
+                    f"(migrate={len(v.migrate_block_location)}, active={len(v.active_block_location)})"
+                )
 
             for remote_bl, source_bl in zip(
                 v.migrate_block_location, v.active_block_location
@@ -811,6 +864,7 @@ def set_cache_context(
     dtype: torch.dtype = torch.bfloat16,
     mode: Literal["gqa", "mla"] = "gqa",
     nanoctrl_address: str | None = None,
+    nanoctrl_scope: str | None = None,
     engine_id: str | None = None,
 ):
     global _CACHE_CONTEXT
@@ -828,6 +882,7 @@ def set_cache_context(
         dtype=dtype,
         mode=mode,
         nanoctrl_address=nanoctrl_address,
+        nanoctrl_scope=nanoctrl_scope,
         engine_id=engine_id,
     )
     return _CACHE_CONTEXT

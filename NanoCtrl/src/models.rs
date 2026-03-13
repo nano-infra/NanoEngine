@@ -135,6 +135,8 @@ pub struct RegisterEngineBody {
     pub p2p_port: Option<u32>, // P2P free instruction port
     #[serde(default)]
     pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
+    #[serde(default)]
+    pub max_num_seqs: Option<u32>, // Max batch size (GDN slot count = max_num_seqs + 1)
 }
 
 #[derive(Debug, Serialize)]

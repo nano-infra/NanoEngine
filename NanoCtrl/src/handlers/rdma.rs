@@ -29,7 +29,12 @@ pub async fn register_mr(
 ) -> Result<impl IntoResponse, AppError> {
     tracing::info!(
         "Registering MR: agent={}, mr_name={}, addr={}, length={}, rkey={}, lkey={}",
-        body.agent_name, body.mr_name, body.addr, body.length, body.rkey, body.lkey
+        body.agent_name,
+        body.mr_name,
+        body.addr,
+        body.length,
+        body.rkey,
+        body.lkey
     );
 
     repo.register_mr(body.scope.as_deref(), &body).await?;

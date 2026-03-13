@@ -83,7 +83,8 @@ impl Sequence {
                 num_checkpointed_tokens: self.num_checkpointed_tokens,
                 num_cached_tokens: self.num_cached_tokens,
                 token_ids: Some(token_ids_vec),
-                slots: None, // Not used in NanoRoute
+                slots: None,        // Not used in NanoRoute
+                vision_slots: None, // Not used in NanoRoute
             },
         )
     }

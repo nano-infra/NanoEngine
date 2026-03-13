@@ -58,7 +58,8 @@ class LLMEngine:
 
     def exit(self):
         """Cleanup engine resources."""
-        del self.executor
+        if hasattr(self, "executor"):
+            del self.executor
 
     def update_num_kvcache_blocks(self):
         self.config.num_kvcache_blocks = self.executor.update_kvcache_blocks()
@@ -144,7 +145,7 @@ class LLMEngine:
             waiting_head_blocks, waiting_total_blocks
         )
 
-        logger.info(
+        logger.debug(
             {
                 "mode": "prefill" if is_prefill else "decode",
                 # "dp_batch_sizes": dp_batch_sizes,
@@ -158,7 +159,7 @@ class LLMEngine:
                 # "sp_res_matrix": sp_res_matrix,
                 "free_blocks": [
                     [
-                        len(worker_state.block_manager[i].free_block_ids)
+                        worker_state.block_manager[i].num_free_blocks
                         for i in range(self.scheduler.attention_sp)
                     ]
                     for worker_state in self.scheduler.worker_state

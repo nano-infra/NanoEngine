@@ -59,6 +59,14 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("active_block_location", &MigrateSequenceView::active_block_location)
         .def_readonly("active_state_slot", &MigrateSequenceView::active_state_slot);
 
+    py::class_<VisionSlotView>(m, "VisionSlotView")
+        .def_readonly("encoder_engine_id", &VisionSlotView::encoder_engine_id)
+        .def_readonly("slot_idx", &VisionSlotView::slot_idx)
+        .def_readonly("num_tokens", &VisionSlotView::num_tokens)
+        .def_readonly("hidden_size", &VisionSlotView::hidden_size)
+        .def_readonly("max_tokens_per_slot", &VisionSlotView::max_tokens_per_slot)
+        .def_readonly("seq_index", &VisionSlotView::seq_index);
+
     // ========== Engine side: serialize → py::bytes ==========
     m.def(
         "serialize_run_batch",
@@ -126,6 +134,14 @@ void bind_model_runner_utils(py::module_& m)
         },
         py::arg("data"),
         py::arg("sp_rank"));
+
+    m.def(
+        "extract_vision_slots_from_bytes",
+        [](py::bytes data) -> std::vector<VisionSlotView> {
+            std::string_view sv = data;
+            return extract_vision_slots_from_bytes(reinterpret_cast<const uint8_t*>(sv.data()), sv.size());
+        },
+        py::arg("data"));
 
     m.def(
         "parse_migrate_batch",

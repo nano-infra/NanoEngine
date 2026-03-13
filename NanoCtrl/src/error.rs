@@ -17,6 +17,7 @@ pub enum AppError {
     /// Redis connectivity or command error.
     Redis(redis::RedisError),
     /// Requested resource does not exist.
+    #[allow(dead_code)]
     NotFound(String),
     /// Conflicting state (e.g. duplicate agent name).
     Conflict(String),
@@ -46,15 +47,16 @@ impl IntoResponse for AppError {
             Self::Redis(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Redis: {e}")),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
-            Self::Serialization(e) => (
-                StatusCode::BAD_REQUEST,
-                format!("Serialization: {e}"),
-            ),
+            Self::Serialization(e) => (StatusCode::BAD_REQUEST, format!("Serialization: {e}")),
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
 
         tracing::error!("{self}");
-        (status, Json(json!({ "status": "error", "message": message }))).into_response()
+        (
+            status,
+            Json(json!({ "status": "error", "message": message })),
+        )
+            .into_response()
     }
 }
 

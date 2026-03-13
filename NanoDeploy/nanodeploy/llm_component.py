@@ -1,9 +1,7 @@
 import atexit
 import json
-import threading
-from typing import List, Optional, Set, Tuple
+from typing import List, Set, Tuple
 
-import httpx
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -11,6 +9,7 @@ from nanodeploy.config import Config
 from nanodeploy.engine.llm_engine import LLMEngine
 from nanodeploy.engine.ray_utils import get_available_nodes_with_master_first
 from nanodeploy.logging import get_logger
+from nanodeploy.server.nanoctrl_client import NanoCtrlClient
 
 logger = get_logger("nanodeploy")
 
@@ -62,10 +61,8 @@ class LLMComponent(LLM):
         self._p2p_clients: dict[str, any] = {}
         self._p2p_ctx = None
 
-        # Engine lifecycle management
-        self._nanoctrl_registered = False
-        self._heartbeat_stop_event = threading.Event()
-        self._heartbeat_thread: Optional[threading.Thread] = None
+        # NanoCtrl lifecycle client (None when nanoctrl_address is not configured)
+        self._nanoctrl: NanoCtrlClient | None = None
 
         # Register with NanoCtrl if configured.
         # engine_server.py will re-register after binding its own P2P socket
@@ -138,49 +135,115 @@ class LLMComponent(LLM):
         )
 
     def _fetch_peer_info_from_nanoctrl(self, target_engine_id: str) -> bool:
-        """Fetch peer engine info from NanoCtrl on-demand.
-
-        Args:
-            target_engine_id: Engine ID to fetch info for
-
-        Returns:
-            True if successfully fetched and cached, False otherwise
-        """
-        if not self.config.nanoctrl_address:
+        """Fetch peer engine info from NanoCtrl on-demand."""
+        if self._nanoctrl is None:
             logger.error("Cannot fetch peer info: NanoCtrl not configured")
             return False
 
-        try:
-            url = f"{self.config.nanoctrl_address}/get_engine_info"
-            payload = {"engine_id": target_engine_id}
-            if self.config.nanoctrl_scope:
-                payload["scope"] = self.config.nanoctrl_scope
+        engine_info = self._nanoctrl.get_engine_info(target_engine_id)
+        if engine_info:
+            logger.info(f"NanoCtrl returned engine_info: {engine_info}")
+            self.set_peer_info(json.dumps(engine_info))
+            logger.info(f"Fetched peer info for {target_engine_id} from NanoCtrl")
+            return True
 
-            with httpx.Client(timeout=5.0, trust_env=False) as client:
-                response = client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
+        logger.error(f"Failed to fetch peer info for {target_engine_id}: not found")
+        return False
 
-                if data.get("status") == "ok":
-                    engine_info = data.get("engine_info", {})
-                    if engine_info:
-                        logger.info(f"NanoCtrl returned engine_info: {engine_info}")
-                        engine_info_str = json.dumps(engine_info)
-                        self.set_peer_info(engine_info_str)
-                        logger.info(
-                            f"Fetched peer info for {target_engine_id} from NanoCtrl"
-                        )
-                        return True
+    def send_free_vision_slots(
+        self, target_encoder_id: str, slot_indices: List[int]
+    ) -> None:
+        """Send P2P free instruction for vision embedding slots to remote encoder.
 
+        Args:
+            target_encoder_id: Encoder engine ID to send free instruction to
+            slot_indices: List of slot indices to free in the encoder's EmbeddingPool
+        """
+        import flatbuffers
+        import numpy as np
+        import zmq
+
+        from nanodeploy.fbs.FreeVisionSlots import (
+            FreeVisionSlotsAddEncoderEngineId,
+            FreeVisionSlotsAddSlotIndices,
+            FreeVisionSlotsAddSourceEngineId,
+            FreeVisionSlotsEnd,
+            FreeVisionSlotsStart,
+            FreeVisionSlotsStartSlotIndicesVector,
+        )
+        from nanodeploy.server.zmq_protocol import encode_packet
+
+        if not slot_indices:
+            return
+
+        # Get target encoder P2P address
+        if target_encoder_id not in self._peer_info:
+            if not self._fetch_peer_info_from_nanoctrl(target_encoder_id):
                 logger.error(
-                    f"Failed to fetch peer info for {target_engine_id}: {data.get('message', 'No engine_info in response')}"
+                    f"Cannot send vision free: failed to fetch peer info for {target_encoder_id}"
                 )
-                return False
-        except Exception as e:
+                return
+
+        peer_info = self._peer_info[target_encoder_id]
+        p2p_host = peer_info.get("p2p_host")
+        p2p_port = peer_info.get("p2p_port")
+
+        if not p2p_host or not p2p_port:
             logger.error(
-                f"Error fetching peer info from NanoCtrl for {target_engine_id}: {e}"
+                f"Cannot send vision free: encoder {target_encoder_id} has no P2P address"
             )
-            return False
+            return
+
+        # Get or create P2P client socket
+        if target_encoder_id not in self._p2p_clients:
+            if self._p2p_ctx is None:
+                self._p2p_ctx = zmq.Context()
+
+            client_socket = self._p2p_ctx.socket(zmq.DEALER)
+            client_socket.set(zmq.LINGER, 0)
+            client_socket.set(zmq.SNDTIMEO, 5000)
+            endpoint = f"tcp://{p2p_host}:{p2p_port}"
+            client_socket.connect(endpoint)
+            self._p2p_clients[target_encoder_id] = client_socket
+            logger.info(f"Created P2P client connection to encoder at {endpoint}")
+        else:
+            client_socket = self._p2p_clients[target_encoder_id]
+
+        # Build FreeVisionSlots FlatBuffer
+        builder = flatbuffers.Builder(256)
+        encoder_id_off = builder.CreateString(target_encoder_id)
+        source_id_off = builder.CreateString(self.engine_id)
+
+        FreeVisionSlotsStartSlotIndicesVector(builder, len(slot_indices))
+        for idx in reversed(slot_indices):
+            builder.PrependInt32(idx)
+        slot_vec = builder.EndVector()
+
+        FreeVisionSlotsStart(builder)
+        FreeVisionSlotsAddEncoderEngineId(builder, encoder_id_off)
+        FreeVisionSlotsAddSlotIndices(builder, slot_vec)
+        FreeVisionSlotsAddSourceEngineId(builder, source_id_off)
+        free_req = FreeVisionSlotsEnd(builder)
+        builder.Finish(free_req)
+
+        payload = bytes(builder.Output())
+
+        # Send via P2P (Action 4 = FreeVisionSlots)
+        packet = encode_packet(action=4, payload=payload)
+
+        try:
+            client_socket.send(packet, zmq.NOBLOCK)
+            logger.debug(
+                f"P2P: Sent vision slot free to encoder {target_encoder_id} "
+                f"for {len(slot_indices)} slots: {slot_indices}"
+            )
+        except zmq.ZMQError as e:
+            logger.error(f"P2P: Failed to send vision free instruction: {e}")
+            try:
+                client_socket.close()
+            except Exception:
+                pass
+            del self._p2p_clients[target_encoder_id]
 
     def send_free_sequences(self, target_engine_id: str, seq_ids: List[int]) -> None:
         """Send P2P free instruction directly to remote engine (no NanoRoute).
@@ -273,11 +336,9 @@ class LLMComponent(LLM):
 
     def shutdown(self):
         """Shutdown the component and cleanup resources."""
-        # Stop heartbeat thread
-        if hasattr(self, "_heartbeat_stop_event"):
-            self._heartbeat_stop_event.set()
-        if hasattr(self, "_heartbeat_thread") and self._heartbeat_thread is not None:
-            self._heartbeat_thread.join(timeout=2.0)
+        # Stop heartbeat and unregister from NanoCtrl
+        if hasattr(self, "_nanoctrl") and self._nanoctrl:
+            self._nanoctrl.stop()
 
         # Close P2P client connections
         if hasattr(self, "_p2p_clients"):
@@ -294,168 +355,49 @@ class LLMComponent(LLM):
             except Exception:
                 pass
 
-        # Unregister from NanoCtrl before exiting
-        if hasattr(self, "_nanoctrl_registered") and self._nanoctrl_registered:
-            self._unregister_from_nanoctrl()
-
         # Call parent exit to cleanup executor
         super().exit()
 
     def _register_with_nanoctrl(self):
-        """Register engine information with NanoCtrl control plane."""
+        """Register engine with NanoCtrl and start heartbeat.
+
+        Also used as the ``on_not_found`` callback — if NanoCtrl restarts and
+        loses state, the heartbeat thread re-invokes this to re-register without
+        restarting the heartbeat thread itself.
+        """
         if not self.config.nanoctrl_address:
             return
 
-        try:
-            # Get peer agent addresses (may be empty initially, but that's ok)
-            peer_addrs = self.get_peer_agent_addrs()
-            logger.info(
-                f"Registering engine {self.engine_id} with {len(peer_addrs)} peer addresses"
+        if self._nanoctrl is None:
+            self._nanoctrl = NanoCtrlClient(
+                self.config.nanoctrl_address, self.config.nanoctrl_scope
             )
 
-            # Prepare registration payload
-            # For ZMQ connection: use the actual node IP so that route (which
-            # may be on a different node) can reach us.  Only fall back to
-            # 127.0.0.1 if we really only bind to loopback.
-            if self.config.host in ("0.0.0.0", ""):
-                from nanodeploy.context.distributed import get_local_ip
+        if self.config.host in ("0.0.0.0", ""):
+            from nanodeploy.context.distributed import get_local_ip
 
-                zmq_host = get_local_ip()
-            else:
-                zmq_host = self.config.host
+            zmq_host = get_local_ip()
+        else:
+            zmq_host = self.config.host
 
-            payload = {
-                "engine_id": self.engine_id,
-                "role": self.config.mode,
-                "world_size": self.config.attn_world_size,
-                "num_blocks": self.config.num_kvcache_blocks,
-                "host": zmq_host,
-                "port": self.config.port,
-                "peer_addrs": peer_addrs,
-                "p2p_host": zmq_host,
-                "p2p_port": self.p2p_port if self.p2p_port else 0,
-            }
-            # Add scope if configured
-            if self.config.nanoctrl_scope:
-                payload["scope"] = self.config.nanoctrl_scope
+        peer_addrs = self.get_peer_agent_addrs()
+        extra = {
+            "role": self.config.mode,
+            "world_size": self.config.attn_world_size,
+            "num_blocks": self.config.num_kvcache_blocks,
+            "host": zmq_host,
+            "port": self.config.port,
+            "peer_addrs": peer_addrs,
+            "p2p_host": zmq_host,
+            "p2p_port": self.p2p_port if self.p2p_port else 0,
+            "max_num_seqs": self.config.max_num_seqs,
+        }
 
-            url = f"{self.config.nanoctrl_address}/register_engine"
-            logger.info(
-                f"Registering engine with NanoCtrl at {url}, payload: {payload}"
+        ok = self._nanoctrl.register(self.engine_id, extra)
+        if ok:
+            # start_heartbeat is a no-op if the thread is already running
+            # (re-registration path from on_not_found callback)
+            self._nanoctrl.start_heartbeat(
+                on_not_found=self._register_with_nanoctrl,
+                name=f"heartbeat-{self.engine_id}",
             )
-
-            # Use sync client since this is called during init
-            with httpx.Client(timeout=10.0, trust_env=False) as client:
-                response = client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                if data.get("status") == "ok":
-                    self._nanoctrl_registered = True
-                    logger.info(
-                        f"Successfully registered engine {payload['engine_id']} with NanoCtrl"
-                    )
-                    # Start heartbeat thread after successful registration
-                    self._start_heartbeat()
-                else:
-                    logger.error(
-                        f"Failed to register engine: {data.get('message', 'Unknown error')}"
-                    )
-                    logger.error(f"Response data: {data}")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error registering engine with NanoCtrl: {e}")
-            logger.error(
-                f"Response: {e.response.text if e.response else 'No response'}"
-            )
-        except Exception as e:
-            logger.error(f"Error registering engine with NanoCtrl: {e}", exc_info=True)
-            # Don't raise - allow engine to continue even if registration fails
-
-    def _unregister_from_nanoctrl(self):
-        """Unregister engine from NanoCtrl control plane."""
-        if not self.config.nanoctrl_address:
-            return
-
-        try:
-            payload = {"engine_id": self.engine_id}
-            if self.config.nanoctrl_scope:
-                payload["scope"] = self.config.nanoctrl_scope
-            url = f"{self.config.nanoctrl_address}/unregister_engine"
-            logger.info(f"Unregistering engine {self.engine_id} from NanoCtrl")
-
-            with httpx.Client(timeout=5.0, trust_env=False) as client:
-                response = client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                if data.get("status") == "ok":
-                    logger.info(
-                        f"Successfully unregistered engine {self.engine_id} from NanoCtrl"
-                    )
-                else:
-                    logger.warning(
-                        f"Failed to unregister engine: {data.get('message', 'Unknown error')}"
-                    )
-        except Exception as e:
-            logger.error(f"Error unregistering engine from NanoCtrl: {e}")
-            # Don't raise - exit should continue even if unregistration fails
-
-    def _start_heartbeat(self):
-        """Start heartbeat thread to keep engine registration alive."""
-        if not self.config.nanoctrl_address or not self._nanoctrl_registered:
-            return
-
-        # Stop existing heartbeat thread if any
-        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
-            return
-
-        self._heartbeat_stop_event.clear()
-
-        def heartbeat_loop():
-            """Heartbeat loop: send heartbeat every 15 seconds."""
-            while not self._heartbeat_stop_event.wait(15.0):
-                try:
-                    self._heartbeat_to_nanoctrl()
-                except Exception as e:
-                    logger.error(f"Error in heartbeat loop: {e}", exc_info=True)
-
-        self._heartbeat_thread = threading.Thread(
-            target=heartbeat_loop, name=f"heartbeat-{self.engine_id}", daemon=True
-        )
-        self._heartbeat_thread.start()
-        logger.info(
-            f"Started heartbeat thread for engine {self.engine_id} (interval: 15s)"
-        )
-
-    def _heartbeat_to_nanoctrl(self):
-        """Send heartbeat to NanoCtrl to refresh TTL."""
-        if not self.config.nanoctrl_address:
-            return
-
-        try:
-            payload = {"engine_id": self.engine_id}
-            if self.config.nanoctrl_scope:
-                payload["scope"] = self.config.nanoctrl_scope
-            url = f"{self.config.nanoctrl_address}/heartbeat_engine"
-
-            # Use sync client with short timeout
-            with httpx.Client(timeout=5.0, trust_env=False) as client:
-                response = client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-
-                if data.get("status") == "ok":
-                    logger.debug(f"Heartbeat successful for engine {self.engine_id}")
-                elif data.get("status") == "not_found":
-                    # Engine not found, re-register
-                    logger.warning(
-                        f"Engine {self.engine_id} not found in NanoCtrl, re-registering..."
-                    )
-                    self._nanoctrl_registered = False
-                    self._register_with_nanoctrl()
-                else:
-                    logger.warning(
-                        f"Heartbeat failed for engine {self.engine_id}: {data.get('message', 'Unknown error')}"
-                    )
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error in heartbeat: {e}")
-        except Exception as e:
-            logger.error(f"Error sending heartbeat: {e}", exc_info=True)

@@ -1,6 +1,6 @@
 use crate::fbs::{
     FreeSequences, FreeSequencesArgs, SamplingParams, SamplingParamsArgs, Sequence, SequenceArgs,
-    SequenceList, SequenceListArgs, SequenceStatus, StepOut,
+    SequenceList, SequenceListArgs, SequenceStatus, StepOut, VisionSlot, VisionSlotArgs,
 };
 use crate::zmq_packet::ZmqPacket;
 use flatbuffers::FlatBufferBuilder;
@@ -31,7 +31,6 @@ pub struct EngineAdapter {
 pub enum StreamEvent {
     Token(u32),
     Finished,
-    #[allow(dead_code)]
     Error(String),
     Migrate(Vec<u8>),
 }
@@ -207,20 +206,15 @@ impl EngineAdapter {
                             let mut map = pending.lock().await;
                             let map_size = map.len();
                             if let Some(state) = map.remove(&seq_id) {
-                                match state.sender.send(StreamEvent::Migrate(payload)) {
-                                    Ok(_) => {
-                                        info!("[DIAG] Migration event sent OK for seq_id={}, pending_map_size={}", seq_id, map_size - 1);
-                                    }
-                                    Err(_) => {
-                                        warn!("[DIAG] Migration event SEND FAILED (rx dropped = client disconnected) for seq_id={}, pending_map_size={}", seq_id, map_size - 1);
-                                    }
+                                if state.sender.send(StreamEvent::Migrate(payload)).is_err() {
+                                    warn!("Migration event send failed (client disconnected) for seq_id={}", seq_id);
                                 }
                             } else {
-                                warn!("[DIAG] Migration response for seq_id={} but NOT FOUND in pending_requests (map_size={})", seq_id, map_size);
+                                warn!("Migration response for seq_id={} not found in pending_requests (map_size={})", seq_id, map_size);
                             }
                         }
                     } else {
-                        warn!("[DIAG] Migration response with no seq_id in SequenceList");
+                        warn!("Migration response with no seq_id in SequenceList");
                     }
                     continue;
                 }
@@ -256,15 +250,15 @@ impl EngineAdapter {
 
                             for token_id in &tokens {
                                 if final_state.sender.send(StreamEvent::Token(*token_id)).is_err() {
-                                    warn!("[DIAG] Sequence {} FINISH token send failed (client disconnected)", seq_id);
+                                    warn!("Sequence {} finish token send failed (client disconnected)", seq_id);
                                     break;
                                 }
                             }
                             if final_state.sender.send(StreamEvent::Finished).is_err() {
-                                warn!("[DIAG] Sequence {} FINISHED event send failed (client disconnected)", seq_id);
+                                warn!("Sequence {} Finished event send failed (client disconnected)", seq_id);
                             }
                         } else {
-                            warn!("[DIAG] Sequence {} FINISHED but NOT FOUND in pending_requests (map_size={})", seq_id, map.len());
+                            warn!("Sequence {} finished but not found in pending_requests (map_size={})", seq_id, map.len());
                         }
                     } else if matches!(status, SequenceStatus::RUNNING) {
                         if let Some(state) = map.get_mut(&seq_id) {
@@ -274,7 +268,7 @@ impl EngineAdapter {
                             for token_id in tokens {
                                 state.accumulated_tokens.push(token_id);
                                 if state.sender.send(StreamEvent::Token(token_id)).is_err() {
-                                    warn!("[DIAG] Sequence {} token send failed (client disconnected), accumulated={}", seq_id, state.accumulated_tokens.len());
+                                    warn!("Sequence {} token send failed (client disconnected)", seq_id);
                                     break;
                                 }
                             }
@@ -283,8 +277,7 @@ impl EngineAdapter {
                                 info!("Sequence {} started generation", seq_id);
                             }
                         } else {
-                            // Only warn for the first occurrence to avoid log spam
-                            warn!("[DIAG] Sequence {} token received but NOT FOUND in pending_requests (map_size={})", seq_id, map.len());
+                            warn!("Sequence {} token received but not found in pending_requests (map_size={})", seq_id, map.len());
                         }
                     }
                 }
@@ -350,6 +343,26 @@ impl EngineAdapter {
         temperature: f32,
         ignore_eos: bool,
     ) -> anyhow::Result<tokio_mpsc::UnboundedReceiver<StreamEvent>> {
+        self.send_add_request_with_vision(
+            seq_id,
+            token_ids,
+            max_tokens,
+            temperature,
+            ignore_eos,
+            None,
+        )
+        .await
+    }
+
+    pub async fn send_add_request_with_vision(
+        &mut self,
+        seq_id: u64,
+        token_ids: &[u32],
+        max_tokens: i32,
+        temperature: f32,
+        ignore_eos: bool,
+        vision_slots_info: Option<&[crate::encoder_adapter::VisionSlotInfo]>,
+    ) -> anyhow::Result<tokio_mpsc::UnboundedReceiver<StreamEvent>> {
         let mut builder = FlatBufferBuilder::new();
         let token_ids_i32: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
         let t_vec = builder.create_vector(&token_ids_i32);
@@ -362,6 +375,28 @@ impl EngineAdapter {
                 ignore_eos,
             },
         );
+
+        // Build vision_slots if provided
+        let vision_slots_vec =
+            vision_slots_info.map(|slots: &[crate::encoder_adapter::VisionSlotInfo]| {
+                let vs: Vec<_> = slots
+                    .iter()
+                    .map(|s| {
+                        let eid = builder.create_string(&s.encoder_engine_id);
+                        VisionSlot::create(
+                            &mut builder,
+                            &VisionSlotArgs {
+                                encoder_engine_id: Some(eid),
+                                slot_idx: s.slot_idx as i32,
+                                num_tokens: s.num_tokens as i32,
+                                hidden_size: s.hidden_size as i32,
+                                max_tokens_per_slot: s.max_tokens_per_slot as i32,
+                            },
+                        )
+                    })
+                    .collect();
+                builder.create_vector(&vs)
+            });
 
         let num_tokens = token_ids.len() as i32;
         let last_token = if num_tokens > 0 {
@@ -381,6 +416,7 @@ impl EngineAdapter {
                 num_checkpointed_tokens: num_tokens,
                 last_token,
                 sampling_params: Some(sampling_params),
+                vision_slots: vision_slots_vec,
                 ..Default::default()
             },
         );

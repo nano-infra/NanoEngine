@@ -40,7 +40,10 @@ impl ZmqPacket {
             .map_err(|e| anyhow::anyhow!("Invalid FlatBuffers ZmqPacket: {}", e))?;
 
         let action = packet.action().0 as u32;
-        let payload = packet.payload().map(|v| v.to_vec()).unwrap_or_default();
+        let payload = packet
+            .payload()
+            .map(|v| v.bytes().to_vec())
+            .unwrap_or_default();
 
         Ok(Self { action, payload })
     }

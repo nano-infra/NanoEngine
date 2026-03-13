@@ -151,31 +151,32 @@ void BlockManager::deallocate(Sequence& seq, BlockContextSlot slot)
 
 bool BlockManager::can_append(Sequence& seq, int num_tokens) const
 {
-    int num_dispatched             = seq.block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_idx_];
-    int total_tokens_needed_before = (num_dispatched + block_size_ - 1) / block_size_;
-    int total_tokens_needed_after  = (num_dispatched + num_tokens + block_size_ - 1) / block_size_;
+    int num_dispatched = seq.block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_idx_];
+    int blocks_needed  = (num_dispatched + num_tokens + block_size_ - 1) / block_size_;
+    int current_blocks = static_cast<int>(seq.block_table(BlockContextSlot::ACTIVE, sp_idx_).size());
+    int additional     = blocks_needed - current_blocks;
+    if (additional < 0)
+        additional = 0;
 
-    return static_cast<int>(free_block_ids_.size()) >= (total_tokens_needed_after - total_tokens_needed_before);
+    return static_cast<int>(free_block_ids_.size()) >= additional;
 }
 
 bool BlockManager::may_append(Sequence& seq, int num_tokens)
 {
-    int current_dispatched = seq.block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_idx_];
+    int   current_dispatched = seq.block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_idx_];
+    auto& table              = seq.block_table(BlockContextSlot::ACTIVE, sp_idx_);
+    int   current_blocks     = static_cast<int>(table.size());
+    int   blocks_needed      = (current_dispatched + num_tokens + block_size_ - 1) / block_size_;
 
-    for (int idx = 0; idx < num_tokens; ++idx) {
-        if ((current_dispatched + idx) % block_size_ == 0) {
-            if (free_block_ids_.empty()) {
-                return false;
-            }
-            int block_id = free_block_ids_.front();
-            seq.block_ctx(BlockContextSlot::ACTIVE).block_location.emplace_back(sp_idx_, block_id);
-            allocate_block(block_id);
-            // Get table reference just before pushing to avoid stale reference
-            seq.block_table(BlockContextSlot::ACTIVE, sp_idx_).push_back(block_id);
+    while (current_blocks < blocks_needed) {
+        if (free_block_ids_.empty()) {
+            return false;
         }
-        else if ((current_dispatched + idx - 1) % block_size_ == 0) {
-            // Logic for updating hash of the previous block (commented out in Python)
-        }
+        int block_id = free_block_ids_.front();
+        seq.block_ctx(BlockContextSlot::ACTIVE).block_location.emplace_back(sp_idx_, block_id);
+        allocate_block(block_id);
+        table.push_back(block_id);
+        current_blocks++;
     }
     return true;
 }

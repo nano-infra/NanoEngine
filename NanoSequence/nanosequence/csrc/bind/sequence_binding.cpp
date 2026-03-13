@@ -289,6 +289,32 @@ void bind_sequence(py::module_& m)
                  }
              })
 
+        // Vision slot management (EP separated mode)
+        .def("add_vision_slot",
+             &Sequence::add_vision_slot,
+             py::arg("encoder_engine_id"),
+             py::arg("slot_idx"),
+             py::arg("num_tokens"),
+             py::arg("hidden_size"),
+             py::arg("max_tokens_per_slot"))
+        .def("clear_vision_slots", &Sequence::clear_vision_slots)
+        .def_property_readonly("vision_slots",
+                               [](const Sequence& s) {
+                                   py::list result;
+                                   for (const auto& vs : s.vision_slots()) {
+                                       if (!vs)
+                                           continue;
+                                       py::dict d;
+                                       d["encoder_engine_id"]   = vs->encoder_engine_id;
+                                       d["slot_idx"]            = vs->slot_idx;
+                                       d["num_tokens"]          = vs->num_tokens;
+                                       d["hidden_size"]         = vs->hidden_size;
+                                       d["max_tokens_per_slot"] = vs->max_tokens_per_slot;
+                                       result.append(d);
+                                   }
+                                   return result;
+                               })
+
         .def(py::pickle(
             [](const Sequence& seq) -> py::bytes {  // __getstate__
                 try {

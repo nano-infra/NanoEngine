@@ -16,6 +16,7 @@ pub mod fbs {
     pub use self::sequence_generated::nanodeploy::fbs::*;
 }
 
+pub mod encoder_adapter;
 pub mod engine_adapter;
 pub mod engine_manager;
 pub mod engine_watcher;
