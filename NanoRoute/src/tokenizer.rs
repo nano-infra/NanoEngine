@@ -8,6 +8,35 @@ use tokenizers::Tokenizer;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
+/// Rewrite Python method-call syntax used by HuggingFace chat templates (notably Qwen3.5)
+/// into equivalent minijinja syntax.
+///
+/// minijinja-contrib adds Python string methods as filters/tests but cannot dispatch them
+/// via Python's `obj.method(args)` syntax. This function fixes the handful of patterns
+/// that appear in the Qwen3.5 chat template.
+fn normalize_for_minijinja(template: &str) -> String {
+    template
+        // Boolean predicates → global function calls (registered on the Environment below)
+        .replace(
+            "content.startswith('<tool_response>')",
+            "startswith(content, '<tool_response>')",
+        )
+        .replace(
+            "content.endswith('</tool_response>')",
+            "endswith(content, '</tool_response>')",
+        )
+        // Chained split/strip method calls → minijinja filter pipelines
+        // e.g. content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')
+        .replace(
+            "content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n')",
+            "(content | split('</think>') | first | rstrip | split('<think>') | last | lstrip)",
+        )
+        .replace(
+            "content.split('</think>')[-1].lstrip('\\n')",
+            "(content | split('</think>') | last | lstrip)",
+        )
+}
+
 pub struct TokenizerService {
     /// Model directory used for `req.model` comparison (no trailing slash).
     /// e.g. `/models/Qwen3-235B-A22B-Instruct-2507`
@@ -142,11 +171,26 @@ impl TokenizerService {
         };
 
         // Rewrite Python-specific method calls that minijinja does not support.
+        //
+        // minijinja-contrib (pycompat) adds Python string methods as filters/tests but
+        // does NOT enable Python method-call dispatch syntax (`obj.method(args)`).
+        // The Qwen template uses that syntax in a few places; rewrite them here.
+        let template_str = normalize_for_minijinja(&template_str);
+
         let mut env = Environment::new();
 
         // Add Python-compatible string methods (startswith, endswith, split,
         // upper, lower, rstrip, lstrip, etc.) needed by HuggingFace chat templates.
         add_to_environment(&mut env);
+
+        // startswith / endswith — also registered as global functions so that
+        // normalize_for_minijinja's rewrites (`startswith(content, '...')`) resolve.
+        env.add_function("startswith", |s: String, prefix: String| -> bool {
+            s.starts_with(prefix.as_str())
+        });
+        env.add_function("endswith", |s: String, suffix: String| -> bool {
+            s.ends_with(suffix.as_str())
+        });
 
         // raise_exception(msg) — called by the Qwen template for input validation.
         env.add_function(
