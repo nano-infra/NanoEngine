@@ -2,6 +2,7 @@ use crate::encoder_adapter::EncoderAdapter;
 use crate::engine_adapter::EngineAdapter;
 use crate::engine_watcher::{EngineEvent, EnginePayload, EngineWatcher};
 use crate::tokenizer::TokenizerService;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -9,14 +10,36 @@ use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-pub struct EngineManager {
-    // We share adapters via Arc<Mutex> because multiple threads (http server) might access them
+/// Per-model engine pool: owns engine adapters and a lazily-loaded tokenizer slot.
+pub struct ModelPool {
     pub prefill_engines: Vec<Arc<Mutex<EngineAdapter>>>,
     pub decode_engines: Vec<Arc<Mutex<EngineAdapter>>>,
     pub encoder_engines: Vec<Arc<Mutex<EncoderAdapter>>>,
-    redis_key_prefix: String,
-    /// Lazily loaded tokenizer; None until first engine with model_path arrives.
+    /// Lazily loaded tokenizer; None until an engine with model_path arrives.
     pub tokenizer_slot: Arc<RwLock<Option<Arc<TokenizerService>>>>,
+}
+
+impl ModelPool {
+    fn new() -> Self {
+        Self {
+            prefill_engines: Vec::new(),
+            decode_engines: Vec::new(),
+            encoder_engines: Vec::new(),
+            tokenizer_slot: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub fn get_next_prefill(&self) -> Option<Arc<Mutex<EngineAdapter>>> {
+        self.prefill_engines.first().cloned()
+    }
+
+    pub fn get_next_decode(&self) -> Option<Arc<Mutex<EngineAdapter>>> {
+        self.decode_engines.first().cloned()
+    }
+
+    pub fn get_next_encoder(&self) -> Option<Arc<Mutex<EncoderAdapter>>> {
+        self.encoder_engines.first().cloned()
+    }
 }
 
 /// Parsed fields from an engine info JSON value.
@@ -28,6 +51,14 @@ struct ParsedEngineInfo {
     num_blocks: i32,
 }
 
+pub struct EngineManager {
+    /// Per-model engine pools, keyed by normalized model_dir (no trailing slash).
+    pub model_pools: HashMap<String, ModelPool>,
+    /// Reverse map: engine_id → model_key. Used for O(1) lookup during removal.
+    engine_model_map: HashMap<String, String>,
+    redis_key_prefix: String,
+}
+
 impl Default for EngineManager {
     fn default() -> Self {
         Self::new()
@@ -37,25 +68,42 @@ impl Default for EngineManager {
 impl EngineManager {
     pub fn new() -> Self {
         Self {
-            prefill_engines: Vec::new(),
-            decode_engines: Vec::new(),
-            encoder_engines: Vec::new(),
-            redis_key_prefix: "".to_string(), // Empty prefix to match NanoCtrl default
-            tokenizer_slot: Arc::new(RwLock::new(None)),
+            model_pools: HashMap::new(),
+            engine_model_map: HashMap::new(),
+            redis_key_prefix: "".to_string(),
         }
     }
 
     pub fn with_scope(scope: Option<String>) -> Self {
         Self {
-            prefill_engines: Vec::new(),
-            decode_engines: Vec::new(),
-            encoder_engines: Vec::new(),
+            model_pools: HashMap::new(),
+            engine_model_map: HashMap::new(),
             redis_key_prefix: scope.unwrap_or_default(),
-            tokenizer_slot: Arc::new(RwLock::new(None)),
         }
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────
+
+    fn normalize_model_key(path: &str) -> String {
+        path.trim_end_matches('/').to_string()
+    }
+
+    pub fn total_engine_counts(&self) -> (usize, usize, usize) {
+        self.model_pools.values().fold((0, 0, 0), |acc, p| {
+            (
+                acc.0 + p.prefill_engines.len(),
+                acc.1 + p.decode_engines.len(),
+                acc.2 + p.encoder_engines.len(),
+            )
+        })
+    }
+
+    /// Returns sorted list of registered model keys for 404 messages / diagnostics.
+    pub fn available_model_keys(&self) -> Vec<&str> {
+        let mut keys: Vec<&str> = self.model_pools.keys().map(|s| s.as_str()).collect();
+        keys.sort();
+        keys
+    }
 
     /// Parse engine info JSON into structured fields.
     /// Handles port as u64 or string, and rewrites 0.0.0.0 → 127.0.0.1.
@@ -97,26 +145,32 @@ impl EngineManager {
         adapter: Arc<Mutex<EngineAdapter>>,
         role: &str,
         engine_id: &str,
+        model_key: &str,
     ) {
+        let pool = self
+            .model_pools
+            .entry(model_key.to_string())
+            .or_insert_with(ModelPool::new);
         match role {
             "prefill" => {
-                self.prefill_engines.push(adapter);
+                pool.prefill_engines.push(adapter);
                 info!(
-                    "Added prefill engine: {} (total: {})",
+                    "Added prefill engine: {} for model {} (total: {})",
                     engine_id,
-                    self.prefill_engines.len()
+                    model_key,
+                    pool.prefill_engines.len()
                 );
             }
             "decode" => {
-                self.decode_engines.push(adapter);
+                pool.decode_engines.push(adapter);
                 info!(
-                    "Added decode engine: {} (total: {})",
+                    "Added decode engine: {} for model {} (total: {})",
                     engine_id,
-                    self.decode_engines.len()
+                    model_key,
+                    pool.decode_engines.len()
                 );
             }
             "encoder" => {
-                // encoder role handled separately via insert_encoder
                 warn!(
                     "insert_engine_by_role called for encoder role; use insert_encoder instead. engine_id={}",
                     engine_id
@@ -124,40 +178,42 @@ impl EngineManager {
             }
             _ => {
                 // hybrid or unified — add to both pools
-                self.prefill_engines.push(adapter.clone());
-                self.decode_engines.push(adapter);
+                pool.prefill_engines.push(adapter.clone());
+                pool.decode_engines.push(adapter);
                 info!(
-                    "Added {} engine: {} (total prefill: {}, decode: {})",
+                    "Added {} engine: {} for model {} (prefill: {}, decode: {})",
                     role,
                     engine_id,
-                    self.prefill_engines.len(),
-                    self.decode_engines.len()
+                    model_key,
+                    pool.prefill_engines.len(),
+                    pool.decode_engines.len()
                 );
             }
         }
+        self.engine_model_map
+            .insert(engine_id.to_string(), model_key.to_string());
     }
 
     /// Insert an encoder adapter into the encoder pool.
-    fn insert_encoder(&mut self, adapter: Arc<Mutex<EncoderAdapter>>, engine_id: &str) {
-        self.encoder_engines.push(adapter);
+    fn insert_encoder(
+        &mut self,
+        adapter: Arc<Mutex<EncoderAdapter>>,
+        engine_id: &str,
+        model_key: &str,
+    ) {
+        let pool = self
+            .model_pools
+            .entry(model_key.to_string())
+            .or_insert_with(ModelPool::new);
+        pool.encoder_engines.push(adapter);
         info!(
-            "Added encoder engine: {} (total: {})",
+            "Added encoder engine: {} for model {} (total: {})",
             engine_id,
-            self.encoder_engines.len()
+            model_key,
+            pool.encoder_engines.len()
         );
-    }
-
-    // Helper to get a round-robin engine (simplest scheduler)
-    pub fn get_next_prefill(&self) -> Option<Arc<Mutex<EngineAdapter>>> {
-        self.prefill_engines.first().cloned()
-    }
-
-    pub fn get_next_decode(&self) -> Option<Arc<Mutex<EngineAdapter>>> {
-        self.decode_engines.first().cloned()
-    }
-
-    pub fn get_next_encoder(&self) -> Option<Arc<Mutex<EncoderAdapter>>> {
-        self.encoder_engines.first().cloned()
+        self.engine_model_map
+            .insert(engine_id.to_string(), model_key.to_string());
     }
 
     // ─── NanoCtrl API ────────────────────────────────────────────────
@@ -299,14 +355,24 @@ impl EngineManager {
     /// Add engine from engine info JSON (used by snapshot and NanoCtrl API paths).
     async fn add_engine_from_info(&mut self, engine_info: serde_json::Value) -> anyhow::Result<()> {
         let parsed = Self::parse_engine_info(&engine_info)?;
-        let model_path = engine_info["model_path"].as_str().map(|s| s.to_string());
+        let model_path = match engine_info["model_path"].as_str() {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                warn!(
+                    "Engine {} has no model_path — skipping (unroutable)",
+                    parsed.engine_id
+                );
+                return Ok(());
+            }
+        };
+        let model_key = Self::normalize_model_key(model_path);
 
         if parsed.role == "encoder" {
             let mut adapter = EncoderAdapter::new(parsed.engine_id.clone());
             adapter.connect(&parsed.connect_addr).await?;
             adapter.uuid = Some(parsed.engine_id.clone());
             let adapter = Arc::new(Mutex::new(adapter));
-            self.insert_encoder(adapter, &parsed.engine_id);
+            self.insert_encoder(adapter, &parsed.engine_id, &model_key);
         } else {
             let mut adapter = EngineAdapter::new(parsed.engine_id.clone());
             adapter.connect(&parsed.connect_addr).await?;
@@ -314,10 +380,10 @@ impl EngineManager {
             adapter.world_size = parsed.world_size;
             adapter.num_blocks = parsed.num_blocks;
             let adapter = Arc::new(Mutex::new(adapter));
-            self.insert_engine_by_role(adapter, &parsed.role, &parsed.engine_id);
+            self.insert_engine_by_role(adapter, &parsed.role, &parsed.engine_id, &model_key);
         }
 
-        self.maybe_spawn_tokenizer_load(model_path.as_deref());
+        self.maybe_spawn_tokenizer_load(Some(model_path));
         Ok(())
     }
 
@@ -335,9 +401,7 @@ impl EngineManager {
         match self.load_snapshot_from_redis(redis_url).await {
             Ok(rev) => {
                 initial_revision = rev;
-                redis_engines = self.prefill_engines.len()
-                    + self.decode_engines.len()
-                    + self.encoder_engines.len();
+                redis_engines = self.engine_model_map.len();
                 debug!(
                     "Loaded {} engines from Redis snapshot (revision={})",
                     redis_engines, rev
@@ -359,27 +423,9 @@ impl EngineManager {
                         redis_engines
                     );
 
-                    // Collect existing engine IDs from snapshot
-                    let mut existing_ids = std::collections::HashSet::new();
-                    for adapter in &self.prefill_engines {
-                        let guard = adapter.lock().await;
-                        if let Some(uuid) = &guard.uuid {
-                            existing_ids.insert(uuid.clone());
-                        }
-                    }
-                    for adapter in &self.decode_engines {
-                        let guard = adapter.lock().await;
-                        if let Some(uuid) = &guard.uuid {
-                            existing_ids.insert(uuid.clone());
-                        }
-                    }
-                    for adapter in &self.encoder_engines {
-                        let guard: tokio::sync::MutexGuard<'_, EncoderAdapter> =
-                            adapter.lock().await;
-                        if let Some(uuid) = &guard.uuid {
-                            existing_ids.insert(uuid.clone());
-                        }
-                    }
+                    // Collect existing engine IDs from reverse map
+                    let existing_ids: std::collections::HashSet<String> =
+                        self.engine_model_map.keys().cloned().collect();
 
                     // Build set of engine IDs reported by NanoCtrl API (source of truth)
                     let api_ids: std::collections::HashSet<String> = api_engines
@@ -443,12 +489,10 @@ impl EngineManager {
             }
         }
 
+        let (p, d, e) = self.total_engine_counts();
         debug!(
-            "Initial engines loaded: {} prefill, {} decode, {} encoder, revision={}",
-            self.prefill_engines.len(),
-            self.decode_engines.len(),
-            self.encoder_engines.len(),
-            initial_revision
+            "Initial engines loaded: {} prefill, {} decode, {} encoder across {} model(s), revision={}",
+            p, d, e, self.model_pools.len(), initial_revision
         );
 
         Ok(initial_revision)
@@ -597,16 +641,36 @@ impl EngineManager {
     // ─── Event handlers ──────────────────────────────────────────────
 
     /// Spawn a background task to lazily load the tokenizer from an engine's model path.
-    /// No-op if tokenizer is already loaded or model_path is None.
-    fn maybe_spawn_tokenizer_load(&self, model_path: Option<&str>) {
-        if let Some(path) = model_path {
-            TokenizerService::spawn_load(self.tokenizer_slot.clone(), path.to_string());
+    /// Routes to the correct per-model pool. No-op if already loaded or model_path is None/empty.
+    fn maybe_spawn_tokenizer_load(&mut self, model_path: Option<&str>) {
+        let Some(path) = model_path else { return };
+        if path.is_empty() {
+            return;
         }
+        let model_key = Self::normalize_model_key(path);
+        let pool = self
+            .model_pools
+            .entry(model_key)
+            .or_insert_with(ModelPool::new);
+        TokenizerService::spawn_load(pool.tokenizer_slot.clone(), path.to_string());
     }
 
     async fn handle_add_engine(&mut self, payload: EnginePayload) -> anyhow::Result<()> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY: Duration = std::time::Duration::from_secs(2);
+
+        // Guard: skip engines without a model_path (unroutable; old protocol)
+        let model_path = match payload.model_path.as_deref() {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                warn!(
+                    "Engine {} has no model_path — skipping (unroutable)",
+                    payload.id
+                );
+                return Ok(());
+            }
+        };
+        let model_key = Self::normalize_model_key(model_path);
 
         // IMPORTANT: Remove existing engine with same ID first to avoid duplicates
         // This handles the case where engine restarts and we get a new ADD event
@@ -646,8 +710,8 @@ impl EngineManager {
                     Ok(_) => {
                         adapter.uuid = Some(payload.id.clone());
                         let adapter = Arc::new(Mutex::new(adapter));
-                        self.insert_encoder(adapter, &payload.id);
-                        self.maybe_spawn_tokenizer_load(payload.model_path.as_deref());
+                        self.insert_encoder(adapter, &payload.id, &model_key);
+                        self.maybe_spawn_tokenizer_load(Some(model_path));
                         return Ok(());
                     }
                     Err(e) => {
@@ -679,8 +743,8 @@ impl EngineManager {
                     adapter.num_blocks = payload.num_blocks as i32;
 
                     let adapter = Arc::new(Mutex::new(adapter));
-                    self.insert_engine_by_role(adapter, &payload.role, &payload.id);
-                    self.maybe_spawn_tokenizer_load(payload.model_path.as_deref());
+                    self.insert_engine_by_role(adapter, &payload.role, &payload.id, &model_key);
+                    self.maybe_spawn_tokenizer_load(Some(model_path));
                     return Ok(());
                 }
                 Err(e) => {
@@ -746,14 +810,24 @@ impl EngineManager {
     async fn handle_remove_engine(&mut self, engine_id: &str) -> anyhow::Result<()> {
         info!("Removing engine: {}", engine_id);
 
+        // Look up which model pool owns this engine (O(1) via reverse map)
+        let model_key = self
+            .engine_model_map
+            .remove(engine_id)
+            .ok_or_else(|| anyhow::anyhow!("Engine {} not found", engine_id))?;
+        let pool = self
+            .model_pools
+            .get_mut(&model_key)
+            .ok_or_else(|| anyhow::anyhow!("Model pool '{}' missing", model_key))?;
+
         // Collect reader handles and I/O thread handles to await after retain
         let mut reader_handles = Vec::new();
         let mut io_thread_handles = Vec::new();
 
         // Remove from prefill_engines and cleanup pending requests
-        let prefill_before = self.prefill_engines.len();
+        let prefill_before = pool.prefill_engines.len();
         let mut removed_prefill = false;
-        self.prefill_engines.retain(|adapter| {
+        pool.prefill_engines.retain(|adapter| {
             let mut adapter_guard = futures::executor::block_on(adapter.lock());
             let should_keep = adapter_guard.uuid.as_deref() != Some(engine_id);
             if !should_keep {
@@ -770,12 +844,12 @@ impl EngineManager {
             }
             should_keep
         });
-        let prefill_after = self.prefill_engines.len();
+        let prefill_after = pool.prefill_engines.len();
 
         // Remove from decode_engines and cleanup pending requests
-        let decode_before = self.decode_engines.len();
+        let decode_before = pool.decode_engines.len();
         let mut removed_decode = false;
-        self.decode_engines.retain(|adapter| {
+        pool.decode_engines.retain(|adapter| {
             let mut adapter_guard = futures::executor::block_on(adapter.lock());
             let should_keep = adapter_guard.uuid.as_deref() != Some(engine_id);
             if !should_keep {
@@ -792,12 +866,12 @@ impl EngineManager {
             }
             should_keep
         });
-        let decode_after = self.decode_engines.len();
+        let decode_after = pool.decode_engines.len();
 
         // Remove from encoder_engines
-        let encoder_before = self.encoder_engines.len();
+        let encoder_before = pool.encoder_engines.len();
         let mut removed_encoder = false;
-        self.encoder_engines
+        pool.encoder_engines
             .retain(|adapter: &Arc<Mutex<EncoderAdapter>>| {
                 let adapter_guard = futures::executor::block_on(adapter.lock());
                 let should_keep = adapter_guard.uuid.as_deref() != Some(engine_id);
@@ -809,7 +883,7 @@ impl EngineManager {
                 }
                 should_keep
             });
-        let encoder_after = self.encoder_engines.len();
+        let encoder_after = pool.encoder_engines.len();
 
         // Await all reader tasks
         for handle in reader_handles {
@@ -828,14 +902,16 @@ impl EngineManager {
 
         if removed_prefill || removed_decode || removed_encoder {
             info!(
-                "Engine removal complete: engine_id={}, prefill: {}->{}, decode: {}->{}, encoder: {}->{}",
-                engine_id, prefill_before, prefill_after, decode_before, decode_after, encoder_before, encoder_after
+                "Engine removal complete: engine_id={}, model={}, prefill: {}→{}, decode: {}→{}, encoder: {}→{}",
+                engine_id, model_key, prefill_before, prefill_after, decode_before, decode_after,
+                encoder_before, encoder_after
             );
             Ok(())
         } else {
             Err(anyhow::anyhow!(
-                "Engine {} not found in prefill, decode, or encoder lists",
-                engine_id
+                "Engine {} not found in prefill, decode, or encoder lists for model '{}'",
+                engine_id,
+                model_key
             ))
         }
     }
@@ -869,26 +945,9 @@ impl EngineManager {
             .filter_map(|e| e["id"].as_str().map(|s| s.to_string()))
             .collect();
 
-        // Collect local engine IDs across all pools
-        let mut local_ids = std::collections::HashSet::new();
-        for adapter in &self.prefill_engines {
-            let g = adapter.lock().await;
-            if let Some(id) = &g.uuid {
-                local_ids.insert(id.clone());
-            }
-        }
-        for adapter in &self.decode_engines {
-            let g = adapter.lock().await;
-            if let Some(id) = &g.uuid {
-                local_ids.insert(id.clone());
-            }
-        }
-        for adapter in &self.encoder_engines {
-            let g = adapter.lock().await;
-            if let Some(id) = &g.uuid {
-                local_ids.insert(id.clone());
-            }
-        }
+        // Collect local engine IDs from reverse map (O(1), no async lock needed)
+        let local_ids: std::collections::HashSet<String> =
+            self.engine_model_map.keys().cloned().collect();
 
         // Remove engines present locally but absent from NanoCtrl (TTL-expired or crashed)
         let stale: Vec<String> = local_ids.difference(&live_ids).cloned().collect();
@@ -903,20 +962,18 @@ impl EngineManager {
         }
 
         if !stale.is_empty() {
+            let (tp, td, enc) = self.total_engine_counts();
             warn!(
-                "Periodic sync evicted {} engine(s) — pool now: {} prefill, {} decode, {} encoder",
-                stale.len(),
-                self.prefill_engines.len(),
-                self.decode_engines.len(),
-                self.encoder_engines.len(),
+                "Periodic sync evicted {} engine(s) — pool now: {} prefill, {} decode, {} encoder across {} model(s)",
+                stale.len(), tp, td, enc, self.model_pools.len()
             );
-            if self.prefill_engines.is_empty() {
-                error!("All prefill engines are gone — router cannot serve any requests");
-            }
-            if self.decode_engines.is_empty() {
-                error!(
-                    "All decode engines are gone — disaggregated requests will fail at migration"
-                );
+            for (key, pool) in &self.model_pools {
+                if pool.prefill_engines.is_empty() && pool.decode_engines.is_empty() {
+                    error!(
+                        "All engines gone for model '{}' — requests will return 503",
+                        key
+                    );
+                }
             }
         }
 
@@ -929,12 +986,15 @@ impl EngineManager {
         redis_url: &str,
     ) -> anyhow::Result<()> {
         warn!("Gap detected, performing full sync");
-        // Clear existing connections
-        self.prefill_engines.clear();
-        self.decode_engines.clear();
-        self.encoder_engines.clear();
+        // Clear engine vectors per pool (preserve tokenizer slots)
+        for pool in self.model_pools.values_mut() {
+            pool.prefill_engines.clear();
+            pool.decode_engines.clear();
+            pool.encoder_engines.clear();
+        }
+        self.engine_model_map.clear();
 
-        // Reload snapshot
+        // Reload from NanoCtrl or Redis
         if let Some(addr) = nanoctrl_address {
             let engines = self.list_engines_from_nanoctrl(addr).await?;
             for engine_info in engines {
@@ -946,11 +1006,10 @@ impl EngineManager {
             self.load_snapshot_from_redis(redis_url).await?;
         }
 
+        let (p, d, e) = self.total_engine_counts();
         info!(
-            "Full sync completed: {} prefill engines, {} decode engines, {} encoder engines",
-            self.prefill_engines.len(),
-            self.decode_engines.len(),
-            self.encoder_engines.len()
+            "Full sync completed: {} prefill engines, {} decode engines, {} encoder engines across {} model(s)",
+            p, d, e, self.model_pools.len()
         );
         Ok(())
     }

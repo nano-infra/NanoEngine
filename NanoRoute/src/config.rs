@@ -5,6 +5,7 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     pub port: u16,
+    #[allow(dead_code)]
     pub model_name: String,
 }
 

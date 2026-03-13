@@ -1,5 +1,5 @@
 use crate::engine_adapter::StreamEvent;
-use crate::engine_manager::EngineManager;
+use crate::engine_manager::{EngineManager, ModelPool};
 use crate::tokenizer::TokenizerService;
 use axum::http::StatusCode;
 use axum::response::{sse::Event, IntoResponse, Response, Sse};
@@ -157,31 +157,10 @@ pub struct Choice {
 // App State
 pub struct AppState {
     pub engine_manager: Arc<Mutex<EngineManager>>,
-    pub tokenizer: Arc<RwLock<Option<Arc<TokenizerService>>>>,
     pub next_request_id: AtomicU64,
 }
 
 // ── Pre-flight helpers ───────────────────────────────────────────────
-
-fn check_model(req_model: &str, served_model_dir: &str) -> Option<Response> {
-    // Normalize trailing slashes so "/models/Foo/" and "/models/Foo" both match.
-    let req = req_model.trim_end_matches('/');
-    let served = served_model_dir.trim_end_matches('/');
-    if req != served {
-        Some(
-            (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "Model '{}' not found. This router serves '{}'.",
-                    req_model, served_model_dir
-                ),
-            )
-                .into_response(),
-        )
-    } else {
-        None
-    }
-}
 
 async fn resolve_tokenizer(
     slot: &RwLock<Option<Arc<TokenizerService>>>,
@@ -192,8 +171,8 @@ async fn resolve_tokenizer(
     }
 }
 
-async fn check_engine_availability(mgr: &EngineManager, has_images: bool) -> Option<Response> {
-    if mgr.get_next_prefill().is_none() {
+fn check_engine_availability(pool: &ModelPool, has_images: bool) -> Option<Response> {
+    if pool.get_next_prefill().is_none() {
         return Some(
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -202,7 +181,7 @@ async fn check_engine_availability(mgr: &EngineManager, has_images: bool) -> Opt
                 .into_response(),
         );
     }
-    if has_images && mgr.get_next_encoder().is_none() {
+    if has_images && pool.get_next_encoder().is_none() {
         return Some(
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -221,74 +200,63 @@ async fn chat_completions(
 ) -> Response {
     tracing::info!("Received request: {:?}", req);
 
-    // 1. Tokenizer (lazy — returns 503 until an engine connects and loads it)
-    let tokenizer = match resolve_tokenizer(&state.tokenizer).await {
+    let model_key = req.model.trim_end_matches('/').to_string();
+    let has_images = req.messages.iter().any(|m| m.content.has_images());
+
+    // Single manager lock: model lookup + engine check + Arc clones, then release
+    let (tokenizer_slot, prefill_adapter, encoder_adapter) = {
+        let mgr = state.engine_manager.lock().await;
+        let pool = match mgr.model_pools.get(&model_key) {
+            Some(p) => p,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "Model '{}' not found. Available: [{}]",
+                        req.model,
+                        mgr.available_model_keys().join(", ")
+                    ),
+                )
+                    .into_response()
+            }
+        };
+        if let Some(err) = check_engine_availability(pool, has_images) {
+            return err;
+        }
+        let prefill = pool.get_next_prefill().unwrap(); // safe: checked above
+        let encoder = if has_images {
+            Some(pool.get_next_encoder().unwrap()) // safe: checked above
+        } else {
+            None
+        };
+        (pool.tokenizer_slot.clone(), prefill, encoder)
+    }; // manager lock released here
+
+    // Tokenizer check (no manager lock held)
+    let tokenizer = match resolve_tokenizer(&tokenizer_slot).await {
         Ok(t) => t,
         Err(e) => return e,
     };
-
-    // 2. Model check against the directory registered by the engine
-    if let Some(err) = check_model(&req.model, tokenizer.model_dir()) {
-        return err;
-    }
-
-    // 3. Engine availability pre-flight
-    let has_images = req.messages.iter().any(|m| m.content.has_images());
-    {
-        let mgr = state.engine_manager.lock().await;
-        if let Some(err) = check_engine_availability(&mgr, has_images).await {
-            return err;
-        }
-    }
 
     // Generate unique sequence ID and request ID
     let seq_id = state.next_request_id.fetch_add(1, Ordering::SeqCst);
     let request_id = format!("chatcmpl-{}", seq_id);
 
-    // Get an available engine from manager (pre-flight confirmed it exists)
-    let adapter = {
-        let mgr = state.engine_manager.lock().await;
-        match mgr.get_next_prefill() {
-            Some(a) => a,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "No prefill engines available",
-                )
-                    .into_response()
-            }
-        }
-    };
-
     // Acquire lock briefly to send request
     let rx_result = {
-        let mut adapter_guard = adapter.lock().await;
+        let mut adapter_guard = prefill_adapter.lock().await;
 
         if has_images {
             // ── Multimodal path: send to EncoderEngine first ──
-            // pre-flight confirmed encoder exists; keep match for TOCTOU safety
-            let encoder_adapter = {
-                let mgr = state.engine_manager.lock().await;
-                mgr.get_next_encoder()
-            };
-            let encoder_adapter: Arc<Mutex<crate::encoder_adapter::EncoderAdapter>> =
-                match encoder_adapter {
-                    Some(a) => a,
-                    None => {
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No encoder engines available for multimodal request",
-                        )
-                            .into_response()
-                    }
-                };
+            // pre-flight confirmed encoder exists; encoder_adapter is Some
+            let encoder = encoder_adapter.unwrap();
 
             // Build encode request JSON (forward original messages)
             let encode_req = serde_json::json!({ "messages": &req.messages });
             let encode_json = serde_json::to_vec(&encode_req).unwrap();
 
             let encode_resp = {
-                let mut enc_guard = encoder_adapter.lock().await;
+                let mut enc_guard = encoder.lock().await;
                 enc_guard.encode(&encode_json).await
             };
             let encode_resp = match encode_resp {
@@ -379,7 +347,7 @@ async fn chat_completions(
         let model_name = req.model.clone();
         let tokenizer = tokenizer.clone();
         let request_id = request_id.clone();
-        let mut active_adapter = adapter.clone();
+        let mut active_adapter = prefill_adapter.clone();
 
         // Use async-stream macros for clean generator syntax
         let stream = async_stream::stream! {
@@ -450,7 +418,7 @@ async fn chat_completions(
 
                         let decode_adapter_arc = {
                             let mgr = state.engine_manager.lock().await;
-                            mgr.get_next_decode()
+                            mgr.model_pools.get(&model_key).and_then(|p| p.get_next_decode())
                         };
 
                         if let Some(decode_adapter_arc) = decode_adapter_arc {
@@ -509,7 +477,9 @@ async fn chat_completions(
                     generated_tokens.clear();
                     let decode_adapter_arc = {
                         let mgr = state.engine_manager.lock().await;
-                        mgr.get_next_decode()
+                        mgr.model_pools
+                            .get(&model_key)
+                            .and_then(|p| p.get_next_decode())
                     };
                     if let Some(decode_adapter_arc) = decode_adapter_arc {
                         let mut decode_adapter = decode_adapter_arc.lock().await;
@@ -551,11 +521,7 @@ async fn health() -> &'static str {
     "OK"
 }
 
-pub async fn start_server(
-    port: u16,
-    engine_manager: Arc<Mutex<EngineManager>>,
-    tokenizer: Arc<RwLock<Option<Arc<TokenizerService>>>>,
-) {
+pub async fn start_server(port: u16, engine_manager: Arc<Mutex<EngineManager>>) {
     // Use timestamp as start ID to avoid collisions on server restart
     // Must fit in u32 for legacy engine protocol
     let start_id = std::time::SystemTime::now()
@@ -565,7 +531,6 @@ pub async fn start_server(
 
     let state = Arc::new(AppState {
         engine_manager,
-        tokenizer,
         next_request_id: AtomicU64::new(start_id),
     });
 

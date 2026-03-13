@@ -19,11 +19,6 @@ pub struct TokenizerService {
 }
 
 impl TokenizerService {
-    /// Returns the model directory for `req.model` comparison.
-    pub fn model_dir(&self) -> &str {
-        &self.model_dir
-    }
-
     /// Probe a model directory for a loadable tokenizer file.
     ///
     /// Tries common names in order; falls back to `tokenizer.json` if none found
