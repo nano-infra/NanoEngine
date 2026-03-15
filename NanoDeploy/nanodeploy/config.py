@@ -38,13 +38,12 @@ class Config(BaseModel):
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = 15000
 
-    # device / backend config
-    # device_type: "cuda" (default) or "npu" for Ascend.
-    # Reads NANO_DEVICE_TYPE env var if not set explicitly.
-    device_type: str = os.getenv("NANO_DEVICE_TYPE", "cuda")
-    # backend_type: "" means auto-detect; set to "ascend"/"hopper"/"gpu_generic" to lock in.
+    # backend_type: "" means auto-detect; "ascend"/"hopper"/"gpu_generic" to lock in.
     # Reads NANO_BACKEND env var if not set explicitly.
+    # Setting backend_type="ascend" automatically implies device_type="npu".
     backend_type: str = os.getenv("NANO_BACKEND", "")
+    # device_type: inferred from backend_type when possible; override via NANO_DEVICE_TYPE.
+    device_type: str = os.getenv("NANO_DEVICE_TYPE", "cuda")
 
     # deployment config
     engine_id: Optional[str] = None
@@ -75,6 +74,12 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
+        # Infer device_type from backend_type when not explicitly set.
+        if self.backend_type == "ascend" and os.getenv("NANO_DEVICE_TYPE") is None:
+            self.device_type = "npu"
+        elif self.backend_type in ("hopper", "gpu_generic") and os.getenv("NANO_DEVICE_TYPE") is None:
+            self.device_type = "cuda"
+
         # Normalise nanoctrl_address (add scheme if missing)
         if (
             self.nanoctrl_address
