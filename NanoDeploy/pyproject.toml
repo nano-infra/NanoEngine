@@ -26,9 +26,11 @@ dependencies = [
     # "flash-attn",
     "xxhash",
     "dlslime>=0.0.1.post9",
-    "nanoccl>=0.0.2",
+    # "nanoccl>=0.0.2",
     "httpx",
     "uvloop>=0.21.0",
+    "jsonargparse",
+    "flatbuffers"
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

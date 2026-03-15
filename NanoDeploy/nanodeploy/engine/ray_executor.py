@@ -9,7 +9,7 @@ from nanodeploy._cpp import serialize_migrate_batch, serialize_run_batch
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
-from nanodeploy.worker.model_runner import ModelRunner
+from nanodeploy.worker.model_runner import GPUModelRunner, NPUModelRunner
 
 logger = get_logger()
 
@@ -41,6 +41,11 @@ class RayExecutor:
         self.workers = []
         self.placement_groups = []
         assert config.attn_world_size == config.ffn_world_size
+
+        # Select worker class based on device type
+        device_type = getattr(config, "device_type", "cuda")
+        self._worker_cls = NPUModelRunner if device_type == "npu" else GPUModelRunner
+        self._resource_key = "NPU" if device_type == "npu" else "GPU"
 
         # Check if running under NanoOps orchestration
         import os
@@ -81,7 +86,7 @@ class RayExecutor:
         # workers may be on a different node.  We create them with
         # defer_dist_init=True so they skip dist.init_process_group().
         for rank in range(self.config.attn_world_size):
-            worker = ModelRunner.remote(self.config, rank, defer_dist_init=True)
+            worker = self._worker_cls.remote(self.config, rank, defer_dist_init=True)
             self.workers.append(worker)
 
         # --- Phase 2: probe worker[0] for actual node IP + free port ------
@@ -128,7 +133,9 @@ class RayExecutor:
             logger.info(f"--- scheduling node: {target_node_id} ---")
 
             pg = placement_group(
-                bundles=[{"CPU": 0.1, "GPU": 1.0} for _ in range(8)],
+                bundles=[
+                    {"CPU": 0.1, self._resource_key: 1.0} for _ in range(8)
+                ],
                 strategy="STRICT_PACK",
                 name=f"pg-node-{node_ids[node_idx]}",
                 _soft_target_node_id=target_node_id,
@@ -142,7 +149,7 @@ class RayExecutor:
             end_rank = min(start_rank + workers_per_node, self.config.attn_world_size)
 
             for rank in range(start_rank, end_rank):
-                worker = ModelRunner.options(placement_group=pg).remote(
+                worker = self._worker_cls.options(placement_group=pg).remote(
                     self.config, rank
                 )
                 self.workers.append(worker)

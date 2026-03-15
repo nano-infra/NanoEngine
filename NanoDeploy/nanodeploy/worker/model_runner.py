@@ -1,6 +1,9 @@
 import os
 
-import flash_mla
+try:
+    import flash_mla
+except ImportError:
+    flash_mla = None
 import numpy as np
 import ray
 import torch
@@ -44,7 +47,6 @@ architectures = {
 }
 
 
-@ray.remote(num_cpus=0.1, num_gpus=1)
 class ModelRunner:
     def __init__(self, config: Config, rank: int, defer_dist_init: bool = False):
         # Set log level
@@ -58,6 +60,10 @@ class ModelRunner:
         self.world_size = config.attn_world_size
         self.rank = rank
         self._dist_initialized = False
+        # Device-type helpers (set properly in _complete_dist_init)
+        _dtype = getattr(config, "device_type", "cuda")
+        self._dev = _dtype
+        self._pin = (_dtype == "cuda")
 
         # Sync C++ Sequence.block_size with Python kvcache_block_size
         from nanodeploy._cpp import Sequence as _Seq
@@ -109,22 +115,50 @@ class ModelRunner:
     # ------------------------------------------------------------------
 
     def _complete_dist_init(self):
-        """Phase-2 init: process group, contexts, CUDA, model, etc."""
+        """Phase-2 init: process group, contexts, device, model, etc."""
         config = self.config
         hf_config = config.hf_config
         rank = self.rank
 
-        torch.manual_seed(0)
-        torch.cuda.manual_seed_all(0)
+        # Determine device type from config (supports "cuda" or "npu")
+        device_type = getattr(config, "device_type", "cuda")
+        # Ascend NPU always runs in eager mode (no CUDA graph)
+        if device_type == "npu":
+            self.enforce_eager = True
 
-        torch.cuda.set_device(0)
+        # Map device_type → CCL backend string.
+        # env:// rendezvous is used universally: HCCL requires it and NCCL
+        # supports it, so we always set MASTER_ADDR/MASTER_PORT and use env://.
+        _CCL_BACKEND = {
+            "cuda": "cpu:gloo,cuda:nccl",
+            "npu":  "hccl",
+        }
+        ccl_backend = _CCL_BACKEND.get(device_type, f"{device_type}:gloo")
+
+        import os
+        master_host, master_port = config.master_address.rsplit(":", 1)
+        os.environ["MASTER_ADDR"] = master_host
+        os.environ["MASTER_PORT"] = master_port
+
+        torch.manual_seed(0)
+
+        if device_type == "npu":
+            import torch_npu
+            torch_npu.npu.manual_seed_all(0)
+            # Ray sets ASCEND_VISIBLE_DEVICES so each worker sees exactly one
+            # NPU as device 0 — mirrors how CUDA workers use set_device(0).
+            torch_npu.npu.set_device(0)
+        else:
+            torch.cuda.manual_seed_all(0)
+            torch.cuda.set_device(0)
 
         dist.init_process_group(
-            "cpu:gloo,cuda:nccl",
-            f"tcp://{config.master_address}",
+            backend=ccl_backend,
+            init_method="env://",
             world_size=self.world_size,
             rank=rank,
         )
+
         self._dist_initialized = True
 
         set_dist_context(
@@ -136,11 +170,17 @@ class ModelRunner:
             ffn_dp=config.ffn_dp,
             ffn_ep=config.ffn_ep,
             ffn_tp=config.ffn_tp,
+            device_type=device_type,
         )
 
         self.default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
-        torch.set_default_device("cuda")
+        torch.set_default_device(device_type)
+
+        # Device helpers used throughout this class for H2D tensor transfers
+        self._dev = device_type
+        # pin_memory is a CUDA-only optimization; disable for NPU
+        self._pin = (device_type == "cuda")
 
         sp_size = get_dist_context().attn_sp_world_size
         ep_size = get_dist_context().ffn_ep_world_size
@@ -200,7 +240,9 @@ class ModelRunner:
         _quant_cfg_dict = getattr(hf_config, "quantization_config", None) or {}
         if not isinstance(_quant_cfg_dict, dict):
             _quant_cfg_dict = {}
-        init_backend(quant_config=_QC(**_quant_cfg_dict))
+        # Pass explicit backend_type from config if set (e.g. "ascend")
+        _backend_type = getattr(config, "backend_type", "") or None
+        init_backend(quant_config=_QC(**_quant_cfg_dict), backend_type=_backend_type)
 
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
@@ -212,22 +254,32 @@ class ModelRunner:
         if num_total_experts > 0:
             ep_rank = get_dist_context().ffn_ep_rank
 
-            # Check FP8 quantization configs
-            quant_config = getattr(hf_config, "quantization_config", None)
-            is_fp8 = False
-            if quant_config is not None:
-                is_fp8 = quant_config.get("quant_method", "") == "fp8"
-
             num_local_experts = num_total_experts // ep_size
-            ExpertContext.get_instance().warmup(
-                ep_group=get_dist_context().ffn_ep_group,
-                ep_rank=ep_rank,
-                ep_size=ep_size,
-                num_local_experts=num_local_experts,
-                hidden_size=hf_config.hidden_size,
-                max_num_sequence=config.max_num_seqs,
-                is_fp8=is_fp8,
-            )
+
+            if device_type == "npu":
+                # Ascend: use ascend_warmup() — no DeepEP buffer
+                ExpertContext.get_instance().ascend_warmup(
+                    ep_group=get_dist_context().ffn_ep_group,
+                    ep_size=ep_size,
+                    num_local_experts=num_local_experts,
+                    hidden_size=hf_config.hidden_size,
+                )
+            else:
+                # CUDA: use standard warmup() with DeepEP
+                quant_config = getattr(hf_config, "quantization_config", None)
+                is_fp8 = False
+                if quant_config is not None:
+                    is_fp8 = quant_config.get("quant_method", "") == "fp8"
+
+                ExpertContext.get_instance().warmup(
+                    ep_group=get_dist_context().ffn_ep_group,
+                    ep_rank=ep_rank,
+                    ep_size=ep_size,
+                    num_local_experts=num_local_experts,
+                    hidden_size=hf_config.hidden_size,
+                    max_num_sequence=config.max_num_seqs,
+                    is_fp8=is_fp8,
+                )
 
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
@@ -235,6 +287,8 @@ class ModelRunner:
         dist.barrier()
 
         self.sampler = Sampler()
+        if self._dev == "cuda" and not self.enforce_eager:
+            self.sampler = torch.compile(self.sampler)
         self.preallocate_kvcache()
 
         # Vision embeddings fetched via RDMA from encoder (EP-separated mode)
@@ -339,7 +393,7 @@ class ModelRunner:
         itemsize = torch.tensor([], dtype=dtype).element_size()
 
         # Allocate local receive buffer on GPU
-        recv_buf = torch.zeros(total_tokens, hidden_size, dtype=dtype, device="cuda")
+        recv_buf = torch.zeros(total_tokens, hidden_size, dtype=dtype, device=self._dev)
         # Register receive buffer as a temporary MR
         recv_buf_size = recv_buf.nelement() * recv_buf.element_size()
         recv_mr = peer_agent.register_memory_region(
@@ -476,12 +530,25 @@ class ModelRunner:
     def exit(self):
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
+        _dev = getattr(self.config, "device_type", "cuda")
+        if _dev == "npu":
+            import torch_npu
+
+            torch_npu.npu.synchronize()
+        else:
+            torch.cuda.synchronize()
         dist.destroy_process_group()
 
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        _dev = getattr(self.config, "device_type", "cuda")
+        if _dev == "npu":
+            import torch_npu
+
+            torch_npu.npu.empty_cache()
+            torch_npu.npu.reset_peak_memory_stats()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = (
             min(self.config.max_num_batched_tokens, 16384),
             min(self.config.max_model_len, 8192),
@@ -494,7 +561,12 @@ class ModelRunner:
         # empty for warmup — serialize empty batch into bytes
         warmup_data = serialize_run_batch([], True)
         self.run_from_bytes(warmup_data, True)
-        torch.cuda.empty_cache()
+        if getattr(self.config, "device_type", "cuda") == "npu":
+            import torch_npu
+
+            torch_npu.npu.empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
     def preallocate_kvcache(self):
         config = self.config
@@ -575,27 +647,27 @@ class ModelRunner:
             )
 
         input_ids = torch.tensor(
-            meta.input_ids, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.input_ids, dtype=torch.int64, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         positions = torch.tensor(
-            meta.positions, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.positions, dtype=torch.int64, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         cu_seqlens_q = torch.tensor(
-            meta.cu_seqlens_q, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.cu_seqlens_q, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         cu_seqlens_k = torch.tensor(
-            meta.cu_seqlens_k, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.cu_seqlens_k, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         slot_mapping = torch.tensor(
-            meta.slot_mapping, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.slot_mapping, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
 
         block_tables = None
         if meta.use_block_tables:
             block_tables = (
-                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
+                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=self._pin)
                 .reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks)
-                .cuda(non_blocking=True)
+                .to(self._dev, non_blocking=True)
             )
 
         cache_ctx = get_cache_context()
@@ -608,8 +680,8 @@ class ModelRunner:
                     for s in aux.state_slots
                 ],
                 dtype=torch.int64,
-                pin_memory=True,
-            ).cuda(non_blocking=True)
+                pin_memory=self._pin,
+            ).to(self._dev, non_blocking=True)
 
         set_context(
             True,
@@ -655,38 +727,38 @@ class ModelRunner:
             raise
 
         input_ids = torch.tensor(
-            meta.input_ids, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.input_ids, dtype=torch.int64, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         positions = torch.tensor(
-            meta.positions, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.positions, dtype=torch.int64, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         slot_mapping = torch.tensor(
-            meta.slot_mapping, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.slot_mapping, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
 
         context_lens = (
-            torch.tensor(meta.context_lens_flat, dtype=torch.int32, pin_memory=True)
+            torch.tensor(meta.context_lens_flat, dtype=torch.int32, pin_memory=self._pin)
             .reshape(sp_size, self.config.max_num_seqs)
-            .cuda(non_blocking=True)
+            .to(self._dev, non_blocking=True)
         )
 
         global_context_lens = (
             torch.tensor(
-                meta.global_context_lens_flat, dtype=torch.int32, pin_memory=True
+                meta.global_context_lens_flat, dtype=torch.int32, pin_memory=self._pin
             )
             .reshape(sp_size, self.config.max_num_seqs)
-            .cuda(non_blocking=True)
+            .to(self._dev, non_blocking=True)
         )
 
         if len(meta.block_tables_flat) == 0:
-            block_tables = torch.empty((0, 0), dtype=torch.int32).cuda(
-                non_blocking=True
+            block_tables = torch.empty((0, 0), dtype=torch.int32).to(
+                self._dev, non_blocking=True
             )
         else:
             block_tables = (
-                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
+                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=self._pin)
                 .reshape(-1, meta.max_num_blocks)
-                .cuda(non_blocking=True)
+                .to(self._dev, non_blocking=True)
             )
 
         q_mask = global_context_lens.clone()
@@ -697,39 +769,39 @@ class ModelRunner:
         res_lse_mask[res_lse_mask != 0] = 1
 
         context_lens_for_attn = torch.tensor(
-            meta.context_lens_for_attn, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.context_lens_for_attn, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
 
         q_slice_get = torch.tensor(
-            meta.q_slice_get, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.q_slice_get, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         q_slice_fill = torch.tensor(
-            meta.q_slice_fill, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.q_slice_fill, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         q_copy_mask = torch.tensor(
-            meta.q_copy_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.q_copy_mask, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_slice_get_to_buffer_output = torch.tensor(
-            meta.res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_slice_fill_to_buffer_output = torch.tensor(
-            meta.res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_to_buffer_output_mask = torch.tensor(
-            meta.res_to_buffer_output_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_to_buffer_output_mask, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_slice_get_to_buffer_input = torch.tensor(
-            meta.res_slice_get_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_slice_get_to_buffer_input, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_slice_fill_to_buffer_input = torch.tensor(
-            meta.res_slice_fill_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_slice_fill_to_buffer_input, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_to_buffer_input_mask = torch.tensor(
-            meta.res_to_buffer_input_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_to_buffer_input_mask, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         q_offsets = torch.tensor(
-            meta.q_offsets, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.q_offsets, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         attention_compute_bs = context_lens_for_attn.numel()
 
         config = self.config
@@ -755,8 +827,8 @@ class ModelRunner:
                     for s in aux.state_slots
                 ],
                 dtype=torch.int64,
-                pin_memory=True,
-            ).cuda(non_blocking=True)
+                pin_memory=self._pin,
+            ).to(self._dev, non_blocking=True)
 
         set_context(
             is_prefill=False,
@@ -823,8 +895,8 @@ class ModelRunner:
     def prepare_sample_from_aux(self, aux):
         """Build temperature tensor from BatchAuxData (no Sequence needed)."""
         temperatures = torch.tensor(
-            aux.temperatures, dtype=torch.float32, pin_memory=True
-        ).cuda(non_blocking=True)
+            aux.temperatures, dtype=torch.float32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         return temperatures
 
     @torch.inference_mode()
@@ -1094,7 +1166,7 @@ class ModelRunner:
             tile_scheduler_metadata_buffer, num_splits_buffer = (
                 flash_mla.get_mla_metadata(
                     torch.ones(
-                        max_attention_comp_seqs, dtype=torch.int32, device="cuda"
+                        max_attention_comp_seqs, dtype=torch.int32, device=self._dev
                     ),
                     hf_config.num_attention_heads // mla_num_kv_heads,
                     mla_num_kv_heads,
@@ -1225,3 +1297,15 @@ class ModelRunner:
             q_offsets=q_offsets,
             gdn_state_slots=gdn_state_slots_buf,
         )
+
+
+# ---------------------------------------------------------------------------
+# NPU ModelRunner variant — requests Ascend NPU resources from Ray
+# ---------------------------------------------------------------------------
+
+
+# Ray does not allow actor class inheritance, so we bind @ray.remote at module
+# level after the plain ModelRunner class is fully defined.
+# ray_executor.py selects GPUModelRunner or NPUModelRunner based on device_type.
+GPUModelRunner = ray.remote(num_cpus=0.1, num_gpus=1)(ModelRunner)
+NPUModelRunner = ray.remote(num_cpus=0.1, resources={"NPU": 1})(ModelRunner)

@@ -24,6 +24,16 @@ class RMSNorm(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        # Fast path on Ascend NPU via npu_rms_norm
+        if not self.add_unit_offset:
+            try:
+                import torch_npu
+
+                out, _ = torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)
+                return out
+            except (ImportError, AttributeError):
+                pass
+
         orig_dtype = x.dtype
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)

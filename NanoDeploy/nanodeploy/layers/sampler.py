@@ -7,7 +7,6 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
 
-    @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         # Check for greedy search (temperature close to 0)
         # Assuming temperatures is [batch_size] or broadcastable

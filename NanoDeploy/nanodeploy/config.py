@@ -38,6 +38,14 @@ class Config(BaseModel):
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = 15000
 
+    # device / backend config
+    # device_type: "cuda" (default) or "npu" for Ascend.
+    # Reads NANO_DEVICE_TYPE env var if not set explicitly.
+    device_type: str = os.getenv("NANO_DEVICE_TYPE", "cuda")
+    # backend_type: "" means auto-detect; set to "ascend"/"hopper"/"gpu_generic" to lock in.
+    # Reads NANO_BACKEND env var if not set explicitly.
+    backend_type: str = os.getenv("NANO_BACKEND", "")
+
     # deployment config
     engine_id: Optional[str] = None
     mode: Literal["prefill", "decode", "hybrid"] = "hybrid"

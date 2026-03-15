@@ -61,15 +61,40 @@ class CacheContext:
     def num_local_kv_heads(self):
         return self.num_kv_heads // self.attention_tp
 
-    def __post_init__(self):
+    @staticmethod
+    def _get_device_mem_info(device: str):
+        """Return (free_bytes, total_bytes) for the given device type."""
+        if device == "npu":
+            import torch_npu
 
-        free, total = torch.cuda.mem_get_info()
+            free, total = torch_npu.npu.mem_get_info()
+            return free, total
+        else:
+            return torch.cuda.mem_get_info()
+
+    @staticmethod
+    def _get_device_memory_stats(device: str):
+        """Return memory stats dict with 'allocated_bytes.all.peak' and '.current'."""
+        if device == "npu":
+            import torch_npu
+
+            stats = torch_npu.npu.memory_stats()
+            # torch_npu memory stats use the same key naming as CUDA
+            return stats
+        else:
+            return torch.cuda.memory_stats()
+
+    def __post_init__(self):
+        # Normalise device string for comparison
+        _dev = str(self.device).split(":")[0]  # e.g. "cuda:0" -> "cuda"
+
+        free, total = self._get_device_mem_info(_dev)
         if self.gpu_memory_limit_gb is not None:
             total = min(total, self.gpu_memory_limit_gb * 1024**3)
-        used = torch.cuda.mem_get_info()[1] - free  # real used
-        memory_stats = torch.cuda.memory_stats()
-        peak = memory_stats["allocated_bytes.all.peak"]
-        current = memory_stats["allocated_bytes.all.current"]
+        used = self._get_device_mem_info(_dev)[1] - free  # real used
+        memory_stats = self._get_device_memory_stats(_dev)
+        peak = memory_stats.get("allocated_bytes.all.peak", 0)
+        current = memory_stats.get("allocated_bytes.all.current", 0)
 
         if self.mode == "gqa":
             assert self.attention_tp <= self.num_kv_heads
@@ -677,9 +702,15 @@ class CacheContext:
                         logger.error("endpoint.read returned None")
                         raise RuntimeError("endpoint.read returned None")
                     slot.wait()
-                    # GPUDirect RDMA may bypass CUDA stream ordering.
+                    # RDMA may bypass device stream ordering.
                     # Synchronize to ensure migrated KV data is visible to subsequent kernels.
-                    torch.cuda.synchronize()
+                    _dev_sync = str(self.device).split(":")[0]
+                    if _dev_sync == "npu":
+                        import torch_npu
+
+                        torch_npu.npu.synchronize()
+                    else:
+                        torch.cuda.synchronize()
 
                     logger.info(
                         f"Completed batch RDMA read from {peer_alias} ({len(rdma_ops)} operations)"
