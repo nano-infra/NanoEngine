@@ -87,6 +87,8 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
 
         # Lazy-init local dispatcher for ep==1 decode path
         self._local_dispatcher: Optional[LocalPaddedDispatcher] = None
+        # Lazy-init decode EP dispatcher (cached across forward calls)
+        self._decode_dispatcher = None
 
     # ------------------------------------------------------------------
     # Public forward
@@ -263,8 +265,26 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
         return output
 
     # ------------------------------------------------------------------
-    # EP > 1: Decode (MC2/Low-Latency path via AscendTokenDispatcherLowLatency)
+    # EP > 1: Decode (AllGather + npu_grouped_matmul + ReduceScatter)
     # ------------------------------------------------------------------
+
+    def _get_decode_dispatcher(self):
+        """Lazy-init and cache the decode dispatcher (one per layer lifetime)."""
+        if self._decode_dispatcher is None:
+            from nanodeploy.layers.token_dispatcher import AscendTokenDispatcherAllGather
+
+            ctx = ExpertContext.get_instance()
+            assert ctx.warmup_called, "ExpertContext must be warmed up before EP compute"
+
+            self._decode_dispatcher = AscendTokenDispatcherAllGather(
+                group=self.ep_group,
+                num_experts=self.num_experts,
+                num_local_experts=self.num_local_experts,
+                hidden_size=self.hidden_size,
+                params_dtype=self.gate_up_proj.dtype,
+                top_k=self.top_k,
+            )
+        return self._decode_dispatcher
 
     def _compute_decode_ep(
         self,
@@ -272,39 +292,43 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        from nanodeploy.layers.token_dispatcher import AscendTokenDispatcherLowLatency
+        import torch_npu
 
-        ctx = ExpertContext.get_instance()
-        assert ctx.warmup_called, "ExpertContext must be warmed up before EP compute"
-
-        dispatcher = AscendTokenDispatcherLowLatency(
-            group=self.ep_group,
-            num_experts=self.num_experts,
-            num_local_experts=self.num_local_experts,
-            hidden_size=self.hidden_size,
-            params_dtype=self.gate_up_proj.dtype,
-        )
+        dispatcher = self._get_decode_dispatcher()
 
         (
             recv_hidden,
             recv_topk_idx,
             recv_topk_weights,
-            masked_m,
-            expected_m,
+            expert_token_nums,  # [num_local_experts] padded counts, sum=active_num
+            group_list_type,    # 1 = count mode
         ) = dispatcher.dispatch(hidden_states, topk_ids, topk_weights)
 
-        # recv_hidden: [num_local_experts, max_m, hidden_size]
-        E, max_m, H = recv_hidden.shape
+        # npu_grouped_matmul routes rows to experts by group_list counts.
+        # Output is always [active_num, ...] (fixed shape from padded counts).
+        gate_up_out = torch_npu.npu_grouped_matmul(
+            x=[recv_hidden],
+            weight=[self.gate_up_proj.transpose(1, 2)],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=expert_token_nums,
+        )[0]
 
-        # Gate-Up grouped matmul (BF16): [E, max_m, H] x [E, H, 2*inter] -> [E, max_m, 2*inter]
-        gateup = torch.bmm(recv_hidden, self.gate_up_proj.transpose(-1, -2))
-        gate, up = gateup.chunk(2, dim=-1)
-        down_input = F.silu(gate) * up  # [E, max_m, inter]
+        gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
-        # Down grouped matmul: [E, max_m, inter] x [E, inter, H] -> [E, max_m, H]
-        down_output = torch.bmm(down_input, self.down_proj.transpose(-1, -2))
+        down_output = torch_npu.npu_grouped_matmul(
+            x=[gate_up_out],
+            weight=[self.down_proj.transpose(1, 2)],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=expert_token_nums,
+        )[0]
 
         if self.tp_size > 1 and self.tp_group is not None:
             dist.all_reduce(down_output, group=self.tp_group)
 
-        return dispatcher.combine(down_output, recv_topk_idx, recv_topk_weights)
+        result = dispatcher.combine(down_output, recv_topk_idx, recv_topk_weights)
+
+        return result

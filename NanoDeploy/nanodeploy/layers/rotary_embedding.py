@@ -1,8 +1,22 @@
 import math
+import os
 from functools import lru_cache
 
 import torch
 from torch import nn
+
+
+def _maybe_torch_compile(fn):
+    """Apply torch.compile on CUDA; skip on Ascend NPU (inductor not supported)."""
+    if os.environ.get("NANO_BACKEND", "") == "ascend":
+        return fn
+    try:
+        import torch_npu
+        if torch.npu.is_available():
+            return fn
+    except ImportError:
+        pass
+    return torch.compile(fn)
 
 
 def apply_rotary_emb(
@@ -38,7 +52,7 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
+    @_maybe_torch_compile
     def forward(
         self,
         positions: torch.Tensor,
@@ -132,7 +146,7 @@ class YarnRotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
+    @_maybe_torch_compile
     def forward(
         self,
         positions: torch.Tensor,

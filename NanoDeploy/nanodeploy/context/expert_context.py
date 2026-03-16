@@ -132,8 +132,8 @@ class ExpertContext:
         """Ascend NPU substitute for warmup() — skips DeepEP buffer creation.
 
         Marks warmup done and stores EP metadata so dispatchers can be
-        instantiated.  The Ascend dispatchers manage their own AllToAll
-        via HCCL and torch_npu MoE ops.
+        instantiated.  The Ascend dispatchers use AllGather/ReduceScatter
+        (HCCL) and torch_npu MoE routing ops.
         """
         if self.warmup_called:
             return
@@ -143,7 +143,7 @@ class ExpertContext:
         self.num_experts = num_local_experts * ep_size
         self.hidden_size = hidden_size
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-        self.buffer = None  # Ascend dispatchers use their own AllToAll
+        self.buffer = None  # Ascend dispatchers use AllGather/ReduceScatter
         self.warmup_called = True
 
     def get_buffer(self):

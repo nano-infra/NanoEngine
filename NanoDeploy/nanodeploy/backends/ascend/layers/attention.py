@@ -121,58 +121,89 @@ class AscendAttention(AttentionBase):
         q: torch.Tensor,
         context,
     ) -> torch.Tensor:
-        """Decode via npu_fused_infer_attention_score, TND layout, sparse_mode=3.
+        """Decode attention via pre-gathered KV + npu_incre_flash_attention (no block_table).
+
+        Both npu_fused_infer_attention_score and npu_incre_flash_attention trigger
+        AclrtSynchronizeStreamWithTimeout on the copy_stream when using block_table,
+        which is forbidden inside ACL graph capture (CANN limitation).
+
+        Work-around: pre-gather the paged KV blocks into a dense [B, N, S_kv, D]
+        tensor using pure index ops (all static output shapes) and call the attention
+        op without block_table.  Every intermediate shape is known at compile time
+        from tensor .shape attributes → fully ACL-graph safe.
 
         Args:
-            q: [bs, num_heads, head_dim]  (TND: one query token per sequence)
+            q: [bs, num_heads, head_dim]
         """
         import torch_npu
 
         bs = q.shape[0]
         compute_bs = getattr(context, "attention_compute_bs", bs) or bs
-        q_compute = q[:compute_bs]
+        q_compute = q[:compute_bs]                             # [B, num_heads, head_dim]
 
-        context_lens = context.context_lens_for_attn[:compute_bs]
-        block_tables = context.block_tables[:compute_bs]
+        context_lens = context.context_lens_for_attn[:compute_bs]  # [B], stays on NPU
+        block_tables = context.block_tables[:compute_bs]            # [B, max_blocks]
 
-        # k_cache/v_cache: [num_blocks, block_size, num_kv_heads, head_dim]
-        # Reshape to [num_blocks, block_size, num_kv_heads*head_dim] for TND paged mode
-        num_blocks, block_size, nkv, kdim = self.k_cache.shape
-        k_flat = self.k_cache.view(num_blocks, block_size, nkv * kdim)
-        v_flat = self.v_cache.view(num_blocks, block_size, nkv * self.v_head_dim)
+        n_blks_total, block_size, nkv, kdim = self.k_cache.shape
+        max_blocks = block_tables.shape[1]                     # compile-time const
+        max_kv_len = max_blocks * block_size                   # compile-time const
 
-        # actual_seq_lengths for TND decode: cumulative (1 query per sequence)
-        actual_seq_lengths_q = list(range(1, compute_bs + 1))
-        actual_seq_lengths_kv = context_lens.tolist()
+        # Pre-gather KV from paged cache — all output shapes are static
+        # positions: [max_kv_len] — reused for both slot computation and mask
+        positions = torch.arange(max_kv_len, device=q_compute.device)
+        blk_idx = positions // block_size                      # [max_kv_len]
+        blk_off = positions % block_size                       # [max_kv_len]
 
-        atten_mask = _get_causal_mask(q_compute.device)
+        # slots[i, p] = flat cache index for (sequence i, KV position p)
+        # block_tables[:, blk_idx]: [B, max_kv_len] — static shape
+        slots = (
+            block_tables[:, blk_idx] * block_size + blk_off.unsqueeze(0)
+        ).clamp(0, n_blks_total * block_size - 1)              # [B, max_kv_len]
 
-        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-            query=q_compute.contiguous(),
-            key=k_flat,
-            value=v_flat,
+        # Gather: [B, max_kv_len, nkv, kdim] — static shape
+        k_flat = self.k_cache.view(-1, nkv, kdim)
+        v_flat = self.v_cache.view(-1, nkv, self.v_head_dim)
+        k_seq = k_flat[slots]                                  # [B, max_kv_len, nkv, kdim]
+        v_seq = v_flat[slots]                                  # [B, max_kv_len, nkv, v_head_dim]
+
+        # Transpose to BNSD: [B, nkv, max_kv_len, kdim]
+        k_bnsd = k_seq.permute(0, 2, 1, 3).contiguous()
+        v_bnsd = v_seq.permute(0, 2, 1, 3).contiguous()
+
+        # query BNSD: [B, num_heads, 1, head_dim]
+        q_bnsd = q_compute.unsqueeze(2)
+
+        # Build boolean attention mask instead of using actual_seq_lengths.
+        # Passing actual_seq_lengths as a device tensor causes CANN to read it via the
+        # copy_stream (host-side kernel configuration), which triggers
+        # AclrtSynchronizeStreamWithTimeout — forbidden inside ACL graph capture.
+        # A bool atten_mask is a normal on-device tensor: no copy_stream sync.
+        # npu_incre_flash_attention accepts bool/int8/uint8 for atten_mask;
+        # True = masked out (invalid/padding), False = attend to.
+        # valid[i, p] = True if position p is within sequence i's KV history.
+        valid = positions.unsqueeze(0) < context_lens.to(torch.int64).view(compute_bs, 1)
+        # atten_mask: [B, 1, 1, max_kv_len] bool — True for padding positions
+        atten_mask = (~valid).unsqueeze(1).unsqueeze(2)
+
+        attn_output = torch_npu.npu_incre_flash_attention(
+            query=q_bnsd,
+            key=k_bnsd,
+            value=v_bnsd,
             atten_mask=atten_mask,
-            block_table=block_tables,
-            input_layout="TND",
-            block_size=block_size,
-            actual_seq_lengths=actual_seq_lengths_q,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            num_key_value_heads=self.num_kv_heads,
             num_heads=self.num_heads,
-            scale=self.scale,
-            sparse_mode=3,
+            scale_value=self.scale,
+            input_layout="BNSD",
+            num_key_value_heads=self.num_kv_heads,
+            # actual_seq_lengths intentionally omitted: device tensor → copy_stream sync
         )
-        # attn_output: [compute_bs, num_heads, head_dim]
-        out = attn_output.view(compute_bs, self.num_heads, self.head_dim)
+        # attn_output: [B, num_heads, 1, head_dim]
+        out = attn_output.squeeze(2)                           # [B, num_heads, head_dim]
 
         # Pad back to original bs if needed (SP padding)
         if compute_bs < bs:
             pad = torch.zeros(
-                bs - compute_bs,
-                self.num_heads,
-                self.head_dim,
-                dtype=out.dtype,
-                device=out.device,
+                bs - compute_bs, self.num_heads, self.head_dim,
+                dtype=out.dtype, device=out.device,
             )
             out = torch.cat([out, pad], dim=0)
 

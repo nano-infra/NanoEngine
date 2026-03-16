@@ -561,6 +561,224 @@ class AscendTokenDispatcherNormal:
         return output.view(self.hidden_shape)
 
 
+def _allgather(tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+    """AllGather along dim=0. Output: [tensor.shape[0] * world_size, ...]"""
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        return tensor
+    output = torch.empty(
+        [tensor.shape[0] * world_size] + list(tensor.shape[1:]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    dist.all_gather_into_tensor(output, tensor, group=group)
+    return output
+
+
+def _reduce_scatter(tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+    """ReduceScatter(sum) along dim=0. Output: [tensor.shape[0] / world_size, ...]"""
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        return tensor
+    chunk_size = tensor.shape[0] // world_size
+    output = torch.empty(
+        [chunk_size] + list(tensor.shape[1:]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    dist.reduce_scatter_tensor(output, tensor, group=group)
+    return output
+
+
+class AscendTokenDispatcherAllGather:
+    """AllGather-based MoE dispatcher for Ascend NPU decode.
+
+    Fixed-shape collectives (AllGather/ReduceScatter) enable ACL graph capture.
+    Uses argsort to sort tokens by expert, then each EP rank computes only its
+    local experts.  Inverse permutation restores original token order with
+    weighted aggregation, and ReduceScatter sums contributions from all ranks.
+    """
+
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        num_experts: int,
+        num_local_experts: int,
+        hidden_size: int,
+        params_dtype: torch.dtype = None,
+        top_k: int = 1,
+    ):
+        self.group = group
+        self.ep_size = dist.get_world_size(group)
+        self.ep_rank = dist.get_rank(group)
+        self.num_experts = num_experts
+        self.num_local_experts = num_local_experts
+        self.hidden_size = hidden_size
+        self.params_dtype = params_dtype
+        self.top_k = top_k
+
+        # Expert index range for this EP rank
+        self.first_expert = self.ep_rank * self.num_local_experts
+        self.last_expert = self.first_expert + self.num_local_experts
+
+        # State saved between dispatch and combine
+        self._perm: Optional[torch.Tensor] = None
+        self._inv_perm: Optional[torch.Tensor] = None
+        self._topk_weights: Optional[torch.Tensor] = None
+        self._num_local_tokens: int = 0
+        self._active_num: int = 0
+        self._total_tokens: int = 0
+        self._top_k: int = 0
+        self._local_start: int = 0
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        """Dispatch tokens via AllGather + argsort-by-expert.
+
+        Output ``sorted_hidden`` is always ``[active_num, H]`` (fixed shape);
+        only the first ``sum(local_expert_tokens)`` rows contain real data.
+
+        Returns:
+            (sorted_hidden, topk_ids, topk_weights, local_expert_tokens,
+             group_list_type=1)
+        """
+        num_local_tokens = hidden_states.shape[0]
+        self._num_local_tokens = num_local_tokens
+
+        # 1. AllGather across EP group — fixed shapes
+        gathered_hidden = _allgather(hidden_states, self.group)      # [B*E, H]
+        gathered_topk_ids = _allgather(topk_ids, self.group)         # [B*E, K]
+        gathered_topk_weights = _allgather(topk_weights, self.group) # [B*E, K]
+
+        total_tokens = gathered_hidden.shape[0]
+        top_k = gathered_topk_ids.shape[1]
+        active_num = total_tokens * top_k
+        H = gathered_hidden.shape[1]
+        self._active_num = active_num
+        self._total_tokens = total_tokens
+        self._top_k = top_k
+
+        # 2. Pre-expand hidden: [T, H] -> [T*K, H]
+        x_expanded = (
+            gathered_hidden.unsqueeze(1)
+            .expand(-1, top_k, -1)
+            .reshape(-1, H)
+        )  # [T*K, H]
+
+        # 3. Sort by expert via argsort on flattened expert ids
+        #    Cast to float32 so argsort runs on AiCore (int32/int64 falls
+        #    back to AiCpu which is slower and may block graph capture).
+        flat_experts = gathered_topk_ids.reshape(-1)  # [T*K]
+        perm = flat_experts.to(torch.float32).argsort(stable=True)  # [T*K]
+        sorted_hidden_full = x_expanded[perm]          # [T*K, H] sorted by expert
+        sorted_experts = flat_experts[perm]            # [T*K] sorted experts
+
+        # Build inverse permutation for combine
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(active_num, device=perm.device,
+                                       dtype=perm.dtype)
+
+        # 4. Per-expert token counts (graph-capture-safe)
+        expert_tokens_all = torch.zeros(
+            self.num_experts, dtype=torch.int64, device=perm.device,
+        )
+        expert_tokens_all.scatter_add_(
+            0,
+            sorted_experts.to(torch.int64),
+            torch.ones(active_num, dtype=torch.int64, device=perm.device),
+        )
+
+        # 5. Extract local expert range
+        local_expert_tokens = expert_tokens_all[
+            self.first_expert : self.last_expert
+        ]
+        if self.first_expert > 0:
+            local_start_t = expert_tokens_all[: self.first_expert].sum()
+        else:
+            local_start_t = expert_tokens_all.new_zeros(())
+        self._local_start = local_start_t
+
+        # 6. Fixed-size extraction: always [active_num, H]
+        base = torch.arange(active_num, device=perm.device, dtype=torch.int64)
+        gather_idx = (base + local_start_t).clamp(max=active_num - 1)
+        sorted_hidden = sorted_hidden_full.index_select(0, gather_idx)
+
+        # 7. Zero out padding rows beyond local count
+        local_count_t = local_expert_tokens.sum()
+        data_mask = (base < local_count_t).unsqueeze(-1).to(sorted_hidden.dtype)
+        sorted_hidden = sorted_hidden * data_mask
+
+        # 8. Pad group_list so sum = active_num
+        local_expert_tokens_padded = local_expert_tokens.clone()
+        padding_needed = active_num - local_count_t
+        local_expert_tokens_padded[-1] = (
+            local_expert_tokens_padded[-1] + padding_needed
+        )
+
+        # Save for combine
+        self._perm = perm
+        self._inv_perm = inv_perm
+        self._topk_weights = gathered_topk_weights
+
+        return (
+            sorted_hidden,
+            topk_ids,
+            topk_weights,
+            local_expert_tokens_padded,
+            1,  # group_list_type = 1 (count mode for npu_grouped_matmul)
+        )
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor = None,
+        topk_weights: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Unpermute expert outputs and ReduceScatter back to local tokens.
+
+        Args:
+            hidden_states: expert compute output [active_num, H]
+        Returns:
+            [num_local_tokens, H]
+        """
+        # 1. Place local expert output back into full sorted array
+        full_sorted = torch.zeros(
+            self._active_num, self.hidden_size,
+            dtype=hidden_states.dtype, device=hidden_states.device,
+        )
+        base = torch.arange(
+            self._active_num, device=hidden_states.device, dtype=torch.int64,
+        )
+        scatter_idx = (base + self._local_start).clamp(max=self._active_num - 1)
+        full_sorted.scatter_add_(
+            0,
+            scatter_idx.unsqueeze(-1).expand_as(hidden_states),
+            hidden_states,
+        )
+
+        # 2. Unsort: reverse the argsort permutation → [T*K, H] in original
+        #    (i*K+k) order
+        unsorted = full_sorted[self._inv_perm]  # [T*K, H]
+
+        # 3. Apply weights and sum per original token
+        flat_weights = self._topk_weights.reshape(-1)  # [T*K]
+        weighted = unsorted * flat_weights.unsqueeze(-1).to(unsorted.dtype)
+
+        # Reshape to [T, K, H] and sum over K
+        per_token = weighted.reshape(
+            self._total_tokens, self._top_k, self.hidden_size
+        ).sum(dim=1)  # [T, H]
+
+        # 4. ReduceScatter across EP group
+        result = _reduce_scatter(per_token, self.group)  # [B, H]
+
+        return result[: self._num_local_tokens]
+
+
 class AscendTokenDispatcherLowLatency:
     """Decode EP dispatcher for Ascend NPU.
 
@@ -593,15 +811,17 @@ class AscendTokenDispatcherLowLatency:
             "ExpertContext must be warmed up (ascend_warmup) before creating dispatchers"
         )
         self.num_max_dispatch_tokens_per_rank = ctx.num_max_dispatch_tokens_per_rank
+        self.global_bs = ctx.num_max_dispatch_tokens_per_rank * self.ep_size
 
-        # Try to get process group name for MC2 ops
-        self.ep_group_name: Optional[str] = None
-        try:
-            from torch.distributed.distributed_c10d import _get_group_tag
+        # MC2 (npu_moe_distribute_dispatch/combine) requires >= 16 cards on A2
+        # (910B).  vllm-ascend falls back to AllGather when
+        # world_size_across_dp < 16 — see ascend_forward_context.py.
+        # Disable MC2 for now; use dist.all_to_all fallback instead.
+        self.moe_all_to_all_group_name: Optional[str] = None
+        # TODO: re-enable MC2 for >= 16 card setups (A2) or A3/A5 devices.
 
-            self.ep_group_name = _get_group_tag(group)
-        except Exception:
-            pass
+        self.enable_dispatch_v2 = False
+        self.need_extra_args = True  # A2/A3 need extra tp args; safe default
 
         self._dispatch_result = None
 
@@ -616,44 +836,97 @@ class AscendTokenDispatcherLowLatency:
         """Dispatch tokens for decode EP.
 
         Returns:
-            (packed_recv_hidden, recv_topk_idx, recv_topk_weights, masked_m, expected_m)
-            packed_recv_hidden: [num_local_experts, max_m, hidden_size]
-            masked_m:           [num_local_experts] int32 — actual token count per expert
-            expected_m:         int — upper bound on tokens per expert
+            (expand_x, topk_idx, topk_weights, expert_token_nums, group_list_type)
+
+            MC2 path:
+                expand_x:           FLAT [total_expanded, H]
+                expert_token_nums:  [num_local_experts] cumsum offsets (group_list)
+                group_list_type:    0 (cumsum offsets for npu_grouped_matmul)
+
+            Fallback path:
+                expand_x:           [num_local_experts, max_m, H] (padded)
+                expert_token_nums:  [num_local_experts] int32 actual counts
+                group_list_type:    -1 (sentinel: use bmm, not grouped_matmul)
         """
         topk_idx = topk_idx.to(torch.int64)
         num_tokens = hidden_states.shape[0]
         top_k = topk_idx.shape[1]
         ne = num_experts or self.num_experts
 
-        expected_m = (
-            num_tokens * self.ep_size * top_k + ne - 1
-        ) // ne
-
         # Try MC2 fused dispatch
         use_mc2 = False
-        if self.ep_group_name is not None:
+        assist_info = ep_recv_counts = tp_recv_counts = expand_scales = None
+
+        if self.moe_all_to_all_group_name is not None:
             try:
                 import torch_npu
 
-                recv_hidden, recv_expert_info = torch_npu.npu_moe_distribute_dispatch(
-                    hidden_states,
-                    topk_idx,
-                    self.ep_group_name,
-                    num_experts=ne,
-                    ep_world_size=self.ep_size,
-                    num_local_experts=self.num_local_experts,
+                expert_ids_i32 = topk_idx.to(torch.int32)
+
+                # --- Pre-dispatch diagnostics ---
+                # Sync NPU and barrier to ensure all ranks arrive together.
+                # If barrier hangs, some rank is stuck before MoE layer.
+                import sys as _sys
+                _rank = dist.get_rank() if dist.is_initialized() else -1
+                torch.npu.synchronize()
+                print(f"[MC2-DBG][R{_rank}] pre-barrier OK, "
+                      f"x.shape={hidden_states.shape} x.dtype={hidden_states.dtype} "
+                      f"expert_ids={expert_ids_i32.flatten().tolist()} "
+                      f"ne={ne} global_bs={self.global_bs} "
+                      f"ep_rank={self.ep_rank} ep_size={self.ep_size} "
+                      f"comm={self.moe_all_to_all_group_name} "
+                      f"v2={self.enable_dispatch_v2}",
+                      file=_sys.stderr, flush=True)
+                dist.barrier(group=self.group)
+                print(f"[MC2-DBG][R{_rank}] post-barrier OK, calling dispatch",
+                      file=_sys.stderr, flush=True)
+
+                kwargs_mc2 = {
+                    "x": hidden_states,
+                    "expert_ids": expert_ids_i32,
+                    "expert_shard_type": 0,
+                    "shared_expert_rank_num": 0,
+                    "moe_expert_num": ne,
+                    "global_bs": self.global_bs,
+                    "expert_token_nums_type": 0,
+                    "scales": None,
+                    "quant_mode": 0,
+                    "group_ep": self.moe_all_to_all_group_name,
+                    "ep_world_size": self.ep_size,
+                    "ep_rank_id": self.ep_rank,
+                }
+                if self.need_extra_args:
+                    kwargs_mc2.update({
+                        "group_tp": self.moe_all_to_all_group_name,
+                        "tp_world_size": 1,
+                        "tp_rank_id": 0,
+                    })
+
+                output_mc2 = (
+                    torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
+                    if self.enable_dispatch_v2
+                    else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
                 )
+                (expand_x, _, assist_info, expert_token_nums,
+                 ep_recv_counts, tp_recv_counts, expand_scales) = output_mc2[0:7]
+
+                # expand_x is FLAT [total_expanded, H] — do NOT reshape to [L, m, H].
+                # expert_token_nums is cumsum offsets (group_list_type=0) for
+                # npu_grouped_matmul routing.
                 use_mc2 = True
-                # recv_hidden: [num_local_experts * max_m, hidden_size]
-                # recv_expert_info: per-expert token counts, shape [num_local_experts]
-                masked_m = recv_expert_info.to(torch.int32)
-                max_m = max(int(masked_m.max().item()), 1)
-                packed_recv_hidden = recv_hidden.view(
-                    self.num_local_experts, max_m, self.hidden_size
+            except Exception as _mc2_err:
+                # Do NOT silently fall back to dist.all_to_all.
+                # If MC2 dispatch fails on one rank but succeeds on others, the
+                # fallback would call a different collective → permanent deadlock.
+                # Raise visibly so we can diagnose and fix the MC2 kwargs.
+                import logging as _logging
+                _logging.getLogger(__name__).error(
+                    "MC2 dispatch failed (%s: %s) — raising to prevent collective mismatch",
+                    type(_mc2_err).__name__, _mc2_err,
                 )
-            except Exception:
-                use_mc2 = False
+                raise RuntimeError(
+                    f"MC2 dispatch failed; silent fallback would deadlock: {_mc2_err}"
+                ) from _mc2_err
 
         # Initialize fallback-only variables so they are always defined for the state dict
         send_splits = recv_splits = masked_m = None
@@ -748,6 +1021,11 @@ class AscendTokenDispatcherLowLatency:
             "topk_idx": topk_idx,
             "topk_weights": topk_weights,
             "use_mc2": use_mc2,
+            # MC2-only fields:
+            "assist_info": assist_info,
+            "ep_recv_counts": ep_recv_counts,
+            "tp_recv_counts": tp_recv_counts,
+            "expand_scales": expand_scales,
             # fallback-only fields:
             "send_splits": send_splits if not use_mc2 else None,
             "recv_splits": recv_splits if not use_mc2 else None,
@@ -759,13 +1037,24 @@ class AscendTokenDispatcherLowLatency:
             "total_recv": total_recv if not use_mc2 else None,
         }
 
-        return (
-            packed_recv_hidden,
-            topk_idx,
-            topk_weights,
-            masked_m,
-            expected_m,
-        )
+        if use_mc2:
+            # MC2 path: return flat expand_x + cumsum group_list
+            return (
+                expand_x,               # flat [total_expanded, H]
+                topk_idx,
+                topk_weights,
+                expert_token_nums,       # [L] cumsum offsets (group_list)
+                0,                       # group_list_type = 0 (cumsum)
+            )
+        else:
+            # Fallback path: return padded [L, max_m, H]
+            return (
+                packed_recv_hidden,
+                topk_idx,
+                topk_weights,
+                masked_m,                # [L] actual counts
+                -1,                      # sentinel: use bmm path
+            )
 
     def combine(
         self,
@@ -777,23 +1066,62 @@ class AscendTokenDispatcherLowLatency:
         state = self._dispatch_result
         use_mc2 = state["use_mc2"]
 
-        if use_mc2 and self.ep_group_name is not None:
+        if use_mc2 and self.moe_all_to_all_group_name is not None:
             try:
                 import torch_npu
 
-                combined = torch_npu.npu_moe_distribute_combine(
-                    hidden_states,
-                    topk_idx,
-                    topk_weights.to(torch.float32),
-                    self.ep_group_name,
-                    num_experts=self.num_experts,
-                    ep_world_size=self.ep_size,
-                    num_local_experts=self.num_local_experts,
+                ep_recv_counts = state["ep_recv_counts"]
+                tp_recv_counts = state["tp_recv_counts"]
+                expand_scales  = state["expand_scales"]
+                assist_info    = state["assist_info"]
+
+                # hidden_states is already flat [total_expanded, H] from
+                # npu_grouped_matmul — pass directly to combine (no reshape).
+                kwargs_mc2 = {
+                    "expand_x": hidden_states,
+                    "expert_ids": topk_idx.to(torch.int32),
+                    "expert_scales": topk_weights.to(torch.float32),
+                    "expert_shard_type": 0,
+                    "shared_expert_rank_num": 0,
+                    "moe_expert_num": self.num_experts,
+                    "global_bs": self.global_bs,
+                    "ep_send_counts": ep_recv_counts,
+                    "group_ep": self.moe_all_to_all_group_name,
+                    "ep_world_size": self.ep_size,
+                    "ep_rank_id": self.ep_rank,
+                    "expand_scales": expand_scales,
+                }
+                if self.enable_dispatch_v2:
+                    kwargs_mc2["assist_info_for_combine"] = assist_info
+                else:
+                    kwargs_mc2["expand_idx"] = assist_info
+                if self.need_extra_args:
+                    kwargs_mc2.update({
+                        "tp_send_counts": tp_recv_counts,
+                        "group_tp": self.moe_all_to_all_group_name,
+                        "tp_world_size": 1,
+                        "tp_rank_id": 0,
+                    })
+
+                combined = (
+                    torch_npu.npu_moe_distribute_combine_v2(**kwargs_mc2)
+                    if self.enable_dispatch_v2
+                    else torch_npu.npu_moe_distribute_combine(**kwargs_mc2)
                 )
                 self._dispatch_result = None
                 return combined
-            except Exception:
-                pass
+            except Exception as _mc2_err:
+                # Do NOT silently fall back to dist.all_to_all.
+                # If MC2 combine fails on one rank after AllToAll already started on
+                # others, the fallback would call a different collective → deadlock.
+                import logging as _logging
+                _logging.getLogger(__name__).error(
+                    "MC2 combine failed (%s: %s) — raising to prevent collective mismatch",
+                    type(_mc2_err).__name__, _mc2_err,
+                )
+                raise RuntimeError(
+                    f"MC2 combine failed; silent fallback would deadlock: {_mc2_err}"
+                ) from _mc2_err
 
         # Fallback: reverse all_to_all and weighted scatter-add back to [N, H]
         orig_hidden   = state["hidden_states"]

@@ -23,16 +23,21 @@ def store_kvcache_npu(
         v_cache:      [num_blocks*block_size, num_heads, head_dim] (flattened view)
         slot_mapping: [N] int64 — target flat slot index per token (-1 = skip)
     """
-    valid_mask = slot_mapping != -1
-    if not valid_mask.any():
-        return
-
-    slots = slot_mapping[valid_mask]
-    # Flatten k_cache to [num_slots, num_kv_heads, head_dim] for index assignment
     k_flat = k_cache.view(-1, k_cache.shape[-2], k_cache.shape[-1])
     v_flat = v_cache.view(-1, v_cache.shape[-2], v_cache.shape[-1])
-    k_flat[slots] = key[valid_mask]
-    v_flat[slots] = value[valid_mask]
+    valid = slot_mapping >= 0                              # [N] bool, stays on NPU
+    # Route invalid (-1) slots to the last cache slot as a harmless dummy target.
+    # Decode (graph capture/replay) always has all-valid slots; prefill runs eager.
+    dummy_idx = k_flat.shape[0] - 1                       # Python int — compile-time const
+    safe_slots = torch.where(valid, slot_mapping,
+                             slot_mapping.new_full((), dummy_idx))  # [N], no D2H
+    vm = valid.view(-1, 1, 1)                              # [N, 1, 1]
+    # For invalid slots: gather existing cache value and write it back (true no-op).
+    # Output shape [N, num_heads, head_dim] is statically determined — ACL-graph safe.
+    k_flat.index_put_((safe_slots,), torch.where(vm, key, k_flat[safe_slots]),
+                      accumulate=False)
+    v_flat.index_put_((safe_slots,), torch.where(vm, value, v_flat[safe_slots]),
+                      accumulate=False)
 
 
 def store_kcache_npu(
@@ -47,10 +52,11 @@ def store_kcache_npu(
         k_cache:      [num_blocks*block_size, head_dim] (flattened view)
         slot_mapping: [N] int64 — target flat slot index per token (-1 = skip)
     """
-    valid_mask = slot_mapping != -1
-    if not valid_mask.any():
-        return
-
-    slots = slot_mapping[valid_mask]
     k_flat = k_cache.view(-1, k_cache.shape[-1])
-    k_flat[slots] = key[valid_mask]
+    valid = slot_mapping >= 0                              # [N] bool
+    dummy_idx = k_flat.shape[0] - 1
+    safe_slots = torch.where(valid, slot_mapping,
+                             slot_mapping.new_full((), dummy_idx))  # [N]
+    vm = valid.view(-1, 1)                                 # [N, 1]
+    k_flat.index_put_((safe_slots,), torch.where(vm, key, k_flat[safe_slots]),
+                      accumulate=False)

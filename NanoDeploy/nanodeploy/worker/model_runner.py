@@ -122,10 +122,6 @@ class ModelRunner:
 
         # Determine device type from config (supports "cuda" or "npu")
         device_type = getattr(config, "device_type", "cuda")
-        # Ascend NPU always runs in eager mode (no CUDA graph)
-        if device_type == "npu":
-            self.enforce_eager = True
-
         # Map device_type → CCL backend string.
         # env:// rendezvous is used universally: HCCL requires it and NCCL
         # supports it, so we always set MASTER_ADDR/MASTER_PORT and use env://.
@@ -263,6 +259,7 @@ class ModelRunner:
                     ep_size=ep_size,
                     num_local_experts=num_local_experts,
                     hidden_size=hf_config.hidden_size,
+                    num_max_dispatch_tokens_per_rank=config.max_num_seqs,
                 )
             else:
                 # CUDA: use standard warmup() with DeepEP
@@ -1012,6 +1009,9 @@ class ModelRunner:
                 if context.gdn_state_slots is not None:
                     graph_vars["gdn_state_slots"][:bs].copy_(context.gdn_state_slots)
 
+            if self._dev == "npu":
+                import torch_npu
+                torch_npu.npu.current_stream().synchronize()
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -1212,7 +1212,15 @@ class ModelRunner:
 
                 completed_graphs += 1
                 logger.info(f"正在捕获图 - (master_bs={master_bs}, attn_bs={attn_bs})")
-                graph = torch.cuda.CUDAGraph()
+                if self._dev == "npu":
+                    try:
+                        from torch_npu.npu.graph import NPUGraph as _NPUGraph
+                    except (ImportError, AttributeError):
+                        import torch_npu
+                        _NPUGraph = torch_npu.npu.NPUGraph
+                    graph = _NPUGraph()
+                else:
+                    graph = torch.cuda.CUDAGraph()
                 set_context(
                     is_prefill=False,
                     max_bs=self.config.max_num_seqs,
@@ -1249,22 +1257,40 @@ class ModelRunner:
                     ),
                 )
 
+                # Synchronize all ranks before warmup run — MC2 (AllToAll)
+                # requires all ranks to enter simultaneously.
+                dist.barrier(group=get_dist_context().cuda_world_group)
+
                 outputs[:master_bs] = self.model(
                     input_ids[:master_bs], positions[:master_bs]
                 )  # warmup
 
-                with torch.cuda.graph(graph, self.graph_pool):
+                # Synchronize again before entering the capture context.
+                dist.barrier(group=get_dist_context().cuda_world_group)
+
+                if self._dev == "npu":
+                    import torch_npu
+                    # Use torch.npu.graph (registered by torch_npu import).
+                    # NPU graphs do not support pool sharing — always pass pool=None.
+                    _graph_ctx = torch.npu.graph(graph)
+                else:
+                    _graph_ctx = torch.cuda.graph(graph, self.graph_pool)
+                with _graph_ctx:
                     outputs[:master_bs] = self.model(
                         input_ids[:master_bs], positions[:master_bs]
                     )  # capture
 
-                if self.graph_pool is None:
+                if self.graph_pool is None and self._dev != "npu":
                     self.graph_pool = graph.pool()
 
                 self.graphs[(master_bs, attn_bs)] = graph
                 self.graph_map[master_bs].append(attn_bs)
 
-                torch.cuda.synchronize()
+                if self._dev == "npu":
+                    import torch_npu
+                    torch_npu.npu.synchronize()
+                else:
+                    torch.cuda.synchronize()
                 dist.barrier(group=get_dist_context().cuda_world_group)
                 reset_context()
 
