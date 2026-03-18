@@ -20,7 +20,9 @@ from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanodeploy.layers.layernorm import RMSNorm
 from nanodeploy.layers.parallelism_transition import (
+    AttnDpToFfnTransition,
     AttnToFfnTransition,
+    FfnToAttnDpTransition,
     FfnToAttnTransition,
 )
 from nanodeploy.layers.rotary_embedding import get_rope
@@ -103,18 +105,52 @@ class Qwen3MoeAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
+        # Try to enable fused QKV+RMSNorm+RoPE Triton kernel (Ascend only)
+        self._fused_qkv_norm_rope = None
+        self._cos_sin_cache_bf16 = None
+        try:
+            from nanodeploy.backends.ascend.ops.fused_qkv_norm_rope import (
+                HAS_TRITON,
+                split_qkv_rmsnorm_rope,
+            )
+            if HAS_TRITON:
+                self._fused_qkv_norm_rope = split_qkv_rmsnorm_rope
+        except ImportError:
+            pass
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-        q, k = self.rotary_emb(positions, q, k)
+        if self._fused_qkv_norm_rope is not None:
+            # Cache bf16 cos_sin_cache (kernel uses bf16; insert_slice needs matching types)
+            if self._cos_sin_cache_bf16 is None:
+                self._cos_sin_cache_bf16 = (
+                    self.rotary_emb.cos_sin_cache.squeeze(1).to(torch.bfloat16)
+                )
+            q, k, v = self._fused_qkv_norm_rope(
+                qkv,
+                self._cos_sin_cache_bf16,
+                positions,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_size,
+                self.kv_size,
+                self.head_dim,
+                self.q_norm.eps,
+            )
+            q = q.view(-1, self.num_heads, self.head_dim)
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, self.num_kv_heads, self.head_dim)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
+            v = v.view(-1, self.num_kv_heads, self.head_dim)
+            q, k = self.rotary_emb(positions, q, k)
 
         o = self.attn(q, k, v)
 
@@ -255,12 +291,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         router_logits = self.gate(hidden_states)
 
-        # Softmax and routing
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # Fused softmax + topk + normalize on Ascend NPU
+        try:
+            import torch_npu
+
+            routing_weights, selected_experts, _ = (
+                torch_npu.npu_moe_gating_top_k_softmax(
+                    router_logits, finished=None, k=self.top_k
+                )
+            )
+        except (ImportError, AttributeError):
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(
+                routing_weights, self.top_k, dim=-1
+            )
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         context = get_context()
@@ -288,6 +333,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             hidden_states, selected_experts, routing_weights, is_prefill=is_prefill
         )
 
+        # Experts may DP-slice output (Ascend fused path), skip reshape then
+        if final_hidden_states.shape[0] != num_tokens:
+            return final_hidden_states
         return final_hidden_states.view(orig_shape)
 
 
@@ -336,16 +384,31 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         self.layer_idx = layer_idx
 
-        # Parallelism transition: when attn uses TP and FFN uses EP,
-        # we must redistribute tokens between the two phases.
+        # Parallelism transition: redistribute tokens between attn and FFN.
+        # Two independent transitions can compose:
+        #   DP gather/slice — when attention_dp > 1 (DP-replicated attn, full-TP FFN)
+        #   TP scatter/gather — when attn_tp > 1 and ffn_ep > 1 (asymmetric TP/EP)
         attn_tp = get_dist_context().attn_tp_world_size
+        attn_dp = get_dist_context().attn_dp_world_size
         ffn_ep = get_dist_context().ffn_ep_world_size
+
+        transitions_a2f = []
+        transitions_f2a = []
+
+        if attn_dp > 1:
+            dp_gather = AttnDpToFfnTransition()
+            dp_slice = FfnToAttnDpTransition(gather_layer=dp_gather)
+            transitions_a2f.append(dp_gather)
+            transitions_f2a.insert(0, dp_slice)
+
         if attn_tp > 1 and ffn_ep > 1:
-            self.attn_to_ffn = AttnToFfnTransition()
-            self.ffn_to_attn = FfnToAttnTransition(scatter_layer=self.attn_to_ffn)
-        else:
-            self.attn_to_ffn = nn.Identity()
-            self.ffn_to_attn = nn.Identity()
+            tp_scatter = AttnToFfnTransition()
+            tp_gather = FfnToAttnTransition(scatter_layer=tp_scatter)
+            transitions_a2f.append(tp_scatter)
+            transitions_f2a.insert(0, tp_gather)
+
+        self.attn_to_ffn = nn.Sequential(*transitions_a2f) if transitions_a2f else nn.Identity()
+        self.ffn_to_attn = nn.Sequential(*transitions_f2a) if transitions_f2a else nn.Identity()
 
     def forward(
         self,
