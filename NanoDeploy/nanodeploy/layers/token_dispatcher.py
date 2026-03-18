@@ -631,6 +631,29 @@ class AscendTokenDispatcherAllGather:
         self._top_k: int = 0
         self._local_start: int = 0
 
+        # Pre-allocated buffers (lazily sized on first dispatch, reused after).
+        # Eliminates per-call Range / OnesLike / ZerosLike kernel launches.
+        self._buf_active_num: int = 0
+        self._arange_buf: Optional[torch.Tensor] = None
+        self._ones_buf: Optional[torch.Tensor] = None
+        self._expert_count_buf: Optional[torch.Tensor] = None
+        self._full_sorted_buf: Optional[torch.Tensor] = None
+
+    def _ensure_buffers(self, active_num: int, device: torch.device):
+        """Allocate reusable buffers on first call; reuse on subsequent calls."""
+        if self._buf_active_num == active_num:
+            return
+        self._buf_active_num = active_num
+        self._arange_buf = torch.arange(
+            active_num, device=device, dtype=torch.int64,
+        )
+        self._ones_buf = torch.ones(
+            active_num, device=device, dtype=torch.float32,
+        )
+        self._expert_count_buf = torch.zeros(
+            self.num_experts, device=device, dtype=torch.float32,
+        )
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -662,6 +685,10 @@ class AscendTokenDispatcherAllGather:
         self._total_tokens = total_tokens
         self._top_k = top_k
 
+        # Pre-allocated buffers (no Range / OnesLike / ZerosLike per call)
+        self._ensure_buffers(active_num, hidden_states.device)
+        arange_buf = self._arange_buf      # [active_num] int64
+
         # 2. Pre-expand hidden: [T, H] -> [T*K, H]
         x_expanded = (
             gathered_hidden.unsqueeze(1)
@@ -677,20 +704,16 @@ class AscendTokenDispatcherAllGather:
         sorted_hidden_full = x_expanded[perm]          # [T*K, H] sorted by expert
         sorted_experts = flat_experts[perm]            # [T*K] sorted experts
 
-        # Build inverse permutation for combine
+        # Build inverse permutation for combine (reuse arange_buf)
         inv_perm = torch.empty_like(perm)
-        inv_perm[perm] = torch.arange(active_num, device=perm.device,
-                                       dtype=perm.dtype)
+        inv_perm[perm] = arange_buf
 
-        # 4. Per-expert token counts (graph-capture-safe)
-        expert_tokens_all = torch.zeros(
-            self.num_experts, dtype=torch.int64, device=perm.device,
+        # 4. Per-expert token counts (graph-capture-safe, float32 → AiCore)
+        self._expert_count_buf.zero_()
+        self._expert_count_buf.scatter_add_(
+            0, sorted_experts.to(torch.int64), self._ones_buf,
         )
-        expert_tokens_all.scatter_add_(
-            0,
-            sorted_experts.to(torch.int64),
-            torch.ones(active_num, dtype=torch.int64, device=perm.device),
-        )
+        expert_tokens_all = self._expert_count_buf.to(torch.int64)
 
         # 5. Extract local expert range
         local_expert_tokens = expert_tokens_all[
@@ -703,13 +726,12 @@ class AscendTokenDispatcherAllGather:
         self._local_start = local_start_t
 
         # 6. Fixed-size extraction: always [active_num, H]
-        base = torch.arange(active_num, device=perm.device, dtype=torch.int64)
-        gather_idx = (base + local_start_t).clamp(max=active_num - 1)
+        gather_idx = (arange_buf + local_start_t).clamp(max=active_num - 1)
         sorted_hidden = sorted_hidden_full.index_select(0, gather_idx)
 
         # 7. Zero out padding rows beyond local count
         local_count_t = local_expert_tokens.sum()
-        data_mask = (base < local_count_t).unsqueeze(-1).to(sorted_hidden.dtype)
+        data_mask = (arange_buf < local_count_t).unsqueeze(-1).to(sorted_hidden.dtype)
         sorted_hidden = sorted_hidden * data_mask
 
         # 8. Pad group_list so sum = active_num
@@ -745,15 +767,22 @@ class AscendTokenDispatcherAllGather:
         Returns:
             [num_local_tokens, H]
         """
+        arange_buf = self._arange_buf      # [active_num] int64
+
         # 1. Place local expert output back into full sorted array
-        full_sorted = torch.zeros(
+        if self._full_sorted_buf is None or self._full_sorted_buf.shape != (
             self._active_num, self.hidden_size,
-            dtype=hidden_states.dtype, device=hidden_states.device,
+        ):
+            self._full_sorted_buf = torch.zeros(
+                self._active_num, self.hidden_size,
+                dtype=hidden_states.dtype, device=hidden_states.device,
+            )
+        full_sorted = self._full_sorted_buf
+        full_sorted.zero_()
+
+        scatter_idx = (arange_buf + self._local_start).clamp(
+            max=self._active_num - 1,
         )
-        base = torch.arange(
-            self._active_num, device=hidden_states.device, dtype=torch.int64,
-        )
-        scatter_idx = (base + self._local_start).clamp(max=self._active_num - 1)
         full_sorted.scatter_add_(
             0,
             scatter_idx.unsqueeze(-1).expand_as(hidden_states),

@@ -173,10 +173,32 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device(device_type)
 
+        # Ascend NPU: let NPU lazily optimize tensor formats internally
+        # (zero memory overhead vs explicit NZ conversion).
+        # jit_compile=False enables eager mode for fused NPU kernels.
+        if device_type == "npu":
+            try:
+                import torch_npu
+                torch.npu.config.allow_internal_format = True
+                torch.npu.set_compile_mode(jit_compile=False)
+            except (ImportError, AttributeError):
+                pass
+
         # Device helpers used throughout this class for H2D tensor transfers
         self._dev = device_type
-        # pin_memory is a CUDA-only optimization; disable for NPU
-        self._pin = (device_type == "cuda")
+        # pin_memory enables truly async H2D transfers with non_blocking=True.
+        # Without it, PyTorch silently falls back to synchronous copies that
+        # block the host (~12 sync copies per decode step, ~94ms/step overhead).
+        # torch_npu supports pin_memory via aclrtMallocHost.
+        if device_type == "npu":
+            try:
+                _pin_test = torch.empty(1, pin_memory=True, device="cpu")
+                del _pin_test
+                self._pin = True
+            except Exception:
+                self._pin = False
+        else:
+            self._pin = (device_type == "cuda")
 
         sp_size = get_dist_context().attn_sp_world_size
         ep_size = get_dist_context().ffn_ep_world_size
@@ -209,21 +231,24 @@ class ModelRunner:
 
             os.makedirs(profiler_dir, exist_ok=True)
 
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-                schedule=None,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    dir_name=profiler_dir,
-                    worker_name=f"{self.engine_id}_rank_{rank}",
-                    use_gzip=False,
-                ),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True,
-            )
+            if self._dev == "npu":
+                self.profiler = self._create_npu_profiler(profiler_dir, rank)
+            else:
+                self.profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    schedule=None,
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                        dir_name=profiler_dir,
+                        worker_name=f"{self.engine_id}_rank_{rank}",
+                        use_gzip=False,
+                    ),
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                )
             logger.info(
                 f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, duration {self.profiler_steps} steps."
             )
@@ -281,15 +306,103 @@ class ModelRunner:
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
 
+        # Ascend NPU: prepare weights for efficient GroupedMatmul / fused GEMM
+        if device_type == "npu":
+            self._prepare_ascend_weights()
+
         dist.barrier()
 
         self.sampler = Sampler()
         if self._dev == "cuda" and not self.enforce_eager:
             self.sampler = torch.compile(self.sampler)
+
+        # Dedicated stream for updating graph_task_group params before replay
+        self._npu_update_stream = None
+        if self._dev == "npu" and not self.enforce_eager:
+            import torch_npu
+            self._npu_update_stream = torch.npu.Stream()
+
         self.preallocate_kvcache()
 
         # Vision embeddings fetched via RDMA from encoder (EP-separated mode)
         self._vision_embeds: dict[str, torch.Tensor] | None = None
+
+    # ------------------------------------------------------------------
+    # Ascend NPU: prepare weights for efficient GroupedMatmul / GEMM
+    # ------------------------------------------------------------------
+
+    def _prepare_ascend_weights(self):
+        """Pre-transpose MoE expert weights for npu_grouped_matmul.
+
+        No FRACTAL_NZ conversion — allow_internal_format=True lets the NPU
+        handle format optimization lazily with zero memory overhead (like
+        vllm-ascend).  Explicit NZ conversion wastes memory due to 16×16
+        tile padding and is incompatible with npu_mm_all_reduce_base in
+        BF16 mode.
+
+        MoE expert weights are pre-transposed + made contiguous so that
+        npu_grouped_matmul gets optimal layout.  Originals are freed to
+        keep net memory delta ≈ 0.
+        """
+        from nanodeploy.backends.ascend.layers.experts import (
+            AscendDistributedRoutedExperts,
+        )
+
+        moe_count = 0
+        for name, module in self.model.named_modules():
+            if isinstance(module, AscendDistributedRoutedExperts):
+                dev = module.gate_up_proj.data.device
+                dt = module.gate_up_proj.dtype
+
+                # gate_up: transpose → contiguous → cache → free original
+                gate_up_t = module.gate_up_proj.data.transpose(1, 2).contiguous()
+                module.gate_up_proj.data = torch.empty(0, dtype=dt, device=dev)
+                module._gate_up_proj_t = gate_up_t
+                moe_count += 1
+
+                # down: transpose → contiguous → cache → free original
+                down_t = module.down_proj.data.transpose(1, 2).contiguous()
+                module.down_proj.data = torch.empty(0, dtype=dt, device=dev)
+                module._down_proj_t = down_t
+                moe_count += 1
+
+        logger.info(f"Pre-transposed {moe_count} MoE expert weights for GroupedMatmul.")
+
+    # ------------------------------------------------------------------
+    # Ascend NPU profiler (torch_npu.profiler)
+    # ------------------------------------------------------------------
+
+    def _create_npu_profiler(self, profiler_dir: str, rank: int):
+        """Create an Ascend NPU profiler matching vllm-ascend's approach."""
+        import torch_npu
+
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=torch_npu.profiler.ExportType.Text,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            msprof_tx=False,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            l2_cache=False,
+            op_attr=False,
+            data_simplification=True,
+            record_op_args=False,
+            gc_detect_threshold=None,
+        )
+
+        return torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            schedule=None,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                profiler_dir,
+                worker_name=f"{self.engine_id}_rank_{rank}",
+            ),
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=False,
+            experimental_config=experimental_config,
+        )
 
     # ------------------------------------------------------------------
     # Vision embedding injection (EP-separated mode)
@@ -758,15 +871,20 @@ class ModelRunner:
                 .to(self._dev, non_blocking=True)
             )
 
+        # Use clamp instead of boolean indexing (tensor[tensor != 0] = 1)
+        # to avoid potential D2H sync from advanced indexing on NPU.
         q_mask = global_context_lens.clone()
         q_mask[sp_rank].fill_(0)
-        q_mask[q_mask != 0] = 1
+        q_mask.clamp_(max=1)
         res_lse_mask = context_lens.clone()
         res_lse_mask[sp_rank].fill_(0)
-        res_lse_mask[res_lse_mask != 0] = 1
+        res_lse_mask.clamp_(max=1)
 
+        # Keep CPU copy as Python list to avoid D2H .tolist() sync in
+        # update_graph_attention_params (saves one aclrtSynchronizeStream).
+        context_lens_for_attn_cpu = list(meta.context_lens_for_attn)
         context_lens_for_attn = torch.tensor(
-            meta.context_lens_for_attn, dtype=torch.int32, pin_memory=self._pin
+            context_lens_for_attn_cpu, dtype=torch.int32, pin_memory=self._pin
         ).to(self._dev, non_blocking=True)
 
         q_slice_get = torch.tensor(
@@ -838,6 +956,7 @@ class ModelRunner:
             res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
             context_lens_for_attn=context_lens_for_attn,
+            context_lens_for_attn_cpu=context_lens_for_attn_cpu,
             attention_compute_bs=attention_compute_bs,
             q_slice_get=q_slice_get,
             q_slice_fill=q_slice_fill,
@@ -873,6 +992,9 @@ class ModelRunner:
         context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
         # Update context lens for attention
         context.context_lens_for_attn[context.q_slice_fill.long()] += 1
+        # Invalidate CPU copy — device tensor was updated in-place, CPU list is stale.
+        # update_graph_attention_params will fall back to .tolist() for loop_count > 1.
+        context.context_lens_for_attn_cpu = None
 
         # Recalculate slot_mapping from context_lens and block_tables.
         # Simply doing slot_mapping.add_(1) is WRONG when a sequence's new
@@ -1009,9 +1131,21 @@ class ModelRunner:
                 if context.gdn_state_slots is not None:
                     graph_vars["gdn_state_slots"][:bs].copy_(context.gdn_state_slots)
 
-            if self._dev == "npu":
-                import torch_npu
-                torch_npu.npu.current_stream().synchronize()
+            # Update attention graph_task_group params with fresh seq lengths,
+            # then sync update_stream → main stream ONCE before replay.
+            if self._npu_update_stream is not None:
+                from nanodeploy.backends.ascend.layers.attention import (
+                    update_graph_attention_params,
+                )
+                update_graph_attention_params(
+                    self._npu_update_stream,
+                    context,
+                    attn_bs,
+                )
+                # GPU-side wait: main stream waits for update_stream without
+                # blocking the CPU (unlike synchronize() which stalls the host).
+                torch.npu.current_stream().wait_stream(self._npu_update_stream)
+
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -1085,15 +1219,22 @@ class ModelRunner:
                     positions.shape,
                     num_sp_seqs,
                 )
+
+            # Prepare temperature tensor BEFORE run_model so the H2D copy
+            # happens while the device is idle (before graph.replay() launches).
+            # Previously this ran AFTER run_model, causing aclrtMemcpy to
+            # host-block until graph.replay() completed (~120ms stall).
+            tp_rank = get_dist_context().attn_tp_rank
+            if tp_rank == 0:
+                temperatures = self.prepare_sample_from_aux(aux)
+
             logits = self.run_model(input_ids, positions, is_prefill)
 
             # Clear RDMA-fetched vision embeddings after prefill forward
             if is_prefill and self._vision_embeds is not None:
                 self._vision_embeds = None
 
-            tp_rank = get_dist_context().attn_tp_rank
             if tp_rank == 0:
-                temperatures = self.prepare_sample_from_aux(aux)
                 input_ids = self.sampler(logits, temperatures)
             else:
                 input_ids = input_ids.new_zeros([num_sp_seqs])
@@ -1193,6 +1334,18 @@ class ModelRunner:
 
         self.attn_bs_step = 16  # 定义 attn_bs 的步长
 
+        # Pre-initialise Ascend graph_task_group params for all capture batch sizes
+        if self._dev == "npu":
+            from nanodeploy.backends.ascend.layers.attention import init_graph_params
+            all_attn_bs = []
+            for _mbs in self.graph_master_rank_bs:
+                curr = _mbs
+                _limit = _mbs + config.max_num_recv_seqs
+                while curr <= _limit:
+                    all_attn_bs.append(curr)
+                    curr += self.attn_bs_step
+            init_graph_params(all_attn_bs)
+
         total_graphs = 0
 
         logger.info(f"开始捕获 CUDAGraph...")
@@ -1261,15 +1414,24 @@ class ModelRunner:
                 # requires all ranks to enter simultaneously.
                 dist.barrier(group=get_dist_context().cuda_world_group)
 
+                if self._dev == "npu":
+                    from nanodeploy.backends.ascend.layers import attention as _ascend_attn
+                    # Warmup mode: pre-computes FIA workspace (allocates device memory)
+                    # outside graph capture where sync/memcpy are allowed.
+                    _ascend_attn._NPU_GRAPH_MODE = "warmup"
+
                 outputs[:master_bs] = self.model(
                     input_ids[:master_bs], positions[:master_bs]
-                )  # warmup
+                )  # warmup (computes workspace on NPU, normal paged path on CUDA)
 
                 # Synchronize again before entering the capture context.
                 dist.barrier(group=get_dist_context().cuda_world_group)
 
                 if self._dev == "npu":
                     import torch_npu
+                    # Switch to graph_task_group capture path INSIDE graph context
+                    # (graph_task_group_begin requires stream to be in capture mode)
+                    _ascend_attn._NPU_GRAPH_MODE = "capture"
                     # Use torch.npu.graph (registered by torch_npu import).
                     # NPU graphs do not support pool sharing — always pass pool=None.
                     _graph_ctx = torch.npu.graph(graph)
@@ -1279,6 +1441,9 @@ class ModelRunner:
                     outputs[:master_bs] = self.model(
                         input_ids[:master_bs], positions[:master_bs]
                     )  # capture
+
+                if self._dev == "npu":
+                    _ascend_attn._NPU_GRAPH_MODE = "replay"
 
                 if self.graph_pool is None and self._dev != "npu":
                     self.graph_pool = graph.pool()

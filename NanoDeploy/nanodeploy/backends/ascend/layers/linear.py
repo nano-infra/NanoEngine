@@ -21,10 +21,23 @@ from nanodeploy.backends.base_backend import (
 )
 from nanodeploy.context.distributed import get_dist_context
 
+ACL_FORMAT_FRACTAL_NZ = 29
+
 
 def _divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
+
+
+def _maybe_cast_nz(weight: torch.Tensor) -> torch.Tensor:
+    """Convert BF16/FP16 weight to FRACTAL_NZ format for faster matmul on Ascend NPU."""
+    if weight.dtype not in (torch.bfloat16, torch.float16):
+        return weight
+    try:
+        import torch_npu
+        return torch_npu.npu_format_cast(weight.contiguous(), ACL_FORMAT_FRACTAL_NZ)
+    except (ImportError, AttributeError, RuntimeError):
+        return weight
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +291,8 @@ class AscendQKVParallelLinear(_AscendLinearMixin, QKVParallelLinearBase):
 
 class AscendRowParallelLinear(_AscendLinearMixin, RowParallelLinearBase):
 
+    _hcomm_cache: dict[int, str] = {}  # group-id → hccl comm name
+
     def __init__(
         self,
         input_size: int,
@@ -303,6 +318,28 @@ class AscendRowParallelLinear(_AscendLinearMixin, RowParallelLinearBase):
             tp_group=tp_group,
         )
 
+        # Try to get HCCL comm name for fused matmul+allreduce
+        self._hcomm_info: str | None = None
+        if self.tp_size > 1:
+            self._hcomm_info = self._get_hcomm_info(self._tp_group)
+
+    @classmethod
+    def _get_hcomm_info(cls, group: dist.ProcessGroup) -> str | None:
+        """Get HCCL comm name for npu_mm_all_reduce_base."""
+        gid = id(group)
+        if gid in cls._hcomm_cache:
+            return cls._hcomm_cache[gid]
+        try:
+            rank = dist.get_rank(group)
+            global_rank = dist.get_global_rank(group, rank)
+            backend = group._get_backend(torch.device("npu"))
+            hcomm = backend.get_hccl_comm_name(global_rank)
+            cls._hcomm_cache[gid] = hcomm
+            return hcomm
+        except (AttributeError, RuntimeError):
+            cls._hcomm_cache[gid] = None
+            return None
+
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str = None
     ):
@@ -313,8 +350,14 @@ class AscendRowParallelLinear(_AscendLinearMixin, RowParallelLinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        bias = self.bias if self.tp_rank == 0 else None
+        if self._hcomm_info is not None:
+            # Fused matmul + HCCL all-reduce (single kernel launch)
+            import torch_npu
+            return torch_npu.npu_mm_all_reduce_base(
+                x, self.weight.t(), self._hcomm_info, bias=bias
+            )
+        y = F.linear(x, self.weight, bias)
         if self.tp_size > 1:
-            # HCCL all-reduce (torch.distributed works transparently with HCCL on NPU)
             dist.all_reduce(y, group=self._tp_group)
         return y

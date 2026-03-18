@@ -47,6 +47,9 @@ class Context:
     # used for all2all q transfer
     q_offsets: torch.Tensor | None = None
     context_lens_for_attn: torch.Tensor | None = None
+    # CPU copy of context_lens_for_attn (Python list) — avoids D2H .tolist()
+    # sync in update_graph_attention_params.
+    context_lens_for_attn_cpu: list | None = None
 
     # GatedDeltaNet state buffers (for mixed attention models like Qwen3.5-MoE)
     # conv_states: [num_layers, num_slots, conv_dim, kernel_size]
@@ -92,6 +95,7 @@ def set_context(
     attention_compute_bs: Optional[int] = None,
     q_offsets: Optional[torch.Tensor] = None,
     context_lens_for_attn: Optional[torch.Tensor] = None,
+    context_lens_for_attn_cpu: list | None = None,
     gdn_conv_states: Optional[torch.Tensor] = None,
     gdn_recurrent_states: Optional[torch.Tensor] = None,
     gdn_state_slots: Optional[torch.Tensor] = None,
@@ -125,6 +129,7 @@ def set_context(
         attention_compute_bs=attention_compute_bs,
         q_offsets=q_offsets,
         context_lens_for_attn=context_lens_for_attn,
+        context_lens_for_attn_cpu=context_lens_for_attn_cpu,
         gdn_conv_states=gdn_conv_states,
         gdn_recurrent_states=gdn_recurrent_states,
         gdn_state_slots=gdn_state_slots,

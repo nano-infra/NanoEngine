@@ -65,8 +65,8 @@ class Config(BaseModel):
 
     # profiler
     enable_profiler: bool = False
-    profiler_start_step: int = 40
-    profiling_step: int = 16
+    profiler_start_step: int = 16
+    profiling_step: int = 32
     profiler_dir: str = "./profiler_res"
 
     # logging config – override via NANODEPLOY_LOG_LEVEL env var
