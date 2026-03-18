@@ -179,12 +179,6 @@ class FfnToAttnDpTransition(nn.Module):
 
         padded_bs = self._gather_layer._padded_bs
         orig_bs = self._gather_layer._original_bs
-
-        # If experts already DP-sliced the output (Ascend decode path),
-        # the tensor is smaller than padded_bs * dp — pass through.
-        if hidden_states.shape[0] < padded_bs * dp:
-            return hidden_states
-
         dp_rank = ctx.attn_dp_rank
         # hidden_states: [padded_bs * dp, H] — slice out this rank's portion,
         # trimming any padding added during prefill.

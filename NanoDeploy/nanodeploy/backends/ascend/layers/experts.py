@@ -52,12 +52,6 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
         self.tp_group = tp_group
         self.is_fp8 = False  # BF16-only
 
-        # DP context for fused DP-slice-before-allreduce optimisation
-        from nanodeploy.context.distributed import get_dist_context
-        _dctx = get_dist_context()
-        self.dp_rank = _dctx.attn_dp_rank
-        self.dp_world_size = _dctx.attn_dp_world_size
-
         assert (
             num_experts % ep_size == 0
         ), f"num_experts {num_experts} must be divisible by ep_size {ep_size}"
@@ -151,18 +145,12 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        dp_slice: bool = False,
     ) -> torch.Tensor:
         """Fused npu_moe_init_routing + npu_grouped_matmul + npu_moe_token_unpermute.
 
         Uses fused NPU MoE routing ops for token permutation, expert counting,
         and weighted unpermutation. Falls back to manual argsort path if the
         fused ops are unavailable.
-
-        Args:
-            dp_slice: When True and dp_world_size > 1, slice output by dp_rank
-                before allreduce to halve communication volume.  Only safe when
-                batch sizes are uniform across DP ranks (decode).
         """
         import torch_npu
 
@@ -171,9 +159,9 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
         active_num = T * K
 
         try:
-            return self._npu_fused_moe(torch_npu, hidden_states, topk_ids, topk_weights, T, H, K, active_num, dp_slice)
+            return self._npu_fused_moe(torch_npu, hidden_states, topk_ids, topk_weights, T, H, K, active_num)
         except (AttributeError, RuntimeError):
-            return self._npu_manual_moe(torch_npu, hidden_states, topk_ids, topk_weights, T, H, K, active_num, dp_slice)
+            return self._npu_manual_moe(torch_npu, hidden_states, topk_ids, topk_weights, T, H, K, active_num)
 
     def _npu_fused_moe(
         self,
@@ -182,7 +170,6 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         T: int, H: int, K: int, active_num: int,
-        dp_slice: bool = False,
     ) -> torch.Tensor:
         """Fast path: fused npu_moe_init_routing_v2 + npu_moe_token_unpermute."""
         # 1. Fused sort + expand + expert counting
@@ -231,13 +218,7 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
             probs=topk_weights,
         )
 
-        # 6. DP slice (halves allreduce volume when attention_dp > 1, decode only)
-        if dp_slice and self.dp_world_size > 1:
-            tokens_per_rank = output.shape[0] // self.dp_world_size
-            start = self.dp_rank * tokens_per_rank
-            output = output[start : start + tokens_per_rank].contiguous()
-
-        # 7. TP AllReduce (async for graph-captured overlap)
+        # 6. TP AllReduce (async for graph-captured overlap)
         if self.tp_size > 1 and self.tp_group is not None:
             work = dist.all_reduce(output, group=self.tp_group, async_op=True)
             work.wait()
@@ -251,7 +232,6 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         T: int, H: int, K: int, active_num: int,
-        dp_slice: bool = False,
     ) -> torch.Tensor:
         """Fallback: manual argsort + scatter_add + IndexPutV2."""
         # 1. Expand: [T, H] -> [T*K, H]
@@ -302,13 +282,7 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
         weighted = unsorted * flat_weights
         output = weighted.reshape(T, K, H).sum(dim=1)
 
-        # 8. DP slice (halves allreduce volume when attention_dp > 1, decode only)
-        if dp_slice and self.dp_world_size > 1:
-            tokens_per_rank = output.shape[0] // self.dp_world_size
-            start = self.dp_rank * tokens_per_rank
-            output = output[start : start + tokens_per_rank].contiguous()
-
-        # 9. TP AllReduce (async for graph-captured overlap)
+        # 8. TP AllReduce (async for graph-captured overlap)
         if self.tp_size > 1 and self.tp_group is not None:
             work = dist.all_reduce(output, group=self.tp_group, async_op=True)
             work.wait()
@@ -329,7 +303,7 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        return self._npu_grouped_matmul_moe(hidden_states, topk_ids, topk_weights, dp_slice=True)
+        return self._npu_grouped_matmul_moe(hidden_states, topk_ids, topk_weights)
 
     # ------------------------------------------------------------------
     # EP > 1: Prefill (AllGather path via AscendTokenDispatcherNormal)
@@ -466,12 +440,6 @@ class AscendDistributedRoutedExperts(DistributedRoutedExpertsBase):
 
         # Unpermute/combine before allreduce (linear ops commute)
         result = dispatcher.combine(down_output, recv_topk_idx, recv_topk_weights)
-
-        # DP slice (halves allreduce volume when attention_dp > 1)
-        if self.dp_world_size > 1:
-            tokens_per_rank = result.shape[0] // self.dp_world_size
-            start = self.dp_rank * tokens_per_rank
-            result = result[start : start + tokens_per_rank].contiguous()
 
         # TP AllReduce (async for graph-captured overlap)
         if self.tp_size > 1 and self.tp_group is not None:

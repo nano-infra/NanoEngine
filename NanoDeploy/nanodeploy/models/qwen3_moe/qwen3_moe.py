@@ -333,9 +333,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             hidden_states, selected_experts, routing_weights, is_prefill=is_prefill
         )
 
-        # Experts may DP-slice output (Ascend fused path), skip reshape then
-        if final_hidden_states.shape[0] != num_tokens:
-            return final_hidden_states
         return final_hidden_states.view(orig_shape)
 
 

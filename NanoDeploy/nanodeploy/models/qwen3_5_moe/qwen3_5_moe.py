@@ -336,17 +336,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             hidden_states, selected_experts, routing_weights, is_prefill=is_prefill
         )
 
-        # Experts may DP-slice output (Ascend fused path); slice shared_out to match
-        if final_hidden_states.shape[0] != num_tokens:
-            dp_ctx = get_dist_context()
-            tpr = num_tokens // dp_ctx.attn_dp_world_size
-            start = dp_ctx.attn_dp_rank * tpr
-            shared_out = shared_out[start : start + tpr]
-
         final_hidden_states = final_hidden_states + shared_out
-
-        if final_hidden_states.shape[0] != num_tokens:
-            return final_hidden_states
         return final_hidden_states.view(orig_shape)
 
 
