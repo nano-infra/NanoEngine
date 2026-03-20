@@ -33,7 +33,9 @@ from nanodeploy.layers.activation import SiluAndMul
 from nanodeploy.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanodeploy.layers.layernorm import RMSNorm
 from nanodeploy.layers.parallelism_transition import (
+    AttnDpToFfnTransition,
     AttnToFfnTransition,
+    FfnToAttnDpTransition,
     FfnToAttnTransition,
 )
 from nanodeploy.layers.rotary_embedding import get_rope
@@ -310,12 +312,21 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
         router_logits = self.gate(hidden_states)
 
-        # Softmax and routing
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # Fused softmax + topk + normalize on Ascend NPU
+        try:
+            import torch_npu
+
+            routing_weights, selected_experts, _ = (
+                torch_npu.npu_moe_gating_top_k_softmax(
+                    router_logits, finished=None, k=self.top_k
+                )
+            )
+        except (ImportError, AttributeError):
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(
+                routing_weights, self.top_k, dim=-1
+            )
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         context = get_context()
@@ -376,15 +387,28 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=True
         )
 
-        # Parallelism transition
+        # Parallelism transition: redistribute tokens between attn and FFN.
         attn_tp = get_dist_context().attn_tp_world_size
+        attn_dp = get_dist_context().attn_dp_world_size
         ffn_ep = get_dist_context().ffn_ep_world_size
+
+        transitions_a2f = []
+        transitions_f2a = []
+
+        if attn_dp > 1:
+            dp_gather = AttnDpToFfnTransition()
+            dp_slice = FfnToAttnDpTransition(gather_layer=dp_gather)
+            transitions_a2f.append(dp_gather)
+            transitions_f2a.insert(0, dp_slice)
+
         if attn_tp > 1 and ffn_ep > 1:
-            self.attn_to_ffn = AttnToFfnTransition()
-            self.ffn_to_attn = FfnToAttnTransition(scatter_layer=self.attn_to_ffn)
-        else:
-            self.attn_to_ffn = nn.Identity()
-            self.ffn_to_attn = nn.Identity()
+            tp_scatter = AttnToFfnTransition()
+            tp_gather = FfnToAttnTransition(scatter_layer=tp_scatter)
+            transitions_a2f.append(tp_scatter)
+            transitions_f2a.insert(0, tp_gather)
+
+        self.attn_to_ffn = nn.Sequential(*transitions_a2f) if transitions_a2f else nn.Identity()
+        self.ffn_to_attn = nn.Sequential(*transitions_f2a) if transitions_f2a else nn.Identity()
 
     def forward(
         self,

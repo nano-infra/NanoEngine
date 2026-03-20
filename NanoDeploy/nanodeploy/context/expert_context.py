@@ -1,6 +1,10 @@
 from typing import Optional
 
-import deep_ep
+try:
+    import deep_ep
+except ImportError:
+    deep_ep = None
+
 import torch
 
 
@@ -8,10 +12,10 @@ class ExpertContext:
     _instance: Optional["ExpertContext"] = None
 
     def __init__(self):
-        self.buffer: Optional[deep_ep.Buffer] = None
+        self.buffer = None  # deep_ep.Buffer or None
         self.ep_size: int = 1
         self.is_fp8: bool = False
-        self.num_sms: int = deep_ep.Buffer.num_sms  # Default from DeepEP (20)
+        self.num_sms: int = deep_ep.Buffer.num_sms if deep_ep is not None else 20
         self.warmup_called: bool = False
         self.num_max_dispatch_tokens_per_rank: int = 128  # DLBlas default
         self.num_local_experts: int = 0
@@ -55,7 +59,10 @@ class ExpertContext:
             self.warmup_called = True
             return
 
-        assert deep_ep is not None, "DeepEP library is required when ep_size > 1"
+        assert deep_ep is not None, (
+            "DeepEP library is required when ep_size > 1. "
+            "For Ascend NPU use ascend_warmup() instead."
+        )
         assert torch.cuda.is_available(), "CUDA must be available for DeepEP"
 
         # num_max_dispatch_tokens_per_rank: align with DLBlas default of 128
@@ -114,7 +121,32 @@ class ExpertContext:
 
         self.warmup_called = True
 
-    def get_buffer(self) -> Optional[deep_ep.Buffer]:
+    def ascend_warmup(
+        self,
+        ep_group: torch.distributed.ProcessGroup,
+        ep_size: int,
+        num_local_experts: int,
+        hidden_size: int,
+        num_max_dispatch_tokens_per_rank: int = 128,
+    ) -> None:
+        """Ascend NPU substitute for warmup() — skips DeepEP buffer creation.
+
+        Marks warmup done and stores EP metadata so dispatchers can be
+        instantiated.  The Ascend dispatchers use AllGather/ReduceScatter
+        (HCCL) and torch_npu MoE routing ops.
+        """
+        if self.warmup_called:
+            return
+        self.ep_group = ep_group
+        self.ep_size = ep_size
+        self.num_local_experts = num_local_experts
+        self.num_experts = num_local_experts * ep_size
+        self.hidden_size = hidden_size
+        self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        self.buffer = None  # Ascend dispatchers use AllGather/ReduceScatter
+        self.warmup_called = True
+
+    def get_buffer(self):
         """获取当前实例的 DeepEP Buffer，如果未初始化或单卡则返回 None"""
         return self.buffer
 

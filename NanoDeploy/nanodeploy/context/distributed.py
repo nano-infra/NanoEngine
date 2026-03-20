@@ -1,5 +1,5 @@
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -30,6 +30,9 @@ class DistContext:
     ffn_tp: int = 1
 
     pp: int = 1
+
+    # Device type: "cuda" (default) or "npu" for Ascend NPU
+    device_type: str = "cuda"
 
     @property
     def attn_dp_rank(self):
@@ -161,18 +164,19 @@ class DistContext:
             "cpu", (self.world_size,), mesh_dim_names=("world",)
         )
 
+        # Use device_type for accelerator meshes ("cuda" or "npu")
         self.cuda_world_mesh = init_device_mesh(
-            "cuda", (self.world_size,), mesh_dim_names=("world",)
+            self.device_type, (self.world_size,), mesh_dim_names=("world",)
         )
 
         self.attn_device_mesh = init_device_mesh(
-            "cuda",
+            self.device_type,
             (self.attention_dp, self.attention_sp, self.attention_tp),
             mesh_dim_names=("attn_dp", "attn_sp", "attn_tp"),
         )
 
         self.ffn_device_mesh = init_device_mesh(
-            "cuda",
+            self.device_type,
             (self.ffn_dp, self.ffn_ep, self.ffn_tp),
             mesh_dim_names=("ffn_dp", "ffn_ep", "ffn_tp"),
         )
@@ -195,6 +199,7 @@ def set_dist_context(
     ffn_ep=1,
     ffn_tp=1,
     pp=1,
+    device_type: str = "cuda",
 ):
     global _DIST_CONTEXT
     _DIST_CONTEXT = DistContext(
@@ -207,6 +212,7 @@ def set_dist_context(
         ffn_ep=ffn_ep,
         ffn_tp=ffn_tp,
         pp=pp,
+        device_type=device_type,
     )
 
 

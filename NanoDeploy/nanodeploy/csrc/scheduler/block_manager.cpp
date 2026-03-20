@@ -2,7 +2,8 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "nanocommon/xxhash.hpp"
+#define XXH_INLINE_ALL
+#include "nanocommon/xxhash.h"
 #include "nanosequence/csrc/sequence/sequence.h"
 
 #include "sequence_generated.h"
@@ -31,12 +32,13 @@ int64_t BlockManager::compute_hash(const std::vector<int>& token_ids, int64_t pr
 
 int64_t BlockManager::compute_hash(const int* token_ids, size_t size, int64_t prefix)
 {
-    xxh::hash_state64_t state;
+    XXH64_state_t state;
+    XXH64_reset(&state, 0);
     if (prefix != -1) {
-        state.update(&prefix, sizeof(prefix));
+        XXH64_update(&state, &prefix, sizeof(prefix));
     }
-    state.update(token_ids, size * sizeof(int));
-    return static_cast<int64_t>(state.digest());
+    XXH64_update(&state, token_ids, size * sizeof(int));
+    return static_cast<int64_t>(XXH64_digest(&state));
 }
 
 Block& BlockManager::allocate_block(int block_id)

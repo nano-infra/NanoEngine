@@ -215,3 +215,7 @@ scripts/.bin/
 
 # vibe-codinig
 .claude
+
+# nanoinfra
+**/profiler_res*/*
+

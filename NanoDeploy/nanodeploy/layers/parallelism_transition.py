@@ -79,9 +79,13 @@ class FfnToAttnTransition(nn.Module):
         dst_tp = ctx.attn_tp_world_size
         if dst_tp <= 1:
             return hidden_states
-        gathered = [torch.empty_like(hidden_states) for _ in range(dst_tp)]
-        dist.all_gather(gathered, hidden_states, group=ctx.attn_tp_group)
-        out = torch.cat(gathered, dim=0)
+        out = torch.empty(
+            dst_tp * hidden_states.shape[0],
+            hidden_states.shape[1],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        dist.all_gather_into_tensor(out, hidden_states, group=ctx.attn_tp_group)
 
         # Strip padding if AttnToFfnTransition padded the batch
         if self._scatter_layer is not None and self._scatter_layer._original_bs > 0:
@@ -90,3 +94,93 @@ class FfnToAttnTransition(nn.Module):
                 out = out[:original_bs]
 
         return out
+
+
+class AttnDpToFfnTransition(nn.Module):
+    """AllGather across attn_dp group to give all ranks all tokens before FFN.
+
+    When attention uses DP replication (attention_dp > 1), each DP group holds
+    a different subset of tokens.  Before entering FFN with full TP (no EP),
+    all ranks need all tokens.  This layer AllGathers along the DP dimension.
+
+    During prefill (eager), DP groups may have different batch sizes (real
+    prompt vs dummy).  We AllReduce(max) to find the largest batch, pad the
+    smaller ones, then AllGather.  During decode (graph capture/replay),
+    batch sizes are guaranteed equal so padding is skipped.
+
+    When attention_dp <= 1, this is a no-op.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._original_bs: int = 0
+        self._padded_bs: int = 0
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from nanodeploy.context.context import get_context
+
+        ctx = get_dist_context()
+        dp = ctx.attn_dp_world_size
+        if dp <= 1:
+            return hidden_states
+
+        self._original_bs = hidden_states.shape[0]
+
+        # Prefill: DP groups may have different token counts (real vs dummy).
+        # Decode / graph capture: sizes are uniform, skip the AllReduce+pad.
+        if get_context().is_prefill:
+            local_bs = torch.tensor(
+                [hidden_states.shape[0]],
+                device=hidden_states.device,
+                dtype=torch.int64,
+            )
+            dist.all_reduce(local_bs, op=dist.ReduceOp.MAX, group=ctx.attn_dp_group)
+            max_bs = local_bs.item()
+            if hidden_states.shape[0] < max_bs:
+                hidden_states = F.pad(
+                    hidden_states, (0, 0, 0, max_bs - hidden_states.shape[0])
+                )
+        else:
+            max_bs = hidden_states.shape[0]
+
+        self._padded_bs = max_bs
+
+        # all_gather_into_tensor avoids ConcatD kernel (~2ms/step).
+        # Buffer allocated inside forward so graph capture records it.
+        gather_buf = torch.empty(
+            dp * hidden_states.shape[0],
+            hidden_states.shape[1],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        dist.all_gather_into_tensor(gather_buf, hidden_states, group=ctx.attn_dp_group)
+        return gather_buf
+
+
+class FfnToAttnDpTransition(nn.Module):
+    """Slice by attn_dp_rank to restore DP-local tokens after FFN.
+
+    The inverse of ``AttnDpToFfnTransition``: after the FFN phase produces
+    output for all tokens, each DP group slices out only its own tokens.
+    Handles padding introduced by the gather layer during prefill.
+
+    When attention_dp <= 1, this is a no-op.
+    """
+
+    def __init__(self, gather_layer: "AttnDpToFfnTransition") -> None:
+        super().__init__()
+        self._gather_layer = gather_layer
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        ctx = get_dist_context()
+        dp = ctx.attn_dp_world_size
+        if dp <= 1:
+            return hidden_states
+
+        padded_bs = self._gather_layer._padded_bs
+        orig_bs = self._gather_layer._original_bs
+        dp_rank = ctx.attn_dp_rank
+        # hidden_states: [padded_bs * dp, H] — slice out this rank's portion,
+        # trimming any padding added during prefill.
+        start = dp_rank * padded_bs
+        return hidden_states[start : start + orig_bs].contiguous()

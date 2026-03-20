@@ -1,6 +1,9 @@
 import os
 
-import flash_mla
+try:
+    import flash_mla
+except ImportError:
+    flash_mla = None
 import numpy as np
 import ray
 import torch
@@ -44,7 +47,6 @@ architectures = {
 }
 
 
-@ray.remote(num_cpus=0.1, num_gpus=1)
 class ModelRunner:
     def __init__(self, config: Config, rank: int, defer_dist_init: bool = False):
         # Set log level
@@ -58,6 +60,10 @@ class ModelRunner:
         self.world_size = config.attn_world_size
         self.rank = rank
         self._dist_initialized = False
+        # Device-type helpers (set properly in _complete_dist_init)
+        _dtype = getattr(config, "device_type", "cuda")
+        self._dev = _dtype
+        self._pin = (_dtype == "cuda")
 
         # Sync C++ Sequence.block_size with Python kvcache_block_size
         from nanodeploy._cpp import Sequence as _Seq
@@ -109,22 +115,46 @@ class ModelRunner:
     # ------------------------------------------------------------------
 
     def _complete_dist_init(self):
-        """Phase-2 init: process group, contexts, CUDA, model, etc."""
+        """Phase-2 init: process group, contexts, device, model, etc."""
         config = self.config
         hf_config = config.hf_config
         rank = self.rank
 
-        torch.manual_seed(0)
-        torch.cuda.manual_seed_all(0)
+        # Determine device type from config (supports "cuda" or "npu")
+        device_type = getattr(config, "device_type", "cuda")
+        # Map device_type → CCL backend string.
+        # env:// rendezvous is used universally: HCCL requires it and NCCL
+        # supports it, so we always set MASTER_ADDR/MASTER_PORT and use env://.
+        _CCL_BACKEND = {
+            "cuda": "cpu:gloo,cuda:nccl",
+            "npu":  "hccl",
+        }
+        ccl_backend = _CCL_BACKEND.get(device_type, f"{device_type}:gloo")
 
-        torch.cuda.set_device(0)
+        import os
+        master_host, master_port = config.master_address.rsplit(":", 1)
+        os.environ["MASTER_ADDR"] = master_host
+        os.environ["MASTER_PORT"] = master_port
+
+        torch.manual_seed(0)
+
+        if device_type == "npu":
+            import torch_npu
+            torch_npu.npu.manual_seed_all(0)
+            # Ray sets ASCEND_VISIBLE_DEVICES so each worker sees exactly one
+            # NPU as device 0 — mirrors how CUDA workers use set_device(0).
+            torch_npu.npu.set_device(0)
+        else:
+            torch.cuda.manual_seed_all(0)
+            torch.cuda.set_device(0)
 
         dist.init_process_group(
-            "cpu:gloo,cuda:nccl",
-            f"tcp://{config.master_address}",
+            backend=ccl_backend,
+            init_method="env://",
             world_size=self.world_size,
             rank=rank,
         )
+
         self._dist_initialized = True
 
         set_dist_context(
@@ -136,11 +166,39 @@ class ModelRunner:
             ffn_dp=config.ffn_dp,
             ffn_ep=config.ffn_ep,
             ffn_tp=config.ffn_tp,
+            device_type=device_type,
         )
 
         self.default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
-        torch.set_default_device("cuda")
+        torch.set_default_device(device_type)
+
+        # Ascend NPU: let NPU lazily optimize tensor formats internally
+        # (zero memory overhead vs explicit NZ conversion).
+        # jit_compile=False enables eager mode for fused NPU kernels.
+        if device_type == "npu":
+            try:
+                import torch_npu
+                torch.npu.config.allow_internal_format = True
+                torch.npu.set_compile_mode(jit_compile=False)
+            except (ImportError, AttributeError):
+                pass
+
+        # Device helpers used throughout this class for H2D tensor transfers
+        self._dev = device_type
+        # pin_memory enables truly async H2D transfers with non_blocking=True.
+        # Without it, PyTorch silently falls back to synchronous copies that
+        # block the host (~12 sync copies per decode step, ~94ms/step overhead).
+        # torch_npu supports pin_memory via aclrtMallocHost.
+        if device_type == "npu":
+            try:
+                _pin_test = torch.empty(1, pin_memory=True, device="cpu")
+                del _pin_test
+                self._pin = True
+            except Exception:
+                self._pin = False
+        else:
+            self._pin = (device_type == "cuda")
 
         sp_size = get_dist_context().attn_sp_world_size
         ep_size = get_dist_context().ffn_ep_world_size
@@ -173,21 +231,24 @@ class ModelRunner:
 
             os.makedirs(profiler_dir, exist_ok=True)
 
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-                schedule=None,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    dir_name=profiler_dir,
-                    worker_name=f"{self.engine_id}_rank_{rank}",
-                    use_gzip=False,
-                ),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True,
-            )
+            if self._dev == "npu":
+                self.profiler = self._create_npu_profiler(profiler_dir, rank)
+            else:
+                self.profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    schedule=None,
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                        dir_name=profiler_dir,
+                        worker_name=f"{self.engine_id}_rank_{rank}",
+                        use_gzip=False,
+                    ),
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                )
             logger.info(
                 f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, duration {self.profiler_steps} steps."
             )
@@ -200,7 +261,9 @@ class ModelRunner:
         _quant_cfg_dict = getattr(hf_config, "quantization_config", None) or {}
         if not isinstance(_quant_cfg_dict, dict):
             _quant_cfg_dict = {}
-        init_backend(quant_config=_QC(**_quant_cfg_dict))
+        # Pass explicit backend_type from config if set (e.g. "ascend")
+        _backend_type = getattr(config, "backend_type", "") or None
+        init_backend(quant_config=_QC(**_quant_cfg_dict), backend_type=_backend_type)
 
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
@@ -212,33 +275,134 @@ class ModelRunner:
         if num_total_experts > 0:
             ep_rank = get_dist_context().ffn_ep_rank
 
-            # Check FP8 quantization configs
-            quant_config = getattr(hf_config, "quantization_config", None)
-            is_fp8 = False
-            if quant_config is not None:
-                is_fp8 = quant_config.get("quant_method", "") == "fp8"
-
             num_local_experts = num_total_experts // ep_size
-            ExpertContext.get_instance().warmup(
-                ep_group=get_dist_context().ffn_ep_group,
-                ep_rank=ep_rank,
-                ep_size=ep_size,
-                num_local_experts=num_local_experts,
-                hidden_size=hf_config.hidden_size,
-                max_num_sequence=config.max_num_seqs,
-                is_fp8=is_fp8,
-            )
+
+            if device_type == "npu":
+                # Ascend: use ascend_warmup() — no DeepEP buffer
+                ExpertContext.get_instance().ascend_warmup(
+                    ep_group=get_dist_context().ffn_ep_group,
+                    ep_size=ep_size,
+                    num_local_experts=num_local_experts,
+                    hidden_size=hf_config.hidden_size,
+                    num_max_dispatch_tokens_per_rank=config.max_num_seqs,
+                )
+            else:
+                # CUDA: use standard warmup() with DeepEP
+                quant_config = getattr(hf_config, "quantization_config", None)
+                is_fp8 = False
+                if quant_config is not None:
+                    is_fp8 = quant_config.get("quant_method", "") == "fp8"
+
+                ExpertContext.get_instance().warmup(
+                    ep_group=get_dist_context().ffn_ep_group,
+                    ep_rank=ep_rank,
+                    ep_size=ep_size,
+                    num_local_experts=num_local_experts,
+                    hidden_size=hf_config.hidden_size,
+                    max_num_sequence=config.max_num_seqs,
+                    is_fp8=is_fp8,
+                )
 
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
 
+        # Ascend NPU: prepare weights for efficient GroupedMatmul / fused GEMM
+        if device_type == "npu":
+            self._prepare_ascend_weights()
+
         dist.barrier()
 
         self.sampler = Sampler()
+        if self._dev == "cuda" and not self.enforce_eager:
+            self.sampler = torch.compile(self.sampler)
+
+        # Dedicated stream for updating graph_task_group params before replay
+        self._npu_update_stream = None
+        if self._dev == "npu" and not self.enforce_eager:
+            import torch_npu
+            self._npu_update_stream = torch.npu.Stream()
+
         self.preallocate_kvcache()
 
         # Vision embeddings fetched via RDMA from encoder (EP-separated mode)
         self._vision_embeds: dict[str, torch.Tensor] | None = None
+
+    # ------------------------------------------------------------------
+    # Ascend NPU: prepare weights for efficient GroupedMatmul / GEMM
+    # ------------------------------------------------------------------
+
+    def _prepare_ascend_weights(self):
+        """Pre-transpose MoE expert weights for npu_grouped_matmul.
+
+        No FRACTAL_NZ conversion — allow_internal_format=True lets the NPU
+        handle format optimization lazily with zero memory overhead (like
+        vllm-ascend).  Explicit NZ conversion wastes memory due to 16×16
+        tile padding and is incompatible with npu_mm_all_reduce_base in
+        BF16 mode.
+
+        MoE expert weights are pre-transposed + made contiguous so that
+        npu_grouped_matmul gets optimal layout.  Originals are freed to
+        keep net memory delta ≈ 0.
+        """
+        from nanodeploy.backends.ascend.layers.experts import (
+            AscendDistributedRoutedExperts,
+        )
+
+        moe_count = 0
+        for name, module in self.model.named_modules():
+            if isinstance(module, AscendDistributedRoutedExperts):
+                dev = module.gate_up_proj.data.device
+                dt = module.gate_up_proj.dtype
+
+                # gate_up: transpose → contiguous → cache → free original
+                gate_up_t = module.gate_up_proj.data.transpose(1, 2).contiguous()
+                module.gate_up_proj.data = torch.empty(0, dtype=dt, device=dev)
+                module._gate_up_proj_t = gate_up_t
+                moe_count += 1
+
+                # down: transpose → contiguous → cache → free original
+                down_t = module.down_proj.data.transpose(1, 2).contiguous()
+                module.down_proj.data = torch.empty(0, dtype=dt, device=dev)
+                module._down_proj_t = down_t
+                moe_count += 1
+
+        logger.info(f"Pre-transposed {moe_count} MoE expert weights for GroupedMatmul.")
+
+    # ------------------------------------------------------------------
+    # Ascend NPU profiler (torch_npu.profiler)
+    # ------------------------------------------------------------------
+
+    def _create_npu_profiler(self, profiler_dir: str, rank: int):
+        """Create an Ascend NPU profiler matching vllm-ascend's approach."""
+        import torch_npu
+
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=torch_npu.profiler.ExportType.Text,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            msprof_tx=False,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            l2_cache=False,
+            op_attr=False,
+            data_simplification=True,
+            record_op_args=False,
+            gc_detect_threshold=None,
+        )
+
+        return torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            schedule=None,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                profiler_dir,
+                worker_name=f"{self.engine_id}_rank_{rank}",
+            ),
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=False,
+            experimental_config=experimental_config,
+        )
 
     # ------------------------------------------------------------------
     # Vision embedding injection (EP-separated mode)
@@ -339,7 +503,7 @@ class ModelRunner:
         itemsize = torch.tensor([], dtype=dtype).element_size()
 
         # Allocate local receive buffer on GPU
-        recv_buf = torch.zeros(total_tokens, hidden_size, dtype=dtype, device="cuda")
+        recv_buf = torch.zeros(total_tokens, hidden_size, dtype=dtype, device=self._dev)
         # Register receive buffer as a temporary MR
         recv_buf_size = recv_buf.nelement() * recv_buf.element_size()
         recv_mr = peer_agent.register_memory_region(
@@ -476,12 +640,25 @@ class ModelRunner:
     def exit(self):
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
+        _dev = getattr(self.config, "device_type", "cuda")
+        if _dev == "npu":
+            import torch_npu
+
+            torch_npu.npu.synchronize()
+        else:
+            torch.cuda.synchronize()
         dist.destroy_process_group()
 
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        _dev = getattr(self.config, "device_type", "cuda")
+        if _dev == "npu":
+            import torch_npu
+
+            torch_npu.npu.empty_cache()
+            torch_npu.npu.reset_peak_memory_stats()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = (
             min(self.config.max_num_batched_tokens, 16384),
             min(self.config.max_model_len, 8192),
@@ -494,7 +671,12 @@ class ModelRunner:
         # empty for warmup — serialize empty batch into bytes
         warmup_data = serialize_run_batch([], True)
         self.run_from_bytes(warmup_data, True)
-        torch.cuda.empty_cache()
+        if getattr(self.config, "device_type", "cuda") == "npu":
+            import torch_npu
+
+            torch_npu.npu.empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
     def preallocate_kvcache(self):
         config = self.config
@@ -575,27 +757,27 @@ class ModelRunner:
             )
 
         input_ids = torch.tensor(
-            meta.input_ids, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.input_ids, dtype=torch.int64, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         positions = torch.tensor(
-            meta.positions, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.positions, dtype=torch.int64, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         cu_seqlens_q = torch.tensor(
-            meta.cu_seqlens_q, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.cu_seqlens_q, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         cu_seqlens_k = torch.tensor(
-            meta.cu_seqlens_k, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.cu_seqlens_k, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         slot_mapping = torch.tensor(
-            meta.slot_mapping, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.slot_mapping, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
 
         block_tables = None
         if meta.use_block_tables:
             block_tables = (
-                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
+                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=self._pin)
                 .reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks)
-                .cuda(non_blocking=True)
+                .to(self._dev, non_blocking=True)
             )
 
         cache_ctx = get_cache_context()
@@ -608,8 +790,8 @@ class ModelRunner:
                     for s in aux.state_slots
                 ],
                 dtype=torch.int64,
-                pin_memory=True,
-            ).cuda(non_blocking=True)
+                pin_memory=self._pin,
+            ).to(self._dev, non_blocking=True)
 
         set_context(
             True,
@@ -655,81 +837,86 @@ class ModelRunner:
             raise
 
         input_ids = torch.tensor(
-            meta.input_ids, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.input_ids, dtype=torch.int64, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         positions = torch.tensor(
-            meta.positions, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.positions, dtype=torch.int64, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         slot_mapping = torch.tensor(
-            meta.slot_mapping, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.slot_mapping, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
 
         context_lens = (
-            torch.tensor(meta.context_lens_flat, dtype=torch.int32, pin_memory=True)
+            torch.tensor(meta.context_lens_flat, dtype=torch.int32, pin_memory=self._pin)
             .reshape(sp_size, self.config.max_num_seqs)
-            .cuda(non_blocking=True)
+            .to(self._dev, non_blocking=True)
         )
 
         global_context_lens = (
             torch.tensor(
-                meta.global_context_lens_flat, dtype=torch.int32, pin_memory=True
+                meta.global_context_lens_flat, dtype=torch.int32, pin_memory=self._pin
             )
             .reshape(sp_size, self.config.max_num_seqs)
-            .cuda(non_blocking=True)
+            .to(self._dev, non_blocking=True)
         )
 
         if len(meta.block_tables_flat) == 0:
-            block_tables = torch.empty((0, 0), dtype=torch.int32).cuda(
-                non_blocking=True
+            block_tables = torch.empty((0, 0), dtype=torch.int32).to(
+                self._dev, non_blocking=True
             )
         else:
             block_tables = (
-                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
+                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=self._pin)
                 .reshape(-1, meta.max_num_blocks)
-                .cuda(non_blocking=True)
+                .to(self._dev, non_blocking=True)
             )
 
+        # Use clamp instead of boolean indexing (tensor[tensor != 0] = 1)
+        # to avoid potential D2H sync from advanced indexing on NPU.
         q_mask = global_context_lens.clone()
         q_mask[sp_rank].fill_(0)
-        q_mask[q_mask != 0] = 1
+        q_mask.clamp_(max=1)
         res_lse_mask = context_lens.clone()
         res_lse_mask[sp_rank].fill_(0)
-        res_lse_mask[res_lse_mask != 0] = 1
+        res_lse_mask.clamp_(max=1)
 
+        # Keep CPU copy as Python list to avoid D2H .tolist() sync in
+        # update_graph_attention_params (saves one aclrtSynchronizeStream).
+        context_lens_for_attn_cpu = list(meta.context_lens_for_attn)
         context_lens_for_attn = torch.tensor(
-            meta.context_lens_for_attn, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            context_lens_for_attn_cpu, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
 
         q_slice_get = torch.tensor(
-            meta.q_slice_get, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.q_slice_get, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         q_slice_fill = torch.tensor(
-            meta.q_slice_fill, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.q_slice_fill, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         q_copy_mask = torch.tensor(
-            meta.q_copy_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.q_copy_mask, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_slice_get_to_buffer_output = torch.tensor(
-            meta.res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_slice_fill_to_buffer_output = torch.tensor(
-            meta.res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_to_buffer_output_mask = torch.tensor(
-            meta.res_to_buffer_output_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_to_buffer_output_mask, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_slice_get_to_buffer_input = torch.tensor(
-            meta.res_slice_get_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_slice_get_to_buffer_input, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_slice_fill_to_buffer_input = torch.tensor(
-            meta.res_slice_fill_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_slice_fill_to_buffer_input, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         res_to_buffer_input_mask = torch.tensor(
-            meta.res_to_buffer_input_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.res_to_buffer_input_mask, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         q_offsets = torch.tensor(
-            meta.q_offsets, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+            meta.q_offsets, dtype=torch.int32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         attention_compute_bs = context_lens_for_attn.numel()
 
         config = self.config
@@ -755,8 +942,8 @@ class ModelRunner:
                     for s in aux.state_slots
                 ],
                 dtype=torch.int64,
-                pin_memory=True,
-            ).cuda(non_blocking=True)
+                pin_memory=self._pin,
+            ).to(self._dev, non_blocking=True)
 
         set_context(
             is_prefill=False,
@@ -769,6 +956,7 @@ class ModelRunner:
             res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
             context_lens_for_attn=context_lens_for_attn,
+            context_lens_for_attn_cpu=context_lens_for_attn_cpu,
             attention_compute_bs=attention_compute_bs,
             q_slice_get=q_slice_get,
             q_slice_fill=q_slice_fill,
@@ -804,6 +992,9 @@ class ModelRunner:
         context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
         # Update context lens for attention
         context.context_lens_for_attn[context.q_slice_fill.long()] += 1
+        # Invalidate CPU copy — device tensor was updated in-place, CPU list is stale.
+        # update_graph_attention_params will fall back to .tolist() for loop_count > 1.
+        context.context_lens_for_attn_cpu = None
 
         # Recalculate slot_mapping from context_lens and block_tables.
         # Simply doing slot_mapping.add_(1) is WRONG when a sequence's new
@@ -823,8 +1014,8 @@ class ModelRunner:
     def prepare_sample_from_aux(self, aux):
         """Build temperature tensor from BatchAuxData (no Sequence needed)."""
         temperatures = torch.tensor(
-            aux.temperatures, dtype=torch.float32, pin_memory=True
-        ).cuda(non_blocking=True)
+            aux.temperatures, dtype=torch.float32, pin_memory=self._pin
+        ).to(self._dev, non_blocking=True)
         return temperatures
 
     @torch.inference_mode()
@@ -940,6 +1131,21 @@ class ModelRunner:
                 if context.gdn_state_slots is not None:
                     graph_vars["gdn_state_slots"][:bs].copy_(context.gdn_state_slots)
 
+            # Update attention graph_task_group params with fresh seq lengths,
+            # then sync update_stream → main stream ONCE before replay.
+            if self._npu_update_stream is not None:
+                from nanodeploy.backends.ascend.layers.attention import (
+                    update_graph_attention_params,
+                )
+                update_graph_attention_params(
+                    self._npu_update_stream,
+                    context,
+                    attn_bs,
+                )
+                # GPU-side wait: main stream waits for update_stream without
+                # blocking the CPU (unlike synchronize() which stalls the host).
+                torch.npu.current_stream().wait_stream(self._npu_update_stream)
+
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -1013,15 +1219,22 @@ class ModelRunner:
                     positions.shape,
                     num_sp_seqs,
                 )
+
+            # Prepare temperature tensor BEFORE run_model so the H2D copy
+            # happens while the device is idle (before graph.replay() launches).
+            # Previously this ran AFTER run_model, causing aclrtMemcpy to
+            # host-block until graph.replay() completed (~120ms stall).
+            tp_rank = get_dist_context().attn_tp_rank
+            if tp_rank == 0:
+                temperatures = self.prepare_sample_from_aux(aux)
+
             logits = self.run_model(input_ids, positions, is_prefill)
 
             # Clear RDMA-fetched vision embeddings after prefill forward
             if is_prefill and self._vision_embeds is not None:
                 self._vision_embeds = None
 
-            tp_rank = get_dist_context().attn_tp_rank
             if tp_rank == 0:
-                temperatures = self.prepare_sample_from_aux(aux)
                 input_ids = self.sampler(logits, temperatures)
             else:
                 input_ids = input_ids.new_zeros([num_sp_seqs])
@@ -1094,7 +1307,7 @@ class ModelRunner:
             tile_scheduler_metadata_buffer, num_splits_buffer = (
                 flash_mla.get_mla_metadata(
                     torch.ones(
-                        max_attention_comp_seqs, dtype=torch.int32, device="cuda"
+                        max_attention_comp_seqs, dtype=torch.int32, device=self._dev
                     ),
                     hf_config.num_attention_heads // mla_num_kv_heads,
                     mla_num_kv_heads,
@@ -1121,6 +1334,18 @@ class ModelRunner:
 
         self.attn_bs_step = 16  # 定义 attn_bs 的步长
 
+        # Pre-initialise Ascend graph_task_group params for all capture batch sizes
+        if self._dev == "npu":
+            from nanodeploy.backends.ascend.layers.attention import init_graph_params
+            all_attn_bs = []
+            for _mbs in self.graph_master_rank_bs:
+                curr = _mbs
+                _limit = _mbs + config.max_num_recv_seqs
+                while curr <= _limit:
+                    all_attn_bs.append(curr)
+                    curr += self.attn_bs_step
+            init_graph_params(all_attn_bs)
+
         total_graphs = 0
 
         logger.info(f"开始捕获 CUDAGraph...")
@@ -1140,7 +1365,15 @@ class ModelRunner:
 
                 completed_graphs += 1
                 logger.info(f"正在捕获图 - (master_bs={master_bs}, attn_bs={attn_bs})")
-                graph = torch.cuda.CUDAGraph()
+                if self._dev == "npu":
+                    try:
+                        from torch_npu.npu.graph import NPUGraph as _NPUGraph
+                    except (ImportError, AttributeError):
+                        import torch_npu
+                        _NPUGraph = torch_npu.npu.NPUGraph
+                    graph = _NPUGraph()
+                else:
+                    graph = torch.cuda.CUDAGraph()
                 set_context(
                     is_prefill=False,
                     max_bs=self.config.max_num_seqs,
@@ -1177,22 +1410,52 @@ class ModelRunner:
                     ),
                 )
 
+                # Synchronize all ranks before warmup run — MC2 (AllToAll)
+                # requires all ranks to enter simultaneously.
+                dist.barrier(group=get_dist_context().cuda_world_group)
+
+                if self._dev == "npu":
+                    from nanodeploy.backends.ascend.layers import attention as _ascend_attn
+                    # Warmup mode: pre-computes FIA workspace (allocates device memory)
+                    # outside graph capture where sync/memcpy are allowed.
+                    _ascend_attn._NPU_GRAPH_MODE = "warmup"
+
                 outputs[:master_bs] = self.model(
                     input_ids[:master_bs], positions[:master_bs]
-                )  # warmup
+                )  # warmup (computes workspace on NPU, normal paged path on CUDA)
 
-                with torch.cuda.graph(graph, self.graph_pool):
+                # Synchronize again before entering the capture context.
+                dist.barrier(group=get_dist_context().cuda_world_group)
+
+                if self._dev == "npu":
+                    import torch_npu
+                    # Switch to graph_task_group capture path INSIDE graph context
+                    # (graph_task_group_begin requires stream to be in capture mode)
+                    _ascend_attn._NPU_GRAPH_MODE = "capture"
+                    # Use torch.npu.graph (registered by torch_npu import).
+                    # NPU graphs do not support pool sharing — always pass pool=None.
+                    _graph_ctx = torch.npu.graph(graph)
+                else:
+                    _graph_ctx = torch.cuda.graph(graph, self.graph_pool)
+                with _graph_ctx:
                     outputs[:master_bs] = self.model(
                         input_ids[:master_bs], positions[:master_bs]
                     )  # capture
 
-                if self.graph_pool is None:
+                if self._dev == "npu":
+                    _ascend_attn._NPU_GRAPH_MODE = "replay"
+
+                if self.graph_pool is None and self._dev != "npu":
                     self.graph_pool = graph.pool()
 
                 self.graphs[(master_bs, attn_bs)] = graph
                 self.graph_map[master_bs].append(attn_bs)
 
-                torch.cuda.synchronize()
+                if self._dev == "npu":
+                    import torch_npu
+                    torch_npu.npu.synchronize()
+                else:
+                    torch.cuda.synchronize()
                 dist.barrier(group=get_dist_context().cuda_world_group)
                 reset_context()
 
@@ -1225,3 +1488,15 @@ class ModelRunner:
             q_offsets=q_offsets,
             gdn_state_slots=gdn_state_slots_buf,
         )
+
+
+# ---------------------------------------------------------------------------
+# NPU ModelRunner variant — requests Ascend NPU resources from Ray
+# ---------------------------------------------------------------------------
+
+
+# Ray does not allow actor class inheritance, so we bind @ray.remote at module
+# level after the plain ModelRunner class is fully defined.
+# ray_executor.py selects GPUModelRunner or NPUModelRunner based on device_type.
+GPUModelRunner = ray.remote(num_cpus=0.1, num_gpus=1)(ModelRunner)
+NPUModelRunner = ray.remote(num_cpus=0.1, resources={"NPU": 1})(ModelRunner)

@@ -1,8 +1,15 @@
 from dataclasses import dataclass
 
 import torch
-from nanoccl.buffer.intra.all_to_all_intra_ll_buffer import AllToAllIntraLLBuffer
 from nanodeploy.context.distributed import get_dist_context
+
+try:
+    from nanoccl.buffer.intra.all_to_all_intra_ll_buffer import AllToAllIntraLLBuffer
+except ImportError:
+    # nanoccl is CUDA/NVSHMEM-only; unavailable on Ascend NPU.
+    # SP > 1 is not supported on Ascend so this path is never reached.
+    class AllToAllIntraLLBuffer:  # type: ignore[no-redef]
+        pass
 from nanodeploy.logging import get_logger
 
 logger = get_logger()

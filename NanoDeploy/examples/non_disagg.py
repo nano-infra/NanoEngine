@@ -1,7 +1,24 @@
-"""Non-disaggregated LLM inference example.
+"""Non-disaggregated LLM inference example (GPU and Ascend NPU).
 
-Usage:
-    python non_disagg.py --model /models/deepseek-v3 --loop_count 1 --kvcache_block_size 64
+Backend selection (priority order):
+  1. --backend_type CLI flag  (device_type is inferred automatically)
+  2. NANO_BACKEND environment variable
+  3. Hardware auto-detection (torch_npu → Hopper → gpu_generic)
+
+GPU (CUDA) usage:
+    python non_disagg.py \\
+        --ray_address 10.102.97.179:7078 --master_address 10.102.97.179:6006 \\
+        --model /models/Qwen3-30B-A3B-FP8 \\
+        --attention_dp 8 --ffn_ep 8 --kvcache_block_size 256
+
+Ascend NPU usage:
+    python non_disagg.py \\
+        --ray_address 10.102.97.179:7078 --master_address 10.102.97.179:6006 \\
+        --model /models/Qwen3-235B-A22B \\
+        --attention_dp 8 --ffn_ep 8 --kvcache_block_size 256 \\
+        --backend_type ascend --enforce_eager true
+
+Config file usage:
     python non_disagg.py --config config.yaml
 """
 
