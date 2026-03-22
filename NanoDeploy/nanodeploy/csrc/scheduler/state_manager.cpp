@@ -2,7 +2,7 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 #include "state_manager.h"
 

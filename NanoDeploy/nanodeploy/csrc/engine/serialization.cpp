@@ -66,6 +66,7 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
         si_builder.add_master_sp_idx(ctx.master_sp_idx);
         si_builder.add_num_tokens(seq->num_tokens());
         si_builder.add_num_cached_tokens(seq->num_cached_tokens());
+        si_builder.add_num_prompt_tokens(seq->num_prompt_tokens());
         si_builder.add_last_token(seq->last_token());
         if (is_prefill && token_ids_off.o != 0) {
             si_builder.add_token_ids(token_ids_off);

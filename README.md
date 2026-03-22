@@ -45,6 +45,55 @@ graph TB
     Ops -->|Session Config| Ctrl
 ```
 
+## 🚀 Installation
+
+The root `pyproject.toml` acts as a meta-package that lets you install any combination of Python components in a single command.
+
+### One-liner: install everything
+
+```bash
+pip install ".[all]"
+```
+
+### Install individual components
+
+```bash
+pip install ".[dlslime]"    # DLSlime transfer engine only
+pip install ".[nanoctrl]"   # NanoCtrl lifecycle client only
+pip install ".[nanodeploy]" # NanoDeploy inference engine only
+```
+
+### Development (editable) installs
+
+Use editable mode during development so that source changes take effect immediately without reinstalling.
+
+```bash
+# Install all components in editable mode
+make install-dev
+
+# Or install only what you need
+make install-dlslime-dev
+make install-nanoctrl-dev
+make install-nanodeploy-dev
+```
+
+> **Note:** `DLSlime` and `NanoDeploy` both contain C++ extensions. The first build will invoke `cmake` + `ninja` and may take a few minutes. `NanoCtrl` is pure Python and installs instantly.
+
+### Summary of `make` targets
+
+| Target                        | Description                                                          |
+| ----------------------------- | -------------------------------------------------------------------- |
+| `make install`                | Build and install all three packages                                 |
+| `make install-dev`            | Editable install of all three packages (recommended for development) |
+| `make install-dlslime`        | Build and install DLSlime only                                       |
+| `make install-nanoctrl`       | Install NanoCtrl only                                                |
+| `make install-nanodeploy`     | Build and install NanoDeploy only                                    |
+| `make install-dlslime-dev`    | Editable install of DLSlime                                          |
+| `make install-nanoctrl-dev`   | Editable install of NanoCtrl                                         |
+| `make install-nanodeploy-dev` | Editable install of NanoDeploy                                       |
+
+______________________________________________________________________
+
 ## 📖 Documentation
 
 - [Deployment Guide](./docs/deployment.md) — Step-by-step instructions for deploying with NanoCtrl, NanoRoute, and NanoDeploy

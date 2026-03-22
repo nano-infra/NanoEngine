@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 #include "sp_state_manager.h"
 #include "thread_pool.h"
@@ -114,6 +114,7 @@ public:
     // Public members exposed to Python
     std::deque<std::shared_ptr<Sequence>>                              waiting;
     std::deque<std::shared_ptr<Sequence>>                              waiting_migration;
+    std::deque<std::shared_ptr<Sequence>>                              prefilling;  // mid-prompt sequences
     std::vector<std::shared_ptr<SPStateManager>>                       worker_state;
     std::unordered_map<int, std::pair<std::shared_ptr<Sequence>, int>> to_be_migrated;
 
@@ -138,6 +139,7 @@ private:
     int         attention_sp_;
 
     int num_kvcache_blocks_;
+    int kvcache_block_size_;
 
     std::string mode_;
 

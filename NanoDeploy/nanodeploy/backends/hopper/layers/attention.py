@@ -17,6 +17,88 @@ from nanodeploy.logging import get_logger
 logger = get_logger()
 
 
+def _build_paged_gather_indices(
+    block_table: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Build flat linear indices for gathering tokens from a paged cache.
+
+    Args:
+        block_table: [num_seqs, max_num_blocks] — int32 physical block IDs
+        cu_seqlens_k:[num_seqs + 1] — cumulative K lengths (int32)
+        block_size:  tokens per cache block
+
+    Returns:
+        linear_indices: [total_k_tokens] — index into cache.reshape(-1, ...)
+    """
+    num_seqs = block_table.shape[0]
+    total_k = int(cu_seqlens_k[-1].item())
+    device = block_table.device
+
+    linear_indices = torch.empty(total_k, dtype=torch.int64, device=device)
+
+    for i in range(num_seqs):
+        start = int(cu_seqlens_k[i].item())
+        end = int(cu_seqlens_k[i + 1].item())
+        seqlen = end - start
+        if seqlen == 0:
+            continue
+        t = torch.arange(seqlen, dtype=torch.int64, device=device)
+        block_ids = block_table[i, t // block_size].to(torch.int64)
+        offsets = t % block_size
+        linear_indices[start:end] = block_ids * block_size + offsets
+
+    return linear_indices
+
+
+def _gather_kv_paged(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather paged KV cache into contiguous ragged tensors for flash_attn_varlen_func.
+
+    Args:
+        k_cache:     [num_blocks, block_size, num_kv_heads, head_dim]
+        v_cache:     [num_blocks, block_size, num_kv_heads, head_dim]
+        block_table: [num_seqs, max_num_blocks] — int32 physical block IDs (-1 = padding)
+        cu_seqlens_k:[num_seqs + 1] — cumulative K lengths (int32)
+        block_size:  tokens per KV block
+
+    Returns:
+        k_gathered: [total_k_tokens, num_kv_heads, head_dim]
+        v_gathered: [total_k_tokens, num_kv_heads, head_dim]
+    """
+    linear_indices = _build_paged_gather_indices(block_table, cu_seqlens_k, block_size)
+
+    _, _, num_kv_heads, head_dim = k_cache.shape
+    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim)
+    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim)
+    return k_flat[linear_indices], v_flat[linear_indices]
+
+
+def _gather_cache_paged(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Gather a single paged cache into a contiguous ragged tensor.
+
+    Works for any cache with shape [num_blocks, block_size, ...].
+
+    Returns:
+        gathered: [total_k_tokens, ...] (remaining dims preserved)
+    """
+    linear_indices = _build_paged_gather_indices(block_table, cu_seqlens_k, block_size)
+    trailing_shape = cache.shape[2:]
+    flat = cache.reshape(-1, *trailing_shape)
+    return flat[linear_indices]
+
+
 class FlashAttentionImpl:
 
     def __init__(
@@ -46,8 +128,16 @@ class FlashAttentionImpl:
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
         if context.is_prefill:
-            if context.block_tables is not None:  # prefix cache
-                k, v = k_cache, v_cache
+            if context.block_tables is not None:
+                num_seqs = context.cu_seqlens_k.shape[0] - 1
+                bt = context.block_tables[sp_rank, :num_seqs, :]
+                k, v = _gather_kv_paged(
+                    k_cache,
+                    v_cache,
+                    bt,
+                    context.cu_seqlens_k,
+                    k_cache.shape[1],  # block_size
+                )
             o = flash_attn_varlen_func(
                 q,
                 k,

@@ -56,6 +56,13 @@ class Context:
     # Per-sequence GDN slot indices: [num_seqs], maps batch position i -> slot index
     gdn_state_slots: torch.Tensor | None = None
 
+    # Chunked prefill: indices into the Q (hidden_states) tensor for the last token of each
+    # final-chunk sequence. Shape: [n_final]. None means all sequences are final chunks.
+    sampling_token_indices: torch.Tensor | None = None
+    # Which sequence index (0-based among sp_rank seqs) each sampling_token_indices entry
+    # corresponds to. Shape: [n_final]. None when sampling_token_indices is None.
+    sampling_seq_indices: torch.Tensor | None = None
+
 
 _CONTEXT = Context()
 
@@ -95,6 +102,8 @@ def set_context(
     gdn_conv_states: Optional[torch.Tensor] = None,
     gdn_recurrent_states: Optional[torch.Tensor] = None,
     gdn_state_slots: Optional[torch.Tensor] = None,
+    sampling_token_indices: Optional[torch.Tensor] = None,
+    sampling_seq_indices: Optional[torch.Tensor] = None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -128,6 +137,8 @@ def set_context(
         gdn_conv_states=gdn_conv_states,
         gdn_recurrent_states=gdn_recurrent_states,
         gdn_state_slots=gdn_state_slots,
+        sampling_token_indices=sampling_token_indices,
+        sampling_seq_indices=sampling_seq_indices,
     )
 
 

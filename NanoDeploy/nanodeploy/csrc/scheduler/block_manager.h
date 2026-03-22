@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "block.h"
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 namespace nanodeploy {
 
@@ -26,6 +26,10 @@ public:
     // Block allocation and deallocation
     bool can_allocate(Sequence& seq) const;
     void allocate(Sequence& seq, int token_idx_from = -1, int token_idx_to = -1);
+
+    // Count consecutive leading blocks whose hash matches an already-active
+    // (shared) block.  These don't need a free slot — we just bump ref_count.
+    int  count_active_prefix_hits(Sequence& seq) const;
     void deallocate(Sequence& seq, BlockContextSlot slot);
 
     // Append related

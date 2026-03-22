@@ -7,7 +7,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 namespace nanodeploy {
 

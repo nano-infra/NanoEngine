@@ -20,7 +20,9 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("slot_mapping", &PrefillMetadata::slot_mapping)
         .def_readonly("block_tables_flat", &PrefillMetadata::block_tables_flat)
         .def_readonly("max_num_blocks", &PrefillMetadata::max_num_blocks)
-        .def_readonly("use_block_tables", &PrefillMetadata::use_block_tables);
+        .def_readonly("use_block_tables", &PrefillMetadata::use_block_tables)
+        .def_readonly("sampling_token_indices", &PrefillMetadata::sampling_token_indices)
+        .def_readonly("sampling_seq_indices", &PrefillMetadata::sampling_seq_indices);
 
     py::class_<DecodeMetadata>(m, "DecodeMetadata")
         .def_readonly("input_ids", &DecodeMetadata::input_ids)

@@ -5,12 +5,12 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 
-#include "nanosequence/csrc/metrics/sequence_metric.h"
-#include "nanosequence/csrc/sequence/sequence.h"
-#include "nanosequence/csrc/sequence/serialization.h"
+#include "nanodeploy/csrc/metrics/sequence_metric.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/serialization.h"
 #include "sequence_generated.h"
 
-#include "nanosequence/csrc/bind/opaque_types.h"
+#include "nanodeploy/csrc/bind/opaque_types.h"
 
 namespace py = pybind11;
 using namespace nanodeploy;

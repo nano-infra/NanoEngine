@@ -1,7 +1,15 @@
 #pragma once
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 #include <pybind11/pybind11.h>
 #include <unordered_map>
+#include <vector>
+
+struct BlockIdList: public std::vector<int> {
+    using std::vector<int>::vector;
+};
+struct SpBlockTable: public std::vector<BlockIdList> {
+    using std::vector<BlockIdList>::vector;
+};
 
 // Declare opaque map types *before* including <pybind11/stl.h> to prevent
 // automatic conversion to Python dict copies.

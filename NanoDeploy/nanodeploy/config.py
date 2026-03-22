@@ -116,7 +116,8 @@ class Config(BaseModel):
         else:
             self.hf_config.max_position_embeddings = self.max_model_len
 
-        assert self.max_num_batched_tokens >= self.max_model_len
+        # With chunked prefill, max_num_batched_tokens may be smaller than max_model_len.
+        assert self.max_num_batched_tokens >= 1
 
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             if hasattr(self.hf_config, "num_key_value_heads"):

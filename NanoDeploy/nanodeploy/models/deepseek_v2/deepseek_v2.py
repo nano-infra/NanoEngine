@@ -660,39 +660,61 @@ class DeepseekV2Attention(nn.Module):
                     )
                 store_kcache(key_states_3d, k_cache, slot_mapping)
 
-            # Expand K from compressed latent: k_nope = compressed_kv @ kc.weight^T
-            # kc.weight: (H, D, R) -> reshape to (H*D, R) -> transpose to (R, H*D)
-            # compressed_kv: (T, R) @ (R, H*D) -> (T, H*D) -> (T, H, D)
+            # Weight matrices for K/V expansion (shared by both paths)
             kc_t = self.kc.weight.reshape(
                 num_heads * self.qk_nope_head_dim, self.kv_lora_rank
             ).T  # (R, H*D)
-            k_nope = (compressed_kv @ kc_t).view(
-                q_len, num_heads, self.qk_nope_head_dim
-            )
-
-            # Build full K: [k_nope (H, 128); k_pe broadcast (H, 64)] -> (T, H, 192)
-            k_pe_expanded = k_pe_3d.expand(-1, num_heads, -1)  # (T, H, 64)
-            k_expanded = torch.cat([k_nope, k_pe_expanded], dim=-1)  # (T, H, 192)
-
-            # Expand V from compressed latent: v = compressed_kv @ vc.weight
-            # vc.weight: (H, R, V) -> permute to (R, H, V) -> reshape to (R, H*V)
-            # compressed_kv: (T, R) @ (R, H*V) -> (T, H*V) -> (T, H, V)
             vc_reshaped = self.vc.weight.permute(1, 0, 2).reshape(
                 self.kv_lora_rank, num_heads * self.v_head_dim
             )  # (R, H*V)
-            v_expanded = (compressed_kv @ vc_reshaped).view(
-                q_len, num_heads, self.v_head_dim
-            )  # (T, H, 128)
 
-            # Attention: Q (T, H, 192) @ K (T, H, 192) -> output (T, H, 128)
-            # Use FA3 which supports different head dims for QK vs V on SM90+
+            if context.block_tables is not None:
+                # === Chunked prefill (chunks 2+): gather ALL K from paged cache ===
+                from nanodeploy.backends.hopper.layers.attention import (
+                    _gather_cache_paged,
+                )
+
+                sp_rank = get_dist_context().attn_sp_rank
+                num_seqs = context.cu_seqlens_k.shape[0] - 1
+                bt = context.block_tables[sp_rank, :num_seqs, :]
+                block_size = k_cache.shape[1]
+
+                # k_cache: [num_blocks, block_size, 1, kv_lora_rank+qk_rope_head_dim]
+                # gathered: [total_k, 1, 576] -> squeeze -> [total_k, 576]
+                k_gathered = _gather_cache_paged(
+                    k_cache, bt, context.cu_seqlens_k, block_size
+                ).squeeze(1)
+
+                compressed_kv_all = k_gathered[:, : self.kv_lora_rank]
+                k_pe_all = k_gathered[:, self.kv_lora_rank :]
+
+                k_nope = (compressed_kv_all @ kc_t).view(
+                    -1, num_heads, self.qk_nope_head_dim
+                )
+                k_pe_expanded = k_pe_all.unsqueeze(1).expand(-1, num_heads, -1)
+                k_expanded = torch.cat([k_nope, k_pe_expanded], dim=-1)
+
+                v_expanded = (compressed_kv_all @ vc_reshaped).view(
+                    -1, num_heads, self.v_head_dim
+                )
+            else:
+                # === First chunk or single-chunk prefill: use fresh K/V ===
+                k_nope = (compressed_kv @ kc_t).view(
+                    q_len, num_heads, self.qk_nope_head_dim
+                )
+                k_pe_expanded = k_pe_3d.expand(-1, num_heads, -1)
+                k_expanded = torch.cat([k_nope, k_pe_expanded], dim=-1)
+
+                v_expanded = (compressed_kv @ vc_reshaped).view(
+                    q_len, num_heads, self.v_head_dim
+                )
+
             from flash_attn_interface import flash_attn_varlen_func
 
-            context = get_context()
             attn_output = flash_attn_varlen_func(
-                q_full,  # (T, H, 192)
-                k_expanded,  # (T, H, 192)
-                v_expanded,  # (T, H, 128)
+                q_full,  # (q_len, H, 192)
+                k_expanded,  # (total_k or q_len, H, 192)
+                v_expanded,  # (total_k or q_len, H, 128)
                 cu_seqlens_q=context.cu_seqlens_q,
                 cu_seqlens_k=context.cu_seqlens_k,
                 max_seqlen_q=context.max_seqlen_q,

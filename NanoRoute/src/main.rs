@@ -20,6 +20,7 @@ pub mod fbs {
 
 mod encoder_adapter;
 mod engine_adapter;
+mod fold_adapter;
 mod http_server;
 mod tokenizer;
 mod tool_parser;
@@ -113,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
             // Log engine counts
             let manager = manager_arc.lock().await;
             let (prefill_count, decode_count, encoder_count) = manager.total_engine_counts();
+            let fold_count = manager.fold_engine_count();
             let model_keys: Vec<String> = manager
                 .available_model_keys()
                 .iter()
@@ -120,8 +122,8 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             drop(manager);
             info!(
-                "Connected engines: {} prefill, {} decode, {} encoder, models: {:?}",
-                prefill_count, decode_count, encoder_count, model_keys
+                "Connected engines: {} prefill, {} decode, {} encoder, {} fold, models: {:?}",
+                prefill_count, decode_count, encoder_count, fold_count, model_keys
             );
             manager_arc
         }

@@ -1,4 +1,4 @@
-# Plan: Chunked Prefill + Prefix Caching in NanoInfra
+# Chunked Prefill + Prefix Caching in NanoInfra
 
 ## Context
 
@@ -6,23 +6,115 @@ Two related features:
 
 **Prefix Caching**: The `BlockManager` already does hash-based block deduplication (shared KV blocks when token content matches). However, `num_cached_tokens` is never set during allocation, so prefill still recomputes KV for all tokens even when their blocks are shared from another sequence. The `prepare_prefill_from_bytes` C++ code already handles `num_cached_tokens` correctly — we just need to wire it from the allocation side.
 
-**Chunked Prefill**: Sequences longer than `max_num_batched_tokens` cannot currently be scheduled (stuck in `waiting` forever). The `allocate()` signature accepts `token_idx_from/to` params but they are `(void)`-cast and ignored. We need sequential chunking: each engine step is still pure-prefill or pure-decode, but a long prompt is split into multiple consecutive prefill steps.
+**Chunked Prefill**: Sequences longer than `max_num_batched_tokens` are split into consecutive prefill steps. Each chunk processes up to `max_num_batched_tokens` tokens, with intermediate KV results cached for subsequent chunks.
+
+## End-to-End Walkthrough
+
+This section traces a 1209-token prompt through the system with `kvcache_block_size=64` and `max_num_batched_tokens=128`.
+
+### Phase 1: Scheduling the First Chunk
+
+1. **`Scheduler::_schedule_prefill()`** processes the WAITING queue.
+
+   - `seq->num_cached_tokens()` = 0, budget = 128.
+   - `chunk_end = 0 + min(128, 1209 - 0) = 128`.
+   - `seq->set_num_tokens(128)` — temporarily set to chunk endpoint.
+   - `can_allocate()` / `allocate()` succeeds → allocates 2 blocks (128 / 64).
+   - `seq->set_status(RUNNING)` → pushed to `running` queue and `scheduled_seqs`.
+
+2. **Serialization** (`serialization.cpp`): serializes `num_tokens=128`, `num_cached_tokens=0`, `num_prompt_tokens=1209`, token_ids\[0..127\], and block_tables.
+
+3. **`prepare_prefill_from_bytes()`** (`model_runner_utils.cpp`):
+
+   - `seqlen_q = 128 - 0 = 128`, `seqlen_k = 128`.
+   - `cu_seqlens_q = [0, 128]`, `cu_seqlens_k = [0, 128]`.
+   - `seqlen_k == seqlen_q` → `use_block_tables = false`, no gather needed.
+   - `sampling_token_indices`: `num_tokens(128) < num_prompt_tokens(1209)` → **not final**, no entry added.
+
+4. **GPU execution**: model runs prefill on 128 tokens with standard `flash_attn_varlen_func`.
+
+   - `store_kvcache` writes K/V to cache slots 0..127.
+   - `ParallelLMHead`: `sampling_token_indices` is set (empty → all non-final), so `lm_head` is skipped entirely.
+
+5. **`postprocess_sequences()`** (`scheduler_utils.cpp`):
+
+   - `seq->num_tokens()(128) < seq->num_prompt_tokens()(1209)` → **non-final chunk detected**.
+   - `seq->set_num_cached_tokens(128)`.
+   - `seq->set_status(PREFILLING)`.
+   - Pushes to `result.continuations`.
+   - Running queue cleanup removes `PREFILLING` sequences.
+
+6. **`Scheduler::postprocess()`**: moves continuations to `prefilling` deque.
+
+### Phase 2: Scheduling Subsequent Chunks (2..9)
+
+1. **`Scheduler::_schedule_prefill()`** now processes `prefilling` queue FIRST (higher priority):
+
+   - `prev_tokens = seq->num_tokens()` (e.g. 128 after chunk 1).
+   - `budget_remaining = 128`, `new_tokens = min(128, 1209 - 128) = 128`.
+   - Shrink-before-preempt: checks `free_blocks > 0` → shrinks if needed.
+   - `seq->set_num_tokens(256)`, `may_append()` allocates 2 more blocks.
+   - Pushed to `running` and `scheduled_seqs`.
+
+2. **`prepare_prefill_from_bytes()`**:
+
+   - `seqlen_q = 256 - 128 = 128` (only new tokens).
+   - `seqlen_k = 256` (total context including cached).
+   - `seqlen_k > seqlen_q` → `use_block_tables = true`, dense block_tables built.
+   - `slot_mapping`: iterates blocks `[num_cached_blocks..num_blocks)`, maps only new tokens.
+   - `sampling_token_indices`: still non-final (256 \< 1209) → empty.
+
+3. **GPU execution**:
+
+   - `store_kvcache` writes fresh K/V to slots 128..255.
+   - **GQA** (`FlashAttentionImpl`): `context.block_tables is not None` → `_gather_kv_paged(k_cache, v_cache, bt, cu_seqlens_k, block_size)` gathers ALL 256 K/V tokens from paged cache into contiguous tensors → `flash_attn_varlen_func(q[128 tokens], k[256 tokens], v[256 tokens], ...)`.
+   - **MLA** (`DeepseekV2Attention`): `context.block_tables is not None` → `_gather_cache_paged(k_cache, bt, cu_seqlens_k, block_size)` gathers compressed keys (576d) → split into `compressed_kv` (512d) + `k_pe` (64d) → expand K/V via `kc`/`vc` weight matrices → `flash_attn_varlen_func`.
+   - **GDN** (`GenericGatedDeltaNet`): `context.block_tables is not None` → load conv state from `gdn_conv_states[layer, slot, :, 1:]` and recurrent state from `gdn_recurrent_states[layer, slot]` → `chunk_gated_delta_rule` with loaded initial state.
+
+4. **Postprocess**: same as Phase 1 — sets `PREFILLING`, pushes to continuations.
+
+Repeat until chunk 10 (the final chunk).
+
+### Phase 3: Final Chunk (chunk 10)
+
+1. **Scheduling**: `new_tokens = min(128, 1209 - 1152) = 57`. `seq->set_num_tokens(1209)`.
+
+2. **`prepare_prefill_from_bytes()`**:
+
+   - `seqlen_q = 57`, `seqlen_k = 1209`.
+   - `sampling_token_indices`: `num_tokens(1209) == num_prompt_tokens(1209)` → **final chunk**, `q_end - 1 = 56` added.
+
+3. **GPU execution**: attention gathers all 1209 K/V tokens. `ParallelLMHead` extracts hidden state at index 56, computes logits, samples first output token.
+
+4. **`postprocess_sequences()`**:
+
+   - `seq->num_tokens()(1209) >= seq->num_prompt_tokens()(1209)` → **final chunk**.
+   - `seq->status() == PREFILLING` → `seq->set_status(RUNNING)` (transition to decode).
+   - Normal `append_token()` runs, sequence enters decode phase.
+
+### Phase 4: Decode
+
+Standard decode loop. Sequence has status `RUNNING`, stays in `running` queue. Each step generates one token until `max_tokens` or EOS.
 
 ## Critical Files
 
-| File                                                          | Role                                                                                  |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `NanoDeploy/nanodeploy/csrc/scheduler/block_manager.h`        | Add `count_active_prefix_hits()`                                                      |
-| `NanoDeploy/nanodeploy/csrc/scheduler/block_manager.cpp`      | Core prefix caching wiring                                                            |
-| `NanoDeploy/nanodeploy/csrc/scheduler/sp_state_manager.h/cpp` | Updated `can_allocate()`, `allocate()` counters                                       |
-| `NanoDeploy/nanodeploy/csrc/scheduler/scheduler.h`            | Add `prefilling` deque                                                                |
-| `NanoDeploy/nanodeploy/csrc/scheduler/scheduler.cpp`          | `_schedule_prefill()` chunking logic                                                  |
-| `NanoDeploy/nanodeploy/csrc/scheduler/scheduler_utils.cpp`    | Postprocess non-final chunk detection                                                 |
-| `NanoSequence/proto/sequence.fbs`                             | Add `PREFILLING = 4` status                                                           |
-| `NanoSequence/nanosequence/csrc/sequence/sequence.h`          | Already has `num_cached_tokens`, `num_prompt_tokens` — no change needed               |
-| `NanoDeploy/nanodeploy/csrc/engine/serialization.cpp`         | Already uses `seq->num_tokens()` / `num_cached_tokens()` correctly — no change needed |
-| `NanoDeploy/nanodeploy/csrc/worker/model_runner_utils.cpp`    | Already handles `num_cached_tokens` correctly — no change needed                      |
-| `NanoDeploy/nanodeploy/backends/hopper/layers/attention.py`   | Fix the dead `block_tables` branch; add paged KV gather for chunked/cached prefill    |
+| File                                                                   | Role                                                                                  |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `NanoDeploy/nanodeploy/csrc/scheduler/block_manager.h`                 | Add `count_active_prefix_hits()`                                                      |
+| `NanoDeploy/nanodeploy/csrc/scheduler/block_manager.cpp`               | Core prefix caching wiring                                                            |
+| `NanoDeploy/nanodeploy/csrc/scheduler/sp_state_manager.h/cpp`          | Updated `can_allocate()`, `allocate()` counters                                       |
+| `NanoDeploy/nanodeploy/csrc/scheduler/scheduler.h`                     | `prefilling` deque                                                                    |
+| `NanoDeploy/nanodeploy/csrc/scheduler/scheduler.cpp`                   | `_schedule_prefill()` chunking logic; `postprocess()` routing; `preempt()` reset      |
+| `NanoDeploy/nanodeploy/csrc/scheduler/scheduler_utils.h`               | `PostprocessResult` struct with `continuations`                                       |
+| `NanoDeploy/nanodeploy/csrc/scheduler/scheduler_utils.cpp`             | Non-final chunk detection; PREFILLING→RUNNING transition                              |
+| `NanoSequence/proto/sequence.fbs`                                      | `PREFILLING = 4` status                                                               |
+| `NanoDeploy/nanodeploy/csrc/engine/serialization.cpp`                  | Serializes `num_prompt_tokens` for chunk detection in workers                         |
+| `NanoDeploy/nanodeploy/csrc/worker/model_runner_utils.cpp`             | `sampling_token_indices/seq_indices`; `slot_mapping` with `cached_offset_in_block`    |
+| `NanoDeploy/nanodeploy/backends/hopper/layers/attention.py`            | `_build_paged_gather_indices`, `_gather_kv_paged`, `_gather_cache_paged`; GQA prefill |
+| `NanoDeploy/nanodeploy/models/deepseek_v2/deepseek_v2.py`              | MLA chunked prefill: gather compressed K + expand K/V                                 |
+| `NanoDeploy/nanodeploy/backends/gpu_generic/layers/gated_delta_net.py` | GDN chunked prefill: conv/recurrent state continuity                                  |
+| `NanoDeploy/nanodeploy/layers/embed_head.py`                           | Sparse `lm_head`: only final-chunk hidden states                                      |
+| `NanoDeploy/nanodeploy/worker/model_runner.py`                         | Wire `sampling_token_indices` from C++ metadata to context                            |
 
 ## Part 1: Prefix Caching — Computation Skip
 
@@ -86,7 +178,7 @@ Note: The `needed_blocks` in `SPStateManager::can_allocate()` (line 128) stays p
 
 ## Part 2: Chunked Prefill — Sequential Chunks
 
-### 2a. `NanoSequence/proto/sequence.fbs` — add PREFILLING status
+### 2a. `NanoSequence/proto/sequence.fbs` — PREFILLING status
 
 ```flatbuffers
 enum SequenceStatus : byte {
@@ -94,367 +186,388 @@ enum SequenceStatus : byte {
   RUNNING = 1,
   FINISHED = 2,
   TO_BE_MIGRATED = 3,
-  PREFILLING = 4,   // NEW: mid-prompt, between chunks
+  PREFILLING = 4,   // mid-prompt, between chunks
 }
 ```
 
-After editing, regenerate `sequence_generated.h` (run flatc or the project's codegen script).
-
-### 2b. `scheduler.h` — add `prefilling` deque
+### 2b. `scheduler.h` — prefilling deque
 
 ```cpp
-std::deque<std::shared_ptr<Sequence>> prefilling;  // mid-prefill sequences (dp-agnostic)
+std::deque<std::shared_ptr<Sequence>> prefilling;  // mid-prefill sequences
 ```
 
-### 2c. `scheduler.cpp` — `_schedule_prefill()` changes
+### 2c. `scheduler.cpp` — `_schedule_prefill()` two-step scheduling
 
-**Process `prefilling` queue FIRST** (higher priority, they hold allocated blocks):
+**Step 1: Schedule PREFILLING sequences first** (higher priority — they already hold allocated blocks):
 
 ```cpp
-// --- Step 1: Schedule PREFILLING (in-progress) sequences ---
 std::deque<std::shared_ptr<Sequence>> not_scheduled_prefilling;
 while (!prefilling.empty()) {
     auto seq = prefilling.front(); prefilling.pop_front();
-    int dp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).dp_idx;
-    int master_sp = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx;
+    int dp_idx    = block_ctx.dp_idx;
+    int master_sp = block_ctx.master_sp_idx;
 
-    int prev_tokens = seq->num_tokens();
+    int prev_tokens     = seq->num_tokens();
     int budget_remaining = max_num_batched_tokens_ - num_batched_tokens[dp_idx][master_sp];
-    int new_tokens = std::min(budget_remaining,
-                              seq->num_prompt_tokens() - prev_tokens);
+    int new_tokens      = std::min(budget_remaining,
+                                   seq->num_prompt_tokens() - prev_tokens);
     if (new_tokens <= 0) { not_scheduled_prefilling.push_back(seq); continue; }
 
-    // *** DEADLOCK PREVENTION + SHRINK BEFORE PREEMPT ***
-    // Only preempt if truly saturated (zero free blocks). Otherwise shrink the
-    // chunk to what the cache can actually absorb — avoids thrashing when decode
-    // sequences hold most blocks but some space remains.
-    {
-        int free_blocks = worker_state[dp_idx]->block_manager[master_sp]->num_free_blocks();
-        int max_appendable_tokens = free_blocks * kvcache_block_size_;
-        if (max_appendable_tokens <= 0) {
-            // Truly saturated — preempt to avoid starvation deadlock
-            preempt(dp_idx, seq);
-            continue;
-        }
-        new_tokens = std::min(new_tokens, max_appendable_tokens);
-    }
+    // Shrink-before-preempt: only preempt if truly saturated.
+    int free_blocks = worker_state[dp_idx]->block_manager[master_sp]->num_free_blocks();
+    int max_appendable = free_blocks * kvcache_block_size_;
+    if (max_appendable <= 0) { preempt(dp_idx, seq); continue; }
+    new_tokens = std::min(new_tokens, max_appendable);
 
     seq->set_num_tokens(prev_tokens + new_tokens);
     worker_state[dp_idx]->block_manager[master_sp]->may_append(*seq, new_tokens);
-    // Update num_dispatched_tokens so future may_append() computes correctly
-    seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[master_sp] = seq->num_tokens();
+    block_ctx.num_dispatched_tokens[master_sp] = seq->num_tokens();
 
     num_seqs[dp_idx][master_sp] += 1;
     num_batched_tokens[dp_idx][master_sp] += new_tokens;
+    worker_state[dp_idx]->running.push_back(seq);
     scheduled_seqs[dp_idx].push_back(seq);
 }
-// Put back unscheduled (budget exhausted) at front of prefilling
-for (auto it = not_scheduled_prefilling.rbegin(); it != not_scheduled_prefilling.rend(); ++it)
-    prefilling.push_front(*it);
+// Put back unscheduled at front (preserve order)
+for (auto it = not_scheduled_prefilling.rbegin(); ...) prefilling.push_front(*it);
 ```
 
-**Modify WAITING queue processing** to chunk long sequences:
+**Step 2: Schedule fresh WAITING sequences** with chunking:
 
 ```cpp
-// --- Step 2: Schedule fresh WAITING sequences with chunking ---
 while (!waiting_queue.empty()) {
     auto seq = waiting_queue.front();
+    int budget = ...;  // min across all SP ranks
+    int num_cached = seq->num_cached_tokens();
+    int chunk_end = num_cached + std::min(budget, seq->num_prompt_tokens() - num_cached);
+    seq->set_num_tokens(chunk_end);  // temporarily set
 
-    // Compute chunk size for this sequence
-    int budget_for_this_seq = ...; // max_num_batched_tokens_ - total_already_scheduled
-    int chunk_end = seq->num_cached_tokens()
-                  + std::min(budget_for_this_seq,
-                             seq->num_prompt_tokens() - seq->num_cached_tokens());
-    // Temporarily set num_tokens to chunk_end for can_allocate/allocate
-    seq->set_num_tokens(chunk_end);
+    bool can_alloc = worker_state[dp_idx]->can_allocate(...);
+    if (!can_alloc) { seq->set_num_tokens(seq->num_prompt_tokens()); break; }
 
-    bool can_alloc = worker_state[dp_idx]->can_allocate(*seq, num_seqs[dp_idx], num_batched_tokens[dp_idx]);
-    if (!can_alloc) {
-        seq->set_num_tokens(seq->num_prompt_tokens()); // restore
-        break;
-    }
     worker_state[dp_idx]->allocate(*seq);  // sets num_cached_tokens via prefix hits
-
-    num_seqs[dp_idx][master_sp] += 1;
-    num_batched_tokens[dp_idx][master_sp] += (seq->num_tokens() - seq->num_cached_tokens());
     seq->set_status(SequenceStatus::RUNNING);
     waiting_queue.pop_front();
     worker_state[dp_idx]->running.push_back(seq);
     scheduled_seqs[dp_idx].push_back(seq);
-    // ...
 }
 ```
 
-### 2d. `scheduler_utils.cpp` — postprocess non-final chunk detection
+### 2d. `scheduler_utils.cpp` — non-final chunk detection and status transitions
 
-In `worker_func`, before `seq->append_token(token_id, ...)`:
+In `worker_func`, before `append_token`:
 
 ```cpp
-// Detect non-final prefill chunk
-bool is_nonfinal_chunk = is_prefill
-    && (seq->num_tokens() < seq->num_prompt_tokens());
-
-if (is_nonfinal_chunk) {
-    // KV is computed for this chunk; mark all chunk tokens as cached
+// Non-final chunk detection — must NOT be guarded by is_prefill.
+// In combined (non-disaggregated) mode, mode_ is never "prefill",
+// but chunked sequences still need to continue.
+if (seq->num_tokens() < seq->num_prompt_tokens()) {
     seq->set_num_cached_tokens(seq->num_tokens());
     seq->set_status(SequenceStatus::PREFILLING);
     result_ctx->chunk_continuations.push_back(seq);
-    break;  // don't process further token_ids for this seq
+    continue;
 }
-// ... existing append_token + migration/finish logic unchanged ...
+
+// Final prefill chunk: transition PREFILLING → RUNNING for decode.
+if (seq->status() == SequenceStatus::PREFILLING) {
+    seq->set_status(SequenceStatus::RUNNING);
+}
+
+// ... existing append_token + finish logic ...
 ```
 
-Also extend the `running` queue cleanup to remove PREFILLING sequences:
+Running queue cleanup removes `PREFILLING` sequences:
 
 ```cpp
 running.erase(std::remove_if(running.begin(), running.end(),
-    [](const std::shared_ptr<Sequence>& s) {
+    [](const auto& s) {
         return s->status() == SequenceStatus::FINISHED
             || s->status() == SequenceStatus::TO_BE_MIGRATED
-            || s->status() == SequenceStatus::PREFILLING; // NEW
+            || s->status() == SequenceStatus::PREFILLING;
     }), running.end());
 ```
 
-Add `chunk_continuations` to `WorkerContext`:
+### 2e. `scheduler_utils.h` — PostprocessResult
 
 ```cpp
-struct WorkerContext {
-    std::vector<Task> tasks;
-    MigrationList migration_candidates;
-    std::vector<std::shared_ptr<Sequence>> chunk_continuations;  // NEW
-    std::exception_ptr eptr = nullptr;
-    int dp_idx;
+struct PostprocessResult {
+    MigrationList                          migrations;
+    std::vector<std::shared_ptr<Sequence>> continuations;  // non-final prefill chunks
 };
 ```
 
-Update `postprocess_sequences()` return type or signature to also return `chunk_continuations`. Simplest: return a struct `PostprocessResult { MigrationList migrations; std::vector<shared_ptr<Sequence>> continuations; }`.
-
-### 2e. `scheduler.cpp` — `Scheduler::postprocess()` — move continuations to prefilling
+### 2f. `scheduler.cpp` — `postprocess()` routes continuations
 
 ```cpp
 void Scheduler::postprocess(...) {
-    auto result = postprocess_sequences(...);
-    for (auto& [seq, dp_idx] : result.migrations)
+    auto result = postprocess_sequences(worker_state, dp_sp_seqs, dp_sp_token_ids,
+                                        eos_, mode_ == "prefill", update_metrics, thread_pool_.get());
+    for (const auto& [seq, dp_idx] : result.migrations)
         to_be_migrated[seq->seq_id()] = {seq, dp_idx};
     for (auto& seq : result.continuations)
-        prefilling.push_back(seq);  // will be picked up in next _schedule_prefill()
+        prefilling.push_back(seq);
 }
 ```
 
-### 2f. `preempt()` adjustment
-
-When preempting a PREFILLING sequence (mid-chunk), restore `num_tokens = num_prompt_tokens` so it starts over cleanly after re-queuing:
+### 2g. `preempt()` — reset mid-chunk sequences
 
 ```cpp
 void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq) {
     seq->set_status(SequenceStatus::WAITING);
     worker_state[dp_idx]->deallocate(*seq);
-    seq->set_num_tokens(seq->num_prompt_tokens());  // Reset to full length
-    seq->set_num_cached_tokens(0);  // Reset (deallocate already calls this)
+    seq->set_num_tokens(seq->num_prompt_tokens());  // reset to full length
     seq->set_num_checkpointed_tokens(static_cast<int>(seq->token_ids().size()));
     waiting.push_front(seq);
 }
 ```
 
-## Part 3: Skip `lm_head` + Sampler for Non-Final Chunks
+## Part 3: Selective lm_head for Non-Final Chunks
 
-### The problem
+### Problem
 
-The GPU still computes `lm_head(hidden_states)` and runs the sampler for **every** chunk, including non-final ones. For non-final chunks the sampled token is discarded in `postprocess`. This wastes significant GPU compute (lm_head over the full vocabulary is large).
+Computing `lm_head(hidden_states)` and sampling for non-final chunks wastes GPU compute — the sampled token is discarded in `postprocess`. lm_head over the full vocabulary is expensive.
 
-### Fix: per-sequence `sampling_token_indices`
+### Implementation
 
-A global `is_final_chunk = false` would skip the sampler for **all** sequences in the batch. But a single batch can contain both non-final chunks (need no sample) and final-chunk sequences (need a sample). We must only run `lm_head` on the hidden states for sequences that complete their prefill.
-
-**`model_runner_utils.h`** — add to `PrefillMetadata`:
+**`model_runner_utils.cpp`** — populates `sampling_token_indices` and `sampling_seq_indices`:
 
 ```cpp
-struct PrefillMetadata {
-    // ... existing fields ...
-    // Indices into the Q (hidden_states) tensor for sequences at their final chunk.
-    // Empty means all sequences are non-final — skip lm_head entirely.
-    std::vector<int> sampling_token_indices;
-};
-```
-
-Each entry is the index of the **last** Q token for a sequence with `num_tokens == num_prompt_tokens`. These are the positions the sampler must read from.
-
-**`model_runner_utils.cpp` — `prepare_prefill_from_bytes`**: populate after building `cu_seqlens_q`:
-
-```cpp
-// After the per-sequence loop that builds cu_seqlens_q:
-meta.sampling_token_indices.clear();
+int seq_pos = 0, q_start = 0;
 for (size_t i = 0; i < si_vec->size(); ++i) {
     auto* si = si_vec->Get(i);
-    if (si->num_tokens() == si->num_prompt_tokens()) {
-        // last Q token index for this sequence = cu_seqlens_q[i+1] - 1
-        meta.sampling_token_indices.push_back(meta.cu_seqlens_q[i + 1] - 1);
+    if (si->master_sp_idx() != sp_rank) continue;
+
+    int seqlen_q = si->num_tokens() - si->num_cached_tokens();
+    int q_end = q_start + seqlen_q;
+
+    int num_prompt = si->num_prompt_tokens();
+    bool is_final = (num_prompt == 0) || (si->num_tokens() >= num_prompt);
+    if (is_final) {
+        meta.sampling_token_indices.push_back(q_end - 1);
+        meta.sampling_seq_indices.push_back(seq_pos);
     }
+    q_start = q_end;
+    seq_pos++;
 }
 ```
 
-This requires `num_prompt_tokens` in `SequenceInput`. Add it to `interface.fbs`:
-
-```flatbuffers
-table SequenceInput {
-  // ... existing ...
-  num_prompt_tokens: int;   // NEW: original prompt length, for chunk detection
-}
-```
-
-And serialize it in `serialization.cpp`: `si_builder.add_num_prompt_tokens(seq->num_prompt_tokens())`.
-
-**`model_runner.py`**: use `sampling_token_indices` to only run `lm_head` on the finishing tokens:
+**`model_runner.py`** — wires indices to context only when some sequences are non-final:
 
 ```python
-meta = prepare_prefill_bytes(...)
-if meta.sampling_token_indices:
-    # Extract only the hidden states that need sampling
-    sample_hs = hidden_states[meta.sampling_token_indices]  # [n_final, hidden_dim]
-    logits = self.lm_head(sample_hs)
-    sampled = self.sampler(logits)
-    # Expand back to full batch size: non-final positions get a placeholder token
-    # (e.g. -1 or EOS); worker_func discards them for PREFILLING sequences anyway
-    output_tokens = [-1] * num_seqs
-    for idx, seq_idx in enumerate(meta.sampling_seq_indices):
-        output_tokens[seq_idx] = sampled[idx]
-else:
-    output_tokens = []   # entirely non-final batch; postprocess detects PREFILLING
+if len(meta.sampling_token_indices) < num_sp_seqs:
+    sampling_token_indices = torch.tensor(meta.sampling_token_indices, ...).cuda()
+    sampling_seq_indices = torch.tensor(meta.sampling_seq_indices, ...).cuda()
 ```
 
-**Note**: `meta.sampling_seq_indices` (parallel list of which sequence number each index corresponds to) can be built in C++ alongside `sampling_token_indices` so Python can reconstruct the sparse output without another Python loop.
-
-The C++ `worker_func` detects `is_nonfinal_chunk` via `num_tokens < num_prompt_tokens` and correctly skips `append_token` for those sequences regardless of what token value is in the output list.
-
-## Part 4: Attention — Paged KV Gather for Cached Prefill
-
-### Flash-Attn API Audit
-
-Neither public ragged-prefill function supports paged (block-table) KV in the base H100 environment:
-
-| Function                  | Ragged Q (`cu_seqlens_q`)   | Paged KV (`page_table`) | Usable here?                                                                    |
-| ------------------------- | --------------------------- | ----------------------- | ------------------------------------------------------------------------------- |
-| `flash_attn_varlen_func`  | ✓                           | ✗                       | Q only                                                                          |
-| `flash_attn_with_kvcache` | `cu_seqlens_q` param exists | ✓                       | Shape mismatch — expects `q: [batch, seqlen_q, ...]` (padded), not truly ragged |
-
-`flash_attn_with_kvcache` with `cu_seqlens_q` interprets `q` as `[batch_size, seqlen_q, nheads, headdim]`. If we pass `q` with shape `[total_q_tokens, nheads, headdim]` (the ragged layout), the kernel treats `total_q_tokens` as `batch_size` and `nheads` as `seqlen_q` — wrong.
-
-### Solution: Gather + `flash_attn_varlen_func`
-
-`store_kvcache` writes new tokens' K/V to their paged slots **before** the attention call, so `k_cache`/`v_cache` already contains all relevant tokens. Gather them into contiguous tensors, then use the ragged kernel:
-
-```python
-def _gather_kv_paged(
-    k_cache: torch.Tensor,        # [num_blocks, block_size, num_kv_heads, head_dim]
-    v_cache: torch.Tensor,
-    block_table: torch.Tensor,    # [num_seqs, max_blocks_per_seq]
-    cu_seqlens_k: torch.Tensor,   # [num_seqs + 1], cumulative K lengths
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather paged K/V into ragged contiguous tensors."""
-    total_k = int(cu_seqlens_k[-1].item())
-    num_kv_heads = k_cache.shape[2]
-    head_dim = k_cache.shape[3]
-    k_out = k_cache.new_empty(total_k, num_kv_heads, head_dim)
-    v_out = v_cache.new_empty(total_k, num_kv_heads, head_dim)
-    num_seqs = block_table.shape[0]
-    for i in range(num_seqs):
-        start = int(cu_seqlens_k[i].item())
-        end   = int(cu_seqlens_k[i + 1].item())
-        seq_len = end - start
-        for tok in range(seq_len):
-            blk = int(block_table[i, tok // block_size].item())
-            off = tok % block_size
-            k_out[start + tok] = k_cache[blk, off]
-            v_out[start + tok] = v_cache[blk, off]
-    return k_out, v_out
-```
-
-In practice, replace the Python loop with a fused CUDA kernel or `torch.index_select` + reshape for performance. The Python loop above is the reference implementation; optimize after correctness is confirmed.
-
-### Fix: replace dead branch in `attention.py`
+**`embed_head.py`** (`ParallelLMHead.forward`) — sparse extraction:
 
 ```python
 if context.is_prefill:
-    if context.block_tables is not None:   # prefix cache hit or chunk 2+
-        # Gather paged K/V into contiguous ragged tensors
-        bt = context.block_tables[sp_rank]        # [num_seqs, max_blocks]
-        k_gathered, v_gathered = _gather_kv_paged(
-            k_cache, v_cache, bt,
-            context.cu_seqlens_k, self.block_size
-        )
-        o = flash_attn_varlen_func(
-            q, k_gathered, v_gathered,
-            cu_seqlens_q=context.cu_seqlens_q,
-            cu_seqlens_k=context.cu_seqlens_k,
-            max_seqlen_q=context.max_seqlen_q,
-            max_seqlen_k=context.max_seqlen_k,
-            softmax_scale=self.scale,
-            causal=True,
-        )
-    else:                                          # first chunk, no cached prefix
-        o = flash_attn_varlen_func(
-            q, k, v,
-            cu_seqlens_q=context.cu_seqlens_q,
-            cu_seqlens_k=context.cu_seqlens_k,
-            max_seqlen_q=context.max_seqlen_q,
-            max_seqlen_k=context.max_seqlen_k,
-            softmax_scale=self.scale,
-            causal=True,
-        )
+    if context.sampling_token_indices is not None:
+        x = x[context.sampling_token_indices].contiguous()
+    else:
+        last_indices = context.cu_seqlens_q[1:] - 1
+        x = x[last_indices].contiguous()
+logits = F.linear(x, self.weight)
 ```
 
-**Notes**:
+## Part 4: Attention — Paged KV Gather for Chunked/Cached Prefill
 
-- `cu_seqlens_k[i]` = total context length for sequence i (cached tokens + new tokens), already computed in `prepare_prefill_from_bytes` from `num_tokens` (= chunk endpoint).
-- `block_tables[sp_rank]`: shape `[num_seqs, max_blocks_per_seq]` — the dense table row for this SP rank.
-- `store_kvcache` already runs first and populates slots `[num_cached_blocks .. num_blocks)`, so `k_cache`/`v_cache` holds the complete context for each sequence.
-- No changes to `store_kvcache` or the slot-mapping logic needed.
+### Flash-Attn API Constraint
 
-### KV storage correctness (no change needed)
+`flash_attn_varlen_func` supports ragged Q (`cu_seqlens_q`) but NOT paged KV (`page_table`). For chunks 2+ where `seqlen_k > seqlen_q`, we need K/V for the full context but only have them in paged cache.
 
-`slot_mapping` in `prepare_prefill_from_bytes` iterates `b = num_cached_blocks .. num_blocks` (only new blocks):
+### Solution: Gather + `flash_attn_varlen_func`
+
+`store_kvcache` writes new tokens' K/V to their paged slots BEFORE the attention call, so `k_cache`/`v_cache` already contains all relevant tokens. Gather them into contiguous tensors, then use the ragged kernel.
+
+### 4a. Gather Utilities (`attention.py`)
+
+Three functions, factored for reuse across attention types:
+
+**`_build_paged_gather_indices`** — builds flat linear indices from block tables:
+
+```python
+def _build_paged_gather_indices(block_table, cu_seqlens_k, block_size) -> torch.Tensor:
+    """Returns linear_indices: [total_k] — index into cache.reshape(-1, ...)."""
+    for i in range(num_seqs):
+        t = torch.arange(seqlen, device=device)
+        block_ids = block_table[i, t // block_size]
+        linear_indices[start:end] = block_ids * block_size + t % block_size
+    return linear_indices
+```
+
+**`_gather_kv_paged`** — gathers K and V caches (for GQA with separate K/V):
+
+```python
+def _gather_kv_paged(k_cache, v_cache, block_table, cu_seqlens_k, block_size):
+    indices = _build_paged_gather_indices(block_table, cu_seqlens_k, block_size)
+    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim)
+    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim)
+    return k_flat[indices], v_flat[indices]
+```
+
+**`_gather_cache_paged`** — gathers a single cache tensor (for MLA with only k_cache):
+
+```python
+def _gather_cache_paged(cache, block_table, cu_seqlens_k, block_size):
+    indices = _build_paged_gather_indices(block_table, cu_seqlens_k, block_size)
+    flat = cache.reshape(-1, *cache.shape[2:])
+    return flat[indices]
+```
+
+### 4b. GQA Attention (`FlashAttentionImpl.forward`)
+
+Used by Qwen3, Qwen3-MoE, Qwen3.5-MoE (full-attention layers).
+
+```python
+if context.is_prefill:
+    if context.block_tables is not None:
+        num_seqs = context.cu_seqlens_k.shape[0] - 1
+        bt = context.block_tables[sp_rank, :num_seqs, :]
+        k, v = _gather_kv_paged(k_cache, v_cache, bt, context.cu_seqlens_k, block_size)
+    o = flash_attn_varlen_func(q, k, v, cu_seqlens_q=..., cu_seqlens_k=..., causal=True)
+```
+
+### 4c. MLA Attention (`DeepseekV2Attention.forward`)
+
+MLA stores compressed key states (576d = 512 latent + 64 RoPE'd k_pe) in `k_cache`. There is no separate `v_cache` — V is reconstructed from the latent.
+
+For chunks 2+:
+
+```python
+if context.block_tables is not None:
+    # Gather compressed keys from paged k_cache: [total_k, 1, 576] -> [total_k, 576]
+    k_gathered = _gather_cache_paged(k_cache, bt, context.cu_seqlens_k, block_size).squeeze(1)
+
+    # Split into latent and RoPE components
+    compressed_kv_all = k_gathered[:, :kv_lora_rank]      # [total_k, 512]
+    k_pe_all          = k_gathered[:, kv_lora_rank:]       # [total_k, 64]
+
+    # Expand K: latent → k_nope via W_UK, concat with k_pe
+    k_nope    = (compressed_kv_all @ kc_t).view(-1, H, 128)
+    k_expanded = torch.cat([k_nope, k_pe_all.expand(-1, H, -1)], dim=-1)  # [total_k, H, 192]
+
+    # Expand V: latent → v via W_UV
+    v_expanded = (compressed_kv_all @ vc_reshaped).view(-1, H, 128)  # [total_k, H, 128]
+```
+
+Then `flash_attn_varlen_func(q_full, k_expanded, v_expanded, ...)`.
+
+For the first chunk (no block_tables): K/V expanded directly from fresh `compressed_kv` projections (no gather needed).
+
+### 4d. GDN Linear Attention (`GenericGatedDeltaNet`)
+
+Used by Qwen3.5-MoE linear-attention layers. GDN does not use paged KV cache; it maintains recurrent state and conv1d state. For chunked prefill, state continuity across chunks is critical.
+
+**Conv1d state** — `_conv1d_prefill_fast`:
+
+```python
+has_prev_state = context.block_tables is not None and gdn_conv_states is not None
+
+if has_prev_state:
+    # Chunks 2+: per-sequence processing with initial_states from previous chunk
+    for i in range(num_seqs):
+        init_state = gdn_conv_states[layer_idx, slot:slot+1, :, 1:].contiguous()
+        seq_out = causal_conv1d_fn(
+            x=qkv[start:end].T.unsqueeze(0),
+            weight=conv_weight,
+            initial_states=init_state,  # [1, conv_dim, kernel_size-1]
+            activation="silu",
+        )
+else:
+    # First chunk: batched with seq_idx (efficient single kernel)
+    qkv_out = causal_conv1d_fn(x=..., weight=..., seq_idx=..., activation="silu")
+
+# Store conv states for next chunk/decode (same for both paths)
+states = causal_conv1d_varlen_states(qkv, cu_seqlens, kernel_size - 1)
+gdn_conv_states[layer_idx, slots, :, 1:] = states
+```
+
+Naive fallback (`_conv1d_prefill_naive`): for chunks 2+, manually prepends the stored conv state and runs `F.conv1d` without built-in padding.
+
+**Recurrent state** — `_gdn_prefill`:
+
+```python
+if gdn_recurrent_states is not None:
+    if context.block_tables is not None:
+        # Chunks 2+: load state from previous chunk
+        initial_state = gdn_recurrent_states[layer_idx, slots[:num_seqs]]
+    else:
+        # First chunk: zero initial state
+        initial_state = zeros(num_seqs, num_v_heads, head_k_dim, head_v_dim)
+
+o, final_state = chunk_gated_delta_rule(
+    q, k, v, g=g, beta=beta, initial_state=initial_state,
+    output_final_state=True, cu_seqlens=cu_seqlens,
+)
+gdn_recurrent_states[layer_idx, slots[:num_seqs]] = final_state
+```
+
+Naive fallback (`_naive_gdn_prefill`): accepts `initial_state` parameter, clones `initial_state[i]` per sequence instead of zeros.
+
+### KV storage correctness (`slot_mapping`)
+
+`slot_mapping` in `prepare_prefill_from_bytes` accounts for partial-block offsets:
 
 ```cpp
-int num_cached_blocks = num_cached / block_size;
-for (int b = num_cached_blocks; b < num_blocks; ++b) { ... }
+int num_cached_blocks      = num_cached / block_size;
+int cached_offset_in_block = num_cached % block_size;
+
+for (int b = num_cached_blocks; b < num_blocks; ++b) {
+    int64_t start = block_id * block_size;
+    int64_t end   = (b != num_blocks - 1) ? start + block_size : start + last_block_tokens;
+    if (b == num_cached_blocks)
+        start += cached_offset_in_block;  // skip already-cached slots in first block
+    for (int64_t k = start; k < end; ++k)
+        meta.slot_mapping.push_back(k);
+}
 ```
 
-Since `num_cached_tokens` is always a multiple of `block_size` (only full-block hits counted), this correctly maps each new token to its physical cache slot. `store_kvcache` writes only those new tokens — no offset bug.
+This handles the case where `num_cached_tokens` is not block-aligned (e.g. prefix cache hit of 192 tokens with block_size=64 → 3 full blocks cached, `cached_offset_in_block=0`; but if prefix cache hit of 200 tokens with block_size=64 → 3 full blocks + 8 tokens in block 3, `cached_offset_in_block=8`).
 
-## Implementation Order
+## Implementation Status
 
-01. `sequence.fbs` + `interface.fbs` — add `PREFILLING = 4`; add `num_prompt_tokens` to `SequenceInput`; regenerate headers
-02. `block_manager.h/cpp` — prefix caching: `count_active_prefix_hits`, `allocate()` update, `can_allocate()` update
-03. `model_runner_utils.h/cpp` — add `sampling_token_indices` + `sampling_seq_indices` to `PrefillMetadata`; populate from sequences where `num_tokens == num_prompt_tokens`
-04. `serialization.cpp` — serialize `num_prompt_tokens` from sequence
-05. `scheduler_utils.h/cpp` — add `chunk_continuations` to `WorkerContext`; detect non-final chunks via `num_tokens < num_prompt_tokens`; update `postprocess_sequences` return
-06. `scheduler.h` — add `prefilling` deque
-07. `scheduler.cpp` — update `_schedule_prefill()` (PREFILLING queue first, shrink-then-preempt); update `postprocess()`; update `preempt()`
-08. `model_runner.py` — selective `lm_head` only on `sampling_token_indices`
-09. `attention.py` — replace dead `block_tables` branch with gather + `flash_attn_varlen_func`
-10. Build and test
+| Component                                    | Status     | Notes                                                           |
+| -------------------------------------------- | ---------- | --------------------------------------------------------------- |
+| `PREFILLING` status in `sequence.fbs`        | ✅ Done    |                                                                 |
+| `prefilling` deque in `scheduler.h`          | ✅ Done    |                                                                 |
+| `_schedule_prefill()` two-step scheduling    | ✅ Done    | PREFILLING queue first, then WAITING with chunking              |
+| `postprocess_sequences()` chunk detection    | ✅ Done    | Removed `is_prefill` guard; added PREFILLING→RUNNING transition |
+| `PostprocessResult` with `continuations`     | ✅ Done    |                                                                 |
+| `preempt()` reset                            | ✅ Done    |                                                                 |
+| `num_prompt_tokens` in `interface.fbs`       | ✅ Done    |                                                                 |
+| `sampling_token_indices/seq_indices`         | ✅ Done    | C++ populates, Python wires to context                          |
+| `ParallelLMHead` sparse extraction           | ✅ Done    |                                                                 |
+| `slot_mapping` with `cached_offset_in_block` | ✅ Done    |                                                                 |
+| `_build_paged_gather_indices`                | ✅ Done    |                                                                 |
+| `_gather_kv_paged` (GQA)                     | ✅ Done    |                                                                 |
+| `_gather_cache_paged` (MLA)                  | ✅ Done    |                                                                 |
+| MLA chunked prefill in `DeepseekV2Attention` | ✅ Done    |                                                                 |
+| GDN conv/recurrent state continuity          | ✅ Done    |                                                                 |
+| Prefix caching (`block_manager` wiring)      | 🔲 Pending | `count_active_prefix_hits`, `allocate()`, `can_allocate()`      |
 
 ## Verification
 
-**Prefix caching test**:
+**Chunked prefill (verified)**:
 
-1. Send two requests with the same long prefix (e.g., system prompt)
-2. First request: all tokens prefilled normally
-3. Second request: `num_cached_tokens > 0` in logs, `seqlen_q < num_prompt_tokens`, TTFP is faster
-4. Check that KV outputs match a non-cached run (correctness)
+1. Model: Qwen3-30B-A3B-FP8, `kvcache_block_size=64`, `max_num_batched_tokens=128`
+2. Prompt: 1209 tokens → 10 chunks (9×128 + 57)
+3. Results:
+   - Output coherent: `<think>\nOkay, the user sent a lot of repetition...`
+   - `max_tokens=128` respected: Output Length = 128
+   - TTFT = 2519.95ms, Decode = 441 tok/s
+   - Sequence completed successfully (Completed: 1)
 
-**Attention test**:
+**Attention correctness test**:
 
 1. Run a 2-chunk sequence; confirm the second chunk takes the gather path (log/assert that `block_tables is not None`)
 2. Confirm numerical output of the 2-chunk run matches a single-chunk reference (with `max_num_batched_tokens` large enough to fit the whole prompt)
 
-**Chunked prefill test**:
+**Prefix caching test** (pending):
 
-1. Set `max_num_batched_tokens = 512`, send a 2000-token prompt
-2. Verify the request is scheduled (not stuck in waiting)
-3. Verify it processes in ~4 chunks, each triggering a prefill step
-4. Verify the final output matches a run with `max_num_batched_tokens = 4096`
-5. Mix with concurrent decode requests — verify decode still runs between chunk prefill steps
+1. Send two requests with the same long prefix
+2. Second request: `num_cached_tokens > 0`, TTFP faster
+3. Check KV outputs match a non-cached run
 
 **Integration**: Run the existing test suite to confirm no regressions.

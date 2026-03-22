@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanoinfra"
+version = "0.1.0"
+description = "NanoInfra monorepo meta-package"
+authors = [{ name = "DeepLink-MLSysResearch" }]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+# Install individual components:
+#   pip install ".[dlslime]"
+#   pip install ".[nanoctrl]"
+#   pip install ".[nanodeploy]"
+#   pip install ".[all]"
+[project.optional-dependencies]
+dlslime = [
+    "dlslime @ file:DLSlime",
+]
+nanoctrl = [
+    "nanoctrl @ file:NanoCtrl",
+]
+nanodeploy = [
+    "nanodeploy @ file:NanoDeploy",
+]
+all = [
+    "dlslime @ file:DLSlime",
+    "nanoctrl @ file:NanoCtrl",
+    "nanodeploy @ file:NanoDeploy",
+]
+
+[tool.setuptools]
+# No Python packages to install from the root itself
+py-modules = []

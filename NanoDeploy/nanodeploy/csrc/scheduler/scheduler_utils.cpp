@@ -2,16 +2,15 @@
 #include <algorithm>
 #include <exception>
 
+#include "nanodeploy/csrc/metrics/sequence_metric.h"
+#include "nanodeploy/csrc/scheduler/scheduler_utils.h"
 #include "nanodeploy/csrc/scheduler/sp_state_manager.h"
-#include "nanosequence/csrc/metrics/sequence_metric.h"
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 #include "sequence_generated.h"
 
 #include "thread_pool.h"
 
 namespace nanodeploy {
-
-using MigrationList = std::vector<std::pair<std::shared_ptr<Sequence>, int>>;
 
 struct Task {
     std::shared_ptr<Sequence> seq;
@@ -20,10 +19,11 @@ struct Task {
 };
 
 struct WorkerContext {
-    std::vector<Task>  tasks;
-    MigrationList      migration_candidates;
-    std::exception_ptr eptr = nullptr;
-    int                dp_idx;
+    std::vector<Task>                      tasks;
+    MigrationList                          migration_candidates;
+    std::vector<std::shared_ptr<Sequence>> chunk_continuations;  // non-final prefill chunks
+    std::exception_ptr                     eptr = nullptr;
+    int                                    dp_idx;
 
     void reserve(size_t n)
     {
@@ -49,6 +49,28 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
 
             if (dummy_set.count(seq))
                 continue;
+
+            // Detect non-final prefill chunk: num_tokens was set to the chunk
+            // endpoint during scheduling; if it's still less than num_prompt_tokens
+            // the sequence is not done prefilling yet.
+            // NOTE: This must NOT be guarded by is_prefill (which reflects the
+            // scheduler mode, e.g. disaggregated "prefill" vs "decode").  In a
+            // combined (non-disaggregated) scheduler the mode is never "prefill",
+            // but chunked sequences still need to continue prefilling.
+            if (seq->num_tokens() < seq->num_prompt_tokens()) {
+                // KV has been computed for this chunk's tokens; advance the
+                // cached token pointer so the next chunk starts here.
+                seq->set_num_cached_tokens(seq->num_tokens());
+                seq->set_status(SequenceStatus::PREFILLING);
+                result_ctx->chunk_continuations.push_back(seq);
+                continue;  // don't process token_ids for this sequence
+            }
+
+            // Final prefill chunk completed — transition to RUNNING so the
+            // sequence stays in the running queue for subsequent decode steps.
+            if (seq->status() == SequenceStatus::PREFILLING) {
+                seq->set_status(SequenceStatus::RUNNING);
+            }
 
             for (int token_id : *task.tokens) {
 
@@ -95,7 +117,8 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                                          running.end(),
                                          [](const std::shared_ptr<Sequence>& s) {
                                              return s->status() == SequenceStatus::FINISHED
-                                                    || s->status() == SequenceStatus::TO_BE_MIGRATED;
+                                                    || s->status() == SequenceStatus::TO_BE_MIGRATED
+                                                    || s->status() == SequenceStatus::PREFILLING;
                                          }),
                           running.end());
         }
@@ -105,13 +128,13 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
     }
 }
 
-MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>               worker_states,
-                                    const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
-                                    const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
-                                    int                                                        eos_id,
-                                    bool                                                       is_prefill,
-                                    bool                                                       update_metrics,
-                                    ThreadPool*                                                thread_pool)
+PostprocessResult postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>               worker_states,
+                                        const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+                                        const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+                                        int                                                        eos_id,
+                                        bool                                                       is_prefill,
+                                        bool                                                       update_metrics,
+                                        ThreadPool*                                                thread_pool)
 {
     size_t num_dp    = worker_states.size();
     size_t num_dp_sp = dp_sp_seqs.size();
@@ -187,15 +210,18 @@ MigrationList postprocess_sequences(std::vector<std::shared_ptr<SPStateManager>>
         }
     }
 
-    MigrationList all_migrations;
+    PostprocessResult result;
     for (const auto& ctx : contexts) {
         if (ctx.eptr) {
             std::rethrow_exception(ctx.eptr);
         }
-        all_migrations.insert(all_migrations.end(), ctx.migration_candidates.begin(), ctx.migration_candidates.end());
+        result.migrations.insert(
+            result.migrations.end(), ctx.migration_candidates.begin(), ctx.migration_candidates.end());
+        result.continuations.insert(
+            result.continuations.end(), ctx.chunk_continuations.begin(), ctx.chunk_continuations.end());
     }
 
-    return all_migrations;
+    return result;
 }
 
 }  // namespace nanodeploy

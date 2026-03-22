@@ -54,6 +54,15 @@ public:
                 ibv_dereg_mr(mr.second);
         }
         mrs_.clear();
+
+        for (auto* mr : id_to_mr_) {
+            if (mr)
+                ibv_dereg_mr(mr);
+        }
+        id_to_mr_.clear();
+        ptr_to_handle_.clear();
+        name_to_id_.clear();
+
         if (pd_ && owns_pd_)
             ibv_dealloc_pd(pd_);
     }

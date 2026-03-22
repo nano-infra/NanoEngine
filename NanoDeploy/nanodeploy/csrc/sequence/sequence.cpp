@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "nanosequence/csrc/metrics/sequence_metric.h"
+#include "nanodeploy/csrc/metrics/sequence_metric.h"
 #include "sequence.h"
 #include "sequence_generated.h"
 

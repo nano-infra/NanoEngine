@@ -2,8 +2,8 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "nanosequence/csrc/metrics/sequence_metric.h"
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/metrics/sequence_metric.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 #include "sequence_generated.h"
 
 #include "scheduler_utils.h"
@@ -30,6 +30,7 @@ Scheduler::Scheduler(const std::string& engine_id,
     attention_dp_(attention_dp),
     attention_sp_(attention_sp),
     num_kvcache_blocks_(num_kvcache_blocks),
+    kvcache_block_size_(kvcache_block_size),
     mode_(mode)
 {
     // Initialize worker states for each DP rank
@@ -65,6 +66,8 @@ bool Scheduler::is_finished() const
 {
     const auto& wait_queue = (mode_ != "decode") ? waiting : waiting_migration;
     if (!wait_queue.empty())
+        return false;
+    if (!prefilling.empty())
         return false;
 
     for (const auto& ws : worker_state) {
@@ -285,6 +288,57 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
     auto& waiting_queue = (mode_ != "decode") ? waiting : waiting_migration;
 
+    // -----------------------------------------------------------------------
+    // Step 1: Schedule PREFILLING sequences (hold allocated blocks, higher
+    // priority).  Process before fresh WAITING sequences.
+    // -----------------------------------------------------------------------
+    std::deque<std::shared_ptr<Sequence>> not_scheduled_prefilling;
+    while (!prefilling.empty()) {
+        auto seq = prefilling.front();
+        prefilling.pop_front();
+        auto& block_ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
+        int   dp_idx    = block_ctx.dp_idx;
+        int   master_sp = block_ctx.master_sp_idx;
+
+        int prev_tokens      = seq->num_tokens();
+        int budget_remaining = max_num_batched_tokens_ - num_batched_tokens[dp_idx][master_sp];
+        int new_tokens       = std::min(budget_remaining, seq->num_prompt_tokens() - prev_tokens);
+        if (new_tokens <= 0) {
+            not_scheduled_prefilling.push_back(seq);
+            continue;
+        }
+
+        // Shrink-before-preempt: only preempt if truly saturated (zero free blocks).
+        {
+            int free_blocks        = worker_state[dp_idx]->block_manager[master_sp]->num_free_blocks();
+            int max_appendable_tok = free_blocks * kvcache_block_size_;
+            if (max_appendable_tok <= 0) {
+                // Cache is saturated — preempt to avoid starvation deadlock
+                preempt(dp_idx, seq);
+                continue;
+            }
+            new_tokens = std::min(new_tokens, max_appendable_tok);
+        }
+
+        // Advance num_tokens to the new chunk endpoint and allocate new blocks
+        seq->set_num_tokens(prev_tokens + new_tokens);
+        worker_state[dp_idx]->block_manager[master_sp]->may_append(*seq, new_tokens);
+        block_ctx.num_dispatched_tokens[master_sp] = seq->num_tokens();
+
+        num_seqs[dp_idx][master_sp] += 1;
+        num_batched_tokens[dp_idx][master_sp] += new_tokens;
+
+        worker_state[dp_idx]->running.push_back(seq);
+        scheduled_seqs[dp_idx].push_back(seq);
+    }
+    // Put back budget-exhausted prefilling sequences at the front (preserve order)
+    for (auto it = not_scheduled_prefilling.rbegin(); it != not_scheduled_prefilling.rend(); ++it)
+        prefilling.push_front(*it);
+
+    // -----------------------------------------------------------------------
+    // Step 2: Schedule fresh WAITING sequences with chunking
+    // -----------------------------------------------------------------------
+
     // For LeastBatch and LeastCache, we maintain a set to act as a min-heap
     std::set<std::pair<int, int>> dp_load_set;
     if (routing_strategy == RoutingStrategy::LeastBatch) {
@@ -307,15 +361,31 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
             for (int attempt = 0; attempt < attention_dp_; ++attempt) {
                 int selected_dp_idx = next_dp_idx();
 
+                // Compute how many tokens to process in this chunk.
+                // seq->num_cached_tokens() is set by allocate() via prefix hits.
+                // Temporarily set num_tokens = chunk_end for can_allocate / allocate.
+                int budget = max_num_batched_tokens_ - num_batched_tokens[selected_dp_idx].begin()->second;
+                // (use the tightest per-SP budget across all SP ranks)
+                for (auto& [sp, tok] : num_batched_tokens[selected_dp_idx]) {
+                    budget = std::min(budget, max_num_batched_tokens_ - tok);
+                }
+                int num_cached = seq->num_cached_tokens();
+                int chunk_end  = num_cached + std::min(budget, seq->num_prompt_tokens() - num_cached);
+                if (chunk_end <= num_cached)
+                    continue;
+                seq->set_num_tokens(chunk_end);
+
                 // Check if this DP rank can allocate the sequence
-                bool can_allocate = worker_state[selected_dp_idx]->can_allocate(
+                bool can_alloc = worker_state[selected_dp_idx]->can_allocate(
                     *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
 
-                if (!can_allocate) {
+                if (!can_alloc) {
+                    // Restore num_tokens on failure before trying next DP rank
+                    seq->set_num_tokens(seq->num_prompt_tokens());
                     continue;
                 }
 
-                // Allocate the sequence
+                // Allocate the sequence (also calls set_num_cached_tokens via prefix hits)
                 worker_state[selected_dp_idx]->allocate(*seq);
 
                 // Update tracking
@@ -351,17 +421,27 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
             for (auto it = dp_load_set.begin(); it != dp_load_set.end(); ++it) {
                 int selected_dp_idx = it->second;
 
-                bool can_allocate = worker_state[selected_dp_idx]->can_allocate(
+                // Compute chunk size
+                int budget = max_num_batched_tokens_;
+                for (auto& [sp, tok] : num_batched_tokens[selected_dp_idx]) {
+                    budget = std::min(budget, max_num_batched_tokens_ - tok);
+                }
+                int num_cached = seq->num_cached_tokens();
+                int chunk_end  = num_cached + std::min(budget, seq->num_prompt_tokens() - num_cached);
+                if (chunk_end <= num_cached)
+                    continue;
+                seq->set_num_tokens(chunk_end);
+
+                bool can_alloc = worker_state[selected_dp_idx]->can_allocate(
                     *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
 
-                if (!can_allocate) {
+                if (!can_alloc) {
+                    seq->set_num_tokens(seq->num_prompt_tokens());
                     continue;
                 }
 
                 // WARNING: erase(it) invalidates the iterator. This is safe here because
-                // we break the loop immediately after. If refactoring to remove the break
-                // or making dp_load_set a member variable, ensure thread-safety and
-                // correct iterator management.
+                // we break the loop immediately after.
                 dp_load_set.erase(it);
                 worker_state[selected_dp_idx]->allocate(*seq);
                 int new_load = (routing_strategy == RoutingStrategy::LeastBatch) ?
@@ -488,6 +568,9 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
     std::cerr << "Preemption happens for seq_id=" << seq->seq_id() << std::endl;
     seq->set_status(SequenceStatus::WAITING);
     worker_state[dp_idx]->deallocate(*seq);
+    // For mid-chunk sequences (PREFILLING), reset num_tokens back to the full
+    // prompt length so the next allocation starts from scratch.
+    seq->set_num_tokens(seq->num_prompt_tokens());
     seq->set_num_checkpointed_tokens(static_cast<int>(seq->token_ids().size()));
     waiting.push_front(seq);
 }
@@ -497,12 +580,17 @@ void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequen
                             bool                                                       update_metrics)
 {
     // Call the C++ postprocess_sequences utility directly with shared_ptrs
-    auto migrations = postprocess_sequences(
+    auto result = postprocess_sequences(
         worker_state, dp_sp_seqs, dp_sp_token_ids, eos_, mode_ == "prefill", update_metrics, thread_pool_.get());
 
     // Store migrations
-    for (const auto& [seq_shared, dp_idx] : migrations) {
+    for (const auto& [seq_shared, dp_idx] : result.migrations) {
         to_be_migrated[seq_shared->seq_id()] = {seq_shared, dp_idx};
+    }
+
+    // Route non-final prefill chunks back to the prefilling queue
+    for (auto& seq : result.continuations) {
+        prefilling.push_back(seq);
     }
 }
 

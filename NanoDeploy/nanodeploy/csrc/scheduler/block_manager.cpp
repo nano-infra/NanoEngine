@@ -3,7 +3,7 @@
 #include <stdexcept>
 
 #include "nanocommon/xxhash.hpp"
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 #include "sequence_generated.h"
 
@@ -67,9 +67,45 @@ void BlockManager::deallocate_block(int block_id)
     block_id_to_free_list_it_[block_id] = std::prev(free_block_ids_.end());
 }
 
+int BlockManager::count_active_prefix_hits(Sequence& seq) const
+{
+    int64_t h          = -1;
+    int     num_blocks = seq.num_blocks(BlockContextSlot::ACTIVE, sp_idx_);
+    int     hits       = 0;
+
+    for (int i = 0; i < num_blocks; ++i) {
+        auto view = seq.block_view(i, BlockContextSlot::ACTIVE, sp_idx_);
+
+        // Only full blocks can be cached
+        if (view.second != static_cast<size_t>(block_size_)) {
+            break;
+        }
+        h = compute_hash(view.first, view.second, h);
+
+        auto it = hash_to_block_id_.find(h);
+        if (it == hash_to_block_id_.end()) {
+            break;
+        }
+        int block_id = it->second;
+        // Must be actively shared (ref_count > 0) and token content must match
+        if (!used_block_ids_.count(block_id)) {
+            break;
+        }
+        const Block& blk = blocks_[block_id];
+        if (blk.token_ids.size() != view.second
+            || !std::equal(blk.token_ids.begin(), blk.token_ids.end(), view.first)) {
+            break;
+        }
+        hits++;
+    }
+    return hits;
+}
+
 bool BlockManager::can_allocate(Sequence& seq) const
 {
-    return static_cast<int>(free_block_ids_.size()) >= seq.num_blocks(BlockContextSlot::ACTIVE, sp_idx_);
+    int n_cached      = count_active_prefix_hits(seq);
+    int blocks_needed = seq.num_blocks(BlockContextSlot::ACTIVE, sp_idx_) - n_cached;
+    return static_cast<int>(free_block_ids_.size()) >= blocks_needed;
 }
 
 void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
@@ -81,9 +117,10 @@ void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
         throw std::runtime_error("Block table is not empty");
     }
 
-    int64_t h          = -1;
-    bool    cache_miss = false;
-    int     num_blocks = seq.num_blocks(BlockContextSlot::ACTIVE, sp_idx_);
+    int64_t h                 = -1;
+    bool    cache_miss        = false;
+    int     num_blocks        = seq.num_blocks(BlockContextSlot::ACTIVE, sp_idx_);
+    int     num_prefix_cached = 0;  // consecutive leading full-block cache hits
 
     for (int i = 0; i < num_blocks; ++i) {
         auto view = seq.block_view(i, BlockContextSlot::ACTIVE, sp_idx_);
@@ -96,7 +133,7 @@ void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
         }
 
         int block_id = -1;
-        if (hash_to_block_id_.count(h)) {
+        if (h != -1 && hash_to_block_id_.count(h)) {
             block_id = hash_to_block_id_.at(h);
         }
 
@@ -121,6 +158,10 @@ void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
             else {
                 block_ptr = &allocate_block(block_id);
             }
+            // Track consecutive leading full-block hits (prefix caching)
+            if (view.second == static_cast<size_t>(block_size_)) {
+                num_prefix_cached++;
+            }
         }
 
         if (h != -1) {
@@ -131,6 +172,10 @@ void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
         seq.block_ctx(BlockContextSlot::ACTIVE).block_location.emplace_back(sp_idx_, block_id);
         table.push_back(block_id);
     }
+
+    // Wire prefix caching: tell the sequence how many leading tokens are already
+    // in the shared KV cache so prefill can skip recomputing them.
+    seq.set_num_cached_tokens(num_prefix_cached * block_size_);
 }
 
 void BlockManager::deallocate(Sequence& seq, BlockContextSlot slot)

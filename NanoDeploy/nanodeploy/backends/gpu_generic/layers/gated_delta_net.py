@@ -235,33 +235,61 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         num_seqs = cu_seqlens.shape[0] - 1
         conv_weight = self.conv1d.weight.squeeze(1)
 
-        # Build seq_idx on GPU — no CPU-GPU syncs
-        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
-        seq_idx = torch.repeat_interleave(
-            torch.arange(num_seqs, dtype=torch.int32, device=qkv.device),
-            seq_lens,
-        ).unsqueeze(
-            0
-        )  # [1, total_tokens]
-
-        # Single batched kernel call across all sequences
-        qkv_out = (
-            causal_conv1d_fn(
-                x=qkv.T.unsqueeze(0),  # [1, conv_dim, total_tokens]
-                weight=conv_weight,
-                bias=None,
-                seq_idx=seq_idx,
-                activation=self.activation,
-            )
-            .squeeze(0)
-            .T
-        )  # [total_tokens, conv_dim]
-
-        # Store conv states for future decode steps — batched extraction, no CPU syncs
         gdn_conv_states = getattr(context, "gdn_conv_states", None)
         gdn_state_slots = getattr(context, "gdn_state_slots", None)
+
+        has_prev_state = (
+            context.block_tables is not None and gdn_conv_states is not None
+        )
+
+        if has_prev_state:
+            # Chunked prefill (chunks 2+): per-sequence with initial_states
+            # from the previous chunk's stored conv state
+            qkv_out = torch.empty_like(qkv)
+            for i in range(num_seqs):
+                start = int(cu_seqlens[i].item())
+                end = int(cu_seqlens[i + 1].item())
+                if end <= start:
+                    continue
+                slot = (
+                    int(gdn_state_slots[i].item()) if gdn_state_slots is not None else i
+                )
+                init_state = gdn_conv_states[
+                    self.layer_idx, slot : slot + 1, :, 1:
+                ].contiguous()
+                seq_out = (
+                    causal_conv1d_fn(
+                        x=qkv[start:end].T.unsqueeze(0),
+                        weight=conv_weight,
+                        initial_states=init_state,
+                        activation=self.activation,
+                    )
+                    .squeeze(0)
+                    .T
+                )
+                qkv_out[start:end] = seq_out
+        else:
+            # First chunk or single-chunk: batched with seq_idx
+            seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+            seq_idx = torch.repeat_interleave(
+                torch.arange(num_seqs, dtype=torch.int32, device=qkv.device),
+                seq_lens,
+            ).unsqueeze(0)
+
+            qkv_out = (
+                causal_conv1d_fn(
+                    x=qkv.T.unsqueeze(0),
+                    weight=conv_weight,
+                    bias=None,
+                    seq_idx=seq_idx,
+                    activation=self.activation,
+                )
+                .squeeze(0)
+                .T
+            )
+
+        # Store conv states for future chunks/decode — batched extraction
         if gdn_conv_states is not None:
-            # [num_seqs, conv_dim, kernel_size-1]
             states = causal_conv1d_varlen_states(
                 qkv, cu_seqlens, self.conv_kernel_size - 1
             )
@@ -281,18 +309,36 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         num_seqs = cu_seqlens.shape[0] - 1
         qkv_out = torch.empty_like(qkv)
 
+        gdn_conv_states = getattr(context, "gdn_conv_states", None)
+        gdn_state_slots = getattr(context, "gdn_state_slots", None)
+        has_prev_state = (
+            context.block_tables is not None and gdn_conv_states is not None
+        )
+
+        conv_weight = self.conv1d.weight  # [conv_dim, 1, kernel_size]
+
         for i in range(num_seqs):
             start = cu_seqlens[i].item()
             end = cu_seqlens[i + 1].item()
             if end <= start:
                 continue
-            seq_qkv = qkv[start:end].unsqueeze(0).transpose(1, 2)
-            seq_out = F.silu(self.conv1d(seq_qkv)[:, :, : end - start])
+            seq_qkv = qkv[start:end].unsqueeze(0).transpose(1, 2)  # [1, D, L]
+
+            if has_prev_state:
+                slot = gdn_state_slots[i].item() if gdn_state_slots is not None else i
+                prev = gdn_conv_states[self.layer_idx, slot, :, 1:].unsqueeze(
+                    0
+                )  # [1, D, k-1]
+                padded = torch.cat([prev, seq_qkv], dim=2)  # [1, D, k-1+L]
+                seq_out = F.silu(
+                    F.conv1d(padded, conv_weight, groups=self.conv_dim)
+                )  # [1, D, L]
+            else:
+                seq_out = F.silu(self.conv1d(seq_qkv)[:, :, : end - start])
+
             qkv_out[start:end] = seq_out.squeeze(0).transpose(0, 1)
 
         # Store conv state
-        gdn_conv_states = getattr(context, "gdn_conv_states", None)
-        gdn_state_slots = getattr(context, "gdn_state_slots", None)
         if gdn_conv_states is not None:
             for i in range(num_seqs):
                 start = cu_seqlens[i].item()
@@ -373,9 +419,18 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         gdn_state_slots = getattr(context, "gdn_state_slots", None)
         initial_state = None
         if gdn_recurrent_states is not None:
-            initial_state = gdn_recurrent_states.new_zeros(
-                num_seqs, self.num_v_heads, self.head_k_dim, self.head_v_dim
-            )
+            if context.block_tables is not None:
+                # Chunked prefill (chunks 2+): load state from previous chunk
+                if gdn_state_slots is not None:
+                    initial_state = gdn_recurrent_states[
+                        self.layer_idx, gdn_state_slots[:num_seqs]
+                    ]
+                else:
+                    initial_state = gdn_recurrent_states[self.layer_idx, :num_seqs]
+            else:
+                initial_state = gdn_recurrent_states.new_zeros(
+                    num_seqs, self.num_v_heads, self.head_k_dim, self.head_v_dim
+                )
 
         if self._chunk_fn is not None:
             o, final_state = self._chunk_fn(
@@ -393,7 +448,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             o = o.squeeze(0)
         else:
             o, final_state = self._naive_gdn_prefill(
-                q, k, v, g, beta, scale, cu_seqlens
+                q, k, v, g, beta, scale, cu_seqlens, initial_state
             )
 
         if gdn_recurrent_states is not None and final_state is not None:
@@ -470,7 +525,9 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
         return x * inv_norm
 
-    def _naive_gdn_prefill(self, q, k, v, g, beta, scale, cu_seqlens):
+    def _naive_gdn_prefill(
+        self, q, k, v, g, beta, scale, cu_seqlens, initial_state=None
+    ):
         """Naive sequential scan for prefill."""
         num_seqs = cu_seqlens.shape[0] - 1
         outputs = []
@@ -483,13 +540,16 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         for i in range(num_seqs):
             start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
 
-            S = torch.zeros(
-                self.num_v_heads,
-                self.head_k_dim,
-                self.head_v_dim,
-                dtype=torch.float32,
-                device=q.device,
-            )
+            if initial_state is not None:
+                S = initial_state[i].float().clone()
+            else:
+                S = torch.zeros(
+                    self.num_v_heads,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                    dtype=torch.float32,
+                    device=q.device,
+                )
 
             if end <= start:
                 final_states.append(S)
