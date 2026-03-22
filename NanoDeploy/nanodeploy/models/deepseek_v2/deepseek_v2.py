@@ -668,10 +668,21 @@ class DeepseekV2Attention(nn.Module):
                 self.kv_lora_rank, num_heads * self.v_head_dim
             )  # (R, H*V)
 
+            # Expand fresh tokens (needed for both paths)
+            k_nope_fresh = (compressed_kv @ kc_t).view(
+                q_len, num_heads, self.qk_nope_head_dim
+            )
+            k_expanded_fresh = torch.cat(
+                [k_nope_fresh, k_pe_3d.expand(-1, num_heads, -1)], dim=-1
+            )
+            v_expanded_fresh = (compressed_kv @ vc_reshaped).view(
+                q_len, num_heads, self.v_head_dim
+            )
+
             if context.block_tables is not None:
-                # === Chunked prefill (chunks 2+): gather ALL K from paged cache ===
                 from nanodeploy.backends.hopper.layers.attention import (
-                    _gather_cache_paged,
+                    _gather_cache_cached_only,
+                    _interleave_cached_fresh,
                 )
 
                 sp_rank = get_dist_context().attn_sp_rank
@@ -679,35 +690,56 @@ class DeepseekV2Attention(nn.Module):
                 bt = context.block_tables[sp_rank, :num_seqs, :]
                 block_size = k_cache.shape[1]
 
-                # k_cache: [num_blocks, block_size, 1, kv_lora_rank+qk_rope_head_dim]
-                # gathered: [total_k, 1, 576] -> squeeze -> [total_k, 576]
-                k_gathered = _gather_cache_paged(
-                    k_cache, bt, context.cu_seqlens_k, block_size
-                ).squeeze(1)
-
-                compressed_kv_all = k_gathered[:, : self.kv_lora_rank]
-                k_pe_all = k_gathered[:, self.kv_lora_rank :]
-
-                k_nope = (compressed_kv_all @ kc_t).view(
-                    -1, num_heads, self.qk_nope_head_dim
+                k_cached_raw, cached_lens, cu_cached = _gather_cache_cached_only(
+                    k_cache,
+                    bt,
+                    context.cu_seqlens_q,
+                    context.cu_seqlens_k,
+                    block_size,
                 )
-                k_pe_expanded = k_pe_all.unsqueeze(1).expand(-1, num_heads, -1)
-                k_expanded = torch.cat([k_nope, k_pe_expanded], dim=-1)
 
-                v_expanded = (compressed_kv_all @ vc_reshaped).view(
-                    -1, num_heads, self.v_head_dim
-                )
+                total_cached = int(cu_cached[-1].item())
+                if total_cached > 0:
+                    k_cached_raw = k_cached_raw.squeeze(1)  # [total_cached, 576]
+                    comp_cached = k_cached_raw[:, : self.kv_lora_rank]
+                    kpe_cached = k_cached_raw[:, self.kv_lora_rank :]
+
+                    k_nope_cached = (comp_cached @ kc_t).view(
+                        -1, num_heads, self.qk_nope_head_dim
+                    )
+                    k_expanded_cached = torch.cat(
+                        [
+                            k_nope_cached,
+                            kpe_cached.unsqueeze(1).expand(-1, num_heads, -1),
+                        ],
+                        dim=-1,
+                    )
+                    v_expanded_cached = (comp_cached @ vc_reshaped).view(
+                        -1, num_heads, self.v_head_dim
+                    )
+
+                    k_expanded = _interleave_cached_fresh(
+                        k_expanded_cached,
+                        k_expanded_fresh,
+                        cached_lens,
+                        cu_cached,
+                        context.cu_seqlens_q,
+                        context.cu_seqlens_k,
+                    )
+                    v_expanded = _interleave_cached_fresh(
+                        v_expanded_cached,
+                        v_expanded_fresh,
+                        cached_lens,
+                        cu_cached,
+                        context.cu_seqlens_q,
+                        context.cu_seqlens_k,
+                    )
+                else:
+                    k_expanded = k_expanded_fresh
+                    v_expanded = v_expanded_fresh
             else:
-                # === First chunk or single-chunk prefill: use fresh K/V ===
-                k_nope = (compressed_kv @ kc_t).view(
-                    q_len, num_heads, self.qk_nope_head_dim
-                )
-                k_pe_expanded = k_pe_3d.expand(-1, num_heads, -1)
-                k_expanded = torch.cat([k_nope, k_pe_expanded], dim=-1)
-
-                v_expanded = (compressed_kv @ vc_reshaped).view(
-                    q_len, num_heads, self.v_head_dim
-                )
+                k_expanded = k_expanded_fresh
+                v_expanded = v_expanded_fresh
 
             from flash_attn_interface import flash_attn_varlen_func
 

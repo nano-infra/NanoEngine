@@ -859,8 +859,8 @@ class ModelRunner:
                 inputs_embeds = self._inject_vision_embeds(input_ids)
                 # Clear after injection attempt
                 self._vision_embeds = None
-            elif is_prefill:
-                logger.info(
+            elif is_prefill and not context.is_dummy:
+                logger.debug(
                     f"[RUN_MODEL] Prefill WITHOUT vision embeds, input_ids.shape={input_ids.shape}"
                 )
             if inputs_embeds is not None:
