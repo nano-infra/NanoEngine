@@ -188,7 +188,11 @@ void BlockManager::allocate(Sequence& seq, int prefix_hint)
 
     // Wire prefix caching: tell the sequence how many leading tokens are already
     // in the shared KV cache so prefill can skip recomputing them.
-    seq.set_num_cached_tokens(num_prefix_cached * block_size_);
+    // Cap at num_tokens - 1 to guarantee seqlen_q >= 1: the model always needs
+    // at least one Q token to produce logits for sampling.
+    int cached_tokens = num_prefix_cached * block_size_;
+    int max_cached    = std::max(0, seq.num_tokens() - 1);
+    seq.set_num_cached_tokens(std::min(cached_tokens, max_cached));
 }
 
 void BlockManager::deallocate(Sequence& seq, BlockContextSlot slot)

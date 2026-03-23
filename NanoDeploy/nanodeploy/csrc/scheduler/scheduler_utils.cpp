@@ -51,13 +51,17 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                 continue;
 
             // Detect non-final prefill chunk: num_tokens was set to the chunk
-            // endpoint during scheduling; if it's still less than num_prompt_tokens
-            // the sequence is not done prefilling yet.
+            // endpoint during scheduling; if it's still less than the re-prefill
+            // target the sequence is not done prefilling yet.
+            // For fresh sequences the target is num_prompt_tokens.
+            // For preempted decode sequences num_checkpointed_tokens includes
+            // generated tokens that must also be re-prefilled.
             // NOTE: This must NOT be guarded by is_prefill (which reflects the
             // scheduler mode, e.g. disaggregated "prefill" vs "decode").  In a
             // combined (non-disaggregated) scheduler the mode is never "prefill",
             // but chunked sequences still need to continue prefilling.
-            if (seq->num_tokens() < seq->num_prompt_tokens()) {
+            int prefill_target = std::max(seq->num_prompt_tokens(), seq->num_checkpointed_tokens());
+            if (seq->num_tokens() < prefill_target) {
                 // KV has been computed for this chunk's tokens; advance the
                 // cached token pointer so the next chunk starts here.
                 seq->set_num_cached_tokens(seq->num_tokens());

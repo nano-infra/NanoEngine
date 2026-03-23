@@ -288,8 +288,12 @@ int Scheduler::compute_chunk_end(const Sequence&                                
     for (auto& [sp, tok] : num_batched_tokens[dp_idx]) {
         budget = std::min(budget, max_num_batched_tokens_ - tok);
     }
+    // For preempted decode sequences, num_checkpointed_tokens > num_prompt_tokens
+    // because it includes generated tokens that must be re-prefilled.
+    // For fresh sequences, num_checkpointed_tokens is 0, so we fall back to num_prompt_tokens.
+    int target     = std::max(seq.num_prompt_tokens(), seq.num_checkpointed_tokens());
     int num_cached = seq.num_cached_tokens();
-    int chunk_end  = num_cached + std::min(budget, seq.num_prompt_tokens() - num_cached);
+    int chunk_end  = num_cached + std::min(budget, target - num_cached);
     return (chunk_end > num_cached) ? chunk_end : -1;
 }
 
@@ -376,8 +380,9 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
     }
 
     while (!waiting_queue.empty()) {
-        auto seq       = waiting_queue.front();
-        bool scheduled = false;
+        auto seq             = waiting_queue.front();
+        bool scheduled       = false;
+        int  orig_num_tokens = seq->num_tokens();  // save for restore on failure
 
         if (routing_strategy == RoutingStrategy::RoundRobin) {
             // Try all DP ranks in round-robin order
@@ -385,7 +390,6 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                 int selected_dp_idx = next_dp_idx();
 
                 // Compute how many tokens to process in this chunk.
-                // seq->num_cached_tokens() is set by allocate() via prefix hits.
                 // Temporarily set num_tokens = chunk_end for can_allocate / allocate.
                 int chunk_end = compute_chunk_end(*seq, selected_dp_idx, num_batched_tokens);
                 if (chunk_end < 0)
@@ -398,7 +402,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
                 if (!can_alloc) {
                     // Restore num_tokens on failure before trying next DP rank
-                    seq->set_num_tokens(seq->num_prompt_tokens());
+                    seq->set_num_tokens(orig_num_tokens);
                     continue;
                 }
 
@@ -448,7 +452,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                     *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
 
                 if (!can_alloc) {
-                    seq->set_num_tokens(seq->num_prompt_tokens());
+                    seq->set_num_tokens(orig_num_tokens);
                     continue;
                 }
 
@@ -580,10 +584,14 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
     std::cerr << "Preemption happens for seq_id=" << seq->seq_id() << std::endl;
     seq->set_status(SequenceStatus::WAITING);
     worker_state[dp_idx]->deallocate(*seq);
-    // For mid-chunk sequences (PREFILLING), reset num_tokens back to the full
-    // prompt length so the next allocation starts from scratch.
-    seq->set_num_tokens(seq->num_prompt_tokens());
-    seq->set_num_checkpointed_tokens(static_cast<int>(seq->token_ids().size()));
+    // Record the full context length (prompt + any generated tokens) so that
+    // re-prefill will rebuild KV for ALL tokens, not just the original prompt.
+    // For PREFILLING sequences token_ids().size() == num_prompt_tokens(), so
+    // this is equivalent to the old reset.  For decode sequences this correctly
+    // preserves the generated continuation.
+    int total_tokens = static_cast<int>(seq->token_ids().size());
+    seq->set_num_tokens(total_tokens);
+    seq->set_num_checkpointed_tokens(total_tokens);
     waiting.push_front(seq);
 }
 
