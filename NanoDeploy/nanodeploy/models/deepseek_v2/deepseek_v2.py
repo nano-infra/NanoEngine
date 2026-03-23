@@ -14,6 +14,10 @@ from nanodeploy.backends.base_backend import (
     MergedColumnParallelLinearBase,
     RowParallelLinearBase,
 )
+from nanodeploy.backends.hopper.layers.attention import (
+    _gather_cache_cached_only,
+    _interleave_cached_fresh,
+)
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
@@ -680,10 +684,6 @@ class DeepseekV2Attention(nn.Module):
             )
 
             if context.block_tables is not None:
-                from nanodeploy.backends.hopper.layers.attention import (
-                    _gather_cache_cached_only,
-                    _interleave_cached_fresh,
-                )
 
                 sp_rank = get_dist_context().attn_sp_rank
                 num_seqs = context.cu_seqlens_k.shape[0] - 1

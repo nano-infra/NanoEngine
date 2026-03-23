@@ -23,9 +23,12 @@ public:
     static int64_t compute_hash(const std::vector<int>& token_ids, int64_t prefix = -1);
     static int64_t compute_hash(const int* token_ids, size_t size, int64_t prefix = -1);
 
-    // Block allocation and deallocation
-    bool can_allocate(Sequence& seq) const;
-    void allocate(Sequence& seq, int token_idx_from = -1, int token_idx_to = -1);
+    // Block allocation and deallocation.
+    // can_allocate returns the number of prefix cache hits (>= 0) on success,
+    // or -1 if allocation is impossible.  The caller can forward this value as
+    // `prefix_hint` to allocate() to avoid a redundant hash scan.
+    int  can_allocate(Sequence& seq) const;
+    void allocate(Sequence& seq, int prefix_hint = -1);
 
     // Count consecutive leading blocks whose hash matches an already-active
     // (shared) block.  These don't need a free slot — we just bump ref_count.

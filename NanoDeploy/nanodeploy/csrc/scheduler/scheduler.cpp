@@ -270,6 +270,20 @@ ScheduleResult Scheduler::schedule()
     return result;
 }
 
+int Scheduler::compute_chunk_end(const Sequence&                                  seq,
+                                 int                                              dp_idx,
+                                 const std::vector<std::unordered_map<int, int>>& num_batched_tokens) const
+{
+    // Use the tightest per-SP budget across all SP ranks for this DP rank.
+    int budget = max_num_batched_tokens_;
+    for (auto& [sp, tok] : num_batched_tokens[dp_idx]) {
+        budget = std::min(budget, max_num_batched_tokens_ - tok);
+    }
+    int num_cached = seq.num_cached_tokens();
+    int chunk_end  = num_cached + std::min(budget, seq.num_prompt_tokens() - num_cached);
+    return (chunk_end > num_cached) ? chunk_end : -1;
+}
+
 std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill()
 {
     std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled_seqs(attention_dp_);
@@ -364,14 +378,8 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                 // Compute how many tokens to process in this chunk.
                 // seq->num_cached_tokens() is set by allocate() via prefix hits.
                 // Temporarily set num_tokens = chunk_end for can_allocate / allocate.
-                int budget = max_num_batched_tokens_ - num_batched_tokens[selected_dp_idx].begin()->second;
-                // (use the tightest per-SP budget across all SP ranks)
-                for (auto& [sp, tok] : num_batched_tokens[selected_dp_idx]) {
-                    budget = std::min(budget, max_num_batched_tokens_ - tok);
-                }
-                int num_cached = seq->num_cached_tokens();
-                int chunk_end  = num_cached + std::min(budget, seq->num_prompt_tokens() - num_cached);
-                if (chunk_end <= num_cached)
+                int chunk_end = compute_chunk_end(*seq, selected_dp_idx, num_batched_tokens);
+                if (chunk_end < 0)
                     continue;
                 seq->set_num_tokens(chunk_end);
 
@@ -422,13 +430,8 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
                 int selected_dp_idx = it->second;
 
                 // Compute chunk size
-                int budget = max_num_batched_tokens_;
-                for (auto& [sp, tok] : num_batched_tokens[selected_dp_idx]) {
-                    budget = std::min(budget, max_num_batched_tokens_ - tok);
-                }
-                int num_cached = seq->num_cached_tokens();
-                int chunk_end  = num_cached + std::min(budget, seq->num_prompt_tokens() - num_cached);
-                if (chunk_end <= num_cached)
+                int chunk_end = compute_chunk_end(*seq, selected_dp_idx, num_batched_tokens);
+                if (chunk_end < 0)
                     continue;
                 seq->set_num_tokens(chunk_end);
 

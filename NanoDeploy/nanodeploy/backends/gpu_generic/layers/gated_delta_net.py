@@ -244,7 +244,16 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
 
         if has_prev_state:
             # Chunked prefill (chunks 2+): per-sequence with initial_states
-            # from the previous chunk's stored conv state
+            # from the previous chunk's stored conv state.
+            #
+            # TODO(perf): This per-seq Python loop is a bottleneck for large
+            # batches.  causal_conv1d_fn supports seq_idx for batch separation
+            # but NOT initial_states + seq_idx together.  Two options:
+            #   1. Upstream batched initial_states support to causal_conv1d_fn.
+            #   2. Write a custom Triton kernel for causal conv1d with
+            #      per-seq initial states (more work, but fully controlled).
+            # For now this is acceptable since GDN is used in hybrid attention
+            # where prefill batch sizes are typically small.
             qkv_out = torch.empty_like(qkv)
             for i in range(num_seqs):
                 start = int(cu_seqlens[i].item())

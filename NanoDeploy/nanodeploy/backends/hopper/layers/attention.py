@@ -9,47 +9,15 @@ from nanodeploy.backends.gpu_generic.kernels.kv_combine import (
     inter_rank_gqa_fwd_batch_decode_combine_kv,
 )
 from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kcache, store_kvcache
+from nanodeploy.backends.gpu_generic.kernels.paged_gather import (
+    build_paged_gather_indices as _build_paged_gather_indices,
+)
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.context.sp_context import get_sp_context
 from nanodeploy.logging import get_logger
 
 logger = get_logger()
-
-
-def _build_paged_gather_indices(
-    block_table: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Build flat linear indices for gathering tokens from a paged cache.
-
-    Args:
-        block_table: [num_seqs, max_num_blocks] — int32 physical block IDs
-        cu_seqlens_k:[num_seqs + 1] — cumulative K lengths (int32)
-        block_size:  tokens per cache block
-
-    Returns:
-        linear_indices: [total_k_tokens] — index into cache.reshape(-1, ...)
-    """
-    num_seqs = block_table.shape[0]
-    total_k = int(cu_seqlens_k[-1].item())
-    device = block_table.device
-
-    linear_indices = torch.empty(total_k, dtype=torch.int64, device=device)
-
-    for i in range(num_seqs):
-        start = int(cu_seqlens_k[i].item())
-        end = int(cu_seqlens_k[i + 1].item())
-        seqlen = end - start
-        if seqlen == 0:
-            continue
-        t = torch.arange(seqlen, dtype=torch.int64, device=device)
-        block_ids = block_table[i, t // block_size].to(torch.int64)
-        offsets = t % block_size
-        linear_indices[start:end] = block_ids * block_size + offsets
-
-    return linear_indices
 
 
 def _gather_kv_paged(

@@ -126,6 +126,12 @@ private:
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
 
+    // Compute the chunk endpoint for a WAITING sequence on a given DP rank.
+    // Returns the new num_tokens value (chunk_end), or -1 if no tokens can be scheduled.
+    int compute_chunk_end(const Sequence&                                  seq,
+                          int                                              dp_idx,
+                          const std::vector<std::unordered_map<int, int>>& num_batched_tokens) const;
+
     // Round-robin counter for DP
     int next_dp_idx();
 

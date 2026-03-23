@@ -252,17 +252,21 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             continue;  // Max seq limit reached, try larger SP Size
         }
 
-        bool physical_check_ok = true;
+        bool             physical_check_ok = true;
+        std::vector<int> prefix_hints(attention_sp_, -1);
         for (size_t i = 0; i < participants.size(); ++i) {
             int rank_id = participants[i].id;
-            if (!block_manager[rank_id]->can_allocate(seq)) {
+            int hits    = block_manager[rank_id]->can_allocate(seq);
+            if (hits < 0) {
                 physical_check_ok = false;
                 break;
             }
+            prefix_hints[rank_id] = hits;
         }
 
         if (physical_check_ok) {
-            // *** Success! ***
+            // *** Success! Store hints for allocate() ***
+            cached_prefix_hints_ = std::move(prefix_hints);
             return true;
         }
 
@@ -278,12 +282,19 @@ void SPStateManager::allocate(Sequence& seq)
     auto& block_ctx     = seq.block_ctx(BlockContextSlot::ACTIVE);
     int   master_sp_idx = block_ctx.master_sp_idx;
 
+    // Use prefix hints cached by can_allocate (if available) to skip
+    // redundant hash scans inside BlockManager::allocate.
+    auto hints = std::move(cached_prefix_hints_);
+    cached_prefix_hints_.clear();
+
+    auto get_hint = [&](int sp_idx) -> int { return (sp_idx < static_cast<int>(hints.size())) ? hints[sp_idx] : -1; };
+
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
         if (sp_idx != master_sp_idx) {
-            block_manager[sp_idx]->allocate(seq);
+            block_manager[sp_idx]->allocate(seq, get_hint(sp_idx));
         }
     }
-    block_manager[master_sp_idx]->allocate(seq);
+    block_manager[master_sp_idx]->allocate(seq, get_hint(master_sp_idx));
 
     // Assign a GDN state slot (index into conv/recurrent state buffers).
     // state_manager_ is a free-list over [0, max_num_seqs_); slot max_num_seqs_

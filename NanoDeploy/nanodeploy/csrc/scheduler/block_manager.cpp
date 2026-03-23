@@ -101,17 +101,17 @@ int BlockManager::count_active_prefix_hits(Sequence& seq) const
     return hits;
 }
 
-bool BlockManager::can_allocate(Sequence& seq) const
+int BlockManager::can_allocate(Sequence& seq) const
 {
     int n_cached      = count_active_prefix_hits(seq);
     int blocks_needed = seq.num_blocks(BlockContextSlot::ACTIVE, sp_idx_) - n_cached;
-    return static_cast<int>(free_block_ids_.size()) >= blocks_needed;
+    if (static_cast<int>(free_block_ids_.size()) >= blocks_needed)
+        return n_cached;  // success: return hit count
+    return -1;            // cannot allocate
 }
 
-void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
+void BlockManager::allocate(Sequence& seq, int prefix_hint)
 {
-    (void)token_idx_from;
-    (void)token_idx_to;
     auto& table = seq.block_table(BlockContextSlot::ACTIVE, sp_idx_);
     if (!table.empty()) {
         throw std::runtime_error("Block table is not empty");
@@ -121,6 +121,13 @@ void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
     bool    cache_miss        = false;
     int     num_blocks        = seq.num_blocks(BlockContextSlot::ACTIVE, sp_idx_);
     int     num_prefix_cached = 0;  // consecutive leading full-block cache hits
+
+    // If can_allocate already computed the prefix hit count we can trust it
+    // for the leading `prefix_hint` full blocks — they are guaranteed to be
+    // cache hits.  We still need to walk those blocks to build the hash chain
+    // and populate the block table, but we can skip the per-block content
+    // comparison for the first `prefix_hint` blocks.
+    int fast_prefix = (prefix_hint > 0) ? prefix_hint : 0;
 
     for (int i = 0; i < num_blocks; ++i) {
         auto view = seq.block_view(i, BlockContextSlot::ACTIVE, sp_idx_);
@@ -137,8 +144,14 @@ void BlockManager::allocate(Sequence& seq, int token_idx_from, int token_idx_to)
             block_id = hash_to_block_id_.at(h);
         }
 
-        if (block_id == -1 || blocks_[block_id].token_ids.size() != view.second
-            || !std::equal(blocks_[block_id].token_ids.begin(), blocks_[block_id].token_ids.end(), view.first)) {
+        // For the first `fast_prefix` blocks we know the content matches
+        // (validated by count_active_prefix_hits in can_allocate).  Skip
+        // the expensive element-wise comparison.
+        if (!cache_miss && i < fast_prefix) {
+            // Guaranteed hit — skip content check
+        }
+        else if (block_id == -1 || blocks_[block_id].token_ids.size() != view.second
+                 || !std::equal(blocks_[block_id].token_ids.begin(), blocks_[block_id].token_ids.end(), view.first)) {
             cache_miss = true;
         }
 

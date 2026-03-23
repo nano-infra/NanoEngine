@@ -160,6 +160,10 @@ private:
     int              num_running_tokens_ = 0;
     std::vector<int> num_running_seqs_per_sp_;
     std::vector<int> num_running_tokens_per_sp_;
+
+    // Per-SP-rank prefix hit counts cached between can_allocate() and allocate().
+    // Populated by can_allocate on success; consumed (moved) by allocate.
+    std::vector<int> cached_prefix_hints_;
 };
 
 }  // namespace nanodeploy

@@ -258,10 +258,13 @@ PrefillMetadata prepare_prefill_from_bytes(const uint8_t* data,
             int seqlen_q = si->num_tokens() - si->num_cached_tokens();
             int q_end    = q_start + seqlen_q;
 
-            // num_prompt_tokens == 0 means the field is absent (old serialization):
-            // treat as final chunk for backward compatibility.
-            int  num_prompt = si->num_prompt_tokens();
-            bool is_final   = (num_prompt == 0) || (si->num_tokens() >= num_prompt);
+            int num_prompt = si->num_prompt_tokens();
+            if (num_prompt == 0) {
+                throw std::runtime_error("prepare_prefill_from_bytes: num_prompt_tokens is 0 for sequence "
+                                         + std::to_string(i)
+                                         + ". This field is required and must be set in SequenceInput.");
+            }
+            bool is_final = (si->num_tokens() >= num_prompt);
             if (is_final) {
                 meta.sampling_token_indices.push_back(q_end - 1);
                 meta.sampling_seq_indices.push_back(seq_pos);
