@@ -5,7 +5,7 @@ project(nanoccl C CXX)
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
 # NanoCCL options for ops
-nanoccl_option(BUILD_INTRA_OPS           "Build intra LL collective ops"    OFF)
+nanoccl_option(BUILD_INTRA_OPS           "Build intra LL collective ops"     ON)
 nanoccl_option(BUILD_INTER_OPS           "Build inter LL collective ops"    OFF)
 
 set(CMAKE_CXX_STANDARD 20)

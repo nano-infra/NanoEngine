@@ -11,7 +11,6 @@ set(RDMA_SOURCES
 add_library(_slime_rdma SHARED ${RDMA_SOURCES})
 
 target_link_libraries(_slime_rdma PUBLIC _slime_device _slime_engine numa ibverbs)
-target_link_libraries(_slime_rdma PUBLIC dlslime_rendezvous hiredis)
 
 set_target_properties(
     _slime_rdma
@@ -23,7 +22,6 @@ set_target_properties(
 target_include_directories(_slime_rdma PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../..>
     $<INSTALL_INTERFACE:include/dlslime>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../../../../third_party/hiredis>
 )
 
 install(

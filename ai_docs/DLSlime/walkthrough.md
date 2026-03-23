@@ -28,11 +28,10 @@ DLSlime/
 │       ├── torch/              # PyTorch c10d 后端 (_slime_torch)
 │       ├── device/             # DeviceSignal 抽象 (CUDA / Host)
 │       ├── engine/
-│       │   ├── assignment.h/cpp    # Assignment 地址切片
-│       │   ├── rdma/               # ← 核心 RDMA 实现 (25 files)
-│       │   ├── nvlink/             # NVLink P2P 后端
-│       │   └── ascend_direct/      # 昇腾直通后端
-│       └── rendezvous/         # 地址 / ZMQ rendezvous
+│           ├── assignment.h/cpp    # Assignment 地址切片
+│           ├── rdma/               # ← 核心 RDMA 实现 (25 files)
+│           ├── nvlink/             # NVLink P2P 后端
+│           └── ascend_direct/      # 昇腾直通后端
 ├── bench/python/               # 性能基准测试
 ├── examples/                   # 使用示例
 ├── tests/                      # 单元测试

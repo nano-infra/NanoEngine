@@ -41,7 +41,6 @@ pub struct DesiredTopologySpec {
     #[serde(default)]
     pub min_bw: Option<String>, // e.g. "100Gbps", reserved for future use
     /// When true, also update each target_peer's spec to include this agent_id.
-    /// Required for Symmetric Rendezvous when only one side (e.g. decode) initiates.
     #[serde(default)]
     pub symmetric: bool,
     #[serde(default)]

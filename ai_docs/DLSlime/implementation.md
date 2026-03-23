@@ -477,7 +477,6 @@ DLSlime/CMakeLists.txt
 ├── third_party/hiredis                # Redis C client
 └── dlslime/csrc/CMakeLists.txt
     ├── device/CMakeLists.txt          → _slime_device  (CUDA/Host)
-    ├── rendezvous/CMakeLists.txt      → dlslime_rendezvous (header-only)
     ├── engine/CMakeLists.txt          → _slime_engine  (Assignment)
     │   └── rdma/CMakeLists.txt        → _slime_rdma    (8 cpp, links ibverbs/numa/hiredis)
     ├── python/CMakeLists.txt          → _slime_c       (pybind11 module)

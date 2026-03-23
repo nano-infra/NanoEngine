@@ -7,25 +7,32 @@ name = "nanoinfra"
 version = "0.1.0"
 description = "NanoInfra monorepo meta-package"
 authors = [{ name = "DeepLink-MLSysResearch" }]
-license = "MIT"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
 # Install individual components:
 #   pip install ".[dlslime]"
+#   pip install ".[nanoccl]"
 #   pip install ".[nanoctrl]"
 #   pip install ".[nanodeploy]"
+#   pip install ".[nanodeployvl]"
 #   pip install ".[all]"
 [project.optional-dependencies]
 dlslime = [
     "dlslime @ file:DLSlime",
+]
+nanoccl = [
+    "nanoccl @ file:NanoCCL",
 ]
 nanoctrl = [
     "nanoctrl @ file:NanoCtrl",
 ]
 nanodeploy = [
     "nanodeploy @ file:NanoDeploy",
+]
+nanodeployvl = [
+    "nanodeployvl @ file:NanoDeployVL",
 ]
 all = [
     "dlslime @ file:DLSlime",

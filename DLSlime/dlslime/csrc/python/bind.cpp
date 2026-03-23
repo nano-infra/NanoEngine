@@ -37,8 +37,6 @@
 #include "dlslime/csrc/engine/rdma/rdma_future.h"
 #include "dlslime/csrc/engine/rdma/rdma_utils.h"
 #include "dlslime/csrc/engine/rdma/rdma_worker.h"
-#ifdef BUILD_RDMA_RENDEZVOUS_ZMQ
-#endif
 #endif
 
 // Ops moved to NanoCCL - these includes are commented out
@@ -79,12 +77,6 @@ namespace py = pybind11;
 #define BUILD_INTRA_OPS_ENABLED false
 #define BUILD_INTER_OPS_ENABLED false
 
-#ifdef BUILD_RDMA_RENDEZVOUS_ZMQ
-#define BUILD_RDMA_RENDEZVOUS_ZMQ_ENABLED true
-#else
-#define BUILD_RDMA_RENDEZVOUS_ZMQ_ENABLED false
-#endif
-
 #define EXPOSE_BUILD_FLAG(m, flag) m.attr("_" #flag) = flag##_ENABLED
 
 PYBIND11_MODULE(_slime_c, m)
@@ -93,7 +85,6 @@ PYBIND11_MODULE(_slime_c, m)
     EXPOSE_BUILD_FLAG(m, BUILD_NVLINK);
     EXPOSE_BUILD_FLAG(m, BUILD_INTRA_OPS);
     EXPOSE_BUILD_FLAG(m, BUILD_INTER_OPS);
-    EXPOSE_BUILD_FLAG(m, BUILD_RDMA_RENDEZVOUS_ZMQ);
 
     py::enum_<dlslime::OpCode>(m, "OpCode")
         .value("READ", dlslime::OpCode::READ)
