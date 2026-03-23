@@ -850,14 +850,12 @@ class ModelRunner:
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             context = get_context()
-            # Inject vision embeddings during prefill if available
             inputs_embeds = None
             if is_prefill and self._vision_embeds is not None:
                 logger.info(
                     f"[RUN_MODEL] Injecting vision embeds for prefill, input_ids.shape={input_ids.shape}, _vision_embeds keys={list(self._vision_embeds.keys())}"
                 )
                 inputs_embeds = self._inject_vision_embeds(input_ids)
-                # Clear after injection attempt
                 self._vision_embeds = None
             elif is_prefill and not context.is_dummy:
                 logger.debug(
