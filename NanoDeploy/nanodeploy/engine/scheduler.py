@@ -28,6 +28,7 @@ class Scheduler(_CppScheduler):
             config.loop_count,
             config.max_num_seqs,
             config.max_num_batched_tokens,
+            config.max_model_len,
             config.eos,
             config.attention_dp,
             config.attention_sp,

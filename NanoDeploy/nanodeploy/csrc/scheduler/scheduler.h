@@ -75,6 +75,7 @@ public:
               int                loop_count,
               int                max_num_seqs,
               int                max_num_batched_tokens,
+              int                max_model_len,
               int                eos,
               int                attention_dp,
               int                attention_sp,
@@ -144,6 +145,7 @@ private:
     int         attention_dp_;
     int         attention_sp_;
 
+    int max_model_len_;
     int num_kvcache_blocks_;
     int kvcache_block_size_;
 

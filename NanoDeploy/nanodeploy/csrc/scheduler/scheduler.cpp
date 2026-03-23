@@ -16,6 +16,7 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                loop_count,
                      int                max_num_seqs,
                      int                max_num_batched_tokens,
+                     int                max_model_len,
                      int                eos,
                      int                attention_dp,
                      int                attention_sp,
@@ -29,6 +30,7 @@ Scheduler::Scheduler(const std::string& engine_id,
     eos_(eos),
     attention_dp_(attention_dp),
     attention_sp_(attention_sp),
+    max_model_len_(max_model_len),
     num_kvcache_blocks_(num_kvcache_blocks),
     kvcache_block_size_(kvcache_block_size),
     mode_(mode)
@@ -45,6 +47,13 @@ Scheduler::Scheduler(const std::string& engine_id,
 
 void Scheduler::add(std::shared_ptr<Sequence> seq)
 {
+    int prompt_len = seq->num_prompt_tokens();
+    if (prompt_len > max_model_len_) {
+        throw std::runtime_error("Prompt length (" + std::to_string(prompt_len) + ") exceeds max_model_len ("
+                                 + std::to_string(max_model_len_)
+                                 + "). Increase --max_model_len or shorten the prompt.");
+    }
+
     seq->active(engine_id_, attention_sp_, attention_dp_, num_kvcache_blocks_);
 
     if (seq->metric) {
