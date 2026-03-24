@@ -26,7 +26,6 @@ readme = "README.md"
 requires-python = ">=3.8"
 version = "0.0.2.post1"
 dependencies = [
-  "xxhash",
   "pydantic>=2.0",
   "pyzmq>=25.0",
   # for --build-no-isolation

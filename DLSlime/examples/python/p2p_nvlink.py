@@ -2,7 +2,6 @@ import os
 
 import torch
 import torch.distributed as dist
-import xxhash
 from dlslime import _slime_c
 
 
@@ -20,7 +19,7 @@ def run_benchmark():
 
     ep = _slime_c.NVLinkEndpoint()
 
-    mr_key = xxhash.xxh64_intdigest("buffer")
+    mr_key = "buffer"
 
     if rank == 0:
         tensor = torch.zeros([16], device=device, dtype=torch.uint8)

@@ -9,8 +9,8 @@
 
 #include "nanodeploy/csrc/sequence/sequence.h"
 
-#include "block_manager.h"
-#include "state_manager.h"
+#include "cache_manager/block_manager.h"
+#include "cache_manager/gdn_state_manager.h"
 
 namespace nanodeploy {
 
@@ -135,10 +135,12 @@ public:
         num_running_tokens_per_sp_[sp_idx] += count;
     }
 
-    // Public members to be exposed to Python
     std::unordered_map<int, std::shared_ptr<BlockManager>> block_manager;
-    std::deque<std::shared_ptr<Sequence>>                  running;
-    std::vector<std::shared_ptr<Sequence>>                 dummy_seqs;
+
+    GDNStateManager gdn_state_manager_;
+
+    std::deque<std::shared_ptr<Sequence>>  running;
+    std::vector<std::shared_ptr<Sequence>> dummy_seqs;
 
     RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;
 
@@ -146,11 +148,10 @@ private:
     void initialize_dummy_seqs();
     int  next_sp_idx();  // Round-robin counter
 
-    std::string  engine_id_;
-    int          attention_sp_;
-    int          max_num_seqs_;
-    int          max_num_batched_tokens_;
-    StateManager state_manager_;  // GDN state slot free-list (slot = seq's index into GDN buffers)
+    std::string engine_id_;
+    int         attention_sp_;
+    int         max_num_seqs_;
+    int         max_num_batched_tokens_;
 
     int kvcache_block_size_;
     int num_kvcache_blocks_;

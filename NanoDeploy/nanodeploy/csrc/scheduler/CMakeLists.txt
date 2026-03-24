@@ -1,7 +1,7 @@
 set(CPP_SOURCES
-    block.cpp
-    block_manager.cpp
-    state_manager.cpp
+    cache_manager/block.cpp
+    cache_manager/block_manager.cpp
+    cache_manager/gdn_state_manager.cpp
     sp_state_manager.cpp
     scheduler_utils.cpp
     scheduler.cpp

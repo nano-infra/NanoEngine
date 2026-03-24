@@ -13,9 +13,9 @@ namespace nanodeploy {
 
 class Sequence;
 
-class StateManager {
+class GDNStateManager {
 public:
-    StateManager(const std::string& engine_id, int sp_idx, int num_slots);
+    GDNStateManager(const std::string& engine_id, int sp_idx, int num_slots);
 
     // State slot allocation and deallocation
     bool can_allocate() const;

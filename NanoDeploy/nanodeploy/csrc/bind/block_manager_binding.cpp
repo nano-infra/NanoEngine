@@ -1,7 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "nanodeploy/csrc/scheduler/block_manager.h"
+#include "nanodeploy/csrc/scheduler/cache_manager/block_manager.h"
 #include "nanodeploy/csrc/sequence/sequence.h"
 
 namespace py = pybind11;

@@ -15,8 +15,8 @@ Usage:
 """
 
 import argparse
+
 import torch
-import xxhash
 import zmq
 from dlslime import _slime_c
 
@@ -31,10 +31,18 @@ except ImportError:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Ascend Direct P2P Read Test")
-    parser.add_argument("--is_target", action="store_true", help="Run as target (receiver)")
-    parser.add_argument("--local_port", type=int, default=17000, help="Local port for ZMQ")
-    parser.add_argument("--remote_port", type=int, default=17001, help="Remote port for ZMQ")
-    parser.add_argument("--localhost", type=str, default="127.0.0.1", help="Localhost IP")
+    parser.add_argument(
+        "--is_target", action="store_true", help="Run as target (receiver)"
+    )
+    parser.add_argument(
+        "--local_port", type=int, default=17000, help="Local port for ZMQ"
+    )
+    parser.add_argument(
+        "--remote_port", type=int, default=17001, help="Remote port for ZMQ"
+    )
+    parser.add_argument(
+        "--localhost", type=str, default="127.0.0.1", help="Localhost IP"
+    )
     parser.add_argument("--device", type=int, default=0, help="NPU device ID")
     return parser.parse_args()
 
@@ -59,10 +67,9 @@ def run_p2p_test():
     # AdxlEngine uses port+1 internally, so we pass local_port+1
     ep.init(args.localhost, args.local_port + 1)
 
-    print(f"[{role}] AscendDirectEndpoint initialized on {args.localhost}:{args.local_port+1}")
-
-    # Create test tensor on NPU
-    mr_key = xxhash.xxh64_intdigest("buffer")
+    print(
+        f"[{role}] AscendDirectEndpoint initialized on {args.localhost}:{args.local_port+1}"
+    )
 
     if args.is_target:
         # Target: has ones that initiator will read
@@ -124,7 +131,7 @@ def run_p2p_test():
     print(f"[{role}] Connected!")
 
     # Register remote memory region
-    remote_mr_key = xxhash.xxh64_intdigest("remote_buffer")
+    remote_mr_key = "remote_buffer"
     remote_mr_info = {
         "addr": remote_info["data_ptr"],
         "offset": 0,
@@ -158,17 +165,22 @@ def run_p2p_test():
         expected_first_half = torch.zeros(8, dtype=torch.uint8, device=device)
         expected_second_half = torch.ones(8, dtype=torch.uint8, device=device)
 
-        assert torch.all(tensor[:8] == expected_first_half), f"First half check failed: {tensor[:8]}"
-        assert torch.all(tensor[8:] == expected_second_half), f"Second half check failed: {tensor[8:]}"
+        assert torch.all(
+            tensor[:8] == expected_first_half
+        ), f"First half check failed: {tensor[:8]}"
+        assert torch.all(
+            tensor[8:] == expected_second_half
+        ), f"Second half check failed: {tensor[8:]}"
 
         print(f"\n[{role}] ✅ Test PASSED! Successfully read remote data via P2P")
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("Ascend Direct P2P Read Test Completed Successfully!")
-        print("="*60)
+        print("=" * 60)
     else:
         print(f"[{role}] Waiting as target...")
         # Keep target alive for a bit
         import time
+
         time.sleep(2)
 
     # Cleanup
@@ -183,5 +195,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Error: {e}")
         import traceback
+
         traceback.print_exc()
         exit(1)

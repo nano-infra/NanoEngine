@@ -18,6 +18,19 @@ namespace nanodeploy {
 // Forward declaration
 class MetricsManager;
 
+class TokenBudget {
+public:
+    TokenBudget(int max_num_tokens);
+    int32_t inject(int32_t num_tokens);
+    int32_t getBudget() const;
+    int32_t getMaxNumTokens() const;
+    void    clear();
+
+private:
+    int32_t max_num_tokens_;
+    int32_t budget_;
+};
+
 // Result of a single scheduling step.
 // This struct is returned by `schedule()` and summarizes which sequences
 // should be executed on each data-parallel (DP) worker (and, if applicable,

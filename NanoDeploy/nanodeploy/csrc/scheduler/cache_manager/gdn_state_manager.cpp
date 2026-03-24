@@ -4,11 +4,11 @@
 
 #include "nanodeploy/csrc/sequence/sequence.h"
 
-#include "state_manager.h"
+#include "gdn_state_manager.h"
 
 namespace nanodeploy {
 
-StateManager::StateManager(const std::string& engine_id, int sp_idx, int num_slots):
+GDNStateManager::GDNStateManager(const std::string& engine_id, int sp_idx, int num_slots):
     engine_id_(engine_id), sp_idx_(sp_idx), num_slots_(num_slots)
 {
     slot_id_to_free_list_it_.resize(num_slots);
@@ -18,7 +18,7 @@ StateManager::StateManager(const std::string& engine_id, int sp_idx, int num_slo
     }
 }
 
-int StateManager::allocate_slot()
+int GDNStateManager::allocate_slot()
 {
     if (free_slots_.empty()) {
         throw std::runtime_error("No free state slots available");
@@ -32,7 +32,7 @@ int StateManager::allocate_slot()
     return slot_id;
 }
 
-void StateManager::deallocate_slot(int slot_id)
+void GDNStateManager::deallocate_slot(int slot_id)
 {
     if (used_slots_.find(slot_id) == used_slots_.end()) {
         throw std::runtime_error("Cannot deallocate an unused state slot");
@@ -43,12 +43,12 @@ void StateManager::deallocate_slot(int slot_id)
     slot_id_to_free_list_it_[slot_id] = std::prev(free_slots_.end());
 }
 
-bool StateManager::can_allocate() const
+bool GDNStateManager::can_allocate() const
 {
     return !free_slots_.empty();
 }
 
-void StateManager::allocate(Sequence& seq)
+void GDNStateManager::allocate(Sequence& seq)
 {
     int existing_slot = seq.state_slot(BlockContextSlot::ACTIVE);
     if (existing_slot != -1) {
@@ -59,7 +59,7 @@ void StateManager::allocate(Sequence& seq)
     seq.set_state_slot(BlockContextSlot::ACTIVE, slot_id);
 }
 
-void StateManager::deallocate(Sequence& seq, BlockContextSlot slot)
+void GDNStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
 {
     int slot_id = seq.state_slot(slot);
     if (slot_id == -1) {

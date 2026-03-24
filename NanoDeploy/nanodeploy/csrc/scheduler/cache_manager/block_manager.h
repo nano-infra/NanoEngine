@@ -8,8 +8,9 @@
 #include <unordered_set>
 #include <vector>
 
-#include "block.h"
 #include "nanodeploy/csrc/sequence/sequence.h"
+
+#include "block.h"
 
 namespace nanodeploy {
 
