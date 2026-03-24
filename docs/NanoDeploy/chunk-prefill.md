@@ -45,8 +45,10 @@ ______________________________________________________________________
 
 NanoDeploy 采用 Drain Prefill 调度方式，严格遵从如下防重入原则：
 
-1. 单个调度批次（Batch）内允许存在多个完整的短 Prefill 请求，但**最多仅存在一个正在被切分的 Chunk 请求**。
+1. 单个 DP 实例的调度批次（Batch）内允许存在多个完整的短 Prefill 请求，但**最多仅存在一个正在被切分的 Chunk 请求**。
 2. 若某 Chunk 请求已开始切分执行，调度器必须优先完成该请求的所有后续 Chunk 计算，期间拒绝切分新的超长请求（但允许混入其他短请求进行 Batch Padding）。
+
+> **实现说明**：唯一 Chunk 约束是由 `max_num_batched_tokens` budget 自然保障的**软约束**——一个 chunked 序列通常占满大部分 budget，同一 DP 上第二个 chunked 序列难以获得额度。代码中无硬性计数器检查。不同 DP 实例可各自拥有独立的 chunked 序列。
 
 ### 2.2 显存管理机制 (全量逻辑分配)
 
@@ -104,22 +106,36 @@ ______________________________________________________________________
 1. 在原有 `SerializationPrefill` 结构中新增 **`num_cached_tokens`** 变量。
 2. 运行时数据下发（Dispatch）时，`tokens` 仅传输**当前 Chunk 真正需要计算**的数量（$L\_{chunk}$），摒弃全量 Prompt 传输，大幅降低 RPC/RDMA 通信开销。
 
-### 3.2 Chunked Attention 高效执行 (Extend Attention)
+### 3.2 Chunked Attention 实现 (Gather + Causal Varlen)
 
-鉴于 Chunked Prefill 每次仅计算序列分片，且需依赖历史已算出的 KV Cache，底层 Attention Kernel（如 FlashInfer 或 FlashAttention-3）必须采用 **Extend Attention (追加注意力)** 模式：
+Chunked Prefill 每次仅计算序列分片（$L\_{chunk}$ 个 Q tokens），但需对完整的历史 KV Context 执行 Attention。当前实现采用 **Gather + Single-Kernel Causal Varlen** 方案：
 
-**1. 算子输入切分 (Q-KV Asymmetry)**
+**1. Q-KV 不对称 (Asymmetry)**
 
-- **Query (Q)**：仅包含当前 Chunk 的 $L\_{chunk}$ 个 tokens，显存内**连续存储**。
-- **Key/Value (KV)**：包含历史的 `num_cached_tokens` 个离散分布的 Paged KV，以及当前 Chunk 刚算出的 $L\_{chunk}$ 个新 KV。
+- **Query (Q)**：仅包含当前 Chunk 的 $L\_{chunk}$ 个 tokens，显存内连续存储。
+- **Key/Value (KV)**：总长度为 `num_tokens`（= `num_cached_tokens` + $L\_{chunk}$），包含已缓存的历史 KV 和当前 Chunk 新算出的 KV。
 
-**2. 混合注意力计算 (Hybrid Attention)**
+**2. Gather + Causal Varlen**
 
-- **Context Attention**：当前 Chunk $Q$ 对齐历史离散 Paged $KV$，**无 Causal Mask**（因前缀对当前全可见）。
-- **Self Attention**：当前 Chunk $Q$ 对齐自身连续新 $KV$，**必须应用 Causal Mask**（防未来信息泄露）。
+1. **Gather 阶段**：从 Paged KV Cache 中仅收集**已缓存部分**（`num_cached_tokens` 个 K/V）到连续显存，与当前 Chunk 新产生的 K/V 拼接，得到完整的连续 ragged tensor。
+2. **Attention 阶段**：调用单次 `flash_attn_varlen_func(Q, K_all, V_all, cu_seqlens_q, cu_seqlens_k, causal=True)`。
 
-**3. KV Cache 按需追加 (In-place Append)**
-虽然 Step 0 已全量分配物理 Block，但每次 Kernel 执行完毕后，仅允许将当前新算出的 $L\_{chunk}$ 个 KV 数据，根据 `num_cached_tokens` 偏移量**追加 (Append)** 写入对应页表，随后更新游标 `num_cached_tokens += L_chunk`。
+**数学等价性**：Causal mask 在完整序列上的行为天然等价于概念上的 "Hybrid Attention"（Context + Self 两阶段）。因为历史 KV 的位置 \< 当前 Chunk Q 的位置，causal mask 不会屏蔽任何历史 token；而 Chunk 内部的 Q-K 对则正常施加 causal 约束。
+
+**3. KV Cache 写入 (In-place Append)**
+
+每次 Kernel 执行完毕后，将当前新算出的 $L\_{chunk}$ 个 KV 数据根据 `slot_mapping`（基于 `num_cached_tokens` 偏移量计算）写入对应的预分配 Block，随后 `postprocess` 更新游标 `num_cached_tokens += L_{chunk}`。
+
+**4. 针对不同 Attention 架构的优化**
+
+- **GQA（Grouped Query Attention）**：Gather 时仅收集已缓存的 K 和 V heads，与 fresh K/V 按序列维度交错拼接（`_gather_kv_cached_concat`）。
+- **MLA（Multi-head Latent Attention）**：Gather 已缓存的压缩 KV（compressed_kv），在 Gather 后展开为完整的 K/V heads，再与 fresh expanded K/V 交错拼接。
+
+### 3.3 Future Work: Paged Prefill Attention
+
+当前 Gather 方案需要显式拷贝已缓存的 KV 到连续显存。对于极长前缀（100K+），Gather 的显存带宽和临时缓冲区开销可能成为瓶颈。
+
+主流推理引擎（SGLang、vLLM）已切换到 **FlashInfer** 的 `BatchPrefillWithPagedKVCache` 作为默认后端，该 kernel 在注意力计算内部直接从 Paged KV Cache 随机读取，无需显式 Gather，也无需 Two-pass Merge。未来可集成 FlashInfer 作为可选 Attention Backend，彻底消除 Gather 开销。
 
 ______________________________________________________________________
 

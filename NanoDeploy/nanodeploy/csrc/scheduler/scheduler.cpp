@@ -279,24 +279,6 @@ ScheduleResult Scheduler::schedule()
     return result;
 }
 
-int Scheduler::compute_chunk_end(const Sequence&                                  seq,
-                                 int                                              dp_idx,
-                                 const std::vector<std::unordered_map<int, int>>& num_batched_tokens) const
-{
-    // Use the tightest per-SP budget across all SP ranks for this DP rank.
-    int budget = max_num_batched_tokens_;
-    for (auto& [sp, tok] : num_batched_tokens[dp_idx]) {
-        budget = std::min(budget, max_num_batched_tokens_ - tok);
-    }
-    // For preempted decode sequences, num_checkpointed_tokens > num_prompt_tokens
-    // because it includes generated tokens that must be re-prefilled.
-    // For fresh sequences, num_checkpointed_tokens is 0, so we fall back to num_prompt_tokens.
-    int target     = std::max(seq.num_prompt_tokens(), seq.num_checkpointed_tokens());
-    int num_cached = seq.num_cached_tokens();
-    int chunk_end  = num_cached + std::min(budget, target - num_cached);
-    return (chunk_end > num_cached) ? chunk_end : -1;
-}
-
 std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill()
 {
     std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled_seqs(attention_dp_);
@@ -335,21 +317,8 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
             continue;
         }
 
-        // Shrink-before-preempt: only preempt if truly saturated (zero free blocks).
-        {
-            int free_blocks        = worker_state[dp_idx]->block_manager[master_sp]->num_free_blocks();
-            int max_appendable_tok = free_blocks * kvcache_block_size_;
-            if (max_appendable_tok <= 0) {
-                // Cache is saturated — preempt to avoid starvation deadlock
-                preempt(dp_idx, seq);
-                continue;
-            }
-            new_tokens = std::min(new_tokens, max_appendable_tok);
-        }
-
-        // Advance num_tokens to the new chunk endpoint and allocate new blocks
+        // Advance num_tokens to the new chunk endpoint (blocks pre-allocated at admission)
         seq->set_num_tokens(prev_tokens + new_tokens);
-        worker_state[dp_idx]->block_manager[master_sp]->may_append(*seq, new_tokens);
         block_ctx.num_dispatched_tokens[master_sp] = seq->num_tokens();
 
         num_seqs[dp_idx][master_sp] += 1;
@@ -380,111 +349,70 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
     }
 
     while (!waiting_queue.empty()) {
-        auto seq             = waiting_queue.front();
-        bool scheduled       = false;
-        int  orig_num_tokens = seq->num_tokens();  // save for restore on failure
+        auto seq       = waiting_queue.front();
+        bool scheduled = false;
 
         if (routing_strategy == RoutingStrategy::RoundRobin) {
-            // Try all DP ranks in round-robin order
             for (int attempt = 0; attempt < attention_dp_; ++attempt) {
-                int selected_dp_idx = next_dp_idx();
-
-                // Compute how many tokens to process in this chunk.
-                // Temporarily set num_tokens = chunk_end for can_allocate / allocate.
-                int chunk_end = compute_chunk_end(*seq, selected_dp_idx, num_batched_tokens);
-                if (chunk_end < 0)
-                    continue;
-                seq->set_num_tokens(chunk_end);
-
-                // Check if this DP rank can allocate the sequence
-                bool can_alloc = worker_state[selected_dp_idx]->can_allocate(
+                int  selected_dp_idx = next_dp_idx();
+                auto result          = worker_state[selected_dp_idx]->try_allocate(
                     *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
-
-                if (!can_alloc) {
-                    // Restore num_tokens on failure before trying next DP rank
-                    seq->set_num_tokens(orig_num_tokens);
+                if (!result)
                     continue;
-                }
 
-                // Allocate the sequence (also calls set_num_cached_tokens via prefix hits)
-                worker_state[selected_dp_idx]->allocate(*seq);
+                auto& block_ctx  = seq->block_ctx(BlockContextSlot::ACTIVE);
+                block_ctx.dp_idx = selected_dp_idx;
+                int master_sp    = block_ctx.master_sp_idx;
 
-                // Update tracking
-                auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
-                block_ctx.dp_idx  = selected_dp_idx;
-                int master_sp_idx = block_ctx.master_sp_idx;
+                num_seqs[selected_dp_idx][master_sp] += 1;
+                num_batched_tokens[selected_dp_idx][master_sp] += result->new_tokens;
 
-                num_seqs[selected_dp_idx][master_sp_idx] += 1;
-                num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens() - seq->num_cached_tokens());
-
-                // Update sequence status
                 seq->set_status(SequenceStatus::RUNNING);
-
-                // Add to scheduled and running queues
                 waiting_queue.pop_front();
                 worker_state[selected_dp_idx]->running.push_back(seq);
                 scheduled_seqs[selected_dp_idx].push_back(seq);
 
-                // Record metrics
                 if (seq->metric) {
                     seq->metric->record_first_scheduled();
-                    if (mode_ == "decode") {
+                    if (mode_ == "decode")
                         seq->metric->record_decode_scheduled();
-                    }
                 }
-
                 scheduled = true;
                 break;
             }
         }
         else if (routing_strategy == RoutingStrategy::LeastBatch || routing_strategy == RoutingStrategy::LeastCache) {
-            // Iterate through DP ranks in increasing order of load
             for (auto it = dp_load_set.begin(); it != dp_load_set.end(); ++it) {
-                int selected_dp_idx = it->second;
-
-                // Compute chunk size
-                int chunk_end = compute_chunk_end(*seq, selected_dp_idx, num_batched_tokens);
-                if (chunk_end < 0)
-                    continue;
-                seq->set_num_tokens(chunk_end);
-
-                bool can_alloc = worker_state[selected_dp_idx]->can_allocate(
+                int  selected_dp_idx = it->second;
+                auto result          = worker_state[selected_dp_idx]->try_allocate(
                     *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
-
-                if (!can_alloc) {
-                    seq->set_num_tokens(orig_num_tokens);
+                if (!result)
                     continue;
-                }
 
-                // WARNING: erase(it) invalidates the iterator. This is safe here because
-                // we break the loop immediately after.
+                // erase(it) invalidates the iterator; safe because we break immediately.
                 dp_load_set.erase(it);
-                worker_state[selected_dp_idx]->allocate(*seq);
                 int new_load = (routing_strategy == RoutingStrategy::LeastBatch) ?
                                    worker_state[selected_dp_idx]->num_running_seqs() :
                                    worker_state[selected_dp_idx]->num_running_tokens();
                 dp_load_set.insert({new_load, selected_dp_idx});
 
-                auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
-                block_ctx.dp_idx  = selected_dp_idx;
-                int master_sp_idx = block_ctx.master_sp_idx;
+                auto& block_ctx  = seq->block_ctx(BlockContextSlot::ACTIVE);
+                block_ctx.dp_idx = selected_dp_idx;
+                int master_sp    = block_ctx.master_sp_idx;
 
-                num_seqs[selected_dp_idx][master_sp_idx] += 1;
-                num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens() - seq->num_cached_tokens());
+                num_seqs[selected_dp_idx][master_sp] += 1;
+                num_batched_tokens[selected_dp_idx][master_sp] += result->new_tokens;
 
                 seq->set_status(SequenceStatus::RUNNING);
-
                 waiting_queue.pop_front();
                 worker_state[selected_dp_idx]->running.push_back(seq);
                 scheduled_seqs[selected_dp_idx].push_back(seq);
 
                 if (seq->metric) {
                     seq->metric->record_first_scheduled();
-                    if (mode_ == "decode") {
+                    if (mode_ == "decode")
                         seq->metric->record_decode_scheduled();
-                    }
                 }
-
                 scheduled = true;
                 break;
             }
@@ -494,7 +422,6 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
         }
 
         if (!scheduled) {
-            // Cannot schedule any more sequences
             break;
         }
     }

@@ -18,19 +18,6 @@ namespace nanodeploy {
 // Forward declaration
 class MetricsManager;
 
-class TokenBudget {
-public:
-    TokenBudget(int max_num_tokens);
-    int32_t inject(int32_t num_tokens);
-    int32_t getBudget() const;
-    int32_t getMaxNumTokens() const;
-    void    clear();
-
-private:
-    int32_t max_num_tokens_;
-    int32_t budget_;
-};
-
 // Result of a single scheduling step.
 // This struct is returned by `schedule()` and summarizes which sequences
 // should be executed on each data-parallel (DP) worker (and, if applicable,
@@ -139,12 +126,6 @@ private:
     // Internal scheduling logic
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
-
-    // Compute the chunk endpoint for a WAITING sequence on a given DP rank.
-    // Returns the new num_tokens value (chunk_end), or -1 if no tokens can be scheduled.
-    int compute_chunk_end(const Sequence&                                  seq,
-                          int                                              dp_idx,
-                          const std::vector<std::unordered_map<int, int>>& num_batched_tokens) const;
 
     // Round-robin counter for DP
     int next_dp_idx();

@@ -277,6 +277,53 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     return false;
 }
 
+std::optional<AllocResult> SPStateManager::try_allocate(Sequence&                           seq,
+                                                        const std::unordered_map<int, int>& num_seqs,
+                                                        const std::unordered_map<int, int>& num_batched_tokens)
+{
+    int orig_num_tokens = seq.num_tokens();
+
+    // Budget pre-check: skip expensive can_allocate if no tokens can be scheduled
+    int budget = max_num_batched_tokens_;
+    for (auto& [sp, tok] : num_batched_tokens)
+        budget = std::min(budget, max_num_batched_tokens_ - tok);
+    if (budget <= 0)
+        return std::nullopt;
+
+    // Set num_tokens to full prompt length for block allocation.
+    // PD separation guarantees no decode traffic competes for KV cache,
+    // so locking all blocks at admission eliminates mid-prefill OOM.
+    int full_len = std::max(seq.num_prompt_tokens(), seq.num_checkpointed_tokens());
+    seq.set_num_tokens(full_len);
+
+    if (!can_allocate(seq, num_seqs, num_batched_tokens)) {
+        seq.set_num_tokens(orig_num_tokens);
+        return std::nullopt;
+    }
+
+    // Physical block allocation (sets seq.num_cached_tokens via prefix matching)
+    allocate(seq);
+
+    // Compute chunk boundary using actual prefix cache hits.
+    // BlockManager::allocate caps num_cached_tokens at num_tokens - 1,
+    // so full_len - num_cached >= 1 is guaranteed (combined with budget >= 1).
+    int num_cached = seq.num_cached_tokens();
+    int new_tokens = std::min(budget, full_len - num_cached);
+    int chunk_end  = num_cached + new_tokens;
+
+    seq.set_num_tokens(chunk_end);
+
+    // For chunked sequences, restrict dispatch to master SP rank
+    if (chunk_end < full_len) {
+        auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
+        int   master_sp = block_ctx.master_sp_idx;
+        std::fill(block_ctx.num_dispatched_tokens.begin(), block_ctx.num_dispatched_tokens.end(), 0);
+        block_ctx.num_dispatched_tokens[master_sp] = chunk_end;
+    }
+
+    return AllocResult{chunk_end, new_tokens};
+}
+
 void SPStateManager::allocate(Sequence& seq)
 {
     auto& block_ctx     = seq.block_ctx(BlockContextSlot::ACTIVE);

@@ -20,6 +20,11 @@ enum class RoutingStrategy {
     LeastCache
 };
 
+struct AllocResult {
+    int chunk_end;   // num_tokens boundary for the current batch
+    int new_tokens;  // budget consumed (= chunk_end - num_cached_tokens)
+};
+
 class SPStateManager {
 public:
     static constexpr int segment_size = 256;
@@ -54,6 +59,17 @@ public:
 
     void allocate(Sequence& seq);
     void deallocate(Sequence& seq, BlockContextSlot slot = BlockContextSlot::ACTIVE);
+
+    // Atomic budget-check + full-prompt allocation + chunk computation.
+    // Internally: saves/restores num_tokens, sets full_len for block allocation,
+    // computes chunk boundary from prefix hits + budget, restricts dispatch for
+    // chunked sequences to master SP rank.
+    // On success: blocks allocated for full prompt, num_tokens = chunk_end,
+    //             returns {chunk_end, new_tokens}.
+    // On failure: num_tokens restored, no side effects, returns nullopt.
+    std::optional<AllocResult> try_allocate(Sequence&                           seq,
+                                            const std::unordered_map<int, int>& num_seqs,
+                                            const std::unordered_map<int, int>& num_batched_tokens);
 
     // Load tracking
     /// \brief Returns the total number of sequences currently running on this engine.
