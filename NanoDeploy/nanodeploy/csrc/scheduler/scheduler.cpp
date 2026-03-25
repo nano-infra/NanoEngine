@@ -1,12 +1,14 @@
 #include <algorithm>
+#include <exception>
+#include <future>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
+#include <unordered_set>
 
 #include "nanodeploy/csrc/metrics/sequence_metric.h"
 #include "nanodeploy/csrc/sequence/sequence.h"
 #include "sequence_generated.h"
-
-#include "scheduler_utils.h"
 
 #include "scheduler.h"
 
@@ -522,13 +524,206 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
     waiting.push_front(seq);
 }
 
+void Scheduler::postprocess_worker_func(std::shared_ptr<SPStateManager> state_manager,
+                                        const PostprocessWorkerContext* ctx,
+                                        PostprocessWorkerContext*       result_ctx,
+                                        int                             eos_id,
+                                        bool                            is_prefill,
+                                        bool                            update_metrics)
+{
+    try {
+        std::unordered_set<std::shared_ptr<Sequence>> dummy_set;
+        for (const auto& dummy : state_manager->dummy_seqs) {
+            dummy_set.insert(dummy);
+        }
+
+        for (const auto& task : ctx->tasks) {
+            std::shared_ptr<Sequence> seq = task.seq;
+
+            if (dummy_set.count(seq))
+                continue;
+
+            // Detect non-final prefill chunk: num_tokens was set to the chunk
+            // endpoint during scheduling; if it's still less than the re-prefill
+            // target the sequence is not done prefilling yet.
+            // For fresh sequences the target is num_prompt_tokens.
+            // For preempted decode sequences num_checkpointed_tokens includes
+            // generated tokens that must also be re-prefilled.
+            // NOTE: This must NOT be guarded by is_prefill (which reflects the
+            // scheduler mode, e.g. disaggregated "prefill" vs "decode").  In a
+            // combined (non-disaggregated) scheduler the mode is never "prefill",
+            // but chunked sequences still need to continue prefilling.
+            int prefill_target = std::max(seq->num_prompt_tokens(), seq->num_checkpointed_tokens());
+            if (seq->num_tokens() < prefill_target) {
+                // KV has been computed for this chunk's tokens; advance the
+                // cached token pointer so the next chunk starts here.
+                seq->set_num_cached_tokens(seq->num_tokens());
+                seq->set_status(SequenceStatus::PREFILLING);
+                result_ctx->chunk_continuations.push_back(seq);
+                continue;  // don't process token_ids for this sequence
+            }
+
+            // Final prefill chunk completed — transition to RUNNING so the
+            // sequence stays in the running queue for subsequent decode steps.
+            if (seq->status() == SequenceStatus::PREFILLING) {
+                seq->set_status(SequenceStatus::RUNNING);
+            }
+
+            for (int token_id : *task.tokens) {
+
+                int master_sp_idx = seq->block_ctx().master_sp_idx;
+                if (task.sp_idx != master_sp_idx) {
+                    throw std::runtime_error("sp_idx mismatch: task.sp_idx=" + std::to_string(task.sp_idx)
+                                             + " != master_sp_idx=" + std::to_string(master_sp_idx)
+                                             + " for seq_id=" + std::to_string(seq->seq_id()));
+                }
+
+                seq->append_token(token_id, BlockContextSlot::ACTIVE, task.sp_idx);
+                state_manager->add_running_tokens(task.sp_idx, 1);
+
+                if (update_metrics && seq->metric) {
+                    if (seq->metric->num_generated_tokens == 0) {
+                        seq->metric->record_first_token();
+                        seq->metric->num_generated_tokens = 1;
+                    }
+                    else {
+                        seq->metric->record_token();
+                    }
+                }
+
+                bool finished = (!seq->sampling_params().ignore_eos && token_id == eos_id)
+                                || (seq->num_completed_tokens() >= seq->sampling_params().max_tokens);
+
+                if (finished) {
+                    seq->set_status(SequenceStatus::FINISHED);
+                    state_manager->deallocate(*seq);
+                    break;
+                }
+                else if (is_prefill) {
+                    seq->set_status(SequenceStatus::TO_BE_MIGRATED);
+                    seq->migrate();
+                    result_ctx->migration_candidates.push_back({seq, result_ctx->dp_idx});
+                    break;
+                }
+            }
+        }
+
+        auto& running = state_manager->running;
+        if (!running.empty()) {
+            running.erase(std::remove_if(running.begin(),
+                                         running.end(),
+                                         [](const std::shared_ptr<Sequence>& s) {
+                                             return s->status() == SequenceStatus::FINISHED
+                                                    || s->status() == SequenceStatus::TO_BE_MIGRATED
+                                                    || s->status() == SequenceStatus::PREFILLING;
+                                         }),
+                          running.end());
+        }
+    }
+    catch (...) {
+        result_ctx->eptr = std::current_exception();
+    }
+}
+
+PostprocessResult
+Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+                                      const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+                                      bool                                                       is_prefill,
+                                      bool                                                       update_metrics)
+{
+    size_t num_dp    = worker_state.size();
+    size_t num_dp_sp = dp_sp_seqs.size();
+    if (num_dp == 0)
+        return {};
+    if (num_dp_sp % num_dp != 0) {
+        throw std::runtime_error("dp_sp_seqs size is not a multiple of num_dp");
+    }
+    size_t num_sp = num_dp_sp / num_dp;
+
+    if (dp_sp_token_ids.size() != num_dp_sp) {
+        throw std::runtime_error("dp_sp_token_ids length mismatch with dp_sp_seqs");
+    }
+
+    std::vector<PostprocessWorkerContext> contexts(num_dp);
+
+    for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
+        auto& ctx  = contexts[dp_idx];
+        ctx.dp_idx = static_cast<int>(dp_idx);
+
+        for (size_t sp_idx = 0; sp_idx < num_sp; ++sp_idx) {
+            size_t      idx          = dp_idx * num_sp + sp_idx;
+            const auto& batch_seqs   = dp_sp_seqs[idx];
+            const auto& batch_tokens = dp_sp_token_ids[idx];
+
+            if (batch_seqs.size() > batch_tokens.size()) {
+                throw std::runtime_error("batch_seqs size mismatch with batch_tokens: not enough tokens");
+            }
+
+            size_t batch_size = batch_seqs.size();
+
+            for (size_t i = 0; i < batch_size; ++i) {
+                ctx.tasks.push_back({batch_seqs[i], &batch_tokens[i], (int)sp_idx});
+            }
+        }
+    }
+
+    if (thread_pool_) {
+        std::vector<std::future<void>> futures;
+        futures.reserve(num_dp);
+
+        for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
+            futures.push_back(thread_pool_->enqueue(postprocess_worker_func,
+                                                    worker_state[dp_idx],
+                                                    &contexts[dp_idx],
+                                                    &contexts[dp_idx],
+                                                    eos_,
+                                                    is_prefill,
+                                                    update_metrics));
+        }
+
+        for (auto& f : futures) {
+            f.get();
+        }
+    }
+    else {
+        std::vector<std::thread> threads;
+        threads.reserve(num_dp);
+
+        for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
+            threads.emplace_back(postprocess_worker_func,
+                                 worker_state[dp_idx],
+                                 &contexts[dp_idx],
+                                 &contexts[dp_idx],
+                                 eos_,
+                                 is_prefill,
+                                 update_metrics);
+        }
+
+        for (auto& t : threads) {
+            if (t.joinable())
+                t.join();
+        }
+    }
+
+    PostprocessResult result;
+    for (const auto& ctx : contexts) {
+        if (ctx.eptr) {
+            std::rethrow_exception(ctx.eptr);
+        }
+        result.migrations.insert(
+            result.migrations.end(), ctx.migration_candidates.begin(), ctx.migration_candidates.end());
+        result.continuations.insert(
+            result.continuations.end(), ctx.chunk_continuations.begin(), ctx.chunk_continuations.end());
+    }
+
+    return result;
+}
+
 void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
                             const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
                             bool                                                       update_metrics)
 {
-    // Call the C++ postprocess_sequences utility directly with shared_ptrs
-    auto result = postprocess_sequences(
-        worker_state, dp_sp_seqs, dp_sp_token_ids, eos_, mode_ == "prefill", update_metrics, thread_pool_.get());
+    auto result = postprocess_sequences_impl(dp_sp_seqs, dp_sp_token_ids, mode_ == "prefill", update_metrics);
 
     // Store migrations
     for (const auto& [seq_shared, dp_idx] : result.migrations) {

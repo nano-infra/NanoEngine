@@ -1,5 +1,4 @@
 #include "nanodeploy/csrc/scheduler/scheduler.h"
-#include "nanodeploy/csrc/scheduler/scheduler_utils.h"
 #include "opaque_types.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -15,18 +14,6 @@ PYBIND11_MAKE_OPAQUE(std::unordered_map<std::string, std::pair<std::shared_ptr<S
 
 void bind_scheduler_utils(py::module_& m)
 {
-    // Bind the postprocess_sequences utility function
-    m.def("postprocess_sequences",
-          &postprocess_sequences,
-          py::arg("worker_states"),
-          py::arg("dp_sp_seqs"),
-          py::arg("dp_sp_token_ids"),
-          py::arg("eos_id"),
-          py::arg("is_prefill"),
-          py::arg("update_metrics") = true,
-          py::arg("thread_pool")    = nullptr,
-          py::call_guard<py::gil_scoped_release>());
-
     // Bind the SPStateManagerList type
     py::class_<std::vector<std::shared_ptr<SPStateManager>>>(m, "SPStateManagerList")
         .def(py::init<>())

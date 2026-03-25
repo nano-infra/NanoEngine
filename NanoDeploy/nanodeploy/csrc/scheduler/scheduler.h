@@ -18,6 +18,15 @@ namespace nanodeploy {
 // Forward declaration
 class MetricsManager;
 
+// Type alias for migration list: vector<pair<sequence pointer, target DP index>>
+using MigrationList = std::vector<std::pair<std::shared_ptr<Sequence>, int>>;
+
+// Result of postprocessing sequences after model execution
+struct PostprocessResult {
+    MigrationList                          migrations;
+    std::vector<std::shared_ptr<Sequence>> continuations;  // non-final prefill chunks
+};
+
 // Result of a single scheduling step.
 // This struct is returned by `schedule()` and summarizes which sequences
 // should be executed on each data-parallel (DP) worker (and, if applicable,
@@ -129,6 +138,38 @@ private:
 
     // Round-robin counter for DP
     int next_dp_idx();
+
+    // Postprocessing internal types
+    struct PostprocessTask {
+        std::shared_ptr<Sequence> seq;
+        const std::vector<int>*   tokens;
+        int                       sp_idx;
+    };
+
+    struct PostprocessWorkerContext {
+        std::vector<PostprocessTask>           tasks;
+        MigrationList                          migration_candidates;
+        std::vector<std::shared_ptr<Sequence>> chunk_continuations;
+        std::exception_ptr                     eptr = nullptr;
+        int                                    dp_idx;
+        void                                   reserve(size_t n)
+        {
+            tasks.reserve(n);
+        }
+    };
+
+    // Postprocessing internal methods
+    static void postprocess_worker_func(std::shared_ptr<SPStateManager> state_manager,
+                                        const PostprocessWorkerContext* ctx,
+                                        PostprocessWorkerContext*       result_ctx,
+                                        int                             eos_id,
+                                        bool                            is_prefill,
+                                        bool                            update_metrics);
+
+    PostprocessResult postprocess_sequences_impl(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+                                                 const std::vector<std::vector<std::vector<int>>>& dp_sp_token_ids,
+                                                 bool                                              is_prefill,
+                                                 bool                                              update_metrics);
 
     // Configuration
     std::string engine_id_;

@@ -1,6 +1,5 @@
 set(CPP_SOURCES
     sp_state_manager.cpp
-    scheduler_utils.cpp
     scheduler.cpp
 )
 
