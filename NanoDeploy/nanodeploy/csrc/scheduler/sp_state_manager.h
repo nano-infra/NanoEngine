@@ -7,10 +7,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "nanodeploy/csrc/cache/block_manager.h"
+#include "nanodeploy/csrc/cache/gdn_state_manager.h"
 #include "nanodeploy/csrc/sequence/sequence.h"
-
-#include "cache_manager/block_manager.h"
-#include "cache_manager/gdn_state_manager.h"
 
 namespace nanodeploy {
 

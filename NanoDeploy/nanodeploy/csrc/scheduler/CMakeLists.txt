@@ -1,7 +1,4 @@
 set(CPP_SOURCES
-    cache_manager/block.cpp
-    cache_manager/block_manager.cpp
-    cache_manager/gdn_state_manager.cpp
     sp_state_manager.cpp
     scheduler_utils.cpp
     scheduler.cpp
@@ -19,7 +16,7 @@ target_compile_options(_nanodeploy_scheduler PRIVATE -O3 -Wall -Wextra)
 # Other dependencies can be PRIVATE since scheduler's headers don't expose them
 target_link_libraries(_nanodeploy_scheduler
     PRIVATE _nanodeploy_metrics
-    PUBLIC _nanosequence _nanosequence_metrics nanocommon
+    PUBLIC _nanosequence _nanosequence_metrics nanocommon _nanodeploy_cache_manager
 )
 
 set_target_properties(
