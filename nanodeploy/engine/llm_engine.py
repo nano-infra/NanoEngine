@@ -36,7 +36,7 @@ class LLMEngine:
         self.executor = RayExecutor(config=config)
         self.update_num_kvcache_blocks()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True, trust_remote_code=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         logger.info(

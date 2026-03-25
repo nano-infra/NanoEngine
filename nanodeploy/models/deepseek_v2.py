@@ -560,8 +560,8 @@ class DeepseekV2Attention(nn.Module):
                 yarn_params = YarnParameters(**kwargs)
                 other_params["yarn_params"] = yarn_params
         self.rotary_emb = get_rope(
-            config.head_dim,
-            rotary_dim=config.head_dim,
+            config.qk_rope_head_dim,
+            rotary_dim=config.qk_rope_head_dim,
             max_position=config.max_position_embeddings,
             base=config.rope_theta,
             # rope_scaling=config.rope_scaling,
