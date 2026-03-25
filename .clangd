@@ -18,9 +18,13 @@ CompileFlags:
 
 ---
 If:
-  PathMatch: (.*\/)?NanoCCL/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$
+  PathMatch: (.*\/)?NanoCCL/.*\.(c|cc|cpp|cxx|cu|cuh|h|hh|hpp|hxx)$
 CompileFlags:
   CompilationDatabase: NanoCCL/build
+  Add:
+    - -INanoCCL
+    - -INanoCCL/nanoccl/csrc
+    - -INanoCommon/include
 
 ---
 If:
@@ -28,11 +32,11 @@ If:
 CompileFlags:
   CompilationDatabase: NanoDeploy/build
   Add:
-    - -I/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoDeploy
-    - -I/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoCommon/include
-    - -I/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoDeploy/build/nanodeploy/csrc/sequence
+    - -INanoDeploy
+    - -INanoCommon/include
+    - -INanoDeploy/build/nanodeploy/csrc/sequence
 
 ---
 CompileFlags:
   Add:
-    - -std=c++17
+    - -std=c++20
