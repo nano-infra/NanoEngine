@@ -67,6 +67,9 @@ public:
 
     int32_t migrate()
     {
+
+        set_num_checkpointed_tokens(num_tokens());
+
         ensure_slot(BlockContextSlot::MIGRATE);
         ensure_slot(BlockContextSlot::ACTIVE);  // Ensure ACTIVE exists before move
 
