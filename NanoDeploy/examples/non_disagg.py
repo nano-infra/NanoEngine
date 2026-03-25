@@ -8,8 +8,8 @@ Usage:
 import os
 
 from jsonargparse import ActionConfigFile, ArgumentParser
+from nanodeploy import Sequence
 from nanodeploy.config import Config
-from nanodeploy.engine.sequence import Sequence
 from nanodeploy.llm_component import LLM
 from nanodeploy.sampling_params import SamplingParams
 from transformers import PreTrainedTokenizerFast

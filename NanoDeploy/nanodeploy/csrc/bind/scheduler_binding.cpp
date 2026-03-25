@@ -148,6 +148,8 @@ void bind_scheduler_utils(py::module_& m)
              py::return_value_policy::reference_internal)
 
         // Public member access
+        .def_readonly("attention_sp", &Scheduler::attention_sp_)
+        .def_readonly("attention_dp", &Scheduler::attention_dp_)
         .def_readwrite("waiting", &Scheduler::waiting)
         .def_readwrite("waiting_migration", &Scheduler::waiting_migration)
         .def_readwrite("worker_state", &Scheduler::worker_state)

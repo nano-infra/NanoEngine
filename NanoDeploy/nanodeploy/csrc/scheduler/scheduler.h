@@ -122,6 +122,16 @@ public:
     const std::unordered_map<int, std::shared_ptr<BlockManager>>& block_manager(int dp_idx) const;
 
     // Public members exposed to Python
+    std::string engine_id_;
+
+    int loop_count_;
+    int max_num_seqs_;
+    int max_num_batched_tokens_;
+    int eos_;
+
+    int attention_dp_;
+    int attention_sp_;
+
     std::deque<std::shared_ptr<Sequence>>                              waiting;
     std::deque<std::shared_ptr<Sequence>>                              waiting_migration;
     std::deque<std::shared_ptr<Sequence>>                              prefilling;  // mid-prompt sequences
@@ -172,14 +182,6 @@ private:
                                                  bool                                              update_metrics);
 
     // Configuration
-    std::string engine_id_;
-    int         loop_count_;
-    int         max_num_seqs_;
-    int         max_num_batched_tokens_;
-    int         eos_;
-    int         attention_dp_;
-    int         attention_sp_;
-
     int max_model_len_;
     int num_kvcache_blocks_;
     int kvcache_block_size_;
