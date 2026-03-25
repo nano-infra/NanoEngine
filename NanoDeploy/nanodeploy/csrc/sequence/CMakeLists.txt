@@ -1,6 +1,5 @@
 set(CPP_SOURCES
     sequence.cpp
-    serialization.cpp
 )
 
 if(TARGET flatc)

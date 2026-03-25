@@ -23,13 +23,7 @@ __all__ = [
     "Sequence",
     "SequenceStatus",
     "SequenceMetric",
-    "deserialize",  # renamed from deserialize_sequences for convenience
-    "serialize",  # renamed from serialize for convenience
     "BlockIdList",
     "DefaultIntDict",
     "DefaultListDict",
 ]
-
-# Alias for backward compatibility
-deserialize_sequences = deserialize
-serialize_sequences = serialize

@@ -294,7 +294,6 @@ private:
 
     // Make get_slot accessible to serialization code
     friend void unpack_block_context(const nanodeploy::fbs::BlockContext* fb_ctx, BlockContext& ctx);
-    friend std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr, size_t data_len);
 
     static std::atomic<uint64_t> next_seq_id_;
 };
