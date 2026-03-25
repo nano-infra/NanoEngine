@@ -1,6 +1,4 @@
-# NanoInfra
-
-A high-performance infrastructure for distributed LLM inference with disaggregated prefill/decode architecture, featuring RDMA-based KV cache migration and efficient resource management.
+# NanoDeploy: A highly available agentic inference serving framework, tailored for disaggregated architectures and high-performance expert parallelism.
 
 ## 📦 Components
 
