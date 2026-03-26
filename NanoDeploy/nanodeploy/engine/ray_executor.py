@@ -5,9 +5,8 @@ from urllib.parse import urlparse
 import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 
-from nanodeploy._cpp import serialize_migrate_batch, serialize_run_batch
+from nanodeploy._cpp import Sequence, serialize_migrate_batch, serialize_run_batch
 from nanodeploy.config import Config
-from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.model_runner import ModelRunner
 

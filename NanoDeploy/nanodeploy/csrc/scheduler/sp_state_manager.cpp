@@ -3,7 +3,7 @@
 #include <iostream>
 #include <random>
 
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 #include "sequence_generated.h"
 
 #include "sp_state_manager.h"
@@ -16,11 +16,11 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                int                kvcache_block_size,
                                int                max_num_seqs,
                                int                max_num_batched_tokens):
+    gdn_state_manager_(engine_id, 0, max_num_seqs),
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
     max_num_batched_tokens_(max_num_batched_tokens),
-    state_manager_(engine_id, 0, max_num_seqs),
     kvcache_block_size_(kvcache_block_size),
     num_kvcache_blocks_(num_kvcache_blocks),
     num_running_seqs_per_sp_(attention_sp, 0),
@@ -252,17 +252,21 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             continue;  // Max seq limit reached, try larger SP Size
         }
 
-        bool physical_check_ok = true;
+        bool             physical_check_ok = true;
+        std::vector<int> prefix_hints(attention_sp_, -1);
         for (size_t i = 0; i < participants.size(); ++i) {
             int rank_id = participants[i].id;
-            if (!block_manager[rank_id]->can_allocate(seq)) {
+            int hits    = block_manager[rank_id]->can_allocate(seq);
+            if (hits < 0) {
                 physical_check_ok = false;
                 break;
             }
+            prefix_hints[rank_id] = hits;
         }
 
         if (physical_check_ok) {
-            // *** Success! ***
+            // *** Success! Store hints for allocate() ***
+            cached_prefix_hints_ = std::move(prefix_hints);
             return true;
         }
 
@@ -273,22 +277,76 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     return false;
 }
 
+std::optional<AllocResult> SPStateManager::try_allocate(Sequence&                           seq,
+                                                        const std::unordered_map<int, int>& num_seqs,
+                                                        const std::unordered_map<int, int>& num_batched_tokens)
+{
+    int orig_num_tokens = seq.num_tokens();
+
+    // Budget pre-check: skip expensive can_allocate if no tokens can be scheduled
+    int budget = max_num_batched_tokens_;
+    for (auto& [sp, tok] : num_batched_tokens)
+        budget = std::min(budget, max_num_batched_tokens_ - tok);
+    if (budget <= 0)
+        return std::nullopt;
+
+    // Set num_tokens to full prompt length for block allocation.
+    // PD separation guarantees no decode traffic competes for KV cache,
+    // so locking all blocks at admission eliminates mid-prefill OOM.
+    int full_len = std::max(seq.num_prompt_tokens(), seq.num_checkpointed_tokens());
+    seq.set_num_tokens(full_len);
+
+    if (!can_allocate(seq, num_seqs, num_batched_tokens)) {
+        seq.set_num_tokens(orig_num_tokens);
+        return std::nullopt;
+    }
+
+    // Physical block allocation (sets seq.num_cached_tokens via prefix matching)
+    allocate(seq);
+
+    // Compute chunk boundary using actual prefix cache hits.
+    // BlockManager::allocate caps num_cached_tokens at num_tokens - 1,
+    // so full_len - num_cached >= 1 is guaranteed (combined with budget >= 1).
+    int num_cached = seq.num_cached_tokens();
+    int new_tokens = std::min(budget, full_len - num_cached);
+    int chunk_end  = num_cached + new_tokens;
+
+    seq.set_num_tokens(chunk_end);
+
+    // For chunked sequences, restrict dispatch to master SP rank
+    if (chunk_end < full_len) {
+        auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
+        int   master_sp = block_ctx.master_sp_idx;
+        std::fill(block_ctx.num_dispatched_tokens.begin(), block_ctx.num_dispatched_tokens.end(), 0);
+        block_ctx.num_dispatched_tokens[master_sp] = chunk_end;
+    }
+
+    return AllocResult{chunk_end, new_tokens};
+}
+
 void SPStateManager::allocate(Sequence& seq)
 {
     auto& block_ctx     = seq.block_ctx(BlockContextSlot::ACTIVE);
     int   master_sp_idx = block_ctx.master_sp_idx;
 
+    // Use prefix hints cached by can_allocate (if available) to skip
+    // redundant hash scans inside BlockManager::allocate.
+    auto hints = std::move(cached_prefix_hints_);
+    cached_prefix_hints_.clear();
+
+    auto get_hint = [&](int sp_idx) -> int { return (sp_idx < static_cast<int>(hints.size())) ? hints[sp_idx] : -1; };
+
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
         if (sp_idx != master_sp_idx) {
-            block_manager[sp_idx]->allocate(seq);
+            block_manager[sp_idx]->allocate(seq, get_hint(sp_idx));
         }
     }
-    block_manager[master_sp_idx]->allocate(seq);
+    block_manager[master_sp_idx]->allocate(seq, get_hint(master_sp_idx));
 
     // Assign a GDN state slot (index into conv/recurrent state buffers).
     // state_manager_ is a free-list over [0, max_num_seqs_); slot max_num_seqs_
     // is the reserved dummy slot and is never allocated here.
-    state_manager_.allocate(seq);
+    gdn_state_manager_.allocate(seq);
 
     num_running_seqs_++;
     num_running_tokens_ += seq.num_tokens();
@@ -303,7 +361,7 @@ void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
     }
 
     // Free the GDN state slot so it can be reused by future sequences.
-    state_manager_.deallocate(seq, slot);
+    gdn_state_manager_.deallocate(seq, slot);
 
     auto& block_ctx     = seq.block_ctx(BlockContextSlot::ACTIVE);
     int   master_sp_idx = block_ctx.master_sp_idx;

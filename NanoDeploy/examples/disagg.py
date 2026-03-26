@@ -21,11 +21,9 @@ import os
 import numpy as np
 import ray
 from jsonargparse import ActionConfigFile, ArgumentParser
-from nanodeploy._cpp import deserialize
+from nanodeploy._cpp import deserialize, SamplingParams, Sequence
 from nanodeploy.config import Config
-from nanodeploy.engine.sequence import Sequence
 from nanodeploy.llm_component import LLMComponent
-from nanodeploy.sampling_params import SamplingParams
 from transformers import PreTrainedTokenizerFast
 
 

@@ -5,9 +5,6 @@
 namespace py = pybind11;
 using namespace nanodeploy;
 
-// SequenceMetric binding is now in nanosequence, not here
-// This file only binds ServerMetric
-
 void bind_server_metric(py::module_& m)
 {
     py::class_<ServerMetric, std::shared_ptr<ServerMetric>>(m, "ServerMetric")

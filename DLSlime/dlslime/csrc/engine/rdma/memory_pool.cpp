@@ -20,12 +20,32 @@ int32_t RDMAMemoryPool::registerMemoryRegion(uintptr_t data_ptr, uint64_t length
 
     // Check if pointer is already registered
     if (ptr_to_handle_.count(data_ptr)) {
-        int32_t handle = ptr_to_handle_[data_ptr];
-        if (name.has_value()) {
-            if (name_to_id_.count(name.value()) && name_to_id_[name.value()] != handle) {
-                SLIME_LOG_ERROR("Name ", name.value(), " registered to diff handle.");
-                return -1;
+        int32_t        handle   = ptr_to_handle_[data_ptr];
+        struct ibv_mr* existing = id_to_mr_[handle];
+
+        if (existing->length >= length) {
+            // Existing MR covers the requested range — reuse it
+            if (name.has_value()) {
+                if (name_to_id_.count(name.value()) && name_to_id_[name.value()] != handle) {
+                    SLIME_LOG_ERROR("Name ", name.value(), " registered to diff handle.");
+                    return -1;
+                }
+                name_to_id_[name.value()] = handle;
             }
+            return handle;
+        }
+
+        // Existing MR is too small (address reused for larger buffer) — re-register
+        SLIME_LOG_INFO(
+            "Re-registering MR at ", (void*)data_ptr, ": old length=", existing->length, ", new length=", length);
+        ibv_dereg_mr(existing);
+
+        int     access_rights = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+        ibv_mr* mr            = ibv_reg_mr(pd_, (void*)data_ptr, length, access_rights);
+        SLIME_ASSERT(mr, " Failed to re-register memory " << data_ptr);
+        id_to_mr_[handle] = mr;
+
+        if (name.has_value()) {
             name_to_id_[name.value()] = handle;
         }
         return handle;

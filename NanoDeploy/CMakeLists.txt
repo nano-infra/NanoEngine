@@ -21,7 +21,6 @@ message(STATUS "NanoInfra Root Path: ${NANOINFRA_DIR}")
 include_directories(.)
 add_subdirectory(${NANOINFRA_DIR}/third_party third_party)
 add_subdirectory(${NANOINFRA_DIR}/NanoCommon NanoCommon)
-add_subdirectory(${NANOINFRA_DIR}/NanoSequence NanoSequence)
 add_subdirectory(nanodeploy/csrc)
 
 # Python Flatbuffers Generation
@@ -52,13 +51,19 @@ set(FBS_GENERATED_FILES
     "${FBS_OUTPUT_DIR}/__init__.py"
 )
 
+# flatc --python with namespace nanodeploy.fbs writes nanodeploy/__init__.py under -o.
+# Generate into a build-dir staging tree and copy only nanodeploy/fbs/ into the source
+# package so the real nanodeploy/__init__.py is never overwritten (no .fbs or import churn).
+set(FBS_PYTHON_STAGING "${CMAKE_CURRENT_BINARY_DIR}/fbs_python_staging")
+
 add_custom_command(
     OUTPUT ${FBS_GENERATED_FILES}
+    COMMAND ${CMAKE_COMMAND} -E remove_directory "${FBS_PYTHON_STAGING}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${FBS_PYTHON_STAGING}"
+    COMMAND $<TARGET_FILE:flatc> --python --gen-object-api -o "${FBS_PYTHON_STAGING}" ${SEQUENCE_PROTO}
+    COMMAND $<TARGET_FILE:flatc> --python --gen-object-api -o "${FBS_PYTHON_STAGING}" ${PACKET_PROTO}
     COMMAND ${CMAKE_COMMAND} -E remove_directory "${FBS_OUTPUT_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${FBS_OUTPUT_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E touch "${FBS_OUTPUT_DIR}/__init__.py"
-    COMMAND $<TARGET_FILE:flatc> --python --gen-object-api -o "${CMAKE_CURRENT_SOURCE_DIR}" ${SEQUENCE_PROTO}
-    COMMAND $<TARGET_FILE:flatc> --python --gen-object-api -o "${CMAKE_CURRENT_SOURCE_DIR}" ${PACKET_PROTO}
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${FBS_PYTHON_STAGING}/nanodeploy/fbs" "${FBS_OUTPUT_DIR}"
     DEPENDS flatc ${SEQUENCE_PROTO} ${PACKET_PROTO}
     COMMENT "Generating Python FlatBuffers bindings from sequence.fbs and packet.fbs"
 )

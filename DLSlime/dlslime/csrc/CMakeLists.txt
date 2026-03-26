@@ -1,5 +1,4 @@
 add_subdirectory(device)
-add_subdirectory(rendezvous)
 add_subdirectory(engine)
 
 add_library(dlslime INTERFACE)

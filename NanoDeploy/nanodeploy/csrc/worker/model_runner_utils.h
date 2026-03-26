@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 namespace nanodeploy {
 
@@ -20,6 +20,16 @@ struct PrefillMetadata {
     std::vector<int> block_tables_flat;
     int              max_num_blocks   = 0;
     bool             use_block_tables = false;
+
+    // Per-sequence sampling info for chunked prefill:
+    // sampling_token_indices[i] = index into the Q (hidden_states) tensor for
+    //   the last token of the i-th final-chunk sequence.
+    // sampling_seq_indices[i]   = which sequence (0-based, among master-sp seqs)
+    //   that token belongs to.
+    // Both vectors are empty when every sequence in the batch is a non-final chunk
+    // (skip lm_head entirely).
+    std::vector<int> sampling_token_indices;
+    std::vector<int> sampling_seq_indices;
 };
 
 struct DecodeMetadata {

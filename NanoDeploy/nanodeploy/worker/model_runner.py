@@ -611,6 +611,21 @@ class ModelRunner:
                 pin_memory=True,
             ).cuda(non_blocking=True)
 
+        # Chunked prefill: selective lm_head — only compute logits for final-chunk seqs.
+        # sampling_token_indices: Q-tensor indices of the last token for each final-chunk seq.
+        # sampling_seq_indices: which seq (0-based) each index corresponds to.
+        # If all sequences are final chunks, set to None to use the fast default path.
+        sampling_token_indices = None
+        sampling_seq_indices = None
+        num_sp_seqs = aux.num_sp_seqs
+        if len(meta.sampling_token_indices) < num_sp_seqs:
+            sampling_token_indices = torch.tensor(
+                meta.sampling_token_indices, dtype=torch.int64, pin_memory=True
+            ).cuda(non_blocking=True)
+            sampling_seq_indices = torch.tensor(
+                meta.sampling_seq_indices, dtype=torch.int64, pin_memory=True
+            ).cuda(non_blocking=True)
+
         set_context(
             True,
             self.config.max_num_seqs,
@@ -626,6 +641,8 @@ class ModelRunner:
             gdn_conv_states=cache_ctx.gdn_conv_states,
             gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
             gdn_state_slots=gdn_state_slots,
+            sampling_token_indices=sampling_token_indices,
+            sampling_seq_indices=sampling_seq_indices,
         )
         return input_ids, positions
 
@@ -833,17 +850,15 @@ class ModelRunner:
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             context = get_context()
-            # Inject vision embeddings during prefill if available
             inputs_embeds = None
             if is_prefill and self._vision_embeds is not None:
                 logger.info(
                     f"[RUN_MODEL] Injecting vision embeds for prefill, input_ids.shape={input_ids.shape}, _vision_embeds keys={list(self._vision_embeds.keys())}"
                 )
                 inputs_embeds = self._inject_vision_embeds(input_ids)
-                # Clear after injection attempt
                 self._vision_embeds = None
-            elif is_prefill:
-                logger.info(
+            elif is_prefill and not context.is_dummy:
+                logger.debug(
                     f"[RUN_MODEL] Prefill WITHOUT vision embeds, input_ids.shape={input_ids.shape}"
                 )
             if inputs_embeds is not None:
@@ -1022,7 +1037,16 @@ class ModelRunner:
             tp_rank = get_dist_context().attn_tp_rank
             if tp_rank == 0:
                 temperatures = self.prepare_sample_from_aux(aux)
-                input_ids = self.sampler(logits, temperatures)
+                context = get_context()
+                if is_prefill and context.sampling_seq_indices is not None:
+                    # Sparse prefill: logits has shape [n_final, vocab_size].
+                    # Sample only final-chunk sequences, then scatter into full output.
+                    temps_filtered = temperatures[context.sampling_seq_indices]
+                    sampled = self.sampler(logits, temps_filtered)
+                    input_ids = input_ids.new_zeros(num_sp_seqs)
+                    input_ids[context.sampling_seq_indices] = sampled
+                else:
+                    input_ids = self.sampler(logits, temperatures)
             else:
                 input_ids = input_ids.new_zeros([num_sp_seqs])
             dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)

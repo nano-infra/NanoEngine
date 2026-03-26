@@ -5,7 +5,7 @@
 
 #include <flatbuffers/flatbuffers.h>
 
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 namespace nanodeploy {
 

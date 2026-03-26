@@ -1,5 +1,4 @@
 #include "nanodeploy/csrc/scheduler/scheduler.h"
-#include "nanodeploy/csrc/scheduler/scheduler_utils.h"
 #include "opaque_types.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -15,18 +14,6 @@ PYBIND11_MAKE_OPAQUE(std::unordered_map<std::string, std::pair<std::shared_ptr<S
 
 void bind_scheduler_utils(py::module_& m)
 {
-    // Bind the postprocess_sequences utility function
-    m.def("postprocess_sequences",
-          &postprocess_sequences,
-          py::arg("worker_states"),
-          py::arg("dp_sp_seqs"),
-          py::arg("dp_sp_token_ids"),
-          py::arg("eos_id"),
-          py::arg("is_prefill"),
-          py::arg("update_metrics") = true,
-          py::arg("thread_pool")    = nullptr,
-          py::call_guard<py::gil_scoped_release>());
-
     // Bind the SPStateManagerList type
     py::class_<std::vector<std::shared_ptr<SPStateManager>>>(m, "SPStateManagerList")
         .def(py::init<>())
@@ -109,11 +96,12 @@ void bind_scheduler_utils(py::module_& m)
 
     // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
-        .def(py::init<const std::string&, int, int, int, int, int, int, int, int, const std::string&>(),
+        .def(py::init<const std::string&, int, int, int, int, int, int, int, int, int, const std::string&>(),
              py::arg("engine_id"),
              py::arg("loop_count"),
              py::arg("max_num_seqs"),
              py::arg("max_num_batched_tokens"),
+             py::arg("max_model_len"),
              py::arg("eos"),
              py::arg("attention_dp"),
              py::arg("attention_sp"),
@@ -160,6 +148,8 @@ void bind_scheduler_utils(py::module_& m)
              py::return_value_policy::reference_internal)
 
         // Public member access
+        .def_readonly("attention_sp", &Scheduler::attention_sp_)
+        .def_readonly("attention_dp", &Scheduler::attention_dp_)
         .def_readwrite("waiting", &Scheduler::waiting)
         .def_readwrite("waiting_migration", &Scheduler::waiting_migration)
         .def_readwrite("worker_state", &Scheduler::worker_state)

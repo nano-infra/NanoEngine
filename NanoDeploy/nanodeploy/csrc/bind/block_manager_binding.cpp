@@ -1,8 +1,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "nanodeploy/csrc/scheduler/block_manager.h"
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/cache/block_manager.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 namespace py = pybind11;
 using namespace nanodeploy;
@@ -29,11 +29,7 @@ void bind_block_manager(py::module_& m)
                     py::arg("token_ids"),
                     py::arg("prefix") = -1)
         .def("can_allocate", &BlockManager::can_allocate)
-        .def("allocate",
-             &BlockManager::allocate,
-             py::arg("seq"),
-             py::arg("token_idx_from") = -1,
-             py::arg("token_idx_to")   = -1)
+        .def("allocate", &BlockManager::allocate, py::arg("seq"), py::arg("prefix_hint") = -1)
         .def("deallocate", &BlockManager::deallocate)
         .def("can_append", &BlockManager::can_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def("may_append", &BlockManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)

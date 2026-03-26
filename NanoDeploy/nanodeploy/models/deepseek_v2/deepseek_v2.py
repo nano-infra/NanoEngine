@@ -14,6 +14,10 @@ from nanodeploy.backends.base_backend import (
     MergedColumnParallelLinearBase,
     RowParallelLinearBase,
 )
+from nanodeploy.backends.hopper.layers.attention import (
+    _gather_cache_cached_only,
+    _interleave_cached_fresh,
+)
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
@@ -660,39 +664,89 @@ class DeepseekV2Attention(nn.Module):
                     )
                 store_kcache(key_states_3d, k_cache, slot_mapping)
 
-            # Expand K from compressed latent: k_nope = compressed_kv @ kc.weight^T
-            # kc.weight: (H, D, R) -> reshape to (H*D, R) -> transpose to (R, H*D)
-            # compressed_kv: (T, R) @ (R, H*D) -> (T, H*D) -> (T, H, D)
+            # Weight matrices for K/V expansion (shared by both paths)
             kc_t = self.kc.weight.reshape(
                 num_heads * self.qk_nope_head_dim, self.kv_lora_rank
             ).T  # (R, H*D)
-            k_nope = (compressed_kv @ kc_t).view(
-                q_len, num_heads, self.qk_nope_head_dim
-            )
-
-            # Build full K: [k_nope (H, 128); k_pe broadcast (H, 64)] -> (T, H, 192)
-            k_pe_expanded = k_pe_3d.expand(-1, num_heads, -1)  # (T, H, 64)
-            k_expanded = torch.cat([k_nope, k_pe_expanded], dim=-1)  # (T, H, 192)
-
-            # Expand V from compressed latent: v = compressed_kv @ vc.weight
-            # vc.weight: (H, R, V) -> permute to (R, H, V) -> reshape to (R, H*V)
-            # compressed_kv: (T, R) @ (R, H*V) -> (T, H*V) -> (T, H, V)
             vc_reshaped = self.vc.weight.permute(1, 0, 2).reshape(
                 self.kv_lora_rank, num_heads * self.v_head_dim
             )  # (R, H*V)
-            v_expanded = (compressed_kv @ vc_reshaped).view(
-                q_len, num_heads, self.v_head_dim
-            )  # (T, H, 128)
 
-            # Attention: Q (T, H, 192) @ K (T, H, 192) -> output (T, H, 128)
-            # Use FA3 which supports different head dims for QK vs V on SM90+
+            # Expand fresh tokens (needed for both paths)
+            k_nope_fresh = (compressed_kv @ kc_t).view(
+                q_len, num_heads, self.qk_nope_head_dim
+            )
+            k_expanded_fresh = torch.cat(
+                [k_nope_fresh, k_pe_3d.expand(-1, num_heads, -1)], dim=-1
+            )
+            v_expanded_fresh = (compressed_kv @ vc_reshaped).view(
+                q_len, num_heads, self.v_head_dim
+            )
+
+            if context.block_tables is not None:
+
+                sp_rank = get_dist_context().attn_sp_rank
+                num_seqs = context.cu_seqlens_k.shape[0] - 1
+                bt = context.block_tables[sp_rank, :num_seqs, :]
+                block_size = k_cache.shape[1]
+
+                k_cached_raw, cached_lens, cu_cached = _gather_cache_cached_only(
+                    k_cache,
+                    bt,
+                    context.cu_seqlens_q,
+                    context.cu_seqlens_k,
+                    block_size,
+                )
+
+                total_cached = int(cu_cached[-1].item())
+                if total_cached > 0:
+                    k_cached_raw = k_cached_raw.squeeze(1)  # [total_cached, 576]
+                    comp_cached = k_cached_raw[:, : self.kv_lora_rank]
+                    kpe_cached = k_cached_raw[:, self.kv_lora_rank :]
+
+                    k_nope_cached = (comp_cached @ kc_t).view(
+                        -1, num_heads, self.qk_nope_head_dim
+                    )
+                    k_expanded_cached = torch.cat(
+                        [
+                            k_nope_cached,
+                            kpe_cached.unsqueeze(1).expand(-1, num_heads, -1),
+                        ],
+                        dim=-1,
+                    )
+                    v_expanded_cached = (comp_cached @ vc_reshaped).view(
+                        -1, num_heads, self.v_head_dim
+                    )
+
+                    k_expanded = _interleave_cached_fresh(
+                        k_expanded_cached,
+                        k_expanded_fresh,
+                        cached_lens,
+                        cu_cached,
+                        context.cu_seqlens_q,
+                        context.cu_seqlens_k,
+                    )
+                    v_expanded = _interleave_cached_fresh(
+                        v_expanded_cached,
+                        v_expanded_fresh,
+                        cached_lens,
+                        cu_cached,
+                        context.cu_seqlens_q,
+                        context.cu_seqlens_k,
+                    )
+                else:
+                    k_expanded = k_expanded_fresh
+                    v_expanded = v_expanded_fresh
+            else:
+                k_expanded = k_expanded_fresh
+                v_expanded = v_expanded_fresh
+
             from flash_attn_interface import flash_attn_varlen_func
 
-            context = get_context()
             attn_output = flash_attn_varlen_func(
-                q_full,  # (T, H, 192)
-                k_expanded,  # (T, H, 192)
-                v_expanded,  # (T, H, 128)
+                q_full,  # (q_len, H, 192)
+                k_expanded,  # (total_k or q_len, H, 192)
+                v_expanded,  # (total_k or q_len, H, 128)
                 cu_seqlens_q=context.cu_seqlens_q,
                 cu_seqlens_k=context.cu_seqlens_k,
                 max_seqlen_q=context.max_seqlen_q,

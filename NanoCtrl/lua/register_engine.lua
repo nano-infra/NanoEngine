@@ -22,16 +22,13 @@ redis.call('EXPIRE', engine_key, ttl)
 -- 3. Atomically increment global revision
 local new_revision = redis.call('INCR', revision_key)
 
--- 4. Construct and publish event (using cjson for JSON manipulation)
-local payload_data = cjson.decode(ARGV[9])
-local event = {
-    event_type = 'ADD',
-    engine_id = ARGV[1],
-    timestamp = redis.call('TIME')[1],  -- Server time (seconds since epoch)
-    revision = new_revision,
-    payload = payload_data
-}
-local event_json = cjson.encode(event)
+-- 4. Construct and publish event.
+-- NOTE: embed ARGV[9] (payload JSON) as a raw string to avoid cjson
+-- re-encoding empty arrays as objects (cjson encodes empty Lua tables as {}).
+local event_json = '{"event_type":"ADD","engine_id":' .. cjson.encode(ARGV[1]) ..
+    ',"timestamp":' .. tostring(redis.call('TIME')[1]) ..
+    ',"revision":' .. tostring(new_revision) ..
+    ',"payload":' .. ARGV[9] .. '}'
 
 -- 5. Publish event atomically (within the same transaction)
 redis.call('PUBLISH', channel, event_json)

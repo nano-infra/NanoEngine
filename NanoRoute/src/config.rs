@@ -59,12 +59,29 @@ pub struct SchedulerConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
+pub struct NanoFoldConfig {
+    /// List of NanoFold server URLs for round-robin load balancing.
+    /// e.g. ["http://127.0.0.1:8201", "http://127.0.0.1:8202"]
+    pub server_urls: Vec<String>,
+    /// Per-request timeout in seconds (structure prediction can take minutes).
+    #[serde(default = "default_fold_timeout")]
+    pub timeout_s: u64,
+}
+
+fn default_fold_timeout() -> u64 {
+    600
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct AppConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub tokenizer: Option<TokenizerConfig>, // optional; loaded lazily from engine if absent
     pub engine: EngineConfig,
     pub scheduler: SchedulerConfig,
+    #[serde(default)]
+    pub nanofold: Option<NanoFoldConfig>,
 }
 
 impl AppConfig {

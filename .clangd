@@ -1,8 +1,42 @@
 CompileFlags:
-  CompilationDatabase: .
+  Add:
+    - -I/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoCommon/include
+    - -I/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoDeploy
+    - -I/mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoDeploy/build/nanodeploy/csrc/sequence
 
 Diagnostics:
   UnusedIncludes: None
 
 Index:
   Background: Build
+
+---
+If:
+  PathMatch: (.*\/)?DLSlime/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$
+CompileFlags:
+  CompilationDatabase: DLSlime/build
+
+---
+If:
+  PathMatch: (.*\/)?NanoCCL/.*\.(c|cc|cpp|cxx|cu|cuh|h|hh|hpp|hxx)$
+CompileFlags:
+  CompilationDatabase: NanoCCL/build
+  Add:
+    - -INanoCCL
+    - -INanoCCL/nanoccl/csrc
+    - -INanoCommon/include
+
+---
+If:
+  PathMatch: (.*\/)?NanoDeploy/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$
+CompileFlags:
+  CompilationDatabase: NanoDeploy/build
+  Add:
+    - -INanoDeploy
+    - -INanoCommon/include
+    - -INanoDeploy/build/nanodeploy/csrc/sequence
+
+---
+CompileFlags:
+  Add:
+    - -std=c++20

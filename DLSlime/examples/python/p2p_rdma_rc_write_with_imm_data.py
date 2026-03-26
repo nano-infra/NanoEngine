@@ -1,11 +1,10 @@
 import torch
-import xxhash
 from dlslime import available_nic, RDMAEndpoint
 
 devices = available_nic()
 assert devices, "No RDMA devices."
 
-mr_key = xxhash.xxh64_intdigest("buffer")
+mr_key = "buffer"
 
 # Initialize RDMA endpoint
 initiator = RDMAEndpoint(num_qp=1, device_name=devices[0], ib_port=1, link_type="RoCE")

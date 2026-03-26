@@ -9,12 +9,177 @@ from nanodeploy.backends.gpu_generic.kernels.kv_combine import (
     inter_rank_gqa_fwd_batch_decode_combine_kv,
 )
 from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kcache, store_kvcache
+from nanodeploy.backends.gpu_generic.kernels.paged_gather import (
+    build_paged_gather_indices as _build_paged_gather_indices,
+)
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.context.sp_context import get_sp_context
 from nanodeploy.logging import get_logger
 
 logger = get_logger()
+
+
+def _gather_kv_paged(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather paged KV cache into contiguous ragged tensors for flash_attn_varlen_func.
+
+    Args:
+        k_cache:     [num_blocks, block_size, num_kv_heads, head_dim]
+        v_cache:     [num_blocks, block_size, num_kv_heads, head_dim]
+        block_table: [num_seqs, max_num_blocks] — int32 physical block IDs (-1 = padding)
+        cu_seqlens_k:[num_seqs + 1] — cumulative K lengths (int32)
+        block_size:  tokens per KV block
+
+    Returns:
+        k_gathered: [total_k_tokens, num_kv_heads, head_dim]
+        v_gathered: [total_k_tokens, num_kv_heads, head_dim]
+    """
+    linear_indices = _build_paged_gather_indices(block_table, cu_seqlens_k, block_size)
+
+    _, _, num_kv_heads, head_dim = k_cache.shape
+    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim)
+    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim)
+    return k_flat[linear_indices], v_flat[linear_indices]
+
+
+def _gather_cache_paged(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Gather a single paged cache into a contiguous ragged tensor.
+
+    Works for any cache with shape [num_blocks, block_size, ...].
+
+    Returns:
+        gathered: [total_k_tokens, ...] (remaining dims preserved)
+    """
+    linear_indices = _build_paged_gather_indices(block_table, cu_seqlens_k, block_size)
+    trailing_shape = cache.shape[2:]
+    flat = cache.reshape(-1, *trailing_shape)
+    return flat[linear_indices]
+
+
+def _compute_cached_split(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-sequence cached/fresh split for chunked prefill.
+
+    Returns:
+        cached_lens:  [num_seqs] — number of previously-cached tokens per sequence
+        cu_cached:    [num_seqs + 1] — cumulative cached lengths
+    """
+    seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).long()
+    seqlens_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).long()
+    cached_lens = seqlens_k - seqlens_q
+    cu_cached = torch.zeros_like(cu_seqlens_k)
+    cu_cached[1:] = cached_lens.cumsum(0)
+    return cached_lens, cu_cached
+
+
+def _interleave_cached_fresh(
+    cached: torch.Tensor,
+    fresh: torch.Tensor,
+    cached_lens: torch.Tensor,
+    cu_cached: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+) -> torch.Tensor:
+    """Interleave cached and fresh tensors into ragged K layout.
+
+    Per sequence i the output is [cached_tokens_i, fresh_tokens_i] contiguously.
+    """
+    num_seqs = cached_lens.shape[0]
+    total_k = int(cu_seqlens_k[-1].item())
+    ref = cached if cached.numel() > 0 else fresh
+    out = ref.new_empty(total_k, *ref.shape[1:])
+
+    for i in range(num_seqs):
+        dst = int(cu_seqlens_k[i].item())
+        nc = int(cached_lens[i].item())
+        cs = int(cu_cached[i].item())
+        qs = int(cu_seqlens_q[i].item())
+        nf = int(cu_seqlens_q[i + 1].item()) - qs
+
+        if nc > 0:
+            out[dst : dst + nc] = cached[cs : cs + nc]
+        if nf > 0:
+            out[dst + nc : dst + nc + nf] = fresh[qs : qs + nf]
+
+    return out
+
+
+def _gather_kv_cached_concat(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_fresh: torch.Tensor,
+    v_fresh: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather only previously-cached K/V from paged cache, concat with fresh K/V.
+
+    Avoids redundantly re-reading fresh tokens that were just written to cache.
+    Falls back to full gather when there are no cached tokens.
+    """
+    cached_lens, cu_cached = _compute_cached_split(cu_seqlens_q, cu_seqlens_k)
+    total_cached = int(cu_cached[-1].item())
+
+    if total_cached == 0:
+        return k_fresh, v_fresh
+
+    cached_indices = _build_paged_gather_indices(block_table, cu_cached, block_size)
+    _, _, num_kv_heads, head_dim = k_cache.shape
+    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim)
+    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim)
+    k_cached = k_flat[cached_indices]
+    v_cached = v_flat[cached_indices]
+
+    k_out = _interleave_cached_fresh(
+        k_cached, k_fresh, cached_lens, cu_cached, cu_seqlens_q, cu_seqlens_k
+    )
+    v_out = _interleave_cached_fresh(
+        v_cached, v_fresh, cached_lens, cu_cached, cu_seqlens_q, cu_seqlens_k
+    )
+    return k_out, v_out
+
+
+def _gather_cache_cached_only(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather only previously-cached tokens from a single paged cache.
+
+    Returns:
+        gathered:    [total_cached, ...] — cached tokens from paged cache
+        cached_lens: [num_seqs] — per-sequence cached counts
+        cu_cached:   [num_seqs + 1] — cumulative cached lengths
+    """
+    cached_lens, cu_cached = _compute_cached_split(cu_seqlens_q, cu_seqlens_k)
+    total_cached = int(cu_cached[-1].item())
+
+    if total_cached == 0:
+        trailing = cache.shape[2:]
+        gathered = cache.new_empty(0, *trailing)
+        return gathered, cached_lens, cu_cached
+
+    cached_indices = _build_paged_gather_indices(block_table, cu_cached, block_size)
+    trailing = cache.shape[2:]
+    flat = cache.reshape(-1, *trailing)
+    return flat[cached_indices], cached_lens, cu_cached
 
 
 class FlashAttentionImpl:
@@ -46,8 +211,19 @@ class FlashAttentionImpl:
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
         if context.is_prefill:
-            if context.block_tables is not None:  # prefix cache
-                k, v = k_cache, v_cache
+            if context.block_tables is not None:
+                num_seqs = context.cu_seqlens_k.shape[0] - 1
+                bt = context.block_tables[sp_rank, :num_seqs, :]
+                k, v = _gather_kv_cached_concat(
+                    k_cache,
+                    v_cache,
+                    k,
+                    v,
+                    bt,
+                    context.cu_seqlens_q,
+                    context.cu_seqlens_k,
+                    k_cache.shape[1],
+                )
             o = flash_attn_varlen_func(
                 q,
                 k,

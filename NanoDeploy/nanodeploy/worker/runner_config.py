@@ -12,6 +12,7 @@ class RunnerConfig:
     max_num_seqs: int | None = None
     dummy_weight: bool = False
     enable_eplb: bool = False
+    device_comm_backend: str = "nccl"
 
 
 # Singleton instance of RunnerConfig

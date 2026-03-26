@@ -1,5 +1,4 @@
 import torch
-import xxhash
 from dlslime import available_nic, RDMAEndpoint
 
 devices = available_nic()

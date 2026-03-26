@@ -13,7 +13,6 @@ classifiers = [
   "Intended Audience :: Developers",
   "Intended Audience :: Science/Research",
   "Intended Audience :: System Administrators",
-  "License :: OSI Approved :: BSD License",
   "Operating System :: POSIX :: Linux",
   "Operating System :: Unix",
   "Programming Language :: C++",
@@ -27,7 +26,6 @@ readme = "README.md"
 requires-python = ">=3.8"
 version = "0.0.2.post1"
 dependencies = [
-  "xxhash",
   "pydantic>=2.0",
   "pyzmq>=25.0",
   # for --build-no-isolation

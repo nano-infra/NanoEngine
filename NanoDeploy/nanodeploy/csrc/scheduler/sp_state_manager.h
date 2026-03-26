@@ -7,10 +7,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "nanosequence/csrc/sequence/sequence.h"
-
-#include "block_manager.h"
-#include "state_manager.h"
+#include "nanodeploy/csrc/cache/block_manager.h"
+#include "nanodeploy/csrc/cache/gdn_state_manager.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 namespace nanodeploy {
 
@@ -18,6 +17,11 @@ enum class RoutingStrategy {
     RoundRobin,
     LeastBatch,
     LeastCache
+};
+
+struct AllocResult {
+    int chunk_end;   // num_tokens boundary for the current batch
+    int new_tokens;  // budget consumed (= chunk_end - num_cached_tokens)
 };
 
 class SPStateManager {
@@ -54,6 +58,17 @@ public:
 
     void allocate(Sequence& seq);
     void deallocate(Sequence& seq, BlockContextSlot slot = BlockContextSlot::ACTIVE);
+
+    // Atomic budget-check + full-prompt allocation + chunk computation.
+    // Internally: saves/restores num_tokens, sets full_len for block allocation,
+    // computes chunk boundary from prefix hits + budget, restricts dispatch for
+    // chunked sequences to master SP rank.
+    // On success: blocks allocated for full prompt, num_tokens = chunk_end,
+    //             returns {chunk_end, new_tokens}.
+    // On failure: num_tokens restored, no side effects, returns nullopt.
+    std::optional<AllocResult> try_allocate(Sequence&                           seq,
+                                            const std::unordered_map<int, int>& num_seqs,
+                                            const std::unordered_map<int, int>& num_batched_tokens);
 
     // Load tracking
     /// \brief Returns the total number of sequences currently running on this engine.
@@ -135,10 +150,12 @@ public:
         num_running_tokens_per_sp_[sp_idx] += count;
     }
 
-    // Public members to be exposed to Python
     std::unordered_map<int, std::shared_ptr<BlockManager>> block_manager;
-    std::deque<std::shared_ptr<Sequence>>                  running;
-    std::vector<std::shared_ptr<Sequence>>                 dummy_seqs;
+
+    GDNStateManager gdn_state_manager_;
+
+    std::deque<std::shared_ptr<Sequence>>  running;
+    std::vector<std::shared_ptr<Sequence>> dummy_seqs;
 
     RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;
 
@@ -146,11 +163,10 @@ private:
     void initialize_dummy_seqs();
     int  next_sp_idx();  // Round-robin counter
 
-    std::string  engine_id_;
-    int          attention_sp_;
-    int          max_num_seqs_;
-    int          max_num_batched_tokens_;
-    StateManager state_manager_;  // GDN state slot free-list (slot = seq's index into GDN buffers)
+    std::string engine_id_;
+    int         attention_sp_;
+    int         max_num_seqs_;
+    int         max_num_batched_tokens_;
 
     int kvcache_block_size_;
     int num_kvcache_blocks_;
@@ -160,6 +176,10 @@ private:
     int              num_running_tokens_ = 0;
     std::vector<int> num_running_seqs_per_sp_;
     std::vector<int> num_running_tokens_per_sp_;
+
+    // Per-SP-rank prefix hit counts cached between can_allocate() and allocate().
+    // Populated by can_allocate on success; consumed (moved) by allocate.
+    std::vector<int> cached_prefix_hints_;
 };
 
 }  // namespace nanodeploy

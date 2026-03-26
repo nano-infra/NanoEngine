@@ -130,7 +130,7 @@ void all_to_all_intra_ll(torch::Tensor                x,
     int num_sms   = world_size;
     int num_warps = MAX_NUM_WARPS < bs ? MAX_NUM_WARPS : bs;
 
-    NANOCOMMON_LOG_INFO("configuration: ", bs, ", ", msg_size, ", ", num_sms, ", ", num_warps, ".");
+    NANOCOMMON_LOG_DEBUG("configuration: ", bs, ", ", msg_size, ", ", num_sms, ", ", num_warps, ".");
 
     int grid_dim  = num_sms;
     int block_dim = num_warps * 32;

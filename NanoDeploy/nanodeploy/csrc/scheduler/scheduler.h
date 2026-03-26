@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 
 #include "sp_state_manager.h"
 #include "thread_pool.h"
@@ -17,6 +17,15 @@ namespace nanodeploy {
 
 // Forward declaration
 class MetricsManager;
+
+// Type alias for migration list: vector<pair<sequence pointer, target DP index>>
+using MigrationList = std::vector<std::pair<std::shared_ptr<Sequence>, int>>;
+
+// Result of postprocessing sequences after model execution
+struct PostprocessResult {
+    MigrationList                          migrations;
+    std::vector<std::shared_ptr<Sequence>> continuations;  // non-final prefill chunks
+};
 
 // Result of a single scheduling step.
 // This struct is returned by `schedule()` and summarizes which sequences
@@ -75,6 +84,7 @@ public:
               int                loop_count,
               int                max_num_seqs,
               int                max_num_batched_tokens,
+              int                max_model_len,
               int                eos,
               int                attention_dp,
               int                attention_sp,
@@ -112,8 +122,19 @@ public:
     const std::unordered_map<int, std::shared_ptr<BlockManager>>& block_manager(int dp_idx) const;
 
     // Public members exposed to Python
+    std::string engine_id_;
+
+    int loop_count_;
+    int max_num_seqs_;
+    int max_num_batched_tokens_;
+    int eos_;
+
+    int attention_dp_;
+    int attention_sp_;
+
     std::deque<std::shared_ptr<Sequence>>                              waiting;
     std::deque<std::shared_ptr<Sequence>>                              waiting_migration;
+    std::deque<std::shared_ptr<Sequence>>                              prefilling;  // mid-prompt sequences
     std::vector<std::shared_ptr<SPStateManager>>                       worker_state;
     std::unordered_map<int, std::pair<std::shared_ptr<Sequence>, int>> to_be_migrated;
 
@@ -128,16 +149,42 @@ private:
     // Round-robin counter for DP
     int next_dp_idx();
 
-    // Configuration
-    std::string engine_id_;
-    int         loop_count_;
-    int         max_num_seqs_;
-    int         max_num_batched_tokens_;
-    int         eos_;
-    int         attention_dp_;
-    int         attention_sp_;
+    // Postprocessing internal types
+    struct PostprocessTask {
+        std::shared_ptr<Sequence> seq;
+        const std::vector<int>*   tokens;
+        int                       sp_idx;
+    };
 
+    struct PostprocessWorkerContext {
+        std::vector<PostprocessTask>           tasks;
+        MigrationList                          migration_candidates;
+        std::vector<std::shared_ptr<Sequence>> chunk_continuations;
+        std::exception_ptr                     eptr = nullptr;
+        int                                    dp_idx;
+        void                                   reserve(size_t n)
+        {
+            tasks.reserve(n);
+        }
+    };
+
+    // Postprocessing internal methods
+    static void postprocess_worker_func(std::shared_ptr<SPStateManager> state_manager,
+                                        const PostprocessWorkerContext* ctx,
+                                        PostprocessWorkerContext*       result_ctx,
+                                        int                             eos_id,
+                                        bool                            is_prefill,
+                                        bool                            update_metrics);
+
+    PostprocessResult postprocess_sequences_impl(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+                                                 const std::vector<std::vector<std::vector<int>>>& dp_sp_token_ids,
+                                                 bool                                              is_prefill,
+                                                 bool                                              update_metrics);
+
+    // Configuration
+    int max_model_len_;
     int num_kvcache_blocks_;
+    int kvcache_block_size_;
 
     std::string mode_;
 

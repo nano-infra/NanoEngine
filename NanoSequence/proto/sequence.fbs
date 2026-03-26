@@ -5,6 +5,7 @@ enum SequenceStatus : byte {
   RUNNING = 1,
   FINISHED = 2,
   TO_BE_MIGRATED = 3,
+  PREFILLING = 4,
 }
 
 struct BlockLocation {

@@ -61,24 +61,6 @@ message(STATUS "NanoInfra Root Path: ${NANOINFRA_DIR}")
 
 add_subdirectory(${NANOINFRA_DIR}/NanoCommon NanoCommon)
 
-# libzmq (source build from third_party, for RDMA rendezvous ZMQ)
-# Wire format: JSON; C++ uses nlohmann/json. No flatbuffers.
-if(BUILD_RDMA)
-  # hiredis (for Redis rendezvous)
-  add_subdirectory(${NANOINFRA_DIR}/third_party/hiredis ${CMAKE_CURRENT_BINARY_DIR}/hiredis EXCLUDE_FROM_ALL)
-
-  if (BUILD_PYTHON)
-      set_target_properties(hiredis PROPERTIES INSTALL_RPATH "$ORIGIN")
-  endif()
-
-  install(TARGETS hiredis
-      EXPORT dlslimeTargets
-      LIBRARY DESTINATION ${DLSLIME_INSTALL_PATH}
-      ARCHIVE DESTINATION ${DLSLIME_INSTALL_PATH}
-      RUNTIME DESTINATION ${DLSLIME_INSTALL_PATH}
-  )
-endif()
-
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} dlslime/csrc ${NANOINFRA_DIR}/NanoCommon/include)
 add_subdirectory(dlslime/csrc)
 

@@ -1,12 +1,14 @@
 #include <algorithm>
+#include <exception>
+#include <future>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
+#include <unordered_set>
 
-#include "nanosequence/csrc/metrics/sequence_metric.h"
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/metrics/sequence_metric.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 #include "sequence_generated.h"
-
-#include "scheduler_utils.h"
 
 #include "scheduler.h"
 
@@ -16,6 +18,7 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                loop_count,
                      int                max_num_seqs,
                      int                max_num_batched_tokens,
+                     int                max_model_len,
                      int                eos,
                      int                attention_dp,
                      int                attention_sp,
@@ -29,7 +32,9 @@ Scheduler::Scheduler(const std::string& engine_id,
     eos_(eos),
     attention_dp_(attention_dp),
     attention_sp_(attention_sp),
+    max_model_len_(max_model_len),
     num_kvcache_blocks_(num_kvcache_blocks),
+    kvcache_block_size_(kvcache_block_size),
     mode_(mode)
 {
     // Initialize worker states for each DP rank
@@ -44,6 +49,13 @@ Scheduler::Scheduler(const std::string& engine_id,
 
 void Scheduler::add(std::shared_ptr<Sequence> seq)
 {
+    int prompt_len = seq->num_prompt_tokens();
+    if (prompt_len > max_model_len_) {
+        throw std::runtime_error("Prompt length (" + std::to_string(prompt_len) + ") exceeds max_model_len ("
+                                 + std::to_string(max_model_len_)
+                                 + "). Increase --max_model_len or shorten the prompt.");
+    }
+
     seq->active(engine_id_, attention_sp_, attention_dp_, num_kvcache_blocks_);
 
     if (seq->metric) {
@@ -65,6 +77,8 @@ bool Scheduler::is_finished() const
 {
     const auto& wait_queue = (mode_ != "decode") ? waiting : waiting_migration;
     if (!wait_queue.empty())
+        return false;
+    if (!prefilling.empty())
         return false;
 
     for (const auto& ws : worker_state) {
@@ -285,6 +299,44 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
     auto& waiting_queue = (mode_ != "decode") ? waiting : waiting_migration;
 
+    // -----------------------------------------------------------------------
+    // Step 1: Schedule PREFILLING sequences (hold allocated blocks, higher
+    // priority).  Process before fresh WAITING sequences.
+    // -----------------------------------------------------------------------
+    std::deque<std::shared_ptr<Sequence>> not_scheduled_prefilling;
+    while (!prefilling.empty()) {
+        auto seq = prefilling.front();
+        prefilling.pop_front();
+        auto& block_ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
+        int   dp_idx    = block_ctx.dp_idx;
+        int   master_sp = block_ctx.master_sp_idx;
+
+        int prev_tokens      = seq->num_tokens();
+        int budget_remaining = max_num_batched_tokens_ - num_batched_tokens[dp_idx][master_sp];
+        int new_tokens       = std::min(budget_remaining, seq->num_prompt_tokens() - prev_tokens);
+        if (new_tokens <= 0) {
+            not_scheduled_prefilling.push_back(seq);
+            continue;
+        }
+
+        // Advance num_tokens to the new chunk endpoint (blocks pre-allocated at admission)
+        seq->set_num_tokens(prev_tokens + new_tokens);
+        block_ctx.num_dispatched_tokens[master_sp] = seq->num_tokens();
+
+        num_seqs[dp_idx][master_sp] += 1;
+        num_batched_tokens[dp_idx][master_sp] += new_tokens;
+
+        worker_state[dp_idx]->running.push_back(seq);
+        scheduled_seqs[dp_idx].push_back(seq);
+    }
+    // Put back budget-exhausted prefilling sequences at the front (preserve order)
+    for (auto it = not_scheduled_prefilling.rbegin(); it != not_scheduled_prefilling.rend(); ++it)
+        prefilling.push_front(*it);
+
+    // -----------------------------------------------------------------------
+    // Step 2: Schedule fresh WAITING sequences with chunking
+    // -----------------------------------------------------------------------
+
     // For LeastBatch and LeastCache, we maintain a set to act as a min-heap
     std::set<std::pair<int, int>> dp_load_set;
     if (routing_strategy == RoutingStrategy::LeastBatch) {
@@ -303,92 +355,66 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
         bool scheduled = false;
 
         if (routing_strategy == RoutingStrategy::RoundRobin) {
-            // Try all DP ranks in round-robin order
             for (int attempt = 0; attempt < attention_dp_; ++attempt) {
-                int selected_dp_idx = next_dp_idx();
-
-                // Check if this DP rank can allocate the sequence
-                bool can_allocate = worker_state[selected_dp_idx]->can_allocate(
+                int  selected_dp_idx = next_dp_idx();
+                auto result          = worker_state[selected_dp_idx]->try_allocate(
                     *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
-
-                if (!can_allocate) {
+                if (!result)
                     continue;
-                }
 
-                // Allocate the sequence
-                worker_state[selected_dp_idx]->allocate(*seq);
+                auto& block_ctx  = seq->block_ctx(BlockContextSlot::ACTIVE);
+                block_ctx.dp_idx = selected_dp_idx;
+                int master_sp    = block_ctx.master_sp_idx;
 
-                // Update tracking
-                auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
-                block_ctx.dp_idx  = selected_dp_idx;
-                int master_sp_idx = block_ctx.master_sp_idx;
+                num_seqs[selected_dp_idx][master_sp] += 1;
+                num_batched_tokens[selected_dp_idx][master_sp] += result->new_tokens;
 
-                num_seqs[selected_dp_idx][master_sp_idx] += 1;
-                num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens() - seq->num_cached_tokens());
-
-                // Update sequence status
                 seq->set_status(SequenceStatus::RUNNING);
-
-                // Add to scheduled and running queues
                 waiting_queue.pop_front();
                 worker_state[selected_dp_idx]->running.push_back(seq);
                 scheduled_seqs[selected_dp_idx].push_back(seq);
 
-                // Record metrics
                 if (seq->metric) {
                     seq->metric->record_first_scheduled();
-                    if (mode_ == "decode") {
+                    if (mode_ == "decode")
                         seq->metric->record_decode_scheduled();
-                    }
                 }
-
                 scheduled = true;
                 break;
             }
         }
         else if (routing_strategy == RoutingStrategy::LeastBatch || routing_strategy == RoutingStrategy::LeastCache) {
-            // Iterate through DP ranks in increasing order of load
             for (auto it = dp_load_set.begin(); it != dp_load_set.end(); ++it) {
-                int selected_dp_idx = it->second;
-
-                bool can_allocate = worker_state[selected_dp_idx]->can_allocate(
+                int  selected_dp_idx = it->second;
+                auto result          = worker_state[selected_dp_idx]->try_allocate(
                     *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
-
-                if (!can_allocate) {
+                if (!result)
                     continue;
-                }
 
-                // WARNING: erase(it) invalidates the iterator. This is safe here because
-                // we break the loop immediately after. If refactoring to remove the break
-                // or making dp_load_set a member variable, ensure thread-safety and
-                // correct iterator management.
+                // erase(it) invalidates the iterator; safe because we break immediately.
                 dp_load_set.erase(it);
-                worker_state[selected_dp_idx]->allocate(*seq);
                 int new_load = (routing_strategy == RoutingStrategy::LeastBatch) ?
                                    worker_state[selected_dp_idx]->num_running_seqs() :
                                    worker_state[selected_dp_idx]->num_running_tokens();
                 dp_load_set.insert({new_load, selected_dp_idx});
 
-                auto& block_ctx   = seq->block_ctx(BlockContextSlot::ACTIVE);
-                block_ctx.dp_idx  = selected_dp_idx;
-                int master_sp_idx = block_ctx.master_sp_idx;
+                auto& block_ctx  = seq->block_ctx(BlockContextSlot::ACTIVE);
+                block_ctx.dp_idx = selected_dp_idx;
+                int master_sp    = block_ctx.master_sp_idx;
 
-                num_seqs[selected_dp_idx][master_sp_idx] += 1;
-                num_batched_tokens[selected_dp_idx][master_sp_idx] += (seq->num_tokens() - seq->num_cached_tokens());
+                num_seqs[selected_dp_idx][master_sp] += 1;
+                num_batched_tokens[selected_dp_idx][master_sp] += result->new_tokens;
 
                 seq->set_status(SequenceStatus::RUNNING);
-
                 waiting_queue.pop_front();
                 worker_state[selected_dp_idx]->running.push_back(seq);
                 scheduled_seqs[selected_dp_idx].push_back(seq);
 
                 if (seq->metric) {
                     seq->metric->record_first_scheduled();
-                    if (mode_ == "decode") {
+                    if (mode_ == "decode")
                         seq->metric->record_decode_scheduled();
-                    }
                 }
-
                 scheduled = true;
                 break;
             }
@@ -398,7 +424,6 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
         }
 
         if (!scheduled) {
-            // Cannot schedule any more sequences
             break;
         }
     }
@@ -488,21 +513,226 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
     std::cerr << "Preemption happens for seq_id=" << seq->seq_id() << std::endl;
     seq->set_status(SequenceStatus::WAITING);
     worker_state[dp_idx]->deallocate(*seq);
-    seq->set_num_checkpointed_tokens(static_cast<int>(seq->token_ids().size()));
+    // Record the full context length (prompt + any generated tokens) so that
+    // re-prefill will rebuild KV for ALL tokens, not just the original prompt.
+    // For PREFILLING sequences token_ids().size() == num_prompt_tokens(), so
+    // this is equivalent to the old reset.  For decode sequences this correctly
+    // preserves the generated continuation.
+    int total_tokens = static_cast<int>(seq->token_ids().size());
+    seq->set_num_tokens(total_tokens);
+    seq->set_num_checkpointed_tokens(total_tokens);
     waiting.push_front(seq);
+}
+
+void Scheduler::postprocess_worker_func(std::shared_ptr<SPStateManager> state_manager,
+                                        const PostprocessWorkerContext* ctx,
+                                        PostprocessWorkerContext*       result_ctx,
+                                        int                             eos_id,
+                                        bool                            is_prefill,
+                                        bool                            update_metrics)
+{
+    try {
+        std::unordered_set<std::shared_ptr<Sequence>> dummy_set;
+        for (const auto& dummy : state_manager->dummy_seqs) {
+            dummy_set.insert(dummy);
+        }
+
+        for (const auto& task : ctx->tasks) {
+            std::shared_ptr<Sequence> seq = task.seq;
+
+            if (dummy_set.count(seq))
+                continue;
+
+            // Detect non-final prefill chunk: num_tokens was set to the chunk
+            // endpoint during scheduling; if it's still less than the re-prefill
+            // target the sequence is not done prefilling yet.
+            // For fresh sequences the target is num_prompt_tokens.
+            // For preempted decode sequences num_checkpointed_tokens includes
+            // generated tokens that must also be re-prefilled.
+            // NOTE: This must NOT be guarded by is_prefill (which reflects the
+            // scheduler mode, e.g. disaggregated "prefill" vs "decode").  In a
+            // combined (non-disaggregated) scheduler the mode is never "prefill",
+            // but chunked sequences still need to continue prefilling.
+            int prefill_target = std::max(seq->num_prompt_tokens(), seq->num_checkpointed_tokens());
+            if (seq->num_tokens() < prefill_target) {
+                // KV has been computed for this chunk's tokens; advance the
+                // cached token pointer so the next chunk starts here.
+                seq->set_num_cached_tokens(seq->num_tokens());
+                seq->set_status(SequenceStatus::PREFILLING);
+                result_ctx->chunk_continuations.push_back(seq);
+                continue;  // don't process token_ids for this sequence
+            }
+
+            // Final prefill chunk completed — transition to RUNNING so the
+            // sequence stays in the running queue for subsequent decode steps.
+            if (seq->status() == SequenceStatus::PREFILLING) {
+                seq->set_status(SequenceStatus::RUNNING);
+            }
+
+            for (int token_id : *task.tokens) {
+
+                int master_sp_idx = seq->block_ctx().master_sp_idx;
+                if (task.sp_idx != master_sp_idx) {
+                    throw std::runtime_error("sp_idx mismatch: task.sp_idx=" + std::to_string(task.sp_idx)
+                                             + " != master_sp_idx=" + std::to_string(master_sp_idx)
+                                             + " for seq_id=" + std::to_string(seq->seq_id()));
+                }
+
+                seq->append_token(token_id, BlockContextSlot::ACTIVE, task.sp_idx);
+                state_manager->add_running_tokens(task.sp_idx, 1);
+
+                if (update_metrics && seq->metric) {
+                    if (seq->metric->num_generated_tokens == 0) {
+                        seq->metric->record_first_token();
+                        seq->metric->num_generated_tokens = 1;
+                    }
+                    else {
+                        seq->metric->record_token();
+                    }
+                }
+
+                bool finished = (!seq->sampling_params().ignore_eos && token_id == eos_id)
+                                || (seq->num_completed_tokens() >= seq->sampling_params().max_tokens);
+
+                if (finished) {
+                    seq->set_status(SequenceStatus::FINISHED);
+                    state_manager->deallocate(*seq);
+                    break;
+                }
+                else if (is_prefill) {
+                    seq->set_status(SequenceStatus::TO_BE_MIGRATED);
+                    seq->migrate();
+                    result_ctx->migration_candidates.push_back({seq, result_ctx->dp_idx});
+                    break;
+                }
+            }
+        }
+
+        auto& running = state_manager->running;
+        if (!running.empty()) {
+            running.erase(std::remove_if(running.begin(),
+                                         running.end(),
+                                         [](const std::shared_ptr<Sequence>& s) {
+                                             return s->status() == SequenceStatus::FINISHED
+                                                    || s->status() == SequenceStatus::TO_BE_MIGRATED
+                                                    || s->status() == SequenceStatus::PREFILLING;
+                                         }),
+                          running.end());
+        }
+    }
+    catch (...) {
+        result_ctx->eptr = std::current_exception();
+    }
+}
+
+PostprocessResult
+Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
+                                      const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+                                      bool                                                       is_prefill,
+                                      bool                                                       update_metrics)
+{
+    size_t num_dp    = worker_state.size();
+    size_t num_dp_sp = dp_sp_seqs.size();
+    if (num_dp == 0)
+        return {};
+    if (num_dp_sp % num_dp != 0) {
+        throw std::runtime_error("dp_sp_seqs size is not a multiple of num_dp");
+    }
+    size_t num_sp = num_dp_sp / num_dp;
+
+    if (dp_sp_token_ids.size() != num_dp_sp) {
+        throw std::runtime_error("dp_sp_token_ids length mismatch with dp_sp_seqs");
+    }
+
+    std::vector<PostprocessWorkerContext> contexts(num_dp);
+
+    for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
+        auto& ctx  = contexts[dp_idx];
+        ctx.dp_idx = static_cast<int>(dp_idx);
+
+        for (size_t sp_idx = 0; sp_idx < num_sp; ++sp_idx) {
+            size_t      idx          = dp_idx * num_sp + sp_idx;
+            const auto& batch_seqs   = dp_sp_seqs[idx];
+            const auto& batch_tokens = dp_sp_token_ids[idx];
+
+            if (batch_seqs.size() > batch_tokens.size()) {
+                throw std::runtime_error("batch_seqs size mismatch with batch_tokens: not enough tokens");
+            }
+
+            size_t batch_size = batch_seqs.size();
+
+            for (size_t i = 0; i < batch_size; ++i) {
+                ctx.tasks.push_back({batch_seqs[i], &batch_tokens[i], (int)sp_idx});
+            }
+        }
+    }
+
+    if (thread_pool_) {
+        std::vector<std::future<void>> futures;
+        futures.reserve(num_dp);
+
+        for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
+            futures.push_back(thread_pool_->enqueue(postprocess_worker_func,
+                                                    worker_state[dp_idx],
+                                                    &contexts[dp_idx],
+                                                    &contexts[dp_idx],
+                                                    eos_,
+                                                    is_prefill,
+                                                    update_metrics));
+        }
+
+        for (auto& f : futures) {
+            f.get();
+        }
+    }
+    else {
+        std::vector<std::thread> threads;
+        threads.reserve(num_dp);
+
+        for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
+            threads.emplace_back(postprocess_worker_func,
+                                 worker_state[dp_idx],
+                                 &contexts[dp_idx],
+                                 &contexts[dp_idx],
+                                 eos_,
+                                 is_prefill,
+                                 update_metrics);
+        }
+
+        for (auto& t : threads) {
+            if (t.joinable())
+                t.join();
+        }
+    }
+
+    PostprocessResult result;
+    for (const auto& ctx : contexts) {
+        if (ctx.eptr) {
+            std::rethrow_exception(ctx.eptr);
+        }
+        result.migrations.insert(
+            result.migrations.end(), ctx.migration_candidates.begin(), ctx.migration_candidates.end());
+        result.continuations.insert(
+            result.continuations.end(), ctx.chunk_continuations.begin(), ctx.chunk_continuations.end());
+    }
+
+    return result;
 }
 
 void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
                             const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
                             bool                                                       update_metrics)
 {
-    // Call the C++ postprocess_sequences utility directly with shared_ptrs
-    auto migrations = postprocess_sequences(
-        worker_state, dp_sp_seqs, dp_sp_token_ids, eos_, mode_ == "prefill", update_metrics, thread_pool_.get());
+    auto result = postprocess_sequences_impl(dp_sp_seqs, dp_sp_token_ids, mode_ == "prefill", update_metrics);
 
     // Store migrations
-    for (const auto& [seq_shared, dp_idx] : migrations) {
+    for (const auto& [seq_shared, dp_idx] : result.migrations) {
         to_be_migrated[seq_shared->seq_id()] = {seq_shared, dp_idx};
+    }
+
+    // Route non-final prefill chunks back to the prefilling queue
+    for (auto& seq : result.continuations) {
+        prefilling.push_back(seq);
     }
 }
 

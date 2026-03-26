@@ -3,9 +3,8 @@
 namespace py = pybind11;
 
 #include "nanocommon/logging.h"
-// Sequence-related bindings from NanoSequence
-#include "nanosequence/csrc/bind/metric_binding.h"
-#include "nanosequence/csrc/bind/sequence_binding.h"
+#include "nanodeploy/csrc/bind/sequence_binding.h"
+#include "nanodeploy/csrc/bind/sequence_metric_binding.h"
 void bind_server_metric(py::module_& m);
 void bind_block_manager(py::module_& m);
 void bind_sp_state_manager(py::module_& m);
@@ -16,7 +15,6 @@ PYBIND11_MODULE(_nanodeploy_cpp, m)
 {
     m.doc() = "NanoDeploy C++ Backend";
 
-    // Sequence and SequenceMetric bindings from NanoSequence
     bind_sequence(m);
     bind_sequence_metric(m);
 

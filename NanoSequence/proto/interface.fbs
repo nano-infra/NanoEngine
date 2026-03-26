@@ -23,6 +23,7 @@ table SequenceInput {
   master_sp_idx: int;
   num_tokens: int;
   num_cached_tokens: int;        // prefill only
+  num_prompt_tokens: int;        // prefill only: original full prompt length (for chunk detection)
   last_token: int;               // decode only
   token_ids: [int];              // prefill only (uncached portion)
   sp_block_table: [IntListI];    // block tables per sp rank

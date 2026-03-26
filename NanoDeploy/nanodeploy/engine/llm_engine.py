@@ -12,11 +12,9 @@ import numpy as np
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-from nanodeploy._cpp import BlockContextSlot
+from nanodeploy._cpp import BlockContextSlot, init_scheduler, Sequence, SequenceStatus
 
 from nanodeploy.config import Config
-from nanodeploy.engine.scheduler import Scheduler
-from nanodeploy.engine.sequence import Sequence, SequenceStatus
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.metrics import MetricsManager
 
@@ -48,7 +46,7 @@ class LLMEngine:
         self.tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
         config.eos = self.tokenizer.eos_token_id
 
-        self.scheduler = Scheduler(config)
+        self.scheduler = init_scheduler(config)
         logger.info(
             f"Initialized Scheduler with RoutingStrategy: {self.scheduler.routing_strategy}"
         )
@@ -176,9 +174,7 @@ class LLMEngine:
             # Normal execution: prefill engine runs prefill, or decode engine runs decode
             token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
             post_sch_begin = time.time()
-            self.scheduler.postprocess(
-                filtered_dp_sp_seqs, token_ids, self.metrics_manager
-            )
+            self.scheduler.postprocess(filtered_dp_sp_seqs, token_ids, True)
             post_sch_end = time.time()
 
         else:

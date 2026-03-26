@@ -3,7 +3,7 @@
 #include <stdexcept>
 
 #include "interface_generated.h"
-#include "nanosequence/csrc/sequence/sequence.h"
+#include "nanodeploy/csrc/sequence/sequence.h"
 #include "sequence_generated.h"
 
 #include "model_runner_utils.h"
@@ -216,9 +216,10 @@ PrefillMetadata prepare_prefill_from_bytes(const uint8_t* data,
         if (!bt || bt->size() == 0)
             continue;
 
-        int num_blocks        = (int)bt->size();
-        int num_cached_blocks = num_cached / block_size;
-        int last_block_tokens = seq_input_last_block_num_tokens(si, sp_rank, block_size);
+        int num_blocks             = (int)bt->size();
+        int num_cached_blocks      = num_cached / block_size;
+        int cached_offset_in_block = num_cached % block_size;
+        int last_block_tokens      = seq_input_last_block_num_tokens(si, sp_rank, block_size);
 
         for (int b = num_cached_blocks; b < num_blocks; ++b) {
             int block_id = bt->Get(b);
@@ -228,6 +229,9 @@ PrefillMetadata prepare_prefill_from_bytes(const uint8_t* data,
             }
             int64_t start = (int64_t)block_id * block_size;
             int64_t end   = (b != num_blocks - 1) ? start + block_size : start + last_block_tokens;
+            if (b == num_cached_blocks) {
+                start += cached_offset_in_block;
+            }
             for (int64_t k = start; k < end; ++k) {
                 meta.slot_mapping.push_back((int)k);
             }
@@ -238,6 +242,37 @@ PrefillMetadata prepare_prefill_from_bytes(const uint8_t* data,
         meta.use_block_tables = true;
         build_block_tables_dense_from_si(
             si_vec, sp_rank, sp_size, max_num_seqs, meta.block_tables_flat, meta.max_num_blocks);
+    }
+
+    // Populate sampling indices: for each master-sp sequence that has reached
+    // the end of its prompt (num_tokens == num_prompt_tokens), record the index
+    // of its last Q token so the Python side can run lm_head only on those.
+    {
+        int seq_pos = 0;  // index among master-sp sequences processed above
+        int q_start = 0;  // cumulative Q token offset before this seq
+        for (size_t i = 0; i < si_vec->size(); ++i) {
+            auto* si = si_vec->Get(i);
+            if (si->master_sp_idx() != sp_rank)
+                continue;
+
+            int seqlen_q = si->num_tokens() - si->num_cached_tokens();
+            int q_end    = q_start + seqlen_q;
+
+            int num_prompt = si->num_prompt_tokens();
+            if (num_prompt == 0) {
+                throw std::runtime_error("prepare_prefill_from_bytes: num_prompt_tokens is 0 for sequence "
+                                         + std::to_string(i)
+                                         + ". This field is required and must be set in SequenceInput.");
+            }
+            bool is_final = (si->num_tokens() >= num_prompt);
+            if (is_final) {
+                meta.sampling_token_indices.push_back(q_end - 1);
+                meta.sampling_seq_indices.push_back(seq_pos);
+            }
+
+            q_start = q_end;
+            seq_pos++;
+        }
     }
 
     return meta;
