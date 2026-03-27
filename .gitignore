@@ -215,3 +215,4 @@ scripts/.bin/
 
 # vibe-codinig
 .claude
+.claude/settings.local.json

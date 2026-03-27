@@ -1,4 +1,4 @@
-# NanoDeploy: A highly available agentic inference serving framework, tailored for disaggregated architectures and high-performance expert parallelism.
+# NanoDeploy: LLM Inference with Prefill-Decode Disaggregation and Wide Expert Parallelism
 
 ## 📦 Components
 
@@ -70,5 +70,5 @@ See individual component [license](./LICENSE).
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/JimyMa/NanoInfra/issues)
+- **Issues**: [GitHub Issues](https://github.com/JimyMa/NanoDeploy/issues)
 - **Documentation**: Check component READMEs
