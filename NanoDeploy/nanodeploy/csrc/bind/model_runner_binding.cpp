@@ -47,14 +47,14 @@ void bind_model_runner_utils(py::module_& m)
     py::class_<BatchAuxData>(m, "BatchAuxData")
         .def_readonly("temperatures", &BatchAuxData::temperatures)
         .def_readonly("state_slots", &BatchAuxData::state_slots)
-        .def_readonly("master_sp_indices", &BatchAuxData::master_sp_indices)
-        .def_readonly("num_sp_seqs", &BatchAuxData::num_sp_seqs);
+        .def_readonly("master_group_indices", &BatchAuxData::master_group_indices)
+        .def_readonly("num_group_seqs", &BatchAuxData::num_group_seqs);
 
     py::class_<MigrateSequenceView>(m, "MigrateSequenceView")
         .def_readonly("seq_id", &MigrateSequenceView::seq_id)
         .def_readonly("migrate_engine_id", &MigrateSequenceView::migrate_engine_id)
         .def_readonly("migrate_num_kvcache_blocks", &MigrateSequenceView::migrate_num_kvcache_blocks)
-        .def_readonly("migrate_attention_sp", &MigrateSequenceView::migrate_attention_sp)
+        .def_readonly("migrate_group_size", &MigrateSequenceView::migrate_group_size)
         .def_readonly("migrate_dp_idx", &MigrateSequenceView::migrate_dp_idx)
         .def_readonly("migrate_block_location", &MigrateSequenceView::migrate_block_location)
         .def_readonly("migrate_state_slot", &MigrateSequenceView::migrate_state_slot)
@@ -90,52 +90,52 @@ void bind_model_runner_utils(py::module_& m)
     // ========== Runner side: deserialize + prepare ==========
     m.def(
         "prepare_prefill_from_bytes",
-        [](py::bytes data, int sp_rank, int sp_size, int block_size, int max_num_seqs, int num_gpu_blocks)
+        [](py::bytes data, int group_rank, int group_size, int block_size, int max_num_seqs, int num_gpu_blocks)
             -> PrefillMetadata {
             std::string_view sv = data;
             return prepare_prefill_from_bytes(reinterpret_cast<const uint8_t*>(sv.data()),
                                               sv.size(),
-                                              sp_rank,
-                                              sp_size,
+                                              group_rank,
+                                              group_size,
                                               block_size,
                                               max_num_seqs,
                                               num_gpu_blocks);
         },
         py::arg("data"),
-        py::arg("sp_rank"),
-        py::arg("sp_size"),
+        py::arg("group_rank"),
+        py::arg("group_size"),
         py::arg("block_size"),
         py::arg("max_num_seqs"),
         py::arg("num_gpu_blocks"));
 
     m.def(
         "prepare_decode_from_bytes",
-        [](py::bytes data, int sp_rank, int sp_size, int block_size, int max_num_seqs, int num_gpu_blocks)
+        [](py::bytes data, int group_rank, int group_size, int block_size, int max_num_seqs, int num_gpu_blocks)
             -> DecodeMetadata {
             std::string_view sv = data;
             return prepare_decode_from_bytes(reinterpret_cast<const uint8_t*>(sv.data()),
                                              sv.size(),
-                                             sp_rank,
-                                             sp_size,
+                                             group_rank,
+                                             group_size,
                                              block_size,
                                              max_num_seqs,
                                              num_gpu_blocks);
         },
         py::arg("data"),
-        py::arg("sp_rank"),
-        py::arg("sp_size"),
+        py::arg("group_rank"),
+        py::arg("group_size"),
         py::arg("block_size"),
         py::arg("max_num_seqs"),
         py::arg("num_gpu_blocks"));
 
     m.def(
         "extract_aux_from_bytes",
-        [](py::bytes data, int sp_rank) -> BatchAuxData {
+        [](py::bytes data, int group_rank) -> BatchAuxData {
             std::string_view sv = data;
-            return extract_aux_from_bytes(reinterpret_cast<const uint8_t*>(sv.data()), sv.size(), sp_rank);
+            return extract_aux_from_bytes(reinterpret_cast<const uint8_t*>(sv.data()), sv.size(), group_rank);
         },
         py::arg("data"),
-        py::arg("sp_rank"));
+        py::arg("group_rank"));
 
     m.def(
         "extract_vision_slots_from_bytes",

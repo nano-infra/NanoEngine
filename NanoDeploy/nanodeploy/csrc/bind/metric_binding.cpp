@@ -43,7 +43,10 @@ void bind_server_metric(py::module_& m)
              py::arg("num_tokens"),
              py::arg("duration"))
         .def("update_token_usage", &ServerMetric::update_token_usage, py::arg("dp_idx"), py::arg("num_tokens"))
-        .def("update_sp_stats", &ServerMetric::update_sp_stats, py::arg("sp_send_counts"), py::arg("sp_recv_counts"))
+        .def("update_group_stats",
+             &ServerMetric::update_group_stats,
+             py::arg("group_send_counts"),
+             py::arg("group_recv_counts"))
 
         // Properties
         .def_property_readonly("avg_prefill_throughput", &ServerMetric::avg_prefill_throughput)
@@ -71,8 +74,8 @@ void bind_server_metric(py::module_& m)
             summary["current_prefill_throughput"] = self.current_prefill_throughput();
             summary["current_decode_throughput"]  = self.current_decode_throughput();
             summary["total_token_usage"]          = self.total_token_usage();
-            summary["sp_send_counts"]             = self.sp_send_request_counts;
-            summary["sp_recv_counts"]             = self.sp_recv_request_counts;
+            summary["group_send_counts"]          = self.group_send_request_counts;
+            summary["group_recv_counts"]          = self.group_recv_request_counts;
             summary["waiting_head_blocks"]        = self.num_waiting_head_blocks;
             summary["waiting_total_blocks"]       = self.num_waiting_total_blocks;
             return summary;

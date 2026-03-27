@@ -33,15 +33,15 @@ def main() -> int:
     assert len(ctx.block_location) == 1
     assert tuple(ctx.block_location[0]) == (0, 42)
 
-    # 2) sp_block_table is a mutable proxy with defaultdict(list)-like semantics
-    ctx.sp_block_table.clear()
-    ctx.sp_block_table[0].append(7)
-    assert list(ctx.sp_block_table[0]) == [7]
+    # 2) group_block_table is a mutable proxy with defaultdict(list)-like semantics
+    ctx.group_block_table.clear()
+    ctx.group_block_table[0].append(7)
+    assert list(ctx.group_block_table[0]) == [7]
 
     # Also verify Sequence.block_table returns a mutable proxy into the same storage
     table = seq.block_table("engine", 0)
     table.append(9)
-    assert list(ctx.sp_block_table[0]) == [7, 9]
+    assert list(ctx.group_block_table[0]) == [7, 9]
 
     # 3) block_ctx_map behaves like a mutable mapping proxy (no dict copy)
     # This mirrors Python usage: seq.block_ctx_map[engine_id].dp_idx = selected_dp_idx

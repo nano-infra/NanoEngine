@@ -6,41 +6,41 @@
 #include "nanodeploy/csrc/sequence/sequence.h"
 #include "sequence_generated.h"
 
-#include "sp_state_manager.h"
+#include "group_manager.h"
 
 namespace nanodeploy {
 
-SPStateManager::SPStateManager(const std::string& engine_id,
-                               int                attention_sp,
-                               int                num_kvcache_blocks,
-                               int                kvcache_block_size,
-                               int                max_num_seqs,
-                               int                max_num_batched_tokens):
+GroupManager::GroupManager(const std::string& engine_id,
+                           int                group_size,
+                           int                num_kvcache_blocks,
+                           int                kvcache_block_size,
+                           int                max_num_seqs,
+                           int                max_num_batched_tokens):
     gdn_state_manager_(engine_id, 0, max_num_seqs),
     engine_id_(engine_id),
-    attention_sp_(attention_sp),
+    group_size_(group_size),
     max_num_seqs_(max_num_seqs),
     max_num_batched_tokens_(max_num_batched_tokens),
     kvcache_block_size_(kvcache_block_size),
     num_kvcache_blocks_(num_kvcache_blocks),
-    num_running_seqs_per_sp_(attention_sp, 0),
-    num_running_tokens_per_sp_(attention_sp, 0)
+    num_running_seqs_per_group_(group_size, 0),
+    num_running_tokens_per_group_(group_size, 0)
 {
-    for (int i = 0; i < attention_sp; ++i) {
+    for (int i = 0; i < group_size; ++i) {
         block_manager[i] = std::make_shared<BlockManager>(engine_id, i, num_kvcache_blocks, kvcache_block_size);
     }
 
     initialize_dummy_seqs();
 }
 
-void SPStateManager::initialize_dummy_seqs()
+void GroupManager::initialize_dummy_seqs()
 {
     // Use a fixed seed for reproducibility or random device
     std::random_device              rd;
     std::mt19937                    gen(rd());
     std::uniform_int_distribution<> dis(0, 7999);
 
-    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+    for (int group_id = 0; group_id < group_size_; ++group_id) {
         std::vector<int> token_ids = {dis(gen)};
 
         SamplingParams sp;
@@ -49,49 +49,49 @@ void SPStateManager::initialize_dummy_seqs()
         sp.ignore_eos  = false;
 
         auto dummy_seq = std::make_shared<Sequence>(token_ids, sp);
-        dummy_seq->active(engine_id_, attention_sp_, 1, num_kvcache_blocks_);
-        dummy_seq->block_ctx().master_sp_idx = sp_idx;
+        dummy_seq->active(engine_id_, group_size_, 1, num_kvcache_blocks_);
+        dummy_seq->block_ctx().master_group_id = group_id;
 
-        dummy_seq->append_token(dis(gen), BlockContextSlot::ACTIVE, sp_idx);
+        dummy_seq->append_token(dis(gen), BlockContextSlot::ACTIVE, group_id);
 
-        block_manager[sp_idx]->allocate(*dummy_seq);
+        block_manager[group_id]->allocate(*dummy_seq);
         dummy_seqs.push_back(dummy_seq);
     }
 }
 
-int SPStateManager::next_sp_idx()
+int GroupManager::next_group_id()
 {
-    int idx        = sp_rr_counter_;
-    sp_rr_counter_ = (sp_rr_counter_ + 1) % attention_sp_;
+    int idx           = group_rr_counter_;
+    group_rr_counter_ = (group_rr_counter_ + 1) % group_size_;
     return idx;
 }
 
-bool SPStateManager::can_append(Sequence& seq, int num_tokens)
+bool GroupManager::can_append(Sequence& seq, int num_tokens)
 {
-    int master_sp_idx = seq.block_ctx(BlockContextSlot::ACTIVE).master_sp_idx;
-    if (block_manager.find(master_sp_idx) == block_manager.end()) {
+    int master_group_id = seq.block_ctx(BlockContextSlot::ACTIVE).master_group_id;
+    if (block_manager.find(master_group_id) == block_manager.end()) {
         return false;
     }
-    return block_manager[master_sp_idx]->can_append(seq, num_tokens);
+    return block_manager[master_group_id]->can_append(seq, num_tokens);
 }
 
-bool SPStateManager::may_append(Sequence& seq, int num_tokens)
+bool GroupManager::may_append(Sequence& seq, int num_tokens)
 {
-    int master_sp_idx = seq.block_ctx(BlockContextSlot::ACTIVE).master_sp_idx;
-    if (block_manager.find(master_sp_idx) != block_manager.end()) {
-        return block_manager[master_sp_idx]->may_append(seq, num_tokens);
+    int master_group_id = seq.block_ctx(BlockContextSlot::ACTIVE).master_group_id;
+    if (block_manager.find(master_group_id) != block_manager.end()) {
+        return block_manager[master_group_id]->may_append(seq, num_tokens);
     }
     return false;
 }
 
-bool SPStateManager::can_allocate(Sequence&                           seq,
-                                  const std::unordered_map<int, int>& num_seqs,
-                                  const std::unordered_map<int, int>& num_batched_tokens)
+bool GroupManager::can_allocate(Sequence&                           seq,
+                                const std::unordered_map<int, int>& num_seqs,
+                                const std::unordered_map<int, int>& num_batched_tokens)
 {
     // Step 1: Determine min required ranks (Initial SP Size)
     int num_tokens           = seq.num_tokens();
     int num_segments         = (num_tokens + segment_size - 1) / segment_size;
-    int initial_ranks_needed = std::max(1, std::min(attention_sp_, num_segments));
+    int initial_ranks_needed = std::max(1, std::min(group_size_, num_segments));
 
     // Step 2 & 3: Prepare and sort all ranks
     struct RankStatus {
@@ -102,14 +102,14 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     };
 
     std::vector<RankStatus> all_ranks;
-    all_ranks.reserve(attention_sp_);
+    all_ranks.reserve(group_size_);
 
-    for (int i = 0; i < attention_sp_; ++i) {
-        long long tokens = num_running_tokens_per_sp_[i];
+    for (int i = 0; i < group_size_; ++i) {
+        long long tokens = num_running_tokens_per_group_[i];
         if (num_batched_tokens.count(i))
             tokens += num_batched_tokens.at(i);
 
-        int seqs = num_running_seqs_per_sp_[i];
+        int seqs = num_running_seqs_per_group_[i];
         if (num_seqs.count(i))
             seqs += num_seqs.at(i);
 
@@ -128,18 +128,18 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     int needed_blocks = (num_tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
 
     // Outer loop: Adaptively increase SP Size
-    for (int current_sp_size = initial_ranks_needed; current_sp_size <= attention_sp_; ++current_sp_size) {
+    for (int current_sp_size = initial_ranks_needed; current_sp_size <= group_size_; ++current_sp_size) {
 
         // Step 4: Select participants for current size
         std::vector<RankStatus> participants;
         std::vector<RankStatus> candidates_pool;
 
         participants.reserve(current_sp_size);
-        candidates_pool.reserve(attention_sp_ - current_sp_size);
+        candidates_pool.reserve(group_size_ - current_sp_size);
 
         long long total_free_blocks_capacity = 0;
 
-        for (int i = 0; i < attention_sp_; ++i) {
+        for (int i = 0; i < group_size_; ++i) {
             if (i < current_sp_size) {
                 participants.push_back(all_ranks[i]);
                 total_free_blocks_capacity += all_ranks[i].free_blocks;
@@ -187,7 +187,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
 
         // Step 5: Water-filling allocation
         auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
-        block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
+        block_ctx.num_dispatched_tokens.assign(group_size_, 0);
 
         std::vector<long long> simulated_kv_loads;
         std::vector<int>       alloc_counts(participants.size(), 0);
@@ -244,8 +244,8 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             std::min_element(participants.begin(), participants.end(), [](const RankStatus& a, const RankStatus& b) {
                 return a.current_batch_load < b.current_batch_load;
             });
-        int master_rank         = min_batch_it->id;
-        block_ctx.master_sp_idx = master_rank;
+        int master_rank           = min_batch_it->id;
+        block_ctx.master_group_id = master_rank;
 
         // 3. Final physical check
         if (min_batch_it->current_batch_load + 1 > max_num_seqs_) {
@@ -253,7 +253,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         }
 
         bool             physical_check_ok = true;
-        std::vector<int> prefix_hints(attention_sp_, -1);
+        std::vector<int> prefix_hints(group_size_, -1);
         for (size_t i = 0; i < participants.size(); ++i) {
             int rank_id = participants[i].id;
             int hits    = block_manager[rank_id]->can_allocate(seq);
@@ -277,9 +277,9 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
     return false;
 }
 
-std::optional<AllocResult> SPStateManager::try_allocate(Sequence&                           seq,
-                                                        const std::unordered_map<int, int>& num_seqs,
-                                                        const std::unordered_map<int, int>& num_batched_tokens)
+std::optional<AllocResult> GroupManager::try_allocate(Sequence&                           seq,
+                                                      const std::unordered_map<int, int>& num_seqs,
+                                                      const std::unordered_map<int, int>& num_batched_tokens)
 {
     int orig_num_tokens = seq.num_tokens();
 
@@ -315,33 +315,35 @@ std::optional<AllocResult> SPStateManager::try_allocate(Sequence&               
 
     // For chunked sequences, restrict dispatch to master SP rank
     if (chunk_end < full_len) {
-        auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
-        int   master_sp = block_ctx.master_sp_idx;
+        auto& block_ctx    = seq.block_ctx(BlockContextSlot::ACTIVE);
+        int   master_group = block_ctx.master_group_id;
         std::fill(block_ctx.num_dispatched_tokens.begin(), block_ctx.num_dispatched_tokens.end(), 0);
-        block_ctx.num_dispatched_tokens[master_sp] = chunk_end;
+        block_ctx.num_dispatched_tokens[master_group] = chunk_end;
     }
 
     return AllocResult{chunk_end, new_tokens};
 }
 
-void SPStateManager::allocate(Sequence& seq)
+void GroupManager::allocate(Sequence& seq)
 {
-    auto& block_ctx     = seq.block_ctx(BlockContextSlot::ACTIVE);
-    int   master_sp_idx = block_ctx.master_sp_idx;
+    auto& block_ctx       = seq.block_ctx(BlockContextSlot::ACTIVE);
+    int   master_group_id = block_ctx.master_group_id;
 
     // Use prefix hints cached by can_allocate (if available) to skip
     // redundant hash scans inside BlockManager::allocate.
     auto hints = std::move(cached_prefix_hints_);
     cached_prefix_hints_.clear();
 
-    auto get_hint = [&](int sp_idx) -> int { return (sp_idx < static_cast<int>(hints.size())) ? hints[sp_idx] : -1; };
+    auto get_hint = [&](int group_id) -> int {
+        return (group_id < static_cast<int>(hints.size())) ? hints[group_id] : -1;
+    };
 
-    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-        if (sp_idx != master_sp_idx) {
-            block_manager[sp_idx]->allocate(seq, get_hint(sp_idx));
+    for (int group_id = 0; group_id < group_size_; ++group_id) {
+        if (group_id != master_group_id) {
+            block_manager[group_id]->allocate(seq, get_hint(group_id));
         }
     }
-    block_manager[master_sp_idx]->allocate(seq, get_hint(master_sp_idx));
+    block_manager[master_group_id]->allocate(seq, get_hint(master_group_id));
 
     // Assign a GDN state slot (index into conv/recurrent state buffers).
     // state_manager_ is a free-list over [0, max_num_seqs_); slot max_num_seqs_
@@ -350,29 +352,29 @@ void SPStateManager::allocate(Sequence& seq)
 
     num_running_seqs_++;
     num_running_tokens_ += seq.num_tokens();
-    num_running_seqs_per_sp_[master_sp_idx]++;
-    num_running_tokens_per_sp_[master_sp_idx] += seq.num_tokens();
+    num_running_seqs_per_group_[master_group_id]++;
+    num_running_tokens_per_group_[master_group_id] += seq.num_tokens();
 }
 
-void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
+void GroupManager::deallocate(Sequence& seq, BlockContextSlot slot)
 {
-    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-        block_manager[sp_idx]->deallocate(seq, slot);
+    for (int group_id = 0; group_id < group_size_; ++group_id) {
+        block_manager[group_id]->deallocate(seq, slot);
     }
 
     // Free the GDN state slot so it can be reused by future sequences.
     gdn_state_manager_.deallocate(seq, slot);
 
-    auto& block_ctx     = seq.block_ctx(BlockContextSlot::ACTIVE);
-    int   master_sp_idx = block_ctx.master_sp_idx;
-    block_ctx.sp_block_table.clear();
+    auto& block_ctx       = seq.block_ctx(BlockContextSlot::ACTIVE);
+    int   master_group_id = block_ctx.master_group_id;
+    block_ctx.group_block_table.clear();
     block_ctx.block_location.clear();
     std::fill(block_ctx.num_dispatched_tokens.begin(), block_ctx.num_dispatched_tokens.end(), 0);
 
     num_running_seqs_--;
     num_running_tokens_ -= seq.num_tokens();
-    num_running_seqs_per_sp_[master_sp_idx]--;
-    num_running_tokens_per_sp_[master_sp_idx] -= seq.num_tokens();
+    num_running_seqs_per_group_[master_group_id]--;
+    num_running_tokens_per_group_[master_group_id] -= seq.num_tokens();
 }
 
 }  // namespace nanodeploy

@@ -18,7 +18,7 @@ class Sequence;
 
 class BlockManager {
 public:
-    BlockManager(const std::string& engine_id, int sp_idx, int num_blocks, int block_size);
+    BlockManager(const std::string& engine_id, int group_id, int num_blocks, int block_size);
 
     // Static hash calculation (using xxhash)
     static int64_t compute_hash(const std::vector<int>& token_ids, int64_t prefix = -1);
@@ -59,7 +59,7 @@ private:
     void   deallocate_block(int block_id);
 
     std::string                           engine_id_;
-    int                                   sp_idx_;
+    int                                   group_id_;
     int                                   block_size_;
     std::vector<Block>                    blocks_;
     std::unordered_map<int64_t, int>      hash_to_block_id_;

@@ -1,5 +1,5 @@
 set(CPP_SOURCES
-    sp_state_manager.cpp
+    group_manager.cpp
     scheduler.cpp
 )
 

@@ -8,8 +8,8 @@
 
 namespace nanodeploy {
 
-GDNStateManager::GDNStateManager(const std::string& engine_id, int sp_idx, int num_slots):
-    engine_id_(engine_id), sp_idx_(sp_idx), num_slots_(num_slots)
+GDNStateManager::GDNStateManager(const std::string& engine_id, int group_id, int num_slots):
+    engine_id_(engine_id), group_id_(group_id), num_slots_(num_slots)
 {
     slot_id_to_free_list_it_.resize(num_slots);
     for (int i = 0; i < num_slots; ++i) {

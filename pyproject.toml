@@ -13,7 +13,6 @@ dependencies = []
 
 # Install individual components:
 #   pip install ".[dlslime]"
-#   pip install ".[nanoccl]"
 #   pip install ".[nanoctrl]"
 #   pip install ".[nanodeploy]"
 #   pip install ".[nanodeployvl]"
@@ -21,9 +20,6 @@ dependencies = []
 [project.optional-dependencies]
 dlslime = [
     "dlslime @ file:DLSlime",
-]
-nanoccl = [
-    "nanoccl @ file:NanoCCL",
 ]
 nanoctrl = [
     "nanoctrl @ file:NanoCtrl",

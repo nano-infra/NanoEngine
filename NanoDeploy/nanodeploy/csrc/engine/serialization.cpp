@@ -16,23 +16,23 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
     for (auto* seq : seqs) {
         auto& ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
 
-        // sp_block_table: only send blocks up to the current chunk's context length.
+        // group_block_table: only send blocks up to the current chunk's context length.
         // Full allocation may reserve blocks beyond num_tokens for future chunks;
         // the model runner only needs [0, ceil(num_tokens/block_size)) per rank.
         int blocks_for_context = (seq->num_tokens() + Sequence::block_size - 1) / Sequence::block_size;
 
-        std::vector<flatbuffers::Offset<fbs::IntListI>> sp_bt_offsets;
-        for (size_t sp = 0; sp < ctx.sp_block_table.size(); ++sp) {
+        std::vector<flatbuffers::Offset<fbs::IntListI>> group_bt_offsets;
+        for (size_t sp = 0; sp < ctx.group_block_table.size(); ++sp) {
             std::vector<int> vals;
-            if (ctx.sp_block_table[sp]) {
-                const auto& full = ctx.sp_block_table[sp]->values;
+            if (ctx.group_block_table[sp]) {
+                const auto& full = ctx.group_block_table[sp]->values;
                 int         n    = std::min((int)full.size(), blocks_for_context);
                 vals.assign(full.begin(), full.begin() + n);
             }
             auto vals_vec = builder.CreateVector(vals);
-            sp_bt_offsets.push_back(fbs::CreateIntListI(builder, vals_vec));
+            group_bt_offsets.push_back(fbs::CreateIntListI(builder, vals_vec));
         }
-        auto sp_bt_vec = builder.CreateVector(sp_bt_offsets);
+        auto group_bt_vec = builder.CreateVector(group_bt_offsets);
 
         // num_dispatched_tokens
         auto ndt_vec = builder.CreateVector(ctx.num_dispatched_tokens);
@@ -69,7 +69,7 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
         }
 
         fbs::SequenceInputBuilder si_builder(builder);
-        si_builder.add_master_sp_idx(ctx.master_sp_idx);
+        si_builder.add_master_group_id(ctx.master_group_id);
         si_builder.add_num_tokens(seq->num_tokens());
         si_builder.add_num_cached_tokens(seq->num_cached_tokens());
         si_builder.add_num_prompt_tokens(seq->num_prompt_tokens());
@@ -77,7 +77,7 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
         if (is_prefill && token_ids_off.o != 0) {
             si_builder.add_token_ids(token_ids_off);
         }
-        si_builder.add_sp_block_table(sp_bt_vec);
+        si_builder.add_group_block_table(group_bt_vec);
         si_builder.add_num_dispatched_tokens(ndt_vec);
         si_builder.add_state_slot(ctx.state_slot);
 
@@ -132,7 +132,7 @@ flatbuffers::DetachedBuffer serialize_migrate_batch(const std::vector<Sequence*>
         msi_builder.add_seq_id(seq->seq_id());
         msi_builder.add_migrate_engine_id(engine_id_off);
         msi_builder.add_migrate_num_kvcache_blocks(migrate_ctx.num_kvcache_blocks);
-        msi_builder.add_migrate_attention_sp(migrate_ctx.attention_sp);
+        msi_builder.add_migrate_group_size(migrate_ctx.group_size);
         msi_builder.add_migrate_dp_idx(migrate_ctx.dp_idx);
         msi_builder.add_migrate_block_location(migrate_bl_vec);
         msi_builder.add_migrate_state_slot(migrate_ctx.state_slot);

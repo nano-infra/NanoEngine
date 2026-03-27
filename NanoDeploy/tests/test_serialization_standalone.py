@@ -35,7 +35,7 @@ def test_serialization():
     # Add some block data
     # Test mutable proxy behavior before serialization
     ctx.block_location.append((0, 50))
-    ctx.sp_block_table[0].append(100)
+    ctx.group_block_table[0].append(100)
 
     # Buffer for serialization
     buf_size = 4096
@@ -78,8 +78,8 @@ def test_serialization():
     assert len(locs) == 1
     assert locs[0] == (0, 50)
 
-    # Check sp_block_table
-    table = ctx2.sp_block_table[0]
+    # Check group_block_table
+    table = ctx2.group_block_table[0]
     print(f"Restored block table: {list(table)}")
     assert list(table) == [100]
 

@@ -6,7 +6,6 @@
 | ------------------------------ | ----------- | ----------------------- | ----------------------------------------------------------------------------------------------- |
 | [DLSlime](./DLSlime)           | C++         | RDMA communication      | Zero-copy KV cache migration, P2P mesh networking, GPUDirect RDMA                               |
 | [NanoBench](./NanoBench)       | Python      | Benchmarking tools      | Performance testing and profiling                                                               |
-| [NanoCCL](./NanoCCL)           | C++ / CUDA  | Low-latency collectives | Intra-/Inter- node AllToAll, SM90+ GPU kernels                                                  |
 | [NanoCommon](./NanoCommon)     | C++         | Shared utilities        | Logging, common data structures, error handling                                                 |
 | [NanoCtrl](./NanoCtrl)         | Rust        | Control plane           | Redis-backed service registry, health monitoring, engine discovery, Python client               |
 | [NanoDeploy](./NanoDeploy)     | Python/C++  | LLM inference engine    | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
@@ -52,7 +51,6 @@ pip install ".[all]"
 
 ```bash
 pip install ".[dlslime]"      # DLSlime transfer engine only
-pip install ".[nanoccl]"      # NanoCCL only (requires CUDA SM90+)
 pip install ".[nanoctrl]"     # NanoCtrl lifecycle client only
 pip install ".[nanodeploy]"   # NanoDeploy inference engine only
 pip install ".[nanodeployvl]" # NanoDeployVL vision-language encoder only

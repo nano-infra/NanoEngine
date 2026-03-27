@@ -21,7 +21,7 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                max_model_len,
                      int                eos,
                      int                attention_dp,
-                     int                attention_sp,
+                     int                group_size,
                      int                num_kvcache_blocks,
                      int                kvcache_block_size,
                      const std::string& mode):
@@ -31,7 +31,7 @@ Scheduler::Scheduler(const std::string& engine_id,
     max_num_batched_tokens_(max_num_batched_tokens),
     eos_(eos),
     attention_dp_(attention_dp),
-    attention_sp_(attention_sp),
+    group_size_(group_size),
     max_model_len_(max_model_len),
     num_kvcache_blocks_(num_kvcache_blocks),
     kvcache_block_size_(kvcache_block_size),
@@ -40,8 +40,8 @@ Scheduler::Scheduler(const std::string& engine_id,
     // Initialize worker states for each DP rank
     worker_state.reserve(attention_dp_);
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-        worker_state.push_back(std::make_shared<SPStateManager>(
-            engine_id_, attention_sp_, num_kvcache_blocks, kvcache_block_size, max_num_seqs_, max_num_batched_tokens_));
+        worker_state.push_back(std::make_shared<GroupManager>(
+            engine_id_, group_size_, num_kvcache_blocks, kvcache_block_size, max_num_seqs_, max_num_batched_tokens_));
     }
     // Initialize thread pool with attention_dp_ threads
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
@@ -56,7 +56,7 @@ void Scheduler::add(std::shared_ptr<Sequence> seq)
                                  + "). Increase --max_model_len or shorten the prompt.");
     }
 
-    seq->active(engine_id_, attention_sp_, attention_dp_, num_kvcache_blocks_);
+    seq->active(engine_id_, group_size_, attention_dp_, num_kvcache_blocks_);
 
     if (seq->metric) {
         seq->metric->record_arrival();
@@ -138,39 +138,39 @@ ScheduleResult Scheduler::schedule()
     result.dp_seqs    = dp_seqs;
     result.is_prefill = has_prefill;
 
-    // Prepare dp_sp_seqs and filtered_dp_sp_seqs
-    result.dp_sp_seqs.reserve(attention_dp_ * attention_sp_);
-    result.filtered_dp_sp_seqs.reserve(attention_dp_ * attention_sp_);
+    // Prepare dp_group_seqs and filtered_dp_group_seqs
+    result.dp_group_seqs.reserve(attention_dp_ * group_size_);
+    result.filtered_dp_group_seqs.reserve(attention_dp_ * group_size_);
 
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-            // dp_sp_seqs is just dp_seqs[dp_idx] repeated for each sp_idx
-            result.dp_sp_seqs.push_back(dp_seqs[dp_idx]);
+        for (int group_id = 0; group_id < group_size_; ++group_id) {
+            // dp_group_seqs is just dp_seqs[dp_idx] repeated for each group_id
+            result.dp_group_seqs.push_back(dp_seqs[dp_idx]);
 
-            // filtered_dp_sp_seqs is dp_seqs[dp_idx] filtered by master_sp_idx
+            // filtered_dp_group_seqs is dp_seqs[dp_idx] filtered by master_group_id
             std::vector<std::shared_ptr<Sequence>> filtered;
             for (const auto& seq : dp_seqs[dp_idx]) {
-                if (seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx == sp_idx) {
+                if (seq->block_ctx(BlockContextSlot::ACTIVE).master_group_id == group_id) {
                     filtered.push_back(seq);
                 }
             }
-            result.filtered_dp_sp_seqs.push_back(std::move(filtered));
+            result.filtered_dp_group_seqs.push_back(std::move(filtered));
         }
     }
 
-    result.sp_send_counts.resize(attention_dp_);
-    result.sp_recv_counts.resize(attention_dp_);
+    result.group_send_counts.resize(attention_dp_);
+    result.group_recv_counts.resize(attention_dp_);
 
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-        result.sp_send_counts[dp_idx].resize(attention_sp_);
-        result.sp_recv_counts[dp_idx].resize(attention_sp_);
+        result.group_send_counts[dp_idx].resize(group_size_);
+        result.group_recv_counts[dp_idx].resize(group_size_);
 
-        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        for (int group_id = 0; group_id < group_size_; ++group_id) {
             // SP Send Count: Number of sequences where this SP rank is MASTER (initiator)
             // AND the sequence is actually distributed (has blocks on > 1 ranks).
             int         send_count = 0;
-            const auto& sp_seqs    = result.filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx];
-            for (const auto& seq : sp_seqs) {
+            const auto& group_seqs = result.filtered_dp_group_seqs[dp_idx * group_size_ + group_id];
+            for (const auto& seq : group_seqs) {
                 const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
                 int         active_ranks = 0;
                 for (int count : tokens) {
@@ -182,7 +182,7 @@ ScheduleResult Scheduler::schedule()
                     send_count++;
                 }
             }
-            result.sp_send_counts[dp_idx][sp_idx] = send_count;
+            result.group_send_counts[dp_idx][group_id] = send_count;
 
             // SP Recv Count: Number of sequences where this SP rank PARTICIPATES
             // AND the sequence is actually distributed.
@@ -204,23 +204,23 @@ ScheduleResult Scheduler::schedule()
                             active_ranks++;
                     }
 
-                    if (active_ranks > 1 && tokens[sp_idx] > 0) {
+                    if (active_ranks > 1 && tokens[group_id] > 0) {
                         recv_count++;
                     }
                 }
             }
-            result.sp_recv_counts[dp_idx][sp_idx] = recv_count;
+            result.group_recv_counts[dp_idx][group_id] = recv_count;
         }
 
         // SP Communication Matrix Logic
-        // Initialize matrix for this DP rank: [attention_sp_][attention_sp_]
-        // result.sp_comm_matrix.push_back(
-        // std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+        // Initialize matrix for this DP rank: [group_size_][group_size_]
+        // result.group_comm_matrix.push_back(
+        // std::vector<std::vector<int>>(group_size_, std::vector<int>(group_size_, 0)));
 
-        result.sp_q_matrix.push_back(std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+        result.group_q_matrix.push_back(std::vector<std::vector<int>>(group_size_, std::vector<int>(group_size_, 0)));
 
-        // result.sp_res_matrix.push_back(
-        //     std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+        // result.group_res_matrix.push_back(
+        //     std::vector<std::vector<int>>(group_size_, std::vector<int>(group_size_, 0)));
 
         for (const auto& seq : dp_seqs[dp_idx]) {
             bool is_dummy = false;
@@ -242,21 +242,21 @@ ScheduleResult Scheduler::schedule()
 
             // Only count if SP is truly enabled (distributed across > 1 ranks)
             if (active_ranks > 1) {
-                int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx;
+                int master_group_id = seq->block_ctx(BlockContextSlot::ACTIVE).master_group_id;
 
                 // For each participating rank:
-                for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-                    if (tokens[sp_idx] > 0) {
+                for (int group_id = 0; group_id < group_size_; ++group_id) {
+                    if (tokens[group_id] > 0) {
                         // Original matrix (Master -> Participant) - kept for compatibility if needed
-                        // result.sp_comm_matrix[dp_idx][master_sp_idx][sp_idx]++;
+                        // result.group_comm_matrix[dp_idx][master_group_id][group_id]++;
 
                         // Q Matrix: Master broadcast to all Participants
                         // Master sends Q to Participant
-                        result.sp_q_matrix[dp_idx][master_sp_idx][sp_idx]++;
+                        result.group_q_matrix[dp_idx][master_group_id][group_id]++;
 
                         // Res Matrix: Participant sends results back to Master
                         // Participant sends Res to Master
-                        // result.sp_res_matrix[dp_idx][sp_idx][master_sp_idx]++;
+                        // result.group_res_matrix[dp_idx][group_id][master_group_id]++;
                     }
                 }
             }
@@ -291,9 +291,9 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
     // Initialize with default values of 0
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-            num_seqs[dp_idx][sp_idx]           = 0;
-            num_batched_tokens[dp_idx][sp_idx] = 0;
+        for (int group_id = 0; group_id < group_size_; ++group_id) {
+            num_seqs[dp_idx][group_id]           = 0;
+            num_batched_tokens[dp_idx][group_id] = 0;
         }
     }
 
@@ -307,12 +307,12 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
     while (!prefilling.empty()) {
         auto seq = prefilling.front();
         prefilling.pop_front();
-        auto& block_ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
-        int   dp_idx    = block_ctx.dp_idx;
-        int   master_sp = block_ctx.master_sp_idx;
+        auto& block_ctx    = seq->block_ctx(BlockContextSlot::ACTIVE);
+        int   dp_idx       = block_ctx.dp_idx;
+        int   master_group = block_ctx.master_group_id;
 
         int prev_tokens      = seq->num_tokens();
-        int budget_remaining = max_num_batched_tokens_ - num_batched_tokens[dp_idx][master_sp];
+        int budget_remaining = max_num_batched_tokens_ - num_batched_tokens[dp_idx][master_group];
         int new_tokens       = std::min(budget_remaining, seq->num_prompt_tokens() - prev_tokens);
         if (new_tokens <= 0) {
             not_scheduled_prefilling.push_back(seq);
@@ -321,10 +321,10 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
         // Advance num_tokens to the new chunk endpoint (blocks pre-allocated at admission)
         seq->set_num_tokens(prev_tokens + new_tokens);
-        block_ctx.num_dispatched_tokens[master_sp] = seq->num_tokens();
+        block_ctx.num_dispatched_tokens[master_group] = seq->num_tokens();
 
-        num_seqs[dp_idx][master_sp] += 1;
-        num_batched_tokens[dp_idx][master_sp] += new_tokens;
+        num_seqs[dp_idx][master_group] += 1;
+        num_batched_tokens[dp_idx][master_group] += new_tokens;
 
         worker_state[dp_idx]->running.push_back(seq);
         scheduled_seqs[dp_idx].push_back(seq);
@@ -364,10 +364,10 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
                 auto& block_ctx  = seq->block_ctx(BlockContextSlot::ACTIVE);
                 block_ctx.dp_idx = selected_dp_idx;
-                int master_sp    = block_ctx.master_sp_idx;
+                int master_group = block_ctx.master_group_id;
 
-                num_seqs[selected_dp_idx][master_sp] += 1;
-                num_batched_tokens[selected_dp_idx][master_sp] += result->new_tokens;
+                num_seqs[selected_dp_idx][master_group] += 1;
+                num_batched_tokens[selected_dp_idx][master_group] += result->new_tokens;
 
                 seq->set_status(SequenceStatus::RUNNING);
                 waiting_queue.pop_front();
@@ -400,10 +400,10 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
                 auto& block_ctx  = seq->block_ctx(BlockContextSlot::ACTIVE);
                 block_ctx.dp_idx = selected_dp_idx;
-                int master_sp    = block_ctx.master_sp_idx;
+                int master_group = block_ctx.master_group_id;
 
-                num_seqs[selected_dp_idx][master_sp] += 1;
-                num_batched_tokens[selected_dp_idx][master_sp] += result->new_tokens;
+                num_seqs[selected_dp_idx][master_group] += 1;
+                num_batched_tokens[selected_dp_idx][master_group] += result->new_tokens;
 
                 seq->set_status(SequenceStatus::RUNNING);
                 waiting_queue.pop_front();
@@ -440,13 +440,13 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
 
         std::unordered_map<int, int>          num_seqs;
         std::deque<std::shared_ptr<Sequence>> skipped;
-        std::vector<int>                      sp_lens(attention_sp_, 0);
+        std::vector<int>                      group_lens(group_size_, 0);
 
         while (!running_queue.empty()) {
             auto seq = running_queue.front();
             running_queue.pop_front();
 
-            int master_rank = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx;
+            int master_rank = seq->block_ctx(BlockContextSlot::ACTIVE).master_group_id;
 
             // Check if we've reached the max sequences for this SP rank
             if (num_seqs[master_rank] >= max_num_seqs_) {
@@ -484,7 +484,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
                 }
                 else {
                     scheduled_seqs[selected_dp_idx].push_back(seq);
-                    sp_lens[master_rank] += seq->num_tokens();
+                    group_lens[master_rank] += seq->num_tokens();
                 }
             }
         }
@@ -498,9 +498,9 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
         }
 
         // Add dummy sequences for SP ranks with no work
-        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-            if (sp_lens[sp_idx] == 0) {
-                scheduled_seqs[selected_dp_idx].push_back(worker_state[selected_dp_idx]->dummy_seqs[sp_idx]);
+        for (int group_id = 0; group_id < group_size_; ++group_id) {
+            if (group_lens[group_id] == 0) {
+                scheduled_seqs[selected_dp_idx].push_back(worker_state[selected_dp_idx]->dummy_seqs[group_id]);
             }
         }
     }
@@ -524,7 +524,7 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
     waiting.push_front(seq);
 }
 
-void Scheduler::postprocess_worker_func(std::shared_ptr<SPStateManager> state_manager,
+void Scheduler::postprocess_worker_func(std::shared_ptr<GroupManager>   state_manager,
                                         const PostprocessWorkerContext* ctx,
                                         PostprocessWorkerContext*       result_ctx,
                                         int                             eos_id,
@@ -571,15 +571,15 @@ void Scheduler::postprocess_worker_func(std::shared_ptr<SPStateManager> state_ma
 
             for (int token_id : *task.tokens) {
 
-                int master_sp_idx = seq->block_ctx().master_sp_idx;
-                if (task.sp_idx != master_sp_idx) {
-                    throw std::runtime_error("sp_idx mismatch: task.sp_idx=" + std::to_string(task.sp_idx)
-                                             + " != master_sp_idx=" + std::to_string(master_sp_idx)
+                int master_group_id = seq->block_ctx().master_group_id;
+                if (task.group_id != master_group_id) {
+                    throw std::runtime_error("group_id mismatch: task.group_id=" + std::to_string(task.group_id)
+                                             + " != master_group_id=" + std::to_string(master_group_id)
                                              + " for seq_id=" + std::to_string(seq->seq_id()));
                 }
 
-                seq->append_token(token_id, BlockContextSlot::ACTIVE, task.sp_idx);
-                state_manager->add_running_tokens(task.sp_idx, 1);
+                seq->append_token(token_id, BlockContextSlot::ACTIVE, task.group_id);
+                state_manager->add_running_tokens(task.group_id, 1);
 
                 if (update_metrics && seq->metric) {
                     if (seq->metric->num_generated_tokens == 0) {
@@ -626,22 +626,22 @@ void Scheduler::postprocess_worker_func(std::shared_ptr<SPStateManager> state_ma
 }
 
 PostprocessResult
-Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
-                                      const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_group_seqs,
+                                      const std::vector<std::vector<std::vector<int>>>&          dp_group_token_ids,
                                       bool                                                       is_prefill,
                                       bool                                                       update_metrics)
 {
     size_t num_dp    = worker_state.size();
-    size_t num_dp_sp = dp_sp_seqs.size();
+    size_t num_dp_sp = dp_group_seqs.size();
     if (num_dp == 0)
         return {};
     if (num_dp_sp % num_dp != 0) {
-        throw std::runtime_error("dp_sp_seqs size is not a multiple of num_dp");
+        throw std::runtime_error("dp_group_seqs size is not a multiple of num_dp");
     }
-    size_t num_sp = num_dp_sp / num_dp;
+    size_t num_groups = num_dp_sp / num_dp;
 
-    if (dp_sp_token_ids.size() != num_dp_sp) {
-        throw std::runtime_error("dp_sp_token_ids length mismatch with dp_sp_seqs");
+    if (dp_group_token_ids.size() != num_dp_sp) {
+        throw std::runtime_error("dp_group_token_ids length mismatch with dp_group_seqs");
     }
 
     std::vector<PostprocessWorkerContext> contexts(num_dp);
@@ -650,10 +650,10 @@ Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_
         auto& ctx  = contexts[dp_idx];
         ctx.dp_idx = static_cast<int>(dp_idx);
 
-        for (size_t sp_idx = 0; sp_idx < num_sp; ++sp_idx) {
-            size_t      idx          = dp_idx * num_sp + sp_idx;
-            const auto& batch_seqs   = dp_sp_seqs[idx];
-            const auto& batch_tokens = dp_sp_token_ids[idx];
+        for (size_t group_id = 0; group_id < num_groups; ++group_id) {
+            size_t      idx          = dp_idx * num_groups + group_id;
+            const auto& batch_seqs   = dp_group_seqs[idx];
+            const auto& batch_tokens = dp_group_token_ids[idx];
 
             if (batch_seqs.size() > batch_tokens.size()) {
                 throw std::runtime_error("batch_seqs size mismatch with batch_tokens: not enough tokens");
@@ -662,7 +662,7 @@ Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_
             size_t batch_size = batch_seqs.size();
 
             for (size_t i = 0; i < batch_size; ++i) {
-                ctx.tasks.push_back({batch_seqs[i], &batch_tokens[i], (int)sp_idx});
+                ctx.tasks.push_back({batch_seqs[i], &batch_tokens[i], (int)group_id});
             }
         }
     }
@@ -719,11 +719,11 @@ Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_
     return result;
 }
 
-void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
-                            const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_group_seqs,
+                            const std::vector<std::vector<std::vector<int>>>&          dp_group_token_ids,
                             bool                                                       update_metrics)
 {
-    auto result = postprocess_sequences_impl(dp_sp_seqs, dp_sp_token_ids, mode_ == "prefill", update_metrics);
+    auto result = postprocess_sequences_impl(dp_group_seqs, dp_group_token_ids, mode_ == "prefill", update_metrics);
 
     // Store migrations
     for (const auto& [seq_shared, dp_idx] : result.migrations) {

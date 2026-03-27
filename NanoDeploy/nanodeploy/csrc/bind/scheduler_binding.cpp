@@ -1,5 +1,4 @@
 #include "nanodeploy/csrc/scheduler/scheduler.h"
-#include "opaque_types.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
@@ -9,30 +8,30 @@ using namespace nanodeploy;
 
 // Make opaque types for Scheduler's containers
 PYBIND11_MAKE_OPAQUE(std::deque<std::shared_ptr<Sequence>>);
-PYBIND11_MAKE_OPAQUE(std::vector<std::shared_ptr<SPStateManager>>);
+PYBIND11_MAKE_OPAQUE(std::vector<std::shared_ptr<GroupManager>>);
 PYBIND11_MAKE_OPAQUE(std::unordered_map<std::string, std::pair<std::shared_ptr<Sequence>, int>>);
 
 void bind_scheduler_utils(py::module_& m)
 {
-    // Bind the SPStateManagerList type
-    py::class_<std::vector<std::shared_ptr<SPStateManager>>>(m, "SPStateManagerList")
+    // Bind the GroupManagerList type
+    py::class_<std::vector<std::shared_ptr<GroupManager>>>(m, "GroupManagerList")
         .def(py::init<>())
-        .def("__len__", [](const std::vector<std::shared_ptr<SPStateManager>>& v) { return v.size(); })
+        .def("__len__", [](const std::vector<std::shared_ptr<GroupManager>>& v) { return v.size(); })
         .def("__getitem__",
-             [](std::vector<std::shared_ptr<SPStateManager>>& v, size_t idx) -> std::shared_ptr<SPStateManager> {
+             [](std::vector<std::shared_ptr<GroupManager>>& v, size_t idx) -> std::shared_ptr<GroupManager> {
                  if (idx >= v.size())
                      throw py::index_error();
                  return v[idx];
              })
         .def("__setitem__",
-             [](std::vector<std::shared_ptr<SPStateManager>>& v, size_t idx, std::shared_ptr<SPStateManager> val) {
+             [](std::vector<std::shared_ptr<GroupManager>>& v, size_t idx, std::shared_ptr<GroupManager> val) {
                  if (idx >= v.size())
                      throw py::index_error();
                  v[idx] = val;
              })
         .def(
             "__iter__",
-            [](std::vector<std::shared_ptr<SPStateManager>>& v) { return py::make_iterator(v.begin(), v.end()); },
+            [](std::vector<std::shared_ptr<GroupManager>>& v) { return py::make_iterator(v.begin(), v.end()); },
             py::keep_alive<0, 1>());
 
     // Bind the to_be_migrated map type
@@ -83,14 +82,14 @@ void bind_scheduler_utils(py::module_& m)
     // Bind the ScheduleResult struct
     py::class_<ScheduleResult>(m, "ScheduleResult")
         .def_readwrite("dp_seqs", &ScheduleResult::dp_seqs)
-        .def_readwrite("dp_sp_seqs", &ScheduleResult::dp_sp_seqs)
-        .def_readwrite("filtered_dp_sp_seqs", &ScheduleResult::filtered_dp_sp_seqs)
+        .def_readwrite("dp_group_seqs", &ScheduleResult::dp_group_seqs)
+        .def_readwrite("filtered_dp_group_seqs", &ScheduleResult::filtered_dp_group_seqs)
         .def_readwrite("is_prefill", &ScheduleResult::is_prefill)
-        .def_readonly("sp_send_counts", &ScheduleResult::sp_send_counts)
-        .def_readonly("sp_recv_counts", &ScheduleResult::sp_recv_counts)
-        // .def_readonly("sp_comm_matrix", &ScheduleResult::sp_comm_matrix)
-        .def_readonly("sp_q_matrix", &ScheduleResult::sp_q_matrix)
-        // .def_readonly("sp_res_matrix", &ScheduleResult::sp_res_matrix);
+        .def_readonly("group_send_counts", &ScheduleResult::group_send_counts)
+        .def_readonly("group_recv_counts", &ScheduleResult::group_recv_counts)
+        // .def_readonly("group_comm_matrix", &ScheduleResult::group_comm_matrix)
+        .def_readonly("group_q_matrix", &ScheduleResult::group_q_matrix)
+        // .def_readonly("group_res_matrix", &ScheduleResult::group_res_matrix);
         .def_readonly("waiting_head_blocks", &ScheduleResult::waiting_head_blocks)
         .def_readonly("waiting_total_blocks", &ScheduleResult::waiting_total_blocks);
 
@@ -104,7 +103,7 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("max_model_len"),
              py::arg("eos"),
              py::arg("attention_dp"),
-             py::arg("attention_sp"),
+             py::arg("group_size"),
              py::arg("num_kvcache_blocks"),
              py::arg("kvcache_block_size"),
              py::arg("mode"))
@@ -148,7 +147,7 @@ void bind_scheduler_utils(py::module_& m)
              py::return_value_policy::reference_internal)
 
         // Public member access
-        .def_readonly("attention_sp", &Scheduler::attention_sp_)
+        .def_readonly("group_size", &Scheduler::group_size_)
         .def_readonly("attention_dp", &Scheduler::attention_dp_)
         .def_readwrite("waiting", &Scheduler::waiting)
         .def_readwrite("waiting_migration", &Scheduler::waiting_migration)

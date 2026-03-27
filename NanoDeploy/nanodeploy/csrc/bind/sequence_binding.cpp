@@ -53,8 +53,8 @@ void bind_sequence(py::module_& m)
         .def(py::init<>())
         .def_readwrite("engine_id", &BlockContext::engine_id)
         .def_readwrite("dp_idx", &BlockContext::dp_idx)
-        .def_readwrite("master_sp_idx", &BlockContext::master_sp_idx)
-        .def_readwrite("attention_sp", &BlockContext::attention_sp)
+        .def_readwrite("master_group_id", &BlockContext::master_group_id)
+        .def_readwrite("group_size", &BlockContext::group_size)
         .def_readwrite("attention_dp", &BlockContext::attention_dp)
         .def_readwrite("num_kvcache_blocks", &BlockContext::num_kvcache_blocks)
         .def_readwrite("state_slot", &BlockContext::state_slot)
@@ -64,18 +64,18 @@ void bind_sequence(py::module_& m)
             [](BlockContext& self, const std::vector<fbs::BlockLocation>& value) { self.block_location = value; },
             py::return_value_policy::reference_internal)
         .def_property(
-            "sp_block_table",
-            [](BlockContext& self) -> std::vector<std::unique_ptr<fbs::IntListT>>& { return self.sp_block_table; },
+            "group_block_table",
+            [](BlockContext& self) -> std::vector<std::unique_ptr<fbs::IntListT>>& { return self.group_block_table; },
             [](BlockContext& self, const std::vector<std::unique_ptr<fbs::IntListT>>& value) {
-                self.sp_block_table.clear();
+                self.group_block_table.clear();
                 for (const auto& item : value) {
                     if (item) {
                         auto new_item    = std::make_unique<fbs::IntListT>();
                         new_item->values = item->values;
-                        self.sp_block_table.push_back(std::move(new_item));
+                        self.group_block_table.push_back(std::move(new_item));
                     }
                     else {
-                        self.sp_block_table.push_back(std::make_unique<fbs::IntListT>());
+                        self.group_block_table.push_back(std::make_unique<fbs::IntListT>());
                     }
                 }
             },
@@ -85,13 +85,13 @@ void bind_sequence(py::module_& m)
             "reset",
             [](BlockContext&      self,
                const std::string& engine_id,
-               int                attention_sp,
+               int                group_size,
                int                attention_dp,
                int                num_kvcache_blocks) {
-                reset_block_context(self, engine_id, attention_sp, attention_dp, num_kvcache_blocks);
+                reset_block_context(self, engine_id, group_size, attention_dp, num_kvcache_blocks);
             },
             py::arg("engine_id"),
-            py::arg("attention_sp"),
+            py::arg("group_size"),
             py::arg("attention_dp"),
             py::arg("num_kvcache_blocks"))
         .def(py::pickle(
@@ -137,16 +137,16 @@ void bind_sequence(py::module_& m)
         .def("active",
              &Sequence::active,
              py::arg("engine_id"),
-             py::arg("attention_sp"),
+             py::arg("group_size"),
              py::arg("attention_dp"),
              py::arg("num_kvcache_blocks"))
         .def("migrate", &Sequence::migrate)
-        .def("context_len", &Sequence::context_len, py::arg("engine_id"), py::arg("sp_idx") = std::nullopt)
+        .def("context_len", &Sequence::context_len, py::arg("engine_id"), py::arg("group_id") = std::nullopt)
         .def("append_token",
              &Sequence::append_token,
              py::arg("token_id"),
              py::arg("slot"),
-             py::arg("sp_idx") = std::nullopt)
+             py::arg("group_id") = std::nullopt)
         .def("block_ctx",
              static_cast<BlockContext& (Sequence::*)(BlockContextSlot)>(&Sequence::block_ctx),
              py::arg("slot") = BlockContextSlot::ACTIVE,
@@ -154,15 +154,15 @@ void bind_sequence(py::module_& m)
         .def("block_table",
              &Sequence::block_table,
              py::arg("slot"),
-             py::arg("sp_idx") = 0,
+             py::arg("group_id") = 0,
              py::return_value_policy::reference_internal)
         .def("dp_idx", &Sequence::dp_idx, py::arg("slot"))
         .def("state_slot", &Sequence::state_slot, py::arg("slot") = BlockContextSlot::ACTIVE)
         .def("set_state_slot", &Sequence::set_state_slot, py::arg("slot"), py::arg("state_slot"))
-        .def("num_blocks", &Sequence::num_blocks, py::arg("slot"), py::arg("sp_idx"))
-        .def("last_block_page_id", &Sequence::last_block_page_id, py::arg("slot"), py::arg("sp_idx"))
-        .def("last_block_num_tokens", &Sequence::last_block_num_tokens, py::arg("slot"), py::arg("sp_idx"))
-        .def("block", &Sequence::block, py::arg("i"), py::arg("slot"), py::arg("sp_idx"))
+        .def("num_blocks", &Sequence::num_blocks, py::arg("slot"), py::arg("group_id"))
+        .def("last_block_page_id", &Sequence::last_block_page_id, py::arg("slot"), py::arg("group_id"))
+        .def("last_block_num_tokens", &Sequence::last_block_num_tokens, py::arg("slot"), py::arg("group_id"))
+        .def("block", &Sequence::block, py::arg("i"), py::arg("slot"), py::arg("group_id"))
 
         .def_property("seq_id", &Sequence::seq_id, &Sequence::set_seq_id)
         .def_property("status", &Sequence::status, &Sequence::set_status)
@@ -260,25 +260,25 @@ void bind_sequence(py::module_& m)
                             // Ensure engine_id is valid
                             // (no-op if already set, but guards against uninitialized memory)
 
-                            // Ensure num_dispatched_tokens matches attention_sp
-                            if (slot->num_dispatched_tokens.size() != static_cast<size_t>(slot->attention_sp)) {
+                            // Ensure num_dispatched_tokens matches group_size
+                            if (slot->num_dispatched_tokens.size() != static_cast<size_t>(slot->group_size)) {
                                 std::cerr << "  slot[" << i << "]: fixing num_dispatched_tokens size "
-                                          << slot->num_dispatched_tokens.size() << " -> " << slot->attention_sp
+                                          << slot->num_dispatched_tokens.size() << " -> " << slot->group_size
                                           << std::endl;
-                                slot->num_dispatched_tokens.resize(slot->attention_sp, 0);
+                                slot->num_dispatched_tokens.resize(slot->group_size, 0);
                             }
 
-                            // Ensure sp_block_table matches attention_sp and has no null pointers
-                            if (slot->sp_block_table.size() != static_cast<size_t>(slot->attention_sp)) {
-                                std::cerr << "  slot[" << i << "]: fixing sp_block_table size "
-                                          << slot->sp_block_table.size() << " -> " << slot->attention_sp << std::endl;
-                                slot->sp_block_table.resize(slot->attention_sp);
+                            // Ensure group_block_table matches group_size and has no null pointers
+                            if (slot->group_block_table.size() != static_cast<size_t>(slot->group_size)) {
+                                std::cerr << "  slot[" << i << "]: fixing group_block_table size "
+                                          << slot->group_block_table.size() << " -> " << slot->group_size << std::endl;
+                                slot->group_block_table.resize(slot->group_size);
                             }
-                            for (size_t j = 0; j < slot->sp_block_table.size(); ++j) {
-                                if (!slot->sp_block_table[j]) {
-                                    std::cerr << "  slot[" << i << "]: fixing null sp_block_table[" << j << "]"
+                            for (size_t j = 0; j < slot->group_block_table.size(); ++j) {
+                                if (!slot->group_block_table[j]) {
+                                    std::cerr << "  slot[" << i << "]: fixing null group_block_table[" << j << "]"
                                               << std::endl;
-                                    slot->sp_block_table[j] = std::make_unique<fbs::IntListT>();
+                                    slot->group_block_table[j] = std::make_unique<fbs::IntListT>();
                                 }
                             }
                         }
@@ -287,8 +287,8 @@ void bind_sequence(py::module_& m)
                             slot                     = std::make_unique<fbs::BlockContextT>();
                             slot->engine_id          = "";
                             slot->dp_idx             = 0;
-                            slot->master_sp_idx      = 0;
-                            slot->attention_sp       = 0;
+                            slot->master_group_id    = 0;
+                            slot->group_size         = 0;
                             slot->attention_dp       = 0;
                             slot->num_kvcache_blocks = 0;
                         }

@@ -12,34 +12,34 @@ namespace nanodeploy {
 // BlockContext free functions
 
 std::unique_ptr<BlockContext>
-make_block_context(const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks)
+make_block_context(const std::string& engine_id, int group_size, int attention_dp, int num_kvcache_blocks)
 {
     auto ctx = std::make_unique<BlockContext>();
-    reset_block_context(*ctx, engine_id, attention_sp, attention_dp, num_kvcache_blocks);
+    reset_block_context(*ctx, engine_id, group_size, attention_dp, num_kvcache_blocks);
     return ctx;
 }
 
 void reset_block_context(
-    BlockContext& ctx, const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks)
+    BlockContext& ctx, const std::string& engine_id, int group_size, int attention_dp, int num_kvcache_blocks)
 {
     ctx.engine_id = engine_id;
 
-    ctx.dp_idx        = 0;
-    ctx.master_sp_idx = 0;
-    ctx.attention_sp  = attention_sp;
-    ctx.attention_dp  = attention_dp;
+    ctx.dp_idx          = 0;
+    ctx.master_group_id = 0;
+    ctx.group_size      = group_size;
+    ctx.attention_dp    = attention_dp;
 
     ctx.num_kvcache_blocks = num_kvcache_blocks;
     ctx.state_slot         = -1;
 
-    // Initialize sp_block_table and num_dispatched_tokens
-    ctx.sp_block_table.clear();
-    ctx.sp_block_table.resize(attention_sp);
-    for (auto& list : ctx.sp_block_table) {
+    // Initialize group_block_table and num_dispatched_tokens
+    ctx.group_block_table.clear();
+    ctx.group_block_table.resize(group_size);
+    for (auto& list : ctx.group_block_table) {
         list = std::make_unique<fbs::IntListT>();
     }
     ctx.num_dispatched_tokens.clear();
-    ctx.num_dispatched_tokens.resize(attention_sp, 0);
+    ctx.num_dispatched_tokens.resize(group_size, 0);
     ctx.block_location.clear();
     ctx.endpoints.clear();  // Initialize endpoints to empty vector
 }
@@ -78,14 +78,14 @@ Sequence::Sequence(const std::vector<int>& token_ids, const SamplingParams& samp
         // Initialize all fields to safe defaults
         ctx->engine_id          = "";
         ctx->dp_idx             = 0;
-        ctx->master_sp_idx      = 0;
-        ctx->attention_sp       = 0;
+        ctx->master_group_id    = 0;
+        ctx->group_size         = 0;
         ctx->attention_dp       = 0;
         ctx->num_kvcache_blocks = 0;
         ctx->state_slot         = -1;
         ctx->block_location.clear();
         ctx->num_dispatched_tokens.clear();
-        ctx->sp_block_table.clear();
+        ctx->group_block_table.clear();
         ctx->endpoints.clear();
         data_->slots[i] = std::move(ctx);
     }
@@ -106,14 +106,14 @@ std::shared_ptr<Sequence> Sequence::from_data(std::unique_ptr<SequenceT> data)
             // Initialize all fields to safe defaults
             ctx->engine_id          = "";
             ctx->dp_idx             = 0;
-            ctx->master_sp_idx      = 0;
-            ctx->attention_sp       = 0;
+            ctx->master_group_id    = 0;
+            ctx->group_size         = 0;
             ctx->attention_dp       = 0;
             ctx->num_kvcache_blocks = 0;
             ctx->state_slot         = -1;
             ctx->block_location.clear();
             ctx->num_dispatched_tokens.clear();
-            ctx->sp_block_table.clear();
+            ctx->group_block_table.clear();
             ctx->endpoints.clear();
             seq->data_->slots[i] = std::move(ctx);
         }
@@ -149,38 +149,38 @@ void Sequence::set_state_slot(BlockContextSlot slot, int state_slot)
     block_ctx(slot).state_slot = state_slot;
 }
 
-std::vector<int>& Sequence::block_table(BlockContextSlot slot, int sp_idx)
+std::vector<int>& Sequence::block_table(BlockContextSlot slot, int group_id)
 {
     auto& ctx = block_ctx(slot);
-    if (sp_idx >= static_cast<int>(ctx.sp_block_table.size())) {
-        size_t old_size = ctx.sp_block_table.size();
-        ctx.sp_block_table.resize(sp_idx + 1);
+    if (group_id >= static_cast<int>(ctx.group_block_table.size())) {
+        size_t old_size = ctx.group_block_table.size();
+        ctx.group_block_table.resize(group_id + 1);
         // Initialize all new elements to avoid null pointers
-        for (size_t i = old_size; i < ctx.sp_block_table.size(); ++i) {
-            ctx.sp_block_table[i] = std::make_unique<fbs::IntListT>();
+        for (size_t i = old_size; i < ctx.group_block_table.size(); ++i) {
+            ctx.group_block_table[i] = std::make_unique<fbs::IntListT>();
         }
     }
-    if (!ctx.sp_block_table[sp_idx]) {
-        ctx.sp_block_table[sp_idx] = std::make_unique<fbs::IntListT>();
+    if (!ctx.group_block_table[group_id]) {
+        ctx.group_block_table[group_id] = std::make_unique<fbs::IntListT>();
     }
     // Return a reference to the values vector directly
-    return ctx.sp_block_table[sp_idx]->values;
+    return ctx.group_block_table[group_id]->values;
 }
 
-int Sequence::context_len(BlockContextSlot slot, std::optional<int> sp_idx)
+int Sequence::context_len(BlockContextSlot slot, std::optional<int> group_id)
 {
     auto& ctx = block_ctx(slot);
-    int   idx = sp_idx.has_value() ? sp_idx.value() : ctx.master_sp_idx;
+    int   idx = group_id.has_value() ? group_id.value() : ctx.master_group_id;
     if (idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
         return 0;
     }
     return ctx.num_dispatched_tokens[idx];
 }
 
-void Sequence::append_token(int token_id, BlockContextSlot slot, std::optional<int> sp_idx)
+void Sequence::append_token(int token_id, BlockContextSlot slot, std::optional<int> group_id)
 {
     auto& ctx = block_ctx(slot);
-    int   idx = sp_idx.has_value() ? sp_idx.value() : ctx.master_sp_idx;
+    int   idx = group_id.has_value() ? group_id.value() : ctx.master_group_id;
 
     data_->token_ids.push_back(token_id);
     data_->last_token = token_id;
@@ -191,59 +191,59 @@ void Sequence::append_token(int token_id, BlockContextSlot slot, std::optional<i
     ctx.num_dispatched_tokens[idx]++;
 }
 
-int Sequence::num_blocks(BlockContextSlot slot, int sp_idx)
+int Sequence::num_blocks(BlockContextSlot slot, int group_id)
 {
     auto& ctx = block_ctx(slot);
-    if (sp_idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
+    if (group_id >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
         return 0;
     }
-    int n_tokens = ctx.num_dispatched_tokens[sp_idx];
+    int n_tokens = ctx.num_dispatched_tokens[group_id];
     return (n_tokens + block_size - 1) / block_size;
 }
 
-int Sequence::last_block_page_id(BlockContextSlot slot, int sp_idx)
+int Sequence::last_block_page_id(BlockContextSlot slot, int group_id)
 {
     auto& ctx = block_ctx(slot);
-    if (sp_idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
+    if (group_id >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
         throw std::out_of_range("SP index out of range (last_block_page_id): seq_id=" + std::to_string(data_->seq_id)
-                                + " sp_idx=" + std::to_string(sp_idx)
+                                + " group_id=" + std::to_string(group_id)
                                 + " num_dispatched_tokens.size()=" + std::to_string(ctx.num_dispatched_tokens.size()));
     }
-    int n_tokens       = ctx.num_dispatched_tokens[sp_idx];
+    int n_tokens       = ctx.num_dispatched_tokens[group_id];
     int last_block_idx = (n_tokens - 1) / block_size;
 
-    if (sp_idx >= static_cast<int>(ctx.sp_block_table.size()) || !ctx.sp_block_table[sp_idx]
-        || last_block_idx >= static_cast<int>(ctx.sp_block_table[sp_idx]->values.size())) {
-        int table_size  = static_cast<int>(ctx.sp_block_table.size());
-        int values_size = (sp_idx >= 0 && sp_idx < table_size && ctx.sp_block_table[sp_idx]) ?
-                              static_cast<int>(ctx.sp_block_table[sp_idx]->values.size()) :
+    if (group_id >= static_cast<int>(ctx.group_block_table.size()) || !ctx.group_block_table[group_id]
+        || last_block_idx >= static_cast<int>(ctx.group_block_table[group_id]->values.size())) {
+        int table_size  = static_cast<int>(ctx.group_block_table.size());
+        int values_size = (group_id >= 0 && group_id < table_size && ctx.group_block_table[group_id]) ?
+                              static_cast<int>(ctx.group_block_table[group_id]->values.size()) :
                               -1;
         throw std::out_of_range("Block index out of range (last_block_page_id): seq_id=" + std::to_string(data_->seq_id)
-                                + " sp_idx=" + std::to_string(sp_idx) + " last_block_idx="
+                                + " group_id=" + std::to_string(group_id) + " last_block_idx="
                                 + std::to_string(last_block_idx) + " num_dispatched_tokens=" + std::to_string(n_tokens)
-                                + " sp_block_table.size()=" + std::to_string(table_size)
-                                + " sp_block_table[sp_idx].values.size()=" + std::to_string(values_size));
+                                + " group_block_table.size()=" + std::to_string(table_size)
+                                + " group_block_table[group_id].values.size()=" + std::to_string(values_size));
     }
-    return ctx.sp_block_table[sp_idx]->values[last_block_idx];
+    return ctx.group_block_table[group_id]->values[last_block_idx];
 }
 
-int Sequence::last_block_num_tokens(BlockContextSlot slot, int sp_idx)
+int Sequence::last_block_num_tokens(BlockContextSlot slot, int group_id)
 {
     auto& ctx = block_ctx(slot);
-    if (sp_idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
+    if (group_id >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
         return 0;
     }
-    int n_tokens = ctx.num_dispatched_tokens[sp_idx];
-    return n_tokens - (num_blocks(slot, sp_idx) - 1) * block_size;
+    int n_tokens = ctx.num_dispatched_tokens[group_id];
+    return n_tokens - (num_blocks(slot, group_id) - 1) * block_size;
 }
 
-std::pair<const int*, size_t> Sequence::block_view(int i, BlockContextSlot slot, int sp_idx) const
+std::pair<const int*, size_t> Sequence::block_view(int i, BlockContextSlot slot, int group_id) const
 {
-    int n_blocks = const_cast<Sequence*>(this)->num_blocks(slot, sp_idx);
+    int n_blocks = const_cast<Sequence*>(this)->num_blocks(slot, group_id);
     if (i < 0 || i >= n_blocks) {
         throw std::out_of_range("Block index out of range (block_view): seq_id=" + std::to_string(data_->seq_id)
                                 + " slot=" + std::to_string(static_cast<int>(slot))
-                                + " sp_idx=" + std::to_string(sp_idx) + " block_index=" + std::to_string(i)
+                                + " group_id=" + std::to_string(group_id) + " block_index=" + std::to_string(i)
                                 + " n_blocks=" + std::to_string(n_blocks));
     }
 
@@ -256,9 +256,9 @@ std::pair<const int*, size_t> Sequence::block_view(int i, BlockContextSlot slot,
     return {&data_->token_ids[start], static_cast<size_t>(end - start)};
 }
 
-std::vector<int> Sequence::block(int i, BlockContextSlot slot, int sp_idx)
+std::vector<int> Sequence::block(int i, BlockContextSlot slot, int group_id)
 {
-    auto view = block_view(i, slot, sp_idx);
+    auto view = block_view(i, slot, group_id);
     if (view.second == 0)
         return {};
     return std::vector<int>(view.first, view.first + view.second);

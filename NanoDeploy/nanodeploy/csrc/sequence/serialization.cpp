@@ -24,18 +24,18 @@ static void validate_block_context(fbs::BlockContextT& ctx)
 
     // Ensure vectors are initialized (not null)
     // block_location should be a valid vector (can be empty)
-    // num_dispatched_tokens should match attention_sp size
-    if (ctx.num_dispatched_tokens.size() != static_cast<size_t>(ctx.attention_sp)) {
-        ctx.num_dispatched_tokens.resize(ctx.attention_sp, 0);
+    // num_dispatched_tokens should match group_size size
+    if (ctx.num_dispatched_tokens.size() != static_cast<size_t>(ctx.group_size)) {
+        ctx.num_dispatched_tokens.resize(ctx.group_size, 0);
     }
 
-    // Ensure sp_block_table matches attention_sp size and has no null pointers
-    if (ctx.sp_block_table.size() != static_cast<size_t>(ctx.attention_sp)) {
-        ctx.sp_block_table.resize(ctx.attention_sp);
+    // Ensure group_block_table matches group_size size and has no null pointers
+    if (ctx.group_block_table.size() != static_cast<size_t>(ctx.group_size)) {
+        ctx.group_block_table.resize(ctx.group_size);
     }
-    for (size_t i = 0; i < ctx.sp_block_table.size(); ++i) {
-        if (!ctx.sp_block_table[i]) {
-            ctx.sp_block_table[i] = std::make_unique<fbs::IntListT>();
+    for (size_t i = 0; i < ctx.group_block_table.size(); ++i) {
+        if (!ctx.group_block_table[i]) {
+            ctx.group_block_table[i] = std::make_unique<fbs::IntListT>();
         }
     }
 
@@ -56,8 +56,8 @@ std::vector<uint8_t> serialize_sequence(const Sequence& seq)
             slot                     = std::make_unique<fbs::BlockContextT>();
             slot->engine_id          = "";
             slot->dp_idx             = 0;
-            slot->master_sp_idx      = 0;
-            slot->attention_sp       = 0;
+            slot->master_group_id    = 0;
+            slot->group_size         = 0;
             slot->attention_dp       = 0;
             slot->num_kvcache_blocks = 0;
         }
@@ -111,8 +111,8 @@ size_t serialize_sequences(uintptr_t                                     data_pt
                     slot                     = std::make_unique<fbs::BlockContextT>();
                     slot->engine_id          = "";
                     slot->dp_idx             = 0;
-                    slot->master_sp_idx      = 0;
-                    slot->attention_sp       = 0;
+                    slot->master_group_id    = 0;
+                    slot->group_size         = 0;
                     slot->attention_dp       = 0;
                     slot->num_kvcache_blocks = 0;
                 }

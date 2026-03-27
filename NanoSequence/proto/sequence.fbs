@@ -20,14 +20,14 @@ table IntList {
 table BlockContext {
   engine_id: string;
   dp_idx: int;
-  master_sp_idx: int;
-  attention_sp: int;
+  master_group_id: int;
+  group_size: int;
   attention_dp: int;
   num_kvcache_blocks: int;
   state_slot: int = -1;
   block_location: [BlockLocation];
   num_dispatched_tokens: [int];
-  sp_block_table: [IntList];
+  group_block_table: [IntList];
   endpoints: [string];
 }
 

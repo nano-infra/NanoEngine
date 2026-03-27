@@ -23,7 +23,6 @@ from nanodeploy.context.distributed import (
     set_dist_context,
 )
 from nanodeploy.context.expert_context import ExpertContext
-from nanodeploy.context.sp_context import set_sp_context
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
@@ -142,26 +141,8 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
 
-        sp_size = get_dist_context().attn_sp_world_size
+        assert config.attention_sp == 1, "attention_sp > 1 (SP) not supported"
         ep_size = get_dist_context().ffn_ep_world_size
-
-        if sp_size > 1:
-            sp_rank = get_dist_context().attn_sp_rank
-            max_head_dim = 0
-            if config.hf_config.num_key_value_heads > 1:
-                max_head_dim = config.hf_config.head_dim
-            else:
-                max_head_dim = (
-                    config.hf_config.kv_lora_rank + config.hf_config.qk_rope_head_dim
-                )
-            set_sp_context(
-                config.max_num_seqs,
-                max_head_dim,
-                hf_config.num_attention_heads,
-                torch.get_default_dtype(),
-                sp_size,
-                sp_rank,
-            )
 
         self.run_count = 0
         self.profiler = None
@@ -489,8 +470,6 @@ class ModelRunner:
         num_seqs = min(
             max_num_batched_tokens // max_model_len, self.config.max_num_seqs
         )
-        sp_rank = get_dist_context().attn_sp_rank
-        sp_size = get_dist_context().attn_sp_world_size
         # empty for warmup — serialize empty batch into bytes
         warmup_data = serialize_run_batch([], True)
         self.run_from_bytes(warmup_data, True)
@@ -550,14 +529,12 @@ class ModelRunner:
             )
 
     def prepare_prefill_bytes(self, data: bytes, aux, is_dummy: bool = False):
-        sp_rank = get_dist_context().attn_sp_rank
-        sp_size = get_dist_context().attn_sp_world_size
         block_size = self.config.kvcache_block_size
 
         meta = prepare_prefill_from_bytes(
             data,
-            sp_rank,
-            sp_size,
+            0,
+            1,
             block_size,
             self.config.max_num_seqs,
             self.config.num_kvcache_blocks,
@@ -566,10 +543,8 @@ class ModelRunner:
         if len(meta.input_ids) == 0:
             logger.critical(
                 "prepare_prefill_from_bytes returned empty input_ids! "
-                "is_dummy=%s sp_rank=%s sp_size=%s block_size=%s max_num_seqs=%s",
+                "is_dummy=%s block_size=%s max_num_seqs=%s",
                 is_dummy,
-                sp_rank,
-                sp_size,
                 block_size,
                 self.config.max_num_seqs,
             )
@@ -594,7 +569,7 @@ class ModelRunner:
         if meta.use_block_tables:
             block_tables = (
                 torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
-                .reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks)
+                .reshape(self.config.max_num_seqs, meta.max_num_blocks)
                 .cuda(non_blocking=True)
             )
 
@@ -617,8 +592,8 @@ class ModelRunner:
         # If all sequences are final chunks, set to None to use the fast default path.
         sampling_token_indices = None
         sampling_seq_indices = None
-        num_sp_seqs = aux.num_sp_seqs
-        if len(meta.sampling_token_indices) < num_sp_seqs:
+        num_seqs = aux.num_sp_seqs
+        if len(meta.sampling_token_indices) < num_seqs:
             sampling_token_indices = torch.tensor(
                 meta.sampling_token_indices, dtype=torch.int64, pin_memory=True
             ).cuda(non_blocking=True)
@@ -627,16 +602,14 @@ class ModelRunner:
             ).cuda(non_blocking=True)
 
         set_context(
-            True,
-            self.config.max_num_seqs,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            meta.max_seqlen_q,
-            meta.max_seqlen_k,
-            slot_mapping,
-            None,
-            block_tables,
-            None,
+            is_prefill=True,
+            max_bs=self.config.max_num_seqs,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=meta.max_seqlen_q,
+            max_seqlen_k=meta.max_seqlen_k,
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
             is_dummy=is_dummy,
             gdn_conv_states=cache_ctx.gdn_conv_states,
             gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
@@ -647,25 +620,21 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode_bytes(self, data: bytes, aux, is_dummy: bool = False):
-        sp_rank = get_dist_context().attn_sp_rank
-        sp_size = get_dist_context().attn_sp_world_size
         block_size = self.config.kvcache_block_size
 
         try:
             meta = prepare_decode_from_bytes(
                 data,
-                sp_rank,
-                sp_size,
+                0,
+                1,
                 block_size,
                 self.config.max_num_seqs,
                 self.config.num_kvcache_blocks,
             )
         except (IndexError, ValueError, RuntimeError) as e:
             logger.error(
-                "prepare_decode_from_bytes failed: %s (sp_rank=%s sp_size=%s block_size=%s max_num_seqs=%s)",
+                "prepare_decode_from_bytes failed: %s (block_size=%s max_num_seqs=%s)",
                 str(e),
-                sp_rank,
-                sp_size,
                 block_size,
                 self.config.max_num_seqs,
             )
@@ -683,15 +652,7 @@ class ModelRunner:
 
         context_lens = (
             torch.tensor(meta.context_lens_flat, dtype=torch.int32, pin_memory=True)
-            .reshape(sp_size, self.config.max_num_seqs)
-            .cuda(non_blocking=True)
-        )
-
-        global_context_lens = (
-            torch.tensor(
-                meta.global_context_lens_flat, dtype=torch.int32, pin_memory=True
-            )
-            .reshape(sp_size, self.config.max_num_seqs)
+            .reshape(self.config.max_num_seqs)
             .cuda(non_blocking=True)
         )
 
@@ -706,56 +667,14 @@ class ModelRunner:
                 .cuda(non_blocking=True)
             )
 
-        q_mask = global_context_lens.clone()
-        q_mask[sp_rank].fill_(0)
-        q_mask[q_mask != 0] = 1
-        res_lse_mask = context_lens.clone()
-        res_lse_mask[sp_rank].fill_(0)
-        res_lse_mask[res_lse_mask != 0] = 1
-
-        context_lens_for_attn = torch.tensor(
-            meta.context_lens_for_attn, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        q_slice_get = torch.tensor(
-            meta.q_slice_get, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_slice_fill = torch.tensor(
-            meta.q_slice_fill, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_copy_mask = torch.tensor(
-            meta.q_copy_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_get_to_buffer_output = torch.tensor(
-            meta.res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_fill_to_buffer_output = torch.tensor(
-            meta.res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_to_buffer_output_mask = torch.tensor(
-            meta.res_to_buffer_output_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_get_to_buffer_input = torch.tensor(
-            meta.res_slice_get_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_fill_to_buffer_input = torch.tensor(
-            meta.res_slice_fill_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_to_buffer_input_mask = torch.tensor(
-            meta.res_to_buffer_input_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_offsets = torch.tensor(
-            meta.q_offsets, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        attention_compute_bs = context_lens_for_attn.numel()
-
         config = self.config
         hf_config = config.hf_config
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
         if is_mla:
             mla_num_kv_heads = 1
+            context_lens_for_mla = context_lens[: aux.num_sp_seqs]
             new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
-                context_lens_for_attn.view(-1),
+                context_lens_for_mla.view(-1),
                 hf_config.num_attention_heads // mla_num_kv_heads,
                 mla_num_kv_heads,
             )
@@ -781,22 +700,7 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
-            global_context_lens=global_context_lens,
-            q_mask=q_mask,
-            res_lse_mask=res_lse_mask,
             is_dummy=is_dummy,
-            context_lens_for_attn=context_lens_for_attn,
-            attention_compute_bs=attention_compute_bs,
-            q_slice_get=q_slice_get,
-            q_slice_fill=q_slice_fill,
-            q_copy_mask=q_copy_mask,
-            res_slice_get_to_buffer_output=res_slice_get_to_buffer_output,
-            res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output,
-            res_to_buffer_output_mask=res_to_buffer_output_mask,
-            res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
-            res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
-            res_to_buffer_input_mask=res_to_buffer_input_mask,
-            q_offsets=q_offsets,
             tile_scheduler_metadata=new_tile_scheduler_metadata,
             num_splits=new_num_splits,
             gdn_conv_states=cache_ctx.gdn_conv_states,
@@ -807,33 +711,25 @@ class ModelRunner:
         return input_ids, positions
 
     def update_decode_inplace(
-        self, input_ids: torch.Tensor, positions: torch.Tensor, num_sp_seqs: int
+        self, input_ids: torch.Tensor, positions: torch.Tensor, num_seqs: int
     ):
         """Update decode metadata in-place for multi-step decode (no Sequence needed)."""
         positions.add_(1)
-        sp_rank = get_dist_context().attn_sp_rank
         block_size = self.config.kvcache_block_size
         context = get_context()
 
         # Update context length (now reflects the NEW token count)
-        context.context_lens[sp_rank][:num_sp_seqs].add_(1)
-        # Update global context length
-        context.global_context_lens[sp_rank][:num_sp_seqs].add_(1)
-        # Update context lens for attention
-        context.context_lens_for_attn[context.q_slice_fill.long()] += 1
+        context.context_lens[:num_seqs].add_(1)
 
         # Recalculate slot_mapping from context_lens and block_tables.
         # Simply doing slot_mapping.add_(1) is WRONG when a sequence's new
         # token crosses a block boundary, because the page_id changes.
-        new_ctx = context.context_lens[sp_rank][:num_sp_seqs]  # already incremented
+        new_ctx = context.context_lens[:num_seqs]  # already incremented
         block_idx = (new_ctx - 1) // block_size  # which block the new token falls in
         offset_in_block = (new_ctx - 1) % block_size  # offset within that block
-        # block_tables is packed by sp_rank order; use q_offsets to find the
-        # starting row for this sp_rank's sequences.
-        bt_offset = context.q_offsets[sp_rank]
-        row_indices = bt_offset + torch.arange(num_sp_seqs, device=block_idx.device)
+        row_indices = torch.arange(num_seqs, device=block_idx.device)
         page_ids = context.block_tables[row_indices, block_idx.long()]
-        context.slot_mapping[:num_sp_seqs] = page_ids * block_size + offset_in_block
+        context.slot_mapping[:num_seqs] = page_ids * block_size + offset_in_block
 
         return input_ids, positions
 
@@ -878,18 +774,17 @@ class ModelRunner:
             context = get_context()
             master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
 
-            ac_bs = context.attention_compute_bs
-            if ac_bs is None:
-                ac_bs = bs
+            # Without SP, attention_compute_bs == bs
+            attn_bs = bs
             valid_attn_bs_list = self.graph_map.get(master_bs)
             if valid_attn_bs_list is None:
                 raise RuntimeError(f"No graph map found for master_bs={master_bs}")
 
             try:
-                attn_bs = next(x for x in valid_attn_bs_list if x >= ac_bs)
+                attn_bs = next(x for x in valid_attn_bs_list if x >= attn_bs)
             except StopIteration:
                 raise RuntimeError(
-                    f"Input attention_compute_bs {ac_bs} exceeds max captured attn_bs "
+                    f"Input bs {bs} exceeds max captured attn_bs "
                     f"({valid_attn_bs_list[-1]}) for master_bs {master_bs}"
                 )
 
@@ -901,13 +796,7 @@ class ModelRunner:
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping  # type: ignore
             graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"].copy_(context.context_lens)  # type: ignore
-            graph_vars["global_context_lens"].zero_()
-            graph_vars["global_context_lens"].copy_(context.global_context_lens)  # type: ignore
-            graph_vars["q_mask"].zero_()
-            graph_vars["q_mask"].copy_(context.q_mask)  # type: ignore
-            graph_vars["res_lse_mask"].zero_()
-            graph_vars["res_lse_mask"].copy_(context.res_lse_mask)  # type: ignore
+            graph_vars["context_lens"][: context.context_lens.shape[0]].copy_(context.context_lens)  # type: ignore
             graph_vars["block_tables"].zero_()
             graph_vars["block_tables"][
                 : context.block_tables.size(0), : context.block_tables.size(1)  # type: ignore
@@ -921,33 +810,6 @@ class ModelRunner:
                 graph_vars["num_splits"].zero_()
                 graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
                 graph_vars["num_splits"][: context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
-
-            graph_vars["context_lens_for_attn"].zero_()
-            graph_vars["context_lens_for_attn"][: context.context_lens_for_attn.shape[0]].copy_(context.context_lens_for_attn)  # type: ignore
-
-            graph_vars["q_slice_get"].fill_(-1)
-            graph_vars["q_slice_fill"].fill_(-1)
-            graph_vars["q_copy_mask"].zero_()
-            graph_vars["q_slice_get"][: context.q_slice_get.shape[0]] = context.q_slice_get  # type: ignore
-            graph_vars["q_slice_fill"][: context.q_slice_fill.shape[0]] = context.q_slice_fill  # type: ignore
-            graph_vars["q_copy_mask"][: context.q_copy_mask.shape[0]] = context.q_copy_mask  # type: ignore
-
-            graph_vars["res_slice_get_to_buffer_output"].fill_(-1)
-            graph_vars["res_slice_fill_to_buffer_output"].fill_(-1)
-            graph_vars["res_to_buffer_output_mask"].zero_()
-            graph_vars["res_slice_get_to_buffer_output"][: context.res_slice_get_to_buffer_output.shape[0]] = context.res_slice_get_to_buffer_output  # type: ignore
-            graph_vars["res_slice_fill_to_buffer_output"][: context.res_slice_fill_to_buffer_output.shape[0]] = context.res_slice_fill_to_buffer_output  # type: ignore
-            graph_vars["res_to_buffer_output_mask"][: context.res_to_buffer_output_mask.shape[0]] = context.res_to_buffer_output_mask  # type: ignore
-
-            graph_vars["res_slice_get_to_buffer_input"].fill_(-1)
-            graph_vars["res_slice_fill_to_buffer_input"].fill_(-1)
-            graph_vars["res_to_buffer_input_mask"].zero_()
-            graph_vars["res_slice_get_to_buffer_input"][: context.res_slice_get_to_buffer_input.shape[0]].copy_(context.res_slice_get_to_buffer_input)  # type: ignore
-            graph_vars["res_slice_fill_to_buffer_input"][: context.res_slice_fill_to_buffer_input.shape[0]].copy_(context.res_slice_fill_to_buffer_input)  # type: ignore
-            graph_vars["res_to_buffer_input_mask"][: context.res_to_buffer_input_mask.shape[0]].copy_(context.res_to_buffer_input_mask)  # type: ignore
-
-            graph_vars["q_offsets"].zero_()
-            graph_vars["q_offsets"].copy_(context.q_offsets)  # type: ignore
 
             if graph_vars.get("gdn_state_slots") is not None:
                 dummy_gdn_slot = get_cache_context().gdn_conv_states.shape[1] - 1
@@ -965,15 +827,12 @@ class ModelRunner:
     @torch.inference_mode()
     def run_from_bytes(self, data: bytes, is_prefill: bool) -> list[list[int]]:
         """Run model from lean RunBatchInput bytes (completely Sequence-free)."""
-        sp_rank = get_dist_context().attn_sp_rank
-        sp_size = get_dist_context().attn_sp_world_size
-
-        # Extract auxiliary data (temperatures, state_slots, master_sp_indices)
-        aux = extract_aux_from_bytes(data, sp_rank)
-        num_sp_seqs = aux.num_sp_seqs
+        # Extract auxiliary data (temperatures, state_slots)
+        aux = extract_aux_from_bytes(data, 0)
+        num_seqs = aux.num_sp_seqs
 
         is_dummy = False
-        if num_sp_seqs == 0:
+        if num_seqs == 0:
             is_dummy = True
             # Create a minimal dummy RunBatchInput with one dummy sequence
             from nanodeploy._cpp import SamplingParams, Sequence as _Seq
@@ -981,14 +840,14 @@ class ModelRunner:
             dummy_seq = _Seq([0], SamplingParams())
             dummy_seq.block_ctx().reset(
                 self.engine_id,
-                sp_size,
+                1,
                 1,
                 get_cache_context().num_local_kvcache_blocks,
             )
-            dummy_seq.block_ctx().master_sp_idx = sp_rank
+            dummy_seq.block_ctx().master_sp_idx = 0
             data = serialize_run_batch([dummy_seq], is_prefill)
-            aux = extract_aux_from_bytes(data, sp_rank)
-            num_sp_seqs = aux.num_sp_seqs
+            aux = extract_aux_from_bytes(data, 0)
+            num_seqs = aux.num_sp_seqs
 
         loop_count = self.config.loop_count if not is_prefill else 1
         for i in range(loop_count):
@@ -1013,20 +872,20 @@ class ModelRunner:
                     )
                 else:
                     input_ids, positions = self.update_decode_inplace(
-                        input_ids, positions, num_sp_seqs
+                        input_ids, positions, num_seqs
                     )
 
             if input_ids.numel() == 0:
                 logger.critical(
                     "EMPTY input_ids before run_model! rank=%s is_prefill=%s "
                     "is_dummy=%s input_ids.shape=%s positions.shape=%s "
-                    "num_sp_seqs=%s",
+                    "num_seqs=%s",
                     self.rank,
                     is_prefill,
                     is_dummy,
                     input_ids.shape,
                     positions.shape,
-                    num_sp_seqs,
+                    num_seqs,
                 )
             logits = self.run_model(input_ids, positions, is_prefill)
 
@@ -1043,12 +902,12 @@ class ModelRunner:
                     # Sample only final-chunk sequences, then scatter into full output.
                     temps_filtered = temperatures[context.sampling_seq_indices]
                     sampled = self.sampler(logits, temps_filtered)
-                    input_ids = input_ids.new_zeros(num_sp_seqs)
+                    input_ids = input_ids.new_zeros(num_seqs)
                     input_ids[context.sampling_seq_indices] = sampled
                 else:
                     input_ids = self.sampler(logits, temperatures)
             else:
-                input_ids = input_ids.new_zeros([num_sp_seqs])
+                input_ids = input_ids.new_zeros([num_seqs])
             dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
 
             # No update_seqs_inner_loop needed — metadata already updated in-place
@@ -1073,43 +932,19 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
-        sp_world_size = get_dist_context().attn_sp_world_size
         config = self.config
         hf_config = config.hf_config
         hf_config.max_position_embeddings = max(
             config.max_model_len, hf_config.max_position_embeddings
         )
         max_bs = min(self.config.max_num_seqs, 512)
-        max_attention_comp_seqs = max_bs + config.max_num_recv_seqs
         block_size = get_cache_context().block_size
         max_num_blocks = (config.max_model_len + block_size - 1) // block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens_for_attn = torch.zeros(max_attention_comp_seqs, dtype=torch.int32)
-        context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
-        global_context_lens = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
-        q_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
-        res_lse_mask = torch.zeros(sp_world_size, max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(
-            max_attention_comp_seqs, max_num_blocks, dtype=torch.int32
-        )
-        q_slice_get = torch.full((max_bs,), -1, dtype=torch.int32)
-        q_slice_fill = torch.full((max_bs,), -1, dtype=torch.int32)
-        q_copy_mask = torch.zeros(max_bs, dtype=torch.int32)
-        res_slice_get_to_buffer_output = torch.full((max_bs,), -1, dtype=torch.int32)
-        res_slice_fill_to_buffer_output = torch.full((max_bs,), -1, dtype=torch.int32)
-        res_to_buffer_output_mask = torch.zeros(max_bs, dtype=torch.int32)
-        res_slice_get_to_buffer_input = torch.full(
-            (config.max_num_recv_seqs,), -1, dtype=torch.int32
-        )
-        res_slice_fill_to_buffer_input = torch.full(
-            (config.max_num_recv_seqs,), -1, dtype=torch.int32
-        )
-        res_to_buffer_input_mask = torch.zeros(
-            config.max_num_recv_seqs, dtype=torch.int32
-        )
-        q_offsets = torch.zeros(sp_world_size + 1, dtype=torch.int32)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
@@ -1117,9 +952,7 @@ class ModelRunner:
             mla_num_kv_heads = 1
             tile_scheduler_metadata_buffer, num_splits_buffer = (
                 flash_mla.get_mla_metadata(
-                    torch.ones(
-                        max_attention_comp_seqs, dtype=torch.int32, device="cuda"
-                    ),
+                    torch.ones(max_bs, dtype=torch.int32, device="cuda"),
                     hf_config.num_attention_heads // mla_num_kv_heads,
                     mla_num_kv_heads,
                 )
@@ -1143,86 +976,55 @@ class ModelRunner:
         self.graph_pool = None
         self.graph_map = {}  # store master_bs -> [available_attn_bs...]
 
-        self.attn_bs_step = 16  # 定义 attn_bs 的步长
+        self.attn_bs_step = 16
 
-        total_graphs = 0
-
-        logger.info(f"开始捕获 CUDAGraph...")
+        logger.info(f"Capturing CUDAGraphs...")
         completed_graphs = 0
 
         for master_bs in reversed(self.graph_master_rank_bs):
-            self.graph_map[master_bs] = []
+            # Without SP, attn_bs == master_bs (no recv seqs from other SP ranks)
+            attn_bs = master_bs
+            self.graph_map[master_bs] = [attn_bs]
 
-            current_attn_bs_candidates = []
-            curr = master_bs
-            limit = master_bs + config.max_num_recv_seqs
-            while curr <= limit:
-                current_attn_bs_candidates.append(curr)
-                curr += self.attn_bs_step
+            completed_graphs += 1
+            logger.info(f"Capturing graph - (master_bs={master_bs}, attn_bs={attn_bs})")
+            graph = torch.cuda.CUDAGraph()
+            set_context(
+                is_prefill=False,
+                max_bs=self.config.max_num_seqs,
+                slot_mapping=slot_mapping[:master_bs],
+                context_lens=context_lens,
+                block_tables=block_tables,
+                tile_scheduler_metadata=tile_scheduler_metadata_buffer,
+                num_splits=num_splits_buffer,
+                gdn_conv_states=_cache_ctx.gdn_conv_states,
+                gdn_recurrent_states=_cache_ctx.gdn_recurrent_states,
+                gdn_state_slots=(
+                    gdn_state_slots_buf[:master_bs]
+                    if gdn_state_slots_buf is not None
+                    else None
+                ),
+            )
 
-            for attn_bs in reversed(current_attn_bs_candidates):
+            outputs[:master_bs] = self.model(
+                input_ids[:master_bs], positions[:master_bs]
+            )  # warmup
 
-                completed_graphs += 1
-                logger.info(f"正在捕获图 - (master_bs={master_bs}, attn_bs={attn_bs})")
-                graph = torch.cuda.CUDAGraph()
-                set_context(
-                    is_prefill=False,
-                    max_bs=self.config.max_num_seqs,
-                    slot_mapping=slot_mapping[:master_bs],
-                    context_lens=context_lens,
-                    block_tables=block_tables,
-                    global_context_lens=global_context_lens,
-                    q_mask=q_mask,
-                    res_lse_mask=res_lse_mask,
-                    q_slice_get=q_slice_get[:master_bs],
-                    q_slice_fill=q_slice_fill[:master_bs],
-                    q_copy_mask=q_copy_mask[:master_bs],
-                    res_slice_get_to_buffer_output=res_slice_get_to_buffer_output[
-                        :master_bs
-                    ],
-                    res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output[
-                        :master_bs
-                    ],
-                    res_to_buffer_output_mask=res_to_buffer_output_mask[:master_bs],
-                    res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
-                    res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
-                    res_to_buffer_input_mask=res_to_buffer_input_mask,
-                    attention_compute_bs=attn_bs,
-                    context_lens_for_attn=context_lens_for_attn,
-                    q_offsets=q_offsets,
-                    tile_scheduler_metadata=tile_scheduler_metadata_buffer,
-                    num_splits=num_splits_buffer,
-                    gdn_conv_states=_cache_ctx.gdn_conv_states,
-                    gdn_recurrent_states=_cache_ctx.gdn_recurrent_states,
-                    gdn_state_slots=(
-                        gdn_state_slots_buf[:master_bs]
-                        if gdn_state_slots_buf is not None
-                        else None
-                    ),
-                )
-
+            with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:master_bs] = self.model(
                     input_ids[:master_bs], positions[:master_bs]
-                )  # warmup
+                )  # capture
 
-                with torch.cuda.graph(graph, self.graph_pool):
-                    outputs[:master_bs] = self.model(
-                        input_ids[:master_bs], positions[:master_bs]
-                    )  # capture
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
 
-                if self.graph_pool is None:
-                    self.graph_pool = graph.pool()
+            self.graphs[(master_bs, attn_bs)] = graph
 
-                self.graphs[(master_bs, attn_bs)] = graph
-                self.graph_map[master_bs].append(attn_bs)
+            torch.cuda.synchronize()
+            dist.barrier(group=get_dist_context().cuda_world_group)
+            reset_context()
 
-                torch.cuda.synchronize()
-                dist.barrier(group=get_dist_context().cuda_world_group)
-                reset_context()
-
-            self.graph_map[master_bs].sort()
-
-        logger.info(f"完成所有 graph 的捕获，成功捕获 {len(self.graphs)} 个图")
+        logger.info(f"Finished capturing {len(self.graphs)} CUDAGraphs")
 
         self.graph_vars = dict(
             input_ids=input_ids,
@@ -1230,22 +1032,8 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
-            global_context_lens=global_context_lens,
             outputs=outputs,
-            q_mask=q_mask,
-            res_lse_mask=res_lse_mask,
             tile_scheduler_metadata=tile_scheduler_metadata_buffer,
             num_splits=num_splits_buffer,
-            context_lens_for_attn=context_lens_for_attn,
-            q_slice_get=q_slice_get,
-            q_slice_fill=q_slice_fill,
-            q_copy_mask=q_copy_mask,
-            res_slice_get_to_buffer_output=res_slice_get_to_buffer_output,
-            res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output,
-            res_to_buffer_output_mask=res_to_buffer_output_mask,
-            res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
-            res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
-            res_to_buffer_input_mask=res_to_buffer_input_mask,
-            q_offsets=q_offsets,
             gdn_state_slots=gdn_state_slots_buf,
         )

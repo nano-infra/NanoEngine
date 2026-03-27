@@ -15,7 +15,7 @@ class Sequence;
 
 class GDNStateManager {
 public:
-    GDNStateManager(const std::string& engine_id, int sp_idx, int num_slots);
+    GDNStateManager(const std::string& engine_id, int group_id, int num_slots);
 
     // State slot allocation and deallocation
     bool can_allocate() const;
@@ -37,7 +37,7 @@ private:
     void deallocate_slot(int slot_id);
 
     std::string engine_id_;
-    int         sp_idx_;
+    int         group_id_;
     int         num_slots_;
 
     std::list<int>                        free_slots_;

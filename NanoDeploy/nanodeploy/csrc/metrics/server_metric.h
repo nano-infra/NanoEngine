@@ -26,8 +26,8 @@ public:
     void record_decode_throughput(long long num_tokens, double duration);
 
     void update_token_usage(int dp_idx, long long num_tokens);
-    void update_sp_stats(const std::vector<std::vector<int>>& sp_send_counts,
-                         const std::vector<std::vector<int>>& sp_recv_counts);
+    void update_group_stats(const std::vector<std::vector<int>>& group_send_counts,
+                            const std::vector<std::vector<int>>& group_recv_counts);
 
     // Properties (Getters)
     std::optional<double> avg_prefill_throughput() const;
@@ -56,9 +56,9 @@ public:
 
     std::vector<double>                prefill_throughput_samples;
     std::vector<double>                decode_throughput_samples;
-    std::unordered_map<int, long long> token_usage_by_dp;       // dp_idx -> count
-    std::unordered_map<int, long long> sp_send_request_counts;  // sp_idx -> count
-    std::unordered_map<int, long long> sp_recv_request_counts;  // sp_idx -> count
+    std::unordered_map<int, long long> token_usage_by_dp;          // dp_idx -> count
+    std::unordered_map<int, long long> group_send_request_counts;  // group_id -> count
+    std::unordered_map<int, long long> group_recv_request_counts;  // group_id -> count
 
     double start_time;
 

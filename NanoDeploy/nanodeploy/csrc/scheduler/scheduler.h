@@ -10,7 +10,7 @@
 
 #include "nanodeploy/csrc/sequence/sequence.h"
 
-#include "sp_state_manager.h"
+#include "group_manager.h"
 #include "thread_pool.h"
 
 namespace nanodeploy {
@@ -30,7 +30,7 @@ struct PostprocessResult {
 // Result of a single scheduling step.
 // This struct is returned by `schedule()` and summarizes which sequences
 // should be executed on each data-parallel (DP) worker (and, if applicable,
-// on each sequence-parallel (SP) shard) for the current iteration.
+// on each group shard) for the current iteration.
 struct ScheduleResult {
     // Sequences scheduled per DP worker for this step.
     // Outer index: DP worker index.
@@ -40,38 +40,38 @@ struct ScheduleResult {
     // Sequences laid out per (DP, SP) shard for this step.
     // Outer index: DP worker index.
     // Inner vector: sequences assigned to that DP worker after applying
-    // sequence-parallel (SP) partitioning / layout.
-    std::vector<std::vector<std::shared_ptr<Sequence>>> dp_sp_seqs;
+    // group partitioning / layout.
+    std::vector<std::vector<std::shared_ptr<Sequence>>> dp_group_seqs;
 
-    // Filtered subset of `dp_sp_seqs` that will actually be executed in this
+    // Filtered subset of `dp_group_seqs` that will actually be executed in this
     // iteration (for example, after removing finished / paused sequences or
     // enforcing per-step limits on tokens or sequences).
-    // Same indexing convention as `dp_sp_seqs`.
-    std::vector<std::vector<std::shared_ptr<Sequence>>> filtered_dp_sp_seqs;
+    // Same indexing convention as `dp_group_seqs`.
+    std::vector<std::vector<std::shared_ptr<Sequence>>> filtered_dp_group_seqs;
 
     // Indicates whether this scheduling step is a prefill step (true) or a
     // decode step (false). Callers can use this to select the appropriate
     // execution path.
     bool is_prefill;
 
-    // SP counts
-    std::vector<std::vector<int>> sp_send_counts;
-    std::vector<std::vector<int>> sp_recv_counts;
+    // Group counts
+    std::vector<std::vector<int>> group_send_counts;
+    std::vector<std::vector<int>> group_recv_counts;
 
-    // Matrix of SP communication counts.
-    // Dimensions: [dp_idx][master_sp_rank][participant_sp_rank]
-    // Value: Number of requests sent from master_sp_rank to participant_sp_rank.
-    // std::vector<std::vector<std::vector<int>>> sp_comm_matrix;
+    // Matrix of Group communication counts.
+    // Dimensions: [dp_idx][master_group][participant_group]
+    // Value: Number of requests sent from master_group to participant_group.
+    // std::vector<std::vector<std::vector<int>>> group_comm_matrix;
 
     // Matrix of Q communication counts (Master -> Participant).
-    // Dimensions: [dp_idx][master_sp_rank][participant_sp_rank]
-    // Value: Number of Q requests sent from master_sp_rank to participant_sp_rank.
-    std::vector<std::vector<std::vector<int>>> sp_q_matrix;
+    // Dimensions: [dp_idx][master_group][participant_group]
+    // Value: Number of Q requests sent from master_group to participant_group.
+    std::vector<std::vector<std::vector<int>>> group_q_matrix;
 
     // Matrix of Res communication counts (Participant -> Master).
-    // Dimensions: [dp_idx][participant_sp_rank][master_sp_rank]
-    // Value: Number of Res requests sent from participant_sp_rank to master_sp_rank.
-    // std::vector<std::vector<std::vector<int>>> sp_res_matrix;
+    // Dimensions: [dp_idx][participant_group][master_group]
+    // Value: Number of Res requests sent from participant_group to master_group.
+    // std::vector<std::vector<std::vector<int>>> group_res_matrix;
 
     // Metrics for waiting queue blocks
     int waiting_head_blocks  = 0;
@@ -87,7 +87,7 @@ public:
               int                max_model_len,
               int                eos,
               int                attention_dp,
-              int                attention_sp,
+              int                group_size,
               int                num_kvcache_blocks,
               int                kvcache_block_size,
               const std::string& mode);
@@ -99,8 +99,8 @@ public:
     ScheduleResult schedule();
 
     // Postprocessing
-    void postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
-                     const std::vector<std::vector<std::vector<int>>>&          dp_sp_token_ids,
+    void postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_group_seqs,
+                     const std::vector<std::vector<std::vector<int>>>&          dp_group_token_ids,
                      bool                                                       update_metrics = true);
 
     // State queries
@@ -130,12 +130,12 @@ public:
     int eos_;
 
     int attention_dp_;
-    int attention_sp_;
+    int group_size_;
 
     std::deque<std::shared_ptr<Sequence>>                              waiting;
     std::deque<std::shared_ptr<Sequence>>                              waiting_migration;
     std::deque<std::shared_ptr<Sequence>>                              prefilling;  // mid-prompt sequences
-    std::vector<std::shared_ptr<SPStateManager>>                       worker_state;
+    std::vector<std::shared_ptr<GroupManager>>                         worker_state;
     std::unordered_map<int, std::pair<std::shared_ptr<Sequence>, int>> to_be_migrated;
 
     // Configuration
@@ -153,7 +153,7 @@ private:
     struct PostprocessTask {
         std::shared_ptr<Sequence> seq;
         const std::vector<int>*   tokens;
-        int                       sp_idx;
+        int                       group_id;
     };
 
     struct PostprocessWorkerContext {
@@ -169,17 +169,18 @@ private:
     };
 
     // Postprocessing internal methods
-    static void postprocess_worker_func(std::shared_ptr<SPStateManager> state_manager,
+    static void postprocess_worker_func(std::shared_ptr<GroupManager>   state_manager,
                                         const PostprocessWorkerContext* ctx,
                                         PostprocessWorkerContext*       result_ctx,
                                         int                             eos_id,
                                         bool                            is_prefill,
                                         bool                            update_metrics);
 
-    PostprocessResult postprocess_sequences_impl(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
-                                                 const std::vector<std::vector<std::vector<int>>>& dp_sp_token_ids,
-                                                 bool                                              is_prefill,
-                                                 bool                                              update_metrics);
+    PostprocessResult
+    postprocess_sequences_impl(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_group_seqs,
+                               const std::vector<std::vector<std::vector<int>>>&          dp_group_token_ids,
+                               bool                                                       is_prefill,
+                               bool                                                       update_metrics);
 
     // Configuration
     int max_model_len_;

@@ -20,17 +20,17 @@ table VisionSlotRef {
 }
 
 table SequenceInput {
-  master_sp_idx: int;
+  master_group_id: int;
   num_tokens: int;
-  num_cached_tokens: int;        // prefill only
-  num_prompt_tokens: int;        // prefill only: original full prompt length (for chunk detection)
-  last_token: int;               // decode only
-  token_ids: [int];              // prefill only (uncached portion)
-  sp_block_table: [IntListI];    // block tables per sp rank
-  num_dispatched_tokens: [int];  // context lengths per sp rank
-  state_slot: int = -1;          // GDN state slot
-  temperature: double = 1.0;     // sampling temperature
-  vision_slots: [VisionSlotRef]; // vision embedding refs (prefill only, EP mode)
+  num_cached_tokens: int;            // prefill only
+  num_prompt_tokens: int;            // prefill only: original full prompt length (for chunk detection)
+  last_token: int;                   // decode only
+  token_ids: [int];                  // prefill only (uncached portion)
+  group_block_table: [IntListI];     // block tables per group
+  num_dispatched_tokens: [int];      // context lengths per group
+  state_slot: int = -1;              // GDN state slot
+  temperature: double = 1.0;         // sampling temperature
+  vision_slots: [VisionSlotRef];     // vision embedding refs (prefill only, EP mode)
 }
 
 table RunBatchInput {
@@ -41,7 +41,7 @@ table RunBatchInput {
 // ========== Migrate Protocol ==========
 
 struct BlockLocationPair {
-  sp_idx: int;
+  group_id: int;
   block_idx: int;
 }
 
@@ -50,7 +50,7 @@ table MigrateSequenceInput {
   // MIGRATE slot fields
   migrate_engine_id: string;
   migrate_num_kvcache_blocks: int;
-  migrate_attention_sp: int;
+  migrate_group_size: int;
   migrate_dp_idx: int;
   migrate_block_location: [BlockLocationPair];
   migrate_state_slot: int = -1;

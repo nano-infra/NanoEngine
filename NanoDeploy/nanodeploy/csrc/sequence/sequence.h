@@ -34,9 +34,9 @@ using BlockContext = fbs::BlockContextT;
 
 // Free functions for BlockContext operations
 std::unique_ptr<BlockContext>
-     make_block_context(const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks);
+     make_block_context(const std::string& engine_id, int group_size, int attention_dp, int num_kvcache_blocks);
 void reset_block_context(
-    BlockContext& ctx, const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks);
+    BlockContext& ctx, const std::string& engine_id, int group_size, int attention_dp, int num_kvcache_blocks);
 
 // Use flatbuffer generated types
 using SequenceT       = fbs::SequenceT;
@@ -57,11 +57,11 @@ public:
     static std::shared_ptr<Sequence> from_data(std::unique_ptr<SequenceT> data);
 
     // Jumping
-    int32_t active(const std::string& engine_id, int attention_sp, int attention_dp, int num_kvcache_blocks)
+    int32_t active(const std::string& engine_id, int group_size, int attention_dp, int num_kvcache_blocks)
     {
         ensure_slot(BlockContextSlot::ACTIVE);
         reset_block_context(
-            *get_slot(BlockContextSlot::ACTIVE), engine_id, attention_sp, attention_dp, num_kvcache_blocks);
+            *get_slot(BlockContextSlot::ACTIVE), engine_id, group_size, attention_dp, num_kvcache_blocks);
         return 0;
     }
 
@@ -95,28 +95,28 @@ public:
         return *get_slot(BlockContextSlot::MIGRATE);
     }
 
-    int context_len(BlockContextSlot slot = BlockContextSlot::ACTIVE, std::optional<int> sp_idx = std::nullopt);
+    int context_len(BlockContextSlot slot = BlockContextSlot::ACTIVE, std::optional<int> group_id = std::nullopt);
 
     void append_token(int                token_id,
-                      BlockContextSlot   slot   = BlockContextSlot::ACTIVE,
-                      std::optional<int> sp_idx = std::nullopt);
+                      BlockContextSlot   slot     = BlockContextSlot::ACTIVE,
+                      std::optional<int> group_id = std::nullopt);
 
     // Block related methods
-    int num_blocks(BlockContextSlot slot, int sp_idx);
-    int last_block_page_id(BlockContextSlot slot, int sp_idx);
-    int last_block_num_tokens(BlockContextSlot slot, int sp_idx);
+    int num_blocks(BlockContextSlot slot, int group_id);
+    int last_block_page_id(BlockContextSlot slot, int group_id);
+    int last_block_num_tokens(BlockContextSlot slot, int group_id);
     // Returns a pointer/size view into the internal token storage for block `i`.
     // The returned pointer is valid only as long as the underlying storage is not
     // modified in a way that can reallocate or invalidate the buffer (e.g., appending
     // tokens to the same sequence). Callers MUST NOT store this pointer beyond the
     // duration in which they can guarantee no such modifications occur.
-    std::pair<const int*, size_t> block_view(int i, BlockContextSlot slot, int sp_idx) const;
-    std::vector<int>              block(int i, BlockContextSlot slot, int sp_idx);
+    std::pair<const int*, size_t> block_view(int i, BlockContextSlot slot, int group_id) const;
+    std::vector<int>              block(int i, BlockContextSlot slot, int group_id);
 
     // Accessors
     BlockContext&       block_ctx(BlockContextSlot slot = BlockContextSlot::ACTIVE);
     const BlockContext& block_ctx(BlockContextSlot slot = BlockContextSlot::ACTIVE) const;
-    std::vector<int>&   block_table(BlockContextSlot slot = BlockContextSlot::ACTIVE, int sp_idx = 0);
+    std::vector<int>&   block_table(BlockContextSlot slot = BlockContextSlot::ACTIVE, int group_id = 0);
 
     int dp_idx(BlockContextSlot slot);
 

@@ -1,5 +1,4 @@
-#include "nanodeploy/csrc/scheduler/sp_state_manager.h"
-#include "opaque_types.h"
+#include "nanodeploy/csrc/scheduler/group_manager.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
@@ -11,7 +10,7 @@ using namespace nanodeploy;
 PYBIND11_MAKE_OPAQUE(std::unordered_map<int, std::shared_ptr<BlockManager>>);
 PYBIND11_MAKE_OPAQUE(std::deque<std::shared_ptr<Sequence>>);
 
-void bind_sp_state_manager(py::module_& m)
+void bind_group_manager(py::module_& m)
 {
     // Bind RoutingStrategy
     py::enum_<RoutingStrategy>(m, "RoutingStrategy")
@@ -99,32 +98,32 @@ void bind_sp_state_manager(py::module_& m)
             [](std::deque<std::shared_ptr<Sequence>>& d) { return py::make_iterator(d.begin(), d.end()); },
             py::keep_alive<0, 1>());
 
-    // Bind SPStateManager
-    py::class_<SPStateManager, std::shared_ptr<SPStateManager>>(m, "SPStateManager")
+    // Bind GroupManager
+    py::class_<GroupManager, std::shared_ptr<GroupManager>>(m, "GroupManager")
         .def(py::init<const std::string&, int, int, int, int, int>(),
              py::arg("engine_id"),
-             py::arg("attention_sp"),
+             py::arg("group_size"),
              py::arg("num_kvcache_blocks"),
              py::arg("kvcache_block_size"),
              py::arg("max_num_seqs"),
              py::arg("max_num_batched_tokens"))
 
-        .def_property_readonly("is_empty", &SPStateManager::is_empty)
+        .def_property_readonly("is_empty", &GroupManager::is_empty)
 
-        .def("can_append", &SPStateManager::can_append, py::arg("seq"), py::arg("num_tokens") = 1)
-        .def("may_append", &SPStateManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)
+        .def("can_append", &GroupManager::can_append, py::arg("seq"), py::arg("num_tokens") = 1)
+        .def("may_append", &GroupManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)
 
         .def("can_allocate",
-             &SPStateManager::can_allocate,
+             &GroupManager::can_allocate,
              py::arg("seq"),
              py::arg("num_seqs"),
              py::arg("num_batched_tokens"))
 
-        .def("allocate", &SPStateManager::allocate, py::arg("seq"))
-        .def("deallocate", &SPStateManager::deallocate, py::arg("seq"), py::arg("slot"))
+        .def("allocate", &GroupManager::allocate, py::arg("seq"))
+        .def("deallocate", &GroupManager::deallocate, py::arg("seq"), py::arg("slot"))
 
-        .def_readwrite("block_manager", &SPStateManager::block_manager)
-        .def_readwrite("running", &SPStateManager::running)
-        .def_readwrite("dummy_seqs", &SPStateManager::dummy_seqs)
-        .def_readwrite("routing_strategy", &SPStateManager::routing_strategy);
+        .def_readwrite("block_manager", &GroupManager::block_manager)
+        .def_readwrite("running", &GroupManager::running)
+        .def_readwrite("dummy_seqs", &GroupManager::dummy_seqs)
+        .def_readwrite("routing_strategy", &GroupManager::routing_strategy);
 }

@@ -24,16 +24,16 @@ struct AllocResult {
     int new_tokens;  // budget consumed (= chunk_end - num_cached_tokens)
 };
 
-class SPStateManager {
+class GroupManager {
 public:
     static constexpr int segment_size = 256;
 
-    SPStateManager(const std::string& engine_id,
-                   int                attention_sp,
-                   int                num_kvcache_blocks,
-                   int                kvcache_block_size,
-                   int                max_num_seqs,
-                   int                max_num_batched_tokens);
+    GroupManager(const std::string& engine_id,
+                 int                group_size,
+                 int                num_kvcache_blocks,
+                 int                kvcache_block_size,
+                 int                max_num_seqs,
+                 int                max_num_batched_tokens);
 
     // State queries
     bool is_empty() const
@@ -48,10 +48,10 @@ public:
     // Allocation logic
     // num_seqs and num_batched_tokens are maps from dp_idx to count/tokens
     // But wait, in Python:
-    // num_seqs: dict[int, int] -> maps master_sp_rank to count?
+    // num_seqs: dict[int, int] -> maps master_group to count?
     // Let's check Python code:
-    // num_seqs[selected_dp_idx][block_ctx.master_sp_idx] += 1
-    // So passed to can_allocate is num_seqs[selected_dp_idx], which is dict[int, int] (sp_idx -> count)
+    // num_seqs[selected_dp_idx][block_ctx.master_group_id] += 1
+    // So passed to can_allocate is num_seqs[selected_dp_idx], which is dict[int, int] (group_id -> count)
     bool can_allocate(Sequence&                           seq,
                       const std::unordered_map<int, int>& num_seqs,
                       const std::unordered_map<int, int>& num_batched_tokens);
@@ -62,7 +62,7 @@ public:
     // Atomic budget-check + full-prompt allocation + chunk computation.
     // Internally: saves/restores num_tokens, sets full_len for block allocation,
     // computes chunk boundary from prefix hits + budget, restricts dispatch for
-    // chunked sequences to master SP rank.
+    // chunked sequences to master group.
     // On success: blocks allocated for full prompt, num_tokens = chunk_end,
     //             returns {chunk_end, new_tokens}.
     // On failure: num_tokens restored, no side effects, returns nullopt.
@@ -73,8 +73,8 @@ public:
     // Load tracking
     /// \brief Returns the total number of sequences currently running on this engine.
     ///
-    /// This aggregates the number of active sequences across all sequence-parallel
-    /// (SP) partitions managed by this SPStateManager.
+    /// This aggregates the number of active sequences across all block group
+    /// (block group) partitions managed by this GroupManager.
     ///
     /// \note This class does not provide internal synchronization. Callers must
     ///       ensure external synchronization if accessed from multiple threads.
@@ -95,59 +95,59 @@ public:
         return num_running_tokens_;
     }
 
-    /// \brief Returns the number of running sequences assigned to a given SP index.
+    /// \brief Returns the number of running sequences assigned to a given group index.
     ///
-    /// \param sp_idx The zero-based sequence-parallel index for which to query
+    /// \param group_id The zero-based block group index for which to query
     ///               the number of running sequences.
-    /// \return The number of currently running sequences mapped to \p sp_idx.
+    /// \return The number of currently running sequences mapped to \p group_id.
     ///
-    /// \warning No bounds checking is performed on \p sp_idx; callers must ensure
-    ///          that it is within the valid range of SP indices for this engine.
+    /// \warning No bounds checking is performed on \p group_id; callers must ensure
+    ///          that it is within the valid range of group indices for this engine.
     /// \note This class does not provide internal synchronization. Callers must
     ///       ensure external synchronization if accessed from multiple threads.
-    int num_running_seqs_per_sp(int sp_idx) const
+    int num_running_seqs_per_group(int group_id) const
     {
-        return num_running_seqs_per_sp_[sp_idx];
+        return num_running_seqs_per_group_[group_id];
     }
 
-    /// \brief Returns the number of running tokens assigned to a given SP index.
+    /// \brief Returns the number of running tokens assigned to a given group index.
     ///
-    /// \param sp_idx The zero-based sequence-parallel index for which to query
+    /// \param group_id The zero-based block group index for which to query
     ///               the number of running tokens.
-    /// \return The number of tokens currently being processed on \p sp_idx.
+    /// \return The number of tokens currently being processed on \p group_id.
     ///
-    /// \warning No bounds checking is performed on \p sp_idx; callers must ensure
-    ///          that it is within the valid range of SP indices for this engine.
+    /// \warning No bounds checking is performed on \p group_id; callers must ensure
+    ///          that it is within the valid range of group indices for this engine.
     /// \note This class does not provide internal synchronization. Callers must
     ///       ensure external synchronization if accessed from multiple threads.
-    int num_running_tokens_per_sp(int sp_idx) const
+    int num_running_tokens_per_group(int group_id) const
     {
-        return num_running_tokens_per_sp_[sp_idx];
+        return num_running_tokens_per_group_[group_id];
     }
 
     // WARNING: This method modifies shared state without thread safety protection.
     // If called concurrently from multiple threads (e.g., in worker_func),
     // this will cause race conditions on the counters.
 
-    /// \brief Adjusts the number of running tokens for a given SP index.
+    /// \brief Adjusts the number of running tokens for a given group index.
     ///
-    /// This updates both the global running-token count and the per-SP running
-    /// token count for the specified \p sp_idx.
+    /// This updates both the global running-token count and the per-group running
+    /// token count for the specified \p group_id.
     ///
-    /// \param sp_idx The zero-based sequence-parallel index whose token count
+    /// \param group_id The zero-based block group index whose token count
     ///               should be updated.
     /// \param count  The number of tokens to add. Implementations may pass a
     ///               negative value to decrement the counters when tokens are
     ///               completed or removed.
     ///
-    /// \warning No bounds checking is performed on \p sp_idx; callers must ensure
-    ///          that it is within the valid range of SP indices for this engine.
+    /// \warning No bounds checking is performed on \p group_id; callers must ensure
+    ///          that it is within the valid range of group indices for this engine.
     /// \note This class does not provide internal synchronization. Callers must
     ///       ensure external synchronization if accessed from multiple threads.
-    void add_running_tokens(int sp_idx, int count)
+    void add_running_tokens(int group_id, int count)
     {
         num_running_tokens_ += count;
-        num_running_tokens_per_sp_[sp_idx] += count;
+        num_running_tokens_per_group_[group_id] += count;
     }
 
     std::unordered_map<int, std::shared_ptr<BlockManager>> block_manager;
@@ -161,23 +161,23 @@ public:
 
 private:
     void initialize_dummy_seqs();
-    int  next_sp_idx();  // Round-robin counter
+    int  next_group_id();  // Round-robin counter
 
     std::string engine_id_;
-    int         attention_sp_;
+    int         group_size_;
     int         max_num_seqs_;
     int         max_num_batched_tokens_;
 
     int kvcache_block_size_;
     int num_kvcache_blocks_;
 
-    int              sp_rr_counter_      = 0;
+    int              group_rr_counter_   = 0;
     int              num_running_seqs_   = 0;
     int              num_running_tokens_ = 0;
-    std::vector<int> num_running_seqs_per_sp_;
-    std::vector<int> num_running_tokens_per_sp_;
+    std::vector<int> num_running_seqs_per_group_;
+    std::vector<int> num_running_tokens_per_group_;
 
-    // Per-SP-rank prefix hit counts cached between can_allocate() and allocate().
+    // Per-group prefix hit counts cached between can_allocate() and allocate().
     // Populated by can_allocate on success; consumed (moved) by allocate.
     std::vector<int> cached_prefix_hints_;
 };

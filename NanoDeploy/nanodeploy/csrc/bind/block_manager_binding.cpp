@@ -21,7 +21,7 @@ void bind_block_manager(py::module_& m)
     py::class_<BlockManager, std::shared_ptr<BlockManager>>(m, "BlockManager")
         .def(py::init<const std::string&, int, int, int>(),
              py::arg("engine_id"),
-             py::arg("sp_idx"),
+             py::arg("group_id"),
              py::arg("num_blocks"),
              py::arg("block_size"))
         .def_static("compute_hash",

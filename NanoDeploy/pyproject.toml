@@ -25,7 +25,6 @@ dependencies = [
     "pyzmq>=25.0",
     "ray",
     "dlslime>=0.0.1.post9",
-    "nanoccl>=0.0.2",
     "httpx",
     "uvloop>=0.21.0",
 ]
