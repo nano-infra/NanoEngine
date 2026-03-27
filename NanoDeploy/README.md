@@ -1,6 +1,6 @@
 # NanoDeploy
 
-A lightweight, high-performance LLM inference deployment system with disaggregated prefill/decode architecture, featuring NanoCtrl (Redis-based service discovery) and NanoRoute (Rust-based load balancer).
+LLM inference engine with Prefill-Decode disaggregation and Wide Expert Parallelism.
 
 ## Key Features
 
@@ -49,6 +49,22 @@ NanoDeploy supports independent parallelism configuration for attention and FFN 
 | Qwen3-MoE-235B | 8    | 8            | 1            | 1            | 1      | 8      | 1      |
 | DeepSeek-V3    | 8    | 8            | 1            | 1            | 1      | 8      | 1      |
 
+## Third-Party GPU Kernels
+
+| Library                                             | Version | Description                                                     | Source      |
+| --------------------------------------------------- | ------- | --------------------------------------------------------------- | ----------- |
+| [DeepEP](https://github.com/deepseek-ai/DeepEP)     | 1.2.1   | Expert-parallel all-to-all communication (MoE dispatch/combine) | deepseek-ai |
+| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) | 2.1.1   | FP8 GEMM kernels with fine-grained scaling (JIT compiled)       | deepseek-ai |
+| [FlashMLA](https://github.com/deepseek-ai/FlashMLA) | 1.0.0   | Multi-head Latent Attention decode kernels for Hopper GPUs      | deepseek-ai |
+
+All three require SM90+ (NVIDIA Hopper) GPUs. Install from source:
+
+```bash
+cd DeepEP && pip install .
+cd DeepGEMM && pip install .
+cd FlashMLA && pip install .
+```
+
 ## Quick Start
 
 ### Prerequisites
@@ -65,8 +81,10 @@ pip install ray redis zmq flatbuffers httpx pydantic jsonargparse
 ### Single-Node Example (Non-Disaggregated)
 
 ```bash
+ray start --head --port=7078 --dashboard-host=0.0.0.0 --dashboard-port=8265
 # examples/non_disagg.py
 python examples/non_disagg.py \
+    --ray_address 10.102.97.179:7078 \
     --model /models/deepseek-v3 \
     --attention_dp 8 --ffn_ep 8 \
     --kvcache_block_size 64 \
@@ -79,6 +97,9 @@ python examples/non_disagg.py \
 > **Prerequisite:** Start NanoCtrl before running this example (see [Deployment Guide](../docs/deployment.md) Step 1).
 
 ```bash
+cd ../NanoCtrl; cargo run --release; cd -;
+ray start --head --port=7078 --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --address <ray-head-ip>:7078
 # examples/disagg.py — common config + per-role overlay
 python examples/disagg.py \
     --model /models/deepseek-v3 \
