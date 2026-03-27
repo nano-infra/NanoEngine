@@ -114,8 +114,3 @@ python examples/disagg.py \
 | `profiler_start_step`    | int   | `40`               | Step number to start profiling             |
 | `profiling_step`         | int   | `16`               | Number of steps to profile                 |
 | `profiler_dir`           | str   | `"./profiler_res"` | Output directory for profiler traces       |
-
-## References
-
-- [Example Scripts Guide](../ai_docs/NanoDeploy/examples.md)
-- [DeepSeek-V3 Development Notes](../ai_docs/NanoDeploy/deepseek_v3_support.md)
