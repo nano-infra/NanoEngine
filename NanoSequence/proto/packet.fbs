@@ -8,8 +8,6 @@ enum Action : byte {
   FreeVisionSlots = 4,
   EncodeRequest = 5,
   EncodeResponse = 6,
-  FoldRequest = 7,
-  FoldResponse = 8,
 }
 
 table ZmqPacket {

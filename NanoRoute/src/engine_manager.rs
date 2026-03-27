@@ -1,7 +1,6 @@
 use crate::encoder_adapter::EncoderAdapter;
 use crate::engine_adapter::EngineAdapter;
 use crate::engine_watcher::{EngineEvent, EnginePayload, EngineWatcher};
-use crate::fold_adapter::FoldAdapter;
 use crate::tokenizer::TokenizerService;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,16 +51,10 @@ struct ParsedEngineInfo {
     num_blocks: i32,
 }
 
-/// Sentinel model key used in engine_model_map for fold engines.
-const FOLD_MODEL_KEY: &str = "__fold__";
-
 pub struct EngineManager {
     /// Per-model engine pools, keyed by normalized model_dir (no trailing slash).
     pub model_pools: HashMap<String, ModelPool>,
-    /// Global fold engine pool (no model-based routing; one pool for all fold engines).
-    /// Each entry is (engine_id, adapter).
-    pub fold_engines: Vec<(String, Arc<FoldAdapter>)>,
-    /// Reverse map: engine_id → model_key (or FOLD_MODEL_KEY). Used for O(1) removal.
+    /// Reverse map: engine_id → model_key. Used for O(1) removal.
     engine_model_map: HashMap<String, String>,
     redis_key_prefix: String,
 }
@@ -76,7 +69,6 @@ impl EngineManager {
     pub fn new() -> Self {
         Self {
             model_pools: HashMap::new(),
-            fold_engines: Vec::new(),
             engine_model_map: HashMap::new(),
             redis_key_prefix: "".to_string(),
         }
@@ -85,7 +77,6 @@ impl EngineManager {
     pub fn with_scope(scope: Option<String>) -> Self {
         Self {
             model_pools: HashMap::new(),
-            fold_engines: Vec::new(),
             engine_model_map: HashMap::new(),
             redis_key_prefix: scope.unwrap_or_default(),
         }
@@ -105,15 +96,6 @@ impl EngineManager {
                 acc.2 + p.encoder_engines.len(),
             )
         })
-    }
-
-    pub fn fold_engine_count(&self) -> usize {
-        self.fold_engines.len()
-    }
-
-    /// Returns cloned Arc handles to all fold adapters (for round-robin selection).
-    pub fn get_fold_engines(&self) -> Vec<Arc<FoldAdapter>> {
-        self.fold_engines.iter().map(|(_, a)| a.clone()).collect()
     }
 
     /// Returns sorted list of registered model keys for 404 messages / diagnostics.
@@ -374,34 +356,6 @@ impl EngineManager {
     async fn add_engine_from_info(&mut self, engine_info: serde_json::Value) -> anyhow::Result<()> {
         let parsed = Self::parse_engine_info(&engine_info)?;
 
-        // Fold engines don't have model_path; handle them before the model_path guard
-        if parsed.role == "fold" {
-            // Skip if already registered (snapshot dedup)
-            if self.engine_model_map.contains_key(&parsed.engine_id) {
-                return Ok(());
-            }
-            match FoldAdapter::connect(&parsed.connect_addr).await {
-                Ok(adapter) => {
-                    let adapter = Arc::new(adapter);
-                    self.fold_engines.push((parsed.engine_id.clone(), adapter));
-                    self.engine_model_map
-                        .insert(parsed.engine_id.clone(), FOLD_MODEL_KEY.to_string());
-                    info!(
-                        "Added fold engine from snapshot: {} (total fold: {})",
-                        parsed.engine_id,
-                        self.fold_engines.len()
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to connect fold engine {} from snapshot: {}",
-                        parsed.engine_id, e
-                    );
-                }
-            }
-            return Ok(());
-        }
-
         let model_path = match engine_info["model_path"].as_str() {
             Some(p) if !p.is_empty() => p,
             _ => {
@@ -538,8 +492,8 @@ impl EngineManager {
 
         let (p, d, enc) = self.total_engine_counts();
         debug!(
-            "Initial engines loaded: {} prefill, {} decode, {} encoder, {} fold across {} model(s), revision={}",
-            p, d, enc, self.fold_engines.len(), self.model_pools.len(), initial_revision
+            "Initial engines loaded: {} prefill, {} decode, {} encoder across {} model(s), revision={}",
+            p, d, enc, self.model_pools.len(), initial_revision
         );
 
         Ok(initial_revision)
@@ -706,60 +660,6 @@ impl EngineManager {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY: Duration = std::time::Duration::from_secs(2);
 
-        // Handle fold role separately — no model_path needed, uses FoldAdapter
-        if payload.role == "fold" {
-            // Dedup: remove existing entry if same engine_id
-            if self.engine_model_map.contains_key(&payload.id) {
-                info!(
-                    "Fold engine {} already known, removing old entry first",
-                    payload.id
-                );
-                let _ = self.handle_remove_engine(&payload.id).await;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            let zmq_addr = if payload.zmq_address.starts_with("tcp://0.0.0.0:") {
-                payload
-                    .zmq_address
-                    .replace("tcp://0.0.0.0:", "tcp://127.0.0.1:")
-            } else {
-                payload.zmq_address.clone()
-            };
-            let addr = zmq_addr.strip_prefix("tcp://").unwrap_or(&zmq_addr);
-
-            for attempt in 1..=MAX_RETRIES {
-                match FoldAdapter::connect(addr).await {
-                    Ok(adapter) => {
-                        let adapter = Arc::new(adapter);
-                        self.fold_engines.push((payload.id.clone(), adapter));
-                        self.engine_model_map
-                            .insert(payload.id.clone(), FOLD_MODEL_KEY.to_string());
-                        info!(
-                            "Added fold engine: {} at {} (total fold: {})",
-                            payload.id,
-                            addr,
-                            self.fold_engines.len()
-                        );
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        if attempt == MAX_RETRIES {
-                            error!(
-                                "Failed to connect to fold engine {} after {} attempts: {}",
-                                payload.id, MAX_RETRIES, e
-                            );
-                            return Err(anyhow::anyhow!("Connection failed: {}", e));
-                        }
-                        warn!(
-                            "Failed to connect to fold engine {} (attempt {}/{}): {}, retrying...",
-                            payload.id, attempt, MAX_RETRIES, e
-                        );
-                        tokio::time::sleep(RETRY_DELAY * attempt).await;
-                    }
-                }
-            }
-            unreachable!()
-        }
-
         // Guard: skip engines without a model_path (unroutable; old protocol)
         let model_path = match payload.model_path.as_deref() {
             Some(p) if !p.is_empty() => p,
@@ -917,21 +817,6 @@ impl EngineManager {
             .remove(engine_id)
             .ok_or_else(|| anyhow::anyhow!("Engine {} not found", engine_id))?;
 
-        // Fold engines are stored globally, not in model pools
-        if model_key == FOLD_MODEL_KEY {
-            let before = self.fold_engines.len();
-            self.fold_engines.retain(|(id, _)| id != engine_id);
-            let after = self.fold_engines.len();
-            if after < before {
-                info!("Removed fold engine: {} (remaining: {})", engine_id, after);
-                return Ok(());
-            }
-            return Err(anyhow::anyhow!(
-                "Fold engine {} not found in fold_engines list",
-                engine_id
-            ));
-        }
-
         let pool = self
             .model_pools
             .get_mut(&model_key)
@@ -1081,8 +966,8 @@ impl EngineManager {
         if !stale.is_empty() {
             let (tp, td, enc) = self.total_engine_counts();
             warn!(
-                "Periodic sync evicted {} engine(s) — pool now: {} prefill, {} decode, {} encoder, {} fold across {} model(s)",
-                stale.len(), tp, td, enc, self.fold_engines.len(), self.model_pools.len()
+                "Periodic sync evicted {} engine(s) — pool now: {} prefill, {} decode, {} encoder across {} model(s)",
+                stale.len(), tp, td, enc, self.model_pools.len()
             );
             for (key, pool) in &self.model_pools {
                 if pool.prefill_engines.is_empty() && pool.decode_engines.is_empty() {

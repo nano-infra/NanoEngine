@@ -2,7 +2,6 @@ use crate::engine_adapter::StreamEvent;
 use crate::engine_manager::{EngineManager, ModelPool};
 use crate::tokenizer::TokenizerService;
 use crate::tool_parser;
-use axum::extract::Path as AxumPath;
 use axum::http::StatusCode;
 use axum::response::{sse::Event, IntoResponse, Response, Sse};
 use axum::{
@@ -12,7 +11,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -282,8 +281,6 @@ pub struct Choice {
 pub struct AppState {
     pub engine_manager: Arc<Mutex<EngineManager>>,
     pub next_request_id: AtomicU64,
-    // Round-robin counter for fold engine selection
-    pub fold_idx: Arc<AtomicUsize>,
 }
 
 // ── Pre-flight helpers ───────────────────────────────────────────────
@@ -773,19 +770,11 @@ pub async fn start_server(port: u16, engine_manager: Arc<Mutex<EngineManager>>) 
     let state = Arc::new(AppState {
         engine_manager,
         next_request_id: AtomicU64::new(start_id),
-        fold_idx: Arc::new(AtomicUsize::new(0)),
     });
 
-    // NanoFold routes are always registered; fold engines are discovered dynamically
-    // and will return 503 when none are available.
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/structure/predict", post(nanofold_post))
-        .route("/v1/structure/embed", post(nanofold_post))
-        .route("/v1/structure/sample", post(nanofold_post))
-        .route("/v1/structure/jobs/:job_id", get(nanofold_job_get))
-        .route("/v1/structure/embeds/:embed_id", get(nanofold_embed_get))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -794,110 +783,4 @@ pub async fn start_server(port: u16, engine_manager: Arc<Mutex<EngineManager>>) 
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
-}
-
-// ── NanoFold ZMQ handlers ────────────────────────────────────────────────────
-
-/// Round-robin POST handler: predict / embed / sample.
-/// Extracts `op` from the URI path and forwards via ZMQ to the chosen FoldAdapter.
-async fn nanofold_post(
-    State(state): State<Arc<AppState>>,
-    uri: axum::http::Uri,
-    Json(mut body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let fold_engines = state.engine_manager.lock().await.get_fold_engines();
-    if fold_engines.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "No fold engines available").into_response();
-    }
-
-    // Derive op from the last URI path segment: /v1/structure/<op>
-    let op = uri.path().rsplit('/').next().unwrap_or("predict");
-
-    // Inject op into the request payload
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert("op".to_string(), serde_json::Value::String(op.to_string()));
-    }
-
-    let payload = match serde_json::to_vec(&body) {
-        Ok(b) => b,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("Serialize error: {}", e)).into_response()
-        }
-    };
-
-    let idx = state.fold_idx.fetch_add(1, Ordering::Relaxed) % fold_engines.len();
-    let adapter = &fold_engines[idx];
-
-    match adapter.request(&payload, 30u64).await {
-        Ok(resp) if resp.ok => (StatusCode::ACCEPTED, resp.raw).into_response(),
-        Ok(resp) => (StatusCode::INTERNAL_SERVER_ERROR, resp.raw).into_response(),
-        Err(e) => {
-            tracing::error!("NanoFold ZMQ error: {}", e);
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("NanoFold unreachable: {}", e),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// GET /v1/structure/jobs/:job_id — fan-out across all adapters.
-/// Jobs are local to the server that created them; we try each until found.
-async fn nanofold_job_get(
-    State(state): State<Arc<AppState>>,
-    AxumPath(job_id): AxumPath<String>,
-) -> impl IntoResponse {
-    fold_poll(&state, "job_status", "job_id", &job_id).await
-}
-
-/// GET /v1/structure/embeds/:embed_id — fan-out across all adapters.
-async fn nanofold_embed_get(
-    State(state): State<Arc<AppState>>,
-    AxumPath(embed_id): AxumPath<String>,
-) -> impl IntoResponse {
-    fold_poll(&state, "embed_status", "embed_id", &embed_id).await
-}
-
-async fn fold_poll(state: &AppState, op: &str, id_key: &str, id_val: &str) -> Response {
-    let fold_engines = state.engine_manager.lock().await.get_fold_engines();
-    if fold_engines.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "No fold engines available").into_response();
-    }
-
-    let mut map = serde_json::Map::new();
-    map.insert("op".to_string(), serde_json::Value::String(op.to_string()));
-    map.insert(
-        id_key.to_string(),
-        serde_json::Value::String(id_val.to_string()),
-    );
-    let payload_bytes = match serde_json::to_vec(&serde_json::Value::Object(map)) {
-        Ok(b) => b,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("Serialize error: {}", e)).into_response()
-        }
-    };
-
-    for adapter in &fold_engines {
-        match adapter.request(&payload_bytes, 30u64).await {
-            Ok(resp) if resp.ok => {
-                return (StatusCode::OK, resp.raw).into_response();
-            }
-            Ok(resp) => {
-                // code=404 means not found on this server; try next
-                if resp.code != Some(404) {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, resp.raw).into_response();
-                }
-            }
-            Err(e) => {
-                tracing::warn!("NanoFold ZMQ poll error: {}", e);
-            }
-        }
-    }
-
-    (
-        StatusCode::NOT_FOUND,
-        format!("{} {} not found on any NanoFold server", id_key, id_val),
-    )
-        .into_response()
 }
