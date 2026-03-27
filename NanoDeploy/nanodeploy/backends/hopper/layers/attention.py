@@ -205,7 +205,7 @@ class FlashAttentionImpl:
         if context.is_prefill:
             if context.block_tables is not None:
                 num_seqs = context.cu_seqlens_k.shape[0] - 1
-                bt = context.block_tables[:num_seqs, :]
+                bt = context.block_tables[0, :num_seqs, :]
                 k, v = _gather_kv_cached_concat(
                     k_cache,
                     v_cache,
@@ -229,8 +229,8 @@ class FlashAttentionImpl:
             )
         else:  # decode
             bs, num_head, head_dim = q.shape
-            context_lens = context.context_lens_for_attn[: context.attention_compute_bs]
-            block_tables = context.block_tables[: context.attention_compute_bs]
+            context_lens = context.context_lens[0, :bs]
+            block_tables = context.block_tables[0, :bs]
 
             o, lse = flash_attn_with_kvcache(
                 q.unsqueeze(1),
@@ -296,9 +296,9 @@ class FlashMLAImpl:
 
         else:  # decode
             bs, num_head, head_dim = q.shape
-            q = q[: context.attention_compute_bs]
-            context_lens = context.context_lens_for_attn[: context.attention_compute_bs]
-            block_tables = context.block_tables[: context.attention_compute_bs]
+            q = q[:bs]
+            context_lens = context.context_lens[0, :bs]
+            block_tables = context.block_tables[0, :bs]
 
             batch_size = q.shape[0]
 

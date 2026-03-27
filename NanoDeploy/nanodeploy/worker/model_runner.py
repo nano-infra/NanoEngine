@@ -529,12 +529,14 @@ class ModelRunner:
             )
 
     def prepare_prefill_bytes(self, data: bytes, aux, is_dummy: bool = False):
+        sp_rank = get_dist_context().attn_sp_rank
+        sp_size = get_dist_context().attn_sp_world_size
         block_size = self.config.kvcache_block_size
 
         meta = prepare_prefill_from_bytes(
             data,
-            0,
-            1,
+            sp_rank,
+            sp_size,
             block_size,
             self.config.max_num_seqs,
             self.config.num_kvcache_blocks,
@@ -569,7 +571,7 @@ class ModelRunner:
         if meta.use_block_tables:
             block_tables = (
                 torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
-                .reshape(self.config.max_num_seqs, meta.max_num_blocks)
+                .reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks)
                 .cuda(non_blocking=True)
             )
 
@@ -592,7 +594,7 @@ class ModelRunner:
         # If all sequences are final chunks, set to None to use the fast default path.
         sampling_token_indices = None
         sampling_seq_indices = None
-        num_seqs = aux.num_sp_seqs
+        num_seqs = aux.num_group_seqs
         if len(meta.sampling_token_indices) < num_seqs:
             sampling_token_indices = torch.tensor(
                 meta.sampling_token_indices, dtype=torch.int64, pin_memory=True
@@ -620,13 +622,15 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode_bytes(self, data: bytes, aux, is_dummy: bool = False):
+        sp_rank = get_dist_context().attn_sp_rank
+        sp_size = get_dist_context().attn_sp_world_size
         block_size = self.config.kvcache_block_size
 
         try:
             meta = prepare_decode_from_bytes(
                 data,
-                0,
-                1,
+                sp_rank,
+                sp_size,
                 block_size,
                 self.config.max_num_seqs,
                 self.config.num_kvcache_blocks,
@@ -652,7 +656,7 @@ class ModelRunner:
 
         context_lens = (
             torch.tensor(meta.context_lens_flat, dtype=torch.int32, pin_memory=True)
-            .reshape(self.config.max_num_seqs)
+            .reshape(sp_size, self.config.max_num_seqs)
             .cuda(non_blocking=True)
         )
 
@@ -672,7 +676,7 @@ class ModelRunner:
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
         if is_mla:
             mla_num_kv_heads = 1
-            context_lens_for_mla = context_lens[: aux.num_sp_seqs]
+            context_lens_for_mla = context_lens[sp_rank, : aux.num_group_seqs]
             new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
                 context_lens_for_mla.view(-1),
                 hf_config.num_attention_heads // mla_num_kv_heads,
@@ -718,17 +722,19 @@ class ModelRunner:
         block_size = self.config.kvcache_block_size
         context = get_context()
 
+        sp_rank = get_dist_context().attn_sp_rank
+
         # Update context length (now reflects the NEW token count)
-        context.context_lens[:num_seqs].add_(1)
+        context.context_lens[sp_rank, :num_seqs].add_(1)
 
         # Recalculate slot_mapping from context_lens and block_tables.
         # Simply doing slot_mapping.add_(1) is WRONG when a sequence's new
         # token crosses a block boundary, because the page_id changes.
-        new_ctx = context.context_lens[:num_seqs]  # already incremented
+        new_ctx = context.context_lens[sp_rank, :num_seqs]  # already incremented
         block_idx = (new_ctx - 1) // block_size  # which block the new token falls in
         offset_in_block = (new_ctx - 1) % block_size  # offset within that block
         row_indices = torch.arange(num_seqs, device=block_idx.device)
-        page_ids = context.block_tables[row_indices, block_idx.long()]
+        page_ids = context.block_tables[sp_rank, row_indices, block_idx.long()]
         context.slot_mapping[:num_seqs] = page_ids * block_size + offset_in_block
 
         return input_ids, positions
@@ -796,10 +802,10 @@ class ModelRunner:
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping  # type: ignore
             graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][: context.context_lens.shape[0]].copy_(context.context_lens)  # type: ignore
+            graph_vars["context_lens"][:, : context.context_lens.shape[1]].copy_(context.context_lens)  # type: ignore
             graph_vars["block_tables"].zero_()
             graph_vars["block_tables"][
-                : context.block_tables.size(0), : context.block_tables.size(1)  # type: ignore
+                :, : context.block_tables.size(1), : context.block_tables.size(2)  # type: ignore
             ] = context.block_tables
 
             config = self.config
@@ -828,8 +834,9 @@ class ModelRunner:
     def run_from_bytes(self, data: bytes, is_prefill: bool) -> list[list[int]]:
         """Run model from lean RunBatchInput bytes (completely Sequence-free)."""
         # Extract auxiliary data (temperatures, state_slots)
-        aux = extract_aux_from_bytes(data, 0)
-        num_seqs = aux.num_sp_seqs
+        sp_rank = get_dist_context().attn_sp_rank
+        aux = extract_aux_from_bytes(data, sp_rank)
+        num_seqs = aux.num_group_seqs
 
         is_dummy = False
         if num_seqs == 0:
@@ -844,10 +851,10 @@ class ModelRunner:
                 1,
                 get_cache_context().num_local_kvcache_blocks,
             )
-            dummy_seq.block_ctx().master_sp_idx = 0
+            dummy_seq.block_ctx().master_group_id = 0
             data = serialize_run_batch([dummy_seq], is_prefill)
-            aux = extract_aux_from_bytes(data, 0)
-            num_seqs = aux.num_sp_seqs
+            aux = extract_aux_from_bytes(data, sp_rank)
+            num_seqs = aux.num_group_seqs
 
         loop_count = self.config.loop_count if not is_prefill else 1
         for i in range(loop_count):
@@ -943,8 +950,8 @@ class ModelRunner:
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        context_lens = torch.zeros(1, max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
