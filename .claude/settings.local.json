@@ -51,7 +51,8 @@
       "Bash(cp -r /mnt/nvme1n1/ml_research/majinming/src/NanoInfra/ai_docs/NanoFold/* /mnt/nvme1n1/ml_research/majinming/src/NanoFold/ai_docs/)",
       "Bash(mkdir -p /mnt/nvme1n1/ml_research/majinming/src/NanoFold/NanoFold /mnt/nvme1n1/ml_research/majinming/src/NanoFold/ai_docs /mnt/nvme1n1/ml_research/majinming/src/NanoFold/nanoroute_fold_adapter)",
       "Bash(cp /mnt/nvme1n1/ml_research/majinming/src/NanoInfra/NanoRoute/src/fold_adapter.rs /mnt/nvme1n1/ml_research/majinming/src/NanoFold/nanoroute_fold_adapter/)",
-      "Bash(mv /mnt/nvme1n1/ml_research/majinming/src/NanoFold/NanoFold/setup.py /mnt/nvme1n1/ml_research/majinming/src/NanoFold/setup.py)"
+      "Bash(mv /mnt/nvme1n1/ml_research/majinming/src/NanoFold/NanoFold/setup.py /mnt/nvme1n1/ml_research/majinming/src/NanoFold/setup.py)",
+      "Bash(git log:*)"
     ]
   }
 }
