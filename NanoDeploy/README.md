@@ -99,7 +99,7 @@ python examples/non_disagg.py \
 ```bash
 cd ../NanoCtrl; cargo run --release; cd -;
 ray start --head --port=7078 --dashboard-host=0.0.0.0 --dashboard-port=8265
-ray start --address 10.102.97.179:7078
+ray start --address <ray-head-ip>:7078
 # examples/disagg.py — common config + per-role overlay
 python examples/disagg.py \
     --model /models/deepseek-v3 \
