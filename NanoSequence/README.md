@@ -1,69 +1,69 @@
 # NanoSequence
 
-C++ Sequence Management Library for NanoInfra.
+FlatBuffers schema and protocol definitions for NanoInfra.
 
 ## Purpose
 
-NanoSequence provides the core **Sequence** data structure and serialization layer used by NanoDeploy's inference engines. It defines:
+NanoSequence defines the **wire format** shared by all NanoInfra components. It provides:
 
-- **Sequence**: LLM request state (tokens, sampling params, KV cache metadata, migration context)
-- **FlatBuffers schemas**: Wire format for engine ↔ router communication
-- **Serialization API**: Zero-copy encode/decode for Sequence objects
+- **FlatBuffers schemas**: The canonical data structures for engine ↔ router communication
+- **Generated bindings**: Compiled to C++ headers, Rust types, and Python classes via `flatc`
 
-## Components
+> **Note:** The C++ runtime (Sequence class, BlockManager, Scheduler, serialization, metrics, pybind11 bindings) has moved to [`NanoDeploy/nanodeploy/csrc/`](../NanoDeploy/nanodeploy/csrc/). NanoSequence now contains only the protocol definitions.
 
-### FlatBuffers Schemas (`proto/`)
+## FlatBuffers Schemas (`proto/`)
 
-- **`sequence.fbs`** — Core inference data structures:
+### `sequence.fbs` — Core inference data structures
 
-  - `Sequence`: Token IDs, status, sampling parameters, block contexts (for KV cache and migration)
-  - `SequenceList`: Batch of sequences
-  - `StepOut`: Token streaming response (seq_id + token_ids + status)
-  - `FreeSequences`: P2P memory release signal (for disaggregated prefill/decode)
-  - Supporting types: `BlockContext`, `SamplingParams`, `SequenceStatus` enum
+- `Sequence`: Token IDs, status, sampling parameters, block contexts, vision slots
+- `SequenceList`: Batch of sequences
+- `StepOut`: Token streaming response (seq_id + token_ids + status)
+- `FreeSequences`: P2P memory release signal (for disaggregated prefill/decode)
+- Supporting types: `BlockContext`, `SamplingParams`, `VisionSlot`, `BlockLocation`
 
-- **`packet.fbs`** — Transport layer:
-
-  - `ZmqPacket`: Wire format for ZMQ messages (`action` enum + `payload` bytes)
-  - `Action`: StepOut=0, AddRequest=1, GetEngineInfo=2, FreeSequences=3
-
-### C++ Library (`nanosequence/csrc/`)
-
-| Module        | Purpose                                                                    |
-| ------------- | -------------------------------------------------------------------------- |
-| **sequence/** | `Sequence` class with token management, KV cache metadata, status tracking |
-| **metrics/**  | Performance metrics (tokens/sec, latency, throughput)                      |
-| **bind/**     | pybind11 bindings exposing Sequence to Python                              |
-
-Key APIs:
-
-```cpp
-// Serialization (FlatBuffers)
-size_t serialize_sequences(uintptr_t buf, size_t size,
-                           const std::vector<std::shared_ptr<Sequence>>& seqs,
-                           bool is_prefill);
-
-std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t buf, size_t len);
+```
+enum SequenceStatus : byte {
+  WAITING = 0,
+  RUNNING = 1,
+  FINISHED = 2,
+  TO_BE_MIGRATED = 3,
+  PREFILLING = 4,
+}
 ```
 
-### Python Bindings
+### `packet.fbs` — Transport layer
 
-The C++ Sequence is exposed to Python via pybind11 as `nanosequence._cpp.Sequence`. NanoDeploy's Python engine uses this for:
+- `ZmqPacket`: Wire format for ZMQ messages (`action` enum + `payload` bytes)
 
-- Holding request state (tokens, status, KV metadata)
-- Serializing Sequence batches for migration (prefill → decode)
-- Zero-copy access to C++ data structures from Python
+```
+enum Action : byte {
+  StepOut = 0,
+  AddRequest = 1,
+  GetEngineInfo = 2,
+  FreeSequences = 3,
+  FreeVisionSlots = 4,
+  EncodeRequest = 5,
+  EncodeResponse = 6,
+  FoldRequest = 7,
+  FoldResponse = 8,
+}
+```
+
+### `interface.fbs` — Batch execution interface
+
+- `SequenceInput`: Per-sequence metadata for batch construction (includes `num_prompt_tokens`)
+- `VisionSlotRef`: Vision embedding references for multimodal inputs
+- `RunBatchInput`: Complete batch descriptor for model execution
+- `MigrateSequenceInput` / `MigrateBatchInput`: KV cache migration protocol
 
 ## Build
 
 Requires:
 
 - CMake 3.16+
-- C++20 compiler
-- FlatBuffers (in `third_party/`)
-- NanoCommon (sibling directory)
+- FlatBuffers (`flatc` binary, built from `third_party/`)
 
-Build standalone:
+Build standalone (generates headers only):
 
 ```bash
 cd NanoSequence
@@ -81,6 +81,7 @@ cmake --build build
 
 ## Integration
 
-- **NanoDeploy**: Python engine imports `nanosequence._cpp` for Sequence management and serialization.
+- **NanoDeploy**: C++ runtime in `nanodeploy/csrc/` includes generated headers for serialization and deserialization. Python engine accesses C++ objects via pybind11 (`nanodeploy._cpp`).
 - **NanoRoute**: Rust router imports generated FlatBuffers types (`fbs::Sequence`, `fbs::ZmqPacket`) for decoding engine responses.
-- **Schema Evolution**: Both `sequence.fbs` and `packet.fbs` are compiled to C++, Rust, and Python via `flatc`.
+- **NanoDeployVL**: Vision encoder uses `EncodeRequest`/`EncodeResponse` actions and `VisionSlot` types.
+- **Schema Evolution**: Schemas are compiled to C++, Rust, and Python via `flatc`. All consumers must regenerate bindings when schemas change.
