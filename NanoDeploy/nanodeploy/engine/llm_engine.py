@@ -100,8 +100,8 @@ class LLMEngine:
         sch_res = self.scheduler.schedule()
         dp_seqs = sch_res.dp_seqs
         is_prefill = sch_res.is_prefill
-        dp_sp_seqs = sch_res.dp_sp_seqs
-        filtered_dp_sp_seqs = sch_res.filtered_dp_sp_seqs
+        dp_group_seqs = sch_res.dp_group_seqs
+        filtered_dp_group_seqs = sch_res.filtered_dp_group_seqs
         total_running = sum(len(seqs) for seqs in dp_seqs)
         total_waiting = len(self.scheduler.waiting)
         total_waiting_migration = len(self.scheduler.waiting_migration)
@@ -114,27 +114,27 @@ class LLMEngine:
         if self.scheduler.waiting_migration:
             logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
 
-        dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
+        dp_group_tp_seqs = [seqs for seqs in dp_group_seqs for _ in range(tp_size)]
 
-        dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
+        dp_group_tp_seqs = [seqs for seqs in dp_group_seqs for _ in range(tp_size)]
         # dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
-        sp_batch_sizes = [
+        group_batch_sizes = [
             [
-                len(filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx])
+                len(filtered_dp_group_seqs[dp_idx * sp_size + sp_idx])
                 for sp_idx in range(sp_size)
             ]
             for dp_idx in range(dp_size)
         ]
 
-        sp_send_counts = sch_res.sp_send_counts
-        sp_recv_counts = sch_res.sp_recv_counts
-        # sp_comm_matrix = sch_res.sp_comm_matrix
-        sp_q_matrix = sch_res.sp_q_matrix
-        # sp_res_matrix = sch_res.sp_res_matrix
+        group_send_counts = sch_res.group_send_counts
+        group_recv_counts = sch_res.group_recv_counts
+        # group_comm_matrix = sch_res.group_comm_matrix
+        group_q_matrix = sch_res.group_q_matrix
+        # group_res_matrix = sch_res.group_res_matrix
 
         # Update metrics with raw counts
-        self.metrics_manager.server_metric.update_sp_stats(
-            sp_send_counts, sp_recv_counts
+        self.metrics_manager.server_metric.update_group_stats(
+            group_send_counts, group_recv_counts
         )
 
         waiting_head_blocks = sch_res.waiting_head_blocks
@@ -147,18 +147,18 @@ class LLMEngine:
             {
                 "mode": "prefill" if is_prefill else "decode",
                 # "dp_batch_sizes": dp_batch_sizes,
-                "sp_batch_sizes": sp_batch_sizes,
-                "sp_send_counts": sp_send_counts,
-                "sp_recv_counts": sp_recv_counts,
+                "group_batch_sizes": group_batch_sizes,
+                "group_send_counts": group_send_counts,
+                "group_recv_counts": group_recv_counts,
                 "waiting_head_blocks": waiting_head_blocks,
                 "waiting_total_blocks": waiting_total_blocks,
-                # "sp_comm_matrix": sp_comm_matrix,
-                "sp_q_matrix": sp_q_matrix,
-                # "sp_res_matrix": sp_res_matrix,
+                # "group_comm_matrix": group_comm_matrix,
+                "group_q_matrix": group_q_matrix,
+                # "group_res_matrix": group_res_matrix,
                 "free_blocks": [
                     [
                         worker_state.block_manager[i].num_free_blocks
-                        for i in range(self.scheduler.attention_sp)
+                        for i in range(self.scheduler.group_size)
                     ]
                     for worker_state in self.scheduler.worker_state
                 ],
@@ -172,9 +172,9 @@ class LLMEngine:
         # Run prefill to populate KV cache (or skip for decode engine receiving prefill request)
         if not (is_prefill and self.config.mode == "decode"):
             # Normal execution: prefill engine runs prefill, or decode engine runs decode
-            token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
+            token_ids = self.executor.run(dp_group_tp_seqs, is_prefill)[::tp_size]
             post_sch_begin = time.time()
-            self.scheduler.postprocess(filtered_dp_sp_seqs, token_ids, True)
+            self.scheduler.postprocess(filtered_dp_group_seqs, token_ids, True)
             post_sch_end = time.time()
 
         else:
@@ -185,7 +185,7 @@ class LLMEngine:
             )
             post_sch_begin = time.time()
             post_sch_end = time.time()
-            self.executor.migrate(dp_sp_seqs)
+            self.executor.migrate(dp_group_seqs)
         outputs = []
         num_tokens = 0
 

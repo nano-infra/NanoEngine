@@ -73,6 +73,19 @@ class NanoCtrlClient:
     # Lifecycle API
     # ------------------------------------------------------------------
 
+    def check_connection(self) -> None:
+        """Verify NanoCtrl is reachable. Raises RuntimeError if not."""
+        try:
+            with httpx.Client(timeout=5.0, trust_env=False) as c:
+                r = c.get(self._base)
+                r.raise_for_status()
+                logger.info(f"NanoCtrl connection verified: {self._base}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Cannot reach NanoCtrl at {self._base}: {e}\n"
+                f"NanoCtrl must be running before engine startup."
+            ) from e
+
     def register(self, engine_id: str, extra: dict) -> bool:
         """POST /register_engine.
 

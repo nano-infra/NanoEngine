@@ -661,13 +661,13 @@ class ModelRunner:
         )
 
         if len(meta.block_tables_flat) == 0:
-            block_tables = torch.empty((0, 0), dtype=torch.int32).cuda(
+            block_tables = torch.empty((1, 0, 0), dtype=torch.int32).cuda(
                 non_blocking=True
             )
         else:
             block_tables = (
                 torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
-                .reshape(-1, meta.max_num_blocks)
+                .reshape(sp_size, -1, meta.max_num_blocks)
                 .cuda(non_blocking=True)
             )
 

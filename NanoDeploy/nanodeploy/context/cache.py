@@ -795,7 +795,7 @@ class CacheContext:
                             continue
 
                         remote_rank = (
-                            v.migrate_dp_idx * v.migrate_attention_sp + remote_sp_idx
+                            v.migrate_dp_idx * v.migrate_group_size + remote_sp_idx
                         )
 
                         if remote_rank < len(peer_addrs):
@@ -825,8 +825,8 @@ class CacheContext:
                 local_state_slot = v.active_state_slot
 
                 if remote_state_slot >= 0 and local_state_slot >= 0:
-                    remote_rank = v.migrate_dp_idx * v.migrate_attention_sp + (
-                        v.migrate_attention_sp - 1
+                    remote_rank = v.migrate_dp_idx * v.migrate_group_size + (
+                        v.migrate_group_size - 1
                     )
                     if remote_rank < len(peer_addrs):
                         peer_alias = peer_addrs[remote_rank]

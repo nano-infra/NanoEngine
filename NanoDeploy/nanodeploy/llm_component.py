@@ -3,13 +3,13 @@ import json
 from typing import List, Set, Tuple
 
 import ray
+from nanoctrl.client import NanoCtrlClient
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nanodeploy.config import Config
 from nanodeploy.engine.llm_engine import LLMEngine
 from nanodeploy.engine.ray_utils import get_available_nodes_with_master_first
 from nanodeploy.logging import get_logger
-from nanodeploy.server.nanoctrl_client import NanoCtrlClient
 
 logger = get_logger("nanodeploy")
 
@@ -47,6 +47,12 @@ class LLMComponent(LLM):
     """
 
     def __init__(self, config: Config):
+        # In PD disagg mode, verify NanoCtrl is reachable before heavy model loading.
+        if config.nanoctrl_address:
+            NanoCtrlClient(
+                config.nanoctrl_address, config.nanoctrl_scope
+            ).check_connection()
+
         super().__init__(config)
 
         # peer_engine_id -> dict(num_blocks, world_size, peer_addrs, p2p_host, p2p_port) for lazy migration
