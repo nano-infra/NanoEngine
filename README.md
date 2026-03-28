@@ -10,7 +10,6 @@
 | [NanoCtrl](./NanoCtrl)         | Rust        | Control plane           | Redis-backed service registry, health monitoring, engine discovery, Python client               |
 | [NanoDeploy](./NanoDeploy)     | Python/C++  | LLM inference engine    | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
 | [NanoDeployVL](./NanoDeployVL) | Python      | Vision-Language encoder | EP-separated ViT encoder, RDMA embedding transfer, Qwen3-VL support                             |
-| [NanoOps](./NanoOps)           | Python      | Operations CLI          | Session orchestration, Ray job management, deployment automation                                |
 | [NanoRoute](./NanoRoute)       | Rust        | HTTP load balancer      | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
 | [NanoSequence](./NanoSequence) | FlatBuffers | Protocol definitions    | Wire-format schemas for sequence, packet, and batch interfaces                                  |
 
