@@ -10,7 +10,6 @@ from nanodeploy.backends.hopper.kernels.block_gemm_fp8 import (
     deep_gemm_fp8,
     quant_fp8_tma,
 )
-from nanodeploy.backends.hopper.kernels.blocked_fp8_fused_moe import *  # noqa: F401, F403
 from nanodeploy.backends.hopper.kernels.fp8 import (
     per_token_group_quant_fp8,
     silu_and_mul_masked_post_quant_fwd,

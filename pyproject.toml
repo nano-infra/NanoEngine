@@ -1,41 +1,51 @@
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+build-backend = "scikit_build_core.build"
+requires = [
+  "scikit-build-core>=0.10",
+  "pybind11>=2.12",
+  "ninja"
+]
 
 [project]
-name = "nanoinfra"
-version = "0.1.0"
-description = "NanoInfra monorepo meta-package"
-authors = [{ name = "DeepLink-MLSysResearch" }]
+authors = [{ name = "DeepLink" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Unix",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Networking",
+  "Topic :: System :: Systems Administration",
+]
+description = "DLSlime Transfer Engine"
+name = "dlslime"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []
-
-# Install individual components:
-#   pip install ".[dlslime]"
-#   pip install ".[nanoctrl]"
-#   pip install ".[nanodeploy]"
-#   pip install ".[nanodeployvl]"
-#   pip install ".[all]"
-[project.optional-dependencies]
-dlslime = [
-    "dlslime @ file:DLSlime",
-]
-nanoctrl = [
-    "nanoctrl @ file:NanoCtrl",
-]
-nanodeploy = [
-    "nanodeploy @ file:NanoDeploy",
-]
-nanodeployvl = [
-    "nanodeployvl @ file:NanoDeployVL",
-]
-all = [
-    "dlslime @ file:DLSlime",
-    "nanoctrl @ file:NanoCtrl",
-    "nanodeploy @ file:NanoDeploy",
+requires-python = ">=3.8"
+version = "0.0.2.post1"
+dependencies = [
+  "pydantic>=2.0",
+  "pyzmq>=25.0",
+  "redis>=4.0",
+  "requests>=2.0",
+  # for --build-no-isolation
+  "scikit-build-core>=0.10",
+  "pybind11>=2.12",
 ]
 
-[tool.setuptools]
-# No Python packages to install from the root itself
-py-modules = []
+[project.urls]
+Homepage = "https://github.com/DeepLink-org/DLSlime.git"
+Repository = "https://github.com/DeepLink-org/DLSlime.git"
+
+[tool.scikit-build]
+# optional env variable:
+# BUILD_TORCH_PLUGIN: OFF
+# BUILD_NVLINK: OFF
+# USE_MACA: OFF
+cmake.args = ["-G Ninja", "-DDLSLIME_INSTALL_PATH=dlslime", "-DBUILD_PYTHON=ON"]
+cmake.build-type = "Release"
+
+build-dir = "build"

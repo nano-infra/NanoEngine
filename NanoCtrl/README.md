@@ -59,7 +59,6 @@ The server will listen on `http://0.0.0.0:3000` by default.
 
 ```bash
 export NANOCTRL_REDIS_URL=redis://127.0.0.1:6379   # NanoCtrl connects to local Redis
-export REDIS_PUBLIC_ADDRESS=10.102.97.1   # IP that remote workers use to reach Redis (master node IP)
 ```
 
 ## Scope Support
@@ -109,7 +108,7 @@ Content-Type: application/json
   "num_blocks": 15000,
   "host": "127.0.0.1",
   "port": 6001,
-  "peer_addrs": ["10.102.97.1:5000"],
+  "peer_addrs": ["<prefill-engine-ip>:5000"],
   "p2p_host": "127.0.0.1",  # optional
   "p2p_port": 5000,         # optional
   "scope": "my-session"      # optional, for multi-tenant isolation
@@ -182,7 +181,7 @@ pip install ".[nanoctrl]"
 from nanoctrl import NanoCtrlClient
 
 client = NanoCtrlClient(
-    address="10.102.97.1:3000",   # host:port or http://host:port
+    address="<nanoctrl-ip>:3000",   # host:port or http://host:port
     scope="my-session",            # optional, for multi-tenant isolation
 )
 

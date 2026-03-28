@@ -84,7 +84,7 @@ pip install ray redis zmq flatbuffers httpx pydantic jsonargparse
 ray start --head --port=7078 --dashboard-host=0.0.0.0 --dashboard-port=8265
 # examples/non_disagg.py
 python examples/non_disagg.py \
-    --ray_address 10.102.97.179:7078 \
+    --ray_address <node0-ip>:7078 \
     --model /models/deepseek-v3 \
     --attention_dp 8 --ffn_ep 8 \
     --kvcache_block_size 64 \
@@ -103,8 +103,8 @@ ray start --address <ray-head-ip>:7078
 # examples/disagg.py — common config + per-role overlay
 python examples/disagg.py \
     --model /models/deepseek-v3 \
-    --ray_address 10.102.97.179:7078 \
-    --nanoctrl_address 10.102.97.179:3000 \
+    --ray_address <node0-ip>:7078 \
+    --nanoctrl_address <node0-ip>:3000 \
     --attention_dp 8 --ffn_ep 8 \
     --kvcache_block_size 64 \
     --prefill.master_address 10.0.0.2:6006 \

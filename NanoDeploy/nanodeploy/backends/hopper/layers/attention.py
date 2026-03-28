@@ -1,7 +1,6 @@
 import flash_mla
 import torch
 from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
-from torch import nn
 
 from nanodeploy.backends.base_backend import AttentionBase
 from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kcache, store_kvcache
@@ -11,54 +10,8 @@ from nanodeploy.backends.gpu_generic.kernels.paged_gather import (
 from nanodeploy.context.context import get_context
 from nanodeploy.logging import get_logger
 
+
 logger = get_logger()
-
-
-def _gather_kv_paged(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather paged KV cache into contiguous ragged tensors for flash_attn_varlen_func.
-
-    Args:
-        k_cache:     [num_blocks, block_size, num_kv_heads, head_dim]
-        v_cache:     [num_blocks, block_size, num_kv_heads, head_dim]
-        block_table: [num_seqs, max_num_blocks] — int32 physical block IDs (-1 = padding)
-        cu_seqlens_k:[num_seqs + 1] — cumulative K lengths (int32)
-        block_size:  tokens per KV block
-
-    Returns:
-        k_gathered: [total_k_tokens, num_kv_heads, head_dim]
-        v_gathered: [total_k_tokens, num_kv_heads, head_dim]
-    """
-    linear_indices = _build_paged_gather_indices(block_table, cu_seqlens_k, block_size)
-
-    _, _, num_kv_heads, head_dim = k_cache.shape
-    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim)
-    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim)
-    return k_flat[linear_indices], v_flat[linear_indices]
-
-
-def _gather_cache_paged(
-    cache: torch.Tensor,
-    block_table: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Gather a single paged cache into a contiguous ragged tensor.
-
-    Works for any cache with shape [num_blocks, block_size, ...].
-
-    Returns:
-        gathered: [total_k_tokens, ...] (remaining dims preserved)
-    """
-    linear_indices = _build_paged_gather_indices(block_table, cu_seqlens_k, block_size)
-    trailing_shape = cache.shape[2:]
-    flat = cache.reshape(-1, *trailing_shape)
-    return flat[linear_indices]
 
 
 def _compute_cached_split(
@@ -257,6 +210,8 @@ class FlashMLAImpl:
         causal: bool = True,
         **kwargs,
     ):
+        import flash_mla
+
         if scale is None:
             scale = 1.0 / (head_size**0.5)
         if num_kv_heads is None:

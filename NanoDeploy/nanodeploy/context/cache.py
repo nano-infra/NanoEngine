@@ -51,7 +51,7 @@ class CacheContext:
 
     # Control plane: server address and engine ID for centralized connection
     nanoctrl_address: str | None = (
-        None  # Control plane server URL (e.g., "http://10.102.97.183:3000")
+        None  # Control plane server URL (e.g., "http://127.0.0.1:3000")
     )
     nanoctrl_scope: str | None = None  # Scope for multi-tenant isolation
     engine_id: str | None = None  # Engine ID for agent naming (format: EngineName:rank)

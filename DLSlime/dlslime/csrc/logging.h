@@ -1,7 +1,3 @@
-//
-// Created by jimy on 3/13/22.
-//
-
 #pragma once
 
 #include <cstdlib>
