@@ -77,7 +77,7 @@ Prefill-Decode disaggregation splits prompt processing (prefill) and token gener
 - 2 nodes with NVIDIA GPUs (SM90+ for FP8), RDMA-capable NICs
 - Redis, Ray cluster, Rust toolchain
 
-### 1. Start Ray
+#### 1. Start Ray
 
 ```bash
 # Node 0 (head)
@@ -91,7 +91,7 @@ ray start --address <node0-ip>:7078
 
 Batch generation without HTTP serving.
 
-**Single node (no NanoCtrl needed):**
+#### Single node (no NanoCtrl needed)
 
 ```bash
 python NanoDeploy/examples/non_disagg.py \
@@ -103,13 +103,16 @@ python NanoDeploy/examples/non_disagg.py \
     --prompt "1+1=?" --max_tokens 128
 ```
 
-**PD disaggregated (2 nodes) — requires NanoCtrl:**
+#### PD disaggregated (2 nodes)
+
+##### 2. Start Redis + NanoCtrl
 
 ```bash
-# Start Redis + NanoCtrl first
 redis-server --bind 0.0.0.0 --port 6379
-cd NanoCtrl && cargo run --release
+cd NanoCtrl && cargo run --release    # edit config.toml to set redis_url
 ```
+
+##### 3. Launch engines
 
 ```bash
 python NanoDeploy/examples/disagg.py \
@@ -123,16 +126,22 @@ python NanoDeploy/examples/disagg.py \
 
 ### Online mode
 
-ZMQ engine servers with OpenAI-compatible HTTP API via NanoRoute. Requires Redis + NanoCtrl + NanoRoute.
+ZMQ engine servers with OpenAI-compatible HTTP API via NanoRoute.
+
+##### 2. Start Redis + NanoCtrl
 
 ```bash
-# Start Redis + NanoCtrl + NanoRoute
 redis-server --bind 0.0.0.0 --port 6379
-cd NanoCtrl && cargo run --release
+cd NanoCtrl && cargo run --release    # edit config.toml to set redis_url
+```
+
+##### 3. Start NanoRoute
+
+```bash
 cd NanoRoute && cargo run --release    # edit config.toml to set nanoctrl_address
 ```
 
-**4. Launch engines**
+##### 4. Launch engines
 
 ```bash
 # Terminal 1 — Decode engine
@@ -162,7 +171,7 @@ python NanoDeploy/nanodeploy/server/engine_server.py \
     --max_num_batched_tokens 16384 --max_model_len 16384
 ```
 
-**5. Send requests**
+##### 5. Send requests
 
 ```bash
 curl http://<node0-ip>:8080/v1/chat/completions \
@@ -171,10 +180,6 @@ curl http://<node0-ip>:8080/v1/chat/completions \
 ```
 
 ______________________________________________________________________
-
-## 📖 Documentation
-
-- [Deployment Guide](./docs/deployment.md) — Step-by-step instructions for deploying with NanoCtrl, NanoRoute, and NanoDeploy
 
 ## 📄 License
 
