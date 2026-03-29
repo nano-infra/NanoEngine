@@ -328,7 +328,8 @@ class CacheContext:
             kv_size = self.kv_cache.numel() * self.kv_cache.itemsize
             self._local_mr_handler = self._peer_agent.register_memory_region(
                 _KV_CACHE_BUFFER_ID,
-                self.kv_cache.data_ptr() + int(self.kv_cache.storage_offset()),
+                self.kv_cache.data_ptr(),
+                int(self.kv_cache.storage_offset()),
                 kv_size,
             )
             logger.info(

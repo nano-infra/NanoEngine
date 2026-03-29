@@ -323,7 +323,8 @@ class ModelRunner:
         recv_buf_size = recv_buf.nelement() * recv_buf.element_size()
         recv_mr = peer_agent.register_memory_region(
             "vision_recv",
-            recv_buf.data_ptr() + int(recv_buf.storage_offset()),
+            recv_buf.data_ptr(),
+            int(recv_buf.storage_offset()),
             recv_buf_size,
         )
 
