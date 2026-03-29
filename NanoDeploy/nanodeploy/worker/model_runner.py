@@ -5,11 +5,9 @@ import numpy as np
 import ray
 import torch
 import torch.distributed as dist
-import torch.profiler as profiler
 from nanodeploy._cpp import (
     extract_aux_from_bytes,
     extract_vision_slots_from_bytes,
-    parse_migrate_batch,
     prepare_decode_from_bytes,
     prepare_prefill_from_bytes,
     serialize_run_batch,
@@ -503,6 +501,12 @@ class ModelRunner:
                 config.nanoctrl_address, config.host, config.port
             )
 
+        # Allocate GDN state buffers for linear_attention layers
+        if layer_types is not None:
+            cache_context.allocate_gdn_states(
+                hf_config, layer_types, config.max_num_seqs
+            )
+
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
@@ -521,12 +525,6 @@ class ModelRunner:
             engine_id=engine_id,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
-
-        # Allocate GDN state buffers for linear_attention layers
-        if layer_types is not None:
-            cache_context.allocate_gdn_states(
-                hf_config, layer_types, config.max_num_seqs
-            )
 
     def prepare_prefill_bytes(self, data: bytes, aux, is_dummy: bool = False):
         sp_rank = get_dist_context().attn_sp_rank

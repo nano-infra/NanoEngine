@@ -19,7 +19,7 @@ set_target_properties(_nanodeploy_cache_manager PROPERTIES
     INSTALL_RPATH "\${ORIGIN}"
 )
 
-target_link_libraries(_nanodeploy_cache_manager PUBLIC _nanosequence PRIVATE nanocommon)
+target_link_libraries(_nanodeploy_cache_manager PUBLIC _nanosequence)
 
 # PUBLIC include: NanoDeploy root so consumers use "nanodeploy/csrc/cache_manager/*.h"
 target_include_directories(_nanodeploy_cache_manager PUBLIC

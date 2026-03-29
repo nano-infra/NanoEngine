@@ -20,7 +20,6 @@ message(STATUS "NanoInfra Root Path: ${NANOINFRA_DIR}")
 
 include_directories(.)
 add_subdirectory(${NANOINFRA_DIR}/third_party third_party)
-add_subdirectory(${NANOINFRA_DIR}/NanoCommon NanoCommon)
 add_subdirectory(nanodeploy/csrc)
 
 # Python Flatbuffers Generation

@@ -15,7 +15,7 @@ target_compile_options(_nanodeploy_scheduler PRIVATE -O3 -Wall -Wextra)
 # Other dependencies can be PRIVATE since scheduler's headers don't expose them
 target_link_libraries(_nanodeploy_scheduler
     PRIVATE _nanodeploy_metrics
-    PUBLIC _nanosequence _nanosequence_metrics nanocommon _nanodeploy_cache_manager
+    PUBLIC _nanosequence _nanosequence_metrics _nanodeploy_cache_manager
 )
 
 set_target_properties(

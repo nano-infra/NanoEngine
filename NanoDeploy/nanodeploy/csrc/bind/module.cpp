@@ -2,9 +2,9 @@
 
 namespace py = pybind11;
 
-#include "nanocommon/logging.h"
 #include "nanodeploy/csrc/bind/sequence_binding.h"
 #include "nanodeploy/csrc/bind/sequence_metric_binding.h"
+#include "nanodeploy/csrc/common/logging.h"
 void bind_server_metric(py::module_& m);
 void bind_block_manager(py::module_& m);
 void bind_group_manager(py::module_& m);

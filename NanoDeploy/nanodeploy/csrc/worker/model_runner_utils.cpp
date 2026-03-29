@@ -2,8 +2,9 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "interface_generated.h"
 #include "nanodeploy/csrc/sequence/sequence.h"
+
+#include "interface_generated.h"
 #include "sequence_generated.h"
 
 #include "model_runner_utils.h"

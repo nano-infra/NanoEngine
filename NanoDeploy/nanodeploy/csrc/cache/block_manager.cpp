@@ -2,7 +2,7 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "nanocommon/xxhash.hpp"
+#include "nanodeploy/csrc/common/xxhash.hpp"
 #include "nanodeploy/csrc/sequence/sequence.h"
 
 #include "sequence_generated.h"

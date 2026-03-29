@@ -4,7 +4,6 @@ add_library(
     server_metric.cpp
 )
 
-target_link_libraries(_nanodeploy_metrics PRIVATE nanocommon)
 target_compile_options(_nanodeploy_metrics PRIVATE -O3 -Wall -Wextra)
 
 set_target_properties(_nanodeploy_metrics PROPERTIES
@@ -21,7 +20,6 @@ add_library(
     sequence_metric.cpp
 )
 
-target_link_libraries(_nanosequence_metrics PRIVATE nanocommon)
 target_compile_options(_nanosequence_metrics PRIVATE -O3 -Wall -Wextra)
 
 set_target_properties(_nanosequence_metrics PROPERTIES

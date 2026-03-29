@@ -65,7 +65,7 @@ set_target_properties(_nanosequence PROPERTIES
 
 target_compile_options(_nanosequence PRIVATE -O3 -Wall -Wextra)
 
-target_link_libraries(_nanosequence PUBLIC flatbuffers PRIVATE nanocommon _nanosequence_metrics)
+target_link_libraries(_nanosequence PUBLIC flatbuffers PRIVATE _nanosequence_metrics)
 
 target_include_directories(_nanosequence PRIVATE ${GEN_HEADER_DIR})
 
@@ -75,7 +75,6 @@ target_include_directories(_nanosequence PUBLIC
     $<BUILD_INTERFACE:${NANOINFRA_DIR}/NanoDeploy>
     $<BUILD_INTERFACE:${GEN_HEADER_DIR}>
     $<BUILD_INTERFACE:${NANOINFRA_DIR}/third_party/flatbuffers/include>
-    $<INSTALL_INTERFACE:include>
 )
 
 install(

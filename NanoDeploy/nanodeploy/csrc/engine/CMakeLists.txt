@@ -9,7 +9,7 @@ add_library(
     ${CPP_SOURCES}
 )
 
-target_link_libraries(_nanodeploy_engine PUBLIC _nanosequence nanocommon)
+target_link_libraries(_nanodeploy_engine PUBLIC _nanosequence)
 
 target_compile_options(_nanodeploy_engine PRIVATE -O3 -Wall -Wextra)
 

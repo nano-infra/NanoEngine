@@ -96,7 +96,7 @@ class CacheContext:
             // block_bytes
         )
 
-        logger.info(
+        logger.debug(
             f"Rank{dist.get_rank()} num_local_kvcache_blocks: {self.num_local_kvcache_blocks}"
         )
 
@@ -266,7 +266,7 @@ class CacheContext:
             device=torch.get_default_device(),
         )
 
-        logger.info(
+        logger.debug(
             f"Allocated GDN states: conv={self.gdn_conv_states.shape} "
             f"({self.gdn_conv_states.element_size() * self.gdn_conv_states.nelement() / 1e9:.2f} GB), "
             f"recurrent={self.gdn_recurrent_states.shape} "
