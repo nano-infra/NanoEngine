@@ -30,7 +30,7 @@ class Context:
     # GatedDeltaNet state buffers (for mixed attention models like Qwen3.5-MoE)
     # conv_states: [num_layers, num_slots, conv_dim, kernel_size]
     gdn_conv_states: torch.Tensor | None = None
-    # recurrent_states: [num_layers, num_slots, num_v_heads, head_k_dim, head_v_dim]
+    # recurrent_states: [num_layers, num_slots, num_v_heads, head_v_dim, head_k_dim] (K-last)
     gdn_recurrent_states: torch.Tensor | None = None
     # Per-sequence GDN slot indices: [num_seqs], maps batch position i -> slot index
     gdn_state_slots: torch.Tensor | None = None

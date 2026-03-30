@@ -15,6 +15,30 @@ from torch import nn
 from nanodeploy.backends.base_backend import DistributedRoutedExpertsBase
 from nanodeploy.context.expert_context import ExpertContext
 from nanodeploy.layers.local_dispatch import LocalPaddedDispatcher
+from nanodeploy.worker.runner_config import get_runner_config
+
+
+def compute_topk_ids(topk_ids, ranks, num_experts):
+    """Optimized version: compute expert IDs for perfect load balancing.
+
+    This function redistributes expert IDs to ensure perfect load balancing
+    across expert parallel ranks. Optimized to use a single torch.arange call.
+    """
+    shape = topk_ids.shape
+    numel = topk_ids.numel()
+    step = num_experts // ranks
+
+    # Single arange call instead of two
+    indices = torch.arange(0, numel, dtype=topk_ids.dtype, device=topk_ids.device)
+
+    # Compute both components from the same indices
+    div_ranks = indices // ranks
+    mod_ranks = indices % ranks
+
+    # Compute the remapped expert IDs
+    topk_ids = (div_ranks % step + mod_ranks * step) % num_experts
+    topk_ids = topk_ids.reshape(shape)
+    return topk_ids
 
 
 class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
@@ -102,8 +126,23 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         )
 
         if self.is_fp8:
-            self.gate_up_scale_inv = nn.Parameter(torch.empty(0, dtype=torch.float32))
-            self.down_scale_inv = nn.Parameter(torch.empty(0, dtype=torch.float32))
+            block_size = 128
+            self.gate_up_scale_inv = nn.Parameter(
+                torch.ones(
+                    self.num_local_experts,
+                    self.local_intermediate_size * 2 // block_size,
+                    hidden_size // block_size,
+                    dtype=torch.float32,
+                )
+            )
+            self.down_scale_inv = nn.Parameter(
+                torch.ones(
+                    self.num_local_experts,
+                    hidden_size // block_size,
+                    self.local_intermediate_size // block_size,
+                    dtype=torch.float32,
+                )
+            )
         else:
             self.gate_up_scale_inv = None
             self.down_scale_inv = None
@@ -123,6 +162,10 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
 
         ctx = ExpertContext.get_instance()
         buffer = ctx.get_buffer()
+
+        if get_runner_config().dummy_eplb:
+            ranks = torch.distributed.get_world_size(self.ep_group)
+            topk_ids = compute_topk_ids(topk_ids, ranks, self.num_experts)
 
         # Use EPLB dispatch if layer_idx != -1
         runner_config = get_runner_config()
