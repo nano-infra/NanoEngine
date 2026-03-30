@@ -166,8 +166,6 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         if get_runner_config().dummy_eplb:
             ranks = torch.distributed.get_world_size(self.ep_group)
             topk_ids = compute_topk_ids(topk_ids, ranks, self.num_experts)
-        else:
-            topk_ids = topk_ids
 
         # Use EPLB dispatch if layer_idx != -1
         runner_config = get_runner_config()
