@@ -933,7 +933,7 @@ class ModelRunner:
             reset_context()
             return graph
 
-        logger.info(f"开始捕获 CUDAGraph...")
+        logger.info("Starting CUDAGraph capture...")
         total_graphs = 0
 
         for master_bs in reversed(self.graph_master_rank_bs):
