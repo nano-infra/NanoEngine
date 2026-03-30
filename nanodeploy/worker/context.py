@@ -26,6 +26,7 @@ class Context:
     # Decode Sequence Parallel
     q_mask: torch.Tensor | None = None
     res_lse_mask: torch.Tensor | None = None
+    use_sp_a2a: bool = False
 
     is_dummy: bool = False
     
@@ -70,6 +71,7 @@ def set_context(
     global_context_lens: Optional[torch.Tensor] = None,
     q_mask: Optional[torch.Tensor] = None,
     res_lse_mask: Optional[torch.Tensor] = None,
+    use_sp_a2a: bool = False,
     is_dummy: bool = False,
     tile_scheduler_metadata: Optional[torch.Tensor] = None,
     num_splits: Optional[torch.Tensor] = None,
@@ -100,6 +102,7 @@ def set_context(
         global_context_lens,
         q_mask=q_mask,
         res_lse_mask=res_lse_mask,
+        use_sp_a2a=use_sp_a2a,
         is_dummy=is_dummy,
         tile_scheduler_metadata=tile_scheduler_metadata,
         num_splits=num_splits,

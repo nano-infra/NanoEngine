@@ -172,6 +172,23 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
 {
     DecodeMetadata meta;
 
+    for (auto* seq : dp_seqs) {
+        const auto& dispatched = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+        int         active_ranks = 0;
+        for (int idx = 0; idx < std::min(sp_size, (int)dispatched.size()); ++idx) {
+            if (dispatched[idx] > 0) {
+                active_ranks++;
+                if (active_ranks > 1) {
+                    meta.use_sp_a2a = true;
+                    break;
+                }
+            }
+        }
+        if (meta.use_sp_a2a) {
+            break;
+        }
+    }
+
     // 1. Prepare input_ids, positions, slot_mapping
     for (auto* seq : dp_seqs) {
         if (seq->block_ctx().master_sp_idx_ == sp_rank) {

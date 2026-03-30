@@ -44,6 +44,7 @@ class FlashAttentionImpl:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
+        use_sp_a2a = sp_size > 1 and context.use_sp_a2a
         if context.is_prefill:
             if context.block_tables is not None:  # prefix cache
                 k, v = k_cache, v_cache
@@ -60,7 +61,7 @@ class FlashAttentionImpl:
             )
         else:  # decode
             bs, num_head, head_dim = q.shape
-            if sp_size > 1:
+            if use_sp_a2a:
                 max_num_seqs = get_sp_context().max_num_seqs
                 q_buffer = get_sp_context().q_buffer
 
@@ -109,7 +110,7 @@ class FlashAttentionImpl:
                 return_softmax_lse=True,
             )[:2]
 
-            if sp_size > 1:
+            if use_sp_a2a:
                 res_buffer = get_sp_context().res_buffer
                 lse_buffer = get_sp_context().lse_buffer
                 lse = lse.to(torch.bfloat16)
@@ -238,10 +239,11 @@ class FlashMLAImpl:
 
         sp_rank = get_dist_context().attn_sp_rank
         sp_size = get_dist_context().attn_sp_world_size
+        use_sp_a2a = sp_size > 1 and context.use_sp_a2a
 
         if not context.is_prefill:  # decode
             bs, num_head, head_dim = q.shape
-            if sp_size > 1:
+            if use_sp_a2a:
                 max_num_seqs = get_sp_context().max_num_seqs
                 q_buffer = get_sp_context().q_buffer
 
@@ -297,7 +299,7 @@ class FlashMLAImpl:
 
             o = o.squeeze(1)
 
-            if sp_size > 1:
+            if use_sp_a2a:
                 _, num_head, v_head_dim = o.shape
 
                 res_buffer = get_sp_context().res_buffer
