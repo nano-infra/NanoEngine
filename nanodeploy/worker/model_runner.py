@@ -971,9 +971,9 @@ class ModelRunner:
                 self.sp_graph_map[master_bs].sort()
 
         logger.info(
-            "完成所有 graph 的捕获，"
-            f"成功捕获 {len(self.local_graphs)} 个 local 图、"
-            f"{len(self.sp_graphs)} 个 SP 图，合计 {total_graphs} 个图"
+            "Finished capturing all graphs. "
+            f"Successfully captured {len(self.local_graphs)} local graphs, "
+            f"{len(self.sp_graphs)} SP graphs, for a total of {total_graphs} graphs."
         )
 
         self.graph_vars = dict(
