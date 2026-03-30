@@ -17,27 +17,22 @@ from nanodeploy.models.quant_config import QuantizationConfig
 
 logger = get_logger()
 
-# Try to import flash-linear-attention kernels at module level
+# Try to import flashinfer GDN kernels (preferred, SM90 native)
 try:
-    from fla.ops.gated_delta_rule import (
-        chunk_gated_delta_rule,
-        fused_recurrent_gated_delta_rule,
-    )
+    from flashinfer import chunk_gated_delta_rule
+    from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 
-    _HAS_FLA = True
+    _HAS_FLASHINFER_GDN = True
 except ImportError:
-    _HAS_FLA = False
+    _HAS_FLASHINFER_GDN = False
     logger.warning(
-        "flash-linear-attention not installed. GatedDeltaNet will use naive fallback."
+        "flashinfer GDN kernels not available. GatedDeltaNet will use naive fallback."
     )
 
 # Try to import causal_conv1d for optimized depthwise conv
 try:
-    from causal_conv1d import (
-        causal_conv1d_fn,
-        causal_conv1d_update,
-        causal_conv1d_varlen_states,
-    )
+    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 
     _HAS_CAUSAL_CONV1D = True
 except ImportError:
@@ -55,6 +50,7 @@ class RMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
 
+    @torch.compile
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -73,9 +69,11 @@ class RMSNormGated(nn.Module):
 class GenericGatedDeltaNet(GatedDeltaNetBase):
     """GatedDeltaNet linear attention.
 
-    Uses flash-linear-attention kernels:
+    Uses flashinfer SM90 kernels:
     - Prefill: chunk_gated_delta_rule
-    - Decode: fused_recurrent_gated_delta_rule
+    - Decode: gated_delta_rule_decode_pretranspose (fused gate computation)
+
+    State layout is K-last: [N, H, V, K].
     """
 
     def __init__(
@@ -145,18 +143,8 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         # Output normalization: RMSNorm with SiLU gating
         self.norm = RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
 
-        # Kernel references
-        self._chunk_fn = chunk_gated_delta_rule if _HAS_FLA else None
-        self._recurrent_fn = fused_recurrent_gated_delta_rule if _HAS_FLA else None
-
-        # Precompute A
-        self._A_exp_cache = None
-
-    def _get_A_exp(self):
-        """Cached -exp(A_log)."""
-        if self._A_exp_cache is None:
-            self._A_exp_cache = -self.A_log.float().exp()
-        return self._A_exp_cache
+        # Kernel availability
+        self._has_flashinfer = _HAS_FLASHINFER_GDN
 
     def forward(
         self,
@@ -183,25 +171,28 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         # 3. Split back to Q, K, V (after conv)
         q, k, v = qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
 
-        # 4. Reshape Q, K, V
-        q = q.view(total_tokens, self.num_k_heads, self.head_k_dim)
-        k = k.view(total_tokens, self.num_k_heads, self.head_k_dim)
-        v = v.view(total_tokens, self.num_v_heads, self.head_v_dim)
+        # 4. Reshape Q, K, V (contiguous needed for flashinfer kernels)
+        q = q.view(total_tokens, self.num_k_heads, self.head_k_dim).contiguous()
+        k = k.view(total_tokens, self.num_k_heads, self.head_k_dim).contiguous()
+        v = v.view(total_tokens, self.num_v_heads, self.head_v_dim).contiguous()
 
-        # 5. Compute beta and gating
-        beta = b.sigmoid()  # [T, num_v_heads]
-        g = self._get_A_exp() * F.softplus(a.float() + self.dt_bias)  # [T, num_v_heads]
-
-        # 6. Expand q, k for GVA
+        # 5. Expand q, k for GVA
         if self.kv_ratio > 1:
             q = q.repeat_interleave(self.kv_ratio, dim=1)
             k = k.repeat_interleave(self.kv_ratio, dim=1)
 
-        # 7. Apply flash-linear-attention kernel
+        # 6. Apply GDN kernel
         scale = self.head_k_dim**-0.5
-        core_attn_out = self._apply_gdn(q, k, v, g, beta, scale, context)
+        if context.is_prefill:
+            beta = b.float().sigmoid()
+            A_exp = -self.A_log.float().exp()
+            g = A_exp * F.softplus(a.float() + self.dt_bias)
+            alpha = g.exp()
+            core_attn_out = self._gdn_prefill(q, k, v, g, alpha, beta, scale, context)
+        else:
+            core_attn_out = self._gdn_decode(q, k, v, a, b, scale, context)
 
-        # 8. Apply gated RMSNorm
+        # 7. Apply gated RMSNorm
         z = z.view(total_tokens, self.num_v_heads, self.head_v_dim)
         out = core_attn_out.reshape(-1, self.head_v_dim)
         z_flat = z.reshape(-1, self.head_v_dim)
@@ -210,7 +201,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
 
         out = out.view(total_tokens, self.num_v_heads, self.head_v_dim)
 
-        # 9. Output projection
+        # 8. Output projection
         out = out.reshape(total_tokens, self.value_dim)
         output = self.out_proj(out)
         return output
@@ -243,40 +234,60 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         )
 
         if has_prev_state:
-            # Chunked prefill (chunks 2+): per-sequence with initial_states
-            # from the previous chunk's stored conv state.
-            #
-            # TODO(perf): This per-seq Python loop is a bottleneck for large
-            # batches.  causal_conv1d_fn supports seq_idx for batch separation
-            # but NOT initial_states + seq_idx together.  Two options:
-            #   1. Upstream batched initial_states support to causal_conv1d_fn.
-            #   2. Write a custom Triton kernel for causal conv1d with
-            #      per-seq initial states (more work, but fully controlled).
-            # For now this is acceptable since GDN is used in hybrid attention
-            # where prefill batch sizes are typically small.
-            qkv_out = torch.empty_like(qkv)
-            for i in range(num_seqs):
-                start = int(cu_seqlens[i].item())
-                end = int(cu_seqlens[i + 1].item())
-                if end <= start:
-                    continue
-                slot = (
-                    int(gdn_state_slots[i].item()) if gdn_state_slots is not None else i
+            # Chunked prefill (chunks 2+): pad variable-length sequences into
+            # a fixed batch so we can call causal_conv1d_fn once with
+            # initial_states, avoiding per-seq Python loops and D2H syncs.
+            total_tokens = qkv.shape[0]
+            max_seqlen = context.max_seqlen_q
+            dim = qkv.shape[1]
+            seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+
+            batch_idx = torch.repeat_interleave(
+                torch.arange(num_seqs, device=qkv.device, dtype=torch.long),
+                seq_lens,
+                output_size=total_tokens,
+            )
+            offsets = torch.repeat_interleave(
+                cu_seqlens[:-1].long(),
+                seq_lens,
+                output_size=total_tokens,
+            )
+            pos_in_seq = (
+                torch.arange(
+                    total_tokens,
+                    device=qkv.device,
+                    dtype=torch.long,
                 )
-                init_state = gdn_conv_states[
-                    self.layer_idx, slot : slot + 1, :, 1:
+                - offsets
+            )
+
+            padded = torch.zeros(
+                num_seqs,
+                dim,
+                max_seqlen,
+                device=qkv.device,
+                dtype=qkv.dtype,
+            )
+            padded[batch_idx, :, pos_in_seq] = qkv
+
+            if gdn_state_slots is not None:
+                init_states = gdn_conv_states[
+                    self.layer_idx, gdn_state_slots[:num_seqs], :, 1:
                 ].contiguous()
-                seq_out = (
-                    causal_conv1d_fn(
-                        x=qkv[start:end].T.unsqueeze(0),
-                        weight=conv_weight,
-                        initial_states=init_state,
-                        activation=self.activation,
-                    )
-                    .squeeze(0)
-                    .T
-                )
-                qkv_out[start:end] = seq_out
+            else:
+                init_states = gdn_conv_states[
+                    self.layer_idx, :num_seqs, :, 1:
+                ].contiguous()
+
+            padded_out = causal_conv1d_fn(
+                x=padded,
+                weight=conv_weight,
+                initial_states=init_states,
+                activation=self.activation,
+            )
+
+            qkv_out = torch.empty_like(qkv)
+            qkv_out[:] = padded_out[batch_idx, :, pos_in_seq]
         else:
             # First chunk or single-chunk: batched with seq_idx
             seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
@@ -302,13 +313,11 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             states = causal_conv1d_varlen_states(
                 qkv, cu_seqlens, self.conv_kernel_size - 1
             )
+            padded = torch.cat([torch.zeros_like(states[:, :, :1]), states], dim=-1)
             if gdn_state_slots is not None:
-                slots = gdn_state_slots[:num_seqs]
-                gdn_conv_states[self.layer_idx, slots, :, 0] = 0
-                gdn_conv_states[self.layer_idx, slots, :, 1:] = states
+                gdn_conv_states[self.layer_idx, gdn_state_slots[:num_seqs]] = padded
             else:
-                gdn_conv_states[self.layer_idx, :num_seqs, :, 0] = 0
-                gdn_conv_states[self.layer_idx, :num_seqs, :, 1:] = states
+                gdn_conv_states[self.layer_idx, :num_seqs] = padded
 
         return qkv_out
 
@@ -403,24 +412,13 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         else:
             return F.silu(qkv)
 
-    def _apply_gdn(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        scale: float,
-        context,
-    ) -> torch.Tensor:
-        """Apply GatedDeltaNet attention (chunk or recurrent)."""
-        if context.is_prefill:
-            return self._gdn_prefill(q, k, v, g, beta, scale, context)
-        else:
-            return self._gdn_decode(q, k, v, g, beta, scale, context)
+    def _gdn_prefill(self, q, k, v, g, alpha, beta, scale, context) -> torch.Tensor:
+        """Prefill: chunk mode. State layout is K-last [N, H, V, K].
 
-    def _gdn_prefill(self, q, k, v, g, beta, scale, context) -> torch.Tensor:
-        """Prefill: chunk mode."""
+        Args:
+            g: log-space decay, used by naive fallback (negative values)
+            alpha: linear decay factor = exp(g), used by flashinfer kernel (in [0, 1])
+        """
         cu_seqlens = context.cu_seqlens_q.long()
         num_seqs = cu_seqlens.shape[0] - 1
 
@@ -429,7 +427,6 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         initial_state = None
         if gdn_recurrent_states is not None:
             if context.block_tables is not None:
-                # Chunked prefill (chunks 2+): load state from previous chunk
                 if gdn_state_slots is not None:
                     initial_state = gdn_recurrent_states[
                         self.layer_idx, gdn_state_slots[:num_seqs]
@@ -438,23 +435,23 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                     initial_state = gdn_recurrent_states[self.layer_idx, :num_seqs]
             else:
                 initial_state = gdn_recurrent_states.new_zeros(
-                    num_seqs, self.num_v_heads, self.head_k_dim, self.head_v_dim
+                    num_seqs, self.num_v_heads, self.head_v_dim, self.head_k_dim
                 )
 
-        if self._chunk_fn is not None:
-            o, final_state = self._chunk_fn(
-                q.unsqueeze(0),
-                k.unsqueeze(0),
-                v.unsqueeze(0),
-                g=g.unsqueeze(0),
-                beta=beta.unsqueeze(0),
+        if self._has_flashinfer:
+            q_normed = self._l2norm(q.float(), dim=-1).to(q.dtype)
+            k_normed = self._l2norm(k.float(), dim=-1).to(k.dtype)
+            o, final_state = chunk_gated_delta_rule(
+                q_normed,
+                k_normed,
+                v,
+                g=alpha,
+                beta=beta,
                 scale=scale,
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=True,
             )
-            o = o.squeeze(0)
         else:
             o, final_state = self._naive_gdn_prefill(
                 q, k, v, g, beta, scale, cu_seqlens, initial_state
@@ -470,51 +467,57 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
 
         return o
 
-    def _gdn_decode(self, q, k, v, g, beta, scale, context) -> torch.Tensor:
-        """Decode: recurrent mode (single step)."""
+    def _gdn_decode(self, q, k, v, a, b, scale, context) -> torch.Tensor:
+        """Decode: flashinfer fused kernel with pool+indices.
+
+        flashinfer takes raw A_log, a, dt_bias, b and computes gates internally,
+        and supports direct pool indexing to avoid gather/scatter overhead.
+        State layout is K-last [pool_size, H, V, K].
+        """
         bs = q.shape[0]
 
         gdn_recurrent_states = getattr(context, "gdn_recurrent_states", None)
         gdn_state_slots = getattr(context, "gdn_state_slots", None)
-        if gdn_recurrent_states is not None:
+
+        if self._has_flashinfer and gdn_recurrent_states is not None:
+            state_pool = gdn_recurrent_states[self.layer_idx]
             if gdn_state_slots is not None:
-                initial_state = gdn_recurrent_states[
-                    self.layer_idx, gdn_state_slots[:bs]
-                ]  # gather
+                indices = gdn_state_slots[:bs].to(torch.int64)
             else:
-                initial_state = gdn_recurrent_states[self.layer_idx, :bs]
-        else:
-            initial_state = q.new_zeros(
-                bs, self.num_v_heads, self.head_k_dim, self.head_v_dim
-            )
+                indices = torch.arange(bs, device=q.device, dtype=torch.int64)
 
-        q_r = q.unsqueeze(1)
-        k_r = k.unsqueeze(1)
-        v_r = v.unsqueeze(1)
-        g_r = g.unsqueeze(1)
-        beta_r = beta.unsqueeze(1)
-
-        if self._recurrent_fn is not None:
-            o, final_state = self._recurrent_fn(
-                q_r,
-                k_r,
-                v_r,
-                g=g_r,
-                beta=beta_r,
+            o, _ = gated_delta_rule_decode_pretranspose(
+                q=q.unsqueeze(1),
+                k=k.unsqueeze(1),
+                v=v.unsqueeze(1),
+                state=None,
+                A_log=self.A_log.detach().float(),
+                a=a.unsqueeze(1),
+                dt_bias=self.dt_bias.detach(),
+                b=b.unsqueeze(1),
                 scale=scale,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm=True,
+                initial_state=state_pool,
+                initial_state_indices=indices,
             )
             o = o.squeeze(1)
-            if gdn_recurrent_states is not None and final_state is not None:
-                if gdn_state_slots is not None:
-                    gdn_recurrent_states[self.layer_idx, gdn_state_slots[:bs]] = (
-                        final_state
-                    )
-                else:
-                    gdn_recurrent_states[self.layer_idx, :bs] = final_state
         else:
+            beta = b.sigmoid()
+            A_exp = -self.A_log.float().exp()
+            g = A_exp * F.softplus(a.float() + self.dt_bias)
+
+            if gdn_recurrent_states is not None:
+                if gdn_state_slots is not None:
+                    initial_state = gdn_recurrent_states[
+                        self.layer_idx, gdn_state_slots[:bs]
+                    ]
+                else:
+                    initial_state = gdn_recurrent_states[self.layer_idx, :bs]
+            else:
+                initial_state = q.new_zeros(
+                    bs, self.num_v_heads, self.head_k_dim, self.head_v_dim
+                )
+
             o, updated_state = self._naive_gdn_decode(
                 q, k, v, g, beta, scale, initial_state
             )
@@ -529,6 +532,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         return o
 
     @staticmethod
+    @torch.compile
     def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
         """L2 normalization matching FLA's l2norm."""
         inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
@@ -537,7 +541,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
     def _naive_gdn_prefill(
         self, q, k, v, g, beta, scale, cu_seqlens, initial_state=None
     ):
-        """Naive sequential scan for prefill."""
+        """Naive sequential scan for prefill. State is K-last [H, V, K]."""
         num_seqs = cu_seqlens.shape[0] - 1
         outputs = []
         final_states = []
@@ -550,12 +554,12 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
 
             if initial_state is not None:
-                S = initial_state[i].float().clone()
+                S = initial_state[i].float().clone()  # [H, V, K]
             else:
                 S = torch.zeros(
                     self.num_v_heads,
-                    self.head_k_dim,
                     self.head_v_dim,
+                    self.head_k_dim,
                     dtype=torch.float32,
                     device=q.device,
                 )
@@ -575,14 +579,14 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 gt = gi[t].float()
 
                 decay = gt.exp().unsqueeze(-1).unsqueeze(-1)
-                S = decay * S
+                S = decay * S  # [H, V, K]
 
-                kv = torch.einsum("hk,hv->hkv", kt, vt)
-                Sk = torch.einsum("hkv,hk->hv", S, kt)
-                correction = torch.einsum("hk,hv->hkv", kt, Sk)
-                S = S + bt.unsqueeze(-1).unsqueeze(-1) * (kv - correction)
+                vk = torch.einsum("hv,hk->hvk", vt, kt)
+                Sk = torch.einsum("hvk,hk->hv", S, kt)
+                correction = torch.einsum("hv,hk->hvk", Sk, kt)
+                S = S + bt.unsqueeze(-1).unsqueeze(-1) * (vk - correction)
 
-                out_t = torch.einsum("hk,hkv->hv", qt, S)
+                out_t = torch.einsum("hk,hvk->hv", qt, S)
                 out_seq.append(out_t)
 
             out_seq = torch.stack(out_seq, dim=0).to(v.dtype)
@@ -598,19 +602,19 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         return output, final_state
 
     def _naive_gdn_decode(self, q, k, v, g, beta, scale, state):
-        """Naive recurrent step for decode."""
+        """Naive recurrent step for decode. State is K-last [B, H, V, K]."""
         q = self._l2norm(q.float(), dim=-1) * scale
         k = self._l2norm(k.float(), dim=-1)
-        state_f32 = state.float()
+        state_f32 = state.float()  # [B, H, V, K]
 
         decay = g.float().exp().unsqueeze(-1).unsqueeze(-1)
         state_f32.mul_(decay)
 
-        kv = torch.einsum("bhk,bhv->bhkv", k, v.float())
-        Sk = torch.einsum("bhkv,bhk->bhv", state_f32, k)
-        correction = torch.einsum("bhk,bhv->bhkv", k, Sk)
-        state_f32.add_(beta.float().unsqueeze(-1).unsqueeze(-1) * (kv - correction))
+        vk = torch.einsum("bhv,bhk->bhvk", v.float(), k)
+        Sk = torch.einsum("bhvk,bhk->bhv", state_f32, k)
+        correction = torch.einsum("bhv,bhk->bhvk", Sk, k)
+        state_f32.add_(beta.float().unsqueeze(-1).unsqueeze(-1) * (vk - correction))
 
-        out = torch.einsum("bhk,bhkv->bhv", q, state_f32)
+        out = torch.einsum("bhk,bhvk->bhv", q, state_f32)
 
         return out.to(v.dtype), state_f32

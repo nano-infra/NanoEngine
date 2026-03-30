@@ -255,13 +255,14 @@ class CacheContext:
             device=torch.get_default_device(),
         )
 
-        # Recurrent state: [num_layers, num_slots, num_v_heads, head_k_dim, head_v_dim]
+        # Recurrent state: [num_layers, num_slots, num_v_heads, head_v_dim, head_k_dim]
+        # K-last layout to match flashinfer's gated_delta_rule_decode_pretranspose
         self.gdn_recurrent_states = torch.zeros(
             num_layers,
             num_slots,
             num_v_heads,
-            head_k_dim,
             head_v_dim,
+            head_k_dim,
             dtype=torch.float32,
             device=torch.get_default_device(),
         )

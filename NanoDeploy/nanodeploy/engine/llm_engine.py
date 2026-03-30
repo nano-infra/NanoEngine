@@ -143,7 +143,7 @@ class LLMEngine:
             waiting_head_blocks, waiting_total_blocks
         )
 
-        logger.debug(
+        logger.info(
             {
                 "mode": "prefill" if is_prefill else "decode",
                 # "dp_batch_sizes": dp_batch_sizes,

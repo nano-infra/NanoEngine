@@ -46,6 +46,8 @@ class Config(BaseModel):
 
     dummy_prefill: Optional[bool] = False
     dummy_weight: Optional[bool] = False
+    dummy_eplb: Optional[bool] = False
+
     enable_eplb: Optional[bool] = False
 
     # control plane config – enabled when nanoctrl_address is provided
