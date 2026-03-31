@@ -20,13 +20,14 @@ dependencies = [
     # "torch>=2.4.0",
     # "triton>=3.0.0",
     # "flash-attn",
-    "transformers>=4.51.0",
+    # "flashinfer",
     "pydantic",
     "pyzmq>=25.0",
-    "ray",
-    "dlslime>=0.0.2",
     "httpx",
     "uvloop>=0.21.0",
+    "ray>=2.50.1",
+    "transformers>=4.51.0",
+    "dlslime==0.0.3.rc1",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

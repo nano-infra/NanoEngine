@@ -2,16 +2,12 @@
 
 ## 📦 Components
 
-| Component                      | Language    | Description             | Key Features                                                                                    |
-| ------------------------------ | ----------- | ----------------------- | ----------------------------------------------------------------------------------------------- |
-| [DLSlime](./DLSlime)           | C++         | RDMA communication      | Zero-copy KV cache migration, P2P mesh networking, GPUDirect RDMA                               |
-| [NanoBench](./NanoBench)       | Python      | Benchmarking tools      | Performance testing and profiling                                                               |
-| [NanoCommon](./NanoCommon)     | C++         | Shared utilities        | Logging, common data structures, error handling                                                 |
-| [NanoCtrl](./NanoCtrl)         | Rust        | Control plane           | Redis-backed service registry, health monitoring, engine discovery, Python client               |
-| [NanoDeploy](./NanoDeploy)     | Python/C++  | LLM inference engine    | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
-| [NanoDeployVL](./NanoDeployVL) | Python      | Vision-Language encoder | EP-separated ViT encoder, RDMA embedding transfer, Qwen3-VL support                             |
-| [NanoRoute](./NanoRoute)       | Rust        | HTTP load balancer      | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
-| [NanoSequence](./NanoSequence) | FlatBuffers | Protocol definitions    | Wire-format schemas for sequence, packet, and batch interfaces                                  |
+| Component                      | Language   | Description             | Key Features                                                                                    |
+| ------------------------------ | ---------- | ----------------------- | ----------------------------------------------------------------------------------------------- |
+| [NanoCtrl](./NanoCtrl)         | Rust       | Control plane           | Redis-backed service registry, health monitoring, engine discovery, Python client               |
+| [NanoDeploy](./NanoDeploy)     | Python/C++ | LLM inference engine    | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
+| [NanoDeployVL](./NanoDeployVL) | Python     | Vision-Language encoder | EP-separated ViT encoder, RDMA embedding transfer, Qwen3-VL support                             |
+| [NanoRoute](./NanoRoute)       | Rust       | HTTP load balancer      | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
 
 ## 🏗️ Architecture
 
@@ -49,7 +45,6 @@ pip install ".[all]"
 ### Install individual components
 
 ```bash
-pip install ".[dlslime]"      # DLSlime transfer engine only
 pip install ".[nanoctrl]"     # NanoCtrl lifecycle client only
 pip install ".[nanodeploy]"   # NanoDeploy inference engine only
 pip install ".[nanodeployvl]" # NanoDeployVL vision-language encoder only
