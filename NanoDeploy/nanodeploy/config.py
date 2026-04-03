@@ -58,6 +58,9 @@ class Config(BaseModel):
     master_address: str = "127.0.0.1:6006"
     ray_address: str = "127.0.0.1:6379"
 
+    # MTP (Multi-Token Prediction) speculative decoding
+    num_speculative_tokens: int = 0  # 0 = disabled, >0 = number of draft tokens
+
     # profiler
     enable_profiler: bool = False
     profiler_start_step: int = 40
@@ -120,6 +123,19 @@ class Config(BaseModel):
 
         # With chunked prefill, max_num_batched_tokens may be smaller than max_model_len.
         assert self.max_num_batched_tokens >= 1
+
+        # MTP validation
+        if self.num_speculative_tokens > 0:
+            has_mtp = (
+                getattr(self.hf_config, "num_nextn_predict_layers", 0) > 0
+                or getattr(self.hf_config, "mtp_num_hidden_layers", 0) > 0
+            )
+            if not has_mtp:
+                raise ValueError(
+                    f"num_speculative_tokens={self.num_speculative_tokens} but "
+                    f"model does not have MTP layers "
+                    f"(num_nextn_predict_layers / mtp_num_hidden_layers not found)"
+                )
 
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             if hasattr(self.hf_config, "num_key_value_heads"):

@@ -24,10 +24,12 @@ from nanodeploy.context.expert_context import ExpertContext
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
+from nanodeploy.models.deepseek_v2.deepseek_v2_mtp import DeepSeekMTP
 from nanodeploy.models.qwen3.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_5_moe.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
+from nanodeploy.models.qwen3_5_moe.qwen3_5_moe_mtp import Qwen3_5MTP
 from nanodeploy.models.qwen3_moe.qwen3_moe import Qwen3MoeForCausalLM
-from nanodeploy.worker.loader import load_model
+from nanodeploy.worker.loader import load_model, load_mtp_model
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 
 logger = get_logger("NANODEPLOY")
@@ -38,6 +40,11 @@ architectures = {
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGeneration,
+}
+
+architectures_mtp = {
+    "DeepseekV3ForCausalLM": DeepSeekMTP,
+    "Qwen3_5MoeForConditionalGeneration": Qwen3_5MTP,
 }
 
 
@@ -211,6 +218,32 @@ class ModelRunner:
 
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
+
+        # --- MTP model initialization ---
+        self.mtp_model = None
+        self._last_hidden = None
+        self.mtp_graphs = None
+        self.mtp_graph_vars = None
+        if config.num_speculative_tokens > 0:
+            mtp_cls = architectures_mtp.get(model_architecture)
+            if mtp_cls is None:
+                raise ValueError(
+                    f"MTP not supported for architecture {model_architecture}"
+                )
+            self.mtp_model = mtp_cls(hf_config)
+            # Share embeddings from target model
+            self.mtp_model.embed_tokens = self.model.model.embed_tokens
+            # For Qwen3.5: share lm_head if tie_word_embeddings
+            if hasattr(self.mtp_model, "lm_head") and getattr(
+                hf_config, "tie_word_embeddings", False
+            ):
+                self.mtp_model.lm_head = self.model.lm_head
+            if not get_runner_config().dummy_weight:
+                load_mtp_model(self.mtp_model, config.model)
+            logger.info(
+                f"MTP model loaded: {mtp_cls.__name__}, "
+                f"num_speculative_tokens={config.num_speculative_tokens}"
+            )
 
         dist.barrier()
 
@@ -774,6 +807,9 @@ class ModelRunner:
                 # the barrier's RDMA writes arrive at peer GPUs while they are already
                 # executing the graph, corrupting NVSHMEM symmetric memory → SIGSEGV.
                 ExpertContext.get_instance().transition_to_low_latency()
+            # Save hidden states for MTP draft generation (decode only)
+            if not is_prefill and self.mtp_model is not None:
+                self._last_hidden = hidden
             return self.model.compute_logits(hidden)
         else:
             bs = input_ids.size(0)
@@ -824,7 +860,11 @@ class ModelRunner:
                     graph_vars["gdn_state_slots"][:bs].copy_(context.gdn_state_slots)
 
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            outputs = graph_vars["outputs"][:bs]
+            # Save hidden states for MTP (need clone since graph_vars are reused)
+            if self.mtp_model is not None:
+                self._last_hidden = outputs.clone()
+            return self.model.compute_logits(outputs)
 
     def migrate_from_bytes(self, data: bytes) -> None:
         """Migrate using lean MigrateBatchInput bytes (no Sequence objects)."""
@@ -901,6 +941,7 @@ class ModelRunner:
                 self._vision_embeds = None
 
             tp_rank = get_dist_context().attn_tp_rank
+            temperatures = None
             if tp_rank == 0:
                 temperatures = self.prepare_sample_from_aux(aux)
                 context = get_context()
@@ -916,6 +957,41 @@ class ModelRunner:
             else:
                 input_ids = input_ids.new_zeros([num_seqs])
             dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
+
+            # MTP draft generation (decode only, after first token sampling)
+            if self.mtp_model is not None and not is_prefill and not is_dummy:
+                # Save decode context and its token_ids before MTP overwrites
+                decode_context = get_context()
+                saved_token_ids = decode_context.token_ids
+
+                drafts = self._generate_mtp_drafts(
+                    input_ids,
+                    positions,
+                    self._last_hidden,
+                    temperatures,
+                    num_seqs,
+                )
+
+                # Append draft tokens to saved token_ids
+                for draft_ids in drafts:
+                    saved_token_ids.append(draft_ids[None, ...])
+
+                # Restore decode context for next loop iteration
+                set_context(
+                    is_prefill=decode_context.is_prefill,
+                    max_bs=decode_context.max_bs,
+                    slot_mapping=decode_context.slot_mapping,
+                    context_lens=decode_context.context_lens,
+                    block_tables=decode_context.block_tables,
+                    is_dummy=decode_context.is_dummy,
+                    tile_scheduler_metadata=decode_context.tile_scheduler_metadata,
+                    num_splits=decode_context.num_splits,
+                    gdn_conv_states=decode_context.gdn_conv_states,
+                    gdn_recurrent_states=decode_context.gdn_recurrent_states,
+                    gdn_state_slots=decode_context.gdn_state_slots,
+                )
+                # Restore token_ids on new context
+                get_context().token_ids = saved_token_ids
 
             # No update_seqs_inner_loop needed — metadata already updated in-place
 
@@ -936,6 +1012,150 @@ class ModelRunner:
         reset_context()
 
         return loop_count_token_ids
+
+    # ------------------------------------------------------------------
+    # MTP (Multi-Token Prediction) draft generation
+    # ------------------------------------------------------------------
+
+    def _set_mtp_context(self, num_seqs: int):
+        """Set context for MTP forward (prefill mode, seq_len=1, no KV cache)."""
+        cu_seqlens = torch.arange(num_seqs + 1, dtype=torch.int32, device="cuda")
+        set_context(
+            is_prefill=True,
+            max_bs=self.config.max_num_seqs,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_k=1,
+            slot_mapping=None,
+            block_tables=None,
+            is_dummy=False,
+        )
+
+    def _run_mtp_step(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+        bs: int,
+    ) -> torch.Tensor:
+        """Run one MTP speculative step. Uses CUDAGraph if captured."""
+        if self.mtp_graphs is not None:
+            master_bs = next((x for x in self.mtp_graph_bs_list if x >= bs), None)
+            if master_bs is not None and master_bs in self.mtp_graphs:
+                gv = self.mtp_graph_vars
+                gv["mtp_input_ids"][:bs] = input_ids
+                gv["mtp_positions"][:bs] = positions
+                gv["mtp_hidden_states"][:bs] = hidden_states
+                self.mtp_graphs[master_bs].replay()
+                return gv["mtp_outputs"][:bs]
+
+        # Eager fallback
+        self._set_mtp_context(bs)
+        return self.mtp_model(
+            input_ids,
+            positions,
+            hidden_states,
+            spec_step_idx=spec_step_idx,
+        )
+
+    @torch.inference_mode()
+    def _generate_mtp_drafts(
+        self,
+        sampled_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        temperatures: torch.Tensor | None,
+        num_seqs: int,
+    ) -> list[torch.Tensor]:
+        """Generate draft tokens using MTP layers (decode only)."""
+        drafts = []
+        current_hidden = hidden_states
+        current_ids = sampled_ids
+        current_pos = positions + 1
+
+        for step in range(self.config.num_speculative_tokens):
+            # _run_mtp_step handles context setup for eager path;
+            # for CUDAGraph path, the context was baked in during capture.
+            mtp_hidden = self._run_mtp_step(
+                current_ids, current_pos, current_hidden, step, num_seqs
+            )
+
+            # Set MTP context for compute_logits (ParallelLMHead reads is_prefill)
+            self._set_mtp_context(num_seqs)
+            mtp_logits = self.mtp_model.compute_logits(mtp_hidden, spec_step_idx=step)
+
+            # Sample on tp_rank 0, broadcast
+            tp_rank = get_dist_context().attn_tp_rank
+            if tp_rank == 0:
+                draft_ids = self.sampler(mtp_logits, temperatures)
+            else:
+                draft_ids = current_ids.new_zeros(num_seqs)
+            dist.all_reduce(draft_ids, group=get_dist_context().attn_tp_group)
+
+            drafts.append(draft_ids)
+            current_hidden = mtp_hidden
+            current_ids = draft_ids
+            current_pos = current_pos + 1
+
+        return drafts
+
+    def _capture_mtp_cudagraphs(self, max_bs: int, hf_config):
+        """Capture separate CUDAGraphs for MTP forward per batch size."""
+        mtp_input_ids = torch.zeros(max_bs, dtype=torch.int64)
+        mtp_positions = torch.zeros(max_bs, dtype=torch.int64)
+        mtp_hidden_states = torch.zeros(max_bs, hf_config.hidden_size)
+        mtp_outputs = torch.zeros(max_bs, hf_config.hidden_size)
+
+        cu_seqlens = torch.arange(max_bs + 1, dtype=torch.int32, device="cuda")
+
+        self.mtp_graph_bs_list = [x for x in [1, 2, 4, 8] if x <= max_bs] + list(
+            range(16, max_bs + 1, 16)
+        )
+        self.mtp_graphs = {}
+
+        logger.info(f"Capturing MTP CUDAGraphs...")
+
+        for bs in reversed(self.mtp_graph_bs_list):
+            logger.info(f"Capturing MTP graph - bs={bs}")
+            set_context(
+                is_prefill=True,
+                max_bs=self.config.max_num_seqs,
+                cu_seqlens_q=cu_seqlens[: bs + 1],
+                cu_seqlens_k=cu_seqlens[: bs + 1],
+                max_seqlen_q=1,
+                max_seqlen_k=1,
+                slot_mapping=None,
+                block_tables=None,
+                is_dummy=False,
+            )
+
+            # Warmup
+            mtp_outputs[:bs] = self.mtp_model(
+                mtp_input_ids[:bs], mtp_positions[:bs], mtp_hidden_states[:bs]
+            )
+
+            # Capture
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, self.graph_pool):
+                mtp_outputs[:bs] = self.mtp_model(
+                    mtp_input_ids[:bs],
+                    mtp_positions[:bs],
+                    mtp_hidden_states[:bs],
+                )
+
+            self.mtp_graphs[bs] = graph
+            reset_context()
+
+        self.mtp_graph_vars = dict(
+            mtp_input_ids=mtp_input_ids,
+            mtp_positions=mtp_positions,
+            mtp_hidden_states=mtp_hidden_states,
+            mtp_outputs=mtp_outputs,
+        )
+
+        logger.info(f"Finished capturing {len(self.mtp_graphs)} MTP CUDAGraphs")
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -1044,3 +1264,7 @@ class ModelRunner:
             num_splits=num_splits_buffer,
             gdn_state_slots=gdn_state_slots_buf,
         )
+
+        # Capture MTP CUDAGraphs (after target model graphs, sharing graph_pool)
+        if self.mtp_model is not None:
+            self._capture_mtp_cudagraphs(max_bs, hf_config)
