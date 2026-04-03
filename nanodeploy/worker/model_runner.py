@@ -238,7 +238,7 @@ class ModelRunner:
 
     def exit(self):
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            del self.local_graphs, self.sp_graphs, self.sp_graph_map, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -392,6 +392,7 @@ class ModelRunner:
         res_lse_mask[sp_rank].fill_(0)
         res_lse_mask[res_lse_mask != 0] = 1
 
+        use_sp_a2a = meta.use_sp_a2a
         context_lens_for_attn = torch.tensor(
             meta.context_lens_for_attn, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
@@ -426,43 +427,9 @@ class ModelRunner:
         q_offsets = torch.tensor(
             meta.q_offsets, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
-        attention_compute_bs = context_lens_for_attn.numel()
-
-        context_lens_for_attn = torch.tensor(
-            meta.context_lens_for_attn, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        q_slice_get = torch.tensor(
-            meta.q_slice_get, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_slice_fill = torch.tensor(
-            meta.q_slice_fill, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_copy_mask = torch.tensor(
-            meta.q_copy_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_get_to_buffer_output = torch.tensor(
-            meta.res_slice_get_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_fill_to_buffer_output = torch.tensor(
-            meta.res_slice_fill_to_buffer_output, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_to_buffer_output_mask = torch.tensor(
-            meta.res_to_buffer_output_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_get_to_buffer_input = torch.tensor(
-            meta.res_slice_get_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_slice_fill_to_buffer_input = torch.tensor(
-            meta.res_slice_fill_to_buffer_input, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        res_to_buffer_input_mask = torch.tensor(
-            meta.res_to_buffer_input_mask, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        q_offsets = torch.tensor(
-            meta.q_offsets, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        attention_compute_bs = context_lens_for_attn.numel()
+        attention_compute_bs = (
+            context_lens_for_attn.numel() if use_sp_a2a else input_ids.size(0)
+        )
         
         config = self.config
         hf_config = config.hf_config
@@ -485,6 +452,7 @@ class ModelRunner:
             global_context_lens=global_context_lens,
             q_mask=q_mask,
             res_lse_mask=res_lse_mask,
+            use_sp_a2a=use_sp_a2a,
             is_dummy=is_dummy,
             context_lens_for_attn=context_lens_for_attn,
             attention_compute_bs=attention_compute_bs,
@@ -564,29 +532,31 @@ class ModelRunner:
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            context = get_context()
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
             master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
-            
-            ac_bs = context.attention_compute_bs
-            if ac_bs is None:
-                ac_bs = bs
-            valid_attn_bs_list = self.graph_map.get(master_bs)
-            if valid_attn_bs_list is None:
-                 raise RuntimeError(f"No graph map found for master_bs={master_bs}")
-            
-            try:
-                attn_bs = next(x for x in valid_attn_bs_list if x >= ac_bs)
-            except StopIteration:
-                raise RuntimeError(
-                    f"Input attention_compute_bs {ac_bs} exceeds max captured attn_bs "
-                    f"({valid_attn_bs_list[-1]}) for master_bs {master_bs}"
-                )
-            
-            graph = self.graphs[(master_bs, attn_bs)]
+
+            if context.use_sp_a2a:
+                ac_bs = context.attention_compute_bs
+                if ac_bs is None:
+                    ac_bs = bs
+                valid_attn_bs_list = self.sp_graph_map.get(master_bs)
+                if valid_attn_bs_list is None:
+                    raise RuntimeError(f"No SP graph map found for master_bs={master_bs}")
+
+                try:
+                    attn_bs = next(x for x in valid_attn_bs_list if x >= ac_bs)
+                except StopIteration:
+                    raise RuntimeError(
+                        f"Input attention_compute_bs {ac_bs} exceeds max captured attn_bs "
+                        f"({valid_attn_bs_list[-1]}) for master_bs {master_bs}"
+                    )
+
+                graph = self.sp_graphs[(master_bs, attn_bs)]
+            else:
+                graph = self.local_graphs[master_bs]
 
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
@@ -908,88 +878,103 @@ class ModelRunner:
             tile_scheduler_metadata_buffer, num_splits_buffer = None, None
 
         self.graph_master_rank_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
+        self.local_graphs = {}
+        self.sp_graphs = {}
         self.graph_pool = None
-        self.graph_map = {}  # store master_bs -> [available_attn_bs...]
-        
-        self.attn_bs_step = 16 # 定义 attn_bs 的步长
+        self.sp_graph_map = {}  # store master_bs -> [available_attn_bs...]
+        self.attn_bs_step = 16
 
-        total_graphs = 0
-        
-        logger.info(f"开始捕获 CUDAGraph...")
-        completed_graphs = 0
+        def capture_graph(master_bs: int, attn_bs: int, use_sp_a2a: bool):
+            graph = torch.cuda.CUDAGraph()
+            set_context(
+                is_prefill=False,
+                max_bs=self.config.max_num_seqs,
+                slot_mapping=slot_mapping[:master_bs],
+                context_lens=context_lens,
+                block_tables=block_tables,
+                global_context_lens=global_context_lens,
+                q_mask=q_mask,
+                res_lse_mask=res_lse_mask,
+                use_sp_a2a=use_sp_a2a,
+                q_slice_get=q_slice_get[:master_bs],
+                q_slice_fill=q_slice_fill[:master_bs],
+                q_copy_mask=q_copy_mask[:master_bs],
+                res_slice_get_to_buffer_output=res_slice_get_to_buffer_output[
+                    :master_bs
+                ],
+                res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output[
+                    :master_bs
+                ],
+                res_to_buffer_output_mask=res_to_buffer_output_mask[:master_bs],
+                res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
+                res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
+                res_to_buffer_input_mask=res_to_buffer_input_mask,
+                attention_compute_bs=attn_bs,
+                context_lens_for_attn=context_lens_for_attn,
+                q_offsets=q_offsets,
+                tile_scheduler_metadata=tile_scheduler_metadata_buffer,
+                num_splits=num_splits_buffer,
+            )
 
-        for master_bs in reversed(self.graph_master_rank_bs):
-            self.graph_map[master_bs] = []
-            
-            current_attn_bs_candidates = []
-            curr = master_bs
-            if sp_world_size == 1:
-                limit = master_bs
-            else:
-                limit = master_bs + config.max_num_recv_seqs
-            while curr <= limit:
-                current_attn_bs_candidates.append(curr)
-                curr += self.attn_bs_step
-            
-            for attn_bs in reversed(current_attn_bs_candidates):
-                
-                completed_graphs += 1
-                logger.info(
-                    f"正在捕获图 - (master_bs={master_bs}, attn_bs={attn_bs})"
-                )
-                graph = torch.cuda.CUDAGraph()
-                set_context(
-                    is_prefill=False,
-                    max_bs=self.config.max_num_seqs,
-                    slot_mapping=slot_mapping[:master_bs],
-                    context_lens=context_lens,
-                    block_tables=block_tables,
-                    global_context_lens=global_context_lens,
-                    q_mask=q_mask,
-                    res_lse_mask=res_lse_mask,
-                    q_slice_get=q_slice_get[:master_bs],
-                    q_slice_fill=q_slice_fill[:master_bs],
-                    q_copy_mask=q_copy_mask[:master_bs],
-                    res_slice_get_to_buffer_output=res_slice_get_to_buffer_output[
-                        :master_bs
-                    ],
-                    res_slice_fill_to_buffer_output=res_slice_fill_to_buffer_output[
-                        :master_bs
-                    ],
-                    res_to_buffer_output_mask=res_to_buffer_output_mask[:master_bs],
-                    res_slice_get_to_buffer_input=res_slice_get_to_buffer_input,
-                    res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
-                    res_to_buffer_input_mask=res_to_buffer_input_mask,
-                    attention_compute_bs=attn_bs,
-                    context_lens_for_attn=context_lens_for_attn,
-                    q_offsets=q_offsets,
-                    tile_scheduler_metadata=tile_scheduler_metadata_buffer,
-                    num_splits=num_splits_buffer,
-                )
+            outputs[:master_bs] = self.model(
+                input_ids[:master_bs], positions[:master_bs]
+            )  # warmup
 
+            with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:master_bs] = self.model(
                     input_ids[:master_bs], positions[:master_bs]
-                )  # warmup
+                )  # capture
 
-                with torch.cuda.graph(graph, self.graph_pool):
-                    outputs[:master_bs] = self.model(
-                        input_ids[:master_bs], positions[:master_bs]
-                    )  # capture
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
 
-                if self.graph_pool is None:
-                    self.graph_pool = graph.pool()
+            torch.cuda.synchronize()
+            dist.barrier(group=get_dist_context().cuda_world_group)
+            reset_context()
+            return graph
 
-                self.graphs[(master_bs, attn_bs)] = graph
-                self.graph_map[master_bs].append(attn_bs)
-                
-                torch.cuda.synchronize()
-                dist.barrier(group=get_dist_context().cuda_world_group)
-                reset_context()
+        logger.info("Starting CUDAGraph capture...")
+        total_graphs = 0
 
-            self.graph_map[master_bs].sort()
+        for master_bs in reversed(self.graph_master_rank_bs):
+            logger.info(f"正在捕获本地图 - (master_bs={master_bs})")
+            self.local_graphs[master_bs] = capture_graph(
+                master_bs=master_bs,
+                attn_bs=master_bs,
+                use_sp_a2a=False,
+            )
+            total_graphs += 1
 
-        logger.info(f"完成所有 graph 的捕获，成功捕获 {len(self.graphs)} 个图")
+        if sp_world_size > 1:
+            for master_bs in reversed(self.graph_master_rank_bs):
+                self.sp_graph_map[master_bs] = []
+
+                current_attn_bs_candidates = []
+                curr = master_bs
+                limit = master_bs + config.max_num_recv_seqs
+                while curr <= limit:
+                    current_attn_bs_candidates.append(curr)
+                    curr += self.attn_bs_step
+
+                for attn_bs in reversed(current_attn_bs_candidates):
+                    logger.info(
+                        f"正在捕获 SP 图 - (master_bs={master_bs}, attn_bs={attn_bs})"
+                    )
+                    self.sp_graphs[(master_bs, attn_bs)] = capture_graph(
+                        master_bs=master_bs,
+                        attn_bs=attn_bs,
+                        use_sp_a2a=True,
+                    )
+                    self.sp_graph_map[master_bs].append(attn_bs)
+                    total_graphs += 1
+
+                self.sp_graph_map[master_bs].sort()
+
+        logger.info(
+            "Finished capturing all graphs. "
+            f"Successfully captured {len(self.local_graphs)} local graphs, "
+            f"{len(self.sp_graphs)} SP graphs, for a total of {total_graphs} graphs."
+        )
 
         self.graph_vars = dict(
             input_ids=input_ids,

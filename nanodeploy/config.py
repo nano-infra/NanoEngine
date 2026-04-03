@@ -15,7 +15,7 @@ class Config:
     max_num_seqs: int = 256
     max_num_recv_seqs: int = 32
     max_model_len: int = 16384
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float = 0.85
     gpu_memory_limit_gb: float | None = None
     routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"] = "RoundRobin"
     scheduler_mode: Literal["centralized", "decentralized"] = "centralized"
@@ -51,7 +51,7 @@ class Config:
     enable_profiler: bool = False
     profiler_start_step: int = 40
     profiling_step: int = 16
-    profiler_dir: str = "/mnt/nvme1n1/ml_research/linbinbin1/profiler_res"
+    profiler_dir: str = "./profiler_res"
     # Time-based profiling (in seconds). If set, will use time instead of steps.
     profiler_start_time: float | None = None  # Start profiling after N seconds
     profiling_duration: float | None = None  # Profile for N seconds
@@ -84,7 +84,25 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        self.hf_config = AutoConfig.from_pretrained(self.model)
+        hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+        # Convert custom config classes (e.g., kimi_k2 which maps to DeepseekV3ForCausalLM)
+        # to the equivalent standard transformers config so Ray can pickle/unpickle without
+        # needing the dynamic transformers_modules module on worker processes.
+        if type(hf_config).__module__.startswith("transformers_modules"):
+            config_dict = hf_config.to_dict()
+            arch = (config_dict.get("architectures") or [""])[0]
+            arch_to_model_type = {
+                "DeepseekV3ForCausalLM": "deepseek_v3",
+            }
+            std_model_type = arch_to_model_type.get(arch)
+            if std_model_type is None:
+                raise ValueError(
+                    f"Unsupported architecture '{arch}' with trust_remote_code config. "
+                    f"Supported: {list(arch_to_model_type.keys())}"
+                )
+            config_dict.pop("model_type", None)
+            hf_config = AutoConfig.for_model(std_model_type, **config_dict)
+        self.hf_config = hf_config
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             assert self.kvcache_block_size == 64
             assert self.attention_tp == 1

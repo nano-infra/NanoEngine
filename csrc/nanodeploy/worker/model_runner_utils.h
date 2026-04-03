@@ -37,6 +37,7 @@ struct DecodeMetadata {
     int              max_num_blocks = 0;
 
     std::vector<int> context_lens_for_attn;
+    bool             use_sp_a2a = false;
 
     std::vector<int> q_slice_get;
     std::vector<int> q_slice_fill;
