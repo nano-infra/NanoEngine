@@ -147,6 +147,7 @@ class HaoAllToAllBufferAdapter:
         self._kernel_impl = kernel_impl.Basic
         self._native_local_buffer = _maybe_get_local_buffer(self._buffer)
         self._compat_mode = self._native_local_buffer is None
+        self._non_transpose_input_scratch: torch.Tensor | None = None
 
         if self._native_local_buffer is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -184,6 +185,14 @@ class HaoAllToAllBufferAdapter:
         backend_x = x
         backend_mask = mask
         backend_is_transpose = is_transpose
+
+        # NanoDeploy's MLA path keeps `mask` at [world_size, max_bs], while the
+        # `Q` payload only passes the active master-rank rows (`bs <= max_bs`).
+        # Native hao_basic currently expects masked non-transpose inputs to have
+        # exactly `max_bs` rows, so pad inactive slots here to preserve the
+        # existing NanoDeploy call contract.
+        if mask is not None and not is_transpose:
+            backend_x = self._pad_masked_non_transpose_input(x, mask)
 
         if self._compat_mode and mask is not None:
             backend_mask = mask.transpose(0, 1).contiguous()
@@ -239,6 +248,48 @@ class HaoAllToAllBufferAdapter:
         target_index = mask.argmax(dim=0)
         slot_index = torch.arange(batch_size, device=x.device)
         return x_3d[target_index, slot_index].contiguous()
+
+    def _pad_masked_non_transpose_input(
+        self, x: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(
+                f"hao_basic masked non-transpose path expects x to be 2D, got {x.ndim}D"
+            )
+        if mask.ndim != 2:
+            raise ValueError(
+                f"hao_basic masked non-transpose path expects mask to be 2D, got {mask.ndim}D"
+            )
+        if mask.size(0) != self.world_size or mask.size(1) != self.max_bs:
+            raise ValueError(
+                "hao_basic masked non-transpose path expects mask shape "
+                f"[world_size, max_bs], got {tuple(mask.shape)}"
+            )
+        if x.size(0) > self.max_bs:
+            raise ValueError(
+                "hao_basic masked non-transpose path expects x rows to be <= max_bs, "
+                f"got rows={x.size(0)} max_bs={self.max_bs}"
+            )
+        if x.size(0) == self.max_bs:
+            return x
+
+        scratch = self._non_transpose_input_scratch
+        if (
+            scratch is None
+            or scratch.shape != (self.max_bs, x.size(1))
+            or scratch.dtype != x.dtype
+            or scratch.device != x.device
+        ):
+            scratch = torch.empty(
+                (self.max_bs, x.size(1)),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            self._non_transpose_input_scratch = scratch
+
+        scratch.zero_()
+        scratch[: x.size(0)].copy_(x)
+        return scratch
 
     def _patch_self_slice(self, output: torch.Tensor) -> None:
         staging = self.local_buffer.view(dtype=output.dtype)[: output.numel()].view_as(output)

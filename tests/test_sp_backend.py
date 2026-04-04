@@ -147,6 +147,35 @@ def test_hao_adapter_native_mode_passes_through_semantics(monkeypatch):
     assert output.shape == (2, 3, 2)
 
 
+def test_hao_adapter_native_mode_pads_masked_non_transpose_input(monkeypatch):
+    monkeypatch.setattr(
+        sp_backend, "_resolve_hao_symbols", lambda: (_FakeNativeHaoBuffer, _FakeKernelImpl)
+    )
+
+    adapter = sp_backend.HaoAllToAllBufferAdapter(
+        max_dispatch_per_msg=2,
+        max_bs=4,
+        rank=0,
+        world_size=2,
+        buffer_size_bytes=64,
+    )
+
+    x = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
+    mask = torch.tensor([[0, 1, 0, 0], [1, 0, 1, 0]], dtype=torch.int32)
+
+    adapter.all_to_all_ll(x, is_transpose=False, mask=mask)
+    call = adapter._buffer.last_call
+
+    expected_x = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [0.0, 0.0]], dtype=torch.float32
+    )
+
+    assert call is not None
+    assert call["is_transpose"] is False
+    assert torch.equal(call["mask"], mask)
+    assert torch.equal(call["x"], expected_x)
+
+
 def test_set_sp_context_uses_backend_factory_and_keyword_args(monkeypatch):
     fake_factory = _FakeFactory()
     monkeypatch.setattr(sp_context, "create_sp_backend_factory", lambda backend: fake_factory)
