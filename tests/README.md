@@ -148,3 +148,107 @@ torchrun --nproc_per_node=4 tests/test_mla_sp_backend_correctness.py --mode both
 - 哪个 rank 失败
 - 第一个不一致的位置
 - 对应的 actual / expected 值
+
+## `benchmark_mla_sp_backend.py`
+
+这个脚本用于在 NanoDeploy 仓库内直接对比两种 MLA SP all2all 后端的性能：
+
+- `legacy_ll`
+- `hao_basic`
+
+它和上面的 correctness 脚本不同点在于：
+
+- 直接输出 walltime / trace 统计
+- 支持一次 `torchrun` 扫多个 `cp_size`
+- 支持按 `fan_out` / `uniform` / `fan_in` 扫不同通信场景
+- 支持按 `batch_size` 扫曲线
+- 按 `Q` / `Res` / `Lse` 分 payload 记录结果
+- 输出 `summary.json`、`comparison.csv` 和 profiler trace
+
+默认 DeepSeek V3 MLA 参数：
+
+- `num_heads=128`
+- `kv_lora_rank=512`
+- `qk_rope_head_dim=64`
+- `Q feature dim = 128 * (512 + 64)`
+- `Res feature dim = 128 * 512`
+- `Lse feature dim = 128`
+
+常用命令：
+
+```bash
+torchrun --nproc_per_node=8 tests/benchmark_mla_sp_backend.py \
+  --cp-sizes 2,4,8 \
+  --patterns fan_out,uniform,fan_in \
+  --batch-sizes 1,2,4,8,16,32 \
+  --backends legacy_ll,hao_basic \
+  --mode graph
+```
+
+快速 smoke：
+
+```bash
+torchrun --nproc_per_node=4 tests/benchmark_mla_sp_backend.py \
+  --cp-sizes 2,4 \
+  --patterns fan_out,uniform,fan_in \
+  --batch-sizes 1,2,4,8 \
+  --payloads Q,Res,Lse \
+  --iters 10 \
+  --repeats 2 \
+  --profile-iters 4 \
+  --warmup 2 \
+  --graph-inner-iters 8
+```
+
+只跑单个 batch size 时也可以继续用旧别名：
+
+```bash
+torchrun --nproc_per_node=8 tests/benchmark_mla_sp_backend.py \
+  --cp-sizes 8 \
+  --patterns fan_out \
+  --num-requests 8 \
+  --payloads Q,Res,Lse
+```
+
+默认输出位置：
+
+- `profiler_traces/mla_sp_backend_bench/summary.json`
+- `profiler_traces/mla_sp_backend_bench/comparison.csv`
+- `profiler_traces/mla_sp_backend_bench/traces/`
+
+CSV 里会带这些关键字段，便于后续画曲线：
+
+- `cp_size`
+- `pattern`
+- `batch_size`
+- `payload`
+- `all2all_mean_us`
+- `comm_region_mean_us`
+- `local_send_bytes_sum`
+
+## `plot_mla_sp_backend_csv.py`
+
+这个脚本用于把上面的 CSV 直接画成曲线图和 speedup 图：
+
+```bash
+python utils_analysis/plot_mla_sp_backend_csv.py \
+  profiler_traces/mla_sp_backend_bench/comparison.csv \
+  --metric all2all_mean_us \
+  --x-log2
+```
+
+如果只想看某个 `cp_size` / `payload`：
+
+```bash
+python utils_analysis/plot_mla_sp_backend_csv.py \
+  profiler_traces/mla_sp_backend_bench/comparison.csv \
+  --metric comm_region_mean_us \
+  --cp-sizes 8 \
+  --payloads Q,Res \
+  --x-log2
+```
+
+默认会输出：
+
+- `latency_cp*_*.png`
+- `speedup_cp*_*.png`
