@@ -195,3 +195,5 @@ cython_debug/
 .cursorindexingignore
 
 *.pyi
+
+profiler_traces/
