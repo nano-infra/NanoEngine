@@ -105,12 +105,13 @@ class ModelRunner:
                     + self.config.hf_config.qk_rope_head_dim
                 )
             set_sp_context(
-                config.max_num_seqs,
-                max_head_dim,
-                hf_config.num_attention_heads,
-                torch.get_default_dtype(),
-                sp_size,
-                sp_rank,
+                max_num_seqs=config.max_num_seqs,
+                head_size=max_head_dim,
+                num_attention_heads=hf_config.num_attention_heads,
+                dtype=torch.get_default_dtype(),
+                rank=sp_rank,
+                sp_size=sp_size,
+                backend=config.sp_backend,
             )
 
         self.run_count = 0

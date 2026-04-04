@@ -58,6 +58,7 @@ class Config:
 
     # performance optimization
     use_dlslime_rpc: bool = True
+    sp_backend: Literal["legacy_ll", "hao_basic"] = "legacy_ll"
     # Optimize Block Table transmission in Decode phase: if True, only send BlockTable
     # for sequences that have KVCache on the target rank; if False, send all BlockTables
     optimize_decode_block_table: bool = True
