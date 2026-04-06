@@ -261,6 +261,7 @@ class FlashMLAImpl:
                 q = q_buffer.all_to_all_ll(
                     q.view([bs, -1]),
                     mask=context.q_mask,
+                    offsets=context.q_offsets,
                 ).view([sp_size * max_num_seqs, num_head, head_dim])
 
                 q = q[: context.attention_compute_bs]

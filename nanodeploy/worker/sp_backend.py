@@ -177,13 +177,18 @@ class HaoAllToAllBufferAdapter:
         mask: torch.Tensor | None = None,
         offsets: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if offsets is not None:
+        if offsets is not None and self._compat_mode:
             raise NotImplementedError(
-                "hao_basic does not support offsets in NanoDeploy's MLA path."
+                "hao_basic offsets require a native DLSlime build; compat mode is unsupported."
+            )
+        if offsets is not None and is_transpose:
+            raise NotImplementedError(
+                "hao_basic offsets only support non-transpose all-to-all."
             )
 
         backend_x = x
         backend_mask = mask
+        backend_offsets = offsets
         backend_is_transpose = is_transpose
 
         # NanoDeploy's MLA path keeps `mask` at [world_size, max_bs], while the
@@ -191,7 +196,7 @@ class HaoAllToAllBufferAdapter:
         # Native hao_basic currently expects masked non-transpose inputs to have
         # exactly `max_bs` rows, so pad inactive slots here to preserve the
         # existing NanoDeploy call contract.
-        if mask is not None and not is_transpose:
+        if offsets is None and mask is not None and not is_transpose:
             backend_x = self._pad_masked_non_transpose_input(x, mask)
 
         if self._compat_mode and mask is not None:
@@ -205,6 +210,7 @@ class HaoAllToAllBufferAdapter:
             impl=self._kernel_impl,
             is_transpose=backend_is_transpose,
             mask=backend_mask,
+            offsets=backend_offsets,
         )
 
         if self._compat_mode and mask is not None:
