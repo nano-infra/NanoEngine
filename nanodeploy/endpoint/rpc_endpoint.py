@@ -57,15 +57,16 @@ class RPCServerEndpoint:
             buffer = binding.buffer
             buffer_ptr = buffer.data_ptr() + buffer.storage_offset()
             
-            # 计算目标rank的sp_rank和sp_size
-            # 如果启用优化且在Decode阶段，才进行过滤；否则传输全量BlockTable
+            # Decode optimize path still sends the full sequence skeleton.
+            # The serializer only trims heavy per-target fields inside each
+            # BlockContext (for example non-target block tables).
             if not is_prefill and self.optimize_decode_block_table:
                 # rank = dp_rank * (attention_sp * attention_tp) + sp_rank * attention_tp + tp_rank
                 # 所以 sp_rank = (rank // attention_tp) % attention_sp
                 sp_rank = (i // self.attention_tp) % self.attention_sp
                 sp_size = self.attention_sp
             else:
-                # Prefill阶段或未启用优化：传输全量BlockTable
+                # Prefill阶段或未启用优化：传输完整 BlockContext
                 sp_rank = -1
                 sp_size = -1
             

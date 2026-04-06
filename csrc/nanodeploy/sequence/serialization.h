@@ -16,8 +16,8 @@ namespace nanodeploy {
  * @param buffer_size 缓冲区总长度（用于安全检查）
  * @param seqs 要序列化的数据
  * @param is_prefill 是否为预填充阶段（影响序列化格式）
- * @param sp_rank 目标SP rank（仅在Decode阶段使用，用于判断是否需要传输BlockTable）
- * @param sp_size SP world size（仅在Decode阶段使用）
+ * @param sp_rank 目标SP rank（仅在Decode优化路径中使用，用于裁剪目标rank无关的重字段）
+ * @param sp_size SP world size（仅在Decode优化路径中使用）
  * @return size_t 实际写入的字节总数
  */
 size_t serialize_sequences(uintptr_t                                     data_ptr,
