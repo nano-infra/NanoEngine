@@ -5,7 +5,7 @@ This script is intentionally narrower than the exploratory SP attention benchmar
 it only validates the three MLA all-to-all payloads used by NanoDeploy's decode path.
 
 Covered cases:
-- `Q`: masked non-transpose dispatch from master rank to remote SP ranks
+- `Q`: masked non-transpose + offsets dispatch from master rank to remote SP ranks
 - `Res`: masked transpose gather back to master rank
 - `Lse`: masked transpose gather back to master rank
 
@@ -46,7 +46,7 @@ class PayloadCase:
     is_transpose: bool
     builder: Callable[
         [torch.Tensor, int, int, int, int, torch.dtype, torch.device],
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor],
     ]
 
 
@@ -241,14 +241,6 @@ def lse_seq_value(rank: int, seq_idx: int) -> float:
     return 64.0 + float(rank * 4 + seq_idx)
 
 
-def q_remote_targets(seq_idx: int, world_size: int) -> list[int]:
-    if world_size <= 1:
-        return []
-    if seq_idx % 2 == 0:
-        return [rank for rank in range(world_size) if rank != MASTER_RANK]
-    return [1 + (seq_idx % (world_size - 1))]
-
-
 def local_buffer_view(
     buffer,
     *,
@@ -271,36 +263,54 @@ def build_q_case(
     device: torch.device,
     *,
     feature_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    x = torch.zeros((num_requests, feature_dim), dtype=dtype, device=device)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    counts = [
+        num_requests // world_size + (1 if src_rank < (num_requests % world_size) else 0)
+        for src_rank in range(world_size)
+    ]
+    local_q_count = counts[rank]
+    x = torch.zeros((local_q_count, feature_dim), dtype=dtype, device=device)
     mask = torch.zeros((world_size, max_num_seqs), dtype=torch.int32, device=device)
+    offsets = torch.zeros(world_size + 1, dtype=torch.int32, device=device)
     expected = torch.zeros(
         (world_size, max_num_seqs, feature_dim), dtype=dtype, device=device
     )
+    expected_flat = expected.view(world_size * max_num_seqs, feature_dim)
+
+    running = 0
+    for src_rank, count in enumerate(counts):
+        offsets[src_rank] = running
+        running += count
+    offsets[world_size] = running
 
     buffer.local_buffer.zero_()
-    local = local_buffer_view(
+    local_flat = local_buffer_view(
         buffer,
         world_size=world_size,
         max_num_seqs=max_num_seqs,
         feature_dim=feature_dim,
         dtype=dtype,
-    )
+    ).view(world_size * max_num_seqs, feature_dim)
 
-    for seq_idx in range(num_requests):
-        value = q_seq_value(seq_idx)
-        targets = q_remote_targets(seq_idx, world_size)
+    global_seq_base = sum(counts[:rank])
+    for local_idx in range(local_q_count):
+        global_seq_idx = global_seq_base + local_idx
+        value = q_seq_value(global_seq_idx)
+        x[local_idx].fill_(value)
+        local_flat[int(offsets[rank].item()) + local_idx].fill_(value)
 
-        if rank == MASTER_RANK:
-            x[seq_idx].fill_(value)
-            local[MASTER_RANK, seq_idx].fill_(value)
-            for target_rank in targets:
-                mask[target_rank, seq_idx] = 1
+    if world_size > 1 and local_q_count > 0:
+        for target_rank in range(world_size):
+            if target_rank != rank:
+                mask[target_rank, :local_q_count] = 1
 
-        if rank == MASTER_RANK or rank in targets:
-            expected[MASTER_RANK, seq_idx].fill_(value)
+    for src_rank, count in enumerate(counts):
+        seq_base = sum(counts[:src_rank])
+        for local_idx in range(count):
+            packed_idx = int(offsets[src_rank].item()) + local_idx
+            expected_flat[packed_idx].fill_(q_seq_value(seq_base + local_idx))
 
-    return x, mask, expected
+    return x, mask, offsets, expected
 
 
 def build_reduce_case(
@@ -314,7 +324,7 @@ def build_reduce_case(
     *,
     feature_dim: int,
     value_fn: Callable[[int, int], float],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor]:
     x = torch.zeros(
         (world_size * max_num_seqs, feature_dim), dtype=dtype, device=device
     )
@@ -346,7 +356,7 @@ def build_reduce_case(
             for seq_idx in range(num_requests):
                 expected[src_rank, seq_idx].fill_(value_fn(src_rank, seq_idx))
 
-    return x, mask, expected
+    return x, mask, None, expected
 
 
 def build_res_case(
@@ -359,7 +369,7 @@ def build_res_case(
     device: torch.device,
     *,
     feature_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor]:
     return build_reduce_case(
         buffer,
         rank,
@@ -383,7 +393,7 @@ def build_lse_case(
     device: torch.device,
     *,
     feature_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor]:
     return build_reduce_case(
         buffer,
         rank,
@@ -451,6 +461,7 @@ def run_eager(
     buffer,
     x: torch.Tensor,
     mask: torch.Tensor,
+    offsets: torch.Tensor | None,
     is_transpose: bool,
     preamble_state: PreambleState,
     group: dist.ProcessGroup,
@@ -458,7 +469,12 @@ def run_eager(
 ) -> torch.Tensor:
     dist.barrier(group=group)
     run_preamble(preamble_state, group)
-    output = buffer.all_to_all_ll(x, is_transpose=is_transpose, mask=mask)
+    output = buffer.all_to_all_ll(
+        x,
+        is_transpose=is_transpose,
+        mask=mask,
+        offsets=offsets,
+    )
     torch.cuda.synchronize(device)
     dist.barrier(group=group)
     return output.clone()
@@ -469,6 +485,7 @@ def run_cudagraph(
     buffer,
     x: torch.Tensor,
     mask: torch.Tensor,
+    offsets: torch.Tensor | None,
     is_transpose: bool,
     warmup: int,
     replays: int,
@@ -480,7 +497,12 @@ def run_cudagraph(
 
     def run_once() -> None:
         run_preamble(preamble_state, group)
-        holder["output"] = buffer.all_to_all_ll(x, is_transpose=is_transpose, mask=mask)
+        holder["output"] = buffer.all_to_all_ll(
+            x,
+            is_transpose=is_transpose,
+            mask=mask,
+            offsets=offsets,
+        )
 
     for _ in range(warmup):
         run_once()
@@ -526,7 +548,7 @@ def run_payload_case(
     preamble_state = create_preamble_state(preamble, group, device)
 
     if mode in ("eager", "both"):
-        x, mask, expected = case.builder(
+        x, mask, offsets, expected = case.builder(
             buffer,
             rank,
             world_size,
@@ -539,6 +561,7 @@ def run_payload_case(
             buffer=buffer,
             x=x,
             mask=mask,
+            offsets=offsets,
             is_transpose=case.is_transpose,
             preamble_state=preamble_state,
             group=group,
@@ -554,7 +577,7 @@ def run_payload_case(
         outputs["eager"] = eager_output
 
     if mode in ("graph", "both"):
-        x, mask, expected = case.builder(
+        x, mask, offsets, expected = case.builder(
             buffer,
             rank,
             world_size,
@@ -567,6 +590,7 @@ def run_payload_case(
             buffer=buffer,
             x=x,
             mask=mask,
+            offsets=offsets,
             is_transpose=case.is_transpose,
             warmup=warmup,
             replays=graph_replays,
@@ -732,6 +756,12 @@ def main() -> None:
         group = dist.group.WORLD
         install_test_dist_context(group)
         dtype = get_dtype(args.dtype)
+
+        if args.num_requests < world_size:
+            raise ValueError(
+                f"--num-requests must be >= world_size for this Q-offsets test; "
+                f"got num_requests={args.num_requests}, world_size={world_size}."
+            )
 
         log_once(
             "Running MLA SP backend correctness check "

@@ -23,12 +23,13 @@ class _FakeCompatHaoBuffer:
     def connect_full_mesh(self, all_handles):
         self.all_handles = all_handles
 
-    def all_to_all(self, x, impl, is_transpose, mask):
+    def all_to_all(self, x, impl, is_transpose, mask, offsets=None):
         self.last_call = {
             "x": x.clone(),
             "impl": impl,
             "is_transpose": is_transpose,
             "mask": None if mask is None else mask.clone(),
+            "offsets": None if offsets is None else offsets.clone(),
         }
         return torch.zeros(
             self.world_size,
@@ -116,6 +117,7 @@ def test_hao_adapter_compat_mode_translates_mask_and_transpose(monkeypatch):
     assert call["impl"] == _FakeKernelImpl.Basic
     assert call["is_transpose"] is False
     assert torch.equal(call["mask"], mask.transpose(0, 1).contiguous())
+    assert call["offsets"] is None
     assert torch.equal(call["x"], expected_x)
     assert torch.equal(output[1], staging[1])
 
@@ -144,6 +146,7 @@ def test_hao_adapter_native_mode_passes_through_semantics(monkeypatch):
     assert call["is_transpose"] is True
     assert torch.equal(call["x"], x)
     assert torch.equal(call["mask"], mask)
+    assert call["offsets"] is None
     assert output.shape == (2, 3, 2)
 
 
@@ -173,7 +176,84 @@ def test_hao_adapter_native_mode_pads_masked_non_transpose_input(monkeypatch):
     assert call is not None
     assert call["is_transpose"] is False
     assert torch.equal(call["mask"], mask)
+    assert call["offsets"] is None
     assert torch.equal(call["x"], expected_x)
+
+
+def test_hao_adapter_native_mode_passes_offsets_without_padding(monkeypatch):
+    monkeypatch.setattr(
+        sp_backend, "_resolve_hao_symbols", lambda: (_FakeNativeHaoBuffer, _FakeKernelImpl)
+    )
+
+    adapter = sp_backend.HaoAllToAllBufferAdapter(
+        max_dispatch_per_msg=2,
+        max_bs=4,
+        rank=0,
+        world_size=2,
+        buffer_size_bytes=64,
+    )
+
+    x = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
+    mask = torch.tensor([[0, 1, 1, 0], [1, 1, 1, 0]], dtype=torch.int32)
+    offsets = torch.tensor([0, 3, 3], dtype=torch.int32)
+
+    adapter.all_to_all_ll(x, is_transpose=False, mask=mask, offsets=offsets)
+    call = adapter._buffer.last_call
+
+    assert call is not None
+    assert call["is_transpose"] is False
+    assert torch.equal(call["x"], x)
+    assert torch.equal(call["mask"], mask)
+    assert torch.equal(call["offsets"], offsets)
+
+
+def test_hao_adapter_compat_mode_rejects_offsets(monkeypatch):
+    monkeypatch.setattr(
+        sp_backend, "_resolve_hao_symbols", lambda: (_FakeCompatHaoBuffer, _FakeKernelImpl)
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    adapter = sp_backend.HaoAllToAllBufferAdapter(
+        max_dispatch_per_msg=1,
+        max_bs=3,
+        rank=0,
+        world_size=2,
+        buffer_size_bytes=64,
+    )
+
+    x = torch.arange(6, dtype=torch.float32).view(3, 2)
+    offsets = torch.tensor([0, 3, 3], dtype=torch.int32)
+
+    try:
+        adapter.all_to_all_ll(x, is_transpose=False, offsets=offsets)
+    except NotImplementedError as exc:
+        assert "compat mode" in str(exc)
+    else:
+        raise AssertionError("Expected compat-mode hao_basic offsets to raise NotImplementedError")
+
+
+def test_hao_adapter_rejects_transpose_offsets(monkeypatch):
+    monkeypatch.setattr(
+        sp_backend, "_resolve_hao_symbols", lambda: (_FakeNativeHaoBuffer, _FakeKernelImpl)
+    )
+
+    adapter = sp_backend.HaoAllToAllBufferAdapter(
+        max_dispatch_per_msg=1,
+        max_bs=3,
+        rank=0,
+        world_size=2,
+        buffer_size_bytes=64,
+    )
+
+    x = torch.arange(12, dtype=torch.float32).view(6, 2)
+    offsets = torch.tensor([0, 3, 3], dtype=torch.int32)
+
+    try:
+        adapter.all_to_all_ll(x, is_transpose=True, offsets=offsets)
+    except NotImplementedError as exc:
+        assert "non-transpose" in str(exc)
+    else:
+        raise AssertionError("Expected transpose hao_basic offsets to raise NotImplementedError")
 
 
 def test_set_sp_context_uses_backend_factory_and_keyword_args(monkeypatch):

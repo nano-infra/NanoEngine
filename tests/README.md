@@ -13,7 +13,7 @@
 
 覆盖三类 MLA 通信：
 
-- `Q`：masked non-transpose
+- `Q`：masked non-transpose + offsets
 - `Res`：masked transpose
 - `Lse`：masked transpose
 
