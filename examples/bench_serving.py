@@ -163,7 +163,7 @@ def print_model_config(engine):
 def run_warmup(engine, max_num_seqs, world_size):
     """Runs warmup phase before the actual benchmark."""
     warmup_input_len = 512
-    warmup_output_len = 256
+    warmup_output_len = 64
     num_warmup_requests = max_num_seqs * world_size
     
     print(f"\n{'=' * 60}")
@@ -411,6 +411,8 @@ def main():
         enable_non_uniform_split=not args.disable_non_uniform_split,
         fixed_sp_segments=args.fixed_sp_segments,
         sp_backend=args.sp_backend,
+        use_dlslime_rpc=True,
+        optimize_decode_block_table=True
     )
     
     # Print Config
