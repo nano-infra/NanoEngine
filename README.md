@@ -63,7 +63,7 @@ cd NanoRoute && cargo build --release && cd ..
 cd NanoCtrl && cargo build --release && pip install -e . && cd ..
 ```
 
-## Quick Start: PD Disaggregated Serving
+## Quick Start: LLM Inference
 
 Prefill-Decode disaggregation splits prompt processing (prefill) and token generation (decode) across separate GPU nodes connected via RDMA.
 
