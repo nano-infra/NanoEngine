@@ -365,7 +365,14 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 qkv.device,
                 qkv.dtype,
             )
-            padded[batch_idx, :, pos_in_seq] = qkv
+            if (
+                ragged_to_padded_triton is not None
+                and can_use_ragged_to_padded_triton is not None
+                and can_use_ragged_to_padded_triton(qkv, cu_seqlens_long, padded)
+            ):
+                ragged_to_padded_triton(qkv, cu_seqlens_long, max_seqlen, out=padded)
+            else:
+                padded[batch_idx, :, pos_in_seq] = qkv
 
             if gdn_state_slots is not None:
                 init_states = gdn_conv_states[
