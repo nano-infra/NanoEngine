@@ -104,13 +104,13 @@ class LLMEngine:
         filtered_dp_group_seqs = sch_res.filtered_dp_group_seqs
 
         # Build dummy seq id set for filtering
-        dummy_ids = set()
+        dummy_seq_ids = set()
         for ws in self.scheduler.worker_state:
             for d in ws.dummy_seqs:
-                dummy_ids.add(id(d))
+                dummy_seq_ids.add(d.seq_id)
 
         total_running = sum(
-            sum(1 for seq in seqs if id(seq) not in dummy_ids) for seqs in dp_seqs
+            sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids) for seqs in dp_seqs
         )
         total_waiting = len(self.scheduler.waiting)
         total_waiting_migration = len(self.scheduler.waiting_migration)
