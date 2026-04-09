@@ -68,15 +68,20 @@ def _rewrite_spec_layer_name(spec_layer: int, name: str) -> str:
                 is_shared = True
             break
 
+    # DeepSeekMTP is flat (no .model sub-module): parameters are
+    # embed_tokens.weight, layers.{N}.enorm.weight, layers.{N}.mtp_block.*, etc.
     if not is_spec_weight:
-        # Transformer sub-weight: add .mtp_block prefix
+        # Transformer sub-weight: add .mtp_block prefix, strip model. prefix
         name = name.replace(
             f"model.layers.{spec_layer}.",
-            f"model.layers.{spec_layer}.mtp_block.",
+            f"layers.{spec_layer}.mtp_block.",
         )
     elif is_shared:
-        # Shared weight (embed_tokens): promote to top-level
-        name = name.replace(f"model.layers.{spec_layer}.", "model.")
+        # Shared weight (embed_tokens): promote to top-level, strip model. prefix
+        name = name.replace(f"model.layers.{spec_layer}.", "")
+    else:
+        # MTP-specific weight (enorm, hnorm, eh_proj, shared_head): strip model. prefix
+        name = name.replace(f"model.layers.{spec_layer}.", f"layers.{spec_layer}.")
 
     return name
 

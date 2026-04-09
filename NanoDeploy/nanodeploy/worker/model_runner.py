@@ -224,6 +224,9 @@ class ModelRunner:
         self._last_hidden = None
         self.mtp_graphs = None
         self.mtp_graph_vars = None
+        # Lazy verify state: drafts and sampled token from previous decode step
+        self._prev_drafts: list[torch.Tensor] | None = None
+        self._prev_sampled_token: torch.Tensor | None = None
         if config.num_speculative_tokens > 0:
             mtp_cls = architectures_mtp.get(model_architecture)
             if mtp_cls is None:
@@ -232,7 +235,8 @@ class ModelRunner:
                 )
             self.mtp_model = mtp_cls(hf_config)
             # Share embeddings from target model
-            self.mtp_model.embed_tokens = self.model.model.embed_tokens
+            target_embed = self.model.model.embed_tokens
+            self.mtp_model.embed_tokens = target_embed
             # For Qwen3.5: share lm_head if tie_word_embeddings
             if hasattr(self.mtp_model, "lm_head") and getattr(
                 hf_config, "tie_word_embeddings", False
@@ -772,6 +776,94 @@ class ModelRunner:
 
         return input_ids, positions
 
+    def _prepare_lazy_verify_decode(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, num_seqs: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expand decode from seqlen_q=1 to seqlen_q=2 for lazy verification.
+
+        Transforms:
+            input_ids:  [bs] (scheduler's token for this step, i.e. prev_sampled)
+            positions:  [bs] (positions from prepare_decode_bytes)
+
+        Into:
+            input_ids:  [bs*2] interleaved [prev_sampled_0, draft_0, prev_sampled_1, draft_1, ...]
+            positions:  [bs*2] interleaved [pos_0, pos_0+1, pos_1, pos_1+1, ...]
+
+        Also updates context: slot_mapping expanded to [bs*2], context_lens += 1,
+        num_tokens_per_seq = 2, MLA metadata recomputed.
+        """
+        sp_rank = get_dist_context().attn_sp_rank
+        block_size = self.config.kvcache_block_size
+        context = get_context()
+
+        prev_sampled = self._prev_sampled_token  # [bs] token from prev step
+        prev_draft = self._prev_drafts[0]  # [bs] draft from prev step
+
+        # Build interleaved input_ids: [prev_sampled_0, draft_0, prev_sampled_1, ...]
+        new_input_ids = torch.empty(
+            num_seqs * 2, dtype=input_ids.dtype, device=input_ids.device
+        )
+        new_input_ids[0::2] = prev_sampled[:num_seqs]
+        new_input_ids[1::2] = prev_draft[:num_seqs]
+
+        # Build interleaved positions: [pos_0, pos_0+1, ...]
+        new_positions = torch.empty(
+            num_seqs * 2, dtype=positions.dtype, device=positions.device
+        )
+        new_positions[0::2] = positions[:num_seqs]
+        new_positions[1::2] = positions[:num_seqs] + 1
+
+        # Expand slot_mapping: 2 slots per seq
+        # context_lens uses post-write semantic (already includes 1 slot for
+        # the standard decode token).  In lazy verify we replace that single
+        # token with 2 (prev_sampled + draft), so the first slot is at
+        # old_ctx - 1 (same position standard decode would use).
+        old_ctx = context.context_lens[sp_rank, :num_seqs]
+        new_slot_mapping = torch.empty(
+            num_seqs * 2, dtype=torch.int32, device=old_ctx.device
+        )
+
+        for offset in range(2):
+            pos = old_ctx - 1 + offset
+            blk_idx = (pos // block_size).long()
+            off_in_block = (pos % block_size).int()
+            row_idx = torch.arange(num_seqs, device=pos.device)
+            max_blocks = context.block_tables.shape[2]
+            blk_idx = torch.clamp(blk_idx, max=max_blocks - 1)
+            page_ids = context.block_tables[sp_rank, row_idx, blk_idx]
+            new_slot_mapping[offset::2] = (page_ids * block_size + off_in_block).int()
+
+        # Update context_lens: old_ctx already accounted for 1 token, we add
+        # 1 more for the draft → total 2 new KV entries in cache.
+        context.context_lens[sp_rank, :num_seqs] += 1
+
+        # Recompute MLA metadata for seqlen_q=2
+        config = self.config
+        hf_config = config.hf_config
+        is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
+        if is_mla:
+            mla_num_kv_heads = 1
+            new_ctx = context.context_lens[sp_rank, :num_seqs]
+            new_tile_sched, new_num_splits = flash_mla.get_mla_metadata(
+                new_ctx.view(-1),
+                2 * hf_config.num_attention_heads // mla_num_kv_heads,
+                mla_num_kv_heads,
+            )
+        else:
+            new_tile_sched, new_num_splits = (
+                context.tile_scheduler_metadata,
+                context.num_splits,
+            )
+
+        # Update context for seqlen_q=2
+        context.slot_mapping = new_slot_mapping
+        context.num_tokens_per_seq = 2
+        if is_mla:
+            context.tile_scheduler_metadata = new_tile_sched
+            context.num_splits = new_num_splits
+
+        return new_input_ids, new_positions
+
     def prepare_sample_from_aux(self, aux):
         """Build temperature tensor from BatchAuxData (no Sequence needed)."""
         temperatures = torch.tensor(
@@ -812,8 +904,65 @@ class ModelRunner:
                 self._last_hidden = hidden
             return self.model.compute_logits(hidden)
         else:
-            bs = input_ids.size(0)
+            n_tokens = input_ids.size(0)
             context = get_context()
+            ntps = context.num_tokens_per_seq
+
+            # Lazy verify path: use dedicated seqlen_q=2 CUDAGraph
+            if (
+                ntps == 2
+                and hasattr(self, "lazy_verify_graphs")
+                and self.lazy_verify_graphs is not None
+            ):
+                bs = n_tokens // 2
+                master_bs = next(
+                    (x for x in self.lazy_verify_graph_bs_list if x >= bs), None
+                )
+                if master_bs is not None and master_bs in self.lazy_verify_graphs:
+                    gv = self.lazy_verify_graph_vars
+                    n = bs * 2
+                    gv["lv_input_ids"][:n] = input_ids
+                    gv["lv_positions"][:n] = positions
+                    gv["lv_slot_mapping"].fill_(-1)
+                    gv["lv_slot_mapping"][:n] = context.slot_mapping
+                    gv["lv_context_lens"].zero_()
+                    gv["lv_context_lens"][:, : context.context_lens.shape[1]].copy_(
+                        context.context_lens
+                    )
+                    gv["lv_block_tables"].zero_()
+                    gv["lv_block_tables"][
+                        :,
+                        : context.block_tables.size(1),
+                        : context.block_tables.size(2),
+                    ] = context.block_tables
+
+                    config = self.config
+                    hf_config = config.hf_config
+                    is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
+                    if is_mla:
+                        gv["lv_tile_sched"].zero_()
+                        gv["lv_tile_sched"].copy_(context.tile_scheduler_metadata)
+                        gv["lv_num_splits"].zero_()
+                        gv["lv_num_splits"][: context.num_splits.shape[0]].copy_(
+                            context.num_splits
+                        )
+
+                    if gv.get("lv_gdn_state_slots") is not None:
+                        dummy_gdn_slot = (
+                            get_cache_context().gdn_conv_states.shape[1] - 1
+                        )
+                        gv["lv_gdn_state_slots"].fill_(dummy_gdn_slot)
+                        if context.gdn_state_slots is not None:
+                            gv["lv_gdn_state_slots"][:bs].copy_(context.gdn_state_slots)
+
+                    self.lazy_verify_graphs[master_bs].replay()
+                    outputs = gv["lv_outputs"][:n]
+                    if self.mtp_model is not None:
+                        self._last_hidden = outputs.clone()
+                    return self.model.compute_logits(outputs)
+
+            # Normal decode (seqlen_q=1) CUDAGraph path
+            bs = n_tokens
             master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
 
             # Without SP, attention_compute_bs == bs
@@ -896,7 +1045,17 @@ class ModelRunner:
             aux = extract_aux_from_bytes(data, sp_rank)
             num_seqs = aux.num_group_seqs
 
-        loop_count = self.config.loop_count if not is_prefill else 1
+        # Use original loop_count for decode iterations (config.loop_count may
+        # be inflated to pre-allocate KV blocks for MTP speculative tokens).
+        if is_prefill:
+            loop_count = 1
+            # Reset lazy verify state on prefill (new sequences have no drafts)
+            self._prev_drafts = None
+            self._prev_sampled_token = None
+        elif hasattr(self.config, "_mtp_original_loop_count"):
+            loop_count = self.config._mtp_original_loop_count
+        else:
+            loop_count = self.config.loop_count
         for i in range(loop_count):
             if self.profiler and self.run_count == self.profiler_start_step:
                 self.profiler.start()
@@ -922,6 +1081,18 @@ class ModelRunner:
                         input_ids, positions, num_seqs
                     )
 
+                # Lazy verify: if we have drafts from the previous step,
+                # expand decode to seqlen_q=2 with [prev_sampled, prev_draft]
+                has_lazy_verify = (
+                    self.mtp_model is not None
+                    and self._prev_drafts is not None
+                    and not is_dummy
+                )
+                if has_lazy_verify:
+                    input_ids, positions = self._prepare_lazy_verify_decode(
+                        input_ids, positions, num_seqs
+                    )
+
             if input_ids.numel() == 0:
                 logger.critical(
                     "EMPTY input_ids before run_model! rank=%s is_prefill=%s "
@@ -942,41 +1113,106 @@ class ModelRunner:
 
             tp_rank = get_dist_context().attn_tp_rank
             temperatures = None
-            if tp_rank == 0:
-                temperatures = self.prepare_sample_from_aux(aux)
-                context = get_context()
-                if is_prefill and context.sampling_seq_indices is not None:
-                    # Sparse prefill: logits has shape [n_final, vocab_size].
-                    # Sample only final-chunk sequences, then scatter into full output.
-                    temps_filtered = temperatures[context.sampling_seq_indices]
-                    sampled = self.sampler(logits, temps_filtered)
-                    input_ids = input_ids.new_zeros(num_seqs)
-                    input_ids[context.sampling_seq_indices] = sampled
-                else:
-                    input_ids = self.sampler(logits, temperatures)
-            else:
-                input_ids = input_ids.new_zeros([num_seqs])
-            dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
 
-            # MTP draft generation (decode only, after first token sampling)
+            # Lazy verify: logits has shape [bs*2, vocab]. Do verification +
+            # sampling together, then output accepted tokens.
+            if not is_prefill and has_lazy_verify:
+                # logits[0::2] = verify logits (after token_{K-1}, predicts next)
+                # logits[1::2] = bonus logits (after draft, predicts bonus token)
+                verify_logits = logits[0::2]  # [bs, vocab]
+                bonus_logits = logits[1::2]  # [bs, vocab]
+
+                verified_tokens = torch.zeros(
+                    1, num_seqs, dtype=torch.int64, device="cuda"
+                )
+                num_accepted = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
+
+                if tp_rank == 0:
+                    temperatures = self.prepare_sample_from_aux(aux)
+                    target_pred = self.sampler(verify_logits, temperatures)
+                    bonus_pred = self.sampler(bonus_logits, temperatures)
+                    prev_draft_0 = self._prev_drafts[0]
+
+                    accepted_mask = target_pred == prev_draft_0
+                    # accepted: output draft + bonus, input_ids = bonus
+                    # rejected: output target_pred, input_ids = target_pred
+                    verified_tokens[0] = prev_draft_0
+                    num_accepted = accepted_mask.long()
+                    # The "new token" for this step:
+                    # accept → sample(bonus_logits), reject → sample(verify_logits)
+                    input_ids = torch.where(accepted_mask, bonus_pred, target_pred)
+                else:
+                    input_ids = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
+
+                dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
+                dist.all_reduce(verified_tokens, group=get_dist_context().attn_tp_group)
+                dist.all_reduce(num_accepted, group=get_dist_context().attn_tp_group)
+
+                self._mtp_verified_tokens = verified_tokens
+                self._mtp_num_accepted = num_accepted
+
+                # Update context_lens: +1 for token_{K-1}, +1 more if accepted
+                context = get_context()
+                sp_rank = get_dist_context().attn_sp_rank
+                # context_lens was set for seqlen_q=2 (already includes both slots)
+                # For rejected seqs: roll back context_lens by 1
+                rejected_mask = num_accepted == 0
+                if rejected_mask.any():
+                    context.context_lens[sp_rank, :num_seqs] -= rejected_mask.int()
+            else:
+                if tp_rank == 0:
+                    temperatures = self.prepare_sample_from_aux(aux)
+                    context = get_context()
+                    if is_prefill and context.sampling_seq_indices is not None:
+                        # Sparse prefill: logits has shape [n_final, vocab_size].
+                        temps_filtered = temperatures[context.sampling_seq_indices]
+                        sampled = self.sampler(logits, temps_filtered)
+                        input_ids = input_ids.new_zeros(num_seqs)
+                        input_ids[context.sampling_seq_indices] = sampled
+                    else:
+                        input_ids = self.sampler(logits, temperatures)
+                else:
+                    input_ids = input_ids.new_zeros([num_seqs])
+                dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
+
+            # MTP lazy verify: generate drafts for the NEXT step
             if self.mtp_model is not None and not is_prefill and not is_dummy:
-                # Save decode context and its token_ids before MTP overwrites
                 decode_context = get_context()
                 saved_token_ids = decode_context.token_ids
 
+                # Generate N draft tokens from MTP using current hidden states
+                # For lazy verify: use hidden from the correct position
+                if has_lazy_verify:
+                    # _last_hidden has shape [bs*2, hidden_size]
+                    # For accepted seqs: use hidden[1::2] (after draft pos)
+                    # For rejected seqs: use hidden[0::2] (after token_{K-1} pos)
+                    h_verify = self._last_hidden[0::2]  # [bs, hidden_size]
+                    h_bonus = self._last_hidden[1::2]  # [bs, hidden_size]
+                    accepted_mask = num_accepted > 0
+                    mtp_hidden = torch.where(
+                        accepted_mask.unsqueeze(-1), h_bonus, h_verify
+                    )
+                    # positions for MTP: depends on accept/reject
+                    # accepted: pos of bonus token = original_pos + 2
+                    # rejected: pos of verify token = original_pos + 1
+                    mtp_positions = positions[0::2] + 1 + num_accepted
+                else:
+                    mtp_hidden = self._last_hidden
+                    mtp_positions = positions
+
                 drafts = self._generate_mtp_drafts(
                     input_ids,
-                    positions,
-                    self._last_hidden,
+                    mtp_positions,
+                    mtp_hidden,
                     temperatures,
                     num_seqs,
                 )
 
-                # Append draft tokens to saved token_ids
-                for draft_ids in drafts:
-                    saved_token_ids.append(draft_ids[None, ...])
+                # Store drafts + sampled token for lazy verification in the NEXT step
+                self._prev_drafts = drafts
+                self._prev_sampled_token = input_ids.clone()
 
-                # Restore decode context for next loop iteration
+                # Restore decode context (MTP draft gen overwrites it)
                 set_context(
                     is_prefill=decode_context.is_prefill,
                     max_bs=decode_context.max_bs,
@@ -990,7 +1226,6 @@ class ModelRunner:
                     gdn_recurrent_states=decode_context.gdn_recurrent_states,
                     gdn_state_slots=decode_context.gdn_state_slots,
                 )
-                # Restore token_ids on new context
                 get_context().token_ids = saved_token_ids
 
             # No update_seqs_inner_loop needed — metadata already updated in-place
@@ -1008,9 +1243,35 @@ class ModelRunner:
             self.run_count += 1
             get_context().token_ids.append(input_ids[None, ...])
 
-        loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
-        reset_context()
+        # Build output: for lazy verify, verified draft tokens come BEFORE
+        # the newly sampled token. base has [new_token] per seq per step.
+        if (
+            self.mtp_model is not None
+            and hasattr(self, "_mtp_verified_tokens")
+            and self._mtp_verified_tokens is not None
+        ):
+            base = torch.cat(get_context().token_ids, dim=0)  # [loop_count, num_seqs]
+            verified = self._mtp_verified_tokens  # [N, num_seqs]
+            accepted = self._mtp_num_accepted  # [num_seqs]
+            loop_count_token_ids = []
+            for s in range(base.shape[1]):
+                n_acc = int(accepted[s].item())
+                seq_tokens = []
+                # Insert accepted draft tokens BEFORE the new token
+                for j in range(n_acc):
+                    seq_tokens.append(int(verified[j, s].item()))
+                # Then the newly sampled token(s) from normal decode
+                for t in range(base.shape[0]):
+                    seq_tokens.append(int(base[t, s].item()))
+                loop_count_token_ids.append(seq_tokens)
+            if self.rank == 0:
+                logger.debug(f"OUTPUT tokens[0]: {loop_count_token_ids[0]}")
+            self._mtp_verified_tokens = None
+            self._mtp_num_accepted = None
+        else:
+            loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
 
+        reset_context()
         return loop_count_token_ids
 
     # ------------------------------------------------------------------
@@ -1018,7 +1279,10 @@ class ModelRunner:
     # ------------------------------------------------------------------
 
     def _set_mtp_context(self, num_seqs: int):
-        """Set context for MTP forward (prefill mode, seq_len=1, no KV cache)."""
+        """Set context for MTP forward (prefill mode, seq_len=1, no KV cache).
+
+        Uses low-latency EP for CUDAGraph compatibility.
+        """
         cu_seqlens = torch.arange(num_seqs + 1, dtype=torch.int32, device="cuda")
         set_context(
             is_prefill=True,
@@ -1030,6 +1294,7 @@ class ModelRunner:
             slot_mapping=None,
             block_tables=None,
             is_dummy=False,
+            use_low_latency_ep=True,
         )
 
     def _run_mtp_step(
@@ -1102,33 +1367,49 @@ class ModelRunner:
         return drafts
 
     def _capture_mtp_cudagraphs(self, max_bs: int, hf_config):
-        """Capture separate CUDAGraphs for MTP forward per batch size."""
+        """Capture separate CUDAGraphs for MTP forward per batch size.
+
+        All context tensors (cu_seqlens) are persisted as instance attrs
+        so they stay alive during graph replay.
+        """
         mtp_input_ids = torch.zeros(max_bs, dtype=torch.int64)
         mtp_positions = torch.zeros(max_bs, dtype=torch.int64)
         mtp_hidden_states = torch.zeros(max_bs, hf_config.hidden_size)
         mtp_outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
+        # Persistent cu_seqlens — must outlive graph lifetime
         cu_seqlens = torch.arange(max_bs + 1, dtype=torch.int32, device="cuda")
 
-        self.mtp_graph_bs_list = [x for x in [1, 2, 4, 8] if x <= max_bs] + list(
-            range(16, max_bs + 1, 16)
-        )
+        # Fewer graph sizes to reduce memory pressure during capture
+        self.mtp_graph_bs_list = [1, 2, 4, 8]
         self.mtp_graphs = {}
 
         logger.info(f"Capturing MTP CUDAGraphs...")
 
+        # Must transition to low-latency before MTP forward
+        ExpertContext.get_instance().transition_to_low_latency()
+
+        # Persist per-bs cu_seqlens so they survive graph lifetime
+        self._mtp_cu_seqlens_per_bs = {}
+
         for bs in reversed(self.mtp_graph_bs_list):
             logger.info(f"Capturing MTP graph - bs={bs}")
+
+            # Each graph gets its OWN cu_seqlens matching its batch size
+            bs_cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+            self._mtp_cu_seqlens_per_bs[bs] = bs_cu_seqlens
+
             set_context(
                 is_prefill=True,
                 max_bs=self.config.max_num_seqs,
-                cu_seqlens_q=cu_seqlens[: bs + 1],
-                cu_seqlens_k=cu_seqlens[: bs + 1],
+                cu_seqlens_q=bs_cu_seqlens,
+                cu_seqlens_k=bs_cu_seqlens,
                 max_seqlen_q=1,
                 max_seqlen_k=1,
                 slot_mapping=None,
                 block_tables=None,
                 is_dummy=False,
+                use_low_latency_ep=True,
             )
 
             # Warmup
@@ -1146,7 +1427,8 @@ class ModelRunner:
                 )
 
             self.mtp_graphs[bs] = graph
-            reset_context()
+
+        reset_context()
 
         self.mtp_graph_vars = dict(
             mtp_input_ids=mtp_input_ids,
@@ -1154,8 +1436,103 @@ class ModelRunner:
             mtp_hidden_states=mtp_hidden_states,
             mtp_outputs=mtp_outputs,
         )
+        # Keep cu_seqlens alive for graph replay
+        self._mtp_cu_seqlens = cu_seqlens
 
         logger.info(f"Finished capturing {len(self.mtp_graphs)} MTP CUDAGraphs")
+
+    def _capture_lazy_verify_cudagraphs(self, max_bs: int, hf_config):
+        """Capture CUDAGraphs for lazy verify decode (seqlen_q=2 per seq).
+
+        Input buffer sizes are max_bs*2 for input_ids, positions, slot_mapping,
+        outputs. The attention layer uses num_tokens_per_seq=2 with causal=True.
+        """
+        block_size = get_cache_context().block_size
+        max_num_blocks = (self.config.max_model_len + block_size - 1) // block_size
+        _cache_ctx = get_cache_context()
+
+        # Buffers sized for max_bs sequences * 2 tokens each
+        lv_input_ids = torch.zeros(max_bs * 2, dtype=torch.int64)
+        lv_positions = torch.zeros(max_bs * 2, dtype=torch.int64)
+        lv_slot_mapping = torch.full((max_bs * 2,), -1, dtype=torch.int32)
+        lv_context_lens = torch.zeros(1, max_bs, dtype=torch.int32)
+        lv_block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
+        lv_outputs = torch.zeros(max_bs * 2, hf_config.hidden_size)
+
+        is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
+        if is_mla:
+            mla_num_kv_heads = 1
+            # For seqlen_q=2: num_q_heads_per_kv = 2 * num_attention_heads // kv_heads
+            lv_tile_sched, lv_num_splits = flash_mla.get_mla_metadata(
+                torch.ones(max_bs, dtype=torch.int32, device="cuda"),
+                2 * hf_config.num_attention_heads // mla_num_kv_heads,
+                mla_num_kv_heads,
+            )
+        else:
+            lv_tile_sched, lv_num_splits = None, None
+
+        # GDN state slots (Qwen3.5)
+        lv_gdn_state_slots = None
+        if _cache_ctx.gdn_conv_states is not None:
+            dummy_gdn_slot = _cache_ctx.gdn_conv_states.shape[1] - 1
+            lv_gdn_state_slots = torch.full(
+                (max_bs,), dummy_gdn_slot, dtype=torch.int64
+            )
+
+        self.lazy_verify_graph_bs_list = [1, 2, 4, 8]
+        self.lazy_verify_graphs = {}
+
+        logger.info("Capturing lazy verify CUDAGraphs (seqlen_q=2)...")
+
+        for bs in reversed(self.lazy_verify_graph_bs_list):
+            n_tokens = bs * 2
+            logger.info(f"Capturing lazy verify graph - bs={bs} (n_tokens={n_tokens})")
+            set_context(
+                is_prefill=False,
+                max_bs=self.config.max_num_seqs,
+                slot_mapping=lv_slot_mapping[:n_tokens],
+                context_lens=lv_context_lens,
+                block_tables=lv_block_tables,
+                is_dummy=False,
+                tile_scheduler_metadata=lv_tile_sched,
+                num_splits=lv_num_splits,
+                num_tokens_per_seq=2,
+                gdn_conv_states=_cache_ctx.gdn_conv_states,
+                gdn_recurrent_states=_cache_ctx.gdn_recurrent_states,
+                gdn_state_slots=(
+                    lv_gdn_state_slots[:bs] if lv_gdn_state_slots is not None else None
+                ),
+            )
+
+            # Warmup
+            lv_outputs[:n_tokens] = self.model(
+                lv_input_ids[:n_tokens], lv_positions[:n_tokens]
+            )
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, self.graph_pool):
+                lv_outputs[:n_tokens] = self.model(
+                    lv_input_ids[:n_tokens], lv_positions[:n_tokens]
+                )
+
+            self.lazy_verify_graphs[bs] = graph
+            reset_context()
+
+        self.lazy_verify_graph_vars = dict(
+            lv_input_ids=lv_input_ids,
+            lv_positions=lv_positions,
+            lv_slot_mapping=lv_slot_mapping,
+            lv_context_lens=lv_context_lens,
+            lv_block_tables=lv_block_tables,
+            lv_outputs=lv_outputs,
+            lv_tile_sched=lv_tile_sched,
+            lv_num_splits=lv_num_splits,
+            lv_gdn_state_slots=lv_gdn_state_slots,
+        )
+
+        logger.info(
+            f"Finished capturing {len(self.lazy_verify_graphs)} lazy verify CUDAGraphs"
+        )
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -1265,6 +1642,15 @@ class ModelRunner:
             gdn_state_slots=gdn_state_slots_buf,
         )
 
-        # Capture MTP CUDAGraphs (after target model graphs, sharing graph_pool)
+        # MTP lazy verify CUDAGraph support:
+        # - Non-GDN models (DeepSeek): MTP draft + lazy verify (seqlen_q=2) use CUDAGraph
+        # - GDN models (Qwen3.5): all eager (GDN recurrent state issues)
         if self.mtp_model is not None:
-            self._capture_mtp_cudagraphs(max_bs, hf_config)
+            _cache_ctx = get_cache_context()
+            if _cache_ctx.gdn_conv_states is None:
+                # DeepSeek: MTP draft + lazy verify use CUDAGraph
+                self._capture_mtp_cudagraphs(max_bs, hf_config)
+                self._capture_lazy_verify_cudagraphs(max_bs, hf_config)
+            else:
+                # Qwen3.5: all eager
+                self.lazy_verify_graphs = None

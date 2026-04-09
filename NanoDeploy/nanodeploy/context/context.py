@@ -35,6 +35,15 @@ class Context:
     # Per-sequence GDN slot indices: [num_seqs], maps batch position i -> slot index
     gdn_state_slots: torch.Tensor | None = None
 
+    # Number of tokens per sequence in decode mode (1 = normal decode,
+    # 2 = lazy verify with [token_{K-1}, draft] per seq).
+    num_tokens_per_seq: int = 1
+
+    # Force low-latency (decode) EP path even when is_prefill=True.
+    # Used by MTP: attention needs prefill mode (flash_attn_varlen) but MoE
+    # must use low-latency dispatch for CUDAGraph compatibility.
+    use_low_latency_ep: bool = False
+
     # Chunked prefill: indices into the Q (hidden_states) tensor for the last token of each
     # final-chunk sequence. Shape: [n_final]. None means all sequences are final chunks.
     sampling_token_indices: torch.Tensor | None = None
@@ -66,6 +75,8 @@ def set_context(
     gdn_conv_states: Optional[torch.Tensor] = None,
     gdn_recurrent_states: Optional[torch.Tensor] = None,
     gdn_state_slots: Optional[torch.Tensor] = None,
+    num_tokens_per_seq: int = 1,
+    use_low_latency_ep: bool = False,
     sampling_token_indices: Optional[torch.Tensor] = None,
     sampling_seq_indices: Optional[torch.Tensor] = None,
 ):
@@ -83,6 +94,8 @@ def set_context(
         is_dummy=is_dummy,
         tile_scheduler_metadata=tile_scheduler_metadata,
         num_splits=num_splits,
+        num_tokens_per_seq=num_tokens_per_seq,
+        use_low_latency_ep=use_low_latency_ep,
         gdn_conv_states=gdn_conv_states,
         gdn_recurrent_states=gdn_recurrent_states,
         gdn_state_slots=gdn_state_slots,

@@ -16,18 +16,15 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
     for (auto* seq : seqs) {
         auto& ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
 
-        // group_block_table: only send blocks up to the current chunk's context length.
-        // Full allocation may reserve blocks beyond num_tokens for future chunks;
-        // the model runner only needs [0, ceil(num_tokens/block_size)) per rank.
-        int blocks_for_context = (seq->num_tokens() + Sequence::block_size - 1) / Sequence::block_size;
-
+        // group_block_table: send all allocated blocks including extras reserved
+        // by may_append() for speculative (MTP) verification, which writes KV
+        // at positions beyond the current num_tokens.
         std::vector<flatbuffers::Offset<fbs::IntListI>> group_bt_offsets;
         for (size_t sp = 0; sp < ctx.group_block_table.size(); ++sp) {
             std::vector<int> vals;
             if (ctx.group_block_table[sp]) {
                 const auto& full = ctx.group_block_table[sp]->values;
-                int         n    = std::min((int)full.size(), blocks_for_context);
-                vals.assign(full.begin(), full.begin() + n);
+                vals.assign(full.begin(), full.end());
             }
             auto vals_vec = builder.CreateVector(vals);
             group_bt_offsets.push_back(fbs::CreateIntListI(builder, vals_vec));

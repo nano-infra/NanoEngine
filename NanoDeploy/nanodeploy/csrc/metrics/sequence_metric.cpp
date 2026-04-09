@@ -94,14 +94,10 @@ std::optional<double> SequenceMetric::avg_tpot_with_queueing() const
 
 std::optional<double> SequenceMetric::avg_tpot_wo_queueing() const
 {
-    // if (!completion_time.has_value() || !first_token_time.has_value() || num_generated_tokens <= 1) {
-    //     return std::nullopt;
-    // }
-    // return ((completion_time.value() - first_token_time.value()) * 1000.0) / (num_generated_tokens - 1);
-    if (!completion_time.has_value() || !first_scheduled_time.has_value() || num_generated_tokens == 0) {
+    if (!completion_time.has_value() || !first_token_time.has_value() || num_generated_tokens <= 1) {
         return std::nullopt;
     }
-    return ((completion_time.value() - first_scheduled_time.value()) * 1000.0) / num_generated_tokens;
+    return ((completion_time.value() - first_token_time.value()) * 1000.0) / (num_generated_tokens - 1);
 }
 
 std::optional<double> SequenceMetric::queueing_time_ms() const

@@ -136,6 +136,12 @@ class Config(BaseModel):
                     f"model does not have MTP layers "
                     f"(num_nextn_predict_layers / mtp_num_hidden_layers not found)"
                 )
+            # Inflate loop_count so the scheduler pre-allocates enough KV cache
+            # blocks for the extra MTP tokens per decode step.
+            # The actual decode loop still runs only the original loop_count
+            # iterations; MTP generates the extra tokens within a single step.
+            self._mtp_original_loop_count = self.loop_count
+            self.loop_count = self.loop_count + self.num_speculative_tokens + 1
 
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             if hasattr(self.hf_config, "num_key_value_heads"):

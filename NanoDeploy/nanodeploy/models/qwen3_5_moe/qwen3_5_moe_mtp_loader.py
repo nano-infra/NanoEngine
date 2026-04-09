@@ -47,28 +47,34 @@ def _remap_weight_name(name: str) -> str | None:
 
     Returns remapped name, or None if weight should be skipped.
 
+    Qwen3_5MTP is a flat module (no .model sub-module), so parameters are
+    like fc.weight, layers.0.*, norm.weight — NOT model.fc.weight.
+
     Checkpoint formats:
-      - mtp.fc.weight → model.fc.weight
-      - mtp.layers.0.* → model.layers.0.*
-      - mtp.pre_fc_norm_embedding.weight → model.pre_fc_norm_embedding.weight
-      - mtp.pre_fc_norm_hidden.weight → model.pre_fc_norm_hidden.weight
-      - mtp.norm.weight → model.norm.weight
-      - model.language_model.embed_tokens.* → model.embed_tokens.*
-      - model.language_model.lm_head.* → model.lm_head.*
-      - lm_head.* → model.lm_head.*
+      - mtp.fc.weight → fc.weight
+      - mtp.layers.0.* → layers.0.*
+      - mtp.pre_fc_norm_embedding.weight → pre_fc_norm_embedding.weight
+      - mtp.pre_fc_norm_hidden.weight → pre_fc_norm_hidden.weight
+      - mtp.norm.weight → norm.weight
+      - model.language_model.embed_tokens.* → embed_tokens.*
+      - model.embed_tokens.* → embed_tokens.*
+      - lm_head.* → lm_head.*
     """
     if name.startswith("mtp."):
-        return name.replace("mtp.", "model.", 1)
+        # mtp.fc.weight → fc.weight
+        return name[len("mtp.") :]
 
     if "embed_tokens" in name:
-        # Strip VLM prefix: model.language_model.embed_tokens → model.embed_tokens
-        name = re.sub(r"^model\.language_model\.", "model.", name)
+        # model.language_model.embed_tokens.weight → embed_tokens.weight
+        # model.embed_tokens.weight → embed_tokens.weight
+        name = re.sub(r"^model\.language_model\.", "", name)
+        name = re.sub(r"^model\.", "", name)
         return name
 
     if "lm_head" in name:
-        name = re.sub(r"^model\.language_model\.", "model.", name)
-        if not name.startswith("model."):
-            name = "model." + name
+        # model.language_model.lm_head.weight → lm_head.weight
+        name = re.sub(r"^model\.language_model\.", "", name)
+        name = re.sub(r"^model\.", "", name)
         return name
 
     # Not an MTP weight

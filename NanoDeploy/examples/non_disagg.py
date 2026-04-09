@@ -37,7 +37,7 @@ def main():
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
-        ignore_eos=False,
+        ignore_eos=True,
         temperature=args.temperature,
     )
     prompts = [args.prompt]

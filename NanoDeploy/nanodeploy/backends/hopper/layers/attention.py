@@ -181,18 +181,20 @@ class FlashAttentionImpl:
                 causal=True,
             )
         else:  # decode
-            bs, num_head, head_dim = q.shape
+            ntps = context.num_tokens_per_seq
+            total_tokens, num_head, head_dim = q.shape
+            bs = total_tokens // ntps
             context_lens = context.context_lens[0, :bs]
             block_tables = context.block_tables[0, :bs]
 
             o, lse = flash_attn_with_kvcache(
-                q.unsqueeze(1),
+                q.reshape(bs, ntps, num_head, head_dim),
                 k_cache,
                 v_cache,
                 cache_seqlens=context_lens,
                 page_table=block_tables,
                 softmax_scale=self.scale,
-                causal=False,
+                causal=ntps > 1,
                 return_softmax_lse=True,
             )[:2]
 
@@ -250,28 +252,29 @@ class FlashMLAImpl:
             )
 
         else:  # decode
-            bs, num_head, head_dim = q.shape
-            q = q[:bs]
+            ntps = context.num_tokens_per_seq
+            total_tokens, num_head, head_dim = q.shape
+            bs = total_tokens // ntps
+            q = q[: bs * ntps]
             context_lens = context.context_lens[0, :bs]
             block_tables = context.block_tables[0, :bs]
-
-            batch_size = q.shape[0]
 
             if context.tile_scheduler_metadata is not None:
                 # Use precomputed metadata from prepare_decode (CUDA graph compatible)
                 tile_scheduler_metadata = context.tile_scheduler_metadata
                 # num_splits must have shape (batch_size + 1); slice buffer to match
-                num_splits = context.num_splits[: batch_size + 1]
+                num_splits = context.num_splits[: bs + 1]
             else:
                 # Fallback: compute inline
+                # For seqlen_q > 1 (lazy verify), adjust num_q_heads_per_kv
                 tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
                     context_lens,
-                    self.num_heads // self.num_kv_heads,
+                    ntps * self.num_heads // self.num_kv_heads,
                     self.num_kv_heads,
                 )
 
             o, lse = flash_mla.flash_mla_with_kvcache(
-                q.unsqueeze(1),
+                q.reshape(bs, ntps, num_head, head_dim),
                 k_cache,
                 block_tables,
                 context_lens,
@@ -279,10 +282,11 @@ class FlashMLAImpl:
                 tile_scheduler_metadata,
                 num_splits,
                 self.scale,
-                self.causal,
+                ntps > 1,  # causal=True when lazy verify
             )
 
-            o = o.squeeze(1)
+            # o: (bs, ntps, H, v_head_dim) → (q_len, H, v_head_dim)
+            o = o.reshape(bs * ntps, o.shape[2], o.shape[3])
 
         return o
 
