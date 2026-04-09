@@ -156,6 +156,15 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             hidden_states: [total_tokens, hidden_size]
         """
         context = get_context()
+
+        # Lazy verify: 2 tokens/seq processed as two sequential decode passes.
+        # Pass 1 processes token_0 (prev_sampled) and saves intermediate state
+        # to backup slots; pass 2 processes token_1 (draft) writing final
+        # state to active slots.  After verify, rejected seqs can be rolled
+        # back by copying backup → active.
+        if context.num_tokens_per_seq == 2 and not context.is_prefill:
+            return self._lazy_verify_forward(hidden_states, context)
+
         total_tokens = hidden_states.shape[0]
 
         # 1. Input projections (fused QKV)
@@ -205,6 +214,101 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         out = out.reshape(total_tokens, self.value_dim)
         output = self.out_proj(out)
         return output
+
+    def _lazy_verify_forward(
+        self,
+        hidden_states: torch.Tensor,
+        context,
+    ) -> torch.Tensor:
+        """Forward for lazy verify (num_tokens_per_seq == 2).
+
+        Processes 2 tokens per sequence using two sequential single-token
+        decode passes.  Between the passes, the intermediate (1-token) state
+        is copied to the backup region of the state pool so that rejected
+        sequences can be rolled back cheaply after verification.
+
+        Args:
+            hidden_states: [bs*2, hidden_size]  interleaved
+                [tok0_seq0, tok1_seq0, tok0_seq1, tok1_seq1, ...]
+        """
+        total_tokens = hidden_states.shape[0]
+        bs = total_tokens // 2
+
+        # ---------- 1. Stateless input projections on ALL tokens ----------
+        qkv_all = self.in_proj_qkv(hidden_states)  # [bs*2, conv_dim]
+        z_all = self.in_proj_z(hidden_states)  # [bs*2, value_dim]
+        a_all = self.in_proj_a(hidden_states)  # [bs*2, num_v_heads]
+        b_all = self.in_proj_b(hidden_states)  # [bs*2, num_v_heads]
+
+        # Split into token_0 (even) and token_1 (odd)
+        qkv_0 = qkv_all[0::2].contiguous()  # [bs, conv_dim]
+        qkv_1 = qkv_all[1::2].contiguous()  # [bs, conv_dim]
+        a_0, a_1 = a_all[0::2].contiguous(), a_all[1::2].contiguous()
+        b_0, b_1 = b_all[0::2].contiguous(), b_all[1::2].contiguous()
+
+        # ---------- 2. Pass 1: decode token_0 (prev_sampled) ----------
+        # Conv1d update (in-place on active conv_states)
+        qkv_0 = self._conv1d_decode(qkv_0, context)
+        # Split Q, K, V
+        q0, k0, v0 = qkv_0.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q0 = q0.view(bs, self.num_k_heads, self.head_k_dim).contiguous()
+        k0 = k0.view(bs, self.num_k_heads, self.head_k_dim).contiguous()
+        v0 = v0.view(bs, self.num_v_heads, self.head_v_dim).contiguous()
+        if self.kv_ratio > 1:
+            q0 = q0.repeat_interleave(self.kv_ratio, dim=1)
+            k0 = k0.repeat_interleave(self.kv_ratio, dim=1)
+        scale = self.head_k_dim**-0.5
+        # GDN decode (in-place on active recurrent_states)
+        o0 = self._gdn_decode(q0, k0, v0, a_0, b_0, scale, context)
+
+        # ---------- 3. Snapshot intermediate state → backup slots ----------
+        gdn_conv_states = context.gdn_conv_states
+        gdn_recurrent_states = context.gdn_recurrent_states
+        gdn_state_slots = context.gdn_state_slots
+        if gdn_conv_states is not None and gdn_state_slots is not None:
+            backup_offset = (gdn_conv_states.shape[1] - 1) // 2
+            active_slots = gdn_state_slots[:bs]
+            # Clamp so that CUDAGraph dummy slots (= 2*max_bs) map to the
+            # dummy slot itself instead of exceeding pool size.
+            max_slot = gdn_conv_states.shape[1] - 1
+            backup_slots = torch.clamp(active_slots + backup_offset, max=max_slot)
+            gdn_conv_states[self.layer_idx, backup_slots] = gdn_conv_states[
+                self.layer_idx, active_slots
+            ]
+            gdn_recurrent_states[self.layer_idx, backup_slots] = gdn_recurrent_states[
+                self.layer_idx, active_slots
+            ]
+
+        # ---------- 4. Pass 2: decode token_1 (draft) ----------
+        qkv_1 = self._conv1d_decode(qkv_1, context)
+        q1, k1, v1 = qkv_1.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q1 = q1.view(bs, self.num_k_heads, self.head_k_dim).contiguous()
+        k1 = k1.view(bs, self.num_k_heads, self.head_k_dim).contiguous()
+        v1 = v1.view(bs, self.num_v_heads, self.head_v_dim).contiguous()
+        if self.kv_ratio > 1:
+            q1 = q1.repeat_interleave(self.kv_ratio, dim=1)
+            k1 = k1.repeat_interleave(self.kv_ratio, dim=1)
+        o1 = self._gdn_decode(q1, k1, v1, a_1, b_1, scale, context)
+
+        # ---------- 5. Interleave outputs ----------
+        core_out = torch.empty(
+            total_tokens,
+            self.num_v_heads,
+            self.head_v_dim,
+            dtype=o0.dtype,
+            device=o0.device,
+        )
+        core_out[0::2] = o0
+        core_out[1::2] = o1
+
+        # ---------- 6. Gated RMSNorm + output projection ----------
+        z_all = z_all.view(total_tokens, self.num_v_heads, self.head_v_dim)
+        out = core_out.reshape(-1, self.head_v_dim)
+        z_flat = z_all.reshape(-1, self.head_v_dim)
+        out = self.norm(out, z_flat)
+        out = out.view(total_tokens, self.num_v_heads, self.head_v_dim)
+        out = out.reshape(total_tokens, self.value_dim)
+        return self.out_proj(out)
 
     def _apply_conv1d(self, qkv: torch.Tensor, context) -> torch.Tensor:
         """Apply causal conv1d to concatenated QKV.

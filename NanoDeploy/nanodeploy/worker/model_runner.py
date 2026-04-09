@@ -1159,6 +1159,32 @@ class ModelRunner:
                 rejected_mask = num_accepted == 0
                 if rejected_mask.any():
                     context.context_lens[sp_rank, :num_seqs] -= rejected_mask.int()
+
+                    # Rollback GDN states for rejected sequences.
+                    # During lazy verify forward, each GDN layer saved the
+                    # intermediate state (after token_0 only) into backup slots.
+                    # For rejected seqs, copy backup → active to discard the
+                    # effect of the draft token.
+                    # NOTE: In attention_dp mode, only the DP rank that owns a
+                    # sequence has a real state slot (0..max_active-1). Other
+                    # ranks carry the dummy slot (= pool_size-1) and must be
+                    # excluded from rollback to avoid out-of-bounds indexing.
+                    _cache_ctx = get_cache_context()
+                    if _cache_ctx.gdn_conv_states is not None:
+                        active_slots = context.gdn_state_slots[:num_seqs]
+                        # Combine rejected mask with real-slot mask
+                        real_slot_mask = active_slots < _cache_ctx.gdn_max_active_slots
+                        rollback_mask = rejected_mask & real_slot_mask
+                        if rollback_mask.any():
+                            backup_offset = _cache_ctx.gdn_max_active_slots
+                            rej_active = active_slots[rollback_mask]
+                            rej_backup = rej_active + backup_offset
+                            _cache_ctx.gdn_conv_states[:, rej_active] = (
+                                _cache_ctx.gdn_conv_states[:, rej_backup]
+                            )
+                            _cache_ctx.gdn_recurrent_states[:, rej_active] = (
+                                _cache_ctx.gdn_recurrent_states[:, rej_backup]
+                            )
             else:
                 if tp_rank == 0:
                     temperatures = self.prepare_sample_from_aux(aux)
@@ -1643,14 +1669,10 @@ class ModelRunner:
         )
 
         # MTP lazy verify CUDAGraph support:
-        # - Non-GDN models (DeepSeek): MTP draft + lazy verify (seqlen_q=2) use CUDAGraph
-        # - GDN models (Qwen3.5): all eager (GDN recurrent state issues)
+        # Both non-GDN (DeepSeek) and GDN (Qwen3.5) models use CUDAGraph for
+        # MTP drafts and lazy verify.  GDN lazy verify uses two sequential
+        # decode passes per layer (fixed-shape, CUDAGraph-friendly) with
+        # intermediate state saved to backup slots for rollback.
         if self.mtp_model is not None:
-            _cache_ctx = get_cache_context()
-            if _cache_ctx.gdn_conv_states is None:
-                # DeepSeek: MTP draft + lazy verify use CUDAGraph
-                self._capture_mtp_cudagraphs(max_bs, hf_config)
-                self._capture_lazy_verify_cudagraphs(max_bs, hf_config)
-            else:
-                # Qwen3.5: all eager
-                self.lazy_verify_graphs = None
+            self._capture_mtp_cudagraphs(max_bs, hf_config)
+            self._capture_lazy_verify_cudagraphs(max_bs, hf_config)
