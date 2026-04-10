@@ -217,18 +217,15 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                 time.sleep(0.001)
                 continue
 
-            dp_seqs, outputs, num_tokens, total_running, sch_lat, post_lat = (
-                engine.step()
-            )
+            result = engine.step()
 
-            # Note: num_tokens is negative for decode (represents capacity usage)
-            logger.debug(f"Engine step completed: {total_running} running sequences")
+            logger.debug(f"Engine step completed: {result.real_bs} running sequences")
 
             # Single-pass optimization: merge all sequence processing into one loop
             current_running_seqs = set()
             newly_appeared_seqs = []  # Store newly appeared sequences for early free
 
-            for seqs in dp_seqs:
+            for seqs in result.dp_seqs:
                 for seq in seqs:
                     current_running_seqs.add(seq.seq_id)
 
@@ -275,7 +272,7 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
             # Free vision embedding slots on encoder after prefill consumes them
             # (EP-separated mode: notify encoder to reclaim EmbeddingPool slots)
             vision_free_by_encoder: dict[str, list[int]] = defaultdict(list)
-            for seqs in dp_seqs:
+            for seqs in result.dp_seqs:
                 for seq in seqs:
                     vs_list = seq.vision_slots
                     if not vs_list:

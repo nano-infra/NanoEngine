@@ -211,11 +211,11 @@ def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requ
 
             # Engine step
             if not engine.is_finished():
-                outputs, _, _, _, _ = engine.step()
+                result = engine.step()
 
                 # Update progress bar with latency info
                 updated = False
-                for seq_id, _ in outputs:
+                for seq_id, _ in result.dp_seqs:
                     if seq_id in seq_map:
                         seq = seq_map[seq_id]
                         if seq.metric and seq.metric.e2e_latency:
