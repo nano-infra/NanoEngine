@@ -110,7 +110,8 @@ class LLMEngine:
                 dummy_seq_ids.add(d.seq_id)
 
         total_running = sum(
-            sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids) for seqs in dp_seqs
+            sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
+            for seqs in dp_seqs
         )
         total_waiting = len(self.scheduler.waiting)
         total_waiting_migration = len(self.scheduler.waiting_migration)
@@ -207,7 +208,9 @@ class LLMEngine:
 
         if is_prefill:
             for seqs in dp_seqs:
-                num_tokens += sum(len(seq) for seq in seqs if id(seq) not in dummy_ids)
+                num_tokens += sum(
+                    len(seq) for seq in seqs if seq.seq_id not in dummy_seq_ids
+                )
         elif token_ids is not None:
             # Count actual generated tokens, excluding dummy sequences
             for dp_idx in range(dp_size):
@@ -216,11 +219,11 @@ class LLMEngine:
                     group_seqs = filtered_dp_group_seqs[group_idx]
                     group_tokens = token_ids[group_idx]
                     for seq, seq_tokens in zip(group_seqs, group_tokens):
-                        if id(seq) not in dummy_ids:
+                        if seq.seq_id not in dummy_seq_ids:
                             num_tokens -= len(seq_tokens)
         else:
             for seqs in dp_seqs:
-                num_real = sum(1 for seq in seqs if id(seq) not in dummy_ids)
+                num_real = sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
                 num_tokens -= num_real * self.config.loop_count
 
         # Collect finished/migrated sequences after postprocess
@@ -230,7 +233,8 @@ class LLMEngine:
                     self.metrics_manager.complete_sequence(seq.seq_id)
                     outputs.append(seq)
         real_bs = sum(
-            sum(1 for seq in seqs if id(seq) not in dummy_ids) for seqs in dp_seqs
+            sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
+            for seqs in dp_seqs
         )
         return (
             dp_seqs,
