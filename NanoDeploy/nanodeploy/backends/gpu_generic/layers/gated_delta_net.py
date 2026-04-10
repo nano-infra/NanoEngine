@@ -44,6 +44,15 @@ except ImportError:
     can_use_repeat_heads_triton = None
     repeat_heads_triton = None
 
+try:
+    from nanodeploy.backends.gpu_generic.kernels.ragged_layout import (
+        can_use_ragged_to_padded_triton,
+        ragged_to_padded_triton,
+    )
+except ImportError:
+    can_use_ragged_to_padded_triton = None
+    ragged_to_padded_triton = None
+
 # Try to import flashinfer GDN kernels (preferred, SM90 native)
 try:
     from flashinfer import chunk_gated_delta_rule
