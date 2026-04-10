@@ -199,8 +199,7 @@ class FlashAttentionImpl:
             )[:2]
 
             # o: (bs, ntps, H, D) → (total_tokens, H, D)
-            if ntps > 1:
-                o = o.reshape(total_tokens, num_head, head_dim)
+            o = o.reshape(total_tokens, num_head, head_dim)
 
         return o
 
