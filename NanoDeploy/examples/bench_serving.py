@@ -215,15 +215,18 @@ def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requ
 
                 # Update progress bar with latency info
                 updated = False
-                for seq_id, _ in result.dp_seqs:
-                    if seq_id in seq_map:
-                        seq = seq_map[seq_id]
-                        if seq.metric and seq.metric.e2e_latency:
-                            completed_latencies.append(seq.metric.e2e_latency / 1000)
-                            avg_lat = np.mean(completed_latencies)
-                            pbar.set_postfix({"Avg Latency": f"{avg_lat:.2f}s"})
-                            updated = True
-                        pbar.update(1)
+                for seqs in result.dp_seqs:
+                    for seq in seqs:
+                        if seq.seq_id in seq_map:
+                            tracked = seq_map[seq.seq_id]
+                            if tracked.metric and tracked.metric.e2e_latency:
+                                completed_latencies.append(
+                                    tracked.metric.e2e_latency / 1000
+                                )
+                                avg_lat = np.mean(completed_latencies)
+                                pbar.set_postfix({"Avg Latency": f"{avg_lat:.2f}s"})
+                                updated = True
+                            pbar.update(1)
             else:
                 time.sleep(0.001)
 

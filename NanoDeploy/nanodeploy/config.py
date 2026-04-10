@@ -136,6 +136,10 @@ class Config(BaseModel):
                     f"model does not have MTP layers "
                     f"(num_nextn_predict_layers / mtp_num_hidden_layers not found)"
                 )
+            if self.loop_count != 1:
+                raise ValueError(
+                    f"MTP requires loop_count=1, got loop_count={self.loop_count}"
+                )
             # Inflate loop_count so the scheduler pre-allocates enough KV cache
             # blocks for the extra MTP tokens per decode step.
             # The actual decode loop still runs only the original loop_count

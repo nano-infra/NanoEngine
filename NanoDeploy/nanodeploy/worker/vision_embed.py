@@ -192,7 +192,11 @@ class VisionEmbedManager:
 
         logger.info(
             f"[VISION_RDMA] Stored vision embeds: shape={recv_buf.shape}, "
-            f"dtype={recv_buf.dtype}, norm={recv_buf.norm().item():.4f}, "
-            f"nonzero={recv_buf.count_nonzero().item()}/{recv_buf.numel()}"
+            f"dtype={recv_buf.dtype}"
         )
+        if logger.isEnabledFor(10):  # DEBUG
+            logger.debug(
+                f"[VISION_RDMA] norm={recv_buf.norm().item():.4f}, "
+                f"nonzero={recv_buf.count_nonzero().item()}/{recv_buf.numel()}"
+            )
         self._vision_embeds = {"image": recv_buf}

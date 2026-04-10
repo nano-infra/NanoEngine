@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--prompt", type=str, default="What is 1+1?")
     parser.add_argument("--max_tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--ignore_eos", type=bool, default=False)
+    parser.add_argument("--ignore_eos", action="store_true")
     args = parser.parse_args()
 
     # Build Config from parsed args (exclude extra args)
