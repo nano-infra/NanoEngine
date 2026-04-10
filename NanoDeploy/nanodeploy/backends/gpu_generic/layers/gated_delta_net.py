@@ -17,6 +17,33 @@ from nanodeploy.models.quant_config import QuantizationConfig
 
 logger = get_logger()
 
+try:
+    from nanodeploy.backends.gpu_generic.kernels.rmsnorm_gated import (
+        can_use_rms_norm_gated_kernel,
+        rms_norm_gated_triton,
+    )
+except ImportError:
+    can_use_rms_norm_gated_kernel = None
+    rms_norm_gated_triton = None
+
+try:
+    from nanodeploy.backends.gpu_generic.kernels.repeat_interleave import (
+        can_use_repeat_interleave_from_prefix_triton,
+        repeat_interleave_from_prefix_triton,
+    )
+except ImportError:
+    can_use_repeat_interleave_from_prefix_triton = None
+    repeat_interleave_from_prefix_triton = None
+
+try:
+    from nanodeploy.backends.gpu_generic.kernels.repeat_heads import (
+        can_use_repeat_heads_triton,
+        repeat_heads_triton,
+    )
+except ImportError:
+    can_use_repeat_heads_triton = None
+    repeat_heads_triton = None
+
 # Try to import flashinfer GDN kernels (preferred, SM90 native)
 try:
     from flashinfer import chunk_gated_delta_rule
@@ -50,13 +77,17 @@ class RMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
 
-    @torch.compile
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [..., hidden_size] — the value to normalize
             gate: [..., hidden_size] — gating signal (SiLU applied)
         """
+        if can_use_rms_norm_gated_kernel is not None and can_use_rms_norm_gated_kernel(
+            x, gate, self.weight
+        ):
+            return rms_norm_gated_triton(x, gate, self.weight, self.eps)
+
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
@@ -145,6 +176,37 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
 
         # Kernel availability
         self._has_flashinfer = _HAS_FLASHINFER_GDN
+        self._conv1d_prefill_padded_ws: torch.Tensor | None = None
+
+    def _get_conv1d_prefill_padded_workspace(
+        self,
+        num_seqs: int,
+        dim: int,
+        max_seqlen: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        ws = self._conv1d_prefill_padded_ws
+        need_new_ws = (
+            ws is None
+            or ws.device != device
+            or ws.dtype != dtype
+            or ws.shape[0] < num_seqs
+            or ws.shape[1] < dim
+            or ws.shape[2] < max_seqlen
+        )
+        if need_new_ws:
+            self._conv1d_prefill_padded_ws = torch.empty(
+                num_seqs,
+                dim,
+                max_seqlen,
+                device=device,
+                dtype=dtype,
+            )
+
+        padded = self._conv1d_prefill_padded_ws[:num_seqs, :dim, :max_seqlen]
+        padded.zero_()
+        return padded
 
     def forward(
         self,
@@ -183,8 +245,17 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             k = k.view(total_tokens, self.num_k_heads, self.head_k_dim).contiguous()
             v = v.view(total_tokens, self.num_v_heads, self.head_v_dim).contiguous()
             if self.kv_ratio > 1:
-                q = q.repeat_interleave(self.kv_ratio, dim=1)
-                k = k.repeat_interleave(self.kv_ratio, dim=1)
+                if (
+                    repeat_heads_triton is not None
+                    and can_use_repeat_heads_triton is not None
+                    and can_use_repeat_heads_triton(q, self.kv_ratio)
+                    and can_use_repeat_heads_triton(k, self.kv_ratio)
+                ):
+                    q = repeat_heads_triton(q, self.kv_ratio)
+                    k = repeat_heads_triton(k, self.kv_ratio)
+                else:
+                    q = q.repeat_interleave(self.kv_ratio, dim=1)
+                    k = k.repeat_interleave(self.kv_ratio, dim=1)
             beta = b.float().sigmoid()
             A_exp = -self.A_log.float().exp()
             g = A_exp * F.softplus(a.float() + self.dt_bias)
@@ -334,18 +405,43 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             total_tokens = qkv.shape[0]
             max_seqlen = context.max_seqlen_q
             dim = qkv.shape[1]
-            seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+            cu_seqlens_long = cu_seqlens.to(torch.int64)
+            batch_values = torch.arange(num_seqs, device=qkv.device, dtype=torch.int64)
+            offset_values = cu_seqlens_long[:-1].contiguous()
 
-            batch_idx = torch.repeat_interleave(
-                torch.arange(num_seqs, device=qkv.device, dtype=torch.long),
-                seq_lens,
-                output_size=total_tokens,
-            )
-            offsets = torch.repeat_interleave(
-                cu_seqlens[:-1].long(),
-                seq_lens,
-                output_size=total_tokens,
-            )
+            if (
+                repeat_interleave_from_prefix_triton is not None
+                and can_use_repeat_interleave_from_prefix_triton is not None
+                and can_use_repeat_interleave_from_prefix_triton(
+                    batch_values, cu_seqlens_long
+                )
+            ):
+                batch_idx = repeat_interleave_from_prefix_triton(
+                    batch_values,
+                    cu_seqlens_long,
+                    total_tokens,
+                    max_repeat_hint=max_seqlen,
+                )
+                offsets = repeat_interleave_from_prefix_triton(
+                    offset_values,
+                    cu_seqlens_long,
+                    total_tokens,
+                    max_repeat_hint=max_seqlen,
+                )
+            else:
+                # print("no torch_interleave")
+
+                seq_lens = (cu_seqlens_long[1:] - cu_seqlens_long[:-1]).contiguous()
+                batch_idx = torch.repeat_interleave(
+                    torch.arange(num_seqs, device=qkv.device, dtype=torch.long),
+                    seq_lens,
+                    output_size=total_tokens,
+                )
+                offsets = torch.repeat_interleave(
+                    cu_seqlens_long[:-1],
+                    seq_lens,
+                    output_size=total_tokens,
+                )
             pos_in_seq = (
                 torch.arange(
                     total_tokens,
@@ -355,23 +451,30 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 - offsets
             )
 
-            padded = torch.zeros(
+            padded = self._get_conv1d_prefill_padded_workspace(
                 num_seqs,
                 dim,
                 max_seqlen,
-                device=qkv.device,
-                dtype=qkv.dtype,
+                qkv.device,
+                qkv.dtype,
             )
-            padded[batch_idx, :, pos_in_seq] = qkv
+            if (
+                ragged_to_padded_triton is not None
+                and can_use_ragged_to_padded_triton is not None
+                and can_use_ragged_to_padded_triton(qkv, cu_seqlens_long, padded)
+            ):
+                ragged_to_padded_triton(qkv, cu_seqlens_long, max_seqlen, out=padded)
+            else:
+                padded[batch_idx, :, pos_in_seq] = qkv
 
             if gdn_state_slots is not None:
                 init_states = gdn_conv_states[
                     self.layer_idx, gdn_state_slots[:num_seqs], :, 1:
-                ].contiguous()
+                ]
             else:
-                init_states = gdn_conv_states[
-                    self.layer_idx, :num_seqs, :, 1:
-                ].contiguous()
+                init_states = gdn_conv_states[self.layer_idx, :num_seqs, :, 1:]
+            if not init_states.is_contiguous():
+                init_states = init_states.contiguous()
 
             padded_out = causal_conv1d_fn(
                 x=padded,
@@ -380,15 +483,31 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 activation=self.activation,
             )
 
-            qkv_out = torch.empty_like(qkv)
-            qkv_out[:] = padded_out[batch_idx, :, pos_in_seq]
+            qkv_out = padded_out[batch_idx, :, pos_in_seq]
         else:
             # First chunk or single-chunk: batched with seq_idx
-            seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
-            seq_idx = torch.repeat_interleave(
-                torch.arange(num_seqs, dtype=torch.int32, device=qkv.device),
-                seq_lens,
-            ).unsqueeze(0)
+            cu_seqlens_long = cu_seqlens.to(torch.int64)
+            seq_values = torch.arange(num_seqs, dtype=torch.int32, device=qkv.device)
+            if (
+                repeat_interleave_from_prefix_triton is not None
+                and can_use_repeat_interleave_from_prefix_triton is not None
+                and can_use_repeat_interleave_from_prefix_triton(
+                    seq_values, cu_seqlens_long
+                )
+            ):
+
+                seq_idx = repeat_interleave_from_prefix_triton(
+                    seq_values,
+                    cu_seqlens_long,
+                    qkv.shape[0],
+                    max_repeat_hint=context.max_seqlen_q,
+                ).unsqueeze(0)
+            else:
+                seq_lens = (cu_seqlens_long[1:] - cu_seqlens_long[:-1]).contiguous()
+                seq_idx = torch.repeat_interleave(
+                    torch.arange(num_seqs, dtype=torch.int32, device=qkv.device),
+                    seq_lens,
+                ).unsqueeze(0)
 
             qkv_out = (
                 causal_conv1d_fn(
@@ -407,11 +526,14 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
             states = causal_conv1d_varlen_states(
                 qkv, cu_seqlens, self.conv_kernel_size - 1
             )
-            padded = torch.cat([torch.zeros_like(states[:, :, :1]), states], dim=-1)
             if gdn_state_slots is not None:
-                gdn_conv_states[self.layer_idx, gdn_state_slots[:num_seqs]] = padded
+                target_states = gdn_conv_states[
+                    self.layer_idx, gdn_state_slots[:num_seqs]
+                ]
             else:
-                gdn_conv_states[self.layer_idx, :num_seqs] = padded
+                target_states = gdn_conv_states[self.layer_idx, :num_seqs]
+            target_states.zero_()
+            target_states[:, :, 1:].copy_(states)
 
         return qkv_out
 
