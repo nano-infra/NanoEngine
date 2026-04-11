@@ -105,6 +105,8 @@ class MetricsManager:
                 metric.log_metrics()
             self.server_metric.add_tokens(num_generated=metric.num_generated_tokens)
             self.server_metric.add_completed_request()
+            # Remove completed metric to prevent unbounded memory growth
+            del self.sequence_metrics[seq_id]
 
     def remove_sequence_metric(self, seq_id: str):
         """Remove a sequence metric (e.g., after logging)."""

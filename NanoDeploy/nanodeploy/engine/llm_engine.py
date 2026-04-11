@@ -115,8 +115,6 @@ class LLMEngine:
             logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
 
         dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
-
-        dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
         # dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
         sp_batch_sizes = [
             [
@@ -203,8 +201,7 @@ class LLMEngine:
             )
             for seq in seqs:
                 if seq.is_finished or seq.is_to_be_migrated:
-                    if seq.is_finished or seq.is_to_be_migrated:
-                        self.metrics_manager.complete_sequence(seq.seq_id)
+                    self.metrics_manager.complete_sequence(seq.seq_id)
                     outputs.append(seq)
         return (
             dp_seqs,
