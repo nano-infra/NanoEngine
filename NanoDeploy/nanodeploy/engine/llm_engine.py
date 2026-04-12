@@ -55,7 +55,22 @@ class LLMEngine:
         self.update_num_kvcache_blocks()
 
         self.tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
-        config.eos = self.tokenizer.eos_token_id
+        eos_ids = set()
+        if self.tokenizer.eos_token_id is not None:
+            eos_ids.add(self.tokenizer.eos_token_id)
+        # Prefer generation_config.json eos_token_id (may differ from tokenizer)
+        try:
+            from transformers import GenerationConfig
+
+            gen_config = GenerationConfig.from_pretrained(config.model)
+            gen_eos = gen_config.eos_token_id
+            if isinstance(gen_eos, list):
+                eos_ids.update(gen_eos)
+            elif gen_eos is not None:
+                eos_ids.add(gen_eos)
+        except Exception:
+            pass
+        config.eos = sorted(eos_ids)
 
         self.scheduler = init_scheduler(config)
         logger.info(

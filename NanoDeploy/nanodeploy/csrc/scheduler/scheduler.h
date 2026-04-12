@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "nanodeploy/csrc/sequence/sequence.h"
@@ -85,7 +86,7 @@ public:
               int                max_num_seqs,
               int                max_num_batched_tokens,
               int                max_model_len,
-              int                eos,
+              std::vector<int>   eos_ids,
               int                attention_dp,
               int                group_size,
               int                num_kvcache_blocks,
@@ -124,10 +125,10 @@ public:
     // Public members exposed to Python
     std::string engine_id_;
 
-    int loop_count_;
-    int max_num_seqs_;
-    int max_num_batched_tokens_;
-    int eos_;
+    int                     loop_count_;
+    int                     max_num_seqs_;
+    int                     max_num_batched_tokens_;
+    std::unordered_set<int> eos_ids_;
 
     int attention_dp_;
     int group_size_;
@@ -172,7 +173,7 @@ private:
     static void postprocess_worker_func(std::shared_ptr<GroupManager>   state_manager,
                                         const PostprocessWorkerContext* ctx,
                                         PostprocessWorkerContext*       result_ctx,
-                                        int                             eos_id,
+                                        const std::unordered_set<int>&  eos_ids,
                                         bool                            is_prefill,
                                         bool                            update_metrics);
 

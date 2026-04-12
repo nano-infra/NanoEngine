@@ -19,7 +19,7 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                max_num_seqs,
                      int                max_num_batched_tokens,
                      int                max_model_len,
-                     int                eos,
+                     std::vector<int>   eos_ids,
                      int                attention_dp,
                      int                group_size,
                      int                num_kvcache_blocks,
@@ -29,7 +29,7 @@ Scheduler::Scheduler(const std::string& engine_id,
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
     max_num_batched_tokens_(max_num_batched_tokens),
-    eos_(eos),
+    eos_ids_(eos_ids.begin(), eos_ids.end()),
     attention_dp_(attention_dp),
     group_size_(group_size),
     max_model_len_(max_model_len),
@@ -527,7 +527,7 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
 void Scheduler::postprocess_worker_func(std::shared_ptr<GroupManager>   state_manager,
                                         const PostprocessWorkerContext* ctx,
                                         PostprocessWorkerContext*       result_ctx,
-                                        int                             eos_id,
+                                        const std::unordered_set<int>&  eos_ids,
                                         bool                            is_prefill,
                                         bool                            update_metrics)
 {
@@ -591,7 +591,7 @@ void Scheduler::postprocess_worker_func(std::shared_ptr<GroupManager>   state_ma
                     }
                 }
 
-                bool finished = (!seq->sampling_params().ignore_eos && token_id == eos_id)
+                bool finished = (!seq->sampling_params().ignore_eos && eos_ids.count(token_id))
                                 || (seq->num_completed_tokens() >= seq->sampling_params().max_tokens);
 
                 if (finished) {
@@ -676,7 +676,7 @@ Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_
                                                     worker_state[dp_idx],
                                                     &contexts[dp_idx],
                                                     &contexts[dp_idx],
-                                                    eos_,
+                                                    eos_ids_,
                                                     is_prefill,
                                                     update_metrics));
         }
@@ -694,7 +694,7 @@ Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_
                                  worker_state[dp_idx],
                                  &contexts[dp_idx],
                                  &contexts[dp_idx],
-                                 eos_,
+                                 eos_ids_,
                                  is_prefill,
                                  update_metrics);
         }

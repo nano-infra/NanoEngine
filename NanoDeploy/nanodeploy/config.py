@@ -1,5 +1,5 @@
 import os
-from typing import Any, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 from transformers import AutoConfig, PretrainedConfig
@@ -34,7 +34,7 @@ class Config(BaseModel):
     enforce_eager: bool = False
     trust_remote_code: bool = False
     hf_config: Any = None
-    eos: int = -1
+    eos: List[int] = []
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = 15000
 

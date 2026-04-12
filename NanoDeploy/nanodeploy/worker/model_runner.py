@@ -363,9 +363,12 @@ class ModelRunner:
             config, "disable_nsa", False
         )
 
+        head_dim = getattr(hf_config, "head_dim", None) or (
+            hf_config.hidden_size // hf_config.num_attention_heads
+        )
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
-            head_dim=hf_config.head_dim,
+            head_dim=head_dim,
             block_size=config.kvcache_block_size,
             num_hidden_layers=num_kv_layers,
             attention_tp=config.attention_tp,
