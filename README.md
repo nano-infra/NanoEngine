@@ -15,6 +15,7 @@
 | ------------- | ------------ | --------------- |
 | DeepSeek-V3   | NanoDeploy   | MLA + MoE       |
 | DeepSeek-V3.2 | NanoDeploy   | MLA + MoE + NSA |
+| Kimi-K2       | NanoDeploy   | MLA + MoE       |
 | Qwen3         | NanoDeploy   | GQA (Dense)     |
 | Qwen3-MoE     | NanoDeploy   | GQA + MoE       |
 | Qwen3.5-MoE   | NanoDeploy   | GQA + GDN + MoE |
@@ -69,7 +70,7 @@ graph TB
 | --------------------------------------------------- | ------- | --------------------------------------------------------------- | ----------- |
 | [DeepEP](https://github.com/deepseek-ai/DeepEP)     | 1.2.1   | Expert-parallel all-to-all communication (MoE dispatch/combine) | deepseek-ai |
 | [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) | 2.1.1   | FP8 GEMM kernels with fine-grained scaling (JIT compiled)       | deepseek-ai |
-| [FlashMLA](https://github.com/deepseek-ai/FlashMLA) | 1.0.0   | Multi-head Latent Attention decode kernels for Hopper GPUs      | deepseek-ai |
+| [FlashMLA](https://github.com/deepseek-ai/FlashMLA) | 1.0.0   | Multi-head Latent Attention decode kernels (dense + FP8 sparse) | deepseek-ai |
 
 All three require SM90+ (NVIDIA Hopper) GPUs. Install from source:
 
