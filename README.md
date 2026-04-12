@@ -33,6 +33,7 @@
 | ✅ **Multi-head Latent Attention (MLA)**           | Compressed KV cache with low-rank projection for DeepSeek-V3 family.                    |
 | ✅ **Multi-Token Prediction (MTP)**                | Speculative decoding with model-native MTP heads.                                       |
 | ✅ **Native Sparse Attention (NSA)**               | FP8 sparse decode with block-level indexing for DeepSeek-V3.2.                          |
+| ✅ **Node Discovery**                              | Automatic engine registration and heartbeat via NanoCtrl service registry.              |
 | ✅ **Prefix Caching**                              | Reuse KV cache of shared prompt prefixes across requests.                               |
 | ✅ **Tensor Parallelism (TP)**                     | Split weight matrices across GPUs for large model inference.                            |
 | ✅ **Wide Expert Parallelism**                     | MoE EP across all GPUs with attention data-parallel (`attention_dp × ffn_ep`).          |
@@ -62,7 +63,21 @@ graph TB
 
 ## 🚀 Installation
 
-The root `pyproject.toml` acts as a meta-package that lets you install any combination of Python components in a single command.
+### Prerequest Third-Party GPU Kernels
+
+| Library                                             | Version | Description                                                     | Source      |
+| --------------------------------------------------- | ------- | --------------------------------------------------------------- | ----------- |
+| [DeepEP](https://github.com/deepseek-ai/DeepEP)     | 1.2.1   | Expert-parallel all-to-all communication (MoE dispatch/combine) | deepseek-ai |
+| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) | 2.1.1   | FP8 GEMM kernels with fine-grained scaling (JIT compiled)       | deepseek-ai |
+| [FlashMLA](https://github.com/deepseek-ai/FlashMLA) | 1.0.0   | Multi-head Latent Attention decode kernels for Hopper GPUs      | deepseek-ai |
+
+All three require SM90+ (NVIDIA Hopper) GPUs. Install from source:
+
+```bash
+cd DeepEP && pip install .
+cd DeepGEMM && pip install .
+cd FlashMLA && pip install .
+```
 
 ### One-liner: install everything
 
