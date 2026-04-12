@@ -178,5 +178,5 @@ class BackendFactory(ABC):
         num_kv_heads: int,
         v_head_dim: int,
         attention_type: str = "MLA",
-        **kwargs,
+        nsa_index_topk: int = 0,
     ) -> AttentionBase: ...

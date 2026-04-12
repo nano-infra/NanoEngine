@@ -19,6 +19,12 @@ logger = get_logger("nanodeploy")
 # PeerAgent path: buffer ID for kv_cache registration
 _KV_CACHE_BUFFER_ID = "kv_cache"
 
+# FP8 quantization tile size (matches deep_gemm per_token_cast_to_fp8)
+_FP8_QUANT_TILE_SIZE = 128
+
+# NSA Indexer FP8 cache quantization block size
+INDEXER_QUANT_BLOCK_SIZE = _FP8_QUANT_TILE_SIZE
+
 # Cache TTL for engine_info from NanoCtrl (seconds)
 # Engine registration rarely changes, cache forever by default (inf means never expire)
 # To refresh, call invalidate_engine_info_cache() or restart the engine
@@ -48,6 +54,11 @@ class CacheContext:
     # used for MLA mode
     kv_lora_rank: int = 0
     qk_rope_head_dim: int = 0
+    is_fp8_kvcache: bool = False
+
+    # NSA Indexer (V3.2 only)
+    index_head_dim: int = 0  # 128 for V3.2, 0 otherwise
+    indexer_cache: Any = None  # IndexerCache instance, set after allocation
 
     # Control plane: server address and engine ID for centralized connection
     nanoctrl_address: str | None = (
@@ -81,15 +92,43 @@ class CacheContext:
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
-        block_bytes = (
-            self.num_hidden_layers
-            * self.block_size
-            * self.num_local_kv_heads
-            * self.head_dim
-            * self.dtype.itemsize
-        )
+        if self.mode == "mla" and self.is_fp8_kvcache:
+            # FP8 MLA layout per token:
+            #   NoPE:  kv_lora_rank bytes (float8_e4m3fn)
+            #   Scale: (kv_lora_rank // tile_size) * 4 bytes (float32 per tile)
+            #   RoPE:  qk_rope_head_dim * 2 bytes (bfloat16)
+            nope_bytes = self.kv_lora_rank
+            scale_bytes = (self.kv_lora_rank // _FP8_QUANT_TILE_SIZE) * 4
+            rope_bytes = self.qk_rope_head_dim * 2
+            self._fp8_head_dim = nope_bytes + scale_bytes + rope_bytes
+            block_bytes = (
+                self.num_hidden_layers
+                * self.block_size
+                * 1  # num_kv_heads
+                * self._fp8_head_dim
+                * 1  # fp8 element size
+            )
+        else:
+            self._fp8_head_dim = 0
+            block_bytes = (
+                self.num_hidden_layers
+                * self.block_size
+                * self.num_local_kv_heads
+                * self.head_dim
+                * self.dtype.itemsize
+            )
         if self.mode == "gqa":
             block_bytes *= 2
+
+        # Account for NSA indexer FP8 cache (V3.2 only)
+        if self.index_head_dim > 0:
+            indexer_bytes_per_token = (
+                self.index_head_dim
+                + self.index_head_dim // INDEXER_QUANT_BLOCK_SIZE * 4
+            )
+            block_bytes += (
+                self.num_hidden_layers * self.block_size * indexer_bytes_per_token
+            )
 
         self.num_local_kvcache_blocks = (
             int(total * self.gpu_memory_utilization - used - peak + current)
@@ -110,12 +149,17 @@ class CacheContext:
         self.endpoints = {}
         self.num_remote_kvcache_blocks = {}
         self.remote_max_num_seqs: dict[str, int] = {}  # engine_id -> max_num_seqs
+        self.remote_gdn_num_slots: dict[str, int] = {}  # engine_id -> gdn_num_slots
+        self.gdn_num_slots: int = 0  # actual dim-1 of gdn tensors
         self._peer_agent = None
         self._peer_agent_addr: str | None = None
         self._connected_peers: set[str] = set()  # track connected peer addresses
         self._local_mr_handler: int | None = None  # local MR handler for kv_cache
         self._local_gdn_conv_mr_handler: int | None = None
         self._local_gdn_recurrent_mr_handler: int | None = None
+        self._local_indexer_mr_handler: int | None = (
+            None  # local MR handler for indexer_cache
+        )
         # NOTE: Remote MR handler caching removed from app layer
         # PeerAgent handles MR info caching via pubsub (mr_update events)
         # register_remote_memory_region is idempotent at endpoint layer
@@ -124,6 +168,12 @@ class CacheContext:
         )
 
     def block_stride(self, block_idx: int):
+        if self.is_fp8_kvcache and self.mode == "mla":
+            # Physical stride uses (block_size + 1) due to padding row for
+            # FlashMLA alignment.  The tensor is allocated with block_size+1
+            # rows then sliced to block_size, so the underlying storage pitch
+            # is (block_size + 1) * head_dim bytes per block.
+            return block_idx * (self.block_size + 1) * 1 * self._fp8_head_dim * 1
         return (
             block_idx
             * self.block_size
@@ -178,8 +228,10 @@ class CacheContext:
         """Compute GDN conv state offset for a REMOTE engine's tensor layout."""
         if self.gdn_conv_states is None:
             return -1
-        remote_num_slots = self.remote_max_num_seqs.get(remote_engine_id, 0) + 1
-        # remote stride(0) = remote_num_slots * local_stride(1)
+        remote_num_slots = self.remote_gdn_num_slots.get(remote_engine_id, 0)
+        if remote_num_slots == 0:
+            # Fallback: assume same layout as local
+            remote_num_slots = self.gdn_num_slots
         remote_stride0 = remote_num_slots * self.gdn_conv_states.stride(1)
         return (
             layer_idx * remote_stride0 + slot_idx * self.gdn_conv_states.stride(1)
@@ -191,7 +243,9 @@ class CacheContext:
         """Compute GDN recurrent state offset for a REMOTE engine's tensor layout."""
         if self.gdn_recurrent_states is None:
             return -1
-        remote_num_slots = self.remote_max_num_seqs.get(remote_engine_id, 0) + 1
+        remote_num_slots = self.remote_gdn_num_slots.get(remote_engine_id, 0)
+        if remote_num_slots == 0:
+            remote_num_slots = self.gdn_num_slots
         remote_stride0 = remote_num_slots * self.gdn_recurrent_states.stride(1)
         return (
             layer_idx * remote_stride0 + slot_idx * self.gdn_recurrent_states.stride(1)
@@ -206,32 +260,104 @@ class CacheContext:
             * self.gdn_recurrent_states.element_size()
         )
 
+    # ------------------------------------------------------------------
+    # NSA Indexer cache stride helpers (PD disaggregation)
+    # ------------------------------------------------------------------
+    # IndexerCache.buffer shape: (num_layers, num_pages, page_size * bytes_per_token)
+    # All offsets are in bytes (uint8 buffer).
+
+    def indexer_page_num_bytes(self) -> int:
+        """Bytes per page (one block) in the indexer cache."""
+        if self.indexer_cache is None:
+            return 0
+        return self.indexer_cache.page_size * self.indexer_cache.bytes_per_token
+
+    def local_indexer_stride(self, layer_idx: int, block_idx: int) -> int:
+        """Byte offset for (layer, block) in the local indexer buffer."""
+        page_bytes = self.indexer_page_num_bytes()
+        return (layer_idx * self.num_local_kvcache_blocks + block_idx) * page_bytes
+
+    def remote_indexer_stride(
+        self, layer_idx: int, block_idx: int, remote_engine_id: str
+    ) -> int:
+        """Byte offset for (layer, block) in a remote engine's indexer buffer."""
+        page_bytes = self.indexer_page_num_bytes()
+        return (
+            layer_idx * self.num_remote_kvcache_blocks[remote_engine_id] + block_idx
+        ) * page_bytes
+
     def allocate_kvcache(self, num_kvcache_blocks):
         self.num_local_kvcache_blocks = num_kvcache_blocks
 
-        kv_count = 2 if self.mode == "gqa" else 1
+        if self.mode == "mla" and self.is_fp8_kvcache:
+            # FP8 MLA: allocate (block_size+1) rows per block for stride padding,
+            # then slice back to block_size.  This ensures the FlashMLA kernel
+            # never reads out-of-bounds on the last row.
+            kv_cache_padded = torch.empty(
+                1,
+                self.num_hidden_layers,
+                self.num_local_kvcache_blocks,
+                self.block_size + 1,
+                1,  # num_kv_heads
+                self._fp8_head_dim,
+                dtype=torch.float8_e4m3fn,
+                device=self.device,
+            )
+            self.kv_cache = kv_cache_padded[:, :, :, : self.block_size, :, :]
+        else:
+            kv_count = 2 if self.mode == "gqa" else 1
+            self.kv_cache = torch.empty(
+                kv_count,
+                self.num_hidden_layers,
+                self.num_local_kvcache_blocks,
+                self.block_size,
+                self.num_local_kv_heads,
+                self.head_dim,
+                dtype=self.dtype,
+                device=self.device,
+            )
 
-        self.kv_cache = torch.empty(
-            kv_count,
-            self.num_hidden_layers,
-            self.num_local_kvcache_blocks,
-            self.block_size,
-            self.num_local_kv_heads,
-            self.head_dim,
-            dtype=self.dtype,
+    def allocate_indexer_cache(self, hf_config):
+        """Allocate NSA indexer FP8 cache for DeepSeek V3.2.
+
+        Uses the same num_pages / page_size as the main KV cache so that
+        block tables are shared between the main attention and the indexer.
+        """
+        from nanodeploy.layers.indexer import IndexerCache
+
+        index_head_dim = getattr(hf_config, "index_head_dim", 0)
+        if index_head_dim == 0:
+            return
+
+        self.indexer_cache = IndexerCache(
+            num_layers=self.num_hidden_layers,
+            num_pages=self.num_local_kvcache_blocks,
+            page_size=self.block_size,
+            head_dim=index_head_dim,
             device=self.device,
         )
+        total_bytes = sum(b.nelement() for b in self.indexer_cache.buffers)
+        logger.debug(
+            f"Allocated IndexerCache: {self.num_hidden_layers} layers, "
+            f"{self.num_local_kvcache_blocks} pages, page_size={self.block_size}, "
+            f"head_dim={index_head_dim}, total={total_bytes / 1e9:.2f} GB"
+        )
 
-    def allocate_gdn_states(self, hf_config, layer_types, max_bs: int):
-        """Allocate fixed-size GDN state buffers for linear_attention layers and register to RDMA.
+    def allocate_gdn_states(
+        self, hf_config, layer_types, max_bs: int, need_backup: bool = False
+    ):
+        """Allocate fixed-size GDN state buffers for linear_attention layers.
 
-        Layout: ``max_bs * 2 + 1`` slots total.
-          - Slots ``0 .. max_bs-1``: **active** slots used during normal decode.
-          - Slots ``max_bs .. 2*max_bs-1``: **backup** slots used by lazy verify
-            to snapshot states before a seqlen_q=2 forward so that rejected
-            sequences can be rolled back cheaply.
-          - Slot ``2*max_bs``: reserved **dummy** slot — a safe write target for
-            CUDAGraph padded positions so they cannot corrupt real states.
+        When *need_backup* is True (MTP enabled), the layout is:
+          - Slots ``0 .. max_bs-1``: **active** slots.
+          - Slots ``max_bs .. 2*max_bs-1``: **backup** slots for lazy verify rollback.
+          - Slot ``2*max_bs``: reserved **dummy** slot.
+          Total: ``max_bs * 2 + 1``.
+
+        When *need_backup* is False, backup slots are omitted:
+          - Slots ``0 .. max_bs-1``: active slots.
+          - Slot ``max_bs``: dummy slot.
+          Total: ``max_bs + 1``.
         """
         num_layers = len(layer_types)
         num_k_heads = getattr(hf_config, "linear_num_key_heads", 0)
@@ -246,8 +372,11 @@ class CacheContext:
         if num_v_heads == 0:
             return
 
-        # 2x slots (active + backup) + 1 dummy
-        num_slots = max_bs * 2 + 1
+        if need_backup:
+            num_slots = max_bs * 2 + 1
+        else:
+            num_slots = max_bs + 1
+        self.gdn_num_slots = num_slots
         self.gdn_max_active_slots = max_bs  # boundary between active/backup
 
         # Conv state: [num_layers, num_slots, conv_dim, kernel_size]
@@ -272,13 +401,19 @@ class CacheContext:
             device=torch.get_default_device(),
         )
 
+        if need_backup:
+            slot_info = (
+                f"active_slots=0..{max_bs-1}, backup_slots={max_bs}..{2*max_bs-1}, "
+                f"dummy_slot={2*max_bs}"
+            )
+        else:
+            slot_info = f"active_slots=0..{max_bs-1}, dummy_slot={max_bs}"
         logger.debug(
             f"Allocated GDN states: conv={self.gdn_conv_states.shape} "
             f"({self.gdn_conv_states.element_size() * self.gdn_conv_states.nelement() / 1e9:.2f} GB), "
             f"recurrent={self.gdn_recurrent_states.shape} "
             f"({self.gdn_recurrent_states.element_size() * self.gdn_recurrent_states.nelement() / 1e9:.2f} GB), "
-            f"active_slots=0..{max_bs-1}, backup_slots={max_bs}..{2*max_bs-1}, "
-            f"dummy_slot={2*max_bs}"
+            f"{slot_info}"
         )
 
     def start_peer_agent(self, mode: str = "hybrid"):
@@ -354,8 +489,8 @@ class CacheContext:
                 self._local_gdn_conv_mr_handler = (
                     self._peer_agent.register_memory_region(
                         "gdn_conv",
-                        self.gdn_conv_states.data_ptr()
-                        + int(self.gdn_conv_states.storage_offset()),
+                        self.gdn_conv_states.data_ptr(),
+                        int(self.gdn_conv_states.storage_offset()),
                         conv_size,
                     )
                 )
@@ -366,14 +501,30 @@ class CacheContext:
                 self._local_gdn_recurrent_mr_handler = (
                     self._peer_agent.register_memory_region(
                         "gdn_recurrent",
-                        self.gdn_recurrent_states.data_ptr()
-                        + int(self.gdn_recurrent_states.storage_offset()),
+                        self.gdn_recurrent_states.data_ptr(),
+                        int(self.gdn_recurrent_states.storage_offset()),
                         recurrent_size,
                     )
                 )
                 logger.info(
                     f"Registered GDN MRs: conv={self._local_gdn_conv_mr_handler}, "
                     f"recurrent={self._local_gdn_recurrent_mr_handler}"
+                )
+
+            # Register IndexerCache (if allocated, V3.2 sparse attention)
+            if self.indexer_cache is not None:
+                indexer_buf = self.indexer_cache.buffer
+                indexer_size = indexer_buf.numel() * indexer_buf.itemsize
+                self._local_indexer_mr_handler = (
+                    self._peer_agent.register_memory_region(
+                        "indexer_cache",
+                        indexer_buf.data_ptr(),
+                        0,
+                        indexer_size,
+                    )
+                )
+                logger.info(
+                    f"Registered IndexerCache MR: handler={self._local_indexer_mr_handler}"
                 )
 
         except Exception as e:
@@ -496,12 +647,13 @@ class CacheContext:
     # ------------------------------------------------------------------
 
     def _ensure_peer_connections(
-        self, connection_requests: list[tuple[str, str, int, int]]
+        self, connection_requests: list[tuple[str, str, int, int, int]]
     ) -> None:
         """Establish connections to remote peers if not already connected.
 
         Args:
-            connection_requests: list of (peer_alias, engine_id, num_kvcache_blocks, max_num_seqs)
+            connection_requests: list of (peer_alias, engine_id, num_kvcache_blocks,
+                                          max_num_seqs, gdn_num_slots)
         """
         remote_peers_to_connect: dict[str, str] = {}
         for (
@@ -509,10 +661,13 @@ class CacheContext:
             engine_id,
             num_kvcache_blocks,
             max_num_seqs,
+            gdn_num_slots,
         ) in connection_requests:
             if peer_alias and peer_alias not in self._connected_peers:
                 self.num_remote_kvcache_blocks[engine_id] = num_kvcache_blocks
                 self.remote_max_num_seqs[engine_id] = max_num_seqs
+                if gdn_num_slots > 0:
+                    self.remote_gdn_num_slots[engine_id] = gdn_num_slots
                 remote_peers_to_connect[peer_alias] = engine_id
 
         if not remote_peers_to_connect:
@@ -532,6 +687,7 @@ class CacheContext:
         self,
         assigns: dict[str, dict[str, list[tuple]]],
         gdn_assigns: dict[str, dict[str, list[tuple]]],
+        indexer_assigns: dict[str, dict[str, list[tuple]]] | None = None,
     ) -> None:
         """Execute batched RDMA reads for KV cache and GDN state migration.
 
@@ -540,6 +696,8 @@ class CacheContext:
                      (peer_alias, kv_idx, layer_idx, remote_block_idx, source_block_idx)
             gdn_assigns: engine_id -> peer_alias -> list of
                          (layer_idx, remote_state_slot, local_state_slot)
+            indexer_assigns: engine_id -> peer_alias -> list of
+                             (layer_idx, remote_block_idx, source_block_idx)
         """
         for engine_id, peer_assigns in assigns.items():
             for peer_alias, assign_batch in peer_assigns.items():
@@ -676,6 +834,39 @@ class CacheContext:
                             f"Failed to get gdn_recurrent MR info for {peer_alias}"
                         )
 
+                # Append IndexerCache RDMA ops (V3.2 sparse attention)
+                indexer_batch = (
+                    (indexer_assigns or {}).get(engine_id, {}).get(peer_alias, [])
+                )
+                if indexer_batch and self.indexer_cache is not None:
+                    remote_indexer_mr_info = self._peer_agent.get_mr_info(
+                        peer_alias, "indexer_cache"
+                    )
+                    if remote_indexer_mr_info:
+                        remote_indexer_mr = (
+                            self._peer_agent.register_remote_memory_region(
+                                peer_alias, "indexer_cache", remote_indexer_mr_info
+                            )
+                        )
+                        local_indexer_mr = self._local_indexer_mr_handler
+                        page_bytes = self.indexer_page_num_bytes()
+                        for layer_idx, remote_block, local_block in indexer_batch:
+                            rdma_ops.append(
+                                (
+                                    local_indexer_mr,
+                                    remote_indexer_mr,
+                                    self.remote_indexer_stride(
+                                        layer_idx, remote_block, engine_id
+                                    ),
+                                    self.local_indexer_stride(layer_idx, local_block),
+                                    page_bytes,
+                                )
+                            )
+                    else:
+                        logger.warning(
+                            f"Failed to get indexer_cache MR info for {peer_alias}"
+                        )
+
                 if not rdma_ops:
                     logger.error(f"No valid RDMA ops for {peer_alias}, skipping")
                     continue
@@ -706,8 +897,6 @@ class CacheContext:
 
         views = parse_migrate_batch(data)
 
-        logger.debug(f"migrate_from_bytes called with {len(views)} sequences")
-
         if self._peer_agent is None:
             logger.error("migrate_from_bytes called but PeerAgent not initialized")
             return
@@ -730,6 +919,7 @@ class CacheContext:
             engine_id = v.migrate_engine_id
             engine_info = engine_info_map.get(engine_id, {})
             remote_max_num_seqs = engine_info.get("max_num_seqs", 0)
+            remote_gdn_num_slots = engine_info.get("gdn_num_slots", 0)
             for peer_alias in engine_info.get("peer_addrs", []):
                 connection_requests.append(
                     (
@@ -737,6 +927,7 @@ class CacheContext:
                         engine_id,
                         v.migrate_num_kvcache_blocks,
                         remote_max_num_seqs,
+                        remote_gdn_num_slots,
                     )
                 )
         self._ensure_peer_connections(connection_requests)
@@ -744,6 +935,7 @@ class CacheContext:
         # Build assignment list
         assigns = defaultdict(lambda: defaultdict(list))
         gdn_assigns = defaultdict(lambda: defaultdict(list))
+        indexer_assigns = defaultdict(lambda: defaultdict(list))
         sp_idx = get_dist_context().attn_sp_rank
 
         for v in views:
@@ -798,23 +990,20 @@ class CacheContext:
                     )
                     continue
 
+                if source_sp_idx != sp_idx:
+                    continue
+
+                remote_rank = v.migrate_dp_idx * v.migrate_group_size + remote_sp_idx
+
+                if remote_rank >= len(peer_addrs):
+                    logger.error(
+                        f"remote_rank {remote_rank} >= len(peer_addrs) {len(peer_addrs)}"
+                    )
+                    continue
+                peer_alias = peer_addrs[remote_rank]
+
                 for kv_idx in range(self.kv_cache.size(0)):
                     for layer_idx in range(self.num_hidden_layers):
-                        if source_sp_idx != sp_idx:
-                            continue
-
-                        remote_rank = (
-                            v.migrate_dp_idx * v.migrate_group_size + remote_sp_idx
-                        )
-
-                        if remote_rank < len(peer_addrs):
-                            peer_alias = peer_addrs[remote_rank]
-                        else:
-                            logger.error(
-                                f"remote_rank {remote_rank} >= len(peer_addrs) {len(peer_addrs)}"
-                            )
-                            continue
-
                         assigns[engine_id][peer_alias].append(
                             (
                                 peer_alias,
@@ -823,6 +1012,13 @@ class CacheContext:
                                 remote_block_idx,
                                 source_block_idx,
                             )
+                        )
+
+                # Indexer cache assignments (V3.2 sparse attention)
+                if self.indexer_cache is not None:
+                    for layer_idx in range(self.num_hidden_layers):
+                        indexer_assigns[engine_id][peer_alias].append(
+                            (layer_idx, remote_block_idx, source_block_idx)
                         )
 
             # GDN assignments
@@ -849,7 +1045,7 @@ class CacheContext:
                                 )
                             )
 
-        self._execute_rdma_reads(assigns, gdn_assigns)
+        self._execute_rdma_reads(assigns, gdn_assigns, indexer_assigns)
 
 
 _CACHE_CONTEXT: CacheContext
@@ -869,6 +1065,8 @@ def set_cache_context(
     gpu_memory_limit_gb: float | None = None,
     kv_lora_rank: int = 0,
     qk_rope_head_dim: int = 0,
+    index_head_dim: int = 0,
+    is_fp8_kvcache: bool = False,
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     mode: Literal["gqa", "mla"] = "gqa",
@@ -882,6 +1080,8 @@ def set_cache_context(
         head_dim=head_dim,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
+        index_head_dim=index_head_dim,
+        is_fp8_kvcache=is_fp8_kvcache,
         block_size=block_size,
         num_hidden_layers=num_hidden_layers,
         attention_tp=attention_tp,

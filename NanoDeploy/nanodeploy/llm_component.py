@@ -387,6 +387,14 @@ class LLMComponent(LLM):
             zmq_host = self.config.host
 
         peer_addrs = self.get_peer_agent_addrs()
+        # Compute gdn_num_slots to match allocate_gdn_states logic:
+        # MTP (num_speculative_tokens > 0) → max_bs * 2 + 1 (active + backup + dummy)
+        # No MTP → max_bs + 1 (active + dummy)
+        max_bs = self.config.max_num_seqs
+        if self.config.num_speculative_tokens > 0:
+            gdn_num_slots = max_bs * 2 + 1
+        else:
+            gdn_num_slots = max_bs + 1
         extra = {
             "role": self.config.mode,
             "world_size": self.config.attn_world_size,
@@ -397,6 +405,7 @@ class LLMComponent(LLM):
             "p2p_host": zmq_host,
             "p2p_port": self.p2p_port if self.p2p_port else 0,
             "max_num_seqs": self.config.max_num_seqs,
+            "gdn_num_slots": gdn_num_slots,
             "model_path": self.config.model,  # tokenizer directory = model directory
         }
 

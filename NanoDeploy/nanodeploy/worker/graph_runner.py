@@ -14,7 +14,7 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from nanodeploy.context.context import Context, reset_context, set_context
+from nanodeploy.context.context import Context, get_context, reset_context, set_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.context.expert_context import ExpertContext
 from nanodeploy.logging import get_logger
@@ -49,18 +49,16 @@ class DecodeGraphRunner:
         self._block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
         self._outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
-        # MLA-specific
+        # MLA-specific: per-BS FlashMLASchedMeta created during capture
         if is_mla:
             import flash_mla
 
-            mla_kv = 1
-            self._tile_sched, self._num_splits = flash_mla.get_mla_metadata(
-                torch.ones(max_bs, dtype=torch.int32, device="cuda"),
-                hf_config.num_attention_heads // mla_kv,
-                mla_kv,
-            )
-        else:
-            self._tile_sched = self._num_splits = None
+            self._flash_mla = flash_mla
+        self._sched_metas: dict[int, object] = {}
+        self._sparse_sched_metas: dict[int, object] = {}
+
+        # NSA indexer detection (V3.2): sparse decode needs its own FlashMLASchedMeta
+        self._has_indexer = is_mla and getattr(hf_config, "index_n_heads", 0) > 0
 
         # GDN state slots
         self._gdn_state_slots = None
@@ -106,14 +104,27 @@ class DecodeGraphRunner:
 
             logger.info(f"Capturing graph - (master_bs={master_bs}, attn_bs={attn_bs})")
 
+            # Each BS gets its own FlashMLASchedMeta (kernel validates batch size)
+            sched_meta = None
+            sparse_sched_meta = None
+            if self._is_mla:
+                sched_meta, _ = self._flash_mla.get_mla_metadata()
+                self._sched_metas[master_bs] = sched_meta
+            if self._has_indexer:
+                sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
+                self._sparse_sched_metas[master_bs] = sparse_sched_meta
+                # Indexer needs non-zero context_lens during warmup so that
+                # deep_gemm MQA-logits and topk operate on valid data.
+                self._context_lens[:, :master_bs] = 1
+
             set_context(
                 is_prefill=False,
                 max_bs=self._max_num_seqs,
                 slot_mapping=self._slot_mapping[:master_bs],
                 context_lens=self._context_lens,
                 block_tables=self._block_tables,
-                tile_scheduler_metadata=self._tile_sched,
-                num_splits=self._num_splits,
+                tile_scheduler_metadata=sched_meta,
+                sparse_tile_scheduler_metadata=sparse_sched_meta,
                 gdn_conv_states=cache_ctx.gdn_conv_states,
                 gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
                 gdn_state_slots=(
@@ -127,6 +138,20 @@ class DecodeGraphRunner:
             self._outputs[:master_bs] = model(
                 self._input_ids[:master_bs], self._positions[:master_bs]
             )
+
+            # Create a fresh FlashMLASchedMeta so that the scheduling
+            # metadata kernel (get_decoding_sched_meta) is captured in the
+            # graph.  dense_decode_fwd only launches it when the metadata
+            # tensor is None; after warmup it is non-None, so without this
+            # reset the graph would replay with stale scheduling data.
+            if self._is_mla:
+                sched_meta, _ = self._flash_mla.get_mla_metadata()
+                self._sched_metas[master_bs] = sched_meta
+                get_context().tile_scheduler_metadata = sched_meta
+            if self._has_indexer:
+                sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
+                self._sparse_sched_metas[master_bs] = sparse_sched_meta
+                get_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             # Capture
             graph = torch.cuda.CUDAGraph()
@@ -177,10 +202,7 @@ class DecodeGraphRunner:
         ] = context.block_tables
 
         if self._is_mla:
-            self._tile_sched.zero_()
-            self._tile_sched.copy_(context.tile_scheduler_metadata)
-            self._num_splits.zero_()
-            self._num_splits[: context.num_splits.shape[0]].copy_(context.num_splits)
+            pass  # FlashMLASchedMeta is managed internally by the kernel; no copy needed
 
         if self._gdn_state_slots is not None:
             self._gdn_state_slots.fill_(self._dummy_gdn_slot)
@@ -213,18 +235,16 @@ class LazyVerifyGraphRunner:
         self._block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
         self._outputs = torch.zeros(max_bs * 2, hf_config.hidden_size)
 
+        # MLA-specific: per-BS FlashMLASchedMeta created during capture
         if is_mla:
             import flash_mla
 
-            mla_kv = 1
-            # seqlen_q=2 → double the q-heads-per-kv ratio
-            self._tile_sched, self._num_splits = flash_mla.get_mla_metadata(
-                torch.ones(max_bs, dtype=torch.int32, device="cuda"),
-                2 * hf_config.num_attention_heads // mla_kv,
-                mla_kv,
-            )
-        else:
-            self._tile_sched = self._num_splits = None
+            self._flash_mla = flash_mla
+        self._sched_metas: dict[int, object] = {}
+        self._sparse_sched_metas: dict[int, object] = {}
+
+        # NSA indexer detection (V3.2): sparse decode needs its own FlashMLASchedMeta
+        self._has_indexer = is_mla and getattr(hf_config, "index_n_heads", 0) > 0
 
         self._gdn_state_slots = None
         self._dummy_gdn_slot = None
@@ -251,6 +271,17 @@ class LazyVerifyGraphRunner:
             n_tokens = bs * 2
             logger.info(f"Capturing lazy verify graph - bs={bs} (n_tokens={n_tokens})")
 
+            # Each BS gets its own FlashMLASchedMeta (kernel validates batch size)
+            sched_meta = None
+            sparse_sched_meta = None
+            if self._is_mla:
+                sched_meta, _ = self._flash_mla.get_mla_metadata()
+                self._sched_metas[bs] = sched_meta
+            if self._has_indexer:
+                sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
+                self._sparse_sched_metas[bs] = sparse_sched_meta
+                self._context_lens[:, :bs] = 1
+
             set_context(
                 is_prefill=False,
                 max_bs=self._max_num_seqs,
@@ -258,8 +289,8 @@ class LazyVerifyGraphRunner:
                 context_lens=self._context_lens,
                 block_tables=self._block_tables,
                 is_dummy=False,
-                tile_scheduler_metadata=self._tile_sched,
-                num_splits=self._num_splits,
+                tile_scheduler_metadata=sched_meta,
+                sparse_tile_scheduler_metadata=sparse_sched_meta,
                 num_tokens_per_seq=2,
                 gdn_conv_states=cache_ctx.gdn_conv_states,
                 gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
@@ -274,6 +305,17 @@ class LazyVerifyGraphRunner:
             self._outputs[:n_tokens] = model(
                 self._input_ids[:n_tokens], self._positions[:n_tokens]
             )
+
+            # Fresh FlashMLASchedMeta so scheduling kernel is captured
+            # (see DecodeGraphRunner.capture for full explanation).
+            if self._is_mla:
+                sched_meta, _ = self._flash_mla.get_mla_metadata()
+                self._sched_metas[bs] = sched_meta
+                get_context().tile_scheduler_metadata = sched_meta
+            if self._has_indexer:
+                sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
+                self._sparse_sched_metas[bs] = sparse_sched_meta
+                get_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, graph_pool):
@@ -313,10 +355,7 @@ class LazyVerifyGraphRunner:
         ] = context.block_tables
 
         if self._is_mla:
-            self._tile_sched.zero_()
-            self._tile_sched.copy_(context.tile_scheduler_metadata)
-            self._num_splits.zero_()
-            self._num_splits[: context.num_splits.shape[0]].copy_(context.num_splits)
+            pass  # FlashMLASchedMeta is managed internally by the kernel; no copy needed
 
         if self._gdn_state_slots is not None:
             self._gdn_state_slots.fill_(self._dummy_gdn_slot)

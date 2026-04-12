@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import flash_mla
 import torch
 import torch.distributed as dist
 
@@ -121,25 +120,17 @@ class MTPWorker:
         hf_config = self.config.hf_config
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
         if is_mla:
-            mla_num_kv_heads = 1
-            new_ctx = context.context_lens[sp_rank, :num_seqs]
-            new_tile_sched, new_num_splits = flash_mla.get_mla_metadata(
-                new_ctx.view(-1),
-                2 * hf_config.num_attention_heads // mla_num_kv_heads,
-                mla_num_kv_heads,
-            )
+            import flash_mla
+
+            new_tile_sched, _ = flash_mla.get_mla_metadata()
         else:
-            new_tile_sched, new_num_splits = (
-                context.tile_scheduler_metadata,
-                context.num_splits,
-            )
+            new_tile_sched = context.tile_scheduler_metadata
 
         # Update context for seqlen_q=2
         context.slot_mapping = new_slot_mapping
         context.num_tokens_per_seq = 2
         if is_mla:
             context.tile_scheduler_metadata = new_tile_sched
-            context.num_splits = new_num_splits
 
         return new_input_ids, new_positions
 
@@ -266,7 +257,6 @@ class MTPWorker:
             block_tables=decode_context.block_tables,
             is_dummy=decode_context.is_dummy,
             tile_scheduler_metadata=decode_context.tile_scheduler_metadata,
-            num_splits=decode_context.num_splits,
             gdn_conv_states=decode_context.gdn_conv_states,
             gdn_recurrent_states=decode_context.gdn_recurrent_states,
             gdn_state_slots=decode_context.gdn_state_slots,

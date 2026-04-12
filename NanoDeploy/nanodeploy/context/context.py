@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from nanodeploy.logging import get_logger
@@ -22,8 +22,10 @@ class Context:
 
     is_dummy: bool = False
 
-    tile_scheduler_metadata: torch.Tensor | None = None
-    num_splits: torch.Tensor | None = None
+    # FlashMLASchedMeta (new API) or None; kernel manages internal tensors lazily.
+    tile_scheduler_metadata: Any = None
+    # Separate FlashMLASchedMeta for sparse decode (NSA V3.2); managed by graph runner.
+    sparse_tile_scheduler_metadata: Any = None
 
     token_ids: list[torch.Tensor] = field(default_factory=list)
 
@@ -70,8 +72,8 @@ def set_context(
     context_lens: torch.Tensor | None = None,
     block_tables: Optional[torch.Tensor] = None,
     is_dummy: bool = False,
-    tile_scheduler_metadata: Optional[torch.Tensor] = None,
-    num_splits: Optional[torch.Tensor] = None,
+    tile_scheduler_metadata: Any = None,
+    sparse_tile_scheduler_metadata: Any = None,
     gdn_conv_states: Optional[torch.Tensor] = None,
     gdn_recurrent_states: Optional[torch.Tensor] = None,
     gdn_state_slots: Optional[torch.Tensor] = None,
@@ -93,7 +95,7 @@ def set_context(
         block_tables,
         is_dummy=is_dummy,
         tile_scheduler_metadata=tile_scheduler_metadata,
-        num_splits=num_splits,
+        sparse_tile_scheduler_metadata=sparse_tile_scheduler_metadata,
         num_tokens_per_seq=num_tokens_per_seq,
         use_low_latency_ep=use_low_latency_ep,
         gdn_conv_states=gdn_conv_states,

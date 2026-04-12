@@ -289,7 +289,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         super().__init__()
 
         self.layer_idx = layer_idx
-        self.self_attn = DeepseekV2Attention(config, quantization_config)
+        self.self_attn = DeepseekV2Attention(
+            config, quantization_config, layer_idx=layer_idx
+        )
 
         if (
             config.n_routed_experts is not None
@@ -443,6 +445,7 @@ class DeepseekV2Attention(nn.Module):
         self,
         config: DeepseekV3Config,
         quantization_config: QuantizationConfig | None = None,
+        layer_idx: int = 0,
     ):
         super().__init__()
         self.q_lora_rank = config.q_lora_rank
@@ -455,6 +458,7 @@ class DeepseekV2Attention(nn.Module):
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         # For MLA, effective num_kv_heads is 1 (single compressed KV representation)
         num_key_value_heads = 1
+        self.is_v32 = hasattr(config, "index_topk")
 
         if self.q_lora_rank is None:
             self.q_proj: (
@@ -541,6 +545,7 @@ class DeepseekV2Attention(nn.Module):
             num_kv_heads=num_key_value_heads,
             v_head_dim=config.kv_lora_rank,
             attention_type="MLA",
+            nsa_index_topk=getattr(config, "index_topk", 0),
         )
 
         self.vc = DeepseekV2BMM(self.num_heads, config.kv_lora_rank, self.v_head_dim)
@@ -552,8 +557,33 @@ class DeepseekV2Attention(nn.Module):
             tp_group=get_dist_context().attn_tp_group,
         )
 
+        # NSA Indexer (V3.2 only)
+        if self.is_v32:
+            from nanodeploy.layers.indexer import Indexer
+
+            self.indexer = Indexer(
+                hidden_size=config.hidden_size,
+                index_n_heads=config.index_n_heads,
+                index_head_dim=config.index_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                q_lora_rank=config.q_lora_rank,
+                index_topk=config.index_topk,
+                max_position_embeddings=config.max_position_embeddings,
+                rope_theta=float(rope_theta),
+                rope_scaling=rope_params,
+                layer_id=layer_idx,
+            )
+        else:
+            self.indexer = None
+
     def _q_proj_absorbed(self, hidden_states, num_heads: int):
-        """Q proj with W_UK absorption (for decode)."""
+        """Q proj with W_UK absorption (for decode).
+
+        Returns:
+            query_states: (q_len, H, kv_lora_rank + qk_rope_head_dim) = (q_len, H, 576)
+            q_pe: (q_len, H, qk_rope_head_dim)
+            q_lora: (q_len, q_lora_rank) — intermediate for indexer (or None if no q_lora_rank)
+        """
         q_len = hidden_states.size(0)
         nope_size = self.kv_lora_rank  # 512
         pe_size = self.qk_rope_head_dim  # 64
@@ -562,8 +592,10 @@ class DeepseekV2Attention(nn.Module):
 
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
+            q_lora = None
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            q_lora = self.q_a_layernorm(self.q_a_proj(hidden_states))
+            q = self.q_b_proj(q_lora)
         q = q.view(q_len, num_heads, self.q_head_dim)
 
         q_nope, q_pe = torch.split(
@@ -573,7 +605,7 @@ class DeepseekV2Attention(nn.Module):
         # Absorb W_UK: q_nope (q_len, H, D) @ kc (H, D, R) -> (q_len, H, R)
         q_nope_out = query_states[..., :nope_size]
         self.kc(q_nope, q_nope_out)
-        return query_states, q_pe
+        return query_states, q_pe, q_lora
 
     def _q_proj_raw(self, hidden_states, num_heads: int):
         """Q proj without absorption (for prefill)."""
@@ -649,10 +681,6 @@ class DeepseekV2Attention(nn.Module):
                 and not context.is_dummy
                 and context.slot_mapping is not None
             ):
-                from nanodeploy.backends.gpu_generic.kernels.kv_store import (
-                    store_kcache,
-                )
-
                 slot_mapping = context.slot_mapping
                 if slot_mapping.numel() != key_states_3d.shape[0]:
                     raise RuntimeError(
@@ -662,7 +690,29 @@ class DeepseekV2Attention(nn.Module):
                         f"(numel={slot_mapping.numel()}), "
                         f"is_dummy={context.is_dummy}"
                     )
-                store_kcache(key_states_3d, k_cache, slot_mapping)
+                if k_cache.dtype == torch.float8_e4m3fn:
+                    from nanodeploy.backends.hopper.kernels.fp8_utils import (
+                        store_kcache_fp8,
+                    )
+
+                    store_kcache_fp8(key_states_3d, k_cache, slot_mapping)
+                else:
+                    from nanodeploy.backends.gpu_generic.kernels.kv_store import (
+                        store_kcache,
+                    )
+
+                    store_kcache(key_states_3d, k_cache, slot_mapping)
+
+            # Store indexer keys during prefill (NSA V3.2 only)
+            if (
+                self.indexer is not None
+                and self.indexer.indexer_cache is not None
+                and not context.is_dummy
+                and context.slot_mapping is not None
+            ):
+                self.indexer.store_prefill_keys(
+                    hidden_states, positions, context.slot_mapping
+                )
 
             # Weight matrices for K/V expansion (shared by both paths)
             kc_t = self.kc.weight.reshape(
@@ -761,8 +811,9 @@ class DeepseekV2Attention(nn.Module):
 
         else:
             # === Absorbed decode path ===
+            context = get_context()
             # Q absorbed: q_nope @ W_UK -> (q_len, H, kv_lora_rank=512), concat with q_pe -> 576
-            query_states, q_pe = self._q_proj_absorbed(hidden_states, num_heads)
+            query_states, q_pe, q_lora = self._q_proj_absorbed(hidden_states, num_heads)
 
             key_states_3d = key_states.unsqueeze(1)  # (q_len, 1, 576)
             # Convert PE dims from interleaved to half format before RoPE
@@ -773,6 +824,40 @@ class DeepseekV2Attention(nn.Module):
             query_states[..., self.kv_lora_rank :] = q_pe
             key_states_3d[..., self.kv_lora_rank :] = k_pe_3d
 
+            # Run NSA Indexer (V3.2 only) — compute topk block indices
+            sparse_indices = None
+            if (
+                self.indexer is not None
+                and self.indexer.indexer_cache is not None
+                and self.attn_fwd.k_cache.dtype == torch.float8_e4m3fn
+            ):
+                from nanodeploy.backends.hopper.layers.attention import (
+                    topk_indices_to_physical,
+                )
+                from nanodeploy.context.distributed import get_dist_context
+
+                sp_rank = get_dist_context().attn_sp_rank
+                ntps = context.num_tokens_per_seq
+                total_tokens = hidden_states.size(0)
+                bs = total_tokens // ntps
+                ctx_lens = context.context_lens[0, :bs]
+                bt = context.block_tables[sp_rank, :bs]
+                topk_indices = self.indexer(
+                    hidden_states, q_lora, positions, ctx_lens, bt, context.slot_mapping
+                )
+                # Convert logical token indices → physical paged indices
+                k_cache = self.attn_fwd.k_cache
+                block_size = k_cache.shape[1]
+                # topk_indices: (bs*ntps, topk), bt: (bs, max_blocks)
+                # For ntps>1 (lazy verify), repeat bt per token
+                if ntps > 1:
+                    bt_expanded = bt.repeat_interleave(ntps, dim=0)
+                else:
+                    bt_expanded = bt
+                sparse_indices = topk_indices_to_physical(
+                    topk_indices, bt_expanded, block_size
+                )
+
             # value_states for MLA decode: same compressed latent (unused by FlashMLA decode)
             value_states = compressed_kv.unsqueeze(1)  # (q_len, 1, 512)
 
@@ -780,6 +865,7 @@ class DeepseekV2Attention(nn.Module):
                 query_states,  # (q_len, H, 576)
                 key_states_3d,  # (q_len, 1, 576)
                 value_states,  # (q_len, 1, 512)
+                sparse_indices=sparse_indices,
             )
 
             # Post-multiply by W_UV (vc BMM)

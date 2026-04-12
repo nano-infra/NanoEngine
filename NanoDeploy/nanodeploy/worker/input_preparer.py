@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import flash_mla
 import torch
 
 from nanodeploy._cpp import prepare_decode_from_bytes, prepare_prefill_from_bytes
@@ -172,15 +171,13 @@ class InputPreparer:
         hf_config = config.hf_config
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
         if is_mla:
+            import flash_mla
+
             mla_num_kv_heads = 1
             context_lens_for_mla = context_lens[sp_rank, : aux.num_group_seqs]
-            new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
-                context_lens_for_mla.view(-1),
-                hf_config.num_attention_heads // mla_num_kv_heads,
-                mla_num_kv_heads,
-            )
+            new_tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
         else:
-            new_tile_scheduler_metadata, new_num_splits = None, None
+            new_tile_scheduler_metadata = None
 
         cache_ctx = get_cache_context()
         gdn_state_slots = None
@@ -203,7 +200,6 @@ class InputPreparer:
             block_tables=block_tables,
             is_dummy=is_dummy,
             tile_scheduler_metadata=new_tile_scheduler_metadata,
-            num_splits=new_num_splits,
             gdn_conv_states=cache_ctx.gdn_conv_states,
             gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
             gdn_state_slots=gdn_state_slots,
