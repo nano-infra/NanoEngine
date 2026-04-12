@@ -19,11 +19,11 @@ logger = get_logger("nanodeploy")
 # PeerAgent path: buffer ID for kv_cache registration
 _KV_CACHE_BUFFER_ID = "kv_cache"
 
-# FP8 MLA KV cache constants (V32 layout: 512 NoPE + 16 scale + 128 RoPE)
-_FP8_MLA_BYTES_PER_TOKEN = 656
+# FP8 quantization tile size (matches deep_gemm per_token_cast_to_fp8)
+_FP8_QUANT_TILE_SIZE = 128
 
-# NSA Indexer FP8 cache quantization block size (matches deep_gemm per_token_cast_to_fp8)
-INDEXER_QUANT_BLOCK_SIZE = 128
+# NSA Indexer FP8 cache quantization block size
+INDEXER_QUANT_BLOCK_SIZE = _FP8_QUANT_TILE_SIZE
 
 # Cache TTL for engine_info from NanoCtrl (seconds)
 # Engine registration rarely changes, cache forever by default (inf means never expire)
@@ -93,8 +93,14 @@ class CacheContext:
             raise ValueError(f"Unknown mode: {self.mode}")
 
         if self.mode == "mla" and self.is_fp8_kvcache:
-            # FP8 MLA: 656 bytes/token (float8_e4m3fn), dtype.itemsize=1
-            self._fp8_head_dim = _FP8_MLA_BYTES_PER_TOKEN
+            # FP8 MLA layout per token:
+            #   NoPE:  kv_lora_rank bytes (float8_e4m3fn)
+            #   Scale: (kv_lora_rank // tile_size) * 4 bytes (float32 per tile)
+            #   RoPE:  qk_rope_head_dim * 2 bytes (bfloat16)
+            nope_bytes = self.kv_lora_rank
+            scale_bytes = (self.kv_lora_rank // _FP8_QUANT_TILE_SIZE) * 4
+            rope_bytes = self.qk_rope_head_dim * 2
+            self._fp8_head_dim = nope_bytes + scale_bytes + rope_bytes
             block_bytes = (
                 self.num_hidden_layers
                 * self.block_size

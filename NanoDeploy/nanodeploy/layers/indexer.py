@@ -46,8 +46,7 @@ from nanodeploy.logging import get_logger
 
 logger = get_logger()
 
-# Indexer FP8 cache layout: 128 bytes FP8 data + 4 bytes FP32 scale = 132 bytes/token
-INDEXER_BYTES_PER_TOKEN = 132
+# FP8 quantization tile size (matches deep_gemm per_token_cast_to_fp8)
 INDEXER_QUANT_BLOCK_SIZE = 128
 
 

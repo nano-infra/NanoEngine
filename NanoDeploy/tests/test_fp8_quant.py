@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from nanodeploy.backends.gpu_generic.kernels.fp8_utils import (
+from nanodeploy.backends.hopper.kernels.fp8_utils import (
     D_NOPE,
     D_ROPE,
     D_TOTAL,

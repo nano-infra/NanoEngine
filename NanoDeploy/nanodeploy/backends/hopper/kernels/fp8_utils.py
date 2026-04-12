@@ -229,13 +229,16 @@ def _store_kcache_fp8_kernel(
 
         # Store scale as float32 (4 bytes)
         scale_offset = cache_base + D_NOPE_C + tile_idx * 4
-        tl.store(cache_ptr + scale_offset, scale, dtype=tl.float32)
+        scale_ptr = (cache_ptr + scale_offset).to(tl.pointer_type(tl.float32))
+        tl.store(scale_ptr, scale)
 
     # -- copy RoPE as-is (bfloat16 → 2 bytes each) --
     rope_offs = tl.arange(0, D_ROPE_C)
     rope_bf16 = tl.load(kv_ptr + pid * kv_row_stride + D_NOPE_C + rope_offs)
     rope_out_offset = cache_base + D_NOPE_C + SCALE_BYTES_C
-    tl.store(cache_ptr + rope_out_offset + rope_offs, rope_bf16)
+    # Cast to bfloat16* so pointer arithmetic advances by 2 bytes per element
+    rope_ptr = (cache_ptr + rope_out_offset).to(tl.pointer_type(tl.bfloat16))
+    tl.store(rope_ptr + rope_offs, rope_bf16)
 
 
 def store_kcache_fp8(
