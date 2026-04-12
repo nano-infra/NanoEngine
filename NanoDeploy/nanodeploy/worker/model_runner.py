@@ -39,11 +39,13 @@ architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
+    "DeepseekV32ForCausalLM": DeepseekV2ForCausalLM,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGeneration,
 }
 
 architectures_mtp = {
     "DeepseekV3ForCausalLM": DeepSeekMTP,
+    "DeepseekV32ForCausalLM": DeepSeekMTP,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5MTP,
 }
 
@@ -274,6 +276,14 @@ class ModelRunner:
             if allocated:
                 layer_id += 1
 
+        # Allocate NSA indexer cache (V3.2 only)
+        if cache_context.index_head_dim > 0:
+            cache_context.allocate_indexer_cache(self.config.hf_config)
+            # Wire indexer cache to each layer's Indexer module
+            for module in self.model.modules():
+                if hasattr(module, "indexer") and module.indexer is not None:
+                    module.indexer.indexer_cache = cache_context.indexer_cache
+
         # Start PeerAgent AFTER kv_cache (and GDN states) are allocated,
         # so that all tensors exist for RDMA memory region registration.
         # In hybrid mode, PeerAgent is started but KV/GDN MR is skipped.
@@ -346,6 +356,13 @@ class ModelRunner:
                 config.nanoctrl_address, config.host, config.port
             )
 
+        # Enable FP8 KV cache for sparse attention (V3.2)
+        # On by default when model has NSA indexer; --disable_nsa turns it off
+        index_head_dim = getattr(hf_config, "index_head_dim", 0)
+        is_fp8_kvcache = (mode == "mla" and index_head_dim > 0) and not getattr(
+            config, "disable_nsa", False
+        )
+
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
@@ -356,6 +373,8 @@ class ModelRunner:
             gpu_memory_limit_gb=config.gpu_memory_limit_gb,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
+            index_head_dim=index_head_dim,
+            is_fp8_kvcache=is_fp8_kvcache,
             device=torch.get_default_device(),
             dtype=torch.get_default_dtype(),
             mode=mode,
@@ -368,7 +387,10 @@ class ModelRunner:
         # Allocate GDN state buffers for linear_attention layers
         if layer_types is not None:
             cache_context.allocate_gdn_states(
-                hf_config, layer_types, config.max_num_seqs
+                hf_config,
+                layer_types,
+                config.max_num_seqs,
+                need_backup=config.num_speculative_tokens > 0,
             )
 
     @torch.inference_mode()

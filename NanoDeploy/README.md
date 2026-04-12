@@ -13,20 +13,13 @@ LLM inference engine with Prefill-Decode disaggregation and Wide Expert Parallel
 
 ## Supported Models
 
-| Model                                                         | Architecture                         | Attention          | FFN      | Quantization | KV Cache Block Size |
-| ------------------------------------------------------------- | ------------------------------------ | ------------------ | -------- | ------------ | ------------------- |
-| [Qwen3](https://huggingface.co/Qwen/Qwen3-8B)                 | `Qwen3ForCausalLM`                   | GQA                | Dense    | BF16         | 256                 |
-| [Qwen3-MoE](https://huggingface.co/Qwen/Qwen3-235B-A22B)      | `Qwen3MoeForCausalLM`                | GQA                | MoE (EP) | FP8 (E4M3)   | 256                 |
-| [Qwen3.5-MoE](https://huggingface.co/Qwen/Qwen3.5-MoE)        | `Qwen3_5MoeForConditionalGeneration` | GQA + GDN (hybrid) | MoE (EP) | FP8 (E4M3)   | 256                 |
-| [DeepSeek-V3](https://huggingface.co/deepseek-ai/DeepSeek-V3) | `DeepseekV3ForCausalLM`              | MLA (FlashMLA)     | MoE (EP) | FP8 (E4M3)   | 64                  |
-
-**Notes:**
-
-- **GQA** (Grouped-Query Attention): Standard multi-head attention with KV sharing across query groups.
-- **GDN** (GatedDeltaNet): Linear attention with gated delta updates. Qwen3.5-MoE uses a hybrid architecture — full GQA attention for ~25% of layers (every 4th) and GDN linear attention for the rest. GDN layers maintain recurrent states instead of KV cache.
-- **MLA** (Multi-head Latent Attention): Compressed KV projection into low-rank space. Decode uses FlashMLA on compressed cache; prefill uses Flash Attention 3 with explicit Q/K/V expansion.
-- **MoE** (Mixture of Experts): Expert parallelism distributes experts across GPUs via `ffn_ep`.
-- **FP8 (E4M3)**: Block-wise FP8 quantization with per-block scale factors.
+| Model                                                         | Architecture                         | Attention | FFN      | KV Cache Block Size |
+| ------------------------------------------------------------- | ------------------------------------ | --------- | -------- | ------------------- |
+| [Qwen3](https://huggingface.co/Qwen/Qwen3-8B)                 | `Qwen3ForCausalLM`                   | GQA       | Dense    | 256                 |
+| [Qwen3-MoE](https://huggingface.co/Qwen/Qwen3-235B-A22B)      | `Qwen3MoeForCausalLM`                | GQA       | MoE (EP) | 256                 |
+| [Qwen3.5-MoE](https://huggingface.co/Qwen/Qwen3.5-MoE)        | `Qwen3_5MoeForConditionalGeneration` | GQA + GDN | MoE (EP) | 256                 |
+| [DeepSeek-V3](https://huggingface.co/deepseek-ai/DeepSeek-V3) | `DeepseekV3ForCausalLM`              | MLA       | MoE (EP) | 64                  |
+| DeepSeek-V3.2                                                 | `DeepseekV32ForCausalLM`             | MLA + NSA | MoE (EP) | 64                  |
 
 ## Parallelism Strategies
 

@@ -1,8 +1,14 @@
-import flash_mla
 import torch
+
+try:
+    import flash_mla
+except ImportError:
+    flash_mla = None
+
 from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 
 from nanodeploy.backends.base_backend import AttentionBase
+from nanodeploy.backends.gpu_generic.kernels.fp8_utils import store_kcache_fp8
 from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kcache, store_kvcache
 from nanodeploy.backends.gpu_generic.kernels.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,
@@ -151,6 +157,7 @@ class FlashAttentionImpl:
         v: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
+        sparse_indices: torch.Tensor | None = None,
     ):
         context = get_context()
         if k_cache.numel() and v_cache.numel() and not get_context().is_dummy:
@@ -205,6 +212,44 @@ class FlashAttentionImpl:
         return o
 
 
+def topk_indices_to_physical(
+    topk_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Convert logical token indices to physical paged KV cache indices.
+
+    Args:
+        topk_indices: (batch, topk) int32 — logical token positions (0..ctx_len-1)
+                      May contain -1 for padding.
+        block_table:  (batch, max_num_blocks) int32 — page table
+        block_size:   int — tokens per page (64 for MLA)
+
+    Returns:
+        physical_indices: (batch, topk) int32 — physical slot indices
+                          (physical_block * block_size + offset)
+                          Padding entries (-1 in input) remain -1.
+    """
+    # Clamp negative indices to 0 so gather doesn't fail; result will be masked later
+    valid_mask = topk_indices >= 0
+    safe_indices = topk_indices.clamp(min=0)
+
+    logical_block = safe_indices // block_size  # (batch, topk)
+    offset_in_block = safe_indices % block_size  # (batch, topk)
+
+    # Gather physical block IDs from block_table: (batch, topk)
+    physical_block = torch.gather(block_table, dim=1, index=logical_block.long()).to(
+        torch.int32
+    )
+
+    physical_indices = physical_block * block_size + offset_in_block
+    # Invalid entries (-1 in input) must remain -1 so that sparse_decode_fwd
+    # correctly skips them.  Using 0 would cause the kernel to attend to
+    # physical slot 0 for every invalid index, corrupting the output.
+    physical_indices = torch.where(valid_mask, physical_indices, -1)
+    return physical_indices
+
+
 class FlashMLAImpl:
     def __init__(
         self,
@@ -214,7 +259,7 @@ class FlashMLAImpl:
         num_kv_heads: int = None,
         v_head_size: int = None,
         causal: bool = True,
-        **kwargs,
+        nsa_index_topk: int = 0,
     ):
         import flash_mla
 
@@ -230,6 +275,7 @@ class FlashMLAImpl:
         self.num_kv_heads = num_kv_heads
         self.v_head_size = v_head_size
         self.causal = causal
+        self.nsa_index_topk = nsa_index_topk
 
         assert num_kv_heads == 1, "MLA requires num kv heads equal to 1"
 
@@ -240,11 +286,15 @@ class FlashMLAImpl:
         v: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
+        sparse_indices: torch.Tensor | None = None,
     ):
 
         context = get_context()
         if k_cache.numel() and not get_context().is_dummy:
-            store_kcache(k, k_cache, context.slot_mapping)
+            if k_cache.dtype == torch.float8_e4m3fn:
+                store_kcache_fp8(k, k_cache, context.slot_mapping)
+            else:
+                store_kcache(k, k_cache, context.slot_mapping)
 
         if context.is_prefill:
             # NOTE: MLA prefill is handled directly in DeepseekV2Attention.forward
@@ -263,31 +313,70 @@ class FlashMLAImpl:
             context_lens = context.context_lens[0, :bs]
             block_tables = context.block_tables[0, :bs]
 
-            if context.tile_scheduler_metadata is not None:
-                # Use precomputed metadata from prepare_decode (CUDA graph compatible)
-                tile_scheduler_metadata = context.tile_scheduler_metadata
-                # num_splits must have shape (batch_size + 1); slice buffer to match
-                num_splits = context.num_splits[: bs + 1]
-            else:
-                # Fallback: compute inline
-                # For seqlen_q > 1 (lazy verify), adjust num_q_heads_per_kv
-                tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
-                    context_lens,
-                    ntps * self.num_heads // self.num_kv_heads,
-                    self.num_kv_heads,
+            # FP8 KV cache REQUIRES sparse decode — dense_decode_fwd
+            # does not support FP8.  When sparse_indices is None (e.g.
+            # during CUDA graph capture warmup), synthesise dummy all-invalid
+            # indices so the sparse kernel is still used.
+            if (
+                k_cache.dtype == torch.float8_e4m3fn
+                and sparse_indices is None
+                and self.nsa_index_topk > 0
+            ):
+                sparse_indices = torch.full(
+                    (bs * ntps, self.nsa_index_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=q.device,
                 )
 
-            o, lse = flash_mla.flash_mla_with_kvcache(
-                q.reshape(bs, ntps, num_head, head_dim),
-                k_cache,
-                block_tables,
-                context_lens,
-                self.v_head_size,
-                tile_scheduler_metadata,
-                num_splits,
-                self.scale,
-                ntps > 1,  # causal=True when lazy verify
-            )
+            if sparse_indices is not None and k_cache.dtype == torch.float8_e4m3fn:
+                # === Sparse decode (NSA V3.2) ===
+                # sparse_indices: (bs * ntps, topk) — physical slot indices
+                # Reshape to (bs, ntps, topk) for flash_mla_with_kvcache
+                topk = sparse_indices.shape[-1]
+                indices_3d = sparse_indices.view(bs, ntps, topk)
+
+                # Use context-managed sparse sched meta (CUDA graph compatible)
+                sparse_meta = context.sparse_tile_scheduler_metadata
+                if sparse_meta is None:
+                    sparse_meta, _ = flash_mla.get_mla_metadata()
+
+                o, lse = flash_mla.flash_mla_with_kvcache(
+                    q.reshape(bs, ntps, num_head, head_dim),
+                    k_cache,
+                    None,  # block_table (not needed for sparse)
+                    None,  # cache_seqlens (not needed for sparse)
+                    self.v_head_size,
+                    sparse_meta,
+                    None,  # num_splits
+                    self.scale,
+                    False,  # causal must be False for sparse
+                    is_fp8_kvcache=True,  # sparse requires FP8
+                    indices=indices_3d,
+                )
+                # Write back so graph runner can track it
+                context.sparse_tile_scheduler_metadata = sparse_meta
+            else:
+                # === Dense decode (default) ===
+                if context.tile_scheduler_metadata is not None:
+                    # Use precomputed metadata from prepare_decode (CUDA graph compatible)
+                    tile_scheduler_metadata = context.tile_scheduler_metadata
+                else:
+                    # Fallback: create fresh FlashMLASchedMeta (will be initialized on first kernel call)
+                    tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
+
+                o, lse = flash_mla.flash_mla_with_kvcache(
+                    q.reshape(bs, ntps, num_head, head_dim),
+                    k_cache,
+                    block_tables,
+                    context_lens,
+                    self.v_head_size,
+                    tile_scheduler_metadata,
+                    None,  # num_splits (managed internally by FlashMLASchedMeta)
+                    self.scale,
+                    ntps > 1,  # causal=True when lazy verify
+                    is_fp8_kvcache=k_cache.dtype == torch.float8_e4m3fn,
+                )
 
             # o: (bs, ntps, H, v_head_dim) → (q_len, H, v_head_dim)
             o = o.reshape(bs * ntps, o.shape[2], o.shape[3])
@@ -305,6 +394,7 @@ class HopperAttention(AttentionBase):
         num_kv_heads,
         v_head_dim,
         attention_type: str = "MLA",
+        nsa_index_topk: int = 0,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -316,7 +406,12 @@ class HopperAttention(AttentionBase):
 
         if attention_type == "MLA":
             self.impl = FlashMLAImpl(
-                num_heads, head_dim, scale, num_kv_heads, v_head_dim
+                num_heads,
+                head_dim,
+                scale,
+                num_kv_heads,
+                v_head_dim,
+                nsa_index_topk=nsa_index_topk,
             )
         elif attention_type == "GQA":
             self.impl = FlashAttentionImpl(
@@ -328,6 +423,14 @@ class HopperAttention(AttentionBase):
         else:
             raise ValueError(f"Unknown attention type: {attention_type}")
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        sparse_indices: torch.Tensor | None = None,
+    ):
         """forward."""
-        return self.impl.forward(q, k, v, self.k_cache, self.v_cache)
+        return self.impl.forward(
+            q, k, v, self.k_cache, self.v_cache, sparse_indices=sparse_indices
+        )

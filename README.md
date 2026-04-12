@@ -9,6 +9,34 @@
 | [NanoDeployVL](./NanoDeployVL) | Python     | Vision-Language encoder | EP-separated ViT encoder, RDMA embedding transfer, Qwen3-VL support                             |
 | [NanoRoute](./NanoRoute)       | Rust       | HTTP load balancer      | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
 
+## 🧠 Supported Models
+
+| Model         | Component    | Architecture    |
+| ------------- | ------------ | --------------- |
+| DeepSeek-V3   | NanoDeploy   | MLA + MoE       |
+| DeepSeek-V3.2 | NanoDeploy   | MLA + MoE + NSA |
+| Qwen3         | NanoDeploy   | GQA (Dense)     |
+| Qwen3-MoE     | NanoDeploy   | GQA + MoE       |
+| Qwen3.5-MoE   | NanoDeploy   | GQA + GDN + MoE |
+| Qwen3-VL      | NanoDeployVL | GQA + MoE + ViT |
+
+## ✨ Key Features
+
+| Feature                                            | Description                                                                             |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| ✅ **Chunked Prefill**                             | Split long prompts into chunks to overlap with decode batches.                          |
+| ✅ **Continuous Batching**                         | Dynamic request scheduling with paged KV cache.                                         |
+| ✅ **CUDA Graph**                                  | Captured decode kernels for low-latency token generation.                               |
+| ✅ **Encoder-Prefill-Decode (EPD) Disaggregation** | Separate encoder, prefill and decode across GPU nodes with GPUDirect RDMA KV migration. |
+| ✅ **FP8 KV Cache**                                | Float8 (E4M3) paged KV cache, ~50% memory reduction.                                    |
+| ✅ **Gated Delta Net (GDN)**                       | Linear attention for Qwen3.5-MoE hybrid full/linear layers.                             |
+| ✅ **Multi-head Latent Attention (MLA)**           | Compressed KV cache with low-rank projection for DeepSeek-V3 family.                    |
+| ✅ **Multi-Token Prediction (MTP)**                | Speculative decoding with model-native MTP heads.                                       |
+| ✅ **Native Sparse Attention (NSA)**               | FP8 sparse decode with block-level indexing for DeepSeek-V3.2.                          |
+| ✅ **Prefix Caching**                              | Reuse KV cache of shared prompt prefixes across requests.                               |
+| ✅ **Tensor Parallelism (TP)**                     | Split weight matrices across GPUs for large model inference.                            |
+| ✅ **Wide Expert Parallelism**                     | MoE EP across all GPUs with attention data-parallel (`attention_dp × ffn_ep`).          |
+
 ## 🏗️ Architecture
 
 ```mermaid

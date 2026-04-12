@@ -191,7 +191,7 @@ class HopperBackendFactory(BackendFactory):
         num_kv_heads: int,
         v_head_dim: int,
         attention_type: str = "MLA",
-        **kwargs,
+        nsa_index_topk: int = 0,
     ) -> AttentionBase:
         from .layers.attention import HopperAttention
 
@@ -202,7 +202,7 @@ class HopperBackendFactory(BackendFactory):
             num_kv_heads=num_kv_heads,
             v_head_dim=v_head_dim,
             attention_type=attention_type,
-            **kwargs,
+            nsa_index_topk=nsa_index_topk,
         )
 
     # ------------------------------------------------------------------

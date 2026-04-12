@@ -61,6 +61,9 @@ class Config(BaseModel):
     # MTP (Multi-Token Prediction) speculative decoding
     num_speculative_tokens: int = 0  # 0 = disabled, >0 = number of draft tokens
 
+    # NSA sparse attention (V3.2) — enabled by default for models with index_head_dim > 0
+    disable_nsa: bool = False
+
     # profiler
     enable_profiler: bool = False
     profiler_start_step: int = 40
@@ -79,6 +82,19 @@ class Config(BaseModel):
             and not self.nanoctrl_address.startswith("https://")
         ):
             self.nanoctrl_address = f"http://{self.nanoctrl_address}"
+
+        # Register deepseek_v32 model type so that AutoConfig can load
+        # DeepSeek-V3.2 checkpoints even when the installed transformers
+        # version does not natively support it.
+        try:
+            from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+            from transformers.models.deepseek_v3.configuration_deepseek_v3 import (
+                DeepseekV3Config,
+            )
+
+            CONFIG_MAPPING.register("deepseek_v32", DeepseekV3Config, exist_ok=True)
+        except Exception:
+            pass  # transformers version too old for DeepseekV3Config; let it fall through
 
         self.hf_config = AutoConfig.from_pretrained(
             self.model, trust_remote_code=self.trust_remote_code
@@ -104,7 +120,10 @@ class Config(BaseModel):
                 if getattr(self.hf_config, "dtype", None) is None:
                     self.hf_config.__dict__["dtype"] = text_cfg.dtype
 
-        if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+        if self.hf_config.architectures[0] in (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+        ):
             assert self.kvcache_block_size == 64
             assert self.attention_tp == 1
         else:
@@ -147,7 +166,10 @@ class Config(BaseModel):
             self._mtp_original_loop_count = self.loop_count
             self.loop_count = self.loop_count + self.num_speculative_tokens + 1
 
-        if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+        if self.hf_config.architectures[0] in (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+        ):
             if hasattr(self.hf_config, "num_key_value_heads"):
                 self.hf_config.num_key_value_heads = 1
 
