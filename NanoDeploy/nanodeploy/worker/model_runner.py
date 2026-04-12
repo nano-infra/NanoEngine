@@ -1,20 +1,16 @@
 import os
 
-import flash_mla
-import numpy as np
 import ray
 import torch
 import torch.distributed as dist
 from nanodeploy._cpp import (
     extract_aux_from_bytes,
     extract_vision_slots_from_bytes,
-    prepare_decode_from_bytes,
-    prepare_prefill_from_bytes,
     serialize_run_batch,
 )
 from nanodeploy.config import Config
 from nanodeploy.context.cache import get_cache_context, set_cache_context
-from nanodeploy.context.context import get_context, reset_context, set_context
+from nanodeploy.context.context import get_context, reset_context
 from nanodeploy.context.distributed import (
     get_dist_context,
     get_local_ip,
@@ -24,11 +20,17 @@ from nanodeploy.context.expert_context import ExpertContext
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
+from nanodeploy.models.deepseek_v2.deepseek_v2_mtp import DeepSeekMTP
 from nanodeploy.models.qwen3.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_5_moe.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
+from nanodeploy.models.qwen3_5_moe.qwen3_5_moe_mtp import Qwen3_5MTP
 from nanodeploy.models.qwen3_moe.qwen3_moe import Qwen3MoeForCausalLM
-from nanodeploy.worker.loader import load_model
+from nanodeploy.worker.graph_runner import DecodeGraphRunner
+from nanodeploy.worker.input_preparer import InputPreparer, prepare_sample_from_aux
+from nanodeploy.worker.loader import load_model, load_mtp_model
+from nanodeploy.worker.mtp_worker import MTPWorker
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
+from nanodeploy.worker.vision_embed import VisionEmbedManager
 
 logger = get_logger("NANODEPLOY")
 
@@ -38,6 +40,11 @@ architectures = {
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGeneration,
+}
+
+architectures_mtp = {
+    "DeepseekV3ForCausalLM": DeepSeekMTP,
+    "Qwen3_5MoeForConditionalGeneration": Qwen3_5MTP,
 }
 
 
@@ -212,204 +219,38 @@ class ModelRunner:
         if not get_runner_config().dummy_weight:
             load_model(self.model, config.model)
 
+        # --- MTP model initialization ---
+        mtp_model = None
+        if config.num_speculative_tokens > 0:
+            mtp_cls = architectures_mtp.get(model_architecture)
+            if mtp_cls is None:
+                raise ValueError(
+                    f"MTP not supported for architecture {model_architecture}"
+                )
+            mtp_model = mtp_cls(hf_config)
+            target_embed = self.model.model.embed_tokens
+            mtp_model.embed_tokens = target_embed
+            if hasattr(mtp_model, "lm_head") and getattr(
+                hf_config, "tie_word_embeddings", False
+            ):
+                mtp_model.lm_head = self.model.lm_head
+            if not get_runner_config().dummy_weight:
+                load_mtp_model(mtp_model, config.model)
+            logger.info(
+                f"MTP model loaded: {mtp_cls.__name__}, "
+                f"num_speculative_tokens={config.num_speculative_tokens}"
+            )
+
         dist.barrier()
 
         self.sampler = Sampler()
+        self.input_preparer = InputPreparer(config)
+        self.vision_manager = VisionEmbedManager(hf_config)
+        self.mtp_worker = (
+            MTPWorker(config, mtp_model, self.sampler) if mtp_model else None
+        )
+
         self.preallocate_kvcache()
-
-        # Vision embeddings fetched via RDMA from encoder (EP-separated mode)
-        self._vision_embeds: dict[str, torch.Tensor] | None = None
-
-    # ------------------------------------------------------------------
-    # Vision embedding injection (EP-separated mode)
-    # ------------------------------------------------------------------
-
-    def _inject_vision_embeds(self, input_ids: torch.Tensor) -> torch.Tensor | None:
-        """Build ``inputs_embeds`` by merging text + vision embeddings.
-
-        If no vision embeddings are stored, returns ``None`` so that the
-        model falls back to its normal ``embed_tokens(input_ids)`` path.
-        """
-        if self._vision_embeds is None:
-            return None
-
-        # Get text embeddings from the model's embedding layer
-        embed_tokens = self.model.model.embed_tokens
-        inputs_embeds = embed_tokens(input_ids)
-
-        hf_config = self.config.hf_config
-
-        # Inject image embeddings
-        if "image" in self._vision_embeds:
-            image_token_id = getattr(hf_config, "image_token_id", None)
-            if image_token_id is not None:
-                image_embeds = self._vision_embeds["image"].to(
-                    dtype=inputs_embeds.dtype
-                )
-                mask = input_ids == image_token_id
-                n_tokens = mask.sum().item()
-                if n_tokens > 0 and n_tokens == image_embeds.shape[0]:
-                    mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
-                    inputs_embeds = inputs_embeds.masked_scatter(
-                        mask_expanded, image_embeds
-                    )
-                    logger.debug(f"Injected {n_tokens} image tokens")
-                else:
-                    logger.warning(
-                        f"Image token count mismatch: input has {n_tokens}, "
-                        f"embeds has {image_embeds.shape[0]} — skipping injection"
-                    )
-
-        # Inject video embeddings
-        if "video" in self._vision_embeds:
-            video_token_id = getattr(hf_config, "video_token_id", None)
-            if video_token_id is not None:
-                video_embeds = self._vision_embeds["video"].to(
-                    dtype=inputs_embeds.dtype
-                )
-                mask = input_ids == video_token_id
-                n_tokens = mask.sum().item()
-                if n_tokens > 0 and n_tokens == video_embeds.shape[0]:
-                    mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
-                    inputs_embeds = inputs_embeds.masked_scatter(
-                        mask_expanded, video_embeds
-                    )
-
-        return inputs_embeds
-
-    # ------------------------------------------------------------------
-    # Vision embedding RDMA fetch (EP-separated mode)
-    # ------------------------------------------------------------------
-
-    def _fetch_vision_embeds_rdma(self, vision_slot_views: list) -> None:
-        """RDMA-fetch vision embeddings from remote encoder(s).
-
-        Reads embeddings from encoder EmbeddingPool into a local receive
-        buffer via dlslime, then stores them in ``self._vision_embeds``
-        for injection during model forward.
-
-        Args:
-            vision_slot_views: List of VisionSlotView from
-                ``extract_vision_slots_from_bytes``.
-        """
-        if not vision_slot_views:
-            return
-
-        cache_ctx = get_cache_context()
-        peer_agent = cache_ctx._peer_agent
-        if peer_agent is None:
-            logger.warning("PeerAgent not available, cannot RDMA-fetch vision embeds")
-            return
-
-        # Group vision slots by encoder_engine_id for batched reads
-        from collections import defaultdict
-
-        from nanodeploy.context.embedding_pool import _VISION_EMBED_BUFFER_ID
-
-        by_encoder: dict[str, list] = defaultdict(list)
-        for v in vision_slot_views:
-            by_encoder[v.encoder_engine_id].append(v)
-
-        # Compute total tokens for local receive buffer
-        total_tokens = sum(v.num_tokens for v in vision_slot_views)
-        hidden_size = vision_slot_views[0].hidden_size
-        # Use model's embedding dtype to match encoder EmbeddingPool dtype
-        # (RDMA copies raw bytes, so local buffer dtype must match remote)
-        dtype = self.model.model.embed_tokens.weight.dtype
-        itemsize = torch.tensor([], dtype=dtype).element_size()
-
-        # Allocate local receive buffer on GPU
-        recv_buf = torch.zeros(total_tokens, hidden_size, dtype=dtype, device="cuda")
-        # Register receive buffer as a temporary MR
-        recv_buf_size = recv_buf.nelement() * recv_buf.element_size()
-        recv_mr = peer_agent.register_memory_region(
-            "vision_recv",
-            recv_buf.data_ptr(),
-            int(recv_buf.storage_offset()),
-            recv_buf_size,
-        )
-
-        # Look up peer_addrs for all encoders via NanoCtrl (cached, single request per engine)
-        encoder_info_map = cache_ctx._fetch_engine_info_from_nanoctrl(
-            set(by_encoder.keys())
-        )
-
-        token_offset = 0
-        for encoder_id, slots in by_encoder.items():
-            # Resolve peer alias from control plane; fall back to legacy convention
-            encoder_info = encoder_info_map.get(encoder_id, {})
-            peer_addrs = encoder_info.get("peer_addrs", [])
-            if peer_addrs:
-                peer_alias = peer_addrs[0]
-            else:
-                logger.warning(
-                    f"No peer_addrs for encoder {encoder_id} in NanoCtrl, "
-                    "falling back to legacy alias"
-                )
-                peer_alias = f"{encoder_id}:0"
-
-            # Ensure connection
-            if peer_alias not in cache_ctx._connected_peers:
-                cache_ctx._peer_agent.set_desired_topology(
-                    target_peers=list(cache_ctx._connected_peers | {peer_alias}),
-                    symmetric=True,
-                )
-                cache_ctx._peer_agent.wait_for_peers([peer_alias], timeout_sec=30)
-                cache_ctx._connected_peers.add(peer_alias)
-
-            # Get remote MR info for vision_embed buffer
-            remote_mr_info = peer_agent.get_mr_info(peer_alias, _VISION_EMBED_BUFFER_ID)
-            if remote_mr_info is None:
-                logger.error(
-                    f"Failed to get MR info for vision_embed from {peer_alias}"
-                )
-                continue
-
-            remote_mr = peer_agent.register_remote_memory_region(
-                peer_alias, _VISION_EMBED_BUFFER_ID, remote_mr_info
-            )
-            endpoint = peer_agent.get_endpoint(peer_alias)
-            if endpoint is None:
-                logger.error(f"Failed to get endpoint for {peer_alias}")
-                continue
-
-            # Build RDMA read ops for all slots from this encoder
-            rdma_ops = []
-            for v in slots:
-                # Encoder EmbeddingPool layout: [num_slots, max_tokens_per_slot, hidden_size]
-                # Remote offset for slot = slot_idx * max_tokens_per_slot * hidden_size * itemsize
-                slot_stride = v.max_tokens_per_slot * v.hidden_size * itemsize
-                remote_off = v.slot_idx * slot_stride
-                # Read only num_tokens * hidden_size (actual data, not full slot)
-                read_len = v.num_tokens * v.hidden_size * itemsize
-                # Local offset in recv buffer
-                local_off = token_offset * hidden_size * itemsize
-
-                rdma_ops.append(
-                    (
-                        recv_mr,  # local MR
-                        remote_mr,  # remote MR
-                        remote_off,  # remote offset
-                        local_off,  # local offset
-                        read_len,  # bytes to read
-                    )
-                )
-                token_offset += v.num_tokens
-
-            # Execute batched RDMA reads
-            if rdma_ops:
-                endpoint.read(rdma_ops)
-                logger.debug(
-                    f"RDMA-fetched {len(rdma_ops)} vision slots from encoder "
-                    f"{encoder_id} ({sum(v.num_tokens for v in slots)} tokens)"
-                )
-
-        # Store as vision embeds for _inject_vision_embeds
-        # The recv_buf contains all vision tokens concatenated
-        logger.info(
-            f"[VISION_RDMA] Stored vision embeds: shape={recv_buf.shape}, dtype={recv_buf.dtype}, norm={recv_buf.norm().item():.4f}, nonzero={recv_buf.count_nonzero().item()}/{recv_buf.numel()}"
-        )
-        self._vision_embeds = {"image": recv_buf}
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
@@ -439,7 +280,7 @@ class ModelRunner:
         cache_context.start_peer_agent(mode=self.config.mode)
 
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            self._init_graph_runners()
         torch.set_default_device("cpu")
         torch.set_default_dtype(self.default_dtype)
         self.warmup_model()
@@ -456,7 +297,9 @@ class ModelRunner:
 
     def exit(self):
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            del self.decode_graph_runner
+            if self.mtp_worker is not None:
+                self.mtp_worker.cleanup()
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -528,224 +371,6 @@ class ModelRunner:
                 hf_config, layer_types, config.max_num_seqs
             )
 
-    def prepare_prefill_bytes(self, data: bytes, aux, is_dummy: bool = False):
-        sp_rank = get_dist_context().attn_sp_rank
-        sp_size = get_dist_context().attn_sp_world_size
-        block_size = self.config.kvcache_block_size
-
-        meta = prepare_prefill_from_bytes(
-            data,
-            sp_rank,
-            sp_size,
-            block_size,
-            self.config.max_num_seqs,
-            self.config.num_kvcache_blocks,
-        )
-
-        if len(meta.input_ids) == 0:
-            logger.critical(
-                "prepare_prefill_from_bytes returned empty input_ids! "
-                "is_dummy=%s block_size=%s max_num_seqs=%s",
-                is_dummy,
-                block_size,
-                self.config.max_num_seqs,
-            )
-
-        input_ids = torch.tensor(
-            meta.input_ids, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
-        positions = torch.tensor(
-            meta.positions, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(
-            meta.cu_seqlens_q, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(
-            meta.cu_seqlens_k, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(
-            meta.slot_mapping, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        block_tables = None
-        if meta.use_block_tables:
-            block_tables = (
-                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
-                .reshape(sp_size, self.config.max_num_seqs, meta.max_num_blocks)
-                .cuda(non_blocking=True)
-            )
-
-        cache_ctx = get_cache_context()
-        gdn_state_slots = None
-        if cache_ctx.gdn_conv_states is not None:
-            dummy_gdn_slot = cache_ctx.gdn_conv_states.shape[1] - 1
-            gdn_state_slots = torch.tensor(
-                [
-                    s if 0 <= s < dummy_gdn_slot else dummy_gdn_slot
-                    for s in aux.state_slots
-                ],
-                dtype=torch.int64,
-                pin_memory=True,
-            ).cuda(non_blocking=True)
-
-        # Chunked prefill: selective lm_head — only compute logits for final-chunk seqs.
-        # sampling_token_indices: Q-tensor indices of the last token for each final-chunk seq.
-        # sampling_seq_indices: which seq (0-based) each index corresponds to.
-        # If all sequences are final chunks, set to None to use the fast default path.
-        sampling_token_indices = None
-        sampling_seq_indices = None
-        num_seqs = aux.num_group_seqs
-        if len(meta.sampling_token_indices) < num_seqs:
-            sampling_token_indices = torch.tensor(
-                meta.sampling_token_indices, dtype=torch.int64, pin_memory=True
-            ).cuda(non_blocking=True)
-            sampling_seq_indices = torch.tensor(
-                meta.sampling_seq_indices, dtype=torch.int64, pin_memory=True
-            ).cuda(non_blocking=True)
-
-        set_context(
-            is_prefill=True,
-            max_bs=self.config.max_num_seqs,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=meta.max_seqlen_q,
-            max_seqlen_k=meta.max_seqlen_k,
-            slot_mapping=slot_mapping,
-            block_tables=block_tables,
-            is_dummy=is_dummy,
-            gdn_conv_states=cache_ctx.gdn_conv_states,
-            gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
-            gdn_state_slots=gdn_state_slots,
-            sampling_token_indices=sampling_token_indices,
-            sampling_seq_indices=sampling_seq_indices,
-        )
-        return input_ids, positions
-
-    def prepare_decode_bytes(self, data: bytes, aux, is_dummy: bool = False):
-        sp_rank = get_dist_context().attn_sp_rank
-        sp_size = get_dist_context().attn_sp_world_size
-        block_size = self.config.kvcache_block_size
-
-        try:
-            meta = prepare_decode_from_bytes(
-                data,
-                sp_rank,
-                sp_size,
-                block_size,
-                self.config.max_num_seqs,
-                self.config.num_kvcache_blocks,
-            )
-        except (IndexError, ValueError, RuntimeError) as e:
-            logger.error(
-                "prepare_decode_from_bytes failed: %s (block_size=%s max_num_seqs=%s)",
-                str(e),
-                block_size,
-                self.config.max_num_seqs,
-            )
-            raise
-
-        input_ids = torch.tensor(
-            meta.input_ids, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
-        positions = torch.tensor(
-            meta.positions, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(
-            meta.slot_mapping, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        context_lens = (
-            torch.tensor(meta.context_lens_flat, dtype=torch.int32, pin_memory=True)
-            .reshape(sp_size, self.config.max_num_seqs)
-            .cuda(non_blocking=True)
-        )
-
-        if len(meta.block_tables_flat) == 0:
-            block_tables = torch.empty((1, 0, 0), dtype=torch.int32).cuda(
-                non_blocking=True
-            )
-        else:
-            block_tables = (
-                torch.tensor(meta.block_tables_flat, dtype=torch.int32, pin_memory=True)
-                .reshape(sp_size, -1, meta.max_num_blocks)
-                .cuda(non_blocking=True)
-            )
-
-        config = self.config
-        hf_config = config.hf_config
-        is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
-        if is_mla:
-            mla_num_kv_heads = 1
-            context_lens_for_mla = context_lens[sp_rank, : aux.num_group_seqs]
-            new_tile_scheduler_metadata, new_num_splits = flash_mla.get_mla_metadata(
-                context_lens_for_mla.view(-1),
-                hf_config.num_attention_heads // mla_num_kv_heads,
-                mla_num_kv_heads,
-            )
-        else:
-            new_tile_scheduler_metadata, new_num_splits = None, None
-
-        cache_ctx = get_cache_context()
-        gdn_state_slots = None
-        if cache_ctx.gdn_conv_states is not None:
-            dummy_gdn_slot = cache_ctx.gdn_conv_states.shape[1] - 1
-            gdn_state_slots = torch.tensor(
-                [
-                    s if 0 <= s < dummy_gdn_slot else dummy_gdn_slot
-                    for s in aux.state_slots
-                ],
-                dtype=torch.int64,
-                pin_memory=True,
-            ).cuda(non_blocking=True)
-
-        set_context(
-            is_prefill=False,
-            max_bs=self.config.max_num_seqs,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            is_dummy=is_dummy,
-            tile_scheduler_metadata=new_tile_scheduler_metadata,
-            num_splits=new_num_splits,
-            gdn_conv_states=cache_ctx.gdn_conv_states,
-            gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
-            gdn_state_slots=gdn_state_slots,
-        )
-
-        return input_ids, positions
-
-    def update_decode_inplace(
-        self, input_ids: torch.Tensor, positions: torch.Tensor, num_seqs: int
-    ):
-        """Update decode metadata in-place for multi-step decode (no Sequence needed)."""
-        positions.add_(1)
-        block_size = self.config.kvcache_block_size
-        context = get_context()
-
-        sp_rank = get_dist_context().attn_sp_rank
-
-        # Update context length (now reflects the NEW token count)
-        context.context_lens[sp_rank, :num_seqs].add_(1)
-
-        # Recalculate slot_mapping from context_lens and block_tables.
-        # Simply doing slot_mapping.add_(1) is WRONG when a sequence's new
-        # token crosses a block boundary, because the page_id changes.
-        new_ctx = context.context_lens[sp_rank, :num_seqs]  # already incremented
-        block_idx = (new_ctx - 1) // block_size  # which block the new token falls in
-        offset_in_block = (new_ctx - 1) % block_size  # offset within that block
-        row_indices = torch.arange(num_seqs, device=block_idx.device)
-        page_ids = context.block_tables[sp_rank, row_indices, block_idx.long()]
-        context.slot_mapping[:num_seqs] = page_ids * block_size + offset_in_block
-
-        return input_ids, positions
-
-    def prepare_sample_from_aux(self, aux):
-        """Build temperature tensor from BatchAuxData (no Sequence needed)."""
-        temperatures = torch.tensor(
-            aux.temperatures, dtype=torch.float32, pin_memory=True
-        ).cuda(non_blocking=True)
-        return temperatures
-
     @torch.inference_mode()
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
@@ -753,87 +378,89 @@ class ModelRunner:
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             context = get_context()
             inputs_embeds = None
-            if is_prefill and self._vision_embeds is not None:
+            if is_prefill and self.vision_manager.has_embeds:
                 logger.info(
-                    f"[RUN_MODEL] Injecting vision embeds for prefill, input_ids.shape={input_ids.shape}, _vision_embeds keys={list(self._vision_embeds.keys())}"
+                    f"[RUN_MODEL] Injecting vision embeds for prefill, "
+                    f"input_ids.shape={input_ids.shape}"
                 )
-                inputs_embeds = self._inject_vision_embeds(input_ids)
-                self._vision_embeds = None
+                inputs_embeds = self.vision_manager.inject(
+                    input_ids, self.model.model.embed_tokens
+                )
+                self.vision_manager.clear()
             elif is_prefill and not context.is_dummy:
                 logger.debug(
-                    f"[RUN_MODEL] Prefill WITHOUT vision embeds, input_ids.shape={input_ids.shape}"
+                    f"[RUN_MODEL] Prefill WITHOUT vision embeds, "
+                    f"input_ids.shape={input_ids.shape}"
                 )
             if inputs_embeds is not None:
                 hidden = self.model(input_ids, positions, inputs_embeds=inputs_embeds)
             else:
                 hidden = self.model(input_ids, positions)
             if is_prefill:
-                # Clean low-latency RDMA buffer here, as part of the prefill stream,
-                # so the nvshmemx_barrier_all_block() inside completes before any rank
-                # calls graph.replay().  Calling it right before graph.replay() races:
-                # the barrier's RDMA writes arrive at peer GPUs while they are already
-                # executing the graph, corrupting NVSHMEM symmetric memory → SIGSEGV.
                 ExpertContext.get_instance().transition_to_low_latency()
+            if not is_prefill and self.mtp_worker is not None:
+                self.mtp_worker.last_hidden = hidden
             return self.model.compute_logits(hidden)
         else:
-            bs = input_ids.size(0)
             context = get_context()
-            master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
 
-            # Without SP, attention_compute_bs == bs
-            attn_bs = bs
-            valid_attn_bs_list = self.graph_map.get(master_bs)
-            if valid_attn_bs_list is None:
-                raise RuntimeError(f"No graph map found for master_bs={master_bs}")
-
-            try:
-                attn_bs = next(x for x in valid_attn_bs_list if x >= attn_bs)
-            except StopIteration:
-                raise RuntimeError(
-                    f"Input bs {bs} exceeds max captured attn_bs "
-                    f"({valid_attn_bs_list[-1]}) for master_bs {master_bs}"
+            # Lazy verify path (seqlen_q=2): dedicated graph runner
+            if (
+                context.num_tokens_per_seq == 2
+                and self.mtp_worker is not None
+                and self.mtp_worker.lv_graph_runner is not None
+            ):
+                outputs = self.mtp_worker.lv_graph_runner.run(
+                    input_ids, positions, context
                 )
+                if outputs is not None:
+                    if self.mtp_worker is not None:
+                        self.mtp_worker.last_hidden = outputs.clone()
+                    return self.model.compute_logits(outputs)
+                # No graph for this bs — eager fallback
+                hidden = self.model(input_ids, positions)
+                if self.mtp_worker is not None:
+                    self.mtp_worker.last_hidden = hidden
+                return self.model.compute_logits(hidden)
 
-            graph = self.graphs[(master_bs, attn_bs)]
-
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping  # type: ignore
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:, : context.context_lens.shape[1]].copy_(context.context_lens)  # type: ignore
-            graph_vars["block_tables"].zero_()
-            graph_vars["block_tables"][
-                :, : context.block_tables.size(1), : context.block_tables.size(2)  # type: ignore
-            ] = context.block_tables
-
-            config = self.config
-            hf_config = config.hf_config
-            is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
-            if is_mla:
-                graph_vars["tile_scheduler_metadata"].zero_()
-                graph_vars["num_splits"].zero_()
-                graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
-                graph_vars["num_splits"][: context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
-
-            if graph_vars.get("gdn_state_slots") is not None:
-                dummy_gdn_slot = get_cache_context().gdn_conv_states.shape[1] - 1
-                graph_vars["gdn_state_slots"].fill_(dummy_gdn_slot)
-                if context.gdn_state_slots is not None:
-                    graph_vars["gdn_state_slots"][:bs].copy_(context.gdn_state_slots)
-
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            # Normal decode (seqlen_q=1)
+            outputs = self.decode_graph_runner.run(input_ids, positions, context)
+            if self.mtp_worker is not None:
+                self.mtp_worker.last_hidden = outputs.clone()
+            return self.model.compute_logits(outputs)
 
     def migrate_from_bytes(self, data: bytes) -> None:
         """Migrate using lean MigrateBatchInput bytes (no Sequence objects)."""
         get_cache_context().migrate_from_bytes(data=data)
 
+    def _standard_sample(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        aux,
+        num_seqs: int,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        """Standard sampling path (prefill or normal decode without lazy verify)."""
+        tp_rank = get_dist_context().attn_tp_rank
+        if tp_rank == 0:
+            temperatures = prepare_sample_from_aux(aux)
+            context = get_context()
+            if is_prefill and context.sampling_seq_indices is not None:
+                temps_filtered = temperatures[context.sampling_seq_indices]
+                sampled = self.sampler(logits, temps_filtered)
+                input_ids = input_ids.new_zeros(num_seqs)
+                input_ids[context.sampling_seq_indices] = sampled
+            else:
+                input_ids = self.sampler(logits, temperatures)
+        else:
+            input_ids = input_ids.new_zeros([num_seqs])
+        dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
+        return input_ids
+
     @torch.inference_mode()
     def run_from_bytes(self, data: bytes, is_prefill: bool) -> list[list[int]]:
         """Run model from lean RunBatchInput bytes (completely Sequence-free)."""
-        # Extract auxiliary data (temperatures, state_slots)
         sp_rank = get_dist_context().attn_sp_rank
         aux = extract_aux_from_bytes(data, sp_rank)
         num_seqs = aux.num_group_seqs
@@ -841,7 +468,6 @@ class ModelRunner:
         is_dummy = False
         if num_seqs == 0:
             is_dummy = True
-            # Create a minimal dummy RunBatchInput with one dummy sequence
             from nanodeploy._cpp import SamplingParams, Sequence as _Seq
 
             dummy_seq = _Seq([0], SamplingParams())
@@ -856,37 +482,60 @@ class ModelRunner:
             aux = extract_aux_from_bytes(data, sp_rank)
             num_seqs = aux.num_group_seqs
 
-        loop_count = self.config.loop_count if not is_prefill else 1
+        # Determine loop count
+        if is_prefill:
+            loop_count = 1
+            if self.mtp_worker is not None:
+                self.mtp_worker.reset_lazy_verify_state()
+        elif hasattr(self.config, "_mtp_original_loop_count"):
+            loop_count = self.config._mtp_original_loop_count
+        else:
+            loop_count = self.config.loop_count
+
         for i in range(loop_count):
+            # --- Profiler start ---
             if self.profiler and self.run_count == self.profiler_start_step:
                 self.profiler.start()
                 logger.info(
                     f"Rank {self.rank}: Profiler started at step {self.run_count}"
                 )
 
+            # --- Prepare inputs ---
+            has_lazy_verify = False
             if is_prefill:
-                # RDMA-fetch vision embeddings from encoder (EP-separated mode)
-                if i == 0 and self._vision_embeds is None:
+                if i == 0 and not self.vision_manager.has_embeds:
                     vision_slots = extract_vision_slots_from_bytes(data)
                     if vision_slots:
-                        self._fetch_vision_embeds_rdma(vision_slots)
-
-                input_ids, positions = self.prepare_prefill_bytes(data, aux, is_dummy)
+                        self.vision_manager.fetch_rdma(
+                            vision_slots, self.model.model.embed_tokens.weight.dtype
+                        )
+                input_ids, positions = self.input_preparer.prepare_prefill_bytes(
+                    data, aux, is_dummy
+                )
             else:
                 if i == 0:
-                    input_ids, positions = self.prepare_decode_bytes(
+                    input_ids, positions = self.input_preparer.prepare_decode_bytes(
                         data, aux, is_dummy
                     )
                 else:
-                    input_ids, positions = self.update_decode_inplace(
+                    input_ids, positions = self.input_preparer.update_decode_inplace(
+                        input_ids, positions, num_seqs
+                    )
+
+                if (
+                    self.mtp_worker is not None
+                    and self.mtp_worker.has_drafts
+                    and not is_dummy
+                ):
+                    has_lazy_verify = True
+                    input_ids, positions = self.mtp_worker.prepare_lazy_verify_decode(
                         input_ids, positions, num_seqs
                     )
 
             if input_ids.numel() == 0:
                 logger.critical(
                     "EMPTY input_ids before run_model! rank=%s is_prefill=%s "
-                    "is_dummy=%s input_ids.shape=%s positions.shape=%s "
-                    "num_seqs=%s",
+                    "is_dummy=%s input_ids.shape=%s positions.shape=%s num_seqs=%s",
                     self.rank,
                     is_prefill,
                     is_dummy,
@@ -894,35 +543,34 @@ class ModelRunner:
                     positions.shape,
                     num_seqs,
                 )
+
+            # --- Forward ---
             logits = self.run_model(input_ids, positions, is_prefill)
+            if is_prefill and self.vision_manager.has_embeds:
+                self.vision_manager.clear()
 
-            # Clear RDMA-fetched vision embeddings after prefill forward
-            if is_prefill and self._vision_embeds is not None:
-                self._vision_embeds = None
-
-            tp_rank = get_dist_context().attn_tp_rank
-            if tp_rank == 0:
-                temperatures = self.prepare_sample_from_aux(aux)
-                context = get_context()
-                if is_prefill and context.sampling_seq_indices is not None:
-                    # Sparse prefill: logits has shape [n_final, vocab_size].
-                    # Sample only final-chunk sequences, then scatter into full output.
-                    temps_filtered = temperatures[context.sampling_seq_indices]
-                    sampled = self.sampler(logits, temps_filtered)
-                    input_ids = input_ids.new_zeros(num_seqs)
-                    input_ids[context.sampling_seq_indices] = sampled
-                else:
-                    input_ids = self.sampler(logits, temperatures)
+            # --- Sampling ---
+            num_accepted = None
+            if not is_prefill and has_lazy_verify:
+                num_accepted = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
+                input_ids = self.mtp_worker.lazy_verify_sample(
+                    logits, aux, num_seqs, num_accepted
+                )
             else:
-                input_ids = input_ids.new_zeros([num_seqs])
-            dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
+                input_ids = self._standard_sample(
+                    logits, input_ids, aux, num_seqs, is_prefill
+                )
 
-            # No update_seqs_inner_loop needed — metadata already updated in-place
+            # --- MTP draft generation ---
+            if self.mtp_worker is not None and not is_prefill and not is_dummy:
+                self.mtp_worker.generate_and_store(
+                    input_ids, positions, aux, num_seqs, has_lazy_verify, num_accepted
+                )
 
+            # --- Profiler step ---
             if self.profiler and self.run_count >= self.profiler_start_step:
                 if self.run_count < self.profiler_end_step:
                     self.profiler.step()
-
                 if self.run_count == self.profiler_end_step - 1:
                     self.profiler.stop()
                     logger.info(
@@ -932,115 +580,25 @@ class ModelRunner:
             self.run_count += 1
             get_context().token_ids.append(input_ids[None, ...])
 
-        loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
+        # --- Build output ---
+        if self.mtp_worker is not None:
+            result = self.mtp_worker.build_output_tokens(self.rank)
+        else:
+            result = torch.cat(get_context().token_ids, dim=0).T.tolist()
         reset_context()
+        return result
 
-        return loop_count_token_ids
-
-    @torch.inference_mode()
-    def capture_cudagraph(self):
+    def _init_graph_runners(self):
+        """Initialize CUDAGraph runners for decode, MTP, and lazy verify."""
         config = self.config
         hf_config = config.hf_config
         hf_config.max_position_embeddings = max(
             config.max_model_len, hf_config.max_position_embeddings
         )
-        max_bs = min(self.config.max_num_seqs, 512)
-        block_size = get_cache_context().block_size
-        max_num_blocks = (config.max_model_len + block_size - 1) // block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(1, max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        cache_ctx = get_cache_context()
 
-        is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
-        if is_mla:
-            mla_num_kv_heads = 1
-            tile_scheduler_metadata_buffer, num_splits_buffer = (
-                flash_mla.get_mla_metadata(
-                    torch.ones(max_bs, dtype=torch.int32, device="cuda"),
-                    hf_config.num_attention_heads // mla_num_kv_heads,
-                    mla_num_kv_heads,
-                )
-            )
-        else:
-            tile_scheduler_metadata_buffer, num_splits_buffer = None, None
+        self.decode_graph_runner = DecodeGraphRunner(config, hf_config, cache_ctx)
+        graph_pool = self.decode_graph_runner.capture(self.model, cache_ctx)
 
-        # GDN state slot indices for CUDAGraph (maps batch position -> buffer slot)
-        _cache_ctx = get_cache_context()
-        gdn_state_slots_buf = None
-        if _cache_ctx.gdn_conv_states is not None:
-            dummy_gdn_slot = _cache_ctx.gdn_conv_states.shape[1] - 1
-            gdn_state_slots_buf = torch.full(
-                (max_bs,), dummy_gdn_slot, dtype=torch.int64
-            )
-
-        self.graph_master_rank_bs = [x for x in [1, 2, 4, 8] if x <= max_bs] + list(
-            range(16, max_bs + 1, 16)
-        )
-        self.graphs = {}
-        self.graph_pool = None
-        self.graph_map = {}  # store master_bs -> [available_attn_bs...]
-
-        self.attn_bs_step = 16
-
-        logger.info(f"Capturing CUDAGraphs...")
-        completed_graphs = 0
-
-        for master_bs in reversed(self.graph_master_rank_bs):
-            # Without SP, attn_bs == master_bs (no recv seqs from other SP ranks)
-            attn_bs = master_bs
-            self.graph_map[master_bs] = [attn_bs]
-
-            completed_graphs += 1
-            logger.info(f"Capturing graph - (master_bs={master_bs}, attn_bs={attn_bs})")
-            graph = torch.cuda.CUDAGraph()
-            set_context(
-                is_prefill=False,
-                max_bs=self.config.max_num_seqs,
-                slot_mapping=slot_mapping[:master_bs],
-                context_lens=context_lens,
-                block_tables=block_tables,
-                tile_scheduler_metadata=tile_scheduler_metadata_buffer,
-                num_splits=num_splits_buffer,
-                gdn_conv_states=_cache_ctx.gdn_conv_states,
-                gdn_recurrent_states=_cache_ctx.gdn_recurrent_states,
-                gdn_state_slots=(
-                    gdn_state_slots_buf[:master_bs]
-                    if gdn_state_slots_buf is not None
-                    else None
-                ),
-            )
-
-            outputs[:master_bs] = self.model(
-                input_ids[:master_bs], positions[:master_bs]
-            )  # warmup
-
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:master_bs] = self.model(
-                    input_ids[:master_bs], positions[:master_bs]
-                )  # capture
-
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-
-            self.graphs[(master_bs, attn_bs)] = graph
-
-            torch.cuda.synchronize()
-            dist.barrier(group=get_dist_context().cuda_world_group)
-            reset_context()
-
-        logger.info(f"Finished capturing {len(self.graphs)} CUDAGraphs")
-
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
-            tile_scheduler_metadata=tile_scheduler_metadata_buffer,
-            num_splits=num_splits_buffer,
-            gdn_state_slots=gdn_state_slots_buf,
-        )
+        if self.mtp_worker is not None:
+            self.mtp_worker.init_graph_runners(self.model, graph_pool, cache_ctx)

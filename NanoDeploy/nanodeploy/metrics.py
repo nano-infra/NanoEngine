@@ -118,3 +118,58 @@ class MetricsManager:
     def get_server_summary(self) -> dict:
         """Get server metrics summary."""
         return self.server_metric.get_summary()
+
+    def log_final_summary(self):
+        """Log final server + sequence metrics summary at end of generation."""
+        sep = "=" * 60
+        logger.info(sep)
+        logger.info("Final Server Metrics Summary")
+        logger.info(sep)
+        self.log_server_metrics(include_detailed=True)
+
+        summary = self.get_server_summary()
+        for key, value in summary.items():
+            if value is not None:
+                logger.info(f"  {key}: {value}")
+
+        # Per-sequence ITL (from start/end timestamps)
+        itl_values = [
+            m.avg_tpot_wo_queueing
+            for m in self.sequence_metrics.values()
+            if m.avg_tpot_wo_queueing is not None
+        ]
+        if itl_values:
+            arr = np.array(itl_values)
+            logger.info(
+                f"  Per-Sequence ITL (from timestamps): "
+                f"mean={np.mean(arr):.2f}ms, "
+                f"median={np.median(arr):.2f}ms, "
+                f"p99={np.percentile(arr, 99):.2f}ms, "
+                f"n={len(arr)}"
+            )
+
+        # Per-token ITL w/o first token (from itl_samples collected in C++)
+        all_itl = []
+        for m in self.sequence_metrics.values():
+            if m.itl_samples:
+                all_itl.extend(m.itl_samples)
+        if all_itl:
+            arr = np.array(all_itl)
+            logger.info(
+                f"  ITL w/o first token (per-token samples): "
+                f"mean={np.mean(arr):.2f}ms, "
+                f"median={np.median(arr):.2f}ms, "
+                f"p99={np.percentile(arr, 99):.2f}ms, "
+                f"n={len(arr)}"
+            )
+
+        # Effective wall-clock throughput
+        total_uptime = summary.get("uptime_seconds", 0)
+        total_gen = summary.get("total_generated_tokens", 0)
+        if total_uptime and total_gen:
+            logger.info(
+                f"  Effective decode throughput (wall-clock): "
+                f"{total_gen / total_uptime:.0f} tok/s "
+                f"({total_gen} tokens / {total_uptime:.1f}s)"
+            )
+        logger.info(sep)

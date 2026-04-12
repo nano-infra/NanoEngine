@@ -225,9 +225,13 @@ class CacheContext:
     def allocate_gdn_states(self, hf_config, layer_types, max_bs: int):
         """Allocate fixed-size GDN state buffers for linear_attention layers and register to RDMA.
 
-        Allocates max_bs + 1 slots: slots 0..max_bs-1 are for real sequences,
-        slot max_bs is a reserved dummy slot used as a safe write target for
-        CUDAGraph padded positions so they cannot corrupt real sequence states.
+        Layout: ``max_bs * 2 + 1`` slots total.
+          - Slots ``0 .. max_bs-1``: **active** slots used during normal decode.
+          - Slots ``max_bs .. 2*max_bs-1``: **backup** slots used by lazy verify
+            to snapshot states before a seqlen_q=2 forward so that rejected
+            sequences can be rolled back cheaply.
+          - Slot ``2*max_bs``: reserved **dummy** slot — a safe write target for
+            CUDAGraph padded positions so they cannot corrupt real states.
         """
         num_layers = len(layer_types)
         num_k_heads = getattr(hf_config, "linear_num_key_heads", 0)
@@ -242,8 +246,9 @@ class CacheContext:
         if num_v_heads == 0:
             return
 
-        # Allocate max_bs + 1 slots: 0..max_bs-1 for real seqs, max_bs = dummy slot.
-        num_slots = max_bs + 1
+        # 2x slots (active + backup) + 1 dummy
+        num_slots = max_bs * 2 + 1
+        self.gdn_max_active_slots = max_bs  # boundary between active/backup
 
         # Conv state: [num_layers, num_slots, conv_dim, kernel_size]
         self.gdn_conv_states = torch.zeros(
@@ -271,7 +276,9 @@ class CacheContext:
             f"Allocated GDN states: conv={self.gdn_conv_states.shape} "
             f"({self.gdn_conv_states.element_size() * self.gdn_conv_states.nelement() / 1e9:.2f} GB), "
             f"recurrent={self.gdn_recurrent_states.shape} "
-            f"({self.gdn_recurrent_states.element_size() * self.gdn_recurrent_states.nelement() / 1e9:.2f} GB)"
+            f"({self.gdn_recurrent_states.element_size() * self.gdn_recurrent_states.nelement() / 1e9:.2f} GB), "
+            f"active_slots=0..{max_bs-1}, backup_slots={max_bs}..{2*max_bs-1}, "
+            f"dummy_slot={2*max_bs}"
         )
 
     def start_peer_agent(self, mode: str = "hybrid"):

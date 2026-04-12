@@ -181,7 +181,14 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
                 hidden_states, topk_ids, topk_weights, is_prefill
             )
 
-        if is_prefill:
+        # use_low_latency_ep: force decode (low-latency) EP path even during
+        # prefill.  Used by MTP which needs prefill attention mode but must
+        # avoid multi-stream DeepEP dispatch for CUDAGraph compatibility.
+        from nanodeploy.context.context import get_context
+
+        use_low_latency = getattr(get_context(), "use_low_latency_ep", False)
+
+        if is_prefill and not use_low_latency:
             return self._compute_prefill_ep(hidden_states, topk_ids, topk_weights)
         else:
             return self._compute_decode_ep(hidden_states, topk_ids, topk_weights)

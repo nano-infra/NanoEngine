@@ -3,7 +3,7 @@ import json
 import os
 import time
 import uuid
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional, Set
 
@@ -19,6 +19,17 @@ from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.metrics import MetricsManager
 
 logger = get_logger()
+
+
+@dataclass
+class StepResult:
+    dp_seqs: list
+    outputs: list
+    prefill_tokens: int
+    decode_tokens: int
+    real_bs: int
+    schedule_latency_ms: float
+    postprocess_latency_ms: float
 
 
 class LLMEngine:
@@ -102,7 +113,17 @@ class LLMEngine:
         is_prefill = sch_res.is_prefill
         dp_group_seqs = sch_res.dp_group_seqs
         filtered_dp_group_seqs = sch_res.filtered_dp_group_seqs
-        total_running = sum(len(seqs) for seqs in dp_seqs)
+
+        # Build dummy seq id set for filtering
+        dummy_seq_ids = set()
+        for ws in self.scheduler.worker_state:
+            for d in ws.dummy_seqs:
+                dummy_seq_ids.add(d.seq_id)
+
+        total_running = sum(
+            sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
+            for seqs in dp_seqs
+        )
         total_waiting = len(self.scheduler.waiting)
         total_waiting_migration = len(self.scheduler.waiting_migration)
         self.metrics_manager.server_metric.update_running_requests(total_running)
@@ -143,7 +164,7 @@ class LLMEngine:
             waiting_head_blocks, waiting_total_blocks
         )
 
-        logger.info(
+        logger.debug(
             {
                 "mode": "prefill" if is_prefill else "decode",
                 # "dp_batch_sizes": dp_batch_sizes,
@@ -170,6 +191,7 @@ class LLMEngine:
         post_sch_end = 0
 
         # Run prefill to populate KV cache (or skip for decode engine receiving prefill request)
+        token_ids = None
         if not (is_prefill and self.config.mode == "decode"):
             # Normal execution: prefill engine runs prefill, or decode engine runs decode
             token_ids = self.executor.run(dp_group_tp_seqs, is_prefill)[::tp_size]
@@ -187,7 +209,8 @@ class LLMEngine:
             post_sch_end = time.time()
             self.executor.migrate(dp_group_seqs)
         outputs = []
-        num_tokens = 0
+        prefill_tokens = 0
+        decode_tokens = 0
 
         for dp_idx, seqs in enumerate(dp_seqs):
             num_tokens_in_dp = sum(len(seq) for seq in seqs)
@@ -195,24 +218,43 @@ class LLMEngine:
                 dp_idx, num_tokens_in_dp
             )
 
+        if is_prefill:
+            for seqs in dp_seqs:
+                prefill_tokens += sum(
+                    len(seq) for seq in seqs if seq.seq_id not in dummy_seq_ids
+                )
+        elif token_ids is not None:
+            for dp_idx in range(dp_size):
+                for sp_idx in range(sp_size):
+                    group_idx = dp_idx * sp_size + sp_idx
+                    group_seqs = filtered_dp_group_seqs[group_idx]
+                    group_tokens = token_ids[group_idx]
+                    for seq, seq_tokens in zip(group_seqs, group_tokens):
+                        if seq.seq_id not in dummy_seq_ids:
+                            decode_tokens += len(seq_tokens)
+        else:
+            for seqs in dp_seqs:
+                num_real = sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
+                decode_tokens += num_real * self.config.loop_count
+
+        # Collect finished/migrated sequences after postprocess
         for seqs in dp_seqs:
-            num_tokens += (
-                sum(len(seq) for seq in seqs)
-                if is_prefill
-                else -len(seqs) * self.config.loop_count
-            )
             for seq in seqs:
                 if seq.is_finished or seq.is_to_be_migrated:
-                    if seq.is_finished or seq.is_to_be_migrated:
-                        self.metrics_manager.complete_sequence(seq.seq_id)
+                    self.metrics_manager.complete_sequence(seq.seq_id)
                     outputs.append(seq)
-        return (
-            dp_seqs,
-            outputs,
-            num_tokens,
-            sum(len(seqs) for seqs in dp_seqs),
-            (sch_end - sch_begin) * 1000,
-            (post_sch_end - post_sch_begin) * 1000,
+        real_bs = sum(
+            sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
+            for seqs in dp_seqs
+        )
+        return StepResult(
+            dp_seqs=dp_seqs,
+            outputs=outputs,
+            prefill_tokens=prefill_tokens,
+            decode_tokens=decode_tokens,
+            real_bs=real_bs,
+            schedule_latency_ms=(sch_end - sch_begin) * 1000,
+            postprocess_latency_ms=(post_sch_end - post_sch_begin) * 1000,
         )
 
     def is_finished(self):
@@ -232,47 +274,62 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.0
         step_count = 0
 
+        # Window-based throughput tracking
+        window_start = perf_counter()
+        window_tokens = 0
+        window_interval = 5.0  # seconds
+        last_tqdm_update = perf_counter()
+        tqdm_interval = 1.0  # seconds
+
         while not self.is_finished():
             t = perf_counter()
-            dp_seqs, output, num_tokens, bs, sch_latency, post_sch_latency = self.step()
-            if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                    self.metrics_manager.server_metric.record_prefill_throughput(
-                        num_tokens, (perf_counter() - t)
-                    )
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                    self.metrics_manager.server_metric.record_decode_throughput(
-                        -num_tokens, (perf_counter() - t)
-                    )
-                itl = (perf_counter() - t) * 1000 / self.config.loop_count
+            result = self.step()
+            step_count += 1
+            step_duration = perf_counter() - t
+
+            if result.prefill_tokens > 0:
+                prefill_throughput = result.prefill_tokens / step_duration
+                self.metrics_manager.server_metric.record_prefill_throughput(
+                    result.prefill_tokens, step_duration
+                )
+            if result.decode_tokens > 0:
+                self.metrics_manager.server_metric.record_decode_throughput(
+                    result.decode_tokens, step_duration
+                )
+                window_tokens += result.decode_tokens
+
+            # Periodic throughput reporting
+            now = perf_counter()
+            window_elapsed = now - window_start
+            if window_elapsed >= window_interval and window_tokens > 0:
+                decode_throughput = window_tokens / window_elapsed
+                logger.info(
+                    f"[Throughput] {decode_throughput:.0f} tok/s "
+                    f"({window_tokens} tokens in {window_elapsed:.1f}s, "
+                    f"bs={result.real_bs}, step={step_count})"
+                )
+                window_start = now
+                window_tokens = 0
+
+            # Update tqdm periodically (not every step)
+            if use_tqdm and (now - last_tqdm_update >= tqdm_interval):
+                last_tqdm_update = now
                 pbar.set_postfix(
                     {
-                        "bs": f"{bs}",
+                        "bs": f"{result.real_bs}",
                         "Prefill": f"{int(prefill_throughput)}tok/s",
                         "Decode": f"{int(decode_throughput)}tok/s",
-                        "itl": f"{itl:.2f}ms",
-                        "sch_ovhd": f"{sch_latency:.2f}ms",
-                        "post_sch_ovhd": f"{post_sch_latency:.2f}ms",
+                        "step": f"{step_count}",
                     }
                 )
-            for seq in output:
+            for seq in result.outputs:
                 finished_seqs.append(seq)
                 if use_tqdm:
                     pbar.update(1)
         if use_tqdm:
             pbar.close()
 
-        logger.info("=" * 60)
-        logger.info("Final Server Metrics Summary")
-        logger.info("=" * 60)
-        self.metrics_manager.log_server_metrics(include_detailed=True)
-        summary = self.metrics_manager.get_server_summary()
-        for key, value in summary.items():
-            if value is not None:
-                logger.info(f"  {key}: {value}")
-        logger.info("=" * 60)
+        self.metrics_manager.log_final_summary()
 
         # Workaround for SIGSEGV during Ray serialization of migrated sequences
         # Use FlatBuffers serialization directly to avoid pickle issues

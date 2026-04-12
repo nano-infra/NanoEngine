@@ -98,11 +98,75 @@ def _should_skip_weight(weight_name: str, num_hidden_layers: int | None = None) 
     return False
 
 
+def _is_mtp_weight(weight_name: str, num_hidden_layers: int | None = None) -> bool:
+    """Check if weight belongs to MTP layers (inverse of base-model skip logic)."""
+    for pat in _MTP_PATTERNS:
+        if pat in weight_name:
+            return True
+    if re.search(r"layers\.\d+\.embed_tokens\.", weight_name):
+        return True
+    if num_hidden_layers is not None:
+        m = _LAYER_RE.search(weight_name)
+        if m and int(m.group(1)) >= num_hidden_layers:
+            return True
+    return False
+
+
 def _strip_vlm_prefix(weight_name: str) -> str:
     """Strip VLM prefix (e.g. 'model.language_model.' -> 'model.') for text models."""
     if weight_name.startswith("model.language_model."):
         return "model." + weight_name[len("model.language_model.") :]
     return weight_name
+
+
+def iterate_mtp_weights(
+    path: str, num_hidden_layers: int | None = None
+) -> Generator[Tuple[str, str, torch.Tensor], None, None]:
+    """Iterate over safetensors, yielding ONLY MTP-layer weights.
+
+    This is the inverse of iterate_weights() which skips MTP weights.
+    Also includes embed_tokens and lm_head weights needed for MTP.
+    """
+    weight_files = sorted(glob(os.path.join(path, "*.safetensors")))
+    pbar = tqdm(weight_files, desc="Loading MTP weights", unit="files")
+
+    try:
+        for file in pbar:
+            with safe_open(file, "pt", "cpu") as f:
+                for raw_weight_name in f.keys():
+                    # Skip non-MTP weights (vision, rotary cache)
+                    for pat in _SKIP_PATTERNS:
+                        if pat in raw_weight_name:
+                            break
+                    else:
+                        # Include MTP weights + embed_tokens/lm_head for sharing
+                        is_mtp = _is_mtp_weight(raw_weight_name, num_hidden_layers)
+                        is_embed_or_head = (
+                            "embed_tokens" in raw_weight_name
+                            or "lm_head" in raw_weight_name
+                        )
+                        if is_mtp or is_embed_or_head:
+                            weight_name = _strip_vlm_prefix(raw_weight_name)
+                            yield weight_name, raw_weight_name, f.get_tensor(
+                                raw_weight_name
+                            )
+    finally:
+        pbar.close()
+
+
+def load_mtp_model(model: nn.Module, path: str) -> None:
+    """Load MTP model weights from safetensors files.
+
+    The MTP model must implement load_weights().
+    """
+    config = getattr(model, "config", None)
+    num_hidden_layers = getattr(config, "num_hidden_layers", None) if config else None
+
+    if not hasattr(model, "load_weights"):
+        raise RuntimeError("MTP model must implement load_weights()")
+
+    weights = iterate_mtp_weights(path, num_hidden_layers)
+    model.load_weights(weights)
 
 
 def iterate_weights(
