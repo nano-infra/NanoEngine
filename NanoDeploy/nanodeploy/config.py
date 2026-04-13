@@ -123,6 +123,7 @@ class Config(BaseModel):
         if self.hf_config.architectures[0] in (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
         ):
             assert self.kvcache_block_size == 64
             assert self.attention_tp == 1
@@ -169,6 +170,7 @@ class Config(BaseModel):
         if self.hf_config.architectures[0] in (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
         ):
             if hasattr(self.hf_config, "num_key_value_heads"):
                 self.hf_config.num_key_value_heads = 1

@@ -534,7 +534,7 @@ class DeepseekV2Attention(nn.Module):
 
         if rope_params is not None:
             mscale_all_dim = rope_params.get("mscale_all_dim", 0)
-            scaling_factor = rope_params["factor"]
+            scaling_factor = rope_params.get("factor", 1.0)
             if mscale_all_dim:
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.softmax_scale = self.softmax_scale * mscale * mscale
