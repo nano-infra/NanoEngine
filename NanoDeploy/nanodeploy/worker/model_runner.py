@@ -40,12 +40,14 @@ architectures = {
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
     "DeepseekV32ForCausalLM": DeepseekV2ForCausalLM,
+    "GlmMoeDsaForCausalLM": DeepseekV2ForCausalLM,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGeneration,
 }
 
 architectures_mtp = {
     "DeepseekV3ForCausalLM": DeepSeekMTP,
     "DeepseekV32ForCausalLM": DeepSeekMTP,
+    "GlmMoeDsaForCausalLM": DeepSeekMTP,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5MTP,
 }
 
@@ -238,6 +240,13 @@ class ModelRunner:
                 mtp_model.lm_head = self.model.lm_head
             if not get_runner_config().dummy_weight:
                 load_mtp_model(mtp_model, config.model)
+            # Share lm_head weights with MTP shared_head.head —
+            # checkpoints either store identical copies or omit the head entirely.
+            for _layer in mtp_model.layers.values():
+                if hasattr(_layer, "shared_head") and hasattr(
+                    _layer.shared_head, "head"
+                ):
+                    _layer.shared_head.head.weight = self.model.lm_head.weight
             logger.info(
                 f"MTP model loaded: {mtp_cls.__name__}, "
                 f"num_speculative_tokens={config.num_speculative_tokens}"
