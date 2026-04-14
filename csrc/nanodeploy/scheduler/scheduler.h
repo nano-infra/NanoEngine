@@ -97,6 +97,8 @@ public:
               bool               use_new_decode_dynamic_sp_scheduler,
               const std::string& dynamic_sp_size_strategy,
               int                dynamic_sp_long_request_threshold,
+              bool               enable_dynamic_sp_bucket_policy,
+              const std::string& dynamic_sp_bucket_policy,
               double             attention_cost_a,
               double             attention_cost_b,
               double             q_cost_a,

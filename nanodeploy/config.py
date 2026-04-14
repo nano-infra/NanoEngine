@@ -6,6 +6,15 @@ import torch
 from transformers import AutoConfig
 
 
+DEEPSEEK_V3_BUCKET_POLICY = (
+    "1:1024-104448;"
+    "5:104449-174080;"
+    "6:174081-194560;"
+    "7:194561-436224;"
+    "8:436225-1048576"
+)
+
+
 @dataclass
 class Config:
     model: str
@@ -78,8 +87,12 @@ class Config:
     # "legacy": keep the current segment-based SP size search.
     # "long_short_sp8": prompt_len > dynamic_sp_long_request_threshold -> SP=attention_sp,
     #                   otherwise SP=1. Master selection and KV placement stay unchanged.
-    dynamic_sp_size_strategy: Literal["legacy", "long_short_sp8"] = "legacy"
+    # "bucket": choose CP size directly from a configured seq-len bucket policy.
+    dynamic_sp_size_strategy: Literal["legacy", "long_short_sp8", "bucket"] = "legacy"
     dynamic_sp_long_request_threshold: int = 100000
+    enable_dynamic_sp_bucket_policy: bool = False
+    dynamic_sp_bucket_policy: str = ""
+    dynamic_sp_bucket_preset: Literal["none", "deepseek_v3"] = "none"
 
     # Linear attention latency model for the new decode dynamic SP scheduler.
     # Current defaults come from:
@@ -116,9 +129,53 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        if self.dynamic_sp_size_strategy not in {"legacy", "long_short_sp8"}:
+        if self.dynamic_sp_size_strategy not in {"legacy", "long_short_sp8", "bucket"}:
             raise ValueError(
-                "dynamic_sp_size_strategy must be one of: legacy, long_short_sp8"
+                "dynamic_sp_size_strategy must be one of: legacy, long_short_sp8, bucket"
+            )
+        if self.dynamic_sp_bucket_preset not in {"none", "deepseek_v3"}:
+            raise ValueError(
+                "dynamic_sp_bucket_preset must be one of: none, deepseek_v3"
+            )
+        preset_policy = ""
+        if self.dynamic_sp_bucket_preset == "deepseek_v3":
+            preset_policy = DEEPSEEK_V3_BUCKET_POLICY
+        if preset_policy:
+            if (
+                self.dynamic_sp_bucket_policy.strip()
+                and self.dynamic_sp_bucket_policy.strip() != preset_policy
+            ):
+                raise ValueError(
+                    "dynamic_sp_bucket_policy conflicts with dynamic_sp_bucket_preset"
+                )
+            self.dynamic_sp_bucket_policy = preset_policy
+        bucket_requested = (
+            self.dynamic_sp_size_strategy == "bucket"
+            or self.enable_dynamic_sp_bucket_policy
+            or bool(self.dynamic_sp_bucket_policy.strip())
+            or self.dynamic_sp_bucket_preset != "none"
+        )
+        if self.dynamic_sp_size_strategy != "bucket" and bucket_requested:
+            raise ValueError(
+                "bucket policy is an independent scheduling strategy; use "
+                "dynamic_sp_size_strategy='bucket' instead of combining it with "
+                "legacy/long_short_sp8"
+            )
+        if self.dynamic_sp_size_strategy == "bucket":
+            self.enable_dynamic_sp_bucket_policy = True
+        if self.enable_dynamic_sp_bucket_policy and not self.dynamic_sp_bucket_policy.strip():
+            raise ValueError(
+                "dynamic_sp_bucket_policy must be non-empty when "
+                "enable_dynamic_sp_bucket_policy is True"
+            )
+        if (
+            self.enable_dynamic_sp_bucket_policy
+            and self.use_new_decode_dynamic_sp_scheduler
+        ):
+            raise ValueError(
+                "dynamic_sp_bucket_policy only applies to the legacy can_allocate path "
+                "and must not be combined with "
+                "use_new_decode_dynamic_sp_scheduler=True"
             )
         hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         # Convert custom config classes (e.g., kimi_k2 which maps to DeepseekV3ForCausalLM)
@@ -145,6 +202,16 @@ class Config:
         else:
             assert self.kvcache_block_size % 256 == 0
             assert 1 <= self.attention_tp <= 8
+        if self.dynamic_sp_bucket_preset == "deepseek_v3":
+            if self.hf_config.architectures[0] != "DeepseekV3ForCausalLM":
+                raise ValueError(
+                    "dynamic_sp_bucket_preset=deepseek_v3 only supports "
+                    "DeepseekV3ForCausalLM"
+                )
+            if self.attention_sp < 8:
+                raise ValueError(
+                    "dynamic_sp_bucket_preset=deepseek_v3 requires attention_sp >= 8"
+                )
         # self.max_model_len = max(
         #     self.max_model_len, self.hf_config.max_position_embeddings
         # )

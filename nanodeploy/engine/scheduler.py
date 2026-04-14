@@ -41,6 +41,8 @@ class Scheduler(_CppScheduler):
             config.use_new_decode_dynamic_sp_scheduler,
             config.dynamic_sp_size_strategy,
             config.dynamic_sp_long_request_threshold,
+            config.enable_dynamic_sp_bucket_policy,
+            config.dynamic_sp_bucket_policy,
             config.dynamic_sp_attention_cost_a,
             config.dynamic_sp_attention_cost_b,
             config.dynamic_sp_q_cost_a,

@@ -28,7 +28,14 @@ enum class SPMasterSelector {
 
 enum class DynamicSPSizeStrategy {
     Legacy,
-    LongShortSP8
+    LongShortSP8,
+    Bucket
+};
+
+struct SPBucketInterval {
+    int sp_size = 1;
+    int seq_len_low = 0;
+    int seq_len_high = 0;
 };
 
 class SPStateManager {
@@ -93,6 +100,8 @@ public:
                    bool               enable_dynamic_sp_size,
                    const std::string& dynamic_sp_size_strategy,
                    int                dynamic_sp_long_request_threshold,
+                   bool               enable_dynamic_sp_bucket_policy,
+                   const std::string& dynamic_sp_bucket_policy,
                    double             attention_cost_a,
                    double             attention_cost_b,
                    double             q_cost_a,
@@ -239,6 +248,7 @@ private:
 
     void initialize_dummy_seqs();
     int  select_master_rank();
+    std::optional<int> select_bucket_sp_size(int seq_len) const;
     void add_communication(PlanningState& state,
                            int            master_sp_idx,
                            const std::vector<int>& dispatched_tokens) const;
@@ -256,6 +266,8 @@ private:
     int segment_size_;
     DynamicSPSizeStrategy dynamic_sp_size_strategy_;
     int                   long_request_sp_threshold_;
+    bool                  enable_dynamic_sp_bucket_policy_;
+    std::vector<SPBucketInterval> dynamic_sp_bucket_policy_;
 
     int              sp_rr_counter_      = 0;
     int              num_running_seqs_   = 0;

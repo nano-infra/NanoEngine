@@ -5,6 +5,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <set>
 
 #include "nanodeploy/sequence/sequence.h"
@@ -12,6 +13,73 @@
 #include "sp_state_manager.h"
 
 namespace nanodeploy {
+
+namespace {
+
+std::string trim_copy(const std::string& input)
+{
+    const auto start = input.find_first_not_of(" \t\n\r");
+    if (start == std::string::npos) {
+        return "";
+    }
+    const auto end = input.find_last_not_of(" \t\n\r");
+    return input.substr(start, end - start + 1);
+}
+
+std::vector<SPBucketInterval> parse_bucket_policy(const std::string& text, int max_sp)
+{
+    std::vector<SPBucketInterval> intervals;
+    const std::string trimmed = trim_copy(text);
+    if (trimmed.empty()) {
+        return intervals;
+    }
+
+    std::stringstream ss(trimmed);
+    std::string item;
+    int prev_high = std::numeric_limits<int>::min();
+    while (std::getline(ss, item, ';')) {
+        item = trim_copy(item);
+        if (item.empty()) {
+            continue;
+        }
+        const auto colon = item.find(':');
+        const auto dash = item.find('-', colon == std::string::npos ? 0 : colon + 1);
+        if (colon == std::string::npos || dash == std::string::npos) {
+            throw std::runtime_error("Invalid dynamic_sp_bucket_policy item: " + item);
+        }
+        SPBucketInterval interval;
+        interval.sp_size = std::stoi(trim_copy(item.substr(0, colon)));
+        interval.seq_len_low = std::stoi(trim_copy(item.substr(colon + 1, dash - colon - 1)));
+        interval.seq_len_high = std::stoi(trim_copy(item.substr(dash + 1)));
+        if (interval.sp_size < 1 || interval.sp_size > max_sp) {
+            throw std::runtime_error("Bucket sp_size out of range: " + item);
+        }
+        if (interval.seq_len_low < 0 || interval.seq_len_high < interval.seq_len_low) {
+            throw std::runtime_error("Invalid bucket seq range: " + item);
+        }
+        if (!intervals.empty() && interval.seq_len_low <= prev_high) {
+            throw std::runtime_error("dynamic_sp_bucket_policy ranges must be strictly increasing");
+        }
+        prev_high = interval.seq_len_high;
+        intervals.push_back(interval);
+    }
+    return intervals;
+}
+
+const char* dynamic_sp_size_strategy_name(DynamicSPSizeStrategy strategy)
+{
+    switch (strategy) {
+        case DynamicSPSizeStrategy::Legacy:
+            return "legacy";
+        case DynamicSPSizeStrategy::LongShortSP8:
+            return "long_short_sp8";
+        case DynamicSPSizeStrategy::Bucket:
+            return "bucket";
+    }
+    return "unknown";
+}
+
+}  // namespace
 
 SPStateManager::SPStateManager(const std::string& engine_id,
                                int                attention_sp,
@@ -25,6 +93,8 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                bool               enable_dynamic_sp_size,
                                const std::string& dynamic_sp_size_strategy,
                                int                dynamic_sp_long_request_threshold,
+                               bool               enable_dynamic_sp_bucket_policy,
+                               const std::string& dynamic_sp_bucket_policy,
                                double             attention_cost_a,
                                double             attention_cost_b,
                                double             q_cost_a,
@@ -50,6 +120,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     segment_size_(segment_size),
     dynamic_sp_size_strategy_(DynamicSPSizeStrategy::Legacy),
     long_request_sp_threshold_(dynamic_sp_long_request_threshold),
+    enable_dynamic_sp_bucket_policy_(enable_dynamic_sp_bucket_policy),
     num_recv_seqs_per_sp_(attention_sp, 0),
     enable_dynamic_sp_size_(enable_dynamic_sp_size),
     cost_model_{
@@ -76,10 +147,13 @@ SPStateManager::SPStateManager(const std::string& engine_id,
         dynamic_sp_size_strategy_ = DynamicSPSizeStrategy::Legacy;
     } else if (dynamic_sp_size_strategy == "long_short_sp8") {
         dynamic_sp_size_strategy_ = DynamicSPSizeStrategy::LongShortSP8;
+    } else if (dynamic_sp_size_strategy == "bucket") {
+        dynamic_sp_size_strategy_ = DynamicSPSizeStrategy::Bucket;
     } else {
         throw std::runtime_error(
             "Unsupported dynamic_sp_size_strategy: " + dynamic_sp_size_strategy);
     }
+    dynamic_sp_bucket_policy_ = parse_bucket_policy(dynamic_sp_bucket_policy, attention_sp_);
 
     // Initialize Running Load Counter
     master_seq_counts_.assign(attention_sp_, 0);
@@ -95,9 +169,9 @@ SPStateManager::SPStateManager(const std::string& engine_id,
               << ", reserved_blocks_per_req=" << reserved_blocks_per_req_ 
               << ", segment_size=" << segment_size_
               << ", fixed_sp_segments=" << fixed_sp_segments_
-              << ", dynamic_sp_size_strategy="
-              << (dynamic_sp_size_strategy_ == DynamicSPSizeStrategy::LongShortSP8 ? "long_short_sp8" : "legacy")
+              << ", dynamic_sp_size_strategy=" << dynamic_sp_size_strategy_name(dynamic_sp_size_strategy_)
               << ", dynamic_sp_long_request_threshold=" << long_request_sp_threshold_
+              << ", enable_dynamic_sp_bucket_policy=" << enable_dynamic_sp_bucket_policy_
               << std::endl;
 
     if (attention_sp_ <= 0) {
@@ -106,6 +180,19 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     if (kvcache_block_size_ <= 0) {
         throw std::runtime_error("kvcache_block_size must be positive to prevent division by zero");
     }
+}
+
+std::optional<int> SPStateManager::select_bucket_sp_size(int seq_len) const
+{
+    if (!enable_dynamic_sp_bucket_policy_) {
+        return std::nullopt;
+    }
+    for (const auto& interval : dynamic_sp_bucket_policy_) {
+        if (interval.seq_len_low <= seq_len && seq_len <= interval.seq_len_high) {
+            return interval.sp_size;
+        }
+    }
+    return std::nullopt;
 }
 
 void SPStateManager::initialize_dummy_seqs()
@@ -849,16 +936,27 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
 
         int start_ranks = initial_num_ranks;
         int end_ranks   = enable_dynamic_sp_size_ ? attention_sp_ : initial_num_ranks;
-        if (dynamic_sp_size_strategy_ == DynamicSPSizeStrategy::LongShortSP8) {
+        bool recompute_segments_for_forced_sp = false;
+        if (dynamic_sp_size_strategy_ == DynamicSPSizeStrategy::Bucket) {
+            const int forced_num_ranks = std::max(
+                1,
+                std::min(
+                    attention_sp_,
+                    select_bucket_sp_size(seq.num_tokens).value_or(initial_num_ranks)));
+            start_ranks = forced_num_ranks;
+            end_ranks = forced_num_ranks;
+            recompute_segments_for_forced_sp = true;
+        } else if (dynamic_sp_size_strategy_ == DynamicSPSizeStrategy::LongShortSP8) {
             const bool is_long_request = seq.num_prompt_tokens > long_request_sp_threshold_;
             const int forced_num_ranks = is_long_request ? attention_sp_ : 1;
             start_ranks = forced_num_ranks;
             end_ranks = forced_num_ranks;
+            recompute_segments_for_forced_sp = true;
         }
 
         for (int target_num_ranks = start_ranks; target_num_ranks <= end_ranks; ++target_num_ranks) {
             int target_num_segments_per_rank = num_segments_per_rank;
-            if (dynamic_sp_size_strategy_ == DynamicSPSizeStrategy::LongShortSP8) {
+            if (recompute_segments_for_forced_sp) {
                 target_num_segments_per_rank = (num_segments + target_num_ranks - 1) / target_num_ranks;
                 if (target_num_segments_per_rank == 0) {
                     target_num_segments_per_rank = 1;
