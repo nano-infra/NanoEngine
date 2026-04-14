@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import torch
 from transformers import AutoConfig
 
 
@@ -69,6 +70,36 @@ class Config:
 
     # Dynamic SP Size Knob
     enable_dynamic_sp_size: bool = False
+    # Decode-only scheduler implementation selector for dynamic SP:
+    # False -> legacy can_allocate-based path
+    # True  -> new batch planner path
+    use_new_decode_dynamic_sp_scheduler: bool = False
+    # SP size selection policy for the legacy dynamic-SP path.
+    # "legacy": keep the current segment-based SP size search.
+    # "long_short_sp8": prompt_len > dynamic_sp_long_request_threshold -> SP=attention_sp,
+    #                   otherwise SP=1. Master selection and KV placement stay unchanged.
+    dynamic_sp_size_strategy: Literal["legacy", "long_short_sp8"] = "legacy"
+    dynamic_sp_long_request_threshold: int = 100000
+
+    # Linear attention latency model for the new decode dynamic SP scheduler.
+    # Current defaults come from:
+    # mla_decode_latency_suite/mla_decode_cost_model/models/flashmla_axb_fit_20260405_160308.json
+    # which was fit on CUDA Graph measurements with batch_size=64.
+    dynamic_sp_attention_cost_a: float = 0.000444280970
+    dynamic_sp_attention_cost_b: float = 9.862626316559
+    # Q/Res/LSE defaults are calibrated from the current DLSlime hao_basic path
+    # used by NanoDeploy-new. Keep this note here so later updates do not
+    # accidentally mix old all_to_all_ll coefficients with hao_basic ones.
+    dynamic_sp_q_cost_a: float = 0.000002768410
+    dynamic_sp_q_cost_b: float = 5.924184585189
+    dynamic_sp_res_cost_a: float = 0.000002764389
+    dynamic_sp_res_cost_b: float = 5.639326242620
+    dynamic_sp_lse_cost_a: float = 0.000026547019
+    dynamic_sp_lse_cost_b: float = 4.263571143096
+    # Leave these at 0 to auto-derive bytes-per-edge for DeepSeek-V3 MLA in __post_init__().
+    dynamic_sp_q_bytes_per_edge: int = 0
+    dynamic_sp_res_bytes_per_edge: int = 0
+    dynamic_sp_lse_bytes_per_edge: int = 0
 
     # Enable non-uniform KVCache partitioning for load balancing
     enable_non_uniform_split: bool = False
@@ -85,6 +116,10 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
+        if self.dynamic_sp_size_strategy not in {"legacy", "long_short_sp8"}:
+            raise ValueError(
+                "dynamic_sp_size_strategy must be one of: legacy, long_short_sp8"
+            )
         hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         # Convert custom config classes (e.g., kimi_k2 which maps to DeepseekV3ForCausalLM)
         # to the equivalent standard transformers config so Ray can pickle/unpickle without
@@ -123,6 +158,37 @@ class Config:
 
             if hasattr(self.hf_config, "num_key_value_heads"):
                 self.hf_config.num_key_value_heads = 1
+
+            def _dtype_size_bytes(torch_dtype: Any) -> int:
+                if torch_dtype is None:
+                    return 2
+                if isinstance(torch_dtype, str):
+                    mapping = {
+                        "torch.float16": 2,
+                        "float16": 2,
+                        "torch.bfloat16": 2,
+                        "bfloat16": 2,
+                        "torch.float32": 4,
+                        "float32": 4,
+                    }
+                    return mapping.get(torch_dtype, 2)
+                try:
+                    return torch.tensor([], dtype=torch_dtype).element_size()
+                except Exception:
+                    return 2
+
+            dtype_size = _dtype_size_bytes(getattr(self.hf_config, "torch_dtype", None))
+            num_heads = int(getattr(self.hf_config, "num_attention_heads"))
+            kv_lora_rank = int(getattr(self.hf_config, "kv_lora_rank"))
+            qk_rope_head_dim = int(getattr(self.hf_config, "qk_rope_head_dim"))
+
+            if self.dynamic_sp_q_bytes_per_edge <= 0:
+                self.dynamic_sp_q_bytes_per_edge = num_heads * (kv_lora_rank + qk_rope_head_dim) * dtype_size
+            if self.dynamic_sp_res_bytes_per_edge <= 0:
+                self.dynamic_sp_res_bytes_per_edge = num_heads * kv_lora_rank * dtype_size
+            if self.dynamic_sp_lse_bytes_per_edge <= 0:
+                # LSE is explicitly converted to bfloat16 before communication.
+                self.dynamic_sp_lse_bytes_per_edge = num_heads * 2
 
     @property
     def attn_world_size(self):

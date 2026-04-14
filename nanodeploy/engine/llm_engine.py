@@ -105,9 +105,22 @@ class LLMEngine:
 
         sp_send_counts = sch_res.sp_send_counts
         sp_recv_counts = sch_res.sp_recv_counts
+        sp_size_hist_per_dp_raw = sch_res.sp_size_hist_per_dp
         # sp_comm_matrix = sch_res.sp_comm_matrix
         sp_q_matrix = sch_res.sp_q_matrix
         # sp_res_matrix = sch_res.sp_res_matrix
+
+        sp_size_hist_per_dp = []
+        sp_size_hist_global: dict[int, int] = {}
+        for dp_hist in sp_size_hist_per_dp_raw:
+            compact_hist = {}
+            for sp_size, count in enumerate(dp_hist):
+                if count > 0:
+                    compact_hist[sp_size] = count
+                    sp_size_hist_global[sp_size] = (
+                        sp_size_hist_global.get(sp_size, 0) + count
+                    )
+            sp_size_hist_per_dp.append(compact_hist)
         
         # Update metrics with raw counts
         self.metrics_manager.server_metric.update_sp_stats(sp_send_counts, sp_recv_counts)
@@ -200,6 +213,8 @@ class LLMEngine:
                     "sp_batch_sizes": sp_batch_sizes,
                     "sp_send_counts": sp_send_counts,
                     "sp_recv_counts": sp_recv_counts,
+                    "sp_size_hist_global": sp_size_hist_global,
+                    "sp_size_hist_per_dp": sp_size_hist_per_dp,
                     "waiting_head_blocks": waiting_head_blocks,
                     "waiting_total_blocks": waiting_total_blocks,
                     # "sp_comm_matrix": sp_comm_matrix,

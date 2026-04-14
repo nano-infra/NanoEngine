@@ -25,20 +25,21 @@ def main():
         help="Routing strategy for decentralized scheduler (default: RoundRobin)"
     )
     args = parser.parse_args()
-    path = os.path.expanduser("/models/qwen3-235B-Instruct-2507-FP8")
+    # path = os.path.expanduser("/mnt/nvme1n1/ml_research/models/models--moonshotai--Kimi-K2-Instruct-0905/snapshots/7152993552508c9f22042b3bb93b5e6acd06ce73")
+    path = os.path.expanduser("/models/deepseek-v3")
 
     decode = LLM(
         path,
         enforce_eager=False,
-        attention_dp=8,
+        attention_dp=16,
         attention_sp=1,
         attention_tp=1,
         ffn_dp=1,
-        ffn_ep=8,
+        ffn_ep=16,
         ffn_tp=1,
         mode="decode",
         master_address="10.102.97.179:26444",
-        ray_address="10.102.97.179:7078",
+        ray_address="10.102.97.179:7799",
         dummy_prefill=True,
         dummy_weight=True,
         perfect_eplb=True,
@@ -48,8 +49,9 @@ def main():
         loop_count=48,
         max_num_send_seqs=128,
         max_num_recv_seqs=130,
-        kvcache_block_size=256,
+        kvcache_block_size=64,
         enable_profiler=False,
+        gpu_memory_utilization=0.9,
         scheduler_mode=args.scheduler_mode,
         routing_strategy=args.routing_strategy,
     )

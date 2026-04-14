@@ -156,7 +156,7 @@ class ModelRunner:
 
             self.profiler = torch.profiler.profile(
                 activities=[
-                    torch.profiler.ProfilerActivity.CPU,
+                    # torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
                 schedule=None,
@@ -193,7 +193,7 @@ class ModelRunner:
         # self.warmup_model()
         self.preallocate_kvcache()
 
-        self.endpoint = RPCClientEndpoint(4*32_000_000, get_dist_context().rank)
+        self.endpoint = RPCClientEndpoint(8*32_000_000, get_dist_context().rank)
 
     def init_rpc_endpoint(self, server_info):
         client_info = self.endpoint.init_client_endpoint()
