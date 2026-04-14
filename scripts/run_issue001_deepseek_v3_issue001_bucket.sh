@@ -43,6 +43,7 @@ DYNAMIC_SP_SIZE_STRATEGY="${DYNAMIC_SP_SIZE_STRATEGY:-bucket}"
 DYNAMIC_SP_BUCKET_PRESET="${DYNAMIC_SP_BUCKET_PRESET:-deepseek_v3}"
 LONG_REQUEST_SP_THRESHOLD="${LONG_REQUEST_SP_THRESHOLD:-100000}"
 DISABLE_NON_UNIFORM_SPLIT="${DISABLE_NON_UNIFORM_SPLIT:-0}"
+STOP_THRESHOLD_MS="${STOP_THRESHOLD_MS:-100}"
 DRY_RUN="${DRY_RUN:-0}"
 
 RUN_TAG="${RUN_TAG:-issue001_deepseek_v3_issue001_bucket_cp_${DYNAMIC_SP_BUCKET_PRESET}_$(date -u +%Y%m%d_%H%M%S)}"
@@ -55,6 +56,40 @@ log() {
     local now
     now=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
     echo "[$now] $*" | tee -a "$PROGRESS_FILE"
+}
+
+extract_metric_from_section() {
+    local file="$1"
+    local section_regex="$2"
+    local metric_label="$3"
+    awk -v section_regex="$section_regex" -v metric_label="$metric_label" '
+        $0 ~ section_regex {in_section=1; next}
+        in_section && /^--- / {exit}
+        in_section && $1 == metric_label {
+            value=$2
+            gsub(/[^0-9eE+.-]/, "", value)
+            print value
+            exit
+        }
+    ' "$file"
+}
+
+parse_metric() {
+    local file="$1"
+    local key="$2"
+    case "$key" in
+        itl_avg) extract_metric_from_section "$file" "^--- ITL With Decode Queue" "Avg:" ;;
+        itl_p99) extract_metric_from_section "$file" "^--- ITL With Decode Queue" "P99:" ;;
+        queue_avg) extract_metric_from_section "$file" "^--- Queueing Time \\(ms\\) ---" "Avg:" ;;
+        queue_p99) extract_metric_from_section "$file" "^--- Queueing Time \\(ms\\) ---" "P99:" ;;
+        decode_queue_avg) extract_metric_from_section "$file" "^--- Decode Queue Time \\(ms\\) ---" "Avg:" ;;
+        decode_queue_p99) extract_metric_from_section "$file" "^--- Decode Queue Time \\(ms\\) ---" "P99:" ;;
+        *) return 1 ;;
+    esac
+}
+
+is_number() {
+    [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]]
 }
 
 rate_to_nreqs() {
@@ -96,6 +131,7 @@ log "DATASET=$DATASET_PATH"
 log "RAY_ADDR=$RAY_ADDR MASTER_ADDR=$MASTER_ADDR"
 log "TOPOLOGY=dp${DP}sp${SP}tp${TP}ep${EP}"
 log "DYNAMIC_SP_SIZE_STRATEGY=$DYNAMIC_SP_SIZE_STRATEGY DYNAMIC_SP_BUCKET_PRESET=$DYNAMIC_SP_BUCKET_PRESET"
+log "STOP_THRESHOLD_MS=$STOP_THRESHOLD_MS"
 log "RATES=${RATES[*]}"
 
 for rate in "${RATES[@]}"; do
@@ -244,6 +280,17 @@ PY
     else
         log "DONE rate=$rate status=FAILED exit_code=$exit_code output=$current_log_dir"
         exit $exit_code
+    fi
+
+    itl_avg="$(parse_metric "$log_file" itl_avg || true)"
+    if [[ -n "${itl_avg:-}" ]] && is_number "$itl_avg"; then
+        log "RESULT rate=$rate itl_avg=${itl_avg}ms"
+        if awk -v itl_avg="$itl_avg" -v stop_ms="$STOP_THRESHOLD_MS" 'BEGIN {exit !(itl_avg > stop_ms)}'; then
+            log "STOP because itl_avg=${itl_avg}ms > ${STOP_THRESHOLD_MS}ms at rate=$rate"
+            break
+        fi
+    else
+        log "WARN rate=$rate unable_to_parse_itl_avg log_file=$log_file"
     fi
 
     sleep 15
