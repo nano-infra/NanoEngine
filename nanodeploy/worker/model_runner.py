@@ -528,6 +528,32 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         return temperatures
 
+    def _log_decode_a2a_masks(self, loop_idx: int, is_dummy: bool) -> None:
+        context = get_context()
+        if context.use_sp_a2a is not True:
+            return
+        if context.q_mask is None or context.res_lse_mask is None or context.q_offsets is None:
+            return
+
+        dist_context = get_dist_context()
+        logger.info(
+            {
+                "mode": "decode_a2a_masks",
+                "global_run_count": self.run_count,
+                "loop_idx": loop_idx,
+                "global_rank": self.rank,
+                "dp_rank": dist_context.attn_dp_rank,
+                "sp_rank": dist_context.attn_sp_rank,
+                "tp_rank": dist_context.attn_tp_rank,
+                "cp_size": dist_context.attn_sp_world_size,
+                "max_bs": int(context.q_mask.shape[1]),
+                "is_dummy": is_dummy,
+                "q_offsets": context.q_offsets.detach().cpu().tolist(),
+                "q_mask": context.q_mask.detach().cpu().tolist(),
+                "res_lse_mask": context.res_lse_mask.detach().cpu().tolist(),
+            }
+        )
+
     @torch.inference_mode()
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
@@ -699,6 +725,7 @@ class ModelRunner:
                     input_ids, positions = self.update_decode(
                         input_ids, positions, dp_seqs
                     )
+                self._log_decode_a2a_masks(loop_idx=i, is_dummy=is_dummy)
 
             logits = self.run_model(input_ids, positions, is_prefill)
 
