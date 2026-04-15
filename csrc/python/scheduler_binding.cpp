@@ -106,7 +106,7 @@ void bind_scheduler_utils(py::module_& m)
         .def_readonly("sp_size_hist_per_dp", &ScheduleResult::sp_size_hist_per_dp)
         // .def_readonly("sp_comm_matrix", &ScheduleResult::sp_comm_matrix)
         .def_readonly("sp_q_matrix", &ScheduleResult::sp_q_matrix)
-        // .def_readonly("sp_res_matrix", &ScheduleResult::sp_res_matrix);
+        .def_readonly("sp_res_matrix", &ScheduleResult::sp_res_matrix)
         .def_readonly("waiting_head_blocks", &ScheduleResult::waiting_head_blocks)
         .def_readonly("waiting_total_blocks", &ScheduleResult::waiting_total_blocks);    // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")

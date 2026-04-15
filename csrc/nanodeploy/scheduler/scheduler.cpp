@@ -331,6 +331,7 @@ ScheduleResult Scheduler::schedule()
     result.sp_send_counts.resize(attention_dp_);
     result.sp_recv_counts.resize(attention_dp_);
     result.sp_size_hist_per_dp.resize(attention_dp_);
+    result.sp_res_matrix.clear();
 
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
         result.sp_send_counts[dp_idx].resize(attention_sp_);
@@ -421,8 +422,8 @@ ScheduleResult Scheduler::schedule()
 
         result.sp_q_matrix.push_back(std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
 
-        // result.sp_res_matrix.push_back(
-        //     std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+        result.sp_res_matrix.push_back(
+            std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
 
         for (const auto& seq : dp_seqs[dp_idx]) {
             bool is_dummy = false;
@@ -449,16 +450,13 @@ ScheduleResult Scheduler::schedule()
                 // For each participating rank:
                 for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
                     if (tokens[sp_idx] > 0) {
-                        // Original matrix (Master -> Participant) - kept for compatibility if needed
-                        // result.sp_comm_matrix[dp_idx][master_sp_idx][sp_idx]++;
+                        if (sp_idx != master_sp_idx) {
+                            // Q Matrix: Master sends Q to each participant.
+                            result.sp_q_matrix[dp_idx][master_sp_idx][sp_idx]++;
 
-                        // Q Matrix: Master broadcast to all Participants
-                        // Master sends Q to Participant
-                        result.sp_q_matrix[dp_idx][master_sp_idx][sp_idx]++;
-
-                        // Res Matrix: Participant sends results back to Master
-                        // Participant sends Res to Master
-                        // result.sp_res_matrix[dp_idx][sp_idx][master_sp_idx]++;
+                            // Res Matrix: Each participant sends one result back to the master.
+                            result.sp_res_matrix[dp_idx][sp_idx][master_sp_idx]++;
+                        }
                     }
                 }
             }
@@ -924,6 +922,7 @@ ScheduleResult Scheduler::_schedule_decentralized()
     result.sp_send_counts.resize(attention_dp_);
     result.sp_recv_counts.resize(attention_dp_);
     result.sp_size_hist_per_dp.resize(attention_dp_);
+    result.sp_res_matrix.clear();
 
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
         result.sp_send_counts[dp_idx].resize(attention_sp_);
@@ -1000,6 +999,7 @@ ScheduleResult Scheduler::_schedule_decentralized()
 
         // SP Q Matrix
         result.sp_q_matrix.push_back(std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
+        result.sp_res_matrix.push_back(std::vector<std::vector<int>>(attention_sp_, std::vector<int>(attention_sp_, 0)));
 
         for (const auto& seq : scheduled_seqs[dp_idx]) {
             bool is_dummy = false;
@@ -1022,8 +1022,9 @@ ScheduleResult Scheduler::_schedule_decentralized()
             if (active_ranks > 1) {
                 int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
                 for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-                    if (tokens[sp_idx] > 0) {
+                    if (tokens[sp_idx] > 0 && sp_idx != master_sp_idx) {
                         result.sp_q_matrix[dp_idx][master_sp_idx][sp_idx]++;
+                        result.sp_res_matrix[dp_idx][sp_idx][master_sp_idx]++;
                     }
                 }
             }

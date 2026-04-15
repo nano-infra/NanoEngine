@@ -108,7 +108,7 @@ class LLMEngine:
         sp_size_hist_per_dp_raw = sch_res.sp_size_hist_per_dp
         # sp_comm_matrix = sch_res.sp_comm_matrix
         sp_q_matrix = sch_res.sp_q_matrix
-        # sp_res_matrix = sch_res.sp_res_matrix
+        sp_res_matrix = sch_res.sp_res_matrix
 
         sp_size_hist_per_dp = []
         sp_size_hist_global: dict[int, int] = {}
@@ -219,7 +219,7 @@ class LLMEngine:
                     "waiting_total_blocks": waiting_total_blocks,
                     # "sp_comm_matrix": sp_comm_matrix,
                     "sp_q_matrix": sp_q_matrix,
-                    # "sp_res_matrix": sp_res_matrix,
+                    "sp_res_matrix": sp_res_matrix,
                     "free_blocks": [
                         [
                             len(worker_state.block_manager[i].free_block_ids)
