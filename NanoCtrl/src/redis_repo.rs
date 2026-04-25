@@ -10,17 +10,17 @@ use serde_json::Value;
 use crate::error::AppError;
 use crate::models::*;
 
-/// Engine TTL in seconds (for heartbeat mechanism).
+/// Entity TTL in seconds (for heartbeat mechanism).
 ///
-/// Engine must send heartbeat every 15 seconds to keep alive.
+/// All entities (engines, agents) must send heartbeat every 15 seconds.
 /// TTL is set to 60 seconds to allow 4 missed heartbeats before expiration.
-pub const ENGINE_TTL_SECS: usize = 60;
+pub const ENTITY_TTL_SECS: usize = 60;
 
 /// Lua scripts loaded once at startup from external `.lua` files.
 pub struct LuaScripts {
     pub register_engine: String,
     pub unregister_engine: String,
-    pub heartbeat_engine: String,
+    pub heartbeat: String,
 }
 
 impl LuaScripts {
@@ -34,7 +34,7 @@ impl LuaScripts {
         Ok(Self {
             register_engine: read("register_engine.lua")?,
             unregister_engine: read("unregister_engine.lua")?,
-            heartbeat_engine: read("heartbeat_engine.lua")?,
+            heartbeat: read("heartbeat_engine.lua")?,
         })
     }
 }
@@ -104,16 +104,6 @@ impl RedisRepo {
         let mut conn = self.conn().await?;
 
         let agent_name = if let Some(alias) = alias {
-            let key = self.scoped_key(scope, &["agent", &alias]);
-            let exists: bool = redis::cmd("EXISTS")
-                .arg(&key)
-                .query_async(&mut *conn)
-                .await?;
-            if exists {
-                return Err(AppError::Conflict(format!(
-                    "Agent {alias} already registered"
-                )));
-            }
             alias
         } else {
             let counter_key = self.scoped_key(scope, &["agent_name_counter"]);
@@ -138,7 +128,14 @@ impl RedisRepo {
             .query_async::<()>(&mut *conn)
             .await?;
 
-        tracing::info!("Registered peer agent: {agent_name}");
+        // Set TTL so stale agents expire if heartbeat stops
+        redis::cmd("EXPIRE")
+            .arg(&key)
+            .arg(ENTITY_TTL_SECS)
+            .query_async::<()>(&mut *conn)
+            .await?;
+
+        tracing::info!("Registered peer agent: {agent_name} (TTL: {ENTITY_TTL_SECS}s)");
         Ok(agent_name)
     }
 
@@ -361,7 +358,7 @@ impl RedisRepo {
             .arg(serde_json::to_string(&body.peer_addrs).unwrap_or_default()) // ARGV[7]
             .arg(engine_info.to_string()) // ARGV[8]
             .arg(payload.to_string()) // ARGV[9]
-            .arg(ENGINE_TTL_SECS.to_string()) // ARGV[10]
+            .arg(ENTITY_TTL_SECS.to_string()) // ARGV[10]
             .arg(body.model_path.as_deref().unwrap_or("")) // ARGV[11]
             .query_async(&mut *conn)
             .await?;
@@ -370,7 +367,7 @@ impl RedisRepo {
             "Registered engine: {} (revision: {}, TTL: {}s)",
             body.engine_id,
             rev,
-            ENGINE_TTL_SECS
+            ENTITY_TTL_SECS
         );
         Ok(rev)
     }
@@ -404,23 +401,29 @@ impl RedisRepo {
         Ok(rev)
     }
 
-    /// Refresh engine heartbeat TTL. Returns `true` if engine exists.
-    pub async fn heartbeat_engine(
+    /// Generic heartbeat: refresh TTL for any entity type.
+    /// `entity_type` is the Redis key prefix ("engine", "agent", etc.).
+    /// Returns `true` if the entity exists, `false` otherwise.
+    pub async fn heartbeat(
         &self,
+        entity_type: &str,
         scope: Option<&str>,
-        engine_id: &str,
+        entity_id: &str,
     ) -> Result<bool, AppError> {
-        let mut conn = self.conn().await?;
-        let engine_key = self.scoped_key(scope, &["engine", engine_id]);
+        let key = self.scoped_key(scope, &[entity_type, entity_id]);
+        self.refresh_ttl(&key, ENTITY_TTL_SECS).await
+    }
 
+    /// Low-level: refresh TTL on any Redis key via Lua script.
+    async fn refresh_ttl(&self, key: &str, ttl_secs: usize) -> Result<bool, AppError> {
+        let mut conn = self.conn().await?;
         let result: i64 = redis::cmd("EVAL")
-            .arg(&*self.scripts.heartbeat_engine)
+            .arg(&*self.scripts.heartbeat)
             .arg(1)
-            .arg(&engine_key)
-            .arg(ENGINE_TTL_SECS.to_string())
+            .arg(key)
+            .arg(ttl_secs.to_string())
             .query_async(&mut *conn)
             .await?;
-
         Ok(result == 1)
     }
 

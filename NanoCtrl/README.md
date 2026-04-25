@@ -55,6 +55,36 @@ cargo run --release
 
 The server will listen on `http://0.0.0.0:3000` by default.
 
+### Background service style (`nanoctrl start/status/stop`)
+
+NanoCtrl now provides a Python CLI wrapper similar to Ray's service lifecycle commands.
+
+```bash
+# Install CLI entrypoint
+pip install -e NanoCtrl/
+
+# Start in background (default config.toml)
+nanoctrl start
+
+# Custom config / binary / log
+nanoctrl start --config /path/to/config.toml --bin /path/to/nanoctrl-server --log-file /tmp/nanoctrl.log
+
+# Check status (PID + health check)
+nanoctrl status
+
+# Stop gracefully
+nanoctrl stop
+
+# Force stop if needed
+nanoctrl stop --force
+```
+
+Notes:
+
+- `nanoctrl start` launches `target/release/nanoctrl-server` when available; otherwise it falls back to `cargo run --release -- --config ...`.
+- Runtime metadata is stored under `$NANOCTRL_RUNTIME_DIR` (or `$XDG_RUNTIME_DIR/nanoctrl`, default `/tmp/nanoctrl`).
+- `nanoctrl status` uses runtime metadata address by default; can be overridden with `--address`.
+
 **Distributed deployment**: When engines run on remote nodes, they need to connect to Redis. If Redis runs on the master node, set:
 
 ```bash

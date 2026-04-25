@@ -4,7 +4,6 @@
 //! Scope is determined by clients (NanoRoute, EngineServer, peer_agent) via
 //! `NANOCTRL_SCOPE` env var.
 
-mod config;
 mod error;
 mod handlers;
 mod models;
@@ -18,19 +17,24 @@ use axum::{
 };
 use clap::Parser;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::config::AppConfig;
 use crate::redis_repo::{LuaScripts, RedisRepo};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
-    #[arg(short, long, default_value = "config.toml")]
-    config: PathBuf,
+    /// Bind host for the HTTP server.
+    #[arg(long, default_value = "0.0.0.0")]
+    host: String,
+    /// Bind port for the HTTP server.
+    #[arg(long, default_value_t = 3000)]
+    port: u16,
+    /// Redis connection URL.
+    #[arg(long, default_value = "redis://127.0.0.1:6379")]
+    redis_url: String,
 }
 
 #[tokio::main]
@@ -43,22 +47,15 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    tracing::info!("Loading configuration from {:?}", args.config);
-    let mut config = AppConfig::load_from_file(&args.config)?;
-
-    // Env override for Redis URL (optional)
-    if let Ok(url) = std::env::var("NANOCTRL_REDIS_URL") {
-        config.redis.url = url;
-    }
-
-    tracing::info!("Using Redis URL: {}", config.redis.url);
+    let redis_url = std::env::var("NANOCTRL_REDIS_URL").unwrap_or(args.redis_url);
+    tracing::info!("Using Redis URL: {}", redis_url);
 
     // Load Lua scripts from external files
     let scripts = LuaScripts::load()?;
     tracing::info!("Loaded Lua scripts from lua/ directory");
 
     // Create Redis repository with connection pool
-    let repo = RedisRepo::new(&config.redis.url, scripts)?;
+    let repo = RedisRepo::new(&redis_url, scripts)?;
     tracing::info!("Redis connection pool initialized");
 
     // Warm up: verify Redis is reachable
@@ -72,6 +69,11 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         // Health
         .route("/", get(handlers::util::root))
+        // Generic heartbeat (unified for all entity types)
+        .route("/heartbeat", post(handlers::util::heartbeat))
+        // Backward-compat aliases (same unified handler)
+        .route("/heartbeat_engine", post(handlers::util::heartbeat))
+        .route("/heartbeat_agent", post(handlers::util::heartbeat))
         // Peer agent
         .route("/start_peer_agent", post(handlers::peer::start_peer_agent))
         .route("/query", post(handlers::peer::query))
@@ -88,10 +90,6 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/unregister_engine",
             post(handlers::engine::unregister_engine),
-        )
-        .route(
-            "/heartbeat_engine",
-            post(handlers::engine::heartbeat_engine),
         )
         .route("/get_engine_info", post(handlers::engine::get_engine_info))
         .route("/list_engines", post(handlers::engine::list_engines))
@@ -135,15 +133,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(repo);
 
-    let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port)
+    let addr: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
         .map_err(|e| {
-            anyhow::anyhow!(
-                "Invalid server address {}:{}: {}",
-                config.server.host,
-                config.server.port,
-                e
-            )
+            anyhow::anyhow!("Invalid server address {}:{}: {}", args.host, args.port, e)
         })?;
     tracing::info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -1,14 +1,13 @@
-local engine_key = KEYS[1]
+-- Generic heartbeat: refresh TTL for any key.
+-- KEYS[1] = the Redis key (engine:{id} or agent:{name})
+-- ARGV[1] = TTL in seconds
+
+local key = KEYS[1]
 local ttl = tonumber(ARGV[1])
 
--- 1. Check if engine exists
-local exists = redis.call('EXISTS', engine_key)
-
-if exists == 0 then
+if redis.call('EXISTS', key) == 0 then
     return 0
 end
 
--- 2. Refresh TTL only (no data change, no event, no revision increment)
-redis.call('EXPIRE', engine_key, ttl)
-
+redis.call('EXPIRE', key, ttl)
 return 1
