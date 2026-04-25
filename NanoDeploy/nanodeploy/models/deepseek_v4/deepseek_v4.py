@@ -366,36 +366,60 @@ class DeepseekV4Compressor(nn.Module):
         self._states: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._compressed_cache: dict[int, torch.Tensor] = {}
 
-    def init_tensorized_state(self, max_slots: int, device: torch.device):
+    def init_tensorized_state(
+        self,
+        max_slots: int,
+        device: torch.device,
+        kv_view: torch.Tensor | None = None,
+        score_view: torch.Tensor | None = None,
+        counts_view: torch.Tensor | None = None,
+    ):
         """Pre-allocate tensorized state buffers for CUDAGraph-safe decode.
 
         Buffer has ``max_slots + 1`` rows — the extra row at index ``max_slots``
         is a "dummy" slot. Batch positions with no valid state (e.g., during
         CUDAGraph warmup where slots are unassigned) are routed to the dummy
         so scatter writes never land in real state.
+
+        S2.2: when called with kv_view / score_view / counts_view arguments
+        (slices into the per-ratio flat buffers in CacheContext), we use those
+        views directly so RDMA migration can target one MR per ratio.  When
+        the views are None (no PD disagg / standalone test), allocate fresh.
         """
         coeff = 2 if self.overlap else 1
         ratio = self.compress_ratio
         self._max_slots = max_slots
         num_rows = max_slots + 1  # +1 dummy
-        self._kv_states = torch.zeros(
-            num_rows,
-            coeff * ratio,
-            coeff * self.head_dim,
-            dtype=torch.float32,
-            device=device,
-        )
-        self._score_states = torch.full(
-            (num_rows, coeff * ratio, coeff * self.head_dim),
-            float("-inf"),
-            dtype=torch.float32,
-            device=device,
-        )
-        self._compressed_counts = torch.zeros(
-            num_rows,
-            dtype=torch.int32,
-            device=device,
-        )
+        if kv_view is not None and score_view is not None and counts_view is not None:
+            assert kv_view.shape == (num_rows, coeff * ratio, coeff * self.head_dim)
+            assert score_view.shape == kv_view.shape
+            assert counts_view.shape == (num_rows,)
+            self._kv_states = kv_view
+            self._score_states = score_view
+            self._compressed_counts = counts_view
+            # Initialize values explicitly (views may be reused across init calls).
+            self._kv_states.zero_()
+            self._score_states.fill_(float("-inf"))
+            self._compressed_counts.zero_()
+        else:
+            self._kv_states = torch.zeros(
+                num_rows,
+                coeff * ratio,
+                coeff * self.head_dim,
+                dtype=torch.float32,
+                device=device,
+            )
+            self._score_states = torch.full(
+                (num_rows, coeff * ratio, coeff * self.head_dim),
+                float("-inf"),
+                dtype=torch.float32,
+                device=device,
+            )
+            self._compressed_counts = torch.zeros(
+                num_rows,
+                dtype=torch.int32,
+                device=device,
+            )
 
     def _overlap_transform(self, tensor: torch.Tensor, value: float) -> torch.Tensor:
         # tensor: [num_blocks, ratio, 2 * head_dim]
@@ -416,6 +440,23 @@ class DeepseekV4Compressor(nn.Module):
         seqlen = hidden_states.size(0)
         ratio = self.compress_ratio
         coeff = 2 if self.overlap else 1
+        # Stage 4 — clear any stale state at this slot from a previously-evicted
+        # owner. State slots are recycled by the scheduler's GDNStateManager;
+        # without this reset, short prompts (seqlen < ratio) that don't fire
+        # compression would inherit the previous seq's _compressed_counts and
+        # then read garbage compressed pages from the pool.
+        if (
+            seq_key is not None
+            and self._compressed_counts is not None
+            and 0 <= seq_key < self._max_slots
+        ):
+            self._compressed_counts[seq_key] = 0
+            self._kv_states[seq_key].zero_()
+            self._score_states[seq_key].fill_(float("-inf"))
+        # Dict-based fallback path: also clear any stale dict entries.
+        if seq_key is not None:
+            self._compressed_cache.pop(seq_key, None)
+            self._states.pop(seq_key, None)
         kv_state = torch.zeros(
             coeff * ratio,
             coeff * self.head_dim,
@@ -568,6 +609,9 @@ class DeepseekV4Compressor(nn.Module):
         rotary_emb: nn.Module,
         seq_slots: torch.Tensor,  # [bs] int64 - slot index in _kv_states
         compressed_cache: torch.Tensor | None,
+        compressed_block_table: (
+            torch.Tensor | None
+        ) = None,  # [num_seqs_active, max_blocks] int32 (paged)
     ) -> None:
         """CUDAGraph-safe batched compressor decode.
 
@@ -657,12 +701,23 @@ class DeepseekV4Compressor(nn.Module):
             num_pages = compressed_cache.shape[0]
             page_size = compressed_cache.shape[1]
             total_slots = num_pages * page_size  # token-level slots
-            # Valid token slots exclude the dummy page (last page)
-            valid_slots = (num_pages - 1) * page_size
-            max_compressed = valid_slots // self._max_slots
-            # Physical token slot = seq_slot * max_compressed + current_count
             cur_counts = self._compressed_counts[seq_slots.long()].long()
-            physical_slots = seq_slots.long() * max_compressed + cur_counts
+            if compressed_block_table is not None:
+                # Paged addressing: page_id = block_table[state_slot, block_idx]
+                # block_idx = count // page_size; tok_in_block = count % page_size
+                block_idx = (cur_counts // page_size).long()  # [bs]
+                tok_in_block = (cur_counts % page_size).long()  # [bs]
+                # Clamp block_idx into [0, max_blocks_per_seq) for graph-safe gather.
+                max_blocks = compressed_block_table.shape[1]
+                block_idx_safe = block_idx.clamp(max=max_blocks - 1)
+                # Gather page IDs: bt[seq_slot, block_idx_safe]
+                page_ids = compressed_block_table[seq_slots.long(), block_idx_safe]
+                physical_slots = page_ids.long() * page_size + tok_in_block
+            else:
+                # Backward-compat: contiguous-chunk addressing (legacy path).
+                valid_slots = (num_pages - 1) * page_size
+                max_compressed = valid_slots // self._max_slots
+                physical_slots = seq_slots.long() * max_compressed + cur_counts
             # Redirect invalid (not compressing) writes to last slot (in dummy page).
             dummy_slot = total_slots - 1
             physical_slots = torch.where(should_compress, physical_slots, dummy_slot)
@@ -1097,6 +1152,11 @@ class DeepseekV4Attention(nn.Module):
         else:
             state_slots_list = list(range(num_seqs))
 
+        # Block table for this layer's compression ratio (paged path).  None
+        # means use legacy contiguous-chunk addressing.
+        cbts = getattr(context, "dsv4_compressed_block_tables", None) or {}
+        comp_bt = cbts.get(self.compress_ratio) if self.compress_ratio else None
+
         if self.compress_ratio:
             for seq_idx in range(num_seqs):
                 qs = int(cu_seqlens_q[seq_idx].item())
@@ -1111,9 +1171,26 @@ class DeepseekV4Attention(nn.Module):
                 if compressed is not None and self.compressed_cache is not None:
                     n_compressed = compressed.shape[0]
                     page_size_c = self.compressed_cache.shape[1]
-                    valid_slots = (self.compressed_cache.shape[0] - 1) * page_size_c
-                    max_compressed = valid_slots // self.compressor._max_slots
-                    if seq_key < self.compressor._max_slots:
+                    if seq_key >= self.compressor._max_slots:
+                        continue  # invalid slot — skip write
+                    if comp_bt is not None:
+                        # Paged: gather per-seq page IDs from the block table,
+                        # convert (token_idx) → (page_id, tok_in_page).
+                        max_blocks = comp_bt.shape[1]
+                        page_ids_for_seq = comp_bt[seq_key]  # [max_blocks] int32
+                        tok_idx = torch.arange(
+                            n_compressed, dtype=torch.int64, device=kv.device
+                        )
+                        block_idx = (tok_idx // page_size_c).clamp(max=max_blocks - 1)
+                        tok_in_block = tok_idx % page_size_c
+                        slots = (
+                            page_ids_for_seq[block_idx].long() * page_size_c
+                            + tok_in_block
+                        ).to(torch.int32)
+                    else:
+                        # Backward-compat: contiguous chunk per seq.
+                        valid_slots = (self.compressed_cache.shape[0] - 1) * page_size_c
+                        max_compressed = valid_slots // self.compressor._max_slots
                         base_slot = seq_key * max_compressed
                         slots = torch.arange(
                             base_slot,
@@ -1121,9 +1198,9 @@ class DeepseekV4Attention(nn.Module):
                             dtype=torch.int32,
                             device=kv.device,
                         )
-                        _store_dsv4_fp8_batched(
-                            compressed, self.compressed_cache, slots, page_size_c
-                        )
+                    _store_dsv4_fp8_batched(
+                        compressed, self.compressed_cache, slots, page_size_c
+                    )
 
         # 3. Build per-Q-token SWA indices via vectorized tensor ops
         device = q.device
@@ -1168,33 +1245,53 @@ class DeepseekV4Attention(nn.Module):
         extra_indices = None
         extra_topk_lengths = None
         if self.compress_ratio and self.compressed_cache is not None:
-            # Token-level slot count (exclude dummy page)
             page_size_c = self.compressed_cache.shape[1]
-            valid_slots = (self.compressed_cache.shape[0] - 1) * page_size_c
-            max_compressed = valid_slots // self.compressor._max_slots
-            extra_topk = ((max_compressed + 63) // 64) * 64
 
-            # Per-Q-token state slot — matches the seq_key used during
-            # compressor.forward_prefill above. Use scheduler-assigned slots
-            # when available, otherwise fall back to batch position.
+            cbts = getattr(context, "dsv4_compressed_block_tables", None) or {}
+            comp_bt = cbts.get(self.compress_ratio)
+
             if context.dsv4_state_slots is not None:
                 seq_slot_per_tok = context.dsv4_state_slots[:num_seqs][
                     seq_idx_per_tok
                 ]  # [total_q]
             else:
                 seq_slot_per_tok = seq_idx_per_tok
-            # Visible compressed blocks for Q token at ctx_pos: (ctx_pos+1)//ratio
+            # Visible compressed blocks (token count) for Q token at ctx_pos:
             visible_blocks = (ctx_pos + 1) // self.compress_ratio  # [total_q]
 
-            base = seq_slot_per_tok * max_compressed  # [total_q]
-            tok_range_c = torch.arange(
-                extra_topk, device=device, dtype=torch.int64
-            ).unsqueeze(0)
-            idx = base.unsqueeze(1) + tok_range_c  # [total_q, extra_topk]
-            valid_c = tok_range_c < visible_blocks.unsqueeze(1)
-            extra_indices = torch.where(valid_c, idx, -1).to(torch.int32)
-            extra_indices = extra_indices.unsqueeze(1)  # [total_q, 1, extra_topk]
-            extra_topk_lengths = visible_blocks.to(torch.int32)
+            if comp_bt is not None:
+                # Paged addressing: gather block IDs from the per-seq table.
+                max_blocks = comp_bt.shape[1]
+                max_compressed = max_blocks * page_size_c
+                extra_topk = ((max_compressed + 63) // 64) * 64
+                tok_range_c = torch.arange(extra_topk, device=device, dtype=torch.int64)
+                block_idx = tok_range_c // page_size_c
+                tok_in_block = tok_range_c % page_size_c
+                block_idx_safe = block_idx.clamp(max=max_blocks - 1)
+                # comp_bt: [num_seqs_active, max_blocks]; we have per-tok seq_slot.
+                page_ids = comp_bt[
+                    seq_slot_per_tok.long().unsqueeze(1),
+                    block_idx_safe.unsqueeze(0),
+                ]
+                physical = page_ids.long() * page_size_c + tok_in_block.unsqueeze(0)
+                valid_c = tok_range_c.unsqueeze(0) < visible_blocks.unsqueeze(1)
+                extra_indices = torch.where(valid_c, physical, -1).to(torch.int32)
+                extra_indices = extra_indices.unsqueeze(1)  # [total_q, 1, extra_topk]
+                extra_topk_lengths = visible_blocks.to(torch.int32)
+            else:
+                # Backward-compat: contiguous-chunk addressing.
+                valid_slots = (self.compressed_cache.shape[0] - 1) * page_size_c
+                max_compressed = valid_slots // self.compressor._max_slots
+                extra_topk = ((max_compressed + 63) // 64) * 64
+                base = seq_slot_per_tok * max_compressed
+                tok_range_c = torch.arange(
+                    extra_topk, device=device, dtype=torch.int64
+                ).unsqueeze(0)
+                idx = base.unsqueeze(1) + tok_range_c
+                valid_c = tok_range_c < visible_blocks.unsqueeze(1)
+                extra_indices = torch.where(valid_c, idx, -1).to(torch.int32)
+                extra_indices = extra_indices.unsqueeze(1)
+                extra_topk_lengths = visible_blocks.to(torch.int32)
             extra_k_cache = self.compressed_cache
 
         # 5. Single flash_mla call: bs=total_q, seq_len_q=1
@@ -1257,12 +1354,18 @@ class DeepseekV4Attention(nn.Module):
             else:
                 seq_slots = torch.arange(bs, dtype=torch.int64, device=q.device)
             positions_per_seq = positions[::ntps]  # [bs]
+            # Block table for this layer's ratio (paged compressed cache).
+            # None → forward_decode_batched falls back to legacy contiguous-chunk
+            # addressing (kept for warmup / pre-Stage-3 compatibility).
+            cbts = getattr(context, "dsv4_compressed_block_tables", None) or {}
+            comp_bt = cbts.get(self.compress_ratio)
             self.compressor.forward_decode_batched(
                 hidden_states[::ntps],
                 positions_per_seq,
                 self.rotary_emb,
                 seq_slots,
                 self.compressed_cache,
+                compressed_block_table=comp_bt,
             )
 
         # 3. Build SWA indices [bs, ntps, swa_topk] — vectorized, no per-seq loop
@@ -1303,34 +1406,63 @@ class DeepseekV4Attention(nn.Module):
         if self.compress_ratio and self.compressed_cache is not None:
             # compressed_cache: [num_pages+1, page_size, 1, 584]; last page is dummy
             page_size_c = self.compressed_cache.shape[1]
-            valid_slots = (self.compressed_cache.shape[0] - 1) * page_size_c
-            max_compressed = valid_slots // self.compressor._max_slots
-            extra_topk = ((max_compressed + 63) // 64) * 64  # align to 64
+
+            cbts = getattr(context, "dsv4_compressed_block_tables", None) or {}
+            comp_bt = cbts.get(self.compress_ratio)
 
             # Use scheduler-assigned state slots (stable per-seq identity).
-            # Falls back to arange(bs) when dsv4_state_slots unavailable.
             if context.dsv4_state_slots is not None:
                 seq_slots = context.dsv4_state_slots[:bs]
             else:
                 seq_slots = torch.arange(bs, dtype=torch.int64, device=q.device)
-            # Clamp compressed counts to extra_topk — the kernel reads at most
-            # topk_length indices from the extra_indices array which is sized
-            # extra_topk; exceeding this causes out-of-bounds reads.
-            extra_topk_lengths = self.compressor._compressed_counts[seq_slots].clamp(
-                max=extra_topk
-            )
 
-            # Build indices: base[b] = seq_slot[b] * max_compressed + arange
-            tok_range = torch.arange(
-                extra_topk, device=q.device, dtype=torch.int32
-            ).unsqueeze(
-                0
-            )  # [1, extra_topk]
-            base_offsets = (seq_slots.to(torch.int32) * max_compressed).unsqueeze(1)
-            extra_indices = base_offsets + tok_range  # [bs, extra_topk]
-            valid_mask = tok_range < extra_topk_lengths.unsqueeze(1)
-            extra_indices = torch.where(valid_mask, extra_indices, -1).to(torch.int32)
-            extra_indices = extra_indices.unsqueeze(1)  # [bs, 1, extra_topk]
+            if comp_bt is not None:
+                # Paged addressing: extra_topk = max_blocks_per_seq * page_size_c
+                # capped at compressor's _compressed_counts (with kernel 64-align).
+                max_blocks = comp_bt.shape[1]
+                max_compressed = max_blocks * page_size_c
+                extra_topk = ((max_compressed + 63) // 64) * 64
+                # Clamp lengths to extra_topk (kernel reads first `length` indices)
+                extra_topk_lengths = self.compressor._compressed_counts[
+                    seq_slots
+                ].clamp(max=extra_topk)
+                # For each (b, t in [0, extra_topk)):
+                #   block_idx = t // page_size_c
+                #   tok_in_block = t % page_size_c
+                #   page_id = comp_bt[seq_slots[b], block_idx]
+                #   physical = page_id * page_size_c + tok_in_block
+                tok_range = torch.arange(extra_topk, device=q.device, dtype=torch.int32)
+                block_idx = (tok_range // page_size_c).long()  # [extra_topk]
+                tok_in_block = (tok_range % page_size_c).long()  # [extra_topk]
+                # Clamp block_idx for graph-safe gather (out-of-range entries
+                # will be masked to -1 by valid_mask below).
+                block_idx_safe = block_idx.clamp(max=max_blocks - 1)
+                # Gather page IDs: [bs, extra_topk]
+                page_ids = comp_bt[
+                    seq_slots.long().unsqueeze(1), block_idx_safe.unsqueeze(0)
+                ]
+                physical = page_ids.long() * page_size_c + tok_in_block.unsqueeze(0)
+                valid_mask = tok_range.unsqueeze(0) < extra_topk_lengths.unsqueeze(1)
+                extra_indices = torch.where(valid_mask, physical, -1).to(torch.int32)
+                extra_indices = extra_indices.unsqueeze(1)  # [bs, 1, extra_topk]
+            else:
+                # Backward-compat: contiguous-chunk addressing (legacy path).
+                valid_slots = (self.compressed_cache.shape[0] - 1) * page_size_c
+                max_compressed = valid_slots // self.compressor._max_slots
+                extra_topk = ((max_compressed + 63) // 64) * 64
+                extra_topk_lengths = self.compressor._compressed_counts[
+                    seq_slots
+                ].clamp(max=extra_topk)
+                tok_range = torch.arange(
+                    extra_topk, device=q.device, dtype=torch.int32
+                ).unsqueeze(0)
+                base_offsets = (seq_slots.to(torch.int32) * max_compressed).unsqueeze(1)
+                extra_indices = base_offsets + tok_range
+                valid_mask = tok_range < extra_topk_lengths.unsqueeze(1)
+                extra_indices = torch.where(valid_mask, extra_indices, -1).to(
+                    torch.int32
+                )
+                extra_indices = extra_indices.unsqueeze(1)
             extra_k_cache = self.compressed_cache
 
         # 5. Get or create per-layer FlashMLASchedMeta

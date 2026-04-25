@@ -17,6 +17,7 @@ Usage:
 """
 
 import os
+import sys
 
 import numpy as np
 import ray
@@ -46,12 +47,26 @@ def main():
     parser.add_argument("--prompt", type=str, default="What is 1+1?")
     parser.add_argument("--max_tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--dsv4_encoding_dir",
+        type=str,
+        default=None,
+        help="Path to encoding_dsv4.py (DSv4 model has no chat_template).",
+    )
 
     args = parser.parse_args()
     defaults = parser.get_defaults()
 
     # Build common config dict (excluding non-Config fields)
-    extra_keys = {"config", "prompt", "max_tokens", "temperature", "prefill", "decode"}
+    extra_keys = {
+        "config",
+        "prompt",
+        "max_tokens",
+        "temperature",
+        "prefill",
+        "decode",
+        "dsv4_encoding_dir",
+    }
     common = {k: v for k, v in vars(args).items() if k not in extra_keys}
 
     def build_config(ns, default_ns, mode: str) -> Config:
@@ -80,15 +95,35 @@ def main():
     sampling_params = SamplingParams(
         temperature=args.temperature, max_tokens=args.max_tokens, ignore_eos=False
     )
+
+    # DSv4-FP8-SGlang has no chat_template — fall back to the optional
+    # encoding_dsv4 script when --dsv4_encoding_dir is provided.
+    dsv4_encode_messages = None
+    if args.dsv4_encoding_dir:
+        sys.path.insert(0, os.path.abspath(args.dsv4_encoding_dir))
+        from encoding_dsv4 import (  # type: ignore
+            encode_messages as dsv4_encode_messages,
+        )
+
+    def encode_prompt(prompt: str) -> list[int]:
+        if dsv4_encode_messages is not None:
+            text = dsv4_encode_messages(
+                [{"role": "user", "content": prompt}],
+                thinking_mode="chat",
+            )
+        elif getattr(tokenizer, "chat_template", None):
+            text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            text = prompt
+        return tokenizer.encode(text)
+
     seqs = [
         Sequence(
-            tokenizer.encode(
-                tokenizer.apply_chat_template(
-                    [{"role": "user", "content": args.prompt}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            ),
+            encode_prompt(args.prompt),
             sampling_params=sampling_params,
         )
     ]

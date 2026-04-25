@@ -145,6 +145,24 @@ flatbuffers::DetachedBuffer serialize_migrate_batch(const std::vector<Sequence*>
         }
         auto active_bl_vec = builder.CreateVectorOfStructs(active_bl);
 
+        // DSv4: pack per-ratio compressed block tables for both MIGRATE and
+        // ACTIVE slots so the decode engine can RDMA the right remote pages.
+        auto pack_cbts = [&](const std::vector<std::unique_ptr<fbs::CompressedBlockTableT>>& cbts) {
+            std::vector<flatbuffers::Offset<fbs::CompressedBlockTableI>> offs;
+            offs.reserve(cbts.size());
+            for (const auto& cbt : cbts) {
+                if (!cbt)
+                    continue;
+                auto ids_vec = builder.CreateVector(cbt->block_ids);
+                offs.push_back(fbs::CreateCompressedBlockTableI(builder, cbt->ratio, ids_vec));
+            }
+            return offs.empty() ?
+                       flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<fbs::CompressedBlockTableI>>>(0) :
+                       builder.CreateVector(offs);
+        };
+        auto migrate_cbt_off = pack_cbts(migrate_ctx.compressed_block_tables);
+        auto active_cbt_off  = pack_cbts(active_ctx.compressed_block_tables);
+
         fbs::MigrateSequenceInputBuilder msi_builder(builder);
         msi_builder.add_seq_id(seq->seq_id());
         msi_builder.add_migrate_engine_id(engine_id_off);
@@ -153,8 +171,12 @@ flatbuffers::DetachedBuffer serialize_migrate_batch(const std::vector<Sequence*>
         msi_builder.add_migrate_dp_idx(migrate_ctx.dp_idx);
         msi_builder.add_migrate_block_location(migrate_bl_vec);
         msi_builder.add_migrate_state_slot(migrate_ctx.state_slot);
+        if (migrate_cbt_off.o != 0)
+            msi_builder.add_migrate_compressed_block_tables(migrate_cbt_off);
         msi_builder.add_active_block_location(active_bl_vec);
         msi_builder.add_active_state_slot(active_ctx.state_slot);
+        if (active_cbt_off.o != 0)
+            msi_builder.add_active_compressed_block_tables(active_cbt_off);
 
         seq_offsets.push_back(msi_builder.Finish());
     }

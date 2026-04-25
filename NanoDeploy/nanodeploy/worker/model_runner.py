@@ -351,6 +351,14 @@ class ModelRunner:
             pool_pages_per_ratio=pool_pages_per_ratio,
         )
 
+        # S2.2: allocate flat compressor scratch state (per ratio, all layers).
+        # Layers will use views into these buffers for RDMA-friendly migration.
+        cache_context.allocate_dsv4_compressor_state(
+            compress_ratios=compress_ratios,
+            head_dim=512,  # DSv4 fixed head dim
+            max_num_seqs=self.config.max_num_seqs,
+        )
+
         # Wire compressed caches to layers and initialize tensorized compressor state
         layer_id = 0
         for module in self.model.modules():
@@ -361,11 +369,33 @@ class ModelRunner:
                     ]
                 else:
                     module.compressed_cache = None
-                # Initialize tensorized compressor state
+                # Initialize tensorized compressor state — pass views into the
+                # per-ratio flat tensors when available.
                 if hasattr(module, "compressor") and module.compress_ratio > 0:
+                    ratio = module.compress_ratio
+                    ratio_layer_idx = cache_context.dsv4_layer_to_ratio_idx.get(
+                        layer_id
+                    )
+                    kv_view = score_view = counts_view = None
+                    if (
+                        ratio_layer_idx is not None
+                        and ratio in cache_context.dsv4_compressor_kv_flat
+                    ):
+                        kv_view = cache_context.dsv4_compressor_kv_flat[ratio][
+                            ratio_layer_idx
+                        ]
+                        score_view = cache_context.dsv4_compressor_score_flat[ratio][
+                            ratio_layer_idx
+                        ]
+                        counts_view = cache_context.dsv4_compressor_counts_flat[ratio][
+                            ratio_layer_idx
+                        ]
                     module.compressor.init_tensorized_state(
                         max_slots=self.config.max_num_seqs,
                         device=cache_context.device,
+                        kv_view=kv_view,
+                        score_view=score_view,
+                        counts_view=counts_view,
                     )
                 layer_id += 1
 

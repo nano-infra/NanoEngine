@@ -573,6 +573,24 @@ std::vector<MigrateSequenceView> parse_migrate_batch(const uint8_t* data, size_t
             }
         }
 
+        // DSv4 (S2.6): unpack per-ratio compressed block tables on both sides.
+        auto unpack_cbts = [](const flatbuffers::Vector<flatbuffers::Offset<fbs::CompressedBlockTableI>>* cbts,
+                              std::unordered_map<int, std::vector<int>>&                                  out) {
+            if (!cbts)
+                return;
+            for (size_t k = 0; k < cbts->size(); ++k) {
+                auto* cbt = cbts->Get(k);
+                if (!cbt)
+                    continue;
+                std::vector<int>& dst = out[cbt->ratio()];
+                if (auto* ids = cbt->block_ids()) {
+                    dst.assign(ids->begin(), ids->end());
+                }
+            }
+        };
+        unpack_cbts(msi->migrate_compressed_block_tables(), v.migrate_compressed_block_tables);
+        unpack_cbts(msi->active_compressed_block_tables(), v.active_compressed_block_tables);
+
         views.push_back(std::move(v));
     }
     return views;

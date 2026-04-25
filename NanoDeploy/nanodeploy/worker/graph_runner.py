@@ -80,6 +80,25 @@ class DecodeGraphRunner:
                 (max_bs,), self._dummy_dsv4_slot, dtype=torch.int64
             )
 
+        # DSv4 compressed-cache block tables (per ratio).  Persistent buffers
+        # indexed by state_slot (matches dsv4_state_slots' addressing) — shape
+        # [max_bs+1, max_blocks_per_seq], with row max_bs reserved as the dummy.
+        # Filled with dummy_page; per-replay copy_() overwrites with InputPreparer's
+        # state-slot-indexed table (also [max_bs+1, max_blocks]).
+        self._dsv4_compressed_block_tables: dict[int, torch.Tensor] = {}
+        self._dsv4_compressed_dummy_pages: dict[int, int] = {}
+        if is_dsv4:
+            pool_cfg = getattr(cache_ctx, "dsv4_compressed_pool_config", {}) or {}
+            dummies = getattr(cache_ctx, "dsv4_compressed_dummy_page", {}) or {}
+            for ratio, (num_pages, _page_size, max_blocks) in pool_cfg.items():
+                if max_blocks <= 0:
+                    continue
+                dummy_page = dummies.get(ratio, num_pages)
+                self._dsv4_compressed_dummy_pages[ratio] = dummy_page
+                self._dsv4_compressed_block_tables[ratio] = torch.full(
+                    (max_bs + 1, max_blocks), dummy_page, dtype=torch.int32
+                )
+
         self._is_mla = is_mla
         self._is_dsv4 = is_dsv4
         self._max_num_seqs = config.max_num_seqs
@@ -147,6 +166,13 @@ class DecodeGraphRunner:
                 dsv4_state_slots=(
                     self._dsv4_state_slots[:master_bs]
                     if self._dsv4_state_slots is not None
+                    else None
+                ),
+                # Pass FULL [max_bs+1, max_blocks] table — indexed by state_slot
+                # (which can be up to max_bs = max_num_seqs for the dummy).
+                dsv4_compressed_block_tables=(
+                    dict(self._dsv4_compressed_block_tables)
+                    if self._dsv4_compressed_block_tables
                     else None
                 ),
             )
@@ -242,6 +268,17 @@ class DecodeGraphRunner:
             self._dsv4_state_slots.fill_(self._dummy_dsv4_slot)
             if context.dsv4_state_slots is not None:
                 self._dsv4_state_slots[:bs].copy_(context.dsv4_state_slots)
+
+        if self._dsv4_compressed_block_tables:
+            for ratio, persistent in self._dsv4_compressed_block_tables.items():
+                persistent.fill_(self._dsv4_compressed_dummy_pages[ratio])
+                src = (context.dsv4_compressed_block_tables or {}).get(ratio)
+                if src is not None:
+                    # Source is also [max_bs+1, max_blocks] (state-slot indexed).
+                    # Both shapes match so we can copy directly. If they differ
+                    # (e.g., src is shorter), copy the available prefix.
+                    n = min(src.shape[0], persistent.shape[0])
+                    persistent[:n].copy_(src[:n])
 
         self._graphs[(master_bs, attn_bs)].replay()
         return self._outputs[:bs]

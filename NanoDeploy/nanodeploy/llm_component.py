@@ -104,7 +104,36 @@ class LLMComponent(LLM):
             "peer_addrs": peer_addrs,
             "p2p_host": zmq_host,
             "p2p_port": self.p2p_port if self.p2p_port else 0,
+            "max_num_seqs": self.config.max_num_seqs,
         }
+
+        # DSv4 (S2.5): publish per-ratio compressed pool sizes so peer engines
+        # can compute remote strides for RDMA migration.
+        is_dsv4 = self.config.hf_config.architectures[0] == "DeepseekV4ForCausalLM"
+        if is_dsv4:
+            compress_ratios = (
+                getattr(self.config.hf_config, "compress_ratios", None) or []
+            )
+            unique_ratios = sorted({r for r in compress_ratios if r > 0})
+            page_size = 2  # matches CacheContext.allocate_dsv4_compressed_caches
+            pool_pages = {}
+            num_layers_per_ratio = {}
+            for ratio in unique_ratios:
+                max_compressed = (self.config.max_model_len // ratio + 63) // 64 * 64
+                max_blocks = (max_compressed + page_size - 1) // page_size
+                worst = self.config.max_num_seqs * max_blocks
+                override = 0
+                if ratio == 4:
+                    override = self.config.dsv4_compressed_pool_pages_ratio4
+                elif ratio == 128:
+                    override = self.config.dsv4_compressed_pool_pages_ratio128
+                pool_pages[ratio] = override if override > 0 else worst
+                num_layers_per_ratio[ratio] = sum(
+                    1 for r in compress_ratios if r == ratio
+                )
+            engine_info["dsv4_compressed_pool_pages"] = pool_pages
+            engine_info["dsv4_max_slots"] = self.config.max_num_seqs
+            engine_info["dsv4_num_layers_per_ratio"] = num_layers_per_ratio
 
         return json.dumps(engine_info)
 

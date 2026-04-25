@@ -60,7 +60,9 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("migrate_block_location", &MigrateSequenceView::migrate_block_location)
         .def_readonly("migrate_state_slot", &MigrateSequenceView::migrate_state_slot)
         .def_readonly("active_block_location", &MigrateSequenceView::active_block_location)
-        .def_readonly("active_state_slot", &MigrateSequenceView::active_state_slot);
+        .def_readonly("active_state_slot", &MigrateSequenceView::active_state_slot)
+        .def_readonly("migrate_compressed_block_tables", &MigrateSequenceView::migrate_compressed_block_tables)
+        .def_readonly("active_compressed_block_tables", &MigrateSequenceView::active_compressed_block_tables);
 
     py::class_<VisionSlotView>(m, "VisionSlotView")
         .def_readonly("encoder_engine_id", &VisionSlotView::encoder_engine_id)
