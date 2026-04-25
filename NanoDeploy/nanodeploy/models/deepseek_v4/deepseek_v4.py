@@ -367,25 +367,32 @@ class DeepseekV4Compressor(nn.Module):
         self._compressed_cache: dict[int, torch.Tensor] = {}
 
     def init_tensorized_state(self, max_slots: int, device: torch.device):
-        """Pre-allocate tensorized state buffers for CUDAGraph-safe decode."""
+        """Pre-allocate tensorized state buffers for CUDAGraph-safe decode.
+
+        Buffer has ``max_slots + 1`` rows — the extra row at index ``max_slots``
+        is a "dummy" slot. Batch positions with no valid state (e.g., during
+        CUDAGraph warmup where slots are unassigned) are routed to the dummy
+        so scatter writes never land in real state.
+        """
         coeff = 2 if self.overlap else 1
         ratio = self.compress_ratio
         self._max_slots = max_slots
+        num_rows = max_slots + 1  # +1 dummy
         self._kv_states = torch.zeros(
-            max_slots,
+            num_rows,
             coeff * ratio,
             coeff * self.head_dim,
             dtype=torch.float32,
             device=device,
         )
         self._score_states = torch.full(
-            (max_slots, coeff * ratio, coeff * self.head_dim),
+            (num_rows, coeff * ratio, coeff * self.head_dim),
             float("-inf"),
             dtype=torch.float32,
             device=device,
         )
         self._compressed_counts = torch.zeros(
-            max_slots,
+            num_rows,
             dtype=torch.int32,
             device=device,
         )
@@ -1083,12 +1090,18 @@ class DeepseekV4Attention(nn.Module):
         num_seqs = cu_seqlens_q.shape[0] - 1
         block_tables = context.block_tables[0]  # [num_seqs, max_blocks]
 
+        # Pull scheduler-assigned state slots into a Python list for per-seq lookup.
+        # Falls back to batch position when unavailable (warmup / legacy path).
+        if context.dsv4_state_slots is not None:
+            state_slots_list = context.dsv4_state_slots[:num_seqs].tolist()
+        else:
+            state_slots_list = list(range(num_seqs))
+
         if self.compress_ratio:
             for seq_idx in range(num_seqs):
                 qs = int(cu_seqlens_q[seq_idx].item())
                 qe = int(cu_seqlens_q[seq_idx + 1].item())
-                # Use batch position as the state slot (matches decode path)
-                seq_key = seq_idx
+                seq_key = state_slots_list[seq_idx]
                 compressed = self.compressor.forward_prefill(
                     hidden_states[qs:qe],
                     positions[qs:qe],
@@ -1161,9 +1174,15 @@ class DeepseekV4Attention(nn.Module):
             max_compressed = valid_slots // self.compressor._max_slots
             extra_topk = ((max_compressed + 63) // 64) * 64
 
-            # Batch position (seq_idx) as the state slot — matches the
-            # per-seq seq_key used during compressor.forward_prefill above.
-            seq_slot_per_tok = seq_idx_per_tok  # [total_q]
+            # Per-Q-token state slot — matches the seq_key used during
+            # compressor.forward_prefill above. Use scheduler-assigned slots
+            # when available, otherwise fall back to batch position.
+            if context.dsv4_state_slots is not None:
+                seq_slot_per_tok = context.dsv4_state_slots[:num_seqs][
+                    seq_idx_per_tok
+                ]  # [total_q]
+            else:
+                seq_slot_per_tok = seq_idx_per_tok
             # Visible compressed blocks for Q token at ctx_pos: (ctx_pos+1)//ratio
             visible_blocks = (ctx_pos + 1) // self.compress_ratio  # [total_q]
 
@@ -1228,13 +1247,15 @@ class DeepseekV4Attention(nn.Module):
         kv_2d = kv.squeeze(1)  # [T, 512]
         _store_dsv4_fp8_batched(kv_2d, self.swa_cache, context.slot_mapping, page_size)
 
-        # 2. Run compressor update — fully batched, CUDAGraph-safe
+        # 2. Run compressor update — fully batched, CUDAGraph-safe.
+        # Use scheduler-assigned state_slots (stable per-sequence identity
+        # across decode steps). Falls back to arange(bs) when slots are not
+        # provided (e.g., during warmup before scheduler populates them).
         if self.compress_ratio and ntps == 1:
-            # Use batch position (0..bs-1) as slot. Stable within a batch and
-            # fits the pre-allocated max_num_seqs-sized compressor buffers.
-            # (Physical block IDs grow with context length and would overflow
-            # the _kv_states buffer.)
-            seq_slots = torch.arange(bs, dtype=torch.int64, device=q.device)
+            if context.dsv4_state_slots is not None:
+                seq_slots = context.dsv4_state_slots[:bs]
+            else:
+                seq_slots = torch.arange(bs, dtype=torch.int64, device=q.device)
             positions_per_seq = positions[::ntps]  # [bs]
             self.compressor.forward_decode_batched(
                 hidden_states[::ntps],
@@ -1286,9 +1307,12 @@ class DeepseekV4Attention(nn.Module):
             max_compressed = valid_slots // self.compressor._max_slots
             extra_topk = ((max_compressed + 63) // 64) * 64  # align to 64
 
-            # Use batch position (matches the compressor's seq_slots for state
-            # addressing consistency).
-            seq_slots = torch.arange(bs, dtype=torch.int64, device=q.device)
+            # Use scheduler-assigned state slots (stable per-seq identity).
+            # Falls back to arange(bs) when dsv4_state_slots unavailable.
+            if context.dsv4_state_slots is not None:
+                seq_slots = context.dsv4_state_slots[:bs]
+            else:
+                seq_slots = torch.arange(bs, dtype=torch.int64, device=q.device)
             # Clamp compressed counts to extra_topk — the kernel reads at most
             # topk_length indices from the extra_indices array which is sized
             # extra_topk; exceeding this causes out-of-bounds reads.

@@ -87,6 +87,21 @@ class InputPreparer:
                 pin_memory=True,
             ).cuda(non_blocking=True)
 
+        # DSv4 compressor state slots — share the same aux.state_slots source
+        # as GDN (the scheduler's GDNStateManager is model-agnostic).
+        dsv4_state_slots = None
+        if cache_ctx.mode == "dsv4":
+            # Dummy slot at index max_num_seqs (compressor buffer has max+1 slots)
+            dummy_dsv4_slot = self.config.max_num_seqs
+            dsv4_state_slots = torch.tensor(
+                [
+                    s if 0 <= s < dummy_dsv4_slot else dummy_dsv4_slot
+                    for s in aux.state_slots
+                ],
+                dtype=torch.int64,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+
         # Chunked prefill: selective lm_head — only compute logits for final-chunk seqs.
         sampling_token_indices = None
         sampling_seq_indices = None
@@ -112,6 +127,7 @@ class InputPreparer:
             gdn_conv_states=cache_ctx.gdn_conv_states,
             gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
             gdn_state_slots=gdn_state_slots,
+            dsv4_state_slots=dsv4_state_slots,
             sampling_token_indices=sampling_token_indices,
             sampling_seq_indices=sampling_seq_indices,
         )
@@ -192,6 +208,19 @@ class InputPreparer:
                 pin_memory=True,
             ).cuda(non_blocking=True)
 
+        # DSv4 compressor state slots
+        dsv4_state_slots = None
+        if cache_ctx.mode == "dsv4":
+            dummy_dsv4_slot = self.config.max_num_seqs
+            dsv4_state_slots = torch.tensor(
+                [
+                    s if 0 <= s < dummy_dsv4_slot else dummy_dsv4_slot
+                    for s in aux.state_slots
+                ],
+                dtype=torch.int64,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+
         set_context(
             is_prefill=False,
             max_bs=self.config.max_num_seqs,
@@ -203,6 +232,7 @@ class InputPreparer:
             gdn_conv_states=cache_ctx.gdn_conv_states,
             gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
             gdn_state_slots=gdn_state_slots,
+            dsv4_state_slots=dsv4_state_slots,
         )
 
         return input_ids, positions

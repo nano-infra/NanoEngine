@@ -70,6 +70,16 @@ class DecodeGraphRunner:
                 (max_bs,), self._dummy_gdn_slot, dtype=torch.int64
             )
 
+        # DSv4 compressor state slots (parallel to gdn_state_slots)
+        self._dsv4_state_slots = None
+        self._dummy_dsv4_slot = None
+        if is_dsv4:
+            # Dummy slot = max_num_seqs (compressor buffer has max+1 slots).
+            self._dummy_dsv4_slot = config.max_num_seqs
+            self._dsv4_state_slots = torch.full(
+                (max_bs,), self._dummy_dsv4_slot, dtype=torch.int64
+            )
+
         self._is_mla = is_mla
         self._is_dsv4 = is_dsv4
         self._max_num_seqs = config.max_num_seqs
@@ -132,6 +142,11 @@ class DecodeGraphRunner:
                 gdn_state_slots=(
                     self._gdn_state_slots[:master_bs]
                     if self._gdn_state_slots is not None
+                    else None
+                ),
+                dsv4_state_slots=(
+                    self._dsv4_state_slots[:master_bs]
+                    if self._dsv4_state_slots is not None
                     else None
                 ),
             )
@@ -222,6 +237,11 @@ class DecodeGraphRunner:
             self._gdn_state_slots.fill_(self._dummy_gdn_slot)
             if context.gdn_state_slots is not None:
                 self._gdn_state_slots[:bs].copy_(context.gdn_state_slots)
+
+        if self._dsv4_state_slots is not None:
+            self._dsv4_state_slots.fill_(self._dummy_dsv4_slot)
+            if context.dsv4_state_slots is not None:
+                self._dsv4_state_slots[:bs].copy_(context.dsv4_state_slots)
 
         self._graphs[(master_bs, attn_bs)].replay()
         return self._outputs[:bs]
