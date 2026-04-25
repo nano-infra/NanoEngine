@@ -40,6 +40,7 @@ class DecodeGraphRunner:
         block_size = cache_ctx.block_size
         max_num_blocks = (config.max_model_len + block_size - 1) // block_size
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
+        is_dsv4 = hf_config.architectures[0] == "DeepseekV4ForCausalLM"
 
         # Persistent input / output buffers
         self._input_ids = torch.zeros(max_bs, dtype=torch.int64)
@@ -50,7 +51,7 @@ class DecodeGraphRunner:
         self._outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
         # MLA-specific: per-BS FlashMLASchedMeta created during capture
-        if is_mla:
+        if is_mla or is_dsv4:
             import flash_mla
 
             self._flash_mla = flash_mla
@@ -70,6 +71,7 @@ class DecodeGraphRunner:
             )
 
         self._is_mla = is_mla
+        self._is_dsv4 = is_dsv4
         self._max_num_seqs = config.max_num_seqs
 
         self._bs_list = _make_bs_list(max_bs)
@@ -107,7 +109,7 @@ class DecodeGraphRunner:
             # Each BS gets its own FlashMLASchedMeta (kernel validates batch size)
             sched_meta = None
             sparse_sched_meta = None
-            if self._is_mla:
+            if self._is_mla or self._is_dsv4:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[master_bs] = sched_meta
             if self._has_indexer:
@@ -144,10 +146,22 @@ class DecodeGraphRunner:
             # graph.  dense_decode_fwd only launches it when the metadata
             # tensor is None; after warmup it is non-None, so without this
             # reset the graph would replay with stale scheduling data.
-            if self._is_mla:
+            if self._is_mla or self._is_dsv4:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[master_bs] = sched_meta
                 get_context().tile_scheduler_metadata = sched_meta
+            if self._is_dsv4:
+                # DSv4 uses per-layer sched_metas (mixed compress_ratio configs).
+                # Drop the warmup-initialized metas so the capture pass creates
+                # fresh ones — this ensures the scheduling kernel runs inside
+                # the graph rather than during eager warmup.
+                from nanodeploy.models.deepseek_v4.deepseek_v4 import (
+                    DeepseekV4Attention,
+                )
+
+                for m in model.modules():
+                    if isinstance(m, DeepseekV4Attention):
+                        m._dsv4_sched_metas.pop(master_bs, None)
             if self._has_indexer:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sparse_sched_metas[master_bs] = sparse_sched_meta

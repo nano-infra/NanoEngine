@@ -42,11 +42,16 @@ class CacheContext:
     gpu_memory_limit_gb: float | None = None
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
-    mode: Literal["gqa", "mla"] = "gqa"
+    mode: Literal["gqa", "mla", "dsv4"] = "gqa"
     num_local_kvcache_blocks = -1
     num_remote_kvcache_blocks: dict[str, int] = None
     kv_cache: torch.Tensor = None
     gdn_conv_states: torch.Tensor | None = None
+
+    # DSv4 compressed KV caches (per-layer, separate from SWA paged cache)
+    # Shape per layer: [max_num_seqs, max_compressed_tokens, 1, 584] uint8
+    dsv4_compressed_caches: dict[int, torch.Tensor] | None = None
+    dsv4_compress_ratios: list[int] | None = None  # per-layer compress ratios
     gdn_recurrent_states: torch.Tensor | None = None
     selected_nic: str | None = None
     endpoints: dict[str, dict[int, Any]] = None  # RDMAEndpoint or RDMALazyPeer
@@ -89,8 +94,16 @@ class CacheContext:
             assert self.block_size == 64, "MLA mode only support block_size=64"
             self.num_kv_heads = 1
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        elif self.mode == "dsv4":
+            assert self.attention_tp == 1
+            assert self.block_size % 64 == 0, "DSv4 block_size must be multiple of 64"
+            self.num_kv_heads = 1
+            self.head_dim = 512  # fixed for DSv4
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
+
+        # DSv4 FP8 packed format: 584 bytes per token
+        _DSV4_BYTES_PER_TOKEN = 584
 
         if self.mode == "mla" and self.is_fp8_kvcache:
             # FP8 MLA layout per token:
@@ -107,6 +120,13 @@ class CacheContext:
                 * 1  # num_kv_heads
                 * self._fp8_head_dim
                 * 1  # fp8 element size
+            )
+        elif self.mode == "dsv4":
+            self._fp8_head_dim = 0
+            # SWA paged cache: [num_layers, num_pages, page_size, 1, 584] uint8
+            # Each block = page_size * 584 bytes per layer
+            block_bytes = (
+                self.num_hidden_layers * self.block_size * _DSV4_BYTES_PER_TOKEN
             )
         else:
             self._fp8_head_dim = 0
@@ -304,6 +324,24 @@ class CacheContext:
                 device=self.device,
             )
             self.kv_cache = kv_cache_padded[:, :, :, : self.block_size, :, :]
+        elif self.mode == "dsv4":
+            _DSV4_BYTES_PER_TOKEN = 584
+            # SWA paged cache: [num_layers, num_pages+1, page_size, 1, 584] uint8
+            # Extra +1 page is a "dummy" absorbing invalid writes (graph-safe).
+            # flash_mla reads this via sparse indices (MODEL1 code path).
+            self.kv_cache = torch.zeros(
+                self.num_hidden_layers,
+                self.num_local_kvcache_blocks + 1,  # +1 dummy page
+                self.block_size,
+                1,  # num_kv_heads (always 1)
+                _DSV4_BYTES_PER_TOKEN,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            logger.info(
+                f"DSv4 SWA cache: {self.kv_cache.shape} (incl dummy page), "
+                f"{self.kv_cache.nelement() / 1e9:.2f} GB"
+            )
         else:
             kv_count = 2 if self.mode == "gqa" else 1
             self.kv_cache = torch.empty(
@@ -315,6 +353,53 @@ class CacheContext:
                 self.head_dim,
                 dtype=self.dtype,
                 device=self.device,
+            )
+
+    def allocate_dsv4_compressed_caches(
+        self, compress_ratios: list[int], max_num_seqs: int, max_model_len: int
+    ):
+        """Allocate per-layer compressed KV caches for DSv4.
+
+        Layers with compress_ratio > 0 get a pre-allocated flat buffer.
+        Shape per layer: [max_num_seqs, max_compressed_tokens, 1, 584] uint8
+        These are indexed by batch position (not managed by the block manager).
+        """
+        _DSV4_BYTES_PER_TOKEN = 584
+        self.dsv4_compress_ratios = compress_ratios
+        self.dsv4_compressed_caches = {}
+        total_bytes = 0
+        for layer_idx, ratio in enumerate(compress_ratios):
+            if ratio == 0:
+                continue
+            # Max compressed tokens per sequence, aligned to 64 for flash_mla
+            max_compressed = (max_model_len // ratio + 63) // 64 * 64
+            # Layout: [num_pages + 1, page_size=2, 1, 584] where
+            # page_size must be even so per-page stride (page_size * 584) is
+            # 16-byte aligned — flash_mla uses 128-bit vector loads on page
+            # base pointers. page_size=1 would give stride=584 (not aligned).
+            # total tokens = max_num_seqs * max_compressed
+            # Physical slot for (seq, tok) = seq * max_compressed + tok
+            # slot → page_idx = slot // 2, tok_in_page = slot % 2
+            # Extra +1 page = dummy slot for graph-safe invalid writes.
+            compressed_page_size = 2
+            total_tokens = max_num_seqs * max_compressed
+            num_pages = (
+                total_tokens + compressed_page_size - 1
+            ) // compressed_page_size
+            buf = torch.zeros(
+                num_pages + 1,  # +1 dummy page
+                compressed_page_size,
+                1,
+                _DSV4_BYTES_PER_TOKEN,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            self.dsv4_compressed_caches[layer_idx] = buf
+            total_bytes += buf.nelement()
+        if total_bytes > 0:
+            logger.info(
+                f"DSv4 compressed caches: {len(self.dsv4_compressed_caches)} layers, "
+                f"total {total_bytes / 1e9:.2f} GB"
             )
 
     def allocate_indexer_cache(self, hf_config):

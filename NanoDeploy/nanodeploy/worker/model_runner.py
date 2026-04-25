@@ -21,6 +21,7 @@ from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
 from nanodeploy.models.deepseek_v2.deepseek_v2_mtp import DeepSeekMTP
+from nanodeploy.models.deepseek_v4.deepseek_v4 import DeepseekV4ForCausalLM
 from nanodeploy.models.qwen3.qwen3 import Qwen3ForCausalLM
 from nanodeploy.models.qwen3_5_moe.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from nanodeploy.models.qwen3_5_moe.qwen3_5_moe_mtp import Qwen3_5MTP
@@ -40,6 +41,7 @@ architectures = {
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
     "DeepseekV32ForCausalLM": DeepseekV2ForCausalLM,
+    "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGeneration,
 }
 
@@ -52,7 +54,16 @@ architectures_mtp = {
 
 @ray.remote(num_cpus=0.1, num_gpus=1)
 class ModelRunner:
-    def __init__(self, config: Config, rank: int, defer_dist_init: bool = False):
+    def __init__(
+        self,
+        config: Config,
+        rank: int,
+        defer_dist_init: bool = False,
+        debug_env: dict[str, str] | None = None,
+    ):
+        if debug_env:
+            os.environ.update({key: str(value) for key, value in debug_env.items()})
+
         # Set log level
         if config.log_level:
             set_log_level(config.log_level)
@@ -261,20 +272,24 @@ class ModelRunner:
         self.config.num_kvcache_blocks = num_kvcache_blocks
         cache_context = get_cache_context()
         cache_context.allocate_kvcache(num_kvcache_blocks)
-        layer_id = 0
-        for module in self.model.modules():
-            allocated = False
-            if hasattr(module, "k_cache"):
-                module.k_cache = cache_context.kv_cache[0][layer_id]
-                allocated = True
-            if hasattr(module, "v_cache"):
-                if cache_context.kv_cache.size(0) > 1:
-                    module.v_cache = cache_context.kv_cache[1][layer_id]
-                else:
-                    module.v_cache = torch.tensor([], device=cache_context.device)
-                allocated = True
-            if allocated:
-                layer_id += 1
+
+        if cache_context.mode == "dsv4":
+            self._wire_dsv4_caches(cache_context)
+        else:
+            layer_id = 0
+            for module in self.model.modules():
+                allocated = False
+                if hasattr(module, "k_cache"):
+                    module.k_cache = cache_context.kv_cache[0][layer_id]
+                    allocated = True
+                if hasattr(module, "v_cache"):
+                    if cache_context.kv_cache.size(0) > 1:
+                        module.v_cache = cache_context.kv_cache[1][layer_id]
+                    else:
+                        module.v_cache = torch.tensor([], device=cache_context.device)
+                    allocated = True
+                if allocated:
+                    layer_id += 1
 
         # Allocate NSA indexer cache (V3.2 only)
         if cache_context.index_head_dim > 0:
@@ -294,6 +309,48 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(self.default_dtype)
         self.warmup_model()
+
+    def _wire_dsv4_caches(self, cache_context):
+        """Wire DSv4 FP8 paged SWA cache + compressed caches to attention layers."""
+        from nanodeploy.models.deepseek_v4.deepseek_v4 import DeepseekV4Attention
+
+        # Collect compress_ratios from model layers
+        compress_ratios = []
+        layer_id = 0
+        for module in self.model.modules():
+            if isinstance(module, DeepseekV4Attention):
+                compress_ratios.append(getattr(module, "compress_ratio", 0))
+                # Wire SWA paged cache (per layer slice)
+                module.swa_cache = cache_context.kv_cache[layer_id]
+                # Keep old k_cache/v_cache as empty for backward compat
+                module.k_cache = torch.tensor([], device=cache_context.device)
+                module.v_cache = torch.tensor([], device=cache_context.device)
+                layer_id += 1
+
+        # Allocate compressed caches for layers with compress_ratio > 0
+        cache_context.allocate_dsv4_compressed_caches(
+            compress_ratios,
+            max_num_seqs=self.config.max_num_seqs,
+            max_model_len=self.config.max_model_len,
+        )
+
+        # Wire compressed caches to layers and initialize tensorized compressor state
+        layer_id = 0
+        for module in self.model.modules():
+            if isinstance(module, DeepseekV4Attention):
+                if layer_id in cache_context.dsv4_compressed_caches:
+                    module.compressed_cache = cache_context.dsv4_compressed_caches[
+                        layer_id
+                    ]
+                else:
+                    module.compressed_cache = None
+                # Initialize tensorized compressor state
+                if hasattr(module, "compressor") and module.compress_ratio > 0:
+                    module.compressor.init_tensorized_state(
+                        max_slots=self.config.max_num_seqs,
+                        device=cache_context.device,
+                    )
+                layer_id += 1
 
     def get_peer_agent_addr(self) -> str | None:
         """Return the peer agent address for this rank."""
@@ -332,8 +389,14 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
 
-        # Detect MLA by presence of kv_lora_rank
-        mode = "mla" if getattr(hf_config, "kv_lora_rank", 0) > 0 else "gqa"
+        # Detect cache mode: dsv4, mla, or gqa
+        is_dsv4 = hf_config.architectures[0] == "DeepseekV4ForCausalLM"
+        if is_dsv4:
+            mode = "dsv4"
+        elif getattr(hf_config, "kv_lora_rank", 0) > 0:
+            mode = "mla"
+        else:
+            mode = "gqa"
         kv_lora_rank = (
             hf_config.kv_lora_rank if hasattr(hf_config, "kv_lora_rank") else 0
         )
