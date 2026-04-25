@@ -350,10 +350,37 @@ void GroupManager::allocate(Sequence& seq)
     // is the reserved dummy slot and is never allocated here.
     gdn_state_manager_.allocate(seq);
 
+    // DSv4: reserve compressed-KV pages for each compression ratio.  The
+    // reservation is sized by the sequence's max possible compressed token
+    // count (= (prompt + max_new_tokens) / ratio, rounded up to page_size).
+    if (!compressed_block_managers_.empty()) {
+        SamplingParams sparams          = seq.sampling_params();
+        int            max_total_tokens = seq.num_prompt_tokens() + sparams.max_tokens;
+        for (auto& [ratio, mgr] : compressed_block_managers_) {
+            int max_compressed_tokens = (max_total_tokens + ratio - 1) / ratio;
+            int ps                    = mgr->page_size();
+            int needed                = (max_compressed_tokens + ps - 1) / ps;
+            if (needed > 0) {
+                mgr->allocate(seq, needed);
+            }
+        }
+    }
+
     num_running_seqs_++;
     num_running_tokens_ += seq.num_tokens();
     num_running_seqs_per_group_[master_group_id]++;
     num_running_tokens_per_group_[master_group_id] += seq.num_tokens();
+}
+
+void GroupManager::configure_compressed_pools(const std::vector<CompressedPoolConfig>& configs)
+{
+    compressed_block_managers_.clear();
+    for (const auto& cfg : configs) {
+        compressed_block_managers_.emplace(
+            cfg.ratio,
+            std::make_unique<CompressedBlockManager>(
+                engine_id_, cfg.ratio, cfg.num_pages, cfg.page_size, cfg.max_blocks_per_seq));
+    }
 }
 
 void GroupManager::deallocate(Sequence& seq, BlockContextSlot slot)
@@ -364,6 +391,11 @@ void GroupManager::deallocate(Sequence& seq, BlockContextSlot slot)
 
     // Free the GDN state slot so it can be reused by future sequences.
     gdn_state_manager_.deallocate(seq, slot);
+
+    // DSv4: return all compressed pages owned by this seq to their pools.
+    for (auto& [ratio, mgr] : compressed_block_managers_) {
+        mgr->deallocate(seq, slot);
+    }
 
     auto& block_ctx       = seq.block_ctx(BlockContextSlot::ACTIVE);
     int   master_group_id = block_ctx.master_group_id;

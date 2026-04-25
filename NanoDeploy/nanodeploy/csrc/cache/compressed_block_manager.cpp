@@ -1,4 +1,3 @@
-#include <algorithm>
 #include <stdexcept>
 
 #include "nanodeploy/csrc/sequence/sequence.h"
@@ -15,10 +14,12 @@ CompressedBlockManager::CompressedBlockManager(
     page_size_(page_size),
     max_blocks_per_seq_(max_blocks_per_seq)
 {
-    page_id_to_free_list_it_.resize(num_pages);
-    for (int i = 0; i < num_pages; ++i) {
+    in_use_.assign(num_pages, 0);
+    free_pages_.reserve(num_pages);
+    // Push in reverse so that pop_back yields IDs in ascending order — handy
+    // for debugging / determinism, no functional difference.
+    for (int i = num_pages - 1; i >= 0; --i) {
         free_pages_.push_back(i);
-        page_id_to_free_list_it_[i] = std::prev(free_pages_.end());
     }
 }
 
@@ -28,24 +29,22 @@ int CompressedBlockManager::allocate_page()
         throw std::runtime_error("CompressedBlockManager: no free pages in pool (ratio=" + std::to_string(ratio_)
                                  + ")");
     }
-    int id = free_pages_.front();
-    free_pages_.pop_front();
-    page_id_to_free_list_it_[id] = free_pages_.end();
-    used_pages_.insert(id);
+    int id = free_pages_.back();
+    free_pages_.pop_back();
+    in_use_[id] = 1;
     return id;
 }
 
 void CompressedBlockManager::deallocate_page(int id)
 {
-    if (used_pages_.find(id) == used_pages_.end()) {
-        // Idempotent: deallocating an already-free page is a no-op rather
-        // than an error, since deallocate(seq, slot) may be called multiple
-        // times during migration / abort paths.
+    if (id < 0 || id >= num_pages_ || !in_use_[id]) {
+        // Idempotent: deallocating an already-free or out-of-range page is a
+        // no-op rather than an error, since deallocate(seq, slot) may be
+        // called multiple times during migration / abort paths.
         return;
     }
-    used_pages_.erase(id);
+    in_use_[id] = 0;
     free_pages_.push_back(id);
-    page_id_to_free_list_it_[id] = std::prev(free_pages_.end());
 }
 
 bool CompressedBlockManager::can_allocate(int num_blocks) const

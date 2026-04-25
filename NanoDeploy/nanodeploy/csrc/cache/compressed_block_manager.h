@@ -1,8 +1,6 @@
 #pragma once
 
-#include <list>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "nanodeploy/csrc/sequence/sequence.h"
@@ -15,8 +13,9 @@ class Sequence;
 // compression ratio).  Simpler than the SWA BlockManager — no prefix caching
 // and no ref-counting, since each page is owned by exactly one sequence.
 //
-// Pattern mirrors GDNStateManager: intrusive std::list free-list with an
-// iterator map for O(1) removal.
+// Free list is a `std::vector<int>` stack (pop_back / push_back) — every op
+// is O(1), data is contiguous, and per-page overhead is just 4 bytes.  A
+// parallel `std::vector<uint8_t>` tracks in-use state for double-free guards.
 class CompressedBlockManager {
 public:
     CompressedBlockManager(
@@ -56,8 +55,8 @@ public:
     }
 
 private:
-    int  allocate_page();          // pop from free_pages_
-    void deallocate_page(int id);  // push to free_pages_
+    int  allocate_page();          // pop_back from free_pages_
+    void deallocate_page(int id);  // push_back to free_pages_
 
     std::string engine_id_;
     int         ratio_;
@@ -65,9 +64,8 @@ private:
     int         page_size_;
     int         max_blocks_per_seq_;
 
-    std::list<int>                        free_pages_;
-    std::vector<std::list<int>::iterator> page_id_to_free_list_it_;
-    std::unordered_set<int>               used_pages_;
+    std::vector<int>     free_pages_;  // stack of free page IDs
+    std::vector<uint8_t> in_use_;      // 1 = in use, 0 = free; indexed by page_id
 };
 
 }  // namespace nanodeploy
