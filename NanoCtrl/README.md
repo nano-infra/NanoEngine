@@ -12,62 +12,57 @@ Control plane server for NanoInfra distributed LLM inference. NanoCtrl is statel
 ## Prerequisites
 
 - Redis server running
-- Rust toolchain
+- Rust toolchain (only needed when building from source)
 
 ## Building
 
 ```bash
 cd NanoCtrl
 cargo build --release
+
+# Build a Python wheel that includes the Rust nanoctrl binary
+maturin build --release
 ```
 
 ## Configuration
 
-NanoCtrl supports configuration via `config.toml` file:
+NanoCtrl supports CLI arguments and environment variables:
 
-```toml
-[server]
-host = "0.0.0.0"
-port = 3000
-
-[redis]
-url = "redis://127.0.0.1:6379"
-```
-
-Configuration can be overridden by environment variables:
-
-- `NANOCTRL_REDIS_URL` - Redis connection URL (overrides config.toml)
+- `NANOCTRL_REDIS_URL` - Redis connection URL
 - `NANOCTRL_RUST_LOG` - Log level (default: `info`)
 
 ## Running
 
 ```bash
-# Default: uses config.toml, Redis at 127.0.0.1:6379
-cargo run --release
+# Default: Redis at 127.0.0.1:6379
+cargo run --release -- server
 
-# Or specify custom config file
-cargo run --release -- --config /path/to/config.toml
+# Or specify a Redis URL
+cargo run --release -- server --redis-url redis://your-redis-host:6379
 
 # Or override via environment variables
 export NANOCTRL_REDIS_URL=redis://your-redis-host:6379
-cargo run --release
+cargo run --release -- server
 ```
 
 The server will listen on `http://0.0.0.0:3000` by default.
 
 ### Background service style (`nanoctrl start/status/stop`)
 
-NanoCtrl now provides a Python CLI wrapper similar to Ray's service lifecycle commands.
+NanoCtrl provides a Rust CLI similar to Ray's service lifecycle commands.
 
 ```bash
-# Install CLI entrypoint
+# Install NanoCtrl package and bundled nanoctrl binary
 pip install -e NanoCtrl/
 
-# Start in background (default config.toml)
+# Start in background
 nanoctrl start
 
-# Custom config / binary / log
-nanoctrl start --config /path/to/config.toml --bin /path/to/nanoctrl-server --log-file /tmp/nanoctrl.log
+# Custom Redis / log
+nanoctrl start --redis-url redis://your-redis-host:6379 --log-file /tmp/nanoctrl.log
+
+# Run server in the foreground
+nanoctrl server --host 0.0.0.0 --port 3000
 
 # Check status (PID + health check)
 nanoctrl status
@@ -81,7 +76,7 @@ nanoctrl stop --force
 
 Notes:
 
-- `nanoctrl start` launches `target/release/nanoctrl-server` when available; otherwise it falls back to `cargo run --release -- --config ...`.
+- `nanoctrl start` launches the same Rust binary in the background and records runtime metadata.
 - Runtime metadata is stored under `$NANOCTRL_RUNTIME_DIR` (or `$XDG_RUNTIME_DIR/nanoctrl`, default `/tmp/nanoctrl`).
 - `nanoctrl status` uses runtime metadata address by default; can be overridden with `--address`.
 
@@ -190,7 +185,7 @@ Content-Type: application/json
 ## Environment Variables
 
 - `NANOCTRL_RUST_LOG` - Log level (default: `info`)
-- `NANOCTRL_REDIS_URL` - Redis connection URL (default: from config.toml)
+- `NANOCTRL_REDIS_URL` - Redis connection URL (default: `redis://127.0.0.1:6379`)
 - `REDIS_PUBLIC_ADDRESS` - For distributed setup: IP:port that remote workers use to reach Redis
 
 ## Python Client (`nanoctrl`)

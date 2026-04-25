@@ -153,7 +153,7 @@ python NanoDeploy/examples/non_disagg.py \
 
 ```bash
 redis-server --bind 0.0.0.0 --port 6379
-cd NanoCtrl && cargo run --release    # edit config.toml to set redis_url
+cd NanoCtrl && cargo run --release -- server --redis-url redis://127.0.0.1:6379
 ```
 
 ##### 3. Launch engines
@@ -176,7 +176,7 @@ ZMQ engine servers with OpenAI-compatible HTTP API via NanoRoute.
 
 ```bash
 redis-server --bind 0.0.0.0 --port 6379
-cd NanoCtrl && cargo run --release    # edit config.toml to set redis_url
+cd NanoCtrl && cargo run --release -- server --redis-url redis://127.0.0.1:6379
 ```
 
 ##### 3. Start NanoRoute

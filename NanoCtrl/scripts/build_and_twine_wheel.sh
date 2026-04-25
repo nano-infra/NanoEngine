@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-PYTHON_VERSIONS=("cp38-cp38" "cp39-cp39" "cp310-cp310" "cp311-cp311" "cp312-cp312" "cp313-cp313")
+PYTHON_VERSIONS=("cp38-cp38")
 
 rm -rf dist build
 
@@ -14,9 +14,9 @@ for py_version in "${PYTHON_VERSIONS[@]}"; do
     export PYTHON_EXE="$PYTHON_PATH/python"
     export PIP_EXE="$PYTHON_PATH/pip"
 
-    echo "Building wheel..."
-    $PIP_EXE install setuptools
-    $PYTHON_EXE -m build --wheel --no-isolation .
+    echo "Building wheel with maturin..."
+    $PIP_EXE install "maturin>=1.0,<2.0"
+    $PYTHON_PATH/maturin build --release --interpreter "$PYTHON_EXE" --out dist
 
     $PIP_EXE uninstall -y nanoctrl
 
