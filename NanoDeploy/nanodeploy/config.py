@@ -156,6 +156,7 @@ class Config(BaseModel):
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
+            "GlmMoeDsaForCausalLM",
         ):
             if self.hf_config.architectures[0] == "DeepseekV4ForCausalLM":
                 assert self.attention_sp == 1
@@ -237,6 +238,7 @@ class Config(BaseModel):
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
+            "GlmMoeDsaForCausalLM",
         ):
             if hasattr(self.hf_config, "num_key_value_heads"):
                 self.hf_config.num_key_value_heads = 1
