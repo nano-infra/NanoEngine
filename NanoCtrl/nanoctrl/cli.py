@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -100,6 +101,85 @@ def _normalize_address(address: str) -> str:
     return f"http://{address.rstrip('/')}"
 
 
+def _detect_public_host() -> str | None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            host = sock.getsockname()[0]
+    except OSError:
+        return None
+
+    if host in {"0.0.0.0", "127.0.0.1"}:
+        return None
+    return host
+
+
+def _detect_hostname_ip() -> str | None:
+    for flag in ("-i", "-I"):
+        try:
+            result = subprocess.run(
+                ["hostname", flag],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return None
+
+        if result.returncode != 0:
+            continue
+
+        for candidate in result.stdout.strip().split():
+            if candidate and candidate not in {"0.0.0.0", "127.0.0.1"}:
+                return candidate
+    return None
+
+
+def _detect_hostname() -> str | None:
+    try:
+        host = socket.gethostname().strip()
+    except OSError:
+        return None
+    if not host or host in {"localhost", "localhost.localdomain"}:
+        return None
+    return host
+
+
+def _resolve_access_host(bind_host: str, override: str | None) -> str:
+    if override:
+        return override
+    if bind_host == "0.0.0.0":
+        return (
+            _detect_hostname_ip()
+            or _detect_public_host()
+            or _detect_hostname()
+            or "127.0.0.1"
+        )
+    return bind_host
+
+
+def _print_next_steps(address: str) -> None:
+    print("")
+    print("----------------------")
+    print("NanoCtrl started.")
+    print("----------------------")
+    print("")
+    print("Next steps")
+    print("  To connect to this NanoCtrl instance from Python:")
+    print("    from nanoctrl import NanoCtrlClient")
+    print(f'    client = NanoCtrlClient("{address}")')
+    print("    client.check_connection()")
+    print("")
+    print("  To inspect NanoCtrl state:")
+    print(f"    python NanoCtrl/examples/connect_nanoctrl.py --address {address}")
+    print("")
+    print("  To stop NanoCtrl:")
+    print("    nanoctrl stop")
+    print("")
+    print("  To check status:")
+    print("    nanoctrl status")
+
+
 def _find_manifest(config_path: Path) -> Path | None:
     candidates = [
         config_path.parent / "Cargo.toml",
@@ -125,24 +205,34 @@ def _check_health(address: str, timeout: float = 1.5) -> tuple[bool, str]:
 
 
 def _resolve_command(args: argparse.Namespace) -> tuple[list[str], str, Path | None]:
-    config_path = Path(args.config).resolve()
-    server_address = f"{args.host}:{args.port}"
+    server_host = args.host
+    server_port = args.port
+    health_host = _resolve_access_host(server_host, args.health_host)
+    health_port = args.health_port or server_port
+    server_address = f"{health_host}:{health_port}"
+    server_args = [
+        "--host",
+        str(server_host),
+        "--port",
+        str(server_port),
+        "--redis-url",
+        str(args.redis_url),
+    ]
 
     if args.bin:
-        cmd = [str(Path(args.bin).resolve()), "--config", str(config_path)]
+        cmd = [str(Path(args.bin).resolve()), *server_args]
         return cmd, server_address, None
 
     local_bin_candidates = [
         Path.cwd() / "target" / "release" / "nanoctrl-server",
-        config_path.parent / "target" / "release" / "nanoctrl-server",
         Path(__file__).resolve().parents[1] / "target" / "release" / "nanoctrl-server",
     ]
     for local_bin in local_bin_candidates:
         if local_bin.exists() and os.access(local_bin, os.X_OK):
-            cmd = [str(local_bin), "--config", str(config_path)]
+            cmd = [str(local_bin), *server_args]
             return cmd, server_address, None
 
-    manifest_path = _find_manifest(config_path)
+    manifest_path = _find_manifest(Path.cwd())
     if manifest_path is None:
         raise RuntimeError(
             "Cannot find NanoCtrl Cargo.toml. Use --bin to specify nanoctrl-server binary."
@@ -155,14 +245,15 @@ def _resolve_command(args: argparse.Namespace) -> tuple[list[str], str, Path | N
         "--manifest-path",
         str(manifest_path),
         "--",
-        "--config",
-        str(config_path),
+        *server_args,
     ]
     return cmd, server_address, manifest_path.parent
 
 
 def _start(args: argparse.Namespace) -> int:
-    target_address = f"{args.host}:{args.port}"
+    target_host = _resolve_access_host(args.host, args.health_host)
+    target_port = args.health_port or args.port
+    target_address = f"{target_host}:{target_port}"
     pid = _read_pid()
     if pid is not None and _is_pid_running(pid):
         print(f"nanoctrl is already running (pid={pid})")
@@ -211,12 +302,17 @@ def _start(args: argparse.Namespace) -> int:
             return 1
         ok, _ = _check_health(server_address, timeout=0.8)
         if ok:
+            print(f"Local node IP: {target_host}")
+            print("")
             print(f"nanoctrl started (pid={proc.pid})")
             print(f"address: {_normalize_address(server_address)}")
             print(f"log: {log_path}")
+            _print_next_steps(server_address)
             return 0
         time.sleep(0.2)
 
+    print(f"Local node IP: {target_host}")
+    print("")
     print(f"nanoctrl process started (pid={proc.pid}), but health check timed out")
     print(f"address: {_normalize_address(server_address)}")
     print(f"log: {log_path}")
@@ -292,13 +388,24 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_start = sub.add_parser("start", help="Start NanoCtrl server in background")
-    p_start.add_argument(
-        "-c", "--config", default="config.toml", help="Path to NanoCtrl config.toml"
-    )
     p_start.add_argument("--bin", default=None, help="Path to nanoctrl-server binary")
-    p_start.add_argument("--host", default=DEFAULT_HOST, help="Health-check host")
+    p_start.add_argument("--host", default="0.0.0.0", help="NanoCtrl bind host")
     p_start.add_argument(
-        "--port", type=int, default=DEFAULT_PORT, help="Health-check port"
+        "--port", type=int, default=DEFAULT_PORT, help="NanoCtrl bind port"
+    )
+    p_start.add_argument(
+        "--redis-url",
+        default="redis://127.0.0.1:6379",
+        help="Redis connection URL",
+    )
+    p_start.add_argument(
+        "--health-host", default=None, help="Optional health-check host override"
+    )
+    p_start.add_argument(
+        "--health-port",
+        type=int,
+        default=None,
+        help="Optional health-check port override",
     )
     p_start.add_argument(
         "--log-file", default=None, help="Log file path (default: runtime dir)"
