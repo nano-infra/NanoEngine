@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "nanodeploy/csrc/sequence/sequence.h"
@@ -71,6 +72,12 @@ struct BatchAuxData {
     std::vector<int>    state_slots;           // per master-sp seq
     std::vector<int>    master_group_indices;  // per all seqs
     int                 num_group_seqs = 0;    // count where master_group == group_rank
+
+    // DSv4 compressed-cache page IDs per ratio.
+    // Outer map key = ratio. Inner outer index = master-group seq index.
+    // Inner inner vector = list of physical page IDs owned by that seq.
+    // Empty when the model has no compressed layers.
+    std::unordered_map<int, std::vector<std::vector<int>>> compressed_block_tables;
 };
 
 // ========== Vision slot refs extracted from RunBatchInput ==========

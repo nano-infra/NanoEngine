@@ -67,6 +67,12 @@ class Config(BaseModel):
     # NSA sparse attention (V3.2) — enabled by default for models with index_head_dim > 0
     disable_nsa: bool = False
 
+    # DSv4 compressed-cache pool sizes (tokens per pool, per ratio).
+    # 0 means "derive worst case = max_num_seqs * max_model_len / ratio".
+    # Set explicitly to a smaller value to save memory when seqs are short.
+    dsv4_compressed_pool_pages_ratio4: int = 0
+    dsv4_compressed_pool_pages_ratio128: int = 0
+
     # profiler
     enable_profiler: bool = False
     profiler_start_step: int = 40

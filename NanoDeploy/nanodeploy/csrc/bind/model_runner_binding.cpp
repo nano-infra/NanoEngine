@@ -48,7 +48,8 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("temperatures", &BatchAuxData::temperatures)
         .def_readonly("state_slots", &BatchAuxData::state_slots)
         .def_readonly("master_group_indices", &BatchAuxData::master_group_indices)
-        .def_readonly("num_group_seqs", &BatchAuxData::num_group_seqs);
+        .def_readonly("num_group_seqs", &BatchAuxData::num_group_seqs)
+        .def_readonly("compressed_block_tables", &BatchAuxData::compressed_block_tables);
 
     py::class_<MigrateSequenceView>(m, "MigrateSequenceView")
         .def_readonly("seq_id", &MigrateSequenceView::seq_id)

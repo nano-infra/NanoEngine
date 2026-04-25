@@ -493,6 +493,36 @@ BatchAuxData extract_aux_from_bytes(const uint8_t* data, size_t data_len, int gr
         if (m_group == group_rank) {
             aux.temperatures.push_back(si->temperature());
             aux.state_slots.push_back(si->state_slot());
+
+            // DSv4 compressed_block_tables: collect per-ratio page IDs for
+            // master-group sequences only.
+            if (auto* cbts = si->compressed_block_tables()) {
+                for (size_t k = 0; k < cbts->size(); ++k) {
+                    auto* cbt = cbts->Get(k);
+                    if (!cbt)
+                        continue;
+                    int   ratio     = cbt->ratio();
+                    auto& per_ratio = aux.compressed_block_tables[ratio];
+                    // Pad earlier seqs that didn't have this ratio (shouldn't
+                    // happen in practice, but keep alignment robust).
+                    while (static_cast<int>(per_ratio.size()) < group_count) {
+                        per_ratio.emplace_back();
+                    }
+                    std::vector<int> ids;
+                    if (auto* ids_fb = cbt->block_ids()) {
+                        ids.assign(ids_fb->begin(), ids_fb->end());
+                    }
+                    per_ratio.push_back(std::move(ids));
+                }
+            }
+            // Backfill any ratios that were registered earlier but missing
+            // for this seq.
+            for (auto& [ratio, per_ratio] : aux.compressed_block_tables) {
+                while (static_cast<int>(per_ratio.size()) <= group_count) {
+                    per_ratio.emplace_back();
+                }
+            }
+
             group_count++;
         }
     }

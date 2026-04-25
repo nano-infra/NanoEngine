@@ -356,50 +356,79 @@ class CacheContext:
             )
 
     def allocate_dsv4_compressed_caches(
-        self, compress_ratios: list[int], max_num_seqs: int, max_model_len: int
+        self,
+        compress_ratios: list[int],
+        max_num_seqs: int,
+        max_model_len: int,
+        pool_pages_per_ratio: dict[int, int] | None = None,
     ):
-        """Allocate per-layer compressed KV caches for DSv4.
+        """Allocate per-layer compressed KV caches for DSv4 (paged shared pool).
 
-        Layers with compress_ratio > 0 get a pre-allocated flat buffer.
-        Shape per layer: [max_num_seqs, max_compressed_tokens, 1, 584] uint8
-        These are indexed by batch position (not managed by the block manager).
+        Each compression ratio gets its own pool of pages, sized either by
+        ``pool_pages_per_ratio[ratio]`` (when provided and > 0) or by the
+        worst case ``ceil(max_num_seqs * max_compressed / page_size)``.
+        Pages are shared across sequences and assigned by the C++
+        CompressedBlockManager via per-seq block tables.
+
+        Cache shape per layer per ratio:
+            [num_pages + 1, page_size=2, 1, 584] uint8
+        page_size=2 ensures the per-page stride (2 * 584) is 16-byte aligned
+        for flash_mla's 128-bit vector loads. The +1 dummy page absorbs
+        graph-safe invalid writes.
         """
         _DSV4_BYTES_PER_TOKEN = 584
+        compressed_page_size = 2
         self.dsv4_compress_ratios = compress_ratios
+        # Per-layer per-ratio cache buffer.
+        # Shape: layer_idx -> uint8 tensor [num_pages+1, 2, 1, 584]
         self.dsv4_compressed_caches = {}
+        # Per-ratio pool config (used by Scheduler.configure_compressed_pools)
+        # ratio -> (num_pages, page_size, max_blocks_per_seq)
+        self.dsv4_compressed_pool_config: dict[int, tuple[int, int, int]] = {}
+        # Per-ratio dummy page id (last index, used to pad block_tables on
+        # the Python side for invalid / unused batch positions).
+        self.dsv4_compressed_dummy_page: dict[int, int] = {}
+        pool_pages_per_ratio = pool_pages_per_ratio or {}
+
         total_bytes = 0
-        for layer_idx, ratio in enumerate(compress_ratios):
-            if ratio == 0:
-                continue
-            # Max compressed tokens per sequence, aligned to 64 for flash_mla
+        # Group layers by ratio to compute pool size once per ratio.
+        unique_ratios = {r for r in compress_ratios if r > 0}
+        for ratio in unique_ratios:
             max_compressed = (max_model_len // ratio + 63) // 64 * 64
-            # Layout: [num_pages + 1, page_size=2, 1, 584] where
-            # page_size must be even so per-page stride (page_size * 584) is
-            # 16-byte aligned — flash_mla uses 128-bit vector loads on page
-            # base pointers. page_size=1 would give stride=584 (not aligned).
-            # total tokens = max_num_seqs * max_compressed
-            # Physical slot for (seq, tok) = seq * max_compressed + tok
-            # slot → page_idx = slot // 2, tok_in_page = slot % 2
-            # Extra +1 page = dummy slot for graph-safe invalid writes.
-            compressed_page_size = 2
-            total_tokens = max_num_seqs * max_compressed
-            num_pages = (
-                total_tokens + compressed_page_size - 1
+            max_blocks_per_seq = (
+                max_compressed + compressed_page_size - 1
             ) // compressed_page_size
-            buf = torch.zeros(
-                num_pages + 1,  # +1 dummy page
+            # Worst-case: every seq fills its full reservation at the same time.
+            worst_case_pages = max_num_seqs * max_blocks_per_seq
+            override = pool_pages_per_ratio.get(ratio, 0)
+            num_pages = override if override > 0 else worst_case_pages
+            self.dsv4_compressed_pool_config[ratio] = (
+                num_pages,
                 compressed_page_size,
-                1,
-                _DSV4_BYTES_PER_TOKEN,
-                dtype=torch.uint8,
-                device=self.device,
+                max_blocks_per_seq,
             )
-            self.dsv4_compressed_caches[layer_idx] = buf
-            total_bytes += buf.nelement()
+            self.dsv4_compressed_dummy_page[ratio] = num_pages  # last index = dummy
+            for layer_idx, lr in enumerate(compress_ratios):
+                if lr != ratio:
+                    continue
+                buf = torch.zeros(
+                    num_pages + 1,  # +1 dummy page
+                    compressed_page_size,
+                    1,
+                    _DSV4_BYTES_PER_TOKEN,
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                self.dsv4_compressed_caches[layer_idx] = buf
+                total_bytes += buf.nelement()
         if total_bytes > 0:
+            sizes_str = ", ".join(
+                f"ratio={r}: {p[0]} pages × {p[1]} tok"
+                for r, p in self.dsv4_compressed_pool_config.items()
+            )
             logger.info(
                 f"DSv4 compressed caches: {len(self.dsv4_compressed_caches)} layers, "
-                f"total {total_bytes / 1e9:.2f} GB"
+                f"total {total_bytes / 1e9:.2f} GB ({sizes_str})"
             )
 
     def allocate_indexer_cache(self, hf_config):

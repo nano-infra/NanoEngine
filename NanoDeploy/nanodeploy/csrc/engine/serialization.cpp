@@ -48,6 +48,22 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
             }
         }
 
+        // DSv4 compressed_block_tables: pack each ratio's per-seq page list
+        flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<fbs::CompressedBlockTableI>>> compressed_bt_off = 0;
+        if (!ctx.compressed_block_tables.empty()) {
+            std::vector<flatbuffers::Offset<fbs::CompressedBlockTableI>> cbt_offsets;
+            cbt_offsets.reserve(ctx.compressed_block_tables.size());
+            for (const auto& cbt : ctx.compressed_block_tables) {
+                if (!cbt)
+                    continue;
+                auto ids_vec = builder.CreateVector(cbt->block_ids);
+                cbt_offsets.push_back(fbs::CreateCompressedBlockTableI(builder, cbt->ratio, ids_vec));
+            }
+            if (!cbt_offsets.empty()) {
+                compressed_bt_off = builder.CreateVector(cbt_offsets);
+            }
+        }
+
         // vision_slots (prefill only, EP mode)
         flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<fbs::VisionSlotRef>>> vision_slots_off = 0;
         if (is_prefill && !seq->data_->vision_slots.empty()) {
@@ -84,6 +100,10 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
 
         if (vision_slots_off.o != 0) {
             si_builder.add_vision_slots(vision_slots_off);
+        }
+
+        if (compressed_bt_off.o != 0) {
+            si_builder.add_compressed_block_tables(compressed_bt_off);
         }
 
         seq_offsets.push_back(si_builder.Finish());

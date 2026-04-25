@@ -336,11 +336,19 @@ class ModelRunner:
                 module.v_cache = torch.tensor([], device=cache_context.device)
                 layer_id += 1
 
+        # Pool sizes from config (0 = derive worst case)
+        pool_pages_per_ratio = {}
+        if self.config.dsv4_compressed_pool_pages_ratio4 > 0:
+            pool_pages_per_ratio[4] = self.config.dsv4_compressed_pool_pages_ratio4
+        if self.config.dsv4_compressed_pool_pages_ratio128 > 0:
+            pool_pages_per_ratio[128] = self.config.dsv4_compressed_pool_pages_ratio128
+
         # Allocate compressed caches for layers with compress_ratio > 0
         cache_context.allocate_dsv4_compressed_caches(
             compress_ratios,
             max_num_seqs=self.config.max_num_seqs,
             max_model_len=self.config.max_model_len,
+            pool_pages_per_ratio=pool_pages_per_ratio,
         )
 
         # Wire compressed caches to layers and initialize tensorized compressor state
