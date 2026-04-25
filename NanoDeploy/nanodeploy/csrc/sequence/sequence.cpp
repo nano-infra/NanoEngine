@@ -41,7 +41,8 @@ void reset_block_context(
     ctx.num_dispatched_tokens.clear();
     ctx.num_dispatched_tokens.resize(group_size, 0);
     ctx.block_location.clear();
-    ctx.endpoints.clear();  // Initialize endpoints to empty vector
+    ctx.endpoints.clear();                // Initialize endpoints to empty vector
+    ctx.compressed_block_tables.clear();  // DSv4 per-ratio compressed blocks
 }
 
 int                   Sequence::block_size = 256;
@@ -147,6 +148,47 @@ int Sequence::state_slot(BlockContextSlot slot) const
 void Sequence::set_state_slot(BlockContextSlot slot, int state_slot)
 {
     block_ctx(slot).state_slot = state_slot;
+}
+
+namespace {
+// Locate (or default-construct) the CompressedBlockTableT entry matching
+// `ratio` in a BlockContext. Returns a mutable reference.
+fbs::CompressedBlockTableT& ensure_compressed_entry(BlockContext& ctx, int ratio)
+{
+    for (auto& up : ctx.compressed_block_tables) {
+        if (up && up->ratio == ratio) {
+            return *up;
+        }
+    }
+    ctx.compressed_block_tables.emplace_back(std::make_unique<fbs::CompressedBlockTableT>());
+    auto& created = *ctx.compressed_block_tables.back();
+    created.ratio = ratio;
+    return created;
+}
+}  // namespace
+
+std::vector<int>& Sequence::compressed_block_table(BlockContextSlot slot, int ratio)
+{
+    auto& ctx = block_ctx(slot);
+    return ensure_compressed_entry(ctx, ratio).block_ids;
+}
+
+const std::vector<int>& Sequence::compressed_block_table(BlockContextSlot slot, int ratio) const
+{
+    static const std::vector<int> EMPTY;
+    const auto&                   ctx = block_ctx(slot);
+    for (const auto& up : ctx.compressed_block_tables) {
+        if (up && up->ratio == ratio) {
+            return up->block_ids;
+        }
+    }
+    return EMPTY;
+}
+
+void Sequence::set_compressed_block_table(BlockContextSlot slot, int ratio, std::vector<int> ids)
+{
+    auto& ctx                                     = block_ctx(slot);
+    ensure_compressed_entry(ctx, ratio).block_ids = std::move(ids);
 }
 
 std::vector<int>& Sequence::block_table(BlockContextSlot slot, int group_id)

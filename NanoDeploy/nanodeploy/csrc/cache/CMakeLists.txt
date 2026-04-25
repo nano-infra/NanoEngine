@@ -2,6 +2,7 @@ set(CPP_SOURCES
     block.cpp
     block_manager.cpp
     gdn_state_manager.cpp
+    compressed_block_manager.cpp
 )
 
 add_library(
