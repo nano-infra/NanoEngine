@@ -65,22 +65,24 @@ graph TB
 
 ## 🚀 Installation
 
-### Prerequest Third-Party GPU Kernels
+### Key Third-Party Dependencies
 
-| Library                                                   | Version | Description                                                         | Source        |
-| --------------------------------------------------------- | ------- | ------------------------------------------------------------------- | ------------- |
-| [DeepEP](https://github.com/deepseek-ai/DeepEP)           | 1.2.1   | Expert-parallel all-to-all communication (MoE dispatch/combine)     | deepseek-ai   |
-| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)       | 2.1.1   | FP8 GEMM kernels with fine-grained scaling (JIT compiled)           | deepseek-ai   |
-| [FlashMLA](https://github.com/deepseek-ai/FlashMLA)       | 1.0.0   | Multi-head Latent Attention decode kernels (dense + FP8 sparse)     | deepseek-ai   |
-| [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | 0.6.6   | High-performance inference kernels for attention, GDN, and sampling | flashinfer-ai |
+| Library                                                   | Version   | Description                                                         | Source        |
+| --------------------------------------------------------- | --------- | ------------------------------------------------------------------- | ------------- |
+| [DeepEP](https://github.com/deepseek-ai/DeepEP)           | 1.2.1     | Expert-parallel all-to-all communication (MoE dispatch/combine)     | deepseek-ai   |
+| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)       | 2.1.1     | FP8 GEMM kernels with fine-grained scaling (JIT compiled)           | deepseek-ai   |
+| [FlashMLA](https://github.com/deepseek-ai/FlashMLA)       | 1.0.0     | Multi-head Latent Attention decode kernels (dense + FP8 sparse)     | deepseek-ai   |
+| [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | 0.6.6     | High-performance inference kernels for attention, GDN, and sampling | flashinfer-ai |
+| [DLSlime](https://github.com/deeplink-org/DLSlime)        | 0.0.3.rc1 | Flexible heterogeneous transfer toolkit for RDMA/NVLink/NVSHMEM     | deeplink-org  |
 
-The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs. Install them from source, and install FlashInfer from PyPI:
+The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs. Install the key dependencies as follows:
 
 ```bash
 cd DeepEP && pip install .
 cd DeepGEMM && pip install .
 cd FlashMLA && pip install .
 pip install flashinfer-python==0.6.6
+pip install dlslime==0.0.3.rc1
 ```
 
 ### One-liner: install everything
