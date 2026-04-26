@@ -60,6 +60,7 @@ class Config(BaseModel):
     # dist config
     master_address: str = "127.0.0.1:6006"
     ray_address: str = "127.0.0.1:6379"
+    executor_backend: Literal["ray", "dlslime"] = "ray"
 
     # MTP (Multi-Token Prediction) speculative decoding
     num_speculative_tokens: int = 0  # 0 = disabled, >0 = number of draft tokens

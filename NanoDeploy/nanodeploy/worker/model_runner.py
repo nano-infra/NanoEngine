@@ -1,4 +1,5 @@
 import os
+import threading
 
 import ray
 import torch
@@ -77,6 +78,10 @@ class ModelRunner:
         self.world_size = config.attn_world_size
         self.rank = rank
         self._dist_initialized = False
+        self._dlslime_agent = None
+        self._dlslime_alias = None
+        self._dlslime_thread = None
+        self._dlslime_peer = None
 
         # Sync C++ Sequence.block_size with Python kvcache_block_size
         from nanodeploy._cpp import Sequence as _Seq
@@ -402,6 +407,64 @@ class ModelRunner:
     def get_peer_agent_addr(self) -> str | None:
         """Return the peer agent address for this rank."""
         return get_cache_context().get_peer_agent_addr()
+
+    def start_dlslime_server(self, driver_alias: str) -> str:
+        """Start a dedicated DLSLime server for executor transport."""
+        if self._dlslime_alias is not None:
+            if self._dlslime_peer != driver_alias:
+                raise RuntimeError(
+                    "DLSLime server already initialized for a different driver "
+                    f"({self._dlslime_peer} != {driver_alias})"
+                )
+            return self._dlslime_alias
+
+        if not self.config.nanoctrl_address:
+            raise RuntimeError(
+                "executor_backend='dlslime' requires nanoctrl_address to be set"
+            )
+
+        try:
+            import dlslime
+            from dlslime.rpc import serve
+        except ImportError as exc:
+            raise RuntimeError(
+                "DLSLime transport requires the optional 'dlslime' dependency"
+            ) from exc
+
+        from nanodeploy.engine.dlslime_protocol import ModelRunnerRpcService
+
+        available_nics = dlslime.available_nic()
+        if not available_nics:
+            raise RuntimeError("No available NICs found for DLSLime worker agent")
+
+        agent_alias = f"{self.engine_id}:rpc:{self.rank}"
+        device = available_nics[get_dist_context().local_rank % len(available_nics)]
+        self._dlslime_agent = dlslime.start_peer_agent(
+            alias=agent_alias,
+            server_url=self.config.nanoctrl_address,
+            device=device,
+            ib_port=1,
+            link_type="RoCE",
+            qp_num=int(os.environ.get("SLIME_QP_NUM", 1)),
+            scope=self.config.nanoctrl_scope,
+        )
+        service = ModelRunnerRpcService(self)
+
+        def _serve_loop():
+            self._dlslime_agent.set_desired_topology([driver_alias])
+            self._dlslime_agent.wait_for_peers([driver_alias], timeout_sec=30)
+            serve(self._dlslime_agent, service, driver_alias)
+
+        self._dlslime_thread = threading.Thread(
+            target=_serve_loop,
+            daemon=True,
+            name=f"dlslime-rank-{self.rank}",
+        )
+        self._dlslime_thread.start()
+        self._dlslime_alias = agent_alias
+        self._dlslime_peer = driver_alias
+        logger.info(f"Rank {self.rank}: DLSLime server ready at {self._dlslime_alias}")
+        return self._dlslime_alias
 
     def p2p_disconnect(self, remote_engine_id: str):
         return get_cache_context().p2p_disconnect(remote_engine_id)
