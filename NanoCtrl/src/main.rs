@@ -133,7 +133,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 
     // Load Lua scripts from external files
     let scripts = LuaScripts::load()?;
-    tracing::info!("Loaded Lua scripts from lua/ directory");
+    tracing::info!("Loaded embedded Lua scripts");
 
     // Create Redis repository with connection pool
     let repo = RedisRepo::new(&redis_url, scripts)?;

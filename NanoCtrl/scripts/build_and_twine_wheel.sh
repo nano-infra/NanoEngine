@@ -26,4 +26,4 @@ done
 
 echo "Ready for upload..."
 
-/opt/python/cp312-cp312/bin/twine upload dist/*
+/opt/python/cp38-cp38/bin/twine upload dist/*

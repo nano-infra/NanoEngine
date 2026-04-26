@@ -16,7 +16,7 @@ use crate::models::*;
 /// TTL is set to 60 seconds to allow 4 missed heartbeats before expiration.
 pub const ENTITY_TTL_SECS: usize = 60;
 
-/// Lua scripts loaded once at startup from external `.lua` files.
+/// Lua scripts embedded once at compile time.
 pub struct LuaScripts {
     pub register_engine: String,
     pub unregister_engine: String,
@@ -24,17 +24,12 @@ pub struct LuaScripts {
 }
 
 impl LuaScripts {
-    /// Load all Lua scripts from the `lua/` directory.
+    /// Load all Lua scripts from embedded source.
     pub fn load() -> Result<Self, AppError> {
-        let lua_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua");
-        let read = |name: &str| -> Result<String, AppError> {
-            std::fs::read_to_string(lua_dir.join(name))
-                .map_err(|e| AppError::Internal(format!("Failed to load Lua script {name}: {e}")))
-        };
         Ok(Self {
-            register_engine: read("register_engine.lua")?,
-            unregister_engine: read("unregister_engine.lua")?,
-            heartbeat: read("heartbeat_engine.lua")?,
+            register_engine: include_str!("../lua/register_engine.lua").to_string(),
+            unregister_engine: include_str!("../lua/unregister_engine.lua").to_string(),
+            heartbeat: include_str!("../lua/heartbeat_engine.lua").to_string(),
         })
     }
 }
