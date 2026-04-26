@@ -40,6 +40,7 @@ class DecodeGraphRunner:
         block_size = cache_ctx.block_size
         max_num_blocks = (config.max_model_len + block_size - 1) // block_size
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
+        is_dsv4 = hf_config.architectures[0] == "DeepseekV4ForCausalLM"
 
         # Persistent input / output buffers
         self._input_ids = torch.zeros(max_bs, dtype=torch.int64)
@@ -50,7 +51,7 @@ class DecodeGraphRunner:
         self._outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
         # MLA-specific: per-BS FlashMLASchedMeta created during capture
-        if is_mla:
+        if is_mla or is_dsv4:
             import flash_mla
 
             self._flash_mla = flash_mla
@@ -69,7 +70,37 @@ class DecodeGraphRunner:
                 (max_bs,), self._dummy_gdn_slot, dtype=torch.int64
             )
 
+        # DSv4 compressor state slots (parallel to gdn_state_slots)
+        self._dsv4_state_slots = None
+        self._dummy_dsv4_slot = None
+        if is_dsv4:
+            # Dummy slot = max_num_seqs (compressor buffer has max+1 slots).
+            self._dummy_dsv4_slot = config.max_num_seqs
+            self._dsv4_state_slots = torch.full(
+                (max_bs,), self._dummy_dsv4_slot, dtype=torch.int64
+            )
+
+        # DSv4 compressed-cache block tables (per ratio).  Persistent buffers
+        # indexed by state_slot (matches dsv4_state_slots' addressing) — shape
+        # [max_bs+1, max_blocks_per_seq], with row max_bs reserved as the dummy.
+        # Filled with dummy_page; per-replay copy_() overwrites with InputPreparer's
+        # state-slot-indexed table (also [max_bs+1, max_blocks]).
+        self._dsv4_compressed_block_tables: dict[int, torch.Tensor] = {}
+        self._dsv4_compressed_dummy_pages: dict[int, int] = {}
+        if is_dsv4:
+            pool_cfg = getattr(cache_ctx, "dsv4_compressed_pool_config", {}) or {}
+            dummies = getattr(cache_ctx, "dsv4_compressed_dummy_page", {}) or {}
+            for ratio, (num_pages, _page_size, max_blocks) in pool_cfg.items():
+                if max_blocks <= 0:
+                    continue
+                dummy_page = dummies.get(ratio, num_pages)
+                self._dsv4_compressed_dummy_pages[ratio] = dummy_page
+                self._dsv4_compressed_block_tables[ratio] = torch.full(
+                    (max_bs + 1, max_blocks), dummy_page, dtype=torch.int32
+                )
+
         self._is_mla = is_mla
+        self._is_dsv4 = is_dsv4
         self._max_num_seqs = config.max_num_seqs
 
         self._bs_list = _make_bs_list(max_bs)
@@ -107,7 +138,7 @@ class DecodeGraphRunner:
             # Each BS gets its own FlashMLASchedMeta (kernel validates batch size)
             sched_meta = None
             sparse_sched_meta = None
-            if self._is_mla:
+            if self._is_mla or self._is_dsv4:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[master_bs] = sched_meta
             if self._has_indexer:
@@ -132,6 +163,18 @@ class DecodeGraphRunner:
                     if self._gdn_state_slots is not None
                     else None
                 ),
+                dsv4_state_slots=(
+                    self._dsv4_state_slots[:master_bs]
+                    if self._dsv4_state_slots is not None
+                    else None
+                ),
+                # Pass FULL [max_bs+1, max_blocks] table — indexed by state_slot
+                # (which can be up to max_bs = max_num_seqs for the dummy).
+                dsv4_compressed_block_tables=(
+                    dict(self._dsv4_compressed_block_tables)
+                    if self._dsv4_compressed_block_tables
+                    else None
+                ),
             )
 
             # Warmup
@@ -144,10 +187,22 @@ class DecodeGraphRunner:
             # graph.  dense_decode_fwd only launches it when the metadata
             # tensor is None; after warmup it is non-None, so without this
             # reset the graph would replay with stale scheduling data.
-            if self._is_mla:
+            if self._is_mla or self._is_dsv4:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[master_bs] = sched_meta
                 get_context().tile_scheduler_metadata = sched_meta
+            if self._is_dsv4:
+                # DSv4 uses per-layer sched_metas (mixed compress_ratio configs).
+                # Drop the warmup-initialized metas so the capture pass creates
+                # fresh ones — this ensures the scheduling kernel runs inside
+                # the graph rather than during eager warmup.
+                from nanodeploy.models.deepseek_v4.deepseek_v4 import (
+                    DeepseekV4Attention,
+                )
+
+                for m in model.modules():
+                    if isinstance(m, DeepseekV4Attention):
+                        m._dsv4_sched_metas.pop(master_bs, None)
             if self._has_indexer:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sparse_sched_metas[master_bs] = sparse_sched_meta
@@ -208,6 +263,22 @@ class DecodeGraphRunner:
             self._gdn_state_slots.fill_(self._dummy_gdn_slot)
             if context.gdn_state_slots is not None:
                 self._gdn_state_slots[:bs].copy_(context.gdn_state_slots)
+
+        if self._dsv4_state_slots is not None:
+            self._dsv4_state_slots.fill_(self._dummy_dsv4_slot)
+            if context.dsv4_state_slots is not None:
+                self._dsv4_state_slots[:bs].copy_(context.dsv4_state_slots)
+
+        if self._dsv4_compressed_block_tables:
+            for ratio, persistent in self._dsv4_compressed_block_tables.items():
+                persistent.fill_(self._dsv4_compressed_dummy_pages[ratio])
+                src = (context.dsv4_compressed_block_tables or {}).get(ratio)
+                if src is not None:
+                    # Source is also [max_bs+1, max_blocks] (state-slot indexed).
+                    # Both shapes match so we can copy directly. If they differ
+                    # (e.g., src is shorter), copy the available prefix.
+                    n = min(src.shape[0], persistent.shape[0])
+                    persistent[:n].copy_(src[:n])
 
         self._graphs[(master_bs, attn_bs)].replay()
         return self._outputs[:bs]

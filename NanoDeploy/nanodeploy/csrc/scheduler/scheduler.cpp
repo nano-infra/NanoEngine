@@ -47,6 +47,13 @@ Scheduler::Scheduler(const std::string& engine_id,
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
 }
 
+void Scheduler::configure_compressed_pools(const std::vector<CompressedPoolConfig>& configs)
+{
+    for (auto& gm : worker_state) {
+        gm->configure_compressed_pools(configs);
+    }
+}
+
 void Scheduler::add(std::shared_ptr<Sequence> seq)
 {
     int prompt_len = seq->num_prompt_tokens();

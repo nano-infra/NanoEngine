@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "nanodeploy/csrc/cache/block_manager.h"
+#include "nanodeploy/csrc/cache/compressed_block_manager.h"
 #include "nanodeploy/csrc/cache/gdn_state_manager.h"
 #include "nanodeploy/csrc/sequence/sequence.h"
 
@@ -22,6 +23,14 @@ enum class RoutingStrategy {
 struct AllocResult {
     int chunk_end;   // num_tokens boundary for the current batch
     int new_tokens;  // budget consumed (= chunk_end - num_cached_tokens)
+};
+
+// DSv4: configuration for one compression ratio's page pool.
+struct CompressedPoolConfig {
+    int ratio;               // e.g. 4 or 128
+    int num_pages;           // pool size (number of pages)
+    int page_size;           // tokens per page (e.g. 2 for 16-byte alignment)
+    int max_blocks_per_seq;  // hard cap per sequence
 };
 
 class GroupManager {
@@ -153,6 +162,16 @@ public:
     std::unordered_map<int, std::shared_ptr<BlockManager>> block_manager;
 
     GDNStateManager gdn_state_manager_;
+
+    // DSv4: per-compression-ratio paged allocator for compressed KV cache.
+    // Empty when the model has no compressed layers (Qwen3.5, V3, V3.2).
+    // Initialized via configure_compressed_pools(...) after construction.
+    // Stored as unique_ptr so map<int, V> doesn't need V to be default-ctible.
+    std::unordered_map<int, std::unique_ptr<CompressedBlockManager>> compressed_block_managers_;
+
+    // Configure DSv4 compressed pools.  Replaces any previous configuration.
+    // Each entry creates a new CompressedBlockManager for its `ratio`.
+    void configure_compressed_pools(const std::vector<CompressedPoolConfig>& configs);
 
     std::deque<std::shared_ptr<Sequence>>  running;
     std::vector<std::shared_ptr<Sequence>> dummy_seqs;

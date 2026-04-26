@@ -1,12 +1,18 @@
 [package]
-name = "nanoctrl-server"
-version = "0.1.0"
+name = "nanoctrl"
+version = "0.0.5"
 edition = "2021"
+description = "NanoInfra control plane server"
+license = "MIT"
+repository = "https://github.com/JimyMa/NanoDeploy"
+
+[[bin]]
+name = "nanoctrl"
+path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
 clap = { version = "4", features = ["derive"] }
-config = "0.14"
 tokio = { version = "1", features = ["full"] }
 redis = { version = "0.27", features = ["tokio-comp"] }
 deadpool-redis = "0.18"

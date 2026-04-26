@@ -17,6 +17,14 @@ table IntList {
   values: [int];
 }
 
+// Per-ratio block-table entry for DSv4 compressed KV cache.
+// Each sequence owns a list of pages (block_ids) in the pool for each
+// compression ratio (e.g. 4, 128).
+table CompressedBlockTable {
+  ratio: int;
+  block_ids: [int];
+}
+
 table BlockContext {
   engine_id: string;
   dp_idx: int;
@@ -29,6 +37,7 @@ table BlockContext {
   num_dispatched_tokens: [int];
   group_block_table: [IntList];
   endpoints: [string];
+  compressed_block_tables: [CompressedBlockTable];
 }
 
 table SamplingParams {

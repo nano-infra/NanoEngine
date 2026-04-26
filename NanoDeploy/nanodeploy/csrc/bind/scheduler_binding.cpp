@@ -93,6 +93,25 @@ void bind_scheduler_utils(py::module_& m)
         .def_readonly("waiting_head_blocks", &ScheduleResult::waiting_head_blocks)
         .def_readonly("waiting_total_blocks", &ScheduleResult::waiting_total_blocks);
 
+    // DSv4 compressed-cache pool configuration (one per ratio).
+    py::class_<CompressedPoolConfig>(m, "CompressedPoolConfig")
+        .def(py::init([](int ratio, int num_pages, int page_size, int max_blocks_per_seq) {
+                 CompressedPoolConfig c;
+                 c.ratio              = ratio;
+                 c.num_pages          = num_pages;
+                 c.page_size          = page_size;
+                 c.max_blocks_per_seq = max_blocks_per_seq;
+                 return c;
+             }),
+             py::arg("ratio"),
+             py::arg("num_pages"),
+             py::arg("page_size"),
+             py::arg("max_blocks_per_seq"))
+        .def_readwrite("ratio", &CompressedPoolConfig::ratio)
+        .def_readwrite("num_pages", &CompressedPoolConfig::num_pages)
+        .def_readwrite("page_size", &CompressedPoolConfig::page_size)
+        .def_readwrite("max_blocks_per_seq", &CompressedPoolConfig::max_blocks_per_seq);
+
     // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
         .def(py::init<const std::string&,
@@ -117,6 +136,9 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("num_kvcache_blocks"),
              py::arg("kvcache_block_size"),
              py::arg("mode"))
+
+        // DSv4 compressed-cache pool configuration
+        .def("configure_compressed_pools", &Scheduler::configure_compressed_pools, py::arg("configs"))
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))

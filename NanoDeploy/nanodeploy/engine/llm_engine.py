@@ -21,6 +21,18 @@ from nanodeploy.metrics import MetricsManager
 logger = get_logger()
 
 
+def _build_executor(config: Config):
+    if config.executor_backend == "ray":
+        from nanodeploy.engine.ray_executor import RayExecutor
+
+        return RayExecutor(config=config)
+    if config.executor_backend == "dlslime":
+        from nanodeploy.engine.dlslime_executor import DLSLimeExecutor
+
+        return DLSLimeExecutor(config=config)
+    raise ValueError(f"Unknown executor backend: {config.executor_backend}")
+
+
 @dataclass
 class StepResult:
     dp_seqs: list
@@ -49,9 +61,7 @@ class LLMEngine:
         self.ps = []
         self.events = []
 
-        from nanodeploy.engine.ray_executor import RayExecutor
-
-        self.executor = RayExecutor(config=config)
+        self.executor = _build_executor(config)
         self.update_num_kvcache_blocks()
 
         self.tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)

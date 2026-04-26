@@ -48,7 +48,8 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("temperatures", &BatchAuxData::temperatures)
         .def_readonly("state_slots", &BatchAuxData::state_slots)
         .def_readonly("master_group_indices", &BatchAuxData::master_group_indices)
-        .def_readonly("num_group_seqs", &BatchAuxData::num_group_seqs);
+        .def_readonly("num_group_seqs", &BatchAuxData::num_group_seqs)
+        .def_readonly("compressed_block_tables", &BatchAuxData::compressed_block_tables);
 
     py::class_<MigrateSequenceView>(m, "MigrateSequenceView")
         .def_readonly("seq_id", &MigrateSequenceView::seq_id)
@@ -59,7 +60,9 @@ void bind_model_runner_utils(py::module_& m)
         .def_readonly("migrate_block_location", &MigrateSequenceView::migrate_block_location)
         .def_readonly("migrate_state_slot", &MigrateSequenceView::migrate_state_slot)
         .def_readonly("active_block_location", &MigrateSequenceView::active_block_location)
-        .def_readonly("active_state_slot", &MigrateSequenceView::active_state_slot);
+        .def_readonly("active_state_slot", &MigrateSequenceView::active_state_slot)
+        .def_readonly("migrate_compressed_block_tables", &MigrateSequenceView::migrate_compressed_block_tables)
+        .def_readonly("active_compressed_block_tables", &MigrateSequenceView::active_compressed_block_tables);
 
     py::class_<VisionSlotView>(m, "VisionSlotView")
         .def_readonly("encoder_engine_id", &VisionSlotView::encoder_engine_id)

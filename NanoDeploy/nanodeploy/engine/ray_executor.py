@@ -23,6 +23,18 @@ def _serialize_migrate(seqs: list[Sequence]) -> bytes:
     return serialize_migrate_batch(seqs)
 
 
+def _collect_dsv4_debug_env() -> dict[str, str] | None:
+    """Forward opt-in DeepSeek-V4 debug env vars to Ray actors."""
+    import os
+
+    debug_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith("NANODEPLOY_DSV4_DEBUG_")
+    }
+    return debug_env or None
+
+
 from nanodeploy.engine.ray_utils import get_available_nodes_with_master_first
 
 
@@ -39,6 +51,12 @@ class RayExecutor:
 
         self.workers = []
         self.placement_groups = []
+        self.worker_debug_env = _collect_dsv4_debug_env()
+        if self.worker_debug_env:
+            logger.info(
+                "Forwarding DeepSeek-V4 debug env to Ray workers: "
+                f"{sorted(self.worker_debug_env)}"
+            )
         assert config.attn_world_size == config.ffn_world_size
 
         # Check if running under NanoOps orchestration
@@ -80,7 +98,12 @@ class RayExecutor:
         # workers may be on a different node.  We create them with
         # defer_dist_init=True so they skip dist.init_process_group().
         for rank in range(self.config.attn_world_size):
-            worker = ModelRunner.remote(self.config, rank, defer_dist_init=True)
+            worker = ModelRunner.remote(
+                self.config,
+                rank,
+                defer_dist_init=True,
+                debug_env=self.worker_debug_env,
+            )
             self.workers.append(worker)
 
         # --- Phase 2: probe worker[0] for actual node IP + free port ------
@@ -142,7 +165,9 @@ class RayExecutor:
 
             for rank in range(start_rank, end_rank):
                 worker = ModelRunner.options(placement_group=pg).remote(
-                    self.config, rank
+                    self.config,
+                    rank,
+                    debug_env=self.worker_debug_env,
                 )
                 self.workers.append(worker)
 

@@ -48,6 +48,22 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
             }
         }
 
+        // DSv4 compressed_block_tables: pack each ratio's per-seq page list
+        flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<fbs::CompressedBlockTableI>>> compressed_bt_off = 0;
+        if (!ctx.compressed_block_tables.empty()) {
+            std::vector<flatbuffers::Offset<fbs::CompressedBlockTableI>> cbt_offsets;
+            cbt_offsets.reserve(ctx.compressed_block_tables.size());
+            for (const auto& cbt : ctx.compressed_block_tables) {
+                if (!cbt)
+                    continue;
+                auto ids_vec = builder.CreateVector(cbt->block_ids);
+                cbt_offsets.push_back(fbs::CreateCompressedBlockTableI(builder, cbt->ratio, ids_vec));
+            }
+            if (!cbt_offsets.empty()) {
+                compressed_bt_off = builder.CreateVector(cbt_offsets);
+            }
+        }
+
         // vision_slots (prefill only, EP mode)
         flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<fbs::VisionSlotRef>>> vision_slots_off = 0;
         if (is_prefill && !seq->data_->vision_slots.empty()) {
@@ -84,6 +100,10 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
 
         if (vision_slots_off.o != 0) {
             si_builder.add_vision_slots(vision_slots_off);
+        }
+
+        if (compressed_bt_off.o != 0) {
+            si_builder.add_compressed_block_tables(compressed_bt_off);
         }
 
         seq_offsets.push_back(si_builder.Finish());
@@ -125,6 +145,24 @@ flatbuffers::DetachedBuffer serialize_migrate_batch(const std::vector<Sequence*>
         }
         auto active_bl_vec = builder.CreateVectorOfStructs(active_bl);
 
+        // DSv4: pack per-ratio compressed block tables for both MIGRATE and
+        // ACTIVE slots so the decode engine can RDMA the right remote pages.
+        auto pack_cbts = [&](const std::vector<std::unique_ptr<fbs::CompressedBlockTableT>>& cbts) {
+            std::vector<flatbuffers::Offset<fbs::CompressedBlockTableI>> offs;
+            offs.reserve(cbts.size());
+            for (const auto& cbt : cbts) {
+                if (!cbt)
+                    continue;
+                auto ids_vec = builder.CreateVector(cbt->block_ids);
+                offs.push_back(fbs::CreateCompressedBlockTableI(builder, cbt->ratio, ids_vec));
+            }
+            return offs.empty() ?
+                       flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<fbs::CompressedBlockTableI>>>(0) :
+                       builder.CreateVector(offs);
+        };
+        auto migrate_cbt_off = pack_cbts(migrate_ctx.compressed_block_tables);
+        auto active_cbt_off  = pack_cbts(active_ctx.compressed_block_tables);
+
         fbs::MigrateSequenceInputBuilder msi_builder(builder);
         msi_builder.add_seq_id(seq->seq_id());
         msi_builder.add_migrate_engine_id(engine_id_off);
@@ -133,8 +171,12 @@ flatbuffers::DetachedBuffer serialize_migrate_batch(const std::vector<Sequence*>
         msi_builder.add_migrate_dp_idx(migrate_ctx.dp_idx);
         msi_builder.add_migrate_block_location(migrate_bl_vec);
         msi_builder.add_migrate_state_slot(migrate_ctx.state_slot);
+        if (migrate_cbt_off.o != 0)
+            msi_builder.add_migrate_compressed_block_tables(migrate_cbt_off);
         msi_builder.add_active_block_location(active_bl_vec);
         msi_builder.add_active_state_slot(active_ctx.state_slot);
+        if (active_cbt_off.o != 0)
+            msi_builder.add_active_compressed_block_tables(active_cbt_off);
 
         seq_offsets.push_back(msi_builder.Finish());
     }

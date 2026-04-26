@@ -20,6 +20,7 @@ pub enum AppError {
     #[allow(dead_code)]
     NotFound(String),
     /// Conflicting state (e.g. duplicate agent name).
+    #[allow(dead_code)]
     Conflict(String),
     /// JSON (de)serialization failure.
     Serialization(serde_json::Error),

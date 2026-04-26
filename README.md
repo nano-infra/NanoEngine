@@ -65,20 +65,24 @@ graph TB
 
 ## 🚀 Installation
 
-### Prerequest Third-Party GPU Kernels
+### Key Third-Party Dependencies
 
-| Library                                             | Version | Description                                                     | Source      |
-| --------------------------------------------------- | ------- | --------------------------------------------------------------- | ----------- |
-| [DeepEP](https://github.com/deepseek-ai/DeepEP)     | 1.2.1   | Expert-parallel all-to-all communication (MoE dispatch/combine) | deepseek-ai |
-| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) | 2.1.1   | FP8 GEMM kernels with fine-grained scaling (JIT compiled)       | deepseek-ai |
-| [FlashMLA](https://github.com/deepseek-ai/FlashMLA) | 1.0.0   | Multi-head Latent Attention decode kernels (dense + FP8 sparse) | deepseek-ai |
+| Library                                                   | Version   | Description                                                         | Source        |
+| --------------------------------------------------------- | --------- | ------------------------------------------------------------------- | ------------- |
+| [DeepEP](https://github.com/deepseek-ai/DeepEP)           | 1.2.1     | Expert-parallel all-to-all communication (MoE dispatch/combine)     | deepseek-ai   |
+| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)       | 2.1.1     | FP8 GEMM kernels with fine-grained scaling (JIT compiled)           | deepseek-ai   |
+| [FlashMLA](https://github.com/deepseek-ai/FlashMLA)       | 1.0.0     | Multi-head Latent Attention decode kernels (dense + FP8 sparse)     | deepseek-ai   |
+| [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | 0.6.6     | High-performance inference kernels for attention, GDN, and sampling | flashinfer-ai |
+| [DLSlime](https://github.com/deeplink-org/DLSlime)        | 0.0.3.rc1 | Flexible heterogeneous transfer toolkit for RDMA/NVLink/NVSHMEM     | deeplink-org  |
 
-All three require SM90+ (NVIDIA Hopper) GPUs. Install from source:
+The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs. Install the key dependencies as follows:
 
 ```bash
 cd DeepEP && pip install .
 cd DeepGEMM && pip install .
 cd FlashMLA && pip install .
+pip install flashinfer-python==0.6.6
+pip install dlslime==0.0.3.rc1
 ```
 
 ### One-liner: install everything
@@ -149,7 +153,7 @@ python NanoDeploy/examples/non_disagg.py \
 
 ```bash
 redis-server --bind 0.0.0.0 --port 6379
-cd NanoCtrl && cargo run --release    # edit config.toml to set redis_url
+cd NanoCtrl && cargo run --release -- server --redis-url redis://127.0.0.1:6379
 ```
 
 ##### 3. Launch engines
@@ -172,7 +176,7 @@ ZMQ engine servers with OpenAI-compatible HTTP API via NanoRoute.
 
 ```bash
 redis-server --bind 0.0.0.0 --port 6379
-cd NanoCtrl && cargo run --release    # edit config.toml to set redis_url
+cd NanoCtrl && cargo run --release -- server --redis-url redis://127.0.0.1:6379
 ```
 
 ##### 3. Start NanoRoute

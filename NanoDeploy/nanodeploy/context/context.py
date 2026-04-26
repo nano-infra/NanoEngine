@@ -37,6 +37,18 @@ class Context:
     # Per-sequence GDN slot indices: [num_seqs], maps batch position i -> slot index
     gdn_state_slots: torch.Tensor | None = None
 
+    # DSv4 compressor state slot indices: [num_seqs] int64. Stable per-seq slot
+    # (0..max_num_seqs-1) assigned by the scheduler's GDNStateManager. Used to
+    # index DeepseekV4Compressor._kv_states / _score_states / _compressed_counts.
+    # Parallel to gdn_state_slots (each model uses at most one of these).
+    dsv4_state_slots: torch.Tensor | None = None
+
+    # DSv4 compressed-cache block tables (per compression ratio).
+    # ratio -> [num_seqs, max_blocks_per_seq] int32 tensor of physical page IDs.
+    # Empty rows / unused entries are padded with the dummy page id
+    # (= cache.shape[0] - 1).
+    dsv4_compressed_block_tables: dict[int, torch.Tensor] | None = None
+
     # Number of tokens per sequence in decode mode (1 = normal decode,
     # 2 = lazy verify with [token_{K-1}, draft] per seq).
     num_tokens_per_seq: int = 1
@@ -77,6 +89,8 @@ def set_context(
     gdn_conv_states: Optional[torch.Tensor] = None,
     gdn_recurrent_states: Optional[torch.Tensor] = None,
     gdn_state_slots: Optional[torch.Tensor] = None,
+    dsv4_state_slots: Optional[torch.Tensor] = None,
+    dsv4_compressed_block_tables: Optional[dict[int, torch.Tensor]] = None,
     num_tokens_per_seq: int = 1,
     use_low_latency_ep: bool = False,
     sampling_token_indices: Optional[torch.Tensor] = None,
@@ -101,6 +115,8 @@ def set_context(
         gdn_conv_states=gdn_conv_states,
         gdn_recurrent_states=gdn_recurrent_states,
         gdn_state_slots=gdn_state_slots,
+        dsv4_state_slots=dsv4_state_slots,
+        dsv4_compressed_block_tables=dsv4_compressed_block_tables,
         sampling_token_indices=sampling_token_indices,
         sampling_seq_indices=sampling_seq_indices,
     )

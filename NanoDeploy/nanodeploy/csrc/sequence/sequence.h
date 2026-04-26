@@ -124,6 +124,13 @@ public:
     int  state_slot(BlockContextSlot slot = BlockContextSlot::ACTIVE) const;
     void set_state_slot(BlockContextSlot slot, int state_slot);
 
+    // DSv4 compressed KV cache block tables (per compression ratio).
+    // Each returned vector is the list of physical page IDs owned by this
+    // sequence for the given ratio.  Empty if not allocated.
+    std::vector<int>&       compressed_block_table(BlockContextSlot slot, int ratio);
+    const std::vector<int>& compressed_block_table(BlockContextSlot slot, int ratio) const;
+    void                    set_compressed_block_table(BlockContextSlot slot, int ratio, std::vector<int> ids);
+
     // Properties
     bool is_finished() const
     {

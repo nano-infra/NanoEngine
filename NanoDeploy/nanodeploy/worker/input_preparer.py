@@ -87,6 +87,55 @@ class InputPreparer:
                 pin_memory=True,
             ).cuda(non_blocking=True)
 
+        # DSv4 compressor state slots — share the same aux.state_slots source
+        # as GDN (the scheduler's GDNStateManager is model-agnostic).
+        dsv4_state_slots = None
+        dsv4_compressed_block_tables = None
+        if cache_ctx.mode == "dsv4":
+            # Dummy slot at index max_num_seqs (compressor buffer has max+1 slots)
+            dummy_dsv4_slot = self.config.max_num_seqs
+            dsv4_state_slots = torch.tensor(
+                [
+                    s if 0 <= s < dummy_dsv4_slot else dummy_dsv4_slot
+                    for s in aux.state_slots
+                ],
+                dtype=torch.int64,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+
+            # DSv4 compressed-cache block tables — indexed by state_slot.
+            # aux.compressed_block_tables[ratio]: list[list[int]] in master-group
+            # seq order; aux.state_slots[i] is the C++ slot id for that seq.
+            # Build [max_num_seqs+1, max_blocks] tensors per ratio, scattering
+            # each seq's page ids into row state_slot. Row max_num_seqs is the
+            # dummy (matches dsv4_state_slots dummy convention).
+            cbt_aux = getattr(aux, "compressed_block_tables", None) or {}
+            pool_cfg = getattr(cache_ctx, "dsv4_compressed_pool_config", {}) or {}
+            dummy_pages = getattr(cache_ctx, "dsv4_compressed_dummy_page", {}) or {}
+            max_slots = self.config.max_num_seqs
+            built = {}
+            for ratio, per_seq in cbt_aux.items():
+                num_pages_cfg, _page_size, max_blocks = pool_cfg.get(ratio, (0, 0, 0))
+                if max_blocks <= 0:
+                    continue
+                dummy_page = dummy_pages.get(ratio, num_pages_cfg)
+                # Initialize all rows (incl. dummy at max_slots) with dummy_page.
+                rows = [[dummy_page] * max_blocks for _ in range(max_slots + 1)]
+                for batch_pos, seq_ids in enumerate(per_seq):
+                    if batch_pos >= len(aux.state_slots):
+                        break
+                    state_slot = aux.state_slots[batch_pos]
+                    if not (0 <= state_slot < max_slots):
+                        continue  # invalid → goes to dummy via default fill
+                    n = min(len(seq_ids), max_blocks)
+                    for j in range(n):
+                        rows[state_slot][j] = seq_ids[j]
+                built[ratio] = torch.tensor(
+                    rows, dtype=torch.int32, pin_memory=True
+                ).cuda(non_blocking=True)
+            if built:
+                dsv4_compressed_block_tables = built
+
         # Chunked prefill: selective lm_head — only compute logits for final-chunk seqs.
         sampling_token_indices = None
         sampling_seq_indices = None
@@ -112,6 +161,8 @@ class InputPreparer:
             gdn_conv_states=cache_ctx.gdn_conv_states,
             gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
             gdn_state_slots=gdn_state_slots,
+            dsv4_state_slots=dsv4_state_slots,
+            dsv4_compressed_block_tables=dsv4_compressed_block_tables,
             sampling_token_indices=sampling_token_indices,
             sampling_seq_indices=sampling_seq_indices,
         )
@@ -192,6 +243,46 @@ class InputPreparer:
                 pin_memory=True,
             ).cuda(non_blocking=True)
 
+        # DSv4 compressor state slots + compressed block tables
+        dsv4_state_slots = None
+        dsv4_compressed_block_tables = None
+        if cache_ctx.mode == "dsv4":
+            dummy_dsv4_slot = self.config.max_num_seqs
+            dsv4_state_slots = torch.tensor(
+                [
+                    s if 0 <= s < dummy_dsv4_slot else dummy_dsv4_slot
+                    for s in aux.state_slots
+                ],
+                dtype=torch.int64,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+
+            cbt_aux = getattr(aux, "compressed_block_tables", None) or {}
+            pool_cfg = getattr(cache_ctx, "dsv4_compressed_pool_config", {}) or {}
+            dummy_pages = getattr(cache_ctx, "dsv4_compressed_dummy_page", {}) or {}
+            max_slots = self.config.max_num_seqs
+            built = {}
+            for ratio, per_seq in cbt_aux.items():
+                num_pages_cfg, _page_size, max_blocks = pool_cfg.get(ratio, (0, 0, 0))
+                if max_blocks <= 0:
+                    continue
+                dummy_page = dummy_pages.get(ratio, num_pages_cfg)
+                rows = [[dummy_page] * max_blocks for _ in range(max_slots + 1)]
+                for batch_pos, seq_ids in enumerate(per_seq):
+                    if batch_pos >= len(aux.state_slots):
+                        break
+                    state_slot = aux.state_slots[batch_pos]
+                    if not (0 <= state_slot < max_slots):
+                        continue
+                    n = min(len(seq_ids), max_blocks)
+                    for j in range(n):
+                        rows[state_slot][j] = seq_ids[j]
+                built[ratio] = torch.tensor(
+                    rows, dtype=torch.int32, pin_memory=True
+                ).cuda(non_blocking=True)
+            if built:
+                dsv4_compressed_block_tables = built
+
         set_context(
             is_prefill=False,
             max_bs=self.config.max_num_seqs,
@@ -203,6 +294,8 @@ class InputPreparer:
             gdn_conv_states=cache_ctx.gdn_conv_states,
             gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
             gdn_state_slots=gdn_state_slots,
+            dsv4_state_slots=dsv4_state_slots,
+            dsv4_compressed_block_tables=dsv4_compressed_block_tables,
         )
 
         return input_ids, positions

@@ -99,7 +99,7 @@ pub struct GetMrInfoResponse {
 pub struct CleanupBody {
     pub agent_name: String,
     #[serde(default)]
-    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -185,14 +185,15 @@ pub struct ListEnginesResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct HeartbeatEngineBody {
-    pub engine_id: String,
+pub struct HeartbeatBody {
+    pub entity_type: String,
+    pub entity_id: String,
     #[serde(default)]
-    pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct HeartbeatEngineResponse {
+pub struct HeartbeatResponse {
     pub status: String,
     pub message: String,
 }

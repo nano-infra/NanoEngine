@@ -1,4 +1,4 @@
-//! Engine management handlers: register, unregister, heartbeat, info, list.
+//! Engine management handlers: register, unregister, info, list.
 
 use axum::{extract::State, response::IntoResponse, Json};
 
@@ -36,32 +36,6 @@ pub async fn unregister_engine(
         status: "ok".to_string(),
         message: format!("Engine {} unregistered successfully", body.engine_id),
     }))
-}
-
-pub async fn heartbeat_engine(
-    State(repo): State<RedisRepo>,
-    Json(body): Json<HeartbeatEngineBody>,
-) -> Result<impl IntoResponse, AppError> {
-    tracing::debug!("Heartbeat for engine: {}", body.engine_id);
-
-    let found = repo
-        .heartbeat_engine(body.scope.as_deref(), &body.engine_id)
-        .await?;
-
-    if found {
-        Ok(Json(HeartbeatEngineResponse {
-            status: "ok".to_string(),
-            message: format!("Heartbeat successful for engine {}", body.engine_id),
-        }))
-    } else {
-        Ok(Json(HeartbeatEngineResponse {
-            status: "not_found".to_string(),
-            message: format!(
-                "Engine {} not found. Please register first.",
-                body.engine_id
-            ),
-        }))
-    }
 }
 
 pub async fn get_engine_info(

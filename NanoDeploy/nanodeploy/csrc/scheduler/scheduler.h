@@ -96,6 +96,11 @@ public:
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
 
+    // DSv4: configure per-compression-ratio compressed-cache pools across
+    // all DP workers.  Must be called once after construction (before any
+    // allocate()) when the model has compressed layers.
+    void configure_compressed_pools(const std::vector<CompressedPoolConfig>& configs);
+
     // Main scheduling functions
     ScheduleResult schedule();
 

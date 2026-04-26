@@ -1,4 +1,4 @@
-//! Utility handlers: health check, Redis address resolution.
+//! Utility handlers: health check, Redis address, generic heartbeat.
 
 use axum::{extract::State, response::IntoResponse, Json};
 
@@ -9,6 +9,40 @@ use crate::redis_repo::RedisRepo;
 
 pub async fn root() -> &'static str {
     "NanoCtrl Server Running"
+}
+
+pub async fn heartbeat(
+    State(repo): State<RedisRepo>,
+    Json(body): Json<HeartbeatBody>,
+) -> Result<impl IntoResponse, AppError> {
+    tracing::debug!("Heartbeat for {}:{}", body.entity_type, body.entity_id);
+
+    let found = repo
+        .heartbeat(&body.entity_type, body.scope.as_deref(), &body.entity_id)
+        .await?;
+
+    let (status, msg) = if found {
+        (
+            "ok",
+            format!(
+                "Heartbeat successful for {} {}",
+                body.entity_type, body.entity_id
+            ),
+        )
+    } else {
+        (
+            "not_found",
+            format!(
+                "{} {} not found. Please register first.",
+                body.entity_type, body.entity_id
+            ),
+        )
+    };
+
+    Ok(Json(HeartbeatResponse {
+        status: status.to_string(),
+        message: msg,
+    }))
 }
 
 pub async fn get_redis_address(

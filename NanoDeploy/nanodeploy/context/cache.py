@@ -42,11 +42,16 @@ class CacheContext:
     gpu_memory_limit_gb: float | None = None
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
-    mode: Literal["gqa", "mla"] = "gqa"
+    mode: Literal["gqa", "mla", "dsv4"] = "gqa"
     num_local_kvcache_blocks = -1
     num_remote_kvcache_blocks: dict[str, int] = None
     kv_cache: torch.Tensor = None
     gdn_conv_states: torch.Tensor | None = None
+
+    # DSv4 compressed KV caches (per-layer, separate from SWA paged cache)
+    # Shape per layer: [max_num_seqs, max_compressed_tokens, 1, 584] uint8
+    dsv4_compressed_caches: dict[int, torch.Tensor] | None = None
+    dsv4_compress_ratios: list[int] | None = None  # per-layer compress ratios
     gdn_recurrent_states: torch.Tensor | None = None
     selected_nic: str | None = None
     endpoints: dict[str, dict[int, Any]] = None  # RDMAEndpoint or RDMALazyPeer
@@ -89,8 +94,16 @@ class CacheContext:
             assert self.block_size == 64, "MLA mode only support block_size=64"
             self.num_kv_heads = 1
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        elif self.mode == "dsv4":
+            assert self.attention_tp == 1
+            assert self.block_size % 64 == 0, "DSv4 block_size must be multiple of 64"
+            self.num_kv_heads = 1
+            self.head_dim = 512  # fixed for DSv4
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
+
+        # DSv4 FP8 packed format: 584 bytes per token
+        _DSV4_BYTES_PER_TOKEN = 584
 
         if self.mode == "mla" and self.is_fp8_kvcache:
             # FP8 MLA layout per token:
@@ -107,6 +120,13 @@ class CacheContext:
                 * 1  # num_kv_heads
                 * self._fp8_head_dim
                 * 1  # fp8 element size
+            )
+        elif self.mode == "dsv4":
+            self._fp8_head_dim = 0
+            # SWA paged cache: [num_layers, num_pages, page_size, 1, 584] uint8
+            # Each block = page_size * 584 bytes per layer
+            block_bytes = (
+                self.num_hidden_layers * self.block_size * _DSV4_BYTES_PER_TOKEN
             )
         else:
             self._fp8_head_dim = 0
@@ -151,6 +171,13 @@ class CacheContext:
         self.remote_max_num_seqs: dict[str, int] = {}  # engine_id -> max_num_seqs
         self.remote_gdn_num_slots: dict[str, int] = {}  # engine_id -> gdn_num_slots
         self.gdn_num_slots: int = 0  # actual dim-1 of gdn tensors
+        # DSv4 (S2.5): per-remote-engine pool sizes for stride math.
+        # remote_compressed_pool_pages[engine_id][ratio] = num_pages on that engine
+        self.remote_compressed_pool_pages: dict[str, dict[int, int]] = {}
+        # remote_dsv4_max_slots[engine_id] = max_num_seqs on that engine
+        self.remote_dsv4_max_slots: dict[str, int] = {}
+        # remote_dsv4_num_layers_per_ratio[engine_id][ratio] = num layers using that ratio
+        self.remote_dsv4_num_layers_per_ratio: dict[str, dict[int, int]] = {}
         self._peer_agent = None
         self._peer_agent_addr: str | None = None
         self._connected_peers: set[str] = set()  # track connected peer addresses
@@ -160,6 +187,11 @@ class CacheContext:
         self._local_indexer_mr_handler: int | None = (
             None  # local MR handler for indexer_cache
         )
+        # DSv4 (S2.4): per-ratio MR handlers for compressed cache and compressor state.
+        self._local_dsv4_compressed_mr_handlers: dict[int, int] = {}
+        self._local_dsv4_compressor_kv_mr_handlers: dict[int, int] = {}
+        self._local_dsv4_compressor_score_mr_handlers: dict[int, int] = {}
+        self._local_dsv4_compressor_counts_mr_handlers: dict[int, int] = {}
         # NOTE: Remote MR handler caching removed from app layer
         # PeerAgent handles MR info caching via pubsub (mr_update events)
         # register_remote_memory_region is idempotent at endpoint layer
@@ -286,6 +318,92 @@ class CacheContext:
             layer_idx * self.num_remote_kvcache_blocks[remote_engine_id] + block_idx
         ) * page_bytes
 
+    # ------------------------------------------------------------------
+    # DSv4 compressed cache + compressor scratch state stride helpers (S2.3)
+    # ------------------------------------------------------------------
+    # All buffers are flat per ratio:
+    #   compressed_caches_flat[ratio]:    [num_layers, num_pages+1, page_size, 1, 584] uint8
+    #   compressor_kv_flat[ratio]:        [num_layers, max_slots+1, coeff*ratio, coeff*head_dim] fp32
+    #   compressor_score_flat[ratio]:     same shape as kv
+    #   compressor_counts_flat[ratio]:    [num_layers, max_slots+1] int32
+
+    def compressed_page_bytes(self, ratio: int) -> int:
+        """Bytes per page in the DSv4 compressed cache for a given ratio."""
+        cfg = getattr(self, "dsv4_compressed_pool_config", {}).get(ratio)
+        if cfg is None:
+            return 0
+        _num_pages, page_size, _max_blocks = cfg
+        _DSV4_BYTES_PER_TOKEN = 584
+        return page_size * _DSV4_BYTES_PER_TOKEN
+
+    def local_compressed_stride(
+        self, ratio: int, ratio_layer_idx: int, page_idx: int
+    ) -> int:
+        """Byte offset for (layer-within-ratio, page) in the LOCAL flat compressed cache."""
+        page_bytes = self.compressed_page_bytes(ratio)
+        cfg = self.dsv4_compressed_pool_config[ratio]
+        num_pages = cfg[0] + 1  # include +1 dummy
+        return (ratio_layer_idx * num_pages + page_idx) * page_bytes
+
+    def remote_compressed_stride(
+        self,
+        ratio: int,
+        ratio_layer_idx: int,
+        page_idx: int,
+        remote_engine_id: str,
+    ) -> int:
+        """Byte offset for (layer-within-ratio, page) on a REMOTE engine."""
+        page_bytes = self.compressed_page_bytes(ratio)
+        remote_pages = self.remote_compressed_pool_pages.get(remote_engine_id, {}).get(
+            ratio
+        )
+        if remote_pages is None:
+            return -1
+        return (ratio_layer_idx * (remote_pages + 1) + page_idx) * page_bytes
+
+    def _compressor_state_row_bytes(self, ratio: int, kind: str) -> int:
+        """Bytes per (layer, slot) row in the compressor scratch buffers."""
+        if kind == "counts":
+            return 4  # int32 scalar per slot
+        # kv / score: coeff*ratio * coeff*head_dim * fp32
+        coeff = 2 if ratio == 4 else 1
+        head_dim = 512  # DSv4 fixed
+        return coeff * ratio * coeff * head_dim * 4
+
+    def _local_max_slots_plus_dummy(self, ratio: int) -> int:
+        """Get the LOCAL max_slots (+1 for dummy) from the compressor state shape."""
+        kv = getattr(self, "dsv4_compressor_kv_flat", {}).get(ratio)
+        if kv is None:
+            return 0
+        return kv.shape[1]  # already includes the +1 dummy
+
+    def local_compressor_state_stride(
+        self, ratio: int, ratio_layer_idx: int, slot: int, kind: str
+    ) -> int:
+        """Byte offset for compressor scratch state on the LOCAL engine.
+
+        kind is one of 'kv', 'score', 'counts'.
+        """
+        row_bytes = self._compressor_state_row_bytes(ratio, kind)
+        slots = self._local_max_slots_plus_dummy(ratio)
+        return (ratio_layer_idx * slots + slot) * row_bytes
+
+    def remote_compressor_state_stride(
+        self,
+        ratio: int,
+        ratio_layer_idx: int,
+        slot: int,
+        kind: str,
+        remote_engine_id: str,
+    ) -> int:
+        """Byte offset for compressor scratch state on a REMOTE engine."""
+        row_bytes = self._compressor_state_row_bytes(ratio, kind)
+        remote_max_slots = self.remote_dsv4_max_slots.get(remote_engine_id, 0)
+        if remote_max_slots == 0:
+            remote_max_slots = self._local_max_slots_plus_dummy(ratio) - 1
+        # +1 for dummy slot
+        return (ratio_layer_idx * (remote_max_slots + 1) + slot) * row_bytes
+
     def allocate_kvcache(self, num_kvcache_blocks):
         self.num_local_kvcache_blocks = num_kvcache_blocks
 
@@ -304,6 +422,24 @@ class CacheContext:
                 device=self.device,
             )
             self.kv_cache = kv_cache_padded[:, :, :, : self.block_size, :, :]
+        elif self.mode == "dsv4":
+            _DSV4_BYTES_PER_TOKEN = 584
+            # SWA paged cache: [num_layers, num_pages+1, page_size, 1, 584] uint8
+            # Extra +1 page is a "dummy" absorbing invalid writes (graph-safe).
+            # flash_mla reads this via sparse indices (MODEL1 code path).
+            self.kv_cache = torch.zeros(
+                self.num_hidden_layers,
+                self.num_local_kvcache_blocks + 1,  # +1 dummy page
+                self.block_size,
+                1,  # num_kv_heads (always 1)
+                _DSV4_BYTES_PER_TOKEN,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            logger.info(
+                f"DSv4 SWA cache: {self.kv_cache.shape} (incl dummy page), "
+                f"{self.kv_cache.nelement() / 1e9:.2f} GB"
+            )
         else:
             kv_count = 2 if self.mode == "gqa" else 1
             self.kv_cache = torch.empty(
@@ -315,6 +451,162 @@ class CacheContext:
                 self.head_dim,
                 dtype=self.dtype,
                 device=self.device,
+            )
+
+    def allocate_dsv4_compressed_caches(
+        self,
+        compress_ratios: list[int],
+        max_num_seqs: int,
+        max_model_len: int,
+        pool_pages_per_ratio: dict[int, int] | None = None,
+    ):
+        """Allocate per-layer compressed KV caches for DSv4 (paged shared pool).
+
+        Each compression ratio gets its own pool of pages, sized either by
+        ``pool_pages_per_ratio[ratio]`` (when provided and > 0) or by the
+        worst case ``ceil(max_num_seqs * max_compressed / page_size)``.
+        Pages are shared across sequences and assigned by the C++
+        CompressedBlockManager via per-seq block tables.
+
+        Cache shape per layer per ratio:
+            [num_pages + 1, page_size=2, 1, 584] uint8
+        page_size=2 ensures the per-page stride (2 * 584) is 16-byte aligned
+        for flash_mla's 128-bit vector loads. The +1 dummy page absorbs
+        graph-safe invalid writes.
+        """
+        _DSV4_BYTES_PER_TOKEN = 584
+        compressed_page_size = 2
+        self.dsv4_compress_ratios = compress_ratios
+        # Per-layer compressed cache *view* into per-ratio flat buffer (S2.1).
+        # layer_idx -> uint8 tensor [num_pages+1, 2, 1, 584] (a view, not a copy)
+        self.dsv4_compressed_caches: dict[int, torch.Tensor] = {}
+        # Per-ratio FLAT compressed cache (one buffer for all layers in this
+        # ratio).  Shape: [num_layers_for_ratio, num_pages+1, page_size, 1, 584].
+        # Single MR registration per ratio for RDMA migration efficiency.
+        self.dsv4_compressed_caches_flat: dict[int, torch.Tensor] = {}
+        # ratio -> ordered list of model layer_idx that use this ratio
+        self.dsv4_layers_per_ratio: dict[int, list[int]] = {}
+        # layer_idx -> position of this layer within its ratio's flat tensor
+        self.dsv4_layer_to_ratio_idx: dict[int, int] = {}
+        # Per-ratio pool config (used by Scheduler.configure_compressed_pools)
+        # ratio -> (num_pages, page_size, max_blocks_per_seq)
+        self.dsv4_compressed_pool_config: dict[int, tuple[int, int, int]] = {}
+        # Per-ratio dummy page id (last index, used to pad block_tables on
+        # the Python side for invalid / unused batch positions).
+        self.dsv4_compressed_dummy_page: dict[int, int] = {}
+        pool_pages_per_ratio = pool_pages_per_ratio or {}
+
+        total_bytes = 0
+        # Group layers by ratio to compute pool size once per ratio.
+        unique_ratios = sorted({r for r in compress_ratios if r > 0})
+        for ratio in unique_ratios:
+            max_compressed = (max_model_len // ratio + 63) // 64 * 64
+            max_blocks_per_seq = (
+                max_compressed + compressed_page_size - 1
+            ) // compressed_page_size
+            # Worst-case: every seq fills its full reservation at the same time.
+            worst_case_pages = max_num_seqs * max_blocks_per_seq
+            override = pool_pages_per_ratio.get(ratio, 0)
+            num_pages = override if override > 0 else worst_case_pages
+            self.dsv4_compressed_pool_config[ratio] = (
+                num_pages,
+                compressed_page_size,
+                max_blocks_per_seq,
+            )
+            self.dsv4_compressed_dummy_page[ratio] = num_pages  # last index = dummy
+            # Collect layer indices using this ratio (in model order)
+            layers_for_ratio = [
+                i for i, lr in enumerate(compress_ratios) if lr == ratio
+            ]
+            self.dsv4_layers_per_ratio[ratio] = layers_for_ratio
+            n_layers = len(layers_for_ratio)
+            # Allocate single flat buffer for this ratio.
+            flat = torch.zeros(
+                n_layers,
+                num_pages + 1,  # +1 dummy page
+                compressed_page_size,
+                1,
+                _DSV4_BYTES_PER_TOKEN,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            self.dsv4_compressed_caches_flat[ratio] = flat
+            total_bytes += flat.nelement()
+            # Expose per-layer views (existing API the model layer expects).
+            for ratio_layer_idx, layer_idx in enumerate(layers_for_ratio):
+                self.dsv4_compressed_caches[layer_idx] = flat[ratio_layer_idx]
+                self.dsv4_layer_to_ratio_idx[layer_idx] = ratio_layer_idx
+        if total_bytes > 0:
+            sizes_str = ", ".join(
+                f"ratio={r}: {p[0]} pages × {p[1]} tok × "
+                f"{len(self.dsv4_layers_per_ratio[r])} layers"
+                for r, p in self.dsv4_compressed_pool_config.items()
+            )
+            logger.info(
+                f"DSv4 compressed caches (flat per ratio): "
+                f"{len(self.dsv4_compressed_caches)} layer views, "
+                f"total {total_bytes / 1e9:.2f} GB ({sizes_str})"
+            )
+
+    def allocate_dsv4_compressor_state(
+        self,
+        compress_ratios: list[int],
+        head_dim: int,
+        max_num_seqs: int,
+    ):
+        """Allocate flat per-ratio compressor scratch state buffers (S2.2).
+
+        For RDMA migration we need single contiguous buffers per (ratio, kind)
+        spanning all layers using that ratio.  Each per-layer Compressor will
+        hold a slice view (`flat[ratio_layer_idx]`) so existing
+        `_kv_states[seq_slot]` indexing keeps working.
+
+        Tensor shapes (per ratio):
+          dsv4_compressor_kv_flat[ratio]:    [num_layers, max_slots+1, coeff*ratio, coeff*head_dim] fp32
+          dsv4_compressor_score_flat[ratio]: same, init to -inf
+          dsv4_compressor_counts_flat[ratio]: [num_layers, max_slots+1] int32
+        """
+        self.dsv4_compressor_kv_flat: dict[int, torch.Tensor] = {}
+        self.dsv4_compressor_score_flat: dict[int, torch.Tensor] = {}
+        self.dsv4_compressor_counts_flat: dict[int, torch.Tensor] = {}
+        if not getattr(self, "dsv4_layers_per_ratio", None):
+            return
+        total_bytes = 0
+        for ratio, layers in self.dsv4_layers_per_ratio.items():
+            n_layers = len(layers)
+            coeff = 2 if ratio == 4 else 1  # overlap when ratio==4 (matches Compressor)
+            kv_buf = torch.zeros(
+                n_layers,
+                max_num_seqs + 1,  # +1 dummy slot
+                coeff * ratio,
+                coeff * head_dim,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            score_buf = torch.full(
+                (n_layers, max_num_seqs + 1, coeff * ratio, coeff * head_dim),
+                float("-inf"),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            counts_buf = torch.zeros(
+                n_layers,
+                max_num_seqs + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.dsv4_compressor_kv_flat[ratio] = kv_buf
+            self.dsv4_compressor_score_flat[ratio] = score_buf
+            self.dsv4_compressor_counts_flat[ratio] = counts_buf
+            total_bytes += (
+                kv_buf.nelement() * kv_buf.itemsize
+                + score_buf.nelement() * score_buf.itemsize
+                + counts_buf.nelement() * counts_buf.itemsize
+            )
+        if total_bytes > 0:
+            logger.info(
+                f"DSv4 compressor scratch state (flat per ratio): "
+                f"{total_bytes / 1e9:.3f} GB"
             )
 
     def allocate_indexer_cache(self, hf_config):
@@ -527,6 +819,65 @@ class CacheContext:
                     f"Registered IndexerCache MR: handler={self._local_indexer_mr_handler}"
                 )
 
+            # DSv4 (S2.4): register flat per-ratio compressed cache + compressor
+            # state buffers — one MR per ratio per kind.  Skipped in hybrid mode
+            # via the same outer guard that protects KV/GDN registration.
+            for ratio, buf in (
+                getattr(self, "dsv4_compressed_caches_flat", None) or {}
+            ).items():
+                handler = self._peer_agent.register_memory_region(
+                    f"dsv4_compressed_r{ratio}",
+                    buf.data_ptr(),
+                    int(buf.storage_offset()),
+                    buf.numel() * buf.itemsize,
+                )
+                self._local_dsv4_compressed_mr_handlers[ratio] = handler
+                logger.info(
+                    f"Registered DSv4 compressed cache MR: ratio={ratio}, "
+                    f"handler={handler}, size={buf.numel() * buf.itemsize / 1e9:.2f} GB"
+                )
+
+            for ratio, buf in (
+                getattr(self, "dsv4_compressor_kv_flat", None) or {}
+            ).items():
+                self._local_dsv4_compressor_kv_mr_handlers[ratio] = (
+                    self._peer_agent.register_memory_region(
+                        f"dsv4_compressor_kv_r{ratio}",
+                        buf.data_ptr(),
+                        int(buf.storage_offset()),
+                        buf.numel() * buf.itemsize,
+                    )
+                )
+            for ratio, buf in (
+                getattr(self, "dsv4_compressor_score_flat", None) or {}
+            ).items():
+                self._local_dsv4_compressor_score_mr_handlers[ratio] = (
+                    self._peer_agent.register_memory_region(
+                        f"dsv4_compressor_score_r{ratio}",
+                        buf.data_ptr(),
+                        int(buf.storage_offset()),
+                        buf.numel() * buf.itemsize,
+                    )
+                )
+            for ratio, buf in (
+                getattr(self, "dsv4_compressor_counts_flat", None) or {}
+            ).items():
+                self._local_dsv4_compressor_counts_mr_handlers[ratio] = (
+                    self._peer_agent.register_memory_region(
+                        f"dsv4_compressor_counts_r{ratio}",
+                        buf.data_ptr(),
+                        int(buf.storage_offset()),
+                        buf.numel() * buf.itemsize,
+                    )
+                )
+            if self._local_dsv4_compressor_kv_mr_handlers:
+                logger.info(
+                    f"Registered DSv4 compressor scratch MRs: "
+                    f"kv={self._local_dsv4_compressor_kv_mr_handlers}, "
+                    f"score={self._local_dsv4_compressor_score_mr_handlers}, "
+                    f"counts={self._local_dsv4_compressor_counts_mr_handlers}"
+                )
+
         except Exception as e:
             logger.error(f"Failed to start PeerAgent: {e}")
             raise
@@ -688,6 +1039,8 @@ class CacheContext:
         assigns: dict[str, dict[str, list[tuple]]],
         gdn_assigns: dict[str, dict[str, list[tuple]]],
         indexer_assigns: dict[str, dict[str, list[tuple]]] | None = None,
+        compressed_assigns: dict[str, dict[str, list[tuple]]] | None = None,
+        compressor_state_assigns: dict[str, dict[str, list[tuple]]] | None = None,
     ) -> None:
         """Execute batched RDMA reads for KV cache and GDN state migration.
 
@@ -698,6 +1051,10 @@ class CacheContext:
                          (layer_idx, remote_state_slot, local_state_slot)
             indexer_assigns: engine_id -> peer_alias -> list of
                              (layer_idx, remote_block_idx, source_block_idx)
+            compressed_assigns: engine_id -> peer_alias -> list of
+                                (ratio, ratio_layer_idx, remote_page_idx, local_page_idx)
+            compressor_state_assigns: engine_id -> peer_alias -> list of
+                                (ratio, ratio_layer_idx, remote_state_slot, local_state_slot)
         """
         for engine_id, peer_assigns in assigns.items():
             for peer_alias, assign_batch in peer_assigns.items():
@@ -834,6 +1191,96 @@ class CacheContext:
                             f"Failed to get gdn_recurrent MR info for {peer_alias}"
                         )
 
+                # Append DSv4 compressed cache + compressor scratch state RDMA ops.
+                comp_batch = (
+                    (compressed_assigns or {}).get(engine_id, {}).get(peer_alias, [])
+                )
+                if comp_batch:
+                    # Group by ratio to register the right MR per ratio.
+                    by_ratio: dict[int, list[tuple]] = {}
+                    for r, rli, rpage, lpage in comp_batch:
+                        by_ratio.setdefault(r, []).append((rli, rpage, lpage))
+                    for ratio, ops in by_ratio.items():
+                        local_handler = self._local_dsv4_compressed_mr_handlers.get(
+                            ratio
+                        )
+                        if local_handler is None:
+                            continue
+                        remote_info = self._peer_agent.get_mr_info(
+                            peer_alias, f"dsv4_compressed_r{ratio}"
+                        )
+                        if not remote_info:
+                            logger.warning(
+                                f"Failed to get DSv4 compressed MR info for {peer_alias}, ratio={ratio}"
+                            )
+                            continue
+                        remote_handler = self._peer_agent.register_remote_memory_region(
+                            peer_alias,
+                            f"dsv4_compressed_r{ratio}",
+                            remote_info,
+                        )
+                        page_bytes = self.compressed_page_bytes(ratio)
+                        for rli, rpage, lpage in ops:
+                            rdma_ops.append(
+                                (
+                                    local_handler,
+                                    remote_handler,
+                                    self.remote_compressed_stride(
+                                        ratio, rli, rpage, engine_id
+                                    ),
+                                    self.local_compressed_stride(ratio, rli, lpage),
+                                    page_bytes,
+                                )
+                            )
+
+                cstate_batch = (
+                    (compressor_state_assigns or {})
+                    .get(engine_id, {})
+                    .get(peer_alias, [])
+                )
+                if cstate_batch:
+                    by_ratio_s: dict[int, list[tuple]] = {}
+                    for r, rli, rslot, lslot in cstate_batch:
+                        by_ratio_s.setdefault(r, []).append((rli, rslot, lslot))
+                    for ratio, ops in by_ratio_s.items():
+                        for kind, local_map in (
+                            ("kv", self._local_dsv4_compressor_kv_mr_handlers),
+                            ("score", self._local_dsv4_compressor_score_mr_handlers),
+                            ("counts", self._local_dsv4_compressor_counts_mr_handlers),
+                        ):
+                            local_handler = local_map.get(ratio)
+                            if local_handler is None:
+                                continue
+                            mr_name = f"dsv4_compressor_{kind}_r{ratio}"
+                            remote_info = self._peer_agent.get_mr_info(
+                                peer_alias, mr_name
+                            )
+                            if not remote_info:
+                                logger.warning(
+                                    f"Failed to get {mr_name} MR info for {peer_alias}"
+                                )
+                                continue
+                            remote_handler = (
+                                self._peer_agent.register_remote_memory_region(
+                                    peer_alias, mr_name, remote_info
+                                )
+                            )
+                            row_bytes = self._compressor_state_row_bytes(ratio, kind)
+                            for rli, rslot, lslot in ops:
+                                rdma_ops.append(
+                                    (
+                                        local_handler,
+                                        remote_handler,
+                                        self.remote_compressor_state_stride(
+                                            ratio, rli, rslot, kind, engine_id
+                                        ),
+                                        self.local_compressor_state_stride(
+                                            ratio, rli, lslot, kind
+                                        ),
+                                        row_bytes,
+                                    )
+                                )
+
                 # Append IndexerCache RDMA ops (V3.2 sparse attention)
                 indexer_batch = (
                     (indexer_assigns or {}).get(engine_id, {}).get(peer_alias, [])
@@ -920,6 +1367,19 @@ class CacheContext:
             engine_info = engine_info_map.get(engine_id, {})
             remote_max_num_seqs = engine_info.get("max_num_seqs", 0)
             remote_gdn_num_slots = engine_info.get("gdn_num_slots", 0)
+            # DSv4 (S2.5): record remote pool sizes for stride math.
+            remote_dsv4_pools = engine_info.get("dsv4_compressed_pool_pages", {}) or {}
+            # Keys may be strings (JSON) — coerce to int.
+            self.remote_compressed_pool_pages[engine_id] = {
+                int(r): int(p) for r, p in remote_dsv4_pools.items()
+            }
+            self.remote_dsv4_max_slots[engine_id] = int(
+                engine_info.get("dsv4_max_slots", remote_max_num_seqs)
+            )
+            remote_layers = engine_info.get("dsv4_num_layers_per_ratio", {}) or {}
+            self.remote_dsv4_num_layers_per_ratio[engine_id] = {
+                int(r): int(n) for r, n in remote_layers.items()
+            }
             for peer_alias in engine_info.get("peer_addrs", []):
                 connection_requests.append(
                     (
@@ -936,6 +1396,9 @@ class CacheContext:
         assigns = defaultdict(lambda: defaultdict(list))
         gdn_assigns = defaultdict(lambda: defaultdict(list))
         indexer_assigns = defaultdict(lambda: defaultdict(list))
+        # DSv4 (S2.6): per-ratio compressed pages + compressor scratch state.
+        compressed_assigns = defaultdict(lambda: defaultdict(list))
+        compressor_state_assigns = defaultdict(lambda: defaultdict(list))
         sp_idx = get_dist_context().attn_sp_rank
 
         for v in views:
@@ -1021,6 +1484,59 @@ class CacheContext:
                             (layer_idx, remote_block_idx, source_block_idx)
                         )
 
+            # DSv4 (S2.6): per-ratio compressed cache + compressor state migration.
+            # migrate_compressed_block_tables[ratio] = list of remote page IDs.
+            # active_compressed_block_tables[ratio]  = list of local page IDs allocated by
+            #                                          the decode engine's GroupManager.
+            if (
+                getattr(self, "dsv4_compressed_caches_flat", None)
+                and v.migrate_compressed_block_tables
+            ):
+                remote_rank = v.migrate_dp_idx * v.migrate_group_size + (
+                    v.migrate_group_size - 1
+                )
+                if 0 <= remote_rank < len(peer_addrs):
+                    peer_alias = peer_addrs[remote_rank]
+                    for (
+                        ratio,
+                        remote_pages,
+                    ) in v.migrate_compressed_block_tables.items():
+                        if ratio not in self.dsv4_compressed_caches_flat:
+                            continue  # decode engine doesn't have this ratio (mismatch)
+                        local_pages = v.active_compressed_block_tables.get(ratio, [])
+                        n_layers = len(self.dsv4_layers_per_ratio.get(ratio, []))
+                        # Pair-wise remote→local page mapping; for each (rli) layer, the
+                        # SAME (remote_page, local_page) pairs apply (the table is per-seq,
+                        # not per-layer).
+                        for ratio_layer_idx in range(n_layers):
+                            for rpage, lpage in zip(remote_pages, local_pages):
+                                compressed_assigns[engine_id][peer_alias].append(
+                                    (ratio, ratio_layer_idx, rpage, lpage)
+                                )
+
+            # DSv4 (S2.6): per-ratio compressor scratch state migration.
+            if (
+                getattr(self, "dsv4_compressor_kv_flat", None)
+                and v.migrate_state_slot >= 0
+                and v.active_state_slot >= 0
+            ):
+                remote_rank = v.migrate_dp_idx * v.migrate_group_size + (
+                    v.migrate_group_size - 1
+                )
+                if 0 <= remote_rank < len(peer_addrs):
+                    peer_alias = peer_addrs[remote_rank]
+                    for ratio in self.dsv4_compressor_kv_flat.keys():
+                        n_layers = len(self.dsv4_layers_per_ratio.get(ratio, []))
+                        for ratio_layer_idx in range(n_layers):
+                            compressor_state_assigns[engine_id][peer_alias].append(
+                                (
+                                    ratio,
+                                    ratio_layer_idx,
+                                    v.migrate_state_slot,
+                                    v.active_state_slot,
+                                )
+                            )
+
             # GDN assignments
             if (
                 self.gdn_conv_states is not None
@@ -1045,7 +1561,13 @@ class CacheContext:
                                 )
                             )
 
-        self._execute_rdma_reads(assigns, gdn_assigns, indexer_assigns)
+        self._execute_rdma_reads(
+            assigns,
+            gdn_assigns,
+            indexer_assigns,
+            compressed_assigns=compressed_assigns,
+            compressor_state_assigns=compressor_state_assigns,
+        )
 
 
 _CACHE_CONTEXT: CacheContext

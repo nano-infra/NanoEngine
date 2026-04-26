@@ -1,6 +1,9 @@
+import json
 import os
+from pathlib import Path
 from typing import Any, List, Literal, Optional
 
+import torch
 from pydantic import BaseModel, Field, model_validator
 from transformers import AutoConfig, PretrainedConfig
 
@@ -57,12 +60,19 @@ class Config(BaseModel):
     # dist config
     master_address: str = "127.0.0.1:6006"
     ray_address: str = "127.0.0.1:6379"
+    executor_backend: Literal["ray", "dlslime"] = "ray"
 
     # MTP (Multi-Token Prediction) speculative decoding
     num_speculative_tokens: int = 0  # 0 = disabled, >0 = number of draft tokens
 
     # NSA sparse attention (V3.2) — enabled by default for models with index_head_dim > 0
     disable_nsa: bool = False
+
+    # DSv4 compressed-cache pool sizes (tokens per pool, per ratio).
+    # 0 means "derive worst case = max_num_seqs * max_model_len / ratio".
+    # Set explicitly to a smaller value to save memory when seqs are short.
+    dsv4_compressed_pool_pages_ratio4: int = 0
+    dsv4_compressed_pool_pages_ratio128: int = 0
 
     # profiler
     enable_profiler: bool = False
@@ -96,9 +106,38 @@ class Config(BaseModel):
         except Exception:
             pass  # transformers version too old for DeepseekV3Config; let it fall through
 
-        self.hf_config = AutoConfig.from_pretrained(
-            self.model, trust_remote_code=self.trust_remote_code
-        )
+        try:
+            from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+            from nanodeploy.models.deepseek_v4.configuration_deepseek_v4 import (
+                DeepseekV4Config,
+            )
+
+            for register in (CONFIG_MAPPING.register, AutoConfig.register):
+                try:
+                    register("deepseek_v4", DeepseekV4Config, exist_ok=True)
+                except TypeError:
+                    register("deepseek_v4", DeepseekV4Config)
+        except Exception:
+            pass
+
+        try:
+            self.hf_config = AutoConfig.from_pretrained(
+                self.model, trust_remote_code=self.trust_remote_code
+            )
+        except ValueError:
+            config_path = Path(self.model) / "config.json"
+            if not config_path.exists():
+                raise
+            with config_path.open() as f:
+                config_dict = json.load(f)
+            if config_dict.get("model_type") != "deepseek_v4":
+                raise
+            from nanodeploy.models.deepseek_v4.configuration_deepseek_v4 import (
+                DeepseekV4Config,
+            )
+
+            self.hf_config = DeepseekV4Config(**config_dict)
 
         # For VLM models with nested text_config (e.g. Qwen3.5-MoE),
         # flatten text_config attributes into hf_config for uniform access.
@@ -123,9 +162,28 @@ class Config(BaseModel):
         if self.hf_config.architectures[0] in (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
+            "DeepseekV4ForCausalLM",
             "GlmMoeDsaForCausalLM",
         ):
-            assert self.kvcache_block_size == 64
+            if self.hf_config.architectures[0] == "DeepseekV4ForCausalLM":
+                assert self.attention_sp == 1
+                assert self.ffn_tp == 1
+                n_experts = getattr(self.hf_config, "n_routed_experts", None)
+                if n_experts is not None:
+                    assert n_experts % self.ffn_ep == 0
+                # NOTE: flash_mla batched decode path supports CUDAGraph for
+                # non-compressed layers. Compressed layers still have per-seq
+                # compressor loops that block graph capture. The overall forward
+                # is CUDAGraph-safe only when ALL layers' compressor loops are
+                # vectorized or when using the eager fallback.
+                if not self.enforce_eager:
+                    logger.info(
+                        "DeepSeek-V4 flash_mla path: CUDAGraph enabled. "
+                        "Compressor loops are NOT yet fully vectorized — "
+                        "graph capture may fail for compressed layers."
+                    )
+            else:
+                assert self.kvcache_block_size == 64
             assert self.attention_tp == 1
         else:
             assert self.kvcache_block_size % 64 == 0
@@ -140,6 +198,22 @@ class Config(BaseModel):
             )
         else:
             self.hf_config.max_position_embeddings = self.max_model_len
+
+        dtype = getattr(self.hf_config, "dtype", None) or getattr(
+            self.hf_config, "torch_dtype", None
+        )
+        if isinstance(dtype, str):
+            dtype = {
+                "bfloat16": torch.bfloat16,
+                "bf16": torch.bfloat16,
+                "float16": torch.float16,
+                "fp16": torch.float16,
+                "float32": torch.float32,
+                "fp32": torch.float32,
+            }.get(dtype, None)
+        if dtype is not None:
+            self.hf_config.dtype = dtype
+            self.hf_config.torch_dtype = dtype
 
         # With chunked prefill, max_num_batched_tokens may be smaller than max_model_len.
         assert self.max_num_batched_tokens >= 1
@@ -170,6 +244,7 @@ class Config(BaseModel):
         if self.hf_config.architectures[0] in (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
+            "DeepseekV4ForCausalLM",
             "GlmMoeDsaForCausalLM",
         ):
             if hasattr(self.hf_config, "num_key_value_heads"):

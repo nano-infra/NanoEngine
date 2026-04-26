@@ -7,6 +7,14 @@ table IntListI {
   values: [int];
 }
 
+// Per-ratio compressed block table flowed to the worker (mirrors
+// nanodeploy.fbs.CompressedBlockTable — kept in this namespace for
+// the interface protocol).
+table CompressedBlockTableI {
+  ratio: int;
+  block_ids: [int];
+}
+
 // ========== Run Protocol ==========
 
 // Vision slot reference passed to the model runner during prefill.
@@ -31,6 +39,7 @@ table SequenceInput {
   state_slot: int = -1;              // GDN state slot
   temperature: double = 1.0;         // sampling temperature
   vision_slots: [VisionSlotRef];     // vision embedding refs (prefill only, EP mode)
+  compressed_block_tables: [CompressedBlockTableI];  // DSv4: per-ratio compressed pages
 }
 
 table RunBatchInput {
@@ -54,9 +63,11 @@ table MigrateSequenceInput {
   migrate_dp_idx: int;
   migrate_block_location: [BlockLocationPair];
   migrate_state_slot: int = -1;
+  migrate_compressed_block_tables: [CompressedBlockTableI];   // DSv4
   // ACTIVE slot fields
   active_block_location: [BlockLocationPair];
   active_state_slot: int = -1;
+  active_compressed_block_tables: [CompressedBlockTableI];    // DSv4
 }
 
 table MigrateBatchInput {

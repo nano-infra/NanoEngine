@@ -6,6 +6,7 @@ Usage:
 """
 
 import os
+import sys
 
 from jsonargparse import ActionConfigFile, ArgumentParser
 from nanodeploy import Sequence
@@ -23,6 +24,7 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--ignore_eos", action="store_true")
+    parser.add_argument("--dsv4_encoding_dir", type=str, default=None)
     args = parser.parse_args()
 
     # Build Config from parsed args (exclude extra args)
@@ -42,16 +44,28 @@ def main():
         temperature=args.temperature,
     )
     prompts = [args.prompt]
+    dsv4_encode_messages = None
+    if args.dsv4_encoding_dir:
+        sys.path.insert(0, os.path.abspath(args.dsv4_encoding_dir))
+        from encoding_dsv4 import encode_messages as dsv4_encode_messages
+
+    def encode_prompt(prompt: str) -> list[int]:
+        if dsv4_encode_messages is not None:
+            prompt = dsv4_encode_messages(
+                [{"role": "user", "content": prompt}],
+                thinking_mode="chat",
+            )
+        elif getattr(tokenizer, "chat_template", None):
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        return tokenizer.encode(prompt)
 
     seqs = [
         Sequence(
-            tokenizer.encode(
-                tokenizer.apply_chat_template(
-                    [{"role": "user", "content": p}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            ),
+            encode_prompt(p),
             sampling_params=sampling_params,
         )
         for p in prompts

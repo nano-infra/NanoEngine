@@ -6,6 +6,10 @@ Single source of truth for:
 - POST /unregister_engine
 - POST /heartbeat_engine  (with auto re-register callback on ``not_found``)
 - POST /get_engine_info
+- POST /start_peer_agent
+- POST /cleanup
+- POST /v1/desired_topology/{alias}
+- POST /query
 
 Usage
 -----
@@ -150,7 +154,7 @@ class NanoCtrlClient:
             return False
 
     def heartbeat(self) -> str:
-        """POST /heartbeat_engine.
+        """POST /heartbeat (unified endpoint).
 
         Returns
         -------
@@ -159,10 +163,10 @@ class NanoCtrlClient:
         """
         if not self._engine_id:
             return "error"
-        body = self._body(engine_id=self._engine_id)
+        body = self._body(entity_type="engine", entity_id=self._engine_id)
         try:
             with httpx.Client(timeout=5.0, trust_env=False) as c:
-                r = c.post(self._url("heartbeat_engine"), json=body)
+                r = c.post(self._url("heartbeat"), json=body)
                 r.raise_for_status()
                 status = r.json().get("status", "error")
                 logger.debug(f"Heartbeat {self._engine_id}: {status}")
@@ -216,6 +220,21 @@ class NanoCtrlClient:
         except Exception as e:
             logger.error(f"Failed to get engine info for {engine_id}: {e}")
         return None
+
+    def list_engines(self) -> list[dict]:
+        """POST /list_engines and return the current engine list."""
+        body = self._body()
+        try:
+            with httpx.Client(timeout=5.0, trust_env=False) as c:
+                r = c.post(self._url("list_engines"), json=body)
+                r.raise_for_status()
+                data = r.json()
+                if data.get("status") == "ok":
+                    return data.get("engines", [])
+                logger.error(f"list_engines returned unexpected payload: {data}")
+        except Exception as e:
+            logger.error(f"Failed to list engines: {e}")
+        return []
 
     # ------------------------------------------------------------------
     # Heartbeat thread
@@ -278,3 +297,75 @@ class NanoCtrlClient:
         self.stop_heartbeat(timeout=timeout)
         if self.registered:
             self.unregister()
+
+    # ------------------------------------------------------------------
+    # Peer-agent API
+    # These methods raise on error so callers can implement retry logic.
+    # ------------------------------------------------------------------
+
+    def register_peer(
+        self,
+        *,
+        alias: str | None,
+        device: str,
+        ib_port: int,
+        link_type: str,
+        address: str,
+        name_prefix: str,
+    ) -> dict:
+        """POST /start_peer_agent → ``{name, redis_address, ...}``."""
+        data = self._body(
+            device=device,
+            ib_port=ib_port,
+            link_type=link_type,
+            address=address,
+            name_prefix=name_prefix,
+        )
+        if alias is not None:
+            data["alias"] = alias
+        with httpx.Client(timeout=10.0, trust_env=False) as c:
+            r = c.post(self._url("start_peer_agent"), json=data)
+            r.raise_for_status()
+            return r.json()
+
+    def cleanup_peer(self, agent_name: str) -> dict:
+        """POST /cleanup → remove agent from NanoCtrl + Redis."""
+        data = self._body(agent_name=agent_name)
+        with httpx.Client(timeout=5.0, trust_env=False) as c:
+            r = c.post(self._url("cleanup"), json=data)
+            r.raise_for_status()
+            return r.json()
+
+    def heartbeat_peer(self, agent_name: str) -> dict:
+        """POST /heartbeat → refresh agent TTL (unified endpoint)."""
+        data = self._body(entity_type="agent", entity_id=agent_name)
+        with httpx.Client(timeout=5.0, trust_env=False) as c:
+            r = c.post(self._url("heartbeat"), json=data)
+            r.raise_for_status()
+            return r.json()
+
+    def set_desired_topology(
+        self,
+        alias: str,
+        *,
+        target_peers: list[str],
+        min_bw: str | None = None,
+        symmetric: bool = False,
+    ) -> dict:
+        """POST /v1/desired_topology/{alias}."""
+        spec = self._body(target_peers=target_peers)
+        if min_bw is not None:
+            spec["min_bw"] = min_bw
+        if symmetric:
+            spec["symmetric"] = True
+        with httpx.Client(timeout=5.0, trust_env=False) as c:
+            r = c.post(self._url(f"v1/desired_topology/{alias}"), json=spec)
+            r.raise_for_status()
+            return r.json()
+
+    def query_peers(self) -> list[dict]:
+        """POST /query → list of registered agents."""
+        with httpx.Client(timeout=5.0, trust_env=False) as c:
+            r = c.post(self._url("query"), json=self._body())
+            r.raise_for_status()
+            return r.json()
