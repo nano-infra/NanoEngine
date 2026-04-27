@@ -18,8 +18,10 @@ use axum::{
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -264,6 +266,7 @@ async fn start_server(args: StartArgs) -> anyhow::Result<()> {
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let log_start_offset = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -280,18 +283,17 @@ async fn start_server(args: StartArgs) -> anyhow::Result<()> {
         "--redis-url".to_string(),
         args.server.redis_url.clone(),
     ];
-    let mut cmd = Command::new("setsid");
-    cmd.arg(&exe)
-        .args(&cmd_args)
+    let mut cmd = Command::new(&exe);
+    cmd.args(&cmd_args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(err_log));
+    #[cfg(unix)]
+    cmd.process_group(0);
 
-    let mut child = cmd.spawn().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to start nanoctrl server via setsid. Ensure setsid is available. Details: {e}"
-        )
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to start nanoctrl server. Details: {e}"))?;
 
     let server_address = normalize_address(&target_address);
     write_runtime(RuntimeMeta {
@@ -308,6 +310,7 @@ async fn start_server(args: StartArgs) -> anyhow::Result<()> {
     while std::time::Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
             cleanup_runtime()?;
+            print_recent_log(&log_path, log_start_offset, 80);
             anyhow::bail!(
                 "nanoctrl failed to start (exit={}). See log: {}",
                 status,
@@ -333,6 +336,7 @@ async fn start_server(args: StartArgs) -> anyhow::Result<()> {
     );
     println!("address: {server_address}");
     println!("log: {}", log_path.display());
+    print_recent_log(&log_path, log_start_offset, 80);
     Ok(())
 }
 
@@ -465,6 +469,7 @@ fn is_pid_running(pid: u32) -> bool {
     Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -474,11 +479,35 @@ fn signal_pid(pid: u32, signal: &str) -> anyhow::Result<()> {
     let status = Command::new("kill")
         .arg(format!("-{signal}"))
         .arg(pid.to_string())
+        .stderr(Stdio::null())
         .status()?;
-    if status.success() {
+    if status.success() || !is_pid_running(pid) {
         Ok(())
     } else {
         anyhow::bail!("failed to send SIG{signal} to pid {pid}")
+    }
+}
+
+fn print_recent_log(path: &std::path::Path, start_offset: u64, max_lines: usize) {
+    let Ok(mut file) = fs::File::open(path) else {
+        return;
+    };
+    if file.seek(SeekFrom::Start(start_offset)).is_err() {
+        return;
+    };
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_err() {
+        return;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return;
+    }
+    let start = lines.len().saturating_sub(max_lines);
+    println!();
+    println!("recent log:");
+    for line in &lines[start..] {
+        println!("{line}");
     }
 }
 

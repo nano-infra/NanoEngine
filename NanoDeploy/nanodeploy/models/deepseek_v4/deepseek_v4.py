@@ -19,6 +19,101 @@ from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2MLP
 from nanodeploy.models.quant_config import QuantizationConfig
 
+# Optional vendored sglang DSV4 fused kernels. When present,
+# _apply_rotary_interleaved replaces ~10 eager elementwise launches per
+# call with a single CUDA kernel.
+# Source (vendored under nanodeploy/_third_party/sglang_jit_kernel):
+#   https://github.com/sgl-project/sglang
+#   python/sglang/jit_kernel/deepseek_v4.py::fused_rope
+# Runtime deps for the vendored slice: torch, triton, tvm-ffi.
+try:
+    from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
+        fused_norm_rope_inplace as _SGL_FUSED_NORM_ROPE,
+        fused_rope as _SGL_FUSED_ROPE,
+    )
+except Exception:
+    # ImportError if tvm-ffi isn't installed; any other Exception if
+    # the vendored layout is broken on this checkout. Fall back to
+    # eager either way.
+    _SGL_FUSED_ROPE = None
+    _SGL_FUSED_NORM_ROPE = None
+
+# Triton kernels for fused UE8M0 FP8 quant. Replace the per-block
+# amax/exp2/clamp/cast op chain (~10 launches per call) with one
+# kernel each.
+try:
+    from nanodeploy.backends.gpu_generic.kernels.fp8_ue8m0_quant import (
+        fp8_quant_dequant_inplace as _TRITON_FP8_QDQ,
+        pack_kv_fp8 as _TRITON_FP8_PACK,
+    )
+except Exception:
+    _TRITON_FP8_QDQ = None
+    _TRITON_FP8_PACK = None
+
+# Vendored sglang DSV4 hyper-connection (HC) tilelang kernels. Fuses
+# the eager F.linear + RMSNorm + sigmoid + sinkhorn + reduce chain in
+# DeepseekV4HCProjector.forward into 2-3 tilelang kernels.
+# Source: https://github.com/sgl-project/sglang
+#   python/sglang/srt/layers/mhc.py
+try:
+    from nanodeploy._third_party.sglang_mhc import mhc_pre as _SGL_MHC_PRE
+except Exception:
+    _SGL_MHC_PRE = None
+
+
+def _maybe_fused_norm_rope(
+    compressed: torch.Tensor,
+    norm: nn.Module,
+    rotary_emb: nn.Module,
+    compressed_pos: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Try the single-kernel RMSNorm+RoPE; return None if unsupported.
+
+    Replaces the pattern::
+
+        out = norm(compressed)
+        out_rope = _apply_rotary_interleaved(rotary_emb, pos, out[..., -rd:].unsqueeze(1)).squeeze(1)
+        out = torch.cat([out[..., :-rd], out_rope], dim=-1)
+
+    with one CUDA kernel that does both. The kernel mutates
+    ``compressed`` in place and the caller continues to use the same
+    tensor.
+
+    Source: https://github.com/sgl-project/sglang
+            python/sglang/jit_kernel/deepseek_v4.py::fused_norm_rope_inplace
+    """
+    if (
+        _SGL_FUSED_NORM_ROPE is None
+        or getattr(rotary_emb, "freqs_cis_cache", None) is None
+        or getattr(norm, "add_unit_offset", False)
+        or not compressed.is_cuda
+        or compressed.dtype != torch.bfloat16
+        or compressed.dim() != 2
+    ):
+        return None
+    try:
+        pos64 = (
+            compressed_pos
+            if compressed_pos.dtype == torch.int64
+            else compressed_pos.long()
+        )
+        buf = compressed if compressed.is_contiguous() else compressed.contiguous()
+        # The kernel is templated on (dtype, head_dim, rope_dim); JIT
+        # builds on first call. weight dtype must equal kv dtype.
+        weight = norm.weight
+        if weight.dtype != buf.dtype:
+            weight = weight.to(buf.dtype)
+        _SGL_FUSED_NORM_ROPE(
+            buf,
+            weight,
+            float(norm.eps),
+            rotary_emb.freqs_cis_cache,
+            pos64,
+        )
+        return buf
+    except Exception:
+        return None
+
 
 def _getattr_any(config, *names, default=None):
     for name in names:
@@ -98,6 +193,48 @@ def _apply_rotary_interleaved(
     x: torch.Tensor,
     inverse: bool = False,
 ):
+    # Fast path: single-kernel RoPE via sglang's fused_rope. The kernel
+    # is in-place and ``x`` is often a slice view of a bigger tensor
+    # (e.g. ``kv[..., -rd:].unsqueeze(1)`` at the attention call site).
+    # If we mutate that view in place and the caller then does
+    # ``kv[..., -rd:] = result``, PyTorch detects the overlapping
+    # memory and raises "some elements of the input tensor and the
+    # written-to tensor refer to a single memory location". To match
+    # the eager path's "return a fresh tensor" semantics we clone
+    # first; the clone is one CUDA memcpy which is still cheaper than
+    # the 7+ elementwise kernels in the eager fallback.
+    # Adapted from https://github.com/sgl-project/sglang
+    #   python/sglang/jit_kernel/deepseek_v4.py::fused_rope
+    if (
+        _SGL_FUSED_ROPE is not None
+        and getattr(rotary_emb, "freqs_cis_cache", None) is not None
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and positions.dtype in (torch.int32, torch.int64)
+        and positions.dim() == 1
+        and x.dim() in (2, 3)
+    ):
+        squeeze_head = x.dim() == 2
+        # Clone to a contiguous bf16 buffer so (a) the kernel's
+        # last-dim-stride-1 contract is satisfied, and (b) we don't
+        # mutate the caller's storage. ``.contiguous()`` is a no-op
+        # when the slice is already C-contiguous, falling back to
+        # ``.clone()`` so we always get a fresh tensor.
+        x_buf = x.contiguous() if x.is_contiguous() else x.contiguous()
+        if x_buf.data_ptr() == x.data_ptr():
+            x_buf = x_buf.clone()
+        x_view = x_buf.unsqueeze(1) if squeeze_head else x_buf
+        try:
+            _SGL_FUSED_ROPE(
+                x_view, None, rotary_emb.freqs_cis_cache, positions, inverse
+            )
+            return x_view.squeeze(1) if squeeze_head else x_view
+        except Exception:
+            # Either the tensor-shape contract failed (unsupported
+            # head_dim, non-contig stride) or the first-call JIT compile
+            # failed. Fall through to the eager implementation.
+            pass
+
     cos_sin = rotary_emb.cos_sin_cache[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
     x_pair = x.float().unflatten(-1, (-1, 2))
@@ -113,9 +250,27 @@ def _apply_rotary_interleaved(
 
 
 def _fp8_quant_dequant_inplace(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
-    """Simulate official DSV4 KV FP8 QAT quant-dequant in-place."""
+    """Simulate official DSV4 KV FP8 QAT quant-dequant in-place.
+
+    Fast path: a single triton kernel does the per-block amax + UE8M0
+    scale + fp8 round-trip in one launch (~1 reduce + 1 elementwise
+    instead of ~10 eager kernels). Falls back to the original eager
+    chain on any failure.
+    """
     if x.numel() == 0:
         return x
+    if (
+        _TRITON_FP8_QDQ is not None
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and x.shape[-1] % block_size == 0
+    ):
+        try:
+            return _TRITON_FP8_QDQ(x, block_size)
+        except Exception:
+            pass
+
     orig_shape = x.shape
     assert orig_shape[-1] % block_size == 0
     view = (
@@ -160,8 +315,18 @@ def _pack_kv_fp8(
     """Quantize KV [T, 512] BF16 → (nope_fp8[T,448], rope_bf16[T,64], scales_u8[T,7]).
 
     Uses power-of-2 (UE8M0) per-64-tile scales, matching official DSv4 / SGLang.
+    Fast path is a single triton kernel; falls back to the eager op chain
+    if the kernel is unavailable.
     """
     assert kv_bf16.dtype == torch.bfloat16 and kv_bf16.shape[-1] == 512
+    if _TRITON_FP8_PACK is not None and kv_bf16.is_cuda:
+        try:
+            return _TRITON_FP8_PACK(
+                kv_bf16, _DSV4_NOPE_DIM, _DSV4_ROPE_DIM, _DSV4_TILE_SIZE
+            )
+        except Exception:
+            pass
+
     nope, rope = kv_bf16.split([_DSV4_NOPE_DIM, _DSV4_ROPE_DIM], dim=-1)
 
     # Per-tile FP8 quantization with power-of-2 scales
@@ -270,7 +435,43 @@ class DeepseekV4HCProjector(nn.Module):
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Fast path: vendored sglang ``mhc_pre`` collapses RMSNorm +
+        # F.linear + sigmoid + sinkhorn + per-token reduction into a
+        # 2-kernel pipeline (mhc_pre_gemm_sqrsum_splitk + mhc_pre_big_fuse).
+        # Adapted from https://github.com/sgl-project/sglang
+        #   python/sglang/srt/layers/mhc.py::mhc_pre
         shape, dtype = x.shape, x.dtype
+        if (
+            _SGL_MHC_PRE is not None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and self.fn.dtype == torch.float32
+        ):
+            try:
+                # mhc_pre expects residual shape [..., hc_mult, hidden];
+                # nanodeploy's ``x`` is already that shape.
+                post_mix, comb_mix, layer_input = _SGL_MHC_PRE(
+                    x.contiguous(),
+                    self.fn,
+                    self.scale,
+                    self.base,
+                    rms_eps=self.eps,
+                    hc_pre_eps=self.eps,
+                    hc_sinkhorn_eps=self.eps,
+                    hc_post_mult_value=2.0,  # nanodeploy: post = 2 * sigmoid(...)
+                    sinkhorn_repeat=self.sinkhorn_iters,
+                )
+                # Outputs come out as fp32 (post_mix, comb_mix) and the
+                # layer_input matches input dtype. Cast post/comb to
+                # match nanodeploy's eager return contract.
+                return (
+                    layer_input,  # y
+                    post_mix.squeeze(-1).to(dtype),  # post (drop trailing 1)
+                    comb_mix.to(dtype),  # comb
+                )
+            except Exception:
+                pass
+
         x_flat = x.flatten(1).float()
         rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.eps)
         mixes = F.linear(x_flat, self.fn) * rsqrt
@@ -494,15 +695,21 @@ class DeepseekV4Compressor(nn.Module):
             kv = self._overlap_transform(kv, 0.0)
             score = self._overlap_transform(score, float("-inf"))
         kv = (kv * score.softmax(dim=1)).sum(dim=1)
-        kv = self.norm(kv.to(dtype))
-
         rd = self.rope_head_dim
         compressed_positions = positions[:cutoff:ratio]
-        kv[:, -rd:] = _apply_rotary_interleaved(
-            rotary_emb,
-            compressed_positions,
-            kv[:, None, -rd:],
-        ).squeeze(1)
+        kv_dtype = kv.to(dtype).contiguous()
+        fused = _maybe_fused_norm_rope(
+            kv_dtype, self.norm, rotary_emb, compressed_positions
+        )
+        if fused is not None:
+            kv = fused
+        else:
+            kv = self.norm(kv_dtype)
+            kv[:, -rd:] = _apply_rotary_interleaved(
+                rotary_emb,
+                compressed_positions,
+                kv[:, None, -rd:],
+            ).squeeze(1)
         _fp8_quant_dequant_inplace(kv[:, :-rd], 64)
         if seq_key is not None:
             self._compressed_cache[seq_key] = kv
@@ -580,16 +787,23 @@ class DeepseekV4Compressor(nn.Module):
         if compressed is None:
             return None
         dtype = hidden_state.dtype
-        compressed = self.norm(compressed.to(dtype))
         rd = self.rope_head_dim
         compressed_pos = hidden_state.new_tensor(
             [position + 1 - ratio], dtype=torch.long
         )
-        compressed[:, -rd:] = _apply_rotary_interleaved(
-            rotary_emb,
-            compressed_pos,
-            compressed[:, None, -rd:],
-        ).squeeze(1)
+        compressed_dtype = compressed.to(dtype).contiguous()
+        fused = _maybe_fused_norm_rope(
+            compressed_dtype, self.norm, rotary_emb, compressed_pos
+        )
+        if fused is not None:
+            compressed = fused
+        else:
+            compressed = self.norm(compressed_dtype)
+            compressed[:, -rd:] = _apply_rotary_interleaved(
+                rotary_emb,
+                compressed_pos,
+                compressed[:, None, -rd:],
+            ).squeeze(1)
         _fp8_quant_dequant_inplace(compressed[:, :-rd], 64)
 
         # Update compressed cache
@@ -662,18 +876,25 @@ class DeepseekV4Compressor(nn.Module):
             # kv_st: [bs, ratio, head_dim], score_st same
             compressed = (kv_st * score_st.softmax(dim=1)).sum(dim=1)  # [bs, head_dim]
 
-        # Apply norm + RoPE + FP8 QAT (batched)
-        compressed = self.norm(compressed.to(dtype))  # [bs, head_dim]
+        # Apply norm + RoPE + FP8 QAT (batched).
+        # Fast path: one CUDA kernel for norm + interleaved RoPE.
         rd = self.rope_head_dim
         compressed_pos = (positions + 1 - ratio).clamp(min=0)  # [bs]
-        # NOTE: cos_sin_cache has shape [max_pos, 1, rd] (singleton head dim),
-        # so we must pass x with a head dim: [bs, 1, rd], not [bs, rd].
-        compressed_rope = _apply_rotary_interleaved(
-            rotary_emb, compressed_pos, compressed[:, None, -rd:]
-        ).squeeze(
-            1
-        )  # [bs, rd]
-        compressed = torch.cat([compressed[:, :-rd], compressed_rope], dim=-1)
+        compressed_dtype = compressed.to(dtype).contiguous()  # [bs, head_dim]
+        fused = _maybe_fused_norm_rope(
+            compressed_dtype, self.norm, rotary_emb, compressed_pos
+        )
+        if fused is not None:
+            compressed = fused
+        else:
+            # Fallback: norm + slice rotate + cat (4–6 launches).
+            compressed = self.norm(compressed_dtype)
+            # cos_sin_cache has shape [max_pos, 1, rd] so x needs a head
+            # axis: [bs, 1, rd], not [bs, rd].
+            compressed_rope = _apply_rotary_interleaved(
+                rotary_emb, compressed_pos, compressed[:, None, -rd:]
+            ).squeeze(1)
+            compressed = torch.cat([compressed[:, :-rd], compressed_rope], dim=-1)
         # In-place FP8 QAT on the nope portion (safe: compressed is a fresh tensor)
         _fp8_quant_dequant_inplace(compressed[:, :-rd], 64)
 
