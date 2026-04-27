@@ -102,7 +102,7 @@ class DLSLimeExecutor(RayExecutor):
         result = [decode_run_result(data) for data in replies]
         _t4 = _time.perf_counter()
         if not is_prefill:
-            logger.info(
+            logger.debug(
                 f"[dlslime run] serialize={(_t1-_t0)*1000:.2f}ms "
                 f"submit={(_t2-_t1)*1000:.2f}ms "
                 f"wait_all={(_t3-_t2)*1000:.2f}ms "

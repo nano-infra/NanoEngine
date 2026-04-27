@@ -175,7 +175,17 @@ class ModelRunner:
         if getattr(config, "enable_profiler", False):
             self.profiler_start_step = getattr(config, "profiler_start_step", 10)
             self.profiler_steps = getattr(config, "profiling_step", 10)
-            self.profiler_end_step = self.profiler_start_step + self.profiler_steps
+            # Number of forward iterations bundled into one profiler.step()
+            # boundary. Default 2 -- amortises per-step bookkeeping overhead
+            # so the captured trace better reflects steady-state cost.
+            # Total forwards captured = profiler_steps * forward_per_step.
+            self.profiler_forward_per_step = max(
+                1, getattr(config, "profiler_forward_per_step", 2)
+            )
+            self.profiler_end_step = (
+                self.profiler_start_step
+                + self.profiler_steps * self.profiler_forward_per_step
+            )
             profiler_dir = getattr(config, "profiler_dir", "./profiler_logs")
 
             os.makedirs(profiler_dir, exist_ok=True)
@@ -196,7 +206,10 @@ class ModelRunner:
                 with_stack=True,
             )
             logger.info(
-                f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, duration {self.profiler_steps} steps."
+                f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, "
+                f"{self.profiler_steps} step boundaries × "
+                f"{self.profiler_forward_per_step} forwards/step "
+                f"(end at {self.profiler_end_step})."
             )
 
         # Initialise the hardware backend before constructing the model so that
@@ -768,7 +781,12 @@ class ModelRunner:
             # --- Profiler step ---
             if self.profiler and self.run_count >= self.profiler_start_step:
                 if self.run_count < self.profiler_end_step:
-                    self.profiler.step()
+                    # Bundle ``profiler_forward_per_step`` forwards into one
+                    # profiler.step() boundary so per-step bookkeeping doesn't
+                    # dominate the trace at small per-iter latencies.
+                    rel = self.run_count - self.profiler_start_step
+                    if (rel + 1) % self.profiler_forward_per_step == 0:
+                        self.profiler.step()
                 if self.run_count == self.profiler_end_step - 1:
                     self.profiler.stop()
                     logger.info(

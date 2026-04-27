@@ -48,7 +48,7 @@ class ModelRunnerRpcService:
             if not is_prefill:
                 from nanodeploy.logging import get_logger
 
-                get_logger().info(
+                get_logger().debug(
                     f"[dlslime worker] decode_req={(t1-t0)*1000:.2f}ms "
                     f"forward={(t2-t1)*1000:.2f}ms "
                     f"encode={(t3-t2)*1000:.2f}ms "

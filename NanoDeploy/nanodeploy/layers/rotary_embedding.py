@@ -37,6 +37,13 @@ class RotaryEmbedding(nn.Module):
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
+        # Complex-form cache consumed by sglang's fused_rope (single-kernel
+        # RoPE for DSV4). Adapted from
+        #   https://github.com/sgl-project/sglang
+        #   python/sglang/jit_kernel/deepseek_v4.py::fused_rope
+        # Shape: [max_pos, rotary_dim/2] complex64.
+        freqs_cis = torch.complex(cos, sin)
+        self.register_buffer("freqs_cis_cache", freqs_cis, persistent=False)
 
     @torch.compile
     def forward(
@@ -131,6 +138,14 @@ class YarnRotaryEmbedding(nn.Module):
 
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
+        # Complex-form cache consumed by sglang's fused_rope (single-kernel
+        # RoPE for DSV4). Adapted from
+        #   https://github.com/sgl-project/sglang
+        #   python/sglang/jit_kernel/deepseek_v4.py::fused_rope
+        # mscale (if any) is folded into the cos/sin magnitudes here, which
+        # matches the math expected by the kernel.
+        freqs_cis = torch.complex(cos, sin)
+        self.register_buffer("freqs_cis_cache", freqs_cis, persistent=False)
 
     @torch.compile
     def forward(
