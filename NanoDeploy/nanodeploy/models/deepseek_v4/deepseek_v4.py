@@ -30,6 +30,7 @@ try:
     from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
         fused_norm_rope_inplace as _SGL_FUSED_NORM_ROPE,
         fused_rope as _SGL_FUSED_ROPE,
+        rmsnorm_self as _SGL_RMSNORM_SELF,
     )
 except Exception:
     # ImportError if tvm-ffi isn't installed; any other Exception if
@@ -37,6 +38,7 @@ except Exception:
     # eager either way.
     _SGL_FUSED_ROPE = None
     _SGL_FUSED_NORM_ROPE = None
+    _SGL_RMSNORM_SELF = None
 
 # Triton kernels for fused UE8M0 FP8 quant. Replace the per-block
 # amax/exp2/clamp/cast op chain (~10 launches per call) with one
@@ -262,16 +264,43 @@ def _apply_rotary_interleaved(
         if x_buf.data_ptr() == x.data_ptr():
             x_buf = x_buf.clone()
         x_view = x_buf.unsqueeze(1) if squeeze_head else x_buf
+        # Compressor.forward_prefill passes ``positions[:cutoff:ratio]``
+        # which is a strided view (stride=ratio). The kernel's
+        # ``TensorMatcher({B})`` requires stride-1, so make it
+        # contiguous here. Cheap when already stride-1.
+        if not positions.is_contiguous():
+            positions = positions.contiguous()
         try:
             _SGL_FUSED_ROPE(
                 x_view, None, rotary_emb.freqs_cis_cache, positions, inverse
             )
             return x_view.squeeze(1) if squeeze_head else x_view
-        except Exception:
+        except Exception as _exc:
             # Either the tensor-shape contract failed (unsupported
             # head_dim, non-contig stride) or the first-call JIT compile
             # failed. Fall through to the eager implementation.
-            pass
+            # One-time diagnostic: log why the fast path bailed so we
+            # can fix it. Gated to fire once per (process, error class).
+            global _FUSED_ROPE_WARNED
+            if "_FUSED_ROPE_WARNED" not in globals():
+                _FUSED_ROPE_WARNED = set()
+            _key = type(_exc).__name__
+            if _key not in _FUSED_ROPE_WARNED:
+                _FUSED_ROPE_WARNED.add(_key)
+                from nanodeploy.logging import get_logger
+
+                get_logger().warning(
+                    "fused_rope fast path bailed: %s. x.shape=%s dtype=%s "
+                    "contig=%s positions.shape=%s dtype=%s inverse=%s. "
+                    "Falling back to eager rope.",
+                    _exc,
+                    tuple(x.shape),
+                    x.dtype,
+                    x.is_contiguous(),
+                    tuple(positions.shape),
+                    positions.dtype,
+                    inverse,
+                )
 
     cos_sin = rotary_emb.cos_sin_cache[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
@@ -1873,7 +1902,43 @@ class DeepseekV4Attention(nn.Module):
         q_flat = self.wq_b(q)
         _debug_dump("attn_wq_b", q_flat, self.layer_idx)
         q = q_flat.view(q_len, self.num_heads, self.head_dim)
-        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.rms_norm_eps)
+        # Fast path: vendored sglang per-head RMSNorm (in-place, no
+        # weight) collapses square + mean + rsqrt + mul into one CUDA
+        # kernel. Falls back to the eager 5-launch chain when the
+        # vendor isn't built or shapes don't match.
+        # https://github.com/sgl-project/sglang
+        #   python/sglang/jit_kernel/deepseek_v4.py::rmsnorm_self
+        if (
+            _SGL_RMSNORM_SELF is not None
+            and q.is_cuda
+            and q.dtype == torch.bfloat16
+            and q.is_contiguous()
+            and q.shape[-1] == self.head_dim  # AOT-built only for head_dim=512
+        ):
+            try:
+                q = _SGL_RMSNORM_SELF(q, float(self.rms_norm_eps))
+            except Exception as _exc:
+                global _RMSNORM_SELF_WARNED
+                if "_RMSNORM_SELF_WARNED" not in globals():
+                    _RMSNORM_SELF_WARNED = set()
+                _key = type(_exc).__name__
+                if _key not in _RMSNORM_SELF_WARNED:
+                    _RMSNORM_SELF_WARNED.add(_key)
+                    from nanodeploy.logging import get_logger
+
+                    get_logger().warning(
+                        "rmsnorm_self fast path bailed: %s. q.shape=%s "
+                        "dtype=%s contig=%s. Eager fallback.",
+                        _exc,
+                        tuple(q.shape),
+                        q.dtype,
+                        q.is_contiguous(),
+                    )
+                q = q * torch.rsqrt(
+                    q.square().mean(-1, keepdim=True) + self.rms_norm_eps
+                )
+        else:
+            q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.rms_norm_eps)
         _debug_dump("attn_q_normed", q, self.layer_idx)
 
         kv_pre = self.wkv(hidden_states)
@@ -1997,26 +2062,96 @@ class DeepseekV4MoE(nn.Module):
             return F.softplus(logits).sqrt()
         raise ValueError(f"Unsupported DeepseekV4 score_func={self.score_func}")
 
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _routing_scores_with_bias(
+        logits: torch.Tensor, bias: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused: gate-logits → sqrtsoftplus scores (untouched, used for
+        weight gather later) and choice_scores (with e_score_correction_bias
+        applied). inductor fuses softplus + sqrt + add (3 launches → 1).
+        """
+        scores = logits.float()
+        scores = F.softplus(scores).sqrt()
+        choice_scores = scores + bias.float()
+        return scores, choice_scores
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _normalize_topk_weights(
+        scores: torch.Tensor,
+        topk_ids: torch.Tensor,
+        route_scale: float,
+    ) -> torch.Tensor:
+        """Fused: gather → renorm by sum → mul by route_scale. Inductor
+        fuses the post-gather chain (4-5 launches → 1)."""
+        topk_weights = scores.gather(1, topk_ids)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights = topk_weights * route_scale
+        return topk_weights
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _fuse_routed_shared(
+        routed_out: torch.Tensor, shared_out: torch.Tensor
+    ) -> torch.Tensor:
+        """Compile-fused post-MoE combine: ``out = routed + shared``.
+
+        Trivially small (one bf16 add on [T, 4096]) but each MoE layer
+        otherwise emits a free-floating ``vectorized_elementwise_kernel``
+        launch under graph replay. Putting this in a compile region
+        lets inductor sometimes co-locate it with adjacent kernels.
+
+        Note: ``route_scale`` is already baked into ``topk_weights`` by
+        ``_normalize_topk_weights`` upstream, and the cross-expert
+        topk-weighted sum is done by ``deep_ep::internode_ll::combine``
+        inside ``routed_experts``. sglang's
+        ``moe_sum_reduce_warp_per_token_vec_kernel`` is the TP-topology
+        equivalent of those, so unnecessary under EP."""
+        return routed_out + shared_out
+
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor
     ) -> torch.Tensor:
         residual = hidden_states
-        scores = self._scores(self.gate(hidden_states))
+        logits = self.gate(hidden_states)
         if self.hash:
+            scores = self._scores(logits)
             topk_ids = self.gate.tid2eid[input_ids].long()
+            topk_weights = scores.gather(1, topk_ids)
+            if self.score_func != "softmax":
+                topk_weights = topk_weights / (
+                    topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+                )
+            topk_weights = topk_weights * self.route_scale
+        elif (
+            self.score_func == "sqrtsoftplus"
+            and self.gate.e_score_correction_bias is not None
+        ):
+            # Fast path: torch.compile-fused scoring + topk-normalization.
+            # Covers the production DSV4 config; falls through for softmax
+            # / sigmoid score_funcs and bias-less gates.
+            scores, choice_scores = self._routing_scores_with_bias(
+                logits, self.gate.e_score_correction_bias
+            )
+            topk_ids = torch.topk(choice_scores, k=self.top_k, dim=-1, sorted=False)[1]
+            topk_weights = self._normalize_topk_weights(
+                scores, topk_ids, self.route_scale
+            )
         else:
+            scores = self._scores(logits)
             choice_scores = scores
             if self.gate.e_score_correction_bias is not None:
                 choice_scores = (
                     choice_scores + self.gate.e_score_correction_bias.float()
                 )
             topk_ids = torch.topk(choice_scores, k=self.top_k, dim=-1, sorted=False)[1]
-        topk_weights = scores.gather(1, topk_ids)
-        if self.score_func != "softmax":
-            topk_weights = topk_weights / (
-                topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-            )
-        topk_weights = topk_weights * self.route_scale
+            topk_weights = scores.gather(1, topk_ids)
+            if self.score_func != "softmax":
+                topk_weights = topk_weights / (
+                    topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+                )
+            topk_weights = topk_weights * self.route_scale
         _debug_dump("moe_scores", scores, self.layer_idx)
         _debug_dump("moe_topk_ids", topk_ids, self.layer_idx)
         _debug_dump("moe_topk_weights", topk_weights, self.layer_idx)
@@ -2026,7 +2161,7 @@ class DeepseekV4MoE(nn.Module):
         _debug_dump("moe_routed_out", out, self.layer_idx)
         shared = self.shared_experts(residual)
         _debug_dump("moe_shared_out", shared, self.layer_idx)
-        out = out + shared
+        out = self._fuse_routed_shared(out, shared)
         _debug_dump("moe_out", out, self.layer_idx)
         return out
 
@@ -2049,6 +2184,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
     @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
     def _hc_post(
         x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
     ):
@@ -2064,6 +2200,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         # token-level drift twice (post-attn and post-ffn). Verified
         # against the 4D reference at ``T=8, hc=4, d=8`` to give a
         # bit-identical result.
+        #
+        # ``@torch.compile`` lets inductor fuse the broadcast-multiply +
+        # reduce-sum + add chain (4-5 launches per call) into a single
+        # fused-reduce kernel. Called twice per layer × 43 layers per
+        # decode step = 86 calls/step → ~350 launches/step collapsed.
         return post.unsqueeze(-1) * x.unsqueeze(1) + torch.sum(
             comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=1
         )
