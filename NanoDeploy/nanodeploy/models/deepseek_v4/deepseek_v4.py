@@ -54,6 +54,18 @@ except Exception:
     _TRITON_FP8_PACK = None
     _TRITON_FP8_STORE = None
 
+# Fused index-construction kernels for ``_decode_attention_flash_mla``.
+# Replace the ~30 elementwise launches per call (arange/where/clamp/
+# floor_divide/remainder/gather chain) with one triton kernel each.
+try:
+    from nanodeploy.models.deepseek_v4.index_kernels import (
+        build_extra_indices_paged as _TRITON_BUILD_EXTRA_INDICES_PAGED,
+        build_swa_indices as _TRITON_BUILD_SWA_INDICES,
+    )
+except Exception:
+    _TRITON_BUILD_SWA_INDICES = None
+    _TRITON_BUILD_EXTRA_INDICES_PAGED = None
+
 # Vendored sglang DSV4 hyper-connection (HC) tilelang kernels. Fuses
 # the eager F.linear + RMSNorm + sigmoid + sinkhorn + reduce chain in
 # DeepseekV4HCProjector.forward into 2-3 tilelang kernels.
@@ -1712,30 +1724,46 @@ class DeepseekV4Attention(nn.Module):
         # window_size recent tokens. Also guard against exceeding swa_topk.
         swa_topk_lengths = context_lens.clamp(max=min(self.window_size, swa_topk))
 
-        # Logical positions: for each seq, the last min(ctx_len, window) tokens
-        # token_offsets[b, t] = ctx_len[b] - win_len[b] + t
-        token_offsets = torch.arange(
-            swa_topk, device=q.device, dtype=torch.int32
-        ).unsqueeze(
-            0
-        )  # [1, swa_topk]
-        start_pos = (context_lens - swa_topk_lengths).unsqueeze(1)  # [bs, 1]
-        logical_pos = start_pos + token_offsets  # [bs, swa_topk]
+        # Fast path: one fused triton kernel for the entire SWA index
+        # construction (~15 elementwise launches → 1). Falls back to the
+        # eager torch chain on shape/dtype mismatch or kernel JIT failure.
+        if (
+            _TRITON_BUILD_SWA_INDICES is not None
+            and context_lens.is_cuda
+            and block_tables.is_cuda
+            and context_lens.dtype == torch.int32
+            and block_tables.dtype == torch.int32
+        ):
+            try:
+                swa_indices = _TRITON_BUILD_SWA_INDICES(
+                    context_lens,
+                    block_tables,
+                    swa_topk,
+                    page_size,
+                    min(self.window_size, swa_topk),
+                ).unsqueeze(1)
+            except Exception:
+                swa_indices = None
+        else:
+            swa_indices = None
 
-        # Mark invalid positions
-        valid_mask = token_offsets < swa_topk_lengths.unsqueeze(1)  # [bs, swa_topk]
-
-        # Convert logical → physical via block_tables
-        page_indices = logical_pos // page_size  # [bs, swa_topk]
-        tok_in_page = logical_pos % page_size  # [bs, swa_topk]
-        # Clamp page_indices to valid range for gather
-        page_indices_safe = page_indices.clamp(0, block_tables.shape[1] - 1).long()
-        physical_blocks = block_tables.gather(1, page_indices_safe)  # [bs, swa_topk]
-        physical_slots = physical_blocks * page_size + tok_in_page
-
-        # Set invalid positions to -1
-        swa_indices = torch.where(valid_mask, physical_slots, -1).to(torch.int32)
-        swa_indices = swa_indices.unsqueeze(1)  # [bs, 1, swa_topk]
+        if swa_indices is None:
+            # Eager fallback (kept for non-CUDA / JIT-failed paths).
+            token_offsets = torch.arange(
+                swa_topk, device=q.device, dtype=torch.int32
+            ).unsqueeze(
+                0
+            )  # [1, swa_topk]
+            start_pos = (context_lens - swa_topk_lengths).unsqueeze(1)  # [bs, 1]
+            logical_pos = start_pos + token_offsets  # [bs, swa_topk]
+            valid_mask = token_offsets < swa_topk_lengths.unsqueeze(1)
+            page_indices = logical_pos // page_size
+            tok_in_page = logical_pos % page_size
+            page_indices_safe = page_indices.clamp(0, block_tables.shape[1] - 1).long()
+            physical_blocks = block_tables.gather(1, page_indices_safe)
+            physical_slots = physical_blocks * page_size + tok_in_page
+            swa_indices = torch.where(valid_mask, physical_slots, -1).to(torch.int32)
+            swa_indices = swa_indices.unsqueeze(1)  # [bs, 1, swa_topk]
 
         # 4. Build compressed indices [bs, 1, extra_topk] (if compressed layers)
         extra_k_cache = None
@@ -1760,29 +1788,56 @@ class DeepseekV4Attention(nn.Module):
                 max_blocks = comp_bt.shape[1]
                 max_compressed = max_blocks * page_size_c
                 extra_topk = ((max_compressed + 63) // 64) * 64
-                # Clamp lengths to extra_topk (kernel reads first `length` indices)
-                extra_topk_lengths = self.compressor._compressed_counts[
-                    seq_slots
-                ].clamp(max=extra_topk)
-                # For each (b, t in [0, extra_topk)):
-                #   block_idx = t // page_size_c
-                #   tok_in_block = t % page_size_c
-                #   page_id = comp_bt[seq_slots[b], block_idx]
-                #   physical = page_id * page_size_c + tok_in_block
-                tok_range = torch.arange(extra_topk, device=q.device, dtype=torch.int32)
-                block_idx = (tok_range // page_size_c).long()  # [extra_topk]
-                tok_in_block = (tok_range % page_size_c).long()  # [extra_topk]
-                # Clamp block_idx for graph-safe gather (out-of-range entries
-                # will be masked to -1 by valid_mask below).
-                block_idx_safe = block_idx.clamp(max=max_blocks - 1)
-                # Gather page IDs: [bs, extra_topk]
-                page_ids = comp_bt[
-                    seq_slots.long().unsqueeze(1), block_idx_safe.unsqueeze(0)
-                ]
-                physical = page_ids.long() * page_size_c + tok_in_block.unsqueeze(0)
-                valid_mask = tok_range.unsqueeze(0) < extra_topk_lengths.unsqueeze(1)
-                extra_indices = torch.where(valid_mask, physical, -1).to(torch.int32)
-                extra_indices = extra_indices.unsqueeze(1)  # [bs, 1, extra_topk]
+
+                # Fast path: one fused triton kernel for the entire paged
+                # extra-indices construction (~15 elementwise launches → 1,
+                # plus produces extra_topk_lengths). Eager fallback below.
+                comp_counts = self.compressor._compressed_counts
+                if (
+                    _TRITON_BUILD_EXTRA_INDICES_PAGED is not None
+                    and seq_slots.is_cuda
+                    and comp_counts is not None
+                    and comp_counts.is_cuda
+                    and comp_bt.is_cuda
+                    and comp_counts.dtype == torch.int32
+                    and comp_bt.dtype == torch.int32
+                ):
+                    try:
+                        extra_indices_2d, extra_topk_lengths = (
+                            _TRITON_BUILD_EXTRA_INDICES_PAGED(
+                                seq_slots,
+                                comp_counts,
+                                comp_bt,
+                                extra_topk,
+                                page_size_c,
+                            )
+                        )
+                        extra_indices = extra_indices_2d.unsqueeze(1)
+                    except Exception:
+                        extra_indices = None
+                else:
+                    extra_indices = None
+
+                if extra_indices is None:
+                    # Eager fallback.
+                    extra_topk_lengths = comp_counts[seq_slots].clamp(max=extra_topk)
+                    tok_range = torch.arange(
+                        extra_topk, device=q.device, dtype=torch.int32
+                    )
+                    block_idx = (tok_range // page_size_c).long()
+                    tok_in_block = (tok_range % page_size_c).long()
+                    block_idx_safe = block_idx.clamp(max=max_blocks - 1)
+                    page_ids = comp_bt[
+                        seq_slots.long().unsqueeze(1), block_idx_safe.unsqueeze(0)
+                    ]
+                    physical = page_ids.long() * page_size_c + tok_in_block.unsqueeze(0)
+                    valid_mask = tok_range.unsqueeze(0) < extra_topk_lengths.unsqueeze(
+                        1
+                    )
+                    extra_indices = torch.where(valid_mask, physical, -1).to(
+                        torch.int32
+                    )
+                    extra_indices = extra_indices.unsqueeze(1)
             else:
                 # Backward-compat: contiguous-chunk addressing (legacy path).
                 valid_slots = (self.compressed_cache.shape[0] - 1) * page_size_c

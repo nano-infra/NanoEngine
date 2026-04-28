@@ -18,6 +18,16 @@ class RunnerConfig:
     # decode path. See nanodeploy/config.py for details.
     use_mega_moe: bool = False
     mega_moe_max_tokens_per_rank: int = 256
+    # Per-step host-critical-path timer. Set ``step_timing=True`` to
+    # log a phase breakdown of run_from_bytes every
+    # ``step_timing_interval`` decode steps. Useful for quantifying
+    # the GPU-idle gap between cudaGraphLaunch invocations (the
+    # device-signal + pingpong-scheduling target). Driver reads env
+    # vars once and threads these into RunnerConfig so Ray actors
+    # see the same value regardless of subprocess env propagation.
+    step_timing: bool = False
+    step_timing_interval: int = 16
+    step_timing_rank: int = 0  # -1 = all ranks
 
 
 # Singleton instance of RunnerConfig
@@ -35,6 +45,9 @@ def set_runner_config(
     enable_eplb: Optional[bool] = None,
     use_mega_moe: Optional[bool] = None,
     mega_moe_max_tokens_per_rank: Optional[int] = None,
+    step_timing: Optional[bool] = None,
+    step_timing_interval: Optional[int] = None,
+    step_timing_rank: Optional[int] = None,
 ):
     global _RUNNER_CONFIG
     _RUNNER_CONFIG = RunnerConfig(
@@ -48,6 +61,11 @@ def set_runner_config(
             if mega_moe_max_tokens_per_rank is not None
             else 256
         ),
+        step_timing=bool(step_timing) if step_timing is not None else False,
+        step_timing_interval=(
+            int(step_timing_interval) if step_timing_interval is not None else 16
+        ),
+        step_timing_rank=(int(step_timing_rank) if step_timing_rank is not None else 0),
     )
 
 

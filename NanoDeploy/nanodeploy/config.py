@@ -86,6 +86,16 @@ class Config(BaseModel):
     # raises with a helpful message.
     mega_moe_max_tokens_per_rank: int = 256
 
+    # Per-step host-critical-path timing. Driver-side flag — threaded
+    # into RunnerConfig at worker init so each Ray actor sees the same
+    # value (env vars don't propagate through Ray runtime_env by
+    # default). When ``step_timing=True``, model_runner.run_from_bytes
+    # logs a phase breakdown (rpc_in / prep / forward / sample / tail)
+    # every ``step_timing_interval`` steps. Off → zero overhead.
+    step_timing: bool = False
+    step_timing_interval: int = 16
+    step_timing_rank: int = 0  # -1 = all ranks
+
     # profiler
     enable_profiler: bool = False
     profiler_start_step: int = 32
