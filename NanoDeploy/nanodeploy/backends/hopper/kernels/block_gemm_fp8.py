@@ -24,8 +24,16 @@ def _quant_fp8_kernel(
     stride_sg,
     GROUP_SIZE: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    ROUND_UE8M0: tl.constexpr = False,
 ):
-    """Quant fp8 kernel."""
+    """Quant fp8 kernel.
+
+    When ``ROUND_UE8M0`` is True, round per-block scales up to the next
+    power of two (matches DSV4's QAT scale_fmt='ue8m0' regime). Without
+    this, plain FP32 scales are used — which is more accurate but does
+    NOT match the trained-on activation distribution and accumulates
+    drift across layers.
+    """
     group_id = tl.program_id(0)
     m_id_start = tl.program_id(1)
     m_id_stride = tl.num_programs(1)
@@ -43,6 +51,11 @@ def _quant_fp8_kernel(
 
         a = tl.load(a_ptrs, mask=m_id < M, other=0).to(tl.float32)
         scale = tl.maximum(tl.max(tl.abs(a)), 1e-6) * rfp8_max
+        if ROUND_UE8M0:
+            # Round up to nearest power of two so the scale is a single
+            # FP32-mantissa-free value (UE8M0). Equivalent to
+            # scale = exp2(ceil(log2(scale))).
+            scale = tl.exp2(tl.ceil(tl.log2(scale)))
         out = a / scale
 
         out = tl.clamp(out, fp8_min, fp8_max)
@@ -56,7 +69,13 @@ def _quant_fp8_kernel(
         s_ptr += m_id_stride * stride_sm
 
 
-def _quant_fp8_launcher(A: Tensor, group_size: int, out: Tensor, scales: Tensor):
+def _quant_fp8_launcher(
+    A: Tensor,
+    group_size: int,
+    out: Tensor,
+    scales: Tensor,
+    round_ue8m0: bool = False,
+):
     """Quant online."""
     M, K = A.shape
     num_groups = K // group_size
@@ -100,6 +119,7 @@ def _quant_fp8_launcher(A: Tensor, group_size: int, out: Tensor, scales: Tensor)
         stride_sg=scales.stride(1),
         GROUP_SIZE=group_size,
         NUM_STAGES=num_stages,
+        ROUND_UE8M0=round_ue8m0,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -112,6 +132,7 @@ def quant_fp8(
     group_size: int,
     dtype: torch.dtype = torch.float8_e4m3fn,
     trans_scale: bool = False,
+    round_ue8m0: bool = False,
 ):
     """Quant fp8."""
     assert A.dim() == 2
@@ -123,10 +144,15 @@ def quant_fp8(
         scales = A.new_empty(num_groups, M, dtype=torch.float32).T
     else:
         scales = A.new_empty(M, num_groups, dtype=torch.float32)
-    return _quant_fp8_launcher(A, group_size, out, scales)
+    return _quant_fp8_launcher(A, group_size, out, scales, round_ue8m0=round_ue8m0)
 
 
-def quant_fp8_tma(A: Tensor, group_size: int, dtype: torch.dtype = torch.float8_e4m3fn):
+def quant_fp8_tma(
+    A: Tensor,
+    group_size: int,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+    round_ue8m0: bool = False,
+):
     """Quant fp8 tma."""
     from deep_gemm import ceil_div, get_m_alignment_for_contiguous_layout
 
@@ -138,7 +164,7 @@ def quant_fp8_tma(A: Tensor, group_size: int, dtype: torch.dtype = torch.float8_
     aligned_M = ceil_div(M, alignment) * alignment
     out = A.new_empty(aligned_M, K, dtype=dtype)
     scales = A.new_empty(num_groups, aligned_M, dtype=torch.float32).T
-    return _quant_fp8_launcher(A, group_size, out, scales)
+    return _quant_fp8_launcher(A, group_size, out, scales, round_ue8m0=round_ue8m0)
 
 
 def deep_gemm_fp8(

@@ -111,6 +111,7 @@ else:
 def _silu_and_mul_kernel(
     gateup_ptr,
     out_ptr,
+    swiglu_limit,
     N: tl.constexpr,
     M,
     stride_gum: tl.constexpr,
@@ -141,6 +142,14 @@ def _silu_and_mul_kernel(
         gate = gate.to(tl.float32)
         up = up.to(tl.float32)
 
+        # DSV4 SwiGLU clamp (matches reference at
+        #   /models_cfs/.../inference/model.py:600-603):
+        #     up   = clamp(up,   min=-L, max=+L)
+        #     gate = clamp(gate, max=+L)
+        #   out = silu(gate) * up
+        # ``swiglu_limit=+inf`` disables (plain SwiGLU semantics).
+        up = tl.minimum(tl.maximum(up, -swiglu_limit), swiglu_limit)
+        gate = tl.minimum(gate, swiglu_limit)
         gate = gate / (1 + _fast_expf(-gate))
         out = gate * up
 
@@ -151,7 +160,11 @@ def _silu_and_mul_kernel(
         out_ptrs += m_id_stride * stride_om
 
 
-def silu_and_mul(gate_up: torch.Tensor, out: torch.Tensor = None):
+def silu_and_mul(
+    gate_up: torch.Tensor,
+    out: torch.Tensor = None,
+    swiglu_limit: float = float("inf"),
+):
     """silu and mul."""
     assert gate_up.dim() == 2
 
@@ -176,6 +189,7 @@ def silu_and_mul(gate_up: torch.Tensor, out: torch.Tensor = None):
     _silu_and_mul_kernel[grid](
         gate_up,
         out,
+        float(swiglu_limit),
         N,
         M,
         stride_gum=gate_up.stride(0),
@@ -560,6 +574,7 @@ def fused_moe_v3(
     w13_weight_fp8: Tuple[torch.Tensor, torch.Tensor],
     w2_weight_fp8: Tuple[torch.Tensor, torch.Tensor],
     num_recv_tokens_per_expert: Optional[List[int]],
+    swiglu_limit: float = float("inf"),
 ):
     hidden_states_fp8, hidden_states_scale = hidden_states_fp8
     if num_recv_tokens_per_expert is None:
@@ -637,7 +652,7 @@ def fused_moe_v3(
         device=gateup_output.device,
         dtype=torch.float32,
     )
-    silu_and_mul(gateup_output.view(-1, N), down_input)
+    silu_and_mul(gateup_output.view(-1, N), down_input, swiglu_limit=swiglu_limit)
 
     down_output = torch.empty(
         (all_tokens, K),
@@ -673,6 +688,7 @@ def fused_moe_v3_bf16(
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,
     num_recv_tokens_per_expert: Optional[List[int]],
+    swiglu_limit: float = float("inf"),
 ):
     """
     BF16 fused MoE computation for prefill (normal) mode.
@@ -737,7 +753,7 @@ def fused_moe_v3_bf16(
         device=hidden_states.device,
         dtype=torch.bfloat16,
     )
-    silu_and_mul(gateup_output.view(-1, N), down_input)
+    silu_and_mul(gateup_output.view(-1, N), down_input, swiglu_limit=swiglu_limit)
     del gateup_output
 
     # Down GEMM (BF16)

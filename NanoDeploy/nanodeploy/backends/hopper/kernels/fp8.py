@@ -201,6 +201,7 @@ def _silu_and_mul_post_quant_kernel(
     size_n,
     fp8_max,
     fp8_min,
+    swiglu_limit,
     BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
 ):
@@ -239,6 +240,14 @@ def _silu_and_mul_post_quant_kernel(
             mask=offs_in_d < size_n,
             other=0.0,
         )
+        # DSV4 SwiGLU clamp (matches reference at
+        #   /models_cfs/.../inference/model.py:600-603):
+        #     up   = clamp(up,   min=-L, max=+L)
+        #     gate = clamp(gate, max=+L)            # asymmetric — upper only
+        #   silu(gate) * up
+        # Pass ``swiglu_limit=+inf`` to disable (plain SwiGLU semantics).
+        up = tl.minimum(tl.maximum(up, -swiglu_limit), swiglu_limit)
+        gate = tl.minimum(gate, swiglu_limit)
         gate = gate / (1 + tl.exp(-gate))
         gate = gate.to(input_ptr.dtype.element_ty)
         gate_up = up * gate
@@ -264,6 +273,7 @@ def silu_and_mul_masked_post_quant_fwd(
     output_scale: torch.Tensor,
     quant_group_size: int,
     masked_m: torch.Tensor,
+    swiglu_limit: float = float("inf"),
 ):
     assert input.is_contiguous()
     assert output.is_contiguous()
@@ -301,6 +311,7 @@ def silu_and_mul_masked_post_quant_fwd(
         size_n,
         fp8_max,
         fp8_min,
+        float(swiglu_limit),
         BLOCK_N=BLOCK_N,
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,

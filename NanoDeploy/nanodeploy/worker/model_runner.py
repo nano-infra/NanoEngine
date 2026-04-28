@@ -95,6 +95,10 @@ class ModelRunner:
             dummy_weight=config.dummy_weight,
             dummy_eplb=config.dummy_eplb,
             enable_eplb=config.enable_eplb,
+            use_mega_moe=getattr(config, "use_mega_moe", False),
+            mega_moe_max_tokens_per_rank=getattr(
+                config, "mega_moe_max_tokens_per_rank", 256
+            ),
         )
 
         if defer_dist_init:

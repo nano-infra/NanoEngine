@@ -302,6 +302,50 @@ def load_weights(
             f"DeepSeek-V4 pending paired weights after loading: "
             f"fp4_experts={len(pending_fp4_experts)}, wo_a={list(pending_wo_a)}"
         )
+
+    # Mega-MoE post-load hook: walk the model tree and transform every
+    # routed-experts layer's weights into the layout
+    # ``deep_gemm.fp8_fp4_mega_moe`` expects. No-op when use_mega_moe
+    # is off or when a layer isn't FP8 (the method bails early).
+    try:
+        from nanodeploy.worker.runner_config import get_runner_config
+
+        if getattr(get_runner_config(), "use_mega_moe", False):
+            transformed = 0
+            failed = 0
+            first_failure_tb: str | None = None
+            for module in model.modules():
+                if not (
+                    hasattr(module, "prepare_mega_weights")
+                    and callable(module.prepare_mega_weights)
+                ):
+                    continue
+                try:
+                    module.prepare_mega_weights()
+                except Exception:
+                    failed += 1
+                    if first_failure_tb is None:
+                        import traceback as _tb
+
+                        first_failure_tb = _tb.format_exc()
+                    continue
+                if getattr(module, "mega_l1_weights", None) is not None:
+                    transformed += 1
+            if transformed:
+                logger.warning(
+                    f"DeepSeek-V4 mega-MoE: transformed weights for {transformed} layers"
+                )
+            if failed:
+                logger.warning(
+                    f"DeepSeek-V4 mega-MoE: {failed} layer(s) failed weight transform; "
+                    f"first traceback:\n{first_failure_tb}"
+                )
+    except Exception:
+        import traceback as _tb
+
+        logger.warning(
+            f"DeepSeek-V4 mega-MoE post-load hook failed:\n{_tb.format_exc()}"
+        )
     if not_found_names:
         unique_patterns = set()
         for name in not_found_names:

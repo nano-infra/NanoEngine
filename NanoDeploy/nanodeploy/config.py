@@ -74,6 +74,18 @@ class Config(BaseModel):
     dsv4_compressed_pool_pages_ratio4: int = 0
     dsv4_compressed_pool_pages_ratio128: int = 0
 
+    # MoE: opt into deep_gemm.fp8_fp4_mega_moe (one-kernel dispatch +
+    # per-expert GEMM + activation + combine). Off by default — gated
+    # so production can stay on the existing deep_ep low-latency path
+    # while we burn in the new path. Requires FP8 weights and Hopper
+    # (sm_90+); the experts layer falls back to the old path otherwise.
+    use_mega_moe: bool = False
+    # Cap on tokens-per-rank for the mega-MoE symmetric buffer. Each
+    # routed-expert layer pre-allocates a SymmBuffer sized for this
+    # cap; bench/decode num_tokens must stay <= this value or the call
+    # raises with a helpful message.
+    mega_moe_max_tokens_per_rank: int = 256
+
     # profiler
     enable_profiler: bool = False
     profiler_start_step: int = 32
