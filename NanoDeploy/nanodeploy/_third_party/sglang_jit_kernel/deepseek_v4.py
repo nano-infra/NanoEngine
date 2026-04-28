@@ -79,6 +79,66 @@ def _jit_silu_and_mul_clamp_module(dtype: torch.dtype):
 
 
 @cache_once
+def _jit_silu_mul_quant_contig_module(
+    quant_group_size: int = 128,
+    scale_ue8m0: bool = True,
+    swizzle: bool = False,
+    apply_swiglu_limit: bool = True,
+):
+    """sglang's silu_and_mul + per-token-group FP8 quant (contiguous variant).
+
+    Fuses ``silu(gate) * up`` (with optional clamp), then per-128-element
+    UE8M0 FP8 quant, into one CUDA kernel. Replaces the eager chain
+    ``silu_and_mul_post_quant_kernel + _quant_fp8_kernel`` (~2 launches +
+    intermediate tensor → 1 launch, no intermediate).
+    """
+    args = make_cpp_args(
+        quant_group_size,
+        scale_ue8m0,
+        swizzle,
+        is_arch_support_pdl(),
+        apply_swiglu_limit,
+    )
+    return load_jit(
+        _make_name("silu_mul_quant_contig"),
+        *args,
+        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
+        cuda_wrappers=[("run", f"SiluAndMulContigPostQuantKernel<{args}>::run")],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
+def _jit_silu_mul_quant_varlen_module(
+    quant_group_size: int = 128,
+    scale_ue8m0: bool = True,
+    swizzle: bool = False,
+    apply_swiglu_limit: bool = True,
+):
+    """sglang's silu_and_mul + per-token-group FP8 quant (masked / varlen).
+
+    For the masked-MoE expert compute path: input is
+    ``[num_experts, num_tokens_padded, 2*hidden_dim]`` and ``masked_m``
+    indicates per-expert valid token count. Output is
+    ``[num_experts, num_tokens_padded, hidden_dim]`` fp8.
+    """
+    args = make_cpp_args(
+        quant_group_size,
+        scale_ue8m0,
+        swizzle,
+        is_arch_support_pdl(),
+        apply_swiglu_limit,
+    )
+    return load_jit(
+        _make_name("silu_mul_quant_varlen"),
+        *args,
+        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
+        cuda_wrappers=[("run", f"SiluAndMulMaskedPostQuantKernel<{args}>::run")],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
 def _jit_fused_rope_module():
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
@@ -86,6 +146,48 @@ def _jit_fused_rope_module():
         *args,
         cuda_files=["deepseek_v4/rope.cuh"],
         cuda_wrappers=[("forward", f"FusedQKRopeKernel<{args}>::forward")],
+    )
+
+
+@cache_once
+def _jit_topk_module():
+    """sglang's NSA top-K=512 + page-table-translation kernel (radix-256
+    in shared memory). Replaces masked_fill + topk + where + (optional
+    page transform) chain."""
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        _make_name("topk"),
+        *args,
+        cuda_files=["deepseek_v4/topk.cuh"],
+        cuda_wrappers=[("topk_transform", f"TopK512Kernel<{args}>::transform")],
+    )
+
+
+@cache_once
+def _jit_compress_module(
+    head_dim: int,
+    dtype_in: torch.dtype,
+    dtype_out: torch.dtype,
+    ratio: int,
+):
+    """sglang's compressor kernel — fuses scatter-update + softmax-weighted-
+    sum into one CUDA pass. ``ratio`` is 4 (overlap) or 128 (non-overlap).
+    Replaces the per-decode chain:
+        kv_state[idx] = kv;  score_state[idx] = score + ape
+        compressed = (kv_state * score_state.softmax(dim=1)).sum(dim=1)
+    """
+    assert ratio in (4, 128)
+    args = make_cpp_args(head_dim, dtype_in, dtype_out, is_arch_support_pdl())
+    kernel_class = f"FlashCompress{ratio}Kernel<{args}>"
+    return load_jit(
+        _make_name(f"compress_{ratio}"),
+        *args,
+        cuda_files=[f"deepseek_v4/c{ratio}.cuh"],
+        cuda_wrappers=[
+            ("decode", f"{kernel_class}::run_decode"),
+            ("prefill", f"{kernel_class}::run_prefill"),
+        ],
+        extra_cuda_cflags=["-use_fast_math"],
     )
 
 
@@ -162,6 +264,48 @@ def fused_norm_rope_inplace(
     module.forward(kv, weight, positions, freq_cis_real, 2, eps, 0)
 
 
+def topk_transform_512(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """sglang's NSA top-K=512 + page-table-translation kernel.
+
+    Single CUDA kernel that:
+      1. Treats positions ``>= seq_lens[b]`` as ``-inf`` (implicit mask).
+      2. Selects the 512 highest-scoring positions per batch entry via a
+         radix-256 sort in shared memory.
+      3. Translates those raw token positions into physical page slots
+         via ``page_tables`` (when caller wants page indices).
+
+    Replaces the masked_fill + topk + where + (optional page transform)
+    chain with a single launch. Drop-in for NanoDeploy's NSA Indexer's
+    final selection step.
+
+    Parameters
+    ----------
+    scores : [bs, max_context_len] float32 (the deep_gemm
+        ``fp8_paged_mqa_logits`` output works directly here).
+    seq_lens : [bs] int32 — actual context length per sequence.
+    page_tables : [bs, max_pages] int32 — physical page id for each
+        logical page slot.
+    out_page_indices : [bs, 512] int32 — pre-allocated output buffer
+        for page-translated slot indices (set to ``-1`` for invalid
+        positions).
+    page_size : int — must be a power of 2.
+    out_raw_indices : optional [bs, 512] int32 — if supplied, also
+        receives the pre-translation raw token positions. Pass ``None``
+        when only page indices are needed.
+    """
+    module = _jit_topk_module()
+    module.topk_transform(
+        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+    )
+
+
 def silu_and_mul_clamp(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -186,6 +330,85 @@ def silu_and_mul_clamp(
     """
     module = _jit_silu_and_mul_clamp_module(input.dtype)
     module.run(input, output, float(swiglu_limit))
+
+
+def silu_mul_quant_contig(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    swiglu_limit: float = float("inf"),
+    transposed: bool = False,
+    quant_group_size: int = 128,
+    scale_ue8m0: bool = True,
+    swizzle: bool = False,
+) -> None:
+    """Fused silu_and_mul + per-token-group FP8 quant (contiguous).
+
+    Replaces the eager chain ``silu_and_mul_post_quant_kernel +
+    _quant_fp8_kernel`` with a single CUDA launch (no intermediate
+    bfloat16 buffer materialized).
+
+    Parameters
+    ----------
+    input : Tensor
+        Shape ``[M, 2*D]`` bfloat16. Last dim is the concatenated
+        ``[gate, up]`` pair; ``silu(gate) * up`` is computed.
+    output : Tensor
+        Shape ``[M, D]`` float8_e4m3fn. Pre-allocated.
+    output_scale : Tensor
+        Shape ``[M, D/quant_group_size]`` float32 (when ``transposed=False``).
+        For ``transposed=True``, see sglang's docs for the col-major int32
+        layout. Pre-allocated.
+    swiglu_limit : float
+        Pre-clamp limit for ``silu(gate) * up``. ``inf`` to skip clamp.
+        DSV4 production uses ``10.0``.
+    transposed : bool
+        Whether the scale is in transposed (col-major int32) layout.
+    quant_group_size : int
+        Must be 128.
+    scale_ue8m0 : bool
+        UE8M0 (power-of-2-rounded) scaling. Matches NanoDeploy's existing
+        UE8M0 quant path.
+    swizzle : bool
+        Layout swizzle for sm100+ TMA paths. Default False on H200.
+    """
+    module = _jit_silu_mul_quant_contig_module(
+        quant_group_size=quant_group_size,
+        scale_ue8m0=scale_ue8m0,
+        swizzle=swizzle,
+        apply_swiglu_limit=(swiglu_limit != float("inf")),
+    )
+    module.run(input, output, output_scale, transposed, float(swiglu_limit))
+
+
+def silu_mul_quant_masked(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    topk: int,
+    swiglu_limit: float = float("inf"),
+    transposed: bool = False,
+    quant_group_size: int = 128,
+    scale_ue8m0: bool = True,
+    swizzle: bool = False,
+) -> None:
+    """Fused silu_and_mul + per-token-group FP8 quant (masked / per-expert).
+
+    For the MoE expert compute path. ``input`` shape
+    ``[num_experts, num_tokens_padded, 2*hidden_dim]`` bf16, ``masked_m``
+    [num_experts] int32 indicates valid tokens per expert. Replaces the
+    existing ``silu_and_mul_masked_post_quant_fwd`` Triton kernel chain.
+    """
+    module = _jit_silu_mul_quant_varlen_module(
+        quant_group_size=quant_group_size,
+        scale_ue8m0=scale_ue8m0,
+        swizzle=swizzle,
+        apply_swiglu_limit=(swiglu_limit != float("inf")),
+    )
+    module.run(
+        input, output, output_scale, masked_m, topk, transposed, float(swiglu_limit)
+    )
 
 
 def rmsnorm_self(q: torch.Tensor, eps: float) -> torch.Tensor:

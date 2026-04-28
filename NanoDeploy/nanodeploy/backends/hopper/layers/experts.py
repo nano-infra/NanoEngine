@@ -677,10 +677,6 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
                 recv_x_fp8, gate_up_weight_fp8, gateup_output, masked_m, expected_m
             )
 
-            from nanodeploy.backends.hopper.kernels.fp8 import (
-                silu_and_mul_masked_post_quant_fwd,
-            )
-
             block_size = 128
             down_input = torch.empty(
                 (num_groups, m, n // 2),
@@ -692,14 +688,47 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
                 device=hidden_states.device,
                 dtype=torch.float32,
             )
-            silu_and_mul_masked_post_quant_fwd(
-                gateup_output,
-                down_input,
-                down_input_scale,
-                block_size,
-                masked_m,
-                swiglu_limit=self._swiglu_limit_runtime,
-            )
+            # Tilelang fast path: sglang's vendored silu+mul+UE8M0-quant
+            # kernel collapses what was the Triton silu_and_mul_post_quant
+            # + a downstream per-token-group quant into a single CUDA
+            # launch. ~250 µs sgl vs 538 µs nanodeploy in v24 trace.
+            _used_tilelang_silu = False
+            try:
+                from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
+                    silu_mul_quant_masked,
+                )
+
+                # NanoDeploy's eager Triton path produces NATURAL scales
+                # (``s = absmax / fp8_max``), so use scale_ue8m0=False to
+                # match — UE8M0 scales would diverge bit-wise from what
+                # downstream deep_gemm expects.
+                silu_mul_quant_masked(
+                    input=gateup_output,
+                    output=down_input,
+                    output_scale=down_input_scale,
+                    masked_m=masked_m.to(torch.int32),
+                    topk=self.top_k,
+                    swiglu_limit=float(self._swiglu_limit_runtime),
+                    quant_group_size=block_size,
+                    scale_ue8m0=False,
+                    swizzle=False,
+                )
+                _used_tilelang_silu = True
+            except Exception:
+                pass
+            if not _used_tilelang_silu:
+                from nanodeploy.backends.hopper.kernels.fp8 import (
+                    silu_and_mul_masked_post_quant_fwd,
+                )
+
+                silu_and_mul_masked_post_quant_fwd(
+                    gateup_output,
+                    down_input,
+                    down_input_scale,
+                    block_size,
+                    masked_m,
+                    swiglu_limit=self._swiglu_limit_runtime,
+                )
             del gateup_output
 
             down_n = self.down_proj.size(1)
