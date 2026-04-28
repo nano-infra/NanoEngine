@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -16,14 +18,27 @@ except Exception:
 
 
 class SiluAndMul(nn.Module):
+    """SwiGLU activation, optionally clamping ``silu(gate) * up`` to
+    ``[-swiglu_limit, +swiglu_limit]`` before it leaves the activation.
 
-    def __init__(self):
+    DSV4 ships ``swiglu_limit=10.0``; older Deepseek/Qwen variants do
+    not clamp (``swiglu_limit=None``). The clamp must run *before* the
+    downstream FP8 quant or it changes the absmax → scale → output
+    rounding and flips top-1 token picks.
+    """
+
+    def __init__(self, swiglu_limit: Optional[float] = None):
         super().__init__()
+        # Stored as +inf when unset so the fused kernel's clamp branch
+        # is a no-op (the kernel always runs; +inf disables the bound).
+        self._swiglu_limit = swiglu_limit
+        self._effective_limit: float = (
+            float("inf") if swiglu_limit is None else float(swiglu_limit)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Fast path: single-kernel SwiGLU when bf16 contig + sglang
-        # fused kernel is available. We pass swiglu_limit=+inf to skip
-        # the clamp branch (matching plain SwiGLU semantics).
+        # fused kernel is available.
         if (
             _SGL_SILU_AND_MUL_CLAMP is not None
             and x.is_cuda
@@ -34,11 +49,21 @@ class SiluAndMul(nn.Module):
             try:
                 D = x.shape[-1] // 2
                 out = torch.empty(*x.shape[:-1], D, dtype=x.dtype, device=x.device)
-                _SGL_SILU_AND_MUL_CLAMP(x, out, float("inf"))
+                _SGL_SILU_AND_MUL_CLAMP(x, out, self._effective_limit)
                 return out
             except Exception:
                 pass
-        return self._compiled_forward(x)
+        return self._eager_forward(x)
+
+    def _eager_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._swiglu_limit is None:
+            return self._compiled_forward(x)
+        # DSV4 reference (model.py:600-603): clamp ``up`` two-sided,
+        # ``gate`` upper-bound only, BEFORE silu * up.
+        gate, up = x.chunk(2, -1)
+        up = up.clamp(-self._effective_limit, self._effective_limit)
+        gate = gate.clamp(max=self._effective_limit)
+        return F.silu(gate) * up
 
     @torch.compile
     def _compiled_forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -45,10 +45,12 @@ try:
     from nanodeploy.backends.gpu_generic.kernels.fp8_ue8m0_quant import (
         fp8_quant_dequant_inplace as _TRITON_FP8_QDQ,
         pack_kv_fp8 as _TRITON_FP8_PACK,
+        store_dsv4_kv_fp8_fused as _TRITON_FP8_STORE,
     )
 except Exception:
     _TRITON_FP8_QDQ = None
     _TRITON_FP8_PACK = None
+    _TRITON_FP8_STORE = None
 
 # Vendored sglang DSV4 hyper-connection (HC) tilelang kernels. Fuses
 # the eager F.linear + RMSNorm + sigmoid + sinkhorn + reduce chain in
@@ -150,18 +152,52 @@ def _debug_dump(name: str, tensor: torch.Tensor, layer_idx: int | None = None) -
         return
     if not _debug_layer_enabled(layer_idx):
         return
-    if os.getenv("NANODEPLOY_DSV4_DEBUG_PREFILL_ONLY", "1") != "0":
+
+    # Resolve context flags up front (these are Python bools/ints, not
+    # tensors — no host↔device sync needed).
+    is_prefill_run = True
+    is_dummy = False
+    try:
+        context = get_context()
+        is_prefill_run = bool(context.is_prefill)
+        is_dummy = bool(getattr(context, "is_dummy", False))
+    except Exception:
+        pass
+
+    # Skip warmup / graph-capture passes always: they don't carry real
+    # data and would break CUDAGraph capture if we did any host sync.
+    if is_dummy and os.getenv("NANODEPLOY_DSV4_DEBUG_SKIP_DUMMY", "1") != "0":
+        return
+
+    # Decode-step dumps require a host sync (.item() on context_lens) to
+    # know which step we're on. That's only safe in eager mode — under
+    # CUDAGraph replay the captured Python doesn't even run, and during
+    # capture warmup we'd invalidate the stream. We disable decode dumps
+    # entirely unless prefill-only is off AND we're not under graphs.
+    decode_step: int | None = None
+    if is_prefill_run:
+        if os.getenv("NANODEPLOY_DSV4_DEBUG_PREFILL_ONLY", "1") != "0":
+            pass  # prefill mode is the default and is graph-safe
+    else:
+        # Decode dumping disabled by default. Only enable with
+        # NANODEPLOY_DSV4_DEBUG_PREFILL_ONLY=0 and require eager mode
+        # (no CUDAGraph) — caller must run with --enforce_eager true.
+        if os.getenv("NANODEPLOY_DSV4_DEBUG_PREFILL_ONLY", "1") != "0":
+            return
+        decode_steps_env = os.getenv("NANODEPLOY_DSV4_DEBUG_DECODE_STEPS", "")
+        if not decode_steps_env.strip():
+            return
         try:
-            context = get_context()
-            if not context.is_prefill:
-                return
-            if (
-                os.getenv("NANODEPLOY_DSV4_DEBUG_SKIP_DUMMY", "1") != "0"
-                and context.is_dummy
-            ):
-                return
+            csl = getattr(get_context(), "context_lens", None)
+            if csl is not None and csl.numel() > 0:
+                decode_step = int(csl.flatten()[0].item())
         except Exception:
-            pass
+            return
+        wanted = {
+            int(x) for x in decode_steps_env.replace(",", " ").split() if x.strip()
+        }
+        if decode_step is None or decode_step not in wanted:
+            return
 
     max_tokens = int(os.getenv("NANODEPLOY_DSV4_DEBUG_MAX_TOKENS", "8"))
     payload = tensor.detach()
@@ -169,9 +205,10 @@ def _debug_dump(name: str, tensor: torch.Tensor, layer_idx: int | None = None) -
         payload = payload[:max_tokens]
     payload = payload.cpu().contiguous()
     layer = "global" if layer_idx is None else f"layer{layer_idx}"
+    step_suffix = "" if decode_step is None else f"_step{decode_step}"
     path = Path(out_dir)
     path.mkdir(parents=True, exist_ok=True)
-    file_path = path / f"nanodeploy_rank{rank}_{layer}_{name}.pt"
+    file_path = path / f"nanodeploy_rank{rank}_{layer}_{name}{step_suffix}.pt"
     if os.getenv("NANODEPLOY_DSV4_DEBUG_ONCE", "1") != "0" and file_path.exists():
         return
     torch.save(
@@ -179,6 +216,7 @@ def _debug_dump(name: str, tensor: torch.Tensor, layer_idx: int | None = None) -
             "name": name,
             "rank": rank,
             "layer": layer_idx,
+            "decode_step": decode_step,
             "shape": tuple(tensor.shape),
             "dtype": str(tensor.dtype),
             "tensor": payload,
@@ -271,6 +309,11 @@ def _fp8_quant_dequant_inplace(x: torch.Tensor, block_size: int = 64) -> torch.T
         except Exception:
             pass
 
+    # Eager fallback — full FP8 round-trip (NOT a no-op). See triton
+    # kernel _ue8m0_quant_dequant_inplace_kernel for why we DON'T copy
+    # reference's no-op semantics here: NanoDeploy's KV cache is FP8
+    # (memory savings) so the local kv must be pre-quantized to keep
+    # the eager-fallback attention path consistent with flash_mla.
     orig_shape = x.shape
     assert orig_shape[-1] % block_size == 0
     view = (
@@ -369,6 +412,31 @@ def _store_dsv4_fp8_batched(
         slot_mapping: [T] int32/int64. Slot = -1 redirects to the dummy last
                       slot (avoids data-dependent control flow for CUDAGraph).
     """
+    # Fast path: single triton kernel does pack + scatter in one launch
+    # (replaces 10+ elementwise/reduce launches that otherwise pile up
+    # in the per-decode-step launch storm).
+    if (
+        _TRITON_FP8_STORE is not None
+        and kv_bf16.is_cuda
+        and cache_buf.is_cuda
+        and cache_buf.dtype == torch.uint8
+        and cache_buf.is_contiguous()
+        and cache_buf.shape[-1] == _DSV4_BYTES_PER_TOKEN
+    ):
+        try:
+            _TRITON_FP8_STORE(
+                kv_bf16.contiguous(),
+                cache_buf,
+                slot_mapping,
+                page_size,
+                nope_dim=_DSV4_NOPE_DIM,
+                rope_dim=_DSV4_ROPE_DIM,
+                tile_size=_DSV4_TILE_SIZE,
+            )
+            return
+        except Exception:
+            pass
+
     nope_fp8, rope_bf16, scales_u8 = _pack_kv_fp8(kv_bf16)
     T = kv_bf16.shape[0]
 
@@ -716,6 +784,10 @@ class DeepseekV4Compressor(nn.Module):
             # Also update compressed count for tensorized path
             if self._compressed_counts is not None and 0 <= seq_key < self._max_slots:
                 self._compressed_counts[seq_key] = kv.shape[0]
+        # Dump prefill-compressor output (parity with reference's
+        # Compressor.forward end-of-prefill dump). ratio is in the
+        # filename so multiple compressor layers don't collide.
+        _debug_dump(f"compressor_r{ratio}_compressed", kv, None)
         return kv
 
     def forward_decode(
@@ -951,6 +1023,22 @@ class DeepseekV4Compressor(nn.Module):
             # Update counts only for compressing seqs
             inc = should_compress.to(torch.int32)
             self._compressed_counts.scatter_add_(0, seq_slots.long(), inc)
+
+        # Dump the compressed kv. We DO NOT gate on
+        # ``bool(should_compress.any())`` because that would do a host
+        # sync (.item()) and invalidate CUDAGraph capture. The dump
+        # function itself early-returns when DEBUG_DIR is unset, so
+        # this is a no-op in production. When debugging, the user is
+        # expected to request a decode step where compression actually
+        # fires (e.g. DECODE_STEPS=128 for prompt_len=8 ratio=128 — at
+        # that step ratio=128, ratio=64, ratio=32, ratio=16, ratio=8,
+        # ratio=4, ratio=2 all fire, so the dumped tensor is always
+        # the real compressor output for the layers we care about).
+        _debug_dump(
+            f"compressor_r{ratio}_compressed",
+            compressed,
+            None,
+        )
 
     def cached(self, seq_key: int) -> torch.Tensor | None:
         return self._compressed_cache.get(seq_key)
@@ -1872,6 +1960,10 @@ class DeepseekV4MoE(nn.Module):
             )
 
         dist_ctx = get_dist_context()
+        # DSV4 ships ``swiglu_limit=10.0`` (clamp silu(gate)*up before
+        # FP8 quant). Models without this attr leave it ``None`` and
+        # the SwiGLU kernels run with ``+inf`` (no-op clamp).
+        swiglu_limit = getattr(config, "swiglu_limit", None)
         self.routed_experts = get_backend().get_distributed_routed_experts(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -1884,6 +1976,7 @@ class DeepseekV4MoE(nn.Module):
             scoring_func=self.score_func,
             routed_scaling_factor=self.route_scale,
             layer_idx=layer_idx,
+            swiglu_limit=swiglu_limit,
         )
         assert config.n_shared_experts == 1
         self.shared_experts = DeepseekV2MLP(
@@ -1959,8 +2052,20 @@ class DeepseekV4DecoderLayer(nn.Module):
     def _hc_post(
         x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
     ):
+        # Reference (model.py:684-687):
+        #     y = post[..., None] * x[..., None, :]
+        #         + sum(comb[..., None] * residual[..., None, :], dim=-3)
+        # i.e. y[..., k, d] = sum_j comb[..., j, k] * residual[..., j, d]
+        # — that's ``comb.T @ residual`` over the hc axis. The earlier
+        # NanoDeploy form ``residual.unsqueeze(1)`` + ``sum(dim=2)``
+        # contracted on the wrong index (computed ``comb @ residual``),
+        # which only matches the reference when ``comb`` is symmetric;
+        # after sinkhorn it generally isn't, so every layer accumulated
+        # token-level drift twice (post-attn and post-ffn). Verified
+        # against the 4D reference at ``T=8, hc=4, d=8`` to give a
+        # bit-identical result.
         return post.unsqueeze(-1) * x.unsqueeze(1) + torch.sum(
-            comb.unsqueeze(-1) * residual.unsqueeze(1), dim=2
+            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=1
         )
 
     def forward(

@@ -105,9 +105,20 @@ class _HopperLinearMixin:
         self.weight_scale_inv.weight_loader = self.weight_loader
 
     def _fp8_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Shared FP8 GEMM path (used by column/row/replicated variants)."""
+        """Shared FP8 GEMM path (used by column/row/replicated variants).
+
+        When the model config specifies ``scale_fmt='ue8m0'`` (DSV4),
+        round activation scales to power-of-two so the FP8 GEMM sees
+        the same input distribution the model was trained on. Without
+        this, the trivial-looking FP32 scale variant accumulates ~2.5%
+        relative drift per FP8 GEMM and flips greedy top-1.
+        """
+        round_ue8m0 = getattr(self.quantization_config, "scale_fmt", None) == "ue8m0"
         input_quant, input_scale = quant_fp8_tma(
-            x, self.quantization_config.block_size[0], dtype=self.weight.dtype
+            x,
+            self.quantization_config.block_size[0],
+            dtype=self.weight.dtype,
+            round_ue8m0=round_ue8m0,
         )
         out = deep_gemm_fp8(
             input_quant,

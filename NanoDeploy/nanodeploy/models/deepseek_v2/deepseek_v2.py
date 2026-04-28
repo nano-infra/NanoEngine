@@ -238,6 +238,7 @@ class DeepseekV2MLP(nn.Module):
         meta: bool = False,
         config: DeepseekV3Config | None = None,
         quantization_config: QuantizationConfig | None = None,
+        swiglu_limit: float | None = None,
     ):
         super().__init__()
 
@@ -267,7 +268,13 @@ class DeepseekV2MLP(nn.Module):
         )
 
         assert hidden_act == "silu"
-        self.act_fn = SiluAndMul()
+        # ``swiglu_limit`` is opt-in per call site, NOT read from the
+        # model config — DSV4's shared experts must NOT clamp even
+        # though ``config.swiglu_limit > 0`` (reference model.py:627
+        # constructs ``Expert(...)`` for shared with the default
+        # ``swiglu_limit=0``). Routed-experts paths plumb the limit
+        # via the experts factory instead.
+        self.act_fn = SiluAndMul(swiglu_limit=swiglu_limit)
 
     def forward(self, x):
         """forward."""
