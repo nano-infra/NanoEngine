@@ -1459,13 +1459,13 @@ class DeepseekV4Attention(nn.Module):
 
         # Alt stream for the KV-side of attention prep (wkv → kv_norm →
         # k_rope → fp8_quant). Q-side (wq_a/b → q_norm → rmsnorm_self →
-        # q_rope) runs on the main stream concurrently. Sync before
-        # flash_mla. Mirrors sglang's stream_kv pattern. The two paths
-        # are genuinely independent (only shared input is hidden_states,
-        # which is read-only), so this is a real overlap — unlike the
-        # v20 set_stream pin attempt which forced serial work into
-        # parallel and caused SM contention.
+        # q_rope) runs on _q_stream concurrently. Sync before flash_mla.
+        # The two paths are genuinely independent (only shared input is
+        # hidden_states, which is read-only), so this is a real overlap.
         self._kv_stream: torch.cuda.Stream | None = None
+        # Alt stream for the Q-side of attention prep. Mirrors KV-stream;
+        # frees main stream to be a sync coordinator during prep.
+        self._q_stream: torch.cuda.Stream | None = None
 
     def _gather_seq_cache(
         self,
@@ -2256,18 +2256,22 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         q_len = hidden_states.size(0)
 
-        # Multi-stream attention prep: Q-side and KV-side are independent
-        # (shared input ``hidden_states`` is read-only). Run KV-side on
-        # ``_kv_stream`` while Q-side runs on the main stream. Sync
-        # before the merged flash_mla call. Mirrors sglang's
+        # Multi-stream attention prep: Q-side, KV-side, and (downstream)
+        # compressor are all independent — shared input ``hidden_states``
+        # is read-only. Q runs on ``_q_stream``, KV runs on ``_kv_stream``,
+        # main is the sync coordinator. Mirrors sglang's
         # ``_forward_prepare_multi_stream`` pattern.
         if self._kv_stream is None:
             self._kv_stream = torch.cuda.Stream()
+        if self._q_stream is None:
+            self._q_stream = torch.cuda.Stream()
         kv_stream = self._kv_stream
+        q_stream = self._q_stream
         main_stream = torch.cuda.current_stream()
         kv_stream.wait_stream(main_stream)
+        q_stream.wait_stream(main_stream)
 
-        # ─── KV-side on alt stream ───
+        # ─── KV-side on _kv_stream ───
         with torch.cuda.stream(kv_stream):
             kv_pre = self.wkv(hidden_states)
             _debug_dump("attn_kv_pre_norm", kv_pre, self.layer_idx)
@@ -2279,65 +2283,61 @@ class DeepseekV4Attention(nn.Module):
             )
             _fp8_quant_dequant_inplace(kv[..., : -self.rope_head_dim], 64)
 
-        # ─── Q-side on main stream (concurrent) ───
-        q_lora_pre = self.wq_a(hidden_states)
-        _debug_dump("attn_q_lora_pre_norm", q_lora_pre, self.layer_idx)
-        q = self.q_norm(q_lora_pre)
-        _debug_dump("attn_q_lora", q, self.layer_idx)
-        q_flat = self.wq_b(q)
-        _debug_dump("attn_wq_b", q_flat, self.layer_idx)
-        q = q_flat.view(q_len, self.num_heads, self.head_dim)
-        # Fast path: vendored sglang per-head RMSNorm (in-place, no
-        # weight) collapses square + mean + rsqrt + mul into one CUDA
-        # kernel. Falls back to the eager 5-launch chain when the
-        # vendor isn't built or shapes don't match.
-        # https://github.com/sgl-project/sglang
-        #   python/sglang/jit_kernel/deepseek_v4.py::rmsnorm_self
-        if (
-            _SGL_RMSNORM_SELF is not None
-            and q.is_cuda
-            and q.dtype == torch.bfloat16
-            and q.is_contiguous()
-            and q.shape[-1] == self.head_dim  # AOT-built only for head_dim=512
-        ):
-            try:
-                q = _SGL_RMSNORM_SELF(q, float(self.rms_norm_eps))
-            except Exception as _exc:
-                global _RMSNORM_SELF_WARNED
-                if "_RMSNORM_SELF_WARNED" not in globals():
-                    _RMSNORM_SELF_WARNED = set()
-                _key = type(_exc).__name__
-                if _key not in _RMSNORM_SELF_WARNED:
-                    _RMSNORM_SELF_WARNED.add(_key)
-                    from nanodeploy.logging import get_logger
+        # ─── Q-side on _q_stream (concurrent with KV-side) ───
+        with torch.cuda.stream(q_stream):
+            q_lora_pre = self.wq_a(hidden_states)
+            _debug_dump("attn_q_lora_pre_norm", q_lora_pre, self.layer_idx)
+            q = self.q_norm(q_lora_pre)
+            _debug_dump("attn_q_lora", q, self.layer_idx)
+            q_flat = self.wq_b(q)
+            _debug_dump("attn_wq_b", q_flat, self.layer_idx)
+            q = q_flat.view(q_len, self.num_heads, self.head_dim)
+            # Fast path: vendored sglang per-head RMSNorm (in-place, no
+            # weight) collapses square + mean + rsqrt + mul into one CUDA
+            # kernel. Falls back to the eager 5-launch chain when the
+            # vendor isn't built or shapes don't match.
+            if (
+                _SGL_RMSNORM_SELF is not None
+                and q.is_cuda
+                and q.dtype == torch.bfloat16
+                and q.is_contiguous()
+                and q.shape[-1] == self.head_dim
+            ):
+                try:
+                    q = _SGL_RMSNORM_SELF(q, float(self.rms_norm_eps))
+                except Exception as _exc:
+                    global _RMSNORM_SELF_WARNED
+                    if "_RMSNORM_SELF_WARNED" not in globals():
+                        _RMSNORM_SELF_WARNED = set()
+                    _key = type(_exc).__name__
+                    if _key not in _RMSNORM_SELF_WARNED:
+                        _RMSNORM_SELF_WARNED.add(_key)
+                        from nanodeploy.logging import get_logger
 
-                    get_logger().warning(
-                        "rmsnorm_self fast path bailed: %s. q.shape=%s "
-                        "dtype=%s contig=%s. Eager fallback.",
-                        _exc,
-                        tuple(q.shape),
-                        q.dtype,
-                        q.is_contiguous(),
+                        get_logger().warning(
+                            "rmsnorm_self fast path bailed: %s. q.shape=%s "
+                            "dtype=%s contig=%s. Eager fallback.",
+                            _exc,
+                            tuple(q.shape),
+                            q.dtype,
+                            q.is_contiguous(),
+                        )
+                    q = q * torch.rsqrt(
+                        q.square().mean(-1, keepdim=True) + self.rms_norm_eps
                     )
+            else:
                 q = q * torch.rsqrt(
                     q.square().mean(-1, keepdim=True) + self.rms_norm_eps
                 )
-        else:
-            q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.rms_norm_eps)
-        _debug_dump("attn_q_normed", q, self.layer_idx)
-        # Apply RoPE in-place on Q's rope tail (Q-side only, on main
-        # stream). The kernel accepts strided inputs (last-dim
-        # stride-1 satisfied by tail slices); writing through the
-        # view eliminates the contiguous-clone + index_put write-back.
-        _apply_rotary_interleaved_inplace(
-            self.rotary_emb, positions, q[..., -self.rope_head_dim :]
-        )
+            _debug_dump("attn_q_normed", q, self.layer_idx)
+            # In-place RoPE on Q's rope tail.
+            _apply_rotary_interleaved_inplace(
+                self.rotary_emb, positions, q[..., -self.rope_head_dim :]
+            )
 
-        # Sync: main stream waits on KV stream before consuming kv in
-        # flash_mla. The compressor and other paths inside
-        # ``_decode_attention_flash_mla`` start from main stream after
-        # this point.
+        # Sync: main stream waits on both Q and KV streams before flash_mla.
         main_stream.wait_stream(kv_stream)
+        main_stream.wait_stream(q_stream)
         _debug_dump("attn_q_after_rope", q, self.layer_idx)
         _debug_dump("attn_window_kv_after_rope", kv, self.layer_idx)
 

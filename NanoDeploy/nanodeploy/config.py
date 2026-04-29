@@ -98,7 +98,7 @@ class Config(BaseModel):
 
     # profiler
     enable_profiler: bool = False
-    profiler_start_step: int = 32
+    profiler_start_step: int = 34
     profiling_step: int = 8
     profiler_forward_per_step: int = 2
     profiler_dir: str = "./profiler_res"
