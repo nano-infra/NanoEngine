@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "nanoctrl-server"
-version = "0.1.0"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "axum",

@@ -21,6 +21,7 @@ pub struct LuaScripts {
     pub register_engine: String,
     pub unregister_engine: String,
     pub heartbeat_engine: String,
+    pub merge_topology_peer: String,
 }
 
 impl LuaScripts {
@@ -35,6 +36,7 @@ impl LuaScripts {
             register_engine: read("register_engine.lua")?,
             unregister_engine: read("unregister_engine.lua")?,
             heartbeat_engine: read("heartbeat_engine.lua")?,
+            merge_topology_peer: read("merge_topology_peer.lua")?,
         })
     }
 }
@@ -473,6 +475,17 @@ impl RedisRepo {
     // ─────────────────────── RDMA ops ──────────────────────────
 
     /// Save desired topology spec and push connect_peer messages to streams.
+    ///
+    /// Semantics: the caller's spec is always written verbatim, and every
+    /// target peer's spec is atomically merged to include the caller.
+    /// This matches RC RDMA's intrinsic symmetry — a QP pair requires both
+    /// sides to participate, so declaring "A wants to talk to B" implies
+    /// "B is in a topology with A". The older `symmetric: false` mode
+    /// relied on reactive rendezvous via qp_ready and is deprecated.
+    ///
+    /// The merge uses a Lua script for atomicity: a non-atomic GET + SET
+    /// has a lost-update race when two agents concurrently declare
+    /// topologies that intersect at the same peer.
     pub async fn save_topology(
         &self,
         scope: Option<&str>,
@@ -491,43 +504,30 @@ impl RedisRepo {
                 .await;
         }
 
-        // Symmetric: merge this agent into each target peer's spec
-        if spec.symmetric {
-            for target_peer in &spec.target_peers {
-                let peer_key = self.scoped_key(scope, &["spec:topology", target_peer]);
-                let existing: Option<String> = conn.get(&peer_key).await.ok().flatten();
-                let mut peer_targets: Vec<String> = existing
-                    .and_then(|s| serde_json::from_str::<DesiredTopologySpec>(&s).ok())
-                    .map(|p| p.target_peers)
-                    .unwrap_or_default();
+        // Atomically merge this agent into each target peer's spec and
+        // notify their stream. The Lua script runs server-side so the
+        // read-modify-write on each peer_key is not interleaved with a
+        // concurrent save_topology from another agent.
+        let scope_str = spec.scope.clone().unwrap_or_default();
+        for target_peer in &spec.target_peers {
+            let peer_key = self.scoped_key(scope, &["spec:topology", target_peer]);
+            let peer_stream = self.scoped_key(scope, &["stream", target_peer]);
 
-                if !peer_targets.contains(&agent_id.to_string()) {
-                    peer_targets.push(agent_id.to_string());
-                }
+            let script = redis::Script::new(&self.scripts.merge_topology_peer);
 
-                let peer_spec = DesiredTopologySpec {
-                    target_peers: peer_targets,
-                    min_bw: None,
-                    symmetric: false,
-                    scope: spec.scope.clone(),
-                };
-                if let Ok(peer_json) = serde_json::to_string(&peer_spec) {
-                    let _: Result<(), _> = conn.set(&peer_key, &peer_json).await;
-                }
+            let _: Result<i64, _> = script
+                .key(&peer_key)
+                .arg(agent_id)
+                .arg(&scope_str)
+                .invoke_async(&mut conn)
+                .await;
 
-                // Push connect_peer to peer's stream too
-                let peer_stream = self.scoped_key(scope, &["stream", target_peer]);
-                self.push_stream_connect(&mut conn, &peer_stream, agent_id)
-                    .await;
-            }
-            tracing::info!(
-                "Symmetric: merged {agent_id} into {} target peer(s) spec",
-                spec.target_peers.len()
-            );
+            // Push connect_peer to peer's stream too
+            self.push_stream_connect(&mut conn, &peer_stream, agent_id)
+                .await;
         }
-
         tracing::info!(
-            "Saved desired topology for agent {agent_id}: {} peer(s)",
+            "Saved desired topology for agent {agent_id}: {} peer(s); merged caller into each target",
             spec.target_peers.len()
         );
         Ok(())

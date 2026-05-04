@@ -35,14 +35,15 @@ fn default_name_prefix() -> String {
 
 /// Desired topology spec for declarative connection management.
 /// Stored in Redis at spec:topology:{agent_id}
+///
+/// Topology is always symmetric: declaring "I want to talk to B" implies
+/// "B is in a topology with me" because RC RDMA requires bilateral QP
+/// handshake. There is no meaningful asymmetric mode, so no opt-in flag.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DesiredTopologySpec {
     pub target_peers: Vec<String>,
     #[serde(default)]
     pub min_bw: Option<String>, // e.g. "100Gbps", reserved for future use
-    /// When true, also update each target_peer's spec to include this agent_id.
-    #[serde(default)]
-    pub symmetric: bool,
     #[serde(default)]
     pub scope: Option<String>, // Scope for partitioning (from NANOCTRL_SCOPE env var on client)
 }
