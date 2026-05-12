@@ -536,19 +536,21 @@ class ModelRunner:
         agent_alias = f"{self.engine_id}:rpc:{self.rank}"
         device = available_nics[get_dist_context().local_rank % len(available_nics)]
         self._dlslime_agent = dlslime.start_peer_agent(
+            nanoctrl_url=self.config.nanoctrl_address,
             alias=agent_alias,
-            server_url=self.config.nanoctrl_address,
             device=device,
-            ib_port=1,
-            link_type="RoCE",
-            qp_num=int(os.environ.get("SLIME_QP_NUM", 1)),
             scope=self.config.nanoctrl_scope,
         )
+        self._dlslime_qp_num = int(os.environ.get("SLIME_QP_NUM", 1))
         service = ModelRunnerRpcService(self)
 
         def _serve_loop():
-            self._dlslime_agent.set_desired_topology([driver_alias])
-            self._dlslime_agent.wait_for_peers([driver_alias], timeout_sec=30)
+            conn = self._dlslime_agent.connect_to(
+                driver_alias,
+                ib_port=1,
+                qp_num=self._dlslime_qp_num,
+            )
+            conn.wait(timeout=30)
             serve(self._dlslime_agent, service, driver_alias)
 
         self._dlslime_thread = threading.Thread(

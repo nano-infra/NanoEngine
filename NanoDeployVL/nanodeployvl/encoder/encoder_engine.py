@@ -25,10 +25,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from nanoctrl.client import NanoCtrlClient
 
 from nanodeploy.context.embedding_pool import EmbeddingPool
 from nanodeploy.logging import get_logger
-from nanodeploy.server.nanoctrl_client import NanoCtrlClient
 
 from nanodeployvl.encoder.encoder_config import EncoderConfig
 from nanodeployvl.vision.encoder import VisionEncoder
@@ -204,15 +204,14 @@ class EncoderEngine:
             scope = self.config.nanoctrl_scope
 
             self._peer_agent = start_fn(
+                nanoctrl_url=server_url,
                 alias=agent_alias,
-                server_url=server_url,
                 device=nic,
-                ib_port=1,
-                link_type="RoCE",
-                qp_num=int(os.environ.get("SLIME_QP_NUM", 1)),
                 scope=scope,
             )
             self._peer_agent_addr = agent_alias
+            self._peer_agent_ib_port = 1
+            self._peer_agent_qp_num = int(os.environ.get("SLIME_QP_NUM", 1))
 
             # Register EmbeddingPool buffer as MR
             self.pool.register_mr(self._peer_agent)
@@ -256,7 +255,7 @@ class EncoderEngine:
             )
 
         info = self.get_engine_info()
-        extra = {
+        metadata = {
             "role": "encoder",
             "world_size": 1,
             "num_blocks": 0,
@@ -266,7 +265,12 @@ class EncoderEngine:
             "p2p_host": info["p2p_host"],
             "p2p_port": info["p2p_port"],
         }
-        ok = self._nanoctrl.register(self.engine_id, extra)
+        ok = self._nanoctrl.register(
+            self.engine_id,
+            kind="encoder",
+            endpoint={"host": info["host"], "port": info["port"]},
+            metadata=metadata,
+        )
         if ok:
             self._nanoctrl.start_heartbeat(name=f"encoder-hb-{self.engine_id}")
 

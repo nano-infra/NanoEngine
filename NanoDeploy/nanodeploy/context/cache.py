@@ -180,6 +180,8 @@ class CacheContext:
         self.remote_dsv4_num_layers_per_ratio: dict[str, dict[int, int]] = {}
         self._peer_agent = None
         self._peer_agent_addr: str | None = None
+        self._peer_agent_ib_port: int = 1
+        self._peer_agent_qp_num: int = 1
         self._connected_peers: set[str] = set()  # track connected peer addresses
         self._local_mr_handler: int | None = None  # local MR handler for kv_cache
         self._local_gdn_conv_mr_handler: int | None = None
@@ -740,14 +742,13 @@ class CacheContext:
                 raise RuntimeError("No available NICs found")
             device = available_nics[get_dist_context().local_rank % len(available_nics)]
             self._peer_agent = start_peer_agent_fn(
+                nanoctrl_url=server_url,
                 alias=agent_alias,
-                server_url=server_url,
                 device=device,
-                ib_port=1,
-                link_type="RoCE",
-                qp_num=int(os.environ.get("SLIME_QP_NUM", 1)),
                 scope=self.nanoctrl_scope,
             )
+            self._peer_agent_ib_port = 1
+            self._peer_agent_qp_num = int(os.environ.get("SLIME_QP_NUM", 1))
             self._peer_agent_addr = agent_alias
 
             # In hybrid mode we only need the PeerAgent alive (for vision
@@ -897,7 +898,7 @@ class CacheContext:
         This method handles all caching logic: checks cache, identifies missing IDs,
         fetches only missing ones from NanoCtrl, and updates cache.
 
-        Uses the lightweight /get_engine_info endpoint instead of /list_engines.
+        Uses the lightweight /get_entity_info endpoint instead of /list_entities.
 
         Args:
             engine_ids: Set of engine_ids to get info for.
@@ -942,15 +943,17 @@ class CacheContext:
             return engine_info_map
 
         fetched_map: dict[str, dict] = {}
-        url = f"{self.nanoctrl_address}/get_engine_info"
+        url = f"{self.nanoctrl_address}/get_entity_info"
         scope = self.nanoctrl_scope or ""
 
         try:
             with httpx.Client(timeout=5.0) as client:
                 for engine_id in missing_ids:
                     try:
-                        # Build request payload with scope
-                        request_payload = {"engine_id": engine_id}
+                        request_payload = {
+                            "entity_type": "service",
+                            "entity_id": engine_id,
+                        }
                         if scope:
                             request_payload["scope"] = scope
 
@@ -959,15 +962,20 @@ class CacheContext:
                         data = response.json()
 
                         if data.get("status") == "ok":
-                            engine_info = data.get("engine_info", {})
+                            entity_info = data.get("entity_info") or {}
+                            engine_info = dict(entity_info.get("metadata") or {})
                             if engine_info:
+                                engine_info.setdefault(
+                                    "id",
+                                    entity_info.get("entity_id", engine_id),
+                                )
                                 fetched_map[engine_id] = engine_info
                         else:
                             logger.warning(
-                                f"get_engine_info for {engine_id} returned status: {data.get('status')}"
+                                f"get_entity_info for {engine_id} returned status: {data.get('status')}"
                             )
                     except Exception as e:
-                        logger.error(f"Error fetching engine_info for {engine_id}: {e}")
+                        logger.error(f"Error fetching entity_info for {engine_id}: {e}")
                         continue
 
             # Update cache with newly fetched data
@@ -1026,11 +1034,16 @@ class CacheContext:
 
         new_peers = list(remote_peers_to_connect.keys())
         logger.info(f"Batch connecting to {len(new_peers)} peers: {new_peers}")
-        all_desired = set(self._connected_peers) | set(new_peers)
-        self._peer_agent.set_desired_topology(
-            target_peers=list(all_desired), symmetric=True
-        )
-        self._peer_agent.wait_for_peers(new_peers, timeout_sec=30)
+        pending_conns = [
+            self._peer_agent.connect_to(
+                peer,
+                ib_port=self._peer_agent_ib_port,
+                qp_num=self._peer_agent_qp_num,
+            )
+            for peer in new_peers
+        ]
+        for conn in pending_conns:
+            conn.wait(timeout=30)
         self._connected_peers.update(new_peers)
         logger.info(f"Batch connection completed for {len(new_peers)} peers")
 

@@ -58,14 +58,12 @@ class DLSLimeExecutor(RayExecutor):
 
         self._driver_alias = f"{self.config.engine_id}:driver:{uuid.uuid4().hex[:8]}"
         self._driver_agent = self._dlslime.start_peer_agent(
+            nanoctrl_url=self.config.nanoctrl_address,
             alias=self._driver_alias,
-            server_url=self.config.nanoctrl_address,
             device=available_nics[0],
-            ib_port=1,
-            link_type="RoCE",
-            qp_num=int(os.environ.get("SLIME_QP_NUM", 1)),
             scope=self.config.nanoctrl_scope,
         )
+        driver_qp_num = int(os.environ.get("SLIME_QP_NUM", 1))
         worker_aliases = ray.get(
             [
                 worker.start_dlslime_server.remote(self._driver_alias)
@@ -73,8 +71,12 @@ class DLSLimeExecutor(RayExecutor):
             ]
         )
         self._worker_aliases = worker_aliases
-        self._driver_agent.set_desired_topology(self._worker_aliases)
-        self._driver_agent.wait_for_peers(self._worker_aliases, timeout_sec=60)
+        pending_conns = [
+            self._driver_agent.connect_to(alias, ib_port=1, qp_num=driver_qp_num)
+            for alias in worker_aliases
+        ]
+        for conn in pending_conns:
+            conn.wait(timeout=60)
         self._proxies = [
             self._proxy_factory(self._driver_agent, alias, ModelRunnerRpcService)
             for alias in worker_aliases

@@ -140,11 +140,12 @@ class VisionEmbedManager:
 
             # Ensure connection
             if peer_alias not in cache_ctx._connected_peers:
-                cache_ctx._peer_agent.set_desired_topology(
-                    target_peers=list(cache_ctx._connected_peers | {peer_alias}),
-                    symmetric=True,
+                conn = cache_ctx._peer_agent.connect_to(
+                    peer_alias,
+                    ib_port=cache_ctx._peer_agent_ib_port,
+                    qp_num=cache_ctx._peer_agent_qp_num,
                 )
-                cache_ctx._peer_agent.wait_for_peers([peer_alias], timeout_sec=30)
+                conn.wait(timeout=30)
                 cache_ctx._connected_peers.add(peer_alias)
 
             # Get remote MR info for vision_embed buffer
