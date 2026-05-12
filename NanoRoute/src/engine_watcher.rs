@@ -147,8 +147,11 @@ impl EngineWatcher {
         let conn = client.get_async_connection().await?;
         let mut pubsub = conn.into_pubsub();
 
-        // Subscribe to channel with scoped prefix
-        let channel = format!("{}:nano_events:engine_update", self.redis_key_prefix);
+        // Subscribe to channel with scoped prefix.
+        // New NanoCtrl publishes entity lifecycle events to
+        // "{scope}:nano_events:{entity_type}_update"; services register under
+        // entity_type="service".
+        let channel = format!("{}:nano_events:service_update", self.redis_key_prefix);
         pubsub.subscribe(&channel).await?;
         debug!("Subscribed to {}", channel);
 
@@ -205,9 +208,13 @@ impl EngineWatcher {
         let event_type = event["event_type"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing event_type"))?;
-        let engine_id = event["engine_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing engine_id"))?
+        // New NanoCtrl events carry `entity_id`; fall back to the legacy
+        // `engine_id` field for compatibility with older publishers.
+        let engine_id = event
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| event.get("engine_id").and_then(|v| v.as_str()))
+            .ok_or_else(|| anyhow::anyhow!("Missing entity_id"))?
             .to_string();
         let revision = event["revision"]
             .as_i64()
@@ -266,7 +273,7 @@ impl EngineWatcher {
         // Handle event by type
         match event_type {
             "ADD" => {
-                let payload_json = event["payload"].clone();
+                let payload_json = Self::flatten_entity_payload(event["payload"].clone());
                 let engine_payload: EnginePayload = serde_json::from_value(payload_json)?;
                 info!(
                     "Sending ADD event to manager: engine_id={}, revision={}",
@@ -289,7 +296,7 @@ impl EngineWatcher {
                 });
             }
             "UPDATE" => {
-                let payload_json = event["payload"].clone();
+                let payload_json = Self::flatten_entity_payload(event["payload"].clone());
                 let engine_payload: EnginePayload = serde_json::from_value(payload_json)?;
                 info!(
                     "Sending UPDATE event to manager: engine_id={}, revision={}",
@@ -309,11 +316,62 @@ impl EngineWatcher {
         Ok(())
     }
 
+    /// Flatten a NanoCtrl entity-info payload into the legacy EnginePayload shape.
+    ///
+    /// New events carry `{entity_type, entity_id, id, kind, endpoint, metadata,
+    /// resource}`; older events published the flat engine info directly. If
+    /// `metadata` is an object we merge it on top of the envelope (legacy
+    /// fields win when both are present).
+    fn flatten_entity_payload(mut payload: serde_json::Value) -> serde_json::Value {
+        let metadata = payload
+            .as_object_mut()
+            .and_then(|obj| obj.remove("metadata"));
+        if let Some(serde_json::Value::Object(meta)) = metadata {
+            if let Some(obj) = payload.as_object_mut() {
+                for (k, v) in meta {
+                    obj.entry(k).or_insert(v);
+                }
+            }
+        }
+        if let Some(obj) = payload.as_object_mut() {
+            // entity_id → id fallback
+            if !obj.contains_key("id") {
+                if let Some(eid) = obj.get("entity_id").cloned() {
+                    obj.insert("id".to_string(), eid);
+                }
+            }
+            // kind → role fallback
+            if !obj.contains_key("role") {
+                if let Some(kind) = obj.get("kind").cloned() {
+                    obj.insert("role".to_string(), kind);
+                }
+            }
+            // Synthesize `zmq_address` from host/port when not present.
+            // The old NanoCtrl constructed this on the server; the new
+            // generic-entity NanoCtrl does not, so we build it here.
+            if !obj.contains_key("zmq_address") {
+                let host = obj.get("host").and_then(|v| v.as_str());
+                let port = obj.get("port").and_then(|v| v.as_u64()).or_else(|| {
+                    obj.get("port")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                });
+                if let (Some(host), Some(port)) = (host, port) {
+                    obj.insert(
+                        "zmq_address".to_string(),
+                        serde_json::Value::String(format!("tcp://{host}:{port}")),
+                    );
+                }
+            }
+        }
+        payload
+    }
+
     async fn get_current_revision_direct(&self) -> anyhow::Result<i64> {
         // Get current revision using a separate connection
         let client = redis::Client::open(self.redis_url.as_str())?;
         let mut conn = client.get_multiplexed_async_connection().await?;
-        let revision_key = format!("{}:nano_meta:engine_revision", self.redis_key_prefix);
+        let revision_key = format!("{}:nano_meta:service_revision", self.redis_key_prefix);
         let revision: Option<i64> = redis::cmd("GET")
             .arg(&revision_key)
             .query_async(&mut conn)

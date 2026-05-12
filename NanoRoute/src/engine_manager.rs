@@ -255,15 +255,21 @@ impl EngineManager {
         }
     }
 
-    /// List all engines from NanoCtrl
+    /// List all engines from NanoCtrl.
+    ///
+    /// The new NanoCtrl exposes a generic entity registry at `/list_entities`.
+    /// Each entity record is `{entity_type, entity_id, id, kind, endpoint,
+    /// metadata, resource}`. Engines register with `entity_type="service"` and
+    /// their engine info is stored in `metadata`. We flatten each entity into
+    /// the legacy engine-info shape so the rest of the pipeline is unchanged.
     pub async fn list_engines_from_nanoctrl(
         &self,
         nanoctrl_address: &str,
     ) -> anyhow::Result<Vec<serde_json::Value>> {
         let client = reqwest::Client::new();
-        let url = format!("{}/list_engines", nanoctrl_address);
+        let url = format!("{}/list_entities", nanoctrl_address);
 
-        let mut body = serde_json::json!({});
+        let mut body = serde_json::json!({ "entity_type": "service" });
         if !self.redis_key_prefix.is_empty() {
             body["scope"] = serde_json::Value::String(self.redis_key_prefix.clone());
         }
@@ -274,8 +280,11 @@ impl EngineManager {
             let result: serde_json::Value = response.json().await?;
             if let Some(status) = result.get("status").and_then(|s| s.as_str()) {
                 if status == "ok" {
-                    if let Some(engines) = result.get("engines").and_then(|e| e.as_array()) {
-                        let engines: Vec<serde_json::Value> = engines.clone();
+                    if let Some(entities) = result.get("entities").and_then(|e| e.as_array()) {
+                        let engines: Vec<serde_json::Value> = entities
+                            .iter()
+                            .filter_map(Self::entity_to_engine_info)
+                            .collect();
                         debug!("Found {} engines from NanoCtrl", engines.len());
                         return Ok(engines);
                     }
@@ -286,13 +295,35 @@ impl EngineManager {
         Err(anyhow::anyhow!("Failed to list engines from NanoCtrl"))
     }
 
+    /// Convert a NanoCtrl entity record into the flat engine-info JSON the
+    /// rest of this module expects. Returns None if the entity is not a
+    /// service entity with a metadata dict.
+    fn entity_to_engine_info(entity: &serde_json::Value) -> Option<serde_json::Value> {
+        let metadata = entity.get("metadata")?.as_object()?.clone();
+        let mut engine_info = serde_json::Value::Object(metadata);
+        let id = entity
+            .get("entity_id")
+            .or_else(|| entity.get("id"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String("unknown".to_string()));
+        engine_info["id"] = id;
+        if let Some(kind) = entity.get("kind").cloned() {
+            // "role" is the legacy name used by parse_engine_info; fall back
+            // to the new "kind" field when metadata doesn't already carry it.
+            if engine_info.get("role").is_none() {
+                engine_info["role"] = kind;
+            }
+        }
+        Some(engine_info)
+    }
+
     // ─── Redis snapshot ──────────────────────────────────────────────
 
     /// Get current revision from Redis
     async fn get_current_revision(&self, redis_url: &str) -> anyhow::Result<i64> {
         let client = redis::Client::open(redis_url)?;
         let mut conn = client.get_multiplexed_async_connection().await?;
-        let revision_key = format!("{}:nano_meta:engine_revision", self.redis_key_prefix);
+        let revision_key = format!("{}:nano_meta:service_revision", self.redis_key_prefix);
         let revision: Option<i64> = redis::cmd("GET")
             .arg(&revision_key)
             .query_async(&mut conn)
@@ -306,24 +337,29 @@ impl EngineManager {
         let client = redis::Client::open(redis_url)?;
         let mut conn = client.get_multiplexed_async_connection().await?;
 
-        // Scan all engine:* keys with scope prefix
-        let pattern = format!("{}:engine:*", self.redis_key_prefix);
+        // Scan all service entity keys with scope prefix.
+        // New NanoCtrl stores entities at "{scope}:{entity_type}:{entity_id}".
+        let pattern = format!("{}:service:*", self.redis_key_prefix);
         let keys: Vec<String> = redis::cmd("KEYS")
             .arg(&pattern)
             .query_async(&mut conn)
             .await?;
 
         for key in keys {
-            let engine_info_str: Option<String> = redis::cmd("HGET")
+            let info_str: Option<String> = redis::cmd("HGET")
                 .arg(&key)
                 .arg("info")
                 .query_async(&mut conn)
                 .await?;
 
-            if let Some(info_str) = engine_info_str {
-                if let Ok(mut engine_info) = serde_json::from_str::<serde_json::Value>(&info_str) {
-                    // `info` JSON may predate the model_path field; read the
-                    // dedicated `model_path` hash field as a direct fallback.
+            if let Some(info_str) = info_str {
+                if let Ok(entity_info) = serde_json::from_str::<serde_json::Value>(&info_str) {
+                    let mut engine_info = match Self::entity_to_engine_info(&entity_info) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+
+                    // Legacy fallback: read "model_path" hash field if not in metadata.
                     if engine_info["model_path"].is_null() {
                         let model_path: Option<String> = redis::cmd("HGET")
                             .arg(&key)
@@ -933,7 +969,7 @@ impl EngineManager {
 
     /// Periodic sync: diff local pool against NanoCtrl live list and remove stale engines.
     ///
-    /// This is the only way to detect engines that died without calling /unregister_engine
+    /// This is the only way to detect engines that died without calling /unregister
     /// (crash, SIGKILL, etc.). Their Redis key expires via TTL, but key expiry does NOT
     /// publish a REMOVE event — so the Pub/Sub watcher never fires for them.
     async fn handle_periodic_sync(&mut self, nanoctrl_address: Option<&str>) -> anyhow::Result<()> {

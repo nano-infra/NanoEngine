@@ -51,8 +51,24 @@ class SiluAndMul(nn.Module):
                 out = torch.empty(*x.shape[:-1], D, dtype=x.dtype, device=x.device)
                 _SGL_SILU_AND_MUL_CLAMP(x, out, self._effective_limit)
                 return out
-            except Exception:
-                pass
+            except Exception as _exc:
+                global _SILU_AND_MUL_CLAMP_WARNED
+                if "_SILU_AND_MUL_CLAMP_WARNED" not in globals():
+                    _SILU_AND_MUL_CLAMP_WARNED = set()
+                _key = type(_exc).__name__
+                if _key not in _SILU_AND_MUL_CLAMP_WARNED:
+                    _SILU_AND_MUL_CLAMP_WARNED.add(_key)
+                    from nanodeploy.logging import get_logger
+
+                    get_logger().warning(
+                        "silu_and_mul_clamp fast path bailed: %s. x.shape=%s "
+                        "dtype=%s contig=%s limit=%s. Eager fallback.",
+                        _exc,
+                        tuple(x.shape),
+                        x.dtype,
+                        x.is_contiguous(),
+                        self._effective_limit,
+                    )
         return self._eager_forward(x)
 
     def _eager_forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -175,9 +175,11 @@ class LLMComponent(LLM):
             logger.error("Cannot fetch peer info: NanoCtrl not configured")
             return False
 
-        engine_info = self._nanoctrl.get_engine_info(target_engine_id)
-        if engine_info:
-            logger.info(f"NanoCtrl returned engine_info: {engine_info}")
+        entity_info = self._nanoctrl.get_entity_info(target_engine_id)
+        if entity_info:
+            logger.info(f"NanoCtrl returned entity_info: {entity_info}")
+            engine_info = dict(entity_info.get("metadata") or {})
+            engine_info.setdefault("id", entity_info.get("entity_id", target_engine_id))
             self.set_peer_info(json.dumps(engine_info))
             logger.info(f"Fetched peer info for {target_engine_id} from NanoCtrl")
             return True
@@ -424,7 +426,7 @@ class LLMComponent(LLM):
             gdn_num_slots = max_bs * 2 + 1
         else:
             gdn_num_slots = max_bs + 1
-        extra = {
+        metadata = {
             "role": self.config.mode,
             "world_size": self.config.attn_world_size,
             "num_blocks": self.config.num_kvcache_blocks,
@@ -438,7 +440,12 @@ class LLMComponent(LLM):
             "model_path": self.config.model,  # tokenizer directory = model directory
         }
 
-        ok = self._nanoctrl.register(self.engine_id, extra)
+        ok = self._nanoctrl.register(
+            self.engine_id,
+            kind=self.config.mode,
+            endpoint={"host": zmq_host, "port": self.config.port},
+            metadata=metadata,
+        )
         if ok:
             # start_heartbeat is a no-op if the thread is already running
             # (re-registration path from on_not_found callback)

@@ -11,16 +11,17 @@
 
 ## 🧠 Supported Models
 
-| Model         | Component    | Architecture    |
-| ------------- | ------------ | --------------- |
-| DeepSeek-V3   | NanoDeploy   | MLA + MoE       |
-| DeepSeek-V3.2 | NanoDeploy   | MLA + MoE + NSA |
-| GLM-5         | NanoDeploy   | MLA + MoE + NSA |
-| Kimi-K2       | NanoDeploy   | MLA + MoE       |
-| Qwen3         | NanoDeploy   | GQA (Dense)     |
-| Qwen3-MoE     | NanoDeploy   | GQA + MoE       |
-| Qwen3.5-MoE   | NanoDeploy   | GQA + GDN + MoE |
-| Qwen3-VL      | NanoDeployVL | GQA + MoE + ViT |
+| Model         | Component    | Architecture          |
+| ------------- | ------------ | --------------------- |
+| DeepSeek-V3   | NanoDeploy   | MLA + MoE             |
+| DeepSeek-V3.2 | NanoDeploy   | MLA + MoE + NSA       |
+| DeepSeek-V4   | NanoDeploy   | MLA + MoE + DSA + SWA |
+| GLM-5         | NanoDeploy   | MLA + MoE + NSA       |
+| Kimi-K2       | NanoDeploy   | MLA + MoE             |
+| Qwen3         | NanoDeploy   | GQA (Dense)           |
+| Qwen3-MoE     | NanoDeploy   | GQA + MoE             |
+| Qwen3.5-MoE   | NanoDeploy   | GQA + GDN + MoE       |
+| Qwen3-VL      | NanoDeployVL | GQA + MoE + ViT       |
 
 ## ✨ Key Features
 

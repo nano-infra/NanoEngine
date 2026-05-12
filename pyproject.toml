@@ -12,14 +12,10 @@ requires-python = ">=3.10"
 dependencies = []
 
 # Install individual components:
-#   pip install ".[nanoctrl]"
 #   pip install ".[nanodeploy]"
 #   pip install ".[nanodeployvl]"
 #   pip install ".[all]"
 [project.optional-dependencies]
-nanoctrl = [
-    "nanoctrl @ file:NanoCtrl",
-]
 nanodeploy = [
     "nanodeploy @ file:NanoDeploy",
 ]
@@ -27,7 +23,6 @@ nanodeployvl = [
     "nanodeployvl @ file:NanoDeployVL",
 ]
 all = [
-    "nanoctrl @ file:NanoCtrl",
     "nanodeploy @ file:NanoDeploy",
     "nanodeployvl @ file:NanoDeployVL",
 ]
