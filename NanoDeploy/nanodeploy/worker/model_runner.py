@@ -378,6 +378,57 @@ class ModelRunner:
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
 
+    def apply_weight_update(
+        self, named_tensors: dict[str, torch.Tensor]
+    ) -> dict[str, int]:
+        """Hot-load HF-named full tensors into the live model on this rank.
+
+        Each parameter has a ``weight_loader`` callback attached at
+        construction time (see ``backends/hopper/layers/linear.py``) that
+        already knows the right TP/EP slice for this rank. The actual copy
+        path lives in ``nanodeploy.worker.weight_update`` so it can be unit-
+        tested without spinning up an engine.
+
+        In-place ``param.data.copy_`` (used both by ``weight_loader`` and
+        the fallback) preserves the storage's address, so any captured
+        CUDA graphs from the previous weight set continue to read the
+        updated values without recapture.
+        """
+        from nanodeploy.worker.weight_update import apply_named_tensors_in_place
+
+        return apply_named_tensors_in_place(self.model, named_tensors)
+
+    def pull_and_apply_weights(self, manifest_blob: bytes, train_alias: str) -> dict:
+        """Direct-pull weight update path (much faster than apply_weight_update).
+
+        Each worker uses its *own* PeerAgent (started for KV-cache
+        migration in ``cache.py:start_peer_agent``) to RDMA-read the
+        manifest from ``train_alias`` in parallel with the other ranks.
+        Avoids the Ray cross-host serialization that dominates the
+        ``apply_weight_update`` path when called from the rollout driver.
+
+        See ``nanodeploy.worker.pull_weights`` for the reusable helper.
+        """
+        from nanodeploy.context.cache import get_cache_context
+        from nanodeploy.worker.pull_weights import pull_and_apply_on_worker
+
+        ctx = get_cache_context()
+        peer_agent = ctx._peer_agent
+        if peer_agent is None:
+            raise RuntimeError(
+                "ModelRunner.pull_and_apply_weights requires the worker's "
+                "PeerAgent to be live; cache_context._peer_agent is None. "
+                "Was start_peer_agent called?"
+            )
+        return pull_and_apply_on_worker(
+            self.model,
+            peer_agent,
+            train_alias,
+            manifest_blob,
+            ib_port=ctx._peer_agent_ib_port,
+            qp_num=ctx._peer_agent_qp_num,
+        )
+
     def allocate_kvcache(self, num_kvcache_blocks: int):
         self.config.num_kvcache_blocks = num_kvcache_blocks
         cache_context = get_cache_context()

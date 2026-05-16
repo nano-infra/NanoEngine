@@ -111,6 +111,32 @@ class LLMEngine:
         """Get peer agent addresses from all workers."""
         return self.executor.get_peer_agent_addrs()
 
+    def update_weights(self, named_tensors: dict[str, "torch.Tensor"]) -> list[dict]:
+        """Apply HF-named full tensors to the live model on every worker.
+
+        Slow path: the dict is shipped to every worker via Ray RPC. For
+        large models prefer ``pull_and_apply_weights`` which has each
+        worker pull from the train side directly via RDMA.
+        """
+        from nanodeploy.engine.weight_sync import update_weights as _update_weights
+
+        return _update_weights(self.executor, named_tensors)
+
+    def pull_and_apply_weights(
+        self, manifest_blob: bytes, train_alias: str
+    ) -> list[dict]:
+        """Fast path: each worker pulls its own copy from ``train_alias`` in
+        parallel via RDMA, then applies in place.
+
+        ``manifest_blob`` is a pickled ``WeightManifest`` (see
+        ``nanorl.weights.transport``). The train side must have already
+        registered the corresponding MRs.
+        """
+        return self.executor.collective_rpc(
+            "pull_and_apply_weights",
+            (manifest_blob, train_alias),
+        )
+
     def add_request(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):
             seqs = [seqs]
