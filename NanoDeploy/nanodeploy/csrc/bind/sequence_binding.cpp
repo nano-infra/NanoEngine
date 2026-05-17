@@ -116,19 +116,22 @@ void bind_sequence(py::module_& m)
 
     py::class_<SamplingParams>(m, "SamplingParams")
         .def(py::init<>())
-        .def(py::init([](double temperature, int32_t max_tokens, bool ignore_eos) {
+        .def(py::init([](double temperature, int32_t max_tokens, bool ignore_eos, bool return_completion_logprobs) {
                  SamplingParams sp;
-                 sp.temperature = temperature;
-                 sp.max_tokens  = max_tokens;
-                 sp.ignore_eos  = ignore_eos;
+                 sp.temperature                = temperature;
+                 sp.max_tokens                 = max_tokens;
+                 sp.ignore_eos                 = ignore_eos;
+                 sp.return_completion_logprobs = return_completion_logprobs;
                  return sp;
              }),
-             py::arg("temperature") = 1.0,
-             py::arg("max_tokens")  = 256,
-             py::arg("ignore_eos")  = false)
+             py::arg("temperature")                = 1.0,
+             py::arg("max_tokens")                 = 256,
+             py::arg("ignore_eos")                 = false,
+             py::arg("return_completion_logprobs") = false)
         .def_readwrite("temperature", &SamplingParams::temperature)
         .def_readwrite("max_tokens", &SamplingParams::max_tokens)
-        .def_readwrite("ignore_eos", &SamplingParams::ignore_eos);
+        .def_readwrite("ignore_eos", &SamplingParams::ignore_eos)
+        .def_readwrite("return_completion_logprobs", &SamplingParams::return_completion_logprobs);
 
     py::class_<Sequence, std::shared_ptr<Sequence>>(m, "Sequence")
         .def(py::init<const std::vector<int>&, const SamplingParams&>(),
@@ -146,7 +149,8 @@ void bind_sequence(py::module_& m)
              &Sequence::append_token,
              py::arg("token_id"),
              py::arg("slot"),
-             py::arg("group_id") = std::nullopt)
+             py::arg("group_id") = std::nullopt,
+             py::arg("logprob")  = std::nullopt)
         .def("block_ctx",
              static_cast<BlockContext& (Sequence::*)(BlockContextSlot)>(&Sequence::block_ctx),
              py::arg("slot") = BlockContextSlot::ACTIVE,
@@ -189,6 +193,7 @@ void bind_sequence(py::module_& m)
                                &Sequence::num_generated_tokens_since_checkpoint)
         .def_property_readonly("prompt_token_ids", &Sequence::prompt_token_ids)
         .def_property_readonly("completion_token_ids", &Sequence::completion_token_ids)
+        .def_property_readonly("completion_logprobs", &Sequence::completion_logprobs)
         .def_property_readonly("num_cached_blocks", &Sequence::num_cached_blocks)
 
         .def("__len__", [](const Sequence& s) { return s.num_tokens(); })

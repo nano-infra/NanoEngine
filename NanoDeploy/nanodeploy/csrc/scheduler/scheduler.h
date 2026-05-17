@@ -107,7 +107,13 @@ public:
     // Postprocessing
     void postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_group_seqs,
                      const std::vector<std::vector<std::vector<int>>>&          dp_group_token_ids,
-                     bool                                                       update_metrics = true);
+                     bool                                                       update_metrics = true,
+                     // Per-token logprobs aligned with ``dp_group_token_ids``. When
+                     // empty/non-shaped to match, the scheduler skips the
+                     // append_token logprob arg (sequences keep empty
+                     // ``completion_logprobs``). The shape is
+                     // [num_dp_groups][batch_size][per_seq_tokens].
+                     const std::vector<std::vector<std::vector<float>>>& dp_group_token_logprobs = {});
 
     // State queries
     bool is_finished() const;
@@ -160,6 +166,9 @@ private:
         std::shared_ptr<Sequence> seq;
         const std::vector<int>*   tokens;
         int                       group_id;
+        // Optional: per-token logprobs aligned with ``*tokens``. nullptr
+        // when the rollout didn't request them; otherwise size matches.
+        const std::vector<float>* logprobs = nullptr;
     };
 
     struct PostprocessWorkerContext {
@@ -186,7 +195,8 @@ private:
     postprocess_sequences_impl(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_group_seqs,
                                const std::vector<std::vector<std::vector<int>>>&          dp_group_token_ids,
                                bool                                                       is_prefill,
-                               bool                                                       update_metrics);
+                               bool                                                       update_metrics,
+                               const std::vector<std::vector<std::vector<float>>>&        dp_group_token_logprobs = {});
 
     // Configuration
     int max_model_len_;

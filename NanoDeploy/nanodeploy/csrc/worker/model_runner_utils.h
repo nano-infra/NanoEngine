@@ -72,6 +72,13 @@ struct BatchAuxData {
     std::vector<int>    state_slots;           // per master-sp seq
     std::vector<int>    master_group_indices;  // per all seqs
     int                 num_group_seqs = 0;    // count where master_group == group_rank
+    // Per master-sp seq: whether to compute per-token logprobs at sample
+    // time. Mirrors SamplingParams.return_completion_logprobs. Vector size
+    // matches ``temperatures`` so the sampler can index in lockstep.
+    std::vector<bool> return_completion_logprobs;
+    // Set when ANY seq in the batch wants logprobs — sampler can fast-path
+    // back to the original (logprob-free) forward when this is false.
+    bool any_return_completion_logprobs = false;
 
     // DSv4 compressed-cache page IDs per ratio.
     // Outer map key = ratio. Inner outer index = master-group seq index.

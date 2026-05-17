@@ -40,6 +40,10 @@ table SequenceInput {
   temperature: double = 1.0;         // sampling temperature
   vision_slots: [VisionSlotRef];     // vision embedding refs (prefill only, EP mode)
   compressed_block_tables: [CompressedBlockTableI];  // DSv4: per-ratio compressed pages
+  // Mirror of SamplingParams.return_completion_logprobs so the worker knows
+  // whether to compute and ship per-token logprobs at sample time.
+  // Append-only — defaults to false on legacy buffers.
+  return_completion_logprobs: bool = false;
 }
 
 table RunBatchInput {

@@ -21,11 +21,20 @@ def decode_run_request(ptr: int, nbytes: int) -> tuple[bytes, bool]:
     return payload[1:], bool(payload[0])
 
 
-def encode_run_result(result: list[list[int]]) -> bytes:
+def encode_run_result(result) -> bytes:
+    """Pickle the per-step worker result. Accepts either the legacy
+    ``list[list[int]]`` (token_ids only) or the new tuple
+    ``(token_ids: list[list[int]], logprobs: list[list[float]] | None)``
+    that ships when SamplingParams.return_completion_logprobs is on.
+    """
     return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def decode_run_result(data: bytes) -> list[list[int]]:
+def decode_run_result(data: bytes):
+    """Returns either ``list[list[int]]`` (legacy) or
+    ``(list[list[int]], list[list[float]] | None)``. Callers should
+    normalise via ``token_ids, logprobs = (r if isinstance(r, tuple) else (r, None))``.
+    """
     return pickle.loads(data)
 
 

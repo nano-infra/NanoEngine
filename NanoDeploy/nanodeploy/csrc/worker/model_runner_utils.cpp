@@ -493,6 +493,9 @@ BatchAuxData extract_aux_from_bytes(const uint8_t* data, size_t data_len, int gr
         if (m_group == group_rank) {
             aux.temperatures.push_back(si->temperature());
             aux.state_slots.push_back(si->state_slot());
+            const bool want_lp = si->return_completion_logprobs();
+            aux.return_completion_logprobs.push_back(want_lp);
+            aux.any_return_completion_logprobs |= want_lp;
 
             // DSv4 compressed_block_tables: collect per-ratio page IDs for
             // master-group sequences only.

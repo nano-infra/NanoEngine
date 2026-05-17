@@ -222,8 +222,14 @@ class ModelRunner:
         hf_config = config.hf_config
         rank = self.rank
 
-        torch.manual_seed(0)
-        torch.cuda.manual_seed_all(0)
+        # Per-rank RNG seed. With DP>1, seeding all replicas with the
+        # same value makes ``torch.empty_like(...).exponential_(1)`` in
+        # the sampler produce byte-identical Gumbel noise on every rank
+        # — n>1 sampling collapses to n=1, GRPO advantages become 0,
+        # training stalls. Use ``rank`` so each replica has its own
+        # stream while the same job is still reproducible from seed 0.
+        torch.manual_seed(rank)
+        torch.cuda.manual_seed_all(rank)
 
         torch.cuda.set_device(0)
 
@@ -787,26 +793,57 @@ class ModelRunner:
         aux,
         num_seqs: int,
         is_prefill: bool,
-    ) -> torch.Tensor:
-        """Standard sampling path (prefill or normal decode without lazy verify)."""
+    ):
+        """Standard sampling path (prefill or normal decode without lazy verify).
+
+        Returns ``(input_ids, logprobs_or_None)`` — when any seq in the
+        batch has ``return_completion_logprobs=True``, ``logprobs`` is a
+        ``[num_seqs]`` float32 tensor of the chosen-token logprobs;
+        otherwise None and the original (compile-cached) forward path is
+        used. The logprob array is TP-all-reduced via a sum (non-rank-0
+        contributes zeros), mirroring the existing input_ids reduction.
+        """
         tp_rank = get_dist_context().attn_tp_rank
+        want_lp = bool(getattr(aux, "any_return_completion_logprobs", False))
+        logprobs = None
         if tp_rank == 0:
             temperatures = prepare_sample_from_aux(aux)
             context = get_context()
             if is_prefill and context.sampling_seq_indices is not None:
                 temps_filtered = temperatures[context.sampling_seq_indices]
-                sampled = self.sampler(logits, temps_filtered)
-                input_ids = input_ids.new_zeros(num_seqs)
-                input_ids[context.sampling_seq_indices] = sampled
+                if want_lp:
+                    sampled, lp_filtered = self.sampler.forward_with_logprobs(
+                        logits, temps_filtered
+                    )
+                    input_ids = input_ids.new_zeros(num_seqs)
+                    input_ids[context.sampling_seq_indices] = sampled
+                    logprobs = torch.zeros(num_seqs, dtype=torch.float32, device="cuda")
+                    logprobs[context.sampling_seq_indices] = lp_filtered.float()
+                else:
+                    sampled = self.sampler(logits, temps_filtered)
+                    input_ids = input_ids.new_zeros(num_seqs)
+                    input_ids[context.sampling_seq_indices] = sampled
             else:
-                input_ids = self.sampler(logits, temperatures)
+                if want_lp:
+                    input_ids, logprobs = self.sampler.forward_with_logprobs(
+                        logits, temperatures
+                    )
+                    logprobs = logprobs.float()
+                else:
+                    input_ids = self.sampler(logits, temperatures)
         else:
             input_ids = input_ids.new_zeros([num_seqs])
+            if want_lp:
+                logprobs = torch.zeros(num_seqs, dtype=torch.float32, device="cuda")
         dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
-        return input_ids
+        if want_lp:
+            # Sum-reduce: non-rank-0 contributed zeros so this recovers the
+            # rank-0 value exactly. Float32 keeps precision intact.
+            dist.all_reduce(logprobs, group=get_dist_context().attn_tp_group)
+        return input_ids, logprobs
 
     @torch.inference_mode()
-    def run_from_bytes(self, data: bytes, is_prefill: bool) -> list[list[int]]:
+    def run_from_bytes(self, data: bytes, is_prefill: bool):
         """Run model from lean RunBatchInput bytes (completely Sequence-free)."""
         _rcfg = get_runner_config()
         _timing = _rcfg.step_timing
@@ -909,13 +946,14 @@ class ModelRunner:
 
             # --- Sampling ---
             num_accepted = None
+            step_logprobs = None  # [num_seqs] float32 when shipping logprobs
             if not is_prefill and has_lazy_verify:
                 num_accepted = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
                 input_ids = self.mtp_worker.lazy_verify_sample(
                     logits, aux, num_seqs, num_accepted
                 )
             else:
-                input_ids = self._standard_sample(
+                input_ids, step_logprobs = self._standard_sample(
                     logits, input_ids, aux, num_seqs, is_prefill
                 )
             if _timer is not None and i == 0:
@@ -944,12 +982,32 @@ class ModelRunner:
 
             self.run_count += 1
             get_context().token_ids.append(input_ids[None, ...])
+            if step_logprobs is not None:
+                # Lazy-init the per-step list on first appearance — context
+                # is reset per step bundle. ``step_logprobs`` shape is
+                # [num_seqs] float32 (zero on non-rank-0 / non-sampled seqs).
+                ctx = get_context()
+                if not hasattr(ctx, "step_logprobs") or ctx.step_logprobs is None:
+                    ctx.step_logprobs = []
+                ctx.step_logprobs.append(step_logprobs[None, ...])
 
         # --- Build output ---
+        # ``logprobs_per_seq`` is ``list[list[float]]`` parallel to ``result``
+        # when shipping logprobs is enabled; None otherwise. Engine-server
+        # serializes both into StepOut.
+        ctx = get_context()
+        logprobs_per_seq = None
+        if getattr(ctx, "step_logprobs", None):
+            logprobs_per_seq = torch.cat(ctx.step_logprobs, dim=0).T.tolist()
         if self.mtp_worker is not None:
             result = self.mtp_worker.build_output_tokens(self.rank)
         else:
-            result = torch.cat(get_context().token_ids, dim=0).T.tolist()
+            result = torch.cat(ctx.token_ids, dim=0).T.tolist()
+        # Keep wire compat: return bare list when no logprobs were requested,
+        # tuple ``(tokens, logprobs)`` when they were. Engine-side decoder
+        # normalises both shapes.
+        if logprobs_per_seq is not None:
+            result = (result, logprobs_per_seq)
         reset_context()
         if _timer is not None:
             _timer.mark("tail")
