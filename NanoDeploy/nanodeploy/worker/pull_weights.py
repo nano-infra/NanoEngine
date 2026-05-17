@@ -83,7 +83,7 @@ def pull_named_tensors_via_rdma(
 
     for entry in manifest.entries:
         dtype = _STR_TO_DTYPE[entry.dtype]
-        buf = torch.empty(tuple(entry.shape), dtype=dtype, device="cpu").contiguous()
+        buf = torch.empty(tuple(entry.shape), dtype=dtype, device="cpu", pin_memory=True)
         received[entry.name] = buf
         peer_agent.register_memory_region(entry.mr_name, buf.data_ptr(), 0, entry.size)
         mr_names.append(entry.mr_name)
