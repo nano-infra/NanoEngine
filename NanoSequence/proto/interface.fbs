@@ -51,6 +51,19 @@ table RunBatchInput {
   is_prefill: bool;
 }
 
+// Per-sequence model runner output. token_ids contains the sampled tokens for
+// this execution bundle; logprobs is parallel to token_ids when
+// return_completion_logprobs was requested, otherwise absent/empty.
+table RunSequenceOutput {
+  token_ids: [int];
+  logprobs: [float];
+}
+
+table RunBatchOutput {
+  sequences: [RunSequenceOutput];
+  has_logprobs: bool = false;
+}
+
 // ========== Migrate Protocol ==========
 
 struct BlockLocationPair {

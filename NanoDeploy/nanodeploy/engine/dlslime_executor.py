@@ -108,7 +108,7 @@ class DLSLimeExecutor(RayExecutor):
                 f"[dlslime run] serialize={(_t1-_t0)*1000:.2f}ms "
                 f"submit={(_t2-_t1)*1000:.2f}ms "
                 f"wait_all={(_t3-_t2)*1000:.2f}ms "
-                f"unpickle={(_t4-_t3)*1000:.2f}ms "
+                f"decode={(_t4-_t3)*1000:.2f}ms "
                 f"total={(_t4-_t0)*1000:.2f}ms"
             )
         return result

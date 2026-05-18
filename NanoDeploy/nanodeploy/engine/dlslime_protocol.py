@@ -1,12 +1,47 @@
 import ctypes
-import os
-import pickle
 import time as _time
 
+import flatbuffers
 from dlslime.rpc import method
+
+from nanodeploy.fbs.RunBatchOutput import (
+    RunBatchOutput,
+    RunBatchOutputAddHasLogprobs,
+    RunBatchOutputAddSequences,
+    RunBatchOutputEnd,
+    RunBatchOutputStart,
+    RunBatchOutputStartSequencesVector,
+)
+from nanodeploy.fbs.RunSequenceOutput import (
+    RunSequenceOutputAddLogprobs,
+    RunSequenceOutputAddTokenIds,
+    RunSequenceOutputCreateLogprobsVector,
+    RunSequenceOutputCreateTokenIdsVector,
+    RunSequenceOutputEnd,
+    RunSequenceOutputStart,
+)
 
 
 _DLSLIME_TIMING = "1"
+
+
+def _create_run_result_seq(
+    builder: flatbuffers.Builder,
+    token_ids,
+    logprobs=None,
+) -> int:
+    token_ids_vec = RunSequenceOutputCreateTokenIdsVector(builder, token_ids)
+    logprobs_vec = (
+        RunSequenceOutputCreateLogprobsVector(builder, logprobs)
+        if logprobs is not None
+        else 0
+    )
+
+    RunSequenceOutputStart(builder)
+    if logprobs_vec:
+        RunSequenceOutputAddLogprobs(builder, logprobs_vec)
+    RunSequenceOutputAddTokenIds(builder, token_ids_vec)
+    return RunSequenceOutputEnd(builder)
 
 
 def encode_run_request(data: bytes, is_prefill: bool) -> bytes:
@@ -22,20 +57,58 @@ def decode_run_request(ptr: int, nbytes: int) -> tuple[bytes, bool]:
 
 
 def encode_run_result(result) -> bytes:
-    """Pickle the per-step worker result. Accepts either the legacy
-    ``list[list[int]]`` (token_ids only) or the new tuple
-    ``(token_ids: list[list[int]], logprobs: list[list[float]] | None)``
-    that ships when SamplingParams.return_completion_logprobs is on.
+    """Encode the per-step worker result as raw FlatBuffers bytes.
+
+    Accepts either the legacy ``list[list[int]]`` (token_ids only) or the
+    tuple ``(token_ids: list[list[int]], logprobs: list[list[float]] | None)``
+    shipped when SamplingParams.return_completion_logprobs is on.
     """
-    return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+    if isinstance(result, tuple):
+        token_ids, logprobs = result
+    else:
+        token_ids, logprobs = result, None
+
+    has_logprobs = logprobs is not None
+    builder = flatbuffers.Builder(256)
+    seq_offsets = [
+        _create_run_result_seq(
+            builder,
+            seq_token_ids,
+            logprobs[i] if has_logprobs and i < len(logprobs) else None,
+        )
+        for i, seq_token_ids in enumerate(token_ids)
+    ]
+
+    RunBatchOutputStartSequencesVector(builder, len(seq_offsets))
+    for seq_offset in reversed(seq_offsets):
+        builder.PrependUOffsetTRelative(seq_offset)
+    seqs_vec = builder.EndVector()
+
+    RunBatchOutputStart(builder)
+    RunBatchOutputAddHasLogprobs(builder, has_logprobs)
+    RunBatchOutputAddSequences(builder, seqs_vec)
+    root = RunBatchOutputEnd(builder)
+    builder.Finish(root)
+    return bytes(builder.Output())
 
 
 def decode_run_result(data: bytes):
-    """Returns either ``list[list[int]]`` (legacy) or
-    ``(list[list[int]], list[list[float]] | None)``. Callers should
-    normalise via ``token_ids, logprobs = (r if isinstance(r, tuple) else (r, None))``.
+    """Decode a worker result.
+
+    Returns either ``list[list[int]]`` (token_ids only) or
+    ``(list[list[int]], list[list[float]])``.
     """
-    return pickle.loads(data)
+    output = RunBatchOutput.GetRootAs(data, 0)
+    has_logprobs = output.HasLogprobs()
+    token_ids = []
+    logprobs = []
+    for i in range(output.SequencesLength()):
+        seq = output.Sequences(i)
+        token_ids.append([seq.TokenIds(j) for j in range(seq.TokenIdsLength())])
+        if has_logprobs:
+            logprobs.append([seq.Logprobs(j) for j in range(seq.LogprobsLength())])
+
+    return (token_ids, logprobs) if has_logprobs else token_ids
 
 
 class ModelRunnerRpcService:
