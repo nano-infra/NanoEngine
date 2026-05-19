@@ -64,6 +64,25 @@ class PeerAgentContext:
             qp_num=int(os.environ.get("SLIME_QP_NUM", 1) if qp_num is None else qp_num),
         )
 
+    @classmethod
+    def start_for_cache_context(
+        cls,
+        cache_context: Any,
+        *,
+        rank: int,
+    ) -> "PeerAgentContext | None":
+        """Start a PeerAgent using transport settings from CacheContext."""
+        return cls.start_peer_agent(
+            nanoctrl_address=cache_context.nanoctrl_address,
+            alias=(
+                f"{cache_context.engine_id}:{rank}"
+                if cache_context.engine_id is not None
+                else None
+            ),
+            device=cache_context.selected_nic,
+            scope=cache_context.nanoctrl_scope,
+        )
+
     def is_connected(self, peer_alias: str) -> bool:
         """Return whether this PeerAgent already connected to ``peer_alias``."""
         return peer_alias in self.connected_peers

@@ -94,6 +94,7 @@ from nanodeploy.context.distributed import (
     set_dist_context,
 )
 from nanodeploy.context.expert_context import ExpertContext
+from nanodeploy.context.peer_agent import PeerAgentContext
 from nanodeploy.context.weight import WeightContext, WeightUpdateEngine
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
@@ -694,9 +695,11 @@ class ModelRunner:
 
     def _init_peer_agent_context(self, cache_context):
         """Start the worker-owned PeerAgent and inject it into RDMA users."""
-        self.peer_agent_context = cache_context.start_peer_agent_context(
-            dist.get_rank()
+        self.peer_agent_context = PeerAgentContext.start_for_cache_context(
+            cache_context,
+            rank=dist.get_rank(),
         )
+        cache_context.set_peer_agent_context(self.peer_agent_context)
         if self.weight_context is not None:
             self.weight_context.set_peer_agent_context(self.peer_agent_context)
         if self.peer_agent_context is not None:

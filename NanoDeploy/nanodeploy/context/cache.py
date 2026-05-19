@@ -711,16 +711,6 @@ class CacheContext:
         """Attach the worker-owned PeerAgentContext to cache RDMA users."""
         self.peer_agent_context = peer_context
 
-    def start_peer_agent_context(self, rank: int) -> PeerAgentContext | None:
-        """Start and attach the PeerAgentContext for this cache context."""
-        self.peer_agent_context = PeerAgentContext.start_peer_agent(
-            nanoctrl_address=self.nanoctrl_address,
-            alias=(f"{self.engine_id}:{rank}" if self.engine_id is not None else None),
-            device=self.selected_nic,
-            scope=self.nanoctrl_scope,
-        )
-        return self.peer_agent_context
-
     def register_peer_agent_memory_regions(self, mode: str = "hybrid") -> None:
         """Register cache-owned RDMA memory regions on the attached PeerAgent.
 
