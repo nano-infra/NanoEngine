@@ -72,6 +72,7 @@ class CacheContext:
     )
     nanoctrl_scope: str | None = None  # Scope for multi-tenant isolation
     engine_id: str | None = None  # Engine ID for agent naming (format: EngineName:rank)
+    peer_agent_context: PeerAgentContext | None = None
     # If nanoctrl_address is provided, engine_id will be fetched from NanoCtrl instead of config
 
     @property
@@ -711,47 +712,34 @@ class CacheContext:
             f"{slot_info}"
         )
 
-    def start_peer_agent(self, mode: str = "hybrid"):
-        """Start PeerAgent and register memory regions for RDMA.
+    def set_peer_agent_context(self, peer_context: PeerAgentContext | None) -> None:
+        """Attach the worker-owned PeerAgentContext to cache RDMA users."""
+        self.peer_agent_context = peer_context
+        if peer_context is None:
+            self._peer_agent = None
+            self._peer_agent_addr = None
+            return
+        self._peer_agent = peer_context.agent
+        self._peer_agent_addr = peer_context.alias
+        self._peer_agent_ib_port = peer_context.ib_port
+        self._peer_agent_qp_num = peer_context.qp_num
+
+    def register_peer_agent_memory_regions(self, mode: str = "hybrid") -> None:
+        """Register cache-owned RDMA memory regions on the attached PeerAgent.
 
         Must be called AFTER allocate_kvcache() and allocate_gdn_states() so that
-        all tensors exist before registration.
-
-        In hybrid mode the PeerAgent is still started (needed for RDMA-fetching
-        vision embeddings from the encoder), but KV cache / GDN MR registration
-        is skipped because hybrid mode does not perform P2P KV transfer.
+        all tensors exist before registration. In hybrid mode the PeerAgent is
+        still alive, but KV cache / GDN MR registration is skipped because
+        hybrid mode does not perform P2P KV transfer.
         """
-        if self.nanoctrl_address is None or self.engine_id is None:
+        peer_context = self.peer_agent_context
+        if peer_context is None:
             return
 
-        start_peer_agent_fn = getattr(dlslime, "start_peer_agent", None)
-        if not callable(start_peer_agent_fn):
-            return
-
-        rank = dist.get_rank()
-        agent_alias = f"{self.engine_id}:{rank}"
-
-        server_url = self.nanoctrl_address
-        if not server_url.startswith("http://") and not server_url.startswith(
-            "https://"
-        ):
-            server_url = f"http://{server_url}"
+        agent_alias = peer_context.alias
+        server_url = peer_context.server_url
 
         try:
-            available_nics = dlslime.available_nic()
-            if not available_nics:
-                raise RuntimeError("No available NICs found")
-            device = available_nics[get_dist_context().local_rank % len(available_nics)]
-            self._peer_agent = start_peer_agent_fn(
-                nanoctrl_url=server_url,
-                alias=agent_alias,
-                device=device,
-                scope=self.nanoctrl_scope,
-            )
-            self._peer_agent_ib_port = 1
-            self._peer_agent_qp_num = int(os.environ.get("SLIME_QP_NUM", 1))
-            self._peer_agent_addr = agent_alias
-
             # In hybrid mode we only need the PeerAgent alive (for vision
             # embed RDMA fetch); KV cache / GDN MR registration is not needed.
             if mode == "hybrid":
@@ -822,7 +810,7 @@ class CacheContext:
                 )
 
             # DSv4 (S2.4): register flat per-ratio compressed cache + compressor
-            # state buffers — one MR per ratio per kind.  Skipped in hybrid mode
+            # state buffers — one MR per ratio per kind. Skipped in hybrid mode
             # via the same outer guard that protects KV/GDN registration.
             for ratio, buf in (
                 getattr(self, "dsv4_compressed_caches_flat", None) or {}
@@ -881,7 +869,7 @@ class CacheContext:
                 )
 
         except Exception as e:
-            logger.error(f"Failed to start PeerAgent: {e}")
+            logger.error(f"Failed to register PeerAgent memory regions: {e}")
             raise
 
     def get_peer_agent_addr(self) -> str | None:
@@ -889,18 +877,13 @@ class CacheContext:
         return self._peer_agent_addr
 
     def get_peer_agent_context(self) -> PeerAgentContext:
-        """Return a public PeerAgent transport handle for RDMA users."""
-        if self._peer_agent is None or self._peer_agent_addr is None:
+        """Return the attached worker-owned PeerAgentContext."""
+        if self.peer_agent_context is None:
             raise RuntimeError(
-                "CacheContext PeerAgent is not initialized. "
-                "Was start_peer_agent called?"
+                "CacheContext PeerAgentContext is not attached. "
+                "Was ModelRunner PeerAgentContext initialized?"
             )
-        return PeerAgentContext(
-            agent=self._peer_agent,
-            alias=self._peer_agent_addr,
-            ib_port=self._peer_agent_ib_port,
-            qp_num=self._peer_agent_qp_num,
-        )
+        return self.peer_agent_context
 
     def ensure_peer_agent_connected(self, peer_alias: str) -> None:
         """Ensure the local PeerAgent is connected to ``peer_alias``."""

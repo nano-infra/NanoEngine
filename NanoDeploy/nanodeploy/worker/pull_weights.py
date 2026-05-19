@@ -2,8 +2,8 @@
 
 Replaces the slow path (rollout-driver pulls 8 GB to CPU, then Ray-RPCs
 the full dict to each of N workers). Instead each worker uses its *own*
-``PeerAgent`` (already started for KV-cache migration in
-``nanodeploy/context/cache.py:start_peer_agent``) to pull the manifest
+``PeerAgent`` (started through ``PeerAgentContext.start_peer_agent``)
+to pull the manifest
 in parallel from the train side.
 
 Speedup model:

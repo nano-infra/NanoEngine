@@ -94,6 +94,7 @@ from nanodeploy.context.distributed import (
     set_dist_context,
 )
 from nanodeploy.context.expert_context import ExpertContext
+from nanodeploy.context.peer_agent import PeerAgentContext
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
@@ -158,6 +159,7 @@ class ModelRunner:
         self._dlslime_alias = None
         self._dlslime_thread = None
         self._dlslime_peer = None
+        self.peer_agent_context = None
 
         # Sync C++ Sequence.block_size with Python kvcache_block_size
         from nanodeploy._cpp import Sequence as _Seq
@@ -407,21 +409,24 @@ class ModelRunner:
     def pull_and_apply_weights(self, manifest_blob: bytes, train_alias: str) -> dict:
         """Direct-pull weight update path (much faster than apply_weight_update).
 
-        Each worker uses its *own* PeerAgent (started for KV-cache
-        migration in ``cache.py:start_peer_agent``) to RDMA-read the
-        manifest from ``train_alias`` in parallel with the other ranks.
+        Each worker uses its *own* PeerAgent (started through
+        ``PeerAgentContext.start_peer_agent``) to RDMA-read the manifest
+        from ``train_alias`` in parallel with the other ranks.
         Avoids the Ray cross-host serialization that dominates the
         ``apply_weight_update`` path when called from the rollout driver.
 
         See ``nanodeploy.worker.pull_weights`` for the reusable helper.
         """
-        from nanodeploy.context.cache import get_cache_context
         from nanodeploy.worker.pull_weights import pull_and_apply_on_worker
 
-        peer_context = get_cache_context().get_peer_agent_context()
+        if self.peer_agent_context is None:
+            raise RuntimeError(
+                "ModelRunner PeerAgentContext is not initialized. "
+                "Was preallocate_kvcache called?"
+            )
         return pull_and_apply_on_worker(
             self.model,
-            peer_context,
+            self.peer_agent_context,
             train_alias,
             manifest_blob,
         )
@@ -460,7 +465,20 @@ class ModelRunner:
         # Start PeerAgent AFTER kv_cache (and GDN states) are allocated,
         # so that all tensors exist for RDMA memory region registration.
         # In hybrid mode, PeerAgent is started but KV/GDN MR is skipped.
-        cache_context.start_peer_agent(mode=self.config.mode)
+        self.peer_agent_context = PeerAgentContext.start_peer_agent(
+            nanoctrl_address=cache_context.nanoctrl_address,
+            alias=(
+                f"{cache_context.engine_id}:{dist.get_rank()}"
+                if cache_context.engine_id is not None
+                else None
+            ),
+            device=cache_context.selected_nic,
+            scope=cache_context.nanoctrl_scope,
+        )
+        cache_context.set_peer_agent_context(self.peer_agent_context)
+        cache_context.register_peer_agent_memory_regions(mode=self.config.mode)
+        if self.peer_agent_context is not None:
+            self.vision_manager.set_peer_agent_context(self.peer_agent_context)
 
         if not self.enforce_eager:
             self._init_graph_runners()
