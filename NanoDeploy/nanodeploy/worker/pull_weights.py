@@ -51,7 +51,8 @@ def _ensure_connected(peer_agent, train_alias: str, ib_port: int, qp_num: int) -
     except RuntimeError:
         pass
     conn = peer_agent.connect_to(train_alias, ib_port=ib_port, qp_num=qp_num)
-    conn.wait(timeout=60.0)
+    if not conn.wait(timeout=60.0):
+        raise RuntimeError(f"Timed out waiting for connection to {train_alias}")
     # Match the SlimeRPC settle delay; otherwise the first WR can hit
     # IBV_WC_RETRY_EXC_ERR before the remote arms its recv path.
     time.sleep(0.2)
