@@ -997,7 +997,7 @@ class ModelRunner:
         # serializes both into StepOut.
         ctx = get_context()
         logprobs_per_seq = None
-        if getattr(ctx, "step_logprobs", None):
+        if getattr(ctx, "step_logprobs", []):
             logprobs_per_seq = torch.cat(ctx.step_logprobs, dim=0).T.tolist()
         if self.mtp_worker is not None:
             result = self.mtp_worker.build_output_tokens(self.rank)
