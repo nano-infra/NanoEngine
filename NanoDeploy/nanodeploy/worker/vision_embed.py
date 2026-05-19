@@ -93,10 +93,12 @@ class VisionEmbedManager:
             return
 
         cache_ctx = get_cache_context()
-        peer_agent = cache_ctx._peer_agent
-        if peer_agent is None:
+        try:
+            peer_context = cache_ctx.get_peer_agent_context()
+        except RuntimeError:
             logger.warning("PeerAgent not available, cannot RDMA-fetch vision embeds")
             return
+        peer_agent = peer_context.agent
 
         from nanodeploy.context.embedding_pool import _VISION_EMBED_BUFFER_ID
 
@@ -139,14 +141,7 @@ class VisionEmbedManager:
                 peer_alias = f"{encoder_id}:0"
 
             # Ensure connection
-            if peer_alias not in cache_ctx._connected_peers:
-                conn = cache_ctx._peer_agent.connect_to(
-                    peer_alias,
-                    ib_port=cache_ctx._peer_agent_ib_port,
-                    qp_num=cache_ctx._peer_agent_qp_num,
-                )
-                conn.wait(timeout=30)
-                cache_ctx._connected_peers.add(peer_alias)
+            cache_ctx.ensure_peer_agent_connected(peer_alias)
 
             # Get remote MR info for vision_embed buffer
             remote_mr_info = peer_agent.get_mr_info(peer_alias, _VISION_EMBED_BUFFER_ID)

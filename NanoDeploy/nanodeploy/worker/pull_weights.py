@@ -27,6 +27,8 @@ from typing import Any
 
 import torch
 
+from nanodeploy.context.peer_agent import PeerAgentContext
+
 logger = logging.getLogger("nanodeploy")
 
 
@@ -53,9 +55,6 @@ def _ensure_connected(peer_agent, train_alias: str, ib_port: int, qp_num: int) -
     conn = peer_agent.connect_to(train_alias, ib_port=ib_port, qp_num=qp_num)
     if not conn.wait(timeout=60.0):
         raise RuntimeError(f"Timed out waiting for connection to {train_alias}")
-    # Match the SlimeRPC settle delay; otherwise the first WR can hit
-    # IBV_WC_RETRY_EXC_ERR before the remote arms its recv path.
-    time.sleep(0.2)
 
 
 def pull_named_tensors_via_rdma(
@@ -84,7 +83,9 @@ def pull_named_tensors_via_rdma(
 
     for entry in manifest.entries:
         dtype = _STR_TO_DTYPE[entry.dtype]
-        buf = torch.empty(tuple(entry.shape), dtype=dtype, device="cpu", pin_memory=True)
+        buf = torch.empty(
+            tuple(entry.shape), dtype=dtype, device="cpu", pin_memory=True
+        )
         received[entry.name] = buf
         peer_agent.register_memory_region(entry.mr_name, buf.data_ptr(), 0, entry.size)
         mr_names.append(entry.mr_name)
@@ -114,12 +115,9 @@ def release_mrs(peer_agent, mr_names) -> None:
 
 def pull_and_apply_on_worker(
     model: torch.nn.Module,
-    peer_agent,
+    peer_context: PeerAgentContext,
     train_alias: str,
     manifest_blob: bytes,
-    *,
-    ib_port: int = 1,
-    qp_num: int = 1,
 ) -> dict[str, Any]:
     """Worker-side entry point: pull the manifest from ``train_alias`` and
     apply tensors in place.
@@ -132,16 +130,16 @@ def pull_and_apply_on_worker(
     manifest = pickle.loads(manifest_blob)
     t0 = time.monotonic()
     named, mr_names = pull_named_tensors_via_rdma(
-        peer_agent,
+        peer_context.agent,
         train_alias,
         manifest,
-        ib_port=ib_port,
-        qp_num=qp_num,
+        ib_port=peer_context.ib_port,
+        qp_num=peer_context.qp_num,
     )
     t_pull = time.monotonic() - t0
     counts = apply_named_tensors_in_place(model, named)
     t_apply = time.monotonic() - t0 - t_pull
-    release_mrs(peer_agent, mr_names)
+    release_mrs(peer_context.agent, mr_names)
 
     stats = {
         "version": manifest.version,

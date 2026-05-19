@@ -418,21 +418,12 @@ class ModelRunner:
         from nanodeploy.context.cache import get_cache_context
         from nanodeploy.worker.pull_weights import pull_and_apply_on_worker
 
-        ctx = get_cache_context()
-        peer_agent = ctx._peer_agent
-        if peer_agent is None:
-            raise RuntimeError(
-                "ModelRunner.pull_and_apply_weights requires the worker's "
-                "PeerAgent to be live; cache_context._peer_agent is None. "
-                "Was start_peer_agent called?"
-            )
+        peer_context = get_cache_context().get_peer_agent_context()
         return pull_and_apply_on_worker(
             self.model,
-            peer_agent,
+            peer_context,
             train_alias,
             manifest_blob,
-            ib_port=ctx._peer_agent_ib_port,
-            qp_num=ctx._peer_agent_qp_num,
         )
 
     def allocate_kvcache(self, num_kvcache_blocks: int):

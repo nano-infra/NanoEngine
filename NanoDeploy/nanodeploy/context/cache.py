@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from nanodeploy.context.distributed import get_dist_context
+from nanodeploy.context.peer_agent import PeerAgentContext
 from nanodeploy.logging import get_logger
 
 logger = get_logger("nanodeploy")
@@ -886,6 +887,34 @@ class CacheContext:
     def get_peer_agent_addr(self) -> str | None:
         """Return the local peer agent address for this rank."""
         return self._peer_agent_addr
+
+    def get_peer_agent_context(self) -> PeerAgentContext:
+        """Return a public PeerAgent transport handle for RDMA users."""
+        if self._peer_agent is None or self._peer_agent_addr is None:
+            raise RuntimeError(
+                "CacheContext PeerAgent is not initialized. "
+                "Was start_peer_agent called?"
+            )
+        return PeerAgentContext(
+            agent=self._peer_agent,
+            alias=self._peer_agent_addr,
+            ib_port=self._peer_agent_ib_port,
+            qp_num=self._peer_agent_qp_num,
+        )
+
+    def ensure_peer_agent_connected(self, peer_alias: str) -> None:
+        """Ensure the local PeerAgent is connected to ``peer_alias``."""
+        peer_context = self.get_peer_agent_context()
+        if peer_alias in self._connected_peers:
+            return
+
+        conn = peer_context.agent.connect_to(
+            peer_alias,
+            ib_port=peer_context.ib_port,
+            qp_num=peer_context.qp_num,
+        )
+        conn.wait(timeout=30)
+        self._connected_peers.add(peer_alias)
 
     def invalidate_engine_info_cache(self):
         """Invalidate the engine_info cache to force a refresh on next fetch."""
