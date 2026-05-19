@@ -71,8 +71,8 @@ class Sampler(nn.Module):
         probs = torch.softmax(scaled_logits, dim=-1)
 
         # Stochastic Gumbel-max sample (does not corrupt log_probs).
-        gumbel = torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
-        sample_tokens = (probs / gumbel).argmax(dim=-1)
+        gumbel = torch.empty_like(log_probs).exponential_(1).clamp_min_(1e-10)
+        sample_tokens = (log_probs - gumbel.log()).argmax(dim=-1)
 
         greedy_tokens = logits.argmax(dim=-1)
         chosen = torch.where(greedy_mask, greedy_tokens, sample_tokens)
