@@ -28,12 +28,13 @@ class Sampler(nn.Module):
             greedy_mask, torch.ones_like(temperatures), temperatures
         )
 
-        # Compute sampling
-        scaled_logits = logits.float().div_(safe_temps.unsqueeze(dim=1))
-        probs = torch.softmax(scaled_logits, dim=-1)
-        sample_tokens = probs.div_(
-            torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
-        ).argmax(dim=-1)
+        # Compute sampling in log-space. This is equivalent to the classic
+        # probs / exponential_noise Gumbel-max trick, but avoids underflowing
+        # very small probabilities to zero.
+        scaled_logits = logits.float() / safe_temps.unsqueeze(dim=1)
+        log_probs = torch.log_softmax(scaled_logits, dim=-1)
+        gumbel = torch.empty_like(log_probs).exponential_(1).clamp_min_(1e-10)
+        sample_tokens = (log_probs - gumbel.log()).argmax(dim=-1)
 
         # Compute greedy
         greedy_tokens = logits.argmax(dim=-1)
@@ -63,12 +64,11 @@ class Sampler(nn.Module):
             greedy_mask, torch.ones_like(temperatures), temperatures
         )
 
-        # Compute scaled distribution + log-probs *before* the destructive
-        # in-place div for Gumbel sampling. log_softmax is numerically
-        # stable; we use it for both greedy and stochastic logprobs.
+        # Compute scaled distribution in log-space. log_softmax is
+        # numerically stable; we use it for both stochastic sampling and
+        # chosen-token logprobs.
         scaled_logits = logits.float() / safe_temps.unsqueeze(dim=1)
         log_probs = torch.log_softmax(scaled_logits, dim=-1)
-        probs = torch.softmax(scaled_logits, dim=-1)
 
         # Stochastic Gumbel-max sample (does not corrupt log_probs).
         gumbel = torch.empty_like(log_probs).exponential_(1).clamp_min_(1e-10)
