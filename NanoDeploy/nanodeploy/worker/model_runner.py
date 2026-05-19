@@ -160,6 +160,8 @@ class ModelRunner:
         self._dlslime_thread = None
         self._dlslime_peer = None
         self.peer_agent_context = None
+        self.weight_context = None
+        self.weight_update_engine = None
 
         # Sync C++ Sequence.block_size with Python kvcache_block_size
         from nanodeploy._cpp import Sequence as _Seq
@@ -374,6 +376,11 @@ class ModelRunner:
 
         dist.barrier()
 
+        from nanodeploy.context.weight import WeightContext
+        from nanodeploy.worker.weight_update_engine import WeightUpdateEngine
+
+        self.weight_context = WeightContext()
+        self.weight_update_engine = WeightUpdateEngine(self.model, self.weight_context)
         self.sampler = Sampler()
         self.input_preparer = InputPreparer(config)
         self.vision_manager = VisionEmbedManager(hf_config)
@@ -402,9 +409,11 @@ class ModelRunner:
         CUDA graphs from the previous weight set continue to read the
         updated values without recapture.
         """
-        from nanodeploy.worker.weight_update import apply_named_tensors_in_place
+        if self.weight_update_engine is None:
+            from nanodeploy.worker.weight_update import apply_named_tensors_in_place
 
-        return apply_named_tensors_in_place(self.model, named_tensors)
+            return apply_named_tensors_in_place(self.model, named_tensors)
+        return self.weight_update_engine.apply_named_tensors(named_tensors)
 
     def pull_and_apply_weights(self, manifest_blob: bytes, train_alias: str) -> dict:
         """Direct-pull weight update path (much faster than apply_weight_update).
@@ -417,19 +426,14 @@ class ModelRunner:
 
         See ``nanodeploy.worker.pull_weights`` for the reusable helper.
         """
-        from nanodeploy.worker.pull_weights import pull_and_apply_on_worker
-
-        if self.peer_agent_context is None:
+        if self.weight_update_engine is None:
+            raise RuntimeError("ModelRunner WeightUpdateEngine is not initialized")
+        if self.peer_agent_context is None or self.weight_context is None:
             raise RuntimeError(
                 "ModelRunner PeerAgentContext is not initialized. "
                 "Was preallocate_kvcache called?"
             )
-        return pull_and_apply_on_worker(
-            self.model,
-            self.peer_agent_context,
-            train_alias,
-            manifest_blob,
-        )
+        return self.weight_update_engine.pull_and_apply(manifest_blob, train_alias)
 
     def allocate_kvcache(self, num_kvcache_blocks: int):
         self.config.num_kvcache_blocks = num_kvcache_blocks
@@ -477,6 +481,8 @@ class ModelRunner:
         )
         cache_context.set_peer_agent_context(self.peer_agent_context)
         cache_context.register_peer_agent_memory_regions(mode=self.config.mode)
+        if self.weight_context is not None:
+            self.weight_context.set_peer_agent_context(self.peer_agent_context)
         if self.peer_agent_context is not None:
             self.vision_manager.set_peer_agent_context(self.peer_agent_context)
 

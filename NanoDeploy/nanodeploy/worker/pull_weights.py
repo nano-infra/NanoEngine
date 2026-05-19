@@ -3,8 +3,7 @@
 Replaces the slow path (rollout-driver pulls 8 GB to CPU, then Ray-RPCs
 the full dict to each of N workers). Instead each worker uses its *own*
 ``PeerAgent`` (started through ``PeerAgentContext.start_peer_agent``)
-to pull the manifest
-in parallel from the train side.
+to pull the manifest in parallel from the train side.
 
 Speedup model:
     OLD: pull_to_driver + N * ray_serialize(8 GB)   ~ 2.9s + 4 * (10–20s)
@@ -20,9 +19,6 @@ worker actually moves.
 from __future__ import annotations
 
 import logging
-import pickle
-import time
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -105,48 +101,17 @@ def pull_named_tensors_via_rdma(
     return received, mr_names
 
 
-def release_mrs(peer_agent, mr_names) -> None:
-    for name in mr_names:
-        try:
-            peer_agent.unregister_memory_region(name)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("unregister_memory_region(%s) failed: %s", name, exc)
-
-
 def pull_and_apply_on_worker(
     model: torch.nn.Module,
     peer_context: PeerAgentContext,
     train_alias: str,
     manifest_blob: bytes,
 ) -> dict[str, Any]:
-    """Worker-side entry point: pull the manifest from ``train_alias`` and
-    apply tensors in place.
+    """Compatibility wrapper around ``WeightUpdateEngine``."""
+    from nanodeploy.context.weight import WeightContext
+    from nanodeploy.worker.weight_update_engine import WeightUpdateEngine
 
-    Returns a stats dict that includes per-stage timings so the driver can
-    see how long the RDMA pull vs apply phases took on this rank.
-    """
-    from nanodeploy.worker.weight_update import apply_named_tensors_in_place
-
-    manifest = pickle.loads(manifest_blob)
-    t0 = time.monotonic()
-    named, mr_names = pull_named_tensors_via_rdma(
-        peer_context.agent,
-        train_alias,
-        manifest,
-        ib_port=peer_context.ib_port,
-        qp_num=peer_context.qp_num,
+    weight_context = WeightContext(peer_context)
+    return WeightUpdateEngine(model, weight_context).pull_and_apply(
+        manifest_blob, train_alias
     )
-    t_pull = time.monotonic() - t0
-    counts = apply_named_tensors_in_place(model, named)
-    t_apply = time.monotonic() - t0 - t_pull
-    release_mrs(peer_context.agent, mr_names)
-
-    stats = {
-        "version": manifest.version,
-        "n_tensors": len(manifest.entries),
-        "pull_s": t_pull,
-        "apply_s": t_apply,
-        **counts,
-    }
-    logger.info("pull_and_apply_on_worker: %s", stats)
-    return stats

@@ -51,13 +51,12 @@ def apply_named_tensors_in_place(
         except AttributeError:
             n_skipped += 1
             continue
-        full_dev = full.to(param.device, non_blocking=True)
         loader = getattr(param, "weight_loader", None)
         if loader is not None:
-            loader(param, full_dev)
+            loader(param, full)
             n_loader += 1
         else:
-            param.data.copy_(full_dev)
+            param.data.copy_(full, non_blocking=True)
             n_direct += 1
         n_loaded += 1
     if sync:
