@@ -94,7 +94,7 @@ from nanodeploy.context.distributed import (
     set_dist_context,
 )
 from nanodeploy.context.expert_context import ExpertContext
-from nanodeploy.context.peer_agent import PeerAgentContext
+from nanodeploy.context.weight import WeightContext, WeightUpdateEngine
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
@@ -376,9 +376,6 @@ class ModelRunner:
 
         dist.barrier()
 
-        from nanodeploy.context.weight import WeightContext
-        from nanodeploy.worker.weight_update_engine import WeightUpdateEngine
-
         self.weight_context = WeightContext()
         self.weight_update_engine = WeightUpdateEngine(self.model, self.weight_context)
         self.sampler = Sampler()
@@ -396,43 +393,13 @@ class ModelRunner:
     def apply_weight_update(
         self, named_tensors: dict[str, torch.Tensor]
     ) -> dict[str, int]:
-        """Hot-load HF-named full tensors into the live model on this rank.
-
-        Each parameter has a ``weight_loader`` callback attached at
-        construction time (see ``backends/hopper/layers/linear.py``) that
-        already knows the right TP/EP slice for this rank. The actual copy
-        path lives in ``nanodeploy.worker.weight_update`` so it can be unit-
-        tested without spinning up an engine.
-
-        In-place ``param.data.copy_`` (used both by ``weight_loader`` and
-        the fallback) preserves the storage's address, so any captured
-        CUDA graphs from the previous weight set continue to read the
-        updated values without recapture.
-        """
         if self.weight_update_engine is None:
-            from nanodeploy.worker.weight_update import apply_named_tensors_in_place
-
-            return apply_named_tensors_in_place(self.model, named_tensors)
+            raise RuntimeError("ModelRunner WeightUpdateEngine is not initialized")
         return self.weight_update_engine.apply_named_tensors(named_tensors)
 
     def pull_and_apply_weights(self, manifest_blob: bytes, train_alias: str) -> dict:
-        """Direct-pull weight update path (much faster than apply_weight_update).
-
-        Each worker uses its *own* PeerAgent (started through
-        ``PeerAgentContext.start_peer_agent``) to RDMA-read the manifest
-        from ``train_alias`` in parallel with the other ranks.
-        Avoids the Ray cross-host serialization that dominates the
-        ``apply_weight_update`` path when called from the rollout driver.
-
-        See ``nanodeploy.worker.pull_weights`` for the reusable helper.
-        """
         if self.weight_update_engine is None:
             raise RuntimeError("ModelRunner WeightUpdateEngine is not initialized")
-        if self.peer_agent_context is None or self.weight_context is None:
-            raise RuntimeError(
-                "ModelRunner PeerAgentContext is not initialized. "
-                "Was preallocate_kvcache called?"
-            )
         return self.weight_update_engine.pull_and_apply(manifest_blob, train_alias)
 
     def allocate_kvcache(self, num_kvcache_blocks: int):
@@ -466,25 +433,9 @@ class ModelRunner:
                 if hasattr(module, "indexer") and module.indexer is not None:
                     module.indexer.indexer_cache = cache_context.indexer_cache
 
-        # Start PeerAgent AFTER kv_cache (and GDN states) are allocated,
-        # so that all tensors exist for RDMA memory region registration.
-        # In hybrid mode, PeerAgent is started but KV/GDN MR is skipped.
-        self.peer_agent_context = PeerAgentContext.start_peer_agent(
-            nanoctrl_address=cache_context.nanoctrl_address,
-            alias=(
-                f"{cache_context.engine_id}:{dist.get_rank()}"
-                if cache_context.engine_id is not None
-                else None
-            ),
-            device=cache_context.selected_nic,
-            scope=cache_context.nanoctrl_scope,
-        )
-        cache_context.set_peer_agent_context(self.peer_agent_context)
+        # Register memory regions after KV/indexer tensors exist. The PeerAgent
+        # itself is started during preallocate_kvcache().
         cache_context.register_peer_agent_memory_regions(mode=self.config.mode)
-        if self.weight_context is not None:
-            self.weight_context.set_peer_agent_context(self.peer_agent_context)
-        if self.peer_agent_context is not None:
-            self.vision_manager.set_peer_agent_context(self.peer_agent_context)
 
         if not self.enforce_eager:
             self._init_graph_runners()
@@ -738,6 +689,18 @@ class ModelRunner:
                 config.max_num_seqs,
                 need_backup=config.num_speculative_tokens > 0,
             )
+
+        self._init_peer_agent_context(cache_context)
+
+    def _init_peer_agent_context(self, cache_context):
+        """Start the worker-owned PeerAgent and inject it into RDMA users."""
+        self.peer_agent_context = cache_context.start_peer_agent_context(
+            dist.get_rank()
+        )
+        if self.weight_context is not None:
+            self.weight_context.set_peer_agent_context(self.peer_agent_context)
+        if self.peer_agent_context is not None:
+            self.vision_manager.set_peer_agent_context(self.peer_agent_context)
 
     @torch.inference_mode()
     def run_model(
