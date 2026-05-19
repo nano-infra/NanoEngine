@@ -159,10 +159,68 @@ def apply_named_tensors_in_place(
 ) -> dict[str, int]:
     """Apply HF-named full tensors to matching model parameters in place.
 
-    Per-parameter ``weight_loader`` callbacks own TP/EP slicing. The fallback
-    path copies directly into the parameter storage, preserving CUDA graph
-    captures that already reference that storage address.
+    Delegates to ``model.load_weights(...)`` when available so that
+    model-specific name remapping (HF ``q/k/v_proj`` → fused ``qkv_proj``,
+    ``gate_proj/up_proj`` → ``gate_up_proj``) and the packed-loader
+    signature (``weight_loader(param, tensor, shard_id, weight_name)``)
+    are handled by the same code path that loads the initial checkpoint.
+
+    Falls back to the previous direct-lookup behaviour only for models
+    that don't implement ``load_weights`` (e.g. test/dummy models). The
+    fallback intentionally counts misses so callers still see the diag
+    stats; this is unsafe for fused-weight models — log a warning when
+    that path is hit on a real model.
+
+    All copies are *in place* (the loaders use ``param.data.copy_``)
+    so any captured CUDA graphs continue to point at the same allocation.
     """
+    if hasattr(model, "load_weights"):
+        # Model-aware path: per-model loader (e.g. qwen3_loader) does
+        # the HF→internal name mapping + calls weight_loader with
+        # (param, tensor, shard_id, weight_name) for fused weights.
+        # Wrap the dict as the (weight_name, raw_weight_name, tensor)
+        # generator the loaders expect — same shape used by the safetensors
+        # checkpoint path.
+        weights_iter = ((name, name, t) for name, t in named_tensors.items())
+        try:
+            model.load_weights(weights_iter)
+        except Exception:
+            logger.exception("apply_named_tensors_in_place: model.load_weights failed")
+            raise
+
+        if sync:
+            torch.cuda.synchronize()
+        # The per-model loader logs its own counts; we return a coarse
+        # tally for compatibility with callers reading the stats.
+        n = len(named_tensors)
+        stats = {
+            "loaded": n,  # delegated; per-model loader reports detail
+            "skipped_unknown": 0,
+            "used_loader_cb": n,
+            "used_direct_copy": 0,
+            "via_model_load_weights": 1,
+        }
+        logger.info("apply_named_tensors_in_place: %s", stats)
+        return stats
+
+    # No model.load_weights — direct fallback (test models, simple stubs).
+    logger.warning(
+        "apply_named_tensors_in_place: model %s has no load_weights(); "
+        "using direct param lookup. Fused weights (qkv_proj, gate_up_proj) "
+        "will be skipped silently.",
+        type(model).__name__,
+    )
+    return _apply_direct(model, named_tensors, sync=sync)
+
+
+def _apply_direct(
+    model: torch.nn.Module,
+    named_tensors: dict[str, torch.Tensor],
+    *,
+    sync: bool,
+) -> dict[str, int]:
+    """Pre-refactor direct-lookup path. Kept for fallback only — does not
+    handle packed-modules-mapping; use ``model.load_weights`` instead."""
     n_loaded = n_skipped = n_loader = n_direct = 0
     for name, full in named_tensors.items():
         try:
@@ -185,8 +243,9 @@ def apply_named_tensors_in_place(
         "skipped_unknown": n_skipped,
         "used_loader_cb": n_loader,
         "used_direct_copy": n_direct,
+        "via_model_load_weights": 0,
     }
-    logger.info("apply_named_tensors_in_place: %s", stats)
+    logger.info("apply_named_tensors_in_place (direct): %s", stats)
     return stats
 
 
