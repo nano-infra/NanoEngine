@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
-@dataclass(frozen=True)
+@dataclass
 class PeerAgentContext:
     """Owns the worker PeerAgent lifecycle and transport settings."""
 
@@ -15,6 +15,7 @@ class PeerAgentContext:
     device: str
     ib_port: int = 1
     qp_num: int = 1
+    connected_peers: set[str] = field(default_factory=set)
 
     @classmethod
     def start_peer_agent(
@@ -62,3 +63,47 @@ class PeerAgentContext:
             ib_port=1,
             qp_num=int(os.environ.get("SLIME_QP_NUM", 1) if qp_num is None else qp_num),
         )
+
+    def is_connected(self, peer_alias: str) -> bool:
+        """Return whether this PeerAgent already connected to ``peer_alias``."""
+        return peer_alias in self.connected_peers
+
+    def ensure_connected(self, peer_alias: str, *, timeout: float = 30) -> None:
+        """Ensure the local PeerAgent is connected to ``peer_alias``."""
+        if self.is_connected(peer_alias):
+            return
+
+        conn = self.agent.connect_to(
+            peer_alias,
+            ib_port=self.ib_port,
+            qp_num=self.qp_num,
+        )
+        if conn.wait(timeout=timeout) is False:
+            raise RuntimeError(f"Timed out waiting for connection to {peer_alias}")
+        self.connected_peers.add(peer_alias)
+
+    def ensure_many_connected(
+        self, peer_aliases: list[str], *, timeout: float = 30
+    ) -> list[str]:
+        """Connect to missing peers and return the newly connected aliases."""
+        new_peers = [peer for peer in peer_aliases if not self.is_connected(peer)]
+        if not new_peers:
+            return []
+
+        pending_conns = [
+            self.agent.connect_to(
+                peer,
+                ib_port=self.ib_port,
+                qp_num=self.qp_num,
+            )
+            for peer in new_peers
+        ]
+        for peer, conn in zip(new_peers, pending_conns, strict=True):
+            if conn.wait(timeout=timeout) is False:
+                raise RuntimeError(f"Timed out waiting for connection to {peer}")
+        self.connected_peers.update(new_peers)
+        return new_peers
+
+    def unregister_memory_region(self, mr_name: str) -> None:
+        """Unregister a local memory region from the owned PeerAgent."""
+        self.agent.unregister_memory_region(mr_name)

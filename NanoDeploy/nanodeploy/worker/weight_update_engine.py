@@ -39,11 +39,9 @@ class WeightUpdateEngine:
         manifest = pickle.loads(manifest_blob)
         t0 = time.monotonic()
         named, mr_names = pull_named_tensors_via_rdma(
-            peer_context.agent,
+            peer_context,
             train_alias,
             manifest,
-            ib_port=peer_context.ib_port,
-            qp_num=peer_context.qp_num,
         )
         pull_s = time.monotonic() - t0
         mr_names_by_tensor = {entry.name: entry.mr_name for entry in manifest.entries}

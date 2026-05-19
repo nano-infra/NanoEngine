@@ -718,11 +718,13 @@ class CacheContext:
         if peer_context is None:
             self._peer_agent = None
             self._peer_agent_addr = None
+            self._connected_peers = set()
             return
         self._peer_agent = peer_context.agent
         self._peer_agent_addr = peer_context.alias
         self._peer_agent_ib_port = peer_context.ib_port
         self._peer_agent_qp_num = peer_context.qp_num
+        self._connected_peers = peer_context.connected_peers
 
     def register_peer_agent_memory_regions(self, mode: str = "hybrid") -> None:
         """Register cache-owned RDMA memory regions on the attached PeerAgent.
@@ -887,17 +889,7 @@ class CacheContext:
 
     def ensure_peer_agent_connected(self, peer_alias: str) -> None:
         """Ensure the local PeerAgent is connected to ``peer_alias``."""
-        peer_context = self.get_peer_agent_context()
-        if peer_alias in self._connected_peers:
-            return
-
-        conn = peer_context.agent.connect_to(
-            peer_alias,
-            ib_port=peer_context.ib_port,
-            qp_num=peer_context.qp_num,
-        )
-        conn.wait(timeout=30)
-        self._connected_peers.add(peer_alias)
+        self.get_peer_agent_context().ensure_connected(peer_alias)
 
     def invalidate_engine_info_cache(self):
         """Invalidate the engine_info cache to force a refresh on next fetch."""
@@ -1046,18 +1038,8 @@ class CacheContext:
 
         new_peers = list(remote_peers_to_connect.keys())
         logger.info(f"Batch connecting to {len(new_peers)} peers: {new_peers}")
-        pending_conns = [
-            self._peer_agent.connect_to(
-                peer,
-                ib_port=self._peer_agent_ib_port,
-                qp_num=self._peer_agent_qp_num,
-            )
-            for peer in new_peers
-        ]
-        for conn in pending_conns:
-            conn.wait(timeout=30)
-        self._connected_peers.update(new_peers)
-        logger.info(f"Batch connection completed for {len(new_peers)} peers")
+        connected = self.get_peer_agent_context().ensure_many_connected(new_peers)
+        logger.info(f"Batch connection completed for {len(connected)} peers")
 
     def _execute_rdma_reads(
         self,

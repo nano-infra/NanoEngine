@@ -143,8 +143,8 @@ class VisionEmbedManager:
                 )
                 peer_alias = f"{encoder_id}:0"
 
-            # Ensure connection
-            cache_ctx.ensure_peer_agent_connected(peer_alias)
+            # Ensure connection through the worker-owned PeerAgentContext.
+            self.peer_agent_context.ensure_connected(peer_alias)
 
             # Get remote MR info for vision_embed buffer
             remote_mr_info = peer_agent.get_mr_info(peer_alias, _VISION_EMBED_BUFFER_ID)

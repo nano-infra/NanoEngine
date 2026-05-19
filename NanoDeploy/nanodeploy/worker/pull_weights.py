@@ -41,25 +41,10 @@ _DTYPE_TO_STR = {
 _STR_TO_DTYPE = {v: k for k, v in _DTYPE_TO_STR.items()}
 
 
-def _ensure_connected(peer_agent, train_alias: str, ib_port: int, qp_num: int) -> None:
-    """Idempotent: connect_to(train_alias) once, wait for it to be ready."""
-    try:
-        peer_agent._get_connection(train_alias)
-        return  # already up
-    except RuntimeError:
-        pass
-    conn = peer_agent.connect_to(train_alias, ib_port=ib_port, qp_num=qp_num)
-    if not conn.wait(timeout=60.0):
-        raise RuntimeError(f"Timed out waiting for connection to {train_alias}")
-
-
 def pull_named_tensors_via_rdma(
-    peer_agent,
+    peer_context: PeerAgentContext,
     train_alias: str,
     manifest,
-    *,
-    ib_port: int = 1,
-    qp_num: int = 1,
 ) -> tuple[dict[str, torch.Tensor], list]:
     """Pull every entry of ``manifest`` from ``train_alias`` into local CPU
     receive buffers via a single batched ``endpoint.read``.
@@ -69,7 +54,8 @@ def pull_named_tensors_via_rdma(
     has copied them, then can call ``unregister_memory_region`` on each
     name in ``registered_mr_names`` to free them.
     """
-    _ensure_connected(peer_agent, train_alias, ib_port, qp_num)
+    peer_context.ensure_connected(train_alias, timeout=60.0)
+    peer_agent = peer_context.agent
     endpoint = peer_agent._get_endpoint(train_alias)
     conn = peer_agent._get_connection(train_alias)
 

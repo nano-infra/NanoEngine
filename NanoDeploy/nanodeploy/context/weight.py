@@ -71,7 +71,7 @@ class WeightContext:
 
         for mr_name in self._registered_mrs:
             try:
-                self.peer_context.agent.unregister_memory_region(mr_name)
+                self.peer_context.unregister_memory_region(mr_name)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("unregister_memory_region(%s) failed: %s", mr_name, exc)
         self._registered_mrs.clear()
