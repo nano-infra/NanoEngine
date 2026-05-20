@@ -1,7 +1,6 @@
 import atexit
 import json
 import os
-import pickle
 import time
 import uuid
 from collections import deque
@@ -151,20 +150,19 @@ class LLMEngine:
         """Get peer agent addresses from all workers."""
         return self.executor.get_peer_agent_addrs()
 
-    def pull_and_apply_weights(
-        self, manifest_blob: bytes, train_alias: str
-    ) -> list[dict]:
+    def pull_and_apply_weights(self, manifest, train_alias: str) -> list[dict]:
         """Fast path: each worker pulls its own copy from ``train_alias`` in
         parallel via RDMA, then applies in place.
 
-        ``manifest_blob`` is a pickled ``WeightManifest`` (see
-        ``nanorl.weights.transport``). The train side must have already
+        ``manifest`` is a small ``WeightManifest`` object. Ray/DLSlimeRPC
+        serialize the method argument; the train side must have already
         registered the corresponding MRs.
         """
         manifest_version = None
         try:
-            manifest_version = getattr(pickle.loads(manifest_blob), "version", None)
-        except Exception:
+            raw_version = getattr(manifest, "version", None)
+            manifest_version = int(raw_version) if raw_version is not None else None
+        except (TypeError, ValueError):
             logger.warning("failed to decode weight manifest version", exc_info=True)
 
         barrier = (
@@ -175,7 +173,7 @@ class LLMEngine:
         with barrier as barrier_wait_s:
             stats = self.executor.collective_rpc(
                 "pull_and_apply_weights",
-                (manifest_blob, train_alias),
+                (manifest, train_alias),
             )
             if manifest_version is not None:
                 self.weight_version = int(manifest_version)

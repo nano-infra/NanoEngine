@@ -398,10 +398,10 @@ class ModelRunner:
             raise RuntimeError("ModelRunner WeightUpdateEngine is not initialized")
         return self.weight_update_engine.apply_named_tensors(named_tensors)
 
-    def pull_and_apply_weights(self, manifest_blob: bytes, train_alias: str) -> dict:
+    def pull_and_apply_weights(self, manifest, train_alias: str) -> dict:
         if self.weight_update_engine is None:
             raise RuntimeError("ModelRunner WeightUpdateEngine is not initialized")
-        return self.weight_update_engine.pull_and_apply(manifest_blob, train_alias)
+        return self.weight_update_engine.pull_and_apply(manifest, train_alias)
 
     def allocate_kvcache(self, num_kvcache_blocks: int):
         self.config.num_kvcache_blocks = num_kvcache_blocks

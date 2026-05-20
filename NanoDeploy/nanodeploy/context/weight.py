@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import pickle
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -265,10 +264,13 @@ class WeightUpdateEngine:
     def apply_context(self, *, sync: bool = True) -> dict[str, int]:
         return self.apply_named_tensors(self.weight_context.named_tensors(), sync=sync)
 
-    def pull_into_context(
-        self, manifest_blob: bytes, train_alias: str
-    ) -> dict[str, Any]:
-        manifest = pickle.loads(manifest_blob)
+    def pull_into_context(self, manifest, train_alias: str) -> dict[str, Any]:
+        if train_alias != manifest.train_alias:
+            logger.warning(
+                "weight manifest train_alias=%s differs from RPC train_alias=%s",
+                manifest.train_alias,
+                train_alias,
+            )
         t0 = time.monotonic()
         self.weight_context.pull_named_tensors_via_rdma(train_alias, manifest)
         pull_s = time.monotonic() - t0
@@ -278,9 +280,9 @@ class WeightUpdateEngine:
             "pull_s": pull_s,
         }
 
-    def pull_and_apply(self, manifest_blob: bytes, train_alias: str) -> dict[str, Any]:
+    def pull_and_apply(self, manifest, train_alias: str) -> dict[str, Any]:
         """RDMA-pull a weight manifest from train side and hot-load it."""
-        pull_stats = self.pull_into_context(manifest_blob, train_alias)
+        pull_stats = self.pull_into_context(manifest, train_alias)
         t0 = time.monotonic()
         try:
             counts = self.apply_context()
