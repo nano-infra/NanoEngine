@@ -7,6 +7,7 @@ from collections import defaultdict
 import torch
 
 from nanodeploy.context.cache import get_cache_context
+from nanodeploy.context.peer_agent import PeerAgentContext
 from nanodeploy.logging import get_logger
 
 logger = get_logger("NANODEPLOY")
@@ -17,7 +18,11 @@ class VisionEmbedManager:
 
     def __init__(self, hf_config):
         self.hf_config = hf_config
+        self.peer_agent_context: PeerAgentContext | None = None
         self._vision_embeds: dict[str, torch.Tensor] | None = None
+
+    def set_peer_agent_context(self, peer_agent_context: PeerAgentContext) -> None:
+        self.peer_agent_context = peer_agent_context
 
     @property
     def has_embeds(self) -> bool:
@@ -93,10 +98,10 @@ class VisionEmbedManager:
             return
 
         cache_ctx = get_cache_context()
-        peer_agent = cache_ctx._peer_agent
-        if peer_agent is None:
+        if self.peer_agent_context is None:
             logger.warning("PeerAgent not available, cannot RDMA-fetch vision embeds")
             return
+        peer_agent = self.peer_agent_context.agent
 
         from nanodeploy.context.embedding_pool import _VISION_EMBED_BUFFER_ID
 
@@ -138,15 +143,8 @@ class VisionEmbedManager:
                 )
                 peer_alias = f"{encoder_id}:0"
 
-            # Ensure connection
-            if peer_alias not in cache_ctx._connected_peers:
-                conn = cache_ctx._peer_agent.connect_to(
-                    peer_alias,
-                    ib_port=cache_ctx._peer_agent_ib_port,
-                    qp_num=cache_ctx._peer_agent_qp_num,
-                )
-                conn.wait(timeout=30)
-                cache_ctx._connected_peers.add(peer_alias)
+            # Ensure connection through the worker-owned PeerAgentContext.
+            self.peer_agent_context.ensure_connected(peer_alias)
 
             # Get remote MR info for vision_embed buffer
             remote_mr_info = peer_agent.get_mr_info(peer_alias, _VISION_EMBED_BUFFER_ID)

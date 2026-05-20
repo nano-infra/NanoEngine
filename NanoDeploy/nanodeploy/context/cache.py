@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from nanodeploy.context.distributed import get_dist_context
+from nanodeploy.context.peer_agent import PeerAgentContext
 from nanodeploy.logging import get_logger
 
 logger = get_logger("nanodeploy")
@@ -71,6 +72,7 @@ class CacheContext:
     )
     nanoctrl_scope: str | None = None  # Scope for multi-tenant isolation
     engine_id: str | None = None  # Engine ID for agent naming (format: EngineName:rank)
+    peer_agent_context: PeerAgentContext | None = None
     # If nanoctrl_address is provided, engine_id will be fetched from NanoCtrl instead of config
 
     @property
@@ -178,11 +180,6 @@ class CacheContext:
         self.remote_dsv4_max_slots: dict[str, int] = {}
         # remote_dsv4_num_layers_per_ratio[engine_id][ratio] = num layers using that ratio
         self.remote_dsv4_num_layers_per_ratio: dict[str, dict[int, int]] = {}
-        self._peer_agent = None
-        self._peer_agent_addr: str | None = None
-        self._peer_agent_ib_port: int = 1
-        self._peer_agent_qp_num: int = 1
-        self._connected_peers: set[str] = set()  # track connected peer addresses
         self._local_mr_handler: int | None = None  # local MR handler for kv_cache
         self._local_gdn_conv_mr_handler: int | None = None
         self._local_gdn_recurrent_mr_handler: int | None = None
@@ -710,47 +707,27 @@ class CacheContext:
             f"{slot_info}"
         )
 
-    def start_peer_agent(self, mode: str = "hybrid"):
-        """Start PeerAgent and register memory regions for RDMA.
+    def set_peer_agent_context(self, peer_context: PeerAgentContext | None) -> None:
+        """Attach the worker-owned PeerAgentContext to cache RDMA users."""
+        self.peer_agent_context = peer_context
+
+    def register_peer_agent_memory_regions(self, mode: str = "hybrid") -> None:
+        """Register cache-owned RDMA memory regions on the attached PeerAgent.
 
         Must be called AFTER allocate_kvcache() and allocate_gdn_states() so that
-        all tensors exist before registration.
-
-        In hybrid mode the PeerAgent is still started (needed for RDMA-fetching
-        vision embeddings from the encoder), but KV cache / GDN MR registration
-        is skipped because hybrid mode does not perform P2P KV transfer.
+        all tensors exist before registration. In hybrid mode the PeerAgent is
+        still alive, but KV cache / GDN MR registration is skipped because
+        hybrid mode does not perform P2P KV transfer.
         """
-        if self.nanoctrl_address is None or self.engine_id is None:
+        peer_context = self.peer_agent_context
+        if peer_context is None:
             return
 
-        start_peer_agent_fn = getattr(dlslime, "start_peer_agent", None)
-        if not callable(start_peer_agent_fn):
-            return
-
-        rank = dist.get_rank()
-        agent_alias = f"{self.engine_id}:{rank}"
-
-        server_url = self.nanoctrl_address
-        if not server_url.startswith("http://") and not server_url.startswith(
-            "https://"
-        ):
-            server_url = f"http://{server_url}"
+        agent_alias = peer_context.alias
+        server_url = peer_context.server_url
+        peer_agent = peer_context.agent
 
         try:
-            available_nics = dlslime.available_nic()
-            if not available_nics:
-                raise RuntimeError("No available NICs found")
-            device = available_nics[get_dist_context().local_rank % len(available_nics)]
-            self._peer_agent = start_peer_agent_fn(
-                nanoctrl_url=server_url,
-                alias=agent_alias,
-                device=device,
-                scope=self.nanoctrl_scope,
-            )
-            self._peer_agent_ib_port = 1
-            self._peer_agent_qp_num = int(os.environ.get("SLIME_QP_NUM", 1))
-            self._peer_agent_addr = agent_alias
-
             # In hybrid mode we only need the PeerAgent alive (for vision
             # embed RDMA fetch); KV cache / GDN MR registration is not needed.
             if mode == "hybrid":
@@ -762,7 +739,7 @@ class CacheContext:
 
             # Register KV cache
             kv_size = self.kv_cache.numel() * self.kv_cache.itemsize
-            self._local_mr_handler = self._peer_agent.register_memory_region(
+            self._local_mr_handler = peer_agent.register_memory_region(
                 _KV_CACHE_BUFFER_ID,
                 self.kv_cache.data_ptr(),
                 int(self.kv_cache.storage_offset()),
@@ -779,20 +756,18 @@ class CacheContext:
                 and self.gdn_recurrent_states is not None
             ):
                 conv_size = self.gdn_conv_states.numel() * self.gdn_conv_states.itemsize
-                self._local_gdn_conv_mr_handler = (
-                    self._peer_agent.register_memory_region(
-                        "gdn_conv",
-                        self.gdn_conv_states.data_ptr(),
-                        int(self.gdn_conv_states.storage_offset()),
-                        conv_size,
-                    )
+                self._local_gdn_conv_mr_handler = peer_agent.register_memory_region(
+                    "gdn_conv",
+                    self.gdn_conv_states.data_ptr(),
+                    int(self.gdn_conv_states.storage_offset()),
+                    conv_size,
                 )
                 recurrent_size = (
                     self.gdn_recurrent_states.numel()
                     * self.gdn_recurrent_states.itemsize
                 )
                 self._local_gdn_recurrent_mr_handler = (
-                    self._peer_agent.register_memory_region(
+                    peer_agent.register_memory_region(
                         "gdn_recurrent",
                         self.gdn_recurrent_states.data_ptr(),
                         int(self.gdn_recurrent_states.storage_offset()),
@@ -808,25 +783,23 @@ class CacheContext:
             if self.indexer_cache is not None:
                 indexer_buf = self.indexer_cache.buffer
                 indexer_size = indexer_buf.numel() * indexer_buf.itemsize
-                self._local_indexer_mr_handler = (
-                    self._peer_agent.register_memory_region(
-                        "indexer_cache",
-                        indexer_buf.data_ptr(),
-                        0,
-                        indexer_size,
-                    )
+                self._local_indexer_mr_handler = peer_agent.register_memory_region(
+                    "indexer_cache",
+                    indexer_buf.data_ptr(),
+                    0,
+                    indexer_size,
                 )
                 logger.info(
                     f"Registered IndexerCache MR: handler={self._local_indexer_mr_handler}"
                 )
 
             # DSv4 (S2.4): register flat per-ratio compressed cache + compressor
-            # state buffers — one MR per ratio per kind.  Skipped in hybrid mode
+            # state buffers — one MR per ratio per kind. Skipped in hybrid mode
             # via the same outer guard that protects KV/GDN registration.
             for ratio, buf in (
                 getattr(self, "dsv4_compressed_caches_flat", None) or {}
             ).items():
-                handler = self._peer_agent.register_memory_region(
+                handler = peer_agent.register_memory_region(
                     f"dsv4_compressed_r{ratio}",
                     buf.data_ptr(),
                     int(buf.storage_offset()),
@@ -842,7 +815,7 @@ class CacheContext:
                 getattr(self, "dsv4_compressor_kv_flat", None) or {}
             ).items():
                 self._local_dsv4_compressor_kv_mr_handlers[ratio] = (
-                    self._peer_agent.register_memory_region(
+                    peer_agent.register_memory_region(
                         f"dsv4_compressor_kv_r{ratio}",
                         buf.data_ptr(),
                         int(buf.storage_offset()),
@@ -853,7 +826,7 @@ class CacheContext:
                 getattr(self, "dsv4_compressor_score_flat", None) or {}
             ).items():
                 self._local_dsv4_compressor_score_mr_handlers[ratio] = (
-                    self._peer_agent.register_memory_region(
+                    peer_agent.register_memory_region(
                         f"dsv4_compressor_score_r{ratio}",
                         buf.data_ptr(),
                         int(buf.storage_offset()),
@@ -864,7 +837,7 @@ class CacheContext:
                 getattr(self, "dsv4_compressor_counts_flat", None) or {}
             ).items():
                 self._local_dsv4_compressor_counts_mr_handlers[ratio] = (
-                    self._peer_agent.register_memory_region(
+                    peer_agent.register_memory_region(
                         f"dsv4_compressor_counts_r{ratio}",
                         buf.data_ptr(),
                         int(buf.storage_offset()),
@@ -880,12 +853,27 @@ class CacheContext:
                 )
 
         except Exception as e:
-            logger.error(f"Failed to start PeerAgent: {e}")
+            logger.error(f"Failed to register PeerAgent memory regions: {e}")
             raise
 
     def get_peer_agent_addr(self) -> str | None:
         """Return the local peer agent address for this rank."""
-        return self._peer_agent_addr
+        return (
+            None if self.peer_agent_context is None else self.peer_agent_context.alias
+        )
+
+    def get_peer_agent_context(self) -> PeerAgentContext:
+        """Return the attached worker-owned PeerAgentContext."""
+        if self.peer_agent_context is None:
+            raise RuntimeError(
+                "CacheContext PeerAgentContext is not attached. "
+                "Was ModelRunner PeerAgentContext initialized?"
+            )
+        return self.peer_agent_context
+
+    def ensure_peer_agent_connected(self, peer_alias: str) -> None:
+        """Ensure the local PeerAgent is connected to ``peer_alias``."""
+        self.get_peer_agent_context().ensure_connected(peer_alias)
 
     def invalidate_engine_info_cache(self):
         """Invalidate the engine_info cache to force a refresh on next fetch."""
@@ -1015,6 +1003,7 @@ class CacheContext:
                                           max_num_seqs, gdn_num_slots)
         """
         remote_peers_to_connect: dict[str, str] = {}
+        peer_context = self.get_peer_agent_context()
         for (
             peer_alias,
             engine_id,
@@ -1022,7 +1011,7 @@ class CacheContext:
             max_num_seqs,
             gdn_num_slots,
         ) in connection_requests:
-            if peer_alias and peer_alias not in self._connected_peers:
+            if peer_alias and not peer_context.is_connected(peer_alias):
                 self.num_remote_kvcache_blocks[engine_id] = num_kvcache_blocks
                 self.remote_max_num_seqs[engine_id] = max_num_seqs
                 if gdn_num_slots > 0:
@@ -1034,18 +1023,8 @@ class CacheContext:
 
         new_peers = list(remote_peers_to_connect.keys())
         logger.info(f"Batch connecting to {len(new_peers)} peers: {new_peers}")
-        pending_conns = [
-            self._peer_agent.connect_to(
-                peer,
-                ib_port=self._peer_agent_ib_port,
-                qp_num=self._peer_agent_qp_num,
-            )
-            for peer in new_peers
-        ]
-        for conn in pending_conns:
-            conn.wait(timeout=30)
-        self._connected_peers.update(new_peers)
-        logger.info(f"Batch connection completed for {len(new_peers)} peers")
+        connected = peer_context.ensure_many_connected(new_peers)
+        logger.info(f"Batch connection completed for {len(connected)} peers")
 
     def _execute_rdma_reads(
         self,
@@ -1069,20 +1048,20 @@ class CacheContext:
             compressor_state_assigns: engine_id -> peer_alias -> list of
                                 (ratio, ratio_layer_idx, remote_state_slot, local_state_slot)
         """
+        peer_context = self.get_peer_agent_context()
+        peer_agent = peer_context.agent
         for engine_id, peer_assigns in assigns.items():
             for peer_alias, assign_batch in peer_assigns.items():
-                if peer_alias not in self._connected_peers:
+                if not peer_context.is_connected(peer_alias):
                     logger.error(f"Peer {peer_alias} not connected, skipping")
                     continue
 
-                remote_mr_info = self._peer_agent.get_mr_info(
-                    peer_alias, _KV_CACHE_BUFFER_ID
-                )
+                remote_mr_info = peer_agent.get_mr_info(peer_alias, _KV_CACHE_BUFFER_ID)
                 if remote_mr_info is None:
                     logger.error(f"Failed to get MR info for {peer_alias}")
                     continue
 
-                remote_mr_handler = self._peer_agent.register_remote_memory_region(
+                remote_mr_handler = peer_agent.register_remote_memory_region(
                     peer_alias,
                     _KV_CACHE_BUFFER_ID,
                     remote_mr_info,
@@ -1099,7 +1078,7 @@ class CacheContext:
                     continue
                 local_mr_handler = self._local_mr_handler
 
-                endpoint = self._peer_agent.get_endpoint(peer_alias)
+                endpoint = peer_agent.get_endpoint(peer_alias)
                 if endpoint is None:
                     logger.error(f"Failed to get endpoint for {peer_alias}")
                     continue
@@ -1151,11 +1130,9 @@ class CacheContext:
                     and self.gdn_recurrent_states is not None
                 ):
                     # Conv state
-                    remote_conv_mr_info = self._peer_agent.get_mr_info(
-                        peer_alias, "gdn_conv"
-                    )
+                    remote_conv_mr_info = peer_agent.get_mr_info(peer_alias, "gdn_conv")
                     if remote_conv_mr_info:
-                        remote_conv_mr = self._peer_agent.register_remote_memory_region(
+                        remote_conv_mr = peer_agent.register_remote_memory_region(
                             peer_alias, "gdn_conv", remote_conv_mr_info
                         )
                         local_conv_mr = self._local_gdn_conv_mr_handler
@@ -1178,11 +1155,11 @@ class CacheContext:
                         )
 
                     # Recurrent state
-                    remote_rec_mr_info = self._peer_agent.get_mr_info(
+                    remote_rec_mr_info = peer_agent.get_mr_info(
                         peer_alias, "gdn_recurrent"
                     )
                     if remote_rec_mr_info:
-                        remote_rec_mr = self._peer_agent.register_remote_memory_region(
+                        remote_rec_mr = peer_agent.register_remote_memory_region(
                             peer_alias, "gdn_recurrent", remote_rec_mr_info
                         )
                         local_rec_mr = self._local_gdn_recurrent_mr_handler
@@ -1219,7 +1196,7 @@ class CacheContext:
                         )
                         if local_handler is None:
                             continue
-                        remote_info = self._peer_agent.get_mr_info(
+                        remote_info = peer_agent.get_mr_info(
                             peer_alias, f"dsv4_compressed_r{ratio}"
                         )
                         if not remote_info:
@@ -1227,7 +1204,7 @@ class CacheContext:
                                 f"Failed to get DSv4 compressed MR info for {peer_alias}, ratio={ratio}"
                             )
                             continue
-                        remote_handler = self._peer_agent.register_remote_memory_region(
+                        remote_handler = peer_agent.register_remote_memory_region(
                             peer_alias,
                             f"dsv4_compressed_r{ratio}",
                             remote_info,
@@ -1265,18 +1242,14 @@ class CacheContext:
                             if local_handler is None:
                                 continue
                             mr_name = f"dsv4_compressor_{kind}_r{ratio}"
-                            remote_info = self._peer_agent.get_mr_info(
-                                peer_alias, mr_name
-                            )
+                            remote_info = peer_agent.get_mr_info(peer_alias, mr_name)
                             if not remote_info:
                                 logger.warning(
                                     f"Failed to get {mr_name} MR info for {peer_alias}"
                                 )
                                 continue
-                            remote_handler = (
-                                self._peer_agent.register_remote_memory_region(
-                                    peer_alias, mr_name, remote_info
-                                )
+                            remote_handler = peer_agent.register_remote_memory_region(
+                                peer_alias, mr_name, remote_info
                             )
                             row_bytes = self._compressor_state_row_bytes(ratio, kind)
                             for rli, rslot, lslot in ops:
@@ -1299,14 +1272,12 @@ class CacheContext:
                     (indexer_assigns or {}).get(engine_id, {}).get(peer_alias, [])
                 )
                 if indexer_batch and self.indexer_cache is not None:
-                    remote_indexer_mr_info = self._peer_agent.get_mr_info(
+                    remote_indexer_mr_info = peer_agent.get_mr_info(
                         peer_alias, "indexer_cache"
                     )
                     if remote_indexer_mr_info:
-                        remote_indexer_mr = (
-                            self._peer_agent.register_remote_memory_region(
-                                peer_alias, "indexer_cache", remote_indexer_mr_info
-                            )
+                        remote_indexer_mr = peer_agent.register_remote_memory_region(
+                            peer_alias, "indexer_cache", remote_indexer_mr_info
                         )
                         local_indexer_mr = self._local_indexer_mr_handler
                         page_bytes = self.indexer_page_num_bytes()
@@ -1357,7 +1328,7 @@ class CacheContext:
 
         views = parse_migrate_batch(data)
 
-        if self._peer_agent is None:
+        if self.peer_agent_context is None:
             logger.error("migrate_from_bytes called but PeerAgent not initialized")
             return
 

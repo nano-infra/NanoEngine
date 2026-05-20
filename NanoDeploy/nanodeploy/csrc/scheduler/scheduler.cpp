@@ -576,7 +576,9 @@ void Scheduler::postprocess_worker_func(std::shared_ptr<GroupManager>   state_ma
                 seq->set_status(SequenceStatus::RUNNING);
             }
 
-            for (int token_id : *task.tokens) {
+            const size_t n_tokens = task.tokens->size();
+            for (size_t ti = 0; ti < n_tokens; ++ti) {
+                int token_id = (*task.tokens)[ti];
 
                 int master_group_id = seq->block_ctx().master_group_id;
                 if (task.group_id != master_group_id) {
@@ -585,7 +587,11 @@ void Scheduler::postprocess_worker_func(std::shared_ptr<GroupManager>   state_ma
                                              + " for seq_id=" + std::to_string(seq->seq_id()));
                 }
 
-                seq->append_token(token_id, BlockContextSlot::ACTIVE, task.group_id);
+                std::optional<float> lp = std::nullopt;
+                if (task.logprobs && ti < task.logprobs->size()) {
+                    lp = (*task.logprobs)[ti];
+                }
+                seq->append_token(token_id, BlockContextSlot::ACTIVE, task.group_id, lp);
                 state_manager->add_running_tokens(task.group_id, 1);
 
                 if (update_metrics && seq->metric) {
@@ -636,8 +642,11 @@ PostprocessResult
 Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_group_seqs,
                                       const std::vector<std::vector<std::vector<int>>>&          dp_group_token_ids,
                                       bool                                                       is_prefill,
-                                      bool                                                       update_metrics)
+                                      bool                                                       update_metrics,
+                                      const std::vector<std::vector<std::vector<float>>>& dp_group_token_logprobs)
 {
+    const bool have_logprobs =
+        !dp_group_token_logprobs.empty() && dp_group_token_logprobs.size() == dp_group_token_ids.size();
     size_t num_dp    = worker_state.size();
     size_t num_dp_sp = dp_group_seqs.size();
     if (num_dp == 0)
@@ -668,8 +677,21 @@ Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_
 
             size_t batch_size = batch_seqs.size();
 
+            const std::vector<std::vector<float>>* batch_lp_ptr = nullptr;
+            if (have_logprobs) {
+                const auto& batch_lp = dp_group_token_logprobs[idx];
+                if (batch_lp.size() >= batch_size) {
+                    batch_lp_ptr = &batch_lp;
+                }
+            }
+
             for (size_t i = 0; i < batch_size; ++i) {
-                ctx.tasks.push_back({batch_seqs[i], &batch_tokens[i], (int)group_id});
+                PostprocessTask t;
+                t.seq      = batch_seqs[i];
+                t.tokens   = &batch_tokens[i];
+                t.group_id = static_cast<int>(group_id);
+                t.logprobs = batch_lp_ptr ? &(*batch_lp_ptr)[i] : nullptr;
+                ctx.tasks.push_back(std::move(t));
             }
         }
     }
@@ -728,9 +750,11 @@ Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_
 
 void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_group_seqs,
                             const std::vector<std::vector<std::vector<int>>>&          dp_group_token_ids,
-                            bool                                                       update_metrics)
+                            bool                                                       update_metrics,
+                            const std::vector<std::vector<std::vector<float>>>&        dp_group_token_logprobs)
 {
-    auto result = postprocess_sequences_impl(dp_group_seqs, dp_group_token_ids, mode_ == "prefill", update_metrics);
+    auto result = postprocess_sequences_impl(
+        dp_group_seqs, dp_group_token_ids, mode_ == "prefill", update_metrics, dp_group_token_logprobs);
 
     // Store migrations
     for (const auto& [seq_shared, dp_idx] : result.migrations) {

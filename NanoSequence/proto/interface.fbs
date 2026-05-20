@@ -40,11 +40,28 @@ table SequenceInput {
   temperature: double = 1.0;         // sampling temperature
   vision_slots: [VisionSlotRef];     // vision embedding refs (prefill only, EP mode)
   compressed_block_tables: [CompressedBlockTableI];  // DSv4: per-ratio compressed pages
+  // Mirror of SamplingParams.return_completion_logprobs so the worker knows
+  // whether to compute and ship per-token logprobs at sample time.
+  // Append-only — defaults to false on legacy buffers.
+  return_completion_logprobs: bool = false;
 }
 
 table RunBatchInput {
   sequences: [SequenceInput];
   is_prefill: bool;
+}
+
+// Per-sequence model runner output. token_ids contains the sampled tokens for
+// this execution bundle; logprobs is parallel to token_ids when
+// return_completion_logprobs was requested, otherwise absent/empty.
+table RunSequenceOutput {
+  token_ids: [int];
+  logprobs: [float];
+}
+
+table RunBatchOutput {
+  sequences: [RunSequenceOutput];
+  has_logprobs: bool = false;
 }
 
 // ========== Migrate Protocol ==========

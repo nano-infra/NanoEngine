@@ -27,8 +27,7 @@ dependencies = [
     "uvloop>=0.21.0",
     "ray>=2.50.1",
     "transformers>=4.51.0",
-    "dlslime>=0.1.0.post2",
-    "nanoctrl>=0.1.0.post2",
+    "dlslime>=0.1.0.post1",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

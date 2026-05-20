@@ -94,6 +94,8 @@ from nanodeploy.context.distributed import (
     set_dist_context,
 )
 from nanodeploy.context.expert_context import ExpertContext
+from nanodeploy.context.peer_agent import PeerAgentContext
+from nanodeploy.context.weight import WeightContext, WeightUpdateEngine
 from nanodeploy.layers.sampler import Sampler
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
@@ -158,6 +160,9 @@ class ModelRunner:
         self._dlslime_alias = None
         self._dlslime_thread = None
         self._dlslime_peer = None
+        self.peer_agent_context = None
+        self.weight_context = None
+        self.weight_update_engine = None
 
         # Sync C++ Sequence.block_size with Python kvcache_block_size
         from nanodeploy._cpp import Sequence as _Seq
@@ -222,8 +227,14 @@ class ModelRunner:
         hf_config = config.hf_config
         rank = self.rank
 
-        torch.manual_seed(0)
-        torch.cuda.manual_seed_all(0)
+        # Per-rank RNG seed. With DP>1, seeding all replicas with the
+        # same value makes ``torch.empty_like(...).exponential_(1)`` in
+        # the sampler produce byte-identical Gumbel noise on every rank
+        # — n>1 sampling collapses to n=1, GRPO advantages become 0,
+        # training stalls. Use ``rank`` so each replica has its own
+        # stream while the same job is still reproducible from seed 0.
+        torch.manual_seed(rank)
+        torch.cuda.manual_seed_all(rank)
 
         torch.cuda.set_device(0)
 
@@ -366,6 +377,8 @@ class ModelRunner:
 
         dist.barrier()
 
+        self.weight_context = WeightContext()
+        self.weight_update_engine = WeightUpdateEngine(self.model, self.weight_context)
         self.sampler = Sampler()
         self.input_preparer = InputPreparer(config)
         self.vision_manager = VisionEmbedManager(hf_config)
@@ -377,6 +390,18 @@ class ModelRunner:
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
+
+    def apply_weight_update(
+        self, named_tensors: dict[str, torch.Tensor]
+    ) -> dict[str, int]:
+        if self.weight_update_engine is None:
+            raise RuntimeError("ModelRunner WeightUpdateEngine is not initialized")
+        return self.weight_update_engine.apply_named_tensors(named_tensors)
+
+    def pull_and_apply_weights(self, manifest_blob: bytes, train_alias: str) -> dict:
+        if self.weight_update_engine is None:
+            raise RuntimeError("ModelRunner WeightUpdateEngine is not initialized")
+        return self.weight_update_engine.pull_and_apply(manifest_blob, train_alias)
 
     def allocate_kvcache(self, num_kvcache_blocks: int):
         self.config.num_kvcache_blocks = num_kvcache_blocks
@@ -409,10 +434,9 @@ class ModelRunner:
                 if hasattr(module, "indexer") and module.indexer is not None:
                     module.indexer.indexer_cache = cache_context.indexer_cache
 
-        # Start PeerAgent AFTER kv_cache (and GDN states) are allocated,
-        # so that all tensors exist for RDMA memory region registration.
-        # In hybrid mode, PeerAgent is started but KV/GDN MR is skipped.
-        cache_context.start_peer_agent(mode=self.config.mode)
+        # Register memory regions after KV/indexer tensors exist. The PeerAgent
+        # itself is started during preallocate_kvcache().
+        cache_context.register_peer_agent_memory_regions(mode=self.config.mode)
 
         if not self.enforce_eager:
             self._init_graph_runners()
@@ -667,6 +691,20 @@ class ModelRunner:
                 need_backup=config.num_speculative_tokens > 0,
             )
 
+        self._init_peer_agent_context(cache_context)
+
+    def _init_peer_agent_context(self, cache_context):
+        """Start the worker-owned PeerAgent and inject it into RDMA users."""
+        self.peer_agent_context = PeerAgentContext.start_for_cache_context(
+            cache_context,
+            rank=dist.get_rank(),
+        )
+        cache_context.set_peer_agent_context(self.peer_agent_context)
+        if self.weight_context is not None:
+            self.weight_context.set_peer_agent_context(self.peer_agent_context)
+        if self.peer_agent_context is not None:
+            self.vision_manager.set_peer_agent_context(self.peer_agent_context)
+
     @torch.inference_mode()
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
@@ -736,26 +774,57 @@ class ModelRunner:
         aux,
         num_seqs: int,
         is_prefill: bool,
-    ) -> torch.Tensor:
-        """Standard sampling path (prefill or normal decode without lazy verify)."""
+    ):
+        """Standard sampling path (prefill or normal decode without lazy verify).
+
+        Returns ``(input_ids, logprobs_or_None)`` — when any seq in the
+        batch has ``return_completion_logprobs=True``, ``logprobs`` is a
+        ``[num_seqs]`` float32 tensor of the chosen-token logprobs;
+        otherwise None and the original (compile-cached) forward path is
+        used. The logprob array is TP-all-reduced via a sum (non-rank-0
+        contributes zeros), mirroring the existing input_ids reduction.
+        """
         tp_rank = get_dist_context().attn_tp_rank
+        want_lp = bool(getattr(aux, "any_return_completion_logprobs", False))
+        logprobs = None
         if tp_rank == 0:
             temperatures = prepare_sample_from_aux(aux)
             context = get_context()
             if is_prefill and context.sampling_seq_indices is not None:
                 temps_filtered = temperatures[context.sampling_seq_indices]
-                sampled = self.sampler(logits, temps_filtered)
-                input_ids = input_ids.new_zeros(num_seqs)
-                input_ids[context.sampling_seq_indices] = sampled
+                if want_lp:
+                    sampled, lp_filtered = self.sampler.forward_with_logprobs(
+                        logits, temps_filtered
+                    )
+                    input_ids = input_ids.new_zeros(num_seqs)
+                    input_ids[context.sampling_seq_indices] = sampled
+                    logprobs = torch.zeros(num_seqs, dtype=torch.float32, device="cuda")
+                    logprobs[context.sampling_seq_indices] = lp_filtered.float()
+                else:
+                    sampled = self.sampler(logits, temps_filtered)
+                    input_ids = input_ids.new_zeros(num_seqs)
+                    input_ids[context.sampling_seq_indices] = sampled
             else:
-                input_ids = self.sampler(logits, temperatures)
+                if want_lp:
+                    input_ids, logprobs = self.sampler.forward_with_logprobs(
+                        logits, temperatures
+                    )
+                    logprobs = logprobs.float()
+                else:
+                    input_ids = self.sampler(logits, temperatures)
         else:
             input_ids = input_ids.new_zeros([num_seqs])
+            if want_lp:
+                logprobs = torch.zeros(num_seqs, dtype=torch.float32, device="cuda")
         dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
-        return input_ids
+        if want_lp:
+            # Sum-reduce: non-rank-0 contributed zeros so this recovers the
+            # rank-0 value exactly. Float32 keeps precision intact.
+            dist.all_reduce(logprobs, group=get_dist_context().attn_tp_group)
+        return input_ids, logprobs
 
     @torch.inference_mode()
-    def run_from_bytes(self, data: bytes, is_prefill: bool) -> list[list[int]]:
+    def run_from_bytes(self, data: bytes, is_prefill: bool):
         """Run model from lean RunBatchInput bytes (completely Sequence-free)."""
         _rcfg = get_runner_config()
         _timing = _rcfg.step_timing
@@ -858,13 +927,14 @@ class ModelRunner:
 
             # --- Sampling ---
             num_accepted = None
+            step_logprobs = None  # [num_seqs] float32 when shipping logprobs
             if not is_prefill and has_lazy_verify:
                 num_accepted = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
                 input_ids = self.mtp_worker.lazy_verify_sample(
                     logits, aux, num_seqs, num_accepted
                 )
             else:
-                input_ids = self._standard_sample(
+                input_ids, step_logprobs = self._standard_sample(
                     logits, input_ids, aux, num_seqs, is_prefill
                 )
             if _timer is not None and i == 0:
@@ -893,12 +963,32 @@ class ModelRunner:
 
             self.run_count += 1
             get_context().token_ids.append(input_ids[None, ...])
+            if step_logprobs is not None:
+                # Lazy-init the per-step list on first appearance — context
+                # is reset per step bundle. ``step_logprobs`` shape is
+                # [num_seqs] float32 (zero on non-rank-0 / non-sampled seqs).
+                ctx = get_context()
+                if not hasattr(ctx, "step_logprobs") or ctx.step_logprobs is None:
+                    ctx.step_logprobs = []
+                ctx.step_logprobs.append(step_logprobs[None, ...])
 
         # --- Build output ---
+        # ``logprobs_per_seq`` is ``list[list[float]]`` parallel to ``result``
+        # when shipping logprobs is enabled; None otherwise. Engine-server
+        # serializes both into StepOut.
+        ctx = get_context()
+        logprobs_per_seq = None
+        if getattr(ctx, "step_logprobs", []):
+            logprobs_per_seq = torch.cat(ctx.step_logprobs, dim=0).T.tolist()
         if self.mtp_worker is not None:
             result = self.mtp_worker.build_output_tokens(self.rank)
         else:
-            result = torch.cat(get_context().token_ids, dim=0).T.tolist()
+            result = torch.cat(ctx.token_ids, dim=0).T.tolist()
+        # Keep wire compat: return bare list when no logprobs were requested,
+        # tuple ``(tokens, logprobs)`` when they were. Engine-side decoder
+        # normalises both shapes.
+        if logprobs_per_seq is not None:
+            result = (result, logprobs_per_seq)
         reset_context()
         if _timer is not None:
             _timer.mark("tail")

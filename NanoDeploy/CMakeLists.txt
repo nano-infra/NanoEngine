@@ -25,6 +25,7 @@ add_subdirectory(nanodeploy/csrc)
 # Python Flatbuffers Generation
 set(SEQUENCE_PROTO "${NANOINFRA_DIR}/NanoSequence/proto/sequence.fbs")
 set(PACKET_PROTO "${NANOINFRA_DIR}/NanoSequence/proto/packet.fbs")
+set(INTERFACE_PROTO "${NANOINFRA_DIR}/NanoSequence/proto/interface.fbs")
 set(FBS_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nanodeploy/fbs")
 
 # Find flatc (target from third_party)
@@ -32,7 +33,7 @@ if(NOT TARGET flatc)
     message(FATAL_ERROR "flatc target not found. Ensure third_party/flatbuffers is included.")
 endif()
 
-# List all expected generated Python files from sequence.fbs + packet.fbs
+# List all expected generated Python files from sequence.fbs + packet.fbs + interface.fbs
 set(FBS_GENERATED_FILES
     # From sequence.fbs
     "${FBS_OUTPUT_DIR}/SequenceStatus.py"
@@ -47,6 +48,17 @@ set(FBS_GENERATED_FILES
     # From packet.fbs
     "${FBS_OUTPUT_DIR}/Action.py"
     "${FBS_OUTPUT_DIR}/ZmqPacket.py"
+    # From interface.fbs
+    "${FBS_OUTPUT_DIR}/IntListI.py"
+    "${FBS_OUTPUT_DIR}/CompressedBlockTableI.py"
+    "${FBS_OUTPUT_DIR}/VisionSlotRef.py"
+    "${FBS_OUTPUT_DIR}/SequenceInput.py"
+    "${FBS_OUTPUT_DIR}/RunBatchInput.py"
+    "${FBS_OUTPUT_DIR}/RunSequenceOutput.py"
+    "${FBS_OUTPUT_DIR}/RunBatchOutput.py"
+    "${FBS_OUTPUT_DIR}/BlockLocationPair.py"
+    "${FBS_OUTPUT_DIR}/MigrateSequenceInput.py"
+    "${FBS_OUTPUT_DIR}/MigrateBatchInput.py"
     "${FBS_OUTPUT_DIR}/__init__.py"
 )
 
@@ -61,10 +73,11 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E make_directory "${FBS_PYTHON_STAGING}"
     COMMAND $<TARGET_FILE:flatc> --python --gen-object-api -o "${FBS_PYTHON_STAGING}" ${SEQUENCE_PROTO}
     COMMAND $<TARGET_FILE:flatc> --python --gen-object-api -o "${FBS_PYTHON_STAGING}" ${PACKET_PROTO}
+    COMMAND $<TARGET_FILE:flatc> --python --gen-object-api -o "${FBS_PYTHON_STAGING}" ${INTERFACE_PROTO}
     COMMAND ${CMAKE_COMMAND} -E remove_directory "${FBS_OUTPUT_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${FBS_PYTHON_STAGING}/nanodeploy/fbs" "${FBS_OUTPUT_DIR}"
-    DEPENDS flatc ${SEQUENCE_PROTO} ${PACKET_PROTO}
-    COMMENT "Generating Python FlatBuffers bindings from sequence.fbs and packet.fbs"
+    DEPENDS flatc ${SEQUENCE_PROTO} ${PACKET_PROTO} ${INTERFACE_PROTO}
+    COMMENT "Generating Python FlatBuffers bindings from sequence.fbs, packet.fbs, and interface.fbs"
 )
 
 # Create a custom target that depends on the generated files

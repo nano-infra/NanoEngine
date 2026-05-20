@@ -44,6 +44,13 @@ table SamplingParams {
   temperature: double = 1.0;
   max_tokens: int = 256;
   ignore_eos: bool;
+  // When true, the sampler computes log_softmax of the chosen token at each
+  // decode step and the worker ships them through StepOut.logprobs to be
+  // accumulated in Sequence.completion_logprobs. Used by NanoRL to build
+  // honest off-policy importance ratios on the trainer (ratios = exp(
+  // current_logprobs - old_logprobs) where old comes from this field).
+  // Append-only field — defaults to false on legacy buffers.
+  return_completion_logprobs: bool = false;
 }
 
 // Vision embedding slot reference on the encoder side.
@@ -68,6 +75,11 @@ table Sequence {
   token_ids: [int];
   slots: [BlockContext];  // Direct vector - size enforced in C++ code
   vision_slots: [VisionSlot];  // Vision embedding references (EP separated mode)
+  // Per-completion-token logprobs (length == num_completed_tokens, parallel
+  // to the completion slice of token_ids). Populated only when sampling_params
+  // .return_completion_logprobs is true; otherwise empty/absent. Append-only
+  // field — legacy buffers deserialise to an empty vector.
+  completion_logprobs: [float];
 }
 
 table SequenceList {
@@ -79,6 +91,11 @@ table StepOut {
   token_id: uint;  // Deprecated: kept for backward compatibility
   token_ids: [uint];  // New field: supports multiple tokens
   status: SequenceStatus;
+  // Per-token logprobs of the chosen tokens, parallel to token_ids. Populated
+  // only when the sampler is asked to return them (SamplingParams.
+  // return_completion_logprobs=true). Append-only field — legacy buffers
+  // deserialise to an empty vector and the scheduler skips the append.
+  logprobs: [float];
 }
 
 table FreeSequences {

@@ -21,6 +21,32 @@ from nanodeploy.metrics import MetricsManager
 logger = get_logger()
 
 
+def _split_run_result(per_dp_results):
+    """Normalise the executor's per-DP result list.
+
+    Each element is either ``list[list[int]]`` (legacy or logprobs
+    disabled) or ``(list[list[int]], list[list[float]] | None)`` when
+    SamplingParams.return_completion_logprobs is on for any seq in the
+    batch. We return ``(token_ids, logprobs)`` where ``logprobs`` is None
+    iff *no* DP shard shipped logprobs (matches the scheduler's empty
+    fallback that skips Sequence.completion_logprobs population).
+    """
+    token_ids = []
+    logprobs = []
+    any_logprobs = False
+    for r in per_dp_results:
+        if isinstance(r, tuple):
+            ids, lp = r
+            token_ids.append(ids)
+            logprobs.append(lp if lp is not None else [])
+            if lp is not None:
+                any_logprobs = True
+        else:
+            token_ids.append(r)
+            logprobs.append([])
+    return token_ids, (logprobs if any_logprobs else None)
+
+
 def _build_executor(config: Config):
     if config.executor_backend == "ray":
         from nanodeploy.engine.ray_executor import RayExecutor
@@ -110,6 +136,32 @@ class LLMEngine:
     def get_peer_agent_addrs(self) -> list[str]:
         """Get peer agent addresses from all workers."""
         return self.executor.get_peer_agent_addrs()
+
+    def update_weights(self, named_tensors: dict[str, "torch.Tensor"]) -> list[dict]:
+        """Apply HF-named full tensors to the live model on every worker.
+
+        Slow path: the dict is shipped to every worker via Ray RPC. For
+        large models prefer ``pull_and_apply_weights`` which has each
+        worker pull from the train side directly via RDMA.
+        """
+        from nanodeploy.engine.weight_sync import update_weights as _update_weights
+
+        return _update_weights(self.executor, named_tensors)
+
+    def pull_and_apply_weights(
+        self, manifest_blob: bytes, train_alias: str
+    ) -> list[dict]:
+        """Fast path: each worker pulls its own copy from ``train_alias`` in
+        parallel via RDMA, then applies in place.
+
+        ``manifest_blob`` is a pickled ``WeightManifest`` (see
+        ``nanorl.weights.transport``). The train side must have already
+        registered the corresponding MRs.
+        """
+        return self.executor.collective_rpc(
+            "pull_and_apply_weights",
+            (manifest_blob, train_alias),
+        )
 
     def add_request(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):
@@ -217,11 +269,24 @@ class LLMEngine:
 
         # Run prefill to populate KV cache (or skip for decode engine receiving prefill request)
         token_ids = None
+        token_logprobs = None
         if not (is_prefill and self.config.mode == "decode"):
-            # Normal execution: prefill engine runs prefill, or decode engine runs decode
-            token_ids = self.executor.run(dp_group_tp_seqs, is_prefill)[::tp_size]
+            # Normal execution: prefill engine runs prefill, or decode engine runs decode.
+            # Each per-DP result is either ``list[list[int]]`` (legacy /
+            # logprobs disabled) or ``(list[list[int]], list[list[float]])``
+            # when SamplingParams.return_completion_logprobs is on.
+            raw = self.executor.run(dp_group_tp_seqs, is_prefill)[::tp_size]
+            token_ids, token_logprobs = _split_run_result(raw)
             post_sch_begin = time.time()
-            self.scheduler.postprocess(filtered_dp_group_seqs, token_ids, True)
+            if token_logprobs is not None:
+                self.scheduler.postprocess(
+                    filtered_dp_group_seqs,
+                    token_ids,
+                    True,
+                    token_logprobs,
+                )
+            else:
+                self.scheduler.postprocess(filtered_dp_group_seqs, token_ids, True)
             post_sch_end = time.time()
 
         else:

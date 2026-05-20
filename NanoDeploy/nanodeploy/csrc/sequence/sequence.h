@@ -97,9 +97,10 @@ public:
 
     int context_len(BlockContextSlot slot = BlockContextSlot::ACTIVE, std::optional<int> group_id = std::nullopt);
 
-    void append_token(int                token_id,
-                      BlockContextSlot   slot     = BlockContextSlot::ACTIVE,
-                      std::optional<int> group_id = std::nullopt);
+    void append_token(int                  token_id,
+                      BlockContextSlot     slot     = BlockContextSlot::ACTIVE,
+                      std::optional<int>   group_id = std::nullopt,
+                      std::optional<float> logprob  = std::nullopt);
 
     // Block related methods
     int num_blocks(BlockContextSlot slot, int group_id);
@@ -153,7 +154,11 @@ public:
     }
     std::vector<int> prompt_token_ids() const;
     std::vector<int> completion_token_ids() const;
-    int              num_cached_blocks() const
+    // Per-token logprobs of the chosen completion tokens. Length matches
+    // ``completion_token_ids().size()`` when SamplingParams.return_completion_logprobs
+    // is true at sample time; empty otherwise.
+    std::vector<float> completion_logprobs() const;
+    int                num_cached_blocks() const
     {
         return data_->num_cached_tokens / block_size;
     }

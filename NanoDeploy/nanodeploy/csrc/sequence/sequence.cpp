@@ -219,7 +219,10 @@ int Sequence::context_len(BlockContextSlot slot, std::optional<int> group_id)
     return ctx.num_dispatched_tokens[idx];
 }
 
-void Sequence::append_token(int token_id, BlockContextSlot slot, std::optional<int> group_id)
+void Sequence::append_token(int                  token_id,
+                            BlockContextSlot     slot,
+                            std::optional<int>   group_id,
+                            std::optional<float> logprob)
 {
     auto& ctx = block_ctx(slot);
     int   idx = group_id.has_value() ? group_id.value() : ctx.master_group_id;
@@ -231,6 +234,12 @@ void Sequence::append_token(int token_id, BlockContextSlot slot, std::optional<i
         ctx.num_dispatched_tokens.resize(idx + 1, 0);
     }
     ctx.num_dispatched_tokens[idx]++;
+    // Append-only when sampling_params.return_completion_logprobs was set at
+    // request time AND the caller actually supplied a logprob. The two-gate
+    // check makes the field forward-compatible with mixed-version workers.
+    if (logprob.has_value() && data_->sampling_params && data_->sampling_params->return_completion_logprobs) {
+        data_->completion_logprobs.push_back(logprob.value());
+    }
 }
 
 int Sequence::num_blocks(BlockContextSlot slot, int group_id)
@@ -311,6 +320,14 @@ std::vector<int> Sequence::prompt_token_ids() const
     if (data_->num_prompt_tokens > static_cast<int>(data_->token_ids.size()))
         return data_->token_ids;
     return std::vector<int>(data_->token_ids.begin(), data_->token_ids.begin() + data_->num_prompt_tokens);
+}
+
+std::vector<float> Sequence::completion_logprobs() const
+{
+    // The vector grows lazily (one entry per append_token where a logprob
+    // was supplied). Length is therefore <= num_completed_tokens; if the
+    // caller didn't request logprobs at sample time, it stays empty.
+    return data_->completion_logprobs;
 }
 
 std::vector<int> Sequence::completion_token_ids() const

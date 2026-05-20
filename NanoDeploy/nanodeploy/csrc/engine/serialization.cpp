@@ -97,6 +97,9 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
         // temperature from sampling_params
         auto sp = seq->sampling_params();
         si_builder.add_temperature(sp.temperature);
+        // Forward the logprob-shipping flag to the worker so the sampler
+        // knows whether to compute & ship per-token logprobs.
+        si_builder.add_return_completion_logprobs(sp.return_completion_logprobs);
 
         if (vision_slots_off.o != 0) {
             si_builder.add_vision_slots(vision_slots_off);

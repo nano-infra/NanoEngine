@@ -152,6 +152,10 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("dp_seqs"),
              py::arg("dp_token_ids"),
              py::arg("update_metrics") = true,
+             // Per-token logprobs aligned with ``dp_token_ids``. Empty
+             // (default) means the rollout didn't request logprobs and
+             // the scheduler skips populating Sequence.completion_logprobs.
+             py::arg("dp_token_logprobs") = std::vector<std::vector<std::vector<float>>>{},
              py::call_guard<py::gil_scoped_release>())
 
         // State queries
