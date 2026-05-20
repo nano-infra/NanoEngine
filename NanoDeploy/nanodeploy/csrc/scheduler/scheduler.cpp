@@ -80,6 +80,16 @@ void Scheduler::add(std::shared_ptr<Sequence> seq)
     }
 }
 
+void Scheduler::set_admission_paused(bool paused)
+{
+    admission_paused_ = paused;
+}
+
+bool Scheduler::admission_paused() const
+{
+    return admission_paused_;
+}
+
 bool Scheduler::is_finished() const
 {
     const auto& wait_queue = (mode_ != "decode") ? waiting : waiting_migration;
@@ -357,7 +367,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
         }
     }
 
-    while (!waiting_queue.empty()) {
+    while (!admission_paused_ && !waiting_queue.empty()) {
         auto seq       = waiting_queue.front();
         bool scheduled = false;
 

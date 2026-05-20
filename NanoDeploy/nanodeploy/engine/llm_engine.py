@@ -1,8 +1,10 @@
 import atexit
 import json
 import os
+import pickle
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, fields
 from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional, Set
@@ -15,10 +17,15 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from nanodeploy._cpp import BlockContextSlot, init_scheduler, Sequence, SequenceStatus
 
 from nanodeploy.config import Config
+from nanodeploy.engine.weight_sync import WeightUpdateBarrier
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.metrics import MetricsManager
 
 logger = get_logger()
+
+
+class AdmissionPaused(RuntimeError):
+    """Raised when streaming rollout tries to admit during weight update."""
 
 
 def _split_run_result(per_dp_results):
@@ -113,6 +120,13 @@ class LLMEngine:
             f"Initialized Scheduler with RoutingStrategy: {self.scheduler.routing_strategy}"
         )
         self.metrics_manager = MetricsManager()
+        self.weight_barrier = WeightUpdateBarrier()
+        self.weight_version: int = 0
+        self.last_generate_weight_version: int = 0
+        self._streaming_mode = False
+        self._admission_paused = False
+        self._stream_pending = deque()
+        self._seq_policy_version: dict[int, int] = {}
 
         atexit.register(self.exit)
 
@@ -137,17 +151,6 @@ class LLMEngine:
         """Get peer agent addresses from all workers."""
         return self.executor.get_peer_agent_addrs()
 
-    def update_weights(self, named_tensors: dict[str, "torch.Tensor"]) -> list[dict]:
-        """Apply HF-named full tensors to the live model on every worker.
-
-        Slow path: the dict is shipped to every worker via Ray RPC. For
-        large models prefer ``pull_and_apply_weights`` which has each
-        worker pull from the train side directly via RDMA.
-        """
-        from nanodeploy.engine.weight_sync import update_weights as _update_weights
-
-        return _update_weights(self.executor, named_tensors)
-
     def pull_and_apply_weights(
         self, manifest_blob: bytes, train_alias: str
     ) -> list[dict]:
@@ -158,24 +161,150 @@ class LLMEngine:
         ``nanorl.weights.transport``). The train side must have already
         registered the corresponding MRs.
         """
-        return self.executor.collective_rpc(
-            "pull_and_apply_weights",
-            (manifest_blob, train_alias),
+        manifest_version = None
+        try:
+            manifest_version = getattr(pickle.loads(manifest_blob), "version", None)
+        except Exception:
+            logger.warning("failed to decode weight manifest version", exc_info=True)
+
+        barrier = (
+            self.weight_barrier.update_streaming(self)
+            if self._streaming_mode
+            else self.weight_barrier.update()
         )
+        with barrier as barrier_wait_s:
+            stats = self.executor.collective_rpc(
+                "pull_and_apply_weights",
+                (manifest_blob, train_alias),
+            )
+            if manifest_version is not None:
+                self.weight_version = int(manifest_version)
+            else:
+                self.weight_version += 1
+            for row in stats:
+                row.setdefault("version", self.weight_version)
+                row.setdefault("barrier_wait_s", barrier_wait_s)
+        logger.info(
+            "engine.pull_and_apply_weights applied version=%s barrier_wait_s=%.3f",
+            self.weight_version,
+            barrier_wait_s,
+        )
+        return stats
+
+    def get_weight_version(self) -> int:
+        return self.weight_version
+
+    def get_last_generate_weight_version(self) -> int:
+        return self.last_generate_weight_version
+
+    def enter_streaming_mode(self) -> None:
+        self._streaming_mode = True
+
+    def exit_streaming_mode(self) -> None:
+        self._streaming_mode = False
+        self._admission_paused = False
+        set_paused = getattr(self.scheduler, "set_admission_paused", None)
+        if set_paused is not None:
+            set_paused(False)
+        self._stream_pending.clear()
+        self._seq_policy_version.clear()
+        self.weight_barrier.notify_step()
+
+    def is_streaming(self) -> bool:
+        return self._streaming_mode
+
+    def pause_admission(self) -> None:
+        self._admission_paused = True
+        set_paused = getattr(self.scheduler, "set_admission_paused", None)
+        if set_paused is not None:
+            set_paused(True)
+
+    def resume_admission(self) -> None:
+        self._admission_paused = False
+        set_paused = getattr(self.scheduler, "set_admission_paused", None)
+        if set_paused is not None:
+            set_paused(False)
+        self.weight_barrier.notify_step()
+
+    def is_admission_paused(self) -> bool:
+        return self._admission_paused
+
+    def submit_request(self, seqs: Sequence | list[Sequence]) -> None:
+        """Queue streaming requests without assigning a policy version yet.
+
+        The version is stamped when the scheduler first selects the sequence
+        for execution. A waiting request has not consumed model weights, so it
+        should observe whatever version is current when it actually starts.
+        """
+        if self._admission_paused:
+            raise AdmissionPaused("streaming admission is paused for weight update")
+        if isinstance(seqs, Sequence):
+            seqs = [seqs]
+        self._stream_pending.extend(seqs)
+
+    def _add_to_scheduler(self, seq: Sequence) -> None:
+        if self.config.mode == "decode":
+            logger.info(
+                f"[DEBUG] Decode engine received seq {seq.seq_id}: last_token={seq.last_token}, num_tokens={seq.num_tokens}, token_ids_len={len(seq.token_ids)}, token_ids_last10={seq.token_ids[-10:] if seq.token_ids else []}"
+            )
+        seq.metric = self.metrics_manager.create_sequence_metric(
+            seq.seq_id, seq.num_prompt_tokens
+        )
+        self.scheduler.add(seq)
+
+    def _admit_stream_pending(self) -> int:
+        if self._admission_paused:
+            return 0
+        admitted = 0
+        while self._stream_pending:
+            self._add_to_scheduler(self._stream_pending.popleft())
+            admitted += 1
+        return admitted
+
+    def _stamp_scheduled_policy_versions(self, dp_seqs: list) -> None:
+        for seqs in dp_seqs:
+            for seq in seqs:
+                self._seq_policy_version.setdefault(seq.seq_id, self.weight_version)
+
+    def step_once(self) -> StepResult:
+        self._admit_stream_pending()
+        return self.step()
+
+    def num_pending(self) -> int:
+        return len(self._stream_pending)
+
+    def num_scheduler_waiting(self) -> int:
+        return len(self.scheduler.waiting) + len(self.scheduler.waiting_migration)
+
+    def num_prefilling(self) -> int:
+        return len(getattr(self.scheduler, "prefilling", []))
+
+    def num_running(self) -> int:
+        return sum(
+            len(self.scheduler.running(dp_idx))
+            for dp_idx in range(self.config.attention_dp)
+        )
+
+    def num_inflight(self) -> int:
+        return self.num_pending() + self.num_scheduler_waiting() + self.num_running()
+
+    def num_active_for_update(self) -> int:
+        # Python-side pending and scheduler waiting requests have not consumed
+        # model weights yet. C++ admission pause prevents waiting from becoming
+        # running during update; only active running/prefilling sequences drain.
+        return self.num_prefilling() + self.num_running()
+
+    def policy_version_for(self, seq_id: int) -> int | None:
+        return self._seq_policy_version.get(seq_id)
+
+    def ack_sequence(self, seq_id: int) -> None:
+        self._seq_policy_version.pop(seq_id, None)
 
     def add_request(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):
             seqs = [seqs]
         for seq in seqs:
-            # Debug: log received sequence info
-            if self.config.mode == "decode":
-                logger.info(
-                    f"[DEBUG] Decode engine received seq {seq.seq_id}: last_token={seq.last_token}, num_tokens={seq.num_tokens}, token_ids_len={len(seq.token_ids)}, token_ids_last10={seq.token_ids[-10:] if seq.token_ids else []}"
-                )
-            seq.metric = self.metrics_manager.create_sequence_metric(
-                seq.seq_id, seq.num_prompt_tokens
-            )
-            self.scheduler.add(seq)
+            self._add_to_scheduler(seq)
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
         self.scheduler.free_to_be_migrated(seqs)
@@ -190,6 +319,8 @@ class LLMEngine:
         is_prefill = sch_res.is_prefill
         dp_group_seqs = sch_res.dp_group_seqs
         filtered_dp_group_seqs = sch_res.filtered_dp_group_seqs
+        if self._streaming_mode:
+            self._stamp_scheduled_policy_versions(dp_seqs)
 
         # Build dummy seq id set for filtering
         dummy_seq_ids = set()
@@ -337,7 +468,7 @@ class LLMEngine:
             sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
             for seqs in dp_seqs
         )
-        return StepResult(
+        step_result = StepResult(
             dp_seqs=dp_seqs,
             outputs=outputs,
             prefill_tokens=prefill_tokens,
@@ -346,11 +477,28 @@ class LLMEngine:
             schedule_latency_ms=(sch_end - sch_begin) * 1000,
             postprocess_latency_ms=(post_sch_end - post_sch_begin) * 1000,
         )
+        if self._streaming_mode:
+            self.weight_barrier.notify_step()
+        return step_result
 
     def is_finished(self):
         return self.scheduler.is_finished()
 
     def generate(
+        self,
+        use_tqdm: bool = True,
+        log_metrics_interval: int = 10,
+        return_serialized: bool = False,
+    ) -> list[Sequence] | list[bytes]:
+        with self.weight_barrier.generation():
+            self.last_generate_weight_version = self.weight_version
+            return self._generate_locked(
+                use_tqdm=use_tqdm,
+                log_metrics_interval=log_metrics_interval,
+                return_serialized=return_serialized,
+            )
+
+    def _generate_locked(
         self,
         use_tqdm: bool = True,
         log_metrics_interval: int = 10,
