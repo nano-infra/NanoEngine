@@ -117,11 +117,13 @@ class PeerAgentContext:
             )
             for peer in new_peers
         ]
+        newly_connected = []
         for peer, conn in zip(new_peers, pending_conns, strict=True):
             if conn.wait(timeout=timeout) is False:
                 raise RuntimeError(f"Timed out waiting for connection to {peer}")
-        self.connected_peers.update(new_peers)
-        return new_peers
+            self.connected_peers.add(peer)
+            newly_connected.append(peer)
+        return newly_connected
 
     def unregister_memory_region(self, mr_name: str) -> None:
         """Unregister a local memory region from the owned PeerAgent."""
