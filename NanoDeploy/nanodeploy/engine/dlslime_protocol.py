@@ -108,7 +108,7 @@ def decode_run_result(data: bytes):
         if has_logprobs:
             logprobs.append([seq.Logprobs(j) for j in range(seq.LogprobsLength())])
 
-    return (token_ids, logprobs) if has_logprobs else token_ids
+    return (token_ids, logprobs) if has_logprobs else (token_ids, None)
 
 
 class ModelRunnerRpcService:
