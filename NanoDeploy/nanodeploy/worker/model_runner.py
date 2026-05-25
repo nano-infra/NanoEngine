@@ -6,7 +6,6 @@ import ray
 import torch
 import torch.distributed as dist
 
-
 # ─── Per-step host-critical-path timer ─────────────────────────────────────
 # Driver enables via ``Config.step_timing=True`` (threaded into RunnerConfig
 # in ModelRunner.__init__). Useful for quantifying the gap between

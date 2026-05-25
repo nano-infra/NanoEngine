@@ -5,7 +5,11 @@ try:
 except ImportError:
     flash_mla = None
 
-from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+try:
+    from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+except ImportError:
+    flash_attn_varlen_func = None  # type: ignore
+    flash_attn_with_kvcache = None  # type: ignore
 
 from nanodeploy.backends.base_backend import AttentionBase
 from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kcache, store_kvcache
@@ -15,7 +19,6 @@ from nanodeploy.backends.gpu_generic.kernels.paged_gather import (
 from nanodeploy.backends.hopper.kernels.fp8_utils import store_kcache_fp8
 from nanodeploy.context.context import get_context
 from nanodeploy.logging import get_logger
-
 
 logger = get_logger()
 

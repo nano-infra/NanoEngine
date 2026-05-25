@@ -23,7 +23,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 _FP8_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
 _UE8M0_BIAS = 127  # IEEE-754-fp32-style exponent bias
 

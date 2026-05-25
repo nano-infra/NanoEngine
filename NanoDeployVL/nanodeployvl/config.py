@@ -10,7 +10,6 @@ from typing import Any, Optional
 
 from nanodeploy.config import Config
 from nanodeploy.logging import get_logger
-
 from pydantic import Field, model_validator
 from transformers import AutoConfig
 

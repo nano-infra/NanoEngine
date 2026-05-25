@@ -21,7 +21,6 @@ from nanodeploy.fbs.RunSequenceOutput import (
     RunSequenceOutputStart,
 )
 
-
 _DLSLIME_TIMING = "1"
 
 

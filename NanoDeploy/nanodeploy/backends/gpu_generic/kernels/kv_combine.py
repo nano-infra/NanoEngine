@@ -3,7 +3,11 @@ from typing import Optional, Union
 import torch
 import triton
 import triton.language as tl
-from flash_attn_interface import _flash_attn_forward
+
+try:
+    from flash_attn_interface import _flash_attn_forward
+except ImportError:
+    _flash_attn_forward = None  # type: ignore
 from triton.language.extra import libdevice
 
 

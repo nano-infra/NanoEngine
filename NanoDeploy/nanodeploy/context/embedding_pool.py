@@ -18,7 +18,6 @@ import heapq
 from typing import Any
 
 import torch
-
 from nanodeploy.logging import get_logger
 
 logger = get_logger("embedding_pool")

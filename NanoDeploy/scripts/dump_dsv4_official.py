@@ -25,7 +25,6 @@ import torch.distributed as dist
 from safetensors.torch import load_model
 from transformers import PreTrainedTokenizerFast
 
-
 BASE_HOOKS = (
     "embed",
     "norm",

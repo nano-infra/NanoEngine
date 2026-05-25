@@ -1,3 +1,5 @@
+import copyreg
+import importlib
 import threading
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
@@ -11,6 +13,38 @@ from nanodeploy.logging import get_logger
 from nanodeploy.worker.model_runner import ModelRunner
 
 logger = get_logger()
+
+
+def _register_config_module_pickler() -> None:
+    """Make ``torch._dynamo.config_utils.ConfigModuleInstance`` picklable.
+
+    torch >= 2.10 ships several module-typed config singletons (e.g.
+    ``torch.distributed.config``, ``torch.cuda.config``) whose class is
+    ``ConfigModuleInstance`` — a ``ModuleType`` subclass with a
+    ``__reduce__`` that refuses pickling. When Ray cloudpickles an actor
+    class, it walks transitively reachable modules and trips over these,
+    failing with ``cannot pickle 'ConfigModuleInstance' object``.
+
+    The configs are never actually needed on the remote side at unpickle
+    time, but Ray's serialize path still has to *get past* them. Register
+    a reducer that just re-imports the module by name on the other side.
+    """
+    try:
+        import torch.distributed.config as _probe
+    except Exception:
+        return
+
+    cls = type(_probe)
+    if cls.__name__ != "ConfigModuleInstance":
+        return
+
+    def _reduce_config_module(mod):
+        return (importlib.import_module, (mod.__name__,))
+
+    copyreg.pickle(cls, _reduce_config_module)
+
+
+_register_config_module_pickler()
 
 
 def _serialize_run(seqs: list[Sequence], is_prefill: bool) -> bytes:
@@ -135,6 +169,17 @@ class RayExecutor:
         # 3. 定义每个节点上要运行的 worker 数量
         workers_per_node = 8
 
+        # When world size exceeds a single node, it must be a multiple of
+        # workers_per_node so each node is fully packed.
+        if (
+            self.config.attn_world_size > workers_per_node
+            and self.config.attn_world_size % workers_per_node != 0
+        ):
+            raise ValueError(
+                f"attn_world_size ({self.config.attn_world_size}) must be a "
+                f"multiple of {workers_per_node} when larger than {workers_per_node}"
+            )
+
         # 4. 计算需要多少个节点
         num_nodes_needed = (
             self.config.attn_world_size + workers_per_node - 1
@@ -149,8 +194,12 @@ class RayExecutor:
             target_node_id = node_ids[node_idx]
             logger.info(f"--- scheduling node: {target_node_id} ---")
 
+            start_rank = node_idx * workers_per_node
+            end_rank = min(start_rank + workers_per_node, self.config.attn_world_size)
+            num_workers_on_node = end_rank - start_rank
+
             pg = placement_group(
-                bundles=[{"CPU": 0.1, "GPU": 1.0} for _ in range(8)],
+                bundles=[{"CPU": 0.1, "GPU": 1.0} for _ in range(num_workers_on_node)],
                 strategy="STRICT_PACK",
                 name=f"pg-node-{node_ids[node_idx]}",
                 _soft_target_node_id=target_node_id,
@@ -159,9 +208,6 @@ class RayExecutor:
             ray.get(pg.ready())
 
             self.placement_groups.append(pg)
-
-            start_rank = node_idx * workers_per_node
-            end_rank = min(start_rank + workers_per_node, self.config.attn_world_size)
 
             for rank in range(start_rank, end_rank):
                 worker = ModelRunner.options(placement_group=pg).remote(

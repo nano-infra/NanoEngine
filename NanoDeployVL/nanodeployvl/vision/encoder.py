@@ -25,7 +25,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from nanodeploy.logging import get_logger
 from safetensors import safe_open
 from tqdm import tqdm

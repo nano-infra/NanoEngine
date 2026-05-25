@@ -18,7 +18,6 @@ import torch
 from safetensors.torch import safe_open, save_file
 from tqdm import tqdm, trange
 
-
 FP4_TABLE = torch.tensor(
     [
         0.0,

@@ -16,17 +16,18 @@ import re
 from typing import Generator, Tuple
 
 import torch
+from torch import nn
+
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.loader import (
-    EXPERT_RE,
-    PACKED_EXPERT_RE,
-    PACKED_EXPERT_SCALE_RE,
     default_weight_loader,
+    EXPERT_RE,
     load_packed_expert_scale,
     load_packed_expert_weight,
     load_per_expert_weight,
+    PACKED_EXPERT_RE,
+    PACKED_EXPERT_SCALE_RE,
 )
-from torch import nn
 
 logger = get_logger()
 

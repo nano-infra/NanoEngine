@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 MAX_FUSED_HIDDEN_SIZE = 4096
 VALIDATED_HIDDEN_SIZES = frozenset({128})

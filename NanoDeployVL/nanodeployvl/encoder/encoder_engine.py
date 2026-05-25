@@ -26,7 +26,6 @@ from typing import Optional
 
 import torch
 from nanoctrl.client import NanoCtrlClient
-
 from nanodeploy.context.embedding_pool import EmbeddingPool
 from nanodeploy.logging import get_logger
 

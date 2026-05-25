@@ -2,7 +2,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 SUPPORTED_VALUE_DTYPES = {torch.int32, torch.int64}
 
 

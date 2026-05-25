@@ -34,7 +34,6 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-
 from nanodeploy.logging import get_logger
 from pydantic import BaseModel
 

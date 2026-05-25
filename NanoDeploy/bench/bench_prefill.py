@@ -11,7 +11,6 @@ import random
 import time
 
 from jsonargparse import ActionConfigFile, ArgumentParser
-
 from nanodeploy import Sequence
 from nanodeploy.config import Config
 from nanodeploy.llm_component import LLM

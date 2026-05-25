@@ -5,7 +5,6 @@ import sys
 from nanodeploy.config import Config
 from nanodeploy.logging import get_logger
 
-
 logger = get_logger("nanodeploy")
 
 

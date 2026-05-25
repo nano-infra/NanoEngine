@@ -91,7 +91,7 @@ def get_available_nodes_with_master_first(master_address: str):
 
     assert sorted_available_nodes, "No available node resources"
     assert (
-        sorted_available_nodes[0].get("NodeManagerAddress") == cleaned_host
+        sorted_available_nodes[0].get("NodeManagerAddress") == resolved_master_ip
     ), "master address is occupied or it is not mounted by ray."
 
     return sorted_available_nodes

@@ -19,6 +19,99 @@ from nanodeploy.layers.rotary_embedding import get_rope
 from nanodeploy.models.deepseek_v2.deepseek_v2 import DeepseekV2MLP
 from nanodeploy.models.quant_config import QuantizationConfig
 
+
+# --- Lazily-compiled helpers ----------------------------------------------
+# Applying ``@torch.compile`` directly as a class-method decorator attaches
+# ConfigModuleInstance references to the class, which break cloudpickle in
+# Ray actors on torch >= 2.10. The class methods below are kept as thin
+# trampolines; their bodies live in module-level functions that are
+# compiled on first call.
+def _routing_scores_with_bias_impl(
+    logits: torch.Tensor, bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = logits.float()
+    scores = F.softplus(scores).sqrt()
+    choice_scores = scores + bias.float()
+    return scores, choice_scores
+
+
+def _normalize_topk_weights_impl(
+    scores: torch.Tensor, topk_ids: torch.Tensor, route_scale: float
+) -> torch.Tensor:
+    topk_weights = scores.gather(1, topk_ids)
+    topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    topk_weights = topk_weights * route_scale
+    return topk_weights
+
+
+def _fuse_routed_shared_impl(
+    routed_out: torch.Tensor, shared_out: torch.Tensor
+) -> torch.Tensor:
+    return routed_out + shared_out
+
+
+def _hc_post_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    return post.unsqueeze(-1) * x.unsqueeze(1) + torch.sum(
+        comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=1
+    )
+
+
+_routing_scores_with_bias_fn = None
+_normalize_topk_weights_fn = None
+_fuse_routed_shared_fn = None
+_hc_post_fn = None
+
+
+def _routing_scores_with_bias_compiled(
+    logits: torch.Tensor, bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _routing_scores_with_bias_fn
+    if _routing_scores_with_bias_fn is None:
+        _routing_scores_with_bias_fn = torch.compile(
+            _routing_scores_with_bias_impl, dynamic=False, fullgraph=True
+        )
+    return _routing_scores_with_bias_fn(logits, bias)
+
+
+def _normalize_topk_weights_compiled(
+    scores: torch.Tensor, topk_ids: torch.Tensor, route_scale: float
+) -> torch.Tensor:
+    global _normalize_topk_weights_fn
+    if _normalize_topk_weights_fn is None:
+        _normalize_topk_weights_fn = torch.compile(
+            _normalize_topk_weights_impl, dynamic=False, fullgraph=True
+        )
+    return _normalize_topk_weights_fn(scores, topk_ids, route_scale)
+
+
+def _fuse_routed_shared_compiled(
+    routed_out: torch.Tensor, shared_out: torch.Tensor
+) -> torch.Tensor:
+    global _fuse_routed_shared_fn
+    if _fuse_routed_shared_fn is None:
+        _fuse_routed_shared_fn = torch.compile(
+            _fuse_routed_shared_impl, dynamic=False, fullgraph=True
+        )
+    return _fuse_routed_shared_fn(routed_out, shared_out)
+
+
+def _hc_post_compiled(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    global _hc_post_fn
+    if _hc_post_fn is None:
+        _hc_post_fn = torch.compile(_hc_post_impl, dynamic=False, fullgraph=True)
+    return _hc_post_fn(x, residual, post, comb)
+
+
 # Optional vendored sglang DSV4 fused kernels. When present,
 # _apply_rotary_interleaved replaces ~10 eager elementwise launches per
 # call with a single CUDA kernel.
@@ -2454,7 +2547,6 @@ class DeepseekV4MoE(nn.Module):
         raise ValueError(f"Unsupported DeepseekV4 score_func={self.score_func}")
 
     @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
     def _routing_scores_with_bias(
         logits: torch.Tensor, bias: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2462,13 +2554,9 @@ class DeepseekV4MoE(nn.Module):
         weight gather later) and choice_scores (with e_score_correction_bias
         applied). inductor fuses softplus + sqrt + add (3 launches → 1).
         """
-        scores = logits.float()
-        scores = F.softplus(scores).sqrt()
-        choice_scores = scores + bias.float()
-        return scores, choice_scores
+        return _routing_scores_with_bias_compiled(logits, bias)
 
     @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
     def _normalize_topk_weights(
         scores: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -2476,13 +2564,9 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         """Fused: gather → renorm by sum → mul by route_scale. Inductor
         fuses the post-gather chain (4-5 launches → 1)."""
-        topk_weights = scores.gather(1, topk_ids)
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        topk_weights = topk_weights * route_scale
-        return topk_weights
+        return _normalize_topk_weights_compiled(scores, topk_ids, route_scale)
 
     @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
     def _fuse_routed_shared(
         routed_out: torch.Tensor, shared_out: torch.Tensor
     ) -> torch.Tensor:
@@ -2499,7 +2583,7 @@ class DeepseekV4MoE(nn.Module):
         inside ``routed_experts``. sglang's
         ``moe_sum_reduce_warp_per_token_vec_kernel`` is the TP-topology
         equivalent of those, so unnecessary under EP."""
-        return routed_out + shared_out
+        return _fuse_routed_shared_compiled(routed_out, shared_out)
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor
@@ -2603,7 +2687,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._hc_stream: torch.cuda.Stream | None = None
 
     @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
     def _hc_post(
         x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
     ):
@@ -2624,9 +2707,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # reduce-sum + add chain (4-5 launches per call) into a single
         # fused-reduce kernel. Called twice per layer × 43 layers per
         # decode step = 86 calls/step → ~350 launches/step collapsed.
-        return post.unsqueeze(-1) * x.unsqueeze(1) + torch.sum(
-            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=1
-        )
+        return _hc_post_compiled(x, residual, post, comb)
 
     def forward(
         self,
