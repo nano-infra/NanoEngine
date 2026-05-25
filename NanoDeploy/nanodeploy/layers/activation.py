@@ -35,6 +35,9 @@ class SiluAndMul(nn.Module):
         self._effective_limit: float = (
             float("inf") if swiglu_limit is None else float(swiglu_limit)
         )
+        # Lazy compile to avoid attaching ConfigModuleInstance refs at
+        # class level (breaks cloudpickle in Ray actors on torch >= 2.10).
+        self._compiled_forward = torch.compile(self._compiled_forward)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Fast path: single-kernel SwiGLU when bf16 contig + sglang
@@ -81,7 +84,6 @@ class SiluAndMul(nn.Module):
         gate = gate.clamp(max=self._effective_limit)
         return F.silu(gate) * up
 
-    @torch.compile
     def _compiled_forward(self, x: torch.Tensor) -> torch.Tensor:
         a, b = x.chunk(2, -1)
         return F.silu(a) * b

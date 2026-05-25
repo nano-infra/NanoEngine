@@ -6,8 +6,13 @@ class Sampler(nn.Module):
 
     def __init__(self):
         super().__init__()
+        # Compile lazily in __init__ rather than via @torch.compile class
+        # decorators. The decorator form attaches torch._dynamo / _inductor
+        # ConfigModuleInstance references to the class, which break
+        # cloudpickle when this module is imported by a Ray actor.
+        self.forward = torch.compile(self.forward)
+        self.forward_with_logprobs = torch.compile(self.forward_with_logprobs)
 
-    @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         # Check for greedy search (temperature close to 0)
         # Assuming temperatures is [batch_size] or broadcastable
@@ -44,7 +49,6 @@ class Sampler(nn.Module):
         # output shape is [batch_size]
         return torch.where(greedy_mask, greedy_tokens, sample_tokens)
 
-    @torch.compile
     def forward_with_logprobs(self, logits: torch.Tensor, temperatures: torch.Tensor):
         """Same sampling as ``forward`` but also returns log-prob of the
         chosen token under the temperature-scaled distribution.

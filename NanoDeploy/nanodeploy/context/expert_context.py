@@ -1,17 +1,31 @@
-from typing import Optional
+from typing import Any, Optional
 
-import deep_ep
 import torch
+
+try:
+    import deep_ep  # type: ignore
+except ImportError:
+    deep_ep = None  # type: ignore
+
+
+def _require_deep_ep():
+    if deep_ep is None:
+        raise ImportError(
+            "deep_ep is required for expert parallelism (ep_size > 1). "
+            "Please install DeepEP to use this feature."
+        )
+    return deep_ep
 
 
 class ExpertContext:
     _instance: Optional["ExpertContext"] = None
 
     def __init__(self):
-        self.buffer: Optional[deep_ep.Buffer] = None
+        self.buffer: Optional[Any] = None
         self.ep_size: int = 1
         self.is_fp8: bool = False
-        self.num_sms: int = deep_ep.Buffer.num_sms  # Default from DeepEP (20)
+        # Default from DeepEP (20); fallback to 20 when deep_ep is unavailable.
+        self.num_sms: int = deep_ep.Buffer.num_sms if deep_ep is not None else 20
         self.warmup_called: bool = False
         self.num_max_dispatch_tokens_per_rank: int = 128  # DLBlas default
         self.num_local_experts: int = 0
@@ -55,7 +69,7 @@ class ExpertContext:
             self.warmup_called = True
             return
 
-        assert deep_ep is not None, "DeepEP library is required when ep_size > 1"
+        _require_deep_ep()
         assert torch.cuda.is_available(), "CUDA must be available for DeepEP"
 
         # num_max_dispatch_tokens_per_rank: align with DLBlas default of 128
@@ -114,7 +128,7 @@ class ExpertContext:
 
         self.warmup_called = True
 
-    def get_buffer(self) -> Optional[deep_ep.Buffer]:
+    def get_buffer(self) -> Optional[Any]:
         """获取当前实例的 DeepEP Buffer，如果未初始化或单卡则返回 None"""
         return self.buffer
 
