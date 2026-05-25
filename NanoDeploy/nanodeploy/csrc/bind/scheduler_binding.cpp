@@ -142,6 +142,8 @@ void bind_scheduler_utils(py::module_& m)
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))
+        .def("set_admission_paused", &Scheduler::set_admission_paused, py::arg("paused"))
+        .def("admission_paused", &Scheduler::admission_paused)
 
         // Scheduling
         .def("schedule", &Scheduler::schedule, py::call_guard<py::gil_scoped_release>())
@@ -187,6 +189,7 @@ void bind_scheduler_utils(py::module_& m)
         .def_readonly("attention_dp", &Scheduler::attention_dp_)
         .def_readwrite("waiting", &Scheduler::waiting)
         .def_readwrite("waiting_migration", &Scheduler::waiting_migration)
+        .def_readwrite("prefilling", &Scheduler::prefilling)
         .def_readwrite("worker_state", &Scheduler::worker_state)
         .def_readwrite("to_be_migrated", &Scheduler::to_be_migrated)
         .def_readwrite("routing_strategy", &Scheduler::routing_strategy);

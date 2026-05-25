@@ -95,6 +95,8 @@ public:
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
+    void set_admission_paused(bool paused);
+    bool admission_paused() const;
 
     // DSv4: configure per-compression-ratio compressed-cache pools across
     // all DP workers.  Must be called once after construction (before any
@@ -151,7 +153,8 @@ public:
     std::unordered_map<int, std::pair<std::shared_ptr<Sequence>, int>> to_be_migrated;
 
     // Configuration
-    RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;
+    RoutingStrategy routing_strategy  = RoutingStrategy::RoundRobin;
+    bool            admission_paused_ = false;
 
 private:
     // Internal scheduling logic
