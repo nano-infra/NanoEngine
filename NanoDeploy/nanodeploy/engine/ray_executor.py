@@ -199,9 +199,7 @@ class RayExecutor:
             num_workers_on_node = end_rank - start_rank
 
             pg = placement_group(
-                bundles=[
-                    {"CPU": 0.1, "GPU": 1.0} for _ in range(num_workers_on_node)
-                ],
+                bundles=[{"CPU": 0.1, "GPU": 1.0} for _ in range(num_workers_on_node)],
                 strategy="STRICT_PACK",
                 name=f"pg-node-{node_ids[node_idx]}",
                 _soft_target_node_id=target_node_id,

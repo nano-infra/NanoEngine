@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 from nanodeploy.context.peer_agent import PeerAgentContext
 
 logger = logging.getLogger("nanodeploy")

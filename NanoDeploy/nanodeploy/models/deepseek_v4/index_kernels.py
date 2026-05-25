@@ -17,7 +17,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 # ─── SWA (sliding-window) physical-slot indices ─────────────────────────────
 
 

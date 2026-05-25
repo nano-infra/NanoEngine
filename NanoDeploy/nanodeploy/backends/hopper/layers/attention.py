@@ -20,7 +20,6 @@ from nanodeploy.backends.hopper.kernels.fp8_utils import store_kcache_fp8
 from nanodeploy.context.context import get_context
 from nanodeploy.logging import get_logger
 
-
 logger = get_logger()
 
 

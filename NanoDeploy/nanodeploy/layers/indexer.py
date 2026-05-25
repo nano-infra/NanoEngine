@@ -38,7 +38,6 @@ import deep_gemm
 import torch
 import torch.nn as nn
 from fast_hadamard_transform import hadamard_transform
-
 from nanodeploy.backends import get_backend
 from nanodeploy.backends.base_backend import ReplicatedLinearBase
 from nanodeploy.layers.rotary_embedding import get_rope

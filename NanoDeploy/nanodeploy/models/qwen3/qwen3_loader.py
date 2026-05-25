@@ -10,9 +10,10 @@ import re
 from typing import Generator, Tuple
 
 import torch
+from torch import nn
+
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.loader import default_weight_loader
-from torch import nn
 
 logger = get_logger()
 

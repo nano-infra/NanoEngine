@@ -13,7 +13,6 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from nanodeploy._cpp import BlockContextSlot, init_scheduler, Sequence, SequenceStatus
-
 from nanodeploy.config import Config
 from nanodeploy.logging import get_logger, set_log_level
 from nanodeploy.metrics import MetricsManager

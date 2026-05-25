@@ -373,6 +373,7 @@ impl EngineAdapter {
                 temperature: temperature as f64,
                 max_tokens,
                 ignore_eos,
+                return_completion_logprobs: false,
             },
         );
 

@@ -64,6 +64,7 @@ impl Sequence {
                 temperature: self.temperature,
                 max_tokens: self.max_tokens,
                 ignore_eos: self.ignore_eos,
+                return_completion_logprobs: false,
             },
         );
 
@@ -85,6 +86,7 @@ impl Sequence {
                 token_ids: Some(token_ids_vec),
                 slots: None,        // Not used in NanoRoute
                 vision_slots: None, // Not used in NanoRoute
+                completion_logprobs: None,
             },
         )
     }

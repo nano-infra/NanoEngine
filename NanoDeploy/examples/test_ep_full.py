@@ -79,7 +79,6 @@ def load_or_make_image(path: str | None, synthetic: bool = True):
 def step_encoder(args) -> tuple:
     """Start EncoderEngine with NanoCtrl + RDMA MR, encode an image."""
     import torch
-
     from nanodeployvl.encoder.encoder_config import EncoderConfig
     from nanodeployvl.encoder.encoder_engine import EncoderEngine
     from nanodeployvl.vision.processor import ImageProcessor
@@ -145,7 +144,6 @@ def step_encoder(args) -> tuple:
 def step_llm(args, slot_metas, token_ids) -> list:
     """Run LLM engine: prefill (with RDMA fetch) + decode in single engine."""
     import ray
-
     from nanodeploy.config import Config
     from nanodeploy.engine.sequence import Sequence
     from nanodeploy.llm_component import LLMComponent

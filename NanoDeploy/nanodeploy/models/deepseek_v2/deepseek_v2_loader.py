@@ -9,17 +9,18 @@ Handles:
 """
 
 import re
-from typing import Generator, Tuple, Callable
+from typing import Callable, Generator, Tuple
 
 import torch
+from torch import nn
+
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.loader import (
-    EXPERT_RE,
     _dequant_fp8_block,
     default_weight_loader,
+    EXPERT_RE,
     load_per_expert_weight,
 )
-from torch import nn
 
 logger = get_logger()
 
@@ -193,7 +194,9 @@ def load_weights(
         if weight_name in kv_b_proj_scales:
             get_tensor_by_name[scale_key] = kv_b_proj_scales[weight_name]
 
-        if _handle_kv_b_proj(model, weight_name, tensor, get_tensor_by_name, config, block_size):
+        if _handle_kv_b_proj(
+            model, weight_name, tensor, get_tensor_by_name, config, block_size
+        ):
             loaded_count += 1
 
     logger.warning(

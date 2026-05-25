@@ -111,6 +111,7 @@ def _hc_post_compiled(
         _hc_post_fn = torch.compile(_hc_post_impl, dynamic=False, fullgraph=True)
     return _hc_post_fn(x, residual, post, comb)
 
+
 # Optional vendored sglang DSV4 fused kernels. When present,
 # _apply_rotary_interleaved replaces ~10 eager elementwise launches per
 # call with a single CUDA kernel.

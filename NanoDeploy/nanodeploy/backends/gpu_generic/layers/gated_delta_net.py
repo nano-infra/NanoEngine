@@ -31,13 +31,12 @@ def _l2norm_impl(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Ten
 _l2norm_compiled_fn = None
 
 
-def _l2norm_compiled(
-    x: torch.Tensor, dim: int = -1, eps: float = 1e-6
-) -> torch.Tensor:
+def _l2norm_compiled(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     global _l2norm_compiled_fn
     if _l2norm_compiled_fn is None:
         _l2norm_compiled_fn = torch.compile(_l2norm_impl)
     return _l2norm_compiled_fn(x, dim, eps)
+
 
 try:
     from nanodeploy.backends.gpu_generic.kernels.rmsnorm_gated import (
