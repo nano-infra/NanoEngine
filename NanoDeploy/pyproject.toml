@@ -21,13 +21,19 @@ dependencies = [
     # "triton>=3.0.0",
     # "flash-attn",
     # "flashinfer",
+    "numpy",
     "pydantic",
     "pyzmq>=25.0",
     "httpx",
     "uvloop>=0.21.0",
     "ray>=2.50.1",
     "transformers>=4.51.0",
-    "dlslime>=0.1.0.post1",
+    "flatbuffers",
+    "jsonargparse>=4.27",
+    "redis>=4.0",
+    "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2",
+    "tqdm",
+    "dlslime>=0.1.16",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -40,6 +46,15 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: System :: Networking",
     "Topic :: System :: Systems Administration",
+]
+
+[project.optional-dependencies]
+cuda-devel = [
+    "cuda-tile",
+    "cuda-python==12.9.4",
+    "nvidia-cudnn-frontend>=1.13.0",
+    "nvidia-cutlass-dsl>=4.4.2",
+    "nvidia-ml-py",
 ]
 
 [project.urls]

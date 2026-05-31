@@ -7,9 +7,17 @@ except ImportError:
 
 try:
     from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+
+    _FA_KVCACHE_TABLE_ARG = "page_table"
 except ImportError:
-    flash_attn_varlen_func = None  # type: ignore
-    flash_attn_with_kvcache = None  # type: ignore
+    try:
+        from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+        _FA_KVCACHE_TABLE_ARG = "block_table"
+    except ImportError:
+        flash_attn_varlen_func = None  # type: ignore
+        flash_attn_with_kvcache = None  # type: ignore
+        _FA_KVCACHE_TABLE_ARG = "page_table"
 
 from nanodeploy.backends.base_backend import AttentionBase
 from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kcache, store_kvcache
@@ -197,15 +205,18 @@ class FlashAttentionImpl:
             context_lens = context.context_lens[0, :bs]
             block_tables = context.block_tables[0, :bs]
 
+            kwargs = {
+                "cache_seqlens": context_lens,
+                _FA_KVCACHE_TABLE_ARG: block_tables,
+                "softmax_scale": self.scale,
+                "causal": ntps > 1,
+                "return_softmax_lse": True,
+            }
             o, lse = flash_attn_with_kvcache(
                 q.reshape(bs, ntps, num_head, head_dim),
                 k_cache,
                 v_cache,
-                cache_seqlens=context_lens,
-                page_table=block_tables,
-                softmax_scale=self.scale,
-                causal=ntps > 1,
-                return_softmax_lse=True,
+                **kwargs,
             )[:2]
 
             # o: (bs, ntps, H, D) → (total_tokens, H, D)

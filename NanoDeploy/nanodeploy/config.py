@@ -210,6 +210,15 @@ class Config(BaseModel):
             assert self.attention_tp == 1
         else:
             assert self.kvcache_block_size % 64 == 0
+            if self.kvcache_block_size % 256 != 0:
+                adjusted_block_size = ((self.kvcache_block_size + 255) // 256) * 256
+                logger.warning(
+                    "kvcache_block_size=%s is incompatible with flash-attn "
+                    "release wheels for paged KV decode; adjusting to %s.",
+                    self.kvcache_block_size,
+                    adjusted_block_size,
+                )
+                self.kvcache_block_size = adjusted_block_size
             assert 1 <= self.attention_tp <= 8
 
         if self.attention_sp == 1:
