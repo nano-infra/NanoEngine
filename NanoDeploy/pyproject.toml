@@ -33,7 +33,7 @@ dependencies = [
     "redis>=4.0",
     "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2",
     "tqdm",
-    "dlslime>=0.1.0.post1",
+    "dlslime>=0.1.16",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
