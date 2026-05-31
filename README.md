@@ -68,22 +68,53 @@ graph TB
 
 ### Key Third-Party Dependencies
 
-| Library                                                   | Version   | Description                                                         | Source        |
-| --------------------------------------------------------- | --------- | ------------------------------------------------------------------- | ------------- |
-| [DeepEP](https://github.com/deepseek-ai/DeepEP)           | 1.2.1     | Expert-parallel all-to-all communication (MoE dispatch/combine)     | deepseek-ai   |
-| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)       | 2.1.1     | FP8 GEMM kernels with fine-grained scaling (JIT compiled)           | deepseek-ai   |
-| [FlashMLA](https://github.com/deepseek-ai/FlashMLA)       | 1.0.0     | Multi-head Latent Attention decode kernels (dense + FP8 sparse)     | deepseek-ai   |
-| [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | 0.6.6     | High-performance inference kernels for attention, GDN, and sampling | flashinfer-ai |
-| [DLSlime](https://github.com/deeplink-org/DLSlime)        | 0.0.3.rc1 | Flexible heterogeneous transfer toolkit for RDMA/NVLink/NVSHMEM     | deeplink-org  |
+The Docker development image pins every external build dependency. Prefer tags when upstream provides a usable tag; otherwise pin the exact commit that has been smoke-tested.
 
-The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs. Install the key dependencies as follows:
+| Library                                                    | Pinned version / ref                    | Notes                                                               |
+| ---------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------- |
+| PyTorch                                                    | `2.10.0+cu128`                          | CUDA 12.8 wheel.                                                    |
+| [DeepEP](https://github.com/deepseek-ai/DeepEP)            | `567632dd` (`v1.2.1-25-g567632d`)       | Nearest tag: `v1.2.1`; pinned commit is the tested post-tag build.  |
+| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)        | `891d57b4` (`v2.1.1.post3-16-g891d57b`) | Nearest tag: `v2.1.1.post3`; pinned commit reports package `2.5.0`. |
+| [FlashMLA](https://github.com/deepseek-ai/FlashMLA)        | `1408756a`                              | Upstream currently has no tags; pinned by commit.                   |
+| [FlashInfer](https://github.com/flashinfer-ai/flashinfer)  | `v0.6.9`                                | Built from source.                                                  |
+| [flash-attn](https://github.com/Dao-AILab/flash-attention) | `v2.8.1` wheel for `cu12` / `torch2.10` | Uses the release wheel.                                             |
+| [DLSlime](https://github.com/Deeplink-org/DLSlime)         | `v0.1.16`                               | Builds `dlslime`; `dlslime-ctrl` is not built in this image.        |
+| Rust                                                       | `1.95.0` via rustup                     | Minimal rustup toolchain; not installed from apt.                   |
+
+The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs. Install the key dependencies manually as follows:
 
 ```bash
 cd DeepEP && pip install .
 cd DeepGEMM && pip install .
 cd FlashMLA && pip install .
-pip install flashinfer-python==0.6.6
-pip install dlslime==0.0.3.rc1
+pip install flashinfer-python==0.6.9
+pip install dlslime==0.1.16
+```
+
+### Docker Development Image
+
+The development container is built from `docker/Dockerfile`. It uses NVIDIA CUDA 12.8 devel, PyTorch 2.10 CUDA 12.8, source-built DeepEP/DeepGEMM/FlashMLA/FlashInfer, release-wheel flash-attn, rustup-managed Rust, and an editable NanoDeploy install.
+
+Build:
+
+```bash
+docker build --network host \
+  -f docker/Dockerfile \
+  -t nanodeploy:0.2.0-cu128-devel \
+  .
+```
+
+Private mirrors or proxies can be passed with Docker build args in local environments; the image does not require them.
+
+Run for local development:
+
+```bash
+docker run --gpus all --rm -it --network host --ipc=host \
+  --cap-add IPC_LOCK --ulimit memlock=-1:-1 \
+  --device=/dev/infiniband \
+  -v /sys/class/infiniband:/sys/class/infiniband:ro \
+  -w /workspace/NanoDeploy/NanoDeploy \
+  nanodeploy:0.2.0-cu128-devel
 ```
 
 ### One-liner: install everything
