@@ -119,12 +119,9 @@ RUN git clone --depth 1 --branch ${DLSLIME_REF} https://github.com/Deeplink-org/
     && cd /opt/src/DLSlime \
     && python3 -m pip install --break-system-packages --no-build-isolation --no-cache-dir -v ./dlslime
 
-WORKDIR /workspace/NanoDeploy
-COPY . /workspace/NanoDeploy
+RUN mkdir -p /workspace
 
-RUN cd /workspace/NanoDeploy/NanoDeploy \
-    && export MAX_JOBS=64 \
-    && python3 -m pip install --break-system-packages --no-build-isolation --no-cache-dir -v -e .
+WORKDIR /workspace
 
 ENV RUSTUP_HOME=/opt/rustup \
     CARGO_HOME=/opt/cargo \
@@ -162,7 +159,7 @@ RUN git init /root/.oh-my-zsh \
 
 LABEL org.opencontainers.image.title="NanoDeploy" \
       org.opencontainers.image.version="${NANODEPLOY_VERSION}" \
-      org.opencontainers.image.description="NanoDeploy CUDA 12.8 devel container with PyTorch, DeepEP, FlashMLA, DeepGEMM, FlashInfer, FlashAttention, and DLSlime" \
+      org.opencontainers.image.description="NanoDeploy CUDA 12.8 devel container with PyTorch, DeepEP, FlashMLA, DeepGEMM, FlashInfer, FlashAttention, DLSlime, and build toolchains. NanoDeploy source is intentionally not included." \
       org.opencontainers.image.ref.name="nanodeploy:${NANODEPLOY_VERSION}-cu128-devel" \
       org.opencontainers.image.vendor.deep_ep="${DEEP_EP_VERSION}@${DEEP_EP_REF}" \
       org.opencontainers.image.vendor.flash_mla="${FLASH_MLA_VERSION}@${FLASH_MLA_REF}" \
