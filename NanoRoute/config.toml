@@ -5,8 +5,8 @@ model_name = "qwen3-235B"
 
 [engine]
 mode = "Disaggregated"
-nanoctrl_scope = "nanoctrl-0"
-nanoctrl_address = "http://127.0.0.1:3000"
+ctrl_scope = "nanoctrl-0"
+ctrl_address = "http://127.0.0.1:4479"
 
 [scheduler]
 queue_size = 1000

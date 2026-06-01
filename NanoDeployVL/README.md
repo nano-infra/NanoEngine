@@ -64,19 +64,18 @@ nanodeployvl-serve \
     --vision_device cuda:0 \
     --vision_dtype bfloat16 \
     --host 0.0.0.0 --port 5002 \
-    --nanoctrl_address 10.102.97.1:3000
+    --ctrl_address 10.102.97.1:3000
 ```
 
-The server registers with NanoCtrl as `role="encoder"` so NanoRoute can discover it dynamically.
+The server registers with dlslime-ctrl as `role="encoder"` so NanoRoute can discover it dynamically.
 
 ### Examples
 
-- `examples/test_encoder_engine.py` — standalone encoder test (no NanoCtrl/RDMA required)
+- `examples/test_encoder_engine.py` — standalone encoder test (no dlslime-ctrl/RDMA required)
 - `examples/test_vl.py` — full multimodal request through NanoRoute
 
 ## Integration
 
-- **NanoRoute**: Discovers encoder engines via NanoCtrl; forwards `EncodeRequest` (Action=5) and receives `EncodeResponse` (Action=6)
+- **NanoRoute**: Discovers encoder engines via dlslime-ctrl; forwards `EncodeRequest` (Action=5) and receives `EncodeResponse` (Action=6)
 - **NanoDeploy**: Prefill engine reads vision embeddings from the EmbeddingPool via RDMA using `VisionSlot` metadata
-- **DLSlime**: PeerAgent provides RDMA memory region registration for zero-copy embedding transfer
-- **NanoCtrl**: Engine lifecycle (register, heartbeat, discovery)
+- **DLSlime**: PeerAgent provides RDMA memory region registration for zero-copy embedding transfer; `dlslime-ctrl` (the DLSlime control-plane server) handles engine lifecycle (register, heartbeat, discovery)

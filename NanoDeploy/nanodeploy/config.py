@@ -53,9 +53,9 @@ class Config(BaseModel):
 
     enable_eplb: Optional[bool] = False
 
-    # control plane config – enabled when nanoctrl_address is provided
-    nanoctrl_scope: Optional[str] = None
-    nanoctrl_address: Optional[str] = None
+    # control plane config – enabled when ctrl_address is provided
+    ctrl_scope: Optional[str] = None
+    ctrl_address: Optional[str] = None
 
     # dist config
     master_address: str = "127.0.0.1:6006"
@@ -108,13 +108,13 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
-        # Normalise nanoctrl_address (add scheme if missing)
+        # Normalise ctrl_address (add scheme if missing)
         if (
-            self.nanoctrl_address
-            and not self.nanoctrl_address.startswith("http://")
-            and not self.nanoctrl_address.startswith("https://")
+            self.ctrl_address
+            and not self.ctrl_address.startswith("http://")
+            and not self.ctrl_address.startswith("https://")
         ):
-            self.nanoctrl_address = f"http://{self.nanoctrl_address}"
+            self.ctrl_address = f"http://{self.ctrl_address}"
 
         # Register deepseek_v32 model type so that AutoConfig can load
         # DeepSeek-V3.2 checkpoints even when the installed transformers

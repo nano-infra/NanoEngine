@@ -115,7 +115,7 @@ def main():
         vision_dtype=args.dtype,
         num_slots=args.num_slots,
         max_tokens_per_slot=args.max_tokens_per_slot,
-        nanoctrl_address=None,  # standalone, no NanoCtrl
+        ctrl_address=None,  # standalone, no NanoCtrl
     )
     print(
         f"[2/5] EncoderConfig: hidden_size={config.hidden_size}, "

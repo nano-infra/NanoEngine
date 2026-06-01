@@ -36,8 +36,8 @@ class TestCacheContextFP8:
         ctx.gdn_recurrent_states = None
         ctx.selected_nic = None
         ctx.endpoints = {}
-        ctx.nanoctrl_address = None
-        ctx.nanoctrl_scope = None
+        ctx.ctrl_address = None
+        ctx.ctrl_scope = None
         ctx.engine_id = None
         ctx._fp8_head_dim = _FP8_MLA_BYTES_PER_TOKEN if is_fp8 else 0
         return ctx

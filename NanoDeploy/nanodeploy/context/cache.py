@@ -67,13 +67,13 @@ class CacheContext:
     indexer_cache: Any = None  # IndexerCache instance, set after allocation
 
     # Control plane: server address and engine ID for centralized connection
-    nanoctrl_address: str | None = (
-        None  # Control plane server URL (e.g., "http://127.0.0.1:3000")
+    ctrl_address: str | None = (
+        None  # Control plane server URL (e.g., "http://127.0.0.1:4479")
     )
-    nanoctrl_scope: str | None = None  # Scope for multi-tenant isolation
+    ctrl_scope: str | None = None  # Scope for multi-tenant isolation
     engine_id: str | None = None  # Engine ID for agent naming (format: EngineName:rank)
     peer_agent_context: PeerAgentContext | None = None
-    # If nanoctrl_address is provided, engine_id will be fetched from NanoCtrl instead of config
+    # If ctrl_address is provided, engine_id will be fetched from NanoCtrl instead of config
 
     @property
     def num_local_kv_heads(self):
@@ -880,7 +880,7 @@ class CacheContext:
         self._engine_info_cache = None
         logger.info("Invalidated engine_info cache")
 
-    def _fetch_engine_info_from_nanoctrl(self, engine_ids: set[str]) -> dict[str, dict]:
+    def _fetch_engine_info_from_ctrl(self, engine_ids: set[str]) -> dict[str, dict]:
         """Get engine_info for specified engine_ids (cache + fetch if needed).
 
         This method handles all caching logic: checks cache, identifies missing IDs,
@@ -924,15 +924,13 @@ class CacheContext:
                     )
 
         # Fetch missing engines from NanoCtrl
-        if not self.nanoctrl_address:
-            logger.warning(
-                "nanoctrl_address not configured, returning cached results only"
-            )
+        if not self.ctrl_address:
+            logger.warning("ctrl_address not configured, returning cached results only")
             return engine_info_map
 
         fetched_map: dict[str, dict] = {}
-        url = f"{self.nanoctrl_address}/get_entity_info"
-        scope = self.nanoctrl_scope or ""
+        url = f"{self.ctrl_address}/get_entity_info"
+        scope = self.ctrl_scope or ""
 
         try:
             with httpx.Client(timeout=5.0) as client:
@@ -1342,7 +1340,7 @@ class CacheContext:
             logger.debug("No target engine_ids found, skipping migration")
             return
 
-        engine_info_map = self._fetch_engine_info_from_nanoctrl(target_engine_ids)
+        engine_info_map = self._fetch_engine_info_from_ctrl(target_engine_ids)
 
         # Ensure connections
         connection_requests: list[tuple[str, str, int, int]] = []
@@ -1576,8 +1574,8 @@ def set_cache_context(
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     mode: Literal["gqa", "mla"] = "gqa",
-    nanoctrl_address: str | None = None,
-    nanoctrl_scope: str | None = None,
+    ctrl_address: str | None = None,
+    ctrl_scope: str | None = None,
     engine_id: str | None = None,
 ):
     global _CACHE_CONTEXT
@@ -1596,8 +1594,8 @@ def set_cache_context(
         device=device,
         dtype=dtype,
         mode=mode,
-        nanoctrl_address=nanoctrl_address,
-        nanoctrl_scope=nanoctrl_scope,
+        ctrl_address=ctrl_address,
+        ctrl_scope=ctrl_scope,
         engine_id=engine_id,
     )
     return _CACHE_CONTEXT

@@ -14,7 +14,7 @@ The "EP separation" is between the vision Encoder and the LLM engine.
 
 Prerequisites:
   - Redis running on 127.0.0.1:6379
-  - NanoCtrl running on 127.0.0.1:3000
+  - NanoCtrl running on 127.0.0.1:4479
   - Ray cluster with at least 1 GPU
   - dlslime installed (RDMA support)
   - Model checkpoint with vision_config (e.g. Qwen3.5-35B-A3B)
@@ -35,7 +35,7 @@ python test_ep_full.py \\
 # Customize
 python test_ep_full.py \\
     --model /models/models-Qwen-Qwen3.5-35B-A3B \\
-    --nanoctrl_address http://127.0.0.1:3000 \\
+    --ctrl_address http://127.0.0.1:4479 \\
     --encoder_device cuda:0 \\
     --max_tokens 64 \\
     --enforce_eager
@@ -92,8 +92,8 @@ def step_encoder(args) -> tuple:
         vision_dtype="bfloat16",
         num_slots=8,
         max_tokens_per_slot=4096,
-        nanoctrl_address=args.nanoctrl_address,
-        nanoctrl_scope=args.nanoctrl_scope,
+        ctrl_address=args.ctrl_address,
+        ctrl_scope=args.ctrl_scope,
         host=args.host,
         p2p_port=0,
     )
@@ -153,8 +153,8 @@ def step_llm(args, slot_metas, token_ids) -> list:
 
     config = Config(
         model=args.model,
-        nanoctrl_address=args.nanoctrl_address,
-        nanoctrl_scope=args.nanoctrl_scope,
+        ctrl_address=args.ctrl_address,
+        ctrl_scope=args.ctrl_scope,
         ray_address=args.ray_address,
         master_address=args.master_address,
         kvcache_block_size=64,
@@ -230,8 +230,8 @@ def main():
     parser.add_argument("--image_path", type=str, default=None)
     parser.add_argument("--prompt", type=str, default="Describe this image in detail.")
     parser.add_argument("--max_tokens", type=int, default=128)
-    parser.add_argument("--nanoctrl_address", type=str, default="http://127.0.0.1:3000")
-    parser.add_argument("--nanoctrl_scope", type=str, default=None)
+    parser.add_argument("--ctrl_address", type=str, default="http://127.0.0.1:4479")
+    parser.add_argument("--ctrl_scope", type=str, default=None)
     parser.add_argument("--ray_address", type=str, default="auto")
     parser.add_argument("--master_address", type=str, default="10.102.97.179:6006")
     parser.add_argument("--host", type=str, default="10.102.97.179")

@@ -21,14 +21,14 @@ class PeerAgentContext:
     def start_peer_agent(
         cls,
         *,
-        nanoctrl_address: str | None,
+        ctrl_address: str | None,
         alias: str | None,
         device: str | None,
         scope: str | None = None,
         qp_num: int | None = None,
     ) -> "PeerAgentContext | None":
         """Start a DLSlime PeerAgent and return its public context handle."""
-        if nanoctrl_address is None or alias is None:
+        if ctrl_address is None or alias is None:
             return None
 
         import dlslime
@@ -37,7 +37,7 @@ class PeerAgentContext:
         if not callable(start_peer_agent_fn):
             return None
 
-        server_url = nanoctrl_address
+        server_url = ctrl_address
         if not server_url.startswith("http://") and not server_url.startswith(
             "https://"
         ):
@@ -50,7 +50,7 @@ class PeerAgentContext:
             device = available_nics[0]
 
         agent = start_peer_agent_fn(
-            nanoctrl_url=server_url,
+            ctrl_url=server_url,
             alias=alias,
             device=device,
             scope=scope,
@@ -73,14 +73,14 @@ class PeerAgentContext:
     ) -> "PeerAgentContext | None":
         """Start a PeerAgent using transport settings from CacheContext."""
         return cls.start_peer_agent(
-            nanoctrl_address=cache_context.nanoctrl_address,
+            ctrl_address=cache_context.ctrl_address,
             alias=(
                 f"{cache_context.engine_id}:{rank}"
                 if cache_context.engine_id is not None
                 else None
             ),
             device=cache_context.selected_nic,
-            scope=cache_context.nanoctrl_scope,
+            scope=cache_context.ctrl_scope,
         )
 
     def is_connected(self, peer_alias: str) -> bool:

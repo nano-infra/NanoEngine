@@ -31,9 +31,9 @@ class EncoderConfig(BaseModel):
         Number of concurrent embedding slots in EmbeddingPool.
     max_tokens_per_slot : int
         Max merged vision tokens per slot.
-    nanoctrl_address : str | None
+    ctrl_address : str | None
         NanoCtrl server URL for service registration.
-    nanoctrl_scope : str | None
+    ctrl_scope : str | None
         NanoCtrl scope for multi-tenant isolation.
     host : str
         Bind address for ZMQ sockets.
@@ -48,8 +48,8 @@ class EncoderConfig(BaseModel):
     vision_dtype: str = "bfloat16"
     num_slots: int = 64
     max_tokens_per_slot: int = 4096
-    nanoctrl_address: str | None = None
-    nanoctrl_scope: str | None = None
+    ctrl_address: str | None = None
+    ctrl_scope: str | None = None
     host: str = "0.0.0.0"
     p2p_port: int = 0  # 0 = auto-bind
     zmq_port: int = 0  # 0 = auto-bind; NanoRoute connects to this port

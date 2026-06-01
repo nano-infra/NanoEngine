@@ -29,9 +29,9 @@ class DLSLimeExecutor(RayExecutor):
                 "dependency. Install NanoDeploy with the 'dlslime' extra."
             ) from exc
 
-        if not config.nanoctrl_address:
+        if not config.ctrl_address:
             raise ValueError(
-                "executor_backend='dlslime' requires nanoctrl_address so "
+                "executor_backend='dlslime' requires ctrl_address so "
                 "PeerAgents can register with NanoCtrl"
             )
 
@@ -58,10 +58,10 @@ class DLSLimeExecutor(RayExecutor):
 
         self._driver_alias = f"{self.config.engine_id}:driver:{uuid.uuid4().hex[:8]}"
         self._driver_agent = self._dlslime.start_peer_agent(
-            nanoctrl_url=self.config.nanoctrl_address,
+            ctrl_url=self.config.ctrl_address,
             alias=self._driver_alias,
             device=available_nics[0],
-            scope=self.config.nanoctrl_scope,
+            scope=self.config.ctrl_scope,
         )
         driver_qp_num = int(os.environ.get("SLIME_QP_NUM", 1))
         worker_aliases = ray.get(

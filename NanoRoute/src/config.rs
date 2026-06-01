@@ -30,11 +30,11 @@ pub enum EngineConfig {
         host: String,
         port: u16,
         #[serde(default)]
-        nanoctrl_address: Option<String>, // e.g., "http://127.0.0.1:3000"
+        ctrl_address: Option<String>, // e.g., "http://127.0.0.1:4479"
         #[serde(default)]
         redis_url: Option<String>, // e.g., "redis://127.0.0.1:6379"
         #[serde(default)]
-        nanoctrl_scope: Option<String>,
+        ctrl_scope: Option<String>,
     },
     Disaggregated {
         #[serde(default)]
@@ -42,11 +42,11 @@ pub enum EngineConfig {
         #[serde(default)]
         decode: Vec<EngineNode>,
         #[serde(default)]
-        nanoctrl_address: Option<String>, // e.g., "http://127.0.0.1:3000"
+        ctrl_address: Option<String>, // e.g., "http://127.0.0.1:4479"
         #[serde(default)]
         redis_url: Option<String>, // e.g., "redis://127.0.0.1:6379"
         #[serde(default)]
-        nanoctrl_scope: Option<String>,
+        ctrl_scope: Option<String>,
     },
 }
 
