@@ -18,3 +18,41 @@ Runtime deps (must be installed by the user):
 
 License: Apache-2.0 (matches upstream sgl-kernel; see LICENSE).
 """
+
+import os
+
+
+def fused_kernels_enabled() -> bool:
+    """Whether the vendored sglang JIT fused kernels should be used.
+
+    These kernels (fused RMSNorm+RoPE, SwiGLU, hyper-connection,
+    compressor, ...) are written for Hopper (sm_90: H100/H200) and rely
+    on TMA / wgmma / PDL code paths that fail to build or crash at
+    runtime on other GPU architectures. On non-Hopper GPUs callers must
+    fall back to their eager implementations: slower, but correct,
+    portable, and still CUDAGraph-capturable — so the same image runs on
+    H200 and non-H200 alike instead of getting stuck on a Hopper-only
+    kernel.
+
+    Selection is automatic by GPU arch. Override with
+    ``NANODEPLOY_SGLANG_FUSED_KERNELS={auto,1,0}`` (default ``auto``):
+      * ``auto`` — enable only on Hopper (compute capability major == 9)
+      * ``1`` / ``on`` / ``force`` — force-enable regardless of arch
+      * ``0`` / ``off`` — force-disable (always use eager fallbacks)
+    """
+    override = os.getenv("NANODEPLOY_SGLANG_FUSED_KERNELS", "auto")
+    override = override.strip().lower()
+    if override in ("0", "off", "false", "no"):
+        return False
+    if override in ("1", "on", "true", "yes", "force"):
+        return True
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        # Hopper only. Bump to ``>= 9`` (or add the Blackwell major) once
+        # these kernels are validated on newer architectures.
+        return torch.cuda.get_device_capability()[0] == 9
+    except Exception:
+        return False
