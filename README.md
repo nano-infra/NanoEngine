@@ -92,7 +92,7 @@ pip install dlslime==0.1.16
 
 ### Docker Development Image
 
-The development container is built from `docker/Dockerfile`. It uses NVIDIA CUDA 12.8 devel, PyTorch 2.10 CUDA 12.8, source-built DeepEP/DeepGEMM/FlashMLA/FlashInfer, release-wheel flash-attn, rustup-managed Rust, and an editable NanoDeploy install.
+The development container is built from `docker/Dockerfile`. It uses NVIDIA CUDA 12.8 devel, PyTorch 2.10 CUDA 12.8, source-built DeepEP/DeepGEMM/FlashMLA/FlashInfer, release-wheel flash-attn, rustup-managed Rust, and the build toolchains needed for NanoDeploy. The image intentionally does not include the NanoDeploy source tree; mount or clone NanoDeploy inside the container and install it there. This keeps the expensive dependency layers reusable across source changes.
 
 Build:
 
@@ -112,8 +112,15 @@ docker run --gpus all --rm -it --network host --ipc=host \
   --cap-add IPC_LOCK --ulimit memlock=-1:-1 \
   --device=/dev/infiniband \
   -v /sys/class/infiniband:/sys/class/infiniband:ro \
+  -v $PWD:/workspace/NanoDeploy \
   -w /workspace/NanoDeploy/NanoDeploy \
   nanodeploy:0.2.0-cu128-devel
+```
+
+Inside the container, install NanoDeploy from the mounted checkout:
+
+```bash
+python3 -m pip install --break-system-packages --no-build-isolation -v -e .
 ```
 
 ### One-liner: install everything
