@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-from nanoctrl.client import NanoCtrlClient
+from dlslime.ctrl import NanoCtrlClient
 from nanodeploy.context.embedding_pool import EmbeddingPool
 from nanodeploy.logging import get_logger
 
@@ -120,7 +120,7 @@ class EncoderEngine:
 
         # --- NanoCtrl lifecycle client ---
         self._nanoctrl: NanoCtrlClient | None = None
-        if config.nanoctrl_address:
+        if config.ctrl_address:
             self._register_with_nanoctrl()
 
         atexit.register(self.shutdown)
@@ -180,7 +180,7 @@ class EncoderEngine:
 
     def _start_peer_agent(self):
         """Start dlslime PeerAgent and register EmbeddingPool MR."""
-        if self.config.nanoctrl_address is None:
+        if self.config.ctrl_address is None:
             return
 
         try:
@@ -192,7 +192,7 @@ class EncoderEngine:
                 return
 
             agent_alias = f"{self.engine_id}:0"
-            server_url = self.config.nanoctrl_address
+            server_url = self.config.ctrl_address
             if not server_url.startswith(("http://", "https://")):
                 server_url = f"http://{server_url}"
 
@@ -200,10 +200,10 @@ class EncoderEngine:
             if not available_nics:
                 raise RuntimeError("No available NICs for RDMA")
             nic = available_nics[0]
-            scope = self.config.nanoctrl_scope
+            scope = self.config.ctrl_scope
 
             self._peer_agent = start_fn(
-                nanoctrl_url=server_url,
+                ctrl_url=server_url,
                 alias=agent_alias,
                 device=nic,
                 scope=scope,
@@ -245,12 +245,12 @@ class EncoderEngine:
         }
 
     def _register_with_nanoctrl(self):
-        if not self.config.nanoctrl_address:
+        if not self.config.ctrl_address:
             return
 
         if self._nanoctrl is None:
             self._nanoctrl = NanoCtrlClient(
-                self.config.nanoctrl_address, self.config.nanoctrl_scope
+                self.config.ctrl_address, self.config.ctrl_scope
             )
 
         info = self.get_engine_info()

@@ -184,7 +184,7 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
 
     # Set p2p_port and re-register
     engine.p2p_port = p2p_port
-    if config.nanoctrl_address:
+    if config.ctrl_address:
         engine._register_with_nanoctrl()
 
     service = BackendService(engine, results_queue)
@@ -356,12 +356,10 @@ class EngineServer:
         logger.info(
             f"Max Tokens:      {self.config.max_num_batched_tokens} batched, {self.config.max_model_len} model length"
         )
-        logger.info(
-            f"NanoCtrl:        {self.config.nanoctrl_address or 'Not configured'}"
-        )
+        logger.info(f"NanoCtrl:        {self.config.ctrl_address or 'Not configured'}")
         logger.info(f"Ray Address:     {self.config.ray_address}")
         logger.info(
-            f"Redis Scope:      {self.config.nanoctrl_scope or 'Not set (using NanoCtrl default)'}"
+            f"Redis Scope:      {self.config.ctrl_scope or 'Not set (using NanoCtrl default)'}"
         )
         logger.info("=" * 80)
 

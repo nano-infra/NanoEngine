@@ -53,39 +53,32 @@ async fn main() -> anyhow::Result<()> {
 
     // Phase 1: Engine Manager & Connect
     // Get NanoCtrl address from config (required for dynamic discovery)
-    let nanoctrl_address = match &config.engine {
-        config::EngineConfig::Unified {
-            nanoctrl_address, ..
-        } => nanoctrl_address.clone(),
-        config::EngineConfig::Disaggregated {
-            nanoctrl_address, ..
-        } => nanoctrl_address.clone(),
+    let ctrl_address = match &config.engine {
+        config::EngineConfig::Unified { ctrl_address, .. } => ctrl_address.clone(),
+        config::EngineConfig::Disaggregated { ctrl_address, .. } => ctrl_address.clone(),
     };
 
-    let nanoctrl_address = match nanoctrl_address {
+    let ctrl_address = match ctrl_address {
         Some(addr) => addr,
         None => {
-            error!("nanoctrl_address is required for dynamic service discovery");
+            error!("ctrl_address is required for dynamic service discovery");
             return Err(anyhow::anyhow!(
-                "nanoctrl_address must be configured in config.toml"
+                "ctrl_address must be configured in config.toml"
             ));
         }
     };
 
-    debug!("Using NanoCtrl at: {}", nanoctrl_address);
+    debug!("Using dlslime-ctrl at: {}", ctrl_address);
 
-    // Get Redis URL from NanoCtrl (once per process; if you see 3x in NanoCtrl log, check for 3 router instances)
-    // Read scope from config, fall back to NANOCTRL_SCOPE env var
+    // Get Redis URL from dlslime-ctrl (once per process; if you see 3x in the log, check for 3 router instances)
+    // Read scope from config, fall back to DLSLIME_CTRL_SCOPE env var.
     let config_scope = match &config.engine {
-        config::EngineConfig::Unified { nanoctrl_scope, .. } => nanoctrl_scope.clone(),
-        config::EngineConfig::Disaggregated { nanoctrl_scope, .. } => nanoctrl_scope.clone(),
+        config::EngineConfig::Unified { ctrl_scope, .. } => ctrl_scope.clone(),
+        config::EngineConfig::Disaggregated { ctrl_scope, .. } => ctrl_scope.clone(),
     };
-    let redis_scope = config_scope.or_else(|| std::env::var("NANOCTRL_SCOPE").ok());
+    let redis_scope = config_scope.or_else(|| std::env::var("DLSLIME_CTRL_SCOPE").ok());
     let engine_mgr = engine_manager::EngineManager::with_scope(redis_scope);
-    let redis_url = match engine_mgr
-        .get_redis_url_from_nanoctrl(&nanoctrl_address)
-        .await
-    {
+    let redis_url = match engine_mgr.get_redis_url_from_ctrl(&ctrl_address).await {
         Ok(url) => {
             debug!("Retrieved Redis URL from NanoCtrl: {}", url);
             url
@@ -105,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
         redis_url
     );
     let engine_manager = match engine_mgr
-        .start_dynamic_discovery(redis_url, Some(nanoctrl_address.clone()))
+        .start_dynamic_discovery(redis_url, Some(ctrl_address.clone()))
         .await
     {
         Ok(manager_arc) => {

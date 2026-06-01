@@ -537,9 +537,9 @@ class ModelRunner:
                 )
             return self._dlslime_alias
 
-        if not self.config.nanoctrl_address:
+        if not self.config.ctrl_address:
             raise RuntimeError(
-                "executor_backend='dlslime' requires nanoctrl_address to be set"
+                "executor_backend='dlslime' requires ctrl_address to be set"
             )
 
         try:
@@ -559,10 +559,10 @@ class ModelRunner:
         agent_alias = f"{self.engine_id}:rpc:{self.rank}"
         device = available_nics[get_dist_context().local_rank % len(available_nics)]
         self._dlslime_agent = dlslime.start_peer_agent(
-            nanoctrl_url=self.config.nanoctrl_address,
+            ctrl_url=self.config.ctrl_address,
             alias=agent_alias,
             device=device,
-            scope=self.config.nanoctrl_scope,
+            scope=self.config.ctrl_scope,
         )
         self._dlslime_qp_num = int(os.environ.get("SLIME_QP_NUM", 1))
         service = ModelRunnerRpcService(self)
@@ -643,11 +643,11 @@ class ModelRunner:
         else:
             num_kv_layers = hf_config.num_hidden_layers
 
-        # If nanoctrl_address is provided, fetch engine_id from NanoCtrl
+        # If ctrl_address is provided, fetch engine_id from NanoCtrl
         engine_id = config.engine_id
-        if config.nanoctrl_address and not engine_id:
-            engine_id = _get_engine_id_from_nanoctrl(
-                config.nanoctrl_address, config.host, config.port
+        if config.ctrl_address and not engine_id:
+            engine_id = _get_engine_id_from_ctrl(
+                config.ctrl_address, config.host, config.port
             )
 
         # Enable FP8 KV cache for sparse attention (V3.2)
@@ -675,8 +675,8 @@ class ModelRunner:
             device=torch.get_default_device(),
             dtype=torch.get_default_dtype(),
             mode=mode,
-            nanoctrl_address=config.nanoctrl_address,
-            nanoctrl_scope=config.nanoctrl_scope,
+            ctrl_address=config.ctrl_address,
+            ctrl_scope=config.ctrl_scope,
             engine_id=engine_id,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks

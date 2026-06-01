@@ -219,12 +219,9 @@ impl EngineManager {
     // ─── NanoCtrl API ────────────────────────────────────────────────
 
     /// Get Redis URL from NanoCtrl API
-    pub async fn get_redis_url_from_nanoctrl(
-        &self,
-        nanoctrl_address: &str,
-    ) -> anyhow::Result<String> {
+    pub async fn get_redis_url_from_ctrl(&self, ctrl_address: &str) -> anyhow::Result<String> {
         let client = reqwest::Client::new();
-        let url = format!("{}/get_redis_address", nanoctrl_address);
+        let url = format!("{}/get_redis_address", ctrl_address);
 
         let response = client
             .post(&url)
@@ -262,12 +259,12 @@ impl EngineManager {
     /// metadata, resource}`. Engines register with `entity_type="service"` and
     /// their engine info is stored in `metadata`. We flatten each entity into
     /// the legacy engine-info shape so the rest of the pipeline is unchanged.
-    pub async fn list_engines_from_nanoctrl(
+    pub async fn list_engines_from_ctrl(
         &self,
-        nanoctrl_address: &str,
+        ctrl_address: &str,
     ) -> anyhow::Result<Vec<serde_json::Value>> {
         let client = reqwest::Client::new();
-        let url = format!("{}/list_entities", nanoctrl_address);
+        let url = format!("{}/list_entities", ctrl_address);
 
         let mut body = serde_json::json!({ "entity_type": "service" });
         if !self.redis_key_prefix.is_empty() {
@@ -429,7 +426,7 @@ impl EngineManager {
     async fn load_initial_engines(
         &mut self,
         redis_url: &str,
-        nanoctrl_address: Option<&str>,
+        ctrl_address: Option<&str>,
     ) -> anyhow::Result<i64> {
         let mut initial_revision = 0i64;
         let mut redis_engines = 0;
@@ -451,8 +448,8 @@ impl EngineManager {
 
         // Then, if NanoCtrl address is provided, also query from API and merge
         // (bootstrap: 1x list_engines per router start)
-        if let Some(addr) = nanoctrl_address {
-            match self.list_engines_from_nanoctrl(addr).await {
+        if let Some(addr) = ctrl_address {
+            match self.list_engines_from_ctrl(addr).await {
                 Ok(api_engines) => {
                     debug!(
                         "NanoCtrl API reports {} engines, Redis snapshot has {} engines",
@@ -542,7 +539,7 @@ impl EngineManager {
     pub async fn start_dynamic_discovery(
         mut self,
         redis_url: String,
-        nanoctrl_address: Option<String>,
+        ctrl_address: Option<String>,
     ) -> anyhow::Result<Arc<Mutex<Self>>> {
         debug!(
             "Using Redis key prefix: '{}' (matches NanoCtrl default)",
@@ -551,7 +548,7 @@ impl EngineManager {
 
         // Step 1: Load snapshot + merge API data
         let initial_revision = self
-            .load_initial_engines(&redis_url, nanoctrl_address.as_deref())
+            .load_initial_engines(&redis_url, ctrl_address.as_deref())
             .await?;
 
         // Step 2: Start watcher with scoped prefix
@@ -566,7 +563,7 @@ impl EngineManager {
 
         // Step 3: Process events in a separate task
         let manager_arc = Arc::new(Mutex::new(self));
-        let nanoctrl_addr_clone = nanoctrl_address.clone();
+        let ctrl_addr_clone = ctrl_address.clone();
         let redis_url_clone = redis_url.clone();
 
         let manager_arc_clone = manager_arc.clone();
@@ -627,7 +624,7 @@ impl EngineManager {
                             expected_revision, actual_revision
                         );
                         if let Err(e) = manager
-                            .handle_gap_detected(nanoctrl_addr_clone.as_deref(), &redis_url_clone)
+                            .handle_gap_detected(ctrl_addr_clone.as_deref(), &redis_url_clone)
                             .await
                         {
                             error!("Failed to handle gap: {}", e);
@@ -636,7 +633,7 @@ impl EngineManager {
                     EngineEvent::ReconnectRequired => {
                         warn!("Reconnect required, triggering full sync");
                         if let Err(e) = manager
-                            .handle_gap_detected(nanoctrl_addr_clone.as_deref(), &redis_url_clone)
+                            .handle_gap_detected(ctrl_addr_clone.as_deref(), &redis_url_clone)
                             .await
                         {
                             error!("Failed to handle reconnect: {}", e);
@@ -652,9 +649,9 @@ impl EngineManager {
         // Redis key expiry is silent (no Pub/Sub event), so the watcher alone can't detect it.
         // Every 90s we query NanoCtrl's live list and remove any engine no longer present.
         // (TTL = 60s, so a crashed engine's key is gone within 60s; 90s gives margin.)
-        if nanoctrl_address.is_some() {
+        if ctrl_address.is_some() {
             let manager_arc_resync = manager_arc.clone();
-            let nanoctrl_addr_resync = nanoctrl_address.clone();
+            let ctrl_addr_resync = ctrl_address.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(90));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -663,7 +660,7 @@ impl EngineManager {
                     interval.tick().await;
                     let mut manager = manager_arc_resync.lock().await;
                     if let Err(e) = manager
-                        .handle_periodic_sync(nanoctrl_addr_resync.as_deref())
+                        .handle_periodic_sync(ctrl_addr_resync.as_deref())
                         .await
                     {
                         warn!("Periodic sync failed: {}", e);
@@ -972,12 +969,12 @@ impl EngineManager {
     /// This is the only way to detect engines that died without calling /unregister
     /// (crash, SIGKILL, etc.). Their Redis key expires via TTL, but key expiry does NOT
     /// publish a REMOVE event — so the Pub/Sub watcher never fires for them.
-    async fn handle_periodic_sync(&mut self, nanoctrl_address: Option<&str>) -> anyhow::Result<()> {
-        let Some(addr) = nanoctrl_address else {
+    async fn handle_periodic_sync(&mut self, ctrl_address: Option<&str>) -> anyhow::Result<()> {
+        let Some(addr) = ctrl_address else {
             return Ok(());
         };
 
-        let live_engines = self.list_engines_from_nanoctrl(addr).await?;
+        let live_engines = self.list_engines_from_ctrl(addr).await?;
         let live_ids: std::collections::HashSet<String> = live_engines
             .iter()
             .filter_map(|e| e["id"].as_str().map(|s| s.to_string()))
@@ -1020,7 +1017,7 @@ impl EngineManager {
 
     async fn handle_gap_detected(
         &mut self,
-        nanoctrl_address: Option<&str>,
+        ctrl_address: Option<&str>,
         redis_url: &str,
     ) -> anyhow::Result<()> {
         warn!("Gap detected, performing full sync");
@@ -1033,8 +1030,8 @@ impl EngineManager {
         self.engine_model_map.clear();
 
         // Reload from NanoCtrl or Redis
-        if let Some(addr) = nanoctrl_address {
-            let engines = self.list_engines_from_nanoctrl(addr).await?;
+        if let Some(addr) = ctrl_address {
+            let engines = self.list_engines_from_ctrl(addr).await?;
             for engine_info in engines {
                 if let Err(e) = self.add_engine_from_info(engine_info).await {
                     warn!("Failed to add engine from full sync: {}", e);

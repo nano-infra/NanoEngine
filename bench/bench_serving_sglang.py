@@ -2662,7 +2662,7 @@ if __name__ == "__main__":
         nargs="*",
         default=None,
         help="URL(s) of the prefill worker(s) for profiling in PD separated mode. "
-        "Can specify multiple URLs: --profile-prefill-url http://localhost:30000 http://localhost:30001. "
+        "Can specify multiple URLs: --profile-prefill-url http://localhost:44790 http://localhost:44791. "
         "NOTE: Cannot be used together with --profile-decode-url. "
         "In PD separated mode, prefill and decode workers must be profiled separately.",
     )

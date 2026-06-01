@@ -62,8 +62,8 @@ class VLServerConfig(BaseModel):
     max_tokens_per_slot: int = 4096
 
     # NanoCtrl (for encoder RDMA registration + service discovery)
-    nanoctrl_address: str | None = None
-    nanoctrl_scope: str | None = None
+    ctrl_address: str | None = None
+    ctrl_scope: str | None = None
 
     # P2P (encoder free listener)
     p2p_port: int = 0
@@ -95,8 +95,8 @@ class VLEngineServer:
             vision_dtype=cfg.encoder_dtype,
             num_slots=cfg.num_slots,
             max_tokens_per_slot=cfg.max_tokens_per_slot,
-            nanoctrl_address=cfg.nanoctrl_address,
-            nanoctrl_scope=cfg.nanoctrl_scope,
+            ctrl_address=cfg.ctrl_address,
+            ctrl_scope=cfg.ctrl_scope,
             p2p_port=cfg.p2p_port,
         )
         logger.info("Starting EncoderEngine on %s", cfg.encoder_device)
@@ -164,8 +164,8 @@ def main():
         encoder_dtype=args.encoder_dtype,
         num_slots=args.num_slots,
         max_tokens_per_slot=args.max_tokens_per_slot,
-        nanoctrl_address=args.nanoctrl_address,
-        nanoctrl_scope=args.nanoctrl_scope,
+        ctrl_address=args.ctrl_address,
+        ctrl_scope=args.ctrl_scope,
         p2p_port=args.p2p_port,
     )
 

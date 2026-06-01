@@ -125,7 +125,7 @@ class VisionEmbedManager:
         )
 
         # Look up peer_addrs for all encoders via NanoCtrl
-        encoder_info_map = cache_ctx._fetch_engine_info_from_nanoctrl(
+        encoder_info_map = cache_ctx._fetch_engine_info_from_ctrl(
             set(by_encoder.keys())
         )
 
