@@ -2,18 +2,25 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 
 # Optional vendored sglang fused kernel: chunk + silu + mul + (clamp) in
 # one CUDA kernel. Falls back to the torch.compile path when the vendor
-# isn't available or shapes/dtype don't fit.
+# isn't available or shapes/dtype don't fit. The kernel is Hopper-only,
+# so it is gated behind the shared GPU-arch check — on non-Hopper GPUs we
+# keep it ``None`` and use the eager/compiled path (CUDAGraph still works).
 # Source: https://github.com/sgl-project/sglang
 #   python/sglang/jit_kernel/deepseek_v4.py::silu_and_mul_clamp
-try:
-    from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
-        silu_and_mul_clamp as _SGL_SILU_AND_MUL_CLAMP,
-    )
-except Exception:
+from nanodeploy._third_party.sglang_jit_kernel import fused_kernels_enabled
+from torch import nn
+
+if fused_kernels_enabled():
+    try:
+        from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
+            silu_and_mul_clamp as _SGL_SILU_AND_MUL_CLAMP,
+        )
+    except Exception:
+        _SGL_SILU_AND_MUL_CLAMP = None
+else:
     _SGL_SILU_AND_MUL_CLAMP = None
 
 

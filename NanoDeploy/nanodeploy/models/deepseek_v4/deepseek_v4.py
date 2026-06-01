@@ -8,6 +8,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from nanodeploy._third_party.sglang_jit_kernel import (
+    fused_kernels_enabled as _sglang_fused_kernels_enabled,
+)
 from nanodeploy.backends import get_backend
 from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kvcache
 from nanodeploy.context.context import get_context
@@ -112,6 +115,12 @@ def _hc_post_compiled(
     return _hc_post_fn(x, residual, post, comb)
 
 
+# Gate every Hopper-only fused kernel (vendored sglang JIT + tilelang)
+# behind a single GPU-arch check. On non-Hopper GPUs these stay ``None``
+# and each call site uses its eager fallback (CUDAGraph still allowed).
+_DSV4_FUSED_KERNELS = _sglang_fused_kernels_enabled()
+
+
 # Optional vendored sglang DSV4 fused kernels. When present,
 # _apply_rotary_interleaved replaces ~10 eager elementwise launches per
 # call with a single CUDA kernel.
@@ -119,16 +128,22 @@ def _hc_post_compiled(
 #   https://github.com/sgl-project/sglang
 #   python/sglang/jit_kernel/deepseek_v4.py::fused_rope
 # Runtime deps for the vendored slice: torch, triton, tvm-ffi.
-try:
-    from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
-        fused_norm_rope_inplace as _SGL_FUSED_NORM_ROPE,
-        fused_rope as _SGL_FUSED_ROPE,
-        rmsnorm_self as _SGL_RMSNORM_SELF,
-    )
-except Exception:
-    # ImportError if tvm-ffi isn't installed; any other Exception if
-    # the vendored layout is broken on this checkout. Fall back to
-    # eager either way.
+if _DSV4_FUSED_KERNELS:
+    try:
+        from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
+            fused_norm_rope_inplace as _SGL_FUSED_NORM_ROPE,
+            fused_rope as _SGL_FUSED_ROPE,
+            rmsnorm_self as _SGL_RMSNORM_SELF,
+        )
+    except Exception:
+        # ImportError if tvm-ffi isn't installed; any other Exception if
+        # the vendored layout is broken on this checkout. Fall back to
+        # eager either way.
+        _SGL_FUSED_ROPE = None
+        _SGL_FUSED_NORM_ROPE = None
+        _SGL_RMSNORM_SELF = None
+else:
+    # Non-Hopper (or explicitly disabled): use the eager RoPE/RMSNorm path.
     _SGL_FUSED_ROPE = None
     _SGL_FUSED_NORM_ROPE = None
     _SGL_RMSNORM_SELF = None
@@ -178,12 +193,17 @@ except Exception:
 # co-launch — the HC eager fallback fired, adding ~12k extra kernels per
 # step and a 40% throughput regression. Rewriting in tilelang keeps both
 # kernels on the same runtime and avoids the conflict.
-try:
-    from nanodeploy.models.deepseek_v4.compress_kernels import (
-        compress_no_overlap_softmax_sum as _TILE_COMPRESS_NO_OVERLAP,
-        compress_overlap_softmax_sum as _TILE_COMPRESS_OVERLAP,
-    )
-except Exception:
+if _DSV4_FUSED_KERNELS:
+    try:
+        from nanodeploy.models.deepseek_v4.compress_kernels import (
+            compress_no_overlap_softmax_sum as _TILE_COMPRESS_NO_OVERLAP,
+            compress_overlap_softmax_sum as _TILE_COMPRESS_OVERLAP,
+        )
+    except Exception:
+        _TILE_COMPRESS_OVERLAP = None
+        _TILE_COMPRESS_NO_OVERLAP = None
+else:
+    # Non-Hopper: eager cat-rearrange + softmax + weighted-sum fallback.
     _TILE_COMPRESS_OVERLAP = None
     _TILE_COMPRESS_NO_OVERLAP = None
 
@@ -192,9 +212,13 @@ except Exception:
 # DeepseekV4HCProjector.forward into 2-3 tilelang kernels.
 # Source: https://github.com/sgl-project/sglang
 #   python/sglang/srt/layers/mhc.py
-try:
-    from nanodeploy._third_party.sglang_mhc import mhc_pre as _SGL_MHC_PRE
-except Exception:
+if _DSV4_FUSED_KERNELS:
+    try:
+        from nanodeploy._third_party.sglang_mhc import mhc_pre as _SGL_MHC_PRE
+    except Exception:
+        _SGL_MHC_PRE = None
+else:
+    # Non-Hopper: eager F.linear + RMSNorm + sigmoid + sinkhorn fallback.
     _SGL_MHC_PRE = None
 
 
