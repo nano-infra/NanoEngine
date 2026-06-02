@@ -222,10 +222,11 @@ OpenAI-compatible HTTP API directly, in the spirit of `vllm serve` — no
 NanoRoute and no ZMQ engine servers required:
 
 ```bash
+# Same Config flags as engine_server.py (--host/--port bind HTTP for serve)
 nanodeploy serve /path/to/model \
-  --host 0.0.0.0 \
-  --port 8100 \
-  --served-model-name Qwen3-4B
+  --host 0.0.0.0 --port 8100 \
+  --served-model-name Qwen3-4B \
+  --ray_address 127.0.0.1:7078
 ```
 
 Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/completions`,
