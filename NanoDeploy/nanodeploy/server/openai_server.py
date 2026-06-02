@@ -25,12 +25,16 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import os
 import queue
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Optional
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from nanodeploy.config import Config
 from nanodeploy.logging import get_logger
@@ -149,8 +153,40 @@ class OpenAIServer:
         self.worker = worker
         self.tokenizer = tokenizer
         self.served_model_name = served_model_name
-        self.model_path = model_path
+        self.model_path = model_path.rstrip("/")
         self.default_max_tokens = default_max_tokens
+        self._model_aliases = self._build_model_aliases()
+
+    def _build_model_aliases(self) -> set[str]:
+        """OpenAI ``model`` values accepted on this server (alias + path)."""
+        aliases: set[str] = {self.served_model_name}
+        for raw in (self.model_path, os.path.expanduser(self.model_path)):
+            aliases.add(raw.rstrip("/"))
+            try:
+                aliases.add(os.path.realpath(raw).rstrip("/"))
+            except OSError:
+                pass
+        base = self.model_path.split("/")[-1]
+        if base:
+            aliases.add(base)
+        return aliases
+
+    def resolve_request_model(self, requested: str | None) -> str | None:
+        """Map client ``model`` to canonical served name, or None if unknown."""
+        if not requested:
+            return None
+        key = requested.strip().rstrip("/")
+        if key in self._model_aliases:
+            return self.served_model_name
+        expanded = os.path.expanduser(key)
+        if expanded.rstrip("/") in self._model_aliases:
+            return self.served_model_name
+        try:
+            if os.path.realpath(expanded).rstrip("/") in self._model_aliases:
+                return self.served_model_name
+        except OSError:
+            pass
+        return None
 
     # -- prompt construction --
 
@@ -225,9 +261,6 @@ class OpenAIServer:
 
 
 def build_app(server: OpenAIServer):
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
-
     app = FastAPI(title="NanoDeploy OpenAI Server")
 
     @app.get("/health")
@@ -252,7 +285,42 @@ def build_app(server: OpenAIServer):
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):  # noqa: ANN202
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Invalid JSON body: {e}",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "JSON body must be an object",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+        if server.resolve_request_model(body.get("model")) is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "message": (
+                            f"Model '{body.get('model')}' not found. "
+                            f"Use one of: {sorted(server._model_aliases)}"
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            )
         messages = body.get("messages") or []
         sampling_params = server._build_sampling_params(body)
         max_tokens = sampling_params.max_tokens
@@ -353,7 +421,42 @@ def build_app(server: OpenAIServer):
 
     @app.post("/v1/completions")
     async def completions(request: Request):  # noqa: ANN202
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Invalid JSON body: {e}",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "JSON body must be an object",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+        if server.resolve_request_model(body.get("model")) is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "message": (
+                            f"Model '{body.get('model')}' not found. "
+                            f"Use one of: {sorted(server._model_aliases)}"
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            )
         prompt = body.get("prompt", "")
         if isinstance(prompt, list):
             prompt = prompt[0] if prompt else ""
@@ -504,8 +607,6 @@ def register_with_ctrl(
 def run_server(
     config: Config,
     *,
-    host: str,
-    port: int,
     served_model_name: str,
     ctrl_address: Optional[str] = None,
     ctrl_scope: Optional[str] = None,
@@ -515,6 +616,9 @@ def run_server(
     from transformers import PreTrainedTokenizerFast
 
     from nanodeploy.llm_component import LLM
+
+    host = config.host
+    port = config.port
 
     logger.info("=" * 72)
     logger.info("NanoDeploy OpenAI Server")
