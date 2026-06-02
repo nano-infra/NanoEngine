@@ -214,6 +214,44 @@ python NanoDeploy/examples/disagg.py \
     --decode.master_address <node1-ip>:6006
 ```
 
+### Single-node serving (`nanodeploy serve`)
+
+For single-node hybrid deployment (prefill + decode in one process), use the
+`nanodeploy serve` command. It runs the engine in-process and exposes an
+OpenAI-compatible HTTP API directly, in the spirit of `vllm serve` — no
+NanoRoute and no ZMQ engine servers required:
+
+```bash
+nanodeploy serve /path/to/model \
+  --host 0.0.0.0 \
+  --port 8100 \
+  --served-model-name Qwen3-4B
+```
+
+Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/completions`,
+`POST /v1/chat/completions` (streaming and non-streaming).
+
+```bash
+curl http://127.0.0.1:8100/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen3-4B", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+To make the node discoverable by a router (e.g. DLRouter) via dlslime-ctrl,
+point it at a running control plane; the server then registers its HTTP
+endpoint (entity kind `nanodeploy`) and keeps a heartbeat:
+
+```bash
+# Control plane (Redis + dlslime-ctrl)
+redis-server --bind 0.0.0.0 --port 6379 &
+dlslime-ctrl server --redis-url redis://127.0.0.1:6379 &
+
+nanodeploy serve /path/to/model \
+  --host 0.0.0.0 --port 8100 \
+  --served-model-name Qwen3-4B \
+  --ctrl-address 127.0.0.1:4479
+```
+
 ### Online mode
 
 ZMQ engine servers with OpenAI-compatible HTTP API via NanoRoute.
