@@ -123,7 +123,9 @@ RUN mkdir -p /workspace
 
 WORKDIR /workspace
 
-ENV RUSTUP_HOME=/opt/rustup \
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    RUSTUP_HOME=/opt/rustup \
     CARGO_HOME=/opt/cargo \
     PATH=/opt/cargo/bin:/usr/local/cuda/bin:${PATH}
 
@@ -148,6 +150,8 @@ RUN git init /root/.oh-my-zsh \
         echo 'export NVSHMEM_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem'; \
         echo 'export RUSTUP_HOME=/opt/rustup'; \
         echo 'export CARGO_HOME=/opt/cargo'; \
+        echo 'export PIP_BREAK_SYSTEM_PACKAGES=1'; \
+        echo 'export PIP_ROOT_USER_ACTION=ignore'; \
         echo 'export PATH=/opt/cargo/bin:/usr/local/cuda/bin:$PATH'; \
         echo 'export LD_LIBRARY_PATH=$NVSHMEM_DIR/lib:/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}'; \
         echo 'export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}'; \
@@ -157,9 +161,15 @@ RUN git init /root/.oh-my-zsh \
         echo 'export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0'; \
       } > /root/.zshrc
 
+ARG VCS_REF=unknown
+
 LABEL org.opencontainers.image.title="NanoDeploy" \
       org.opencontainers.image.version="${NANODEPLOY_VERSION}" \
       org.opencontainers.image.description="NanoDeploy CUDA 12.8 devel container with PyTorch, DeepEP, FlashMLA, DeepGEMM, FlashInfer, FlashAttention, DLSlime, and build toolchains. NanoDeploy source is intentionally not included." \
+      org.opencontainers.image.source="https://github.com/DeepLink-org/NanoDeploy" \
+      org.opencontainers.image.url="https://github.com/DeepLink-org/NanoDeploy" \
+      org.opencontainers.image.documentation="https://github.com/DeepLink-org/NanoDeploy#docker-development-image" \
+      org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.ref.name="nanodeploy:${NANODEPLOY_VERSION}-cu128-devel" \
       org.opencontainers.image.vendor.deep_ep="${DEEP_EP_VERSION}@${DEEP_EP_REF}" \
       org.opencontainers.image.vendor.flash_mla="${FLASH_MLA_VERSION}@${FLASH_MLA_REF}" \
