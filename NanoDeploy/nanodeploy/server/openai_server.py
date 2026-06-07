@@ -76,6 +76,9 @@ class EngineWorker:
     def __init__(self, engine: Any) -> None:
         self.engine = engine
         self._inbox: "queue.Queue[_Request]" = queue.Queue()
+        # PD: seq_ids whose prefill-side MIGRATE KV blocks can be freed once a
+        # decode engine has pulled them. Drained on the engine thread.
+        self._free_inbox: "queue.Queue[list[int]]" = queue.Queue()
         self._active: dict[int, _Request] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -90,6 +93,11 @@ class EngineWorker:
 
     def submit(self, req: _Request) -> None:
         self._inbox.put(req)
+
+    def free_sequences(self, seq_ids: list[int]) -> None:
+        """Queue prefill-side MIGRATE KV blocks for release (PD)."""
+        if seq_ids:
+            self._free_inbox.put(list(seq_ids))
 
     def _push(self, req: _Request, item: Optional[dict]) -> None:
         req.loop.call_soon_threadsafe(req.aqueue.put_nowait, item)
@@ -112,6 +120,26 @@ class EngineWorker:
                     self._push(req, {"error": str(e)})
                     self._push(req, None)
 
+            # PD: release prefill-side MIGRATE KV blocks once a decode engine
+            # has confirmed it pulled them (driven via /pd/free).
+            while True:
+                try:
+                    free_ids = self._free_inbox.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    from nanodeploy import Sequence
+
+                    stubs = []
+                    for sid in free_ids:
+                        stub = Sequence([])
+                        stub.seq_id = sid
+                        stubs.append(stub)
+                    engine.free_to_be_migrated(stubs)
+                    logger.info(f"Freed migrated sequences: {free_ids}")
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"free_to_be_migrated failed for {free_ids}: {e}")
+
             if engine.is_finished():
                 time.sleep(0.001)
                 continue
@@ -128,12 +156,38 @@ class EngineWorker:
                 continue
 
             for seq_id, req in list(self._active.items()):
-                comp = req.seq.completion_token_ids
+                seq = req.seq
+                # PD prefill handoff: a ``mode="prefill"`` engine marks the
+                # sequence TO_BE_MIGRATED after the first generated token. Ship
+                # the serialized sequence (with its MIGRATE BlockContext) to the
+                # caller and stop driving it locally.
+                if seq.is_to_be_migrated:
+                    try:
+                        from nanodeploy.server.pd import encode_migration
+
+                        comp = seq.completion_token_ids
+                        payload = encode_migration(seq)
+                        self._push(
+                            req,
+                            {
+                                "migration": payload,
+                                "first_token": comp[-1] if comp else None,
+                                "seq_id": seq_id,
+                            },
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.error(f"Failed to serialize migration for {seq_id}: {e}")
+                        self._push(req, {"error": f"migration serialize failed: {e}"})
+                    self._push(req, None)
+                    self._active.pop(seq_id, None)
+                    continue
+
+                comp = seq.completion_token_ids
                 if len(comp) > req.emitted:
                     new_tokens = comp[req.emitted :]
                     req.emitted = len(comp)
                     self._push(req, {"tokens": new_tokens})
-                if req.seq.is_finished:
+                if seq.is_finished:
                     self._push(req, {"finish": True})
                     self._push(req, None)
                     self._active.pop(seq_id, None)
@@ -233,6 +287,44 @@ class OpenAIServer:
         self.worker.submit(req)
         return req
 
+    def submit_migrated(self, seq: Any) -> _Request:
+        """Submit a deserialized prefilled sequence to a decode engine (PD).
+
+        The sequence keeps its original seq_id and its MIGRATE BlockContext, so
+        the decode engine routes it to ``waiting_migration`` and RDMA-pulls the
+        KV cache from the prefill engine on the next step. Already-generated
+        completion tokens (the prefill token) are streamed back too, so the
+        decode response carries the full answer.
+        """
+        loop = asyncio.get_running_loop()
+        req = _Request(seq=seq, aqueue=asyncio.Queue(), loop=loop)
+        self.worker.submit(req)
+        return req
+
+    async def await_migration(self, req: _Request) -> dict:
+        """Drain a prefill request until it hands off or finishes locally.
+
+        Returns one of:
+        - ``{"migration": ..., "first_token": ..., "seq_id": ...}`` when the
+          sequence was marked TO_BE_MIGRATED and should resume on a decode
+          engine (the normal PD path), or
+        - ``{"finished": True, "tokens": [...]}`` when the prefill engine fully
+          finished the request locally (e.g. the first sampled token is EOS, so
+          the scheduler marks it FINISHED instead of TO_BE_MIGRATED). In that
+          case there is no KV to migrate and no decode handoff is needed.
+        """
+        tokens: list[int] = []
+        while True:
+            item = await req.aqueue.get()
+            if item is None:
+                return {"finished": True, "tokens": tokens}
+            if "error" in item:
+                raise RuntimeError(item["error"])
+            if "migration" in item:
+                return item
+            if "tokens" in item:
+                tokens.extend(item["tokens"])
+
     async def stream_text(
         self, req: _Request, max_tokens: int
     ) -> AsyncGenerator[tuple[str, _Generation], None]:
@@ -248,6 +340,13 @@ class OpenAIServer:
             if "tokens" in item:
                 gen.token_ids.extend(item["tokens"])
                 full = self.tokenizer.decode(gen.token_ids, skip_special_tokens=True)
+                # A multi-byte UTF-8 character (e.g. an emoji) can be split
+                # across several byte-level BPE tokens. Decoding before all of
+                # its bytes have arrived yields a trailing U+FFFD replacement
+                # char. Hold the delta back until the character completes so we
+                # never emit (and lock in) a broken "\ufffd".
+                if full.endswith("\ufffd"):
+                    continue
                 delta = full[len(decoded) :]
                 decoded = full
                 if delta:
@@ -325,12 +424,103 @@ def build_app(server: OpenAIServer):
         sampling_params = server._build_sampling_params(body)
         max_tokens = sampling_params.max_tokens
         prompt_ids = server._encode_chat(messages)
-        req = server.submit(prompt_ids, sampling_params)
 
         created = int(time.time())
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex}"
         model = server.served_model_name
         stream = bool(body.get("stream", False))
+
+        kv_transfer = body.get("kv_transfer_params") or {}
+
+        # PD prefill stage: run prefill and return the serialized migration
+        # payload instead of generating a full completion.
+        #
+        # NOTE: do NOT clamp max_tokens to 1 here. A ``mode="prefill"`` engine
+        # already stops after the first generated token by marking the sequence
+        # TO_BE_MIGRATED (see scheduler postprocess). Clamping to 1 would instead
+        # make ``num_completed_tokens >= max_tokens`` true, marking the sequence
+        # FINISHED (no migration), and would also serialize max_tokens=1 into the
+        # migrated sequence so the decode engine generates nothing. We keep the
+        # user's max_tokens so the decode engine resumes with the correct budget.
+        if kv_transfer.get("do_remote_decode"):
+            preq = server.submit(prompt_ids, sampling_params)
+            try:
+                mig = await server.await_migration(preq)
+            except RuntimeError as e:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": {"message": str(e), "type": "engine_error"}},
+                )
+            # Prefill finished the request locally (e.g. first token is EOS):
+            # there is nothing to migrate, so return the completion directly.
+            if not mig.get("migration"):
+                done_tokens = mig.get("tokens") or []
+                text = server.tokenizer.decode(done_tokens, skip_special_tokens=True)
+                return JSONResponse(
+                    {
+                        "id": cmpl_id,
+                        "object": "chat.completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": text},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": len(prompt_ids),
+                            "completion_tokens": len(done_tokens),
+                            "total_tokens": len(prompt_ids) + len(done_tokens),
+                        },
+                    }
+                )
+            return JSONResponse(
+                {
+                    "id": cmpl_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": ""},
+                            "finish_reason": "length",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": len(prompt_ids),
+                        "completion_tokens": 0,
+                        "total_tokens": len(prompt_ids),
+                    },
+                    "kv_transfer_params": {
+                        "migration": mig["migration"],
+                        "first_token": mig.get("first_token"),
+                        "seq_id": mig.get("seq_id"),
+                    },
+                }
+            )
+
+        # PD decode stage: resume a prefilled sequence pulled from a prefill node.
+        if kv_transfer.get("migration"):
+            from nanodeploy.server.pd import decode_migration
+
+            try:
+                migrated_seq = decode_migration(kv_transfer["migration"])
+            except Exception as e:  # noqa: BLE001
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": f"invalid migration payload: {e}",
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+            req = server.submit_migrated(migrated_seq)
+        else:
+            req = server.submit(prompt_ids, sampling_params)
 
         if stream:
 
@@ -463,12 +653,88 @@ def build_app(server: OpenAIServer):
         sampling_params = server._build_sampling_params(body)
         max_tokens = sampling_params.max_tokens
         prompt_ids = server.tokenizer.encode(prompt)
-        req = server.submit(prompt_ids, sampling_params)
 
         created = int(time.time())
         cmpl_id = f"cmpl-{uuid.uuid4().hex}"
         model = server.served_model_name
         stream = bool(body.get("stream", False))
+
+        kv_transfer = body.get("kv_transfer_params") or {}
+
+        # PD prefill stage: run prefill and return a migration payload. Do NOT
+        # clamp max_tokens to 1 -- the mode="prefill" engine already stops after
+        # the first token via TO_BE_MIGRATED, and the user's max_tokens must be
+        # preserved into the migrated sequence for the decode engine. See the
+        # chat handler above for the full rationale.
+        if kv_transfer.get("do_remote_decode"):
+            preq = server.submit(prompt_ids, sampling_params)
+            try:
+                mig = await server.await_migration(preq)
+            except RuntimeError as e:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": {"message": str(e), "type": "engine_error"}},
+                )
+            # Prefill finished the request locally (e.g. first token is EOS):
+            # there is nothing to migrate, so return the completion directly.
+            if not mig.get("migration"):
+                done_tokens = mig.get("tokens") or []
+                text = server.tokenizer.decode(done_tokens, skip_special_tokens=True)
+                return JSONResponse(
+                    {
+                        "id": cmpl_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {"index": 0, "text": text, "finish_reason": "stop"}
+                        ],
+                        "usage": {
+                            "prompt_tokens": len(prompt_ids),
+                            "completion_tokens": len(done_tokens),
+                            "total_tokens": len(prompt_ids) + len(done_tokens),
+                        },
+                    }
+                )
+            return JSONResponse(
+                {
+                    "id": cmpl_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "text": "", "finish_reason": "length"}],
+                    "usage": {
+                        "prompt_tokens": len(prompt_ids),
+                        "completion_tokens": 0,
+                        "total_tokens": len(prompt_ids),
+                    },
+                    "kv_transfer_params": {
+                        "migration": mig["migration"],
+                        "first_token": mig.get("first_token"),
+                        "seq_id": mig.get("seq_id"),
+                    },
+                }
+            )
+
+        # PD decode stage: resume a prefilled sequence.
+        if kv_transfer.get("migration"):
+            from nanodeploy.server.pd import decode_migration
+
+            try:
+                migrated_seq = decode_migration(kv_transfer["migration"])
+            except Exception as e:  # noqa: BLE001
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": f"invalid migration payload: {e}",
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+            req = server.submit_migrated(migrated_seq)
+        else:
+            req = server.submit(prompt_ids, sampling_params)
 
         if stream:
 
@@ -534,6 +800,51 @@ def build_app(server: OpenAIServer):
             }
         )
 
+    @app.post("/pd/free")
+    async def pd_free(request: Request):  # noqa: ANN202
+        """Release prefill-side MIGRATE KV blocks after a decode pull (PD).
+
+        Called by the router (or decode node) once the decode engine has pulled
+        the KV cache, so the prefill engine can reclaim the migrated blocks.
+        """
+        try:
+            body = await request.json()
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Invalid JSON body: {e}",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+        seq_ids = body.get("seq_ids") if isinstance(body, dict) else None
+        if not isinstance(seq_ids, list):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "'seq_ids' must be a list of integers",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+        try:
+            seq_ids = [int(s) for s in seq_ids]
+        except (TypeError, ValueError) as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"invalid seq_ids: {e}",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+        server.worker.free_sequences(seq_ids)
+        return JSONResponse({"freed": seq_ids})
+
     return app
 
 
@@ -560,8 +871,14 @@ def register_with_ctrl(
     port: int,
     served_model_name: str,
     model_path: str,
+    role: str = "hybrid",
+    engine_id: Optional[str] = None,
 ):
     """Register this HTTP endpoint with dlslime-ctrl and start heartbeat.
+
+    ``role`` (hybrid|prefill|decode) lets a router (DLRouter) assign the node to
+    the right PD pool; ``engine_id`` maps the HTTP node to its in-engine
+    NanoCtrl entity (used for KV migration peer resolution).
 
     Returns the ``NanoCtrlClient`` (call ``.stop()`` on shutdown) or ``None``.
     """
@@ -573,10 +890,12 @@ def register_with_ctrl(
     metadata = {
         "served_model_name": served_model_name,
         "model_path": model_path,
-        "role": "hybrid",
+        "role": role,
         "host": advertise_host,
         "port": port,
     }
+    if engine_id is not None:
+        metadata["engine_id"] = engine_id
 
     client = NanoCtrlClient(ctrl_address, ctrl_scope)
     client.check_connection()
@@ -615,7 +934,7 @@ def run_server(
     import uvicorn
     from transformers import PreTrainedTokenizerFast
 
-    from nanodeploy.llm_component import LLM
+    from nanodeploy.llm_component import LLM, LLMComponent
 
     host = config.host
     port = config.port
@@ -629,10 +948,23 @@ def run_server(
     logger.info(f"  ctrl-address:      {ctrl_address or '(disabled)'}")
     logger.info("=" * 72)
 
-    # Build the in-process engine. We deliberately use LLM (not LLMComponent)
-    # and leave config.ctrl_address unset so the *engine* does not register its
-    # ZMQ endpoint; this server registers its own HTTP endpoint instead.
-    engine = LLM(config)
+    # Build the in-process engine.
+    #
+    # hybrid: use the bare LLM. The engine does not self-register with
+    #   dlslime-ctrl; this HTTP server registers its own endpoint instead.
+    # prefill/decode (PD disaggregation): use LLMComponent so the engine
+    #   registers under its engine_id with peer_addrs / pool metadata, which the
+    #   peer decode engine needs to RDMA-pull KV. Workers also register their KV
+    #   memory-regions (the mode != "hybrid" path). This requires ctrl_address.
+    if config.mode != "hybrid":
+        if not config.ctrl_address:
+            raise ValueError(
+                f"mode={config.mode!r} (PD disaggregation) requires --ctrl_address "
+                "so engines can register peer agents and resolve KV migration peers"
+            )
+        engine = LLMComponent(config)
+    else:
+        engine = LLM(config)
     tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
 
     worker = EngineWorker(engine)
@@ -660,6 +992,8 @@ def run_server(
                     port=port,
                     served_model_name=served_model_name,
                     model_path=config.model,
+                    role=config.mode,
+                    engine_id=getattr(engine, "engine_id", None),
                 )
             except Exception as e:  # noqa: BLE001
                 logger.error(f"Could not register with dlslime-ctrl: {e}")

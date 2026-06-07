@@ -161,13 +161,17 @@ class RayExecutor:
 
     def _init_with_new_pg(self):
         """Initialize workers by creating new placement groups (existing logic)."""
-        # 2. 获取所有节点的 NodeID
-        nodes = get_available_nodes_with_master_first(self.config.master_address)
-        node_ids = [node["NodeID"] for node in nodes]
-        logger.debug(f"find nodes (NodeIDs): {node_ids}")
-
         # 3. 定义每个节点上要运行的 worker 数量
         workers_per_node = 8
+
+        # 2. 获取所有节点的 NodeID。每个节点至少要有 master 上所需的空闲 GPU 数
+        # （单节点 PD: prefill/decode 可以共驻同一节点，只要还有空闲卡）。
+        required_on_master = min(self.config.attn_world_size, workers_per_node)
+        nodes = get_available_nodes_with_master_first(
+            self.config.master_address, required_gpus=required_on_master
+        )
+        node_ids = [node["NodeID"] for node in nodes]
+        logger.debug(f"find nodes (NodeIDs): {node_ids}")
 
         # When world size exceeds a single node, it must be a multiple of
         # workers_per_node so each node is fully packed.
@@ -198,10 +202,15 @@ class RayExecutor:
             end_rank = min(start_rank + workers_per_node, self.config.attn_world_size)
             num_workers_on_node = end_rank - start_rank
 
+            # PG names must be globally unique. Include the engine id so several
+            # engines (e.g. prefill + decode for PD disaggregation) can co-locate
+            # on the same node without colliding on a fixed ``pg-node-<id>`` name.
+            # Fall back to the executor's object id if engine_id is unset.
+            engine_tag = getattr(self.config, "engine_id", None) or id(self)
             pg = placement_group(
                 bundles=[{"CPU": 0.1, "GPU": 1.0} for _ in range(num_workers_on_node)],
                 strategy="STRICT_PACK",
-                name=f"pg-node-{node_ids[node_idx]}",
+                name=f"pg-node-{node_ids[node_idx]}-{engine_tag}",
                 _soft_target_node_id=target_node_id,
             )
 

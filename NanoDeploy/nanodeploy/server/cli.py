@@ -34,7 +34,6 @@ def _serve_main(argv: Sequence[str]) -> None:
         "model",
         type=str,
         nargs="?",
-        default=None,
         help="Path to the model (positional shorthand for --model)",
     )
     parser.add_argument(
@@ -47,12 +46,17 @@ def _serve_main(argv: Sequence[str]) -> None:
     args = parser.parse_args(list(argv))
 
     init_args = {k: v for k, v in vars(args).items() if k not in _SERVE_EXTRA_KEYS}
-    model_path = args.model or init_args.get("model")
+    model_path = getattr(args, "model", None) or init_args.get("model")
     if not model_path:
         parser.error("model path is required (positional or --model)")
 
     init_args["model"] = model_path
-    init_args["mode"] = "hybrid"
+    # ``mode`` comes from Config (--mode hybrid|prefill|decode, default hybrid).
+    # hybrid runs prefill+decode in-process; prefill/decode enable PD
+    # disaggregation where the decode engine RDMA-pulls KV from prefill.
+    mode = init_args.get("mode", "hybrid")
+    if mode not in ("hybrid", "prefill", "decode"):
+        parser.error(f"invalid --mode {mode!r} (expected hybrid|prefill|decode)")
 
     try:
         config = Config(**init_args)

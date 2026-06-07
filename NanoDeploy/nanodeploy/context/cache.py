@@ -933,7 +933,11 @@ class CacheContext:
         scope = self.ctrl_scope or ""
 
         try:
-            with httpx.Client(timeout=5.0) as client:
+            # trust_env=False: ignore HTTP(S)_PROXY/ALL_PROXY env vars. NanoCtrl
+            # is an internal address; routing it through a cluster proxy makes
+            # the request hang (httpx defaults to trust_env=True). This matches
+            # dlslime's NanoCtrlClient, which also uses trust_env=False.
+            with httpx.Client(timeout=5.0, trust_env=False) as client:
                 for engine_id in missing_ids:
                     try:
                         request_payload = {
@@ -1054,15 +1058,19 @@ class CacheContext:
                     logger.error(f"Peer {peer_alias} not connected, skipping")
                     continue
 
+                conn = peer_agent.query_connection(peer_alias)
+                if conn is None or conn.endpoint is None:
+                    logger.error(f"Failed to get endpoint for {peer_alias}")
+                    continue
+                endpoint = conn.endpoint
+
                 remote_mr_info = peer_agent.get_mr_info(peer_alias, _KV_CACHE_BUFFER_ID)
                 if remote_mr_info is None:
                     logger.error(f"Failed to get MR info for {peer_alias}")
                     continue
 
-                remote_mr_handler = peer_agent.register_remote_memory_region(
-                    peer_alias,
-                    _KV_CACHE_BUFFER_ID,
-                    remote_mr_info,
+                remote_mr_handler = peer_agent.get_handle(
+                    _KV_CACHE_BUFFER_ID, peer_alias=peer_alias
                 )
                 logger.debug(
                     f"Remote MR for {peer_alias}: handler={remote_mr_handler}, "
@@ -1075,11 +1083,6 @@ class CacheContext:
                     )
                     continue
                 local_mr_handler = self._local_mr_handler
-
-                endpoint = peer_agent.get_endpoint(peer_alias)
-                if endpoint is None:
-                    logger.error(f"Failed to get endpoint for {peer_alias}")
-                    continue
 
                 # Build KV cache RDMA ops
                 rdma_ops: list[tuple] = []
@@ -1130,8 +1133,8 @@ class CacheContext:
                     # Conv state
                     remote_conv_mr_info = peer_agent.get_mr_info(peer_alias, "gdn_conv")
                     if remote_conv_mr_info:
-                        remote_conv_mr = peer_agent.register_remote_memory_region(
-                            peer_alias, "gdn_conv", remote_conv_mr_info
+                        remote_conv_mr = peer_agent.get_handle(
+                            "gdn_conv", peer_alias=peer_alias
                         )
                         local_conv_mr = self._local_gdn_conv_mr_handler
                         conv_len = self.gdn_conv_slot_num_bytes()
@@ -1157,8 +1160,8 @@ class CacheContext:
                         peer_alias, "gdn_recurrent"
                     )
                     if remote_rec_mr_info:
-                        remote_rec_mr = peer_agent.register_remote_memory_region(
-                            peer_alias, "gdn_recurrent", remote_rec_mr_info
+                        remote_rec_mr = peer_agent.get_handle(
+                            "gdn_recurrent", peer_alias=peer_alias
                         )
                         local_rec_mr = self._local_gdn_recurrent_mr_handler
                         rec_len = self.gdn_recurrent_slot_num_bytes()
@@ -1202,10 +1205,8 @@ class CacheContext:
                                 f"Failed to get DSv4 compressed MR info for {peer_alias}, ratio={ratio}"
                             )
                             continue
-                        remote_handler = peer_agent.register_remote_memory_region(
-                            peer_alias,
-                            f"dsv4_compressed_r{ratio}",
-                            remote_info,
+                        remote_handler = peer_agent.get_handle(
+                            f"dsv4_compressed_r{ratio}", peer_alias=peer_alias
                         )
                         page_bytes = self.compressed_page_bytes(ratio)
                         for rli, rpage, lpage in ops:
@@ -1246,8 +1247,8 @@ class CacheContext:
                                     f"Failed to get {mr_name} MR info for {peer_alias}"
                                 )
                                 continue
-                            remote_handler = peer_agent.register_remote_memory_region(
-                                peer_alias, mr_name, remote_info
+                            remote_handler = peer_agent.get_handle(
+                                mr_name, peer_alias=peer_alias
                             )
                             row_bytes = self._compressor_state_row_bytes(ratio, kind)
                             for rli, rslot, lslot in ops:
@@ -1274,8 +1275,8 @@ class CacheContext:
                         peer_alias, "indexer_cache"
                     )
                     if remote_indexer_mr_info:
-                        remote_indexer_mr = peer_agent.register_remote_memory_region(
-                            peer_alias, "indexer_cache", remote_indexer_mr_info
+                        remote_indexer_mr = peer_agent.get_handle(
+                            "indexer_cache", peer_alias=peer_alias
                         )
                         local_indexer_mr = self._local_indexer_mr_handler
                         page_bytes = self.indexer_page_num_bytes()
