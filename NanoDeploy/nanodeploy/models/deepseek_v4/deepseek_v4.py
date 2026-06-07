@@ -13,6 +13,7 @@ from nanodeploy._third_party.sglang_jit_kernel import (
 )
 from nanodeploy.backends import get_backend
 from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kvcache
+from nanodeploy.compile_utils import maybe_compile
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.layers.activation import SiluAndMul
@@ -75,7 +76,7 @@ def _routing_scores_with_bias_compiled(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     global _routing_scores_with_bias_fn
     if _routing_scores_with_bias_fn is None:
-        _routing_scores_with_bias_fn = torch.compile(
+        _routing_scores_with_bias_fn = maybe_compile(
             _routing_scores_with_bias_impl, dynamic=False, fullgraph=True
         )
     return _routing_scores_with_bias_fn(logits, bias)
@@ -86,7 +87,7 @@ def _normalize_topk_weights_compiled(
 ) -> torch.Tensor:
     global _normalize_topk_weights_fn
     if _normalize_topk_weights_fn is None:
-        _normalize_topk_weights_fn = torch.compile(
+        _normalize_topk_weights_fn = maybe_compile(
             _normalize_topk_weights_impl, dynamic=False, fullgraph=True
         )
     return _normalize_topk_weights_fn(scores, topk_ids, route_scale)
@@ -97,7 +98,7 @@ def _fuse_routed_shared_compiled(
 ) -> torch.Tensor:
     global _fuse_routed_shared_fn
     if _fuse_routed_shared_fn is None:
-        _fuse_routed_shared_fn = torch.compile(
+        _fuse_routed_shared_fn = maybe_compile(
             _fuse_routed_shared_impl, dynamic=False, fullgraph=True
         )
     return _fuse_routed_shared_fn(routed_out, shared_out)
@@ -111,7 +112,7 @@ def _hc_post_compiled(
 ) -> torch.Tensor:
     global _hc_post_fn
     if _hc_post_fn is None:
-        _hc_post_fn = torch.compile(_hc_post_impl, dynamic=False, fullgraph=True)
+        _hc_post_fn = maybe_compile(_hc_post_impl, dynamic=False, fullgraph=True)
     return _hc_post_fn(x, residual, post, comb)
 
 

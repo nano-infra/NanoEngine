@@ -1,6 +1,6 @@
 set(PYBIND11_FINDPYTHON ON)
 
-find_package(pybind11 CONFIG REQUIRED)
+# find_package(pybind11 CONFIG REQUIRED)
 
 set(BINDING_SOURCES
     module.cpp

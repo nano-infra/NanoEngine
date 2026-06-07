@@ -3,6 +3,7 @@ The entire ZMQ message is a single FlatBuffers buffer containing a ZmqPacket tab
 """
 
 import flatbuffers
+
 from nanodeploy.fbs.ZmqPacket import (
     ZmqPacket,
     ZmqPacketAddAction,
