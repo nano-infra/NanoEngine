@@ -2,6 +2,7 @@ import math
 from functools import lru_cache
 
 import torch
+from nanodeploy.compile_utils import maybe_compile
 from torch import nn
 
 
@@ -46,7 +47,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("freqs_cis_cache", freqs_cis, persistent=False)
         # Lazy compile to avoid attaching ConfigModuleInstance refs at class
         # level, which breaks cloudpickle in Ray actors (torch >= 2.10).
-        self.forward = torch.compile(self.forward)
+        self.forward = maybe_compile(self.forward)
 
     def forward(
         self,
@@ -149,7 +150,7 @@ class YarnRotaryEmbedding(nn.Module):
         freqs_cis = torch.complex(cos, sin)
         self.register_buffer("freqs_cis_cache", freqs_cis, persistent=False)
         # Lazy compile (see note in RotaryEmbedding above).
-        self.forward = torch.compile(self.forward)
+        self.forward = maybe_compile(self.forward)
 
     def forward(
         self,

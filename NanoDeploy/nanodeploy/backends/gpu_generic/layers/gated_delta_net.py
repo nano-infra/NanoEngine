@@ -11,6 +11,7 @@ from torch import nn
 
 from nanodeploy.backends import get_backend
 from nanodeploy.backends.base_backend import GatedDeltaNetBase, ReplicatedLinearBase
+from nanodeploy.compile_utils import maybe_compile
 from nanodeploy.context.context import get_context
 from nanodeploy.logging import get_logger
 from nanodeploy.models.quant_config import QuantizationConfig
@@ -34,7 +35,7 @@ _l2norm_compiled_fn = None
 def _l2norm_compiled(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     global _l2norm_compiled_fn
     if _l2norm_compiled_fn is None:
-        _l2norm_compiled_fn = torch.compile(_l2norm_impl)
+        _l2norm_compiled_fn = maybe_compile(_l2norm_impl)
     return _l2norm_compiled_fn(x, dim, eps)
 
 

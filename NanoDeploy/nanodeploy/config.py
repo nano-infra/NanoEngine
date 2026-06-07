@@ -13,6 +13,11 @@ logger = get_logger("nanodeploy")
 
 
 class Config(BaseModel):
+
+    model_config = {
+        "arbitrary_types_allowed": True,
+    }
+
     model: str = Field(..., description="Path to the model")
 
     # scheduler config
@@ -35,8 +40,23 @@ class Config(BaseModel):
 
     # runner config
     enforce_eager: bool = False
+    # Globally disable ``torch.compile`` (run all compiled paths eagerly).
+    # ``enforce_eager`` only skips CUDAGraph capture; several layers
+    # (rotary embedding, activation, sampler, ...) still wrap their forward
+    # with ``torch.compile``, which invokes the inductor/triton backend.
+    # On platforms where that backend is not adapted (e.g. PPU) the first
+    # compiled call raises ``BackendCompilerFailed``. Set this to run those
+    # paths in plain eager mode. Threaded into the worker via the Config
+    # object so it reliably reaches Ray actors.
+    disable_compile: bool = False
     trust_remote_code: bool = False
-    hf_config: Any = None
+    # ``repr=False``: the HF config stores ``dtype`` as a real ``torch.dtype``
+    # object, which transformers' ``to_json_string()`` (used by its ``__repr__``)
+    # cannot JSON-serialize on transformers <= 4.51.x (only ``torch_dtype`` is
+    # stringified there). Including it in the pydantic repr makes any
+    # ``repr(Config)`` — e.g. Ray's actor-error formatting — crash with
+    # "Object of type dtype is not JSON serializable", masking the real error.
+    hf_config: Any = Field(default=None, repr=False)
     eos: List[int] = []
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = 15000

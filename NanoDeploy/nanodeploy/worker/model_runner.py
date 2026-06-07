@@ -152,6 +152,18 @@ class ModelRunner:
         self.engine_id = self.config.engine_id
         hf_config = config.hf_config
         self.enforce_eager = config.enforce_eager
+
+        # Disable torch.compile before any compiled layer is built or any
+        # lazily-compiled helper runs. Every nanodeploy call site routes through
+        # nanodeploy.compile_utils.maybe_compile, which returns the original
+        # callable unwrapped when disabled — so torch.compile (and the
+        # inductor/triton backend) is never invoked. Must run before model
+        # construction in _complete_dist_init().
+        if getattr(config, "disable_compile", False):
+            from nanodeploy.compile_utils import set_compile_disabled
+
+            set_compile_disabled(True)
+            logger.info("torch.compile disabled (config.disable_compile=True)")
         self.world_size = config.attn_world_size
         self.rank = rank
         self._dist_initialized = False

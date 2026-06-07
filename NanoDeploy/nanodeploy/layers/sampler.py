@@ -1,4 +1,5 @@
 import torch
+from nanodeploy.compile_utils import maybe_compile
 from torch import nn
 
 
@@ -10,8 +11,8 @@ class Sampler(nn.Module):
         # decorators. The decorator form attaches torch._dynamo / _inductor
         # ConfigModuleInstance references to the class, which break
         # cloudpickle when this module is imported by a Ray actor.
-        self.forward = torch.compile(self.forward)
-        self.forward_with_logprobs = torch.compile(self.forward_with_logprobs)
+        self.forward = maybe_compile(self.forward)
+        self.forward_with_logprobs = maybe_compile(self.forward_with_logprobs)
 
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         # Check for greedy search (temperature close to 0)

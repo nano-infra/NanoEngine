@@ -5,4 +5,5 @@ include(FetchContent)
 set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FLATBUFFERS_INSTALL OFF CACHE BOOL "" FORCE)
 
+add_subdirectory(pybind11)
 add_subdirectory(flatbuffers)

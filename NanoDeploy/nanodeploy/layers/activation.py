@@ -11,6 +11,7 @@ import torch.nn.functional as F
 # Source: https://github.com/sgl-project/sglang
 #   python/sglang/jit_kernel/deepseek_v4.py::silu_and_mul_clamp
 from nanodeploy._third_party.sglang_jit_kernel import fused_kernels_enabled
+from nanodeploy.compile_utils import maybe_compile
 from torch import nn
 
 if fused_kernels_enabled():
@@ -44,7 +45,7 @@ class SiluAndMul(nn.Module):
         )
         # Lazy compile to avoid attaching ConfigModuleInstance refs at
         # class level (breaks cloudpickle in Ray actors on torch >= 2.10).
-        self._compiled_forward = torch.compile(self._compiled_forward)
+        self._compiled_forward = maybe_compile(self._compiled_forward)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Fast path: single-kernel SwiGLU when bf16 contig + sglang

@@ -187,9 +187,12 @@ class _FA2AttentionImpl:
             block_table=block_tables,
             softmax_scale=self.scale,
             causal=ntps > 1,
-            return_softmax_lse=True,
+            # NOTE: ``return_softmax_lse`` intentionally omitted — the LSE is
+            # unused here (only ``out`` is consumed) and some flash-attn builds
+            # (e.g. the PPU runtime) reject that keyword. Default is False, so
+            # upstream FA2 returns just ``out`` too.
         )
-        # FA2 returns either ``out`` or ``(out, lse)`` depending on the flag.
+        # Defensive: handle builds that still return ``(out, lse)``.
         o = out[0] if isinstance(out, tuple) else out
         if ntps > 1:
             o = o.reshape(total_tokens, num_head, head_dim)
