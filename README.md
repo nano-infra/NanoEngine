@@ -253,6 +253,49 @@ nanodeploy serve /path/to/model \
   --ctrl-address 127.0.0.1:4479
 ```
 
+#### PD disaggregation with `nanodeploy serve` + DLRouter
+
+`nanodeploy serve` also supports Prefill-Decode disaggregation over HTTP.
+Launch one engine with `--mode prefill` and another with `--mode decode`
+(both pointed at the same dlslime-ctrl). They register their role with the
+control plane and connect their PeerAgents for KV migration. A PD-aware
+gateway such as [DLRouter](https://github.com/DeepLink-org/DLRouter) then
+orchestrates the two-stage handoff: it asks the prefill node to process the
+prompt and return an opaque KV migration payload (via `kv_transfer_params`),
+hands that payload to the decode node, which RDMA-pulls the KV cache and
+streams the completion, and finally releases the prefill-side KV blocks
+(`POST /pd/free`).
+
+```bash
+# Control plane (Redis + dlslime-ctrl)
+redis-server --bind 0.0.0.0 --port 6379 &
+dlslime-ctrl server --redis-url redis://127.0.0.1:6379 &
+
+# Prefill node
+nanodeploy serve /path/to/model \
+  --host 0.0.0.0 --port 8101 \
+  --served-model-name Qwen3-4B \
+  --mode prefill \
+  --ctrl-address 127.0.0.1:4479 \
+  --ray_address 127.0.0.1:7078
+
+# Decode node
+nanodeploy serve /path/to/model \
+  --host 0.0.0.0 --port 8102 \
+  --served-model-name Qwen3-4B \
+  --mode decode \
+  --ctrl-address 127.0.0.1:4479 \
+  --ray_address 127.0.0.1:7078
+```
+
+DLRouter discovers both nodes (entity kind `nanodeploy`) via dlslime-ctrl,
+maps their roles to `PREFILL`/`DECODE`, and serves an OpenAI-compatible API.
+Point clients at DLRouter; requests transparently flow prefill → KV
+migration → decode. When the prefill node fully answers a request on its own
+(e.g. the first sampled token is EOS), the completion is returned directly
+without a decode handoff. Prefill and decode engines may co-locate on the
+same node when GPU resources allow.
+
 ### Online mode
 
 ZMQ engine servers with OpenAI-compatible HTTP API via NanoRoute.
