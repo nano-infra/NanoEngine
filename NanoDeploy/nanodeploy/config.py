@@ -14,8 +14,9 @@ logger = get_logger("nanodeploy")
 
 class Config(BaseModel):
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = {
+        "arbitrary_types_allowed": True,
+    }
 
     model: str = Field(..., description="Path to the model")
 
