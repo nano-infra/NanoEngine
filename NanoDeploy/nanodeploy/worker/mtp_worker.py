@@ -269,7 +269,7 @@ class MTPWorker:
     def build_output_tokens(self, rank: int) -> list[list[int]]:
         """Assemble final output tokens, interleaving verified MTP drafts."""
         if self._mtp_verified_tokens is not None:
-            base = torch.cat(get_context().token_ids, dim=0)  # [loop_count, num_seqs]
+            base = torch.cat(get_context().token_ids, dim=0)  # [1, num_seqs]
             verified = self._mtp_verified_tokens  # [N, num_seqs]
             accepted = self._mtp_num_accepted  # [num_seqs]
             result = []

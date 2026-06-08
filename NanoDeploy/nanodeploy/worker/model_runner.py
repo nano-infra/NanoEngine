@@ -824,14 +824,21 @@ class ModelRunner:
                 else:
                     input_ids = self.sampler(logits, temperatures)
         else:
+            # Non-leader TP ranks don't sample; they return a placeholder. The
+            # real token is distributed via the control plane, not a GPU
+            # collective (see below).
             input_ids = input_ids.new_zeros([num_seqs])
             if want_lp:
                 logprobs = torch.zeros(num_seqs, dtype=torch.float32, device="cuda")
-        dist.all_reduce(input_ids, group=get_dist_context().attn_tp_group)
-        if want_lp:
-            # Sum-reduce: non-rank-0 contributed zeros so this recovers the
-            # rank-0 value exactly. Float32 keeps precision intact.
-            dist.all_reduce(logprobs, group=get_dist_context().attn_tp_group)
+        # NOTE: no cross-TP collective here (nano-vllm style). Only TP rank 0
+        # samples; the engine consumes rank-0's result only
+        # (executor.run(...)[::tp_size] in LLMEngine.step), and the sampled token
+        # reaches the other TP ranks for the *next* step through the serialized
+        # batch bytes (scheduler.postprocess appends the token to the sequences,
+        # which are re-serialized and dispatched to every worker, then read back
+        # via prepare_decode_bytes -> seq.last_token). Reducing/broadcasting the
+        # token over MCCL is both unnecessary and deadlocks the P2P path on this
+        # hardware after a few decode steps.
         return input_ids, logprobs
 
     @torch.inference_mode()
@@ -865,123 +872,107 @@ class ModelRunner:
             aux = extract_aux_from_bytes(data, sp_rank)
             num_seqs = aux.num_group_seqs
 
-        # Determine loop count
+        if is_prefill and self.mtp_worker is not None:
+            self.mtp_worker.reset_lazy_verify_state()
+
+        # --- Profiler start ---
+        if self.profiler and self.run_count == self.profiler_start_step:
+            self.profiler.start()
+            logger.info(f"Rank {self.rank}: Profiler started at step {self.run_count}")
+
+        # --- Prepare inputs ---
+        has_lazy_verify = False
         if is_prefill:
-            loop_count = 1
-            if self.mtp_worker is not None:
-                self.mtp_worker.reset_lazy_verify_state()
-        elif hasattr(self.config, "_mtp_original_loop_count"):
-            loop_count = self.config._mtp_original_loop_count
+            if not self.vision_manager.has_embeds:
+                vision_slots = extract_vision_slots_from_bytes(data)
+                if vision_slots:
+                    self.vision_manager.fetch_rdma(
+                        vision_slots, self.model.model.embed_tokens.weight.dtype
+                    )
+            input_ids, positions = self.input_preparer.prepare_prefill_bytes(
+                data, aux, is_dummy
+            )
         else:
-            loop_count = self.config.loop_count
+            input_ids, positions = self.input_preparer.prepare_decode_bytes(
+                data, aux, is_dummy
+            )
+            if _timer is not None:
+                _timer.mark("prep")
 
-        for i in range(loop_count):
-            # --- Profiler start ---
-            if self.profiler and self.run_count == self.profiler_start_step:
-                self.profiler.start()
+            if (
+                self.mtp_worker is not None
+                and self.mtp_worker.has_drafts
+                and not is_dummy
+            ):
+                has_lazy_verify = True
+                input_ids, positions = self.mtp_worker.prepare_lazy_verify_decode(
+                    input_ids, positions, num_seqs
+                )
+
+        if input_ids.numel() == 0:
+            logger.critical(
+                "EMPTY input_ids before run_model! rank=%s is_prefill=%s "
+                "is_dummy=%s input_ids.shape=%s positions.shape=%s num_seqs=%s",
+                self.rank,
+                is_prefill,
+                is_dummy,
+                input_ids.shape,
+                positions.shape,
+                num_seqs,
+            )
+
+        # --- Forward ---
+        logits = self.run_model(input_ids, positions, is_prefill)
+        if _timer is not None:
+            _timer.mark("forward")
+        if is_prefill and self.vision_manager.has_embeds:
+            self.vision_manager.clear()
+
+        # --- Sampling ---
+        num_accepted = None
+        step_logprobs = None  # [num_seqs] float32 when shipping logprobs
+        if not is_prefill and has_lazy_verify:
+            num_accepted = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
+            input_ids = self.mtp_worker.lazy_verify_sample(
+                logits, aux, num_seqs, num_accepted
+            )
+        else:
+            input_ids, step_logprobs = self._standard_sample(
+                logits, input_ids, aux, num_seqs, is_prefill
+            )
+        if _timer is not None:
+            _timer.mark("sample")
+
+        # --- MTP draft generation ---
+        if self.mtp_worker is not None and not is_prefill and not is_dummy:
+            self.mtp_worker.generate_and_store(
+                input_ids, positions, aux, num_seqs, has_lazy_verify, num_accepted
+            )
+
+        # --- Profiler step ---
+        if self.profiler and self.run_count >= self.profiler_start_step:
+            if self.run_count < self.profiler_end_step:
+                # Bundle ``profiler_forward_per_step`` forwards into one
+                # profiler.step() boundary so per-step bookkeeping doesn't
+                # dominate the trace at small per-iter latencies.
+                rel = self.run_count - self.profiler_start_step
+                if (rel + 1) % self.profiler_forward_per_step == 0:
+                    self.profiler.step()
+            if self.run_count == self.profiler_end_step - 1:
+                self.profiler.stop()
                 logger.info(
-                    f"Rank {self.rank}: Profiler started at step {self.run_count}"
+                    f"Rank {self.rank}: Profiler stopped and saved at step {self.run_count}"
                 )
 
-            # --- Prepare inputs ---
-            has_lazy_verify = False
-            if is_prefill:
-                if i == 0 and not self.vision_manager.has_embeds:
-                    vision_slots = extract_vision_slots_from_bytes(data)
-                    if vision_slots:
-                        self.vision_manager.fetch_rdma(
-                            vision_slots, self.model.model.embed_tokens.weight.dtype
-                        )
-                input_ids, positions = self.input_preparer.prepare_prefill_bytes(
-                    data, aux, is_dummy
-                )
-            else:
-                if i == 0:
-                    input_ids, positions = self.input_preparer.prepare_decode_bytes(
-                        data, aux, is_dummy
-                    )
-                else:
-                    input_ids, positions = self.input_preparer.update_decode_inplace(
-                        input_ids, positions, num_seqs
-                    )
-                if _timer is not None and i == 0:
-                    _timer.mark("prep")
-
-                if (
-                    self.mtp_worker is not None
-                    and self.mtp_worker.has_drafts
-                    and not is_dummy
-                ):
-                    has_lazy_verify = True
-                    input_ids, positions = self.mtp_worker.prepare_lazy_verify_decode(
-                        input_ids, positions, num_seqs
-                    )
-
-            if input_ids.numel() == 0:
-                logger.critical(
-                    "EMPTY input_ids before run_model! rank=%s is_prefill=%s "
-                    "is_dummy=%s input_ids.shape=%s positions.shape=%s num_seqs=%s",
-                    self.rank,
-                    is_prefill,
-                    is_dummy,
-                    input_ids.shape,
-                    positions.shape,
-                    num_seqs,
-                )
-
-            # --- Forward ---
-            logits = self.run_model(input_ids, positions, is_prefill)
-            if _timer is not None and i == 0:
-                _timer.mark("forward")
-            if is_prefill and self.vision_manager.has_embeds:
-                self.vision_manager.clear()
-
-            # --- Sampling ---
-            num_accepted = None
-            step_logprobs = None  # [num_seqs] float32 when shipping logprobs
-            if not is_prefill and has_lazy_verify:
-                num_accepted = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
-                input_ids = self.mtp_worker.lazy_verify_sample(
-                    logits, aux, num_seqs, num_accepted
-                )
-            else:
-                input_ids, step_logprobs = self._standard_sample(
-                    logits, input_ids, aux, num_seqs, is_prefill
-                )
-            if _timer is not None and i == 0:
-                _timer.mark("sample")
-
-            # --- MTP draft generation ---
-            if self.mtp_worker is not None and not is_prefill and not is_dummy:
-                self.mtp_worker.generate_and_store(
-                    input_ids, positions, aux, num_seqs, has_lazy_verify, num_accepted
-                )
-
-            # --- Profiler step ---
-            if self.profiler and self.run_count >= self.profiler_start_step:
-                if self.run_count < self.profiler_end_step:
-                    # Bundle ``profiler_forward_per_step`` forwards into one
-                    # profiler.step() boundary so per-step bookkeeping doesn't
-                    # dominate the trace at small per-iter latencies.
-                    rel = self.run_count - self.profiler_start_step
-                    if (rel + 1) % self.profiler_forward_per_step == 0:
-                        self.profiler.step()
-                if self.run_count == self.profiler_end_step - 1:
-                    self.profiler.stop()
-                    logger.info(
-                        f"Rank {self.rank}: Profiler stopped and saved at step {self.run_count}"
-                    )
-
-            self.run_count += 1
-            get_context().token_ids.append(input_ids[None, ...])
-            if step_logprobs is not None:
-                # Lazy-init the per-step list on first appearance — context
-                # is reset per step bundle. ``step_logprobs`` shape is
-                # [num_seqs] float32 (zero on non-rank-0 / non-sampled seqs).
-                ctx = get_context()
-                if not hasattr(ctx, "step_logprobs") or ctx.step_logprobs is None:
-                    ctx.step_logprobs = []
-                ctx.step_logprobs.append(step_logprobs[None, ...])
+        self.run_count += 1
+        get_context().token_ids.append(input_ids[None, ...])
+        if step_logprobs is not None:
+            # ``step_logprobs`` shape is [num_seqs] float32 (zero on
+            # non-rank-0 / non-sampled seqs).
+            ctx = get_context()
+            if not hasattr(ctx, "step_logprobs") or ctx.step_logprobs is None:
+                ctx.step_logprobs = []
+            ctx.step_logprobs.append(step_logprobs[None, ...])
 
         # --- Build output ---
         # ``logprobs_per_seq`` is ``list[list[float]]`` parallel to ``result``

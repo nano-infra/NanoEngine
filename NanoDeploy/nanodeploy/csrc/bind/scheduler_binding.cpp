@@ -126,7 +126,7 @@ void bind_scheduler_utils(py::module_& m)
                       int,
                       const std::string&>(),
              py::arg("engine_id"),
-             py::arg("loop_count"),
+             py::arg("num_speculative_tokens"),
              py::arg("max_num_seqs"),
              py::arg("max_num_batched_tokens"),
              py::arg("max_model_len"),

@@ -317,13 +317,24 @@ DecodeMetadata prepare_decode_from_bytes(const uint8_t* data,
         meta.input_ids.push_back(si->last_token());
         meta.positions.push_back(si->num_tokens() - 1);
 
-        int page_id = seq_input_last_block_page_id(si, group_rank);
-        int offset  = seq_input_last_block_num_tokens(si, group_rank, block_size);
+        // Slot for the token being written = its absolute position within the
+        // KV cache. The block table may be eagerly over-allocated (a fresh
+        // block is appended once ctx_len becomes an exact multiple of
+        // block_size, ahead of the token that will fill it), so the token's
+        // owning block is derived from its position rather than from the LAST
+        // entry of the block table. Mirrors update_decode_inplace() in
+        // input_preparer.py.
+        int   ctx         = seq_input_context_len(si, group_rank);
+        int   last_pos    = ctx - 1;  // position of the token being stored
+        int   block_index = (block_size > 0) ? last_pos / block_size : 0;
+        int   offset      = (block_size > 0) ? last_pos % block_size : 0;
+        auto* bt          = seq_input_block_table(si, group_rank);
+        int   page_id     = (bt && block_index >= 0 && block_index < (int)bt->size()) ? bt->Get(block_index) : -1;
         if (page_id < 0 || page_id >= num_gpu_blocks) {
             throw std::runtime_error("prepare_decode_from_bytes: page_id " + std::to_string(page_id)
                                      + " out of range [0, " + std::to_string(num_gpu_blocks) + ")");
         }
-        meta.slot_mapping.push_back((int)((int64_t)page_id * block_size + offset - 1));
+        meta.slot_mapping.push_back((int)((int64_t)page_id * block_size + offset));
     }
 
     // 2. context_lens, global_context_lens

@@ -15,7 +15,7 @@
 namespace nanodeploy {
 
 Scheduler::Scheduler(const std::string& engine_id,
-                     int                loop_count,
+                     int                num_speculative_tokens,
                      int                max_num_seqs,
                      int                max_num_batched_tokens,
                      int                max_model_len,
@@ -26,7 +26,11 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                kvcache_block_size,
                      const std::string& mode):
     engine_id_(engine_id),
-    loop_count_(loop_count),
+    num_speculative_tokens_(num_speculative_tokens),
+    // Plain decode appends 1 token/step. With MTP a step may append the base
+    // token plus the speculative tokens (and we keep a 1-token margin), matching
+    // the old loop_count = 1 + num_speculative_tokens + 1 reservation.
+    kv_reserve_tokens_(num_speculative_tokens > 0 ? num_speculative_tokens + 2 : 1),
     max_num_seqs_(max_num_seqs),
     max_num_batched_tokens_(max_num_batched_tokens),
     eos_ids_(eos_ids.begin(), eos_ids.end()),
@@ -462,7 +466,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
             }
 
             // Try to ensure we can append tokens
-            while (!worker_state[selected_dp_idx]->can_append(*seq, loop_count_)) {
+            while (!worker_state[selected_dp_idx]->can_append(*seq, kv_reserve_tokens_)) {
                 // Need to preempt to free up space
                 if (!running_queue.empty()) {
                     auto victim = running_queue.back();
@@ -485,7 +489,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
             if (seq) {
                 // Successfully ensured space for this sequence
                 num_seqs[master_rank] += 1;
-                if (!worker_state[selected_dp_idx]->may_append(*seq, loop_count_)) {
+                if (!worker_state[selected_dp_idx]->may_append(*seq, kv_reserve_tokens_)) {
                     // This should not happen if can_append is correct, but handle it gracefully
                     preempt(selected_dp_idx, seq);
                 }

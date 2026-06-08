@@ -30,7 +30,7 @@ except ImportError as e:
 def init_scheduler(config: Config) -> Scheduler:
     sched = Scheduler(
         config.engine_id,
-        config.loop_count,
+        config.num_speculative_tokens,
         config.max_num_seqs,
         config.max_num_batched_tokens,
         config.max_model_len,

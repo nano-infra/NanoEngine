@@ -298,26 +298,3 @@ class InputPreparer:
         )
 
         return input_ids, positions
-
-    def update_decode_inplace(
-        self, input_ids: torch.Tensor, positions: torch.Tensor, num_seqs: int
-    ):
-        """Update decode metadata in-place for multi-step decode (no Sequence needed)."""
-        positions.add_(1)
-        block_size = self.config.kvcache_block_size
-        context = get_context()
-
-        sp_rank = get_dist_context().attn_sp_rank
-
-        # Update context length (now reflects the NEW token count)
-        context.context_lens[sp_rank, :num_seqs].add_(1)
-
-        # Recalculate slot_mapping from context_lens and block_tables.
-        new_ctx = context.context_lens[sp_rank, :num_seqs]  # already incremented
-        block_idx = (new_ctx - 1) // block_size  # which block the new token falls in
-        offset_in_block = (new_ctx - 1) % block_size  # offset within that block
-        row_indices = torch.arange(num_seqs, device=block_idx.device)
-        page_ids = context.block_tables[sp_rank, row_indices, block_idx.long()]
-        context.slot_mapping[:num_seqs] = page_ids * block_size + offset_in_block
-
-        return input_ids, positions

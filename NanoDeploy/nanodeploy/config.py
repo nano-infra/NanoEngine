@@ -21,7 +21,6 @@ class Config(BaseModel):
     model: str = Field(..., description="Path to the model")
 
     # scheduler config
-    loop_count: int = 1
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 16
     max_num_recv_seqs: int = 32
@@ -282,16 +281,10 @@ class Config(BaseModel):
                     f"model does not have MTP layers "
                     f"(num_nextn_predict_layers / mtp_num_hidden_layers not found)"
                 )
-            if self.loop_count != 1:
-                raise ValueError(
-                    f"MTP requires loop_count=1, got loop_count={self.loop_count}"
-                )
-            # Inflate loop_count so the scheduler pre-allocates enough KV cache
-            # blocks for the extra MTP tokens per decode step.
-            # The actual decode loop still runs only the original loop_count
-            # iterations; MTP generates the extra tokens within a single step.
-            self._mtp_original_loop_count = self.loop_count
-            self.loop_count = self.loop_count + self.num_speculative_tokens + 1
+            # KV-cache reservation for the extra MTP tokens per decode step is
+            # handled in the C++ scheduler directly from num_speculative_tokens;
+            # nothing to inflate here. The decode loop always runs a single
+            # iteration — MTP produces its extra tokens within that one step.
 
         if self.hf_config.architectures[0] in (
             "DeepseekV3ForCausalLM",

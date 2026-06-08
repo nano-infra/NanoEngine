@@ -30,7 +30,6 @@ def main():
         max_num_seqs=128,
         max_model_len=200_000,
         max_num_batched_tokens=200_000,
-        loop_count=48,
         # max_num_send_seqs=128, # Not standard config args, checking if Config supports them or if they go into kwargs of Config. Config definition has them.
         # max_num_recv_seqs=130,
         # kvcache_block_size=256,

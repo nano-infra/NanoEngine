@@ -82,7 +82,7 @@ struct ScheduleResult {
 class Scheduler {
 public:
     Scheduler(const std::string& engine_id,
-              int                loop_count,
+              int                num_speculative_tokens,
               int                max_num_seqs,
               int                max_num_batched_tokens,
               int                max_model_len,
@@ -136,7 +136,13 @@ public:
     // Public members exposed to Python
     std::string engine_id_;
 
-    int                     loop_count_;
+    // Number of MTP draft tokens (0 = MTP disabled). Used to size per-step KV
+    // reservation: a decode step may append the base token plus up to this many
+    // speculative tokens (plus a 1-token margin).
+    int num_speculative_tokens_;
+    // Tokens to reserve KV space for per scheduling step (1 for plain decode,
+    // num_speculative_tokens_ + 2 when MTP is enabled).
+    int                     kv_reserve_tokens_;
     int                     max_num_seqs_;
     int                     max_num_batched_tokens_;
     std::unordered_set<int> eos_ids_;

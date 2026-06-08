@@ -68,8 +68,6 @@ def main() -> None:
         "8",
         "--ffn_tp",
         "1",
-        "--loop_count",
-        "1",
         "--kvcache_block_size",
         "64",
         "--max_num_seqs",

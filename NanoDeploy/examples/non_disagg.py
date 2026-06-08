@@ -1,7 +1,7 @@
 """Non-disaggregated LLM inference example.
 
 Usage:
-    python non_disagg.py --model /models/deepseek-v3 --loop_count 1 --kvcache_block_size 64
+    python non_disagg.py --model /models/deepseek-v3 --kvcache_block_size 64
     python non_disagg.py --config config.yaml
 """
 
@@ -20,8 +20,8 @@ def main():
     parser = ArgumentParser(description="Non-disaggregated LLM inference example")
     parser.add_argument("--config", action=ActionConfigFile)
     parser.add_class_arguments(Config, fail_untyped=False)
-    parser.add_argument("--prompt", type=str, default="What is 1+1?")
-    parser.add_argument("--max_tokens", type=int, default=64)
+    parser.add_argument("--prompt", type=str, default="请介绍一下上海")
+    parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--ignore_eos", action="store_true")
     parser.add_argument("--dsv4_encoding_dir", type=str, default=None)
