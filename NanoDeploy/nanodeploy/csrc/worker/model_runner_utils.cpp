@@ -324,10 +324,15 @@ DecodeMetadata prepare_decode_from_bytes(const uint8_t* data,
         // owning block is derived from its position rather than from the LAST
         // entry of the block table. Mirrors update_decode_inplace() in
         // input_preparer.py.
-        int   ctx         = seq_input_context_len(si, group_rank);
-        int   last_pos    = ctx - 1;  // position of the token being stored
-        int   block_index = (block_size > 0) ? last_pos / block_size : 0;
-        int   offset      = (block_size > 0) ? last_pos % block_size : 0;
+        int ctx      = seq_input_context_len(si, group_rank);
+        int last_pos = ctx - 1;  // position of the token being stored
+        // Guard last_pos < 0 (e.g. ctx == 0 from an empty seq / unexpected
+        // scheduling state): force block_index = -1 so the page_id < 0 check
+        // below raises a clean error instead of silently resolving to
+        // bt->Get(0) with offset -1 (page_id * block_size - 1 → last slot of
+        // the preceding block, i.e. memory corruption).
+        int   block_index = (block_size > 0 && last_pos >= 0) ? last_pos / block_size : -1;
+        int   offset      = (block_size > 0 && last_pos >= 0) ? last_pos % block_size : 0;
         auto* bt          = seq_input_block_table(si, group_rank);
         int   page_id     = (bt && block_index >= 0 && block_index < (int)bt->size()) ? bt->Get(block_index) : -1;
         if (page_id < 0 || page_id >= num_gpu_blocks) {
