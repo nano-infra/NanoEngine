@@ -352,7 +352,6 @@ def main():
         ffn_tp=1,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=1024000,
-        loop_count=args.loop_count,
         routing_strategy=args.routing_strategy,
     )
     engine = LLM(config)

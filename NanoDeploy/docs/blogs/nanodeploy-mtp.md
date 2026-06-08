@@ -146,16 +146,15 @@ MTP forward 和标准 decode forward 使用完全不同的上下文配置：
 
 #### 3.4 KV Cache 预算与调度协同
 
-MTP 虽然每步只运行 1 次 decode loop，但可能产出 1 + N 个 token（1 个采样 + N 个被接受的草稿）。调度器必须提前预留足够的 KV Cache block：
+MTP 每步只运行 1 次 decode，但可能产出 1 + N 个 token（1 个采样 + N 个被接受的草稿）。调度器必须提前预留足够的 KV Cache block：
 
-```python
-# config.py
-self._mtp_original_loop_count = self.loop_count  # 保存原始值 (1)
-self.loop_count = self.loop_count + num_speculative_tokens + 1
-# 例: num_speculative_tokens=1 → loop_count 从 1 膨胀到 3
+```cpp
+// scheduler.cpp —— 直接由 num_speculative_tokens 推导每步预留的 token 数
+kv_reserve_tokens_ = num_speculative_tokens > 0 ? num_speculative_tokens + 2 : 1;
+// 例: num_speculative_tokens=1 → 每步预留 3 个 token 的 block
 ```
 
-调度器使用膨胀后的 `loop_count` 计算 block 需求，而实际 decode 循环使用原始值（恒为 1）。这样既保证了 KV Cache 不会 OOM，又避免了不必要的多轮循环。
+C++ 调度器用 `kv_reserve_tokens_` 计算 block 需求（普通 decode 为 1），保证 KV Cache 不会 OOM。decode 循环本身恒为单次执行——MTP 在这一次执行内产出额外的 token，无需任何多轮循环。
 
 ### 4. 模块化代码架构
 
@@ -166,7 +165,6 @@ ModelRunner (编排者, ~590 行)
   ├── InputPreparer       (输入准备, ~235 行)
   │     prepare_prefill_bytes()
   │     prepare_decode_bytes()
-  │     update_decode_inplace()
   │
   ├── MTPWorker           (MTP 生命周期, ~385 行)
   │     prepare_lazy_verify_decode()
@@ -229,14 +227,14 @@ CUDAGraph capture：5 decode graphs + 5 MTP graphs + 5 lazy verify graphs，所�
 
 ### 7. 设计取舍总结
 
-| 设计决策                | 取舍                  | 理由                                       |
-| ----------------------- | --------------------- | ------------------------------------------ |
-| seqlen_q=2 而非树状推测 | 每步只验证 1 个 draft | 状态管理简洁，CUDAGraph 友好，无指数级膨胀 |
-| 独立的三路 Graph Runner | 额外的 buffer 显存    | 职责清晰，capture/replay 解耦，便于调试    |
-| GDN 双倍状态池          | 2× 显存开销           | 快照/回滚零重计算，无需 recompile          |
-| MTP 低延迟 EP 模式      | 上下文切换开销        | 确保 draft 生成的专家路由延迟最小          |
-| loop_count 膨胀         | 调度器多分配 block    | 提前预留 KV Cache，运行时无 OOM 风险       |
-| 组合模式拆分            | 多文件、多类          | 高内聚低耦合，单文件可读，便于独立修改     |
+| 设计决策                       | 取舍                  | 理由                                       |
+| ------------------------------ | --------------------- | ------------------------------------------ |
+| seqlen_q=2 而非树状推测        | 每步只验证 1 个 draft | 状态管理简洁，CUDAGraph 友好，无指数级膨胀 |
+| 独立的三路 Graph Runner        | 额外的 buffer 显存    | 职责清晰，capture/replay 解耦，便于调试    |
+| GDN 双倍状态池                 | 2× 显存开销           | 快照/回滚零重计算，无需 recompile          |
+| MTP 低延迟 EP 模式             | 上下文切换开销        | 确保 draft 生成的专家路由延迟最小          |
+| 按 num_speculative_tokens 预留 | 调度器多分配 block    | 提前预留 KV Cache，运行时无 OOM 风险       |
+| 组合模式拆分                   | 多文件、多类          | 高内聚低耦合，单文件可读，便于独立修改     |
 
 ### 8. 未来方向
 

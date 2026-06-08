@@ -324,7 +324,7 @@ class LLMEngine:
         else:
             for seqs in dp_seqs:
                 num_real = sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
-                decode_tokens += num_real * self.config.loop_count
+                decode_tokens += num_real
 
         # Collect finished/migrated sequences after postprocess
         for seqs in dp_seqs:

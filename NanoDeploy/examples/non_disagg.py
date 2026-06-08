@@ -1,7 +1,7 @@
 """Non-disaggregated LLM inference example.
 
 Usage:
-    python non_disagg.py --model /models/deepseek-v3 --loop_count 1 --kvcache_block_size 64
+    python non_disagg.py --model /models/deepseek-v3 --kvcache_block_size 64
     python non_disagg.py --config config.yaml
 """
 

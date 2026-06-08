@@ -10,8 +10,7 @@ Usage:
         --kvcache_block_size 64 \\
         --attention_dp 8 --ffn_ep 8 \\
         --prefill.master_address <node1-ip>:6006 \\
-        --decode.master_address <node0-ip>:6006 \\
-        --decode.loop_count 16
+        --decode.master_address <node0-ip>:6006
 
     python disagg.py --config disagg_config.yaml
 """
