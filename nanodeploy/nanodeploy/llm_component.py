@@ -296,7 +296,7 @@ class LLMComponent(LLM):
             del self._p2p_clients[target_encoder_id]
 
     def send_free_sequences(self, target_engine_id: str, seq_ids: List[int]) -> None:
-        """Send P2P free instruction directly to remote engine (no NanoRoute).
+        """Send P2P free instruction directly to remote engine (no nanodeploy-router).
 
         Args:
             target_engine_id: Engine ID to send free instruction to

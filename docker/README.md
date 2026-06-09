@@ -55,7 +55,7 @@ docker run --gpus all --rm -it --network host --ipc=host \
   --device=/dev/infiniband \
   -v /sys/class/infiniband:/sys/class/infiniband:ro \
   -v $PWD:/workspace/NanoDeploy \
-  -w /workspace/NanoDeploy/NanoDeploy \
+  -w /workspace/NanoDeploy/nanodeploy \
   nanodeploy:0.2.0-cu128-devel
 ```
 

@@ -3,7 +3,7 @@
 
 Run with torchrun, for example:
 
-  torchrun --nproc-per-node 8 NanoDeploy/scripts/dump_dsv4_official.py \
+  torchrun --nproc-per-node 8 nanodeploy/scripts/dump_dsv4_official.py \
     --inference-dir /models_cfs/models--deepseek-ai--DeepSeek-V4-Flash/inference \
     --ckpt-path /models_cfs/models--deepseek-ai--DeepSeek-V4-Flash-converted \
     --config /models_cfs/models--deepseek-ai--DeepSeek-V4-Flash/inference/config.json \

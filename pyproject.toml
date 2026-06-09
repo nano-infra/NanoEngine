@@ -17,15 +17,15 @@ dependencies = []
 #   pip install ".[all]"
 [project.optional-dependencies]
 nanodeploy = [
-    "nanodeploy @ file:NanoDeploy",
+    "nanodeploy @ file:nanodeploy",
 ]
 # NanoDeployVL was folded into nanodeploy as the `nanodeploy.vl` subpackage.
 # This extra now just pulls nanodeploy with its optional VL dependencies.
 nanodeployvl = [
-    "nanodeploy[vl] @ file:NanoDeploy",
+    "nanodeploy[vl] @ file:nanodeploy",
 ]
 all = [
-    "nanodeploy[vl] @ file:NanoDeploy",
+    "nanodeploy[vl] @ file:nanodeploy",
 ]
 
 [tool.setuptools]

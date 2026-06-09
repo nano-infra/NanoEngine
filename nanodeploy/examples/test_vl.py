@@ -1,4 +1,4 @@
-"""Test multimodal (VL) request through NanoRoute."""
+"""Test multimodal (VL) request through nanodeploy-router."""
 
 import base64
 import json

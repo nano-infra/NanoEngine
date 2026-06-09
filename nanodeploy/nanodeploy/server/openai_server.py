@@ -9,7 +9,7 @@ OpenAI-compatible HTTP API, in the spirit of ``vllm serve``::
         --served-model-name Qwen3-4B \
         --ctrl-address 127.0.0.1:4479
 
-Unlike the disaggregated stack (NanoRoute + ZMQ engine servers), this path
+Unlike the disaggregated stack (nanodeploy-router + ZMQ engine servers), this path
 talks to the engine through in-process queues, with no ZMQ and no Rust
 front-end. When ``--ctrl-address`` is given, the server registers its own
 HTTP endpoint with dlslime-ctrl so a router (e.g. DLRouter) can discover it.

@@ -2,7 +2,7 @@
 
 Manages a standalone ``EncoderEngine`` (ViT + EmbeddingPool + RDMA) and
 registers it with NanoCtrl for service discovery.  Client-facing
-``/v1/chat/completions`` is handled entirely by **NanoRoute**, which
+``/v1/chat/completions`` is handled entirely by **nanodeploy-router**, which
 discovers this encoder via NanoCtrl and communicates through ZMQ
 (Action=5/6 encode protocol).
 
@@ -13,7 +13,7 @@ Architecture
     Client (HTTP)
       │
       ▼
-    NanoRoute (HTTP reverse proxy + ZMQ router)
+    nanodeploy-router (HTTP reverse proxy + ZMQ router)
       ├── tokenize text + detect images
       ├── ZMQ Action=5 → EncoderEngine (image encode)
       ├── ZMQ Action=6 ← vision_slots + input_ids
@@ -23,7 +23,7 @@ Architecture
 
     VLEngineServer (this process)
       ├── EncoderEngine: ViT + EmbeddingPool + RDMA MR
-      ├── ZMQ ROUTER: accept encode requests from NanoRoute
+      ├── ZMQ ROUTER: accept encode requests from nanodeploy-router
       ├── P2P ZMQ: accept slot-free from LLM engines
       └── NanoCtrl: register encoder + heartbeat
 """
@@ -78,7 +78,7 @@ class VLEngineServer:
 
     Manages an ``EncoderEngine`` (vision encoding + RDMA EmbeddingPool)
     and registers with NanoCtrl.  Client requests are routed by
-    NanoRoute, which connects to the encoder's ZMQ encode service.
+    nanodeploy-router, which connects to the encoder's ZMQ encode service.
     """
 
     def __init__(self, config: VLServerConfig) -> None:
@@ -142,7 +142,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="NanoDeployVL Encoder Server "
-        "(client requests go through NanoRoute)"
+        "(client requests go through nanodeploy-router)"
     )
     parser.add_argument("--model", required=True, help="HF model directory")
     parser.add_argument("--host", default="0.0.0.0")

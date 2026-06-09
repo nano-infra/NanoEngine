@@ -1,10 +1,10 @@
-# NanoRoute
+# nanodeploy-router
 
 High-performance Inference Router written in Rust.
 
 ## Architecture
 
-NanoRoute acts as the request routing layer for distributed inference. It exposes an OpenAI-compatible HTTP API and connects to Python Inference Engines via **ZMQ**, with dynamic service discovery powered by **dlslime-ctrl + Redis**.
+nanodeploy-router acts as the request routing layer for distributed inference. It exposes an OpenAI-compatible HTTP API and connects to Python Inference Engines via **ZMQ**, with dynamic service discovery powered by **dlslime-ctrl + Redis**.
 
 ### Key Components
 
@@ -16,7 +16,7 @@ NanoRoute acts as the request routing layer for distributed inference. It expose
 
 ### Service Discovery Flow
 
-1. On startup, NanoRoute queries **dlslime-ctrl** for the Redis address (`/get_redis_address`).
+1. On startup, nanodeploy-router queries **dlslime-ctrl** for the Redis address (`/get_redis_address`).
 2. Loads an initial engine snapshot from both **Redis** and the **dlslime-ctrl API** (`/list_engines`).
 3. Subscribes to Redis pub/sub channel `{scope}:nano_events:engine_update` for incremental updates.
 4. On gap detection (missed revision), triggers a full re-sync.

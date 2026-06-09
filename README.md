@@ -4,22 +4,22 @@
 
 | Component                                   | Language   | Description             | Key Features                                                                                    |
 | ------------------------------------------- | ---------- | ----------------------- | ----------------------------------------------------------------------------------------------- |
-| [NanoDeploy](./NanoDeploy)                  | Python/C++ | LLM inference engine    | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
-| [nanodeploy.vl](./NanoDeploy/nanodeploy/vl) | Python     | Vision-Language encoder | EP-separated ViT encoder, RDMA embedding transfer, Qwen3-VL support (subpackage of NanoDeploy)  |
-| [NanoRoute](./NanoRoute)                    | Rust       | HTTP load balancer      | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
+| [nanodeploy](./nanodeploy)                  | Python/C++ | LLM inference engine    | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
+| [nanodeploy.vl](./nanodeploy/nanodeploy/vl) | Python     | Vision-Language encoder | EP-separated ViT encoder, RDMA embedding transfer, Qwen3-VL support (subpackage of NanoDeploy)  |
+| [nanodeploy-router](./nanodeploy-router)    | Rust       | HTTP load balancer      | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
 
 ## 🧠 Supported Models
 
 | Model         | Component     | Architecture          |
 | ------------- | ------------- | --------------------- |
-| DeepSeek-V3   | NanoDeploy    | MLA + MoE             |
-| DeepSeek-V3.2 | NanoDeploy    | MLA + MoE + NSA       |
-| DeepSeek-V4   | NanoDeploy    | MLA + MoE + DSA + SWA |
-| GLM-5         | NanoDeploy    | MLA + MoE + NSA       |
-| Kimi-K2       | NanoDeploy    | MLA + MoE             |
-| Qwen3         | NanoDeploy    | GQA (Dense)           |
-| Qwen3-MoE     | NanoDeploy    | GQA + MoE             |
-| Qwen3.5-MoE   | NanoDeploy    | GQA + GDN + MoE       |
+| DeepSeek-V3   | nanodeploy    | MLA + MoE             |
+| DeepSeek-V3.2 | nanodeploy    | MLA + MoE + NSA       |
+| DeepSeek-V4   | nanodeploy    | MLA + MoE + DSA + SWA |
+| GLM-5         | nanodeploy    | MLA + MoE + NSA       |
+| Kimi-K2       | nanodeploy    | MLA + MoE             |
+| Qwen3         | nanodeploy    | GQA (Dense)           |
+| Qwen3-MoE     | nanodeploy    | GQA + MoE             |
+| Qwen3.5-MoE   | nanodeploy    | GQA + GDN + MoE       |
 | Qwen3-VL      | nanodeploy.vl | GQA + MoE + ViT       |
 
 ## ✨ Key Features
@@ -45,7 +45,7 @@
 ```mermaid
 graph TB
     Client[Client Layer<br/>HTTP Requests / OpenAI SDK]
-    Route[NanoRoute<br/>Rust/HTTP<br/>Load Balancer]
+    Route[nanodeploy-router<br/>Rust/HTTP<br/>Load Balancer]
     VL[nanodeploy.vl<br/>Vision Encoder]
     Prefill[Prefill Engine<br/>Python/C++]
     Decode[Decode Engine<br/>Python/C++]
@@ -109,10 +109,10 @@ pip install ".[nanodeployvl]" # NanoDeploy + vision-language extras (nanodeploy.
 
 ```bash
 # Build NanoDeploy C++ extensions in-place
-cd NanoDeploy && pip install -e . && cd ..
+cd nanodeploy && pip install -e . && cd ..
 
-# Build NanoRoute (Rust)
-cd NanoRoute && cargo build --release && cd ..
+# Build nanodeploy-router (Rust)
+cd nanodeploy-router && cargo build --release && cd ..
 
 # Build dlslime-ctrl (Rust) from the DLSlime checkout
 cd /path/to/DLSlime/dlslime-ctrl && cargo build --release && cd -
@@ -144,7 +144,7 @@ Batch generation without HTTP serving.
 #### Single node (no dlslime-ctrl needed)
 
 ```bash
-python NanoDeploy/examples/non_disagg.py \
+python nanodeploy/examples/non_disagg.py \
     --model /models/Qwen3-235B-A22B \
     --ray_address <node0-ip>:7078 \
     --master_address <node0-ip>:6006 \
@@ -165,7 +165,7 @@ dlslime-ctrl server --redis-url redis://127.0.0.1:6379
 ##### 3. Launch engines
 
 ```bash
-python NanoDeploy/examples/disagg.py \
+python nanodeploy/examples/disagg.py \
     --model /models/Qwen3-235B-A22B \
     --ray_address <node0-ip>:7078 \
     --ctrl_address <node0-ip>:4479 \
@@ -179,7 +179,7 @@ python NanoDeploy/examples/disagg.py \
 For single-node hybrid deployment (prefill + decode in one process), use the
 `nanodeploy serve` command. It runs the engine in-process and exposes an
 OpenAI-compatible HTTP API directly, in the spirit of `vllm serve` — no
-NanoRoute and no ZMQ engine servers required:
+nanodeploy-router and no ZMQ engine servers required:
 
 ```bash
 # Same Config flags as engine_server.py (--host/--port bind HTTP for serve)
@@ -258,7 +258,7 @@ same node when GPU resources allow.
 
 ### Online mode
 
-ZMQ engine servers with OpenAI-compatible HTTP API via NanoRoute.
+ZMQ engine servers with OpenAI-compatible HTTP API via nanodeploy-router.
 
 ##### 2. Start Redis + dlslime-ctrl
 
@@ -267,17 +267,17 @@ redis-server --bind 0.0.0.0 --port 6379
 dlslime-ctrl server --redis-url redis://127.0.0.1:6379
 ```
 
-##### 3. Start NanoRoute
+##### 3. Start nanodeploy-router
 
 ```bash
-cd NanoRoute && cargo run --release    # edit config.toml to set ctrl_address
+cd nanodeploy-router && cargo run --release    # edit config.toml to set ctrl_address
 ```
 
 ##### 4. Launch engines
 
 ```bash
 # Terminal 1 — Decode engine
-python NanoDeploy/nanodeploy/server/engine_server.py \
+python nanodeploy/nanodeploy/server/engine_server.py \
     --model /models/Qwen3-235B-A22B \
     --mode decode \
     --ray_address <node0-ip>:7078 \
@@ -290,7 +290,7 @@ python NanoDeploy/nanodeploy/server/engine_server.py \
     --max_num_batched_tokens 16384 --max_model_len 16384
 
 # Terminal 2 — Prefill engine
-python NanoDeploy/nanodeploy/server/engine_server.py \
+python nanodeploy/nanodeploy/server/engine_server.py \
     --model /models/Qwen3-235B-A22B \
     --mode prefill \
     --ray_address <node0-ip>:7078 \

@@ -41,7 +41,7 @@ class EncoderConfig(BaseModel):
     p2p_port : int
         Port for P2P ZMQ free-slot notifications.
     zmq_port : int
-        Port for the ZMQ encode service (NanoRoute connects here).
+        Port for the ZMQ encode service (nanodeploy-router connects here).
     """
 
     model: str
@@ -53,7 +53,7 @@ class EncoderConfig(BaseModel):
     ctrl_scope: str | None = None
     host: str = "0.0.0.0"
     p2p_port: int = 0  # 0 = auto-bind
-    zmq_port: int = 0  # 0 = auto-bind; NanoRoute connects to this port
+    zmq_port: int = 0  # 0 = auto-bind; nanodeploy-router connects to this port
 
     # Populated during validation
     vision_config: Any = Field(default=None, exclude=True)

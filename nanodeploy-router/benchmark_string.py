@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NanoRoute 字符串评测脚本
+nanodeploy-router 字符串评测脚本
 支持流式和非流式请求的性能测试
 """
 
@@ -27,8 +27,8 @@ class BenchmarkResult:
     error_msg: Optional[str] = None
 
 
-class NanoRouteBenchmark:
-    """NanoRoute 性能评测类"""
+class NanoDeployRouterBenchmark:
+    """nanodeploy-router 性能评测类"""
 
     def __init__(self, base_url: str = "http://127.0.0.1:8080"):
         self.base_url = base_url.rstrip("/")
@@ -268,12 +268,12 @@ class NanoRouteBenchmark:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="NanoRoute 字符串评测脚本")
+    parser = argparse.ArgumentParser(description="nanodeploy-router 字符串评测脚本")
     parser.add_argument(
         "--url",
         type=str,
         default="http://127.0.0.1:3001",
-        help="NanoRoute 服务器地址 (默认: http://127.0.0.1:3001)",
+        help="nanodeploy-router 服务器地址 (默认: http://127.0.0.1:3001)",
     )
     parser.add_argument(
         "--model", type=str, default="opt-1.3b", help="模型名称 (默认: opt-1.3b)"
@@ -305,7 +305,7 @@ async def main():
         print(f"错误: 无法解析 messages JSON: {e}")
         return
 
-    benchmark = NanoRouteBenchmark(base_url=args.url)
+    benchmark = NanoDeployRouterBenchmark(base_url=args.url)
 
     # 健康检查
     print("检查服务器健康状态...")

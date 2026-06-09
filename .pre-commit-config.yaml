@@ -41,19 +41,19 @@ repos:
     rev: v1.0
     hooks:
       - id: fmt
-        name: fmt (NanoRoute)
-        args: ["--manifest-path", "NanoRoute/Cargo.toml"]
-        files: ^NanoRoute/
+        name: fmt (nanodeploy-router)
+        args: ["--manifest-path", "nanodeploy-router/Cargo.toml"]
+        files: ^nanodeploy-router/
         pass_filenames: false
-      # NanoRoute
+      # nanodeploy-router
       - id: cargo-check
-        name: cargo check (NanoRoute)
-        args: ["--manifest-path", "NanoRoute/Cargo.toml"]
-        files: ^NanoRoute/
+        name: cargo check (nanodeploy-router)
+        args: ["--manifest-path", "nanodeploy-router/Cargo.toml"]
+        files: ^nanodeploy-router/
       - id: clippy
-        name: clippy (NanoRoute)
-        args: ["--manifest-path", "NanoRoute/Cargo.toml", "--", "-D", "warnings"]
-        files: ^NanoRoute/
+        name: clippy (nanodeploy-router)
+        args: ["--manifest-path", "nanodeploy-router/Cargo.toml", "--", "-D", "warnings"]
+        files: ^nanodeploy-router/
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.6
