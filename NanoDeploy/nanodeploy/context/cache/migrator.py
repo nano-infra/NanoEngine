@@ -316,6 +316,23 @@ class KVMigratorMixin:
     # Shared migration helpers
     # ------------------------------------------------------------------
 
+    def _remote_global_rank(
+        self,
+        dp_idx: int,
+        sp_idx: int,
+        sp_size: int,
+        tp_idx: int,
+        tp_size: int,
+    ) -> int:
+        """Map a remote (dp, sp, tp) cell to its global rank in ``peer_addrs``.
+
+        ``peer_addrs`` is ordered by the attention device-mesh global rank,
+        i.e. ``dp_idx * (sp_size * tp_size) + sp_idx * tp_size + tp_idx``.
+        For attention_tp == 1 this reduces to ``dp_idx * sp_size + sp_idx``,
+        preserving the previous (TP=1 / MLA) behavior.
+        """
+        return (dp_idx * sp_size + sp_idx) * tp_size + tp_idx
+
     def _ensure_peer_connections(
         self, connection_requests: list[tuple[str, str, int, int, int]]
     ) -> None:
@@ -671,6 +688,26 @@ class KVMigratorMixin:
             engine_info = engine_info_map.get(engine_id, {})
             remote_max_num_seqs = engine_info.get("max_num_seqs", 0)
             remote_gdn_num_slots = engine_info.get("gdn_num_slots", 0)
+            # PD + GQA: remember the remote engine's attention_tp so peer
+            # selection can address the matching per-rank KV-head shard.
+            self.remote_attention_tp[engine_id] = int(
+                engine_info.get("attention_tp", 1)
+            )
+            # The RDMA block-copy migrates whole (layer, block) regions whose
+            # byte size depends on num_local_kv_heads. That only lines up when
+            # prefill and decode shard KV heads identically; otherwise a decode
+            # rank would copy bytes that belong to a different head subset.
+            remote_nlkv = int(
+                engine_info.get("num_local_kv_heads", self.num_local_kv_heads)
+            )
+            if remote_nlkv != self.num_local_kv_heads:
+                logger.error(
+                    f"KV-head shard mismatch for engine {engine_id}: "
+                    f"remote num_local_kv_heads={remote_nlkv}, "
+                    f"local={self.num_local_kv_heads}. PD KV migration requires "
+                    f"matching attention_tp / KV-head sharding between prefill "
+                    f"and decode engines."
+                )
             # DSv4 (S2.5): record remote pool sizes for stride math.
             remote_dsv4_pools = engine_info.get("dsv4_compressed_pool_pages", {}) or {}
             # Keys may be strings (JSON) — coerce to int.
@@ -703,7 +740,11 @@ class KVMigratorMixin:
         # DSv4 (S2.6): per-ratio compressed pages + compressor scratch state.
         compressed_assigns = defaultdict(lambda: defaultdict(list))
         compressor_state_assigns = defaultdict(lambda: defaultdict(list))
-        sp_idx = get_dist_context().attn_sp_rank
+        dist_ctx = get_dist_context()
+        sp_idx = dist_ctx.attn_sp_rank
+        # Local TP rank. Each decode TP rank owns a distinct KV-head shard and
+        # reads it from the prefill rank holding the same shard (same tp_idx).
+        tp_idx = dist_ctx.attn_tp_rank
 
         for v in views:
             engine_id = v.migrate_engine_id
@@ -760,7 +801,13 @@ class KVMigratorMixin:
                 if source_sp_idx != sp_idx:
                     continue
 
-                remote_rank = v.migrate_dp_idx * v.migrate_group_size + remote_sp_idx
+                remote_rank = self._remote_global_rank(
+                    v.migrate_dp_idx,
+                    remote_sp_idx,
+                    v.migrate_group_size,
+                    tp_idx,
+                    self.remote_attention_tp.get(engine_id, 1),
+                )
 
                 if remote_rank >= len(peer_addrs):
                     logger.error(
@@ -796,8 +843,12 @@ class KVMigratorMixin:
                 getattr(self, "dsv4_compressed_caches_flat", None)
                 and v.migrate_compressed_block_tables
             ):
-                remote_rank = v.migrate_dp_idx * v.migrate_group_size + (
-                    v.migrate_group_size - 1
+                remote_rank = self._remote_global_rank(
+                    v.migrate_dp_idx,
+                    v.migrate_group_size - 1,
+                    v.migrate_group_size,
+                    tp_idx,
+                    self.remote_attention_tp.get(engine_id, 1),
                 )
                 if 0 <= remote_rank < len(peer_addrs):
                     peer_alias = peer_addrs[remote_rank]
@@ -824,8 +875,12 @@ class KVMigratorMixin:
                 and v.migrate_state_slot >= 0
                 and v.active_state_slot >= 0
             ):
-                remote_rank = v.migrate_dp_idx * v.migrate_group_size + (
-                    v.migrate_group_size - 1
+                remote_rank = self._remote_global_rank(
+                    v.migrate_dp_idx,
+                    v.migrate_group_size - 1,
+                    v.migrate_group_size,
+                    tp_idx,
+                    self.remote_attention_tp.get(engine_id, 1),
                 )
                 if 0 <= remote_rank < len(peer_addrs):
                     peer_alias = peer_addrs[remote_rank]
@@ -850,8 +905,12 @@ class KVMigratorMixin:
                 local_state_slot = v.active_state_slot
 
                 if remote_state_slot >= 0 and local_state_slot >= 0:
-                    remote_rank = v.migrate_dp_idx * v.migrate_group_size + (
-                        v.migrate_group_size - 1
+                    remote_rank = self._remote_global_rank(
+                        v.migrate_dp_idx,
+                        v.migrate_group_size - 1,
+                        v.migrate_group_size,
+                        tp_idx,
+                        self.remote_attention_tp.get(engine_id, 1),
                     )
                     if remote_rank < len(peer_addrs):
                         peer_alias = peer_addrs[remote_rank]

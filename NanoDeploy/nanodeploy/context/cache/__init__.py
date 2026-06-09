@@ -160,6 +160,8 @@ class CacheContext(CacheLayoutMixin, KVCacheAllocatorMixin, KVMigratorMixin):
         self.num_remote_kvcache_blocks = {}
         self.remote_max_num_seqs: dict[str, int] = {}  # engine_id -> max_num_seqs
         self.remote_gdn_num_slots: dict[str, int] = {}  # engine_id -> gdn_num_slots
+        # engine_id -> remote engine's attention_tp (for PD + GQA peer mapping).
+        self.remote_attention_tp: dict[str, int] = {}
         self.gdn_num_slots: int = 0  # actual dim-1 of gdn tensors
         # DSv4 (S2.5): per-remote-engine pool sizes for stride math.
         # remote_compressed_pool_pages[engine_id][ratio] = num_pages on that engine

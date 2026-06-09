@@ -296,7 +296,11 @@ class LLMEngine:
             )
             post_sch_begin = time.time()
             post_sch_end = time.time()
-            self.executor.migrate(dp_group_seqs)
+            # TP-expand so every worker (all dp*sp*tp ranks) receives the
+            # migrate batch. With attention_tp > 1 (GQA) each TP rank holds a
+            # distinct KV-head shard and must run its own RDMA reads; sending
+            # only dp_group_seqs would leave tp_idx > 0 ranks unmigrated.
+            self.executor.migrate(dp_group_tp_seqs)
         outputs = []
         prefill_tokens = 0
         decode_tokens = 0
