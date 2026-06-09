@@ -65,22 +65,15 @@ graph TB
 
 ## 🚀 Installation
 
-### Key Third-Party Dependencies
+### Docker Development Image
 
-The Docker development image pins every external build dependency. Prefer tags when upstream provides a usable tag; otherwise pin the exact commit that has been smoke-tested.
+A prebuilt CUDA 12.8 development image bundles all build dependencies (PyTorch,
+DeepEP/DeepGEMM/FlashMLA/FlashInfer, flash-attn, DLSlime, Rust toolchain), plus an
+optional variant with **3FS USRBIO** support. See **[`docker/README.md`](./docker/README.md)**
+for the pinned dependency versions, build/run commands, and the 3FS image.
 
-| Library                                                    | Pinned version / ref                    | Notes                                                               |
-| ---------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------- |
-| PyTorch                                                    | `2.10.0+cu128`                          | CUDA 12.8 wheel.                                                    |
-| [DeepEP](https://github.com/deepseek-ai/DeepEP)            | `567632dd` (`v1.2.1-25-g567632d`)       | Nearest tag: `v1.2.1`; pinned commit is the tested post-tag build.  |
-| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)        | `891d57b4` (`v2.1.1.post3-16-g891d57b`) | Nearest tag: `v2.1.1.post3`; pinned commit reports package `2.5.0`. |
-| [FlashMLA](https://github.com/deepseek-ai/FlashMLA)        | `1408756a`                              | Upstream currently has no tags; pinned by commit.                   |
-| [FlashInfer](https://github.com/flashinfer-ai/flashinfer)  | `v0.6.9`                                | Built from source.                                                  |
-| [flash-attn](https://github.com/Dao-AILab/flash-attention) | `v2.8.1` wheel for `cu12` / `torch2.10` | Uses the release wheel.                                             |
-| [DLSlime](https://github.com/Deeplink-org/DLSlime)         | `v0.1.16`                               | Builds `dlslime`; `dlslime-ctrl` is not built in this image.        |
-| Rust                                                       | `1.95.0` via rustup                     | Minimal rustup toolchain; not installed from apt.                   |
-
-The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs. Install the key dependencies manually as follows:
+The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs. To install the key dependencies
+manually instead of using the image:
 
 ```bash
 cd DeepEP && pip install .
@@ -88,39 +81,6 @@ cd DeepGEMM && pip install .
 cd FlashMLA && pip install .
 pip install flashinfer-python==0.6.9
 pip install dlslime==0.1.16
-```
-
-### Docker Development Image
-
-The development container is built from `docker/Dockerfile`. It uses NVIDIA CUDA 12.8 devel, PyTorch 2.10 CUDA 12.8, source-built DeepEP/DeepGEMM/FlashMLA/FlashInfer, release-wheel flash-attn, rustup-managed Rust, and the build toolchains needed for NanoDeploy. The image intentionally does not include the NanoDeploy source tree; mount or clone NanoDeploy inside the container and install it there. This keeps the expensive dependency layers reusable across source changes.
-
-Build:
-
-```bash
-docker build --network host \
-  -f docker/Dockerfile \
-  -t nanodeploy:0.2.0-cu128-devel \
-  .
-```
-
-Private mirrors or proxies can be passed with Docker build args in local environments; the image does not require them.
-
-Run for local development:
-
-```bash
-docker run --gpus all --rm -it --network host --ipc=host \
-  --cap-add IPC_LOCK --ulimit memlock=-1:-1 \
-  --device=/dev/infiniband \
-  -v /sys/class/infiniband:/sys/class/infiniband:ro \
-  -v $PWD:/workspace/NanoDeploy \
-  -w /workspace/NanoDeploy/NanoDeploy \
-  nanodeploy:0.2.0-cu128-devel
-```
-
-Inside the container, install NanoDeploy from the mounted checkout:
-
-```bash
-python3 -m pip install --break-system-packages --no-build-isolation -v -e .
 ```
 
 ### One-liner: install everything
