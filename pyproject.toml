@@ -16,15 +16,23 @@ dependencies = []
 #   pip install ".[nanodeployvl]"   # Vision-Language support (nanodeploy.vl subpackage)
 #   pip install ".[all]"
 [project.optional-dependencies]
+# Standalone GPU kernels. nanodeploy depends on this; the file: URL resolves
+# the local monorepo path.
+nanodeploy-kernel = [
+    "nanodeploy-kernel @ file:nanodeploy-kernel",
+]
 nanodeploy = [
+    "nanodeploy-kernel @ file:nanodeploy-kernel",
     "nanodeploy @ file:nanodeploy",
 ]
 # NanoDeployVL was folded into nanodeploy as the `nanodeploy.vl` subpackage.
 # This extra now just pulls nanodeploy with its optional VL dependencies.
 nanodeployvl = [
+    "nanodeploy-kernel @ file:nanodeploy-kernel",
     "nanodeploy[vl] @ file:nanodeploy",
 ]
 all = [
+    "nanodeploy-kernel @ file:nanodeploy-kernel",
     "nanodeploy[vl] @ file:nanodeploy",
 ]
 

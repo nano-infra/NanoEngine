@@ -2,11 +2,12 @@
 
 ## 📦 Components
 
-| Component                                   | Language   | Description             | Key Features                                                                                    |
-| ------------------------------------------- | ---------- | ----------------------- | ----------------------------------------------------------------------------------------------- |
-| [nanodeploy](./nanodeploy)                  | Python/C++ | LLM inference engine    | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
-| [nanodeploy.vl](./nanodeploy/nanodeploy/vl) | Python     | Vision-Language encoder | EP-separated ViT encoder, RDMA embedding transfer, Qwen3-VL support (subpackage of NanoDeploy)  |
-| [nanodeploy-router](./nanodeploy-router)    | Rust       | HTTP load balancer      | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
+| Component                                   | Language    | Description             | Key Features                                                                                    |
+| ------------------------------------------- | ----------- | ----------------------- | ----------------------------------------------------------------------------------------------- |
+| [nanodeploy](./nanodeploy)                  | Python/C++  | LLM inference engine    | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
+| [nanodeploy-kernel](./nanodeploy-kernel)    | Python/CUDA | GPU compute kernels     | Triton + tvm-ffi JIT kernels (fp8, MoE, rmsnorm, ...), standalone dependency of NanoDeploy      |
+| [nanodeploy.vl](./nanodeploy/nanodeploy/vl) | Python      | Vision-Language encoder | EP-separated ViT encoder, RDMA embedding transfer, Qwen3-VL support (subpackage of NanoDeploy)  |
+| [nanodeploy-router](./nanodeploy-router)    | Rust        | HTTP load balancer      | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
 
 ## 🧠 Supported Models
 
@@ -108,6 +109,9 @@ pip install ".[nanodeployvl]" # NanoDeploy + vision-language extras (nanodeploy.
 ### For developers
 
 ```bash
+# Install the standalone GPU kernels first (nanodeploy depends on it)
+cd nanodeploy-kernel && pip install -e . && cd ..
+
 # Build NanoDeploy C++ extensions in-place
 cd nanodeploy && pip install -e . && cd ..
 

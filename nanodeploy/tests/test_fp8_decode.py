@@ -3,7 +3,7 @@
 import flash_mla
 import pytest
 import torch
-from nanodeploy.backends.hopper.kernels.fp8_utils import (
+from nanodeploy_kernel.hopper.fp8_utils import (
     D_NOPE,
     D_TOTAL,
     dequantize_and_unpack_mla,

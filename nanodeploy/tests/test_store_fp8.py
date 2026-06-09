@@ -2,8 +2,8 @@
 
 import pytest
 import torch
-from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kcache
-from nanodeploy.backends.hopper.kernels.fp8_utils import (
+from nanodeploy_kernel.gpu_generic.kv_store import store_kcache
+from nanodeploy_kernel.hopper.fp8_utils import (
     D_NOPE,
     D_TOTAL,
     dequantize_nope_fp8,

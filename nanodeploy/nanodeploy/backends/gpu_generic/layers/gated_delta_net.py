@@ -40,7 +40,7 @@ def _l2norm_compiled(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch
 
 
 try:
-    from nanodeploy.backends.gpu_generic.kernels.rmsnorm_gated import (
+    from nanodeploy_kernel.gpu_generic.rmsnorm_gated import (
         can_use_rms_norm_gated_kernel,
         rms_norm_gated_triton,
     )
@@ -49,7 +49,7 @@ except ImportError:
     rms_norm_gated_triton = None
 
 try:
-    from nanodeploy.backends.gpu_generic.kernels.repeat_interleave import (
+    from nanodeploy_kernel.gpu_generic.repeat_interleave import (
         can_use_repeat_interleave_from_prefix_triton,
         repeat_interleave_from_prefix_triton,
     )
@@ -58,7 +58,7 @@ except ImportError:
     repeat_interleave_from_prefix_triton = None
 
 try:
-    from nanodeploy.backends.gpu_generic.kernels.repeat_heads import (
+    from nanodeploy_kernel.gpu_generic.repeat_heads import (
         can_use_repeat_heads_triton,
         repeat_heads_triton,
     )
@@ -67,7 +67,7 @@ except ImportError:
     repeat_heads_triton = None
 
 try:
-    from nanodeploy.backends.gpu_generic.kernels.ragged_layout import (
+    from nanodeploy_kernel.gpu_generic.ragged_layout import (
         can_use_ragged_to_padded_triton,
         ragged_to_padded_triton,
     )

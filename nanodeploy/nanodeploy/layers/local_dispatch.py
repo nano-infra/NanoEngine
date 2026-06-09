@@ -6,14 +6,14 @@
 so the same masked grouped GEMMs work for both EP==1 and EP>1.
 
 Triton kernels live in:
-    nanodeploy/backends/gpu_generic/kernels/local_dispatch.py
+    nanodeploy_kernel/gpu_generic/local_dispatch.py
 """
 
 from typing import Union
 
 import torch
 import triton
-from nanodeploy.backends.gpu_generic.kernels.local_dispatch import (
+from nanodeploy_kernel.gpu_generic.local_dispatch import (
     ALIGNMENT,
     local_combine_kernel,
     local_dispatch_kernel,

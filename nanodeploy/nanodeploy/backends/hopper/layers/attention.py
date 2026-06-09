@@ -19,12 +19,13 @@ except ImportError:
         flash_attn_with_kvcache = None  # type: ignore
         _FA_KVCACHE_TABLE_ARG = "page_table"
 
-from nanodeploy.backends.base_backend import AttentionBase
-from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kcache, store_kvcache
-from nanodeploy.backends.gpu_generic.kernels.paged_gather import (
+from nanodeploy_kernel.gpu_generic.kv_store import store_kcache, store_kvcache
+from nanodeploy_kernel.gpu_generic.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,
 )
-from nanodeploy.backends.hopper.kernels.fp8_utils import store_kcache_fp8
+from nanodeploy_kernel.hopper.fp8_utils import store_kcache_fp8
+
+from nanodeploy.backends.base_backend import AttentionBase
 from nanodeploy.context.context import get_context
 from nanodeploy.logging import get_logger
 

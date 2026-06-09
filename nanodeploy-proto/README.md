@@ -1,4 +1,4 @@
-# proto
+# nanodeploy-proto
 
 FlatBuffers schema and protocol definitions for NanoInfra.
 
@@ -9,9 +9,9 @@ This directory defines the **wire format** shared by all NanoInfra components. I
 - **FlatBuffers schemas**: The canonical data structures for engine ↔ router communication
 - **Generated bindings**: Compiled to C++ headers, Rust types, and Python classes via `flatc`
 
-> **Note:** The C++ runtime (Sequence class, BlockManager, Scheduler, serialization, metrics, pybind11 bindings) lives in [`NanoDeploy/nanodeploy/csrc/`](../NanoDeploy/nanodeploy/csrc/). This `proto/` directory contains only the protocol definitions.
+> **Note:** The C++ runtime (Sequence class, BlockManager, Scheduler, serialization, metrics, pybind11 bindings) lives in [`nanodeploy/nanodeploy/csrc/`](../nanodeploy/nanodeploy/csrc/). This `nanodeploy-proto/` directory contains only the protocol definitions.
 
-## FlatBuffers Schemas (`proto/`)
+## FlatBuffers Schemas (`nanodeploy-proto/`)
 
 ### `sequence.fbs` — Core inference data structures
 
@@ -64,10 +64,10 @@ Requires:
 - FlatBuffers (`flatc` binary, built from `third_party/`)
 
 The schemas are compiled as part of the NanoDeploy build (which generates the
-C++ headers and Python bindings under `NanoDeploy/nanodeploy/fbs/`):
+C++ headers and Python bindings under `nanodeploy/nanodeploy/fbs/`):
 
 ```bash
-cd NanoDeploy
+cd nanodeploy
 cmake -B build -G Ninja
 cmake --build build
 ```
