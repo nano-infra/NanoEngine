@@ -103,6 +103,21 @@ class LLMComponent(LLM):
             "p2p_host": zmq_host,
             "p2p_port": self.p2p_port if self.p2p_port else 0,
             "max_num_seqs": self.config.max_num_seqs,
+            # Attention parallel layout. Consumers (decode engines) need these
+            # to map a (dp_idx, sp_idx, tp_idx) cell to the right global rank
+            # in ``peer_addrs`` during PD KV migration. peer_addrs is ordered by
+            # global rank = dp_idx*(sp*tp) + sp_idx*tp + tp_idx.
+            "attention_dp": self.config.attention_dp,
+            "attention_sp": self.config.attention_sp,
+            "attention_tp": self.config.attention_tp,
+            # Per-rank KV-head shard size. The RDMA block-copy migration requires
+            # the prefill and decode engines to share the same per-rank KV-head
+            # layout (i.e. equal attention_tp for GQA), so the decode side can
+            # validate before issuing reads.
+            "num_local_kv_heads": (
+                getattr(self.config.hf_config, "num_key_value_heads", 1)
+                // self.config.attention_tp
+            ),
         }
 
         # DSv4 (S2.5): publish per-ratio compressed pool sizes so peer engines
