@@ -106,7 +106,7 @@ class EncoderEngine:
         self._heartbeat_stop_event = threading.Event()
         self._start_p2p_free_listener()
 
-        # --- ZMQ encode service (NanoRoute connects here) ---
+        # --- ZMQ encode service (nanodeploy-router connects here) ---
         self._zmq_port: int = config.zmq_port
         self._zmq_thread: Optional[threading.Thread] = None
         self._processor: Optional["ImageProcessor"] = None
@@ -275,11 +275,11 @@ class EncoderEngine:
             self._nanoctrl.start_heartbeat(name=f"encoder-hb-{self.engine_id}")
 
     # ------------------------------------------------------------------
-    # ZMQ encode service (NanoRoute → EncoderEngine)
+    # ZMQ encode service (nanodeploy-router → EncoderEngine)
     # ------------------------------------------------------------------
 
     def _start_zmq_encode_service(self):
-        """Start a ZMQ ROUTER socket to accept encode requests from NanoRoute.
+        """Start a ZMQ ROUTER socket to accept encode requests from nanodeploy-router.
 
         Protocol (JSON over ZmqPacket):
         - Request  action=5: {"messages": [...], "image_urls": [...]}

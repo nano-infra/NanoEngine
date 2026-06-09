@@ -72,12 +72,12 @@ cmake -B build -G Ninja
 cmake --build build
 ```
 
-NanoRoute regenerates its Rust bindings from these same `.fbs` files via its
+nanodeploy-router regenerates its Rust bindings from these same `.fbs` files via its
 `build.rs`.
 
 ## Integration
 
 - **NanoDeploy**: C++ runtime in `nanodeploy/csrc/` includes generated headers for serialization and deserialization. Python engine accesses C++ objects via pybind11 (`nanodeploy._cpp`).
-- **NanoRoute**: Rust router imports generated FlatBuffers types (`fbs::Sequence`, `fbs::ZmqPacket`) for decoding engine responses.
+- **nanodeploy-router**: Rust router imports generated FlatBuffers types (`fbs::Sequence`, `fbs::ZmqPacket`) for decoding engine responses.
 - **nanodeploy.vl**: Vision encoder uses `EncodeRequest`/`EncodeResponse` actions and `VisionSlot` types.
 - **Schema Evolution**: Schemas are compiled to C++, Rust, and Python via `flatc`. All consumers must regenerate bindings when schemas change.

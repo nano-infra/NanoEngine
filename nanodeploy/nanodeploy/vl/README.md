@@ -7,7 +7,7 @@ Vision-Language encoder engine for NanoInfra, shipped as the `nanodeploy.vl` sub
 ```
 Client (HTTP)
   │
-NanoRoute ──ZMQ(Action=5)──► EncoderEngine
+nanodeploy-router ──ZMQ(Action=5)──► EncoderEngine
   │                              │
   │                         encode images
   │                              │
@@ -17,7 +17,7 @@ NanoRoute ──ZMQ(Action=5)──► EncoderEngine
   └──ZMQ──► Decode Engine
 ```
 
-1. NanoRoute receives a multimodal request and forwards image/video data to the encoder engine
+1. nanodeploy-router receives a multimodal request and forwards image/video data to the encoder engine
 2. **EncoderEngine** runs the ViT, writes embeddings to a GPU **EmbeddingPool**, and returns slot metadata
 3. The prefill engine reads embeddings from the pool via RDMA (zero-copy) and runs the LLM forward pass
 4. After prefill, the encoder reclaims the slots via a P2P free notification
@@ -70,15 +70,15 @@ nanodeployvl-serve \
     --ctrl_address 10.102.97.1:3000
 ```
 
-The server registers with dlslime-ctrl as `role="encoder"` so NanoRoute can discover it dynamically.
+The server registers with dlslime-ctrl as `role="encoder"` so nanodeploy-router can discover it dynamically.
 
 ### Examples
 
-- `NanoDeploy/examples/test_encoder_engine.py` — standalone encoder test (no dlslime-ctrl/RDMA required)
-- `NanoDeploy/examples/test_vl.py` — full multimodal request through NanoRoute
+- `nanodeploy/examples/test_encoder_engine.py` — standalone encoder test (no dlslime-ctrl/RDMA required)
+- `nanodeploy/examples/test_vl.py` — full multimodal request through nanodeploy-router
 
 ## Integration
 
-- **NanoRoute**: Discovers encoder engines via dlslime-ctrl; forwards `EncodeRequest` (Action=5) and receives `EncodeResponse` (Action=6)
+- **nanodeploy-router**: Discovers encoder engines via dlslime-ctrl; forwards `EncodeRequest` (Action=5) and receives `EncodeResponse` (Action=6)
 - **NanoDeploy**: Prefill engine reads vision embeddings from the EmbeddingPool via RDMA using `VisionSlot` metadata
 - **DLSlime**: PeerAgent provides RDMA memory region registration for zero-copy embedding transfer; `dlslime-ctrl` (the DLSlime control-plane server) handles engine lifecycle (register, heartbeat, discovery)

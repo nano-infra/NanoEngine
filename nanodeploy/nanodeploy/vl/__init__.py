@@ -20,6 +20,6 @@ __all__ = [
     "EncoderEngine",
     "VisionEncoder",
     "ImageProcessor",
-    "VLEngineServer",  # encoder-only server (NanoRoute handles client requests)
+    "VLEngineServer",  # encoder-only server (nanodeploy-router handles client requests)
     "VLServerConfig",
 ]

@@ -4,7 +4,7 @@
 This is adapted from the DeepSeek-V4 release inference converter, with a
 NanoDeploy-friendly CLI:
 
-    python NanoDeploy/scripts/convert_dsv4_weight.py -i /path/to/hf -o /path/to/out
+    python nanodeploy/scripts/convert_dsv4_weight.py -i /path/to/hf -o /path/to/out
 """
 
 import json
