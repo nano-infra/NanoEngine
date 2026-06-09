@@ -9,7 +9,7 @@ else()
     find_program(FLATC_EXECUTABLE flatc REQUIRED)
 endif()
 
-set(FBS_SOURCE "${NANOINFRA_DIR}/NanoSequence/proto/sequence.fbs")
+set(FBS_SOURCE "${NANOINFRA_DIR}/proto/sequence.fbs")
 set(GEN_HEADER_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 set(GEN_HEADER "${GEN_HEADER_DIR}/sequence_generated.h")
 
@@ -26,7 +26,7 @@ add_custom_command(
     COMMENT "Generating FlatBuffers header for Sequence"
 )
 
-set(INTERFACE_FBS_SOURCE "${NANOINFRA_DIR}/NanoSequence/proto/interface.fbs")
+set(INTERFACE_FBS_SOURCE "${NANOINFRA_DIR}/proto/interface.fbs")
 set(INTERFACE_GEN_HEADER "${GEN_HEADER_DIR}/interface_generated.h")
 
 add_custom_command(

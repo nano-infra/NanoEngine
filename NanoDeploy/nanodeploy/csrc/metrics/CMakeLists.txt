@@ -13,7 +13,7 @@ set_target_properties(_nanodeploy_metrics PROPERTIES
 
 install(TARGETS _nanodeploy_metrics LIBRARY DESTINATION ${NANODEPLOY_INSTALL_PATH})
 
-# Sequence metrics library (moved from NanoSequence)
+# Sequence metrics library (C++ runtime; schemas live in top-level proto/)
 add_library(
     _nanosequence_metrics
     SHARED
