@@ -698,15 +698,11 @@ class DeepseekV2Attention(nn.Module):
                         f"is_dummy={context.is_dummy}"
                     )
                 if k_cache.dtype == torch.float8_e4m3fn:
-                    from nanodeploy.backends.hopper.kernels.fp8_utils import (
-                        store_kcache_fp8,
-                    )
+                    from nanodeploy_kernel.hopper.fp8_utils import store_kcache_fp8
 
                     store_kcache_fp8(key_states_3d, k_cache, slot_mapping)
                 else:
-                    from nanodeploy.backends.gpu_generic.kernels.kv_store import (
-                        store_kcache,
-                    )
+                    from nanodeploy_kernel.gpu_generic.kv_store import store_kcache
 
                     store_kcache(key_states_3d, k_cache, slot_mapping)
 

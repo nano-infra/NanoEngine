@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 try:
-    from nanodeploy.backends.gpu_generic.kernels.rmsnorm import (
+    from nanodeploy_kernel.gpu_generic.rmsnorm import (
         add_rms_norm_triton,
         can_use_rms_norm_kernel,
         rms_norm_triton,

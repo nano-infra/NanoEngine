@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from nanodeploy.backends.hopper.kernels.fp8_utils import (
+from nanodeploy_kernel.hopper.fp8_utils import (
     D_NOPE,
     D_ROPE,
     D_TOTAL,

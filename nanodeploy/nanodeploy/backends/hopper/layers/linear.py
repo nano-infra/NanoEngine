@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from nanodeploy_kernel.hopper.block_gemm_fp8 import deep_gemm_fp8, quant_fp8_tma
 from torch import nn
 
 from nanodeploy.backends.base_backend import (
@@ -17,10 +18,6 @@ from nanodeploy.backends.base_backend import (
     QKVParallelLinearBase,
     ReplicatedLinearBase,
     RowParallelLinearBase,
-)
-from nanodeploy.backends.hopper.kernels.block_gemm_fp8 import (
-    deep_gemm_fp8,
-    quant_fp8_tma,
 )
 from nanodeploy.context.distributed import get_dist_context
 from nanodeploy.models.quant_config import QuantizationConfig

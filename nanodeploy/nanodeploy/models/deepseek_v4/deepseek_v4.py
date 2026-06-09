@@ -6,13 +6,14 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch import nn
+from nanodeploy_kernel.gpu_generic.kv_store import store_kvcache
 
-from nanodeploy._third_party.sglang_jit_kernel import (
+from nanodeploy_kernel.sglang_jit_kernel import (
     fused_kernels_enabled as _sglang_fused_kernels_enabled,
 )
+from torch import nn
+
 from nanodeploy.backends import get_backend
-from nanodeploy.backends.gpu_generic.kernels.kv_store import store_kvcache
 from nanodeploy.compile_utils import maybe_compile
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
@@ -125,13 +126,13 @@ _DSV4_FUSED_KERNELS = _sglang_fused_kernels_enabled()
 # Optional vendored sglang DSV4 fused kernels. When present,
 # _apply_rotary_interleaved replaces ~10 eager elementwise launches per
 # call with a single CUDA kernel.
-# Source (vendored under nanodeploy/_third_party/sglang_jit_kernel):
+# Source (vendored under nanodeploy_kernel/sglang_jit_kernel):
 #   https://github.com/sgl-project/sglang
 #   python/sglang/jit_kernel/deepseek_v4.py::fused_rope
 # Runtime deps for the vendored slice: torch, triton, tvm-ffi.
 if _DSV4_FUSED_KERNELS:
     try:
-        from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
+        from nanodeploy_kernel.sglang_jit_kernel.deepseek_v4 import (
             fused_norm_rope_inplace as _SGL_FUSED_NORM_ROPE,
             fused_rope as _SGL_FUSED_ROPE,
             rmsnorm_self as _SGL_RMSNORM_SELF,
@@ -153,7 +154,7 @@ else:
 # amax/exp2/clamp/cast op chain (~10 launches per call) with one
 # kernel each.
 try:
-    from nanodeploy.backends.gpu_generic.kernels.fp8_ue8m0_quant import (
+    from nanodeploy_kernel.gpu_generic.fp8_ue8m0_quant import (
         fp8_quant_dequant_inplace as _TRITON_FP8_QDQ,
         pack_kv_fp8 as _TRITON_FP8_PACK,
         store_dsv4_kv_fp8_fused as _TRITON_FP8_STORE,
@@ -215,7 +216,7 @@ else:
 #   python/sglang/srt/layers/mhc.py
 if _DSV4_FUSED_KERNELS:
     try:
-        from nanodeploy._third_party.sglang_mhc import mhc_pre as _SGL_MHC_PRE
+        from nanodeploy_kernel.sglang_mhc import mhc_pre as _SGL_MHC_PRE
     except Exception:
         _SGL_MHC_PRE = None
 else:

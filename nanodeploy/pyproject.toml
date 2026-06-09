@@ -21,6 +21,10 @@ dependencies = [
     # "triton>=3.0.0",
     # "flash-attn",
     # "flashinfer",
+    # GPU compute kernels, split into a standalone package. For local
+    # (monorepo) installs this is resolved via the root pyproject `file:`
+    # extra or by `pip install -e nanodeploy-kernel` beforehand.
+    "nanodeploy-kernel",
     "numpy",
     "pydantic",
     "pyzmq>=25.0",

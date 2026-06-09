@@ -422,8 +422,8 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         ]
 
         if self.is_fp8:
-            from nanodeploy.backends.hopper.kernels.fp8 import per_token_group_quant_fp8
-            from nanodeploy.backends.hopper.kernels.fused_moe_v3 import fused_moe_v3
+            from nanodeploy_kernel.hopper.fp8 import per_token_group_quant_fp8
+            from nanodeploy_kernel.hopper.fused_moe_v3 import fused_moe_v3
 
             x_fp8, x_scales = per_token_group_quant_fp8(hidden_states, 128)
             x_to_compute = (x_fp8, x_scales)
@@ -439,9 +439,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
                 swiglu_limit=self._swiglu_limit_runtime,
             )
         else:
-            from nanodeploy.backends.hopper.kernels.fused_moe_v3 import (
-                fused_moe_v3_bf16,
-            )
+            from nanodeploy_kernel.hopper.fused_moe_v3 import fused_moe_v3_bf16
 
             out_states = fused_moe_v3_bf16(
                 hidden_states,
@@ -477,7 +475,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         H = self.hidden_size
 
         if self.is_fp8:
-            from nanodeploy.backends.hopper.kernels.fp8 import (
+            from nanodeploy_kernel.hopper.fp8 import (
                 per_token_group_quant_fp8,
                 silu_and_mul_masked_post_quant_fwd,
             )
@@ -588,7 +586,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         )
 
         if self.is_fp8:
-            from nanodeploy.backends.hopper.kernels.fp8 import per_token_group_quant_fp8
+            from nanodeploy_kernel.hopper.fp8 import per_token_group_quant_fp8
 
             x_fp8, x_scales = per_token_group_quant_fp8(hidden_states, 128)
             x_to_dispatch = (x_fp8, x_scales)
@@ -600,7 +598,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         )
 
         if self.is_fp8:
-            from nanodeploy.backends.hopper.kernels.fused_moe_v3 import fused_moe_v3
+            from nanodeploy_kernel.hopper.fused_moe_v3 import fused_moe_v3
 
             gate_up_weight_tup = (self.gate_up_proj, self.gate_up_scale_inv)
             down_weight_tup = (self.down_proj, self.down_scale_inv)
@@ -614,9 +612,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
                 swiglu_limit=self._swiglu_limit_runtime,
             )
         else:
-            from nanodeploy.backends.hopper.kernels.fused_moe_v3 import (
-                fused_moe_v3_bf16,
-            )
+            from nanodeploy_kernel.hopper.fused_moe_v3 import fused_moe_v3_bf16
 
             down_output = fused_moe_v3_bf16(
                 recv_x,
@@ -694,7 +690,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
             # launch. ~250 µs sgl vs 538 µs nanodeploy in v24 trace.
             _used_tilelang_silu = False
             try:
-                from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
+                from nanodeploy_kernel.sglang_jit_kernel.deepseek_v4 import (
                     silu_mul_quant_masked,
                 )
 
@@ -717,7 +713,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
             except Exception:
                 pass
             if not _used_tilelang_silu:
-                from nanodeploy.backends.hopper.kernels.fp8 import (
+                from nanodeploy_kernel.hopper.fp8 import (
                     silu_and_mul_masked_post_quant_fwd,
                 )
 
@@ -804,7 +800,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         """
         import deep_gemm
 
-        from nanodeploy.backends.hopper.kernels.fp8 import per_token_group_quant_fp8
+        from nanodeploy_kernel.hopper.fp8 import per_token_group_quant_fp8
 
         num_tokens = hidden_states.shape[0]
         buf = self._get_mega_moe_buf()

@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from nanodeploy.compile_utils import maybe_compile
 
 # Optional vendored sglang fused kernel: chunk + silu + mul + (clamp) in
 # one CUDA kernel. Falls back to the torch.compile path when the vendor
@@ -10,13 +11,12 @@ import torch.nn.functional as F
 # keep it ``None`` and use the eager/compiled path (CUDAGraph still works).
 # Source: https://github.com/sgl-project/sglang
 #   python/sglang/jit_kernel/deepseek_v4.py::silu_and_mul_clamp
-from nanodeploy._third_party.sglang_jit_kernel import fused_kernels_enabled
-from nanodeploy.compile_utils import maybe_compile
+from nanodeploy_kernel.sglang_jit_kernel import fused_kernels_enabled
 from torch import nn
 
 if fused_kernels_enabled():
     try:
-        from nanodeploy._third_party.sglang_jit_kernel.deepseek_v4 import (
+        from nanodeploy_kernel.sglang_jit_kernel.deepseek_v4 import (
             silu_and_mul_clamp as _SGL_SILU_AND_MUL_CLAMP,
         )
     except Exception:

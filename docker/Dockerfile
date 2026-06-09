@@ -75,7 +75,7 @@ RUN python3 -m pip install --break-system-packages --default-timeout=600 --retri
 
 COPY nanodeploy/pyproject.toml /tmp/nanodeploy-pyproject.toml
 
-RUN python3 -c 'import subprocess, sys, tomllib; data = tomllib.load(open("/tmp/nanodeploy-pyproject.toml", "rb")); deps = list(data["project"]["dependencies"]); deps += data["project"].get("optional-dependencies", {}).get("cuda-devel", []); skip = {"dlslime"}; deps = [d for d in deps if d.split(";", 1)[0].split("[", 1)[0].split("<", 1)[0].split(">", 1)[0].split("=", 1)[0].strip().lower().replace("_", "-") not in skip]; subprocess.check_call([sys.executable, "-m", "pip", "install", "--break-system-packages", "--default-timeout=600", "--retries=20", "--progress-bar", "off", *deps])'
+RUN python3 -c 'import subprocess, sys, tomllib; data = tomllib.load(open("/tmp/nanodeploy-pyproject.toml", "rb")); deps = list(data["project"]["dependencies"]); deps += data["project"].get("optional-dependencies", {}).get("cuda-devel", []); skip = {"dlslime", "nanodeploy-kernel"}; deps = [d for d in deps if d.split(";", 1)[0].split("[", 1)[0].split("<", 1)[0].split(">", 1)[0].split("=", 1)[0].strip().lower().replace("_", "-") not in skip]; subprocess.check_call([sys.executable, "-m", "pip", "install", "--break-system-packages", "--default-timeout=600", "--retries=20", "--progress-bar", "off", *deps])'
 
 RUN mkdir -p /opt/src
 

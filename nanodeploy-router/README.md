@@ -9,7 +9,7 @@ nanodeploy-router acts as the request routing layer for distributed inference. I
 ### Key Components
 
 - **HTTP Layer**: Axum-based REST API (`/health`, `/v1/chat/completions`). Supports both streaming (SSE) and non-streaming responses.
-- **Engine Adapter**: ZMQ DEALER socket for low-latency communication with inference engines. Wire format is a single FlatBuffers `ZmqPacket` (schema: `proto/packet.fbs`) containing `action` enum + `payload` bytes. Inner payloads (SequenceList, StepOut, etc.) are defined in `proto/sequence.fbs`.
+- **Engine Adapter**: ZMQ DEALER socket for low-latency communication with inference engines. Wire format is a single FlatBuffers `ZmqPacket` (schema: `nanodeploy-proto/packet.fbs`) containing `action` enum + `payload` bytes. Inner payloads (SequenceList, StepOut, etc.) are defined in `nanodeploy-proto/sequence.fbs`.
 - **Engine Manager**: Manages ZMQ connections to engines discovered via the dlslime-ctrl API and Redis. Supports prefill/decode disaggregation.
 - **Engine Watcher**: Redis pub/sub listener for real-time engine add/remove/update events, with gap detection and automatic full-sync recovery.
 - **Tokenizer**: HuggingFace `tokenizers` + `minijinja` for ChatML template rendering.

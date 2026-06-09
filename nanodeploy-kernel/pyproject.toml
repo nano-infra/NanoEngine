@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanodeploy-kernel"
+version = "0.2.0"
+authors = [{ name = "DeepLink-MLSysResearch" }]
+license = { text = "MIT" }
+readme = "README.md"
+description = "Triton and tvm-ffi JIT compute kernels for NanoDeploy"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    # torch / triton are provided by the runtime environment (CUDA wheels),
+    # so they are intentionally not pinned here, matching nanodeploy.
+    # "torch",
+    # "triton",
+    "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2",
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/nanodeploy-project/nano-deploy"
+
+[tool.setuptools.packages.find]
+include = ["nanodeploy_kernel*"]
+
+[tool.setuptools.package-data]
+# Ship the JIT C++/CUDA headers consumed at runtime by tvm-ffi load_inline
+# (paths are resolved relative to sglang_jit_kernel/utils.py via __file__).
+nanodeploy_kernel = [
+    "sglang_jit_kernel/include/**/*",
+    "sglang_jit_kernel/csrc/**/*",
+]

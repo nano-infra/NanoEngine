@@ -59,9 +59,12 @@ docker run --gpus all --rm -it --network host --ipc=host \
   nanodeploy:0.2.0-cu128-devel
 ```
 
-Inside the container, install NanoDeploy from the mounted checkout:
+Inside the container, install NanoDeploy from the mounted checkout. The engine
+depends on the standalone `nanodeploy-kernel` package, so install it first (it is
+not published to PyPI):
 
 ```bash
+python3 -m pip install --break-system-packages --no-build-isolation -v -e ../nanodeploy-kernel
 python3 -m pip install --break-system-packages --no-build-isolation -v -e .
 ```
 

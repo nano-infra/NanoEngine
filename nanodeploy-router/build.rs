@@ -95,7 +95,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = env::var("OUT_DIR")?;
     let flatc = find_or_build_flatc()?;
 
-    let fbs_files = ["../proto/sequence.fbs", "../proto/packet.fbs"];
+    let fbs_files = [
+        "../nanodeploy-proto/sequence.fbs",
+        "../nanodeploy-proto/packet.fbs",
+    ];
 
     // Re-run if the flatc binary mtime changes (e.g. user upgraded an
     // in-place install). Note this does NOT cover swapping ``flatc`` to a

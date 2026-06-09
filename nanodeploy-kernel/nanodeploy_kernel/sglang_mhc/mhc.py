@@ -17,7 +17,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from nanodeploy._third_party.sglang_jit_kernel.utils import is_arch_support_pdl
+from nanodeploy_kernel.sglang_jit_kernel.utils import is_arch_support_pdl
 
 
 def is_nsa_prefill_cp_round_robin_split() -> bool:
