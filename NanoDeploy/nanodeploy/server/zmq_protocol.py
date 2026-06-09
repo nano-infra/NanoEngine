@@ -1,4 +1,4 @@
-"""ZMQ packet encode/decode using FlatBuffers (schema: NanoSequence/proto/packet.fbs).
+"""ZMQ packet encode/decode using FlatBuffers (schema: proto/packet.fbs).
 The entire ZMQ message is a single FlatBuffers buffer containing a ZmqPacket table.
 """
 

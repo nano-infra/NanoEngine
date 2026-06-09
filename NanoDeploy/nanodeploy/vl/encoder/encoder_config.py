@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from nanodeploy.logging import get_logger
 from pydantic import BaseModel, Field, model_validator
 from transformers import AutoConfig
+
+from nanodeploy.logging import get_logger
 
 logger = get_logger("encoder")
 

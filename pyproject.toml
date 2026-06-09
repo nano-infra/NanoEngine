@@ -13,18 +13,19 @@ dependencies = []
 
 # Install individual components:
 #   pip install ".[nanodeploy]"
-#   pip install ".[nanodeployvl]"
+#   pip install ".[nanodeployvl]"   # Vision-Language support (nanodeploy.vl subpackage)
 #   pip install ".[all]"
 [project.optional-dependencies]
 nanodeploy = [
     "nanodeploy @ file:NanoDeploy",
 ]
+# NanoDeployVL was folded into nanodeploy as the `nanodeploy.vl` subpackage.
+# This extra now just pulls nanodeploy with its optional VL dependencies.
 nanodeployvl = [
-    "nanodeployvl @ file:NanoDeployVL",
+    "nanodeploy[vl] @ file:NanoDeploy",
 ]
 all = [
-    "nanodeploy @ file:NanoDeploy",
-    "nanodeployvl @ file:NanoDeployVL",
+    "nanodeploy[vl] @ file:NanoDeploy",
 ]
 
 [tool.setuptools]

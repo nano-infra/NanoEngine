@@ -1,6 +1,6 @@
-# NanoDeployVL
+# nanodeploy.vl
 
-Vision-Language encoder engine for NanoInfra. Implements an **EP-separated** (Encoder-Prefill separated) architecture where the vision encoder runs as a standalone service, producing embeddings that are transferred to LLM prefill engines via RDMA.
+Vision-Language encoder engine for NanoInfra, shipped as the `nanodeploy.vl` subpackage. Implements an **EP-separated** (Encoder-Prefill separated) architecture where the vision encoder runs as a standalone service, producing embeddings that are transferred to LLM prefill engines via RDMA.
 
 ## Architecture
 
@@ -46,8 +46,11 @@ Vision model config and special token IDs (`image_token_id`, `video_token_id`, e
 
 ## Installation
 
+VL support ships inside `nanodeploy` as the `nanodeploy.vl` subpackage with its
+extra dependencies behind the `vl` extra:
+
 ```bash
-pip install -e NanoDeployVL/
+pip install -e "NanoDeploy[vl]"
 # or via the root meta-package
 pip install ".[nanodeployvl]"
 ```
@@ -71,8 +74,8 @@ The server registers with dlslime-ctrl as `role="encoder"` so NanoRoute can disc
 
 ### Examples
 
-- `examples/test_encoder_engine.py` — standalone encoder test (no dlslime-ctrl/RDMA required)
-- `examples/test_vl.py` — full multimodal request through NanoRoute
+- `NanoDeploy/examples/test_encoder_engine.py` — standalone encoder test (no dlslime-ctrl/RDMA required)
+- `NanoDeploy/examples/test_vl.py` — full multimodal request through NanoRoute
 
 ## Integration
 

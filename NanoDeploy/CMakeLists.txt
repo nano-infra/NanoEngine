@@ -23,9 +23,9 @@ add_subdirectory(${NANOINFRA_DIR}/third_party third_party)
 add_subdirectory(nanodeploy/csrc)
 
 # Python Flatbuffers Generation
-set(SEQUENCE_PROTO "${NANOINFRA_DIR}/NanoSequence/proto/sequence.fbs")
-set(PACKET_PROTO "${NANOINFRA_DIR}/NanoSequence/proto/packet.fbs")
-set(INTERFACE_PROTO "${NANOINFRA_DIR}/NanoSequence/proto/interface.fbs")
+set(SEQUENCE_PROTO "${NANOINFRA_DIR}/proto/sequence.fbs")
+set(PACKET_PROTO "${NANOINFRA_DIR}/proto/packet.fbs")
+set(INTERFACE_PROTO "${NANOINFRA_DIR}/proto/interface.fbs")
 set(FBS_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nanodeploy/fbs")
 
 # Find flatc (target from third_party)

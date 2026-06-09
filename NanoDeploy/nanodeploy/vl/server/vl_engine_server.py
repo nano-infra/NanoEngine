@@ -34,13 +34,14 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from nanodeploy.logging import get_logger
 from pydantic import BaseModel
 
-from nanodeployvl.encoder.encoder_config import EncoderConfig
-from nanodeployvl.encoder.encoder_engine import EncoderEngine
+from nanodeploy.logging import get_logger
 
-logger = get_logger("nanodeployvl")
+from nanodeploy.vl.encoder.encoder_config import EncoderConfig
+from nanodeploy.vl.encoder.encoder_engine import EncoderEngine
+
+logger = get_logger("nanodeploy.vl")
 
 
 # ── Server configuration ────────────────────────────────────────────

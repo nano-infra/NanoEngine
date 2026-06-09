@@ -18,11 +18,12 @@ from __future__ import annotations
 from typing import Union
 
 import torch
-from nanodeploy.logging import get_logger
 from PIL import Image
 from transformers import AutoProcessor
 
-logger = get_logger("nanodeployvl")
+from nanodeploy.logging import get_logger
+
+logger = get_logger("nanodeploy.vl")
 
 
 class ImageProcessor:
