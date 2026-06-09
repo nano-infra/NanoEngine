@@ -8,12 +8,13 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from nanodeploy.config import Config
-from nanodeploy.logging import get_logger
 from pydantic import Field, model_validator
 from transformers import AutoConfig
 
-logger = get_logger("nanodeployvl")
+from nanodeploy.config import Config
+from nanodeploy.logging import get_logger
+
+logger = get_logger("nanodeploy.vl")
 
 
 class VLConfig(Config):

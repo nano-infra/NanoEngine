@@ -48,14 +48,8 @@ import os
 import sys
 import time
 
-# Resolve NanoDeployVL
-_vl_root = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "..",
-    "NanoDeployVL",
-)
-if os.path.isdir(_vl_root):
-    sys.path.insert(0, _vl_root)
+# VL support now ships inside nanodeploy as the ``nanodeploy.vl`` subpackage,
+# so no sys.path manipulation is required.
 
 
 def load_or_make_image(path: str | None, synthetic: bool = True):
@@ -79,9 +73,9 @@ def load_or_make_image(path: str | None, synthetic: bool = True):
 def step_encoder(args) -> tuple:
     """Start EncoderEngine with NanoCtrl + RDMA MR, encode an image."""
     import torch
-    from nanodeployvl.encoder.encoder_config import EncoderConfig
-    from nanodeployvl.encoder.encoder_engine import EncoderEngine
-    from nanodeployvl.vision.processor import ImageProcessor
+    from nanodeploy.vl.encoder.encoder_config import EncoderConfig
+    from nanodeploy.vl.encoder.encoder_engine import EncoderEngine
+    from nanodeploy.vl.vision.processor import ImageProcessor
 
     image = load_or_make_image(args.image_path)
     print(f"[Encoder] Image: {image.size}")

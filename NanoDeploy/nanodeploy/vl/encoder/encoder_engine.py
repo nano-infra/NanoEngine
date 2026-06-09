@@ -26,11 +26,12 @@ from typing import Optional
 
 import torch
 from dlslime.ctrl import NanoCtrlClient
+
 from nanodeploy.context.embedding_pool import EmbeddingPool
 from nanodeploy.logging import get_logger
 
-from nanodeployvl.encoder.encoder_config import EncoderConfig
-from nanodeployvl.vision.encoder import VisionEncoder
+from nanodeploy.vl.encoder.encoder_config import EncoderConfig
+from nanodeploy.vl.vision.encoder import VisionEncoder
 
 logger = get_logger("encoder_engine")
 
@@ -113,7 +114,7 @@ class EncoderEngine:
 
         # --- Warmup ImageProcessor (loads HF tokenizer/processor) ---
         if self._processor is None:
-            from nanodeployvl.vision.processor import ImageProcessor
+            from nanodeploy.vl.vision.processor import ImageProcessor
 
             self._processor = ImageProcessor(config.model)
             logger.info("ImageProcessor pre-loaded during init")
@@ -286,7 +287,7 @@ class EncoderEngine:
         """
         import zmq
 
-        from nanodeployvl.vision.processor import ImageProcessor
+        from nanodeploy.vl.vision.processor import ImageProcessor
 
         # Lazy-load processor (shares model path with encoder)
         self._processor = ImageProcessor(self.config.model)
@@ -354,8 +355,9 @@ class EncoderEngine:
         import time
 
         import httpx as _httpx
-        from nanodeploy.server.zmq_protocol import encode_packet
         from PIL import Image as _Image
+
+        from nanodeploy.server.zmq_protocol import encode_packet
 
         assert self._processor is not None
         t0 = time.perf_counter()

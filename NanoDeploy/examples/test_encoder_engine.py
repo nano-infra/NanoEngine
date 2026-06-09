@@ -39,16 +39,8 @@ import time
 
 import torch
 
-# ---------------------------------------------------------------------------
-# Resolve NanoDeployVL path
-# ---------------------------------------------------------------------------
-_root = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "..",
-    "NanoDeployVL",
-)
-if os.path.isdir(_root):
-    sys.path.insert(0, _root)
+# VL support now ships inside nanodeploy as the ``nanodeploy.vl`` subpackage,
+# so no sys.path manipulation is required.
 
 
 def load_image(path: str | None, url: str | None):
@@ -107,7 +99,7 @@ def main():
     # ----------------------------------------------------------------
     # 2. Build EncoderConfig (no NanoCtrl)
     # ----------------------------------------------------------------
-    from nanodeployvl.encoder.encoder_config import EncoderConfig
+    from nanodeploy.vl.encoder.encoder_config import EncoderConfig
 
     config = EncoderConfig(
         model=args.model,
@@ -128,7 +120,7 @@ def main():
     # 3. Create EncoderEngine
     # ----------------------------------------------------------------
     t0 = time.time()
-    from nanodeployvl.encoder.encoder_engine import EncoderEngine
+    from nanodeploy.vl.encoder.encoder_engine import EncoderEngine
 
     engine = EncoderEngine(config)
     print(f"[3/5] EncoderEngine created in {time.time() - t0:.1f}s")
@@ -140,7 +132,7 @@ def main():
     # ----------------------------------------------------------------
     # 4. Preprocess image via ImageProcessor
     # ----------------------------------------------------------------
-    from nanodeployvl.vision.processor import ImageProcessor
+    from nanodeploy.vl.vision.processor import ImageProcessor
 
     processor = ImageProcessor(args.model)
 

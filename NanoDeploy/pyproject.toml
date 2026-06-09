@@ -59,12 +59,21 @@ cuda-devel = [
     "nvidia-cutlass-dsl>=4.4.2",
     "nvidia-ml-py",
 ]
+# Vision-Language support (nanodeploy.vl). Install with: pip install "nanodeploy[vl]"
+vl = [
+    "Pillow",
+    "safetensors",
+]
+vl-dev = [
+    "qwen-vl-utils",
+]
 
 [project.urls]
 Homepage = "https://github.com/nanodeploy-project/nano-deploy"
 
 [project.scripts]
 nanodeploy = "nanodeploy.server.cli:main"
+nanodeployvl-serve = "nanodeploy.vl.server.vl_engine_server:main"
 
 [tool.scikit-build]
 # optional env variable:
