@@ -50,7 +50,7 @@ VL support ships inside `nanodeploy` as the `nanodeploy.vl` subpackage with its
 extra dependencies behind the `vl` extra:
 
 ```bash
-pip install -e "NanoDeploy/[vl]"
+pip install -e "NanoDeploy[vl]"
 # or via the root meta-package
 pip install ".[nanodeployvl]"
 ```
