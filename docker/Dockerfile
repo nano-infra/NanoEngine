@@ -3,7 +3,7 @@ FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
 ARG PYTORCH_VERSION=2.10.0
 ARG PYTORCH_INDEX_URL
 ARG EXPECTED_TORCH_CUDA=12.8
-ARG NANODEPLOY_VERSION=0.2.0
+ARG DLENGINE_VERSION=0.2.0
 ARG PIP_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL
 ARG PIP_TRUSTED_HOST
@@ -73,9 +73,9 @@ RUN python3 -m pip install --break-system-packages --default-timeout=600 --retri
         "scikit-build-core>=0.10" \
         "maturin>=1.0,<2.0"
 
-COPY nanodeploy/pyproject.toml /tmp/nanodeploy-pyproject.toml
+COPY dlengine/pyproject.toml /tmp/dlengine-pyproject.toml
 
-RUN python3 -c 'import subprocess, sys, tomllib; data = tomllib.load(open("/tmp/nanodeploy-pyproject.toml", "rb")); deps = list(data["project"]["dependencies"]); deps += data["project"].get("optional-dependencies", {}).get("cuda-devel", []); skip = {"dlslime", "nanodeploy-kernel"}; deps = [d for d in deps if d.split(";", 1)[0].split("[", 1)[0].split("<", 1)[0].split(">", 1)[0].split("=", 1)[0].strip().lower().replace("_", "-") not in skip]; subprocess.check_call([sys.executable, "-m", "pip", "install", "--break-system-packages", "--default-timeout=600", "--retries=20", "--progress-bar", "off", *deps])'
+RUN python3 -c 'import subprocess, sys, tomllib; data = tomllib.load(open("/tmp/dlengine-pyproject.toml", "rb")); deps = list(data["project"]["dependencies"]); deps += data["project"].get("optional-dependencies", {}).get("cuda-devel", []); skip = {"dlslime"}; deps = [d for d in deps if d.split(";", 1)[0].split("[", 1)[0].split("<", 1)[0].split(">", 1)[0].split("=", 1)[0].strip().lower().replace("_", "-") not in skip]; subprocess.check_call([sys.executable, "-m", "pip", "install", "--break-system-packages", "--default-timeout=600", "--retries=20", "--progress-bar", "off", *deps])'
 
 RUN mkdir -p /opt/src
 
@@ -163,14 +163,14 @@ RUN git init /root/.oh-my-zsh \
 
 ARG VCS_REF=unknown
 
-LABEL org.opencontainers.image.title="NanoDeploy" \
-      org.opencontainers.image.version="${NANODEPLOY_VERSION}" \
-      org.opencontainers.image.description="NanoDeploy CUDA 12.8 devel container with PyTorch, DeepEP, FlashMLA, DeepGEMM, FlashInfer, FlashAttention, DLSlime, and build toolchains. NanoDeploy source is intentionally not included." \
+LABEL org.opencontainers.image.title="DLEngine" \
+      org.opencontainers.image.version="${DLENGINE_VERSION}" \
+      org.opencontainers.image.description="DLEngine CUDA 12.8 devel container with PyTorch, DeepEP, FlashMLA, DeepGEMM, FlashInfer, FlashAttention, DLSlime, and build toolchains. DLEngine source is intentionally not included." \
       org.opencontainers.image.source="https://github.com/DeepLink-org/NanoDeploy" \
       org.opencontainers.image.url="https://github.com/DeepLink-org/NanoDeploy" \
       org.opencontainers.image.documentation="https://github.com/DeepLink-org/NanoDeploy#docker-development-image" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.ref.name="nanodeploy:${NANODEPLOY_VERSION}-cu128-devel" \
+      org.opencontainers.image.ref.name="dlengine:${DLENGINE_VERSION}-cu128-devel" \
       org.opencontainers.image.vendor.deep_ep="${DEEP_EP_VERSION}@${DEEP_EP_REF}" \
       org.opencontainers.image.vendor.flash_mla="${FLASH_MLA_VERSION}@${FLASH_MLA_REF}" \
       org.opencontainers.image.vendor.deep_gemm="${DEEP_GEMM_VERSION}@${DEEP_GEMM_REF}" \

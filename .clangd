@@ -12,13 +12,13 @@ CompileFlags:
 
 ---
 If:
-  PathMatch: (.*\/)?nanodeploy/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$
+  PathMatch: (.*\/)?dlengine/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$
 CompileFlags:
-  CompilationDatabase: nanodeploy/build
+  CompilationDatabase: dlengine/build
   Add:
-    - -Inanodeploy
+    - -Idlengine
     - -INanoCommon/include
-    - -Inanodeploy/build/nanodeploy/csrc/sequence
+    - -Idlengine/build/dlengine/csrc/sequence
 
 ---
 CompileFlags:

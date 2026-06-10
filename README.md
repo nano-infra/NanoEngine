@@ -1,27 +1,25 @@
-# NanoDeploy: LLM Inference with Prefill-Decode Disaggregation and Wide Expert Parallelism
+# DLEngine: LLM Inference with Prefill-Decode Disaggregation and Wide Expert Parallelism
 
 ## 📦 Components
 
-| Component                                   | Language    | Description             | Key Features                                                                                    |
-| ------------------------------------------- | ----------- | ----------------------- | ----------------------------------------------------------------------------------------------- |
-| [nanodeploy](./nanodeploy)                  | Python/C++  | LLM inference engine    | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
-| [nanodeploy-kernel](./nanodeploy-kernel)    | Python/CUDA | GPU compute kernels     | Triton + tvm-ffi JIT kernels (fp8, MoE, rmsnorm, ...), standalone dependency of NanoDeploy      |
-| [nanodeploy.vl](./nanodeploy/nanodeploy/vl) | Python      | Vision-Language encoder | EP-separated ViT encoder, RDMA embedding transfer, Qwen3-VL support (subpackage of NanoDeploy)  |
-| [nanodeploy-router](./nanodeploy-router)    | Rust        | HTTP load balancer      | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
+| Component                            | Language   | Description          | Key Features                                                                                    |
+| ------------------------------------ | ---------- | -------------------- | ----------------------------------------------------------------------------------------------- |
+| [dlengine](./dlengine)               | Python/C++ | LLM inference engine | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
+| [dlengine-router](./dlengine-router) | Rust       | HTTP load balancer   | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
 
 ## 🧠 Supported Models
 
-| Model         | Component     | Architecture          |
-| ------------- | ------------- | --------------------- |
-| DeepSeek-V3   | nanodeploy    | MLA + MoE             |
-| DeepSeek-V3.2 | nanodeploy    | MLA + MoE + NSA       |
-| DeepSeek-V4   | nanodeploy    | MLA + MoE + DSA + SWA |
-| GLM-5         | nanodeploy    | MLA + MoE + NSA       |
-| Kimi-K2       | nanodeploy    | MLA + MoE             |
-| Qwen3         | nanodeploy    | GQA (Dense)           |
-| Qwen3-MoE     | nanodeploy    | GQA + MoE             |
-| Qwen3.5-MoE   | nanodeploy    | GQA + GDN + MoE       |
-| Qwen3-VL      | nanodeploy.vl | GQA + MoE + ViT       |
+| Model         | Component   | Architecture          |
+| ------------- | ----------- | --------------------- |
+| DeepSeek-V3   | dlengine    | MLA + MoE             |
+| DeepSeek-V3.2 | dlengine    | MLA + MoE + NSA       |
+| DeepSeek-V4   | dlengine    | MLA + MoE + DSA + SWA |
+| GLM-5         | dlengine    | MLA + MoE + NSA       |
+| Kimi-K2       | dlengine    | MLA + MoE             |
+| Qwen3         | dlengine    | GQA (Dense)           |
+| Qwen3-MoE     | dlengine    | GQA + MoE             |
+| Qwen3.5-MoE   | dlengine    | GQA + GDN + MoE       |
+| Qwen3-VL      | dlengine.vl | GQA + MoE + ViT       |
 
 ## ✨ Key Features
 
@@ -46,8 +44,8 @@
 ```mermaid
 graph TB
     Client[Client Layer<br/>HTTP Requests / OpenAI SDK]
-    Route[nanodeploy-router<br/>Rust/HTTP<br/>Load Balancer]
-    VL[nanodeploy.vl<br/>Vision Encoder]
+    Route[dlengine-router<br/>Rust/HTTP<br/>Load Balancer]
+    VL[dlengine.vl<br/>Vision Encoder]
     Prefill[Prefill Engine<br/>Python/C++]
     Decode[Decode Engine<br/>Python/C++]
     Ctrl[dlslime-ctrl<br/>Redis<br/>Service Registry<br/>from DLSlime]
@@ -93,8 +91,8 @@ pip install ".[all]"
 ### Install individual components
 
 ```bash
-pip install ".[nanodeploy]"   # NanoDeploy inference engine only
-pip install ".[nanodeployvl]" # NanoDeploy + vision-language extras (nanodeploy.vl subpackage)
+pip install ".[dlengine]"   # DLEngine inference engine only
+pip install ".[dlenginevl]" # DLEngine + vision-language extras (dlengine.vl subpackage)
 ```
 
 > The control-plane server (`dlslime-ctrl`) and its Python client (`dlslime.ctrl.NanoCtrlClient`)
@@ -109,14 +107,11 @@ pip install ".[nanodeployvl]" # NanoDeploy + vision-language extras (nanodeploy.
 ### For developers
 
 ```bash
-# Install the standalone GPU kernels first (nanodeploy depends on it)
-cd nanodeploy-kernel && pip install -e . && cd ..
+# Build DLEngine C++ extensions in-place (GPU kernels ship in dlengine.kernel)
+cd dlengine && pip install -e . && cd ..
 
-# Build NanoDeploy C++ extensions in-place
-cd nanodeploy && pip install -e . && cd ..
-
-# Build nanodeploy-router (Rust)
-cd nanodeploy-router && cargo build --release && cd ..
+# Build dlengine-router (Rust)
+cd dlengine-router && cargo build --release && cd ..
 
 # Build dlslime-ctrl (Rust) from the DLSlime checkout
 cd /path/to/DLSlime/dlslime-ctrl && cargo build --release && cd -
@@ -148,7 +143,7 @@ Batch generation without HTTP serving.
 #### Single node (no dlslime-ctrl needed)
 
 ```bash
-python nanodeploy/examples/non_disagg.py \
+python dlengine/examples/non_disagg.py \
     --model /models/Qwen3-235B-A22B \
     --ray_address <node0-ip>:7078 \
     --master_address <node0-ip>:6006 \
@@ -169,7 +164,7 @@ dlslime-ctrl server --redis-url redis://127.0.0.1:6379
 ##### 3. Launch engines
 
 ```bash
-python nanodeploy/examples/disagg.py \
+python dlengine/examples/disagg.py \
     --model /models/Qwen3-235B-A22B \
     --ray_address <node0-ip>:7078 \
     --ctrl_address <node0-ip>:4479 \
@@ -178,16 +173,16 @@ python nanodeploy/examples/disagg.py \
     --decode.master_address <node1-ip>:6006
 ```
 
-### Single-node serving (`nanodeploy serve`)
+### Single-node serving (`dlengine serve`)
 
 For single-node hybrid deployment (prefill + decode in one process), use the
-`nanodeploy serve` command. It runs the engine in-process and exposes an
+`dlengine serve` command. It runs the engine in-process and exposes an
 OpenAI-compatible HTTP API directly, in the spirit of `vllm serve` — no
-nanodeploy-router and no ZMQ engine servers required:
+dlengine-router and no ZMQ engine servers required:
 
 ```bash
 # Same Config flags as engine_server.py (--host/--port bind HTTP for serve)
-nanodeploy serve /path/to/model \
+dlengine serve /path/to/model \
   --host 0.0.0.0 --port 8100 \
   --served-model-name Qwen3-4B \
   --ray_address 127.0.0.1:7078
@@ -204,22 +199,22 @@ curl http://127.0.0.1:8100/v1/chat/completions \
 
 To make the node discoverable by a router (e.g. DLRouter) via dlslime-ctrl,
 point it at a running control plane; the server then registers its HTTP
-endpoint (entity kind `nanodeploy`) and keeps a heartbeat:
+endpoint (entity kind `dlengine`) and keeps a heartbeat:
 
 ```bash
 # Control plane (Redis + dlslime-ctrl)
 redis-server --bind 0.0.0.0 --port 6379 &
 dlslime-ctrl server --redis-url redis://127.0.0.1:6379 &
 
-nanodeploy serve /path/to/model \
+dlengine serve /path/to/model \
   --host 0.0.0.0 --port 8100 \
   --served-model-name Qwen3-4B \
   --ctrl-address 127.0.0.1:4479
 ```
 
-#### PD disaggregation with `nanodeploy serve` + DLRouter
+#### PD disaggregation with `dlengine serve` + DLRouter
 
-`nanodeploy serve` also supports Prefill-Decode disaggregation over HTTP.
+`dlengine serve` also supports Prefill-Decode disaggregation over HTTP.
 Launch one engine with `--mode prefill` and another with `--mode decode`
 (both pointed at the same dlslime-ctrl). They register their role with the
 control plane and connect their PeerAgents for KV migration. A PD-aware
@@ -236,7 +231,7 @@ redis-server --bind 0.0.0.0 --port 6379 &
 dlslime-ctrl server --redis-url redis://127.0.0.1:6379 &
 
 # Prefill node
-nanodeploy serve /path/to/model \
+dlengine serve /path/to/model \
   --host 0.0.0.0 --port 8101 \
   --served-model-name Qwen3-4B \
   --mode prefill \
@@ -244,7 +239,7 @@ nanodeploy serve /path/to/model \
   --ray_address 127.0.0.1:7078
 
 # Decode node
-nanodeploy serve /path/to/model \
+dlengine serve /path/to/model \
   --host 0.0.0.0 --port 8102 \
   --served-model-name Qwen3-4B \
   --mode decode \
@@ -252,7 +247,7 @@ nanodeploy serve /path/to/model \
   --ray_address 127.0.0.1:7078
 ```
 
-DLRouter discovers both nodes (entity kind `nanodeploy`) via dlslime-ctrl,
+DLRouter discovers both nodes (entity kind `dlengine`) via dlslime-ctrl,
 maps their roles to `PREFILL`/`DECODE`, and serves an OpenAI-compatible API.
 Point clients at DLRouter; requests transparently flow prefill → KV
 migration → decode. When the prefill node fully answers a request on its own
@@ -262,7 +257,7 @@ same node when GPU resources allow.
 
 ### Online mode
 
-ZMQ engine servers with OpenAI-compatible HTTP API via nanodeploy-router.
+ZMQ engine servers with OpenAI-compatible HTTP API via dlengine-router.
 
 ##### 2. Start Redis + dlslime-ctrl
 
@@ -271,17 +266,17 @@ redis-server --bind 0.0.0.0 --port 6379
 dlslime-ctrl server --redis-url redis://127.0.0.1:6379
 ```
 
-##### 3. Start nanodeploy-router
+##### 3. Start dlengine-router
 
 ```bash
-cd nanodeploy-router && cargo run --release    # edit config.toml to set ctrl_address
+cd dlengine-router && cargo run --release    # edit config.toml to set ctrl_address
 ```
 
 ##### 4. Launch engines
 
 ```bash
 # Terminal 1 — Decode engine
-python nanodeploy/nanodeploy/server/engine_server.py \
+python dlengine/dlengine/server/engine_server.py \
     --model /models/Qwen3-235B-A22B \
     --mode decode \
     --ray_address <node0-ip>:7078 \
@@ -294,7 +289,7 @@ python nanodeploy/nanodeploy/server/engine_server.py \
     --max_num_batched_tokens 16384 --max_model_len 16384
 
 # Terminal 2 — Prefill engine
-python nanodeploy/nanodeploy/server/engine_server.py \
+python dlengine/dlengine/server/engine_server.py \
     --model /models/Qwen3-235B-A22B \
     --mode prefill \
     --ray_address <node0-ip>:7078 \

@@ -41,19 +41,19 @@ repos:
     rev: v1.0
     hooks:
       - id: fmt
-        name: fmt (nanodeploy-router)
-        args: ["--manifest-path", "nanodeploy-router/Cargo.toml"]
-        files: ^nanodeploy-router/
+        name: fmt (dlengine-router)
+        args: ["--manifest-path", "dlengine-router/Cargo.toml"]
+        files: ^dlengine-router/
         pass_filenames: false
-      # nanodeploy-router
+      # dlengine-router
       - id: cargo-check
-        name: cargo check (nanodeploy-router)
-        args: ["--manifest-path", "nanodeploy-router/Cargo.toml"]
-        files: ^nanodeploy-router/
+        name: cargo check (dlengine-router)
+        args: ["--manifest-path", "dlengine-router/Cargo.toml"]
+        files: ^dlengine-router/
       - id: clippy
-        name: clippy (nanodeploy-router)
-        args: ["--manifest-path", "nanodeploy-router/Cargo.toml", "--", "-D", "warnings"]
-        files: ^nanodeploy-router/
+        name: clippy (dlengine-router)
+        args: ["--manifest-path", "dlengine-router/Cargo.toml", "--", "-D", "warnings"]
+        files: ^dlengine-router/
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.6

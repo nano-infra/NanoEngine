@@ -1,0 +1,18 @@
+namespace dlengine.fbs;
+
+enum Action : byte {
+  StepOut = 0,
+  AddRequest = 1,
+  GetEngineInfo = 2,
+  FreeSequences = 3,
+  FreeVisionSlots = 4,
+  EncodeRequest = 5,
+  EncodeResponse = 6,
+}
+
+table ZmqPacket {
+  action: Action;
+  payload: [ubyte];
+}
+
+root_type ZmqPacket;
