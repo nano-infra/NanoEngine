@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=60"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -15,26 +15,12 @@ dependencies = []
 #   pip install ".[nanodeploy]"
 #   pip install ".[nanodeployvl]"   # Vision-Language support (nanodeploy.vl subpackage)
 #   pip install ".[all]"
-[project.optional-dependencies]
-# Standalone GPU kernels. nanodeploy depends on this; the file: URL resolves
-# the local monorepo path.
-nanodeploy-kernel = [
-    "nanodeploy-kernel @ file:nanodeploy-kernel",
-]
-nanodeploy = [
-    "nanodeploy-kernel @ file:nanodeploy-kernel",
-    "nanodeploy @ file:nanodeploy",
-]
-# NanoDeployVL was folded into nanodeploy as the `nanodeploy.vl` subpackage.
-# This extra now just pulls nanodeploy with its optional VL dependencies.
-nanodeployvl = [
-    "nanodeploy-kernel @ file:nanodeploy-kernel",
-    "nanodeploy[vl] @ file:nanodeploy",
-]
-all = [
-    "nanodeploy-kernel @ file:nanodeploy-kernel",
-    "nanodeploy[vl] @ file:nanodeploy",
-]
+#
+# The optional-dependencies are generated dynamically in setup.py so the
+# local monorepo subpackages can be referenced via *absolute* `file://` URLs.
+# Relative PEP 508 direct references (e.g. `file:nanodeploy-kernel`) are
+# rejected by modern `packaging` (>=24) with "Invalid URL given".
+dynamic = ["optional-dependencies"]
 
 [tool.setuptools]
 # No Python packages to install from the root itself
