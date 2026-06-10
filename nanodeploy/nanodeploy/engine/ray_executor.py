@@ -58,13 +58,32 @@ def _serialize_migrate(seqs: list[Sequence]) -> bytes:
 
 
 def _collect_dsv4_debug_env() -> dict[str, str] | None:
-    """Forward opt-in DeepSeek-V4 debug env vars to Ray actors."""
+    """Forward opt-in debug env vars to Ray actors.
+
+    Ray actors do not inherit the driver's environment, so any debugging env
+    var must be explicitly forwarded here (applied in ``ModelRunner.__init__``
+    via ``os.environ.update`` before CUDA/dist init). Forwards the DeepSeek-V4
+    debug knobs plus general debugging vars (synchronous CUDA launches, our
+    per-op synchronize probe, and NCCL/MCCL debug logging).
+    """
     import os
 
+    _PASSTHROUGH = (
+        "CUDA_LAUNCH_BLOCKING",
+        "NANODEPLOY_DEBUG_SYNC",
+        "NANODEPLOY_DEBUG_OPSYNC",
+        "NANODEPLOY_CHUNKED_ALLREDUCE",
+        "NCCL_DEBUG",
+        "NCCL_DEBUG_SUBSYS",
+        "MCCL_DEBUG",
+        "MCCL_DEBUG_SUBSYS",
+        "TORCH_NCCL_BLOCKING_WAIT",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING",
+    )
     debug_env = {
         key: value
         for key, value in os.environ.items()
-        if key.startswith("NANODEPLOY_DSV4_DEBUG_")
+        if key.startswith("NANODEPLOY_DSV4_DEBUG_") or key in _PASSTHROUGH
     }
     return debug_env or None
 

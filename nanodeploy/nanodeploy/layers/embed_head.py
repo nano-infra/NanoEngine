@@ -1,9 +1,48 @@
+import os
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from nanodeploy.context.context import get_context
 from nanodeploy.context.distributed import get_dist_context
 from torch import nn
+
+# MCCL (MetaX CCL) has issues with large tensor all_reduce/all_gather:
+# - all_gather deadlocks after the first call (P2P path issue)
+# - all_reduce deadlocks when tensor > ~32k elements
+# Workaround: use chunked all_reduce with small chunks.
+# Enable via: NANODEPLOY_CHUNKED_ALLREDUCE=1 (default off)
+_ALLREDUCE_CHUNK_SIZE = 32768
+
+
+def _chunked_all_reduce(tensor: torch.Tensor, group) -> None:
+    """All-reduce, optionally chunked for MCCL large-tensor deadlock workaround.
+
+    Enable chunking via env var NANODEPLOY_CHUNKED_ALLREDUCE=1 (for MetaX GPUs).
+    Default: plain all_reduce (no chunking, no sync overhead).
+    """
+    # Check env at call time (not import) since Ray workers set env in __init__
+    if os.getenv("NANODEPLOY_CHUNKED_ALLREDUCE", "0") != "1":
+        # Normal path: plain all_reduce, no chunking
+        dist.all_reduce(tensor, group=group)
+        return
+
+    # Chunked path for MCCL workaround
+    if torch.cuda.is_current_stream_capturing():
+        # Graph capture: no sync allowed, tensors are small anyway
+        dist.all_reduce(tensor, group=group)
+        return
+
+    numel = tensor.numel()
+    if numel <= _ALLREDUCE_CHUNK_SIZE:
+        dist.all_reduce(tensor, group=group)
+    else:
+        flat = tensor.view(-1)
+        for i in range(0, numel, _ALLREDUCE_CHUNK_SIZE):
+            end = min(i + _ALLREDUCE_CHUNK_SIZE, numel)
+            chunk = flat[i:end].contiguous()
+            dist.all_reduce(chunk, group=group)
+            flat[i:end] = chunk
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -42,7 +81,7 @@ class VocabParallelEmbedding(nn.Module):
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
-            dist.all_reduce(y, group=get_dist_context().attn_tp_group)
+            _chunked_all_reduce(y, get_dist_context().attn_tp_group)
         return y
 
 
@@ -68,16 +107,20 @@ class ParallelLMHead(VocabParallelEmbedding):
                 x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
-            all_logits = (
-                [torch.empty_like(logits) for _ in range(self.tp_size)]
-                if self.tp_rank == 0
-                else None
+            # Use all_reduce instead of all_gather. On this hardware's MCCL
+            # backend, all_gather deadlocks after the first call (P2P issue),
+            # while all_reduce works reliably (with chunking for large tensors).
+            # Strategy: each rank places its shard into a full-vocab buffer at
+            # the correct offset, then all_reduce (sum) gives the complete
+            # logits on every rank. Only rank 0 needs the result for sampling.
+            batch_size = logits.size(0)
+            vocab_per_rank = logits.size(-1)
+            full_vocab = vocab_per_rank * self.tp_size
+            full_logits = torch.zeros(
+                batch_size, full_vocab, device=logits.device, dtype=logits.dtype
             )
-            dist.gather(
-                logits,
-                all_logits,
-                dist.get_process_group_ranks(get_dist_context().attn_tp_group)[0],
-                group=get_dist_context().attn_tp_group,
-            )
-            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+            start = self.tp_rank * vocab_per_rank
+            full_logits[:, start : start + vocab_per_rank] = logits
+            _chunked_all_reduce(full_logits, get_dist_context().attn_tp_group)
+            logits = full_logits if self.tp_rank == 0 else None
         return logits
