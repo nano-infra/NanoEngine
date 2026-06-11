@@ -11,7 +11,6 @@ from torch import nn
 
 from dlengine.compile_utils import maybe_compile
 from dlengine.context.context import get_context
-
 from dlengine.layers import get_backend
 from dlengine.layers.base_backend import GatedDeltaNetBase, ReplicatedLinearBase
 from dlengine.logging import get_logger

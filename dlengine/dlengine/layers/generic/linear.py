@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from dlengine.context.distributed import get_dist_context
-
 from dlengine.layers.base_backend import (
     ColumnParallelLinearBase,
     MergedColumnParallelLinearBase,

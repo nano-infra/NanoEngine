@@ -29,7 +29,6 @@ from dlslime.ctrl import NanoCtrlClient
 
 from dlengine.context.embedding_pool import EmbeddingPool
 from dlengine.logging import get_logger
-
 from dlengine.vl.encoder.encoder_config import EncoderConfig
 from dlengine.vl.vision.encoder import VisionEncoder
 

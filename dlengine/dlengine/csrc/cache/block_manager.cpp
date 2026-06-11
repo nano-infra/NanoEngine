@@ -62,9 +62,78 @@ void BlockManager::deallocate_block(int block_id)
     if (blocks_[block_id].ref_count != 0) {
         throw std::runtime_error("Block ref_count is not 0");
     }
+    // L3: queue the just-evicted block for offload to 3FS.  We record only
+    // (hash, block_id); the data still lives in GPU memory until this block is
+    // physically reused.  drain_pending_offloads() re-validates that the block
+    // still carries this hash, so a reused block is never offloaded with stale
+    // data (the hash chain makes a reuse change blocks_[id].hash).
+    if (l3_enabled_) {
+        const Block& blk = blocks_[block_id];
+        if (blk.hash != -1) {
+            pending_offloads_.emplace_back(blk.hash, block_id);
+        }
+    }
     used_block_ids_.erase(block_id);
     free_block_ids_.push_back(block_id);
     block_id_to_free_list_it_[block_id] = std::prev(free_block_ids_.end());
+}
+
+// --- L3 (3FS) tiered KV cache hooks ---------------------------------------
+void BlockManager::set_l3_resident_hashes(const std::vector<int64_t>& hashes)
+{
+    l3_resident_hashes_.clear();
+    l3_resident_hashes_.insert(hashes.begin(), hashes.end());
+}
+
+void BlockManager::mark_l3_resident(const std::vector<int64_t>& hashes)
+{
+    l3_resident_hashes_.insert(hashes.begin(), hashes.end());
+}
+
+std::vector<int64_t> BlockManager::compute_block_hashes(Sequence& seq) const
+{
+    std::vector<int64_t> out;
+    int64_t              h          = -1;
+    int                  num_blocks = seq.num_blocks(BlockContextSlot::ACTIVE, group_id_);
+    for (int i = 0; i < num_blocks; ++i) {
+        auto view = seq.block_view(i, BlockContextSlot::ACTIVE, group_id_);
+        // Only full leading blocks participate in the prefix hash chain.
+        if (view.second != static_cast<size_t>(block_size_)) {
+            break;
+        }
+        h = compute_hash(view.first, view.second, h);
+        out.push_back(h);
+    }
+    return out;
+}
+
+std::vector<std::pair<int64_t, int>> BlockManager::drain_pending_loads()
+{
+    std::vector<std::pair<int64_t, int>> out;
+    out.reserve(pending_loads_.size());
+    for (const auto& entry : pending_loads_) {
+        // Defensive: only return blocks that still carry the queued hash.
+        if (blocks_[entry.second].hash == entry.first) {
+            out.push_back(entry);
+        }
+    }
+    pending_loads_.clear();
+    return out;
+}
+
+std::vector<std::pair<int64_t, int>> BlockManager::drain_pending_offloads()
+{
+    std::vector<std::pair<int64_t, int>> out;
+    out.reserve(pending_offloads_.size());
+    for (const auto& entry : pending_offloads_) {
+        // Only offload blocks whose GPU data still matches the queued hash;
+        // a reused block has a different blocks_[id].hash and is skipped.
+        if (blocks_[entry.second].hash == entry.first) {
+            out.push_back(entry);
+        }
+    }
+    pending_offloads_.clear();
+    return out;
 }
 
 int BlockManager::count_active_prefix_hits(Sequence& seq) const
@@ -147,12 +216,23 @@ void BlockManager::allocate(Sequence& seq, int prefix_hint)
         // For the first `fast_prefix` blocks we know the content matches
         // (validated by count_active_prefix_hits in can_allocate).  Skip
         // the expensive element-wise comparison.
+        bool l3_hit = false;
         if (!cache_miss && i < fast_prefix) {
             // Guaranteed hit — skip content check
         }
         else if (block_id == -1 || blocks_[block_id].token_ids.size() != view.second
                  || !std::equal(blocks_[block_id].token_ids.begin(), blocks_[block_id].token_ids.end(), view.first)) {
-            cache_miss = true;
+            // Not resident in the GPU prefix cache.  If L3 is enabled and the
+            // prefix chain is still intact for this sequence (no prior miss),
+            // and this full block is durable in L3, treat it as a loadable hit
+            // rather than a recompute miss.  The hash chain guarantees the L3
+            // hits form a contiguous leading prefix.
+            if (l3_enabled_ && !cache_miss && h != -1 && l3_resident_hashes_.count(h)) {
+                l3_hit = true;
+            }
+            else {
+                cache_miss = true;
+            }
         }
 
         Block* block_ptr = nullptr;
@@ -162,6 +242,18 @@ void BlockManager::allocate(Sequence& seq, int prefix_hint)
             }
             block_id  = free_block_ids_.front();
             block_ptr = &allocate_block(block_id);
+        }
+        else if (l3_hit) {
+            // KV data lives only in L3: allocate a fresh GPU block and schedule
+            // a load.  The block counts toward the cached prefix (recompute is
+            // skipped), so the load MUST complete before the forward pass.
+            if (free_block_ids_.empty()) {
+                throw std::runtime_error("No free blocks available");
+            }
+            block_id  = free_block_ids_.front();
+            block_ptr = &allocate_block(block_id);
+            pending_loads_.emplace_back(h, block_id);
+            num_prefix_cached++;  // h != -1 here, always a full block
         }
         else {
             if (used_block_ids_.count(block_id)) {

@@ -35,5 +35,14 @@ void bind_block_manager(py::module_& m)
         .def("may_append", &BlockManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def_property_readonly("free_block_ids", &BlockManager::free_block_ids)
         .def_property_readonly("num_free_blocks", &BlockManager::num_free_blocks)
-        .def_property_readonly("blocks", &BlockManager::blocks);
+        .def_property_readonly("blocks", &BlockManager::blocks)
+        // --- L3 (3FS) tiered KV cache hooks ---
+        .def("set_l3_enabled", &BlockManager::set_l3_enabled, py::arg("enabled"))
+        .def_property_readonly("l3_enabled", &BlockManager::l3_enabled)
+        .def("set_l3_resident_hashes", &BlockManager::set_l3_resident_hashes, py::arg("hashes"))
+        .def("mark_l3_resident", &BlockManager::mark_l3_resident, py::arg("hashes"))
+        .def("is_l3_resident", &BlockManager::is_l3_resident, py::arg("hash"))
+        .def("compute_block_hashes", &BlockManager::compute_block_hashes, py::arg("seq"))
+        .def("drain_pending_loads", &BlockManager::drain_pending_loads)
+        .def("drain_pending_offloads", &BlockManager::drain_pending_offloads);
 }

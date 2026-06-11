@@ -113,6 +113,11 @@ class LLMEngine:
         )
         self.metrics_manager = MetricsManager()
 
+        # L3 (3FS) tiered KV cache — lazily armed on the first step() once the
+        # C++ worker_state / block managers exist. Inert unless config.l3_enable.
+        self._l3_ready = False
+        self._l3_active = False
+
         atexit.register(self.exit)
 
     def exit(self):
@@ -179,7 +184,94 @@ class LLMEngine:
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
         self.scheduler.free_to_be_migrated(seqs)
 
+    # ------------------------------------------------------------------ #
+    # L3 (3FS) tiered KV cache driver hooks
+    # ------------------------------------------------------------------ #
+    def _l3_block_managers(self):
+        """Yield (worker_state_idx, BlockManager) for the PoC's single group."""
+        for i, ws in enumerate(self.scheduler.worker_state):
+            yield i, ws.block_manager[0]
+
+    def _l3_rank_dir(self, rank: int) -> str:
+        l3_dir = self.config.l3_dir or os.path.join(
+            self.config.l3_mountpoint, "dlengine_l3"
+        )
+        return os.path.join(l3_dir, f"rank{rank}")
+
+    def _l3_scan_resident(self, rank: int) -> list:
+        """Read durable block hashes for ``rank`` from the 3FS dir (cross-restart)."""
+        out = []
+        rdir = self._l3_rank_dir(rank)
+        try:
+            for name in os.listdir(rdir):
+                if not name.endswith(".kv"):
+                    continue
+                v = int(name[:-3], 16)
+                if v >= (1 << 63):  # back to signed int64
+                    v -= 1 << 64
+                out.append(v)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"[L3] resident scan failed for rank{rank}: {e}")
+        return out
+
+    def _l3_init_once(self):
+        if self._l3_ready:
+            return
+        self._l3_ready = True
+        if not getattr(self.config, "l3_enable", False):
+            return
+        # PoC scope: single SP group, no KV-head sharding (config also guards).
+        if self.config.attention_sp != 1 or self.config.attention_tp != 1:
+            logger.warning("[L3] disabled: requires attention_sp==tp==1")
+            return
+        if getattr(self.scheduler, "group_size", 1) != 1:
+            logger.warning("[L3] disabled: requires group_size==1")
+            return
+        self._l3_active = True
+        for rank, bm in self._l3_block_managers():
+            bm.set_l3_enabled(True)
+            resident = self._l3_scan_resident(rank)
+            if resident:
+                bm.mark_l3_resident(resident)
+            logger.info(
+                f"[L3] armed worker_state[{rank}] with {len(resident)} resident hashes"
+            )
+
+    def _l3_loads_before_run(self):
+        """Drain L3 load work emitted by allocate() and pull KV before forward."""
+        if not self._l3_active:
+            return
+        per_worker = [
+            [(int(h), int(b)) for (h, b) in bm.drain_pending_loads()]
+            for _, bm in self._l3_block_managers()
+        ]
+        if any(per_worker):
+            n = sum(len(p) for p in per_worker)
+            logger.info(f"[L3] loading {n} block(s) from 3FS before forward")
+            self.executor.l3_load(per_worker)
+
+    def _l3_offloads_after_step(self):
+        """Drain evicted blocks and persist them to 3FS, then mark resident."""
+        if not self._l3_active:
+            return
+        bms = list(self._l3_block_managers())
+        per_worker = [
+            [(int(h), int(b)) for (h, b) in bm.drain_pending_offloads()]
+            for _, bm in bms
+        ]
+        if not any(per_worker):
+            return
+        n = sum(len(p) for p in per_worker)
+        logger.info(f"[L3] offloading {n} evicted block(s) to 3FS")
+        self.executor.l3_store(per_worker)
+        for (_, bm), pairs in zip(bms, per_worker):
+            if pairs:
+                bm.mark_l3_resident([h for (h, _) in pairs])
+
     def step(self):
+        self._l3_init_once()
         dp_size = self.config.attention_dp
         sp_size = self.config.attention_sp
         tp_size = self.config.attention_tp
@@ -266,6 +358,11 @@ class LLMEngine:
         post_sch_begin = 0
         post_sch_end = 0
 
+        # L3: pull any prefix blocks resident only in 3FS into the freshly
+        # allocated ACTIVE blocks BEFORE the forward reads them (the scheduler
+        # marked them cached, so recompute was skipped — the data must be here).
+        self._l3_loads_before_run()
+
         # Run prefill to populate KV cache (or skip for decode engine receiving prefill request)
         token_ids = None
         token_logprobs = None
@@ -301,6 +398,12 @@ class LLMEngine:
             # distinct KV-head shard and must run its own RDMA reads; sending
             # only dp_group_seqs would leave tp_idx > 0 ranks unmigrated.
             self.executor.migrate(dp_group_tp_seqs)
+
+        # L3: persist blocks evicted during this step's postprocess (finished /
+        # preempted sequences) to 3FS, then mark their hashes resident so a
+        # later identical prefix loads from L3 instead of recomputing.
+        self._l3_offloads_after_step()
+
         outputs = []
         prefill_tokens = 0
         decode_tokens = 0

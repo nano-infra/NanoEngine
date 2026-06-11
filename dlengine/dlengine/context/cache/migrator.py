@@ -13,7 +13,6 @@ import time
 from collections import defaultdict
 
 import torch
-
 from dlengine.context.distributed import get_dist_context
 from dlengine.context.peer_agent import PeerAgentContext
 from dlengine.logging import get_logger

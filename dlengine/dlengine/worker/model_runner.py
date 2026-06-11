@@ -174,6 +174,7 @@ class ModelRunner:
         self.peer_agent_context = None
         self.weight_context = None
         self.weight_update_engine = None
+        self.l3_store = None  # Hf3fsL3Store, created in allocate_kvcache when enabled
 
         # Sync C++ Sequence.block_size with Python kvcache_block_size
         from dlengine._cpp import Sequence as _Seq
@@ -448,6 +449,23 @@ class ModelRunner:
         # Register memory regions after KV/indexer tensors exist. The PeerAgent
         # itself is started during preallocate_kvcache().
         cache_context.register_peer_agent_memory_regions(mode=self.config.mode)
+
+        # L3 (3FS) tiered KV cache: build the per-worker USRBIO store now that
+        # the kv_cache tensor exists. Inert unless config.l3_enable.
+        if getattr(self.config, "l3_enable", False):
+            try:
+                from dlengine.context.cache.l3_hf3fs import Hf3fsL3Store
+
+                self.l3_store = Hf3fsL3Store(
+                    cache_context,
+                    mountpoint=self.config.l3_mountpoint,
+                    l3_dir=self.config.l3_dir,
+                    staging_blocks=self.config.l3_staging_blocks,
+                    rank=self.rank,
+                )
+            except Exception as e:
+                logger.error(f"[L3] failed to init Hf3fsL3Store, disabling: {e}")
+                self.l3_store = None
 
         if not self.enforce_eager:
             self._init_graph_runners()
@@ -777,6 +795,29 @@ class ModelRunner:
     def migrate_from_bytes(self, data: bytes) -> None:
         """Migrate using lean MigrateBatchInput bytes (no Sequence objects)."""
         get_cache_context().migrate_from_bytes(data=data)
+
+    # ------------------------------------------------------------------ #
+    # L3 (3FS) tiered KV cache worker RPCs (driven by collective_rpc)
+    # ------------------------------------------------------------------ #
+    def l3_store_blocks(self, pairs: list[tuple[int, int]]) -> int:
+        """Persist (hash, block_id) GPU blocks to 3FS. Returns #stored."""
+        if self.l3_store is None or not pairs:
+            return 0
+        return len(self.l3_store.store([tuple(p) for p in pairs]))
+
+    def l3_load_blocks(self, pairs: list[tuple[int, int]]) -> int:
+        """Load (hash, block_id) blocks from 3FS into GPU. Returns #loaded.
+
+        Synchronizes so the data is visible before the forward pass runs.
+        """
+        if self.l3_store is None or not pairs:
+            return 0
+        n = self.l3_store.load([tuple(p) for p in pairs])
+        torch.cuda.synchronize()
+        return n
+
+    def l3_stats(self) -> dict:
+        return self.l3_store.stats() if self.l3_store is not None else {}
 
     def _standard_sample(
         self,

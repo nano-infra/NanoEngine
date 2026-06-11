@@ -25,7 +25,6 @@ from dlengine.kernel.triton.generic.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,
 )
 from dlengine.kernel.triton.hopper.fp8_utils import store_kcache_fp8
-
 from dlengine.layers.base_backend import AttentionBase
 from dlengine.logging import get_logger
 
