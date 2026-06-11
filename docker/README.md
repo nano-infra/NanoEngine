@@ -1,11 +1,11 @@
-# NanoDeploy Docker Images
+# DLEngine Docker Images
 
-This directory holds the container build definitions for NanoDeploy.
+This directory holds the container build definitions for DLEngine.
 
-| File                                     | Image                          | Purpose                                                                                                         |
-| ---------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| [`Dockerfile`](./Dockerfile)             | `nanodeploy:0.2.0-cu128-devel` | CUDA 12.8 development image (PyTorch + DeepEP/DeepGEMM/FlashMLA/FlashInfer/flash-attn/DLSlime + Rust toolchain) |
-| [`Dockerfile.hf3fs`](./Dockerfile.hf3fs) | `nanodeploy:cu128-devel-3fs`   | The dev image **plus 3FS USRBIO** (`hf3fs_py_usrbio`) support                                                   |
+| File                                     | Image                        | Purpose                                                                                                         |
+| ---------------------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| [`Dockerfile`](./Dockerfile)             | `dlengine:0.2.0-cu128-devel` | CUDA 12.8 development image (PyTorch + DeepEP/DeepGEMM/FlashMLA/FlashInfer/flash-attn/DLSlime + Rust toolchain) |
+| [`Dockerfile.hf3fs`](./Dockerfile.hf3fs) | `dlengine:cu128-devel-3fs`   | The dev image **plus 3FS USRBIO** (`hf3fs_py_usrbio`) support                                                   |
 
 ______________________________________________________________________
 
@@ -13,8 +13,8 @@ ______________________________________________________________________
 
 Built from NVIDIA CUDA 12.8 devel (Ubuntu 24.04, Python 3.12), PyTorch 2.10 CUDA 12.8,
 source-built DeepEP/DeepGEMM/FlashMLA/FlashInfer, release-wheel flash-attn, rustup-managed
-Rust, and the build toolchains needed for NanoDeploy. The image intentionally **does not
-include the NanoDeploy source tree**; mount or clone NanoDeploy inside the container and
+Rust, and the build toolchains needed for DLEngine. The image intentionally **does not
+include the DLEngine source tree**; mount or clone DLEngine inside the container and
 install it there. This keeps the expensive dependency layers reusable across source changes.
 
 ### Pinned third-party dependencies
@@ -40,7 +40,7 @@ The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs.
 ```bash
 docker build --network host \
   -f docker/Dockerfile \
-  -t nanodeploy:0.2.0-cu128-devel \
+  -t dlengine:0.2.0-cu128-devel \
   .
 ```
 
@@ -54,17 +54,15 @@ docker run --gpus all --rm -it --network host --ipc=host \
   --cap-add IPC_LOCK --ulimit memlock=-1:-1 \
   --device=/dev/infiniband \
   -v /sys/class/infiniband:/sys/class/infiniband:ro \
-  -v $PWD:/workspace/NanoDeploy \
-  -w /workspace/NanoDeploy/nanodeploy \
-  nanodeploy:0.2.0-cu128-devel
+  -v $PWD:/workspace/DLEngine \
+  -w /workspace/DLEngine/dlengine \
+  dlengine:0.2.0-cu128-devel
 ```
 
-Inside the container, install NanoDeploy from the mounted checkout. The engine
-depends on the standalone `nanodeploy-kernel` package, so install it first (it is
-not published to PyPI):
+Inside the container, install DLEngine from the mounted checkout (the GPU
+compute kernels ship inside the `dlengine.kernel` subpackage):
 
 ```bash
-python3 -m pip install --break-system-packages --no-build-isolation -v -e ../nanodeploy-kernel
 python3 -m pip install --break-system-packages --no-build-isolation -v -e .
 ```
 
@@ -73,7 +71,7 @@ ______________________________________________________________________
 ## 3FS USRBIO image (`Dockerfile.hf3fs`)
 
 Adds 3FS USRBIO support (`hf3fs_py_usrbio` + `hf3fs_fuse`) on top of the dev image, for
-testing 3FS access (FUSE/POSIX and USRBIO) from inside a NanoDeploy container.
+testing 3FS access (FUSE/POSIX and USRBIO) from inside a DLEngine container.
 
 ### Why it is built this way
 
@@ -88,23 +86,23 @@ testing 3FS access (FUSE/POSIX and USRBIO) from inside a NanoDeploy container.
 
 ### Prerequisites
 
-- Base image `nanodeploy:0.2.0-cu128-devel` built (see above).
+- Base image `dlengine:0.2.0-cu128-devel` built (see above).
 - Runtime image `hf3fs:dev-py312` available locally (provides the jammy `.so`).
 - The **cp312** wheel copied into this `docker/` directory (it is git-ignored):
 
 ```bash
 cp /path/to/3FS/dist/hf3fs_py_usrbio-1.2.9+22fca04-cp312-cp312-linux_x86_64.whl \
-   NanoDeploy/docker/
+   DLEngine/docker/
 ```
 
 ### Build
 
 ```bash
-cd NanoDeploy
-docker build -f docker/Dockerfile.hf3fs -t nanodeploy:cu128-devel-3fs docker/
+cd DLEngine
+docker build -f docker/Dockerfile.hf3fs -t dlengine:cu128-devel-3fs docker/
 ```
 
-Build args (optional): `NANODEPLOY_BASE`, `HF3FS_RUNTIME_IMAGE`, `HF3FS_WHEEL`.
+Build args (optional): `DLENGINE_BASE`, `HF3FS_RUNTIME_IMAGE`, `HF3FS_WHEEL`.
 
 The Dockerfile runs `python3 -c "import hf3fs_py_usrbio, hf3fs_fuse.io"` as the last step,
 so a successful build **guarantees the import works** (import needs neither RDMA hardware
@@ -131,7 +129,7 @@ docker run --gpus all --rm -it \
   --cap-add IPC_LOCK --ulimit memlock=-1:-1 \
   --ipc=host \
   --mount type=bind,source=/3fs,target=/3fs,bind-propagation=rslave \
-  nanodeploy:cu128-devel-3fs zsh
+  dlengine:cu128-devel-3fs zsh
 ```
 
 Equivalent shorter form:

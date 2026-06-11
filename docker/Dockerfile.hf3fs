@@ -1,23 +1,23 @@
-# Adds 3FS USRBIO (hf3fs_py_usrbio) support on top of the NanoDeploy image.
+# Adds 3FS USRBIO (hf3fs_py_usrbio) support on top of the DLEngine image.
 #
 # The prebuilt wheel is compiled on Ubuntu 22.04 (jammy); its native lib
 # libhf3fs_api_shared.so depends on boost 1.74 / ICU 70 / glog / gflags / ...
-# which differ from NanoDeploy's Ubuntu 24.04 (noble) sonames. So instead of
+# which differ from DLEngine's Ubuntu 24.04 (noble) sonames. So instead of
 # apt-installing them, we copy the exact runtime .so from the hf3fs:dev-py312
 # image and add them to LD_LIBRARY_PATH.
 #
 # Build (context = this docker/ dir, wheel must be copied here first):
 #   cp /path/to/3FS/dist/hf3fs_py_usrbio-1.2.9+22fca04-cp312-cp312-linux_x86_64.whl \
-#      NanoDeploy/docker/
-#   docker build -f docker/Dockerfile.hf3fs -t nanodeploy:cu128-devel-3fs docker/
+#      DLEngine/docker/
+#   docker build -f docker/Dockerfile.hf3fs -t dlengine:cu128-devel-3fs docker/
 
-ARG NANODEPLOY_BASE=nanodeploy:0.2.0-cu128-devel
+ARG DLENGINE_BASE=dlengine:0.2.0-cu128-devel
 ARG HF3FS_RUNTIME_IMAGE=hf3fs:dev-py312
 ARG HF3FS_WHEEL=hf3fs_py_usrbio-1.2.9+22fca04-cp312-cp312-linux_x86_64.whl
 
 FROM ${HF3FS_RUNTIME_IMAGE} AS hf3fs-runtime
 
-FROM ${NANODEPLOY_BASE}
+FROM ${DLENGINE_BASE}
 
 RUN mkdir -p /opt/hf3fs/lib
 

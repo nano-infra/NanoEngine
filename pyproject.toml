@@ -12,13 +12,13 @@ requires-python = ">=3.10"
 dependencies = []
 
 # Install individual components:
-#   pip install ".[nanodeploy]"
-#   pip install ".[nanodeployvl]"   # Vision-Language support (nanodeploy.vl subpackage)
+#   pip install ".[dlengine]"
+#   pip install ".[dlenginevl]"   # Vision-Language support (dlengine.vl subpackage)
 #   pip install ".[all]"
 #
 # The optional-dependencies are generated dynamically in setup.py so the
 # local monorepo subpackages can be referenced via *absolute* `file://` URLs.
-# Relative PEP 508 direct references (e.g. `file:nanodeploy-kernel`) are
+# Relative PEP 508 direct references (e.g. `file:dlengine`) are
 # rejected by modern `packaging` (>=24) with "Invalid URL given".
 dynamic = ["optional-dependencies"]
 

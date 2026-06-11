@@ -197,10 +197,10 @@ cython_debug/
 
 *.pyi
 
-# NanoDeploy generated files
-nanodeploy/nanodeploy/fbs/
-nanodeploy/engine_rpc_pb2.py
-nanodeploy/engine_rpc_pb2_grpc.py
+# DLEngine generated files
+dlengine/dlengine/fbs/
+dlengine/engine_rpc_pb2.py
+dlengine/engine_rpc_pb2_grpc.py
 
 # rust
 .cargo/

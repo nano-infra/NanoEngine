@@ -1,0 +1,54 @@
+[package]
+name = "dlengine-router"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.36", features = ["full"] }
+
+# Web Framework
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP Client
+reqwest = { version = "0.11", features = ["json"] }
+
+# Configuration
+config = "0.14"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI Args
+clap = { version = "4.5", features = ["derive"] }
+
+# IPC & Utils
+flatbuffers = "25.12.19"
+
+# Tokenizers
+tokenizers = { version = "0.21", features = ["onig"] }
+
+# Error Handling
+anyhow = "1.0"
+
+# Async Utilities
+futures = "0.3"
+async-stream = "0.3"
+minijinja = { version = "2", features = ["json", "loader", "adjacent_loop_items"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+
+# ZMQ (async engine protocol)
+zmq = "0.10"
+
+# Redis for dynamic service discovery
+redis = { version = "0.27", features = ["tokio-comp", "aio", "streams"] }
+
+[dev-dependencies]
+tempfile = "3.10"

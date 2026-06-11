@@ -3,9 +3,9 @@
 The optional-dependencies cannot be expressed statically in pyproject.toml
 because the local subpackages must be referenced by *absolute* `file://`
 URLs. Modern `packaging` (>=24) rejects relative direct references such as
-``nanodeploy-kernel @ file:nanodeploy-kernel`` with "Invalid URL given", so we
-compute absolute URLs based on this file's location at build time, keeping the
-result portable across machines/checkout paths.
+``dlengine @ file:dlengine`` with "Invalid URL given", so we compute absolute
+URLs based on this file's location at build time, keeping the result portable
+across machines/checkout paths.
 """
 
 import os
@@ -21,17 +21,15 @@ def _local(rel_path: str) -> str:
     return (_ROOT / rel_path).as_uri()
 
 
-_KERNEL = f"nanodeploy-kernel @ {_local('nanodeploy-kernel')}"
-_NANODEPLOY = f"nanodeploy @ {_local('nanodeploy')}"
-_NANODEPLOY_VL = f"nanodeploy[vl] @ {_local('nanodeploy')}"
+_DLENGINE = f"dlengine @ {_local('dlengine')}"
+_DLENGINE_VL = f"dlengine[vl] @ {_local('dlengine')}"
 
 setup(
     extras_require={
-        "nanodeploy-kernel": [_KERNEL],
-        "nanodeploy": [_KERNEL, _NANODEPLOY],
-        # NanoDeployVL was folded into nanodeploy as the `nanodeploy.vl`
-        # subpackage; this extra just pulls nanodeploy with its VL extras.
-        "nanodeployvl": [_KERNEL, _NANODEPLOY_VL],
-        "all": [_KERNEL, _NANODEPLOY_VL],
+        "dlengine": [_DLENGINE],
+        # DLEngineVL was folded into dlengine as the `dlengine.vl`
+        # subpackage; this extra just pulls dlengine with its VL extras.
+        "dlenginevl": [_DLENGINE_VL],
+        "all": [_DLENGINE_VL],
     },
 )
