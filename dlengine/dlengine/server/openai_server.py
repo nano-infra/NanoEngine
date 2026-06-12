@@ -59,10 +59,18 @@ class _Request:
 
 @dataclass
 class _Generation:
-    """Result of consuming a request's token stream."""
+    """Result of consuming a request's token stream.
+
+    ``prefix_offset`` / ``read_offset`` track the incremental detokenizer window
+    (vLLM-style): instead of re-decoding the whole token list on every step
+    (O(n^2) and event-loop blocking), only a small trailing slice is decoded to
+    compute each delta. See :meth:`OpenAIServer._incremental_detokenize`.
+    """
 
     token_ids: list = field(default_factory=list)
     finish_reason: str = "stop"
+    prefix_offset: int = 0
+    read_offset: int = 0
 
 
 class EngineWorker:
@@ -180,6 +188,7 @@ class EngineWorker:
                         self._push(req, {"error": f"migration serialize failed: {e}"})
                     self._push(req, None)
                     self._active.pop(seq_id, None)
+                    logger.info(f"Request handed off for migration: seq_id={seq_id}")
                     continue
 
                 comp = seq.completion_token_ids
@@ -191,6 +200,10 @@ class EngineWorker:
                     self._push(req, {"finish": True})
                     self._push(req, None)
                     self._active.pop(seq_id, None)
+                    logger.info(
+                        f"Request finished: seq_id={seq_id} "
+                        f"completion_len={len(comp)}"
+                    )
 
 
 class OpenAIServer:
@@ -285,6 +298,10 @@ class OpenAIServer:
         loop = asyncio.get_running_loop()
         req = _Request(seq=seq, aqueue=asyncio.Queue(), loop=loop)
         self.worker.submit(req)
+        logger.info(
+            f"Submitted request to engine: seq_id={seq.seq_id} "
+            f"prompt_len={len(prompt_ids)} max_tokens={sampling_params.max_tokens}"
+        )
         return req
 
     def submit_migrated(self, seq: Any) -> _Request:
@@ -299,6 +316,7 @@ class OpenAIServer:
         loop = asyncio.get_running_loop()
         req = _Request(seq=seq, aqueue=asyncio.Queue(), loop=loop)
         self.worker.submit(req)
+        logger.info(f"Submitted migrated request to engine: seq_id={seq.seq_id}")
         return req
 
     async def await_migration(self, req: _Request) -> dict:
@@ -325,12 +343,39 @@ class OpenAIServer:
             if "tokens" in item:
                 tokens.extend(item["tokens"])
 
+    def _incremental_detokenize(self, gen: _Generation) -> str:
+        """Decode only the newly produced text since the last delta.
+
+        Decodes a trailing slice (``[prefix_offset:]``) rather than the whole
+        token list, so per-token work is ~O(1) instead of O(n) (the old
+        full-sequence decode made each stream O(n^2) and saturated the single
+        FastAPI event loop, starving request admission). This is the vLLM
+        incremental-detokenization scheme.
+
+        A multi-byte UTF-8 character (e.g. an emoji) can be split across several
+        byte-level BPE tokens; decoding before all bytes have arrived yields a
+        trailing U+FFFD. In that case we return "" and hold the delta back until
+        the character completes, so we never emit a broken "\ufffd".
+        """
+        ids = gen.token_ids
+        prefix_text = self.tokenizer.decode(
+            ids[gen.prefix_offset : gen.read_offset], skip_special_tokens=True
+        )
+        new_text = self.tokenizer.decode(
+            ids[gen.prefix_offset :], skip_special_tokens=True
+        )
+        if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
+            delta = new_text[len(prefix_text) :]
+            gen.prefix_offset = gen.read_offset
+            gen.read_offset = len(ids)
+            return delta
+        return ""
+
     async def stream_text(
         self, req: _Request, max_tokens: int
     ) -> AsyncGenerator[tuple[str, _Generation], None]:
         """Yield ``(delta_text, generation)`` as tokens arrive."""
         gen = _Generation()
-        decoded = ""
         while True:
             item = await req.aqueue.get()
             if item is None:
@@ -339,16 +384,7 @@ class OpenAIServer:
                 raise RuntimeError(item["error"])
             if "tokens" in item:
                 gen.token_ids.extend(item["tokens"])
-                full = self.tokenizer.decode(gen.token_ids, skip_special_tokens=True)
-                # A multi-byte UTF-8 character (e.g. an emoji) can be split
-                # across several byte-level BPE tokens. Decoding before all of
-                # its bytes have arrived yields a trailing U+FFFD replacement
-                # char. Hold the delta back until the character completes so we
-                # never emit (and lock in) a broken "\ufffd".
-                if full.endswith("\ufffd"):
-                    continue
-                delta = full[len(decoded) :]
-                decoded = full
+                delta = self._incremental_detokenize(gen)
                 if delta:
                     yield delta, gen
         gen.finish_reason = "length" if len(gen.token_ids) >= max_tokens else "stop"
@@ -384,9 +420,12 @@ def build_app(server: OpenAIServer):
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):  # noqa: ANN202
+        client = request.client.host if request.client else "unknown"
+        logger.info(f"Received request: POST /v1/chat/completions from {client}")
         try:
             body = await request.json()
         except Exception as e:
+            logger.warning(f"Rejected request (400): invalid JSON body: {e}")
             return JSONResponse(
                 status_code=400,
                 content={
@@ -397,6 +436,7 @@ def build_app(server: OpenAIServer):
                 },
             )
         if not isinstance(body, dict):
+            logger.warning("Rejected request (400): JSON body must be an object")
             return JSONResponse(
                 status_code=400,
                 content={
@@ -407,6 +447,9 @@ def build_app(server: OpenAIServer):
                 },
             )
         if server.resolve_request_model(body.get("model")) is None:
+            logger.warning(
+                f"Rejected request (404): model {body.get('model')!r} not found"
+            )
             return JSONResponse(
                 status_code=404,
                 content={
@@ -611,9 +654,12 @@ def build_app(server: OpenAIServer):
 
     @app.post("/v1/completions")
     async def completions(request: Request):  # noqa: ANN202
+        client = request.client.host if request.client else "unknown"
+        logger.info(f"Received request: POST /v1/completions from {client}")
         try:
             body = await request.json()
         except Exception as e:
+            logger.warning(f"Rejected request (400): invalid JSON body: {e}")
             return JSONResponse(
                 status_code=400,
                 content={
@@ -624,6 +670,7 @@ def build_app(server: OpenAIServer):
                 },
             )
         if not isinstance(body, dict):
+            logger.warning("Rejected request (400): JSON body must be an object")
             return JSONResponse(
                 status_code=400,
                 content={
@@ -634,6 +681,9 @@ def build_app(server: OpenAIServer):
                 },
             )
         if server.resolve_request_model(body.get("model")) is None:
+            logger.warning(
+                f"Rejected request (404): model {body.get('model')!r} not found"
+            )
             return JSONResponse(
                 status_code=404,
                 content={
@@ -948,27 +998,55 @@ def run_server(
     logger.info(f"  ctrl-address:      {ctrl_address or '(disabled)'}")
     logger.info("=" * 72)
 
-    # Build the in-process engine.
+    # Build the engine + worker.
     #
-    # hybrid: use the bare LLM. The engine does not self-register with
-    #   dlslime-ctrl; this HTTP server registers its own endpoint instead.
-    # prefill/decode (PD disaggregation): use LLMComponent so the engine
-    #   registers under its engine_id with peer_addrs / pool metadata, which the
-    #   peer decode engine needs to RDMA-pull KV. Workers also register their KV
-    #   memory-regions (the mode != "hybrid" path). This requires ctrl_address.
-    if config.mode != "hybrid":
-        if not config.ctrl_address:
-            raise ValueError(
-                f"mode={config.mode!r} (PD disaggregation) requires --ctrl_address "
-                "so engines can register peer agents and resolve KV migration peers"
-            )
-        engine = LLMComponent(config)
-    else:
-        engine = LLM(config)
-    tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
+    # config.engine_ipc: run the engine in a separate process (EngineServer)
+    #   exposing a zmq DEALER over an ipc:// socket; this HTTP server talks to
+    #   it via ZmqEngineWorker. The HTTP process never initializes CUDA/Ray.
+    # in-process (default): drive engine.step() on a background thread.
+    #   hybrid uses the bare LLM (HTTP server registers its own endpoint);
+    #   prefill/decode (PD) use LLMComponent so the engine registers under its
+    #   engine_id with peer_addrs / pool metadata for KV migration (needs ctrl).
+    engine: Any = None
+    engine_proc = None
+    engine_endpoint: Optional[str] = None
 
-    worker = EngineWorker(engine)
-    worker.start()
+    if config.engine_ipc:
+        import multiprocessing
+
+        from dlengine.server.engine_server import run_engine_server
+        from dlengine.server.zmq_engine_client import ZmqEngineWorker
+
+        engine_endpoint = f"ipc:///tmp/dlengine-{uuid.uuid4().hex}.sock"
+        # NOT daemon: EngineServer.serve() itself spawns a child backend
+        # process (run_engine_backend), and daemonic processes cannot have
+        # children. Cleaned up explicitly in the shutdown hook below.
+        engine_proc = multiprocessing.Process(
+            target=run_engine_server,
+            args=(config, engine_endpoint),
+            daemon=False,
+            name="dlengine-engine",
+        )
+        engine_proc.start()
+        logger.info(
+            f"Started engine process (pid={engine_proc.pid}) at {engine_endpoint}"
+        )
+        worker: Any = ZmqEngineWorker(engine_endpoint)
+    else:
+        if config.mode != "hybrid":
+            if not config.ctrl_address:
+                raise ValueError(
+                    f"mode={config.mode!r} (PD disaggregation) requires "
+                    "--ctrl_address so engines can register peer agents and "
+                    "resolve KV migration peers"
+                )
+            engine = LLMComponent(config)
+        else:
+            engine = LLM(config)
+        worker = EngineWorker(engine)
+        worker.start()
+
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
 
     server = OpenAIServer(
         worker=worker,
@@ -983,6 +1061,13 @@ def run_server(
     @app.on_event("startup")
     async def _on_startup() -> None:  # noqa: ANN202
         nonlocal ctrl_client
+        # ipc path: connect to the engine process and block until it is ready
+        # (also resolves the engine_id needed for PD peer registration).
+        if config.engine_ipc:
+            await worker.start()
+            engine_id = worker.engine_id
+        else:
+            engine_id = getattr(engine, "engine_id", None)
         if ctrl_address:
             try:
                 ctrl_client = register_with_ctrl(
@@ -993,7 +1078,7 @@ def run_server(
                     served_model_name=served_model_name,
                     model_path=config.model,
                     role=config.mode,
-                    engine_id=getattr(engine, "engine_id", None),
+                    engine_id=engine_id,
                 )
             except Exception as e:  # noqa: BLE001
                 logger.error(f"Could not register with dlslime-ctrl: {e}")
@@ -1003,5 +1088,14 @@ def run_server(
         if ctrl_client is not None:
             ctrl_client.stop()
         worker.stop()
+        if engine_proc is not None:
+            engine_proc.terminate()
+            engine_proc.join(timeout=5)
+            if engine_endpoint and engine_endpoint.startswith("ipc://"):
+                sock_path = engine_endpoint[len("ipc://") :]
+                try:
+                    os.unlink(sock_path)
+                except OSError:
+                    pass
 
     uvicorn.run(app, host=host, port=port)

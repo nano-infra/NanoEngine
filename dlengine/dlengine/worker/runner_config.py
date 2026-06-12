@@ -28,6 +28,9 @@ class RunnerConfig:
     step_timing: bool = False
     step_timing_interval: int = 16
     step_timing_rank: int = 0  # -1 = all ranks
+    # GPU-idle probe (CUDA-event inter-step gap). See Config.gpu_idle_probe.
+    # Reuses step_timing_interval / step_timing_rank for cadence + rank.
+    gpu_idle_probe: bool = False
 
 
 # Singleton instance of RunnerConfig
@@ -48,6 +51,7 @@ def set_runner_config(
     step_timing: Optional[bool] = None,
     step_timing_interval: Optional[int] = None,
     step_timing_rank: Optional[int] = None,
+    gpu_idle_probe: Optional[bool] = None,
 ):
     global _RUNNER_CONFIG
     _RUNNER_CONFIG = RunnerConfig(
@@ -66,6 +70,7 @@ def set_runner_config(
             int(step_timing_interval) if step_timing_interval is not None else 16
         ),
         step_timing_rank=(int(step_timing_rank) if step_timing_rank is not None else 0),
+        gpu_idle_probe=bool(gpu_idle_probe) if gpu_idle_probe is not None else False,
     )
 
 

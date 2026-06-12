@@ -66,6 +66,12 @@ class Config(BaseModel):
     host: str = "0.0.0.0"
     port: int = 5000
 
+    # ``dlengine serve`` (OpenAI HTTP server) engine transport. When True, the
+    # engine runs in a separate process exposing a zmq DEALER over an ipc://
+    # socket and the HTTP server connects as a zmq client; when False (default)
+    # the engine runs in-process on a background thread (EngineWorker).
+    engine_ipc: bool = False
+
     dummy_prefill: Optional[bool] = False
     dummy_weight: Optional[bool] = False
     dummy_eplb: Optional[bool] = False
@@ -131,6 +137,13 @@ class Config(BaseModel):
     step_timing: bool = False
     step_timing_interval: int = 16
     step_timing_rank: int = 0  # -1 = all ranks
+
+    # GPU-idle probe: measures the inter-step GPU-idle gap (end of the
+    # previous step's GPU work → start of the next step) with CUDA events,
+    # independent of the sync-heavy ``step_timing`` host timer. Logs
+    # ``gap``/``busy``/``duty`` every ``step_timing_interval`` steps on
+    # ``step_timing_rank``. Off → zero overhead.
+    gpu_idle_probe: bool = False
 
     # profiler
     enable_profiler: bool = False

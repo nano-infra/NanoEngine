@@ -9,6 +9,7 @@ from dlengine.engine.dlslime_protocol import (
     decode_run_result,
     encode_run_request,
     ModelRunnerRpcService,
+    unpack_reply_header,
 )
 from dlengine.engine.ray_executor import RayExecutor
 from dlengine.logging import get_logger
@@ -83,6 +84,24 @@ class DLSLimeExecutor(RayExecutor):
         ]
         logger.info(f"DLSLime transport ready for {len(self._worker_aliases)} workers")
 
+    def _probe_totals(self) -> tuple[int, int, int, int]:
+        """Sum the C++ RpcSession timing probes across all DP-shard proxies.
+
+        Returns cumulative (write_with_imm_ns, write_with_imm_count,
+        imm_recv_ns, imm_recv_count). Missing/older sessions (no probe
+        support) contribute 0 so this degrades gracefully.
+        """
+        wwi_ns = wwi_cnt = imm_ns = imm_cnt = 0
+        for p in self._proxies:
+            session = getattr(getattr(p, "_runtime", None), "session", None)
+            if session is None:
+                continue
+            wwi_ns += getattr(session, "write_with_imm_ns_total", 0)
+            wwi_cnt += getattr(session, "write_with_imm_count", 0)
+            imm_ns += getattr(session, "imm_recv_ns_total", 0)
+            imm_cnt += getattr(session, "imm_recv_count", 0)
+        return wwi_ns, wwi_cnt, imm_ns, imm_cnt
+
     def run(
         self,
         dp_seqs: list[list[Sequence]],
@@ -94,6 +113,13 @@ class DLSLimeExecutor(RayExecutor):
         _t0 = _time.perf_counter()
         batch_bytes = [serialize_run_batch(seqs, is_prefill) for seqs in dp_seqs]
         _t1 = _time.perf_counter()
+        # Bytes sent to the runners this forward (serialized RunBatch input).
+        self.last_run_request_bytes = sum(len(b) for b in batch_bytes)
+        # Snapshot the C++ RPC timing probes before issuing the forward so we
+        # can attribute the writeWithImm (send) / immRecv (recv) cost to this
+        # step. On the no-pump fast path both verbs complete synchronously
+        # inside run_batch, so the snapshot must straddle submit + wait_all.
+        wwi_ns0, _, imm_ns0, _ = self._probe_totals()
         futures = [
             proxy.run_batch(encode_run_request(data, is_prefill))
             for proxy, data in zip(self._proxies, batch_bytes)
@@ -101,14 +127,37 @@ class DLSLimeExecutor(RayExecutor):
         _t2 = _time.perf_counter()
         replies = self._wait_all(futures)
         _t3 = _time.perf_counter()
+        wwi_ns1, _, imm_ns1, _ = self._probe_totals()
+        # Summed across DP shards; reported per-step in the heartbeat.
+        self.last_run_wwi_ms = max(wwi_ns1 - wwi_ns0, 0) / 1e6
+        self.last_run_immrecv_ms = max(imm_ns1 - imm_ns0, 0) / 1e6
+        self.last_run_reply_bytes = sum(len(d) for d in replies)
         result = [decode_run_result(data) for data in replies]
         _t4 = _time.perf_counter()
+        # Pure network latency = client round trip - remote handler time. Each
+        # reply carries the server-side handler duration (decode + forward) in
+        # its 8-byte header; shards run in parallel so the slowest one bounds
+        # the compute overlapped with this step.
+        server_compute_ms = 0.0
+        if replies:
+            server_compute_ms = max(unpack_reply_header(d) for d in replies) / 1e6
+        self.last_run_server_compute_ms = server_compute_ms
+        # transfer (round-trip wall clock) minus remote compute ≈ wire +
+        # queueing + dispatch, with no GPU compute or pump idle pollution.
+        self.last_run_net_ms = max((_t3 - _t1) * 1000.0 - server_compute_ms, 0.0)
+        # Per-forward DLSlime timing breakdown (surfaced in the engine heartbeat).
+        self.last_run_serialize_ms = (_t1 - _t0) * 1000.0
+        self.last_run_submit_ms = (_t2 - _t1) * 1000.0
+        self.last_run_wait_ms = (_t3 - _t2) * 1000.0
+        self.last_run_decode_ms = (_t4 - _t3) * 1000.0
+        # Transfer = send (submit) + wait-for-reply round trip.
+        self.last_run_transfer_ms = (_t3 - _t1) * 1000.0
         if not is_prefill:
             logger.debug(
-                f"[dlslime run] serialize={(_t1-_t0)*1000:.2f}ms "
-                f"submit={(_t2-_t1)*1000:.2f}ms "
-                f"wait_all={(_t3-_t2)*1000:.2f}ms "
-                f"decode={(_t4-_t3)*1000:.2f}ms "
+                f"[dlslime run] serialize={self.last_run_serialize_ms:.2f}ms "
+                f"submit={self.last_run_submit_ms:.2f}ms "
+                f"wait_all={self.last_run_wait_ms:.2f}ms "
+                f"decode={self.last_run_decode_ms:.2f}ms "
                 f"total={(_t4-_t0)*1000:.2f}ms"
             )
         return result

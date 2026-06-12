@@ -351,6 +351,8 @@ class RayExecutor:
     ) -> list[list[list[int]]]:
         # Serialize into lean RunBatchInput bytes, send bytes instead of Sequence objects
         batch_bytes = [_serialize_run(seqs, is_prefill) for seqs in dp_seqs]
+        # Bytes sent to the runners this forward (serialized RunBatch input).
+        self.last_run_request_bytes = sum(len(b) for b in batch_bytes)
         ray_futures = [
             getattr(worker, "run_from_bytes").remote(b, is_prefill)
             for b, worker in zip(batch_bytes, self.workers)
