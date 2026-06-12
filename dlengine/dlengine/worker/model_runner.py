@@ -247,6 +247,7 @@ class ModelRunner:
             step_timing_interval=getattr(config, "step_timing_interval", 16),
             step_timing_rank=getattr(config, "step_timing_rank", 0),
             gpu_idle_probe=getattr(config, "gpu_idle_probe", False),
+            dlslime_timing=getattr(config, "dlslime_timing", False),
         )
 
         if defer_dist_init:
@@ -468,6 +469,14 @@ class ModelRunner:
         return self.weight_update_engine.pull_and_apply(manifest_blob, train_alias)
 
     def allocate_kvcache(self, num_kvcache_blocks: int):
+        # Per-rank startup progress. allocate_kvcache runs several collective
+        # ops (peer-agent memory registration, CUDA-graph capture, warmup
+        # forward with MoE all-to-all); if one rank stalls, every rank hangs.
+        # These one-shot INFO lines (tagged with the rank) make it obvious
+        # which rank stopped and at which stage. Negligible cost (startup only).
+        logger.info(
+            f"[startup] r{self.rank} allocate_kvcache begin ({num_kvcache_blocks=})"
+        )
         self.config.num_kvcache_blocks = num_kvcache_blocks
         cache_context = get_cache_context()
         cache_context.allocate_kvcache(num_kvcache_blocks)
@@ -500,7 +509,9 @@ class ModelRunner:
 
         # Register memory regions after KV/indexer tensors exist. The PeerAgent
         # itself is started during preallocate_kvcache().
+        logger.info(f"[startup] r{self.rank} register_peer_agent_memory_regions begin")
         cache_context.register_peer_agent_memory_regions(mode=self.config.mode)
+        logger.info(f"[startup] r{self.rank} register_peer_agent_memory_regions done")
 
         # L3 (3FS) tiered KV cache: build the per-worker USRBIO store now that
         # the kv_cache tensor exists. Inert unless config.l3_enable.
@@ -520,10 +531,14 @@ class ModelRunner:
                 self.l3_store = None
 
         if not self.enforce_eager:
+            logger.info(f"[startup] r{self.rank} cudagraph capture begin")
             self._init_graph_runners()
+            logger.info(f"[startup] r{self.rank} cudagraph capture done")
         torch.set_default_device("cpu")
         torch.set_default_dtype(self.default_dtype)
+        logger.info(f"[startup] r{self.rank} warmup_model begin")
         self.warmup_model()
+        logger.info(f"[startup] r{self.rank} warmup_model done")
 
     def _wire_dsv4_caches(self, cache_context):
         """Wire DSv4 FP8 paged SWA cache + compressed caches to attention layers."""

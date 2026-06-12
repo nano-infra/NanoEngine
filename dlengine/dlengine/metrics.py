@@ -104,6 +104,8 @@ class MetricsManager:
         self._report_immrecv_ms = 0.0
         # Pure network latency (round trip - remote handler) accumulator.
         self._report_net_ms = 0.0
+        # Driver-side request serialization time (serialize_run_batch).
+        self._report_serialize_ms = 0.0
 
     def create_sequence_metric(
         self, seq_id: str, num_prompt_tokens: int
@@ -163,6 +165,7 @@ class MetricsManager:
         wwi_ms: float = 0.0,
         immrecv_ms: float = 0.0,
         net_ms: float = 0.0,
+        serialize_ms: float = 0.0,
     ):
         """Accumulate per-step tokens and emit a status line every interval.
 
@@ -189,6 +192,7 @@ class MetricsManager:
         self._report_wwi_ms += wwi_ms
         self._report_immrecv_ms += immrecv_ms
         self._report_net_ms += net_ms
+        self._report_serialize_ms += serialize_ms
         now = time.time()
         elapsed = now - self._last_report_time
         if elapsed < self._report_interval_s:
@@ -215,6 +219,7 @@ class MetricsManager:
             avg_wwi_ms=self._report_wwi_ms / steps,
             avg_immrecv_ms=self._report_immrecv_ms / steps,
             avg_net_ms=self._report_net_ms / steps,
+            avg_serialize_ms=self._report_serialize_ms / steps,
         )
         self._last_report_time = now
         self._report_prefill_tokens_per_dp = None
@@ -229,6 +234,7 @@ class MetricsManager:
         self._report_wwi_ms = 0.0
         self._report_immrecv_ms = 0.0
         self._report_net_ms = 0.0
+        self._report_serialize_ms = 0.0
 
     def log_engine_status(
         self,
@@ -253,6 +259,7 @@ class MetricsManager:
         avg_wwi_ms: float | None = None,
         avg_immrecv_ms: float | None = None,
         avg_net_ms: float | None = None,
+        avg_serialize_ms: float | None = None,
     ):
         """Record windowed throughput and log a one-line engine status report.
 
@@ -302,6 +309,8 @@ class MetricsManager:
                 f"fwd_rx={_human_bytes(fwd_rx_bytes or 0)} "
                 f"(tx {_human_bytes(fwd_tx_bytes / n)}/step)"
             )
+            if avg_serialize_ms:
+                xfer_str += f" serialize={avg_serialize_ms:.2f} ms/step"
             if avg_transfer_ms:
                 xfer_str += f" transfer={avg_transfer_ms:.2f} ms/step"
             # Breakdown of the RDMA verbs inside transfer (DLSlime only):

@@ -31,6 +31,8 @@ class RunnerConfig:
     # GPU-idle probe (CUDA-event inter-step gap). See Config.gpu_idle_probe.
     # Reuses step_timing_interval / step_timing_rank for cadence + rank.
     gpu_idle_probe: bool = False
+    # Worker-side DLSlime RPC handler timing ("[dlslime worker]" INFO lines).
+    dlslime_timing: bool = False
 
 
 # Singleton instance of RunnerConfig
@@ -52,6 +54,7 @@ def set_runner_config(
     step_timing_interval: Optional[int] = None,
     step_timing_rank: Optional[int] = None,
     gpu_idle_probe: Optional[bool] = None,
+    dlslime_timing: Optional[bool] = None,
 ):
     global _RUNNER_CONFIG
     _RUNNER_CONFIG = RunnerConfig(
@@ -71,6 +74,7 @@ def set_runner_config(
         ),
         step_timing_rank=(int(step_timing_rank) if step_timing_rank is not None else 0),
         gpu_idle_probe=bool(gpu_idle_probe) if gpu_idle_probe is not None else False,
+        dlslime_timing=bool(dlslime_timing) if dlslime_timing is not None else False,
     )
 
 

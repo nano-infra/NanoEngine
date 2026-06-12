@@ -28,6 +28,35 @@ from dlengine.server.zmq_protocol import decode_packet, encode_packet
 
 logger = get_logger()
 
+# Internal (backend -> frontend results_queue) action code for one step's
+# batched stepouts. The frontend unpacks the batch and forwards each entry
+# over zmq as a regular action-0 StepOut, so the wire protocol seen by
+# clients (ZmqEngineWorker, DLRouter) is unchanged.
+_ACTION_STEPOUT_BATCH = 4
+
+
+def build_stepout_payload(seq_id, token_ids, status) -> bytes:
+    """Build a StepOut flatbuffer payload for one sequence."""
+    if isinstance(token_ids, int):
+        token_ids = [token_ids]
+
+    builder = flatbuffers.Builder(256)
+
+    StepOutStartTokenIdsVector(builder, len(token_ids))
+    for token_id in reversed(token_ids):  # FlatBuffers builds vectors in reverse
+        builder.PrependUint32(token_id)
+    token_ids_vector = builder.EndVector()
+
+    StepOutStart(builder)
+    StepOutAddSeqId(builder, seq_id)
+    if token_ids:
+        StepOutAddTokenId(builder, token_ids[-1])  # Backward compatibility
+    StepOutAddTokenIds(builder, token_ids_vector)
+    StepOutAddStatus(builder, status)
+    step_out = StepOutEnd(builder)
+    builder.Finish(step_out)
+    return builder.Output()
+
 
 class BackendService:
     """Backend service that runs LLM engine and processes requests from queue."""
@@ -104,28 +133,19 @@ class BackendService:
 
     def _send_stepout(self, seq_id, token_ids, status):
         """Send step output with one or more tokens."""
-        # Normalize to list
-        if isinstance(token_ids, int):
-            token_ids = [token_ids]
-
-        builder = flatbuffers.Builder(256)
-
-        # Build token_ids vector
-        StepOutStartTokenIdsVector(builder, len(token_ids))
-        for token_id in reversed(token_ids):  # FlatBuffers builds vectors in reverse
-            builder.PrependUint32(token_id)
-        token_ids_vector = builder.EndVector()
-
-        StepOutStart(builder)
-        StepOutAddSeqId(builder, seq_id)
-        if token_ids:
-            StepOutAddTokenId(builder, token_ids[-1])  # Backward compatibility
-        StepOutAddTokenIds(builder, token_ids_vector)
-        StepOutAddStatus(builder, status)
-        step_out = StepOutEnd(builder)
-        builder.Finish(step_out)
-        payload = builder.Output()
+        payload = build_stepout_payload(seq_id, token_ids, status)
         self._send_response(action=0, payload=payload)
+
+    def _send_stepout_batch(self, entries):
+        """Send one step's worth of stepouts as a single queue put.
+
+        ``entries`` is a list of (seq_id, token_ids, status) tuples. Batching
+        moves the per-seq flatbuffer building and zmq sends to the frontend
+        process, off the engine step loop's critical path (one mp.Queue put
+        per step instead of one per running sequence).
+        """
+        if entries:
+            self._send_response(action=_ACTION_STEPOUT_BATCH, payload=entries)
 
     def _send_migration(self, seq):
         buffer_size = (
@@ -193,9 +213,20 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
     import queue
 
     logger.info("Engine Loop Started in Backend Process")
+
+    # Loop-phase timing (outside engine.step(), which has its own breakdown in
+    # the heartbeat): drain = inbound request handling (add/deserialize),
+    # emit = stepout/migration/vision-free emission. Logged every ~5s; this is
+    # exactly the driver-side work that shows up as GPU idle gap on workers.
+    _lp_drain_ms = 0.0
+    _lp_emit_ms = 0.0
+    _lp_steps = 0
+    _lp_last_log = time.time()
+
     while True:
         try:
             # Drain queue of all current requests
+            _t_drain = time.perf_counter()
             while True:
                 try:
                     action, payload = requests_queue.get_nowait()
@@ -213,6 +244,7 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                         traceback.print_exc()
                 except queue.Empty:
                     break
+            _lp_drain_ms += (time.perf_counter() - _t_drain) * 1000
 
             if engine.scheduler.is_finished():
                 time.sleep(0.001)
@@ -222,41 +254,58 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
 
             logger.debug(f"Engine step completed: {result.real_bs} running sequences")
 
-            # Single-pass optimization: merge all sequence processing into one loop
+            _t_emit = time.perf_counter()
+            # Single-pass optimization: merge all sequence processing into one loop.
+            # NOTE: avoid seq.token_ids here -- each access copies the full C++
+            # token vector into a Python list, which costs tens of ms/step at
+            # full batch. Use scalar properties (seq_id/last_token/num_tokens).
+            track_running = engine.config.mode == "decode"
             current_running_seqs = set()
             newly_appeared_seqs = []  # Store newly appeared sequences for early free
+            stepout_batch = []  # (seq_id, token_id, status) for this step
+            vision_free_by_encoder: dict[str, list[int]] = defaultdict(list)
 
             for seqs in result.dp_seqs:
                 for seq in seqs:
-                    current_running_seqs.add(seq.seq_id)
+                    seq_id = seq.seq_id
+
+                    # Free vision embedding slots on encoder after prefill consumes
+                    # them (EP-separated mode: encoder reclaims EmbeddingPool slots)
+                    vs_list = seq.vision_slots
+                    if vs_list:
+                        for vs in vs_list:
+                            vision_free_by_encoder[vs["encoder_engine_id"]].append(
+                                vs["slot_idx"]
+                            )
+                        seq.clear_vision_slots()
+
+                    if track_running:
+                        current_running_seqs.add(seq_id)
 
                     # Skip system sequences
-                    if seq.seq_id < 8:
+                    if seq_id < 8:
                         continue
 
                     # Track newly appeared sequences for early free (decode only)
-                    if (
-                        engine.config.mode == "decode"
-                        and seq.seq_id not in service._previous_running_seqs
-                    ):
+                    if track_running and seq_id not in service._previous_running_seqs:
                         newly_appeared_seqs.append(seq)
 
                     # Send stepout/migration based on sequence state
                     if seq.is_finished:
-                        service._send_stepout(
-                            seq.seq_id, seq.token_ids[-1], SequenceStatus.FINISHED
+                        stepout_batch.append(
+                            (seq_id, seq.last_token, SequenceStatus.FINISHED)
                         )
                         # Clean up tracking to prevent memory leak
-                        service._freed_sequences.discard(seq.seq_id)
+                        service._freed_sequences.discard(seq_id)
                     elif seq.is_to_be_migrated:
                         service._send_migration(seq)
-                    elif len(seq.token_ids) > 0:
+                    elif seq.num_tokens > 0:
                         # Send last token for all running sequences (1 token per step in decode)
-                        service._send_stepout(
-                            seq.seq_id,
-                            seq.token_ids[-1],
-                            SequenceStatus.RUNNING,
+                        stepout_batch.append(
+                            (seq_id, seq.last_token, SequenceStatus.RUNNING)
                         )
+
+            service._send_stepout_batch(stepout_batch)
 
             # Early free: Process only newly appeared sequences (much faster than full iteration)
             if newly_appeared_seqs:
@@ -270,20 +319,6 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                         )
                         service._send_p2p_free_if_migrated(seq)
 
-            # Free vision embedding slots on encoder after prefill consumes them
-            # (EP-separated mode: notify encoder to reclaim EmbeddingPool slots)
-            vision_free_by_encoder: dict[str, list[int]] = defaultdict(list)
-            for seqs in result.dp_seqs:
-                for seq in seqs:
-                    vs_list = seq.vision_slots
-                    if not vs_list:
-                        continue
-                    for vs in vs_list:
-                        vision_free_by_encoder[vs["encoder_engine_id"]].append(
-                            vs["slot_idx"]
-                        )
-                    seq.clear_vision_slots()
-
             for encoder_id, slot_indices in vision_free_by_encoder.items():
                 try:
                     engine.send_free_vision_slots(encoder_id, slot_indices)
@@ -294,6 +329,19 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
 
             # Update tracking for next step
             service._previous_running_seqs = current_running_seqs
+
+            _lp_emit_ms += (time.perf_counter() - _t_emit) * 1000
+            _lp_steps += 1
+            now = time.time()
+            if now - _lp_last_log >= 5.0 and _lp_steps > 0:
+                logger.info(
+                    f"[backend_loop] drain={_lp_drain_ms / _lp_steps:.2f} "
+                    f"emit={_lp_emit_ms / _lp_steps:.2f} ms/step (n={_lp_steps})"
+                )
+                _lp_drain_ms = 0.0
+                _lp_emit_ms = 0.0
+                _lp_steps = 0
+                _lp_last_log = now
 
         except Exception as e:
             logger.error(f"Engine Backend Loop Error: {e}")
@@ -390,6 +438,16 @@ class EngineServer:
                     action, payload = await loop.run_in_executor(
                         None, self.results_queue.get
                     )
+                    if action == _ACTION_STEPOUT_BATCH:
+                        # One step's stepouts, batched by the backend to keep
+                        # its loop fast. Fan out as regular per-seq StepOut
+                        # packets so the zmq wire protocol is unchanged.
+                        for seq_id, token_id, status in payload:
+                            data = encode_packet(
+                                0, build_stepout_payload(seq_id, token_id, status)
+                            )
+                            await socket.send(data)
+                        continue
                     data = encode_packet(action, payload)
                     await socket.send(data)
                 except Exception as e:

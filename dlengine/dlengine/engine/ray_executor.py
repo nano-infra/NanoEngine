@@ -1,5 +1,6 @@
 import copyreg
 import importlib
+import os
 import threading
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
@@ -99,6 +100,11 @@ class RayExecutor:
         self.lock = threading.Lock()
 
         # 1. 初始化 Ray 连接
+        # Disable Ray's per-worker log deduplication so that identical log
+        # lines from all DP/EP ranks are forwarded separately to the driver.
+        # Without this, a hang on a single rank is invisible because Ray
+        # collapses the other ranks' identical messages into one line.
+        os.environ.setdefault("RAY_DEDUP_LOGS", "0")
         with self.lock:
             ray.init(address=config.ray_address, ignore_reinit_error=True)
 
@@ -113,8 +119,6 @@ class RayExecutor:
         assert config.attn_world_size == config.ffn_world_size
 
         # Check if running under NanoOps orchestration
-        import os
-
         nanoops_pg_id = os.getenv("NANOOPS_PLACEMENT_GROUP_ID")
 
         if nanoops_pg_id:

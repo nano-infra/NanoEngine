@@ -276,6 +276,7 @@ class LLMEngine:
         wwi_ms = 0.0
         immrecv_ms = 0.0
         net_ms = 0.0
+        serialize_ms = 0.0
         if not (is_prefill and self.config.mode == "decode"):
             # Normal execution: prefill engine runs prefill, or decode engine runs decode.
             # Each per-DP result is either ``list[list[int]]`` (legacy /
@@ -288,6 +289,7 @@ class LLMEngine:
             wwi_ms = getattr(self.executor, "last_run_wwi_ms", 0.0)
             immrecv_ms = getattr(self.executor, "last_run_immrecv_ms", 0.0)
             net_ms = getattr(self.executor, "last_run_net_ms", 0.0)
+            serialize_ms = getattr(self.executor, "last_run_serialize_ms", 0.0)
             token_ids, token_logprobs = _split_run_result(raw)
             post_sch_begin = time.time()
             if token_logprobs is not None:
@@ -401,6 +403,7 @@ class LLMEngine:
             wwi_ms=wwi_ms,
             immrecv_ms=immrecv_ms,
             net_ms=net_ms,
+            serialize_ms=serialize_ms,
         )
 
         return StepResult(

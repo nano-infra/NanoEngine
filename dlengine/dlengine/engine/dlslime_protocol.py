@@ -22,8 +22,6 @@ from dlengine.fbs.RunSequenceOutput import (
     RunSequenceOutputStart,
 )
 
-_DLSLIME_TIMING = "1"
-
 # Each run_batch reply is prefixed with an 8-byte little-endian uint64 holding
 # the server-side handler duration in nanoseconds (decode + forward). The
 # client subtracts this from the measured round trip to derive a "pure" network
@@ -150,16 +148,22 @@ class ModelRunnerRpcService:
         handler_ns = int((t2 - t0) * 1e9)
         encoded = encode_run_result(result, handler_ns)
         t3 = _time.perf_counter()
-        if _DLSLIME_TIMING and not is_prefill:
-            from dlengine.logging import get_logger
+        # Gated by Config.dlslime_timing (threaded into RunnerConfig on the
+        # worker, same as step_timing). INFO so it is visible without flooding
+        # the logs with unrelated DEBUG output.
+        if not is_prefill:
+            from dlengine.worker.runner_config import get_runner_config
 
-            get_logger().debug(
-                f"[dlslime worker] decode_req={(t1-t0)*1000:.2f}ms "
-                f"forward={(t2-t1)*1000:.2f}ms "
-                f"encode={(t3-t2)*1000:.2f}ms "
-                f"total={(t3-t0)*1000:.2f}ms "
-                f"resp_bytes={len(encoded)}"
-            )
+            if get_runner_config().dlslime_timing:
+                from dlengine.logging import get_logger
+
+                get_logger().info(
+                    f"[dlslime worker] decode_req={(t1-t0)*1000:.2f}ms "
+                    f"forward={(t2-t1)*1000:.2f}ms "
+                    f"encode={(t3-t2)*1000:.2f}ms "
+                    f"total={(t3-t0)*1000:.2f}ms "
+                    f"resp_bytes={len(encoded)}"
+                )
         return encoded
 
     @method(raw=True)
