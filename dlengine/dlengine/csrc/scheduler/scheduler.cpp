@@ -348,6 +348,28 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
     // Step 2: Schedule fresh WAITING sequences with chunking
     // -----------------------------------------------------------------------
 
+    // Short-circuit: if every group on every DP rank is already at
+    // max_num_seqs, no waiting sequence can be admitted this step. Skip the
+    // per-sequence try_allocate path (water-fill + prefix-hash scans), which
+    // otherwise runs on the step critical path every step while the engine
+    // is saturated. Mirrors can_allocate's check: current_batch_load =
+    // num_running_seqs_per_group + num_seqs scheduled this step.
+    if (!waiting_queue.empty()) {
+        bool all_full = true;
+        for (int dp_idx = 0; dp_idx < attention_dp_ && all_full; ++dp_idx) {
+            for (int group_id = 0; group_id < group_size_; ++group_id) {
+                int load = worker_state[dp_idx]->num_running_seqs_per_group(group_id) + num_seqs[dp_idx][group_id];
+                if (load < max_num_seqs_) {
+                    all_full = false;
+                    break;
+                }
+            }
+        }
+        if (all_full) {
+            return scheduled_seqs;
+        }
+    }
+
     // For LeastBatch and LeastCache, we maintain a set to act as a min-heap
     std::set<std::pair<int, int>> dp_load_set;
     if (routing_strategy == RoutingStrategy::LeastBatch) {

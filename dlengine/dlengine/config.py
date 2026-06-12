@@ -138,6 +138,11 @@ class Config(BaseModel):
     step_timing_interval: int = 16
     step_timing_rank: int = 0  # -1 = all ranks
 
+    # Worker-side DLSlime RPC handler timing ("[dlslime worker]" lines:
+    # decode_req / forward / encode per decode step). Threaded into
+    # RunnerConfig like step_timing. Off by default.
+    dlslime_timing: bool = False
+
     # GPU-idle probe: measures the inter-step GPU-idle gap (end of the
     # previous step's GPU work → start of the next step) with CUDA events,
     # independent of the sync-heavy ``step_timing`` host timer. Logs
