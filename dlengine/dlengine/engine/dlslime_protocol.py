@@ -1,4 +1,5 @@
 import ctypes
+import struct
 import time as _time
 
 import flatbuffers
@@ -22,6 +23,23 @@ from dlengine.fbs.RunSequenceOutput import (
 )
 
 _DLSLIME_TIMING = "1"
+
+# Each run_batch reply is prefixed with an 8-byte little-endian uint64 holding
+# the server-side handler duration in nanoseconds (decode + forward). The
+# client subtracts this from the measured round trip to derive a "pure" network
+# latency (wire + queueing), excluding remote GPU compute. The FlatBuffers root
+# therefore starts at byte offset 8 (see decode_run_result).
+_REPLY_HEADER = struct.Struct("<Q")
+REPLY_HEADER_SIZE = _REPLY_HEADER.size
+
+
+def pack_reply_header(server_handler_ns: int) -> bytes:
+    return _REPLY_HEADER.pack(int(server_handler_ns))
+
+
+def unpack_reply_header(data) -> int:
+    """Read the server handler nanoseconds from the start of a reply buffer."""
+    return _REPLY_HEADER.unpack_from(data, 0)[0]
 
 
 def _create_run_result_seq(
@@ -55,12 +73,15 @@ def decode_run_request(ptr: int, nbytes: int) -> tuple[bytes, bool]:
     return payload[1:], bool(payload[0])
 
 
-def encode_run_result(result) -> bytes:
+def encode_run_result(result, server_handler_ns: int = 0) -> bytes:
     """Encode the per-step worker result as raw FlatBuffers bytes.
 
     Accepts either the legacy ``list[list[int]]`` (token_ids only) or the
     tuple ``(token_ids: list[list[int]], logprobs: list[list[float]] | None)``
     shipped when SamplingParams.return_completion_logprobs is on.
+
+    The returned buffer is prefixed with an 8-byte server-handler-ns header
+    (see _REPLY_HEADER); the FlatBuffers root starts at REPLY_HEADER_SIZE.
     """
     if isinstance(result, tuple):
         token_ids, logprobs = result
@@ -88,16 +109,17 @@ def encode_run_result(result) -> bytes:
     RunBatchOutputAddSequences(builder, seqs_vec)
     root = RunBatchOutputEnd(builder)
     builder.Finish(root)
-    return bytes(builder.Output())
+    return pack_reply_header(server_handler_ns) + bytes(builder.Output())
 
 
 def decode_run_result(data: bytes):
     """Decode a worker result.
 
     Returns either ``list[list[int]]`` (token_ids only) or
-    ``(list[list[int]], list[list[float]])``.
+    ``(list[list[int]], list[list[float]])``. The 8-byte server-timing header
+    prepended by encode_run_result is skipped via the root offset.
     """
-    output = RunBatchOutput.GetRootAs(data, 0)
+    output = RunBatchOutput.GetRootAs(data, REPLY_HEADER_SIZE)
     has_logprobs = output.HasLogprobs()
     token_ids = []
     logprobs = []
@@ -118,28 +140,27 @@ class ModelRunnerRpcService:
     def run_batch(self, channel, ptr: int, nbytes: int) -> bytes:
         if self._runner is None:
             raise RuntimeError("ModelRunnerRpcService is not attached to a runner")
-        if _DLSLIME_TIMING:
-            t0 = _time.perf_counter()
-            data, is_prefill = decode_run_request(ptr, nbytes)
-            t1 = _time.perf_counter()
-            result = self._runner.run_from_bytes(data, is_prefill)
-            t2 = _time.perf_counter()
-            encoded = encode_run_result(result)
-            t3 = _time.perf_counter()
-            if not is_prefill:
-                from dlengine.logging import get_logger
-
-                get_logger().debug(
-                    f"[dlslime worker] decode_req={(t1-t0)*1000:.2f}ms "
-                    f"forward={(t2-t1)*1000:.2f}ms "
-                    f"encode={(t3-t2)*1000:.2f}ms "
-                    f"total={(t3-t0)*1000:.2f}ms "
-                    f"resp_bytes={len(encoded)}"
-                )
-            return encoded
+        # Always measure the handler duration (decode + forward); it is shipped
+        # back in the reply header so the client can isolate network latency.
+        t0 = _time.perf_counter()
         data, is_prefill = decode_run_request(ptr, nbytes)
+        t1 = _time.perf_counter()
         result = self._runner.run_from_bytes(data, is_prefill)
-        return encode_run_result(result)
+        t2 = _time.perf_counter()
+        handler_ns = int((t2 - t0) * 1e9)
+        encoded = encode_run_result(result, handler_ns)
+        t3 = _time.perf_counter()
+        if _DLSLIME_TIMING and not is_prefill:
+            from dlengine.logging import get_logger
+
+            get_logger().debug(
+                f"[dlslime worker] decode_req={(t1-t0)*1000:.2f}ms "
+                f"forward={(t2-t1)*1000:.2f}ms "
+                f"encode={(t3-t2)*1000:.2f}ms "
+                f"total={(t3-t0)*1000:.2f}ms "
+                f"resp_bytes={len(encoded)}"
+            )
+        return encoded
 
     @method(raw=True)
     def migrate_batch(self, channel, ptr: int, nbytes: int) -> bytes:

@@ -20,7 +20,6 @@ from torch import nn
 
 from dlengine.context.context import get_context
 from dlengine.context.distributed import get_dist_context
-
 from dlengine.layers import get_backend
 from dlengine.layers.activation import SiluAndMul
 from dlengine.layers.base_backend import (

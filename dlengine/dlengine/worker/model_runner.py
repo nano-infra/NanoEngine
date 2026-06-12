@@ -79,6 +79,57 @@ class _StepTimer:
         )
 
 
+class _CudaForwardTimer:
+    """CUDA-event timer for the GPU-side forward breakdown.
+
+    Records lightweight events on the current stream and reads elapsed_time
+    once at report time (a single sync on the final event). Unlike _StepTimer
+    it does NOT call torch.cuda.synchronize() at each mark, so it neither
+    serializes the pipeline nor distorts the very forward it is measuring —
+    elapsed_time reflects the GPU timeline between two events regardless of
+    host-side syncs.
+
+    Decode breakdown (deltas between consecutive marks):
+        model   — transformer forward / CUDA-graph replay (fwd_start → model)
+        logits  — compute_logits / lm_head                (model → logits)
+        sample  — sampler kernels                          (logits → sample)
+
+    Note: a CUDA-graph decode replay is a single opaque launch, so the
+    transformer cannot be subdivided further from the host; ``model`` is the
+    whole captured graph.
+    """
+
+    __slots__ = ("events",)
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, "torch.cuda.Event"]] = []
+
+    def mark(self, label: str) -> None:
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self.events.append((label, ev))
+
+    def report(
+        self, rank: int, run_count: int, num_seqs: int, is_prefill: bool
+    ) -> None:
+        if len(self.events) < 2:
+            return
+        # elapsed_time needs both events completed; one sync on the last.
+        self.events[-1][1].synchronize()
+        total_ms = self.events[0][1].elapsed_time(self.events[-1][1])
+        parts = []
+        for i in range(1, len(self.events)):
+            label, ev = self.events[i]
+            dt = self.events[i - 1][1].elapsed_time(ev)
+            pct = (dt / total_ms * 100) if total_ms > 0 else 0.0
+            parts.append(f"{label}={dt:.3f}ms({pct:.0f}%)")
+        kind = "prefill" if is_prefill else "decode"
+        get_logger().info(
+            f"[fwd_timing] r{rank} {kind} step={run_count} "
+            f"num_seqs={num_seqs} total={total_ms:.3f}ms  " + "  ".join(parts)
+        )
+
+
 from dlengine._cpp import (
     extract_aux_from_bytes,
     extract_vision_slots_from_bytes,
@@ -174,6 +225,7 @@ class ModelRunner:
         self.peer_agent_context = None
         self.weight_context = None
         self.weight_update_engine = None
+        self.l3_store = None  # Hf3fsL3Store, created in allocate_kvcache when enabled
 
         # Sync C++ Sequence.block_size with Python kvcache_block_size
         from dlengine._cpp import Sequence as _Seq
@@ -194,6 +246,7 @@ class ModelRunner:
             step_timing=getattr(config, "step_timing", False),
             step_timing_interval=getattr(config, "step_timing_interval", 16),
             step_timing_rank=getattr(config, "step_timing_rank", 0),
+            gpu_idle_probe=getattr(config, "gpu_idle_probe", False),
         )
 
         if defer_dist_init:
@@ -448,6 +501,23 @@ class ModelRunner:
         # Register memory regions after KV/indexer tensors exist. The PeerAgent
         # itself is started during preallocate_kvcache().
         cache_context.register_peer_agent_memory_regions(mode=self.config.mode)
+
+        # L3 (3FS) tiered KV cache: build the per-worker USRBIO store now that
+        # the kv_cache tensor exists. Inert unless config.l3_enable.
+        if getattr(self.config, "l3_enable", False):
+            try:
+                from dlengine.context.cache.l3_hf3fs import Hf3fsL3Store
+
+                self.l3_store = Hf3fsL3Store(
+                    cache_context,
+                    mountpoint=self.config.l3_mountpoint,
+                    l3_dir=self.config.l3_dir,
+                    staging_blocks=self.config.l3_staging_blocks,
+                    rank=self.rank,
+                )
+            except Exception as e:
+                logger.error(f"[L3] failed to init Hf3fsL3Store, disabling: {e}")
+                self.l3_store = None
 
         if not self.enforce_eager:
             self._init_graph_runners()
@@ -717,6 +787,12 @@ class ModelRunner:
             self.vision_manager.set_peer_agent_context(self.peer_agent_context)
 
     @torch.inference_mode()
+    def _mark_fwd(self, label: str) -> None:
+        """Record a CUDA-event mark on the active forward timer, if any."""
+        ft = getattr(self, "_fwd_timer", None)
+        if ft is not None:
+            ft.mark(label)
+
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
@@ -745,7 +821,10 @@ class ModelRunner:
                 ExpertContext.get_instance().transition_to_low_latency()
             if not is_prefill and self.mtp_worker is not None:
                 self.mtp_worker.last_hidden = hidden
-            return self.model.compute_logits(hidden)
+            self._mark_fwd("model")
+            logits = self.model.compute_logits(hidden)
+            self._mark_fwd("logits")
+            return logits
         else:
             context = get_context()
 
@@ -772,11 +851,37 @@ class ModelRunner:
             outputs = self.decode_graph_runner.run(input_ids, positions, context)
             if self.mtp_worker is not None:
                 self.mtp_worker.last_hidden = outputs.clone()
-            return self.model.compute_logits(outputs)
+            self._mark_fwd("model")
+            logits = self.model.compute_logits(outputs)
+            self._mark_fwd("logits")
+            return logits
 
     def migrate_from_bytes(self, data: bytes) -> None:
         """Migrate using lean MigrateBatchInput bytes (no Sequence objects)."""
         get_cache_context().migrate_from_bytes(data=data)
+
+    # ------------------------------------------------------------------ #
+    # L3 (3FS) tiered KV cache worker RPCs (driven by collective_rpc)
+    # ------------------------------------------------------------------ #
+    def l3_store_blocks(self, pairs: list[tuple[int, int]]) -> int:
+        """Persist (hash, block_id) GPU blocks to 3FS. Returns #stored."""
+        if self.l3_store is None or not pairs:
+            return 0
+        return len(self.l3_store.store([tuple(p) for p in pairs]))
+
+    def l3_load_blocks(self, pairs: list[tuple[int, int]]) -> int:
+        """Load (hash, block_id) blocks from 3FS into GPU. Returns #loaded.
+
+        Synchronizes so the data is visible before the forward pass runs.
+        """
+        if self.l3_store is None or not pairs:
+            return 0
+        n = self.l3_store.load([tuple(p) for p in pairs])
+        torch.cuda.synchronize()
+        return n
+
+    def l3_stats(self) -> dict:
+        return self.l3_store.stats() if self.l3_store is not None else {}
 
     def _standard_sample(
         self,
@@ -849,6 +954,31 @@ class ModelRunner:
         _timer = _StepTimer() if _timing else None
         if _timer is not None:
             _timer.mark("start")
+        # CUDA-event forward breakdown: only active on the steps that will be
+        # reported (interval + rank gate, using the post-increment run_count),
+        # so event creation overhead is ~0 on ordinary steps.
+        _fwd_timer = None
+        if _timing:
+            _rk = _rcfg.step_timing_rank
+            if (_rk < 0 or self.rank == _rk) and (
+                (self.run_count + 1) % _rcfg.step_timing_interval == 0
+            ):
+                _fwd_timer = _CudaForwardTimer()
+        self._fwd_timer = _fwd_timer
+        # GPU-idle probe: record a start event before any GPU op of this step.
+        # Combined with the previous step's end event it yields the inter-step
+        # GPU-idle gap (no host sync on the hot path; one sync only on report
+        # steps, after the gap window has already closed).
+        _gap_start_evt = None
+        _gap_report = False
+        if (
+            _rcfg.gpu_idle_probe
+            and torch.cuda.is_initialized()
+            and (_rcfg.step_timing_rank < 0 or self.rank == _rcfg.step_timing_rank)
+        ):
+            _gap_start_evt = torch.cuda.Event(enable_timing=True)
+            _gap_start_evt.record()
+            _gap_report = (self.run_count + 1) % _rcfg.step_timing_interval == 0
         sp_rank = get_dist_context().attn_sp_rank
         aux = extract_aux_from_bytes(data, sp_rank)
         num_seqs = aux.num_group_seqs
@@ -922,6 +1052,8 @@ class ModelRunner:
             )
 
         # --- Forward ---
+        if _fwd_timer is not None:
+            _fwd_timer.mark("fwd_start")
         logits = self.run_model(input_ids, positions, is_prefill)
         if _timer is not None:
             _timer.mark("forward")
@@ -940,6 +1072,8 @@ class ModelRunner:
             input_ids, step_logprobs = self._standard_sample(
                 logits, input_ids, aux, num_seqs, is_prefill
             )
+        if _fwd_timer is not None:
+            _fwd_timer.mark("sample")
         if _timer is not None:
             _timer.mark("sample")
 
@@ -1002,6 +1136,29 @@ class ModelRunner:
                 _rcfg.step_timing_interval,
                 _rcfg.step_timing_rank,
             )
+        if _fwd_timer is not None:
+            _fwd_timer.report(self.rank, self.run_count, num_seqs, is_prefill)
+        self._fwd_timer = None
+        # GPU-idle probe: close this step's window and, on report steps,
+        # measure the gap from the previous step's GPU end to this step's
+        # GPU start (idle) plus this step's GPU-busy span.
+        if _gap_start_evt is not None:
+            _gap_end_evt = torch.cuda.Event(enable_timing=True)
+            _gap_end_evt.record()
+            prev_end = getattr(self, "_gap_prev_end_evt", None)
+            if _gap_report and prev_end is not None:
+                _gap_end_evt.synchronize()
+                gap_ms = prev_end.elapsed_time(_gap_start_evt)
+                busy_ms = _gap_start_evt.elapsed_time(_gap_end_evt)
+                total_ms = gap_ms + busy_ms
+                duty = (busy_ms / total_ms * 100) if total_ms > 0 else 0.0
+                kind = "prefill" if is_prefill else "decode"
+                get_logger().info(
+                    f"[gpu_idle] r{self.rank} {kind} step={self.run_count} "
+                    f"num_seqs={num_seqs} gap={gap_ms:.3f}ms busy={busy_ms:.3f}ms "
+                    f"step={total_ms:.3f}ms duty={duty:.0f}%"
+                )
+            self._gap_prev_end_evt = _gap_end_evt
         return result
 
     def _init_graph_runners(self):

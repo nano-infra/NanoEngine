@@ -196,10 +196,11 @@ class LLMEngine:
             for d in ws.dummy_seqs:
                 dummy_seq_ids.add(d.seq_id)
 
-        total_running = sum(
-            sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
-            for seqs in dp_seqs
-        )
+        # Actual number of in-flight sequences (admitted, not yet finished),
+        # independent of whether this step is a prefill or a decode step. The
+        # current step's batch (dp_seqs) is exposed separately as real_bs.
+        running_per_dp = [len(ws.running) for ws in self.scheduler.worker_state]
+        total_running = sum(running_per_dp)
         total_waiting = len(self.scheduler.waiting)
         total_waiting_migration = len(self.scheduler.waiting_migration)
         self.metrics_manager.server_metric.update_running_requests(total_running)
@@ -269,12 +270,24 @@ class LLMEngine:
         # Run prefill to populate KV cache (or skip for decode engine receiving prefill request)
         token_ids = None
         token_logprobs = None
+        forward_tx_bytes = 0
+        forward_rx_bytes = 0
+        transfer_ms = 0.0
+        wwi_ms = 0.0
+        immrecv_ms = 0.0
+        net_ms = 0.0
         if not (is_prefill and self.config.mode == "decode"):
             # Normal execution: prefill engine runs prefill, or decode engine runs decode.
             # Each per-DP result is either ``list[list[int]]`` (legacy /
             # logprobs disabled) or ``(list[list[int]], list[list[float]])``
             # when SamplingParams.return_completion_logprobs is on.
             raw = self.executor.run(dp_group_tp_seqs, is_prefill)[::tp_size]
+            forward_tx_bytes = getattr(self.executor, "last_run_request_bytes", 0)
+            forward_rx_bytes = getattr(self.executor, "last_run_reply_bytes", 0)
+            transfer_ms = getattr(self.executor, "last_run_transfer_ms", 0.0)
+            wwi_ms = getattr(self.executor, "last_run_wwi_ms", 0.0)
+            immrecv_ms = getattr(self.executor, "last_run_immrecv_ms", 0.0)
+            net_ms = getattr(self.executor, "last_run_net_ms", 0.0)
             token_ids, token_logprobs = _split_run_result(raw)
             post_sch_begin = time.time()
             if token_logprobs is not None:
@@ -302,8 +315,8 @@ class LLMEngine:
             # only dp_group_seqs would leave tp_idx > 0 ranks unmigrated.
             self.executor.migrate(dp_group_tp_seqs)
         outputs = []
-        prefill_tokens = 0
-        decode_tokens = 0
+        prefill_tokens_per_dp = [0] * dp_size
+        decode_tokens_per_dp = [0] * dp_size
 
         for dp_idx, seqs in enumerate(dp_seqs):
             num_tokens_in_dp = sum(len(seq) for seq in seqs)
@@ -312,8 +325,8 @@ class LLMEngine:
             )
 
         if is_prefill:
-            for seqs in dp_seqs:
-                prefill_tokens += sum(
+            for dp_idx, seqs in enumerate(dp_seqs):
+                prefill_tokens_per_dp[dp_idx] += sum(
                     len(seq) for seq in seqs if seq.seq_id not in dummy_seq_ids
                 )
         elif token_ids is not None:
@@ -324,11 +337,14 @@ class LLMEngine:
                     group_tokens = token_ids[group_idx]
                     for seq, seq_tokens in zip(group_seqs, group_tokens):
                         if seq.seq_id not in dummy_seq_ids:
-                            decode_tokens += len(seq_tokens)
+                            decode_tokens_per_dp[dp_idx] += len(seq_tokens)
         else:
-            for seqs in dp_seqs:
+            for dp_idx, seqs in enumerate(dp_seqs):
                 num_real = sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
-                decode_tokens += num_real
+                decode_tokens_per_dp[dp_idx] += num_real
+
+        prefill_tokens = sum(prefill_tokens_per_dp)
+        decode_tokens = sum(decode_tokens_per_dp)
 
         # Collect finished/migrated sequences after postprocess
         for seqs in dp_seqs:
@@ -340,14 +356,61 @@ class LLMEngine:
             sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
             for seqs in dp_seqs
         )
+
+        # Periodic engine status report (throttling/accounting live in the
+        # metrics manager; this path drives step() directly, bypassing
+        # generate(), so it is what produces the serve-mode heartbeat).
+        try:
+            group_size = self.scheduler.group_size
+            # Each DP rank owns group_size block managers, each with
+            # num_kvcache_blocks blocks. Report KV usage per DP rank so the
+            # heartbeat shows attention_dp separate values.
+            blocks_per_dp = self.config.num_kvcache_blocks * group_size
+            used_blocks_per_dp = [
+                blocks_per_dp
+                - sum(ws.block_manager[i].num_free_blocks for i in range(group_size))
+                for ws in self.scheduler.worker_state
+            ]
+        except Exception:  # noqa: BLE001
+            blocks_per_dp = self.config.num_kvcache_blocks
+            used_blocks_per_dp = None
+        # Latency breakdown for this step. forward = executor.run/migrate, i.e.
+        # the gap between scheduling end and postprocess start.
+        schedule_latency_ms = (sch_end - sch_begin) * 1000
+        forward_latency_ms = (
+            (post_sch_begin - sch_end) * 1000 if post_sch_begin else 0.0
+        )
+        postprocess_latency_ms = (post_sch_end - post_sch_begin) * 1000
+
+        self.metrics_manager.maybe_report_engine_status(
+            engine_id=self.engine_id,
+            mode=self.config.mode,
+            running_per_dp=running_per_dp,
+            waiting=total_waiting,
+            waiting_migration=total_waiting_migration,
+            used_blocks_per_dp=used_blocks_per_dp,
+            total_blocks=blocks_per_dp,
+            prefill_tokens_per_dp=prefill_tokens_per_dp,
+            decode_tokens_per_dp=decode_tokens_per_dp,
+            schedule_ms=schedule_latency_ms,
+            forward_ms=forward_latency_ms,
+            postprocess_ms=postprocess_latency_ms,
+            forward_tx_bytes=forward_tx_bytes,
+            forward_rx_bytes=forward_rx_bytes,
+            transfer_ms=transfer_ms,
+            wwi_ms=wwi_ms,
+            immrecv_ms=immrecv_ms,
+            net_ms=net_ms,
+        )
+
         return StepResult(
             dp_seqs=dp_seqs,
             outputs=outputs,
             prefill_tokens=prefill_tokens,
             decode_tokens=decode_tokens,
             real_bs=real_bs,
-            schedule_latency_ms=(sch_end - sch_begin) * 1000,
-            postprocess_latency_ms=(post_sch_end - post_sch_begin) * 1000,
+            schedule_latency_ms=schedule_latency_ms,
+            postprocess_latency_ms=postprocess_latency_ms,
         )
 
     def is_finished(self):

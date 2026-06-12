@@ -217,7 +217,16 @@ PrefillMetadata prepare_prefill_from_bytes(const uint8_t* data,
         if (!bt || bt->size() == 0)
             continue;
 
-        int num_blocks             = (int)bt->size();
+        // Only iterate over blocks covering the currently-dispatched tokens.
+        // For chunked prefill the block table is pre-allocated for the full
+        // prompt at admission, so bt->size() can exceed the blocks needed for
+        // this chunk (seqlen = chunk endpoint). Using bt->size() would emit a
+        // slot_mapping longer than the fresh-token count N and break the
+        // store_kvcache assertion (slot_mapping.numel() == N).
+        int num_blocks = (seqlen + block_size - 1) / block_size;
+        if (num_blocks > (int)bt->size())
+            num_blocks = (int)bt->size();
+
         int num_cached_blocks      = num_cached / block_size;
         int cached_offset_in_block = num_cached % block_size;
         int last_block_tokens      = seq_input_last_block_num_tokens(si, group_rank, block_size);

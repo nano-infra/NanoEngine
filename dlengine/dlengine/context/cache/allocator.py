@@ -6,7 +6,6 @@ torch tensors and stores them on the shared ``CacheContext`` state via
 """
 
 import torch
-
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")

@@ -310,10 +310,13 @@ class EngineServer:
         self.results_queue = multiprocessing.Queue()
         self.backend_process = None
 
-    async def serve(self):
+    async def serve(self, bind_endpoint: Optional[str] = None):
         ctx = zmq.asyncio.Context()
         socket = ctx.socket(zmq.DEALER)
-        listen_addr = f"tcp://*:{self.config.port}"
+        # Default binds a TCP port (disaggregated stack, Rust DLRouter client).
+        # ``dlengine serve --engine_ipc`` passes an ipc:// endpoint so the
+        # co-located OpenAI HTTP server can connect without a port conflict.
+        listen_addr = bind_endpoint or f"tcp://*:{self.config.port}"
         socket.bind(listen_addr)
 
         # Create P2P socket for receiving free instructions (dynamic port)
@@ -416,6 +419,28 @@ class EngineServer:
             results_loop(),
             p2p_recv_loop(),
         )
+
+
+def run_engine_server(config: Config, bind_endpoint: Optional[str] = None):
+    """Top-level entry point for spawning EngineServer in a child process.
+
+    Used by ``dlengine serve --engine_ipc``: the OpenAI HTTP server starts this
+    via ``multiprocessing.Process`` so the engine runs in its own process and
+    exposes a zmq DEALER over ``bind_endpoint`` (an ipc:// socket). Must be a
+    module-level function so it is picklable across the process boundary.
+    """
+    try:
+        import uvloop
+
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except Exception:  # noqa: BLE001
+        pass
+
+    server = EngineServer(config)
+    try:
+        asyncio.run(server.serve(bind_endpoint=bind_endpoint))
+    except KeyboardInterrupt:
+        logger.info("Engine server process shutting down...")
 
 
 def main():

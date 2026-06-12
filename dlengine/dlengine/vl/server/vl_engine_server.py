@@ -37,7 +37,6 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from dlengine.logging import get_logger
-
 from dlengine.vl.encoder.encoder_config import EncoderConfig
 from dlengine.vl.encoder.encoder_engine import EncoderEngine
 

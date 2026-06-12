@@ -66,6 +66,12 @@ class Config(BaseModel):
     host: str = "0.0.0.0"
     port: int = 5000
 
+    # ``dlengine serve`` (OpenAI HTTP server) engine transport. When True, the
+    # engine runs in a separate process exposing a zmq DEALER over an ipc://
+    # socket and the HTTP server connects as a zmq client; when False (default)
+    # the engine runs in-process on a background thread (EngineWorker).
+    engine_ipc: bool = False
+
     dummy_prefill: Optional[bool] = False
     dummy_weight: Optional[bool] = False
     dummy_eplb: Optional[bool] = False
@@ -93,6 +99,23 @@ class Config(BaseModel):
     dsv4_compressed_pool_pages_ratio4: int = 0
     dsv4_compressed_pool_pages_ratio128: int = 0
 
+    # ------------------------------------------------------------------ #
+    # L3 (3FS) tiered KV cache — persists evicted KV blocks to a 3FS mount
+    # keyed by block hash, and loads them back on a prefix miss instead of
+    # recomputing prefill. Disabled by default (fully inert when off).
+    # PoC scope: mode="hybrid", attention_sp == attention_tp == 1.
+    # ------------------------------------------------------------------ #
+    l3_enable: bool = False
+    l3_mountpoint: str = "/3fs/mnt"
+    # Directory under the mount for per-block files; defaults to
+    # "<mountpoint>/dlengine_l3" when None.
+    l3_dir: Optional[str] = None
+    # Skip L3 entirely for prompts shorter than this many full blocks
+    # (short prefills are cheap to recompute; avoids tiny-IO overhead).
+    l3_min_prefix_blocks: int = 1
+    # Host staging buffer / ioring depth, in blocks, per worker.
+    l3_staging_blocks: int = 8
+
     # MoE: opt into deep_gemm.fp8_fp4_mega_moe (one-kernel dispatch +
     # per-expert GEMM + activation + combine). Off by default — gated
     # so production can stay on the existing deep_ep low-latency path
@@ -114,6 +137,13 @@ class Config(BaseModel):
     step_timing: bool = False
     step_timing_interval: int = 16
     step_timing_rank: int = 0  # -1 = all ranks
+
+    # GPU-idle probe: measures the inter-step GPU-idle gap (end of the
+    # previous step's GPU work → start of the next step) with CUDA events,
+    # independent of the sync-heavy ``step_timing`` host timer. Logs
+    # ``gap``/``busy``/``duty`` every ``step_timing_interval`` steps on
+    # ``step_timing_rank``. Off → zero overhead.
+    gpu_idle_probe: bool = False
 
     # profiler
     enable_profiler: bool = False
@@ -294,6 +324,28 @@ class Config(BaseModel):
         ):
             if hasattr(self.hf_config, "num_key_value_heads"):
                 self.hf_config.num_key_value_heads = 1
+
+        # L3 (3FS) tiered KV cache — PoC scope guard. The driver-side block
+        # manager marks L3 hits as "cached" (recompute skipped), so the
+        # worker-side load MUST be guaranteed; restrict to topologies where
+        # block_id -> worker routing is unambiguous (single SP group, no KV
+        # head sharding). Disable rather than risk loading garbage KV.
+        if self.l3_enable:
+            if self.attention_sp != 1 or self.attention_tp != 1:
+                logger.warning(
+                    "l3_enable requires attention_sp==1 and attention_tp==1 "
+                    "(PoC scope); got sp=%s tp=%s — disabling L3.",
+                    self.attention_sp,
+                    self.attention_tp,
+                )
+                self.l3_enable = False
+            elif self.mode not in ("hybrid", "prefill"):
+                logger.warning(
+                    "l3_enable PoC supports mode in {hybrid, prefill}; got "
+                    "%s — disabling L3.",
+                    self.mode,
+                )
+                self.l3_enable = False
 
         # Convert dynamic trust_remote_code config class (from transformers_modules.*)
         # to a standard PretrainedConfig so Ray can serialize it across workers.

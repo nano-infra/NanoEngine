@@ -13,7 +13,6 @@ from torch import nn
 
 from dlengine.context.distributed import get_dist_context
 from dlengine.kernel.triton.hopper.block_gemm_fp8 import deep_gemm_fp8, quant_fp8_tma
-
 from dlengine.layers.base_backend import (
     ColumnParallelLinearBase,
     MergedColumnParallelLinearBase,

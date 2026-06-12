@@ -307,6 +307,42 @@ class RayExecutor:
             timeout=timeout,
         )
 
+    def l3_load(
+        self,
+        per_worker_pairs: List[List[tuple]],
+        timeout: float | None = None,
+    ) -> list[int]:
+        """Load (hash, block_id) blocks from 3FS into each worker's GPU.
+
+        ``per_worker_pairs[i]`` is dispatched to ``self.workers[i]`` (the L3
+        PoC requires attention_sp == attention_tp == 1, so worker index == the
+        scheduler's worker_state/dp index).
+        """
+        return ray.get(
+            [
+                getattr(w, "l3_load_blocks").remote(pairs)
+                for pairs, w in zip(per_worker_pairs, self.workers)
+            ],
+            timeout=timeout,
+        )
+
+    def l3_store(
+        self,
+        per_worker_pairs: List[List[tuple]],
+        timeout: float | None = None,
+    ) -> list[int]:
+        """Persist (hash, block_id) GPU blocks to 3FS, per worker."""
+        return ray.get(
+            [
+                getattr(w, "l3_store_blocks").remote(pairs)
+                for pairs, w in zip(per_worker_pairs, self.workers)
+            ],
+            timeout=timeout,
+        )
+
+    def l3_stats(self) -> list[dict]:
+        return self.collective_rpc("l3_stats")
+
     def run(
         self,
         dp_seqs: List[List[Sequence]],
@@ -315,6 +351,8 @@ class RayExecutor:
     ) -> list[list[list[int]]]:
         # Serialize into lean RunBatchInput bytes, send bytes instead of Sequence objects
         batch_bytes = [_serialize_run(seqs, is_prefill) for seqs in dp_seqs]
+        # Bytes sent to the runners this forward (serialized RunBatch input).
+        self.last_run_request_bytes = sum(len(b) for b in batch_bytes)
         ray_futures = [
             getattr(worker, "run_from_bytes").remote(b, is_prefill)
             for b, worker in zip(batch_bytes, self.workers)
