@@ -172,6 +172,9 @@ void bind_scheduler_utils(py::module_& m)
              py::overload_cast<const std::vector<std::shared_ptr<Sequence>>&>(&Scheduler::free_to_be_migrated),
              py::arg("seqs"))
 
+        // Abort: stop generating for a sequence and free its KV blocks.
+        .def("abort", &Scheduler::abort, py::arg("seq_id"))
+
         // Access methods
         .def("running",
              py::overload_cast<int>(&Scheduler::running),

@@ -1,3 +1,5 @@
+#include <optional>
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -91,6 +93,32 @@ void bind_model_runner_utils(py::module_& m)
             return py::bytes(reinterpret_cast<const char*>(buf.data()), buf.size());
         },
         py::arg("seqs"));
+
+    // ========== DLSlime run_batch reply codec (hot path) ==========
+    // Same wire format as the Python flatbuffers implementation in
+    // dlengine/engine/dlslime_protocol.py; these exist purely to take the
+    // per-seq encode/decode loops out of the Python interpreter.
+    m.def(
+        "encode_run_result",
+        [](const std::vector<std::vector<int32_t>>&              token_ids,
+           const std::optional<std::vector<std::vector<float>>>& logprobs,
+           uint64_t                                              server_handler_ns) -> py::bytes {
+            std::string out = encode_run_result(token_ids, logprobs ? &*logprobs : nullptr, server_handler_ns);
+            return py::bytes(out.data(), out.size());
+        },
+        py::arg("token_ids"),
+        py::arg("logprobs")          = py::none(),
+        py::arg("server_handler_ns") = 0);
+
+    m.def(
+        "decode_run_result",
+        [](py::bytes data) -> py::tuple {
+            std::string_view sv   = data;
+            auto             view = decode_run_result(reinterpret_cast<const uint8_t*>(sv.data()), sv.size());
+            py::object       lp   = view.has_logprobs ? py::cast(view.logprobs) : py::object(py::none());
+            return py::make_tuple(py::cast(view.token_ids), lp);
+        },
+        py::arg("data"));
 
     // ========== Runner side: deserialize + prepare ==========
     m.def(

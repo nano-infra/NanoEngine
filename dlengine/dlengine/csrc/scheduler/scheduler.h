@@ -125,6 +125,15 @@ public:
     void free_to_be_migrated(std::shared_ptr<Sequence> seq);
     void free_to_be_migrated(const std::vector<std::shared_ptr<Sequence>>& seqs);
 
+    // Abort a sequence wherever it currently lives (running / prefilling /
+    // waiting / to_be_migrated): mark it FINISHED and release its KV blocks so
+    // the engine stops generating for it. Used for server-side stop-string
+    // early termination and client cancellation. Returns true if found.
+    //
+    // MUST be called between steps (no forward in flight), since it mutates the
+    // running deques and frees blocks — same constraint as free_to_be_migrated.
+    bool abort(uint64_t seq_id);
+
     // Access to running sequences
     std::deque<std::shared_ptr<Sequence>>&       running(int dp_idx);
     const std::deque<std::shared_ptr<Sequence>>& running(int dp_idx) const;

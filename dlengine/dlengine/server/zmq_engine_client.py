@@ -45,6 +45,7 @@ _ACTION_MIGRATION = 1
 _ACTION_ADD = 1
 _ACTION_GET_INFO = 2
 _ACTION_FREE = 3
+_ACTION_ABORT = 5
 
 
 class ZmqEngineWorker:
@@ -119,6 +120,21 @@ class ZmqEngineWorker:
             return
         payload = self._build_free_payload(seq_ids)
         self._outbox.put_nowait((_ACTION_FREE, payload))
+
+    def abort(self, seq_id: int) -> None:
+        """Stop generating for ``seq_id`` (server-side stop string / cancel).
+
+        Finalizes the request locally so the caller's stream ends immediately
+        (without a round-trip), then asks the engine to drop the sequence and
+        free its KV blocks so it stops running out to ``max_tokens``.
+        """
+        req = self._active.pop(seq_id, None)
+        if req is not None:
+            self._push(req, {"finish": True})
+            self._push(req, None)
+        if self._outbox is not None:
+            payload = self._build_free_payload([seq_id])
+            self._outbox.put_nowait((_ACTION_ABORT, payload))
 
     def _build_free_payload(self, seq_ids: list[int]) -> bytes:
         import flatbuffers

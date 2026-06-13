@@ -102,35 +102,83 @@ class DLSLimeExecutor(RayExecutor):
             imm_cnt += getattr(session, "imm_recv_count", 0)
         return wwi_ns, wwi_cnt, imm_ns, imm_cnt
 
-    def run(
-        self,
-        dp_seqs: list[list[Sequence]],
-        is_prefill: bool,
-        timeout: float | None = None,
-    ) -> list[list[list[int]]]:
+    def _probe_per_proxy(self) -> tuple[list[int], list[int]]:
+        """Per-proxy cumulative (write_with_imm_ns, imm_recv_ns) snapshots.
+
+        The DP shards issue and complete their RPCs concurrently, so the
+        per-step wall-clock cost of these verbs is the *slowest* shard (max of
+        the per-proxy deltas), not the sum across shards. Returning per-proxy
+        values lets :meth:`run_wait` take that max instead of an ~Nx-inflated
+        sum. Missing/older sessions contribute 0 (graceful degradation).
+        """
+        wwi: list[int] = []
+        imm: list[int] = []
+        for p in self._proxies:
+            session = getattr(getattr(p, "_runtime", None), "session", None)
+            if session is None:
+                wwi.append(0)
+                imm.append(0)
+                continue
+            wwi.append(getattr(session, "write_with_imm_ns_total", 0))
+            imm.append(getattr(session, "imm_recv_ns_total", 0))
+        return wwi, imm
+
+    def run_async(self, dp_seqs: list[list[Sequence]], is_prefill: bool) -> dict:
+        """Serialize and submit one forward to all DP shards without waiting.
+
+        Returns an opaque handle for :meth:`run_wait`. Splitting submit from
+        wait lets the driver overlap its own bookkeeping (stepout emission,
+        metrics, request drain) with the GPU forward of the next step.
+        """
         import time as _time
 
         _t0 = _time.perf_counter()
         batch_bytes = [serialize_run_batch(seqs, is_prefill) for seqs in dp_seqs]
         _t1 = _time.perf_counter()
-        # Bytes sent to the runners this forward (serialized RunBatch input).
-        self.last_run_request_bytes = sum(len(b) for b in batch_bytes)
         # Snapshot the C++ RPC timing probes before issuing the forward so we
         # can attribute the writeWithImm (send) / immRecv (recv) cost to this
         # step. On the no-pump fast path both verbs complete synchronously
         # inside run_batch, so the snapshot must straddle submit + wait_all.
-        wwi_ns0, _, imm_ns0, _ = self._probe_totals()
+        wwi_ns0_list, imm_ns0_list = self._probe_per_proxy()
         futures = [
             proxy.run_batch(encode_run_request(data, is_prefill))
             for proxy, data in zip(self._proxies, batch_bytes)
         ]
         _t2 = _time.perf_counter()
-        replies = self._wait_all(futures)
+        return {
+            "futures": futures,
+            "is_prefill": is_prefill,
+            "request_bytes": sum(len(b) for b in batch_bytes),
+            "t0": _t0,
+            "t1": _t1,
+            "t2": _t2,
+            "wwi_ns0_list": wwi_ns0_list,
+            "imm_ns0_list": imm_ns0_list,
+        }
+
+    def run_wait(self, handle: dict) -> list[list[list[int]]]:
+        """Wait for a forward submitted via :meth:`run_async` and decode it."""
+        import time as _time
+
+        is_prefill = handle["is_prefill"]
+        # Bytes sent to the runners this forward (serialized RunBatch input).
+        self.last_run_request_bytes = handle["request_bytes"]
+        replies = self._wait_all(handle["futures"])
         _t3 = _time.perf_counter()
-        wwi_ns1, _, imm_ns1, _ = self._probe_totals()
-        # Summed across DP shards; reported per-step in the heartbeat.
-        self.last_run_wwi_ms = max(wwi_ns1 - wwi_ns0, 0) / 1e6
-        self.last_run_immrecv_ms = max(imm_ns1 - imm_ns0, 0) / 1e6
+        wwi_ns1_list, imm_ns1_list = self._probe_per_proxy()
+        # DP shards run concurrently, so the per-step wall-clock cost of each
+        # verb is the slowest shard (max of per-proxy deltas), NOT the sum —
+        # summing inflates the metric ~Nx (N = #DP shards).
+        wwi_delta = max(
+            (a - b for a, b in zip(wwi_ns1_list, handle["wwi_ns0_list"])),
+            default=0,
+        )
+        imm_delta = max(
+            (a - b for a, b in zip(imm_ns1_list, handle["imm_ns0_list"])),
+            default=0,
+        )
+        self.last_run_wwi_ms = max(wwi_delta, 0) / 1e6
+        self.last_run_immrecv_ms = max(imm_delta, 0) / 1e6
         self.last_run_reply_bytes = sum(len(d) for d in replies)
         result = [decode_run_result(data) for data in replies]
         _t4 = _time.perf_counter()
@@ -144,23 +192,33 @@ class DLSLimeExecutor(RayExecutor):
         self.last_run_server_compute_ms = server_compute_ms
         # transfer (round-trip wall clock) minus remote compute ≈ wire +
         # queueing + dispatch, with no GPU compute or pump idle pollution.
-        self.last_run_net_ms = max((_t3 - _t1) * 1000.0 - server_compute_ms, 0.0)
+        self.last_run_net_ms = max(
+            (_t3 - handle["t1"]) * 1000.0 - server_compute_ms, 0.0
+        )
         # Per-forward DLSlime timing breakdown (surfaced in the engine heartbeat).
-        self.last_run_serialize_ms = (_t1 - _t0) * 1000.0
-        self.last_run_submit_ms = (_t2 - _t1) * 1000.0
-        self.last_run_wait_ms = (_t3 - _t2) * 1000.0
+        self.last_run_serialize_ms = (handle["t1"] - handle["t0"]) * 1000.0
+        self.last_run_submit_ms = (handle["t2"] - handle["t1"]) * 1000.0
+        self.last_run_wait_ms = (_t3 - handle["t2"]) * 1000.0
         self.last_run_decode_ms = (_t4 - _t3) * 1000.0
         # Transfer = send (submit) + wait-for-reply round trip.
-        self.last_run_transfer_ms = (_t3 - _t1) * 1000.0
+        self.last_run_transfer_ms = (_t3 - handle["t1"]) * 1000.0
         if not is_prefill:
             logger.debug(
                 f"[dlslime run] serialize={self.last_run_serialize_ms:.2f}ms "
                 f"submit={self.last_run_submit_ms:.2f}ms "
                 f"wait_all={self.last_run_wait_ms:.2f}ms "
                 f"decode={self.last_run_decode_ms:.2f}ms "
-                f"total={(_t4-_t0)*1000:.2f}ms"
+                f"total={(_t4-handle['t0'])*1000:.2f}ms"
             )
         return result
+
+    def run(
+        self,
+        dp_seqs: list[list[Sequence]],
+        is_prefill: bool,
+        timeout: float | None = None,
+    ) -> list[list[list[int]]]:
+        return self.run_wait(self.run_async(dp_seqs, is_prefill))
 
     def migrate(
         self,

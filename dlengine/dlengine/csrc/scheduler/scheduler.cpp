@@ -816,4 +816,60 @@ void Scheduler::free_to_be_migrated(const std::vector<std::shared_ptr<Sequence>>
     }
 }
 
+bool Scheduler::abort(uint64_t seq_id)
+{
+    // 1) In-flight (running) sequences across all DP workers. Mirror the
+    // FINISHED handling in postprocess_worker_func: mark FINISHED, deallocate
+    // KV blocks, then drop from the running deque.
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        auto& running = worker_state[dp_idx]->running;
+        for (auto it = running.begin(); it != running.end(); ++it) {
+            if ((*it)->seq_id() == seq_id) {
+                auto seq = *it;
+                seq->set_status(SequenceStatus::FINISHED);
+                worker_state[dp_idx]->deallocate(*seq);
+                running.erase(it);
+                return true;
+            }
+        }
+    }
+
+    // 2) Mid-prompt (prefilling) sequences hold ACTIVE blocks on their dp_idx.
+    for (auto it = prefilling.begin(); it != prefilling.end(); ++it) {
+        if ((*it)->seq_id() == seq_id) {
+            auto seq    = *it;
+            int  dp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).dp_idx;
+            seq->set_status(SequenceStatus::FINISHED);
+            if (dp_idx >= 0 && dp_idx < attention_dp_) {
+                worker_state[dp_idx]->deallocate(*seq);
+            }
+            prefilling.erase(it);
+            return true;
+        }
+    }
+
+    // 3) Not-yet-scheduled sequences (no KV blocks allocated yet): just drop.
+    for (auto* q : {&waiting, &waiting_migration}) {
+        for (auto it = q->begin(); it != q->end(); ++it) {
+            if ((*it)->seq_id() == seq_id) {
+                (*it)->set_status(SequenceStatus::FINISHED);
+                q->erase(it);
+                return true;
+            }
+        }
+    }
+
+    // 4) Prefill->decode handoff pending (PD): release the MIGRATE-slot blocks.
+    auto mit = to_be_migrated.find(static_cast<int>(seq_id));
+    if (mit != to_be_migrated.end()) {
+        auto& original_seq    = mit->second.first;
+        int   selected_dp_idx = mit->second.second;
+        worker_state[selected_dp_idx]->deallocate(*original_seq, BlockContextSlot::MIGRATE);
+        to_be_migrated.erase(mit);
+        return true;
+    }
+
+    return false;
+}
+
 }  // namespace dlengine

@@ -2,24 +2,11 @@ import ctypes
 import struct
 import time as _time
 
-import flatbuffers
 from dlslime.rpc import method
 
-from dlengine.fbs.RunBatchOutput import (
-    RunBatchOutput,
-    RunBatchOutputAddHasLogprobs,
-    RunBatchOutputAddSequences,
-    RunBatchOutputEnd,
-    RunBatchOutputStart,
-    RunBatchOutputStartSequencesVector,
-)
-from dlengine.fbs.RunSequenceOutput import (
-    RunSequenceOutputAddLogprobs,
-    RunSequenceOutputAddTokenIds,
-    RunSequenceOutputCreateLogprobsVector,
-    RunSequenceOutputCreateTokenIdsVector,
-    RunSequenceOutputEnd,
-    RunSequenceOutputStart,
+from dlengine._cpp import (
+    decode_run_result as _decode_run_result_cpp,
+    encode_run_result as _encode_run_result_cpp,
 )
 
 # Each run_batch reply is prefixed with an 8-byte little-endian uint64 holding
@@ -38,25 +25,6 @@ def pack_reply_header(server_handler_ns: int) -> bytes:
 def unpack_reply_header(data) -> int:
     """Read the server handler nanoseconds from the start of a reply buffer."""
     return _REPLY_HEADER.unpack_from(data, 0)[0]
-
-
-def _create_run_result_seq(
-    builder: flatbuffers.Builder,
-    token_ids,
-    logprobs=None,
-) -> int:
-    token_ids_vec = RunSequenceOutputCreateTokenIdsVector(builder, token_ids)
-    logprobs_vec = (
-        RunSequenceOutputCreateLogprobsVector(builder, logprobs)
-        if logprobs is not None
-        else 0
-    )
-
-    RunSequenceOutputStart(builder)
-    if logprobs_vec:
-        RunSequenceOutputAddLogprobs(builder, logprobs_vec)
-    RunSequenceOutputAddTokenIds(builder, token_ids_vec)
-    return RunSequenceOutputEnd(builder)
 
 
 def encode_run_request(data: bytes, is_prefill: bool) -> bytes:
@@ -80,54 +48,29 @@ def encode_run_result(result, server_handler_ns: int = 0) -> bytes:
 
     The returned buffer is prefixed with an 8-byte server-handler-ns header
     (see _REPLY_HEADER); the FlatBuffers root starts at REPLY_HEADER_SIZE.
+
+    Encoding runs in C++ (dlengine._cpp.encode_run_result) to keep the
+    per-seq loop out of the interpreter on the per-step hot path; the wire
+    format is unchanged.
     """
     if isinstance(result, tuple):
         token_ids, logprobs = result
     else:
         token_ids, logprobs = result, None
 
-    has_logprobs = logprobs is not None
-    builder = flatbuffers.Builder(256)
-    seq_offsets = [
-        _create_run_result_seq(
-            builder,
-            seq_token_ids,
-            logprobs[i] if has_logprobs and i < len(logprobs) else None,
-        )
-        for i, seq_token_ids in enumerate(token_ids)
-    ]
-
-    RunBatchOutputStartSequencesVector(builder, len(seq_offsets))
-    for seq_offset in reversed(seq_offsets):
-        builder.PrependUOffsetTRelative(seq_offset)
-    seqs_vec = builder.EndVector()
-
-    RunBatchOutputStart(builder)
-    RunBatchOutputAddHasLogprobs(builder, has_logprobs)
-    RunBatchOutputAddSequences(builder, seqs_vec)
-    root = RunBatchOutputEnd(builder)
-    builder.Finish(root)
-    return pack_reply_header(server_handler_ns) + bytes(builder.Output())
+    return _encode_run_result_cpp(token_ids, logprobs, server_handler_ns)
 
 
 def decode_run_result(data: bytes):
     """Decode a worker result.
 
-    Returns either ``list[list[int]]`` (token_ids only) or
-    ``(list[list[int]], list[list[float]])``. The 8-byte server-timing header
-    prepended by encode_run_result is skipped via the root offset.
+    Returns ``(list[list[int]], list[list[float]] | None)``. The 8-byte
+    server-timing header prepended by encode_run_result is skipped inside the
+    C++ decoder (dlengine._cpp.decode_run_result), which replaces the former
+    per-seq/per-token Python flatbuffers accessor loop on the per-step hot
+    path; the wire format is unchanged.
     """
-    output = RunBatchOutput.GetRootAs(data, REPLY_HEADER_SIZE)
-    has_logprobs = output.HasLogprobs()
-    token_ids = []
-    logprobs = []
-    for i in range(output.SequencesLength()):
-        seq = output.Sequences(i)
-        token_ids.append([seq.TokenIds(j) for j in range(seq.TokenIdsLength())])
-        if has_logprobs:
-            logprobs.append([seq.Logprobs(j) for j in range(seq.LogprobsLength())])
-
-    return (token_ids, logprobs) if has_logprobs else (token_ids, None)
+    return _decode_run_result_cpp(data)
 
 
 class ModelRunnerRpcService:

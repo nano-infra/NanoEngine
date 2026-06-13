@@ -5,10 +5,25 @@ interface that all backend implementations must satisfy.
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 from torch import nn
+
+
+class PrequantizedActivation(NamedTuple):
+    """FP8 activation quantised upstream of a linear layer.
+
+    Produced by fused norm+quant kernels (see
+    kernel/triton/hopper/rmsnorm_quant_fp8.py) and consumed by FP8 linear
+    layers in place of the bf16 hidden states, skipping their internal
+    ``quant_fp8_tma`` call. ``q``/``scales`` use quant_fp8_tma's
+    TMA-aligned layout; ``num_tokens`` is the unpadded row count.
+    """
+
+    q: torch.Tensor
+    scales: torch.Tensor
+    num_tokens: int
 
 
 class LinearBase(nn.Module, ABC):

@@ -34,6 +34,10 @@ logger = get_logger()
 # clients (ZmqEngineWorker, DLRouter) is unchanged.
 _ACTION_STEPOUT_BATCH = 4
 
+# client -> engine: ABORT (stop generating for the given seq_ids and free their
+# KV blocks). Reuses the FreeSequences flatbuffer payload (seq_ids list).
+_ACTION_ABORT = 5
+
 
 def build_stepout_payload(seq_id, token_ids, status) -> bytes:
     """Build a StepOut flatbuffer payload for one sequence."""
@@ -131,6 +135,35 @@ class BackendService:
             logger.error(f"Error handling free sequences: {e}")
             traceback.print_exc()
 
+    def _handle_abort(self, payload: bytes):
+        """Abort sequences and notify clients with a FINISHED stepout.
+
+        Called between steps (the backend loop defers aborts while a forward is
+        in flight, since aborting frees KV blocks the forward may still touch).
+        """
+        try:
+            from dlengine.fbs.FreeSequences import FreeSequences
+
+            abort_req = FreeSequences.GetRootAs(payload, 0)
+            n = abort_req.SeqIdsLength()
+            seq_ids = [abort_req.SeqIds(i) for i in range(n)] if n > 0 else []
+            if not seq_ids:
+                return
+
+            aborted = self.engine.abort(seq_ids)
+            logger.info(f"Aborted {len(aborted)}/{len(seq_ids)} sequences: {aborted}")
+
+            # Emit a FINISHED stepout for each aborted sequence so any client
+            # (OpenAI server, DLRouter) tears down the request cleanly. The
+            # aborted seq has been removed from the running set, so the normal
+            # step emit loop would not otherwise report it.
+            for seq_id in aborted:
+                self._send_stepout(seq_id, [], SequenceStatus.FINISHED)
+                self._freed_sequences.discard(seq_id)
+        except Exception as e:
+            logger.error(f"Error handling abort: {e}")
+            traceback.print_exc()
+
     def _send_stepout(self, seq_id, token_ids, status):
         """Send step output with one or more tokens."""
         payload = build_stepout_payload(seq_id, token_ids, status)
@@ -216,16 +249,29 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
 
     # Loop-phase timing (outside engine.step(), which has its own breakdown in
     # the heartbeat): drain = inbound request handling (add/deserialize),
-    # emit = stepout/migration/vision-free emission. Logged every ~5s; this is
-    # exactly the driver-side work that shows up as GPU idle gap on workers.
+    # emit = step_complete + stepout/migration/vision-free emission. Logged
+    # every ~5s. With the pipelined loop below, drain and emit run while the
+    # next forward is already executing on the workers, so they no longer
+    # show up as GPU idle gap.
     _lp_drain_ms = 0.0
     _lp_emit_ms = 0.0
     _lp_steps = 0
     _lp_last_log = time.time()
 
+    # Pipelined step loop: after waiting on step N's replies and running the
+    # (cheap) postprocess, immediately schedule and submit step N+1 so the
+    # GPU starts working again; then do step N's bookkeeping (token counting,
+    # heartbeat, stepout emission) and the request-queue drain in the shadow
+    # of step N+1's forward. The serial critical path between two forwards
+    # shrinks to wait + postprocess + schedule + serialize + submit.
+    pending = None  # in-flight PendingStep (forward submitted, not yet waited)
+    deferred_frees = []  # free_sequences payloads parked while a forward is in flight
+    deferred_aborts = []  # abort payloads parked while a forward is in flight
+
     while True:
         try:
-            # Drain queue of all current requests
+            # Drain queue of all current requests (overlapped with the
+            # in-flight forward when pending is set)
             _t_drain = time.perf_counter()
             while True:
                 try:
@@ -236,7 +282,21 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                         elif action == 2:
                             service._handle_get_info()
                         elif action == 3:
-                            service._handle_free_sequences(payload)
+                            # Freeing sequences mutates scheduler/block state;
+                            # unsafe while those seqs may be in the in-flight
+                            # batch. Park until the forward completes.
+                            if pending is not None:
+                                deferred_frees.append(payload)
+                            else:
+                                service._handle_free_sequences(payload)
+                        elif action == _ACTION_ABORT:
+                            # Aborting frees KV blocks the in-flight forward may
+                            # still touch; park until the forward completes
+                            # (same constraint as free_sequences above).
+                            if pending is not None:
+                                deferred_aborts.append(payload)
+                            else:
+                                service._handle_abort(payload)
                         else:
                             logger.warning(f"Unknown action: {action}")
                     except Exception as e:
@@ -246,15 +306,37 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                     break
             _lp_drain_ms += (time.perf_counter() - _t_drain) * 1000
 
-            if engine.scheduler.is_finished():
-                time.sleep(0.001)
-                continue
+            if pending is None:
+                if engine.scheduler.is_finished():
+                    time.sleep(0.001)
+                    continue
+                pending = engine.step_begin()
 
-            result = engine.step()
+            # Wait for the in-flight forward and apply its tokens.
+            result = engine.step_finish(pending)
+            done = pending
+            pending = None
 
-            logger.debug(f"Engine step completed: {result.real_bs} running sequences")
+            # No forward in flight: safe to apply parked frees/aborts before the
+            # next schedule sees (and could re-batch) those sequences.
+            if deferred_frees:
+                for payload in deferred_frees:
+                    service._handle_free_sequences(payload)
+                deferred_frees.clear()
+            if deferred_aborts:
+                for payload in deferred_aborts:
+                    service._handle_abort(payload)
+                deferred_aborts.clear()
+
+            # Kick off the next step's forward before doing step N's
+            # bookkeeping, so the GPU is busy while we count/emit below.
+            if not engine.scheduler.is_finished():
+                pending = engine.step_begin()
 
             _t_emit = time.perf_counter()
+            engine.step_complete(done, result)
+
+            logger.debug(f"Engine step completed: {result.real_bs} running sequences")
             # Single-pass optimization: merge all sequence processing into one loop.
             # NOTE: avoid seq.token_ids here -- each access copies the full C++
             # token vector into a Python list, which costs tens of ms/step at
@@ -346,6 +428,9 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
         except Exception as e:
             logger.error(f"Engine Backend Loop Error: {e}")
             traceback.print_exc()
+            # Drop any in-flight step: its executor handle can no longer be
+            # safely waited on after an arbitrary failure.
+            pending = None
             time.sleep(1)
 
 

@@ -73,6 +73,38 @@ class _Generation:
     read_offset: int = 0
 
 
+def _earliest_stop(text: str, stops: list[str]) -> Optional[int]:
+    """Return the index of the earliest stop-string occurrence, or ``None``.
+
+    Matches OpenAI/SGLang semantics: generation is cut just before the first
+    stop string and the stop string itself is excluded from the output.
+    """
+    best: Optional[int] = None
+    for s in stops:
+        idx = text.find(s)
+        if idx != -1 and (best is None or idx < best):
+            best = idx
+    return best
+
+
+def _partial_stop_holdback(text: str, stops: list[str]) -> int:
+    """Length of the trailing run of ``text`` that may be a partial stop match.
+
+    A stop string can be split across decode/delta boundaries (e.g. ``"Quest"``
+    then ``"ion:"`` for stop ``"Question:"``). To avoid emitting a prefix of a
+    stop string that later completes, we withhold the longest suffix of ``text``
+    that equals a proper prefix of some stop string. The held bytes are emitted
+    later, either after the match completes (and is cut) or once the stream ends.
+    """
+    max_hold = 0
+    for s in stops:
+        for k in range(min(len(s) - 1, len(text)), 0, -1):
+            if text.endswith(s[:k]):
+                max_hold = max(max_hold, k)
+                break
+    return max_hold
+
+
 class EngineWorker:
     """Drives ``engine.step()`` on a background thread.
 
@@ -87,6 +119,9 @@ class EngineWorker:
         # PD: seq_ids whose prefill-side MIGRATE KV blocks can be freed once a
         # decode engine has pulled them. Drained on the engine thread.
         self._free_inbox: "queue.Queue[list[int]]" = queue.Queue()
+        # seq_ids to abort (server-side stop string / cancel). Drained on the
+        # engine thread between steps so it never races the forward.
+        self._abort_inbox: "queue.Queue[int]" = queue.Queue()
         self._active: dict[int, _Request] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -106,6 +141,10 @@ class EngineWorker:
         """Queue prefill-side MIGRATE KV blocks for release (PD)."""
         if seq_ids:
             self._free_inbox.put(list(seq_ids))
+
+    def abort(self, seq_id: int) -> None:
+        """Request early termination of a running sequence (engine thread)."""
+        self._abort_inbox.put(int(seq_id))
 
     def _push(self, req: _Request, item: Optional[dict]) -> None:
         req.loop.call_soon_threadsafe(req.aqueue.put_nowait, item)
@@ -147,6 +186,22 @@ class EngineWorker:
                     logger.info(f"Freed migrated sequences: {free_ids}")
                 except Exception as e:  # noqa: BLE001
                     logger.error(f"free_to_be_migrated failed for {free_ids}: {e}")
+
+            # Drain abort requests between steps: stop generating for these
+            # sequences, free their KV, and finalize the waiting HTTP request.
+            while True:
+                try:
+                    abort_id = self._abort_inbox.get_nowait()
+                except queue.Empty:
+                    break
+                req = self._active.pop(abort_id, None)
+                try:
+                    engine.abort(abort_id)
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"abort failed for {abort_id}: {e}")
+                if req is not None:
+                    self._push(req, {"finish": True})
+                    self._push(req, None)
 
             if engine.is_finished():
                 time.sleep(0.001)
@@ -290,6 +345,24 @@ class OpenAIServer:
             ignore_eos=bool(body.get("ignore_eos", False)),
         )
 
+    @staticmethod
+    def _parse_stop(body: dict) -> list[str]:
+        """Extract OpenAI-style stop sequences from a request body.
+
+        ``stop`` may be a single string or a list of strings (lm_eval sends its
+        ``until`` list here, e.g. ``["Question:", "</s>", "<|im_end|>"]``). The
+        engine has no native stop-string support, so generation is truncated in
+        the serving layer (see :meth:`stream_text`).
+        """
+        raw = body.get("stop")
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [s for s in raw if isinstance(s, str) and s]
+
     def submit(self, prompt_ids: list[int], sampling_params: Any) -> _Request:
         from dlengine import Sequence
 
@@ -372,22 +445,69 @@ class OpenAIServer:
         return ""
 
     async def stream_text(
-        self, req: _Request, max_tokens: int
+        self, req: _Request, max_tokens: int, stop: Optional[list[str]] = None
     ) -> AsyncGenerator[tuple[str, _Generation], None]:
-        """Yield ``(delta_text, generation)`` as tokens arrive."""
+        """Yield ``(delta_text, generation)`` as tokens arrive.
+
+        When ``stop`` sequences are given, generation is truncated at the
+        earliest stop string (matched against the cumulative decoded text, so a
+        stop string split across token/delta boundaries is still caught). The
+        stop string itself is not emitted, matching OpenAI/SGLang semantics.
+
+        On a stop hit we ask the engine to abort the sequence (free its KV and
+        stop generating) instead of letting it run out to ``max_tokens``, so we
+        get SGLang-style early-stop throughput.
+        """
+        stops = stop or []
         gen = _Generation()
+        text = ""  # cumulative decoded text (emitted + pending)
+        emitted = 0  # number of chars already yielded
+        finish_reason: Optional[str] = None
         while True:
             item = await req.aqueue.get()
             if item is None:
                 break
             if "error" in item:
                 raise RuntimeError(item["error"])
-            if "tokens" in item:
-                gen.token_ids.extend(item["tokens"])
-                delta = self._incremental_detokenize(gen)
-                if delta:
-                    yield delta, gen
-        gen.finish_reason = "length" if len(gen.token_ids) >= max_tokens else "stop"
+            if "tokens" not in item:
+                continue
+            gen.token_ids.extend(item["tokens"])
+            delta = self._incremental_detokenize(gen)
+            if not delta:
+                continue
+            text += delta
+            if stops:
+                idx = _earliest_stop(text, stops)
+                if idx is not None:
+                    if idx > emitted:
+                        yield text[emitted:idx], gen
+                        emitted = idx
+                    finish_reason = "stop"
+                    self._abort_request(req)
+                    break
+                # Hold back a trailing partial stop match until it completes
+                # (and gets cut) or is proven not to be a stop string.
+                safe = len(text) - _partial_stop_holdback(text, stops)
+                if safe > emitted:
+                    yield text[emitted:safe], gen
+                    emitted = safe
+            else:
+                yield text[emitted:], gen
+                emitted = len(text)
+        if finish_reason is None:
+            # Stream ended (EOS / max_tokens): flush any held-back partial-stop
+            # tail, since it never completed into a real stop string.
+            if emitted < len(text):
+                yield text[emitted:], gen
+            finish_reason = "length" if len(gen.token_ids) >= max_tokens else "stop"
+        gen.finish_reason = finish_reason
+
+    def _abort_request(self, req: _Request) -> None:
+        """Best-effort engine-side abort for a request that hit a stop string."""
+        try:
+            self.worker.abort(req.seq.seq_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"abort failed for seq_id={req.seq.seq_id}: {e}")
 
 
 # ----------------------------------------------------------------------------
@@ -466,6 +586,7 @@ def build_app(server: OpenAIServer):
         messages = body.get("messages") or []
         sampling_params = server._build_sampling_params(body)
         max_tokens = sampling_params.max_tokens
+        stop = server._parse_stop(body)
         prompt_ids = server._encode_chat(messages)
 
         created = int(time.time())
@@ -586,7 +707,9 @@ def build_app(server: OpenAIServer):
                 yield f"data: {json.dumps(first)}\n\n".encode()
                 gen = _Generation()
                 try:
-                    async for delta, gen in server.stream_text(req, max_tokens):
+                    async for delta, gen in server.stream_text(
+                        req, max_tokens, stop=stop
+                    ):
                         chunk = {
                             "id": cmpl_id,
                             "object": "chat.completion.chunk",
@@ -624,7 +747,7 @@ def build_app(server: OpenAIServer):
         text = ""
         gen = _Generation()
         try:
-            async for delta, gen in server.stream_text(req, max_tokens):
+            async for delta, gen in server.stream_text(req, max_tokens, stop=stop):
                 text += delta
         except RuntimeError as e:
             return JSONResponse(
@@ -702,6 +825,7 @@ def build_app(server: OpenAIServer):
             prompt = prompt[0] if prompt else ""
         sampling_params = server._build_sampling_params(body)
         max_tokens = sampling_params.max_tokens
+        stop = server._parse_stop(body)
         prompt_ids = server.tokenizer.encode(prompt)
 
         created = int(time.time())
@@ -793,7 +917,9 @@ def build_app(server: OpenAIServer):
 
                 gen = _Generation()
                 try:
-                    async for delta, gen in server.stream_text(req, max_tokens):
+                    async for delta, gen in server.stream_text(
+                        req, max_tokens, stop=stop
+                    ):
                         chunk = {
                             "id": cmpl_id,
                             "object": "text_completion",
@@ -826,7 +952,7 @@ def build_app(server: OpenAIServer):
         text = ""
         gen = _Generation()
         try:
-            async for delta, gen in server.stream_text(req, max_tokens):
+            async for delta, gen in server.stream_text(req, max_tokens, stop=stop):
                 text += delta
         except RuntimeError as e:
             return JSONResponse(
