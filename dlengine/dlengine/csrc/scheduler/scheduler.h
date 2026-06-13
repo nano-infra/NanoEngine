@@ -101,6 +101,12 @@ public:
     // allocate()) when the model has compressed layers.
     void configure_compressed_pools(const std::vector<CompressedPoolConfig>& configs);
 
+    // Disable/enable cross-request prefix caching across all DP workers. Must
+    // be called once after construction (before any allocate()). Disabled for
+    // models with linear-attention layers, where prefix reuse corrupts the
+    // recurrent state cache.
+    void set_prefix_caching_enabled(bool enabled);
+
     // Main scheduling functions
     ScheduleResult schedule();
 

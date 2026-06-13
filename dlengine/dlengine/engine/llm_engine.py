@@ -145,6 +145,12 @@ class LLMEngine:
         )
         self.metrics_manager = MetricsManager()
 
+        # Seq ids whose prefix-cache hit has already been counted. A prompt is
+        # admitted once but (under chunked prefill) appears in several prefill
+        # steps, so we tally num_cached_tokens exactly once per sequence and
+        # drop the id again when the sequence finishes.
+        self._prefix_counted_seq_ids: set[int] = set()
+
         atexit.register(self.exit)
 
     def exit(self):
@@ -425,11 +431,24 @@ class LLMEngine:
                 dp_idx, num_tokens_in_dp
             )
 
+        # Prefix-cache accounting (prefill only): tally each newly admitted
+        # prompt's cached vs. total prompt tokens exactly once.
+        prefix_cached_tokens = 0
+        prefix_prompt_tokens = 0
+
         if pending.is_prefill:
             for dp_idx, seqs in enumerate(dp_seqs):
                 prefill_tokens_per_dp[dp_idx] += sum(
                     len(seq) for seq in seqs if seq.seq_id not in dummy_seq_ids
                 )
+                for seq in seqs:
+                    if seq.seq_id in dummy_seq_ids:
+                        continue
+                    if seq.seq_id in self._prefix_counted_seq_ids:
+                        continue
+                    self._prefix_counted_seq_ids.add(seq.seq_id)
+                    prefix_cached_tokens += seq.num_cached_tokens
+                    prefix_prompt_tokens += seq.num_prompt_tokens
         elif token_ids is not None:
             for dp_idx in range(dp_size):
                 for sp_idx in range(sp_size):
@@ -452,6 +471,7 @@ class LLMEngine:
             for seq in seqs:
                 if seq.is_finished or seq.is_to_be_migrated:
                     self.metrics_manager.complete_sequence(seq.seq_id)
+                    self._prefix_counted_seq_ids.discard(seq.seq_id)
                     outputs.append(seq)
         result.outputs = outputs
         result.real_bs = sum(
@@ -494,6 +514,8 @@ class LLMEngine:
             total_blocks=blocks_per_dp,
             prefill_tokens_per_dp=prefill_tokens_per_dp,
             decode_tokens_per_dp=decode_tokens_per_dp,
+            prefix_cached_tokens=prefix_cached_tokens,
+            prefix_prompt_tokens=prefix_prompt_tokens,
             schedule_ms=result.schedule_latency_ms,
             forward_ms=forward_latency_ms,
             postprocess_ms=result.postprocess_latency_ms,

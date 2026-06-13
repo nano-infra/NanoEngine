@@ -58,6 +58,13 @@ void Scheduler::configure_compressed_pools(const std::vector<CompressedPoolConfi
     }
 }
 
+void Scheduler::set_prefix_caching_enabled(bool enabled)
+{
+    for (auto& gm : worker_state) {
+        gm->set_prefix_caching_enabled(enabled);
+    }
+}
+
 void Scheduler::add(std::shared_ptr<Sequence> seq)
 {
     int prompt_len = seq->num_prompt_tokens();

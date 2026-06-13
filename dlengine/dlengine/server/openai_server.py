@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import os
 import queue
+import signal
 import threading
 import time
 import uuid
@@ -71,6 +73,12 @@ class _Generation:
     finish_reason: str = "stop"
     prefix_offset: int = 0
     read_offset: int = 0
+    tool_calls: list = field(default_factory=list)
+    reasoning: Optional[str] = None
+    # True while the current streamed delta belongs to the model's reasoning
+    # ("thinking") region rather than the user-visible answer. Consumers route
+    # the delta to ``reasoning_content`` instead of ``content`` accordingly.
+    in_reasoning: bool = False
 
 
 def _earliest_stop(text: str, stops: list[str]) -> Optional[int]:
@@ -278,6 +286,15 @@ class OpenAIServer:
         self.model_path = model_path.rstrip("/")
         self.default_max_tokens = default_max_tokens
         self._model_aliases = self._build_model_aliases()
+        from dlengine.server.tool_parser import detect_parser_name, get_tool_parser
+
+        self.tool_parser_name = detect_parser_name(
+            model_path,
+            served_model_name,
+            getattr(tokenizer, "chat_template", None),
+        )
+        self.tool_parser = get_tool_parser(self.tool_parser_name)
+        logger.info(f"Tool-call parser: {self.tool_parser_name}")
 
     def _build_model_aliases(self) -> set[str]:
         """OpenAI ``model`` values accepted on this server (alias + path)."""
@@ -312,11 +329,109 @@ class OpenAIServer:
 
     # -- prompt construction --
 
-    def _encode_chat(self, messages: list[dict]) -> list[int]:
+    @staticmethod
+    def _normalize_messages(messages: list[dict]) -> list[dict]:
+        """Reshape OpenAI/Anthropic-proxy messages into what chat templates expect.
+
+        Two incompatibilities break Jinja chat templates (e.g. Qwen3.5):
+          1. ``content`` arrives as a list of content parts
+             (``[{"type": "text", "text": ...}]``) instead of a plain string.
+          2. assistant ``tool_calls[].function.arguments`` arrives as a JSON
+             string (per the OpenAI spec), but templates iterate it with the
+             ``|items`` filter, which requires a mapping.
+        """
+
+        def flatten_content(content: Any) -> Any:
+            if not isinstance(content, list):
+                return content
+            texts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    texts.append(part)
+                elif isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        texts.append(text)
+            return "".join(texts)
+
+        normalized: list[dict] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                normalized.append(message)
+                continue
+            new_message = dict(message)
+
+            if "content" in new_message:
+                new_message["content"] = flatten_content(new_message["content"])
+
+            tool_calls = new_message.get("tool_calls")
+            if isinstance(tool_calls, list):
+                new_tool_calls = []
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        new_tool_calls.append(call)
+                        continue
+                    call = dict(call)
+                    fn = call.get("function")
+                    if isinstance(fn, dict):
+                        fn = dict(fn)
+                        args = fn.get("arguments")
+                        if isinstance(args, str):
+                            try:
+                                parsed = json.loads(args) if args.strip() else {}
+                            except (ValueError, TypeError):
+                                parsed = {}
+                            fn["arguments"] = parsed if isinstance(parsed, dict) else {}
+                        elif args is None:
+                            fn["arguments"] = {}
+                        call["function"] = fn
+                    new_tool_calls.append(call)
+                new_message["tool_calls"] = new_tool_calls
+
+            normalized.append(new_message)
+        return normalized
+
+    @staticmethod
+    def _prompt_opens_thinking(prompt: str) -> bool:
+        """True if the rendered prompt leaves a ``<think>`` block open.
+
+        Thinking templates (e.g. Qwen3.5) append a bare ``<think>`` to the
+        generation prompt, so the model's output starts inside the reasoning
+        region and emits only the closing ``</think>``. When thinking is
+        disabled the template instead appends a self-closed ``<think></think>``,
+        which this correctly reports as not open.
+        """
+        open_idx = prompt.rfind("<think>")
+        if open_idx == -1:
+            return False
+        return prompt.rfind("</think>") < open_idx
+
+    def _encode_chat(
+        self,
+        messages: list[dict],
+        tools: Optional[list[dict]] = None,
+        tool_choice: Any = None,
+    ) -> tuple[list[int], bool]:
+        """Return ``(prompt_token_ids, reasoning_open)``.
+
+        ``reasoning_open`` indicates the chat template started a ``<think>``
+        block the model is expected to close, so the streaming layer can route
+        the leading reasoning to ``reasoning_content`` instead of ``content``.
+        """
         tok = self.tokenizer
+        messages = self._normalize_messages(messages)
         if getattr(tok, "chat_template", None):
+            template_kwargs: dict[str, Any] = {}
+            if tools:
+                # Qwen3/Hermes templates render tool schemas into a system
+                # preamble when ``tools`` is provided. Unsupported templates
+                # silently ignore the kwarg, so this is safe across models.
+                template_kwargs["tools"] = tools
             prompt = tok.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                **template_kwargs,
             )
         else:
             # Minimal fallback when the tokenizer ships no chat template.
@@ -324,7 +439,7 @@ class OpenAIServer:
                 f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages
             ]
             prompt = "\n".join(parts) + "\nassistant:"
-        return tok.encode(prompt)
+        return tok.encode(prompt), self._prompt_opens_thinking(prompt)
 
     # -- request submission + streaming --
 
@@ -445,7 +560,12 @@ class OpenAIServer:
         return ""
 
     async def stream_text(
-        self, req: _Request, max_tokens: int, stop: Optional[list[str]] = None
+        self,
+        req: _Request,
+        max_tokens: int,
+        stop: Optional[list[str]] = None,
+        hold_markers: Optional[list[str]] = None,
+        reasoning_open: bool = False,
     ) -> AsyncGenerator[tuple[str, _Generation], None]:
         """Yield ``(delta_text, generation)`` as tokens arrive.
 
@@ -457,12 +577,27 @@ class OpenAIServer:
         On a stop hit we ask the engine to abort the sequence (free its KV and
         stop generating) instead of letting it run out to ``max_tokens``, so we
         get SGLang-style early-stop throughput.
+
+        ``hold_markers`` (e.g. ``<tool_call>`` / ``<think>``) are *soft* cuts: as
+        soon as one appears, content emission freezes at the marker and the rest
+        of the generation is buffered (not streamed as content). Generation is
+        NOT aborted so the tool call completes; the caller parses the full text
+        afterwards (see :meth:`OpenAIServer.tool_parser`). Trailing partial
+        matches of either ``stop`` or ``hold_markers`` are withheld so a tag
+        split across delta boundaries never leaks a fragment.
         """
         stops = stop or []
+        markers = hold_markers or []
         gen = _Generation()
         text = ""  # cumulative decoded text (emitted + pending)
         emitted = 0  # number of chars already yielded
         finish_reason: Optional[str] = None
+        holding_marker = False
+        # Thinking models open ``<think>`` in the prompt; the generated text is
+        # reasoning until the closing ``</think>``. While active we route the
+        # text to a reasoning channel (gen.in_reasoning) instead of content.
+        reasoning_active = reasoning_open
+        think_close = "</think>"
         while True:
             item = await req.aqueue.get()
             if item is None:
@@ -476,6 +611,30 @@ class OpenAIServer:
             if not delta:
                 continue
             text += delta
+            if reasoning_active:
+                close = text.find(think_close, emitted)
+                if close == -1:
+                    # No closing tag yet: stream reasoning, but hold back a
+                    # trailing partial "</think>" so the tag never leaks.
+                    holdback = _partial_stop_holdback(text, [think_close])
+                    safe = len(text) - holdback
+                    if safe > emitted:
+                        gen.in_reasoning = True
+                        chunk = text[emitted:safe]
+                        gen.reasoning = (gen.reasoning or "") + chunk
+                        yield chunk, gen
+                        emitted = safe
+                    continue
+                # Closing tag found: flush remaining reasoning, drop the tag,
+                # then fall through to normal content handling for the tail.
+                if close > emitted:
+                    gen.in_reasoning = True
+                    chunk = text[emitted:close]
+                    gen.reasoning = (gen.reasoning or "") + chunk
+                    yield chunk, gen
+                emitted = close + len(think_close)
+                reasoning_active = False
+                gen.in_reasoning = False
             if stops:
                 idx = _earliest_stop(text, stops)
                 if idx is not None:
@@ -485,19 +644,36 @@ class OpenAIServer:
                     finish_reason = "stop"
                     self._abort_request(req)
                     break
-                # Hold back a trailing partial stop match until it completes
-                # (and gets cut) or is proven not to be a stop string.
-                safe = len(text) - _partial_stop_holdback(text, stops)
-                if safe > emitted:
-                    yield text[emitted:safe], gen
-                    emitted = safe
-            else:
-                yield text[emitted:], gen
-                emitted = len(text)
+            # Freeze emission at the first tool/think marker; buffer the rest.
+            if markers and not holding_marker:
+                midx = _earliest_stop(text, markers)
+                if midx is not None:
+                    holding_marker = True
+                    if midx > emitted:
+                        yield text[emitted:midx], gen
+                        emitted = midx
+            if holding_marker:
+                continue
+            # Hold back a trailing partial stop/marker match until it completes
+            # (and gets cut) or is proven not to be a real tag.
+            holdback = _partial_stop_holdback(text, stops + markers)
+            safe = len(text) - holdback
+            if safe > emitted:
+                yield text[emitted:safe], gen
+                emitted = safe
         if finish_reason is None:
             # Stream ended (EOS / max_tokens): flush any held-back partial-stop
-            # tail, since it never completed into a real stop string.
-            if emitted < len(text):
+            # tail, since it never completed into a real stop string. Do NOT
+            # flush a buffered tool/think region; the caller parses it instead.
+            if reasoning_active and emitted < len(text):
+                # Model produced only reasoning and never closed </think>:
+                # emit the tail on the reasoning channel, not as content.
+                gen.in_reasoning = True
+                chunk = text[emitted:]
+                gen.reasoning = (gen.reasoning or "") + chunk
+                yield chunk, gen
+            elif not holding_marker and not reasoning_active and emitted < len(text):
+                gen.in_reasoning = False
                 yield text[emitted:], gen
             finish_reason = "length" if len(gen.token_ids) >= max_tokens else "stop"
         gen.finish_reason = finish_reason
@@ -508,6 +684,39 @@ class OpenAIServer:
             self.worker.abort(req.seq.seq_id)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"abort failed for seq_id={req.seq.seq_id}: {e}")
+
+    def _spawn_disconnect_monitor(self, request: "Request", req: _Request):
+        """Abort the engine sequence if the HTTP client disconnects mid-generation.
+
+        Without this, killing the client (e.g. ``curl`` Ctrl+C) leaves the
+        sequence running on the GPU until it hits EOS/``max_tokens``, wasting
+        compute and KV. Non-streaming requests in particular are never cancelled
+        by the ASGI server on disconnect, so we poll ``is_disconnected()`` here
+        and trigger the existing abort path (engine frees KV and stops decoding).
+
+        Returns an ``asyncio.Task`` the caller must cancel once generation
+        finishes normally.
+        """
+
+        async def _monitor() -> None:
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        logger.info(
+                            f"client disconnected; aborting seq_id={req.seq.seq_id}"
+                        )
+                        self._abort_request(req)
+                        return
+                    await asyncio.sleep(0.25)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:  # noqa: BLE001 - monitor must never crash
+                logger.debug(
+                    f"disconnect monitor error for seq_id={req.seq.seq_id}: {e}"
+                )
+                return
+
+        return asyncio.ensure_future(_monitor())
 
 
 # ----------------------------------------------------------------------------
@@ -521,6 +730,22 @@ def build_app(server: OpenAIServer):
     @app.get("/health")
     async def health() -> PlainTextResponse:  # noqa: ANN202
         return PlainTextResponse("OK")
+
+    @app.get("/metrics")
+    async def metrics() -> PlainTextResponse:  # noqa: ANN202
+        engine = getattr(server.worker, "engine", None)
+        metrics_manager = getattr(engine, "metrics_manager", None)
+        if metrics_manager is None:
+            return PlainTextResponse(
+                "# HELP dlengine_up DLEngine metrics exporter health.\n"
+                "# TYPE dlengine_up gauge\n"
+                "dlengine_up 0\n",
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+        return PlainTextResponse(
+            metrics_manager.to_prometheus(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.get("/v1/models")
     async def models() -> JSONResponse:  # noqa: ANN202
@@ -584,10 +809,15 @@ def build_app(server: OpenAIServer):
                 },
             )
         messages = body.get("messages") or []
+        tools = body.get("tools")
+        tool_choice = body.get("tool_choice")
+        use_tools = bool(tools) and tool_choice != "none"
         sampling_params = server._build_sampling_params(body)
         max_tokens = sampling_params.max_tokens
         stop = server._parse_stop(body)
-        prompt_ids = server._encode_chat(messages)
+        prompt_ids, reasoning_open = server._encode_chat(
+            messages, tools=tools, tool_choice=tool_choice
+        )
 
         created = int(time.time())
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -706,10 +936,27 @@ def build_app(server: OpenAIServer):
                 }
                 yield f"data: {json.dumps(first)}\n\n".encode()
                 gen = _Generation()
+                finished_normally = False
+                monitor = server._spawn_disconnect_monitor(request, req)
+                hold_markers = (
+                    list(server.tool_parser.open_markers) if use_tools else None
+                )
+                streamed_reasoning = False
                 try:
                     async for delta, gen in server.stream_text(
-                        req, max_tokens, stop=stop
+                        req,
+                        max_tokens,
+                        stop=stop,
+                        hold_markers=hold_markers,
+                        reasoning_open=reasoning_open,
                     ):
+                        # Reasoning ("thinking") tokens go to reasoning_content;
+                        # everything else is the user-visible answer.
+                        if gen.in_reasoning:
+                            streamed_reasoning = True
+                            delta_obj = {"reasoning_content": delta}
+                        else:
+                            delta_obj = {"content": delta}
                         chunk = {
                             "id": cmpl_id,
                             "object": "chat.completion.chunk",
@@ -718,34 +965,78 @@ def build_app(server: OpenAIServer):
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"content": delta},
+                                    "delta": delta_obj,
                                     "finish_reason": None,
                                 }
                             ],
                         }
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
+                    final_finish_reason = gen.finish_reason
+                    if use_tools:
+                        full_text = server.tokenizer.decode(
+                            gen.token_ids, skip_special_tokens=True
+                        )
+                        parsed = server.tool_parser.parse_full(full_text)
+                        tool_delta: dict[str, Any] = {}
+                        # Only attach reasoning here if it was not already
+                        # streamed live (avoids duplicating the think region).
+                        if parsed.reasoning is not None and not streamed_reasoning:
+                            tool_delta["reasoning_content"] = parsed.reasoning
+                        if parsed.tool_calls:
+                            tool_delta["tool_calls"] = [
+                                {"index": i, **tc.to_dict()}
+                                for i, tc in enumerate(parsed.tool_calls)
+                            ]
+                            final_finish_reason = "tool_calls"
+                        if tool_delta:
+                            tool_chunk = {
+                                "id": cmpl_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": tool_delta,
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(tool_chunk)}\n\n".encode()
+                    final = {
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": final_finish_reason,
+                            }
+                        ],
+                    }
+                    finished_normally = True
+                    yield f"data: {json.dumps(final)}\n\n".encode()
+                    yield b"data: [DONE]\n\n"
                 except RuntimeError as e:
                     err = {"error": {"message": str(e), "type": "engine_error"}}
+                    finished_normally = True
                     yield f"data: {json.dumps(err)}\n\n".encode()
                     yield b"data: [DONE]\n\n"
-                    return
-                final = {
-                    "id": cmpl_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {"index": 0, "delta": {}, "finish_reason": gen.finish_reason}
-                    ],
-                }
-                yield f"data: {json.dumps(final)}\n\n".encode()
-                yield b"data: [DONE]\n\n"
+                finally:
+                    monitor.cancel()
+                    # Client dropped mid-stream (GeneratorExit before the loop
+                    # finished): make sure the engine stops generating.
+                    if not finished_normally:
+                        server._abort_request(req)
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
         # Non-streaming: drain the whole generation.
         text = ""
         gen = _Generation()
+        monitor = server._spawn_disconnect_monitor(request, req)
         try:
             async for delta, gen in server.stream_text(req, max_tokens, stop=stop):
                 text += delta
@@ -754,6 +1045,22 @@ def build_app(server: OpenAIServer):
                 status_code=500,
                 content={"error": {"message": str(e), "type": "engine_error"}},
             )
+        finally:
+            monitor.cancel()
+        # Always split off the reasoning region and any tool-call markup so the
+        # think text never leaks into ``content`` (the template opens <think>
+        # in the prompt, so the answer is preceded by reasoning + </think>).
+        parsed = server.tool_parser.parse_full(text)
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": parsed.content if parsed.content is not None else "",
+        }
+        if parsed.reasoning is not None:
+            message["reasoning_content"] = parsed.reasoning
+        finish_reason = gen.finish_reason
+        if use_tools and parsed.tool_calls:
+            message["tool_calls"] = [tc.to_dict() for tc in parsed.tool_calls]
+            finish_reason = "tool_calls"
         return JSONResponse(
             {
                 "id": cmpl_id,
@@ -763,8 +1070,8 @@ def build_app(server: OpenAIServer):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": gen.finish_reason,
+                        "message": message,
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": {
@@ -916,6 +1223,8 @@ def build_app(server: OpenAIServer):
                 import json
 
                 gen = _Generation()
+                finished_normally = False
+                monitor = server._spawn_disconnect_monitor(request, req)
                 try:
                     async for delta, gen in server.stream_text(
                         req, max_tokens, stop=stop
@@ -930,27 +1239,33 @@ def build_app(server: OpenAIServer):
                             ],
                         }
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
+                    final = {
+                        "id": cmpl_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {"index": 0, "text": "", "finish_reason": gen.finish_reason}
+                        ],
+                    }
+                    finished_normally = True
+                    yield f"data: {json.dumps(final)}\n\n".encode()
+                    yield b"data: [DONE]\n\n"
                 except RuntimeError as e:
                     err = {"error": {"message": str(e), "type": "engine_error"}}
+                    finished_normally = True
                     yield f"data: {json.dumps(err)}\n\n".encode()
                     yield b"data: [DONE]\n\n"
-                    return
-                final = {
-                    "id": cmpl_id,
-                    "object": "text_completion",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {"index": 0, "text": "", "finish_reason": gen.finish_reason}
-                    ],
-                }
-                yield f"data: {json.dumps(final)}\n\n".encode()
-                yield b"data: [DONE]\n\n"
+                finally:
+                    monitor.cancel()
+                    if not finished_normally:
+                        server._abort_request(req)
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
         text = ""
         gen = _Generation()
+        monitor = server._spawn_disconnect_monitor(request, req)
         try:
             async for delta, gen in server.stream_text(req, max_tokens, stop=stop):
                 text += delta
@@ -959,6 +1274,8 @@ def build_app(server: OpenAIServer):
                 status_code=500,
                 content={"error": {"message": str(e), "type": "engine_error"}},
             )
+        finally:
+            monitor.cancel()
         return JSONResponse(
             {
                 "id": cmpl_id,
@@ -1122,6 +1439,9 @@ def run_server(
     logger.info(f"  http:              {host}:{port}")
     logger.info(f"  mode:              {config.mode}")
     logger.info(f"  ctrl-address:      {ctrl_address or '(disabled)'}")
+    logger.info(
+        f"  monitor:           {'enabled' if config.enable_monitor else 'disabled'}"
+    )
     logger.info("=" * 72)
 
     # Build the engine + worker.
@@ -1187,13 +1507,68 @@ def run_server(
     @app.on_event("startup")
     async def _on_startup() -> None:  # noqa: ANN202
         nonlocal ctrl_client
+        # Register signal handlers on the *running* loop so Ctrl+C / SIGTERM are
+        # dispatched promptly even under uvloop and even while we are parked in
+        # the engine-readiness ``await`` below (plain signal.signal handlers are
+        # unreliable there). _signal_cleanup is defined later in run_server but
+        # resolved via closure at call time.
+        try:
+            loop = asyncio.get_running_loop()
+            for _sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(_sig, _signal_cleanup, _sig)
+        except (NotImplementedError, RuntimeError):
+            pass
         # ipc path: connect to the engine process and block until it is ready
         # (also resolves the engine_id needed for PD peer registration).
         if config.engine_ipc:
-            await worker.start()
+            # Race readiness against engine-process liveness: if the engine
+            # subprocess dies during startup (no GPUs / Ray PG unavailable /
+            # CUDA OOM), the readiness handshake would otherwise hang forever.
+            # Surface it as a startup failure so the server cleans up and exits
+            # instead of wedging with an unkillable HTTP loop.
+            start_task = asyncio.ensure_future(worker.start())
+            while not start_task.done():
+                if engine_proc is not None and not engine_proc.is_alive():
+                    start_task.cancel()
+                    raise RuntimeError(
+                        "Engine process exited during startup "
+                        f"(exitcode={engine_proc.exitcode}); aborting server start"
+                    )
+                done, _ = await asyncio.wait({start_task}, timeout=0.5)
+            await start_task  # propagate any exception raised by worker.start()
             engine_id = worker.engine_id
         else:
             engine_id = getattr(engine, "engine_id", None)
+        if config.enable_monitor:
+            try:
+                from dlengine.monitor import (
+                    default_dlengine_target,
+                    GRAFANA_PORT,
+                    PROMETHEUS_PORT,
+                    start_monitor_stack,
+                )
+
+                target = config.monitor_target or default_dlengine_target(port)
+                monitor_root = start_monitor_stack(
+                    config.monitor_dir,
+                    dlengine_target=target,
+                    scrape_interval=config.monitor_scrape_interval,
+                )
+                logger.info(
+                    "Started DLEngine monitor stack at %s "
+                    "(Prometheus http://localhost:%s, Grafana http://localhost:%s, "
+                    "target %s)",
+                    monitor_root,
+                    PROMETHEUS_PORT,
+                    GRAFANA_PORT,
+                    target,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    "Could not start monitor stack. /metrics is still available "
+                    "for Prometheus scrape: %s",
+                    e,
+                )
         if ctrl_address:
             try:
                 ctrl_client = register_with_ctrl(
@@ -1209,19 +1584,75 @@ def run_server(
             except Exception as e:  # noqa: BLE001
                 logger.error(f"Could not register with dlslime-ctrl: {e}")
 
+    _cleanup_done = {"v": False}
+
+    def _cleanup() -> None:
+        """Tear down the ctrl registration, zmq worker, and engine subprocess.
+
+        Idempotent and safe to call from a signal handler, the FastAPI shutdown
+        hook, or the post-serve ``finally``. Crucially this runs even when the
+        ASGI lifespan never finished startup (e.g. Ctrl+C during a slow model
+        load), which the old shutdown-event-only path did not — that left the
+        engine process and its Ray actors orphaned.
+        """
+        if _cleanup_done["v"]:
+            return
+        _cleanup_done["v"] = True
+        try:
+            if ctrl_client is not None:
+                ctrl_client.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            worker.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        if engine_proc is not None:
+            try:
+                engine_proc.terminate()
+                engine_proc.join(timeout=5)
+                if engine_proc.is_alive():
+                    engine_proc.kill()
+                    engine_proc.join(timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
+        if engine_endpoint and engine_endpoint.startswith("ipc://"):
+            sock_path = engine_endpoint[len("ipc://") :]
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+
     @app.on_event("shutdown")
     async def _on_shutdown() -> None:  # noqa: ANN202
-        if ctrl_client is not None:
-            ctrl_client.stop()
-        worker.stop()
-        if engine_proc is not None:
-            engine_proc.terminate()
-            engine_proc.join(timeout=5)
-            if engine_endpoint and engine_endpoint.startswith("ipc://"):
-                sock_path = engine_endpoint[len("ipc://") :]
-                try:
-                    os.unlink(sock_path)
-                except OSError:
-                    pass
+        _cleanup()
 
-    uvicorn.run(app, host=host, port=port)
+    # Own the signal handlers instead of uvicorn: uvicorn does not cancel the
+    # lifespan-startup task on SIGINT, so Ctrl+C during a slow startup would
+    # hang the process (and never clean up the engine subprocess). Our handler
+    # stays installed throughout startup, tears everything down, and hard-exits.
+    _signal_state = {"in_progress": False}
+
+    def _signal_cleanup(signum, _frame=None) -> None:
+        # A second signal while we're already tearing down means "I don't care
+        # about graceful, kill it now" — hard-exit immediately.
+        if _signal_state["in_progress"]:
+            os._exit(1)
+        _signal_state["in_progress"] = True
+        logger.info(f"Received signal {signum}; shutting down engine and exiting")
+        _cleanup()
+        os._exit(0)
+
+    server_uv = uvicorn.Server(uvicorn.Config(app, host=host, port=port))
+    server_uv.install_signal_handlers = lambda: None
+    # Plain handlers cover the window before the event loop is running. Once the
+    # loop is up we ALSO register via loop.add_signal_handler in the startup
+    # hook below: uvicorn runs on uvloop, which does not reliably dispatch plain
+    # signal.signal handlers while the main thread is parked in an ``await``
+    # (e.g. the engine readiness wait), so Ctrl+C would otherwise be ignored.
+    signal.signal(signal.SIGINT, _signal_cleanup)
+    signal.signal(signal.SIGTERM, _signal_cleanup)
+    try:
+        server_uv.run()
+    finally:
+        _cleanup()

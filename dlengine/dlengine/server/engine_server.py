@@ -1,5 +1,6 @@
 import asyncio
 import ctypes
+import os
 import traceback
 from collections import defaultdict
 from typing import Optional
@@ -557,11 +558,50 @@ class EngineServer:
                     logger.error(f"P2P recv loop error: {e}")
                     traceback.print_exc()
 
-        await asyncio.gather(
-            recv_loop(),
-            results_loop(),
-            p2p_recv_loop(),
-        )
+        async def backend_watchdog():
+            """Exit the engine server if its backend process dies.
+
+            The backend (run_engine_backend) does the heavy CUDA/Ray init and
+            can fail at startup (e.g. no free GPUs / Ray placement group
+            unavailable). Without this, the recv/results/p2p loops keep running
+            on an empty shell, the GET_INFO request is never answered, and the
+            HTTP server's readiness handshake hangs forever. Surfacing the death
+            lets ``run_engine_server`` unwind, reap the backend, and close the
+            zmq socket so the parent fails fast instead of wedging.
+            """
+            while True:
+                bp = self.backend_process
+                if bp is not None and not bp.is_alive():
+                    logger.error(
+                        f"Engine backend process exited (exitcode={bp.exitcode}); "
+                        "shutting down engine server"
+                    )
+                    return
+                await asyncio.sleep(0.5)
+
+        tasks = [
+            asyncio.create_task(coro)
+            for coro in (
+                recv_loop(),
+                results_loop(),
+                p2p_recv_loop(),
+                backend_watchdog(),
+            )
+        ]
+        try:
+            done, still_pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # Propagate any real failure (not a clean watchdog-triggered exit).
+        for t in done:
+            exc = t.exception()
+            if exc is not None:
+                raise exc
 
 
 def run_engine_server(config: Config, bind_endpoint: Optional[str] = None):
@@ -580,10 +620,46 @@ def run_engine_server(config: Config, bind_endpoint: Optional[str] = None):
         pass
 
     server = EngineServer(config)
+
+    # The HTTP parent terminates us with SIGTERM on shutdown. Convert it to a
+    # KeyboardInterrupt so asyncio unwinds and the finally below tears down the
+    # daemon backend process (and, with it, the Ray ModelRunner actors) instead
+    # of leaking them. Default SIGTERM would kill us without any cleanup.
+    import signal as _signal
+
+    def _on_term(_signum, _frame):
+        raise KeyboardInterrupt
+
     try:
+        _signal.signal(_signal.SIGTERM, _on_term)
+    except Exception:  # noqa: BLE001
+        pass
+
+    exit_code = 0
+    try:
+        # serve() returns (rather than blocking forever) if the backend process
+        # dies — see backend_watchdog. Treat that as a failure exit so the HTTP
+        # parent's liveness check sees a dead engine and aborts startup.
         asyncio.run(server.serve(bind_endpoint=bind_endpoint))
+        logger.error("Engine server stopped (backend process is no longer alive)")
+        exit_code = 1
     except KeyboardInterrupt:
         logger.info("Engine server process shutting down...")
+    finally:
+        backend = getattr(server, "backend_process", None)
+        if backend is not None:
+            try:
+                backend.terminate()
+                backend.join(timeout=5)
+                if backend.is_alive():
+                    backend.kill()
+                    backend.join(timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
+    # Hard-exit so lingering non-daemon executor threads (e.g. a results_loop
+    # blocked in Queue.get) can't keep this process alive — otherwise the parent
+    # would never observe the engine as dead.
+    os._exit(exit_code)
 
 
 def main():

@@ -138,6 +138,11 @@ std::vector<std::pair<int64_t, int>> BlockManager::drain_pending_offloads()
 
 int BlockManager::count_active_prefix_hits(Sequence& seq) const
 {
+    // Linear-attention models: no cross-request prefix reuse (see header).
+    if (!prefix_caching_enabled_) {
+        return 0;
+    }
+
     int64_t h          = -1;
     int     num_blocks = seq.num_blocks(BlockContextSlot::ACTIVE, group_id_);
     int     hits       = 0;
@@ -201,7 +206,10 @@ void BlockManager::allocate(Sequence& seq, int prefix_hint)
     for (int i = 0; i < num_blocks; ++i) {
         auto view = seq.block_view(i, BlockContextSlot::ACTIVE, group_id_);
 
-        if (view.second == static_cast<size_t>(block_size_)) {
+        // Linear-attention models: keep h == -1 so every block is treated as a
+        // cache miss (allocated fresh, never shared) and num_prefix_cached stays
+        // 0 — i.e. num_cached_tokens == 0 and the full prompt is recomputed.
+        if (prefix_caching_enabled_ && view.second == static_cast<size_t>(block_size_)) {
             h = compute_hash(view.first, view.second, h);
         }
         else {

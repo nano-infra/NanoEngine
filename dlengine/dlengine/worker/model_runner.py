@@ -136,7 +136,7 @@ from dlengine._cpp import (
     serialize_run_batch,
 )
 from dlengine.config import Config
-from dlengine.context.cache import get_cache_context, set_cache_context
+from dlengine.context.cache import CacheContext, get_cache_context, set_cache_context
 from dlengine.context.context import get_context, reset_context
 from dlengine.context.distributed import (
     get_dist_context,
@@ -891,6 +891,17 @@ class ModelRunner:
         head_dim = getattr(hf_config, "head_dim", None) or (
             hf_config.hidden_size // hf_config.num_attention_heads
         )
+        # Reserve memory for GDN linear-attention state buffers (allocated below
+        # via allocate_gdn_states) so KV-cache sizing stays within the
+        # utilization target on hybrid models.
+        reserved_state_bytes = 0
+        if layer_types is not None:
+            reserved_state_bytes = CacheContext.estimate_gdn_state_bytes(
+                hf_config,
+                layer_types,
+                config.max_num_seqs,
+                need_backup=config.num_speculative_tokens > 0,
+            )
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=head_dim,
@@ -909,6 +920,7 @@ class ModelRunner:
             ctrl_address=config.ctrl_address,
             ctrl_scope=config.ctrl_scope,
             engine_id=engine_id,
+            reserved_state_bytes=reserved_state_bytes,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 

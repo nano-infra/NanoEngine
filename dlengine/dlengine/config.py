@@ -66,6 +66,14 @@ class Config(BaseModel):
     host: str = "0.0.0.0"
     port: int = 5000
 
+    # Monitoring. When enabled, ``dlengine serve`` exposes Prometheus metrics
+    # at /metrics and starts a local Prometheus/Grafana stack. Prometheus
+    # listens on 9090 and Grafana listens on 3000.
+    enable_monitor: bool = False
+    monitor_dir: str = ".dlengine-monitor"
+    monitor_scrape_interval: str = "5s"
+    monitor_target: Optional[str] = None
+
     # ``dlengine serve`` (OpenAI HTTP server) engine transport. When True, the
     # engine runs in a separate process exposing a zmq DEALER over an ipc://
     # socket and the HTTP server connects as a zmq client; when False (default)

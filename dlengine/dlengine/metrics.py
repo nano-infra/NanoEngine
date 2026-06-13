@@ -21,6 +21,16 @@ from dlengine.logging import get_logger
 logger = get_logger()
 
 
+def _prom_value(value: object, default: float = 0.0) -> float:
+    """Convert optional metric values to Prometheus-friendly floats."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _human_bytes(n: float) -> str:
     """Format a byte count as a compact human-readable string."""
     step = float(n)
@@ -82,6 +92,23 @@ class MetricsManager:
     def __init__(self, report_interval_s: float = 5.0):
         self.server_metric = ServerMetric()
         self.sequence_metrics: dict[str, SequenceMetric] = {}
+        self.engine_id: str = ""
+        self.engine_mode: str = ""
+        self.running_per_dp: list[int] = []
+        self.used_blocks_per_dp: list[int] = []
+        self.total_blocks_per_dp: int = 0
+        self.last_schedule_ms: float = 0.0
+        self.last_forward_ms: float = 0.0
+        self.last_postprocess_ms: float = 0.0
+        self.last_step_count: int = 0
+        self.last_forward_tx_bytes: int = 0
+        self.last_forward_rx_bytes: int = 0
+        self.last_transfer_ms: float = 0.0
+        self.last_wwi_ms: float = 0.0
+        self.last_immrecv_ms: float = 0.0
+        self.last_net_ms: float = 0.0
+        self.last_serialize_ms: float = 0.0
+        self.last_prefix_cache_hit_rate: float = 0.0
         # Periodic engine-status reporting state, driven from the engine's
         # step loop via maybe_report_engine_status().
         self._report_interval_s = report_interval_s
@@ -106,6 +133,10 @@ class MetricsManager:
         self._report_net_ms = 0.0
         # Driver-side request serialization time (serialize_run_batch).
         self._report_serialize_ms = 0.0
+        # Prefix-cache accounting over the window: cached prompt tokens served
+        # from the KV cache vs. total prompt tokens of newly admitted prefills.
+        self._report_prefix_cached_tokens = 0
+        self._report_prefix_prompt_tokens = 0
 
     def create_sequence_metric(
         self, seq_id: str, num_prompt_tokens: int
@@ -156,6 +187,8 @@ class MetricsManager:
         total_blocks: int,
         prefill_tokens_per_dp: list[int],
         decode_tokens_per_dp: list[int],
+        prefix_cached_tokens: int = 0,
+        prefix_prompt_tokens: int = 0,
         schedule_ms: float = 0.0,
         forward_ms: float = 0.0,
         postprocess_ms: float = 0.0,
@@ -193,6 +226,8 @@ class MetricsManager:
         self._report_immrecv_ms += immrecv_ms
         self._report_net_ms += net_ms
         self._report_serialize_ms += serialize_ms
+        self._report_prefix_cached_tokens += prefix_cached_tokens
+        self._report_prefix_prompt_tokens += prefix_prompt_tokens
         now = time.time()
         elapsed = now - self._last_report_time
         if elapsed < self._report_interval_s:
@@ -220,6 +255,8 @@ class MetricsManager:
             avg_immrecv_ms=self._report_immrecv_ms / steps,
             avg_net_ms=self._report_net_ms / steps,
             avg_serialize_ms=self._report_serialize_ms / steps,
+            prefix_cached_tokens=self._report_prefix_cached_tokens,
+            prefix_prompt_tokens=self._report_prefix_prompt_tokens,
         )
         self._last_report_time = now
         self._report_prefill_tokens_per_dp = None
@@ -235,6 +272,8 @@ class MetricsManager:
         self._report_immrecv_ms = 0.0
         self._report_net_ms = 0.0
         self._report_serialize_ms = 0.0
+        self._report_prefix_cached_tokens = 0
+        self._report_prefix_prompt_tokens = 0
 
     def log_engine_status(
         self,
@@ -260,6 +299,8 @@ class MetricsManager:
         avg_immrecv_ms: float | None = None,
         avg_net_ms: float | None = None,
         avg_serialize_ms: float | None = None,
+        prefix_cached_tokens: int = 0,
+        prefix_prompt_tokens: int = 0,
     ):
         """Record windowed throughput and log a one-line engine status report.
 
@@ -274,6 +315,27 @@ class MetricsManager:
         if decode_tokens > 0:
             self.server_metric.record_decode_throughput(decode_tokens, elapsed)
 
+        self.engine_id = engine_id
+        self.engine_mode = mode
+        self.running_per_dp = list(running_per_dp)
+        self.used_blocks_per_dp = list(used_blocks_per_dp or [])
+        self.total_blocks_per_dp = total_blocks
+        self.last_schedule_ms = _prom_value(avg_schedule_ms)
+        self.last_forward_ms = _prom_value(avg_forward_ms)
+        self.last_postprocess_ms = _prom_value(avg_postprocess_ms)
+        self.last_step_count = int(steps or 0)
+        self.last_forward_tx_bytes = int(fwd_tx_bytes or 0)
+        self.last_forward_rx_bytes = int(fwd_rx_bytes or 0)
+        self.last_transfer_ms = _prom_value(avg_transfer_ms)
+        self.last_wwi_ms = _prom_value(avg_wwi_ms)
+        self.last_immrecv_ms = _prom_value(avg_immrecv_ms)
+        self.last_net_ms = _prom_value(avg_net_ms)
+        self.last_serialize_ms = _prom_value(avg_serialize_ms)
+        if prefix_prompt_tokens > 0:
+            self.last_prefix_cache_hit_rate = (
+                prefix_cached_tokens / prefix_prompt_tokens
+            )
+
         if used_blocks_per_dp is not None:
             used_str = "|".join(str(u) for u in used_blocks_per_dp)
         else:
@@ -287,6 +349,16 @@ class MetricsManager:
             pf_str = "|".join("0" for _ in prefill_tokens_per_dp)
             dec_str = "|".join("0" for _ in decode_tokens_per_dp)
         sm = self.server_metric
+        # Prefix-cache hit rate over the window: cached prompt tokens reused
+        # from the KV cache divided by the total prompt tokens of newly
+        # admitted prefills. Only shown when at least one prefill was admitted.
+        cache_str = ""
+        if prefix_prompt_tokens > 0:
+            hit_rate = prefix_cached_tokens / prefix_prompt_tokens
+            cache_str = (
+                f" | prefix-cache {hit_rate * 100:.1f}% "
+                f"({prefix_cached_tokens}/{prefix_prompt_tokens} tok)"
+            )
         # Per-step latency breakdown (schedule / forward / postprocess),
         # averaged over the reporting window. ``total`` is their sum, useful for
         # spotting which stage dominates step time.
@@ -334,6 +406,7 @@ class MetricsManager:
             f"tput pf={pf_str} dec={dec_str} tok/s ({elapsed:.0f}s) | "
             f"done={sm.num_completed_requests} "
             f"tok={sm.total_prompt_tokens}p/{sm.total_generated_tokens}g"
+            f"{cache_str}"
             f"{lat_str}"
             f"{xfer_str}"
         )
@@ -346,6 +419,104 @@ class MetricsManager:
     def get_server_summary(self) -> dict:
         """Get server metrics summary."""
         return self.server_metric.get_summary()
+
+    def to_prometheus(self) -> str:
+        """Return a Prometheus text-format snapshot for Grafana dashboards."""
+        sm = self.server_metric
+        lines = [
+            "# HELP dlengine_up DLEngine metrics exporter health.",
+            "# TYPE dlengine_up gauge",
+            "dlengine_up 1",
+            "# HELP dlengine_uptime_seconds DLEngine process uptime.",
+            "# TYPE dlengine_uptime_seconds gauge",
+            f"dlengine_uptime_seconds {_prom_value(sm.uptime)}",
+            "# HELP dlengine_requests Number of requests by state.",
+            "# TYPE dlengine_requests gauge",
+            f'dlengine_requests{{state="running"}} {sm.num_running_requests}',
+            f'dlengine_requests{{state="waiting"}} {sm.num_waiting_requests}',
+            (
+                'dlengine_requests{state="waiting_migration"} '
+                f"{sm.num_waiting_migration_requests}"
+            ),
+            f'dlengine_requests{{state="completed"}} {sm.num_completed_requests}',
+            "# HELP dlengine_tokens Total token counters.",
+            "# TYPE dlengine_tokens counter",
+            f'dlengine_tokens{{type="prompt"}} {sm.total_prompt_tokens}',
+            f'dlengine_tokens{{type="generated"}} {sm.total_generated_tokens}',
+            f'dlengine_tokens{{type="all"}} {sm.total_tokens}',
+            "# HELP dlengine_throughput_tokens_per_second Current token throughput.",
+            "# TYPE dlengine_throughput_tokens_per_second gauge",
+            (
+                'dlengine_throughput_tokens_per_second{phase="prefill"} '
+                f"{_prom_value(sm.current_prefill_throughput)}"
+            ),
+            (
+                'dlengine_throughput_tokens_per_second{phase="decode"} '
+                f"{_prom_value(sm.current_decode_throughput)}"
+            ),
+            "# HELP dlengine_avg_throughput_tokens_per_second Average token throughput.",
+            "# TYPE dlengine_avg_throughput_tokens_per_second gauge",
+            (
+                'dlengine_avg_throughput_tokens_per_second{phase="prefill"} '
+                f"{_prom_value(sm.avg_prefill_throughput)}"
+            ),
+            (
+                'dlengine_avg_throughput_tokens_per_second{phase="decode"} '
+                f"{_prom_value(sm.avg_decode_throughput)}"
+            ),
+            "# HELP dlengine_waiting_blocks Waiting queue KV block demand.",
+            "# TYPE dlengine_waiting_blocks gauge",
+            f'dlengine_waiting_blocks{{type="head"}} {sm.num_waiting_head_blocks}',
+            f'dlengine_waiting_blocks{{type="total"}} {sm.num_waiting_total_blocks}',
+            "# HELP dlengine_step_latency_ms Last reported average step latency.",
+            "# TYPE dlengine_step_latency_ms gauge",
+            f'dlengine_step_latency_ms{{phase="schedule"}} {self.last_schedule_ms}',
+            f'dlengine_step_latency_ms{{phase="forward"}} {self.last_forward_ms}',
+            (
+                'dlengine_step_latency_ms{phase="postprocess"} '
+                f"{self.last_postprocess_ms}"
+            ),
+            "# HELP dlengine_step_count Last reported heartbeat window step count.",
+            "# TYPE dlengine_step_count gauge",
+            f"dlengine_step_count {self.last_step_count}",
+            "# HELP dlengine_forward_bytes Last reported forward transfer bytes.",
+            "# TYPE dlengine_forward_bytes gauge",
+            f'dlengine_forward_bytes{{direction="tx"}} {self.last_forward_tx_bytes}',
+            f'dlengine_forward_bytes{{direction="rx"}} {self.last_forward_rx_bytes}',
+            "# HELP dlengine_transfer_latency_ms Last reported transfer latency.",
+            "# TYPE dlengine_transfer_latency_ms gauge",
+            f'dlengine_transfer_latency_ms{{phase="transfer"}} {self.last_transfer_ms}',
+            f'dlengine_transfer_latency_ms{{phase="write_with_imm"}} {self.last_wwi_ms}',
+            f'dlengine_transfer_latency_ms{{phase="imm_recv"}} {self.last_immrecv_ms}',
+            f'dlengine_transfer_latency_ms{{phase="network"}} {self.last_net_ms}',
+            f'dlengine_transfer_latency_ms{{phase="serialize"}} {self.last_serialize_ms}',
+            "# HELP dlengine_prefix_cache_hit_rate Prefix-cache hit rate of admitted prefills.",
+            "# TYPE dlengine_prefix_cache_hit_rate gauge",
+            f"dlengine_prefix_cache_hit_rate {_prom_value(self.last_prefix_cache_hit_rate)}",
+        ]
+        for dp_idx, running in enumerate(self.running_per_dp):
+            lines.append(
+                "# HELP dlengine_running_requests_per_dp Running requests per DP rank."
+                if dp_idx == 0
+                else ""
+            )
+            lines.append(
+                "# TYPE dlengine_running_requests_per_dp gauge" if dp_idx == 0 else ""
+            )
+            lines.append(f'dlengine_running_requests_per_dp{{dp="{dp_idx}"}} {running}')
+        for dp_idx, used in enumerate(self.used_blocks_per_dp):
+            lines.append(
+                "# HELP dlengine_kv_blocks KV cache blocks per DP rank."
+                if dp_idx == 0
+                else ""
+            )
+            lines.append("# TYPE dlengine_kv_blocks gauge" if dp_idx == 0 else "")
+            lines.append(f'dlengine_kv_blocks{{dp="{dp_idx}",state="used"}} {used}')
+            lines.append(
+                f'dlengine_kv_blocks{{dp="{dp_idx}",state="total"}} '
+                f"{self.total_blocks_per_dp}"
+            )
+        return "\n".join(line for line in lines if line) + "\n"
 
     def log_final_summary(self):
         """Log final server + sequence metrics summary at end of generation."""

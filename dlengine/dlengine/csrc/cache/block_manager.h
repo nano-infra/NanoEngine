@@ -70,6 +70,24 @@ public:
     // allocate()), so Python can probe L3 membership with exact keys.
     std::vector<int64_t> compute_block_hashes(Sequence& seq) const;
 
+    // --- Prefix caching toggle -------------------------------------------
+    // Cross-request prefix cache reuse (and, transitively, L3) is UNSAFE for
+    // models with linear-attention / GatedDeltaNet layers: the recurrent
+    // (conv + state) cache is not captured by the shared KV blocks, so a
+    // sequence that "inherits" a cached prefix would skip recomputing those
+    // tokens and start its linear-attention state from a stale slot. We
+    // disable prefix matching for such models so every sequence recomputes
+    // its full prompt from a zero state (num_cached_tokens stays 0 here; the
+    // chunked-prefill cursor is advanced separately by the scheduler).
+    void set_prefix_caching_enabled(bool enabled)
+    {
+        prefix_caching_enabled_ = enabled;
+    }
+    bool prefix_caching_enabled() const
+    {
+        return prefix_caching_enabled_;
+    }
+
     // Drain (return + clear) the pending (hash, block_id) work queues.
     std::vector<std::pair<int64_t, int>> drain_pending_loads();
     std::vector<std::pair<int64_t, int>> drain_pending_offloads();
@@ -104,6 +122,10 @@ private:
     std::list<int>                        free_block_ids_;
     std::vector<std::list<int>::iterator> block_id_to_free_list_it_;
     std::unordered_set<int>               used_block_ids_;
+
+    // Cross-request prefix cache reuse. Default on; disabled for linear-
+    // attention models (see set_prefix_caching_enabled).
+    bool prefix_caching_enabled_ = true;
 
     // --- L3 (3FS) tiered KV cache state -----------------------------------
     bool                                 l3_enabled_ = false;

@@ -28,6 +28,9 @@ class CacheContext(CacheLayoutMixin, KVCacheAllocatorMixin, KVMigratorMixin):
     attention_tp: int
     gpu_memory_utilization: float
     gpu_memory_limit_gb: float | None = None
+    # Bytes to reserve out of the utilization budget for state buffers allocated
+    # *after* KV sizing (e.g. GDN linear-attention conv/recurrent states).
+    reserved_state_bytes: int = 0
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     mode: Literal["gqa", "mla", "dsv4"] = "gqa"
@@ -140,7 +143,13 @@ class CacheContext(CacheLayoutMixin, KVCacheAllocatorMixin, KVMigratorMixin):
             )
 
         self.num_local_kvcache_blocks = (
-            int(total * self.gpu_memory_utilization - used - peak + current)
+            int(
+                total * self.gpu_memory_utilization
+                - used
+                - peak
+                + current
+                - self.reserved_state_bytes
+            )
             // block_bytes
         )
 
@@ -213,9 +222,11 @@ def set_cache_context(
     ctrl_address: str | None = None,
     ctrl_scope: str | None = None,
     engine_id: str | None = None,
+    reserved_state_bytes: int = 0,
 ):
     global _CACHE_CONTEXT
     _CACHE_CONTEXT = CacheContext(
+        reserved_state_bytes=reserved_state_bytes,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         kv_lora_rank=kv_lora_rank,

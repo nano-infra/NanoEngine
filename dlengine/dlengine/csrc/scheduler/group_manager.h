@@ -173,6 +173,15 @@ public:
     // Each entry creates a new CompressedBlockManager for its `ratio`.
     void configure_compressed_pools(const std::vector<CompressedPoolConfig>& configs);
 
+    // Toggle cross-request prefix caching on every block manager in this group
+    // (disabled for linear-attention models; see BlockManager header).
+    void set_prefix_caching_enabled(bool enabled)
+    {
+        for (auto& [gid, bm] : block_manager) {
+            bm->set_prefix_caching_enabled(enabled);
+        }
+    }
+
     std::deque<std::shared_ptr<Sequence>>  running;
     std::vector<std::shared_ptr<Sequence>> dummy_seqs;
 
