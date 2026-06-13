@@ -26,13 +26,23 @@ _SERVE_EXTRA_KEYS = frozenset({"config", "model", "served_model_name"})
 
 
 def _normalize_serve_argv(argv: Sequence[str]) -> list[str]:
-    """Let ``--enable_monitor`` work as a bare flag with jsonargparse."""
+    """Let ``--enable_monitor`` work as ``--enable_monitor true`` with jsonargparse."""
     normalized: list[str] = []
-    for arg in argv:
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
         if arg == "--enable_monitor":
-            normalized.extend(["--enable_monitor", "true"])
+            # Check if next arg is a boolean value
+            if i + 1 < len(argv) and argv[i + 1].lower() in ("true", "false"):
+                normalized.extend(["--enable_monitor", argv[i + 1].lower()])
+                i += 2
+            else:
+                # Default to true if no value provided
+                normalized.extend(["--enable_monitor", "true"])
+                i += 1
         else:
             normalized.append(arg)
+            i += 1
     return normalized
 
 

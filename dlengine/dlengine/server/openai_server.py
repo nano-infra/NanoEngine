@@ -733,6 +733,19 @@ def build_app(server: OpenAIServer):
 
     @app.get("/metrics")
     async def metrics() -> PlainTextResponse:  # noqa: ANN202
+        # For ZmqEngineWorker (engine_ipc=true), fetch metrics from engine process
+        if hasattr(server.worker, "get_metrics"):
+            try:
+                metrics_text = await server.worker.get_metrics()
+                if metrics_text:
+                    return PlainTextResponse(
+                        metrics_text,
+                        media_type="text/plain; version=0.0.4; charset=utf-8",
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to fetch metrics from engine: {e}")
+
+        # Fallback for in-process engine
         engine = getattr(server.worker, "engine", None)
         metrics_manager = getattr(engine, "metrics_manager", None)
         if metrics_manager is None:
@@ -1541,28 +1554,53 @@ def run_server(
             engine_id = getattr(engine, "engine_id", None)
         if config.enable_monitor:
             try:
+                import shutil
+
                 from dlengine.monitor import (
+                    create_monitor_stack,
                     default_dlengine_target,
                     GRAFANA_PORT,
                     PROMETHEUS_PORT,
                     start_monitor_stack,
                 )
 
-                target = config.monitor_target or default_dlengine_target(port)
-                monitor_root = start_monitor_stack(
+                docker_available = shutil.which("docker") is not None
+                target = (
+                    f"host.docker.internal:{port}"
+                    if docker_available
+                    else default_dlengine_target(port)
+                )
+                monitor_root = create_monitor_stack(
                     config.monitor_dir,
                     dlengine_target=target,
                     scrape_interval=config.monitor_scrape_interval,
                 )
-                logger.info(
-                    "Started DLEngine monitor stack at %s "
-                    "(Prometheus http://localhost:%s, Grafana http://localhost:%s, "
-                    "target %s)",
-                    monitor_root,
-                    PROMETHEUS_PORT,
-                    GRAFANA_PORT,
-                    target,
-                )
+                if docker_available:
+                    start_monitor_stack(
+                        config.monitor_dir,
+                        dlengine_target=target,
+                        scrape_interval=config.monitor_scrape_interval,
+                    )
+                    logger.info(
+                        "Started DLEngine monitor stack at %s "
+                        "(Prometheus http://localhost:%s, Grafana http://localhost:%s, "
+                        "target %s)",
+                        monitor_root,
+                        PROMETHEUS_PORT,
+                        GRAFANA_PORT,
+                        target,
+                    )
+                else:
+                    logger.info(
+                        "DLEngine monitor config written to %s; docker CLI not "
+                        "found, so Prometheus/Grafana were not started and no "
+                        "running Prometheus config was changed. Configure your "
+                        "Prometheus to scrape %s. Metrics endpoint from inside "
+                        "this container: http://localhost:%s/metrics",
+                        monitor_root,
+                        target,
+                        port,
+                    )
             except Exception as e:  # noqa: BLE001
                 logger.error(
                     "Could not start monitor stack. /metrics is still available "

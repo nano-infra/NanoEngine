@@ -95,6 +95,43 @@ def _panel(
     }
 
 
+def _panel_multi(
+    panel_id: int,
+    title: str,
+    targets: list[tuple[str, str]],
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    unit: str = "short",
+    defaults_extra: dict | None = None,
+) -> dict:
+    """A timeseries panel with explicit (expr, legend) targets."""
+    defaults = {"unit": unit}
+    if defaults_extra:
+        defaults.update(defaults_extra)
+    return {
+        "id": panel_id,
+        "type": "timeseries",
+        "title": title,
+        "gridPos": {"x": x, "y": y, "w": w, "h": h},
+        "fieldConfig": {"defaults": defaults, "overrides": []},
+        "targets": [
+            {
+                "datasource": {"type": "prometheus", "uid": "Prometheus"},
+                "expr": expr,
+                "legendFormat": legend,
+                "refId": chr(ord("A") + i),
+            }
+            for i, (expr, legend) in enumerate(targets)
+        ],
+        "options": {
+            "legend": {"displayMode": "list", "placement": "bottom"},
+            "tooltip": {"mode": "multi", "sort": "none"},
+        },
+    }
+
+
 def _dashboard_config() -> dict:
     return {
         "uid": "dlengine-overview",
@@ -172,6 +209,76 @@ def _dashboard_config() -> dict:
                 12,
                 8,
                 "ms",
+            ),
+            _panel_multi(
+                8,
+                "Prefix Cache Hit Rate",
+                [
+                    ("dlengine_prefix_cache_hit_rate_per_dp", "dp={{dp}}"),
+                    ("dlengine_prefix_cache_hit_rate", "overall"),
+                ],
+                0,
+                24,
+                8,
+                8,
+                "percentunit",
+                {"min": 0, "max": 1},
+            ),
+            _panel_multi(
+                9,
+                "TTFT",
+                [
+                    (
+                        "histogram_quantile(0.5, rate(dlengine_ttft_seconds_bucket[5m]))",
+                        "p50",
+                    ),
+                    (
+                        "histogram_quantile(0.9, rate(dlengine_ttft_seconds_bucket[5m]))",
+                        "p90",
+                    ),
+                    (
+                        "histogram_quantile(0.99, rate(dlengine_ttft_seconds_bucket[5m]))",
+                        "p99",
+                    ),
+                    (
+                        "rate(dlengine_ttft_seconds_sum[5m]) / "
+                        "clamp_min(rate(dlengine_ttft_seconds_count[5m]), 1e-9)",
+                        "avg",
+                    ),
+                ],
+                8,
+                24,
+                8,
+                8,
+                "s",
+            ),
+            _panel_multi(
+                10,
+                "TPOT",
+                [
+                    (
+                        "histogram_quantile(0.5, rate(dlengine_tpot_seconds_bucket[5m]))",
+                        "p50",
+                    ),
+                    (
+                        "histogram_quantile(0.9, rate(dlengine_tpot_seconds_bucket[5m]))",
+                        "p90",
+                    ),
+                    (
+                        "histogram_quantile(0.99, rate(dlengine_tpot_seconds_bucket[5m]))",
+                        "p99",
+                    ),
+                    (
+                        "rate(dlengine_tpot_seconds_sum[5m]) / "
+                        "clamp_min(rate(dlengine_tpot_seconds_count[5m]), 1e-9)",
+                        "avg",
+                    ),
+                ],
+                16,
+                24,
+                8,
+                8,
+                "s",
             ),
         ],
     }

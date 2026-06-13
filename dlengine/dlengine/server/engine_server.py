@@ -39,6 +39,9 @@ _ACTION_STEPOUT_BATCH = 4
 # KV blocks). Reuses the FreeSequences flatbuffer payload (seq_ids list).
 _ACTION_ABORT = 5
 
+# client -> engine: fetch Prometheus-format metrics from the backend process.
+_ACTION_GET_METRICS = 6
+
 
 def build_stepout_payload(seq_id, token_ids, status) -> bytes:
     """Build a StepOut flatbuffer payload for one sequence."""
@@ -97,6 +100,19 @@ class BackendService:
     def _handle_get_info(self):
         resp_payload = self.engine.get_engine_info().encode("utf-8")
         self._send_response(action=2, payload=resp_payload)
+
+    def _handle_get_metrics(self):
+        """Fetch Prometheus-format metrics from the engine metrics_manager."""
+        try:
+            metrics_manager = getattr(self.engine, "metrics_manager", None)
+            if metrics_manager is None:
+                resp_payload = b""
+            else:
+                resp_payload = metrics_manager.to_prometheus().encode("utf-8")
+            self._send_response(action=_ACTION_GET_METRICS, payload=resp_payload)
+        except Exception as e:
+            logger.error(f"Error getting metrics: {e}")
+            self._send_response(action=_ACTION_GET_METRICS, payload=b"")
 
     def _handle_free_sequences(self, payload: bytes):
         """Handle P2P free sequence request."""
@@ -282,6 +298,8 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                             service._handle_add_request(payload)
                         elif action == 2:
                             service._handle_get_info()
+                        elif action == _ACTION_GET_METRICS:
+                            service._handle_get_metrics()
                         elif action == 3:
                             # Freeing sequences mutates scheduler/block state;
                             # unsafe while those seqs may be in the in-flight

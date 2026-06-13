@@ -109,6 +109,35 @@ class MetricsManager:
         self.last_net_ms: float = 0.0
         self.last_serialize_ms: float = 0.0
         self.last_prefix_cache_hit_rate: float = 0.0
+        self.last_prefix_cache_hit_rate_per_dp: list[float] = []
+        # Latency aggregates, accumulated as completed sequences are reaped.
+        # Stored in seconds for Prometheus convention; *_last kept in ms for
+        # human-friendly at-a-glance gauges.
+        self._ttft_sum_s: float = 0.0
+        self._ttft_count: int = 0
+        self._tpot_sum_s: float = 0.0
+        self._tpot_count: int = 0
+        self.last_ttft_ms: float = 0.0
+        self.last_tpot_ms: float = 0.0
+        # Histogram buckets for TTFT/TPOT percentiles (in seconds)
+        # Buckets: 1ms, 5ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms, 1s, 2s, 5s, 10s, +inf
+        self._ttft_buckets = [
+            0.001,
+            0.005,
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+        ]
+        self._ttft_bucket_counts: list[int] = [0] * len(self._ttft_buckets)
+        self._tpot_buckets = [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]
+        self._tpot_bucket_counts: list[int] = [0] * len(self._tpot_buckets)
         # Periodic engine-status reporting state, driven from the engine's
         # step loop via maybe_report_engine_status().
         self._report_interval_s = report_interval_s
@@ -134,9 +163,10 @@ class MetricsManager:
         # Driver-side request serialization time (serialize_run_batch).
         self._report_serialize_ms = 0.0
         # Prefix-cache accounting over the window: cached prompt tokens served
-        # from the KV cache vs. total prompt tokens of newly admitted prefills.
-        self._report_prefix_cached_tokens = 0
-        self._report_prefix_prompt_tokens = 0
+        # from the KV cache vs. total prompt tokens of newly admitted prefills,
+        # tracked per DP rank (each rank owns its own prefix cache).
+        self._report_prefix_cached_tokens_per_dp: list[int] | None = None
+        self._report_prefix_prompt_tokens_per_dp: list[int] | None = None
 
     def create_sequence_metric(
         self, seq_id: str, num_prompt_tokens: int
@@ -170,6 +200,29 @@ class MetricsManager:
                 metric.log_metrics()
             self.server_metric.add_tokens(num_generated=metric.num_generated_tokens)
             self.server_metric.add_completed_request()
+            # Aggregate TTFT / TPOT for the Prometheus summaries. Both are
+            # reported by the C++ metric in milliseconds and may be None for
+            # degenerate sequences (no first token / single-token outputs).
+            ttft_ms = metric.ttft
+            if ttft_ms is not None:
+                ttft_s = ttft_ms / 1000.0
+                self._ttft_sum_s += ttft_s
+                self._ttft_count += 1
+                self.last_ttft_ms = ttft_ms
+                # Record TTFT histogram bucket
+                for i, bucket in enumerate(self._ttft_buckets):
+                    if ttft_s <= bucket:
+                        self._ttft_bucket_counts[i] += 1
+            tpot_ms = metric.avg_tpot_wo_queueing
+            if tpot_ms is not None:
+                tpot_s = tpot_ms / 1000.0
+                self._tpot_sum_s += tpot_s
+                self._tpot_count += 1
+                self.last_tpot_ms = tpot_ms
+                # Record TPOT histogram bucket
+                for i, bucket in enumerate(self._tpot_buckets):
+                    if tpot_s <= bucket:
+                        self._tpot_bucket_counts[i] += 1
 
     def remove_sequence_metric(self, seq_id: str):
         """Remove a sequence metric (e.g., after logging)."""
@@ -187,8 +240,8 @@ class MetricsManager:
         total_blocks: int,
         prefill_tokens_per_dp: list[int],
         decode_tokens_per_dp: list[int],
-        prefix_cached_tokens: int = 0,
-        prefix_prompt_tokens: int = 0,
+        prefix_cached_tokens_per_dp: list[int] | None = None,
+        prefix_prompt_tokens_per_dp: list[int] | None = None,
         schedule_ms: float = 0.0,
         forward_ms: float = 0.0,
         postprocess_ms: float = 0.0,
@@ -226,8 +279,18 @@ class MetricsManager:
         self._report_immrecv_ms += immrecv_ms
         self._report_net_ms += net_ms
         self._report_serialize_ms += serialize_ms
-        self._report_prefix_cached_tokens += prefix_cached_tokens
-        self._report_prefix_prompt_tokens += prefix_prompt_tokens
+        if prefix_cached_tokens_per_dp is not None:
+            if self._report_prefix_cached_tokens_per_dp is None:
+                self._report_prefix_cached_tokens_per_dp = [0] * len(
+                    prefix_cached_tokens_per_dp
+                )
+                self._report_prefix_prompt_tokens_per_dp = [0] * len(
+                    prefix_prompt_tokens_per_dp
+                )
+            for i, t in enumerate(prefix_cached_tokens_per_dp):
+                self._report_prefix_cached_tokens_per_dp[i] += t
+            for i, t in enumerate(prefix_prompt_tokens_per_dp):
+                self._report_prefix_prompt_tokens_per_dp[i] += t
         now = time.time()
         elapsed = now - self._last_report_time
         if elapsed < self._report_interval_s:
@@ -255,8 +318,8 @@ class MetricsManager:
             avg_immrecv_ms=self._report_immrecv_ms / steps,
             avg_net_ms=self._report_net_ms / steps,
             avg_serialize_ms=self._report_serialize_ms / steps,
-            prefix_cached_tokens=self._report_prefix_cached_tokens,
-            prefix_prompt_tokens=self._report_prefix_prompt_tokens,
+            prefix_cached_tokens_per_dp=self._report_prefix_cached_tokens_per_dp,
+            prefix_prompt_tokens_per_dp=self._report_prefix_prompt_tokens_per_dp,
         )
         self._last_report_time = now
         self._report_prefill_tokens_per_dp = None
@@ -272,8 +335,8 @@ class MetricsManager:
         self._report_immrecv_ms = 0.0
         self._report_net_ms = 0.0
         self._report_serialize_ms = 0.0
-        self._report_prefix_cached_tokens = 0
-        self._report_prefix_prompt_tokens = 0
+        self._report_prefix_cached_tokens_per_dp = None
+        self._report_prefix_prompt_tokens_per_dp = None
 
     def log_engine_status(
         self,
@@ -299,8 +362,8 @@ class MetricsManager:
         avg_immrecv_ms: float | None = None,
         avg_net_ms: float | None = None,
         avg_serialize_ms: float | None = None,
-        prefix_cached_tokens: int = 0,
-        prefix_prompt_tokens: int = 0,
+        prefix_cached_tokens_per_dp: list[int] | None = None,
+        prefix_prompt_tokens_per_dp: list[int] | None = None,
     ):
         """Record windowed throughput and log a one-line engine status report.
 
@@ -331,10 +394,15 @@ class MetricsManager:
         self.last_immrecv_ms = _prom_value(avg_immrecv_ms)
         self.last_net_ms = _prom_value(avg_net_ms)
         self.last_serialize_ms = _prom_value(avg_serialize_ms)
-        if prefix_prompt_tokens > 0:
-            self.last_prefix_cache_hit_rate = (
-                prefix_cached_tokens / prefix_prompt_tokens
-            )
+        cached_per_dp = prefix_cached_tokens_per_dp or []
+        prompt_per_dp = prefix_prompt_tokens_per_dp or []
+        if prompt_per_dp:
+            self.last_prefix_cache_hit_rate_per_dp = [
+                (c / p if p > 0 else 0.0) for c, p in zip(cached_per_dp, prompt_per_dp)
+            ]
+            total_prompt = sum(prompt_per_dp)
+            if total_prompt > 0:
+                self.last_prefix_cache_hit_rate = sum(cached_per_dp) / total_prompt
 
         if used_blocks_per_dp is not None:
             used_str = "|".join(str(u) for u in used_blocks_per_dp)
@@ -349,16 +417,18 @@ class MetricsManager:
             pf_str = "|".join("0" for _ in prefill_tokens_per_dp)
             dec_str = "|".join("0" for _ in decode_tokens_per_dp)
         sm = self.server_metric
-        # Prefix-cache hit rate over the window: cached prompt tokens reused
-        # from the KV cache divided by the total prompt tokens of newly
-        # admitted prefills. Only shown when at least one prefill was admitted.
+        # Prefix-cache hit rate over the window, per DP rank: cached prompt
+        # tokens reused from the KV cache divided by the total prompt tokens of
+        # newly admitted prefills. Only shown when at least one prefill was
+        # admitted somewhere in the window.
         cache_str = ""
-        if prefix_prompt_tokens > 0:
-            hit_rate = prefix_cached_tokens / prefix_prompt_tokens
-            cache_str = (
-                f" | prefix-cache {hit_rate * 100:.1f}% "
-                f"({prefix_cached_tokens}/{prefix_prompt_tokens} tok)"
+        if prompt_per_dp and sum(prompt_per_dp) > 0:
+            hit_str = "|".join(
+                f"{(c / p * 100) if p > 0 else 0.0:.0f}"
+                for c, p in zip(cached_per_dp, prompt_per_dp)
             )
+            overall = sum(cached_per_dp) / sum(prompt_per_dp) * 100
+            cache_str = f" | prefix-cache {hit_str} % ({overall:.1f}% all)"
         # Per-step latency breakdown (schedule / forward / postprocess),
         # averaged over the reporting window. ``total`` is their sum, useful for
         # spotting which stage dominates step time.
@@ -490,9 +560,47 @@ class MetricsManager:
             f'dlengine_transfer_latency_ms{{phase="imm_recv"}} {self.last_immrecv_ms}',
             f'dlengine_transfer_latency_ms{{phase="network"}} {self.last_net_ms}',
             f'dlengine_transfer_latency_ms{{phase="serialize"}} {self.last_serialize_ms}',
-            "# HELP dlengine_prefix_cache_hit_rate Prefix-cache hit rate of admitted prefills.",
+            "# HELP dlengine_prefix_cache_hit_rate Prefix-cache hit rate of admitted prefills (overall).",
             "# TYPE dlengine_prefix_cache_hit_rate gauge",
             f"dlengine_prefix_cache_hit_rate {_prom_value(self.last_prefix_cache_hit_rate)}",
+            # TTFT (time to first token) as a Prometheus histogram: the
+            # cumulative _bucket series enables histogram_quantile (P50/P90/P99)
+            # while _sum/_count give a rate-able average. The *_avg/_last gauges
+            # are convenience read-outs.
+            "# HELP dlengine_ttft_seconds Time to first token, per completed request.",
+            "# TYPE dlengine_ttft_seconds histogram",
+            *(
+                f'dlengine_ttft_seconds_bucket{{le="{bucket}"}} {count}'
+                for bucket, count in zip(self._ttft_buckets, self._ttft_bucket_counts)
+            ),
+            f'dlengine_ttft_seconds_bucket{{le="+Inf"}} {self._ttft_count}',
+            f"dlengine_ttft_seconds_sum {self._ttft_sum_s}",
+            f"dlengine_ttft_seconds_count {self._ttft_count}",
+            "# HELP dlengine_ttft_seconds_avg Average time to first token.",
+            "# TYPE dlengine_ttft_seconds_avg gauge",
+            f"dlengine_ttft_seconds_avg "
+            f"{self._ttft_sum_s / self._ttft_count if self._ttft_count else 0.0}",
+            "# HELP dlengine_ttft_ms_last Most recent time to first token (ms).",
+            "# TYPE dlengine_ttft_ms_last gauge",
+            f"dlengine_ttft_ms_last {self.last_ttft_ms}",
+            # TPOT (time per output token, excluding queueing): per-token decode
+            # latency averaged over each request, then aggregated server-side.
+            "# HELP dlengine_tpot_seconds Time per output token (excl. queueing).",
+            "# TYPE dlengine_tpot_seconds histogram",
+            *(
+                f'dlengine_tpot_seconds_bucket{{le="{bucket}"}} {count}'
+                for bucket, count in zip(self._tpot_buckets, self._tpot_bucket_counts)
+            ),
+            f'dlengine_tpot_seconds_bucket{{le="+Inf"}} {self._tpot_count}',
+            f"dlengine_tpot_seconds_sum {self._tpot_sum_s}",
+            f"dlengine_tpot_seconds_count {self._tpot_count}",
+            "# HELP dlengine_tpot_seconds_avg Average time per output token.",
+            "# TYPE dlengine_tpot_seconds_avg gauge",
+            f"dlengine_tpot_seconds_avg "
+            f"{self._tpot_sum_s / self._tpot_count if self._tpot_count else 0.0}",
+            "# HELP dlengine_tpot_ms_last Most recent time per output token (ms).",
+            "# TYPE dlengine_tpot_ms_last gauge",
+            f"dlengine_tpot_ms_last {self.last_tpot_ms}",
         ]
         for dp_idx, running in enumerate(self.running_per_dp):
             lines.append(
@@ -515,6 +623,22 @@ class MetricsManager:
             lines.append(
                 f'dlengine_kv_blocks{{dp="{dp_idx}",state="total"}} '
                 f"{self.total_blocks_per_dp}"
+            )
+        for dp_idx, rate in enumerate(self.last_prefix_cache_hit_rate_per_dp):
+            lines.append(
+                "# HELP dlengine_prefix_cache_hit_rate_per_dp "
+                "Prefix-cache hit rate per DP rank."
+                if dp_idx == 0
+                else ""
+            )
+            lines.append(
+                "# TYPE dlengine_prefix_cache_hit_rate_per_dp gauge"
+                if dp_idx == 0
+                else ""
+            )
+            lines.append(
+                f'dlengine_prefix_cache_hit_rate_per_dp{{dp="{dp_idx}"}} '
+                f"{_prom_value(rate)}"
             )
         return "\n".join(line for line in lines if line) + "\n"
 

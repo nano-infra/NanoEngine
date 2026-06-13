@@ -432,9 +432,10 @@ class LLMEngine:
             )
 
         # Prefix-cache accounting (prefill only): tally each newly admitted
-        # prompt's cached vs. total prompt tokens exactly once.
-        prefix_cached_tokens = 0
-        prefix_prompt_tokens = 0
+        # prompt's cached vs. total prompt tokens exactly once. Tracked per DP
+        # rank since each rank owns its own block managers / prefix cache.
+        prefix_cached_tokens_per_dp = [0] * dp_size
+        prefix_prompt_tokens_per_dp = [0] * dp_size
 
         if pending.is_prefill:
             for dp_idx, seqs in enumerate(dp_seqs):
@@ -447,8 +448,8 @@ class LLMEngine:
                     if seq.seq_id in self._prefix_counted_seq_ids:
                         continue
                     self._prefix_counted_seq_ids.add(seq.seq_id)
-                    prefix_cached_tokens += seq.num_cached_tokens
-                    prefix_prompt_tokens += seq.num_prompt_tokens
+                    prefix_cached_tokens_per_dp[dp_idx] += seq.num_cached_tokens
+                    prefix_prompt_tokens_per_dp[dp_idx] += seq.num_prompt_tokens
         elif token_ids is not None:
             for dp_idx in range(dp_size):
                 for sp_idx in range(sp_size):
@@ -514,8 +515,8 @@ class LLMEngine:
             total_blocks=blocks_per_dp,
             prefill_tokens_per_dp=prefill_tokens_per_dp,
             decode_tokens_per_dp=decode_tokens_per_dp,
-            prefix_cached_tokens=prefix_cached_tokens,
-            prefix_prompt_tokens=prefix_prompt_tokens,
+            prefix_cached_tokens_per_dp=prefix_cached_tokens_per_dp,
+            prefix_prompt_tokens_per_dp=prefix_prompt_tokens_per_dp,
             schedule_ms=result.schedule_latency_ms,
             forward_ms=forward_latency_ms,
             postprocess_ms=result.postprocess_latency_ms,
