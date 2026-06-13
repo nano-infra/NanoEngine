@@ -243,6 +243,39 @@ class KVCacheAllocatorMixin:
             f"head_dim={index_head_dim}, total={total_bytes / 1e9:.2f} GB"
         )
 
+    @staticmethod
+    def estimate_gdn_state_bytes(
+        hf_config, layer_types, max_bs: int, need_backup: bool = False
+    ) -> int:
+        """Per-rank bytes the GDN conv + recurrent state buffers will occupy.
+
+        Used to reserve memory *before* the KV-cache block count is derived from
+        ``gpu_memory_utilization`` — otherwise a hybrid (linear + full attention)
+        model over-allocates KV blocks and then blows past the utilization
+        target when ``allocate_gdn_states`` runs afterwards.
+
+        MUST stay in sync with :meth:`allocate_gdn_states` below.
+        """
+        if not layer_types:
+            return 0
+        num_layers = len(layer_types)
+        num_k_heads = getattr(hf_config, "linear_num_key_heads", 0)
+        num_v_heads = getattr(hf_config, "linear_num_value_heads", 0)
+        head_k_dim = getattr(hf_config, "linear_key_head_dim", 0)
+        head_v_dim = getattr(hf_config, "linear_value_head_dim", 0)
+        conv_kernel_size = getattr(hf_config, "linear_conv_kernel_dim", 4)
+        if num_v_heads == 0:
+            return 0
+        key_dim = num_k_heads * head_k_dim
+        value_dim = num_v_heads * head_v_dim
+        conv_dim = key_dim * 2 + value_dim
+        num_slots = max_bs * 2 + 1 if need_backup else max_bs + 1
+        conv_bytes = num_layers * num_slots * conv_dim * conv_kernel_size * 2  # bf16
+        recurrent_bytes = (
+            num_layers * num_slots * num_v_heads * head_v_dim * head_k_dim * 4
+        )  # float32
+        return conv_bytes + recurrent_bytes
+
     def allocate_gdn_states(
         self, hf_config, layer_types, max_bs: int, need_backup: bool = False
     ):

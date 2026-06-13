@@ -69,6 +69,38 @@ class StepResult:
     postprocess_latency_ms: float
 
 
+@dataclass
+class PendingStep:
+    """In-flight step state between step_begin() and step_complete().
+
+    Carries the schedule output plus the executor handle of the submitted
+    forward so the driver can overlap bookkeeping of step N with the GPU
+    forward of step N+1 (see run_engine_backend's pipelined loop).
+    """
+
+    dp_seqs: list
+    is_prefill: bool
+    filtered_dp_group_seqs: list
+    dummy_seq_ids: set
+    running_per_dp: list
+    total_waiting: int
+    total_waiting_migration: int
+    sch_begin: float
+    sch_end: float
+    handle: Optional[dict] = None  # executor run_async handle (None = migrate path)
+    # Filled by step_finish():
+    token_ids: Optional[list] = None
+    post_sch_begin: float = 0.0
+    post_sch_end: float = 0.0
+    forward_tx_bytes: int = 0
+    forward_rx_bytes: int = 0
+    transfer_ms: float = 0.0
+    wwi_ms: float = 0.0
+    immrecv_ms: float = 0.0
+    net_ms: float = 0.0
+    serialize_ms: float = 0.0
+
+
 class LLMEngine:
     def __init__(self, config: Config):
         self.engine_id = str(uuid.uuid4())
@@ -112,6 +144,12 @@ class LLMEngine:
             f"Initialized Scheduler with RoutingStrategy: {self.scheduler.routing_strategy}"
         )
         self.metrics_manager = MetricsManager()
+
+        # Seq ids whose prefix-cache hit has already been counted. A prompt is
+        # admitted once but (under chunked prefill) appears in several prefill
+        # steps, so we tally num_cached_tokens exactly once per sequence and
+        # drop the id again when the sequence finishes.
+        self._prefix_counted_seq_ids: set[int] = set()
 
         atexit.register(self.exit)
 
@@ -179,7 +217,29 @@ class LLMEngine:
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
         self.scheduler.free_to_be_migrated(seqs)
 
-    def step(self):
+    def abort(self, seq_ids: int | list[int]) -> list[int]:
+        """Stop generating for the given sequences and free their KV blocks.
+
+        Returns the subset of ``seq_ids`` that were actually found and aborted.
+        MUST be called between steps (no forward in flight); the backend loop
+        enforces this by deferring aborts while a step is pending.
+        """
+        if isinstance(seq_ids, int):
+            seq_ids = [seq_ids]
+        aborted: list[int] = []
+        for seq_id in seq_ids:
+            if self.scheduler.abort(int(seq_id)):
+                aborted.append(int(seq_id))
+        return aborted
+
+    def step_begin(self) -> PendingStep:
+        """Schedule one step and submit its forward to the workers.
+
+        Returns immediately after the (non-blocking) submit; pair with
+        step_finish() + step_complete(). The PD-disagg migrate path (prefill
+        request on a decode engine) runs synchronously here since it has no
+        forward to overlap.
+        """
         dp_size = self.config.attention_dp
         sp_size = self.config.attention_sp
         tp_size = self.config.attention_tp
@@ -264,58 +324,103 @@ class LLMEngine:
         )
 
         sch_end = time.time()
-        post_sch_begin = 0
-        post_sch_end = 0
 
-        # Run prefill to populate KV cache (or skip for decode engine receiving prefill request)
-        token_ids = None
-        token_logprobs = None
-        forward_tx_bytes = 0
-        forward_rx_bytes = 0
-        transfer_ms = 0.0
-        wwi_ms = 0.0
-        immrecv_ms = 0.0
-        net_ms = 0.0
-        serialize_ms = 0.0
+        pending = PendingStep(
+            dp_seqs=dp_seqs,
+            is_prefill=is_prefill,
+            filtered_dp_group_seqs=filtered_dp_group_seqs,
+            dummy_seq_ids=dummy_seq_ids,
+            running_per_dp=running_per_dp,
+            total_waiting=total_waiting,
+            total_waiting_migration=total_waiting_migration,
+            sch_begin=sch_begin,
+            sch_end=sch_end,
+        )
+
         if not (is_prefill and self.config.mode == "decode"):
-            # Normal execution: prefill engine runs prefill, or decode engine runs decode.
-            # Each per-DP result is either ``list[list[int]]`` (legacy /
-            # logprobs disabled) or ``(list[list[int]], list[list[float]])``
-            # when SamplingParams.return_completion_logprobs is on.
-            raw = self.executor.run(dp_group_tp_seqs, is_prefill)[::tp_size]
-            forward_tx_bytes = getattr(self.executor, "last_run_request_bytes", 0)
-            forward_rx_bytes = getattr(self.executor, "last_run_reply_bytes", 0)
-            transfer_ms = getattr(self.executor, "last_run_transfer_ms", 0.0)
-            wwi_ms = getattr(self.executor, "last_run_wwi_ms", 0.0)
-            immrecv_ms = getattr(self.executor, "last_run_immrecv_ms", 0.0)
-            net_ms = getattr(self.executor, "last_run_net_ms", 0.0)
-            serialize_ms = getattr(self.executor, "last_run_serialize_ms", 0.0)
-            token_ids, token_logprobs = _split_run_result(raw)
-            post_sch_begin = time.time()
-            if token_logprobs is not None:
-                self.scheduler.postprocess(
-                    filtered_dp_group_seqs,
-                    token_ids,
-                    True,
-                    token_logprobs,
-                )
-            else:
-                self.scheduler.postprocess(filtered_dp_group_seqs, token_ids, True)
-            post_sch_end = time.time()
-
+            # Normal execution: prefill engine runs prefill, or decode engine
+            # runs decode. Submit only; step_finish() waits for the replies.
+            pending.handle = self.executor.run_async(dp_group_tp_seqs, is_prefill)
         else:
             # PD disaggregation: decode engine receives prefill request
             # DO NOT run prefill on decode engine - KV cache will be migrated from prefill engine
             logger.info(
                 f"Decode engine receiving prefill request, skipping local prefill execution"
             )
-            post_sch_begin = time.time()
-            post_sch_end = time.time()
             # TP-expand so every worker (all dp*sp*tp ranks) receives the
             # migrate batch. With attention_tp > 1 (GQA) each TP rank holds a
             # distinct KV-head shard and must run its own RDMA reads; sending
             # only dp_group_seqs would leave tp_idx > 0 ranks unmigrated.
             self.executor.migrate(dp_group_tp_seqs)
+        return pending
+
+    def step_finish(self, pending: PendingStep) -> StepResult:
+        """Wait for the submitted forward and postprocess its results.
+
+        Only the work that the next step_begin() depends on lives here (reply
+        wait + token append); counting/metrics/heartbeat are deferred to
+        step_complete() so they can be overlapped with the next forward.
+        """
+        tp_size = self.config.attention_tp
+        token_ids = None
+        token_logprobs = None
+        if pending.handle is not None:
+            # Each per-DP result is either ``list[list[int]]`` (legacy /
+            # logprobs disabled) or ``(list[list[int]], list[list[float]])``
+            # when SamplingParams.return_completion_logprobs is on.
+            raw = self.executor.run_wait(pending.handle)[::tp_size]
+            pending.forward_tx_bytes = getattr(
+                self.executor, "last_run_request_bytes", 0
+            )
+            pending.forward_rx_bytes = getattr(self.executor, "last_run_reply_bytes", 0)
+            pending.transfer_ms = getattr(self.executor, "last_run_transfer_ms", 0.0)
+            pending.wwi_ms = getattr(self.executor, "last_run_wwi_ms", 0.0)
+            pending.immrecv_ms = getattr(self.executor, "last_run_immrecv_ms", 0.0)
+            pending.net_ms = getattr(self.executor, "last_run_net_ms", 0.0)
+            pending.serialize_ms = getattr(self.executor, "last_run_serialize_ms", 0.0)
+            token_ids, token_logprobs = _split_run_result(raw)
+            pending.post_sch_begin = time.time()
+            if token_logprobs is not None:
+                self.scheduler.postprocess(
+                    pending.filtered_dp_group_seqs,
+                    token_ids,
+                    True,
+                    token_logprobs,
+                )
+            else:
+                self.scheduler.postprocess(
+                    pending.filtered_dp_group_seqs, token_ids, True
+                )
+            pending.post_sch_end = time.time()
+        else:
+            pending.post_sch_begin = time.time()
+            pending.post_sch_end = pending.post_sch_begin
+        pending.token_ids = token_ids
+
+        return StepResult(
+            dp_seqs=pending.dp_seqs,
+            outputs=[],
+            prefill_tokens=0,
+            decode_tokens=0,
+            real_bs=0,
+            schedule_latency_ms=(pending.sch_end - pending.sch_begin) * 1000,
+            postprocess_latency_ms=(pending.post_sch_end - pending.post_sch_begin)
+            * 1000,
+        )
+
+    def step_complete(self, pending: PendingStep, result: StepResult) -> StepResult:
+        """Token accounting, finished-seq collection, and heartbeat for one step.
+
+        Pure bookkeeping over already-postprocessed sequences: safe to run
+        after the next step has been scheduled and submitted, so the backend
+        loop calls this in the shadow of the next GPU forward.
+        """
+        dp_size = self.config.attention_dp
+        sp_size = self.config.attention_sp
+        dp_seqs = pending.dp_seqs
+        dummy_seq_ids = pending.dummy_seq_ids
+        token_ids = pending.token_ids
+
         outputs = []
         prefill_tokens_per_dp = [0] * dp_size
         decode_tokens_per_dp = [0] * dp_size
@@ -326,16 +431,30 @@ class LLMEngine:
                 dp_idx, num_tokens_in_dp
             )
 
-        if is_prefill:
+        # Prefix-cache accounting (prefill only): tally each newly admitted
+        # prompt's cached vs. total prompt tokens exactly once. Tracked per DP
+        # rank since each rank owns its own block managers / prefix cache.
+        prefix_cached_tokens_per_dp = [0] * dp_size
+        prefix_prompt_tokens_per_dp = [0] * dp_size
+
+        if pending.is_prefill:
             for dp_idx, seqs in enumerate(dp_seqs):
                 prefill_tokens_per_dp[dp_idx] += sum(
                     len(seq) for seq in seqs if seq.seq_id not in dummy_seq_ids
                 )
+                for seq in seqs:
+                    if seq.seq_id in dummy_seq_ids:
+                        continue
+                    if seq.seq_id in self._prefix_counted_seq_ids:
+                        continue
+                    self._prefix_counted_seq_ids.add(seq.seq_id)
+                    prefix_cached_tokens_per_dp[dp_idx] += seq.num_cached_tokens
+                    prefix_prompt_tokens_per_dp[dp_idx] += seq.num_prompt_tokens
         elif token_ids is not None:
             for dp_idx in range(dp_size):
                 for sp_idx in range(sp_size):
                     group_idx = dp_idx * sp_size + sp_idx
-                    group_seqs = filtered_dp_group_seqs[group_idx]
+                    group_seqs = pending.filtered_dp_group_seqs[group_idx]
                     group_tokens = token_ids[group_idx]
                     for seq, seq_tokens in zip(group_seqs, group_tokens):
                         if seq.seq_id not in dummy_seq_ids:
@@ -345,16 +464,18 @@ class LLMEngine:
                 num_real = sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
                 decode_tokens_per_dp[dp_idx] += num_real
 
-        prefill_tokens = sum(prefill_tokens_per_dp)
-        decode_tokens = sum(decode_tokens_per_dp)
+        result.prefill_tokens = sum(prefill_tokens_per_dp)
+        result.decode_tokens = sum(decode_tokens_per_dp)
 
         # Collect finished/migrated sequences after postprocess
         for seqs in dp_seqs:
             for seq in seqs:
                 if seq.is_finished or seq.is_to_be_migrated:
                     self.metrics_manager.complete_sequence(seq.seq_id)
+                    self._prefix_counted_seq_ids.discard(seq.seq_id)
                     outputs.append(seq)
-        real_bs = sum(
+        result.outputs = outputs
+        result.real_bs = sum(
             sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
             for seqs in dp_seqs
         )
@@ -378,43 +499,47 @@ class LLMEngine:
             used_blocks_per_dp = None
         # Latency breakdown for this step. forward = executor.run/migrate, i.e.
         # the gap between scheduling end and postprocess start.
-        schedule_latency_ms = (sch_end - sch_begin) * 1000
         forward_latency_ms = (
-            (post_sch_begin - sch_end) * 1000 if post_sch_begin else 0.0
+            (pending.post_sch_begin - pending.sch_end) * 1000
+            if pending.post_sch_begin
+            else 0.0
         )
-        postprocess_latency_ms = (post_sch_end - post_sch_begin) * 1000
 
         self.metrics_manager.maybe_report_engine_status(
             engine_id=self.engine_id,
             mode=self.config.mode,
-            running_per_dp=running_per_dp,
-            waiting=total_waiting,
-            waiting_migration=total_waiting_migration,
+            running_per_dp=pending.running_per_dp,
+            waiting=pending.total_waiting,
+            waiting_migration=pending.total_waiting_migration,
             used_blocks_per_dp=used_blocks_per_dp,
             total_blocks=blocks_per_dp,
             prefill_tokens_per_dp=prefill_tokens_per_dp,
             decode_tokens_per_dp=decode_tokens_per_dp,
-            schedule_ms=schedule_latency_ms,
+            prefix_cached_tokens_per_dp=prefix_cached_tokens_per_dp,
+            prefix_prompt_tokens_per_dp=prefix_prompt_tokens_per_dp,
+            schedule_ms=result.schedule_latency_ms,
             forward_ms=forward_latency_ms,
-            postprocess_ms=postprocess_latency_ms,
-            forward_tx_bytes=forward_tx_bytes,
-            forward_rx_bytes=forward_rx_bytes,
-            transfer_ms=transfer_ms,
-            wwi_ms=wwi_ms,
-            immrecv_ms=immrecv_ms,
-            net_ms=net_ms,
-            serialize_ms=serialize_ms,
+            postprocess_ms=result.postprocess_latency_ms,
+            forward_tx_bytes=pending.forward_tx_bytes,
+            forward_rx_bytes=pending.forward_rx_bytes,
+            transfer_ms=pending.transfer_ms,
+            wwi_ms=pending.wwi_ms,
+            immrecv_ms=pending.immrecv_ms,
+            net_ms=pending.net_ms,
+            serialize_ms=pending.serialize_ms,
         )
+        return result
 
-        return StepResult(
-            dp_seqs=dp_seqs,
-            outputs=outputs,
-            prefill_tokens=prefill_tokens,
-            decode_tokens=decode_tokens,
-            real_bs=real_bs,
-            schedule_latency_ms=schedule_latency_ms,
-            postprocess_latency_ms=postprocess_latency_ms,
-        )
+    def step(self):
+        """Synchronous one-step execution (schedule + forward + bookkeeping).
+
+        Kept for generate() and other non-pipelined callers; the backend
+        server loop uses step_begin/step_finish/step_complete directly to
+        overlap driver bookkeeping with the next GPU forward.
+        """
+        pending = self.step_begin()
+        result = self.step_finish(pending)
+        return self.step_complete(pending, result)
 
     def is_finished(self):
         return self.scheduler.is_finished()

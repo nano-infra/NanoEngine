@@ -45,6 +45,8 @@ _ACTION_MIGRATION = 1
 _ACTION_ADD = 1
 _ACTION_GET_INFO = 2
 _ACTION_FREE = 3
+_ACTION_ABORT = 5
+_ACTION_GET_METRICS = 6
 
 
 class ZmqEngineWorker:
@@ -65,6 +67,7 @@ class ZmqEngineWorker:
         self._send_task: Optional[asyncio.Task] = None
         self._ready = asyncio.Event()
         self.engine_id: Optional[str] = None
+        self._metrics_future: Optional[asyncio.Future] = None
 
     async def start(self, info_timeout: Optional[float] = None) -> None:
         """Connect to the engine process and wait until it is ready.
@@ -119,6 +122,43 @@ class ZmqEngineWorker:
             return
         payload = self._build_free_payload(seq_ids)
         self._outbox.put_nowait((_ACTION_FREE, payload))
+
+    def abort(self, seq_id: int) -> None:
+        """Stop generating for ``seq_id`` (server-side stop string / cancel).
+
+        Finalizes the request locally so the caller's stream ends immediately
+        (without a round-trip), then asks the engine to drop the sequence and
+        free its KV blocks so it stops running out to ``max_tokens``.
+        """
+        req = self._active.pop(seq_id, None)
+        if req is not None:
+            self._push(req, {"finish": True})
+            self._push(req, None)
+        if self._outbox is not None:
+            payload = self._build_free_payload([seq_id])
+            self._outbox.put_nowait((_ACTION_ABORT, payload))
+
+    async def get_metrics(self) -> str:
+        """Fetch Prometheus-format metrics from the engine process.
+
+        Sends a GET_METRICS request and waits for the response.
+        Returns the metrics text or empty string on error.
+        """
+        if self._socket is None:
+            return ""
+        loop = asyncio.get_event_loop()
+        self._metrics_future = loop.create_future()
+        self._outbox.put_nowait((_ACTION_GET_METRICS, b""))
+        try:
+            return await asyncio.wait_for(self._metrics_future, timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("Timeout waiting for metrics response")
+            return ""
+        except Exception as e:
+            logger.warning(f"Error fetching metrics: {e}")
+            return ""
+        finally:
+            self._metrics_future = None
 
     def _build_free_payload(self, seq_ids: list[int]) -> bytes:
         import flatbuffers
@@ -177,6 +217,8 @@ class ZmqEngineWorker:
                     self._handle_migration(payload)
                 elif action == _ACTION_GET_INFO:
                     self._handle_engine_info(payload)
+                elif action == _ACTION_GET_METRICS:
+                    self._handle_engine_metrics(payload)
                 else:
                     logger.warning(f"ZmqEngineWorker unknown action: {action}")
             except Exception as e:  # noqa: BLE001
@@ -243,3 +285,12 @@ class ZmqEngineWorker:
             logger.error(f"Failed to parse engine info: {e}")
         finally:
             self._ready.set()
+
+    def _handle_engine_metrics(self, payload: bytes) -> None:
+        """Handle metrics response from engine."""
+        if self._metrics_future is not None and not self._metrics_future.done():
+            try:
+                metrics = payload.decode("utf-8")
+                self._metrics_future.set_result(metrics)
+            except Exception as e:  # noqa: BLE001
+                self._metrics_future.set_exception(e)

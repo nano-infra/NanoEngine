@@ -14,6 +14,7 @@ from dlengine.layers.activation import SiluAndMul
 from dlengine.layers.base_backend import (
     DistributedRoutedExpertsBase,
     MergedColumnParallelLinearBase,
+    PrequantizedActivation,
     QKVParallelLinearBase,
     RowParallelLinearBase,
 )
@@ -27,6 +28,24 @@ from dlengine.layers.rotary_embedding import get_rope
 from dlengine.logging import get_logger
 from dlengine.worker.runner_config import get_runner_config
 from ..quant_config import QuantizationConfig
+
+try:
+    from dlengine.kernel.triton.generic.fused_topk import (
+        can_use_fused_softmax_topk,
+        fused_softmax_topk,
+    )
+except ImportError:
+    can_use_fused_softmax_topk = None
+    fused_softmax_topk = None
+
+try:
+    from dlengine.kernel.triton.hopper.rmsnorm_quant_fp8 import (
+        add_rms_norm_quant_fp8,
+        can_use_add_rms_norm_quant_fp8,
+    )
+except ImportError:
+    add_rms_norm_quant_fp8 = None
+    can_use_add_rms_norm_quant_fp8 = None
 
 logger = get_logger()
 
@@ -256,12 +275,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits = self.gate(hidden_states)
 
         # Softmax and routing
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        if fused_softmax_topk is not None and can_use_fused_softmax_topk(
+            router_logits, self.top_k
+        ):
+            # Single fused kernel; emits fp32 weights + int64 ids so the
+            # DeepEP dispatcher-side casts become no-ops.
+            routing_weights, selected_experts = fused_softmax_topk(
+                router_logits, self.top_k, renormalize=True
+            )
+        else:
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(
+                routing_weights, self.top_k, dim=-1
+            )
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            routing_weights = routing_weights.to(hidden_states.dtype)
 
         context = get_context()
         is_prefill = context.is_prefill
@@ -336,6 +364,22 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         self.layer_idx = layer_idx
 
+        # Fuse input_layernorm + FP8 activation quant into one kernel and
+        # hand the prequantized activation straight to qkv_proj's DeepGEMM
+        # (skips one kernel launch + a bf16 HBM round-trip per layer).
+        # Only valid on the Hopper FP8 path with 128-blocked scales.
+        self._fuse_norm_quant_qkv = (
+            add_rms_norm_quant_fp8 is not None
+            and quantization_config.quant_method == "fp8"
+            and list(quantization_config.block_size or [])[:1] == [128]
+            and can_use_add_rms_norm_quant_fp8(config.hidden_size)
+            and hasattr(self.self_attn.qkv_proj, "_fp8_forward")
+            and not self.input_layernorm.add_unit_offset
+        )
+        self._norm_quant_ue8m0 = (
+            getattr(quantization_config, "scale_fmt", None) == "ue8m0"
+        )
+
         # Parallelism transition: when attn uses TP and FFN uses EP,
         # we must redistribute tokens between the two phases.
         attn_tp = get_dist_context().attn_tp_world_size
@@ -356,6 +400,23 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif (
+            self._fuse_norm_quant_qkv
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and residual.dtype == torch.bfloat16
+            and residual.is_contiguous()
+            and residual.shape == hidden_states.shape
+        ):
+            q, scales, residual = add_rms_norm_quant_fp8(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+                dtype=self.self_attn.qkv_proj.weight.dtype,
+                round_ue8m0=self._norm_quant_ue8m0,
+            )
+            hidden_states = PrequantizedActivation(q, scales, hidden_states.shape[0])
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 

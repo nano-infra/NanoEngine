@@ -269,6 +269,14 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         scale = self.head_k_dim**-0.5
 
         if context.is_prefill:
+            # Neutralise stale recurrent/conv state left in a recycled slot by a
+            # previous request before any prefill path reads it. The GDN state
+            # pool is persistent and is not cleared on slot reuse, so without
+            # this a fresh sequence batched with a chunked-prefill continuation
+            # (block_tables set batch-globally) can pick up the prior occupant's
+            # state — harmless zeros on the first run after startup, but garbage
+            # on every subsequent run.
+            self._zero_fresh_slots(context)
             # 2. Prefill path: chunk conv1d + chunk GDN
             qkv = self._apply_conv1d(qkv, context)
             q, k, v = qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
@@ -504,6 +512,12 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 ]
             else:
                 init_states = gdn_conv_states[self.layer_idx, :num_seqs, :, 1:]
+            # Force fresh (first-chunk) sequences to start from a zero conv
+            # state (see _continuation_keep_mask); guards against stale state in
+            # a reused slot when a fresh seq is batched with a continuation.
+            keep = self._continuation_keep_mask(context, num_seqs, init_states.dtype)
+            if keep is not None:
+                init_states = init_states * keep.view(-1, 1, 1)
             if not init_states.is_contiguous():
                 init_states = init_states.contiguous()
 
@@ -680,6 +694,14 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                     ]
                 else:
                     initial_state = gdn_recurrent_states[self.layer_idx, :num_seqs]
+                # Force fresh (first-chunk) sequences to start from zero state;
+                # block_tables is batch-global so a fresh seq batched with a
+                # continuation would otherwise inherit a stale reused slot.
+                keep = self._continuation_keep_mask(
+                    context, num_seqs, initial_state.dtype
+                )
+                if keep is not None:
+                    initial_state = initial_state * keep.view(-1, 1, 1, 1)
             else:
                 initial_state = gdn_recurrent_states.new_zeros(
                     num_seqs, self.num_v_heads, self.head_v_dim, self.head_k_dim
@@ -782,6 +804,80 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
     def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
         """L2 normalization matching FLA's l2norm."""
         return _l2norm_compiled(x, dim, eps)
+
+    def _zero_fresh_slots(self, context) -> None:
+        """Zero the conv + recurrent state slots of fresh (first-chunk) seqs
+        before prefill reads them.
+
+        The GDN state pool is persistent across requests and is *not* cleared
+        when a slot is recycled, so a slot handed to a new sequence still holds
+        the previous occupant's final state. In a mixed prefill batch (a fresh
+        sequence batched with a chunked-prefill continuation) ``block_tables``
+        is set batch-globally, so several read paths — notably the naive conv1d
+        fallback (``_conv1d_prefill_naive``), which has no per-seq mask — would
+        otherwise pick up that stale state. Zeroing the fresh sequences' slots
+        in place here neutralises the leak for every downstream path
+        (fast/naive, conv/recurrent) in a single sync-free scatter-multiply;
+        continuation sequences (keep == 1) retain their state untouched.
+
+        Only needed when ``block_tables`` is set: when it is ``None`` no
+        sequence in the batch has cached tokens, so every prefill path already
+        starts from a freshly-allocated zero state.
+        """
+        if context.block_tables is None:
+            return
+        gdn_state_slots = getattr(context, "gdn_state_slots", None)
+        if gdn_state_slots is None:
+            return
+        cu_q = getattr(context, "cu_seqlens_q", None)
+        if cu_q is None:
+            return
+        num_seqs = cu_q.shape[0] - 1
+        if num_seqs <= 0:
+            return
+        keep = self._continuation_keep_mask(context, num_seqs, torch.float32)
+        if keep is None:
+            return
+        slots = gdn_state_slots[:num_seqs].long()
+
+        gdn_recurrent_states = getattr(context, "gdn_recurrent_states", None)
+        if gdn_recurrent_states is not None:
+            keep_r = keep.view(-1, 1, 1, 1).to(gdn_recurrent_states.dtype)
+            gdn_recurrent_states[self.layer_idx, slots] = (
+                gdn_recurrent_states[self.layer_idx, slots] * keep_r
+            )
+
+        gdn_conv_states = getattr(context, "gdn_conv_states", None)
+        if gdn_conv_states is not None:
+            keep_c = keep.view(-1, 1, 1).to(gdn_conv_states.dtype)
+            gdn_conv_states[self.layer_idx, slots] = (
+                gdn_conv_states[self.layer_idx, slots] * keep_c
+            )
+
+    @staticmethod
+    def _continuation_keep_mask(context, num_seqs: int, dtype: torch.dtype):
+        """Per-seq multiplier: 1.0 for sequences that continue from a cached
+        recurrent state (chunked-prefill chunk 2+), 0.0 for fresh first-chunk
+        sequences.
+
+        ``block_tables is not None`` is a *batch-global* flag, so a fresh
+        sequence (no cached tokens) batched together with a chunked-prefill
+        continuation would otherwise read stale conv/recurrent state left in
+        its reused slot by a previous sequence. Multiplying the gathered
+        initial state by this mask forces fresh sequences to start from zero
+        without leaking across requests. Computed from cu_seqlens (cached =
+        seqlen_k - seqlen_q) so it stays sync-free (no ``.item()``/``bool()``).
+        """
+        cu_q = getattr(context, "cu_seqlens_q", None)
+        cu_k = getattr(context, "cu_seqlens_k", None)
+        if cu_q is None or cu_k is None:
+            return None
+        cu_q = cu_q.long()
+        cu_k = cu_k.long()
+        seqlen_q = cu_q[1 : num_seqs + 1] - cu_q[:num_seqs]
+        seqlen_k = cu_k[1 : num_seqs + 1] - cu_k[:num_seqs]
+        # cached tokens = seqlen_k - seqlen_q; > 0 only for continuations.
+        return (seqlen_k > seqlen_q).to(dtype)
 
     def _naive_gdn_prefill(
         self, q, k, v, g, beta, scale, cu_seqlens, initial_state=None

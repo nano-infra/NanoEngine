@@ -347,12 +347,8 @@ class RayExecutor:
     def l3_stats(self) -> list[dict]:
         return self.collective_rpc("l3_stats")
 
-    def run(
-        self,
-        dp_seqs: List[List[Sequence]],
-        is_prefill: bool,
-        timeout: float | None = None,
-    ) -> list[list[list[int]]]:
+    def run_async(self, dp_seqs: List[List[Sequence]], is_prefill: bool) -> dict:
+        """Serialize and submit one forward without waiting (see run_wait)."""
         # Serialize into lean RunBatchInput bytes, send bytes instead of Sequence objects
         batch_bytes = [_serialize_run(seqs, is_prefill) for seqs in dp_seqs]
         # Bytes sent to the runners this forward (serialized RunBatch input).
@@ -361,8 +357,20 @@ class RayExecutor:
             getattr(worker, "run_from_bytes").remote(b, is_prefill)
             for b, worker in zip(batch_bytes, self.workers)
         ]
+        return {"futures": ray_futures}
+
+    def run_wait(self, handle: dict) -> list[list[list[int]]]:
+        return ray.get(handle["futures"])
+
+    def run(
+        self,
+        dp_seqs: List[List[Sequence]],
+        is_prefill: bool,
+        timeout: float | None = None,
+    ) -> list[list[list[int]]]:
+        handle = self.run_async(dp_seqs, is_prefill)
         return ray.get(
-            ray_futures,
+            handle["futures"],
             timeout=timeout,
         )
 

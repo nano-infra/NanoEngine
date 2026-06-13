@@ -123,6 +123,7 @@ class ExpertContext:
             num_rdma_bytes=num_rdma_bytes,
             low_latency_mode=True,
             num_qps_per_rank=num_qps_per_rank,
+            allow_nvlink_for_low_latency_mode=True,
         )
         self.buffer.set_num_sms(self.num_sms)
 

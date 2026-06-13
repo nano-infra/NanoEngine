@@ -1,5 +1,8 @@
 #include "serialization.h"
 
+#include <cstring>
+#include <stdexcept>
+
 #include <flatbuffers/flatbuffers.h>
 
 #include "interface_generated.h"
@@ -117,6 +120,88 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
     builder.Finish(batch);
 
     return builder.Release();
+}
+
+std::string encode_run_result(const std::vector<std::vector<int32_t>>& token_ids,
+                              const std::vector<std::vector<float>>*   logprobs,
+                              uint64_t                                 server_handler_ns)
+{
+    const bool has_logprobs = logprobs != nullptr;
+
+    flatbuffers::FlatBufferBuilder builder(1024);
+
+    std::vector<flatbuffers::Offset<fbs::RunSequenceOutput>> seq_offsets;
+    seq_offsets.reserve(token_ids.size());
+    for (size_t i = 0; i < token_ids.size(); ++i) {
+        auto tokens_off = builder.CreateVector(token_ids[i]);
+
+        flatbuffers::Offset<flatbuffers::Vector<float>> lp_off = 0;
+        if (has_logprobs && i < logprobs->size()) {
+            lp_off = builder.CreateVector((*logprobs)[i]);
+        }
+
+        fbs::RunSequenceOutputBuilder so_builder(builder);
+        so_builder.add_token_ids(tokens_off);
+        if (lp_off.o != 0) {
+            so_builder.add_logprobs(lp_off);
+        }
+        seq_offsets.push_back(so_builder.Finish());
+    }
+
+    auto seqs_vec = builder.CreateVector(seq_offsets);
+    auto root     = fbs::CreateRunBatchOutput(builder, seqs_vec, has_logprobs);
+    builder.Finish(root);
+
+    std::string out;
+    out.resize(kRunResultHeaderSize + builder.GetSize());
+    // 8-byte little-endian server-handler-ns header (matches struct.pack "<Q").
+    for (size_t b = 0; b < kRunResultHeaderSize; ++b) {
+        out[b] = static_cast<char>((server_handler_ns >> (8 * b)) & 0xff);
+    }
+    std::memcpy(out.data() + kRunResultHeaderSize, builder.GetBufferPointer(), builder.GetSize());
+    return out;
+}
+
+RunResultView decode_run_result(const uint8_t* data, size_t len)
+{
+    if (len < kRunResultHeaderSize) {
+        throw std::runtime_error("run result reply shorter than its 8-byte header");
+    }
+
+    RunResultView view;
+    // interface.fbs declares no root_type, so use the generic root accessor
+    // (equivalent to the Python GetRootAs(data, REPLY_HEADER_SIZE)).
+    const auto* output = flatbuffers::GetRoot<fbs::RunBatchOutput>(data + kRunResultHeaderSize);
+    view.has_logprobs  = output->has_logprobs();
+
+    const auto* seqs = output->sequences();
+    if (seqs == nullptr) {
+        return view;
+    }
+
+    view.token_ids.reserve(seqs->size());
+    if (view.has_logprobs) {
+        view.logprobs.reserve(seqs->size());
+    }
+    for (const auto* seq : *seqs) {
+        const auto* tokens = seq->token_ids();
+        if (tokens != nullptr) {
+            view.token_ids.emplace_back(tokens->begin(), tokens->end());
+        }
+        else {
+            view.token_ids.emplace_back();
+        }
+        if (view.has_logprobs) {
+            const auto* lps = seq->logprobs();
+            if (lps != nullptr) {
+                view.logprobs.emplace_back(lps->begin(), lps->end());
+            }
+            else {
+                view.logprobs.emplace_back();
+            }
+        }
+    }
+    return view;
 }
 
 flatbuffers::DetachedBuffer serialize_migrate_batch(const std::vector<Sequence*>& seqs)

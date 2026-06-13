@@ -79,6 +79,21 @@ def init_scheduler(config: Config) -> Scheduler:
                     for c in cfgs
                 )
             )
+
+    # Linear-attention / GatedDeltaNet models: cross-request prefix caching is
+    # unsafe because the recurrent (conv + state) cache is not captured by the
+    # shared KV blocks. A prefix-cache hit would skip recomputing those tokens
+    # and start the linear-attention state from a stale slot, corrupting output
+    # non-deterministically under concurrency. Disable it so every request
+    # recomputes its full prompt from a zero state.
+    layer_types = getattr(config.hf_config, "layer_types", None)
+    if layer_types and any(lt == "linear_attention" for lt in layer_types):
+        sched.set_prefix_caching_enabled(False)
+        logger.info(
+            "Linear-attention model detected (layer_types contains "
+            "'linear_attention'): disabled cross-request prefix caching to "
+            "keep the GatedDeltaNet recurrent state correct."
+        )
     return sched
 
 

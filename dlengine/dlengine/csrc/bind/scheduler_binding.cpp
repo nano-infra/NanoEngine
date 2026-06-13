@@ -140,6 +140,9 @@ void bind_scheduler_utils(py::module_& m)
         // DSv4 compressed-cache pool configuration
         .def("configure_compressed_pools", &Scheduler::configure_compressed_pools, py::arg("configs"))
 
+        // Cross-request prefix caching toggle (disabled for linear-attention)
+        .def("set_prefix_caching_enabled", &Scheduler::set_prefix_caching_enabled, py::arg("enabled"))
+
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))
 
@@ -171,6 +174,9 @@ void bind_scheduler_utils(py::module_& m)
         .def("free_to_be_migrated",
              py::overload_cast<const std::vector<std::shared_ptr<Sequence>>&>(&Scheduler::free_to_be_migrated),
              py::arg("seqs"))
+
+        // Abort: stop generating for a sequence and free its KV blocks.
+        .def("abort", &Scheduler::abort, py::arg("seq_id"))
 
         // Access methods
         .def("running",

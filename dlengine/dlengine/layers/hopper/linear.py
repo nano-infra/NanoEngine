@@ -16,6 +16,7 @@ from dlengine.kernel.triton.hopper.block_gemm_fp8 import deep_gemm_fp8, quant_fp
 from dlengine.layers.base_backend import (
     ColumnParallelLinearBase,
     MergedColumnParallelLinearBase,
+    PrequantizedActivation,
     QKVParallelLinearBase,
     ReplicatedLinearBase,
     RowParallelLinearBase,
@@ -110,21 +111,30 @@ class _HopperLinearMixin:
         this, the trivial-looking FP32 scale variant accumulates ~2.5%
         relative drift per FP8 GEMM and flips greedy top-1.
         """
-        round_ue8m0 = getattr(self.quantization_config, "scale_fmt", None) == "ue8m0"
-        input_quant, input_scale = quant_fp8_tma(
-            x,
-            self.quantization_config.block_size[0],
-            dtype=self.weight.dtype,
-            round_ue8m0=round_ue8m0,
-        )
+        if isinstance(x, PrequantizedActivation):
+            # Activation already quantised by a fused norm+quant kernel.
+            input_quant, input_scale, num_tokens = x
+            out_dtype = torch.bfloat16
+        else:
+            round_ue8m0 = (
+                getattr(self.quantization_config, "scale_fmt", None) == "ue8m0"
+            )
+            input_quant, input_scale = quant_fp8_tma(
+                x,
+                self.quantization_config.block_size[0],
+                dtype=self.weight.dtype,
+                round_ue8m0=round_ue8m0,
+            )
+            num_tokens = x.size(0)
+            out_dtype = x.dtype
         out = deep_gemm_fp8(
             input_quant,
             input_scale,
             self.weight,
             self.weight_scale_inv,
-            out_dtype=x.dtype,
+            out_dtype=out_dtype,
         )
-        out = out[: x.size(0)]
+        out = out[:num_tokens]
         if self.bias is not None:
             out = out + self.bias
         return out

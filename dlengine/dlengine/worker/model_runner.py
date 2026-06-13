@@ -136,7 +136,7 @@ from dlengine._cpp import (
     serialize_run_batch,
 )
 from dlengine.config import Config
-from dlengine.context.cache import get_cache_context, set_cache_context
+from dlengine.context.cache import CacheContext, get_cache_context, set_cache_context
 from dlengine.context.context import get_context, reset_context
 from dlengine.context.distributed import (
     get_dist_context,
@@ -708,10 +708,144 @@ class ModelRunner:
         num_seqs = min(
             max_num_batched_tokens // max_model_len, self.config.max_num_seqs
         )
+        # Pre-compile the prefill MoE DeepGEMM kernels before serving so the
+        # first real prefill doesn't JIT-compile inside the forward (which
+        # stalls this rank while peers time out in the DeepEP combine
+        # collective). Best-effort: never fatal.
+        try:
+            self._warmup_deep_gemm_moe(max_num_batched_tokens)
+        except Exception as e:  # pragma: no cover - warmup must never crash boot
+            logger.warning(f"[startup] r{self.rank} deep_gemm MoE warmup skipped: {e}")
         # empty for warmup — serialize empty batch into bytes
         warmup_data = serialize_run_batch([], True)
         self.run_from_bytes(warmup_data, True)
         torch.cuda.empty_cache()
+
+    def _warmup_deep_gemm_moe(self, max_num_batched_tokens: int):
+        """Pre-compile DeepGEMM grouped-GEMM kernels for the prefill MoE path.
+
+        The prefill expert path (``fused_moe_v3`` / ``fused_moe_v3_bf16``) uses
+        DeepGEMM's *contiguous* grouped GEMM, whose JIT-compiled kernel + block
+        config is selected by the token count. The existing dummy warmup only
+        exercises a single 1-token prefill, so the large-M kernels real prefills
+        need are JIT-compiled lazily inside the first serving forward. That
+        stalls the compiling rank for seconds while the other ranks sit in the
+        DeepEP ``combine`` collective until their watchdog fires, surfacing as
+        ``CUDA error: unspecified launch failure`` (DeepEP intranode.cu).
+
+        We warm the kernels here by replaying the post-dispatch compute on
+        synthetic inputs across a sweep of token-count buckets. ``fused_moe_v3``
+        is pure local DeepGEMM compute (no DeepEP collective), so this is
+        collective-safe and runs independently on every rank.
+        """
+        import os
+
+        if os.environ.get("DLENGINE_DISABLE_DEEPGEMM_WARMUP", "") == "1":
+            return
+        try:
+            import deep_gemm  # noqa: F401
+        except ImportError:
+            return
+
+        # Locate a routed-experts module (all MoE layers share weight shapes,
+        # so warming one compiles the kernels used by every layer).
+        experts = None
+        for module in self.model.modules():
+            if (
+                hasattr(module, "gate_up_proj")
+                and hasattr(module, "down_proj")
+                and hasattr(module, "top_k")
+                and hasattr(module, "num_local_experts")
+            ):
+                experts = module
+                break
+        # Only the EP (DeepGEMM grouped) path needs this; EP==1 uses a different
+        # local path that doesn't JIT large grouped GEMMs.
+        if experts is None or int(getattr(experts, "ep_size", 1)) <= 1:
+            return
+
+        from dlengine.kernel.triton.hopper.fused_moe_v3 import (
+            fused_moe_v3,
+            fused_moe_v3_bf16,
+        )
+
+        E = int(experts.num_local_experts)
+        top_k = int(experts.top_k)
+        K = int(experts.gate_up_proj.size(2))  # hidden_size
+        if E <= 0 or top_k <= 0:
+            return
+
+        # ep_scatter requires all_tokens % 128 == 0; keep per-expert counts a
+        # multiple of 128 (also the contiguous-layout alignment) and the total
+        # token budget under the per-step cap.
+        cap = max(int(max_num_batched_tokens), E * 128)
+        cs = [c for c in (128, 256, 512, 1024, 2048) if E * c <= cap]
+        if not cs:
+            cs = [128]
+
+        is_fp8 = bool(getattr(experts, "is_fp8", False))
+        swiglu_limit = float(getattr(experts, "_swiglu_limit_runtime", float("inf")))
+        dev = experts.gate_up_proj.device
+
+        logger.info(
+            f"[startup] r{self.rank} deep_gemm MoE warmup begin "
+            f"(fp8={is_fp8} E={E} top_k={top_k} buckets={[E * c for c in cs]})"
+        )
+        with torch.inference_mode():
+            for c in cs:
+                all_tokens = E * c
+                if all_tokens % top_k != 0:
+                    continue  # need an integer #tokens to reshape into [m, top_k]
+                m_orig = all_tokens // top_k
+                num_recv = [c] * E
+                # The token->expert histogram must equal num_recv exactly, or
+                # ep_scatter writes outside each expert's region. Assign each
+                # expert exactly c rows.
+                topk_idx = (
+                    torch.arange(E, device=dev)
+                    .repeat_interleave(c)
+                    .reshape(m_orig, top_k)
+                    .to(torch.int64)
+                )
+                topk_weights = torch.ones(
+                    (m_orig, top_k), dtype=torch.float32, device=dev
+                )
+                try:
+                    if is_fp8:
+                        x_fp8 = torch.zeros(
+                            (m_orig, K), dtype=torch.float8_e4m3fn, device=dev
+                        )
+                        x_scale = torch.ones(
+                            (m_orig, K // 128), dtype=torch.float32, device=dev
+                        )
+                        fused_moe_v3(
+                            (x_fp8, x_scale),
+                            topk_idx,
+                            topk_weights,
+                            (experts.gate_up_proj, experts.gate_up_scale_inv),
+                            (experts.down_proj, experts.down_scale_inv),
+                            num_recv,
+                            swiglu_limit=swiglu_limit,
+                        )
+                    else:
+                        x = torch.zeros((m_orig, K), dtype=torch.bfloat16, device=dev)
+                        fused_moe_v3_bf16(
+                            x,
+                            topk_idx,
+                            topk_weights,
+                            experts.gate_up_proj,
+                            experts.down_proj,
+                            num_recv,
+                            swiglu_limit=swiglu_limit,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[startup] r{self.rank} deep_gemm MoE warmup bucket "
+                        f"all_tokens={all_tokens} failed: {e}"
+                    )
+            torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        logger.info(f"[startup] r{self.rank} deep_gemm MoE warmup done")
 
     def preallocate_kvcache(self):
         config = self.config
@@ -757,6 +891,17 @@ class ModelRunner:
         head_dim = getattr(hf_config, "head_dim", None) or (
             hf_config.hidden_size // hf_config.num_attention_heads
         )
+        # Reserve memory for GDN linear-attention state buffers (allocated below
+        # via allocate_gdn_states) so KV-cache sizing stays within the
+        # utilization target on hybrid models.
+        reserved_state_bytes = 0
+        if layer_types is not None:
+            reserved_state_bytes = CacheContext.estimate_gdn_state_bytes(
+                hf_config,
+                layer_types,
+                config.max_num_seqs,
+                need_backup=config.num_speculative_tokens > 0,
+            )
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=head_dim,
@@ -775,6 +920,7 @@ class ModelRunner:
             ctrl_address=config.ctrl_address,
             ctrl_scope=config.ctrl_scope,
             engine_id=engine_id,
+            reserved_state_bytes=reserved_state_bytes,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
