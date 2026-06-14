@@ -895,12 +895,14 @@ class ModelRunner:
         # via allocate_gdn_states) so KV-cache sizing stays within the
         # utilization target on hybrid models.
         reserved_state_bytes = 0
+        gdn_cache_slots = max(0, getattr(config, "gdn_state_cache_slots", 0))
         if layer_types is not None:
             reserved_state_bytes = CacheContext.estimate_gdn_state_bytes(
                 hf_config,
                 layer_types,
                 config.max_num_seqs,
                 need_backup=config.num_speculative_tokens > 0,
+                cache_slots=gdn_cache_slots,
             )
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
@@ -931,6 +933,7 @@ class ModelRunner:
                 layer_types,
                 config.max_num_seqs,
                 need_backup=config.num_speculative_tokens > 0,
+                cache_slots=gdn_cache_slots,
             )
 
         self._init_peer_agent_context(cache_context)

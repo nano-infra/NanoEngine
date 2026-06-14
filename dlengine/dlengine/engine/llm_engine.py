@@ -150,6 +150,12 @@ class LLMEngine:
         # steps, so we tally num_cached_tokens exactly once per sequence and
         # drop the id again when the sequence finishes.
         self._prefix_counted_seq_ids: set[int] = set()
+        # Per-sequence prefix-cache hit logging (debug): set
+        # DLENGINE_LOG_PREFIX_HITS=1 to emit one INFO line per admitted prompt
+        # with its dp rank, affinity key and cached/prompt token counts.
+        self._log_prefix_hits = os.environ.get(
+            "DLENGINE_LOG_PREFIX_HITS", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
 
         atexit.register(self.exit)
 
@@ -450,6 +456,19 @@ class LLMEngine:
                     self._prefix_counted_seq_ids.add(seq.seq_id)
                     prefix_cached_tokens_per_dp[dp_idx] += seq.num_cached_tokens
                     prefix_prompt_tokens_per_dp[dp_idx] += seq.num_prompt_tokens
+                    if self._log_prefix_hits:
+                        _cached = seq.num_cached_tokens
+                        _prompt = seq.num_prompt_tokens
+                        logger.info(
+                            "[prefix-hit] seq_id=%s dp=%d affinity_key=%s "
+                            "cached=%d/%d (%.1f%%)",
+                            seq.seq_id,
+                            dp_idx,
+                            getattr(seq, "affinity_key", 0),
+                            _cached,
+                            _prompt,
+                            (_cached / _prompt * 100.0) if _prompt else 0.0,
+                        )
         elif token_ids is not None:
             for dp_idx in range(dp_size):
                 for sp_idx in range(sp_size):

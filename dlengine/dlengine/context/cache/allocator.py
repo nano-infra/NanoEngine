@@ -245,7 +245,11 @@ class KVCacheAllocatorMixin:
 
     @staticmethod
     def estimate_gdn_state_bytes(
-        hf_config, layer_types, max_bs: int, need_backup: bool = False
+        hf_config,
+        layer_types,
+        max_bs: int,
+        need_backup: bool = False,
+        cache_slots: int = 0,
     ) -> int:
         """Per-rank bytes the GDN conv + recurrent state buffers will occupy.
 
@@ -269,7 +273,10 @@ class KVCacheAllocatorMixin:
         key_dim = num_k_heads * head_k_dim
         value_dim = num_v_heads * head_v_dim
         conv_dim = key_dim * 2 + value_dim
-        num_slots = max_bs * 2 + 1 if need_backup else max_bs + 1
+        # Parked (session-cache) slots are added to the active region; see
+        # allocate_gdn_states for the layout.
+        active_capacity = max_bs + max(0, cache_slots)
+        num_slots = active_capacity * 2 + 1 if need_backup else active_capacity + 1
         conv_bytes = num_layers * num_slots * conv_dim * conv_kernel_size * 2  # bf16
         recurrent_bytes = (
             num_layers * num_slots * num_v_heads * head_v_dim * head_k_dim * 4
@@ -277,21 +284,33 @@ class KVCacheAllocatorMixin:
         return conv_bytes + recurrent_bytes
 
     def allocate_gdn_states(
-        self, hf_config, layer_types, max_bs: int, need_backup: bool = False
+        self,
+        hf_config,
+        layer_types,
+        max_bs: int,
+        need_backup: bool = False,
+        cache_slots: int = 0,
     ):
         """Allocate fixed-size GDN state buffers for linear_attention layers.
 
+        ``cache_slots`` extra slots are appended to the active region so the
+        scheduler can PARK finished sessions' recurrent state for cross-turn
+        reuse (see Config.gdn_state_cache_slots). They are valid (below the
+        dummy slot), so the worker never clamps them. With
+        ``active = max_bs + cache_slots``:
+
         When *need_backup* is True (MTP enabled), the layout is:
-          - Slots ``0 .. max_bs-1``: **active** slots.
-          - Slots ``max_bs .. 2*max_bs-1``: **backup** slots for lazy verify rollback.
-          - Slot ``2*max_bs``: reserved **dummy** slot.
-          Total: ``max_bs * 2 + 1``.
+          - Slots ``0 .. active-1``: **active** slots (incl. parked).
+          - Slots ``active .. 2*active-1``: **backup** slots for lazy verify rollback.
+          - Slot ``2*active``: reserved **dummy** slot.
+          Total: ``active * 2 + 1``.
 
         When *need_backup* is False, backup slots are omitted:
-          - Slots ``0 .. max_bs-1``: active slots.
-          - Slot ``max_bs``: dummy slot.
-          Total: ``max_bs + 1``.
+          - Slots ``0 .. active-1``: active slots (incl. parked).
+          - Slot ``active``: dummy slot.
+          Total: ``active + 1``.
         """
+        max_bs = max_bs + max(0, cache_slots)
         num_layers = len(layer_types)
         num_k_heads = getattr(hf_config, "linear_num_key_heads", 0)
         num_v_heads = getattr(hf_config, "linear_num_value_heads", 0)

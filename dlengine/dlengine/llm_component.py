@@ -431,10 +431,14 @@ class LLMComponent(LLM):
             zmq_host = self.config.host
 
         peer_addrs = self.get_peer_agent_addrs()
-        # Compute gdn_num_slots to match allocate_gdn_states logic:
-        # MTP (num_speculative_tokens > 0) → max_bs * 2 + 1 (active + backup + dummy)
-        # No MTP → max_bs + 1 (active + dummy)
-        max_bs = self.config.max_num_seqs
+        # Compute gdn_num_slots to match allocate_gdn_states logic. The active
+        # region includes gdn_state_cache_slots parked slots for session-scoped
+        # state caching, so active = max_num_seqs + gdn_state_cache_slots:
+        # MTP (num_speculative_tokens > 0) → active * 2 + 1 (active + backup + dummy)
+        # No MTP → active + 1 (active + dummy)
+        max_bs = self.config.max_num_seqs + max(
+            0, getattr(self.config, "gdn_state_cache_slots", 0)
+        )
         if self.config.num_speculative_tokens > 0:
             gdn_num_slots = max_bs * 2 + 1
         else:

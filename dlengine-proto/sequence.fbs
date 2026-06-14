@@ -80,6 +80,10 @@ table Sequence {
   // .return_completion_logprobs is true; otherwise empty/absent. Append-only
   // field — legacy buffers deserialise to an empty vector.
   completion_logprobs: [float];
+  // Optional client session affinity key for SessionPrefix routing
+  // (0 = no explicit session; scheduler then uses content-derived cache-aware
+  // routing). Append-only field — legacy buffers deserialise to 0.
+  affinity_key: uint64 = 0;
 }
 
 table SequenceList {

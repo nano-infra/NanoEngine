@@ -175,6 +175,46 @@ int BlockManager::count_active_prefix_hits(Sequence& seq) const
     return hits;
 }
 
+int BlockManager::matched_prefix_blocks(Sequence& seq, int scan_cap) const
+{
+    // Linear-attention models: no cross-request prefix reuse (see header).
+    if (!prefix_caching_enabled_) {
+        return 0;
+    }
+
+    int64_t h          = -1;
+    int     num_blocks = seq.num_blocks(BlockContextSlot::ACTIVE, group_id_);
+    if (scan_cap > 0 && num_blocks > scan_cap) {
+        num_blocks = scan_cap;
+    }
+    int matched = 0;
+
+    for (int i = 0; i < num_blocks; ++i) {
+        auto view = seq.block_view(i, BlockContextSlot::ACTIVE, group_id_);
+
+        // Only full blocks participate in the prefix hash chain.
+        if (view.second != static_cast<size_t>(block_size_)) {
+            break;
+        }
+        h = compute_hash(view.first, view.second, h);
+
+        auto it = hash_to_block_id_.find(h);
+        if (it == hash_to_block_id_.end()) {
+            break;
+        }
+        // Content must match. Unlike count_active_prefix_hits, the block need
+        // not be currently active — a finished prior turn's cached blocks
+        // (ref_count 0 but not yet recycled) still count as "warm" for routing.
+        const Block& blk = blocks_[it->second];
+        if (blk.token_ids.size() != view.second
+            || !std::equal(blk.token_ids.begin(), blk.token_ids.end(), view.first)) {
+            break;
+        }
+        matched++;
+    }
+    return matched;
+}
+
 int BlockManager::can_allocate(Sequence& seq) const
 {
     int n_cached      = count_active_prefix_hits(seq);
@@ -309,6 +349,25 @@ void BlockManager::deallocate(Sequence& seq, BlockContextSlot slot)
     }
     seq.set_num_cached_tokens(0);
     table.clear();
+}
+
+void BlockManager::release_block_ids(const std::vector<int>& block_ids)
+{
+    // Mirror deallocate(): walk in reverse so the hash-chain owner (the last
+    // referencing block) is released last, matching allocation order.
+    for (auto it = block_ids.rbegin(); it != block_ids.rend(); ++it) {
+        int block_id = *it;
+        if (block_id < 0 || block_id >= static_cast<int>(blocks_.size())) {
+            continue;
+        }
+        Block& block = blocks_[block_id];
+        if (block.ref_count > 0) {
+            block.ref_count--;
+        }
+        if (block.ref_count == 0 && used_block_ids_.count(block_id)) {
+            deallocate_block(block_id);
+        }
+    }
 }
 
 bool BlockManager::can_append(Sequence& seq, int num_tokens) const

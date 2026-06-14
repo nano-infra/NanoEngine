@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import sys
+from typing import Any
 
 from dlengine.config import Config
 from dlengine.logging import get_logger
@@ -80,21 +81,81 @@ def init_scheduler(config: Config) -> Scheduler:
                 )
             )
 
+    # Apply the configured DP routing strategy (default RoundRobin). This is a
+    # public, runtime-mutable field on the scheduler; the strategy object is
+    # (re)built lazily on the next scheduling pass.
+    sched.routing_strategy = RoutingStrategy[config.routing_strategy]
+
     # Linear-attention / GatedDeltaNet models: cross-request prefix caching is
     # unsafe because the recurrent (conv + state) cache is not captured by the
     # shared KV blocks. A prefix-cache hit would skip recomputing those tokens
     # and start the linear-attention state from a stale slot, corrupting output
     # non-deterministically under concurrency. Disable it so every request
     # recomputes its full prompt from a zero state.
-    layer_types = getattr(config.hf_config, "layer_types", None)
-    if layer_types and any(lt == "linear_attention" for lt in layer_types):
+    is_linear_attention = _has_linear_attention(config.hf_config)
+    if is_linear_attention:
         sched.set_prefix_caching_enabled(False)
         logger.info(
             "Linear-attention model detected (layer_types contains "
             "'linear_attention'): disabled cross-request prefix caching to "
             "keep the GatedDeltaNet recurrent state correct."
         )
+
+    # Session-scoped GatedDeltaNet state caching: retain a finished turn's KV
+    # blocks + GDN recurrent-state slot and reuse them on the next turn from the
+    # same session as a chunked-prefill continuation.
+    #
+    # MUTED: correct GDN continuation needs the next turn to be a token-exact
+    # extension of the parked context, but agent clients (e.g. Claude Code)
+    # re-render each turn — the assistant generation prompt injects a transient
+    # ``<think>`` that vanishes once the turn becomes history, and tool/system
+    # blocks are periodically rewritten — so the parked context is essentially
+    # never an exact prefix and adoption always rejects. We therefore keep the
+    # feature off regardless of the ``--gdn_state_cache_slots`` flag. The C++
+    # machinery stays in place (inert) for workloads that append verbatim.
+    cache_slots = max(0, getattr(config, "gdn_state_cache_slots", 0))
+    if cache_slots > 0:
+        logger.warning(
+            "gdn_state_cache_slots=%d requested but session-scoped GDN state "
+            "caching is muted: it requires token-exact prompt continuation, "
+            "which re-rendering agent clients do not provide. Ignoring.",
+            cache_slots,
+        )
     return sched
+
+
+def _has_linear_attention(hf_config: Any) -> bool:
+    """Whether ``hf_config`` (or any nested sub-config) declares a
+    ``linear_attention`` layer.
+
+    Hybrid models such as Qwen3.5-MoE nest ``layer_types`` under a sub-config
+    (e.g. ``text_config``) rather than at the top level, so we must walk nested
+    PretrainedConfig children -- otherwise the linear-attention guard silently
+    misses and cross-request prefix caching stays (unsafely) enabled.
+    """
+    seen: set[int] = set()
+
+    def visit(cfg: Any) -> bool:
+        if cfg is None or id(cfg) in seen:
+            return False
+        seen.add(id(cfg))
+        layer_types = getattr(cfg, "layer_types", None)
+        if layer_types and any(lt == "linear_attention" for lt in layer_types):
+            return True
+        # Recurse into nested PretrainedConfig children (text_config, etc.).
+        sub = getattr(cfg, "sub_configs", None)
+        names = list(sub.keys()) if isinstance(sub, dict) else []
+        for name in ("text_config", "thinker_config", "decoder_config"):
+            if name not in names:
+                names.append(name)
+        for name in names:
+            child = getattr(cfg, name, None)
+            if hasattr(child, "to_dict") or getattr(child, "layer_types", None):
+                if visit(child):
+                    return True
+        return False
+
+    return visit(hf_config)
 
 
 __all__ = [

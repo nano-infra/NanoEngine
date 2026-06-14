@@ -65,6 +65,13 @@ void Scheduler::set_prefix_caching_enabled(bool enabled)
     }
 }
 
+void Scheduler::set_session_cache_slots(int capacity)
+{
+    for (auto& gm : worker_state) {
+        gm->set_session_cache_slots(capacity);
+    }
+}
+
 void Scheduler::add(std::shared_ptr<Sequence> seq)
 {
     int prompt_len = seq->num_prompt_tokens();
@@ -377,90 +384,46 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
         }
     }
 
-    // For LeastBatch and LeastCache, we maintain a set to act as a min-heap
-    std::set<std::pair<int, int>> dp_load_set;
-    if (routing_strategy == RoutingStrategy::LeastBatch) {
-        for (int i = 0; i < attention_dp_; ++i) {
-            dp_load_set.insert({worker_state[i]->num_running_seqs(), i});
-        }
-    }
-    else if (routing_strategy == RoutingStrategy::LeastCache) {
-        for (int i = 0; i < attention_dp_; ++i) {
-            dp_load_set.insert({worker_state[i]->num_running_tokens(), i});
-        }
-    }
+    // Routing is delegated to a strategy object (see router.h). The router
+    // produces an ordered list of candidate DP ranks per sequence; we try them
+    // in order and admit on the first that allocates. Load-order rankings are
+    // recomputed from live worker_state counters, which try_allocate updates,
+    // so successive sequences in this pass see up-to-date loads.
+    Router&      router = ensure_router();
+    RouteContext ctx{worker_state, attention_dp_};
 
     while (!waiting_queue.empty()) {
-        auto seq       = waiting_queue.front();
-        bool scheduled = false;
+        auto seq        = waiting_queue.front();
+        bool scheduled  = false;
+        auto candidates = router.rank_candidates(*seq, ctx);
 
-        if (routing_strategy == RoutingStrategy::RoundRobin) {
-            for (int attempt = 0; attempt < attention_dp_; ++attempt) {
-                int  selected_dp_idx = next_dp_idx();
-                auto result          = worker_state[selected_dp_idx]->try_allocate(
-                    *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
-                if (!result)
-                    continue;
+        for (int selected_dp_idx : candidates) {
+            auto result = worker_state[selected_dp_idx]->try_allocate(
+                *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
+            if (!result)
+                continue;
 
-                auto& block_ctx  = seq->block_ctx(BlockContextSlot::ACTIVE);
-                block_ctx.dp_idx = selected_dp_idx;
-                int master_group = block_ctx.master_group_id;
+            auto& block_ctx  = seq->block_ctx(BlockContextSlot::ACTIVE);
+            block_ctx.dp_idx = selected_dp_idx;
+            int master_group = block_ctx.master_group_id;
 
-                num_seqs[selected_dp_idx][master_group] += 1;
-                num_batched_tokens[selected_dp_idx][master_group] += result->new_tokens;
+            num_seqs[selected_dp_idx][master_group] += 1;
+            num_batched_tokens[selected_dp_idx][master_group] += result->new_tokens;
 
-                seq->set_status(SequenceStatus::RUNNING);
-                waiting_queue.pop_front();
-                worker_state[selected_dp_idx]->running.push_back(seq);
-                scheduled_seqs[selected_dp_idx].push_back(seq);
+            seq->set_status(SequenceStatus::RUNNING);
+            waiting_queue.pop_front();
+            worker_state[selected_dp_idx]->running.push_back(seq);
+            scheduled_seqs[selected_dp_idx].push_back(seq);
 
-                if (seq->metric) {
-                    seq->metric->record_first_scheduled();
-                    if (mode_ == "decode")
-                        seq->metric->record_decode_scheduled();
-                }
-                scheduled = true;
-                break;
+            router.on_placed(*seq, selected_dp_idx);
+
+            if (seq->metric) {
+                seq->metric->record_first_scheduled();
+                if (mode_ == "decode")
+                    seq->metric->record_decode_scheduled();
             }
-        }
-        else if (routing_strategy == RoutingStrategy::LeastBatch || routing_strategy == RoutingStrategy::LeastCache) {
-            for (auto it = dp_load_set.begin(); it != dp_load_set.end(); ++it) {
-                int  selected_dp_idx = it->second;
-                auto result          = worker_state[selected_dp_idx]->try_allocate(
-                    *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
-                if (!result)
-                    continue;
-
-                // erase(it) invalidates the iterator; safe because we break immediately.
-                dp_load_set.erase(it);
-                int new_load = (routing_strategy == RoutingStrategy::LeastBatch) ?
-                                   worker_state[selected_dp_idx]->num_running_seqs() :
-                                   worker_state[selected_dp_idx]->num_running_tokens();
-                dp_load_set.insert({new_load, selected_dp_idx});
-
-                auto& block_ctx  = seq->block_ctx(BlockContextSlot::ACTIVE);
-                block_ctx.dp_idx = selected_dp_idx;
-                int master_group = block_ctx.master_group_id;
-
-                num_seqs[selected_dp_idx][master_group] += 1;
-                num_batched_tokens[selected_dp_idx][master_group] += result->new_tokens;
-
-                seq->set_status(SequenceStatus::RUNNING);
-                waiting_queue.pop_front();
-                worker_state[selected_dp_idx]->running.push_back(seq);
-                scheduled_seqs[selected_dp_idx].push_back(seq);
-
-                if (seq->metric) {
-                    seq->metric->record_first_scheduled();
-                    if (mode_ == "decode")
-                        seq->metric->record_decode_scheduled();
-                }
-                scheduled = true;
-                break;
-            }
-        }
-        else {
-            throw std::runtime_error("Unknown routing strategy");
+            scheduled = true;
+            break;
         }
 
         if (!scheduled) {
@@ -642,7 +605,9 @@ void Scheduler::postprocess_worker_func(std::shared_ptr<GroupManager>   state_ma
 
                 if (finished) {
                     seq->set_status(SequenceStatus::FINISHED);
-                    state_manager->deallocate(*seq);
+                    // Park the session's KV blocks + GDN state slot for warm
+                    // cross-turn reuse when eligible; otherwise plain free.
+                    state_manager->park_or_deallocate(*seq);
                     break;
                 }
                 else if (is_prefill) {

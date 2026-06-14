@@ -183,6 +183,7 @@ void bind_sequence(py::module_& m)
         .def_property(
             "num_checkpointed_tokens", &Sequence::num_checkpointed_tokens, &Sequence::set_num_checkpointed_tokens)
         .def_property("num_cached_tokens", &Sequence::num_cached_tokens, &Sequence::set_num_cached_tokens)
+        .def_property("affinity_key", &Sequence::affinity_key, &Sequence::set_affinity_key)
         .def_readwrite("metric", &Sequence::metric)
         .def_property("sampling_params", &Sequence::sampling_params, &Sequence::set_sampling_params)
 

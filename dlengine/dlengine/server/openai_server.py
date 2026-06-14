@@ -1,18 +1,18 @@
-"""Single-process OpenAI-compatible HTTP server for DLEngine.
+"""OpenAI-compatible HTTP server for DLEngine.
 
-This is the ``dlengine serve`` entry point. It runs a *hybrid* engine
-(prefill + decode in the same process) directly in-process and exposes an
-OpenAI-compatible HTTP API, in the spirit of ``vllm serve``::
+This is the ``dlengine serve`` entry point. It exposes an OpenAI-compatible
+HTTP API, in the spirit of ``vllm serve``::
 
     dlengine serve /path/to/model \
         --host 0.0.0.0 --port 8100 \
         --served-model-name Qwen3-4B \
         --ctrl-address 127.0.0.1:4479
 
-Unlike the disaggregated stack (dlengine-router + ZMQ engine servers), this path
-talks to the engine through in-process queues, with no ZMQ and no Rust
-front-end. When ``--ctrl-address`` is given, the server registers its own
-HTTP endpoint with dlslime-ctrl so a router (e.g. DLRouter) can discover it.
+The engine always runs in a separate process (``EngineServer``) exposing a zmq
+DEALER over an ipc:// socket; this HTTP process connects as a zmq client
+(``ZmqEngineWorker``) and never initializes CUDA/Ray itself. When
+``--ctrl-address`` is given, the server registers its own HTTP endpoint with
+dlslime-ctrl so a router (e.g. DLRouter) can discover it.
 
 Endpoints:
 - ``GET  /health``
@@ -24,6 +24,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import json
 import os
@@ -279,6 +280,9 @@ class OpenAIServer:
         served_model_name: str,
         model_path: str,
         default_max_tokens: int = 512,
+        dump_requests_redis: Optional[str] = None,
+        dump_requests_stream: Optional[str] = None,
+        dump_requests_maxlen: Optional[int] = None,
     ) -> None:
         self.worker = worker
         self.tokenizer = tokenizer
@@ -295,6 +299,14 @@ class OpenAIServer:
         )
         self.tool_parser = get_tool_parser(self.tool_parser_name)
         logger.info(f"Tool-call parser: {self.tool_parser_name}")
+
+        from dlengine.server.request_dump import RequestDumper
+
+        self.request_dumper = RequestDumper(
+            setting=dump_requests_redis,
+            stream=dump_requests_stream,
+            maxlen=dump_requests_maxlen,
+        )
 
     def _build_model_aliases(self) -> set[str]:
         """OpenAI ``model`` values accepted on this server (alias + path)."""
@@ -478,11 +490,55 @@ class OpenAIServer:
             return []
         return [s for s in raw if isinstance(s, str) and s]
 
-    def submit(self, prompt_ids: list[int], sampling_params: Any) -> _Request:
+    # Headers a client/proxy can use to pin a conversation to a DP rank under
+    # the SessionPrefix routing strategy. Checked in order; first non-empty wins.
+    _SESSION_HEADERS = ("x-session-id", "x-dlengine-session", "anthropic-session-id")
+
+    @staticmethod
+    def session_affinity_key(request: Any, body: dict) -> int:
+        """Derive a 64-bit session affinity key for SessionPrefix routing.
+
+        Priority: an explicit session header, then the OpenAI ``user`` field,
+        then the Anthropic ``metadata.user_id`` field. Returns 0 ("no explicit
+        session") when none is present, in which case the scheduler falls back to
+        content-derived cache-aware routing. The key only matters under
+        ``--routing_strategy SessionPrefix``; it is carried on the serialized
+        Sequence so it reaches the engine process.
+        """
+        raw = None
+        try:
+            for h in OpenAIServer._SESSION_HEADERS:
+                v = request.headers.get(h)
+                if v:
+                    raw = v
+                    break
+        except Exception:  # noqa: BLE001 - headers may be absent in some callers
+            raw = None
+        if not raw:
+            user = body.get("user")
+            if isinstance(user, str) and user:
+                raw = user
+        if not raw:
+            meta = body.get("metadata")
+            if isinstance(meta, dict):
+                uid = meta.get("user_id")
+                if isinstance(uid, str) and uid:
+                    raw = uid
+        if not raw:
+            return 0
+        digest = hashlib.blake2b(raw.encode("utf-8"), digest_size=8).digest()
+        key = int.from_bytes(digest, "big") & 0xFFFFFFFFFFFFFFFF
+        return key or 1  # 0 is reserved for "no session"
+
+    def submit(
+        self, prompt_ids: list[int], sampling_params: Any, affinity_key: int = 0
+    ) -> _Request:
         from dlengine import Sequence
 
         seq = Sequence(prompt_ids, sampling_params=sampling_params)
         seq.seq_id = next(_seq_id_counter)
+        if affinity_key:
+            seq.affinity_key = affinity_key
         loop = asyncio.get_running_loop()
         req = _Request(seq=seq, aqueue=asyncio.Queue(), loop=loop)
         self.worker.submit(req)
@@ -490,6 +546,22 @@ class OpenAIServer:
             f"Submitted request to engine: seq_id={seq.seq_id} "
             f"prompt_len={len(prompt_ids)} max_tokens={sampling_params.max_tokens}"
         )
+        if self.request_dumper.enabled:
+            try:
+                prompt_text = self.tokenizer.decode(
+                    prompt_ids, skip_special_tokens=False
+                )
+            except Exception:  # noqa: BLE001
+                prompt_text = ""
+            self.request_dumper.dump(
+                ts=time.time(),
+                seq_id=seq.seq_id,
+                model=self.served_model_name,
+                affinity_key=str(affinity_key),
+                prompt_len=len(prompt_ids),
+                token_ids=prompt_ids,
+                prompt_text=prompt_text,
+            )
         return req
 
     def submit_migrated(self, seq: Any) -> _Request:
@@ -733,7 +805,7 @@ def build_app(server: OpenAIServer):
 
     @app.get("/metrics")
     async def metrics() -> PlainTextResponse:  # noqa: ANN202
-        # For ZmqEngineWorker (engine_ipc=true), fetch metrics from engine process
+        # Fetch metrics from the engine process via ZmqEngineWorker.
         if hasattr(server.worker, "get_metrics"):
             try:
                 metrics_text = await server.worker.get_metrics()
@@ -831,6 +903,7 @@ def build_app(server: OpenAIServer):
         prompt_ids, reasoning_open = server._encode_chat(
             messages, tools=tools, tool_choice=tool_choice
         )
+        affinity_key = server.session_affinity_key(request, body)
 
         created = int(time.time())
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -850,7 +923,7 @@ def build_app(server: OpenAIServer):
         # migrated sequence so the decode engine generates nothing. We keep the
         # user's max_tokens so the decode engine resumes with the correct budget.
         if kv_transfer.get("do_remote_decode"):
-            preq = server.submit(prompt_ids, sampling_params)
+            preq = server.submit(prompt_ids, sampling_params, affinity_key=affinity_key)
             try:
                 mig = await server.await_migration(preq)
             except RuntimeError as e:
@@ -927,7 +1000,7 @@ def build_app(server: OpenAIServer):
                 )
             req = server.submit_migrated(migrated_seq)
         else:
-            req = server.submit(prompt_ids, sampling_params)
+            req = server.submit(prompt_ids, sampling_params, affinity_key=affinity_key)
 
         if stream:
 
@@ -1095,6 +1168,69 @@ def build_app(server: OpenAIServer):
             }
         )
 
+    @app.post("/v1/messages")
+    async def anthropic_messages(request: Request):  # noqa: ANN202
+        from dlengine.server.anthropic_api import handle_messages
+
+        client = request.client.host if request.client else "unknown"
+        logger.info(f"Received request: POST /v1/messages from {client}")
+        try:
+            body = await request.json()
+        except Exception as e:
+            logger.warning(f"Rejected request (400): invalid JSON body: {e}")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": f"Invalid JSON body: {e}",
+                    },
+                },
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "JSON body must be an object",
+                    },
+                },
+            )
+        return await handle_messages(server, request, body)
+
+    @app.post("/v1/messages/count_tokens")
+    async def anthropic_count_tokens(request: Request):  # noqa: ANN202
+        from dlengine.server.anthropic_api import handle_count_tokens
+
+        try:
+            body = await request.json()
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": f"Invalid JSON body: {e}",
+                    },
+                },
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "JSON body must be an object",
+                    },
+                },
+            )
+        return await handle_count_tokens(server, body)
+
     @app.post("/v1/completions")
     async def completions(request: Request):  # noqa: ANN202
         client = request.client.host if request.client else "unknown"
@@ -1147,6 +1283,7 @@ def build_app(server: OpenAIServer):
         max_tokens = sampling_params.max_tokens
         stop = server._parse_stop(body)
         prompt_ids = server.tokenizer.encode(prompt)
+        affinity_key = server.session_affinity_key(request, body)
 
         created = int(time.time())
         cmpl_id = f"cmpl-{uuid.uuid4().hex}"
@@ -1161,7 +1298,7 @@ def build_app(server: OpenAIServer):
         # preserved into the migrated sequence for the decode engine. See the
         # chat handler above for the full rationale.
         if kv_transfer.get("do_remote_decode"):
-            preq = server.submit(prompt_ids, sampling_params)
+            preq = server.submit(prompt_ids, sampling_params, affinity_key=affinity_key)
             try:
                 mig = await server.await_migration(preq)
             except RuntimeError as e:
@@ -1228,7 +1365,7 @@ def build_app(server: OpenAIServer):
                 )
             req = server.submit_migrated(migrated_seq)
         else:
-            req = server.submit(prompt_ids, sampling_params)
+            req = server.submit(prompt_ids, sampling_params, affinity_key=affinity_key)
 
         if stream:
 
@@ -1440,8 +1577,6 @@ def run_server(
     import uvicorn
     from transformers import PreTrainedTokenizerFast
 
-    from dlengine.llm_component import LLM, LLMComponent
-
     host = config.host
     port = config.port
 
@@ -1459,51 +1594,27 @@ def run_server(
 
     # Build the engine + worker.
     #
-    # config.engine_ipc: run the engine in a separate process (EngineServer)
-    #   exposing a zmq DEALER over an ipc:// socket; this HTTP server talks to
-    #   it via ZmqEngineWorker. The HTTP process never initializes CUDA/Ray.
-    # in-process (default): drive engine.step() on a background thread.
-    #   hybrid uses the bare LLM (HTTP server registers its own endpoint);
-    #   prefill/decode (PD) use LLMComponent so the engine registers under its
-    #   engine_id with peer_addrs / pool metadata for KV migration (needs ctrl).
-    engine: Any = None
-    engine_proc = None
-    engine_endpoint: Optional[str] = None
+    # The engine always runs in a separate process (EngineServer) exposing a zmq
+    # DEALER over an ipc:// socket; this HTTP server talks to it via
+    # ZmqEngineWorker and never initializes CUDA/Ray itself.
+    import multiprocessing
 
-    if config.engine_ipc:
-        import multiprocessing
+    from dlengine.server.engine_server import run_engine_server
+    from dlengine.server.zmq_engine_client import ZmqEngineWorker
 
-        from dlengine.server.engine_server import run_engine_server
-        from dlengine.server.zmq_engine_client import ZmqEngineWorker
-
-        engine_endpoint = f"ipc:///tmp/dlengine-{uuid.uuid4().hex}.sock"
-        # NOT daemon: EngineServer.serve() itself spawns a child backend
-        # process (run_engine_backend), and daemonic processes cannot have
-        # children. Cleaned up explicitly in the shutdown hook below.
-        engine_proc = multiprocessing.Process(
-            target=run_engine_server,
-            args=(config, engine_endpoint),
-            daemon=False,
-            name="dlengine-engine",
-        )
-        engine_proc.start()
-        logger.info(
-            f"Started engine process (pid={engine_proc.pid}) at {engine_endpoint}"
-        )
-        worker: Any = ZmqEngineWorker(engine_endpoint)
-    else:
-        if config.mode != "hybrid":
-            if not config.ctrl_address:
-                raise ValueError(
-                    f"mode={config.mode!r} (PD disaggregation) requires "
-                    "--ctrl_address so engines can register peer agents and "
-                    "resolve KV migration peers"
-                )
-            engine = LLMComponent(config)
-        else:
-            engine = LLM(config)
-        worker = EngineWorker(engine)
-        worker.start()
+    engine_endpoint = f"ipc:///tmp/dlengine-{uuid.uuid4().hex}.sock"
+    # NOT daemon: EngineServer.serve() itself spawns a child backend process
+    # (run_engine_backend), and daemonic processes cannot have children. Cleaned
+    # up explicitly in the shutdown hook below.
+    engine_proc = multiprocessing.Process(
+        target=run_engine_server,
+        args=(config, engine_endpoint),
+        daemon=False,
+        name="dlengine-engine",
+    )
+    engine_proc.start()
+    logger.info(f"Started engine process (pid={engine_proc.pid}) at {engine_endpoint}")
+    worker: Any = ZmqEngineWorker(engine_endpoint)
 
     tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
 
@@ -1512,6 +1623,9 @@ def run_server(
         tokenizer=tokenizer,
         served_model_name=served_model_name,
         model_path=config.model,
+        dump_requests_redis=config.dump_requests_redis,
+        dump_requests_stream=config.dump_requests_stream,
+        dump_requests_maxlen=config.dump_requests_maxlen,
     )
     app = build_app(server)
 
@@ -1531,27 +1645,25 @@ def run_server(
                 loop.add_signal_handler(_sig, _signal_cleanup, _sig)
         except (NotImplementedError, RuntimeError):
             pass
-        # ipc path: connect to the engine process and block until it is ready
-        # (also resolves the engine_id needed for PD peer registration).
-        if config.engine_ipc:
-            # Race readiness against engine-process liveness: if the engine
-            # subprocess dies during startup (no GPUs / Ray PG unavailable /
-            # CUDA OOM), the readiness handshake would otherwise hang forever.
-            # Surface it as a startup failure so the server cleans up and exits
-            # instead of wedging with an unkillable HTTP loop.
-            start_task = asyncio.ensure_future(worker.start())
-            while not start_task.done():
-                if engine_proc is not None and not engine_proc.is_alive():
-                    start_task.cancel()
-                    raise RuntimeError(
-                        "Engine process exited during startup "
-                        f"(exitcode={engine_proc.exitcode}); aborting server start"
-                    )
-                done, _ = await asyncio.wait({start_task}, timeout=0.5)
-            await start_task  # propagate any exception raised by worker.start()
-            engine_id = worker.engine_id
-        else:
-            engine_id = getattr(engine, "engine_id", None)
+        # Connect to the engine process and block until it is ready (also
+        # resolves the engine_id needed for PD peer registration).
+        #
+        # Race readiness against engine-process liveness: if the engine
+        # subprocess dies during startup (no GPUs / Ray PG unavailable /
+        # CUDA OOM), the readiness handshake would otherwise hang forever.
+        # Surface it as a startup failure so the server cleans up and exits
+        # instead of wedging with an unkillable HTTP loop.
+        start_task = asyncio.ensure_future(worker.start())
+        while not start_task.done():
+            if engine_proc is not None and not engine_proc.is_alive():
+                start_task.cancel()
+                raise RuntimeError(
+                    "Engine process exited during startup "
+                    f"(exitcode={engine_proc.exitcode}); aborting server start"
+                )
+            done, _ = await asyncio.wait({start_task}, timeout=0.5)
+        await start_task  # propagate any exception raised by worker.start()
+        engine_id = worker.engine_id
         if config.enable_monitor:
             try:
                 import shutil
@@ -1663,6 +1775,10 @@ def run_server(
 
     @app.on_event("shutdown")
     async def _on_shutdown() -> None:  # noqa: ANN202
+        try:
+            await server.request_dumper.aclose()
+        except Exception:  # noqa: BLE001
+            pass
         _cleanup()
 
     # Own the signal handlers instead of uvicorn: uvicorn does not cancel the

@@ -27,7 +27,39 @@ class Config(BaseModel):
     max_model_len: int = 16384
     gpu_memory_utilization: float = 0.9
     gpu_memory_limit_gb: Optional[float] = None
-    routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
+    routing_strategy: Literal[
+        "RoundRobin", "LeastBatch", "LeastCache", "SessionPrefix"
+    ] = "RoundRobin"
+
+    # Session-scoped GatedDeltaNet (linear-attention) state caching. When a
+    # request from a session (affinity_key) finishes, its KV blocks and GDN
+    # recurrent-state slot are PARKED keyed by the session instead of freed; the
+    # next turn from that session reuses them (skip recomputing the shared
+    # prefix). Only effective on linear-attention/hybrid models (which otherwise
+    # cannot do cross-request prefix caching) and with SessionPrefix routing.
+    # This many warm sessions are kept; each costs one GDN state slot plus its
+    # retained KV blocks (evicted LRU under capacity / KV pressure).
+    #
+    # DISABLED BY DEFAULT (0). Correct GDN state continuation requires the next
+    # turn's prompt to be a *token-exact* extension of the parked context
+    # (prompt + generated tokens), because the parked recurrent state covers
+    # exactly that many tokens (a shorter common prefix can't be used — it would
+    # double-process the divergent tail). In practice agent clients like Claude
+    # Code re-render each turn (the assistant generation prompt injects a
+    # transient ``<think>`` that disappears once the turn becomes history, and
+    # tool-result/system-reminder blocks are periodically rewritten), so the
+    # parked context is almost never an exact prefix of the next turn and
+    # adoption rejects. Leave at 0 unless your client appends verbatim
+    # (token-exact, no re-rendering) across turns.
+    gdn_state_cache_slots: int = 0
+
+    # Debug: dump every inbound request's tokenized prompt to a Redis stream so
+    # prefix-cache divergence can be inspected. None/empty disables (zero
+    # overhead). "1"/"true" -> redis://127.0.0.1:6379/0; any other value is used
+    # verbatim as the Redis URL. Falls back to env DLENGINE_DUMP_REQUESTS_REDIS.
+    dump_requests_redis: Optional[str] = None
+    dump_requests_stream: str = "dlengine:requests"
+    dump_requests_maxlen: int = 200000
 
     # parallel config
     attention_tp: int = 1
@@ -72,12 +104,6 @@ class Config(BaseModel):
     enable_monitor: bool = False
     monitor_dir: str = ".dlengine-monitor"
     monitor_scrape_interval: str = "5s"
-
-    # ``dlengine serve`` (OpenAI HTTP server) engine transport. When True, the
-    # engine runs in a separate process exposing a zmq DEALER over an ipc://
-    # socket and the HTTP server connects as a zmq client; when False (default)
-    # the engine runs in-process on a background thread (EngineWorker).
-    engine_ipc: bool = False
 
     dummy_prefill: Optional[bool] = False
     dummy_weight: Optional[bool] = False

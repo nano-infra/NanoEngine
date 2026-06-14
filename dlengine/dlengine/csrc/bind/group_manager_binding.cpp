@@ -17,6 +17,7 @@ void bind_group_manager(py::module_& m)
         .value("RoundRobin", RoutingStrategy::RoundRobin)
         .value("LeastBatch", RoutingStrategy::LeastBatch)
         .value("LeastCache", RoutingStrategy::LeastCache)
+        .value("SessionPrefix", RoutingStrategy::SessionPrefix)
         .export_values()
         .def_static("__class_getitem__",
                     [](const std::string& name) {
@@ -26,13 +27,16 @@ void bind_group_manager(py::module_& m)
                             return RoutingStrategy::LeastBatch;
                         if (name == "LeastCache")
                             return RoutingStrategy::LeastCache;
+                        if (name == "SessionPrefix")
+                            return RoutingStrategy::SessionPrefix;
                         throw py::key_error(name);
                     })
         .def_property_readonly_static("__members__", [](py::object /* self */) {
             py::dict m;
-            m["RoundRobin"] = RoutingStrategy::RoundRobin;
-            m["LeastBatch"] = RoutingStrategy::LeastBatch;
-            m["LeastCache"] = RoutingStrategy::LeastCache;
+            m["RoundRobin"]    = RoutingStrategy::RoundRobin;
+            m["LeastBatch"]    = RoutingStrategy::LeastBatch;
+            m["LeastCache"]    = RoutingStrategy::LeastCache;
+            m["SessionPrefix"] = RoutingStrategy::SessionPrefix;
             return m;
         });
 
