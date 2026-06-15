@@ -108,8 +108,9 @@ public:
         index_[key] = std::prev(lru_.end());
 
         while (static_cast<int>(lru_.size()) > capacity_) {
+            uint64_t key_to_erase = lru_.front().affinity_key;
             displaced.push_back(std::move(lru_.front()));
-            index_.erase(lru_.front().affinity_key);
+            index_.erase(key_to_erase);
             lru_.pop_front();
         }
         return displaced;
