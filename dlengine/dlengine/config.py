@@ -53,10 +53,14 @@ class Config(BaseModel):
     # (token-exact, no re-rendering) across turns.
     gdn_state_cache_slots: int = 0
 
-    # Debug: dump every inbound request's tokenized prompt to a Redis stream so
-    # prefix-cache divergence can be inspected. None/empty disables (zero
-    # overhead). "1"/"true" -> redis://127.0.0.1:6379/0; any other value is used
-    # verbatim as the Redis URL. Falls back to env DLENGINE_DUMP_REQUESTS_REDIS.
+    # Debug: dump per-request data to a Redis stream (engine-side, so it works
+    # for ``dlengine serve`` AND offline ``generate()``). Two record kinds keyed
+    # on seq_id: ``kind="request"`` (tokenized prompt, for prefix-cache
+    # divergence inspection) and ``kind="complete"`` (latency: ttft/tpot/e2e,
+    # queue/prefill time, per-chunk prefill latencies, ITL avg/p50/p99). See
+    # dlengine.metrics.dump. None/empty disables (zero overhead). "1"/"true" ->
+    # redis://127.0.0.1:6379/0; any other value is the Redis URL verbatim. Falls
+    # back to env DLENGINE_DUMP_REQUESTS_REDIS.
     dump_requests_redis: Optional[str] = None
     dump_requests_stream: str = "dlengine:requests"
     dump_requests_maxlen: int = 200000
@@ -293,7 +297,7 @@ class Config(BaseModel):
                         "graph capture may fail for compressed layers."
                     )
             else:
-                assert self.kvcache_block_size == 64
+                self.kvcache_block_size = 64
             assert self.attention_tp == 1
         else:
             assert self.kvcache_block_size % 64 == 0

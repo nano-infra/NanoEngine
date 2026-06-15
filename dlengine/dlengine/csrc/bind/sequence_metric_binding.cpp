@@ -22,6 +22,9 @@ void bind_sequence_metric(py::module_& m)
         .def_readwrite("num_generated_tokens", &SequenceMetric::num_generated_tokens)
         .def_readwrite("itl_samples", &SequenceMetric::itl_samples)
         .def_readwrite("last_token_time", &SequenceMetric::last_token_time)
+        .def_readwrite("num_prefill_chunks", &SequenceMetric::num_prefill_chunks)
+        .def_readwrite("prefill_chunk_samples", &SequenceMetric::prefill_chunk_samples)
+        .def_readwrite("last_chunk_time", &SequenceMetric::last_chunk_time)
         .def("record_arrival", &SequenceMetric::record_arrival)
         .def("record_first_scheduled", &SequenceMetric::record_first_scheduled)
         .def("record_decode_arrival", &SequenceMetric::record_decode_arrival)
@@ -29,6 +32,7 @@ void bind_sequence_metric(py::module_& m)
         .def("record_first_token", &SequenceMetric::record_first_token)
         .def("record_token", &SequenceMetric::record_token)
         .def("record_completion", &SequenceMetric::record_completion)
+        .def("record_prefill_chunk", &SequenceMetric::record_prefill_chunk)
 
         .def_property_readonly("ttft", &SequenceMetric::ttft)
         .def_property_readonly("e2e_latency", &SequenceMetric::e2e_latency)
@@ -39,6 +43,7 @@ void bind_sequence_metric(py::module_& m)
         .def_property_readonly("avg_itl", &SequenceMetric::avg_itl)
         .def_property_readonly("p50_itl", &SequenceMetric::p50_itl)
         .def_property_readonly("p99_itl", &SequenceMetric::p99_itl)
+        .def_property_readonly("prefill_time_ms", &SequenceMetric::prefill_time_ms)
 
         .def("log_metrics", &SequenceMetric::log_metrics)
         .def(py::pickle([](const SequenceMetric& p) { return p.getstate(); },
@@ -51,6 +56,8 @@ void bind_sequence_metric(py::module_& m)
                                             std::optional<double>,
                                             std::optional<double>,
                                             int,
+                                            int,
+                                            std::vector<double>,
                                             int,
                                             std::vector<double>>& t) { return SequenceMetric::setstate(t); }));
 }

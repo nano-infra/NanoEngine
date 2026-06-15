@@ -67,6 +67,24 @@ void SequenceMetric::record_completion()
     completion_time = current_time();
 }
 
+void SequenceMetric::record_prefill_chunk()
+{
+    double now = current_time();
+    double ref;
+    if (last_chunk_time.has_value()) {
+        ref = last_chunk_time.value();
+    }
+    else if (first_scheduled_time.has_value()) {
+        ref = first_scheduled_time.value();
+    }
+    else {
+        ref = now;
+    }
+    prefill_chunk_samples.push_back((now - ref) * 1000.0);
+    last_chunk_time = now;
+    num_prefill_chunks++;
+}
+
 std::optional<double> SequenceMetric::ttft() const
 {
     if (!first_token_time.has_value() || !arrival_time.has_value()) {
@@ -114,6 +132,14 @@ std::optional<double> SequenceMetric::decode_queue_time_ms() const
         return std::nullopt;
     }
     return (decode_scheduled_time.value() - decode_arrival_time.value()) * 1000.0;
+}
+
+std::optional<double> SequenceMetric::prefill_time_ms() const
+{
+    if (!first_token_time.has_value() || !first_scheduled_time.has_value()) {
+        return std::nullopt;
+    }
+    return (first_token_time.value() - first_scheduled_time.value()) * 1000.0;
 }
 
 std::optional<double> SequenceMetric::avg_itl() const
@@ -164,6 +190,8 @@ std::tuple<uint64_t,
            std::optional<double>,
            int,
            int,
+           std::vector<double>,
+           int,
            std::vector<double>>
 SequenceMetric::getstate() const
 {
@@ -177,7 +205,9 @@ SequenceMetric::getstate() const
                            last_token_time,
                            num_prompt_tokens,
                            num_generated_tokens,
-                           itl_samples);
+                           itl_samples,
+                           num_prefill_chunks,
+                           prefill_chunk_samples);
 }
 
 std::shared_ptr<SequenceMetric> SequenceMetric::setstate(const std::tuple<uint64_t,
@@ -189,6 +219,8 @@ std::shared_ptr<SequenceMetric> SequenceMetric::setstate(const std::tuple<uint64
                                                                           std::optional<double>,
                                                                           std::optional<double>,
                                                                           int,
+                                                                          int,
+                                                                          std::vector<double>,
                                                                           int,
                                                                           std::vector<double>>& state)
 {
@@ -203,6 +235,8 @@ std::shared_ptr<SequenceMetric> SequenceMetric::setstate(const std::tuple<uint64
     metric->num_prompt_tokens     = std::get<8>(state);
     metric->num_generated_tokens  = std::get<9>(state);
     metric->itl_samples           = std::get<10>(state);
+    metric->num_prefill_chunks    = std::get<11>(state);
+    metric->prefill_chunk_samples = std::get<12>(state);
 
     return metric;
 }

@@ -562,6 +562,12 @@ void Scheduler::postprocess_worker_func(std::shared_ptr<GroupManager>   state_ma
                 // cached token pointer so the next chunk starts here.
                 seq->set_num_cached_tokens(seq->num_tokens());
                 seq->set_status(SequenceStatus::PREFILLING);
+                // Non-final prefill chunk: record its latency for per-request
+                // chunk-prefill accounting (the final chunk is recorded below,
+                // alongside the first token).
+                if (update_metrics && seq->metric) {
+                    seq->metric->record_prefill_chunk();
+                }
                 result_ctx->chunk_continuations.push_back(seq);
                 continue;  // don't process token_ids for this sequence
             }
@@ -592,6 +598,9 @@ void Scheduler::postprocess_worker_func(std::shared_ptr<GroupManager>   state_ma
 
                 if (update_metrics && seq->metric) {
                     if (seq->metric->num_generated_tokens == 0) {
+                        // Final prefill chunk completes here (it produces the
+                        // first token), so count it before the first-token mark.
+                        seq->metric->record_prefill_chunk();
                         seq->metric->record_first_token();
                         seq->metric->num_generated_tokens = 1;
                     }

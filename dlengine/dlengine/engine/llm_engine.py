@@ -1,5 +1,4 @@
 import atexit
-import json
 import os
 import time
 import uuid
@@ -16,6 +15,7 @@ from dlengine._cpp import BlockContextSlot, init_scheduler, Sequence, SequenceSt
 from dlengine.config import Config
 from dlengine.logging import get_logger, set_log_level
 from dlengine.metrics import MetricsManager
+from dlengine.metrics.dump import EngineMetricDumper
 
 logger = get_logger()
 
@@ -145,11 +145,28 @@ class LLMEngine:
         )
         self.metrics_manager = MetricsManager()
 
+        # Engine-side request/metric dumper (Redis). Lives here (not in the HTTP
+        # server) so it also fires for offline ``generate()`` usage. Captures the
+        # exact tokenized prompt at admission and per-request latency (incl.
+        # chunk-prefill timing) at completion. No-op unless enabled.
+        self._metric_dumper = EngineMetricDumper(
+            model=config.model,
+            setting=config.dump_requests_redis,
+            stream=config.dump_requests_stream,
+            maxlen=config.dump_requests_maxlen,
+        )
+
         # Seq ids whose prefix-cache hit has already been counted. A prompt is
         # admitted once but (under chunked prefill) appears in several prefill
         # steps, so we tally num_cached_tokens exactly once per sequence and
         # drop the id again when the sequence finishes.
         self._prefix_counted_seq_ids: set[int] = set()
+        # Snapshot of each sequence's prefix-cache hit (num_cached_tokens) taken
+        # at its first prefill step. The BlockManager zeroes num_cached_tokens
+        # when a finished sequence is deallocated, which happens before the
+        # completion record is dumped; without this snapshot the dumped
+        # ``cached_len`` would always read 0. Keyed by seq_id, cleared on finish.
+        self._prefix_cached_tokens_by_seq: dict[int, int] = {}
         # Per-sequence prefix-cache hit logging (debug): set
         # DLENGINE_LOG_PREFIX_HITS=1 to emit one INFO line per admitted prompt
         # with its dp rank, affinity key and cached/prompt token counts.
@@ -161,6 +178,9 @@ class LLMEngine:
 
     def exit(self):
         """Cleanup engine resources."""
+        dumper = getattr(self, "_metric_dumper", None)
+        if dumper is not None:
+            dumper.close()
         if hasattr(self, "executor"):
             del self.executor
 
@@ -218,6 +238,7 @@ class LLMEngine:
             seq.metric = self.metrics_manager.create_sequence_metric(
                 seq.seq_id, seq.num_prompt_tokens
             )
+            self._metric_dumper.record_request(seq, self.tokenizer)
             self.scheduler.add(seq)
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
@@ -261,6 +282,22 @@ class LLMEngine:
         for ws in self.scheduler.worker_state:
             for d in ws.dummy_seqs:
                 dummy_seq_ids.add(d.seq_id)
+
+        # Snapshot the prefix-cache hit (num_cached_tokens) here, immediately
+        # after scheduling. This is the only point where the value is reliable:
+        # the BlockManager sets it in allocate() during schedule(), but
+        # scheduler.postprocess() (in step_finish) frees finished sequences and
+        # deallocate() resets it to 0 *before* step_complete() reads it. Captured
+        # once per sequence (first prefill chunk); consumed by the heartbeat
+        # tally and the completion dump, cleared when the sequence finishes.
+        if is_prefill:
+            for seqs in dp_seqs:
+                for seq in seqs:
+                    if seq.seq_id in dummy_seq_ids:
+                        continue
+                    self._prefix_cached_tokens_by_seq.setdefault(
+                        seq.seq_id, seq.num_cached_tokens
+                    )
 
         # Actual number of in-flight sequences (admitted, not yet finished),
         # independent of whether this step is a prefill or a decode step. The
@@ -454,10 +491,15 @@ class LLMEngine:
                     if seq.seq_id in self._prefix_counted_seq_ids:
                         continue
                     self._prefix_counted_seq_ids.add(seq.seq_id)
-                    prefix_cached_tokens_per_dp[dp_idx] += seq.num_cached_tokens
+                    # Use the schedule-time snapshot: seq.num_cached_tokens has
+                    # already been zeroed by deallocate() for finished seqs by
+                    # the time this (deferred) accounting runs.
+                    _cached = self._prefix_cached_tokens_by_seq.get(
+                        seq.seq_id, seq.num_cached_tokens
+                    )
+                    prefix_cached_tokens_per_dp[dp_idx] += _cached
                     prefix_prompt_tokens_per_dp[dp_idx] += seq.num_prompt_tokens
                     if self._log_prefix_hits:
-                        _cached = seq.num_cached_tokens
                         _prompt = seq.num_prompt_tokens
                         logger.info(
                             "[prefix-hit] seq_id=%s dp=%d affinity_key=%s "
@@ -491,7 +533,18 @@ class LLMEngine:
             for seq in seqs:
                 if seq.is_finished or seq.is_to_be_migrated:
                     self.metrics_manager.complete_sequence(seq.seq_id)
+                    # complete_sequence() stamps completion_time; dump after it so
+                    # e2e is populated. Only FINISHED requests have full metrics
+                    # (migration handoffs are dumped by the decode engine).
+                    if self._metric_dumper.enabled and seq.is_finished:
+                        self._metric_dumper.record_completion(
+                            seq,
+                            cached_len=self._prefix_cached_tokens_by_seq.get(
+                                seq.seq_id, getattr(seq, "num_cached_tokens", 0)
+                            ),
+                        )
                     self._prefix_counted_seq_ids.discard(seq.seq_id)
+                    self._prefix_cached_tokens_by_seq.pop(seq.seq_id, None)
                     outputs.append(seq)
         result.outputs = outputs
         result.real_bs = sum(

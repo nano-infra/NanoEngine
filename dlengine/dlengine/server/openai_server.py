@@ -280,9 +280,6 @@ class OpenAIServer:
         served_model_name: str,
         model_path: str,
         default_max_tokens: int = 512,
-        dump_requests_redis: Optional[str] = None,
-        dump_requests_stream: Optional[str] = None,
-        dump_requests_maxlen: Optional[int] = None,
     ) -> None:
         self.worker = worker
         self.tokenizer = tokenizer
@@ -299,14 +296,9 @@ class OpenAIServer:
         )
         self.tool_parser = get_tool_parser(self.tool_parser_name)
         logger.info(f"Tool-call parser: {self.tool_parser_name}")
-
-        from dlengine.server.request_dump import RequestDumper
-
-        self.request_dumper = RequestDumper(
-            setting=dump_requests_redis,
-            stream=dump_requests_stream,
-            maxlen=dump_requests_maxlen,
-        )
+        # NOTE: request/metric dumping (``--dump_requests_redis``) is performed
+        # engine-side (see ``LLMEngine`` / ``dlengine.metrics.dump``), so it works
+        # for offline ``generate()`` too and avoids double-writing here.
 
     def _build_model_aliases(self) -> set[str]:
         """OpenAI ``model`` values accepted on this server (alias + path)."""
@@ -546,22 +538,6 @@ class OpenAIServer:
             f"Submitted request to engine: seq_id={seq.seq_id} "
             f"prompt_len={len(prompt_ids)} max_tokens={sampling_params.max_tokens}"
         )
-        if self.request_dumper.enabled:
-            try:
-                prompt_text = self.tokenizer.decode(
-                    prompt_ids, skip_special_tokens=False
-                )
-            except Exception:  # noqa: BLE001
-                prompt_text = ""
-            self.request_dumper.dump(
-                ts=time.time(),
-                seq_id=seq.seq_id,
-                model=self.served_model_name,
-                affinity_key=str(affinity_key),
-                prompt_len=len(prompt_ids),
-                token_ids=prompt_ids,
-                prompt_text=prompt_text,
-            )
         return req
 
     def submit_migrated(self, seq: Any) -> _Request:
@@ -1623,9 +1599,6 @@ def run_server(
         tokenizer=tokenizer,
         served_model_name=served_model_name,
         model_path=config.model,
-        dump_requests_redis=config.dump_requests_redis,
-        dump_requests_stream=config.dump_requests_stream,
-        dump_requests_maxlen=config.dump_requests_maxlen,
     )
     app = build_app(server)
 
@@ -1775,10 +1748,6 @@ def run_server(
 
     @app.on_event("shutdown")
     async def _on_shutdown() -> None:  # noqa: ANN202
-        try:
-            await server.request_dumper.aclose()
-        except Exception:  # noqa: BLE001
-            pass
         _cleanup()
 
     # Own the signal handlers instead of uvicorn: uvicorn does not cancel the

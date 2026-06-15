@@ -751,7 +751,8 @@ class DeepseekV2Attention(nn.Module):
                     block_size,
                 )
 
-                total_cached = int(cu_cached[-1].item())
+                # shape[0] is host-known (no device sync); equals cu_cached[-1].
+                total_cached = k_cached_raw.shape[0]
                 if total_cached > 0:
                     k_cached_raw = k_cached_raw.squeeze(1)  # [total_cached, 576]
                     comp_cached = k_cached_raw[:, : self.kv_lora_rank]
@@ -794,19 +795,42 @@ class DeepseekV2Attention(nn.Module):
                 k_expanded = k_expanded_fresh
                 v_expanded = v_expanded_fresh
 
-            from flash_attn_interface import flash_attn_varlen_func
+            # Varlen MLA prefill with mismatched qk/v head dims (192/128).
+            # Prefer FlashAttention-3 (flash_attn_interface) when available;
+            # otherwise fall back to FlashMLA's varlen kernel, which is built for
+            # MLA head dims. (Plain flash_attn / FA2 does not support qk!=v
+            # head dims, so it is intentionally not used here.)
+            try:
+                from flash_attn_interface import flash_attn_varlen_func
 
-            attn_output = flash_attn_varlen_func(
-                q_full,  # (q_len, H, 192)
-                k_expanded,  # (total_k or q_len, H, 192)
-                v_expanded,  # (total_k or q_len, H, 128)
-                cu_seqlens_q=context.cu_seqlens_q,
-                cu_seqlens_k=context.cu_seqlens_k,
-                max_seqlen_q=context.max_seqlen_q,
-                max_seqlen_k=context.max_seqlen_k,
-                softmax_scale=self.softmax_scale,
-                causal=True,
-            )
+                attn_output = flash_attn_varlen_func(
+                    q_full,  # (q_len, H, 192)
+                    k_expanded,  # (total_k or q_len, H, 192)
+                    v_expanded,  # (total_k or q_len, H, 128)
+                    cu_seqlens_q=context.cu_seqlens_q,
+                    cu_seqlens_k=context.cu_seqlens_k,
+                    max_seqlen_q=context.max_seqlen_q,
+                    max_seqlen_k=context.max_seqlen_k,
+                    softmax_scale=self.softmax_scale,
+                    causal=True,
+                )
+            except ModuleNotFoundError:
+                from flash_mla import flash_attn_varlen_func
+
+                attn_output = flash_attn_varlen_func(
+                    q_full,  # (q_len, H, 192)
+                    k_expanded,  # (total_k or q_len, H, 192)
+                    v_expanded,  # (total_k or q_len, H, 128)
+                    context.cu_seqlens_q,
+                    context.cu_seqlens_k,
+                    context.max_seqlen_q,
+                    context.max_seqlen_k,
+                    softmax_scale=self.softmax_scale,
+                    causal=True,
+                )
+            # FA3 returns out, FlashMLA returns (out, lse): normalize to out.
+            if isinstance(attn_output, tuple):
+                attn_output = attn_output[0]
             # attn_output: (T, H, v_head_dim=128) — no vc BMM needed
             attn_output = attn_output.reshape(q_len, -1)  # (T, H*128)
             attn_output = self.o_proj(attn_output)
@@ -834,7 +858,6 @@ class DeepseekV2Attention(nn.Module):
                 and self.indexer.indexer_cache is not None
                 and self.attn_fwd.k_cache.dtype == torch.float8_e4m3fn
             ):
-                from dlengine.context.distributed import get_dist_context
                 from dlengine.layers.hopper.attention import topk_indices_to_physical
 
                 sp_rank = get_dist_context().attn_sp_rank
