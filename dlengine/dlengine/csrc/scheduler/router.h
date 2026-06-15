@@ -43,6 +43,9 @@ public:
     // routers record affinity and clear any wait bookkeeping).
     virtual void on_placed(const Sequence& /*seq*/, int /*dp_idx*/) {}
 
+    // Notify the router that ``seq_id`` was aborted so it can clear bookkeeping.
+    virtual void on_aborted(uint64_t /*seq_id*/) {}
+
     virtual const char* name() const = 0;
 
 protected:
@@ -180,6 +183,11 @@ public:
             affinity_[key] = dp_idx;
         }
         wait_.erase(seq.seq_id());
+    }
+
+    void on_aborted(uint64_t seq_id) override
+    {
+        wait_.erase(seq_id);
     }
 
     const char* name() const override

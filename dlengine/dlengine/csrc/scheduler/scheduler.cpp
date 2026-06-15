@@ -799,6 +799,12 @@ void Scheduler::free_to_be_migrated(const std::vector<std::shared_ptr<Sequence>>
 
 bool Scheduler::abort(uint64_t seq_id)
 {
+    auto finish_abort = [&]() {
+        if (router_) {
+            router_->on_aborted(seq_id);
+        }
+        return true;
+    };
     // 1) In-flight (running) sequences across all DP workers. Mirror the
     // FINISHED handling in postprocess_worker_func: mark FINISHED, deallocate
     // KV blocks, then drop from the running deque.
@@ -810,7 +816,7 @@ bool Scheduler::abort(uint64_t seq_id)
                 seq->set_status(SequenceStatus::FINISHED);
                 worker_state[dp_idx]->deallocate(*seq);
                 running.erase(it);
-                return true;
+                return finish_abort();
             }
         }
     }
@@ -825,7 +831,7 @@ bool Scheduler::abort(uint64_t seq_id)
                 worker_state[dp_idx]->deallocate(*seq);
             }
             prefilling.erase(it);
-            return true;
+            return finish_abort();
         }
     }
 
@@ -835,7 +841,7 @@ bool Scheduler::abort(uint64_t seq_id)
             if ((*it)->seq_id() == seq_id) {
                 (*it)->set_status(SequenceStatus::FINISHED);
                 q->erase(it);
-                return true;
+                return finish_abort();
             }
         }
     }
@@ -847,7 +853,7 @@ bool Scheduler::abort(uint64_t seq_id)
         int   selected_dp_idx = mit->second.second;
         worker_state[selected_dp_idx]->deallocate(*original_seq, BlockContextSlot::MIGRATE);
         to_be_migrated.erase(mit);
-        return true;
+        return finish_abort();
     }
 
     return false;
