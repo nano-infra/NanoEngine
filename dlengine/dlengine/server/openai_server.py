@@ -28,9 +28,7 @@ import hashlib
 import itertools
 import json
 import os
-import queue
 import signal
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -114,168 +112,12 @@ def _partial_stop_holdback(text: str, stops: list[str]) -> int:
     return max_hold
 
 
-class EngineWorker:
-    """Drives ``engine.step()`` on a background thread.
-
-    HTTP handlers submit requests via :meth:`submit`; the worker feeds them to
-    the engine, then after every step pushes newly produced completion tokens
-    back to each request's asyncio queue (thread-safe via ``call_soon_threadsafe``).
-    """
-
-    def __init__(self, engine: Any) -> None:
-        self.engine = engine
-        self._inbox: "queue.Queue[_Request]" = queue.Queue()
-        # PD: seq_ids whose prefill-side MIGRATE KV blocks can be freed once a
-        # decode engine has pulled them. Drained on the engine thread.
-        self._free_inbox: "queue.Queue[list[int]]" = queue.Queue()
-        # seq_ids to abort (server-side stop string / cancel). Drained on the
-        # engine thread between steps so it never races the forward.
-        self._abort_inbox: "queue.Queue[int]" = queue.Queue()
-        self._active: dict[int, _Request] = {}
-        self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run, name="dlengine-engine", daemon=True
-        )
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def submit(self, req: _Request) -> None:
-        self._inbox.put(req)
-
-    def free_sequences(self, seq_ids: list[int]) -> None:
-        """Queue prefill-side MIGRATE KV blocks for release (PD)."""
-        if seq_ids:
-            self._free_inbox.put(list(seq_ids))
-
-    def abort(self, seq_id: int) -> None:
-        """Request early termination of a running sequence (engine thread)."""
-        self._abort_inbox.put(int(seq_id))
-
-    def _push(self, req: _Request, item: Optional[dict]) -> None:
-        req.loop.call_soon_threadsafe(req.aqueue.put_nowait, item)
-
-    def _run(self) -> None:
-        engine = self.engine
-        logger.info("Engine worker loop started")
-        while not self._stop.is_set():
-            # Admit any newly submitted requests.
-            while True:
-                try:
-                    req = self._inbox.get_nowait()
-                except queue.Empty:
-                    break
-                try:
-                    engine.add_request(req.seq)
-                    self._active[req.seq.seq_id] = req
-                except Exception as e:  # noqa: BLE001
-                    logger.error(f"Failed to add request {req.seq.seq_id}: {e}")
-                    self._push(req, {"error": str(e)})
-                    self._push(req, None)
-
-            # PD: release prefill-side MIGRATE KV blocks once a decode engine
-            # has confirmed it pulled them (driven via /pd/free).
-            while True:
-                try:
-                    free_ids = self._free_inbox.get_nowait()
-                except queue.Empty:
-                    break
-                try:
-                    from dlengine import Sequence
-
-                    stubs = []
-                    for sid in free_ids:
-                        stub = Sequence([])
-                        stub.seq_id = sid
-                        stubs.append(stub)
-                    engine.free_to_be_migrated(stubs)
-                    logger.info(f"Freed migrated sequences: {free_ids}")
-                except Exception as e:  # noqa: BLE001
-                    logger.error(f"free_to_be_migrated failed for {free_ids}: {e}")
-
-            # Drain abort requests between steps: stop generating for these
-            # sequences, free their KV, and finalize the waiting HTTP request.
-            while True:
-                try:
-                    abort_id = self._abort_inbox.get_nowait()
-                except queue.Empty:
-                    break
-                req = self._active.pop(abort_id, None)
-                try:
-                    engine.abort(abort_id)
-                except Exception as e:  # noqa: BLE001
-                    logger.error(f"abort failed for {abort_id}: {e}")
-                if req is not None:
-                    self._push(req, {"finish": True})
-                    self._push(req, None)
-
-            if engine.is_finished():
-                time.sleep(0.001)
-                continue
-
-            try:
-                engine.step()
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Engine step failed: {e}", exc_info=True)
-                for req in list(self._active.values()):
-                    self._push(req, {"error": str(e)})
-                    self._push(req, None)
-                self._active.clear()
-                time.sleep(0.1)
-                continue
-
-            for seq_id, req in list(self._active.items()):
-                seq = req.seq
-                # PD prefill handoff: a ``mode="prefill"`` engine marks the
-                # sequence TO_BE_MIGRATED after the first generated token. Ship
-                # the serialized sequence (with its MIGRATE BlockContext) to the
-                # caller and stop driving it locally.
-                if seq.is_to_be_migrated:
-                    try:
-                        from dlengine.server.pd import encode_migration
-
-                        comp = seq.completion_token_ids
-                        payload = encode_migration(seq)
-                        self._push(
-                            req,
-                            {
-                                "migration": payload,
-                                "first_token": comp[-1] if comp else None,
-                                "seq_id": seq_id,
-                            },
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        logger.error(f"Failed to serialize migration for {seq_id}: {e}")
-                        self._push(req, {"error": f"migration serialize failed: {e}"})
-                    self._push(req, None)
-                    self._active.pop(seq_id, None)
-                    logger.info(f"Request handed off for migration: seq_id={seq_id}")
-                    continue
-
-                comp = seq.completion_token_ids
-                if len(comp) > req.emitted:
-                    new_tokens = comp[req.emitted :]
-                    req.emitted = len(comp)
-                    self._push(req, {"tokens": new_tokens})
-                if seq.is_finished:
-                    self._push(req, {"finish": True})
-                    self._push(req, None)
-                    self._active.pop(seq_id, None)
-                    logger.info(
-                        f"Request finished: seq_id={seq_id} "
-                        f"completion_len={len(comp)}"
-                    )
-
-
 class OpenAIServer:
     """Holds the engine worker, tokenizer and serving metadata."""
 
     def __init__(
         self,
-        worker: EngineWorker,
+        worker: Any,
         tokenizer: Any,
         served_model_name: str,
         model_path: str,

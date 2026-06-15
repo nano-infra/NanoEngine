@@ -255,8 +255,11 @@ class LLMEngine:
             seq_ids = [seq_ids]
         aborted: list[int] = []
         for seq_id in seq_ids:
-            if self.scheduler.abort(int(seq_id)):
-                aborted.append(int(seq_id))
+            seq_id = int(seq_id)
+            if self.scheduler.abort(seq_id):
+                self._prefix_counted_seq_ids.discard(seq_id)
+                self._prefix_cached_tokens_by_seq.pop(seq_id, None)
+                aborted.append(seq_id)
         return aborted
 
     def step_begin(self) -> PendingStep:
