@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -9,6 +11,31 @@
 #include "group_manager.h"
 
 namespace dlengine {
+
+namespace {
+// Env-gated diagnostics for session-scoped GDN state caching. Set
+// DLENGINE_LOG_SESSION_CACHE=1 to trace park/adopt decisions (why a warm
+// session does or does not get reused) to stderr.
+bool session_cache_debug()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("DLENGINE_LOG_SESSION_CACHE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
+// Longest common prefix length of two token id vectors (diagnostic only).
+int common_prefix_len(const std::vector<int>& a, const std::vector<int>& b)
+{
+    int n = static_cast<int>(std::min(a.size(), b.size()));
+    int i = 0;
+    while (i < n && a[i] == b[i]) {
+        ++i;
+    }
+    return i;
+}
+}  // namespace
 
 GroupManager::GroupManager(const std::string& engine_id,
                            int                group_size,
@@ -290,15 +317,34 @@ std::optional<AllocResult> GroupManager::try_allocate(Sequence&                 
     if (budget <= 0)
         return std::nullopt;
 
+    // Fast path: a warm session from a previous turn can be adopted as a
+    // chunked-prefill continuation (no recompute of the shared prefix, GDN
+    // recurrent state reused in place). Only valid for the seq's *first* chunk
+    // (num_checkpointed == num_prompt); for later chunks the seq is already
+    // running and must not be re-adopted.
+    if (session_cache_.enabled() && seq.num_checkpointed_tokens() <= seq.num_prompt_tokens()
+        && seq.num_cached_tokens() == 0) {
+        if (auto adopted = try_adopt_session(seq, budget)) {
+            return adopted;
+        }
+    }
+
     // Set num_tokens to full prompt length for block allocation.
     // PD separation guarantees no decode traffic competes for KV cache,
     // so locking all blocks at admission eliminates mid-prefill OOM.
     int full_len = std::max(seq.num_prompt_tokens(), seq.num_checkpointed_tokens());
     seq.set_num_tokens(full_len);
 
-    if (!can_allocate(seq, num_seqs, num_batched_tokens)) {
-        seq.set_num_tokens(orig_num_tokens);
-        return std::nullopt;
+    // Under KV pressure, free warm parked sessions (LRU first) to make room
+    // rather than rejecting admission outright. Each evicted session returns
+    // its KV blocks + GDN slot to the free pools.
+    while (!can_allocate(seq, num_seqs, num_batched_tokens)) {
+        auto evicted = session_cache_.evict_lru();
+        if (!evicted) {
+            seq.set_num_tokens(orig_num_tokens);
+            return std::nullopt;
+        }
+        free_parked(*evicted);
     }
 
     // Physical block allocation (sets seq.num_cached_tokens via prefix matching)
@@ -407,6 +453,232 @@ void GroupManager::deallocate(Sequence& seq, BlockContextSlot slot)
     num_running_tokens_ -= seq.num_tokens();
     num_running_seqs_per_group_[master_group_id]--;
     num_running_tokens_per_group_[master_group_id] -= seq.num_tokens();
+}
+
+// --- Session-scoped GatedDeltaNet state caching ---------------------------
+
+void GroupManager::set_session_cache_slots(int capacity)
+{
+    if (capacity < 0) {
+        capacity = 0;
+    }
+    session_cache_.set_capacity(capacity);
+
+    // Resize the GDN state-slot free list to cover the extra parked slots.
+    // The GPU pool's active region is [0, max_num_seqs_ + capacity); the
+    // dummy/backup slots live above it and are never handed out here. Safe to
+    // rebuild because this runs once at init, before any allocate().
+    gdn_state_manager_.reset(max_num_seqs_ + capacity);
+}
+
+void GroupManager::free_parked(const ParkedSession& entry)
+{
+    if (!entry.group_block_tables.empty()) {
+        // group_size_ == 1 when caching is enabled, but free every recorded
+        // group defensively in case that invariant ever relaxes.
+        for (int gid = 0; gid < static_cast<int>(entry.group_block_tables.size()); ++gid) {
+            auto it = block_manager.find(gid);
+            if (it != block_manager.end() && it->second) {
+                it->second->release_block_ids(entry.group_block_tables[gid]);
+            }
+        }
+    }
+    gdn_state_manager_.free_slot(entry.state_slot);
+}
+
+std::optional<AllocResult> GroupManager::try_adopt_session(Sequence& seq, int budget)
+{
+    if (!session_cache_.enabled() || group_size_ != 1) {
+        return std::nullopt;
+    }
+    uint64_t key = seq.affinity_key();
+    if (key == 0) {
+        return std::nullopt;
+    }
+
+    const ParkedSession* e = session_cache_.peek(key);
+    if (e == nullptr) {
+        if (session_cache_debug()) {
+            std::fprintf(stderr,
+                         "[session-cache] MISS seq_id=%llu key=%llu (no parked session) parked=%d\n",
+                         (unsigned long long)seq.seq_id(),
+                         (unsigned long long)key,
+                         session_cache_.size());
+        }
+        return std::nullopt;
+    }
+
+    const int full_len = std::max(seq.num_prompt_tokens(), seq.num_checkpointed_tokens());
+
+    // The parked GDN slot holds the recurrent state for exactly e->length
+    // tokens, so num_cached_tokens MUST equal e->length for the continuation to
+    // be correct. We therefore need at least one *new* token (full_len >
+    // e->length); a same-or-shorter prompt can't reuse this state — drop it.
+    const auto& toks      = seq.token_ids();
+    bool        prefix_ok = e->length > 0 && e->length < full_len && static_cast<int>(toks.size()) >= e->length
+                     && std::equal(e->token_ids.begin(), e->token_ids.end(), toks.begin());
+    if (!prefix_ok) {
+        if (session_cache_debug()) {
+            int lcp = common_prefix_len(e->token_ids, toks);
+            std::fprintf(stderr,
+                         "[session-cache] REJECT seq_id=%llu key=%llu parked_len=%d full_len=%d "
+                         "common_prefix=%d (need exact prefix of length parked_len, and full_len > "
+                         "parked_len). Dropping stale entry.\n",
+                         (unsigned long long)seq.seq_id(),
+                         (unsigned long long)key,
+                         e->length,
+                         full_len,
+                         lcp);
+        }
+        if (auto dead = session_cache_.take(key)) {
+            free_parked(*dead);
+        }
+        return std::nullopt;
+    }
+
+    // Capacity check: blocks needed to grow group-0's table from the cached
+    // prefix up to the full prompt (all blocks locked at admission).
+    const int have_blocks = (e->length + kvcache_block_size_ - 1) / kvcache_block_size_;
+    const int need_blocks = (full_len + kvcache_block_size_ - 1) / kvcache_block_size_;
+    const int extra       = std::max(0, need_blocks - have_blocks);
+    if (block_manager[0]->num_free_blocks() < extra) {
+        if (session_cache_debug()) {
+            std::fprintf(stderr,
+                         "[session-cache] DEFER seq_id=%llu key=%llu need_extra_blocks=%d free=%d "
+                         "(leaving parked)\n",
+                         (unsigned long long)seq.seq_id(),
+                         (unsigned long long)key,
+                         extra,
+                         block_manager[0]->num_free_blocks());
+        }
+        // Leave the entry parked; the cold path (or a later retry) handles it.
+        return std::nullopt;
+    }
+
+    // Commit: take ownership of the parked resources.
+    ParkedSession ent    = std::move(*session_cache_.take(key));
+    const int     master = 0;  // group_size_ == 1
+
+    auto& bctx           = seq.block_ctx(BlockContextSlot::ACTIVE);
+    bctx.master_group_id = master;
+
+    auto& table = seq.block_table(BlockContextSlot::ACTIVE, master);
+    table       = ent.group_block_tables.empty() ? std::vector<int>{} : ent.group_block_tables[0];
+
+    bctx.block_location.clear();
+    bctx.block_location.reserve(table.size());
+    for (int bid : table) {
+        bctx.block_location.emplace_back(master, bid);
+    }
+
+    if (static_cast<int>(bctx.num_dispatched_tokens.size()) < group_size_) {
+        bctx.num_dispatched_tokens.assign(group_size_, 0);
+    }
+    bctx.num_dispatched_tokens[master] = ent.length;  // cached extent (for may_append)
+
+    seq.set_state_slot(BlockContextSlot::ACTIVE, ent.state_slot);
+
+    // Grow the block table to cover the full prompt (lock all blocks now).
+    block_manager[master]->may_append(seq, full_len - ent.length);
+
+    // Continuation cursor: the prefix is already resident, so the forward only
+    // recomputes [ent.length, chunk_end).
+    seq.set_num_tokens(full_len);
+    seq.set_num_cached_tokens(ent.length);
+
+    // Update running counters (mirror allocate(): counts the full prompt).
+    num_running_seqs_++;
+    num_running_tokens_ += full_len;
+    num_running_seqs_per_group_[master]++;
+    num_running_tokens_per_group_[master] += full_len;
+
+    // Compute this chunk's boundary from the per-step budget.
+    int new_tokens = std::min(budget, full_len - ent.length);
+    int chunk_end  = ent.length + new_tokens;
+    seq.set_num_tokens(chunk_end);
+    bctx.num_dispatched_tokens[master] = chunk_end;
+
+    if (session_cache_debug()) {
+        std::fprintf(stderr,
+                     "[session-cache] ADOPT seq_id=%llu key=%llu reused=%d/%d tokens (%.1f%%) "
+                     "chunk_end=%d slot=%d\n",
+                     (unsigned long long)seq.seq_id(),
+                     (unsigned long long)key,
+                     ent.length,
+                     full_len,
+                     full_len > 0 ? (100.0 * ent.length / full_len) : 0.0,
+                     chunk_end,
+                     ent.state_slot);
+    }
+
+    return AllocResult{chunk_end, new_tokens};
+}
+
+void GroupManager::park_or_deallocate(Sequence& seq)
+{
+    auto& bctx = seq.block_ctx(BlockContextSlot::ACTIVE);
+    int   slot = seq.state_slot(BlockContextSlot::ACTIVE);
+    int   len  = seq.num_tokens();
+
+    auto& table0 = seq.block_table(BlockContextSlot::ACTIVE, 0);
+
+    // Eligibility: caching on, single-SP, has a session key, a GDN slot and a
+    // non-empty block table. Anything else falls back to a plain free.
+    bool eligible = session_cache_.enabled() && group_size_ == 1 && seq.affinity_key() != 0 && slot >= 0 && len > 0
+                    && !table0.empty();
+    if (!eligible) {
+        deallocate(seq);
+        return;
+    }
+
+    ParkedSession ent;
+    ent.affinity_key    = seq.affinity_key();
+    ent.state_slot      = slot;
+    ent.master_group_id = bctx.master_group_id;
+
+    const auto& toks     = seq.token_ids();
+    int         copy_len = std::min<int>(len, static_cast<int>(toks.size()));
+    ent.length           = copy_len;
+    ent.token_ids.assign(toks.begin(), toks.begin() + copy_len);
+    ent.group_block_tables.resize(1);
+    ent.group_block_tables[0] = table0;  // copy the retained block ids
+
+    // Detach the resources from the sequence WITHOUT freeing them (ownership
+    // moves to the parked entry). Clearing the table prevents a later
+    // deallocate() on this seq object from double-freeing the parked blocks.
+    table0.clear();
+    bctx.block_location.clear();
+    std::fill(bctx.num_dispatched_tokens.begin(), bctx.num_dispatched_tokens.end(), 0);
+    seq.set_state_slot(BlockContextSlot::ACTIVE, -1);
+    seq.set_num_cached_tokens(0);
+
+    // DSv4 compressed pages aren't part of the parked state — return them.
+    for (auto& [ratio, mgr] : compressed_block_managers_) {
+        mgr->deallocate(seq, BlockContextSlot::ACTIVE);
+    }
+
+    // The sequence leaves the running set (counters mirror deallocate()).
+    num_running_seqs_--;
+    num_running_tokens_ -= len;
+    num_running_seqs_per_group_[ent.master_group_id]--;
+    num_running_tokens_per_group_[ent.master_group_id] -= len;
+
+    if (session_cache_debug()) {
+        std::fprintf(stderr,
+                     "[session-cache] PARK seq_id=%llu key=%llu len=%d slot=%d blocks=%d (warm=%d)\n",
+                     (unsigned long long)seq.seq_id(),
+                     (unsigned long long)ent.affinity_key,
+                     ent.length,
+                     ent.state_slot,
+                     static_cast<int>(ent.group_block_tables[0].size()),
+                     session_cache_.size() + 1);
+    }
+
+    // Park; free any entry it displaces (same-key replacement or LRU eviction).
+    auto displaced = session_cache_.put(std::move(ent));
+    for (auto& d : displaced) {
+        free_parked(d);
+    }
 }
 
 }  // namespace dlengine

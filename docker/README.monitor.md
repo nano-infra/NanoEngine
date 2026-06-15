@@ -33,6 +33,6 @@ Extra serve flags can be passed with `DLENGINE_SERVE_ARGS`:
 
 ```bash
 DLENGINE_MODEL=/path/to/model \
-DLENGINE_SERVE_ARGS="--engine_ipc true --ray_address 127.0.0.1:6379" \
+DLENGINE_SERVE_ARGS="--ray_address 127.0.0.1:6379" \
 docker compose -f docker-compose.monitor.yml up -d
 ```

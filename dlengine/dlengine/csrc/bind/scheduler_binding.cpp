@@ -143,6 +143,9 @@ void bind_scheduler_utils(py::module_& m)
         // Cross-request prefix caching toggle (disabled for linear-attention)
         .def("set_prefix_caching_enabled", &Scheduler::set_prefix_caching_enabled, py::arg("enabled"))
 
+        // Session-scoped GatedDeltaNet state caching (warm-session capacity)
+        .def("set_session_cache_slots", &Scheduler::set_session_cache_slots, py::arg("capacity"))
+
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))
 

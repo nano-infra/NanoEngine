@@ -466,8 +466,8 @@ class EngineServer:
         ctx = zmq.asyncio.Context()
         socket = ctx.socket(zmq.DEALER)
         # Default binds a TCP port (disaggregated stack, Rust DLRouter client).
-        # ``dlengine serve --engine_ipc`` passes an ipc:// endpoint so the
-        # co-located OpenAI HTTP server can connect without a port conflict.
+        # ``dlengine serve`` passes an ipc:// endpoint so the co-located OpenAI
+        # HTTP server can connect without a port conflict.
         listen_addr = bind_endpoint or f"tcp://*:{self.config.port}"
         socket.bind(listen_addr)
 
@@ -625,7 +625,7 @@ class EngineServer:
 def run_engine_server(config: Config, bind_endpoint: Optional[str] = None):
     """Top-level entry point for spawning EngineServer in a child process.
 
-    Used by ``dlengine serve --engine_ipc``: the OpenAI HTTP server starts this
+    Used by ``dlengine serve``: the OpenAI HTTP server starts this
     via ``multiprocessing.Process`` so the engine runs in its own process and
     exposes a zmq DEALER over ``bind_endpoint`` (an ipc:// socket). Must be a
     module-level function so it is picklable across the process boundary.

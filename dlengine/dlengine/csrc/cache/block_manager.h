@@ -33,8 +33,25 @@ public:
 
     // Count consecutive leading blocks whose hash matches an already-active
     // (shared) block.  These don't need a free slot — we just bump ref_count.
-    int  count_active_prefix_hits(Sequence& seq) const;
+    int count_active_prefix_hits(Sequence& seq) const;
+
+    // Read-only count of consecutive leading full blocks of ``seq`` whose hash
+    // (and content) is resident in this manager's prefix cache, regardless of
+    // whether the block is currently active. Used by cache-aware routing to
+    // measure how much of a prompt is already warm on a given DP rank. Side
+    // effect free; ``scan_cap`` bounds the walk on very long prompts.
+    int matched_prefix_blocks(Sequence& seq, int scan_cap = 512) const;
+
     void deallocate(Sequence& seq, BlockContextSlot slot);
+
+    // Release a raw list of physical block ids (decrement ref_count, free at 0)
+    // WITHOUT going through a Sequence. Used to free the KV blocks retained by a
+    // parked session (see SessionStateCache) when it is evicted: those blocks
+    // are detached from any live Sequence but their ref_count is still held by
+    // the parked entry. Safe to call with overlapping / already-freed ids only
+    // if the caller guarantees correct ownership (the parked entry owns its
+    // blocks exclusively).
+    void release_block_ids(const std::vector<int>& block_ids);
 
     // --- L3 (3FS) tiered KV cache hooks -----------------------------------
     // All L3 behavior is inert unless set_l3_enabled(true) has been called.

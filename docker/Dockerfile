@@ -10,13 +10,18 @@ ARG PIP_TRUSTED_HOST
 ARG RUST_TOOLCHAIN=1.95.0
 ARG DEEP_EP_REF=567632dd59810d77b3cc05553df953cc0f779799
 ARG DEEP_EP_VERSION=v1.2.1-25-g567632d
-ARG FLASH_MLA_REF=1408756a88e52a25196b759eaf8db89d2b51b5a1
-ARG FLASH_MLA_VERSION=1408756
+ARG FLASH_MLA_REF=71c737929f2567bd0a094ae140f8f60f390b1232
+ARG FLASH_MLA_VERSION=71c7379
 ARG DEEP_GEMM_REF=891d57b4db1071624b5c8fa0d1e51cb317fa709f
 ARG DEEP_GEMM_VERSION=v2.1.1.post3-16-g891d57b
 ARG FLASHINFER_REF=v0.6.9
 ARG DLSLIME_REF=v0.1.16
 ARG FLASH_ATTN_WHEEL=https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+# FlashAttention-3 (Hopper / SM90) — installed as the `flash_attn_interface`
+# module from PyTorch's official prebuilt index (ABI-stable for torch>=2.9).
+# Needed by DeepSeek-V3 MLA varlen prefill (qk=192 / v=128 head dims).
+ARG FLASH_ATTN3_INDEX_URL=https://download.pytorch.org/whl/cu128
+ARG FLASH_ATTN3_VERSION=flash-attn-3
 ARG OH_MY_ZSH_REF=c86ba78e2ff5c5a3e9282a84c0cc220dd3d5f253
 ARG ZSH_AUTOSUGGESTIONS_REF=v0.7.1
 ARG ZSH_SYNTAX_HIGHLIGHTING_REF=0.8.0
@@ -115,6 +120,10 @@ RUN git clone --recursive --depth 1 --branch ${FLASHINFER_REF} https://github.co
 
 RUN python3 -m pip install --break-system-packages --no-cache-dir "${FLASH_ATTN_WHEEL}"
 
+# FlashAttention-3 (flash_attn_interface). Prebuilt wheel from the PyTorch index.
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+        --index-url "${FLASH_ATTN3_INDEX_URL}" "${FLASH_ATTN3_VERSION}"
+
 RUN git clone --depth 1 --branch ${DLSLIME_REF} https://github.com/Deeplink-org/DLSlime.git /opt/src/DLSlime \
     && cd /opt/src/DLSlime \
     && python3 -m pip install --break-system-packages --no-build-isolation --no-cache-dir -v ./dlslime
@@ -165,7 +174,7 @@ ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="DLEngine" \
       org.opencontainers.image.version="${DLENGINE_VERSION}" \
-      org.opencontainers.image.description="DLEngine CUDA 12.8 devel container with PyTorch, DeepEP, FlashMLA, DeepGEMM, FlashInfer, FlashAttention, DLSlime, and build toolchains. DLEngine source is intentionally not included." \
+      org.opencontainers.image.description="DLEngine CUDA 12.8 devel container with PyTorch, DeepEP, FlashMLA, DeepGEMM, FlashInfer, FlashAttention (2 + 3), DLSlime, and build toolchains. DLEngine source is intentionally not included." \
       org.opencontainers.image.source="https://github.com/DeepLink-org/NanoDeploy" \
       org.opencontainers.image.url="https://github.com/DeepLink-org/NanoDeploy" \
       org.opencontainers.image.documentation="https://github.com/DeepLink-org/NanoDeploy#docker-development-image" \
@@ -177,6 +186,7 @@ LABEL org.opencontainers.image.title="DLEngine" \
       org.opencontainers.image.vendor.flashinfer="${FLASHINFER_REF}" \
       org.opencontainers.image.vendor.dlslime="${DLSLIME_REF}" \
       org.opencontainers.image.vendor.flash_attn="v2.8.1+cu12torch2.10cxx11abiTRUE" \
+      org.opencontainers.image.vendor.flash_attn3="${FLASH_ATTN3_VERSION}@${FLASH_ATTN3_INDEX_URL}" \
       org.opencontainers.image.vendor.rust="${RUST_TOOLCHAIN}" \
       org.opencontainers.image.vendor.oh_my_zsh="${OH_MY_ZSH_REF}" \
       org.opencontainers.image.vendor.zsh_autosuggestions="${ZSH_AUTOSUGGESTIONS_REF}" \

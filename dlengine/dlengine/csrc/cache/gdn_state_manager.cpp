@@ -18,6 +18,18 @@ GDNStateManager::GDNStateManager(const std::string& engine_id, int group_id, int
     }
 }
 
+void GDNStateManager::reset(int num_slots)
+{
+    num_slots_ = num_slots;
+    free_slots_.clear();
+    used_slots_.clear();
+    slot_id_to_free_list_it_.assign(num_slots, free_slots_.end());
+    for (int i = 0; i < num_slots; ++i) {
+        free_slots_.push_back(i);
+        slot_id_to_free_list_it_[i] = std::prev(free_slots_.end());
+    }
+}
+
 int GDNStateManager::allocate_slot()
 {
     if (free_slots_.empty()) {

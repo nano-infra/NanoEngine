@@ -21,6 +21,11 @@ public:
     void record_first_token();
     void record_token();
     void record_completion();
+    // Called once per prefill step the sequence participates in (each chunked
+    // prefill step, including the final chunk that emits the first token). The
+    // gap since the previous chunk (or since first_scheduled for the first
+    // chunk) is appended to prefill_chunk_samples.
+    void record_prefill_chunk();
 
     std::optional<double> ttft() const;
     std::optional<double> e2e_latency() const;
@@ -31,6 +36,9 @@ public:
     std::optional<double> avg_itl() const;
     std::optional<double> p50_itl() const;
     std::optional<double> p99_itl() const;
+    // Total prefill compute time (first_scheduled -> first_token), excluding
+    // queue wait. Sum of prefill_chunk_samples for a non-preempted sequence.
+    std::optional<double> prefill_time_ms() const;
 
     void log_metrics() const;
 
@@ -46,6 +54,10 @@ public:
     int                   num_generated_tokens = 0;
     std::vector<double>   itl_samples;
     std::optional<double> last_token_time;
+    // Chunked-prefill accounting (see record_prefill_chunk()).
+    int                   num_prefill_chunks = 0;
+    std::vector<double>   prefill_chunk_samples;  // per-chunk latency (ms)
+    std::optional<double> last_chunk_time;
 
     // For pickle support
     std::tuple<uint64_t,
@@ -57,6 +69,8 @@ public:
                std::optional<double>,
                std::optional<double>,
                int,
+               int,
+               std::vector<double>,
                int,
                std::vector<double>>
     getstate() const;
@@ -70,6 +84,8 @@ public:
                                                                      std::optional<double>,
                                                                      std::optional<double>,
                                                                      int,
+                                                                     int,
+                                                                     std::vector<double>,
                                                                      int,
                                                                      std::vector<double>>& state);
 

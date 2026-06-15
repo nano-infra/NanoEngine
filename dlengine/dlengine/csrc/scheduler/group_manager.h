@@ -12,12 +12,19 @@
 #include "dlengine/csrc/cache/gdn_state_manager.h"
 #include "dlengine/csrc/sequence/sequence.h"
 
+#include "session_state_cache.h"
+
 namespace dlengine {
 
 enum class RoutingStrategy {
     RoundRobin,
     LeastBatch,
-    LeastCache
+    LeastCache,
+    // Session/prefix-aware: route a sequence to the DP rank that already holds
+    // the longest cached prefix of its prompt (and, when available, the rank
+    // that served the same client session), so multi-turn conversations keep
+    // hitting a warm prefix cache. Falls back to least-cache load balancing.
+    SessionPrefix
 };
 
 struct AllocResult {
@@ -67,6 +74,39 @@ public:
 
     void allocate(Sequence& seq);
     void deallocate(Sequence& seq, BlockContextSlot slot = BlockContextSlot::ACTIVE);
+
+    // Session-scoped GatedDeltaNet state caching ----------------------------
+    //
+    // When a finished sequence carries a session affinity key, PARK its KV
+    // blocks + GDN recurrent-state slot keyed by the session instead of freeing
+    // them (park_or_deallocate). The next turn from the same session is then
+    // served as a chunked-prefill continuation that skips recomputing the
+    // shared prefix (try_adopt_session). Only active when:
+    //   * session caching is enabled (capacity > 0), AND
+    //   * group_size == 1 (single-SP; multi-SP block layout is not parked), AND
+    //   * the sequence has a non-zero affinity_key.
+    // On any other path it degrades to a plain deallocate / cold allocate.
+
+    // Set the number of warm sessions to retain (0 disables). Re-sizes the GDN
+    // state-slot free list to (max_num_seqs + capacity). Call once at init,
+    // before any allocate(), mirroring set_prefix_caching_enabled().
+    void set_session_cache_slots(int capacity);
+
+    int num_parked_sessions() const
+    {
+        return session_cache_.size();
+    }
+
+    // Finish hook: park the sequence if eligible, otherwise deallocate().
+    void park_or_deallocate(Sequence& seq);
+
+    // Admission hook: if a warm session matches ``seq`` (same affinity key and
+    // its prompt extends the parked context), adopt the parked blocks + slot
+    // and return the chunk boundary; the caller skips the cold allocate path.
+    // ``budget`` is the per-step token budget for this chunk. Returns nullopt
+    // when there is no usable warm session (caller falls back to try_allocate's
+    // cold path).
+    std::optional<AllocResult> try_adopt_session(Sequence& seq, int budget);
 
     // Atomic budget-check + full-prompt allocation + chunk computation.
     // Internally: saves/restores num_tokens, sets full_len for block allocation,
@@ -161,6 +201,18 @@ public:
 
     std::unordered_map<int, std::shared_ptr<BlockManager>> block_manager;
 
+    // Cache-aware routing probe: how many leading full blocks of ``seq`` are
+    // already warm on this DP rank. Block hashes are token-derived and thus
+    // identical across SP groups, so the representative group 0 is sufficient.
+    int matched_prefix_blocks(Sequence& seq) const
+    {
+        auto it = block_manager.find(0);
+        if (it == block_manager.end() || !it->second) {
+            return 0;
+        }
+        return it->second->matched_prefix_blocks(seq);
+    }
+
     GDNStateManager gdn_state_manager_;
 
     // DSv4: per-compression-ratio paged allocator for compressed KV cache.
@@ -190,6 +242,13 @@ public:
 private:
     void initialize_dummy_seqs();
     int  next_group_id();  // Round-robin counter
+
+    // Free the KV blocks + GDN slot retained by a parked session that is being
+    // evicted/replaced (resources are exclusively owned by the entry).
+    void free_parked(const ParkedSession& entry);
+
+    // LRU store of warm-session resources (empty / inert when capacity == 0).
+    SessionStateCache session_cache_;
 
     std::string engine_id_;
     int         group_size_;

@@ -17,10 +17,25 @@ class GDNStateManager {
 public:
     GDNStateManager(const std::string& engine_id, int group_id, int num_slots);
 
+    // Rebuild the free list for a new total slot count, dropping all current
+    // allocations. Must only be called at init (before any allocate()); used to
+    // enlarge the pool for session-scoped state caching.
+    void reset(int num_slots);
+
     // State slot allocation and deallocation
     bool can_allocate() const;
     void allocate(Sequence& seq);
     void deallocate(Sequence& seq, BlockContextSlot slot);
+
+    // Return a slot id to the free list without a backing Sequence. Used to
+    // free the GDN state slot retained by a parked session (see
+    // SessionStateCache) on eviction. No-op for slot_id < 0.
+    void free_slot(int slot_id)
+    {
+        if (slot_id >= 0) {
+            deallocate_slot(slot_id);
+        }
+    }
 
     // Accessors
     std::vector<int> free_slots() const

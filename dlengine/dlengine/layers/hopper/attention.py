@@ -60,23 +60,41 @@ def _interleave_cached_fresh(
     """Interleave cached and fresh tensors into ragged K layout.
 
     Per sequence i the output is [cached_tokens_i, fresh_tokens_i] contiguously.
+
+    Fully vectorized: per-row destination indices are computed on-device and the
+    rows are scattered in two ``index_put`` ops. This replaces the former Python
+    per-sequence loop, which issued ~5 ``.item()`` host syncs per sequence (×2
+    for K and V, ×num_layers) and serialized the GPU during chunked prefill.
     """
-    num_seqs = cached_lens.shape[0]
-    total_k = int(cu_seqlens_k[-1].item())
+    # total_k == total_cached + total_fresh, and both are host-known tensor
+    # shapes, so the output is allocated without a device->host sync.
+    total_cached = cached.shape[0]
+    total_fresh = fresh.shape[0]
     ref = cached if cached.numel() > 0 else fresh
-    out = ref.new_empty(total_k, *ref.shape[1:])
+    out = ref.new_empty(total_cached + total_fresh, *ref.shape[1:])
 
-    for i in range(num_seqs):
-        dst = int(cu_seqlens_k[i].item())
-        nc = int(cached_lens[i].item())
-        cs = int(cu_cached[i].item())
-        qs = int(cu_seqlens_q[i].item())
-        nf = int(cu_seqlens_q[i + 1].item()) - qs
+    device = cu_seqlens_k.device
+    cu_k = cu_seqlens_k.to(torch.int64)
+    cu_q = cu_seqlens_q.to(torch.int64)
+    cu_c = cu_cached.to(torch.int64)
+    clens = cached_lens.to(torch.int64)
 
-        if nc > 0:
-            out[dst : dst + nc] = cached[cs : cs + nc]
-        if nf > 0:
-            out[dst + nc : dst + nc + nf] = fresh[qs : qs + nf]
+    # Cached rows: row j of `cached` belongs to seq s where cu_c[s] <= j <
+    # cu_c[s+1]; it lands at cu_k[s] + (j - cu_c[s]) (prefix occupies the head).
+    if total_cached > 0:
+        idx_c = torch.arange(total_cached, device=device, dtype=torch.int64)
+        seq_c = torch.searchsorted(cu_c, idx_c, right=True) - 1
+        dest_c = cu_k[seq_c] + (idx_c - cu_c[seq_c])
+        out[dest_c] = cached
+
+    # Fresh rows: row j of `fresh` belongs to seq s where cu_q[s] <= j <
+    # cu_q[s+1]; it lands at cu_k[s] + cached_lens[s] + (j - cu_q[s]) (after the
+    # cached prefix for that sequence).
+    if total_fresh > 0:
+        idx_f = torch.arange(total_fresh, device=device, dtype=torch.int64)
+        seq_f = torch.searchsorted(cu_q, idx_f, right=True) - 1
+        dest_f = cu_k[seq_f] + clens[seq_f] + (idx_f - cu_q[seq_f])
+        out[dest_f] = fresh
 
     return out
 
@@ -102,7 +120,9 @@ def _gather_kv_cached_concat(
     if total_cached == 0:
         return k_fresh, v_fresh
 
-    cached_indices = _build_paged_gather_indices(block_table, cu_cached, block_size)
+    cached_indices = _build_paged_gather_indices(
+        block_table, cu_cached, block_size, total_k=total_cached
+    )
     _, _, num_kv_heads, head_dim = k_cache.shape
     k_flat = k_cache.reshape(-1, num_kv_heads, head_dim)
     v_flat = v_cache.reshape(-1, num_kv_heads, head_dim)
@@ -140,7 +160,9 @@ def _gather_cache_cached_only(
         gathered = cache.new_empty(0, *trailing)
         return gathered, cached_lens, cu_cached
 
-    cached_indices = _build_paged_gather_indices(block_table, cu_cached, block_size)
+    cached_indices = _build_paged_gather_indices(
+        block_table, cu_cached, block_size, total_k=total_cached
+    )
     trailing = cache.shape[2:]
     flat = cache.reshape(-1, *trailing)
     return flat[cached_indices], cached_lens, cu_cached

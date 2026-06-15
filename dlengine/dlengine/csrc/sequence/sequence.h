@@ -236,6 +236,19 @@ public:
         data_->num_cached_tokens = n;
     }
 
+    // Optional client session affinity key for SessionPrefix routing (0 = none).
+    // Part of the serialized FlatBuffers state, so it survives the IPC engine
+    // boundary; when 0 the router falls back to content-derived cache-aware
+    // routing.
+    uint64_t affinity_key() const
+    {
+        return data_->affinity_key;
+    }
+    void set_affinity_key(uint64_t key)
+    {
+        data_->affinity_key = key;
+    }
+
     SamplingParams sampling_params() const
     {
         if (data_->sampling_params) {

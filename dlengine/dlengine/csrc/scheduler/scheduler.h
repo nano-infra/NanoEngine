@@ -12,6 +12,7 @@
 #include "dlengine/csrc/sequence/sequence.h"
 
 #include "group_manager.h"
+#include "router.h"
 #include "thread_pool.h"
 
 namespace dlengine {
@@ -107,6 +108,13 @@ public:
     // recurrent state cache.
     void set_prefix_caching_enabled(bool enabled);
 
+    // Enable session-scoped GatedDeltaNet state caching across all DP workers:
+    // retain up to ``capacity`` warm sessions' KV blocks + GDN state slots for
+    // cross-turn reuse (0 disables). Must be called once after construction,
+    // before any allocate(); resizes the GDN state-slot free lists to match the
+    // enlarged GPU state pool (max_num_seqs + capacity active slots).
+    void set_session_cache_slots(int capacity);
+
     // Main scheduling functions
     ScheduleResult schedule();
 
@@ -178,6 +186,20 @@ private:
     // Internal scheduling logic
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
+
+    // Lazily (re)build the routing strategy object to match routing_strategy,
+    // which is a public field callers may flip at runtime. Stateful routers
+    // (RR cursor, session affinity) persist across scheduling passes.
+    Router& ensure_router()
+    {
+        if (!router_ || router_built_for_ != routing_strategy) {
+            router_           = make_router(routing_strategy);
+            router_built_for_ = routing_strategy;
+        }
+        return *router_;
+    }
+    std::unique_ptr<Router> router_;
+    RoutingStrategy         router_built_for_ = RoutingStrategy::RoundRobin;
 
     // Round-robin counter for DP
     int next_dp_idx();

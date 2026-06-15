@@ -1,15 +1,13 @@
 """ZMQ client driver for the ``dlengine serve`` multiprocess engine path.
 
-When ``--engine_ipc`` is set, the OpenAI HTTP server runs the engine in a
-separate process (see :func:`dlengine.server.engine_server.run_engine_server`)
-that exposes a zmq DEALER socket over an ``ipc://`` endpoint. This module
-provides :class:`ZmqEngineWorker`, a drop-in replacement for the in-process
-``EngineWorker`` (same ``start``/``stop``/``submit``/``free_sequences`` surface,
-consumed by :class:`~dlengine.server.openai_server.OpenAIServer`) that talks to
-that engine process as a zmq client.
+The OpenAI HTTP server always runs the engine in a separate process (see
+:func:`dlengine.server.engine_server.run_engine_server`) that exposes a zmq
+DEALER socket over an ``ipc://`` endpoint. This module provides
+:class:`ZmqEngineWorker` (``start``/``stop``/``submit``/``free_sequences``
+surface, consumed by :class:`~dlengine.server.openai_server.OpenAIServer`) that
+talks to that engine process as a zmq client.
 
-Unlike ``EngineWorker`` (which runs ``engine.step()`` on a background thread and
-pushes tokens via ``call_soon_threadsafe``), this worker lives entirely on the
+This worker lives entirely on the
 FastAPI asyncio event loop: an outbound queue serializes sends and a single recv
 task fans incoming StepOut/Migration packets back into each request's asyncio
 queue with ``put_nowait``.

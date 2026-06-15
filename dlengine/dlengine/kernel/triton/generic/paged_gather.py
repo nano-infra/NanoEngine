@@ -42,6 +42,7 @@ def build_paged_gather_indices(
     block_table: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     block_size: int,
+    total_k: int | None = None,
 ) -> torch.Tensor:
     """Build flat linear indices for gathering tokens from a paged cache.
 
@@ -49,12 +50,15 @@ def build_paged_gather_indices(
         block_table: [num_seqs, max_num_blocks] — int32 physical block IDs
         cu_seqlens_k:[num_seqs + 1] — cumulative K lengths (int32)
         block_size:  tokens per cache block
+        total_k:     optional host-known total token count. When provided, the
+                     ``cu_seqlens_k[-1].item()`` device->host sync is skipped.
 
     Returns:
         linear_indices: [total_k_tokens] — index into cache.reshape(-1, ...)
     """
     num_seqs = block_table.shape[0]
-    total_k = int(cu_seqlens_k[-1].item())
+    if total_k is None:
+        total_k = int(cu_seqlens_k[-1].item())
     device = block_table.device
 
     linear_indices = torch.empty(total_k, dtype=torch.int64, device=device)
