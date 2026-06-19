@@ -202,7 +202,32 @@ class ModelRunner:
         self.config = config
         self.engine_id = self.config.engine_id
         hf_config = config.hf_config
+        enable_mla_reference_fallback = getattr(
+            config, "enable_mla_reference_fallback", False
+        )
+        setattr(
+            hf_config,
+            "enable_mla_reference_fallback",
+            enable_mla_reference_fallback,
+        )
         self.enforce_eager = config.enforce_eager
+        if (
+            enable_mla_reference_fallback
+            and getattr(hf_config, "kv_lora_rank", 0) > 0
+            and (
+                getattr(hf_config, "kv_lora_rank", 0)
+                + getattr(hf_config, "qk_rope_head_dim", 0)
+            )
+            not in (512, 576)
+        ):
+            if not self.enforce_eager:
+                logger.warning(
+                    "Forcing eager decode because MLA reference fallback is "
+                    "enabled for unsupported FlashMLA head_dim=%s",
+                    getattr(hf_config, "kv_lora_rank", 0)
+                    + getattr(hf_config, "qk_rope_head_dim", 0),
+                )
+            self.enforce_eager = True
 
         # Disable torch.compile before any compiled layer is built or any
         # lazily-compiled helper runs. Every dlengine call site routes through
@@ -881,12 +906,29 @@ class ModelRunner:
                 config.ctrl_address, config.host, config.port
             )
 
-        # Enable FP8 KV cache for sparse attention (V3.2)
-        # On by default when model has NSA indexer; --disable_nsa turns it off
+        # Enable FP8 KV cache for sparse attention (V3.2).
+        # The reference fallback is correctness-only and cannot read the FP8
+        # packed cache, so disabling FP8 cache for unsupported shapes is opt-in.
         index_head_dim = getattr(hf_config, "index_head_dim", 0)
+        mla_head_dim = kv_lora_rank + qk_rope_head_dim
+        flash_mla_supported = mla_head_dim in (512, 576)
+        enable_mla_reference_fallback = getattr(
+            config, "enable_mla_reference_fallback", False
+        )
         is_fp8_kvcache = (mode == "mla" and index_head_dim > 0) and not getattr(
             config, "disable_nsa", False
         )
+        if (
+            is_fp8_kvcache
+            and enable_mla_reference_fallback
+            and not flash_mla_supported
+        ):
+            logger.warning(
+                "Disabling FP8 MLA KV cache because MLA reference fallback is "
+                "enabled for unsupported FlashMLA head_dim=%s.",
+                mla_head_dim,
+            )
+            is_fp8_kvcache = False
 
         head_dim = getattr(hf_config, "head_dim", None) or (
             hf_config.hidden_size // hf_config.num_attention_heads

@@ -451,10 +451,13 @@ class Indexer(nn.Module):
         # (block_tables.shape[-1] * page_size is constant per captured graph).
         max_context_len = block_tables.shape[-1] * page_size
         context_lens_i32 = context_lens.to(torch.int32)
+        context_lens_for_gemm = context_lens_i32
+        if context_lens_for_gemm.dim() == 1:
+            context_lens_for_gemm = context_lens_for_gemm[:, None]
 
         # Schedule metadata for deep_gemm
         schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
-            context_lens_i32, page_size, self.sm_count
+            context_lens_for_gemm, page_size, self.sm_count
         )
 
         # Compute logits: (batch * ntps, max_context_len) FP32
@@ -462,7 +465,7 @@ class Indexer(nn.Module):
             q_fp8_4d,
             kv_cache,
             weights,
-            context_lens_i32,
+            context_lens_for_gemm,
             block_tables.to(torch.int32),
             schedule_meta,
             max_context_len,
