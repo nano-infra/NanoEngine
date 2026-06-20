@@ -22,6 +22,7 @@ from dlengine.layers.hopper.attention import (
     _gather_cache_cached_only,
     _interleave_cached_fresh,
 )
+from dlengine.kernel.triton.generic.paged_gather import build_paged_gather_indices
 from dlengine.layers.layernorm import RMSNorm
 from dlengine.layers.parallelism_transition import (
     AttnToFfnTransition,
@@ -33,6 +34,35 @@ from dlengine.worker.runner_config import get_runner_config
 from ..quant_config import QuantizationConfig
 
 logger = get_logger()
+
+# Varlen attention func for non-absorbed MLA prefill, resolved once.
+# FA3 (``flash_attn_interface``) supports arbitrary head dims (incl. 256/256)
+# and is preferred; ``flash_mla``'s varlen kernel only covers standard MLA
+# dims and returns NaN for unsupported shapes. ``False`` means "not yet
+# resolved" so the lookup happens lazily on first attention call.
+_PREFILL_VARLEN_FUNC = False
+_PREFILL_VARLEN_IS_FA3 = False
+
+
+def _get_prefill_varlen_func():
+    """Return ``(func, is_fa3)`` for non-absorbed MLA prefill, or ``(None, False)``."""
+    global _PREFILL_VARLEN_FUNC, _PREFILL_VARLEN_IS_FA3
+    if _PREFILL_VARLEN_FUNC is False:
+        try:
+            from flash_attn_interface import flash_attn_varlen_func
+
+            _PREFILL_VARLEN_FUNC = flash_attn_varlen_func
+            _PREFILL_VARLEN_IS_FA3 = True
+        except ModuleNotFoundError:
+            try:
+                from flash_mla import flash_attn_varlen_func
+
+                _PREFILL_VARLEN_FUNC = flash_attn_varlen_func
+                _PREFILL_VARLEN_IS_FA3 = False
+            except ModuleNotFoundError:
+                _PREFILL_VARLEN_FUNC = None
+                _PREFILL_VARLEN_IS_FA3 = False
+    return _PREFILL_VARLEN_FUNC, _PREFILL_VARLEN_IS_FA3
 
 
 def yarn_get_mscale(scale=1, mscale=1):
@@ -463,6 +493,9 @@ class DeepseekV2Attention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.enable_mla_reference_fallback = getattr(
+            config, "enable_mla_reference_fallback", False
+        )
         # For MLA, effective num_kv_heads is 1 (single compressed KV representation)
         num_key_value_heads = 1
         self.is_v32 = hasattr(config, "index_topk")
@@ -647,6 +680,147 @@ class DeepseekV2Attention(nn.Module):
         # value_states: (q_len, kv_lora_rank) — normalized compressed latent
         return key_states, value_states, k_pe
 
+    def _flash_mla_decode_supported(self) -> bool:
+        return (self.kv_lora_rank + self.qk_rope_head_dim) in (512, 576)
+
+    def _unsupported_mla_message(self) -> str:
+        return (
+            "Current FlashMLA kernels do not support this MLA shape "
+            f"(decode head_dim={self.kv_lora_rank + self.qk_rope_head_dim}, "
+            f"prefill q/v dims={self.q_head_dim}/{self.v_head_dim}). "
+            "Set enable_mla_reference_fallback=True only for correctness/debug "
+            "runs; it is slow and disables the optimized decode path."
+        )
+
+    def _flash_prefill_supported(self) -> bool:
+        """Whether a varlen attention kernel exists for the non-absorbed prefill.
+
+        Prefill runs the *non-absorbed* MLA path with native head dims
+        (``q_head_dim`` / ``v_head_dim``).  FA3 (``flash_attn_interface``)
+        supports arbitrary head dims, but it is not always installed.  The
+        ``flash_mla`` varlen fallback only instantiates the standard DeepSeek
+        MLA dims (192/128); for GLM/DSA-style 256/256 it has no usable kernel.
+        The slow reference path is available only when explicitly enabled.
+        """
+        func, is_fa3 = _get_prefill_varlen_func()
+        if func is None:
+            return False
+        # FA3 handles arbitrary head dims; the flash_mla varlen fallback only
+        # supports the standard DeepSeek MLA dims.
+        return is_fa3 or (self.q_head_dim, self.v_head_dim) == (192, 128)
+
+    def _varlen_attention_reference(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        causal: bool,
+    ) -> torch.Tensor:
+        outs = []
+        num_seqs = cu_seqlens_q.numel() - 1
+        for i in range(num_seqs):
+            q_start = int(cu_seqlens_q[i].item())
+            q_end = int(cu_seqlens_q[i + 1].item())
+            k_start = int(cu_seqlens_k[i].item())
+            k_end = int(cu_seqlens_k[i + 1].item())
+            qi = q[q_start:q_end]
+            ki = k[k_start:k_end]
+            vi = v[k_start:k_end]
+
+            scores = torch.einsum("qhd,khd->hqk", qi.float(), ki.float())
+            scores = scores * self.softmax_scale
+            if causal:
+                q_len = q_end - q_start
+                k_len = k_end - k_start
+                cached_len = k_len - q_len
+                q_pos = torch.arange(q_len, device=q.device).unsqueeze(1)
+                k_pos = torch.arange(k_len, device=q.device).unsqueeze(0)
+                mask = k_pos <= (cached_len + q_pos)
+                scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+
+            probs = torch.softmax(scores, dim=-1).to(vi.dtype)
+            out = torch.einsum("hqk,khd->qhd", probs, vi)
+            outs.append(out)
+        return torch.cat(outs, dim=0) if outs else q.new_empty(0, q.shape[1], v.shape[-1])
+
+    def _decode_varlen_fallback(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        key_states: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        num_heads: int,
+    ) -> torch.Tensor:
+        context = get_context()
+        ntps = context.num_tokens_per_seq
+        total_tokens = hidden_states.size(0)
+        bs = total_tokens // ntps
+
+        q_full, _q_nope, q_pe = self._q_proj_raw(hidden_states, num_heads)
+        q_pe = _interleaved_to_half(q_pe)
+        k_pe_3d = _interleaved_to_half(k_pe.unsqueeze(1))
+        q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
+        q_full[..., self.qk_nope_head_dim :] = q_pe
+
+        key_states_3d = key_states.unsqueeze(1)
+        key_states_3d[..., self.kv_lora_rank :] = k_pe_3d
+
+        k_cache = self.attn_fwd.k_cache
+        if k_cache.dtype == torch.float8_e4m3fn:
+            raise RuntimeError(
+                "BF16 varlen MLA fallback cannot read FP8 packed KV cache; "
+                "FP8 KV cache should be disabled for unsupported FlashMLA dims."
+            )
+        if k_cache.numel() and not context.is_dummy and context.slot_mapping is not None:
+            from dlengine.kernel.triton.generic.kv_store import store_kcache
+
+            store_kcache(key_states_3d, k_cache, context.slot_mapping)
+
+        sp_rank = get_dist_context().attn_sp_rank
+        context_lens = context.context_lens[sp_rank, :bs]
+        block_tables = context.block_tables[sp_rank, :bs]
+        cu_seqlens_k = torch.empty(bs + 1, dtype=torch.int32, device=hidden_states.device)
+        cu_seqlens_k[0] = 0
+        cu_seqlens_k[1:] = context_lens.cumsum(0)
+        q_lens = torch.full((bs,), ntps, dtype=torch.int32, device=hidden_states.device)
+        cu_seqlens_q = torch.empty(bs + 1, dtype=torch.int32, device=hidden_states.device)
+        cu_seqlens_q[0] = 0
+        cu_seqlens_q[1:] = q_lens.cumsum(0)
+
+        total_k = int(cu_seqlens_k[-1].item())
+        gather_indices = build_paged_gather_indices(
+            block_tables, cu_seqlens_k, k_cache.shape[1], total_k=total_k
+        )
+        k_cached_raw = k_cache.reshape(-1, *k_cache.shape[2:])[gather_indices].squeeze(1)
+
+        comp_cached = k_cached_raw[:, : self.kv_lora_rank]
+        kpe_cached = k_cached_raw[:, self.kv_lora_rank :]
+        kc_t = self.kc.weight.reshape(
+            num_heads * self.qk_nope_head_dim, self.kv_lora_rank
+        ).T
+        vc_reshaped = self.vc.weight.permute(1, 0, 2).reshape(
+            self.kv_lora_rank, num_heads * self.v_head_dim
+        )
+        k_nope = (comp_cached @ kc_t).view(-1, num_heads, self.qk_nope_head_dim)
+        k_expanded = torch.cat(
+            [k_nope, kpe_cached.unsqueeze(1).expand(-1, num_heads, -1)], dim=-1
+        )
+        v_expanded = (comp_cached @ vc_reshaped).view(-1, num_heads, self.v_head_dim)
+
+        attn_output = self._varlen_attention_reference(
+            q_full,
+            k_expanded,
+            v_expanded,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            causal=ntps > 1,
+        )
+        attn_output = attn_output.reshape(total_tokens, -1)
+        return self.o_proj(attn_output)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -795,49 +969,66 @@ class DeepseekV2Attention(nn.Module):
                 k_expanded = k_expanded_fresh
                 v_expanded = v_expanded_fresh
 
-            # Varlen MLA prefill with mismatched qk/v head dims (192/128).
-            # Prefer FlashAttention-3 (flash_attn_interface) when available;
-            # otherwise fall back to FlashMLA's varlen kernel, which is built for
-            # MLA head dims. (Plain flash_attn / FA2 does not support qk!=v
-            # head dims, so it is intentionally not used here.)
-            try:
-                from flash_attn_interface import flash_attn_varlen_func
-
-                attn_output = flash_attn_varlen_func(
-                    q_full,  # (q_len, H, 192)
-                    k_expanded,  # (total_k or q_len, H, 192)
-                    v_expanded,  # (total_k or q_len, H, 128)
-                    cu_seqlens_q=context.cu_seqlens_q,
-                    cu_seqlens_k=context.cu_seqlens_k,
-                    max_seqlen_q=context.max_seqlen_q,
-                    max_seqlen_k=context.max_seqlen_k,
-                    softmax_scale=self.softmax_scale,
-                    causal=True,
-                )
-            except ModuleNotFoundError:
-                from flash_mla import flash_attn_varlen_func
-
-                attn_output = flash_attn_varlen_func(
-                    q_full,  # (q_len, H, 192)
-                    k_expanded,  # (total_k or q_len, H, 192)
-                    v_expanded,  # (total_k or q_len, H, 128)
+            # Varlen MLA prefill with mismatched qk/v head dims. FlashMLA
+            # wheels used in this environment do not instantiate 256/256 MLA;
+            # the slow reference path is available only when explicitly enabled.
+            if not self._flash_prefill_supported():
+                if not self.enable_mla_reference_fallback:
+                    raise RuntimeError(self._unsupported_mla_message())
+                attn_output = self._varlen_attention_reference(
+                    q_full,
+                    k_expanded,
+                    v_expanded,
                     context.cu_seqlens_q,
                     context.cu_seqlens_k,
-                    context.max_seqlen_q,
-                    context.max_seqlen_k,
-                    softmax_scale=self.softmax_scale,
                     causal=True,
                 )
-            # FA3 returns out, FlashMLA returns (out, lse): normalize to out.
-            if isinstance(attn_output, tuple):
-                attn_output = attn_output[0]
+            else:
+                varlen_func, is_fa3 = _get_prefill_varlen_func()
+                if is_fa3:
+                    attn_output = varlen_func(
+                        q_full,  # (q_len, H, qk_head_dim)
+                        k_expanded,  # (total_k or q_len, H, qk_head_dim)
+                        v_expanded,  # (total_k or q_len, H, v_head_dim)
+                        cu_seqlens_q=context.cu_seqlens_q,
+                        cu_seqlens_k=context.cu_seqlens_k,
+                        max_seqlen_q=context.max_seqlen_q,
+                        max_seqlen_k=context.max_seqlen_k,
+                        softmax_scale=self.softmax_scale,
+                        causal=True,
+                    )
+                else:
+                    attn_output = varlen_func(
+                        q_full,
+                        k_expanded,
+                        v_expanded,
+                        context.cu_seqlens_q,
+                        context.cu_seqlens_k,
+                        context.max_seqlen_q,
+                        context.max_seqlen_k,
+                        softmax_scale=self.softmax_scale,
+                        causal=True,
+                    )
+                # FA3 returns out, FlashMLA returns (out, lse): normalize to out.
+                if isinstance(attn_output, tuple):
+                    attn_output = attn_output[0]
             # attn_output: (T, H, v_head_dim=128) — no vc BMM needed
             attn_output = attn_output.reshape(q_len, -1)  # (T, H*128)
             attn_output = self.o_proj(attn_output)
             return attn_output
 
         else:
-            # === Absorbed decode path ===
+            # === Decode path ===
+            # FlashMLA decode wheels used here only instantiate MLA head dims
+            # 512/576. For other shapes, the slow non-absorbed reference path
+            # is available only when explicitly enabled.
+            if not self._flash_mla_decode_supported():
+                if not self.enable_mla_reference_fallback:
+                    raise RuntimeError(self._unsupported_mla_message())
+                return self._decode_varlen_fallback(
+                    positions, hidden_states, key_states, compressed_kv, k_pe, num_heads
+                )
+
             context = get_context()
             # Q absorbed: q_nope @ W_UK -> (q_len, H, kv_lora_rank=512), concat with q_pe -> 576
             query_states, q_pe, q_lora = self._q_proj_absorbed(hidden_states, num_heads)

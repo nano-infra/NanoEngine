@@ -18,6 +18,34 @@ from dlengine.layers.local_dispatch import LocalPaddedDispatcher
 from dlengine.worker.runner_config import get_runner_config
 
 
+# Resolved once on first use and cached — this runs in the MoE decode hot
+# path (two calls per layer, every step), so repeated getattr lookups are
+# wasteful.
+_MASKED_FP8_GEMM_FN = None
+
+
+def _m_grouped_fp8_gemm_nt_masked(
+    deep_gemm, a, b, d, masked_m, expected_m
+) -> None:
+    global _MASKED_FP8_GEMM_FN
+    fn = _MASKED_FP8_GEMM_FN
+    if fn is None:
+        for _name in (
+            "m_grouped_fp8_gemm_nt_masked",
+            "fp8_m_grouped_gemm_nt_masked",
+            "m_grouped_fp8_fp4_gemm_nt_masked",
+        ):
+            fn = getattr(deep_gemm, _name, None)
+            if fn is not None:
+                break
+        if fn is None:
+            raise AttributeError(
+                "deep_gemm does not provide a masked m-grouped FP8 GEMM API"
+            )
+        _MASKED_FP8_GEMM_FN = fn
+    fn(a, b, d, masked_m, expected_m)
+
+
 def compute_topk_ids(topk_ids, ranks, num_experts):
     """Optimized version: compute expert IDs for perfect load balancing.
 
@@ -493,7 +521,8 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
             gateup_output = torch.empty(
                 (E, max_m, N), device=hidden_states.device, dtype=torch.bfloat16
             )
-            deep_gemm.m_grouped_fp8_gemm_nt_masked(
+            _m_grouped_fp8_gemm_nt_masked(
+                deep_gemm,
                 (padded_fp8, padded_scale),
                 (self.gate_up_proj, self.gate_up_scale_inv),
                 gateup_output,
@@ -525,7 +554,8 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
             down_output = torch.empty(
                 (E, max_m, H), device=hidden_states.device, dtype=torch.bfloat16
             )
-            deep_gemm.m_grouped_fp8_gemm_nt_masked(
+            _m_grouped_fp8_gemm_nt_masked(
+                deep_gemm,
                 (down_input, down_input_scale),
                 (self.down_proj, self.down_scale_inv),
                 down_output,
@@ -669,7 +699,8 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
             gateup_output = torch.empty(
                 (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
             )
-            deep_gemm.m_grouped_fp8_gemm_nt_masked(
+            _m_grouped_fp8_gemm_nt_masked(
+                deep_gemm,
                 recv_x_fp8, gate_up_weight_fp8, gateup_output, masked_m, expected_m
             )
 
@@ -733,7 +764,8 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
                 device=hidden_states.device,
                 dtype=torch.bfloat16,
             )
-            deep_gemm.m_grouped_fp8_gemm_nt_masked(
+            _m_grouped_fp8_gemm_nt_masked(
+                deep_gemm,
                 down_input_fp8, down_weight_fp8, down_output, masked_m, expected_m
             )
         else:

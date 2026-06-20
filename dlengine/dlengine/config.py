@@ -130,6 +130,11 @@ class Config(BaseModel):
     # NSA sparse attention (V3.2) — enabled by default for models with index_head_dim > 0
     disable_nsa: bool = False
 
+    # Correctness-only fallback for MLA shapes that current FlashMLA wheels do
+    # not instantiate (for example 256/256). Disabled by default because it
+    # uses slow PyTorch reference attention and disables CUDA graph/FP8 KV cache.
+    enable_mla_reference_fallback: bool = False
+
     # DSv4 compressed-cache pool sizes (tokens per pool, per ratio).
     # 0 means "derive worst case = max_num_seqs * max_model_len / ratio".
     # Set explicitly to a smaller value to save memory when seqs are short.
