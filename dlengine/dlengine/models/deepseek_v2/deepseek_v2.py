@@ -65,6 +65,71 @@ def _get_prefill_varlen_func():
     return _PREFILL_VARLEN_FUNC, _PREFILL_VARLEN_IS_FA3
 
 
+# Sparse-prefill kernel (DeepSeek V3.2 / GLM-DSA). ``False`` = not resolved.
+_FLASH_MLA_SPARSE_FWD = False
+
+# NSA sparse prefill (DeepSeek V3.2 / GLM-DSA). Enabled by default: for prompts
+# longer than ``index_topk`` it reproduces the trained sparse attention pattern
+# (each query attends its top-``index_topk`` keys + the attention-sink tokens,
+# which ``compute_prefill_topk`` force-includes). Set the env var to "0" to fall
+# back to dense full-attention prefill.
+_NSA_SPARSE_PREFILL = (
+    __import__("os").environ.get("DLENGINE_DSV4_DEBUG_NSA_SPARSE_PREFILL", "1")
+    not in ("0", "", "false", "False")
+)
+_SPARSE_PREFILL_LOGGED = False
+_SPARSE_PREFILL_CACHED_WARNED = False
+
+
+def _get_flash_mla_sparse_fwd():
+    """Return ``flash_mla_sparse_fwd`` or ``None`` if unavailable."""
+    global _FLASH_MLA_SPARSE_FWD
+    if _FLASH_MLA_SPARSE_FWD is False:
+        try:
+            from flash_mla import flash_mla_sparse_fwd
+
+            _FLASH_MLA_SPARSE_FWD = flash_mla_sparse_fwd
+        except (ModuleNotFoundError, ImportError):
+            _FLASH_MLA_SPARSE_FWD = None
+    return _FLASH_MLA_SPARSE_FWD
+
+
+# Cache of (num_heads, topk) -> bool: whether ``flash_mla_sparse_fwd`` accepts
+# the shape. The kernel only instantiates specific head counts / topk blocks,
+# so we probe once and fall back to dense prefill on unsupported shapes.
+_SPARSE_PREFILL_SUPPORTED: dict = {}
+
+
+def _sparse_prefill_supported(num_heads: int, topk: int, head_dim: int) -> bool:
+    key = (num_heads, topk, head_dim)
+    cached = _SPARSE_PREFILL_SUPPORTED.get(key)
+    if cached is not None:
+        return cached
+    fwd = _get_flash_mla_sparse_fwd()
+    if fwd is None:
+        _SPARSE_PREFILL_SUPPORTED[key] = False
+        return False
+    try:
+        q = torch.zeros(1, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        kv = torch.zeros(1, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+        idx = torch.full((1, 1, topk), -1, dtype=torch.int32, device="cuda")
+        idx[0, 0, 0] = 0
+        fwd(q, kv, idx, head_dim**-0.5, d_v=512)
+        supported = True
+    except Exception as exc:  # noqa: BLE001 — probe; any failure -> fall back
+        logger.warning(
+            "flash_mla_sparse_fwd unsupported for num_heads=%d topk=%d "
+            "head_dim=%d (%s); using dense prefill.",
+            num_heads,
+            topk,
+            head_dim,
+            exc,
+        )
+        supported = False
+    _SPARSE_PREFILL_SUPPORTED[key] = supported
+    return supported
+
+
 def yarn_get_mscale(scale=1, mscale=1):
     if scale <= 1:
         return 1.0
@@ -106,9 +171,6 @@ def compute_topk_ids(topk_ids, ranks, num_experts):
     ) % num_experts
     topk_ids = topk_ids.reshape(shape)
     return topk_ids
-
-
-# 已改
 
 
 class DeepseekV2MoE(nn.Module):
@@ -891,6 +953,100 @@ class DeepseekV2Attention(nn.Module):
                     hidden_states, positions, context.slot_mapping
                 )
 
+            # === NSA sparse prefill (DeepSeek V3.2 / GLM-DSA) ===
+            # This DSA model is *trained* with the lightning indexer applied in
+            # prefill too: each query attends only to its top-``index_topk``
+            # keys. Dense full attention is what the model never saw and diverges
+            # from training once a sequence exceeds ``index_topk`` (≈2048),
+            # corrupting long-prompt outputs (and the KV/indexer keys that decode
+            # later reads). Reproduce the trained sparse pattern with the absorbed
+            # MLA form (same as decode) + ``flash_mla_sparse_fwd``.
+            #
+            # Handles the no-cached-prefix case (fresh single-chunk prompt):
+            # ``key_states_3d`` already covers the whole sequence, so
+            # ``compute_prefill_topk`` over the fresh keys gives the exact
+            # per-query selection. The cached-prefix / chunked case (total_cached
+            # > 0) is handled by the dense fallback below for now; note this is an
+            # *eager* path (only decode is CUDA-graph captured), so the host sync
+            # to read ``total_cached`` is safe.
+            nsa_prefill = (
+                _NSA_SPARSE_PREFILL
+                and self.indexer is not None
+                and self.indexer.indexer_cache is not None
+                and context.cu_seqlens_q is not None
+            )
+            total_cached = 0
+            if (
+                nsa_prefill
+                and context.block_tables is not None
+                and context.cu_seqlens_k is not None
+            ):
+                total_cached = int(
+                    (context.cu_seqlens_k[-1] - context.cu_seqlens_q[-1]).item()
+                )
+            sparse_fwd = (
+                _get_flash_mla_sparse_fwd()
+                if (nsa_prefill and total_cached == 0)
+                else None
+            )
+            if nsa_prefill and total_cached > 0:
+                global _SPARSE_PREFILL_CACHED_WARNED
+                if not _SPARSE_PREFILL_CACHED_WARNED:
+                    _SPARSE_PREFILL_CACHED_WARNED = True
+                    logger.warning(
+                        "[NSA] prefill chunk has a cached prefix (total_cached=%d); "
+                        "falling back to DENSE attention for this chunk. This path "
+                        "is not sparse and may degrade very long (>1 chunk) or "
+                        "prefix-cached prompts. Sparse cached-prefix prefill is the "
+                        "remaining TODO.",
+                        total_cached,
+                    )
+            if sparse_fwd is not None:
+                seq_lens = (
+                    context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
+                )
+                max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() else 0
+                if max_seq_len > self.indexer.index_topk and _sparse_prefill_supported(
+                    num_heads,
+                    self.indexer.index_topk,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ):
+                    global _SPARSE_PREFILL_LOGGED
+                    if not _SPARSE_PREFILL_LOGGED:
+                        _SPARSE_PREFILL_LOGGED = True
+                        logger.info(
+                            "[NSA] sparse prefill ACTIVE (max_seq_len=%d > index_topk=%d)",
+                            max_seq_len,
+                            self.indexer.index_topk,
+                        )
+                    if self.q_lora_rank is None:
+                        q_lora = None
+                    else:
+                        q_lora = self.q_a_layernorm(self.q_a_proj(hidden_states))
+                    # Absorbed query: q_nope @ W_UK -> (q_len, H, 512), + RoPE'd q_pe.
+                    query_states = hidden_states.new_empty(
+                        [q_len, num_heads, self.kv_lora_rank + self.qk_rope_head_dim]
+                    )
+                    self.kc(q_nope, query_states[..., : self.kv_lora_rank])
+                    query_states[..., self.kv_lora_rank :] = q_pe
+
+                    topk_indices = self.indexer.compute_prefill_topk(
+                        q_lora, hidden_states, positions, context.cu_seqlens_q
+                    )  # (q_len, index_topk) int32, absolute key positions
+
+                    out, _, _ = sparse_fwd(
+                        query_states,  # (s_q, H, 576)
+                        key_states_3d,  # (s_kv, 1, 576) compressed latent + RoPE'd k_pe
+                        topk_indices.unsqueeze(1),  # (s_q, 1, topk)
+                        self.softmax_scale,
+                        d_v=self.kv_lora_rank,
+                    )
+                    # out: (s_q, H, 512) -> W_UV (vc) -> (s_q, H, v_head_dim)
+                    attn_bmm_out = out.new_empty(q_len, num_heads, self.v_head_dim)
+                    self.vc(out, attn_bmm_out)
+                    attn_output = attn_bmm_out.reshape(q_len, -1)
+                    return self.o_proj(attn_output)
+
             # Weight matrices for K/V expansion (shared by both paths)
             kc_t = self.kc.weight.reshape(
                 num_heads * self.qk_nope_head_dim, self.kv_lora_rank
@@ -928,7 +1084,18 @@ class DeepseekV2Attention(nn.Module):
                 # shape[0] is host-known (no device sync); equals cu_cached[-1].
                 total_cached = k_cached_raw.shape[0]
                 if total_cached > 0:
-                    k_cached_raw = k_cached_raw.squeeze(1)  # [total_cached, 576]
+                    k_cached_raw = k_cached_raw.squeeze(1)
+                    if k_cache.dtype == torch.float8_e4m3fn:
+                        # FP8 packed cache (656 bytes/token): dequantize+unpack
+                        # back to bf16 [total_cached, 576] before BF16 matmuls.
+                        from dlengine.kernel.triton.hopper.fp8_utils import (
+                            dequantize_and_unpack_mla,
+                        )
+
+                        k_cached_raw = dequantize_and_unpack_mla(
+                            k_cached_raw.view(torch.uint8)
+                        )
+                    # k_cached_raw: [total_cached, 576]
                     comp_cached = k_cached_raw[:, : self.kv_lora_rank]
                     kpe_cached = k_cached_raw[:, self.kv_lora_rank :]
 

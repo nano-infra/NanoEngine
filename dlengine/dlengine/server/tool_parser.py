@@ -5,7 +5,7 @@ module turns the raw generated text into the OpenAI ``tool_calls`` shape so the
 serving layer (:mod:`dlengine.server.openai_server`) can return function calls
 that agent scaffolds (SWE-bench, etc.) understand.
 
-Two formats are supported:
+The supported formats are:
 
 - *Hermes* (Qwen2.5 and earlier Qwen3 chat templates): each call is a JSON
   object wrapped in ``<tool_call> ... </tool_call>``::
@@ -24,6 +24,11 @@ Two formats are supported:
       </parameter>
       </function>
       </tool_call>
+
+- *GLM-4.5+ / GLM-5 XML*: the function name immediately follows
+  ``<tool_call>``, with ``<arg_key>`` / ``<arg_value>`` pairs for arguments::
+
+      <tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call>
 
 Reasoning ("thinking") models wrap a chain-of-thought in ``<think> ...
 </think>`` before the answer. The chat template usually injects the opening
@@ -183,10 +188,64 @@ class Qwen3XMLToolParser(ToolParser):
         )
 
 
+class GLMXMLToolParser(ToolParser):
+    """Parser for the GLM-4.5 / GLM-4.6 / GLM-4.7 / GLM-5 XML format."""
+
+    open_markers = ("<tool_call>", "<think>")
+
+    _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+    _ARG_RE = re.compile(
+        r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>",
+        re.DOTALL,
+    )
+
+    def parse_full(self, text: str) -> ParsedOutput:
+        reasoning, text = _extract_reasoning(text)
+
+        tool_calls: list[ToolCall] = []
+        for tc in self._TOOL_CALL_RE.finditer(text):
+            block = tc.group(1).strip()
+            if not block:
+                continue
+
+            first_arg = block.find("<arg_key>")
+            if first_arg == -1:
+                name = block.strip()
+                arg_text = ""
+            else:
+                name = block[:first_arg].strip()
+                arg_text = block[first_arg:]
+            if not name:
+                continue
+
+            args: dict = {}
+            for p in self._ARG_RE.finditer(arg_text):
+                key = p.group(1).strip()
+                if not key:
+                    continue
+                args[key] = _coerce_value(p.group(2))
+            tool_calls.append(
+                ToolCall(
+                    function=Function(
+                        name=name, arguments=json.dumps(args, ensure_ascii=False)
+                    )
+                )
+            )
+
+        content = self._TOOL_CALL_RE.sub("", text).strip()
+        return ParsedOutput(
+            content=content or None, tool_calls=tool_calls, reasoning=reasoning
+        )
+
+
 _REGISTRY: dict[str, type[ToolParser]] = {
     "hermes": HermesToolParser,
     "qwen3_xml": Qwen3XMLToolParser,
     "qwen3_coder": Qwen3XMLToolParser,
+    "glm": GLMXMLToolParser,
+    "glm45": GLMXMLToolParser,
+    "glm47": GLMXMLToolParser,
+    "glm5": GLMXMLToolParser,
 }
 
 
@@ -203,16 +262,21 @@ def detect_parser_name(
     """Heuristically pick a parser.
 
     The most reliable signal is the chat template itself: Qwen3.5 / Qwen3-Coder
-    templates instruct the model to emit ``<function=...>`` XML, while Hermes
-    templates use a JSON object inside ``<tool_call>``. Fall back to the model
-    path, then to Hermes.
+    templates instruct the model to emit ``<function=...>`` XML, GLM-4.5+
+    templates use ``<arg_key>`` / ``<arg_value>`` pairs, while Hermes templates
+    use a JSON object inside ``<tool_call>``. Fall back to the model path, then
+    to Hermes.
     """
     if chat_template:
+        if "<arg_key>" in chat_template or "<arg_value>" in chat_template:
+            return "glm"
         if "<function=" in chat_template:
             return "qwen3_xml"
         if "<tool_call>" in chat_template:
             return "hermes"
     ident = f"{model_path} {served_model_name}".lower()
+    if "glm" in ident:
+        return "glm"
     if "qwen3.5" in ident or "qwen3-coder" in ident or "qwen3_coder" in ident:
         return "qwen3_xml"
     return "hermes"
