@@ -612,7 +612,7 @@ class Indexer(nn.Module):
         logits = torch.where(
             torch.isfinite(logits) & (logits.abs() < 1e30),
             logits,
-            torch.full_like(logits, float("-inf")),
+            float("-inf"),
         )
 
         # TopK: select top index_topk token positions
