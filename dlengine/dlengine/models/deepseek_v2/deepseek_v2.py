@@ -1088,11 +1088,13 @@ class DeepseekV2Attention(nn.Module):
                     if k_cache.dtype == torch.float8_e4m3fn:
                         # FP8 packed cache (656 bytes/token): dequantize+unpack
                         # back to bf16 [total_cached, 576] before BF16 matmuls.
-                        from dlengine.kernel.triton.hopper.fp8_utils import (
-                            dequantize_and_unpack_mla,
-                        )
-
-                        k_cached_raw = dequantize_and_unpack_mla(
+                        dequantize_fn = getattr(self, "_dequantize_fn", None)
+                        if dequantize_fn is None:
+                            from dlengine.kernel.triton.hopper.fp8_utils import (
+                                dequantize_and_unpack_mla as dequantize_fn,
+                            )
+                            self._dequantize_fn = dequantize_fn
+                        k_cached_raw = dequantize_fn(
                             k_cached_raw.view(torch.uint8)
                         )
                     # k_cached_raw: [total_cached, 576]
