@@ -425,7 +425,6 @@ class Indexer(nn.Module):
         # query: (N, n_heads, head_dim), key: (N, head_dim)
         weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
         # Fold gates into the query (MQA): qw[i, d] = sum_h w[i, h] * q[i, h, d]
-        # codespell:ignore-next-line nd
         qw = torch.einsum("nhd,nh->nd", query.float(), weights)  # (N, head_dim)
         key_f = key.float()
 
