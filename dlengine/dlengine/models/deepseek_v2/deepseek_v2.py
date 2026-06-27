@@ -9,6 +9,7 @@ from transformers import DeepseekV3Config
 
 from dlengine.context.context import get_context
 from dlengine.context.distributed import get_dist_context
+from dlengine.kernel.triton.generic.paged_gather import build_paged_gather_indices
 from dlengine.layers import get_backend
 from dlengine.layers.activation import SiluAndMul
 from dlengine.layers.base_backend import (
@@ -22,7 +23,6 @@ from dlengine.layers.hopper.attention import (
     _gather_cache_cached_only,
     _interleave_cached_fresh,
 )
-from dlengine.kernel.triton.generic.paged_gather import build_paged_gather_indices
 from dlengine.layers.layernorm import RMSNorm
 from dlengine.layers.parallelism_transition import (
     AttnToFfnTransition,
@@ -73,10 +73,9 @@ _FLASH_MLA_SPARSE_FWD = False
 # (each query attends its top-``index_topk`` keys + the attention-sink tokens,
 # which ``compute_prefill_topk`` force-includes). Set the env var to "0" to fall
 # back to dense full-attention prefill.
-_NSA_SPARSE_PREFILL = (
-    __import__("os").environ.get("DLENGINE_DSV4_DEBUG_NSA_SPARSE_PREFILL", "1")
-    not in ("0", "", "false", "False")
-)
+_NSA_SPARSE_PREFILL = __import__("os").environ.get(
+    "DLENGINE_DSV4_DEBUG_NSA_SPARSE_PREFILL", "1"
+) not in ("0", "", "false", "False")
 _SPARSE_PREFILL_LOGGED = False
 _SPARSE_PREFILL_CACHED_WARNED = False
 
@@ -805,7 +804,9 @@ class DeepseekV2Attention(nn.Module):
             probs = torch.softmax(scores, dim=-1).to(vi.dtype)
             out = torch.einsum("hqk,khd->qhd", probs, vi)
             outs.append(out)
-        return torch.cat(outs, dim=0) if outs else q.new_empty(0, q.shape[1], v.shape[-1])
+        return (
+            torch.cat(outs, dim=0) if outs else q.new_empty(0, q.shape[1], v.shape[-1])
+        )
 
     def _decode_varlen_fallback(
         self,
@@ -836,7 +837,11 @@ class DeepseekV2Attention(nn.Module):
                 "BF16 varlen MLA fallback cannot read FP8 packed KV cache; "
                 "FP8 KV cache should be disabled for unsupported FlashMLA dims."
             )
-        if k_cache.numel() and not context.is_dummy and context.slot_mapping is not None:
+        if (
+            k_cache.numel()
+            and not context.is_dummy
+            and context.slot_mapping is not None
+        ):
             from dlengine.kernel.triton.generic.kv_store import store_kcache
 
             store_kcache(key_states_3d, k_cache, context.slot_mapping)
@@ -844,11 +849,15 @@ class DeepseekV2Attention(nn.Module):
         sp_rank = get_dist_context().attn_sp_rank
         context_lens = context.context_lens[sp_rank, :bs]
         block_tables = context.block_tables[sp_rank, :bs]
-        cu_seqlens_k = torch.empty(bs + 1, dtype=torch.int32, device=hidden_states.device)
+        cu_seqlens_k = torch.empty(
+            bs + 1, dtype=torch.int32, device=hidden_states.device
+        )
         cu_seqlens_k[0] = 0
         cu_seqlens_k[1:] = context_lens.cumsum(0)
         q_lens = torch.full((bs,), ntps, dtype=torch.int32, device=hidden_states.device)
-        cu_seqlens_q = torch.empty(bs + 1, dtype=torch.int32, device=hidden_states.device)
+        cu_seqlens_q = torch.empty(
+            bs + 1, dtype=torch.int32, device=hidden_states.device
+        )
         cu_seqlens_q[0] = 0
         cu_seqlens_q[1:] = q_lens.cumsum(0)
 
@@ -856,7 +865,9 @@ class DeepseekV2Attention(nn.Module):
         gather_indices = build_paged_gather_indices(
             block_tables, cu_seqlens_k, k_cache.shape[1], total_k=total_k
         )
-        k_cached_raw = k_cache.reshape(-1, *k_cache.shape[2:])[gather_indices].squeeze(1)
+        k_cached_raw = k_cache.reshape(-1, *k_cache.shape[2:])[gather_indices].squeeze(
+            1
+        )
 
         comp_cached = k_cached_raw[:, : self.kv_lora_rank]
         kpe_cached = k_cached_raw[:, self.kv_lora_rank :]
@@ -989,22 +1000,8 @@ class DeepseekV2Attention(nn.Module):
                 if (nsa_prefill and total_cached == 0)
                 else None
             )
-            if nsa_prefill and total_cached > 0:
-                global _SPARSE_PREFILL_CACHED_WARNED
-                if not _SPARSE_PREFILL_CACHED_WARNED:
-                    _SPARSE_PREFILL_CACHED_WARNED = True
-                    logger.warning(
-                        "[NSA] prefill chunk has a cached prefix (total_cached=%d); "
-                        "falling back to DENSE attention for this chunk. This path "
-                        "is not sparse and may degrade very long (>1 chunk) or "
-                        "prefix-cached prompts. Sparse cached-prefix prefill is the "
-                        "remaining TODO.",
-                        total_cached,
-                    )
             if sparse_fwd is not None:
-                seq_lens = (
-                    context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
-                )
+                seq_lens = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
                 max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() else 0
                 if max_seq_len > self.indexer.index_topk and _sparse_prefill_supported(
                     num_heads,
@@ -1093,10 +1090,9 @@ class DeepseekV2Attention(nn.Module):
                             from dlengine.kernel.triton.hopper.fp8_utils import (
                                 dequantize_and_unpack_mla as dequantize_fn,
                             )
+
                             self._dequantize_fn = dequantize_fn
-                        k_cached_raw = dequantize_fn(
-                            k_cached_raw.view(torch.uint8)
-                        )
+                        k_cached_raw = dequantize_fn(k_cached_raw.view(torch.uint8))
                     # k_cached_raw: [total_cached, 576]
                     comp_cached = k_cached_raw[:, : self.kv_lora_rank]
                     kpe_cached = k_cached_raw[:, self.kv_lora_rank :]

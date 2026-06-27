@@ -28,6 +28,7 @@ from multiprocessing.shared_memory import SharedMemory
 from typing import Iterable
 
 import torch
+
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")

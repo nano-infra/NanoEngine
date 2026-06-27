@@ -542,7 +542,7 @@ class ModelRunner:
         # the kv_cache tensor exists. Inert unless config.l3_enable.
         if getattr(self.config, "l3_enable", False):
             try:
-                from dlengine.context.cache.l3_hf3fs import Hf3fsL3Store
+                from dlengine.storage.l3_hf3fs import Hf3fsL3Store
 
                 self.l3_store = Hf3fsL3Store(
                     cache_context,
@@ -918,11 +918,7 @@ class ModelRunner:
         is_fp8_kvcache = (mode == "mla" and index_head_dim > 0) and not getattr(
             config, "disable_nsa", False
         )
-        if (
-            is_fp8_kvcache
-            and enable_mla_reference_fallback
-            and not flash_mla_supported
-        ):
+        if is_fp8_kvcache and enable_mla_reference_fallback and not flash_mla_supported:
             logger.warning(
                 "Disabling FP8 MLA KV cache because MLA reference fallback is "
                 "enabled for unsupported FlashMLA head_dim=%s.",

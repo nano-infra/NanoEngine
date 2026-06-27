@@ -40,6 +40,7 @@ import torch
 import torch.nn as nn
 from fast_hadamard_transform import hadamard_transform
 
+from dlengine.kernel.tilelang.deepseek.fp8_index import fp8_index
 from dlengine.layers import get_backend
 from dlengine.layers.base_backend import ReplicatedLinearBase
 from dlengine.layers.rotary_embedding import get_rope
@@ -47,20 +48,11 @@ from dlengine.logging import get_logger
 
 logger = get_logger()
 
+
 # FP8 quantization tile size (matches deep_gemm per_token_cast_to_fp8)
 INDEXER_QUANT_BLOCK_SIZE = 128
 
-# Attention-sink tokens for NSA/DSA sparse attention. These models are trained
-# with the first token(s) always attended; the lightning indexer's learned
-# top-k can drop them once context exceeds ``index_topk``, which collapses
-# long-context generation. We force the leading ``_NSA_NUM_SINKS`` tokens into
-# every query's selection. Override via the env var (forwarded to Ray workers
-# through the ``DLENGINE_DSV4_DEBUG_`` prefix).
-_NSA_NUM_SINKS = int(
-    os.environ.get("DLENGINE_DSV4_DEBUG_NSA_NUM_SINKS", "1") or "1"
-)
-# Debug selection override mode (decode): "", "sink_recent", or "trailing".
-_NSA_SELECT_MODE = os.environ.get("DLENGINE_DSV4_DEBUG_NSA_SELECT", "") or ""
+
 # EAGER-ONLY one-shot dump of the raw learned selection composition.
 _NSA_DUMP_SELECT = (
     os.environ.get("DLENGINE_DSV4_DEBUG_NSA_DUMP", "")
@@ -239,7 +231,6 @@ class Indexer(nn.Module):
         layer_id: Layer index (for cache buffer selection)
     """
 
-    _sink_cfg_logged = False
     _sel_dump_logged = False
 
     def __init__(
@@ -434,6 +425,7 @@ class Indexer(nn.Module):
         # query: (N, n_heads, head_dim), key: (N, head_dim)
         weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
         # Fold gates into the query (MQA): qw[i, d] = sum_h w[i, h] * q[i, h, d]
+        # codespell:ignore-next-line nd
         qw = torch.einsum("nhd,nh->nd", query.float(), weights)  # (N, head_dim)
         key_f = key.float()
 
@@ -463,15 +455,6 @@ class Indexer(nn.Module):
                 top_idx = (top_idx + start).to(torch.int32)
                 top_idx[top_val == neg_inf] = -1
                 indices[start + a : start + b, :k] = top_idx
-            # Attention sink: force the sequence's leading token(s) into every
-            # query's selection (see decode-path note). Absolute positions
-            # ``start .. start + n_sink``; clamped to the sequence length.
-            n_sink = min(_NSA_NUM_SINKS, seq_len)
-            if n_sink > 0:
-                sink_ids = torch.arange(
-                    start, start + n_sink, dtype=torch.int32, device=indices.device
-                )
-                indices[start:end, -n_sink:] = sink_ids.unsqueeze(0)
         return indices
 
     def _compute_gate_weights(
@@ -520,15 +503,6 @@ class Indexer(nn.Module):
             topk_indices: (num_tokens, index_topk) int32 — selected token indices
         """
         assert self.indexer_cache is not None, "IndexerCache not initialized"
-        if not Indexer._sink_cfg_logged:
-            Indexer._sink_cfg_logged = True
-            logger.info(
-                "[NSA] indexer sink fix active: _NSA_NUM_SINKS=%d (index_topk=%d) "
-                "select_mode=%r",
-                _NSA_NUM_SINKS,
-                self.index_topk,
-                _NSA_SELECT_MODE or "learned",
-            )
         num_tokens = hidden_states.shape[0]
         batch_size = context_lens.shape[0]
 
@@ -655,8 +629,12 @@ class Indexer(nn.Module):
                 logger.info(
                     "[NSA dump] bad_positions(first40)=%s last_valid=%d "
                     "|logit|>1e6=%d >1e12=%d >1e20=%d (of %d finite)",
-                    bad_pos[:40].tolist(), ctx_len - 1,
-                    gt1e6, gt1e12, gt1e20, int(finite_region.numel()),
+                    bad_pos[:40].tolist(),
+                    ctx_len - 1,
+                    gt1e6,
+                    gt1e12,
+                    gt1e20,
+                    int(finite_region.numel()),
                 )
                 logger.info(
                     "[NSA dump] layer=%d ctx=%d in_last256=%d in_lasttopk=%d has0=%s "
@@ -664,17 +642,28 @@ class Indexer(nn.Module):
                     "weights[absmax=%.3e nan=%d] q_fp8[absmax=%.3e] "
                     "q_scale[min=%.3e max=%.3e] "
                     "highest10=%s",
-                    self.layer_id, ctx_len, in_last256, in_last2k,
+                    self.layer_id,
+                    ctx_len,
+                    in_last256,
+                    in_last2k,
                     bool((valid == 0).any().item()),
-                    float(valid_region[torch.isfinite(valid_region)].min().item())
-                    if torch.isfinite(valid_region).any() else float("nan"),
-                    float(valid_region[torch.isfinite(valid_region)].max().item())
-                    if torch.isfinite(valid_region).any() else float("nan"),
-                    n_nan, n_inf,
+                    (
+                        float(valid_region[torch.isfinite(valid_region)].min().item())
+                        if torch.isfinite(valid_region).any()
+                        else float("nan")
+                    ),
+                    (
+                        float(valid_region[torch.isfinite(valid_region)].max().item())
+                        if torch.isfinite(valid_region).any()
+                        else float("nan")
+                    ),
+                    n_nan,
+                    n_inf,
                     float(weights.abs().max().item()),
                     int(torch.isnan(weights).sum().item()),
                     float(q_fp8.float().abs().max().item()),
-                    float(q_scale.min().item()), float(q_scale.max().item()),
+                    float(q_scale.min().item()),
+                    float(q_scale.max().item()),
                     srt[-10:].tolist(),
                 )
 
@@ -687,35 +676,5 @@ class Indexer(nn.Module):
                 device=topk_indices.device,
             )
             topk_indices = torch.cat([topk_indices, padding], dim=-1)
-
-        # Attention sink: NSA/DSA models are trained with the initial token(s)
-        # always visible. Once context exceeds ``index_topk`` the learned top-k
-        # can drop token 0, which collapses long-context decoding into garbage
-        # (repetition / token soup). Force the leading sink token(s) into every
-        # query's selection. Verified: forcing token 0 restores coherent
-        # generation well past ``index_topk``.
-        if _NSA_NUM_SINKS > 0:
-            ar_sink = torch.arange(
-                _NSA_NUM_SINKS, dtype=torch.int32, device=topk_indices.device
-            )
-            topk_indices[:, -_NSA_NUM_SINKS:] = ar_sink.unsqueeze(0)
-
-        # Graph-safe debug selection override (DLENGINE_DSV4_DEBUG_NSA_SELECT).
-        # Replaces the *learned* selection with a deterministic window for queries
-        # whose context exceeds ``index_topk``. Used to isolate whether the
-        # learned top-k is the root cause of long-context degradation:
-        #   - "sink_recent": token 0 (sink) + most-recent ``index_topk-1`` tokens
-        #   - "trailing":    most-recent ``index_topk`` tokens (no sink)
-        # Pure tensor ops only (no host sync) so it is CUDA-graph safe.
-        if _NSA_SELECT_MODE in ("sink_recent", "trailing"):
-            ar = torch.arange(
-                self.index_topk, dtype=torch.int32, device=topk_indices.device
-            ).unsqueeze(0)  # (1, topk)
-            start = (ctx_expanded - self.index_topk).clamp(min=0).to(torch.int32)
-            window = (start + ar).clamp(max=(ctx_expanded - 1).to(torch.int32))
-            if _NSA_SELECT_MODE == "sink_recent":
-                window[:, 0] = 0  # force sink
-            use_override = ctx_expanded > self.index_topk  # (total_q, 1)
-            topk_indices = torch.where(use_override, window, topk_indices)
 
         return topk_indices
