@@ -76,8 +76,6 @@ _FLASH_MLA_SPARSE_FWD = False
 _NSA_SPARSE_PREFILL = __import__("os").environ.get(
     "DLENGINE_DSV4_DEBUG_NSA_SPARSE_PREFILL", "1"
 ) not in ("0", "", "false", "False")
-_SPARSE_PREFILL_LOGGED = False
-_SPARSE_PREFILL_CACHED_WARNED = False
 
 
 def _get_flash_mla_sparse_fwd():
@@ -1008,14 +1006,6 @@ class DeepseekV2Attention(nn.Module):
                     self.indexer.index_topk,
                     self.kv_lora_rank + self.qk_rope_head_dim,
                 ):
-                    global _SPARSE_PREFILL_LOGGED
-                    if not _SPARSE_PREFILL_LOGGED:
-                        _SPARSE_PREFILL_LOGGED = True
-                        logger.info(
-                            "[NSA] sparse prefill ACTIVE (max_seq_len=%d > index_topk=%d)",
-                            max_seq_len,
-                            self.indexer.index_topk,
-                        )
                     if self.q_lora_rank is None:
                         q_lora = None
                     else:
