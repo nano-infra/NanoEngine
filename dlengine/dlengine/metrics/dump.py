@@ -25,7 +25,8 @@ Two record kinds are appended to the stream, joinable on ``seq_id``:
   ``affinity_key``, ``prompt_len``, ``token_ids`` (JSON int list), ``prompt_text``.
 - ``kind="complete"`` (on finish): ``ts``, ``seq_id``, ``model``,
   ``affinity_key``, ``prompt_len``, ``cached_len``, ``output_len`` and
-  engine-measured latency (ms): ``ttft_ms``, ``tpot_ms``, ``e2e_ms``,
+  ``completion_token_ids`` (JSON int list), plus engine-measured latency
+  (ms): ``ttft_ms``, ``tpot_ms``, ``e2e_ms``,
   ``queue_ms``, ``prefill_ms`` (first_scheduled -> first token), ``avg_itl_ms`` /
   ``p50_itl_ms`` / ``p99_itl_ms``, ``num_prefill_chunks`` and ``chunk_prefill_ms``
   (JSON float list of per-chunk prefill latencies), plus ``itl_ms`` (JSON float
@@ -65,7 +66,7 @@ def _resolve_url(setting: Optional[str]) -> Optional[str]:
     if raw.lower() in _FALSE:
         return None
     if raw.lower() in _TRUE:
-        return "redis://127.0.0.1:6379/0"
+        return "redis://127.0.0.1:16379/0"
     return raw
 
 
@@ -92,6 +93,16 @@ def _decode_prompt(tokenizer: Any, prompt_ids: list[int]) -> str:
         return tokenizer.decode(prompt_ids, skip_special_tokens=False)
     except Exception:  # noqa: BLE001 - prompt text is best-effort debug data
         return ""
+
+
+def _completion_token_ids(seq: Any) -> list[int]:
+    try:
+        return list(seq.completion_token_ids)
+    except Exception:  # noqa: BLE001 - tolerate older Sequence wrappers
+        try:
+            return list(seq.token_ids)[seq.num_prompt_tokens :]
+        except Exception:
+            return []
 
 
 class MetricDumper:
@@ -241,6 +252,7 @@ class EngineMetricDumper:
         metric = getattr(seq, "metric", None)
         if metric is None:
             return
+        completion_ids = _completion_token_ids(seq)
 
         self._writer.dump(
             kind="complete",
@@ -251,6 +263,7 @@ class EngineMetricDumper:
             prompt_len=seq.num_prompt_tokens,
             cached_len=cached_len,
             output_len=metric.num_generated_tokens,
+            completion_token_ids=completion_ids,
             ttft_ms=_round_ms(metric.ttft),
             tpot_ms=_round_ms(metric.avg_tpot_wo_queueing),
             e2e_ms=_round_ms(metric.e2e_latency),

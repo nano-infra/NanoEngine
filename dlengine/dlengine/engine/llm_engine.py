@@ -186,6 +186,20 @@ class LLMEngine:
 
     def update_num_kvcache_blocks(self):
         self.config.num_kvcache_blocks = self.executor.update_kvcache_blocks()
+        service_token_capacity = (
+            self.config.num_kvcache_blocks * self.config.kvcache_block_size
+        )
+        if self.config.max_model_len > service_token_capacity:
+            logger.warning(
+                "max_model_len=%d exceeds KV cache capacity (%d blocks x %d "
+                "tokens = %d); clamping effective max_model_len to %d.",
+                self.config.max_model_len,
+                self.config.num_kvcache_blocks,
+                self.config.kvcache_block_size,
+                service_token_capacity,
+                service_token_capacity,
+            )
+            self.config.max_model_len = service_token_capacity
 
     def get_engine_id(self):
         return self.engine_id

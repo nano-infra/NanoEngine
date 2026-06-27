@@ -69,7 +69,7 @@ def _make_ctx(mode: str, num_layers: int, num_pages: int, block_size: int):
 
 
 def _run_mode(mode, mountpoint, num_layers, num_pages, block_size, nblocks):
-    from dlengine.context.cache.l3_hf3fs import Hf3fsL3Store
+    from dlengine.storage.l3_hf3fs import Hf3fsL3Store
 
     ctx = _make_ctx(mode, num_layers, num_pages, block_size)
     store = Hf3fsL3Store(

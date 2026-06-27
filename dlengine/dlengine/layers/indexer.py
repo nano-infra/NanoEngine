@@ -33,18 +33,21 @@ Weight names in HF checkpoint:
 """
 
 import math
+import os
 
 import deep_gemm
 import torch
 import torch.nn as nn
 from fast_hadamard_transform import hadamard_transform
 
+from dlengine.kernel.tilelang.deepseek.fp8_index import fp8_index
 from dlengine.layers import get_backend
 from dlengine.layers.base_backend import ReplicatedLinearBase
 from dlengine.layers.rotary_embedding import get_rope
 from dlengine.logging import get_logger
 
 logger = get_logger()
+
 
 # FP8 quantization tile size (matches deep_gemm per_token_cast_to_fp8)
 INDEXER_QUANT_BLOCK_SIZE = 128
@@ -156,11 +159,20 @@ class IndexerCache:
             slot_mapping >= 0, slot_mapping, torch.zeros_like(slot_mapping)
         )
 
-        # Compute page/offset for each token
+        # Compute page/offset for each token.
+        #
+        # IMPORTANT: deep_gemm's fp8_paged_mqa_logits (and sglang) expect each
+        # page laid out as a contiguous FP8 block for ALL tokens, followed by a
+        # contiguous scale block for all tokens:
+        #     [tok0_fp8(128) .. tok63_fp8(128)] [tok0_scale(4) .. tok63_scale(4)]
+        # i.e. SCALE_OFFSET = page_size * head_dim. (NOT per-token interleaved
+        # [fp8|scale]; that mislayout makes the kernel read scale bytes from the
+        # middle of the FP8 data, yielding ~1e29 garbage logits that only matter
+        # once context exceeds index_topk and real top-k selection kicks in.)
         page_idx = safe_slots // page_size  # (N,)
         offset_in_page = safe_slots % page_size  # (N,)
-        fp8_byte_offset = offset_in_page * bpt  # (N,)
-        scale_byte_offset = fp8_byte_offset + head_dim  # (N,)
+        fp8_byte_offset = offset_in_page * head_dim  # (N,) within fp8 block
+        scale_byte_offset = page_size * head_dim + offset_in_page * 4  # (N,)
 
         # Vectorised scatter into flat buffer view
         row_stride = page_size * bpt
@@ -206,6 +218,8 @@ class Indexer(nn.Module):
         rope_scaling: RoPE scaling config dict
         layer_id: Layer index (for cache buffer selection)
     """
+
+    _sel_dump_logged = False
 
     def __init__(
         self,
@@ -364,6 +378,72 @@ class Indexer(nn.Module):
         key = self._compute_key(hidden_states, positions)
         self.indexer_cache.store_key_fp8(self.layer_id, key, slot_mapping)
 
+    def compute_prefill_topk(
+        self,
+        q_lora: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        query_chunk: int = 2048,
+    ) -> torch.Tensor:
+        """Per-query top-k selection for the non-prefix (single-chunk) prefill.
+
+        Mirrors the lightning-indexer scoring used at decode, but produces a
+        causal top-k for *every* query token instead of just the last one.
+        Computed in BF16/FP32 (no FP8 quantization) — the selection (a topk
+        argmax) is robust to that, and this avoids the paged-FP8 MQA machinery
+        which is decode-shaped.
+
+        The indexer is MQA (a single key head shared by all ``n_heads`` query
+        heads), so the per-head gate weights fold into the query:
+            score[i, j] = sum_d (sum_h w[i, h] * q[i, h, d]) * k[j, d]
+        which keeps the score matrix at ``[L, L]`` instead of ``[L, H, L]``.
+
+        Args:
+            q_lora:        (num_tokens, q_lora_rank) — main-attn Q LoRA.
+            hidden_states: (num_tokens, hidden_size)
+            positions:     (num_tokens,) — absolute positions for RoPE.
+            cu_seqlens:    (num_seqs + 1,) int — cumulative query lengths.
+
+        Returns:
+            indices: (num_tokens, index_topk) int32 — absolute key positions
+                     into the (concatenated) KV, ``-1`` for invalid/padding.
+        """
+        query, key = self._compute_q_k(q_lora, hidden_states, positions)
+        # query: (N, n_heads, head_dim), key: (N, head_dim)
+        weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
+        # Fold gates into the query (MQA): qw[i, d] = sum_h w[i, h] * q[i, h, d]
+        qw = torch.einsum("nhd,nh->nd", query.float(), weights)  # (N, head_dim)
+        key_f = key.float()
+
+        num_tokens = qw.shape[0]
+        indices = torch.full(
+            (num_tokens, self.index_topk), -1, dtype=torch.int32, device=qw.device
+        )
+        num_seqs = cu_seqlens.shape[0] - 1
+        neg_inf = float("-inf")
+        for s in range(num_seqs):
+            start = int(cu_seqlens[s].item())
+            end = int(cu_seqlens[s + 1].item())
+            seq_len = end - start
+            if seq_len <= 0:
+                continue
+            seq_key = key_f[start:end]  # (L, D)
+            k = min(self.index_topk, seq_len)
+            for a in range(0, seq_len, query_chunk):
+                b = min(a + query_chunk, seq_len)
+                seq_q = qw[start + a : start + b]  # (C, D)
+                score = seq_q @ seq_key.T  # (C, L)
+                # Causal mask: query at local row (a + r) attends keys j <= a + r.
+                rows = torch.arange(a, b, device=qw.device).unsqueeze(1)  # (C, 1)
+                cols = torch.arange(seq_len, device=qw.device).unsqueeze(0)  # (1, L)
+                score.masked_fill_(cols > rows, neg_inf)
+                top_val, top_idx = score.topk(k, dim=-1)
+                top_idx = (top_idx + start).to(torch.int32)
+                top_idx[top_val == neg_inf] = -1
+                indices[start + a : start + b, :k] = top_idx
+        return indices
+
     def _compute_gate_weights(
         self,
         hidden_states: torch.Tensor,
@@ -482,6 +562,19 @@ class Indexer(nn.Module):
         # Mask invalid positions (beyond actual sequence length)
         arange = torch.arange(max_context_len, device=logits.device).unsqueeze(0)
         logits = logits.masked_fill(arange >= ctx_expanded, float("-inf"))
+
+        # deep_gemm's fp8_paged_mqa_logits is called with clean_logits=False, so it
+        # leaves non-finite / uninitialized values in the output (sglang notes the
+        # logits "should be cleaned in topk_transform"). A handful of NaN/+inf or
+        # fp32-saturated (~3e38) entries would otherwise dominate the top-k and
+        # corrupt the sparse selection once context exceeds index_topk. Replace any
+        # non-finite or absurdly-large-magnitude score with -inf so it is never
+        # selected. Real indexer logits are O(100s).
+        logits = torch.where(
+            torch.isfinite(logits) & (logits.abs() < 1e30),
+            logits,
+            float("-inf"),
+        )
 
         # TopK: select top index_topk token positions
         # actual_topk is constant (block_table capacity >= index_topk in practice)

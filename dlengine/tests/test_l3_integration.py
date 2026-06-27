@@ -72,7 +72,7 @@ def main() -> int:
     try:
         import hf3fs_fuse.io  # noqa: F401
         from dlengine._cpp import BlockContextSlot, BlockManager
-        from dlengine.context.cache.l3_hf3fs import Hf3fsL3Store
+        from dlengine.storage.l3_hf3fs import Hf3fsL3Store
     except Exception as e:
         return _skip(f"deps unavailable: {e}")
 
