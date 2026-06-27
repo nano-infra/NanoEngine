@@ -53,18 +53,6 @@ logger = get_logger()
 INDEXER_QUANT_BLOCK_SIZE = 128
 
 
-# EAGER-ONLY one-shot dump of the raw learned selection composition.
-_NSA_DUMP_SELECT = (
-    os.environ.get("DLENGINE_DSV4_DEBUG_NSA_DUMP", "")
-    or os.environ.get("DLENGINE_DSV4_DEBUG_NSA_DUMP_SELECT", "0")
-) not in (
-    "0",
-    "",
-    "false",
-    "False",
-)
-
-
 def _per_token_cast_to_fp8_ue8m0(x: torch.Tensor):
     """Graph-safe per-token FP8 quantization with UE8M0 scales.
 
