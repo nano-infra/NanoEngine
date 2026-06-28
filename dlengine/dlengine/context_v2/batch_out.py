@@ -40,7 +40,7 @@ def set_batch_out_context(
     global _BATCH_OUT_CONTEXT
     _BATCH_OUT_CONTEXT = BatchOutContext(
         token_ids=[] if token_ids is None else token_ids,
-        step_logprobs=step_logprobs,
+        step_logprobs=[] if step_logprobs is None else step_logprobs,
     )
     return _BATCH_OUT_CONTEXT
 
