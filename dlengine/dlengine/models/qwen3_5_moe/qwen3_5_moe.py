@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.cache.plan import qwen35_cache_plan
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.layers import get_backend
 from dlengine.layers.activation import SiluAndMul
@@ -495,6 +496,9 @@ class Qwen3_5MoeForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         logits = self.lm_head(hidden_states)
         return logits
+
+    def get_cache_plan(self):
+        return qwen35_cache_plan()
 
     def load_weights(self, weights):
         """Load weights using per-model loader."""

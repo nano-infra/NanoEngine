@@ -1,4 +1,40 @@
+from dataclasses import dataclass
+
 import torch
+
+from dlengine.context_v2 import BaseContext
+from dlengine.context_v2.cache._registry import register_cache_backend
+
+
+@dataclass
+class GQAContext(BaseContext):
+    kv_cache: torch.Tensor | None = None
+
+    @classmethod
+    def get_context_type(cls) -> str:
+        return "gqa"
+
+    @classmethod
+    def get_context_name(cls) -> str:
+        return "GQAContext"
+
+    def clear_context(self) -> None:
+        self.kv_cache = None
+
+    def reset_context(self) -> None:
+        self.clear_context()
+
+
+_GQA_CONTEXT = GQAContext()
+
+
+def get_gqa_context() -> GQAContext:
+    return _GQA_CONTEXT
+
+
+def reset_gqa_context() -> None:
+    global _GQA_CONTEXT
+    _GQA_CONTEXT = GQAContext()
 
 
 def configure_gqa_cache(context) -> None:
@@ -30,8 +66,20 @@ def allocate_gqa_kvcache(context) -> None:
     )
 
 
+GQA_CACHE_BACKEND = register_cache_backend(
+    "gqa",
+    configure=configure_gqa_cache,
+    get_block_bytes=get_gqa_block_bytes,
+    allocate=allocate_gqa_kvcache,
+)
+
+
 __all__ = [
+    "GQA_CACHE_BACKEND",
+    "GQAContext",
     "allocate_gqa_kvcache",
     "configure_gqa_cache",
     "get_gqa_block_bytes",
+    "get_gqa_context",
+    "reset_gqa_context",
 ]

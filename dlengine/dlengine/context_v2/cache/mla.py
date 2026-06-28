@@ -1,6 +1,45 @@
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 
+from dlengine.context_v2 import BaseContext
+from dlengine.context_v2.cache._registry import register_cache_backend
+
 FP8_QUANT_TILE_SIZE = 128
+
+
+@dataclass
+class MLAContext(BaseContext):
+    kv_cache: torch.Tensor | None = None
+    sparse_tile_scheduler_metadata: Any = None
+
+    @classmethod
+    def get_context_type(cls) -> str:
+        return "mla"
+
+    @classmethod
+    def get_context_name(cls) -> str:
+        return "MLAContext"
+
+    def clear_context(self) -> None:
+        self.kv_cache = None
+        self.sparse_tile_scheduler_metadata = None
+
+    def reset_context(self) -> None:
+        self.clear_context()
+
+
+_MLA_CONTEXT = MLAContext()
+
+
+def get_mla_context() -> MLAContext:
+    return _MLA_CONTEXT
+
+
+def reset_mla_context() -> None:
+    global _MLA_CONTEXT
+    _MLA_CONTEXT = MLAContext()
 
 
 def configure_mla_cache(context) -> None:
@@ -68,9 +107,21 @@ def allocate_mla_kvcache(context) -> None:
     )
 
 
+MLA_CACHE_BACKEND = register_cache_backend(
+    "mla",
+    configure=configure_mla_cache,
+    get_block_bytes=get_mla_block_bytes,
+    allocate=allocate_mla_kvcache,
+)
+
+
 __all__ = [
     "FP8_QUANT_TILE_SIZE",
+    "MLA_CACHE_BACKEND",
+    "MLAContext",
     "allocate_mla_kvcache",
     "configure_mla_cache",
     "get_mla_block_bytes",
+    "get_mla_context",
+    "reset_mla_context",
 ]

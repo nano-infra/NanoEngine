@@ -1,3 +1,3 @@
-from dlengine.context_v2.cache._layout import CacheLayoutMixin
+from dlengine.disagg.p2p.cache_layout import CacheLayoutMixin
 
 __all__ = ["CacheLayoutMixin"]

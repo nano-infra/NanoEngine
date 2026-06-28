@@ -1,4 +1,40 @@
+from dataclasses import dataclass
+from typing import Any
+
+from dlengine.context_v2 import BaseContext
+
 INDEXER_QUANT_BLOCK_SIZE = 128
+
+
+@dataclass
+class IndexerContext(BaseContext):
+    indexer_cache: Any = None
+
+    @classmethod
+    def get_context_type(cls) -> str:
+        return "indexer"
+
+    @classmethod
+    def get_context_name(cls) -> str:
+        return "IndexerContext"
+
+    def clear_context(self) -> None:
+        self.indexer_cache = None
+
+    def reset_context(self) -> None:
+        self.clear_context()
+
+
+_INDEXER_CONTEXT = IndexerContext()
+
+
+def get_indexer_context() -> IndexerContext:
+    return _INDEXER_CONTEXT
+
+
+def reset_indexer_context() -> None:
+    global _INDEXER_CONTEXT
+    _INDEXER_CONTEXT = IndexerContext()
 
 
 def get_indexer_block_bytes(context) -> int:
@@ -29,6 +65,9 @@ def allocate_indexer_cache(context, hf_config) -> None:
 
 __all__ = [
     "INDEXER_QUANT_BLOCK_SIZE",
+    "IndexerContext",
     "allocate_indexer_cache",
     "get_indexer_block_bytes",
+    "get_indexer_context",
+    "reset_indexer_context",
 ]

@@ -1,11 +1,65 @@
+from dataclasses import dataclass, field
+
 import torch
 
+from dlengine.context_v2 import BaseContext
 from dlengine.context_v2.cache.hca import DSV4_BYTES_PER_TOKEN
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")
 
 DSV4_COMPRESSED_PAGE_SIZE = 2
+
+
+@dataclass
+class CSAContext(BaseContext):
+    dsv4_compress_ratios: list[int] | None = None
+    dsv4_compressed_caches: dict[int, torch.Tensor] | None = None
+    dsv4_compressed_caches_flat: dict[int, torch.Tensor] = field(default_factory=dict)
+    dsv4_layers_per_ratio: dict[int, list[int]] = field(default_factory=dict)
+    dsv4_layer_to_ratio_idx: dict[int, int] = field(default_factory=dict)
+    dsv4_compressed_pool_config: dict[int, tuple[int, int, int]] = field(
+        default_factory=dict
+    )
+    dsv4_compressed_dummy_page: dict[int, int] = field(default_factory=dict)
+    dsv4_compressor_kv_flat: dict[int, torch.Tensor] = field(default_factory=dict)
+    dsv4_compressor_score_flat: dict[int, torch.Tensor] = field(default_factory=dict)
+    dsv4_compressor_counts_flat: dict[int, torch.Tensor] = field(default_factory=dict)
+
+    @classmethod
+    def get_context_type(cls) -> str:
+        return "csa"
+
+    @classmethod
+    def get_context_name(cls) -> str:
+        return "CSAContext"
+
+    def clear_context(self) -> None:
+        self.dsv4_compress_ratios = None
+        self.dsv4_compressed_caches = None
+        self.dsv4_compressed_caches_flat.clear()
+        self.dsv4_layers_per_ratio.clear()
+        self.dsv4_layer_to_ratio_idx.clear()
+        self.dsv4_compressed_pool_config.clear()
+        self.dsv4_compressed_dummy_page.clear()
+        self.dsv4_compressor_kv_flat.clear()
+        self.dsv4_compressor_score_flat.clear()
+        self.dsv4_compressor_counts_flat.clear()
+
+    def reset_context(self) -> None:
+        self.clear_context()
+
+
+_CSA_CONTEXT = CSAContext()
+
+
+def get_csa_context() -> CSAContext:
+    return _CSA_CONTEXT
+
+
+def reset_csa_context() -> None:
+    global _CSA_CONTEXT
+    _CSA_CONTEXT = CSAContext()
 
 
 def allocate_dsv4_compressed_caches(
@@ -127,7 +181,10 @@ def allocate_dsv4_compressor_state(
 
 
 __all__ = [
+    "CSAContext",
     "DSV4_COMPRESSED_PAGE_SIZE",
     "allocate_dsv4_compressed_caches",
     "allocate_dsv4_compressor_state",
+    "get_csa_context",
+    "reset_csa_context",
 ]

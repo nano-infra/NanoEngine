@@ -82,14 +82,20 @@ class PeerContext(BaseContext):
         rank: int,
     ) -> "PeerContext | None":
         """Start a PeerAgent using transport settings from CacheContext."""
+        alias = (
+            f"{cache_context.engine_id}:{rank}"
+            if cache_context.engine_id is not None
+            else None
+        )
+        device = (
+            _select_cache_peer_device()
+            if cache_context.ctrl_address is not None and alias is not None
+            else None
+        )
         return cls.start_peer_agent(
             ctrl_address=cache_context.ctrl_address,
-            alias=(
-                f"{cache_context.engine_id}:{rank}"
-                if cache_context.engine_id is not None
-                else None
-            ),
-            device=cache_context.selected_nic,
+            alias=alias,
+            device=device,
             scope=cache_context.ctrl_scope,
         )
 
@@ -147,5 +153,12 @@ class PeerContext(BaseContext):
 
 
 PeerAgentContext = PeerContext
+
+
+def _select_cache_peer_device() -> str | None:
+    from dlengine.disagg.p2p import select_peer_device
+
+    return select_peer_device()
+
 
 __all__ = ["PeerAgentContext", "PeerContext"]

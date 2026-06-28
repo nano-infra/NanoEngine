@@ -8,6 +8,7 @@ from torch import nn
 from transformers import DeepseekV3Config
 
 from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.cache.plan import deepseek_mla_cache_plan
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.kernel.triton.generic.paged_gather import build_paged_gather_indices
 from dlengine.layers import get_backend
@@ -508,6 +509,11 @@ class DeepseekV2ForCausalLM(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor):
         """Compute logits of the model output."""
         return self.lm_head(hidden_states)
+
+    def get_cache_plan(self):
+        return deepseek_mla_cache_plan(
+            use_indexer=getattr(self.config, "index_head_dim", 0) > 0
+        )
 
     def load_weights(self, weights):
         """Load weights using per-model loader."""

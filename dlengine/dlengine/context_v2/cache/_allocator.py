@@ -4,29 +4,19 @@ The public method names stay on CacheContext for compatibility. Backend
 allocation details live in the backend cache modules.
 """
 
+from dlengine.context_v2.cache._registry import get_cache_backend
 from dlengine.context_v2.cache.csa import (
     allocate_dsv4_compressed_caches,
     allocate_dsv4_compressor_state,
 )
 from dlengine.context_v2.cache.gdn import allocate_gdn_states, estimate_gdn_state_bytes
-from dlengine.context_v2.cache.gqa import allocate_gqa_kvcache
-from dlengine.context_v2.cache.hca import allocate_dsv4_kvcache
 from dlengine.context_v2.cache.indexer import allocate_indexer_cache
-from dlengine.context_v2.cache.mla import allocate_mla_kvcache
 
 
 class KVCacheAllocatorMixin:
     def allocate_kvcache(self, num_kvcache_blocks):
         self.num_local_kvcache_blocks = num_kvcache_blocks
-
-        if self.mode == "gqa":
-            allocate_gqa_kvcache(self)
-        elif self.mode == "mla":
-            allocate_mla_kvcache(self)
-        elif self.mode == "dsv4":
-            allocate_dsv4_kvcache(self)
-        else:
-            raise ValueError(f"Unknown cache mode: {self.mode}")
+        get_cache_backend(self.mode).allocate(self)
 
     def allocate_dsv4_compressed_caches(
         self,
