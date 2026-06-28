@@ -9,6 +9,8 @@
 # MLAContext: MLA attention cache management
 # GDNContext: GDN attention cache management
 # DSAContext: DSA attention cache management
+# HSAContext: DeepSeekv4 HSA
+# CSAContext: DeepSeekv4 CSA
 
 # For MoE
 # ExpertContext: Expert-level context for the runtime
