@@ -8,7 +8,7 @@ from dlengine.context_v2 import BaseContext
 @dataclass
 class BatchOutContext(BaseContext):
     token_ids: list[torch.Tensor] = field(default_factory=list)
-    step_logprobs: list[torch.Tensor] | None = None
+    step_logprobs: list[torch.Tensor] = field(default_factory=list)
 
     @classmethod
     def get_context_type(cls) -> str:
@@ -19,8 +19,8 @@ class BatchOutContext(BaseContext):
         return "BatchOutContext"
 
     def clear_context(self) -> None:
-        self.token_ids.clear()
-        self.step_logprobs = None
+        self.token_ids = []
+        self.step_logprobs = []
 
     def reset_context(self) -> None:
         self.clear_context()
