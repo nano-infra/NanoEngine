@@ -115,9 +115,9 @@ def allocate_dsv4_compressor_state(
         context.dsv4_compressor_score_flat[ratio] = score_buf
         context.dsv4_compressor_counts_flat[ratio] = counts_buf
         total_bytes += (
-            kv_buf.nelement() * kv_buf.itemsize
-            + score_buf.nelement() * score_buf.itemsize
-            + counts_buf.nelement() * counts_buf.itemsize
+            kv_buf.nelement() * kv_buf.element_size()
+            + score_buf.nelement() * score_buf.element_size()
+            + counts_buf.nelement() * counts_buf.element_size()
         )
     if total_bytes > 0:
         logger.info(
