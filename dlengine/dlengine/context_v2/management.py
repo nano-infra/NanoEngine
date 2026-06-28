@@ -1,9 +1,9 @@
 from dlengine.context_v2 import BaseContext
 from dlengine.context_v2.batch import reset_batch_context
 from dlengine.context_v2.batch_out import reset_batch_out_context
-from dlengine.context_v2.dsa import reset_dsa_context
+from dlengine.context_v2.cache.dsa import reset_dsa_context
+from dlengine.context_v2.cache.hca import reset_hca_context
 from dlengine.context_v2.expert import reset_expert_context
-from dlengine.context_v2.hsa import reset_hsa_context
 
 
 class ContextManagement:
@@ -11,7 +11,7 @@ class ContextManagement:
     def reset_runtime_contexts() -> None:
         reset_batch_context()
         reset_batch_out_context()
-        reset_hsa_context()
+        reset_hca_context()
         reset_dsa_context()
         reset_expert_context()
 

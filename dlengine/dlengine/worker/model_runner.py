@@ -5,6 +5,39 @@ import time as _time
 import ray
 import torch
 import torch.distributed as dist
+from dlengine._cpp import (
+    extract_aux_from_bytes,
+    extract_vision_slots_from_bytes,
+    serialize_run_batch,
+)
+from dlengine.config import Config
+from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.batch_out import get_batch_out_context
+from dlengine.context_v2.cache import CacheContext, get_cache_context, set_cache_context
+from dlengine.context_v2.distributed import (
+    get_dist_context,
+    get_local_ip,
+    set_dist_context,
+)
+from dlengine.context_v2.expert import ExpertContext
+from dlengine.context_v2.management import reset_runtime_contexts
+from dlengine.context_v2.parameter import WeightContext, WeightUpdateEngine
+from dlengine.context_v2.peer import PeerAgentContext
+from dlengine.layers.sampler import Sampler
+from dlengine.logging import get_logger, set_log_level
+from dlengine.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
+from dlengine.models.deepseek_v2.deepseek_v2_mtp import DeepSeekMTP
+from dlengine.models.deepseek_v4.deepseek_v4 import DeepseekV4ForCausalLM
+from dlengine.models.qwen3.qwen3 import Qwen3ForCausalLM
+from dlengine.models.qwen3_5_moe.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
+from dlengine.models.qwen3_5_moe.qwen3_5_moe_mtp import Qwen3_5MTP
+from dlengine.models.qwen3_moe.qwen3_moe import Qwen3MoeForCausalLM
+from dlengine.worker.graph_runner import DecodeGraphRunner
+from dlengine.worker.input_preparer import InputPreparer, prepare_sample_from_aux
+from dlengine.worker.loader import load_model, load_mtp_model
+from dlengine.worker.mtp_runner import MTPRunner
+from dlengine.worker.runner_config import get_runner_config, set_runner_config
+from dlengine.worker.vision_embed import VisionEmbedManager
 
 # ─── Per-step host-critical-path timer ─────────────────────────────────────
 # Driver enables via ``Config.step_timing=True`` (threaded into RunnerConfig
@@ -129,40 +162,6 @@ class _CudaForwardTimer:
             f"num_seqs={num_seqs} total={total_ms:.3f}ms  " + "  ".join(parts)
         )
 
-
-from dlengine._cpp import (
-    extract_aux_from_bytes,
-    extract_vision_slots_from_bytes,
-    serialize_run_batch,
-)
-from dlengine.config import Config
-from dlengine.context.cache import CacheContext, get_cache_context, set_cache_context
-from dlengine.context_v2.batch import get_batch_context
-from dlengine.context_v2.batch_out import get_batch_out_context
-from dlengine.context_v2.distributed import (
-    get_dist_context,
-    get_local_ip,
-    set_dist_context,
-)
-from dlengine.context_v2.expert import ExpertContext
-from dlengine.context_v2.management import reset_runtime_contexts
-from dlengine.context_v2.parameter import WeightContext, WeightUpdateEngine
-from dlengine.context_v2.peer import PeerAgentContext
-from dlengine.layers.sampler import Sampler
-from dlengine.logging import get_logger, set_log_level
-from dlengine.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
-from dlengine.models.deepseek_v2.deepseek_v2_mtp import DeepSeekMTP
-from dlengine.models.deepseek_v4.deepseek_v4 import DeepseekV4ForCausalLM
-from dlengine.models.qwen3.qwen3 import Qwen3ForCausalLM
-from dlengine.models.qwen3_5_moe.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
-from dlengine.models.qwen3_5_moe.qwen3_5_moe_mtp import Qwen3_5MTP
-from dlengine.models.qwen3_moe.qwen3_moe import Qwen3MoeForCausalLM
-from dlengine.worker.graph_runner import DecodeGraphRunner
-from dlengine.worker.input_preparer import InputPreparer, prepare_sample_from_aux
-from dlengine.worker.loader import load_model, load_mtp_model
-from dlengine.worker.mtp_worker import MTPWorker
-from dlengine.worker.runner_config import get_runner_config, set_runner_config
-from dlengine.worker.vision_embed import VisionEmbedManager
 
 logger = get_logger("DLENGINE")
 
@@ -474,8 +473,8 @@ class ModelRunner:
         self.sampler = Sampler()
         self.input_preparer = InputPreparer(config)
         self.vision_manager = VisionEmbedManager(hf_config)
-        self.mtp_worker = (
-            MTPWorker(config, mtp_model, self.sampler) if mtp_model else None
+        self.mtp_runner = (
+            MTPRunner(config, mtp_model, self.sampler) if mtp_model else None
         )
 
         self.preallocate_kvcache()
@@ -544,7 +543,7 @@ class ModelRunner:
         # the kv_cache tensor exists. Inert unless config.l3_enable.
         if getattr(self.config, "l3_enable", False):
             try:
-                from dlengine.storage.l3_hf3fs import Hf3fsL3Store
+                from dlengine.disagg.storage.l3_hf3fs import Hf3fsL3Store
 
                 self.l3_store = Hf3fsL3Store(
                     cache_context,
@@ -720,8 +719,8 @@ class ModelRunner:
     def exit(self):
         if not self.enforce_eager:
             del self.decode_graph_runner
-            if self.mtp_worker is not None:
-                self.mtp_worker.cleanup()
+            if self.mtp_runner is not None:
+                self.mtp_runner.cleanup()
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -822,7 +821,8 @@ class ModelRunner:
             for c in cs:
                 all_tokens = E * c
                 if all_tokens % top_k != 0:
-                    continue  # need an integer #tokens to reshape into [m, top_k]
+                    # need an integer #tokens to reshape into [m, top_k]
+                    continue
                 m_orig = all_tokens // top_k
                 num_recv = [c] * E
                 # The token->expert histogram must equal num_recv exactly, or
@@ -1023,8 +1023,8 @@ class ModelRunner:
                 hidden = self.model(input_ids, positions)
             if is_prefill:
                 ExpertContext.get_instance().transition_to_low_latency()
-            if not is_prefill and self.mtp_worker is not None:
-                self.mtp_worker.last_hidden = hidden
+            if not is_prefill and self.mtp_runner is not None:
+                self.mtp_runner.last_hidden = hidden
             self._mark_fwd("model")
             logits = self.model.compute_logits(hidden)
             self._mark_fwd("logits")
@@ -1035,26 +1035,26 @@ class ModelRunner:
             # Lazy verify path (seqlen_q=2): dedicated graph runner
             if (
                 context.num_tokens_per_seq == 2
-                and self.mtp_worker is not None
-                and self.mtp_worker.lv_graph_runner is not None
+                and self.mtp_runner is not None
+                and self.mtp_runner.lv_graph_runner is not None
             ):
-                outputs = self.mtp_worker.lv_graph_runner.run(
+                outputs = self.mtp_runner.lv_graph_runner.run(
                     input_ids, positions, context
                 )
                 if outputs is not None:
-                    if self.mtp_worker is not None:
-                        self.mtp_worker.last_hidden = outputs.clone()
+                    if self.mtp_runner is not None:
+                        self.mtp_runner.last_hidden = outputs.clone()
                     return self.model.compute_logits(outputs)
                 # No graph for this bs — eager fallback
                 hidden = self.model(input_ids, positions)
-                if self.mtp_worker is not None:
-                    self.mtp_worker.last_hidden = hidden
+                if self.mtp_runner is not None:
+                    self.mtp_runner.last_hidden = hidden
                 return self.model.compute_logits(hidden)
 
             # Normal decode (seqlen_q=1)
             outputs = self.decode_graph_runner.run(input_ids, positions, context)
-            if self.mtp_worker is not None:
-                self.mtp_worker.last_hidden = outputs.clone()
+            if self.mtp_runner is not None:
+                self.mtp_runner.last_hidden = outputs.clone()
             self._mark_fwd("model")
             logits = self.model.compute_logits(outputs)
             self._mark_fwd("logits")
@@ -1206,8 +1206,8 @@ class ModelRunner:
             aux = extract_aux_from_bytes(data, sp_rank)
             num_seqs = aux.num_group_seqs
 
-        if is_prefill and self.mtp_worker is not None:
-            self.mtp_worker.reset_lazy_verify_state()
+        if is_prefill and self.mtp_runner is not None:
+            self.mtp_runner.reset_lazy_verify_state()
 
         # --- Profiler start ---
         if self.profiler and self.run_count == self.profiler_start_step:
@@ -1234,12 +1234,12 @@ class ModelRunner:
                 _timer.mark("prep")
 
             if (
-                self.mtp_worker is not None
-                and self.mtp_worker.has_drafts
+                self.mtp_runner is not None
+                and self.mtp_runner.has_drafts
                 and not is_dummy
             ):
                 has_lazy_verify = True
-                input_ids, positions = self.mtp_worker.prepare_lazy_verify_decode(
+                input_ids, positions = self.mtp_runner.prepare_lazy_verify_decode(
                     input_ids, positions, num_seqs
                 )
 
@@ -1269,7 +1269,7 @@ class ModelRunner:
         step_logprobs = None  # [num_seqs] float32 when shipping logprobs
         if not is_prefill and has_lazy_verify:
             num_accepted = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
-            input_ids = self.mtp_worker.lazy_verify_sample(
+            input_ids = self.mtp_runner.lazy_verify_sample(
                 logits, aux, num_seqs, num_accepted
             )
         else:
@@ -1282,8 +1282,8 @@ class ModelRunner:
             _timer.mark("sample")
 
         # --- MTP draft generation ---
-        if self.mtp_worker is not None and not is_prefill and not is_dummy:
-            self.mtp_worker.generate_and_store(
+        if self.mtp_runner is not None and not is_prefill and not is_dummy:
+            self.mtp_runner.generate_and_store(
                 input_ids, positions, aux, num_seqs, has_lazy_verify, num_accepted
             )
 
@@ -1319,8 +1319,8 @@ class ModelRunner:
         logprobs_per_seq = None
         if batch_out.step_logprobs:
             logprobs_per_seq = torch.cat(batch_out.step_logprobs, dim=0).T.tolist()
-        if self.mtp_worker is not None:
-            result = self.mtp_worker.build_output_tokens(self.rank)
+        if self.mtp_runner is not None:
+            result = self.mtp_runner.build_output_tokens(self.rank)
         else:
             result = torch.cat(batch_out.token_ids, dim=0).T.tolist()
         # Keep wire compat: return bare list when no logprobs were requested,
@@ -1376,5 +1376,5 @@ class ModelRunner:
         self.decode_graph_runner = DecodeGraphRunner(config, hf_config, cache_ctx)
         graph_pool = self.decode_graph_runner.capture(self.model, cache_ctx)
 
-        if self.mtp_worker is not None:
-            self.mtp_worker.init_graph_runners(self.model, graph_pool, cache_ctx)
+        if self.mtp_runner is not None:
+            self.mtp_runner.init_graph_runners(self.model, graph_pool, cache_ctx)

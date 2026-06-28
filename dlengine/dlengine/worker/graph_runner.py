@@ -14,10 +14,10 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 from dlengine.context_v2.batch import Context, get_batch_context, set_batch_context
+from dlengine.context_v2.cache.dsa import get_dsa_context
+from dlengine.context_v2.cache.hca import get_hca_context
 from dlengine.context_v2.distributed import get_dist_context
-from dlengine.context_v2.dsa import get_dsa_context
 from dlengine.context_v2.expert import ExpertContext, set_expert_context
-from dlengine.context_v2.hsa import get_hsa_context
 from dlengine.context_v2.management import reset_runtime_contexts
 from dlengine.logging import get_logger
 
@@ -176,7 +176,7 @@ class DecodeGraphRunner:
                     else None
                 ),
             )
-            get_hsa_context().tile_scheduler_metadata = sched_meta
+            get_hca_context().tile_scheduler_metadata = sched_meta
             get_dsa_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             # Warmup
@@ -192,7 +192,7 @@ class DecodeGraphRunner:
             if self._is_mla or self._is_dsv4:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[master_bs] = sched_meta
-                get_hsa_context().tile_scheduler_metadata = sched_meta
+                get_hca_context().tile_scheduler_metadata = sched_meta
             if self._is_dsv4:
                 # DSv4 uses per-layer sched_metas (mixed compress_ratio configs).
                 # Drop the warmup-initialized metas so the capture pass creates
@@ -369,7 +369,7 @@ class LazyVerifyGraphRunner:
                     else None
                 ),
             )
-            get_hsa_context().tile_scheduler_metadata = sched_meta
+            get_hca_context().tile_scheduler_metadata = sched_meta
             get_dsa_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             # Warmup
@@ -382,7 +382,7 @@ class LazyVerifyGraphRunner:
             if self._is_mla:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[bs] = sched_meta
-                get_hsa_context().tile_scheduler_metadata = sched_meta
+                get_hca_context().tile_scheduler_metadata = sched_meta
             if self._has_indexer:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sparse_sched_metas[bs] = sparse_sched_meta
