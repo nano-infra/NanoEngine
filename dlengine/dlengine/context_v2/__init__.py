@@ -4,12 +4,12 @@
 # PeerAgentContext: P2P communication and discovery
 # DistrbutedContext: Collective communication group
 
-# For Attention Caches
+# For Attention Caches (see context_v2.cache)
 # GQAContext: GQA attention cache management
 # MLAContext: MLA attention cache management
 # GDNContext: GDN attention cache management
-# DSAContext: DSA attention cache management
-# HSAContext: DeepSeekv4 HSA
+# DSAContext: DeepSeekv3.2 DSA
+# HCAContext: DeepSeekv4 HCA
 # CSAContext: DeepSeekv4 CSA
 
 # For MoE

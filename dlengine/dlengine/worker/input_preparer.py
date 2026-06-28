@@ -5,10 +5,10 @@ from __future__ import annotations
 import torch
 from dlengine._cpp import prepare_decode_from_bytes, prepare_prefill_from_bytes
 from dlengine.config import Config
-from dlengine.context.cache import get_cache_context
 from dlengine.context_v2.batch import get_batch_context, set_batch_context
+from dlengine.context_v2.cache import get_cache_context
+from dlengine.context_v2.cache.hca import get_hca_context
 from dlengine.context_v2.distributed import get_dist_context
-from dlengine.context_v2.hsa import get_hsa_context
 from dlengine.logging import get_logger
 
 logger = get_logger("DLENGINE")
@@ -296,6 +296,6 @@ class InputPreparer:
             dsv4_state_slots=dsv4_state_slots,
             dsv4_compressed_block_tables=dsv4_compressed_block_tables,
         )
-        get_hsa_context().tile_scheduler_metadata = new_tile_scheduler_metadata
+        get_hca_context().tile_scheduler_metadata = new_tile_scheduler_metadata
 
         return input_ids, positions

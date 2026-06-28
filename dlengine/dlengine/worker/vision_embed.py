@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 import torch
-from dlengine.context.cache import get_cache_context
+from dlengine.context_v2.cache import get_cache_context
 from dlengine.context_v2.peer import PeerAgentContext
 from dlengine.logging import get_logger
 

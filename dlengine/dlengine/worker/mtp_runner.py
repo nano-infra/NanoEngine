@@ -5,12 +5,12 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 from dlengine.config import Config
-from dlengine.context.cache import get_cache_context
 from dlengine.context_v2.batch import get_batch_context, set_batch_context
 from dlengine.context_v2.batch_out import get_batch_out_context
+from dlengine.context_v2.cache import get_cache_context
+from dlengine.context_v2.cache.hca import get_hca_context
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.context_v2.expert import set_expert_context
-from dlengine.context_v2.hsa import get_hsa_context
 from dlengine.layers.sampler import Sampler
 from dlengine.logging import get_logger
 from dlengine.worker.graph_runner import LazyVerifyGraphRunner, MTPGraphRunner
@@ -19,7 +19,7 @@ from dlengine.worker.input_preparer import prepare_sample_from_aux
 logger = get_logger("DLENGINE")
 
 
-class MTPWorker:
+class MTPRunner:
     """Manages MTP speculative decoding: lazy verify, draft generation, and sampling."""
 
     def __init__(self, config: Config, mtp_model, sampler: Sampler):
@@ -126,13 +126,13 @@ class MTPWorker:
 
             new_tile_sched, _ = flash_mla.get_mla_metadata()
         else:
-            new_tile_sched = get_hsa_context().tile_scheduler_metadata
+            new_tile_sched = get_hca_context().tile_scheduler_metadata
 
         # Update context for seqlen_q=2
         context.slot_mapping = new_slot_mapping
         context.num_tokens_per_seq = 2
         if is_mla:
-            get_hsa_context().tile_scheduler_metadata = new_tile_sched
+            get_hca_context().tile_scheduler_metadata = new_tile_sched
 
         return new_input_ids, new_positions
 
@@ -228,7 +228,7 @@ class MTPWorker:
         """
         decode_context = get_batch_context()
         saved_token_ids = get_batch_out_context().token_ids
-        saved_tile_scheduler_metadata = get_hsa_context().tile_scheduler_metadata
+        saved_tile_scheduler_metadata = get_hca_context().tile_scheduler_metadata
 
         tp_rank = get_dist_context().attn_tp_rank
         temperatures = prepare_sample_from_aux(aux) if tp_rank == 0 else None
@@ -263,7 +263,7 @@ class MTPWorker:
             gdn_recurrent_states=decode_context.gdn_recurrent_states,
             gdn_state_slots=decode_context.gdn_state_slots,
         )
-        get_hsa_context().tile_scheduler_metadata = saved_tile_scheduler_metadata
+        get_hca_context().tile_scheduler_metadata = saved_tile_scheduler_metadata
         get_batch_out_context().token_ids = saved_token_ids
 
     # ------------------------------------------------------------------
