@@ -73,7 +73,7 @@ def allocate_gdn_states(
         conv_dim,
         conv_kernel_size,
         dtype=torch.bfloat16,
-        device=torch.get_default_device(),
+        device=context.device,
     )
 
     context.gdn_recurrent_states = torch.zeros(
@@ -83,7 +83,7 @@ def allocate_gdn_states(
         head_v_dim,
         head_k_dim,
         dtype=torch.float32,
-        device=torch.get_default_device(),
+        device=context.device,
     )
 
     if need_backup:
