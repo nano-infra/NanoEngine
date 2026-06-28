@@ -14,8 +14,8 @@ from collections import defaultdict
 
 import torch
 
-from dlengine.context.peer_agent import PeerAgentContext
 from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context_v2.peer import PeerAgentContext
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")
