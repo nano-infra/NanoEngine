@@ -251,8 +251,10 @@ class DistContext(ContextManagerMixin, BaseContext):
         return self.ffn_cpu_device_mesh.get_group("ffn_tp")
 
     @property
+    @property
     def local_rank(self) -> int:
-        return dist.get_node_local_rank(self.rank % 8)
+        import os
+        return int(os.environ.get("LOCAL_RANK", str(self.rank % 8)))
 
     @property
     def cpu_world_rank(self) -> int:
