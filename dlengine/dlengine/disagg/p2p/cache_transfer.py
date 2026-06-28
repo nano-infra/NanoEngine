@@ -40,7 +40,6 @@ def select_peer_device() -> str:
 
 
 def initialize_migration_state(context) -> None:
-    context.endpoints = {}
     context.num_remote_kvcache_blocks = {}
     context.remote_max_num_seqs = {}
     context.remote_attention_tp = {}
@@ -260,7 +259,6 @@ class P2PCacheTransfer:
         this flow, so this method clears transfer-side bookkeeping and cached
         engine metadata. Existing PeerAgent connections may remain reusable.
         """
-        self.endpoints.pop(remote_engine_id, None)
         self.num_remote_kvcache_blocks.pop(remote_engine_id, None)
         self.remote_max_num_seqs.pop(remote_engine_id, None)
         self.remote_attention_tp.pop(remote_engine_id, None)

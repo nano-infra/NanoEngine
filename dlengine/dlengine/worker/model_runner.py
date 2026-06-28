@@ -728,7 +728,10 @@ class ModelRunner:
         return self.cache_transfer.p2p_disconnect(remote_engine_id)
 
     def get_num_connected_peers(self):
-        return len(self.cache_transfer.endpoints)
+        peer_context = self.cache_transfer.peer_agent_context
+        if peer_context is None:
+            return 0
+        return len(peer_context.connected_peers)
 
     def exit(self):
         if not self.enforce_eager:
