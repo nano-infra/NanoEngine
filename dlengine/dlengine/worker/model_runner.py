@@ -137,15 +137,15 @@ from dlengine._cpp import (
 )
 from dlengine.config import Config
 from dlengine.context.cache import CacheContext, get_cache_context, set_cache_context
-from dlengine.context.context import get_context, reset_context
-from dlengine.context.distributed import (
+from dlengine.context.expert_context import ExpertContext
+from dlengine.context.peer_agent import PeerAgentContext
+from dlengine.context.weight import WeightContext, WeightUpdateEngine
+from dlengine.context_v2.batch import get_batch_context, reset_batch_context
+from dlengine.context_v2.distributed import (
     get_dist_context,
     get_local_ip,
     set_dist_context,
 )
-from dlengine.context.expert_context import ExpertContext
-from dlengine.context.peer_agent import PeerAgentContext
-from dlengine.context.weight import WeightContext, WeightUpdateEngine
 from dlengine.layers.sampler import Sampler
 from dlengine.logging import get_logger, set_log_level
 from dlengine.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
@@ -999,7 +999,7 @@ class ModelRunner:
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            context = get_context()
+            context = get_batch_context()
             inputs_embeds = None
             if is_prefill and self.vision_manager.has_embeds:
                 logger.info(
@@ -1028,7 +1028,7 @@ class ModelRunner:
             self._mark_fwd("logits")
             return logits
         else:
-            context = get_context()
+            context = get_batch_context()
 
             # Lazy verify path (seqlen_q=2): dedicated graph runner
             if (
@@ -1107,7 +1107,7 @@ class ModelRunner:
         logprobs = None
         if tp_rank == 0:
             temperatures = prepare_sample_from_aux(aux)
-            context = get_context()
+            context = get_batch_context()
             if is_prefill and context.sampling_seq_indices is not None:
                 temps_filtered = temperatures[context.sampling_seq_indices]
                 if want_lp:
@@ -1301,11 +1301,11 @@ class ModelRunner:
                 )
 
         self.run_count += 1
-        get_context().token_ids.append(input_ids[None, ...])
+        get_batch_context().token_ids.append(input_ids[None, ...])
         if step_logprobs is not None:
             # ``step_logprobs`` shape is [num_seqs] float32 (zero on
             # non-rank-0 / non-sampled seqs).
-            ctx = get_context()
+            ctx = get_batch_context()
             if not hasattr(ctx, "step_logprobs") or ctx.step_logprobs is None:
                 ctx.step_logprobs = []
             ctx.step_logprobs.append(step_logprobs[None, ...])
@@ -1314,7 +1314,7 @@ class ModelRunner:
         # ``logprobs_per_seq`` is ``list[list[float]]`` parallel to ``result``
         # when shipping logprobs is enabled; None otherwise. Engine-server
         # serializes both into StepOut.
-        ctx = get_context()
+        ctx = get_batch_context()
         logprobs_per_seq = None
         if getattr(ctx, "step_logprobs", []):
             logprobs_per_seq = torch.cat(ctx.step_logprobs, dim=0).T.tolist()
@@ -1327,7 +1327,7 @@ class ModelRunner:
         # normalises both shapes.
         if logprobs_per_seq is not None:
             result = (result, logprobs_per_seq)
-        reset_context()
+        reset_batch_context()
         if _timer is not None:
             _timer.mark("tail")
             _timer.report(

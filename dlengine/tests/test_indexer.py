@@ -31,7 +31,7 @@ def _init_backend():
     import os
 
     import torch.distributed as dist
-    from dlengine.context.distributed import set_dist_context
+    from dlengine.context_v2.distributed import set_dist_context
     from dlengine.layers import _backend, init_backend
 
     if not dist.is_initialized():

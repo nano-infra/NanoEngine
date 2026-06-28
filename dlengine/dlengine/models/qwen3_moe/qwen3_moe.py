@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3MoeConfig
 
-from dlengine.context.context import get_context
-from dlengine.context.distributed import get_dist_context
+from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.distributed import get_dist_context
 from dlengine.layers import get_backend
 from dlengine.layers.activation import SiluAndMul
 from dlengine.layers.base_backend import (
@@ -291,7 +291,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
             routing_weights = routing_weights.to(hidden_states.dtype)
 
-        context = get_context()
+        context = get_batch_context()
         is_prefill = context.is_prefill
 
         # Workaround for Qwen3 MoE FP8 scales: DeepGEMM expects 3D scale tensors

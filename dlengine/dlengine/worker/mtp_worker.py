@@ -6,8 +6,8 @@ import torch
 import torch.distributed as dist
 from dlengine.config import Config
 from dlengine.context.cache import get_cache_context
-from dlengine.context.context import get_context, set_context
-from dlengine.context.distributed import get_dist_context
+from dlengine.context_v2.batch import get_batch_context, set_batch_context
+from dlengine.context_v2.distributed import get_dist_context
 from dlengine.layers.sampler import Sampler
 from dlengine.logging import get_logger
 from dlengine.worker.graph_runner import LazyVerifyGraphRunner, MTPGraphRunner
@@ -77,7 +77,7 @@ class MTPWorker:
         """
         sp_rank = get_dist_context().attn_sp_rank
         block_size = self.config.kvcache_block_size
-        context = get_context()
+        context = get_batch_context()
 
         prev_sampled = self._prev_sampled_token  # [bs] token from prev step
         prev_draft = self._prev_drafts[0]  # [bs] draft from prev step
@@ -182,7 +182,7 @@ class MTPWorker:
         self._mtp_num_accepted = num_accepted
 
         # Rollback context_lens and GDN states for rejected sequences
-        context = get_context()
+        context = get_batch_context()
         sp_rank = get_dist_context().attn_sp_rank
         rejected_mask = num_accepted == 0
         if rejected_mask.any():
@@ -223,7 +223,7 @@ class MTPWorker:
 
         Saves and restores the decode context around MTP forward passes.
         """
-        decode_context = get_context()
+        decode_context = get_batch_context()
         saved_token_ids = decode_context.token_ids
 
         tp_rank = get_dist_context().attn_tp_rank
@@ -248,7 +248,7 @@ class MTPWorker:
         self._prev_sampled_token = input_ids.clone()
 
         # Restore decode context (MTP draft gen overwrites it)
-        set_context(
+        set_batch_context(
             is_prefill=decode_context.is_prefill,
             max_bs=decode_context.max_bs,
             slot_mapping=decode_context.slot_mapping,
@@ -260,7 +260,7 @@ class MTPWorker:
             gdn_recurrent_states=decode_context.gdn_recurrent_states,
             gdn_state_slots=decode_context.gdn_state_slots,
         )
-        get_context().token_ids = saved_token_ids
+        get_batch_context().token_ids = saved_token_ids
 
     # ------------------------------------------------------------------
     # Output assembly
@@ -269,7 +269,7 @@ class MTPWorker:
     def build_output_tokens(self, rank: int) -> list[list[int]]:
         """Assemble final output tokens, interleaving verified MTP drafts."""
         if self._mtp_verified_tokens is not None:
-            base = torch.cat(get_context().token_ids, dim=0)  # [1, num_seqs]
+            base = torch.cat(get_batch_context().token_ids, dim=0)  # [1, num_seqs]
             verified = self._mtp_verified_tokens  # [N, num_seqs]
             accepted = self._mtp_num_accepted  # [num_seqs]
             result = []
@@ -287,7 +287,7 @@ class MTPWorker:
             self._mtp_num_accepted = None
             return result
         else:
-            return torch.cat(get_context().token_ids, dim=0).T.tolist()
+            return torch.cat(get_batch_context().token_ids, dim=0).T.tolist()
 
     # ------------------------------------------------------------------
     # Internal: MTP forward helpers
@@ -296,7 +296,7 @@ class MTPWorker:
     def _set_mtp_context(self, num_seqs: int):
         """Set context for MTP forward (prefill mode, seq_len=1, no KV cache)."""
         cu_seqlens = torch.arange(num_seqs + 1, dtype=torch.int32, device="cuda")
-        set_context(
+        set_batch_context(
             is_prefill=True,
             max_bs=self.config.max_num_seqs,
             cu_seqlens_q=cu_seqlens,

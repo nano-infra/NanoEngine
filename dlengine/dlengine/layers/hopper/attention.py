@@ -19,7 +19,7 @@ except ImportError:
         flash_attn_with_kvcache = None  # type: ignore
         _FA_KVCACHE_TABLE_ARG = "page_table"
 
-from dlengine.context.context import get_context
+from dlengine.context_v2.batch import get_batch_context
 from dlengine.kernel.triton.generic.kv_store import store_kcache, store_kvcache
 from dlengine.kernel.triton.generic.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,
@@ -192,8 +192,8 @@ class FlashAttentionImpl:
         v_cache: torch.Tensor,
         sparse_indices: torch.Tensor | None = None,
     ):
-        context = get_context()
-        if k_cache.numel() and v_cache.numel() and not get_context().is_dummy:
+        context = get_batch_context()
+        if k_cache.numel() and v_cache.numel() and not get_batch_context().is_dummy:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
             if context.block_tables is not None:
@@ -325,8 +325,8 @@ class FlashMLAImpl:
         sparse_indices: torch.Tensor | None = None,
     ):
 
-        context = get_context()
-        if k_cache.numel() and not get_context().is_dummy:
+        context = get_batch_context()
+        if k_cache.numel() and not get_batch_context().is_dummy:
             if k_cache.dtype == torch.float8_e4m3fn:
                 store_kcache_fp8(k, k_cache, context.slot_mapping)
             else:

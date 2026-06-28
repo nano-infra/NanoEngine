@@ -6,8 +6,8 @@ import torch
 from dlengine._cpp import prepare_decode_from_bytes, prepare_prefill_from_bytes
 from dlengine.config import Config
 from dlengine.context.cache import get_cache_context
-from dlengine.context.context import get_context, set_context
-from dlengine.context.distributed import get_dist_context
+from dlengine.context_v2.batch import get_batch_context, set_batch_context
+from dlengine.context_v2.distributed import get_dist_context
 from dlengine.logging import get_logger
 
 logger = get_logger("DLENGINE")
@@ -147,7 +147,7 @@ class InputPreparer:
                 meta.sampling_seq_indices, dtype=torch.int64, pin_memory=True
             ).cuda(non_blocking=True)
 
-        set_context(
+        set_batch_context(
             is_prefill=True,
             max_bs=self.config.max_num_seqs,
             cu_seqlens_q=cu_seqlens_q,
@@ -282,7 +282,7 @@ class InputPreparer:
             if built:
                 dsv4_compressed_block_tables = built
 
-        set_context(
+        set_batch_context(
             is_prefill=False,
             max_bs=self.config.max_num_seqs,
             slot_mapping=slot_mapping,
