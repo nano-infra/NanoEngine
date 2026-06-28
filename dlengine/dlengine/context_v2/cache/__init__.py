@@ -87,13 +87,14 @@ class CacheContext(CacheLayoutMixin, KVCacheAllocatorMixin, KVMigratorMixin):
         return self.num_kv_heads // self.attention_tp
 
     def __post_init__(self):
-        free, total = torch.cuda.mem_get_info()
+        free, total = torch.cuda.mem_get_info(self.device)
+        real_total = total
         if self.gpu_memory_limit_gb is not None:
             total = min(total, self.gpu_memory_limit_gb * 1024**3)
-        used = torch.cuda.mem_get_info()[1] - free  # real used
-        memory_stats = torch.cuda.memory_stats()
-        peak = memory_stats["allocated_bytes.all.peak"]
-        current = memory_stats["allocated_bytes.all.current"]
+        used = real_total - free  # real used
+        memory_stats = torch.cuda.memory_stats(self.device)
+        peak = memory_stats.get("allocated_bytes.all.peak", 0)
+        current = memory_stats.get("allocated_bytes.all.current", 0)
 
         if self.mode == "gqa":
             configure_gqa_cache(self)
