@@ -49,6 +49,7 @@ class BatchContext(BaseContext):
         return "BatchContext"
 
     def clear_context(self) -> None:
+        self.__dict__.clear()
         self.__dict__.update(BatchContext().__dict__)
 
     def reset_context(self) -> None:
