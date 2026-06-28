@@ -73,16 +73,17 @@ class EmbeddingPool:
     def free(self, slot_idx: int) -> None:
         if slot_idx in self._slot_token_counts:
             del self._slot_token_counts[slot_idx]
-        if slot_idx not in self._free_slots:
             heapq.heappush(self._free_slots, slot_idx)
 
     def free_many(self, slot_indices: list[int]) -> None:
+        added = False
         for idx in slot_indices:
             if idx in self._slot_token_counts:
                 del self._slot_token_counts[idx]
-            if idx not in self._free_slots:
                 self._free_slots.append(idx)
-        heapq.heapify(self._free_slots)
+                added = True
+        if added:
+            heapq.heapify(self._free_slots)
 
     def get_slot_tensor(self, slot_idx: int) -> torch.Tensor:
         n = self._slot_token_counts.get(slot_idx, self.max_tokens_per_slot)
