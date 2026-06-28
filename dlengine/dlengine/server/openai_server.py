@@ -1318,7 +1318,7 @@ CTRL_ENTITY_KIND = "dlengine"
 
 def _advertise_host(host: str) -> str:
     if host in ("0.0.0.0", ""):
-        from dlengine.context.distributed import get_local_ip
+        from dlengine.context_v2.distributed import get_local_ip
 
         return get_local_ip()
     return host

@@ -13,9 +13,14 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
-from dlengine.context.context import Context, get_context, reset_context, set_context
-from dlengine.context.distributed import get_dist_context
 from dlengine.context.expert_context import ExpertContext
+from dlengine.context_v2.batch import (
+    Context,
+    get_batch_context,
+    reset_batch_context,
+    set_batch_context,
+)
+from dlengine.context_v2.distributed import get_dist_context
 from dlengine.logging import get_logger
 
 logger = get_logger("DLENGINE")
@@ -147,7 +152,7 @@ class DecodeGraphRunner:
                 # deep_gemm MQA-logits and topk operate on valid data.
                 self._context_lens[:, :master_bs] = 1
 
-            set_context(
+            set_batch_context(
                 is_prefill=False,
                 max_bs=self._max_num_seqs,
                 slot_mapping=self._slot_mapping[:master_bs],
@@ -189,7 +194,7 @@ class DecodeGraphRunner:
             if self._is_mla or self._is_dsv4:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[master_bs] = sched_meta
-                get_context().tile_scheduler_metadata = sched_meta
+                get_batch_context().tile_scheduler_metadata = sched_meta
             if self._is_dsv4:
                 # DSv4 uses per-layer sched_metas (mixed compress_ratio configs).
                 # Drop the warmup-initialized metas so the capture pass creates
@@ -203,7 +208,7 @@ class DecodeGraphRunner:
             if self._has_indexer:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sparse_sched_metas[master_bs] = sparse_sched_meta
-                get_context().sparse_tile_scheduler_metadata = sparse_sched_meta
+                get_batch_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             # Capture
             graph = torch.cuda.CUDAGraph()
@@ -219,7 +224,7 @@ class DecodeGraphRunner:
 
             torch.cuda.synchronize()
             dist.barrier(group=get_dist_context().cuda_world_group)
-            reset_context()
+            reset_batch_context()
 
         logger.info(f"Finished capturing {len(self._graphs)} decode CUDAGraphs")
         return self._graph_pool
@@ -350,7 +355,7 @@ class LazyVerifyGraphRunner:
                 self._sparse_sched_metas[bs] = sparse_sched_meta
                 self._context_lens[:, :bs] = 1
 
-            set_context(
+            set_batch_context(
                 is_prefill=False,
                 max_bs=self._max_num_seqs,
                 slot_mapping=self._slot_mapping[:n_tokens],
@@ -379,11 +384,11 @@ class LazyVerifyGraphRunner:
             if self._is_mla:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[bs] = sched_meta
-                get_context().tile_scheduler_metadata = sched_meta
+                get_batch_context().tile_scheduler_metadata = sched_meta
             if self._has_indexer:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sparse_sched_metas[bs] = sparse_sched_meta
-                get_context().sparse_tile_scheduler_metadata = sparse_sched_meta
+                get_batch_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, graph_pool):
@@ -392,7 +397,7 @@ class LazyVerifyGraphRunner:
                 )
 
             self._graphs[bs] = graph
-            reset_context()
+            reset_batch_context()
 
         logger.info(f"Finished capturing {len(self._graphs)} lazy verify CUDAGraphs")
 
@@ -472,7 +477,7 @@ class MTPGraphRunner:
             cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
             self._cu_seqlens_per_bs[bs] = cu_seqlens
 
-            set_context(
+            set_batch_context(
                 is_prefill=True,
                 max_bs=self._max_num_seqs,
                 cu_seqlens_q=cu_seqlens,
@@ -503,7 +508,7 @@ class MTPGraphRunner:
 
             self._graphs[bs] = graph
 
-        reset_context()
+        reset_batch_context()
         logger.info(f"Finished capturing {len(self._graphs)} MTP CUDAGraphs")
 
     # -- replay -------------------------------------------------------------

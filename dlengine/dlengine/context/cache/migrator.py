@@ -13,8 +13,9 @@ import time
 from collections import defaultdict
 
 import torch
-from dlengine.context.distributed import get_dist_context
+
 from dlengine.context.peer_agent import PeerAgentContext
+from dlengine.context_v2.distributed import get_dist_context
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")

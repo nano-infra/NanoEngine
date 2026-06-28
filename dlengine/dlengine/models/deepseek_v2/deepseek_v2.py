@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import DeepseekV3Config
 
-from dlengine.context.context import get_context
-from dlengine.context.distributed import get_dist_context
+from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.distributed import get_dist_context
 from dlengine.kernel.triton.generic.paged_gather import build_paged_gather_indices
 from dlengine.layers import get_backend
 from dlengine.layers.activation import SiluAndMul
@@ -295,7 +295,7 @@ class DeepseekV2MoE(nn.Module):
         router_logits = self.gate(hidden_states)
         topk_idx, topk_weights = self.route_tokens_to_experts(router_logits)
 
-        context = get_context()
+        context = get_batch_context()
         is_prefill = context.is_prefill
 
         final_hidden_states = self.routed_experts(
@@ -815,7 +815,7 @@ class DeepseekV2Attention(nn.Module):
         k_pe: torch.Tensor,
         num_heads: int,
     ) -> torch.Tensor:
-        context = get_context()
+        context = get_batch_context()
         ntps = context.num_tokens_per_seq
         total_tokens = hidden_states.size(0)
         bs = total_tokens // ntps
@@ -900,7 +900,7 @@ class DeepseekV2Attention(nn.Module):
         """Forward with separate prefill (non-absorbed) and decode (absorbed) paths."""
         num_heads = self.num_heads
         q_len = hidden_states.size(0)
-        is_prefill = get_context().is_prefill
+        is_prefill = get_batch_context().is_prefill
 
         # KV projection (shared between prefill and decode)
         key_states, compressed_kv, k_pe = self._kv_proj(hidden_states)
@@ -927,7 +927,7 @@ class DeepseekV2Attention(nn.Module):
 
             # Store compressed KV (576 dims) into cache for future decode
             k_cache = self.attn_fwd.k_cache
-            context = get_context()
+            context = get_batch_context()
             if (
                 k_cache.numel()
                 and not context.is_dummy
@@ -1184,7 +1184,7 @@ class DeepseekV2Attention(nn.Module):
                     positions, hidden_states, key_states, compressed_kv, k_pe, num_heads
                 )
 
-            context = get_context()
+            context = get_batch_context()
             # Q absorbed: q_nope @ W_UK -> (q_len, H, kv_lora_rank=512), concat with q_pe -> 576
             query_states, q_pe, q_lora = self._q_proj_absorbed(hidden_states, num_heads)
 

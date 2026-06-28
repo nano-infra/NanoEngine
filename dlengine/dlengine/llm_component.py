@@ -424,7 +424,7 @@ class LLMComponent(LLM):
             )
 
         if self.config.host in ("0.0.0.0", ""):
-            from dlengine.context.distributed import get_local_ip
+            from dlengine.context_v2.distributed import get_local_ip
 
             zmq_host = get_local_ip()
         else:

@@ -224,7 +224,7 @@ class EncoderEngine:
 
     def get_engine_info(self) -> dict:
         if self.config.host in ("0.0.0.0", ""):
-            from dlengine.context.distributed import get_local_ip
+            from dlengine.context_v2.distributed import get_local_ip
 
             host = get_local_ip()
         else:

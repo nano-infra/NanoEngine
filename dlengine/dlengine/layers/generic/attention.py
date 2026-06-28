@@ -21,7 +21,7 @@ except ImportError:
     flash_attn_with_kvcache = None  # type: ignore
     _HAS_FA2 = False
 
-from dlengine.context.context import get_context
+from dlengine.context_v2.batch import get_batch_context
 from dlengine.kernel.triton.generic.kv_store import store_kvcache
 from dlengine.kernel.triton.generic.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,
@@ -154,7 +154,7 @@ class _FA2AttentionImpl:
         v_cache: torch.Tensor,
         sparse_indices: torch.Tensor | None = None,
     ):
-        context = get_context()
+        context = get_batch_context()
         if k_cache.numel() and v_cache.numel() and not context.is_dummy:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 

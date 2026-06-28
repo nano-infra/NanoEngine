@@ -9,8 +9,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from dlengine.compile_utils import maybe_compile
-from dlengine.context.context import get_context
-from dlengine.context.distributed import get_dist_context
+from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.distributed import get_dist_context
 from dlengine.kernel.jit.sgl import (
     fused_kernels_enabled as _sglang_fused_kernels_enabled,
 )
@@ -318,7 +318,7 @@ def _debug_dump(name: str, tensor: torch.Tensor, layer_idx: int | None = None) -
     is_prefill_run = True
     is_dummy = False
     try:
-        context = get_context()
+        context = get_batch_context()
         is_prefill_run = bool(context.is_prefill)
         is_dummy = bool(getattr(context, "is_dummy", False))
     except Exception:
@@ -348,7 +348,7 @@ def _debug_dump(name: str, tensor: torch.Tensor, layer_idx: int | None = None) -
         if not decode_steps_env.strip():
             return
         try:
-            csl = getattr(get_context(), "context_lens", None)
+            csl = getattr(get_batch_context(), "context_lens", None)
             if csl is not None and csl.numel() > 0:
                 decode_step = int(csl.flatten()[0].item())
         except Exception:
@@ -1703,7 +1703,7 @@ class DeepseekV4Attention(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        context = get_context()
+        context = get_batch_context()
 
         # Write KV to cache: either new FP8 SWA cache or legacy BF16 cache
         if self.swa_cache is not None and not context.is_dummy:
@@ -1784,7 +1784,7 @@ class DeepseekV4Attention(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        context = get_context()
+        context = get_batch_context()
         if self.k_cache.numel() and self.v_cache.numel() and not context.is_dummy:
             store_kvcache(
                 kv.contiguous(),
@@ -1856,7 +1856,7 @@ class DeepseekV4Attention(nn.Module):
         """
         import flash_mla
 
-        context = get_context()
+        context = get_batch_context()
 
         # Fallback for warmup/dummy: no block_tables means we can't build
         # physical slot indices. Defer to the einsum path (correctness-only;
@@ -2066,7 +2066,7 @@ class DeepseekV4Attention(nn.Module):
         """
         import flash_mla
 
-        context = get_context()
+        context = get_batch_context()
         ntps = getattr(context, "num_tokens_per_seq", 1)
         total_tokens = q.shape[0]
         bs = total_tokens // ntps
@@ -2312,7 +2312,7 @@ class DeepseekV4Attention(nn.Module):
     def _paged_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
-        context = get_context()
+        context = get_batch_context()
         if self.k_cache.numel() and self.v_cache.numel() and not context.is_dummy:
             store_kvcache(
                 k.contiguous(),
@@ -2459,7 +2459,7 @@ class DeepseekV4Attention(nn.Module):
         _debug_dump("attn_q_after_rope", q, self.layer_idx)
         _debug_dump("attn_window_kv_after_rope", kv, self.layer_idx)
 
-        if get_context().is_prefill:
+        if get_batch_context().is_prefill:
             if self.swa_cache is not None:
                 out = self._prefill_attention_flash_mla(q, kv, hidden_states, positions)
             else:
@@ -2661,7 +2661,7 @@ class DeepseekV4MoE(nn.Module):
         # + combine. Main stream waits before _fuse_routed_shared. Skip on
         # prefill (routed_experts behaviour differs and the alt stream's
         # benefit is small for batched prefill).
-        is_prefill = get_context().is_prefill
+        is_prefill = get_batch_context().is_prefill
         use_shared_stream = not is_prefill
         if use_shared_stream:
             if self._shared_stream is None:

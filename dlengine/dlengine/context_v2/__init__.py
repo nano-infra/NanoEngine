@@ -1,7 +1,7 @@
 # A series of persistent resources during the lifecycle of the runtime
 
 # Transformation and discovery
-# PeerAgentContext: P2P communication
+# PeerAgentContext: P2P communication and discovery
 # DistrbutedContext: Collective communication group
 
 # For Attention Caches
@@ -24,41 +24,27 @@ import abc
 
 class BaseContext(abc.ABC):
     @abc.abstractmethod
-    def __init__(self):
+    def clear_context(self) -> None:
         pass
 
     @abc.abstractmethod
-    def __del__(self):
+    def reset_context(self) -> None:
         pass
 
+    @classmethod
     @abc.abstractmethod
+    def get_context_type(cls) -> str:
+        pass
+
+    @classmethod
+    @abc.abstractmethod
+    def get_context_name(cls) -> str:
+        pass
+
+
+class ContextManagerMixin:
     def __enter__(self):
-        pass
+        return self
 
-    @abc.abstractmethod
     def __exit__(self, exc_type, exc_value, traceback):
-        pass
-
-    @abc.abstractmethod
-    def get_context() -> "BaseContext":
-        pass
-
-    @abc.abstractmethod
-    def set_context(context: "BaseContext"):
-        pass
-
-    @abc.abstractmethod
-    def clear_context():
-        pass
-
-    @abc.abstractmethod
-    def reset_context():
-        pass
-
-    @abc.abstractmethod
-    def get_context_type() -> str:
-        pass
-
-    @abc.abstractmethod
-    def get_context_name() -> str:
-        pass
+        self.clear_context()

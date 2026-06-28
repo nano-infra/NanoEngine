@@ -5,8 +5,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from dlengine.context.context import get_context
-from dlengine.context.distributed import get_dist_context
+from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.distributed import get_dist_context
 
 # MCCL (MetaX CCL) has issues with large tensor all_reduce/all_gather:
 # - all_gather deadlocks after the first call (P2P path issue)
@@ -98,7 +98,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
-        context = get_context()
+        context = get_batch_context()
         if context.is_prefill:
             if context.sampling_token_indices is not None:
                 # Chunked prefill: only extract hidden states for final-chunk sequences.

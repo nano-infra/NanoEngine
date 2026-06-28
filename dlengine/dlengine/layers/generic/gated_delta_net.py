@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from dlengine.compile_utils import maybe_compile
-from dlengine.context.context import get_context
+from dlengine.context_v2.batch import get_batch_context
 from dlengine.layers import get_backend
 from dlengine.layers.base_backend import GatedDeltaNetBase, ReplicatedLinearBase
 from dlengine.logging import get_logger
@@ -248,7 +248,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         Args:
             hidden_states: [total_tokens, hidden_size]
         """
-        context = get_context()
+        context = get_batch_context()
 
         # Lazy verify: 2 tokens/seq processed as two sequential decode passes.
         # Pass 1 processes token_0 (prev_sampled) and saves intermediate state

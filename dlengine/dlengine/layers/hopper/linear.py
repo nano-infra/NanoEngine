@@ -11,7 +11,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from dlengine.context.distributed import get_dist_context
+from dlengine.context_v2.distributed import get_dist_context
 from dlengine.kernel.triton.hopper.block_gemm_fp8 import deep_gemm_fp8, quant_fp8_tma
 from dlengine.layers.base_backend import (
     ColumnParallelLinearBase,
