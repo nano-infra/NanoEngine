@@ -20,6 +20,8 @@ except ImportError:
         _FA_KVCACHE_TABLE_ARG = "page_table"
 
 from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.dsa import get_dsa_context
+from dlengine.context_v2.hsa import get_hsa_context
 from dlengine.kernel.triton.generic.kv_store import store_kcache, store_kvcache
 from dlengine.kernel.triton.generic.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,
@@ -373,7 +375,8 @@ class FlashMLAImpl:
                 indices_3d = sparse_indices.view(bs, ntps, topk)
 
                 # Use context-managed sparse sched meta (CUDA graph compatible)
-                sparse_meta = context.sparse_tile_scheduler_metadata
+                dsa_context = get_dsa_context()
+                sparse_meta = dsa_context.sparse_tile_scheduler_metadata
                 if sparse_meta is None:
                     sparse_meta, _ = flash_mla.get_mla_metadata()
 
@@ -391,12 +394,13 @@ class FlashMLAImpl:
                     indices=indices_3d,
                 )
                 # Write back so graph runner can track it
-                context.sparse_tile_scheduler_metadata = sparse_meta
+                dsa_context.sparse_tile_scheduler_metadata = sparse_meta
             else:
                 # === Dense decode (default) ===
-                if context.tile_scheduler_metadata is not None:
+                hsa_context = get_hsa_context()
+                if hsa_context.tile_scheduler_metadata is not None:
                     # Use precomputed metadata from prepare_decode (CUDA graph compatible)
-                    tile_scheduler_metadata = context.tile_scheduler_metadata
+                    tile_scheduler_metadata = hsa_context.tile_scheduler_metadata
                 else:
                     # Fallback: create fresh FlashMLASchedMeta (will be initialized on first kernel call)
                     tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()

@@ -13,14 +13,12 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
-from dlengine.context.expert_context import ExpertContext
-from dlengine.context_v2.batch import (
-    Context,
-    get_batch_context,
-    reset_batch_context,
-    set_batch_context,
-)
+from dlengine.context_v2.batch import Context, get_batch_context, set_batch_context
 from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context_v2.dsa import get_dsa_context
+from dlengine.context_v2.expert import ExpertContext, set_expert_context
+from dlengine.context_v2.hsa import get_hsa_context
+from dlengine.context_v2.management import reset_runtime_contexts
 from dlengine.logging import get_logger
 
 logger = get_logger("DLENGINE")
@@ -158,8 +156,6 @@ class DecodeGraphRunner:
                 slot_mapping=self._slot_mapping[:master_bs],
                 context_lens=self._context_lens,
                 block_tables=self._block_tables,
-                tile_scheduler_metadata=sched_meta,
-                sparse_tile_scheduler_metadata=sparse_sched_meta,
                 gdn_conv_states=cache_ctx.gdn_conv_states,
                 gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
                 gdn_state_slots=(
@@ -180,6 +176,8 @@ class DecodeGraphRunner:
                     else None
                 ),
             )
+            get_hsa_context().tile_scheduler_metadata = sched_meta
+            get_dsa_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             # Warmup
             self._outputs[:master_bs] = model(
@@ -194,7 +192,7 @@ class DecodeGraphRunner:
             if self._is_mla or self._is_dsv4:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[master_bs] = sched_meta
-                get_batch_context().tile_scheduler_metadata = sched_meta
+                get_hsa_context().tile_scheduler_metadata = sched_meta
             if self._is_dsv4:
                 # DSv4 uses per-layer sched_metas (mixed compress_ratio configs).
                 # Drop the warmup-initialized metas so the capture pass creates
@@ -208,7 +206,7 @@ class DecodeGraphRunner:
             if self._has_indexer:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sparse_sched_metas[master_bs] = sparse_sched_meta
-                get_batch_context().sparse_tile_scheduler_metadata = sparse_sched_meta
+                get_dsa_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             # Capture
             graph = torch.cuda.CUDAGraph()
@@ -224,7 +222,7 @@ class DecodeGraphRunner:
 
             torch.cuda.synchronize()
             dist.barrier(group=get_dist_context().cuda_world_group)
-            reset_batch_context()
+            reset_runtime_contexts()
 
         logger.info(f"Finished capturing {len(self._graphs)} decode CUDAGraphs")
         return self._graph_pool
@@ -362,8 +360,6 @@ class LazyVerifyGraphRunner:
                 context_lens=self._context_lens,
                 block_tables=self._block_tables,
                 is_dummy=False,
-                tile_scheduler_metadata=sched_meta,
-                sparse_tile_scheduler_metadata=sparse_sched_meta,
                 num_tokens_per_seq=2,
                 gdn_conv_states=cache_ctx.gdn_conv_states,
                 gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
@@ -373,6 +369,8 @@ class LazyVerifyGraphRunner:
                     else None
                 ),
             )
+            get_hsa_context().tile_scheduler_metadata = sched_meta
+            get_dsa_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             # Warmup
             self._outputs[:n_tokens] = model(
@@ -384,11 +382,11 @@ class LazyVerifyGraphRunner:
             if self._is_mla:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sched_metas[bs] = sched_meta
-                get_batch_context().tile_scheduler_metadata = sched_meta
+                get_hsa_context().tile_scheduler_metadata = sched_meta
             if self._has_indexer:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sparse_sched_metas[bs] = sparse_sched_meta
-                get_batch_context().sparse_tile_scheduler_metadata = sparse_sched_meta
+                get_dsa_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, graph_pool):
@@ -397,7 +395,7 @@ class LazyVerifyGraphRunner:
                 )
 
             self._graphs[bs] = graph
-            reset_batch_context()
+            reset_runtime_contexts()
 
         logger.info(f"Finished capturing {len(self._graphs)} lazy verify CUDAGraphs")
 
@@ -487,8 +485,8 @@ class MTPGraphRunner:
                 slot_mapping=None,
                 block_tables=None,
                 is_dummy=False,
-                use_low_latency_ep=True,
             )
+            set_expert_context(use_low_latency_ep=True)
 
             # Warmup
             self._outputs[:bs] = mtp_model(
@@ -508,7 +506,7 @@ class MTPGraphRunner:
 
             self._graphs[bs] = graph
 
-        reset_batch_context()
+        reset_runtime_contexts()
         logger.info(f"Finished capturing {len(self._graphs)} MTP CUDAGraphs")
 
     # -- replay -------------------------------------------------------------
