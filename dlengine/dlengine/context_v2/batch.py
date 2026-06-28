@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -16,29 +16,19 @@ class BatchContext(BaseContext):
     max_seqlen_k: int = 0
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
-    block_tables: torch.Tensor | None = None
-
     is_dummy: bool = False
+    num_tokens_per_seq: int = 1
+    sampling_token_indices: torch.Tensor | None = None
+    sampling_seq_indices: torch.Tensor | None = None
 
-    # TODO(context_v2): move attention-backend-specific fields below into
-    # GQA/MLA/DSA/GDN/DSv4 contexts once all call sites use this facade.
-    tile_scheduler_metadata: Any = None
-    sparse_tile_scheduler_metadata: Any = None
-
-    token_ids: list[torch.Tensor] = field(default_factory=list)
-
+    # TODO(context_v2): move these backend-specific fields to their own
+    # attention contexts after all call sites use BatchContext directly.
+    block_tables: torch.Tensor | None = None
     gdn_conv_states: torch.Tensor | None = None
     gdn_recurrent_states: torch.Tensor | None = None
     gdn_state_slots: torch.Tensor | None = None
-
     dsv4_state_slots: torch.Tensor | None = None
     dsv4_compressed_block_tables: dict[int, torch.Tensor] | None = None
-
-    num_tokens_per_seq: int = 1
-    use_low_latency_ep: bool = False
-
-    sampling_token_indices: torch.Tensor | None = None
-    sampling_seq_indices: torch.Tensor | None = None
 
     @classmethod
     def get_context_type(cls) -> str:
@@ -76,15 +66,12 @@ def set_batch_context(
     context_lens: torch.Tensor | None = None,
     block_tables: Optional[torch.Tensor] = None,
     is_dummy: bool = False,
-    tile_scheduler_metadata: Any = None,
-    sparse_tile_scheduler_metadata: Any = None,
     gdn_conv_states: Optional[torch.Tensor] = None,
     gdn_recurrent_states: Optional[torch.Tensor] = None,
     gdn_state_slots: Optional[torch.Tensor] = None,
     dsv4_state_slots: Optional[torch.Tensor] = None,
     dsv4_compressed_block_tables: Optional[dict[int, torch.Tensor]] = None,
     num_tokens_per_seq: int = 1,
-    use_low_latency_ep: bool = False,
     sampling_token_indices: Optional[torch.Tensor] = None,
     sampling_seq_indices: Optional[torch.Tensor] = None,
 ) -> BatchContext:
@@ -100,18 +87,14 @@ def set_batch_context(
         context_lens=context_lens,
         block_tables=block_tables,
         is_dummy=is_dummy,
-        tile_scheduler_metadata=tile_scheduler_metadata,
-        sparse_tile_scheduler_metadata=sparse_tile_scheduler_metadata,
-        token_ids=[],
+        num_tokens_per_seq=num_tokens_per_seq,
+        sampling_token_indices=sampling_token_indices,
+        sampling_seq_indices=sampling_seq_indices,
         gdn_conv_states=gdn_conv_states,
         gdn_recurrent_states=gdn_recurrent_states,
         gdn_state_slots=gdn_state_slots,
         dsv4_state_slots=dsv4_state_slots,
         dsv4_compressed_block_tables=dsv4_compressed_block_tables,
-        num_tokens_per_seq=num_tokens_per_seq,
-        use_low_latency_ep=use_low_latency_ep,
-        sampling_token_indices=sampling_token_indices,
-        sampling_seq_indices=sampling_seq_indices,
     )
     return _CONTEXT
 

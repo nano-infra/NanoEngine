@@ -7,7 +7,10 @@ import torch.distributed as dist
 from dlengine.config import Config
 from dlengine.context.cache import get_cache_context
 from dlengine.context_v2.batch import get_batch_context, set_batch_context
+from dlengine.context_v2.batch_out import get_batch_out_context
 from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context_v2.expert import set_expert_context
+from dlengine.context_v2.hsa import get_hsa_context
 from dlengine.layers.sampler import Sampler
 from dlengine.logging import get_logger
 from dlengine.worker.graph_runner import LazyVerifyGraphRunner, MTPGraphRunner
@@ -123,13 +126,13 @@ class MTPWorker:
 
             new_tile_sched, _ = flash_mla.get_mla_metadata()
         else:
-            new_tile_sched = context.tile_scheduler_metadata
+            new_tile_sched = get_hsa_context().tile_scheduler_metadata
 
         # Update context for seqlen_q=2
         context.slot_mapping = new_slot_mapping
         context.num_tokens_per_seq = 2
         if is_mla:
-            context.tile_scheduler_metadata = new_tile_sched
+            get_hsa_context().tile_scheduler_metadata = new_tile_sched
 
         return new_input_ids, new_positions
 
@@ -224,7 +227,8 @@ class MTPWorker:
         Saves and restores the decode context around MTP forward passes.
         """
         decode_context = get_batch_context()
-        saved_token_ids = decode_context.token_ids
+        saved_token_ids = get_batch_out_context().token_ids
+        saved_tile_scheduler_metadata = get_hsa_context().tile_scheduler_metadata
 
         tp_rank = get_dist_context().attn_tp_rank
         temperatures = prepare_sample_from_aux(aux) if tp_rank == 0 else None
@@ -255,12 +259,12 @@ class MTPWorker:
             context_lens=decode_context.context_lens,
             block_tables=decode_context.block_tables,
             is_dummy=decode_context.is_dummy,
-            tile_scheduler_metadata=decode_context.tile_scheduler_metadata,
             gdn_conv_states=decode_context.gdn_conv_states,
             gdn_recurrent_states=decode_context.gdn_recurrent_states,
             gdn_state_slots=decode_context.gdn_state_slots,
         )
-        get_batch_context().token_ids = saved_token_ids
+        get_hsa_context().tile_scheduler_metadata = saved_tile_scheduler_metadata
+        get_batch_out_context().token_ids = saved_token_ids
 
     # ------------------------------------------------------------------
     # Output assembly
@@ -268,8 +272,9 @@ class MTPWorker:
 
     def build_output_tokens(self, rank: int) -> list[list[int]]:
         """Assemble final output tokens, interleaving verified MTP drafts."""
+        token_ids = get_batch_out_context().token_ids
         if self._mtp_verified_tokens is not None:
-            base = torch.cat(get_batch_context().token_ids, dim=0)  # [1, num_seqs]
+            base = torch.cat(token_ids, dim=0)  # [1, num_seqs]
             verified = self._mtp_verified_tokens  # [N, num_seqs]
             accepted = self._mtp_num_accepted  # [num_seqs]
             result = []
@@ -287,7 +292,7 @@ class MTPWorker:
             self._mtp_num_accepted = None
             return result
         else:
-            return torch.cat(get_batch_context().token_ids, dim=0).T.tolist()
+            return torch.cat(token_ids, dim=0).T.tolist()
 
     # ------------------------------------------------------------------
     # Internal: MTP forward helpers
@@ -306,8 +311,8 @@ class MTPWorker:
             slot_mapping=None,
             block_tables=None,
             is_dummy=False,
-            use_low_latency_ep=True,
         )
+        set_expert_context(use_low_latency_ep=True)
 
     def _run_mtp_step(
         self,

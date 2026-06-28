@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 import torch
 from torch import nn
 
-from dlengine.context.expert_context import ExpertContext
+from dlengine.context_v2.expert import ExpertContext, get_expert_runtime_context
 from dlengine.layers.base_backend import DistributedRoutedExpertsBase
 from dlengine.layers.local_dispatch import LocalPaddedDispatcher
 from dlengine.worker.runner_config import get_runner_config
@@ -389,9 +389,7 @@ class HopperDistributedRoutedExperts(DistributedRoutedExpertsBase):
         # use_low_latency_ep: force decode (low-latency) EP path even during
         # prefill.  Used by MTP which needs prefill attention mode but must
         # avoid multi-stream DeepEP dispatch for CUDAGraph compatibility.
-        from dlengine.context_v2.batch import get_batch_context
-
-        use_low_latency = getattr(get_batch_context(), "use_low_latency_ep", False)
+        use_low_latency = get_expert_runtime_context().use_low_latency_ep
 
         if is_prefill and not use_low_latency:
             return self._compute_prefill_ep(hidden_states, topk_ids, topk_weights)

@@ -8,6 +8,7 @@ from dlengine.config import Config
 from dlengine.context.cache import get_cache_context
 from dlengine.context_v2.batch import get_batch_context, set_batch_context
 from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context_v2.hsa import get_hsa_context
 from dlengine.logging import get_logger
 
 logger = get_logger("DLENGINE")
@@ -289,12 +290,12 @@ class InputPreparer:
             context_lens=context_lens,
             block_tables=block_tables,
             is_dummy=is_dummy,
-            tile_scheduler_metadata=new_tile_scheduler_metadata,
             gdn_conv_states=cache_ctx.gdn_conv_states,
             gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
             gdn_state_slots=gdn_state_slots,
             dsv4_state_slots=dsv4_state_slots,
             dsv4_compressed_block_tables=dsv4_compressed_block_tables,
         )
+        get_hsa_context().tile_scheduler_metadata = new_tile_scheduler_metadata
 
         return input_ids, positions

@@ -137,15 +137,17 @@ from dlengine._cpp import (
 )
 from dlengine.config import Config
 from dlengine.context.cache import CacheContext, get_cache_context, set_cache_context
-from dlengine.context.expert_context import ExpertContext
 from dlengine.context.peer_agent import PeerAgentContext
 from dlengine.context.weight import WeightContext, WeightUpdateEngine
-from dlengine.context_v2.batch import get_batch_context, reset_batch_context
+from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.batch_out import get_batch_out_context
 from dlengine.context_v2.distributed import (
     get_dist_context,
     get_local_ip,
     set_dist_context,
 )
+from dlengine.context_v2.expert import ExpertContext
+from dlengine.context_v2.management import reset_runtime_contexts
 from dlengine.layers.sampler import Sampler
 from dlengine.logging import get_logger, set_log_level
 from dlengine.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
@@ -1301,33 +1303,32 @@ class ModelRunner:
                 )
 
         self.run_count += 1
-        get_batch_context().token_ids.append(input_ids[None, ...])
+        batch_out = get_batch_out_context()
+        batch_out.token_ids.append(input_ids[None, ...])
         if step_logprobs is not None:
             # ``step_logprobs`` shape is [num_seqs] float32 (zero on
             # non-rank-0 / non-sampled seqs).
-            ctx = get_batch_context()
-            if not hasattr(ctx, "step_logprobs") or ctx.step_logprobs is None:
-                ctx.step_logprobs = []
-            ctx.step_logprobs.append(step_logprobs[None, ...])
+            if batch_out.step_logprobs is None:
+                batch_out.step_logprobs = []
+            batch_out.step_logprobs.append(step_logprobs[None, ...])
 
         # --- Build output ---
         # ``logprobs_per_seq`` is ``list[list[float]]`` parallel to ``result``
         # when shipping logprobs is enabled; None otherwise. Engine-server
         # serializes both into StepOut.
-        ctx = get_batch_context()
         logprobs_per_seq = None
-        if getattr(ctx, "step_logprobs", []):
-            logprobs_per_seq = torch.cat(ctx.step_logprobs, dim=0).T.tolist()
+        if batch_out.step_logprobs:
+            logprobs_per_seq = torch.cat(batch_out.step_logprobs, dim=0).T.tolist()
         if self.mtp_worker is not None:
             result = self.mtp_worker.build_output_tokens(self.rank)
         else:
-            result = torch.cat(ctx.token_ids, dim=0).T.tolist()
+            result = torch.cat(batch_out.token_ids, dim=0).T.tolist()
         # Keep wire compat: return bare list when no logprobs were requested,
         # tuple ``(tokens, logprobs)`` when they were. Engine-side decoder
         # normalises both shapes.
         if logprobs_per_seq is not None:
             result = (result, logprobs_per_seq)
-        reset_batch_context()
+        reset_runtime_contexts()
         if _timer is not None:
             _timer.mark("tail")
             _timer.report(
