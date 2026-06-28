@@ -137,8 +137,6 @@ from dlengine._cpp import (
 )
 from dlengine.config import Config
 from dlengine.context.cache import CacheContext, get_cache_context, set_cache_context
-from dlengine.context.peer_agent import PeerAgentContext
-from dlengine.context.weight import WeightContext, WeightUpdateEngine
 from dlengine.context_v2.batch import get_batch_context
 from dlengine.context_v2.batch_out import get_batch_out_context
 from dlengine.context_v2.distributed import (
@@ -148,6 +146,8 @@ from dlengine.context_v2.distributed import (
 )
 from dlengine.context_v2.expert import ExpertContext
 from dlengine.context_v2.management import reset_runtime_contexts
+from dlengine.context_v2.parameter import WeightContext, WeightUpdateEngine
+from dlengine.context_v2.peer import PeerAgentContext
 from dlengine.layers.sampler import Sampler
 from dlengine.logging import get_logger, set_log_level
 from dlengine.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
