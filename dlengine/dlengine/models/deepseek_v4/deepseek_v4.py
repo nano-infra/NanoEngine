@@ -10,6 +10,7 @@ from torch import nn
 
 from dlengine.compile_utils import maybe_compile
 from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.cache.plan import deepseek_v4_cache_plan
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.kernel.jit.sgl import (
     fused_kernels_enabled as _sglang_fused_kernels_enabled,
@@ -2840,6 +2841,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor):
         return self.lm_head(hidden_states)
+
+    def get_cache_plan(self):
+        return deepseek_v4_cache_plan()
 
     def load_weights(self, weights):
         from .deepseek_v4_loader import load_weights

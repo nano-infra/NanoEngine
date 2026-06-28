@@ -14,8 +14,8 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 from dlengine.context_v2.batch import Context, get_batch_context, set_batch_context
-from dlengine.context_v2.cache.dsa import get_dsa_context
 from dlengine.context_v2.cache.hca import get_hca_context
+from dlengine.context_v2.cache.mla import get_mla_context
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.context_v2.expert import ExpertContext, set_expert_context
 from dlengine.context_v2.management import reset_runtime_contexts
@@ -177,7 +177,7 @@ class DecodeGraphRunner:
                 ),
             )
             get_hca_context().tile_scheduler_metadata = sched_meta
-            get_dsa_context().sparse_tile_scheduler_metadata = sparse_sched_meta
+            get_mla_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             # Warmup
             self._outputs[:master_bs] = model(
@@ -206,7 +206,7 @@ class DecodeGraphRunner:
             if self._has_indexer:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sparse_sched_metas[master_bs] = sparse_sched_meta
-                get_dsa_context().sparse_tile_scheduler_metadata = sparse_sched_meta
+                get_mla_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             # Capture
             graph = torch.cuda.CUDAGraph()
@@ -370,7 +370,7 @@ class LazyVerifyGraphRunner:
                 ),
             )
             get_hca_context().tile_scheduler_metadata = sched_meta
-            get_dsa_context().sparse_tile_scheduler_metadata = sparse_sched_meta
+            get_mla_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             # Warmup
             self._outputs[:n_tokens] = model(
@@ -386,7 +386,7 @@ class LazyVerifyGraphRunner:
             if self._has_indexer:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
                 self._sparse_sched_metas[bs] = sparse_sched_meta
-                get_dsa_context().sparse_tile_scheduler_metadata = sparse_sched_meta
+                get_mla_context().sparse_tile_scheduler_metadata = sparse_sched_meta
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, graph_pool):

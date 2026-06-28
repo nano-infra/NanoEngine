@@ -14,6 +14,7 @@ from dlengine.config import Config
 from dlengine.context_v2.batch import get_batch_context
 from dlengine.context_v2.batch_out import get_batch_out_context
 from dlengine.context_v2.cache import CacheContext, get_cache_context, set_cache_context
+from dlengine.context_v2.cache.plan import CachePlan, gqa_cache_plan
 from dlengine.context_v2.distributed import (
     get_dist_context,
     get_local_ip,
@@ -23,6 +24,7 @@ from dlengine.context_v2.expert import ExpertContext
 from dlengine.context_v2.management import reset_runtime_contexts
 from dlengine.context_v2.parameter import WeightContext, WeightUpdateEngine
 from dlengine.context_v2.peer import PeerAgentContext
+from dlengine.disagg.p2p import get_p2p_cache_transfer
 from dlengine.layers.sampler import Sampler
 from dlengine.logging import get_logger, set_log_level
 from dlengine.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
@@ -249,6 +251,7 @@ class ModelRunner:
         self._dlslime_thread = None
         self._dlslime_peer = None
         self.peer_agent_context = None
+        self.cache_transfer = get_p2p_cache_transfer()
         self.weight_context = None
         self.weight_update_engine = None
         self.l3_store = None  # Hf3fsL3Store, created in allocate_kvcache when enabled
@@ -409,6 +412,7 @@ class ModelRunner:
 
         model_architecture = hf_config.architectures[0]
         self.model = architectures[model_architecture](hf_config)
+        self.cache_plan = self._get_model_cache_plan()
 
         # Warmup ExpertContext for MoE models
         num_total_experts = getattr(hf_config, "num_experts", 0) or getattr(
@@ -482,6 +486,16 @@ class ModelRunner:
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
 
+    def _get_model_cache_plan(self) -> CachePlan:
+        get_plan = getattr(self.model, "get_cache_plan", None)
+        if callable(get_plan):
+            return get_plan()
+        logger.warning(
+            "Model %s does not declare a cache plan; falling back to GQA",
+            type(self.model).__name__,
+        )
+        return gqa_cache_plan()
+
     def apply_weight_update(
         self, named_tensors: dict[str, torch.Tensor]
     ) -> dict[str, int]:
@@ -507,7 +521,7 @@ class ModelRunner:
         cache_context = get_cache_context()
         cache_context.allocate_kvcache(num_kvcache_blocks)
 
-        if cache_context.mode == "dsv4":
+        if self.cache_plan.has("hca"):
             self._wire_dsv4_caches(cache_context)
         else:
             layer_id = 0
@@ -526,7 +540,7 @@ class ModelRunner:
                     layer_id += 1
 
         # Allocate NSA indexer cache (V3.2 only)
-        if cache_context.index_head_dim > 0:
+        if self.cache_plan.has("indexer") and cache_context.index_head_dim > 0:
             cache_context.allocate_indexer_cache(self.config.hf_config)
             # Wire indexer cache to each layer's Indexer module
             for module in self.model.modules():
@@ -536,7 +550,7 @@ class ModelRunner:
         # Register memory regions after KV/indexer tensors exist. The PeerAgent
         # itself is started during preallocate_kvcache().
         logger.info(f"[startup] r{self.rank} register_peer_agent_memory_regions begin")
-        cache_context.register_peer_agent_memory_regions(mode=self.config.mode)
+        self.cache_transfer.register_peer_agent_memory_regions(mode=self.config.mode)
         logger.info(f"[startup] r{self.rank} register_peer_agent_memory_regions done")
 
         # L3 (3FS) tiered KV cache: build the per-worker USRBIO store now that
@@ -648,7 +662,7 @@ class ModelRunner:
 
     def get_peer_agent_addr(self) -> str | None:
         """Return the peer agent address for this rank."""
-        return get_cache_context().get_peer_agent_addr()
+        return self.cache_transfer.get_peer_agent_addr()
 
     def start_dlslime_server(self, driver_alias: str) -> str:
         """Start a dedicated DLSLime server for executor transport."""
@@ -711,10 +725,13 @@ class ModelRunner:
         return self._dlslime_alias
 
     def p2p_disconnect(self, remote_engine_id: str):
-        return get_cache_context().p2p_disconnect(remote_engine_id)
+        return self.cache_transfer.p2p_disconnect(remote_engine_id)
 
     def get_num_connected_peers(self):
-        return len(get_cache_context().endpoints)
+        peer_context = self.cache_transfer.peer_agent_context
+        if peer_context is None:
+            return 0
+        return len(peer_context.connected_peers)
 
     def exit(self):
         if not self.enforce_eager:
@@ -878,14 +895,8 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
 
-        # Detect cache mode: dsv4, mla, or gqa
-        is_dsv4 = hf_config.architectures[0] == "DeepseekV4ForCausalLM"
-        if is_dsv4:
-            mode = "dsv4"
-        elif getattr(hf_config, "kv_lora_rank", 0) > 0:
-            mode = "mla"
-        else:
-            mode = "gqa"
+        cache_plan = self.cache_plan
+        mode = cache_plan.primary
         kv_lora_rank = (
             hf_config.kv_lora_rank if hasattr(hf_config, "kv_lora_rank") else 0
         )
@@ -917,9 +928,9 @@ class ModelRunner:
         enable_mla_reference_fallback = getattr(
             config, "enable_mla_reference_fallback", False
         )
-        is_fp8_kvcache = (mode == "mla" and index_head_dim > 0) and not getattr(
-            config, "disable_nsa", False
-        )
+        is_fp8_kvcache = (
+            cache_plan.has("indexer") and index_head_dim > 0
+        ) and not getattr(config, "disable_nsa", False)
         if is_fp8_kvcache and enable_mla_reference_fallback and not flash_mla_supported:
             logger.warning(
                 "Disabling FP8 MLA KV cache because MLA reference fallback is "
@@ -936,7 +947,7 @@ class ModelRunner:
         # utilization target on hybrid models.
         reserved_state_bytes = 0
         gdn_cache_slots = max(0, getattr(config, "gdn_state_cache_slots", 0))
-        if layer_types is not None:
+        if cache_plan.has("gdn") and layer_types is not None:
             reserved_state_bytes = CacheContext.estimate_gdn_state_bytes(
                 hf_config,
                 layer_types,
@@ -967,7 +978,7 @@ class ModelRunner:
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
         # Allocate GDN state buffers for linear_attention layers
-        if layer_types is not None:
+        if cache_plan.has("gdn") and layer_types is not None:
             cache_context.allocate_gdn_states(
                 hf_config,
                 layer_types,
@@ -984,7 +995,7 @@ class ModelRunner:
             cache_context,
             rank=dist.get_rank(),
         )
-        cache_context.set_peer_agent_context(self.peer_agent_context)
+        self.cache_transfer.set_peer_agent_context(self.peer_agent_context)
         if self.weight_context is not None:
             self.weight_context.set_peer_agent_context(self.peer_agent_context)
         if self.peer_agent_context is not None:
@@ -1062,7 +1073,7 @@ class ModelRunner:
 
     def migrate_from_bytes(self, data: bytes) -> None:
         """Migrate using lean MigrateBatchInput bytes (no Sequence objects)."""
-        get_cache_context().migrate_from_bytes(data=data)
+        self.cache_transfer.migrate_from_bytes(data=data)
 
     # ------------------------------------------------------------------ #
     # L3 (3FS) tiered KV cache worker RPCs (driven by collective_rpc)

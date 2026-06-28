@@ -8,7 +8,7 @@
 # GQAContext: GQA attention cache management
 # MLAContext: MLA attention cache management
 # GDNContext: GDN attention cache management
-# DSAContext: DeepSeekv3.2 DSA
+# DSA metadata: DeepSeekv3.2 DSA sparse scheduler metadata lives in MLAContext
 # HCAContext: DeepSeekv4 HCA
 # CSAContext: DeepSeekv4 CSA
 

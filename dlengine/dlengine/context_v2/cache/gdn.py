@@ -1,15 +1,52 @@
+from dataclasses import dataclass
+
 import torch
 
+from dlengine.context_v2 import BaseContext
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")
 
 
+@dataclass
+class GDNContext(BaseContext):
+    gdn_conv_states: torch.Tensor | None = None
+    gdn_recurrent_states: torch.Tensor | None = None
+    gdn_num_slots: int = 0
+    gdn_max_active_slots: int = 0
+
+    @classmethod
+    def get_context_type(cls) -> str:
+        return "gdn"
+
+    @classmethod
+    def get_context_name(cls) -> str:
+        return "GDNContext"
+
+    def clear_context(self) -> None:
+        self.gdn_conv_states = None
+        self.gdn_recurrent_states = None
+        self.gdn_num_slots = 0
+        self.gdn_max_active_slots = 0
+
+    def reset_context(self) -> None:
+        self.clear_context()
+
+
+_GDN_CONTEXT = GDNContext()
+
+
+def get_gdn_context() -> GDNContext:
+    return _GDN_CONTEXT
+
+
+def reset_gdn_context() -> None:
+    global _GDN_CONTEXT
+    _GDN_CONTEXT = GDNContext()
+
+
 def initialize_gdn_cache_state(context) -> None:
-    context.remote_gdn_num_slots = {}
     context.gdn_num_slots = 0
-    context._local_gdn_conv_mr_handler = None
-    context._local_gdn_recurrent_mr_handler = None
 
 
 def estimate_gdn_state_bytes(
@@ -103,7 +140,10 @@ def allocate_gdn_states(
 
 
 __all__ = [
+    "GDNContext",
     "allocate_gdn_states",
     "estimate_gdn_state_bytes",
+    "get_gdn_context",
     "initialize_gdn_cache_state",
+    "reset_gdn_context",
 ]

@@ -1,6 +1,21 @@
 import tilelang
+import tilelang
 import tilelang.language as T
 import torch
+
+tilelang.set_log_level("WARNING")
+
+
+pass_configs = {
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    tilelang.PassConfigKey.TL_DISABLE_FAST_MATH: True,
+}
+
+
+FP8 = "float8_e4m3"
+BF16 = "bfloat16"
+FP32 = "float32"
 
 
 @tilelang.jit(out_idx=[4], pass_configs=pass_configs)

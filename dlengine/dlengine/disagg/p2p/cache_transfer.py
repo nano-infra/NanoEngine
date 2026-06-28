@@ -1,9 +1,10 @@
-"""KV-cache migration / transfer (RDMA + NanoCtrl control plane).
+"""KV-cache P2P migration / transfer (RDMA + NanoCtrl control plane).
 
-Extracted from ``CacheContext`` and mixed back in. Owns the
-PD-disaggregation transfer path: peer-agent memory-region registration,
-NanoCtrl engine lookup, peer connection setup, and the batched RDMA reads
-that pull KV / GDN / indexer / DSv4 state from a remote prefill engine.
+Owns the PD-disaggregation transfer path: peer-agent memory-region
+registration, NanoCtrl engine lookup, peer connection setup, and the batched
+RDMA reads that pull KV / GDN / indexer / DSv4 state from a remote prefill
+engine. Cache state remains in ``context_v2.cache``; P2P-specific byte-offset
+math lives next to the transfer path.
 
 This module is intentionally P2P-specific. Storage-backed transfer backends
 (e.g. 3FS) belong under ``dlengine.disagg.storage``.
@@ -18,6 +19,7 @@ import torch.distributed as dist
 
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.context_v2.peer import PeerAgentContext
+from dlengine.disagg.p2p.cache_layout import P2PCacheLayout
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")
@@ -38,15 +40,17 @@ def select_peer_device() -> str:
 
 
 def initialize_migration_state(context) -> None:
-    context.endpoints = {}
     context.num_remote_kvcache_blocks = {}
     context.remote_max_num_seqs = {}
     context.remote_attention_tp = {}
+    context.remote_gdn_num_slots = {}
     context.remote_compressed_pool_pages = {}
     context.remote_dsv4_max_slots = {}
     context.remote_dsv4_num_layers_per_ratio = {}
     context._local_mr_handler = None
     context._local_indexer_mr_handler = None
+    context._local_gdn_conv_mr_handler = None
+    context._local_gdn_recurrent_mr_handler = None
     context._local_dsv4_compressed_mr_handlers = {}
     context._local_dsv4_compressor_kv_mr_handlers = {}
     context._local_dsv4_compressor_score_mr_handlers = {}
@@ -54,7 +58,32 @@ def initialize_migration_state(context) -> None:
     context._engine_info_cache = None
 
 
-class KVMigratorMixin:
+class P2PCacheTransfer:
+    """P2P cache transfer manager.
+
+    The transfer manager owns remote-engine metadata, PeerAgent state, and local
+    MR handlers. It delegates cache tensors and layout helper methods to the
+    active CacheContext returned by ``get_cache_context()``.
+    """
+
+    def __init__(self) -> None:
+        self.peer_agent_context: PeerAgentContext | None = None
+        self.layout = P2PCacheLayout(self)
+        initialize_migration_state(self)
+
+    @property
+    def cache_context(self):
+        from dlengine.context_v2.cache import get_cache_context
+
+        return get_cache_context()
+
+    def __getattr__(self, name):
+        cache_context = self.cache_context
+        class_attr = getattr(type(cache_context), name, None)
+        if hasattr(class_attr, "__get__"):
+            return class_attr.__get__(self, type(self))
+        return getattr(cache_context, name)
+
     def set_peer_agent_context(self, peer_context: PeerAgentContext | None) -> None:
         """Attach the worker-owned PeerAgentContext to cache RDMA users."""
         self.peer_agent_context = peer_context
@@ -214,7 +243,7 @@ class KVMigratorMixin:
         """Return the attached worker-owned PeerAgentContext."""
         if self.peer_agent_context is None:
             raise RuntimeError(
-                "CacheContext PeerAgentContext is not attached. "
+                "P2PCacheTransfer PeerAgentContext is not attached. "
                 "Was ModelRunner PeerAgentContext initialized?"
             )
         return self.peer_agent_context
@@ -222,6 +251,22 @@ class KVMigratorMixin:
     def ensure_peer_agent_connected(self, peer_alias: str) -> None:
         """Ensure the local PeerAgent is connected to ``peer_alias``."""
         self.get_peer_agent_context().ensure_connected(peer_alias)
+
+    def p2p_disconnect(self, remote_engine_id: str):
+        """Forget local connection metadata for a remote engine.
+
+        PeerAgent does not currently expose a required hard-disconnect path for
+        this flow, so this method clears transfer-side bookkeeping and cached
+        engine metadata. Existing PeerAgent connections may remain reusable.
+        """
+        self.num_remote_kvcache_blocks.pop(remote_engine_id, None)
+        self.remote_max_num_seqs.pop(remote_engine_id, None)
+        self.remote_attention_tp.pop(remote_engine_id, None)
+        self.remote_gdn_num_slots.pop(remote_engine_id, None)
+        self.remote_compressed_pool_pages.pop(remote_engine_id, None)
+        self.remote_dsv4_max_slots.pop(remote_engine_id, None)
+        self.remote_dsv4_num_layers_per_ratio.pop(remote_engine_id, None)
+        self.invalidate_engine_info_cache()
 
     def invalidate_engine_info_cache(self):
         """Invalidate the engine_info cache to force a refresh on next fetch."""
@@ -458,13 +503,13 @@ class KVMigratorMixin:
                     remote_block_idx,
                     source_block_idx,
                 ) in enumerate(assign_batch):
-                    local_off = self.local_kv_stride(
+                    local_off = self.layout.local_kv_stride(
                         kv_idx, layer_idx, source_block_idx
                     )
-                    remote_off = self.remote_kv_stride(
+                    remote_off = self.layout.remote_kv_stride(
                         kv_idx, layer_idx, remote_block_idx, engine_id
                     )
-                    length = self.block_stride(1)
+                    length = self.layout.block_stride(1)
 
                     if local_mr_handler is None or remote_mr_handler is None:
                         logger.error(
@@ -502,16 +547,16 @@ class KVMigratorMixin:
                             "gdn_conv", peer_alias=peer_alias
                         )
                         local_conv_mr = self._local_gdn_conv_mr_handler
-                        conv_len = self.gdn_conv_slot_num_bytes()
+                        conv_len = self.layout.gdn_conv_slot_num_bytes()
                         for layer_idx, remote_slot, local_slot in gdn_batch:
                             rdma_ops.append(
                                 (
                                     local_conv_mr,
                                     remote_conv_mr,
-                                    self.remote_gdn_conv_stride(
+                                    self.layout.remote_gdn_conv_stride(
                                         layer_idx, remote_slot, engine_id
                                     ),
-                                    self.gdn_conv_stride(layer_idx, local_slot),
+                                    self.layout.gdn_conv_stride(layer_idx, local_slot),
                                     conv_len,
                                 )
                             )
@@ -529,16 +574,18 @@ class KVMigratorMixin:
                             "gdn_recurrent", peer_alias=peer_alias
                         )
                         local_rec_mr = self._local_gdn_recurrent_mr_handler
-                        rec_len = self.gdn_recurrent_slot_num_bytes()
+                        rec_len = self.layout.gdn_recurrent_slot_num_bytes()
                         for layer_idx, remote_slot, local_slot in gdn_batch:
                             rdma_ops.append(
                                 (
                                     local_rec_mr,
                                     remote_rec_mr,
-                                    self.remote_gdn_recurrent_stride(
+                                    self.layout.remote_gdn_recurrent_stride(
                                         layer_idx, remote_slot, engine_id
                                     ),
-                                    self.gdn_recurrent_stride(layer_idx, local_slot),
+                                    self.layout.gdn_recurrent_stride(
+                                        layer_idx, local_slot
+                                    ),
                                     rec_len,
                                 )
                             )
@@ -573,16 +620,18 @@ class KVMigratorMixin:
                         remote_handler = peer_agent.get_handle(
                             f"dsv4_compressed_r{ratio}", peer_alias=peer_alias
                         )
-                        page_bytes = self.compressed_page_bytes(ratio)
+                        page_bytes = self.layout.compressed_page_bytes(ratio)
                         for rli, rpage, lpage in ops:
                             rdma_ops.append(
                                 (
                                     local_handler,
                                     remote_handler,
-                                    self.remote_compressed_stride(
+                                    self.layout.remote_compressed_stride(
                                         ratio, rli, rpage, engine_id
                                     ),
-                                    self.local_compressed_stride(ratio, rli, lpage),
+                                    self.layout.local_compressed_stride(
+                                        ratio, rli, lpage
+                                    ),
                                     page_bytes,
                                 )
                             )
@@ -615,16 +664,18 @@ class KVMigratorMixin:
                             remote_handler = peer_agent.get_handle(
                                 mr_name, peer_alias=peer_alias
                             )
-                            row_bytes = self._compressor_state_row_bytes(ratio, kind)
+                            row_bytes = self.layout.compressor_state_row_bytes(
+                                ratio, kind
+                            )
                             for rli, rslot, lslot in ops:
                                 rdma_ops.append(
                                     (
                                         local_handler,
                                         remote_handler,
-                                        self.remote_compressor_state_stride(
+                                        self.layout.remote_compressor_state_stride(
                                             ratio, rli, rslot, kind, engine_id
                                         ),
-                                        self.local_compressor_state_stride(
+                                        self.layout.local_compressor_state_stride(
                                             ratio, rli, lslot, kind
                                         ),
                                         row_bytes,
@@ -644,16 +695,18 @@ class KVMigratorMixin:
                             "indexer_cache", peer_alias=peer_alias
                         )
                         local_indexer_mr = self._local_indexer_mr_handler
-                        page_bytes = self.indexer_page_num_bytes()
+                        page_bytes = self.layout.indexer_page_num_bytes()
                         for layer_idx, remote_block, local_block in indexer_batch:
                             rdma_ops.append(
                                 (
                                     local_indexer_mr,
                                     remote_indexer_mr,
-                                    self.remote_indexer_stride(
+                                    self.layout.remote_indexer_stride(
                                         layer_idx, remote_block, engine_id
                                     ),
-                                    self.local_indexer_stride(layer_idx, local_block),
+                                    self.layout.local_indexer_stride(
+                                        layer_idx, local_block
+                                    ),
                                     page_bytes,
                                 )
                             )
@@ -958,3 +1011,29 @@ class KVMigratorMixin:
             compressed_assigns=compressed_assigns,
             compressor_state_assigns=compressor_state_assigns,
         )
+
+
+_P2P_CACHE_TRANSFER = P2PCacheTransfer()
+
+
+def get_p2p_cache_transfer() -> P2PCacheTransfer:
+    return _P2P_CACHE_TRANSFER
+
+
+def reset_p2p_cache_transfer() -> None:
+    _P2P_CACHE_TRANSFER.peer_agent_context = None
+    initialize_migration_state(_P2P_CACHE_TRANSFER)
+
+
+# Backward compatibility for old context/cache shims.
+KVMigratorMixin = P2PCacheTransfer
+
+
+__all__ = [
+    "KVMigratorMixin",
+    "P2PCacheTransfer",
+    "get_p2p_cache_transfer",
+    "initialize_migration_state",
+    "reset_p2p_cache_transfer",
+    "select_peer_device",
+]

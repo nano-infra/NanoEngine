@@ -3,6 +3,7 @@ import torch.distributed as dist
 from torch import nn
 from transformers import Qwen3Config
 
+from dlengine.context_v2.cache.plan import gqa_cache_plan
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.layers import get_backend
 from dlengine.layers.activation import SiluAndMul
@@ -214,6 +215,9 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def get_cache_plan(self):
+        return gqa_cache_plan()
 
     def load_weights(self, weights):
         """Load weights using per-model loader."""

@@ -5,11 +5,9 @@ configuration plus cache-backed runtime state. Model layers query it for
 compute/load/store buffers, while disaggregation code uses it for cache layout
 arithmetic and local tensor access.
 
-The implementation is currently split into internal mixins:
+The implementation is currently split into internal helpers:
 - _allocator: local cache buffer allocation.
-- _layout: byte-offset, stride, gather/scatter, and layout transformation math.
-P2P transfer helpers live under ``dlengine.disagg.p2p`` and are still mixed in
-here temporarily to preserve the current public API.
+P2P transfer helpers and RDMA byte-offset math live under ``dlengine.disagg.p2p``.
 """
 
 import dataclasses
@@ -18,26 +16,34 @@ from typing import Any, Literal
 import torch
 import torch.distributed as dist
 
-from dlengine.context_v2.cache._allocator import KVCacheAllocatorMixin
-from dlengine.context_v2.cache._layout import CacheLayoutMixin
-from dlengine.context_v2.cache.gdn import initialize_gdn_cache_state
-from dlengine.context_v2.cache.gqa import configure_gqa_cache, get_gqa_block_bytes
-from dlengine.context_v2.cache.hca import configure_dsv4_cache, get_dsv4_block_bytes
-from dlengine.context_v2.cache.indexer import get_indexer_block_bytes
-from dlengine.context_v2.cache.mla import configure_mla_cache, get_mla_block_bytes
-from dlengine.context_v2.peer import PeerAgentContext
-from dlengine.disagg.p2p.cache_transfer import (
-    initialize_migration_state,
-    KVMigratorMixin,
-    select_peer_device,
+from dlengine.context_v2.cache import (  # noqa: F401  # noqa: F401  # noqa: F401
+    gqa as _gqa_backend,
+    hca as _hca_backend,
+    mla as _mla_backend,
 )
+from dlengine.context_v2.cache._allocator import KVCacheAllocatorMixin
+from dlengine.context_v2.cache._registry import (
+    CacheBackend,
+    get_cache_backend,
+    register_cache_backend,
+    registered_cache_backends,
+)
+from dlengine.context_v2.cache.csa import get_csa_context
+from dlengine.context_v2.cache.gdn import get_gdn_context, initialize_gdn_cache_state
+from dlengine.context_v2.cache.gqa import get_gqa_context
+from dlengine.context_v2.cache.hca import get_hca_context
+from dlengine.context_v2.cache.indexer import (
+    get_indexer_block_bytes,
+    get_indexer_context,
+)
+from dlengine.context_v2.cache.mla import get_mla_context
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")
 
 
 @dataclasses.dataclass
-class CacheContext(CacheLayoutMixin, KVCacheAllocatorMixin, KVMigratorMixin):
+class CacheContext(KVCacheAllocatorMixin):
     num_kv_heads: int
     head_dim: int
     block_size: int
@@ -53,16 +59,6 @@ class CacheContext(CacheLayoutMixin, KVCacheAllocatorMixin, KVMigratorMixin):
     mode: Literal["gqa", "mla", "dsv4"] = "gqa"
     num_local_kvcache_blocks = -1
     num_remote_kvcache_blocks: dict[str, int] = None
-    kv_cache: torch.Tensor = None
-    gdn_conv_states: torch.Tensor | None = None
-
-    # DSv4 compressed KV caches (per-layer, separate from SWA paged cache)
-    # Shape per layer: [max_num_seqs, max_compressed_tokens, 1, 584] uint8
-    dsv4_compressed_caches: dict[int, torch.Tensor] | None = None
-    dsv4_compress_ratios: list[int] | None = None  # per-layer compress ratios
-    gdn_recurrent_states: torch.Tensor | None = None
-    selected_nic: str | None = None
-    endpoints: dict[str, dict[int, Any]] = None  # RDMAEndpoint or RDMALazyPeer
 
     # used for MLA mode
     kv_lora_rank: int = 0
@@ -71,20 +67,155 @@ class CacheContext(CacheLayoutMixin, KVCacheAllocatorMixin, KVMigratorMixin):
 
     # NSA Indexer (V3.2 only)
     index_head_dim: int = 0  # 128 for V3.2, 0 otherwise
-    indexer_cache: Any = None  # IndexerCache instance, set after allocation
 
-    # Control plane: server address and engine ID for centralized connection
+    # Control plane: server address and engine ID for disaggregation users.
     ctrl_address: str | None = (
         None  # Control plane server URL (e.g., "http://127.0.0.1:4479")
     )
     ctrl_scope: str | None = None  # Scope for multi-tenant isolation
     engine_id: str | None = None  # Engine ID for agent naming (format: EngineName:rank)
-    peer_agent_context: PeerAgentContext | None = None
     # If ctrl_address is provided, engine_id will be fetched from NanoCtrl instead of config
 
     @property
     def num_local_kv_heads(self):
         return self.num_kv_heads // self.attention_tp
+
+    def _primary_cache_context(self):
+        if self.mode == "gqa":
+            return get_gqa_context()
+        if self.mode == "mla":
+            return get_mla_context()
+        if self.mode == "dsv4":
+            return get_hca_context()
+        raise ValueError(f"Unknown cache mode: {self.mode}")
+
+    @property
+    def kv_cache(self):
+        return self._primary_cache_context().kv_cache
+
+    @kv_cache.setter
+    def kv_cache(self, value) -> None:
+        self._primary_cache_context().kv_cache = value
+
+    @property
+    def gdn_conv_states(self):
+        return get_gdn_context().gdn_conv_states
+
+    @gdn_conv_states.setter
+    def gdn_conv_states(self, value) -> None:
+        get_gdn_context().gdn_conv_states = value
+
+    @property
+    def gdn_recurrent_states(self):
+        return get_gdn_context().gdn_recurrent_states
+
+    @gdn_recurrent_states.setter
+    def gdn_recurrent_states(self, value) -> None:
+        get_gdn_context().gdn_recurrent_states = value
+
+    @property
+    def gdn_num_slots(self) -> int:
+        return get_gdn_context().gdn_num_slots
+
+    @gdn_num_slots.setter
+    def gdn_num_slots(self, value: int) -> None:
+        get_gdn_context().gdn_num_slots = value
+
+    @property
+    def gdn_max_active_slots(self) -> int:
+        return get_gdn_context().gdn_max_active_slots
+
+    @gdn_max_active_slots.setter
+    def gdn_max_active_slots(self, value: int) -> None:
+        get_gdn_context().gdn_max_active_slots = value
+
+    @property
+    def indexer_cache(self):
+        return get_indexer_context().indexer_cache
+
+    @indexer_cache.setter
+    def indexer_cache(self, value) -> None:
+        get_indexer_context().indexer_cache = value
+
+    @property
+    def dsv4_compress_ratios(self):
+        return get_csa_context().dsv4_compress_ratios
+
+    @dsv4_compress_ratios.setter
+    def dsv4_compress_ratios(self, value) -> None:
+        get_csa_context().dsv4_compress_ratios = value
+
+    @property
+    def dsv4_compressed_caches(self):
+        return get_csa_context().dsv4_compressed_caches
+
+    @dsv4_compressed_caches.setter
+    def dsv4_compressed_caches(self, value) -> None:
+        get_csa_context().dsv4_compressed_caches = value
+
+    @property
+    def dsv4_compressed_caches_flat(self):
+        return get_csa_context().dsv4_compressed_caches_flat
+
+    @dsv4_compressed_caches_flat.setter
+    def dsv4_compressed_caches_flat(self, value) -> None:
+        get_csa_context().dsv4_compressed_caches_flat = value
+
+    @property
+    def dsv4_layers_per_ratio(self):
+        return get_csa_context().dsv4_layers_per_ratio
+
+    @dsv4_layers_per_ratio.setter
+    def dsv4_layers_per_ratio(self, value) -> None:
+        get_csa_context().dsv4_layers_per_ratio = value
+
+    @property
+    def dsv4_layer_to_ratio_idx(self):
+        return get_csa_context().dsv4_layer_to_ratio_idx
+
+    @dsv4_layer_to_ratio_idx.setter
+    def dsv4_layer_to_ratio_idx(self, value) -> None:
+        get_csa_context().dsv4_layer_to_ratio_idx = value
+
+    @property
+    def dsv4_compressed_pool_config(self):
+        return get_csa_context().dsv4_compressed_pool_config
+
+    @dsv4_compressed_pool_config.setter
+    def dsv4_compressed_pool_config(self, value) -> None:
+        get_csa_context().dsv4_compressed_pool_config = value
+
+    @property
+    def dsv4_compressed_dummy_page(self):
+        return get_csa_context().dsv4_compressed_dummy_page
+
+    @dsv4_compressed_dummy_page.setter
+    def dsv4_compressed_dummy_page(self, value) -> None:
+        get_csa_context().dsv4_compressed_dummy_page = value
+
+    @property
+    def dsv4_compressor_kv_flat(self):
+        return get_csa_context().dsv4_compressor_kv_flat
+
+    @dsv4_compressor_kv_flat.setter
+    def dsv4_compressor_kv_flat(self, value) -> None:
+        get_csa_context().dsv4_compressor_kv_flat = value
+
+    @property
+    def dsv4_compressor_score_flat(self):
+        return get_csa_context().dsv4_compressor_score_flat
+
+    @dsv4_compressor_score_flat.setter
+    def dsv4_compressor_score_flat(self, value) -> None:
+        get_csa_context().dsv4_compressor_score_flat = value
+
+    @property
+    def dsv4_compressor_counts_flat(self):
+        return get_csa_context().dsv4_compressor_counts_flat
+
+    @dsv4_compressor_counts_flat.setter
+    def dsv4_compressor_counts_flat(self, value) -> None:
+        get_csa_context().dsv4_compressor_counts_flat = value
 
     def __post_init__(self):
         free, total = torch.cuda.mem_get_info(self.device)
@@ -96,17 +227,9 @@ class CacheContext(CacheLayoutMixin, KVCacheAllocatorMixin, KVMigratorMixin):
         peak = memory_stats.get("allocated_bytes.all.peak", 0)
         current = memory_stats.get("allocated_bytes.all.current", 0)
 
-        if self.mode == "gqa":
-            configure_gqa_cache(self)
-            block_bytes = get_gqa_block_bytes(self)
-        elif self.mode == "mla":
-            configure_mla_cache(self)
-            block_bytes = get_mla_block_bytes(self)
-        elif self.mode == "dsv4":
-            configure_dsv4_cache(self)
-            block_bytes = get_dsv4_block_bytes(self)
-        else:
-            raise ValueError(f"Unknown mode: {self.mode}")
+        backend = get_cache_backend(self.mode)
+        backend.configure(self)
+        block_bytes = backend.get_block_bytes(self)
 
         block_bytes += get_indexer_block_bytes(self)
 
@@ -127,8 +250,6 @@ class CacheContext(CacheLayoutMixin, KVCacheAllocatorMixin, KVMigratorMixin):
 
         assert self.num_local_kvcache_blocks > 0
 
-        self.selected_nic = select_peer_device()
-        initialize_migration_state(self)
         initialize_gdn_cache_state(self)
 
 

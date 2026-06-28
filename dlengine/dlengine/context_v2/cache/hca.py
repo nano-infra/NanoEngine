@@ -4,6 +4,7 @@ from typing import Any
 import torch
 
 from dlengine.context_v2 import BaseContext
+from dlengine.context_v2.cache._registry import register_cache_backend
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")
@@ -41,9 +42,18 @@ def allocate_dsv4_kvcache(context) -> None:
     )
 
 
+DSV4_CACHE_BACKEND = register_cache_backend(
+    "dsv4",
+    configure=configure_dsv4_cache,
+    get_block_bytes=get_dsv4_block_bytes,
+    allocate=allocate_dsv4_kvcache,
+)
+
+
 @dataclass
 class HCAContext(BaseContext):
     tile_scheduler_metadata: Any = None
+    kv_cache: torch.Tensor | None = None
 
     @classmethod
     def get_context_type(cls) -> str:
@@ -55,6 +65,7 @@ class HCAContext(BaseContext):
 
     def clear_context(self) -> None:
         self.tile_scheduler_metadata = None
+        self.kv_cache = None
 
     def reset_context(self) -> None:
         self.clear_context()
@@ -67,9 +78,15 @@ def get_hca_context() -> HCAContext:
     return _HCA_CONTEXT
 
 
-def set_hca_context(tile_scheduler_metadata: Any = None) -> HCAContext:
+def set_hca_context(
+    tile_scheduler_metadata: Any = None,
+    kv_cache: torch.Tensor | None = None,
+) -> HCAContext:
     global _HCA_CONTEXT
-    _HCA_CONTEXT = HCAContext(tile_scheduler_metadata=tile_scheduler_metadata)
+    _HCA_CONTEXT = HCAContext(
+        tile_scheduler_metadata=tile_scheduler_metadata,
+        kv_cache=kv_cache,
+    )
     return _HCA_CONTEXT
 
 
@@ -79,6 +96,7 @@ def reset_hca_context() -> None:
 
 
 __all__ = [
+    "DSV4_CACHE_BACKEND",
     "DSV4_BYTES_PER_TOKEN",
     "HCAContext",
     "allocate_dsv4_kvcache",

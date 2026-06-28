@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections import defaultdict
 
 import torch
-from dlengine.context_v2.cache import get_cache_context
 from dlengine.context_v2.peer import PeerAgentContext
+from dlengine.disagg.p2p import get_p2p_cache_transfer
 from dlengine.logging import get_logger
 
 logger = get_logger("DLENGINE")
@@ -96,13 +96,13 @@ class VisionEmbedManager:
         if not vision_slot_views:
             return
 
-        cache_ctx = get_cache_context()
+        cache_transfer = get_p2p_cache_transfer()
         if self.peer_agent_context is None:
             logger.warning("PeerAgent not available, cannot RDMA-fetch vision embeds")
             return
         peer_agent = self.peer_agent_context.agent
 
-        from dlengine.context.embedding_pool import _VISION_EMBED_BUFFER_ID
+        from dlengine.context_v2.cache.emb import _VISION_EMBED_BUFFER_ID
 
         by_encoder: dict[str, list] = defaultdict(list)
         for v in vision_slot_views:
@@ -125,7 +125,7 @@ class VisionEmbedManager:
         )
 
         # Look up peer_addrs for all encoders via NanoCtrl
-        encoder_info_map = cache_ctx._fetch_engine_info_from_ctrl(
+        encoder_info_map = cache_transfer._fetch_engine_info_from_ctrl(
             set(by_encoder.keys())
         )
 
