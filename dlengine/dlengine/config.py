@@ -250,33 +250,50 @@ class Config(BaseModel):
                 raise
             with config_path.open() as f:
                 config_dict = json.load(f)
-            if config_dict.get("model_type") != "deepseek_v4":
+            if config_dict.get("model_type") == "qwen3_5":
+                text_config = config_dict.get("text_config")
+                self.hf_config = PretrainedConfig(**config_dict)
+                if isinstance(text_config, dict):
+                    self.hf_config.text_config = PretrainedConfig(**text_config)
+            elif config_dict.get("model_type") != "deepseek_v4":
                 raise
-            from dlengine.models.deepseek_v4.configuration_deepseek_v4 import (
-                DeepseekV4Config,
-            )
+            else:
+                from dlengine.models.deepseek_v4.configuration_deepseek_v4 import (
+                    DeepseekV4Config,
+                )
 
-            self.hf_config = DeepseekV4Config(**config_dict)
+                self.hf_config = DeepseekV4Config(**config_dict)
 
         # For VLM models with nested text_config (e.g. Qwen3.5-MoE),
         # flatten text_config attributes into hf_config for uniform access.
         if hasattr(self.hf_config, "text_config"):
             text_cfg = self.hf_config.text_config
-            for attr in dir(text_cfg):
+            if isinstance(text_cfg, dict):
+                text_config_dict = text_cfg
+            elif hasattr(text_cfg, "to_dict"):
+                text_config_dict = text_cfg.to_dict()
+            else:
+                text_config_dict = vars(text_cfg)
+            for attr, value in text_config_dict.items():
                 if attr.startswith("_"):
                     continue
                 if not hasattr(self.hf_config, attr):
                     try:
-                        setattr(self.hf_config, attr, getattr(text_cfg, attr))
+                        setattr(self.hf_config, attr, value)
                     except Exception as e:
                         logger.warning(
                             f"Could not flatten attribute '{attr}' from text_config: {e}"
                         )
             # Explicitly propagate dtype/torch_dtype from text_config
             # (top-level config may have dtype=None while text_config has bfloat16)
-            if getattr(text_cfg, "dtype", None) is not None:
+            text_dtype = (
+                text_cfg.get("dtype")
+                if isinstance(text_cfg, dict)
+                else getattr(text_cfg, "dtype", None)
+            )
+            if text_dtype is not None:
                 if getattr(self.hf_config, "dtype", None) is None:
-                    self.hf_config.__dict__["dtype"] = text_cfg.dtype
+                    self.hf_config.__dict__["dtype"] = text_dtype
 
         if self.hf_config.architectures[0] in (
             "DeepseekV3ForCausalLM",

@@ -15,11 +15,7 @@ from dlengine.context_v2.batch import get_batch_context
 from dlengine.context_v2.batch_out import get_batch_out_context
 from dlengine.context_v2.cache import CacheContext, get_cache_context, set_cache_context
 from dlengine.context_v2.cache.plan import CachePlan, gqa_cache_plan
-from dlengine.context_v2.distributed import (
-    get_dist_context,
-    get_local_ip,
-    set_dist_context,
-)
+from dlengine.context_v2.distributed import get_dist_context, set_dist_context
 from dlengine.context_v2.expert import ExpertContext
 from dlengine.context_v2.management import reset_runtime_contexts
 from dlengine.context_v2.parameter import WeightContext, WeightUpdateEngine
@@ -31,9 +27,11 @@ from dlengine.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
 from dlengine.models.deepseek_v2.deepseek_v2_mtp import DeepSeekMTP
 from dlengine.models.deepseek_v4.deepseek_v4 import DeepseekV4ForCausalLM
 from dlengine.models.qwen3.qwen3 import Qwen3ForCausalLM
+from dlengine.models.qwen3_5.qwen3_5 import Qwen3_5ForConditionalGeneration
 from dlengine.models.qwen3_5_moe.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from dlengine.models.qwen3_5_moe.qwen3_5_moe_mtp import Qwen3_5MTP
 from dlengine.models.qwen3_moe.qwen3_moe import Qwen3MoeForCausalLM
+from dlengine.utils.network import get_free_port, get_local_ip
 from dlengine.worker.graph_runner import DecodeGraphRunner
 from dlengine.worker.input_preparer import InputPreparer, prepare_sample_from_aux
 from dlengine.worker.loader import load_model, load_mtp_model
@@ -171,6 +169,7 @@ logger = get_logger("DLENGINE")
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
+    "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGeneration,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
     "DeepseekV32ForCausalLM": DeepseekV2ForCausalLM,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
@@ -293,16 +292,7 @@ class ModelRunner:
 
     def get_node_info(self):
         """Return (ip, free_port) of the node this worker runs on."""
-        import socket
-
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
-            s2.bind(("", 0))
-            port = s2.getsockname()[1]
-        return ip, port
+        return get_local_ip(), get_free_port()
 
     def init_dist(self, master_address: str):
         """Complete deferred distributed initialization.
