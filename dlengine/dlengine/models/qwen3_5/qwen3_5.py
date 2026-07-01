@@ -207,10 +207,12 @@ class Qwen3_5DecoderLayer(nn.Module):
 
         if self.layer_type == "full_attention":
             hidden_states = self.self_attn(positions, hidden_states)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         elif self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(hidden_states)
-
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        elif self.layer_type == "mlp_only":
+            hidden_states = self.post_attention_layernorm(residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
