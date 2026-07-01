@@ -269,10 +269,14 @@ class Config(BaseModel):
         if hasattr(self.hf_config, "text_config"):
             text_cfg = self.hf_config.text_config
             if isinstance(text_cfg, dict):
-                text_items = text_cfg.items()
+                text_config_dict = text_cfg
+            elif hasattr(text_cfg, "to_dict"):
+                text_config_dict = text_cfg.to_dict()
             else:
-                text_items = vars(text_cfg).items()
-            for attr, value in text_items:
+                text_config_dict = vars(text_cfg)
+            for attr, value in text_config_dict.items():
+                if attr.startswith("_"):
+                    continue
                 if not hasattr(self.hf_config, attr):
                     try:
                         setattr(self.hf_config, attr, value)
@@ -282,9 +286,14 @@ class Config(BaseModel):
                         )
             # Explicitly propagate dtype/torch_dtype from text_config
             # (top-level config may have dtype=None while text_config has bfloat16)
-            if getattr(text_cfg, "dtype", None) is not None:
+            text_dtype = (
+                text_cfg.get("dtype")
+                if isinstance(text_cfg, dict)
+                else getattr(text_cfg, "dtype", None)
+            )
+            if text_dtype is not None:
                 if getattr(self.hf_config, "dtype", None) is None:
-                    self.hf_config.__dict__["dtype"] = text_cfg.dtype
+                    self.hf_config.__dict__["dtype"] = text_dtype
 
         if self.hf_config.architectures[0] in (
             "DeepseekV3ForCausalLM",
