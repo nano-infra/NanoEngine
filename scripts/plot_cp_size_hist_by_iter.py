@@ -305,7 +305,7 @@ def plot_full(rows, cp_sizes, context: str, out_path: Path, hide_header: bool, l
     for cp_size in cp_sizes:
         plot_line(ax, x, [row[f"cp_{cp_size}"] for row in rows], cp_size)
     style_axes(ax)
-    ax.set_xlabel("Decode iteration")
+    ax.set_xlabel("Decode Iter")
     ax.set_ylabel("Request count")
     if not hide_header:
         add_figure_header(fig, context, "All CP sizes")
@@ -332,7 +332,7 @@ def plot_dual_axis(rows, cp_sizes, context: str, out_path: Path, hide_header: bo
         ax_left.set_ylim(0, 1)
 
     style_axes(ax_left)
-    ax_left.set_xlabel("Decode iteration")
+    ax_left.set_xlabel("Decode Iter")
     ax_left.set_ylabel("Request count for CP>1")
 
     if 1 in cp_sizes:
@@ -373,7 +373,7 @@ def plot_non_cp1(rows, cp_sizes, context: str, out_path: Path, hide_header: bool
     for cp_size in non_cp1:
         plot_line(ax, x, [row[f"cp_{cp_size}"] for row in rows], cp_size)
     style_axes(ax)
-    ax.set_xlabel("Decode iteration")
+    ax.set_xlabel("Decode Iter")
     ax.set_ylabel("Request count")
     ax.set_ylim(0, max(1, peak_non_cp1 * 1.1))
     if not hide_header:

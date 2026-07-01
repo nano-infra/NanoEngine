@@ -85,11 +85,15 @@ class Config:
     use_new_decode_dynamic_sp_scheduler: bool = False
     # SP size selection policy for the legacy dynamic-SP path.
     # "legacy": keep the current segment-based SP size search.
-    # "long_short_sp8": prompt_len > dynamic_sp_long_request_threshold -> SP=attention_sp,
-    #                   otherwise SP=1. Master selection and KV placement stay unchanged.
+    # "long_short": prompt_len > dynamic_sp_long_request_threshold -> SP=dynamic_sp_long_request_size,
+    #               otherwise SP=1. Master selection and KV placement stay unchanged.
+    # "long_short_sp8": backward-compatible alias of "long_short".
     # "bucket": choose CP size directly from a configured seq-len bucket policy.
-    dynamic_sp_size_strategy: Literal["legacy", "long_short_sp8", "bucket"] = "legacy"
+    dynamic_sp_size_strategy: Literal[
+        "legacy", "long_short", "long_short_sp8", "bucket"
+    ] = "legacy"
     dynamic_sp_long_request_threshold: int = 100000
+    dynamic_sp_long_request_size: int = 0
     enable_dynamic_sp_bucket_policy: bool = False
     dynamic_sp_bucket_policy: str = ""
     dynamic_sp_bucket_preset: Literal["none", "deepseek_v3"] = "none"
@@ -129,9 +133,18 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        if self.dynamic_sp_size_strategy not in {"legacy", "long_short_sp8", "bucket"}:
+        if self.dynamic_sp_size_strategy == "long_short_sp8":
+            self.dynamic_sp_size_strategy = "long_short"
+        if self.dynamic_sp_size_strategy not in {"legacy", "long_short", "bucket"}:
             raise ValueError(
-                "dynamic_sp_size_strategy must be one of: legacy, long_short_sp8, bucket"
+                "dynamic_sp_size_strategy must be one of: legacy, long_short, "
+                "long_short_sp8, bucket"
+            )
+        if self.dynamic_sp_long_request_size <= 0:
+            self.dynamic_sp_long_request_size = self.attention_sp
+        if not 1 <= self.dynamic_sp_long_request_size <= self.attention_sp:
+            raise ValueError(
+                "dynamic_sp_long_request_size must be in [1, attention_sp]"
             )
         if self.dynamic_sp_bucket_preset not in {"none", "deepseek_v3"}:
             raise ValueError(
@@ -159,7 +172,7 @@ class Config:
             raise ValueError(
                 "bucket policy is an independent scheduling strategy; use "
                 "dynamic_sp_size_strategy='bucket' instead of combining it with "
-                "legacy/long_short_sp8"
+                "legacy/long_short"
             )
         if self.dynamic_sp_size_strategy == "bucket":
             self.enable_dynamic_sp_bucket_policy = True

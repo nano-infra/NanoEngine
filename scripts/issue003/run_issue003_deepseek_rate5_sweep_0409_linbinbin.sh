@@ -24,6 +24,7 @@ ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="${USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER:-0}"
 DYNAMIC_SP_SIZE_STRATEGY="${DYNAMIC_SP_SIZE_STRATEGY:-legacy}"
 LONG_REQUEST_SP_THRESHOLD="${LONG_REQUEST_SP_THRESHOLD:-100000}"
+LONG_REQUEST_SP_SIZE="${LONG_REQUEST_SP_SIZE:-0}"
 SWEEP_STRATEGY="${SWEEP_STRATEGY:-dp4sp8}"
 SWEEP_ROUTING="${SWEEP_ROUTING:-LeastBatch}"
 
@@ -53,10 +54,10 @@ log() {
 
 ensure_headers() {
     if [[ ! -f "$SUMMARY_FILE" ]]; then
-        printf "strategy\trouting\trate\tn_reqs\tstatus\titl_avg_ms\titl_p99_ms\tqueue_avg_ms\tqueue_p99_ms\tdecode_queue_avg_ms\tdecode_queue_p99_ms\tlog_file\tjson_file\n" > "$SUMMARY_FILE"
+        printf "strategy\trouting\tpolicy\trate\tn_reqs\tstatus\titl_avg_ms\titl_p99_ms\tqueue_avg_ms\tqueue_p99_ms\tdecode_queue_avg_ms\tdecode_queue_p99_ms\tlog_file\tjson_file\n" > "$SUMMARY_FILE"
     fi
     if [[ ! -f "$STATE_FILE" ]]; then
-        printf "strategy\trouting\tmax_ok_rate\tfirst_over_rate\tstop_reason\n" > "$STATE_FILE"
+        printf "strategy\trouting\tpolicy\tmax_ok_rate\tfirst_over_rate\tstop_reason\n" > "$STATE_FILE"
     fi
 }
 
@@ -116,6 +117,35 @@ strategy_args() {
         dp32sp1) echo "--dp-size 32 --sp-size 1" ;;
         *) return 1 ;;
     esac
+}
+
+strategy_sp_size() {
+    case "$1" in
+        dp4sp8) echo "8" ;;
+        dp32sp1) echo "1" ;;
+        *) return 1 ;;
+    esac
+}
+
+policy_key_for_strategy() {
+    local strategy="$1"
+    local effective_long_request_sp_size="$LONG_REQUEST_SP_SIZE"
+
+    if [[ -z "$effective_long_request_sp_size" || "$effective_long_request_sp_size" == "0" ]]; then
+        effective_long_request_sp_size="$(strategy_sp_size "$strategy")"
+    fi
+
+    if [[ "$DYNAMIC_SP_SIZE_STRATEGY" == "long_short" || "$DYNAMIC_SP_SIZE_STRATEGY" == "long_short_sp8" ]]; then
+        echo "long_short_sp${effective_long_request_sp_size}_thr${LONG_REQUEST_SP_THRESHOLD}"
+        return
+    fi
+
+    if [[ "$DYNAMIC_SP_SIZE_STRATEGY" == "legacy" ]]; then
+        echo "legacy"
+        return
+    fi
+
+    echo "$DYNAMIC_SP_SIZE_STRATEGY"
 }
 
 find_latest_artifact_dir() {
@@ -194,19 +224,21 @@ clear_resume_result() {
 load_summary_ok_result() {
     local strategy="$1"
     local routing="$2"
-    local rate="$3"
+    local policy="$3"
+    local rate="$4"
     local row=""
     local _strategy=""
     local _routing=""
+    local _policy=""
     local _rate=""
     local _n_reqs=""
     local _status=""
 
     [[ -f "$SUMMARY_FILE" ]] || return 1
 
-    row="$(awk -F '\t' -v strategy="$strategy" -v routing="$routing" -v rate="$rate" '
+    row="$(awk -F '\t' -v strategy="$strategy" -v routing="$routing" -v policy="$policy" -v rate="$rate" '
         NR == 1 { next }
-        $1 == strategy && $2 == routing && ($3 + 0) == (rate + 0) && $5 == "ok" {
+        $1 == strategy && $2 == routing && $3 == policy && ($4 + 0) == (rate + 0) && $6 == "ok" {
             row = $0
         }
         END {
@@ -217,7 +249,7 @@ load_summary_ok_result() {
     ' "$SUMMARY_FILE")"
     [[ -n "${row:-}" ]] || return 1
 
-    IFS=$'\t' read -r _strategy _routing _rate _n_reqs _status \
+    IFS=$'\t' read -r _strategy _routing _policy _rate _n_reqs _status \
         RESUME_ITL_AVG RESUME_ITL_P99 RESUME_QUEUE_AVG RESUME_QUEUE_P99 \
         RESUME_DECODE_QUEUE_AVG RESUME_DECODE_QUEUE_P99 RESUME_LOG_FILE RESUME_JSON_FILE <<< "$row"
 
@@ -268,15 +300,16 @@ load_artifact_ok_result() {
 hydrate_existing_ok_result() {
     local strategy="$1"
     local routing="$2"
-    local rate="$3"
-    local n_reqs="$4"
+    local policy="$3"
+    local rate="$4"
+    local n_reqs="$5"
 
     clear_resume_result
     if [[ "$FORCE_RERUN" -ne 0 || "$RESUME_SKIP_SUCCESS" -eq 0 ]]; then
         return 1
     fi
 
-    if load_summary_ok_result "$strategy" "$routing" "$rate"; then
+    if load_summary_ok_result "$strategy" "$routing" "$policy" "$rate"; then
         return 0
     fi
 
@@ -289,12 +322,12 @@ hydrate_existing_ok_result() {
 }
 
 record_summary() {
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "$10" "${11}" "${12}" "${13}" >> "$SUMMARY_FILE"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" >> "$SUMMARY_FILE"
 }
 
 record_state() {
-    printf "%s\t%s\t%s\t%s\t%s\n" "$1" "$2" "$3" "$4" "$5" >> "$STATE_FILE"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$1" "$2" "$3" "$4" "$5" "$6" >> "$STATE_FILE"
 }
 
 run_one_attempt() {
@@ -321,6 +354,7 @@ run_one_attempt() {
     if [[ -n "${DYNAMIC_SP_SIZE_STRATEGY:-}" ]]; then
         sp_strategy_args+=(--dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY")
         sp_strategy_args+=(--long-request-sp-threshold "$LONG_REQUEST_SP_THRESHOLD")
+        sp_strategy_args+=(--long-request-sp-size "$LONG_REQUEST_SP_SIZE")
     fi
     # shellcheck disable=SC2086
     BASE_LOG_DIR="$BASE_LOG_DIR" bash "$START_BENCH_SH" \
@@ -354,13 +388,15 @@ sweep_one_setting() {
     local max_ok_rate="NA"
     local first_over_rate=""
     local stop_reason="max_rate_reached"
+    local policy_key=""
     local strat_prefix
     local routing_tag
 
     strat_prefix="$(strategy_prefix "$strategy")"
     routing_tag="$(routing_short "$routing")"
+    policy_key="$(policy_key_for_strategy "$strategy")"
 
-    log "===== START strategy=$strategy routing=$routing start=$rate step=$STEP_RATE max=$MAX_RATE ====="
+    log "===== START strategy=$strategy routing=$routing policy=$policy_key start=$rate step=$STEP_RATE max=$MAX_RATE ====="
 
     while should_continue_rate "$rate" "$STEP_RATE" "$MAX_RATE"; do
         local n_reqs
@@ -378,7 +414,7 @@ sweep_one_setting() {
 
         n_reqs="$(rate_to_nreqs "$rate")"
 
-        if hydrate_existing_ok_result "$strategy" "$routing" "$rate" "$n_reqs"; then
+        if hydrate_existing_ok_result "$strategy" "$routing" "$policy_key" "$rate" "$n_reqs"; then
             status="ok"
             itl_avg="$RESUME_ITL_AVG"
             itl_p99="$RESUME_ITL_P99"
@@ -388,10 +424,10 @@ sweep_one_setting() {
             decode_queue_p99="$RESUME_DECODE_QUEUE_P99"
             log_file="$RESUME_LOG_FILE"
             json_file="$RESUME_JSON_FILE"
-            log "SKIP strategy=$strategy routing=$routing rate=$rate reason=existing_ok_${RESUME_HIT_SOURCE} itl_avg=${itl_avg}ms"
+            log "SKIP strategy=$strategy routing=$routing policy=$policy_key rate=$rate reason=existing_ok_${RESUME_HIT_SOURCE} itl_avg=${itl_avg}ms"
         else
             while (( attempt <= MAX_RETRIES )); do
-                log "RUN strategy=$strategy routing=$routing rate=$rate n_reqs=$n_reqs attempt=$attempt/$MAX_RETRIES"
+                log "RUN strategy=$strategy routing=$routing policy=$policy_key rate=$rate n_reqs=$n_reqs attempt=$attempt/$MAX_RETRIES"
 
                 set +e
                 run_one_attempt "$strategy" "$routing" "$rate" "$n_reqs" >> "$OUT_LOG" 2>&1
@@ -418,30 +454,30 @@ sweep_one_setting() {
                     status="run_failed"
                 fi
 
-                log "WARN strategy=$strategy routing=$routing rate=$rate attempt=$attempt status=$status"
+                log "WARN strategy=$strategy routing=$routing policy=$policy_key rate=$rate attempt=$attempt status=$status"
                 attempt=$((attempt + 1))
                 sleep 10
             done
         fi
 
         if [[ "$status" != "ok" ]]; then
-            record_summary "$strategy" "$routing" "$rate" "$n_reqs" "$status" "" "" "" "" "" "" "${log_file:-}" "${json_file:-}"
-            record_state "$strategy" "$routing" "$max_ok_rate" "$first_over_rate" "${status}_at_${rate}"
-            log "ERROR strategy=$strategy routing=$routing rate=$rate final_status=$status"
+            record_summary "$strategy" "$routing" "$policy_key" "$rate" "$n_reqs" "$status" "" "" "" "" "" "" "${log_file:-}" "${json_file:-}"
+            record_state "$strategy" "$routing" "$policy_key" "$max_ok_rate" "$first_over_rate" "${status}_at_${rate}"
+            log "ERROR strategy=$strategy routing=$routing policy=$policy_key rate=$rate final_status=$status"
             return 1
         fi
 
         if [[ -z "${RESUME_HIT_SOURCE:-}" || "$RESUME_HIT_SOURCE" == "artifact" ]]; then
-            record_summary "$strategy" "$routing" "$rate" "$n_reqs" "ok" "$itl_avg" "${itl_p99:-}" "${queue_avg:-}" "${queue_p99:-}" "${decode_queue_avg:-}" "${decode_queue_p99:-}" "$log_file" "${json_file:-}"
+            record_summary "$strategy" "$routing" "$policy_key" "$rate" "$n_reqs" "ok" "$itl_avg" "${itl_p99:-}" "${queue_avg:-}" "${queue_p99:-}" "${decode_queue_avg:-}" "${decode_queue_p99:-}" "$log_file" "${json_file:-}"
         fi
         if [[ -z "${RESUME_HIT_SOURCE:-}" ]]; then
-            log "RESULT strategy=$strategy routing=$routing rate=$rate itl_avg=${itl_avg}ms itl_p99=${itl_p99}ms queue_avg=${queue_avg}ms queue_p99=${queue_p99}ms decode_queue_avg=${decode_queue_avg}ms decode_queue_p99=${decode_queue_p99}ms"
+            log "RESULT strategy=$strategy routing=$routing policy=$policy_key rate=$rate itl_avg=${itl_avg}ms itl_p99=${itl_p99}ms queue_avg=${queue_avg}ms queue_p99=${queue_p99}ms decode_queue_avg=${decode_queue_avg}ms decode_queue_p99=${decode_queue_p99}ms"
         fi
 
         if awk -v itl_avg="$itl_avg" -v stop_ms="$STOP_THRESHOLD_MS" "BEGIN {exit !(itl_avg > stop_ms)}"; then
             first_over_rate="$rate"
             stop_reason="itl_avg_gt_${STOP_THRESHOLD_MS}_at_${rate}"
-            log "STOP strategy=$strategy routing=$routing because itl_avg=${itl_avg}ms > ${STOP_THRESHOLD_MS}ms"
+            log "STOP strategy=$strategy routing=$routing policy=$policy_key because itl_avg=${itl_avg}ms > ${STOP_THRESHOLD_MS}ms"
             break
         fi
 
@@ -450,8 +486,8 @@ sweep_one_setting() {
         sleep "$SLEEP_BETWEEN_RUNS"
     done
 
-    record_state "$strategy" "$routing" "$max_ok_rate" "$first_over_rate" "$stop_reason"
-    log "===== DONE strategy=$strategy routing=$routing max_ok=$max_ok_rate first_over=${first_over_rate:-none} reason=$stop_reason ====="
+    record_state "$strategy" "$routing" "$policy_key" "$max_ok_rate" "$first_over_rate" "$stop_reason"
+    log "===== DONE strategy=$strategy routing=$routing policy=$policy_key max_ok=$max_ok_rate first_over=${first_over_rate:-none} reason=$stop_reason ====="
 }
 
 main() {
