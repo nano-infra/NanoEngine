@@ -743,7 +743,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 g.unsqueeze(0),
                 beta.unsqueeze(0),
                 scale=scale,
-                initial_state=initial_state,
+                initial_state=initial_state.to(q.dtype) if initial_state is not None else None,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 state_v_first=True,
