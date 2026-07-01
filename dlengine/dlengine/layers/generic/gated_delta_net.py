@@ -136,8 +136,8 @@ class RMSNormGated(nn.Module):
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
         x = self.weight * x.to(input_dtype)
-        x = x * F.silu(gate.to(torch.float32))
-        return x.to(input_dtype)
+        x = x * F.silu(gate.to(torch.float32)).to(input_dtype)
+        return x
 
 
 class GenericGatedDeltaNet(GatedDeltaNetBase):
