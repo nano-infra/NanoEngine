@@ -1,4 +1,3 @@
-import socket
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -6,17 +5,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from dlengine.context_v2 import BaseContext, ContextManagerMixin
-
-
-def get_local_ip() -> str:
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.connect(("8.8.8.8", 80))
-        local_ip = sock.getsockname()[0]
-        sock.close()
-        return local_ip
-    except Exception as exc:
-        return f"Fail to get local ip: {str(exc)}"
+from dlengine.utils.network import get_local_ip
 
 
 @dataclass
@@ -254,6 +243,7 @@ class DistContext(ContextManagerMixin, BaseContext):
     @property
     def local_rank(self) -> int:
         import os
+
         return int(os.environ.get("LOCAL_RANK", str(self.rank % 8)))
 
     @property

@@ -15,6 +15,7 @@ from dlengine.layers import get_backend
 from dlengine.layers.base_backend import GatedDeltaNetBase, ReplicatedLinearBase
 from dlengine.logging import get_logger
 from dlengine.models.quant_config import QuantizationConfig
+from dlengine.utils.cuda import is_hopper
 
 logger = get_logger()
 
@@ -217,21 +218,10 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         self.norm = RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
 
         # Kernel availability
-        self._has_flashinfer = _HAS_FLASHINFER_GDN and self._supports_flashinfer_gdn()
-        self._has_fla = (not self._is_hopper()) and _HAS_FLA_GDN
+        is_hopper_gpu = is_hopper()
+        self._has_flashinfer = _HAS_FLASHINFER_GDN and is_hopper_gpu
+        self._has_fla = (not is_hopper_gpu) and _HAS_FLA_GDN
         self._conv1d_prefill_padded_ws: torch.Tensor | None = None
-
-    @staticmethod
-    def _is_hopper() -> bool:
-        if not torch.cuda.is_available():
-            return False
-        arch_major, _ = torch.cuda.get_device_capability()
-        return arch_major == 9
-
-    @staticmethod
-    def _supports_flashinfer_gdn() -> bool:
-        """Use FlashInfer GDN only on Hopper; prefer FLA for other GPUs."""
-        return GenericGatedDeltaNet._is_hopper()
 
     def _get_conv1d_prefill_padded_workspace(
         self,

@@ -1,19 +1,9 @@
-import socket
 from dataclasses import dataclass
 
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
-
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        return local_ip
-    except Exception as e:
-        return f"Fail to get local ip：{str(e)}"
+from dlengine.utils.network import get_local_ip
 
 
 @dataclass
