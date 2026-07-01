@@ -30,7 +30,10 @@ class GDNContext(BaseContext):
         self.gdn_max_active_slots = 0
 
     def reset_context(self) -> None:
-        self.clear_context()
+        # GDN state buffers are persistent cache-backed runtime state, like a
+        # KV cache. They must survive per-step runtime-context resets so the
+        # decode step can continue from the recurrent state written by prefill.
+        pass
 
 
 _GDN_CONTEXT = GDNContext()
@@ -41,8 +44,7 @@ def get_gdn_context() -> GDNContext:
 
 
 def reset_gdn_context() -> None:
-    global _GDN_CONTEXT
-    _GDN_CONTEXT = GDNContext()
+    _GDN_CONTEXT.reset_context()
 
 
 def initialize_gdn_cache_state(context) -> None:

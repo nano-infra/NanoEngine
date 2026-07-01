@@ -31,6 +31,7 @@ from dlengine.models.deepseek_v2.deepseek_v2 import DeepseekV2ForCausalLM
 from dlengine.models.deepseek_v2.deepseek_v2_mtp import DeepSeekMTP
 from dlengine.models.deepseek_v4.deepseek_v4 import DeepseekV4ForCausalLM
 from dlengine.models.qwen3.qwen3 import Qwen3ForCausalLM
+from dlengine.models.qwen3_5.qwen3_5 import Qwen3_5ForConditionalGeneration
 from dlengine.models.qwen3_5_moe.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from dlengine.models.qwen3_5_moe.qwen3_5_moe_mtp import Qwen3_5MTP
 from dlengine.models.qwen3_moe.qwen3_moe import Qwen3MoeForCausalLM
@@ -171,6 +172,7 @@ logger = get_logger("DLENGINE")
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
+    "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGeneration,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
     "DeepseekV32ForCausalLM": DeepseekV2ForCausalLM,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,

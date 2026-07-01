@@ -87,6 +87,17 @@ except ImportError:
         "flashinfer GDN kernels not available. GatedDeltaNet will use naive fallback."
     )
 
+# Try to import flash-linear-attention GDN kernels (preferred for non-Hopper).
+try:
+    from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
+        fused_recurrent_gated_delta_rule as fla_fused_recurrent_gated_delta_rule,
+    )
+
+    _HAS_FLA_GDN = True
+except ImportError:
+    _HAS_FLA_GDN = False
+
 # Try to import causal_conv1d for optimized depthwise conv
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -124,8 +135,8 @@ class RMSNormGated(nn.Module):
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
         x = self.weight * x.to(input_dtype)
-        x = x * F.silu(gate.to(input_dtype))
-        return x
+        x = x * F.silu(gate.to(torch.float32))
+        return x.to(input_dtype)
 
 
 class GenericGatedDeltaNet(GatedDeltaNetBase):
@@ -206,8 +217,21 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         self.norm = RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
 
         # Kernel availability
-        self._has_flashinfer = _HAS_FLASHINFER_GDN
+        self._has_flashinfer = _HAS_FLASHINFER_GDN and self._supports_flashinfer_gdn()
+        self._has_fla = (not self._is_hopper()) and _HAS_FLA_GDN
         self._conv1d_prefill_padded_ws: torch.Tensor | None = None
+
+    @staticmethod
+    def _is_hopper() -> bool:
+        if not torch.cuda.is_available():
+            return False
+        arch_major, _ = torch.cuda.get_device_capability()
+        return arch_major == 9
+
+    @staticmethod
+    def _supports_flashinfer_gdn() -> bool:
+        """Use FlashInfer GDN only on Hopper; prefer FLA for other GPUs."""
+        return GenericGatedDeltaNet._is_hopper()
 
     def _get_conv1d_prefill_padded_workspace(
         self,
@@ -721,6 +745,21 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 output_final_state=True,
                 cu_seqlens=cu_seqlens,
             )
+        elif self._has_fla:
+            o, final_state = fla_chunk_gated_delta_rule(
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                g.unsqueeze(0),
+                beta.unsqueeze(0),
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                state_v_first=True,
+                cu_seqlens=cu_seqlens,
+            )
+            o = o.squeeze(0)
         else:
             o, final_state = self._naive_gdn_prefill(
                 q, k, v, g, beta, scale, cu_seqlens, initial_state
@@ -770,6 +809,35 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 initial_state_indices=indices,
             )
             o = o.squeeze(1)
+        elif self._has_fla and gdn_recurrent_states is not None:
+            if gdn_state_slots is not None:
+                initial_state = gdn_recurrent_states[
+                    self.layer_idx, gdn_state_slots[:bs]
+                ]
+            else:
+                initial_state = gdn_recurrent_states[self.layer_idx, :bs]
+            beta = b.sigmoid()
+            A_exp = -self.A_log.float().exp()
+            g = A_exp * F.softplus(a.float() + self.dt_bias)
+            o, updated_state = fla_fused_recurrent_gated_delta_rule(
+                q.unsqueeze(1),
+                k.unsqueeze(1),
+                v.unsqueeze(1),
+                g=g.unsqueeze(1),
+                beta=beta.unsqueeze(1),
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                state_v_first=True,
+            )
+            o = o.squeeze(1)
+            if gdn_state_slots is not None:
+                gdn_recurrent_states[self.layer_idx, gdn_state_slots[:bs]] = (
+                    updated_state
+                )
+            else:
+                gdn_recurrent_states[self.layer_idx, :bs] = updated_state
         else:
             beta = b.sigmoid()
             A_exp = -self.A_log.float().exp()
@@ -784,7 +852,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                     initial_state = gdn_recurrent_states[self.layer_idx, :bs]
             else:
                 initial_state = q.new_zeros(
-                    bs, self.num_v_heads, self.head_k_dim, self.head_v_dim
+                    bs, self.num_v_heads, self.head_v_dim, self.head_k_dim
                 )
 
             o, updated_state = self._naive_gdn_decode(

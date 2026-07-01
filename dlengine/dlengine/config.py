@@ -250,24 +250,32 @@ class Config(BaseModel):
                 raise
             with config_path.open() as f:
                 config_dict = json.load(f)
-            if config_dict.get("model_type") != "deepseek_v4":
+            if config_dict.get("model_type") == "qwen3_5":
+                text_config = config_dict.get("text_config")
+                self.hf_config = PretrainedConfig(**config_dict)
+                if isinstance(text_config, dict):
+                    self.hf_config.text_config = PretrainedConfig(**text_config)
+            elif config_dict.get("model_type") != "deepseek_v4":
                 raise
-            from dlengine.models.deepseek_v4.configuration_deepseek_v4 import (
-                DeepseekV4Config,
-            )
+            else:
+                from dlengine.models.deepseek_v4.configuration_deepseek_v4 import (
+                    DeepseekV4Config,
+                )
 
-            self.hf_config = DeepseekV4Config(**config_dict)
+                self.hf_config = DeepseekV4Config(**config_dict)
 
         # For VLM models with nested text_config (e.g. Qwen3.5-MoE),
         # flatten text_config attributes into hf_config for uniform access.
         if hasattr(self.hf_config, "text_config"):
             text_cfg = self.hf_config.text_config
-            for attr in dir(text_cfg):
-                if attr.startswith("_"):
-                    continue
+            if isinstance(text_cfg, dict):
+                text_items = text_cfg.items()
+            else:
+                text_items = vars(text_cfg).items()
+            for attr, value in text_items:
                 if not hasattr(self.hf_config, attr):
                     try:
-                        setattr(self.hf_config, attr, getattr(text_cfg, attr))
+                        setattr(self.hf_config, attr, value)
                     except Exception as e:
                         logger.warning(
                             f"Could not flatten attribute '{attr}' from text_config: {e}"
