@@ -58,6 +58,7 @@ void bind_sequence(py::module_& m)
         .def_readwrite("attention_dp", &BlockContext::attention_dp)
         .def_readwrite("num_kvcache_blocks", &BlockContext::num_kvcache_blocks)
         .def_readwrite("state_slot", &BlockContext::state_slot)
+        .def_readwrite("hisparse_slot", &BlockContext::hisparse_slot)
         .def_property(
             "block_location",
             [](BlockContext& self) -> std::vector<fbs::BlockLocation>& { return self.block_location; },

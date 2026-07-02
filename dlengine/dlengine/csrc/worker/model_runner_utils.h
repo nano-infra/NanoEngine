@@ -70,6 +70,7 @@ struct DecodeMetadata {
 struct BatchAuxData {
     std::vector<double> temperatures;          // per master-sp seq
     std::vector<int>    state_slots;           // per master-sp seq
+    std::vector<int>    hisparse_slots;        // per master-sp seq
     std::vector<int>    master_group_indices;  // per all seqs
     int                 num_group_seqs = 0;    // count where master_group == group_rank
     // Per master-sp seq: whether to compute per-token logprobs at sample

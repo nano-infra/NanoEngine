@@ -19,6 +19,7 @@ import torch.distributed as dist
 from dlengine.context_v2.cache import (  # noqa: F401  # noqa: F401  # noqa: F401
     gqa as _gqa_backend,
     hca as _hca_backend,
+    hisparse as _hisparse_backend,
     mla as _mla_backend,
 )
 from dlengine.context_v2.cache._allocator import KVCacheAllocatorMixin
@@ -32,6 +33,7 @@ from dlengine.context_v2.cache.csa import get_csa_context
 from dlengine.context_v2.cache.gdn import get_gdn_context, initialize_gdn_cache_state
 from dlengine.context_v2.cache.gqa import get_gqa_context
 from dlengine.context_v2.cache.hca import get_hca_context
+from dlengine.context_v2.cache.hisparse import get_hisparse_context
 from dlengine.context_v2.cache.indexer import (
     get_indexer_block_bytes,
     get_indexer_context,

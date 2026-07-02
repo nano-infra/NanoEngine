@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 from dlengine.context_v2.batch import Context, get_batch_context, set_batch_context
 from dlengine.context_v2.cache.hca import get_hca_context
+from dlengine.context_v2.cache.hisparse import get_hisparse_context
 from dlengine.context_v2.cache.mla import get_mla_context
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.context_v2.expert import ExpertContext, set_expert_context
@@ -51,6 +52,7 @@ class DecodeGraphRunner:
         self._context_lens = torch.zeros(1, max_bs, dtype=torch.int32)
         self._block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
         self._outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        self._hisparse_slots = torch.full((max_bs,), max_bs, dtype=torch.int64)
 
         # MLA-specific: per-BS FlashMLASchedMeta created during capture
         if is_mla or is_dsv4:
@@ -150,6 +152,10 @@ class DecodeGraphRunner:
                 # deep_gemm MQA-logits and topk operate on valid data.
                 self._context_lens[:, :master_bs] = 1
 
+            hisparse_ctx = get_hisparse_context()
+            if hisparse_ctx.num_real_reqs is not None:
+                hisparse_ctx.num_real_reqs.fill_(master_bs)
+
             set_batch_context(
                 is_prefill=False,
                 max_bs=self._max_num_seqs,
@@ -175,6 +181,9 @@ class DecodeGraphRunner:
                     if self._dsv4_compressed_block_tables
                     else None
                 ),
+                hisparse_slots=self._hisparse_slots[:master_bs],
+                hisparse_slot_mapping=self._slot_mapping[:master_bs],
+                hisparse_num_real_reqs=get_hisparse_context().num_real_reqs,
             )
             get_hca_context().tile_scheduler_metadata = sched_meta
             get_mla_context().sparse_tile_scheduler_metadata = sparse_sched_meta
@@ -247,6 +256,12 @@ class DecodeGraphRunner:
         self._positions[:bs] = positions
         self._slot_mapping.fill_(-1)
         self._slot_mapping[:bs] = context.slot_mapping
+        self._hisparse_slots.fill_(self._max_num_seqs)
+        if context.hisparse_slots is not None:
+            self._hisparse_slots[:bs].copy_(context.hisparse_slots[:bs])
+        hisparse_ctx = get_hisparse_context()
+        if hisparse_ctx.num_real_reqs is not None:
+            hisparse_ctx.num_real_reqs.fill_(bs)
         self._context_lens.zero_()
         self._context_lens[:, : context.context_lens.shape[1]].copy_(
             context.context_lens

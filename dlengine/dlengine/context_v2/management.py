@@ -6,6 +6,7 @@ from dlengine.context_v2.cache.emb import reset_embedding_pool
 from dlengine.context_v2.cache.gdn import reset_gdn_context
 from dlengine.context_v2.cache.gqa import reset_gqa_context
 from dlengine.context_v2.cache.hca import reset_hca_context
+from dlengine.context_v2.cache.hisparse import reset_hisparse_context
 from dlengine.context_v2.cache.indexer import reset_indexer_context
 from dlengine.context_v2.cache.mla import reset_mla_context
 from dlengine.context_v2.expert import reset_expert_context
@@ -23,6 +24,7 @@ class ContextManagement:
         reset_csa_context()
         reset_gdn_context()
         reset_indexer_context()
+        reset_hisparse_context()
         reset_embedding_pool()
         reset_p2p_cache_transfer()
         reset_expert_context()

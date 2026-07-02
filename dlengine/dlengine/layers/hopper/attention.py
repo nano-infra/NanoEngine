@@ -329,10 +329,11 @@ class FlashMLAImpl:
 
         context = get_batch_context()
         if k_cache.numel() and not get_batch_context().is_dummy:
+            slot_mapping = context.hisparse_slot_mapping if context.hisparse_slot_mapping is not None else context.slot_mapping
             if k_cache.dtype == torch.float8_e4m3fn:
-                store_kcache_fp8(k, k_cache, context.slot_mapping)
+                store_kcache_fp8(k, k_cache, slot_mapping)
             else:
-                store_kcache(k, k_cache, context.slot_mapping)
+                store_kcache(k, k_cache, slot_mapping)
 
         if context.is_prefill:
             # NOTE: MLA prefill is handled directly in DeepseekV2Attention.forward

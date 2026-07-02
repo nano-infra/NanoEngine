@@ -44,6 +44,7 @@ GroupManager::GroupManager(const std::string& engine_id,
                            int                max_num_seqs,
                            int                max_num_batched_tokens):
     gdn_state_manager_(engine_id, 0, max_num_seqs),
+    hisparse_slot_manager_(engine_id, 0, max_num_seqs),
     engine_id_(engine_id),
     group_size_(group_size),
     max_num_seqs_(max_num_seqs),
@@ -56,7 +57,6 @@ GroupManager::GroupManager(const std::string& engine_id,
     for (int i = 0; i < group_size; ++i) {
         block_manager[i] = std::make_shared<BlockManager>(engine_id, i, num_kvcache_blocks, kvcache_block_size);
     }
-
     initialize_dummy_seqs();
 }
 
@@ -115,6 +115,9 @@ bool GroupManager::can_allocate(Sequence&                           seq,
                                 const std::unordered_map<int, int>& num_seqs,
                                 const std::unordered_map<int, int>& num_batched_tokens)
 {
+    if (seq.block_ctx(BlockContextSlot::ACTIVE).hisparse_slot < 0 && !hisparse_slot_manager_.can_allocate()) {
+        return false;
+    }
     // Step 1: Determine min required ranks (Initial SP Size)
     int num_tokens           = seq.num_tokens();
     int num_segments         = (num_tokens + segment_size - 1) / segment_size;
@@ -370,6 +373,7 @@ std::optional<AllocResult> GroupManager::try_allocate(Sequence&                 
     return AllocResult{chunk_end, new_tokens};
 }
 
+
 void GroupManager::allocate(Sequence& seq)
 {
     auto& block_ctx       = seq.block_ctx(BlockContextSlot::ACTIVE);
@@ -390,6 +394,8 @@ void GroupManager::allocate(Sequence& seq)
         }
     }
     block_manager[master_group_id]->allocate(seq, get_hint(master_group_id));
+
+    hisparse_slot_manager_.allocate(seq);
 
     // Assign a GDN state slot (index into conv/recurrent state buffers).
     // state_manager_ is a free-list over [0, max_num_seqs_); slot max_num_seqs_
@@ -434,6 +440,8 @@ void GroupManager::deallocate(Sequence& seq, BlockContextSlot slot)
     for (int group_id = 0; group_id < group_size_; ++group_id) {
         block_manager[group_id]->deallocate(seq, slot);
     }
+
+    hisparse_slot_manager_.deallocate(seq, slot);
 
     // Free the GDN state slot so it can be reused by future sequences.
     gdn_state_manager_.deallocate(seq, slot);
