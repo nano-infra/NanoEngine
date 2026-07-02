@@ -14,6 +14,7 @@ from dlengine.config import Config
 from dlengine.context_v2.batch import get_batch_context
 from dlengine.context_v2.batch_out import get_batch_out_context
 from dlengine.context_v2.cache import CacheContext, get_cache_context, set_cache_context
+from dlengine.context_v2.cache.hisparse import initialize_hisparse_context
 from dlengine.context_v2.cache.plan import CachePlan, gqa_cache_plan
 from dlengine.context_v2.distributed import get_dist_context, set_dist_context
 from dlengine.context_v2.expert import ExpertContext
@@ -212,6 +213,13 @@ class ModelRunner:
             "enable_mla_reference_fallback",
             enable_mla_reference_fallback,
         )
+        for attr in (
+            "enable_hisparse",
+            "hisparse_device_buffer_size",
+            "hisparse_host_to_device_ratio",
+            "hisparse_swap_in_block_size",
+        ):
+            setattr(hf_config, attr, getattr(config, attr, None))
         self.enforce_eager = config.enforce_eager
         if (
             enable_mla_reference_fallback
@@ -536,6 +544,25 @@ class ModelRunner:
             for module in self.model.modules():
                 if hasattr(module, "indexer") and module.indexer is not None:
                     module.indexer.indexer_cache = cache_context.indexer_cache
+
+        if self.cache_plan.has("hisparse"):
+            initialize_hisparse_context(
+                self.config.max_num_seqs,
+                cache_context.device,
+                self.config.hisparse_device_buffer_size,
+            )
+            if not self.config.dummy_prefill:
+                raise RuntimeError("HiSparse Phase 1 requires dummy_prefill=True")
+            with torch.no_grad():
+                cache_context.kv_cache.zero_()
+                if cache_context.indexer_cache is not None:
+                    cache_context.indexer_cache.buffer.zero_()
+            logger.info(
+                "HiSparse Phase 1 initialized: dummy-prefill deterministic zero "
+                "KV/indexer cache, device_buffer_size=%s, swap_in_block_size=%s",
+                self.config.hisparse_device_buffer_size,
+                self.config.hisparse_swap_in_block_size,
+            )
 
         # Register memory regions after KV/indexer tensors exist. The PeerAgent
         # itself is started during preallocate_kvcache().
@@ -928,6 +955,8 @@ class ModelRunner:
                 mla_head_dim,
             )
             is_fp8_kvcache = False
+        if cache_plan.has("hisparse") and not is_fp8_kvcache:
+            raise RuntimeError("HiSparse requires FP8 MLA KV cache")
 
         head_dim = getattr(hf_config, "head_dim", None) or (
             hf_config.hidden_size // hf_config.num_attention_heads

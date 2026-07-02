@@ -129,6 +129,10 @@ class Config(BaseModel):
 
     # NSA sparse attention (V3.2) — enabled by default for models with index_head_dim > 0
     disable_nsa: bool = False
+    enable_hisparse: bool = False
+    hisparse_device_buffer_size: int = 4096
+    hisparse_host_to_device_ratio: int = 2
+    hisparse_swap_in_block_size: int = 960
 
     # Correctness-only fallback for MLA shapes that current FlashMLA wheels do
     # not instantiate (for example 256/256). Disabled by default because it
@@ -362,6 +366,48 @@ class Config(BaseModel):
 
         # With chunked prefill, max_num_batched_tokens may be smaller than max_model_len.
         assert self.max_num_batched_tokens >= 1
+
+        # HiSparse Phase 1 guard. This first implementation is decode-only
+        # and intentionally requires dummy_prefill so it cannot be accidentally
+        # used as a production sparse/offload path before real cache migration
+        # is wired in.
+        if self.enable_hisparse:
+            arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
+            if arch != "DeepseekV32ForCausalLM":
+                raise ValueError(
+                    "enable_hisparse Phase 1 only supports DeepseekV32ForCausalLM; "
+                    f"got {arch!r}"
+                )
+            if self.mode != "decode":
+                raise ValueError(
+                    f"enable_hisparse Phase 1 requires mode='decode'; got {self.mode!r}"
+                )
+            if not self.dummy_prefill:
+                raise ValueError(
+                    "enable_hisparse Phase 1 requires dummy_prefill=True "
+                    "to keep it out of production traffic."
+                )
+            if self.attention_sp != 1:
+                raise ValueError(
+                    "enable_hisparse Phase 1 rejects attention_sp > 1 until "
+                    "per-rank block-table and slot semantics are validated."
+                )
+            if self.attention_tp != 1:
+                raise ValueError("enable_hisparse requires attention_tp == 1")
+            if self.num_speculative_tokens != 0:
+                raise ValueError("enable_hisparse Phase 1 does not support MTP")
+            if self.disable_nsa:
+                raise ValueError("enable_hisparse requires NSA/indexer to be enabled")
+            if getattr(self.hf_config, "index_head_dim", 0) <= 0:
+                raise ValueError("enable_hisparse requires DSV3.2 index_head_dim > 0")
+            if getattr(self.hf_config, "index_topk", 0) <= 0:
+                raise ValueError("enable_hisparse requires DSV3.2 index_topk > 0")
+            if self.hisparse_device_buffer_size <= 0:
+                raise ValueError("hisparse_device_buffer_size must be positive")
+            if self.hisparse_host_to_device_ratio < 1:
+                raise ValueError("hisparse_host_to_device_ratio must be >= 1")
+            if self.hisparse_swap_in_block_size <= 0:
+                raise ValueError("hisparse_swap_in_block_size must be positive")
 
         # MTP validation
         if self.num_speculative_tokens > 0:

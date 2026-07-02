@@ -518,6 +518,7 @@ BatchAuxData extract_aux_from_bytes(const uint8_t* data, size_t data_len, int gr
         if (m_group == group_rank) {
             aux.temperatures.push_back(si->temperature());
             aux.state_slots.push_back(si->state_slot());
+            aux.hisparse_slots.push_back(si->hisparse_slot());
             const bool want_lp = si->return_completion_logprobs();
             aux.return_completion_logprobs.push_back(want_lp);
             aux.any_return_completion_logprobs |= want_lp;

@@ -31,6 +31,7 @@ void reset_block_context(
 
     ctx.num_kvcache_blocks = num_kvcache_blocks;
     ctx.state_slot         = -1;
+    ctx.hisparse_slot      = -1;
 
     // Initialize group_block_table and num_dispatched_tokens
     ctx.group_block_table.clear();
@@ -84,6 +85,7 @@ Sequence::Sequence(const std::vector<int>& token_ids, const SamplingParams& samp
         ctx->attention_dp       = 0;
         ctx->num_kvcache_blocks = 0;
         ctx->state_slot         = -1;
+        ctx->hisparse_slot      = -1;
         ctx->block_location.clear();
         ctx->num_dispatched_tokens.clear();
         ctx->group_block_table.clear();
@@ -112,6 +114,7 @@ std::shared_ptr<Sequence> Sequence::from_data(std::unique_ptr<SequenceT> data)
             ctx->attention_dp       = 0;
             ctx->num_kvcache_blocks = 0;
             ctx->state_slot         = -1;
+            ctx->hisparse_slot      = -1;
             ctx->block_location.clear();
             ctx->num_dispatched_tokens.clear();
             ctx->group_block_table.clear();

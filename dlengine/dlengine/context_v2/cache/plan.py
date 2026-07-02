@@ -22,9 +22,15 @@ def qwen35_cache_plan() -> CachePlan:
     return CachePlan(primary="gqa", components=("gqa", "gdn"))
 
 
-def deepseek_mla_cache_plan(*, use_indexer: bool = False) -> CachePlan:
-    components = ("mla", "indexer") if use_indexer else ("mla",)
-    return CachePlan(primary="mla", components=components)
+def deepseek_mla_cache_plan(
+    *, use_indexer: bool = False, use_hisparse: bool = False
+) -> CachePlan:
+    components = ["mla"]
+    if use_indexer:
+        components.append("indexer")
+    if use_hisparse:
+        components.append("hisparse")
+    return CachePlan(primary="mla", components=tuple(components))
 
 
 def deepseek_v4_cache_plan() -> CachePlan:

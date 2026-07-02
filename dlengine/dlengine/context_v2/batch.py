@@ -29,6 +29,9 @@ class BatchContext(BaseContext):
     gdn_state_slots: torch.Tensor | None = None
     dsv4_state_slots: torch.Tensor | None = None
     dsv4_compressed_block_tables: dict[int, torch.Tensor] | None = None
+    hisparse_slots: torch.Tensor | None = None
+    hisparse_slot_mapping: torch.Tensor | None = None
+    hisparse_num_real_reqs: torch.Tensor | None = None
 
     @classmethod
     def get_context_type(cls) -> str:
@@ -71,6 +74,9 @@ def set_batch_context(
     gdn_state_slots: Optional[torch.Tensor] = None,
     dsv4_state_slots: Optional[torch.Tensor] = None,
     dsv4_compressed_block_tables: Optional[dict[int, torch.Tensor]] = None,
+    hisparse_slots: Optional[torch.Tensor] = None,
+    hisparse_slot_mapping: Optional[torch.Tensor] = None,
+    hisparse_num_real_reqs: Optional[torch.Tensor] = None,
     num_tokens_per_seq: int = 1,
     sampling_token_indices: Optional[torch.Tensor] = None,
     sampling_seq_indices: Optional[torch.Tensor] = None,
@@ -95,6 +101,9 @@ def set_batch_context(
         gdn_state_slots=gdn_state_slots,
         dsv4_state_slots=dsv4_state_slots,
         dsv4_compressed_block_tables=dsv4_compressed_block_tables,
+        hisparse_slots=hisparse_slots,
+        hisparse_slot_mapping=hisparse_slot_mapping,
+        hisparse_num_real_reqs=hisparse_num_real_reqs,
     )
     return _CONTEXT
 

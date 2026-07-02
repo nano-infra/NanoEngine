@@ -8,6 +8,7 @@ from dlengine.config import Config
 from dlengine.context_v2.batch import get_batch_context, set_batch_context
 from dlengine.context_v2.cache import get_cache_context
 from dlengine.context_v2.cache.hca import get_hca_context
+from dlengine.context_v2.cache.hisparse import get_hisparse_context
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.logging import get_logger
 
@@ -283,6 +284,24 @@ class InputPreparer:
             if built:
                 dsv4_compressed_block_tables = built
 
+        hisparse_slots = None
+        hisparse_slot_mapping = None
+        hisparse_num_real_reqs = None
+        if getattr(self.config, "enable_hisparse", False):
+            hisparse_ctx = get_hisparse_context()
+            dummy_slot = self.config.max_num_seqs
+            raw_slots = list(getattr(aux, "hisparse_slots", []))[: aux.num_group_seqs]
+            raw_slots.extend([dummy_slot] * max(0, aux.num_group_seqs - len(raw_slots)))
+            hisparse_slots = torch.tensor(
+                [s if 0 <= s < dummy_slot else dummy_slot for s in raw_slots],
+                dtype=torch.int64,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            hisparse_slot_mapping = slot_mapping
+            hisparse_num_real_reqs = hisparse_ctx.num_real_reqs
+            if hisparse_num_real_reqs is not None:
+                hisparse_num_real_reqs.fill_(aux.num_group_seqs)
+
         set_batch_context(
             is_prefill=False,
             max_bs=self.config.max_num_seqs,
@@ -295,6 +314,9 @@ class InputPreparer:
             gdn_state_slots=gdn_state_slots,
             dsv4_state_slots=dsv4_state_slots,
             dsv4_compressed_block_tables=dsv4_compressed_block_tables,
+            hisparse_slots=hisparse_slots,
+            hisparse_slot_mapping=hisparse_slot_mapping,
+            hisparse_num_real_reqs=hisparse_num_real_reqs,
         )
         get_hca_context().tile_scheduler_metadata = new_tile_scheduler_metadata
 

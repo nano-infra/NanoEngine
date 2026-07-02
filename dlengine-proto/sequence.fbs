@@ -38,6 +38,7 @@ table BlockContext {
   group_block_table: [IntList];
   endpoints: [string];
   compressed_block_tables: [CompressedBlockTable];
+  hisparse_slot: int = -1;
 }
 
 table SamplingParams {

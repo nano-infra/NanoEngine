@@ -512,7 +512,8 @@ class DeepseekV2ForCausalLM(nn.Module):
 
     def get_cache_plan(self):
         return deepseek_mla_cache_plan(
-            use_indexer=getattr(self.config, "index_head_dim", 0) > 0
+            use_indexer=getattr(self.config, "index_head_dim", 0) > 0,
+            use_hisparse=getattr(self.config, "enable_hisparse", False),
         )
 
     def load_weights(self, weights):
@@ -1233,6 +1234,10 @@ class DeepseekV2Attention(nn.Module):
                 sparse_indices = topk_indices_to_physical(
                     topk_indices, bt_expanded, block_size
                 )
+                if getattr(self.config, "enable_hisparse", False):
+                    from dlengine.context_v2.cache.hisparse import remap_sparse_indices
+
+                    sparse_indices = remap_sparse_indices(sparse_indices)
 
             # value_states for MLA decode: same compressed latent (unused by FlashMLA decode)
             value_states = compressed_kv.unsqueeze(1)  # (q_len, 1, 512)

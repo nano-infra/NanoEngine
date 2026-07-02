@@ -44,6 +44,7 @@ table SequenceInput {
   // whether to compute and ship per-token logprobs at sample time.
   // Append-only — defaults to false on legacy buffers.
   return_completion_logprobs: bool = false;
+  hisparse_slot: int = -1;
 }
 
 table RunBatchInput {

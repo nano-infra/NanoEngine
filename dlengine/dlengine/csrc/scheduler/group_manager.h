@@ -10,6 +10,7 @@
 #include "dlengine/csrc/cache/block_manager.h"
 #include "dlengine/csrc/cache/compressed_block_manager.h"
 #include "dlengine/csrc/cache/gdn_state_manager.h"
+#include "dlengine/csrc/cache/hisparse_slot_manager.h"
 #include "dlengine/csrc/sequence/sequence.h"
 
 #include "session_state_cache.h"
@@ -214,6 +215,7 @@ public:
     }
 
     GDNStateManager gdn_state_manager_;
+    HiSparseSlotManager hisparse_slot_manager_;
 
     // DSv4: per-compression-ratio paged allocator for compressed KV cache.
     // Empty when the model has no compressed layers (Qwen3.5, V3, V3.2).

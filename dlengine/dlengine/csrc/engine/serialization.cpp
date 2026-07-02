@@ -96,6 +96,7 @@ flatbuffers::DetachedBuffer serialize_run_batch(const std::vector<Sequence*>& se
         si_builder.add_group_block_table(group_bt_vec);
         si_builder.add_num_dispatched_tokens(ndt_vec);
         si_builder.add_state_slot(ctx.state_slot);
+        si_builder.add_hisparse_slot(ctx.hisparse_slot);
 
         // temperature from sampling_params
         auto sp = seq->sampling_params();
