@@ -87,7 +87,8 @@ class PendingStep:
     total_waiting_migration: int
     sch_begin: float
     sch_end: float
-    handle: Optional[dict] = None  # executor run_async handle (None = migrate path)
+    # executor run_async handle (None = migrate path)
+    handle: Optional[dict] = None
     # Filled by step_finish():
     token_ids: Optional[list] = None
     post_sch_begin: float = 0.0
@@ -296,7 +297,7 @@ class LLMEngine:
 
         # Build dummy seq id set for filtering
         dummy_seq_ids = set()
-        for ws in self.scheduler.worker_state:
+        for ws in self.scheduler.group_manager:
             for d in ws.dummy_seqs:
                 dummy_seq_ids.add(d.seq_id)
 
@@ -319,7 +320,7 @@ class LLMEngine:
         # Actual number of in-flight sequences (admitted, not yet finished),
         # independent of whether this step is a prefill or a decode step. The
         # current step's batch (dp_seqs) is exposed separately as real_bs.
-        running_per_dp = [len(ws.running) for ws in self.scheduler.worker_state]
+        running_per_dp = [len(ws.running) for ws in self.scheduler.group_manager]
         total_running = sum(running_per_dp)
         total_waiting = len(self.scheduler.waiting)
         total_waiting_migration = len(self.scheduler.waiting_migration)
@@ -375,10 +376,10 @@ class LLMEngine:
                 # "group_res_matrix": group_res_matrix,
                 "free_blocks": [
                     [
-                        worker_state.block_manager[i].num_free_blocks
+                        group_manager.block_manager[i].num_free_blocks
                         for i in range(self.scheduler.group_size)
                     ]
-                    for worker_state in self.scheduler.worker_state
+                    for group_manager in self.scheduler.group_manager
                 ],
             }
         )
@@ -581,7 +582,7 @@ class LLMEngine:
             used_blocks_per_dp = [
                 blocks_per_dp
                 - sum(ws.block_manager[i].num_free_blocks for i in range(group_size))
-                for ws in self.scheduler.worker_state
+                for ws in self.scheduler.group_manager
             ]
         except Exception:  # noqa: BLE001
             blocks_per_dp = self.config.num_kvcache_blocks

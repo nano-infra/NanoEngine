@@ -42,9 +42,9 @@ Scheduler::Scheduler(const std::string& engine_id,
     mode_(mode)
 {
     // Initialize worker states for each DP rank
-    worker_state.reserve(attention_dp_);
+    group_manager.reserve(attention_dp_);
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-        worker_state.push_back(std::make_shared<GroupManager>(
+        group_manager.push_back(std::make_shared<GroupManager>(
             engine_id_, group_size_, num_kvcache_blocks, kvcache_block_size, max_num_seqs_, max_num_batched_tokens_));
     }
     // Initialize thread pool with attention_dp_ threads
@@ -53,21 +53,21 @@ Scheduler::Scheduler(const std::string& engine_id,
 
 void Scheduler::configure_compressed_pools(const std::vector<CompressedPoolConfig>& configs)
 {
-    for (auto& gm : worker_state) {
+    for (auto& gm : group_manager) {
         gm->configure_compressed_pools(configs);
     }
 }
 
 void Scheduler::set_prefix_caching_enabled(bool enabled)
 {
-    for (auto& gm : worker_state) {
+    for (auto& gm : group_manager) {
         gm->set_prefix_caching_enabled(enabled);
     }
 }
 
 void Scheduler::set_session_cache_slots(int capacity)
 {
-    for (auto& gm : worker_state) {
+    for (auto& gm : group_manager) {
         gm->set_session_cache_slots(capacity);
     }
 }
@@ -106,7 +106,7 @@ bool Scheduler::is_finished() const
     if (!prefilling.empty())
         return false;
 
-    for (const auto& ws : worker_state) {
+    for (const auto& ws : group_manager) {
         if (!ws->is_empty())
             return false;
     }
@@ -115,22 +115,22 @@ bool Scheduler::is_finished() const
 
 std::deque<std::shared_ptr<Sequence>>& Scheduler::running(int dp_idx)
 {
-    return worker_state[dp_idx]->running;
+    return group_manager[dp_idx]->running;
 }
 
 const std::deque<std::shared_ptr<Sequence>>& Scheduler::running(int dp_idx) const
 {
-    return worker_state[dp_idx]->running;
+    return group_manager[dp_idx]->running;
 }
 
 std::unordered_map<int, std::shared_ptr<BlockManager>>& Scheduler::block_manager(int dp_idx)
 {
-    return worker_state[dp_idx]->block_manager;
+    return group_manager[dp_idx]->block_manager;
 }
 
 const std::unordered_map<int, std::shared_ptr<BlockManager>>& Scheduler::block_manager(int dp_idx) const
 {
-    return worker_state[dp_idx]->block_manager;
+    return group_manager[dp_idx]->block_manager;
 }
 
 int Scheduler::next_dp_idx()
@@ -214,7 +214,7 @@ ScheduleResult Scheduler::schedule()
             int recv_count = 0;
             for (const auto& seq : dp_seqs[dp_idx]) {
                 bool is_dummy = false;
-                for (const auto& dummy : worker_state[dp_idx]->dummy_seqs) {
+                for (const auto& dummy : group_manager[dp_idx]->dummy_seqs) {
                     if (seq == dummy) {
                         is_dummy = true;
                         break;
@@ -249,7 +249,7 @@ ScheduleResult Scheduler::schedule()
 
         for (const auto& seq : dp_seqs[dp_idx]) {
             bool is_dummy = false;
-            for (const auto& dummy : worker_state[dp_idx]->dummy_seqs) {
+            for (const auto& dummy : group_manager[dp_idx]->dummy_seqs) {
                 if (seq == dummy) {
                     is_dummy = true;
                     break;
@@ -351,7 +351,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
         num_seqs[dp_idx][master_group] += 1;
         num_batched_tokens[dp_idx][master_group] += new_tokens;
 
-        worker_state[dp_idx]->running.push_back(seq);
+        group_manager[dp_idx]->running.push_back(seq);
         scheduled_seqs[dp_idx].push_back(seq);
     }
     // Put back budget-exhausted prefilling sequences at the front (preserve order)
@@ -372,7 +372,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
         bool all_full = true;
         for (int dp_idx = 0; dp_idx < attention_dp_ && all_full; ++dp_idx) {
             for (int group_id = 0; group_id < group_size_; ++group_id) {
-                int load = worker_state[dp_idx]->num_running_seqs_per_group(group_id) + num_seqs[dp_idx][group_id];
+                int load = group_manager[dp_idx]->num_running_seqs_per_group(group_id) + num_seqs[dp_idx][group_id];
                 if (load < max_num_seqs_) {
                     all_full = false;
                     break;
@@ -387,10 +387,10 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
     // Routing is delegated to a strategy object (see router.h). The router
     // produces an ordered list of candidate DP ranks per sequence; we try them
     // in order and admit on the first that allocates. Load-order rankings are
-    // recomputed from live worker_state counters, which try_allocate updates,
+    // recomputed from live group_manager counters, which try_allocate updates,
     // so successive sequences in this pass see up-to-date loads.
     Router&      router = ensure_router();
-    RouteContext ctx{worker_state, attention_dp_};
+    RouteContext ctx{group_manager, attention_dp_};
 
     while (!waiting_queue.empty()) {
         auto seq        = waiting_queue.front();
@@ -398,7 +398,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
         auto candidates = router.rank_candidates(*seq, ctx);
 
         for (int selected_dp_idx : candidates) {
-            auto result = worker_state[selected_dp_idx]->try_allocate(
+            auto result = group_manager[selected_dp_idx]->try_allocate(
                 *seq, num_seqs[selected_dp_idx], num_batched_tokens[selected_dp_idx]);
             if (!result)
                 continue;
@@ -412,7 +412,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
             seq->set_status(SequenceStatus::RUNNING);
             waiting_queue.pop_front();
-            worker_state[selected_dp_idx]->running.push_back(seq);
+            group_manager[selected_dp_idx]->running.push_back(seq);
             scheduled_seqs[selected_dp_idx].push_back(seq);
 
             router.on_placed(*seq, selected_dp_idx);
@@ -439,7 +439,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
     std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled_seqs(attention_dp_);
 
     for (int selected_dp_idx = 0; selected_dp_idx < attention_dp_; ++selected_dp_idx) {
-        auto& running_queue = worker_state[selected_dp_idx]->running;
+        auto& running_queue = group_manager[selected_dp_idx]->running;
 
         std::unordered_map<int, int>          num_seqs;
         std::deque<std::shared_ptr<Sequence>> skipped;
@@ -458,7 +458,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
             }
 
             // Try to ensure we can append tokens
-            while (!worker_state[selected_dp_idx]->can_append(*seq, kv_reserve_tokens_)) {
+            while (!group_manager[selected_dp_idx]->can_append(*seq, kv_reserve_tokens_)) {
                 // Need to preempt to free up space
                 if (!running_queue.empty()) {
                     auto victim = running_queue.back();
@@ -481,7 +481,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
             if (seq) {
                 // Successfully ensured space for this sequence
                 num_seqs[master_rank] += 1;
-                if (!worker_state[selected_dp_idx]->may_append(*seq, kv_reserve_tokens_)) {
+                if (!group_manager[selected_dp_idx]->may_append(*seq, kv_reserve_tokens_)) {
                     // This should not happen if can_append is correct, but handle it gracefully
                     preempt(selected_dp_idx, seq);
                 }
@@ -503,7 +503,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
         // Add dummy sequences for SP ranks with no work
         for (int group_id = 0; group_id < group_size_; ++group_id) {
             if (group_lens[group_id] == 0) {
-                scheduled_seqs[selected_dp_idx].push_back(worker_state[selected_dp_idx]->dummy_seqs[group_id]);
+                scheduled_seqs[selected_dp_idx].push_back(group_manager[selected_dp_idx]->dummy_seqs[group_id]);
             }
         }
     }
@@ -515,7 +515,7 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
 {
     std::cerr << "Preemption happens for seq_id=" << seq->seq_id() << std::endl;
     seq->set_status(SequenceStatus::WAITING);
-    worker_state[dp_idx]->deallocate(*seq);
+    group_manager[dp_idx]->deallocate(*seq);
     // Record the full context length (prompt + any generated tokens) so that
     // re-prefill will rebuild KV for ALL tokens, not just the original prompt.
     // For PREFILLING sequences token_ids().size() == num_prompt_tokens(), so
@@ -654,7 +654,7 @@ Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_
 {
     const bool have_logprobs =
         !dp_group_token_logprobs.empty() && dp_group_token_logprobs.size() == dp_group_token_ids.size();
-    size_t num_dp    = worker_state.size();
+    size_t num_dp    = group_manager.size();
     size_t num_dp_sp = dp_group_seqs.size();
     if (num_dp == 0)
         return {};
@@ -709,7 +709,7 @@ Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_
 
         for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
             futures.push_back(thread_pool_->enqueue(postprocess_worker_func,
-                                                    worker_state[dp_idx],
+                                                    group_manager[dp_idx],
                                                     &contexts[dp_idx],
                                                     &contexts[dp_idx],
                                                     eos_ids_,
@@ -727,7 +727,7 @@ Scheduler::postprocess_sequences_impl(const std::vector<std::vector<std::shared_
 
         for (size_t dp_idx = 0; dp_idx < num_dp; ++dp_idx) {
             threads.emplace_back(postprocess_worker_func,
-                                 worker_state[dp_idx],
+                                 group_manager[dp_idx],
                                  &contexts[dp_idx],
                                  &contexts[dp_idx],
                                  eos_ids_,
@@ -786,7 +786,7 @@ void Scheduler::free_to_be_migrated(std::shared_ptr<Sequence> seq)
     // and empty block tables. Deallocating that would be a no-op, leaking all KV blocks.
     auto& original_seq    = it->second.first;
     int   selected_dp_idx = it->second.second;
-    worker_state[selected_dp_idx]->deallocate(*original_seq, BlockContextSlot::MIGRATE);
+    group_manager[selected_dp_idx]->deallocate(*original_seq, BlockContextSlot::MIGRATE);
     to_be_migrated.erase(it);
 }
 
@@ -809,12 +809,12 @@ bool Scheduler::abort(uint64_t seq_id)
     // FINISHED handling in postprocess_worker_func: mark FINISHED, deallocate
     // KV blocks, then drop from the running deque.
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-        auto& running = worker_state[dp_idx]->running;
+        auto& running = group_manager[dp_idx]->running;
         for (auto it = running.begin(); it != running.end(); ++it) {
             if ((*it)->seq_id() == seq_id) {
                 auto seq = *it;
                 seq->set_status(SequenceStatus::FINISHED);
-                worker_state[dp_idx]->deallocate(*seq);
+                group_manager[dp_idx]->deallocate(*seq);
                 running.erase(it);
                 return finish_abort();
             }
@@ -828,7 +828,7 @@ bool Scheduler::abort(uint64_t seq_id)
             int  dp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).dp_idx;
             seq->set_status(SequenceStatus::FINISHED);
             if (dp_idx >= 0 && dp_idx < attention_dp_) {
-                worker_state[dp_idx]->deallocate(*seq);
+                group_manager[dp_idx]->deallocate(*seq);
             }
             prefilling.erase(it);
             return finish_abort();
@@ -851,7 +851,7 @@ bool Scheduler::abort(uint64_t seq_id)
     if (mit != to_be_migrated.end()) {
         auto& original_seq    = mit->second.first;
         int   selected_dp_idx = mit->second.second;
-        worker_state[selected_dp_idx]->deallocate(*original_seq, BlockContextSlot::MIGRATE);
+        group_manager[selected_dp_idx]->deallocate(*original_seq, BlockContextSlot::MIGRATE);
         to_be_migrated.erase(mit);
         return finish_abort();
     }
