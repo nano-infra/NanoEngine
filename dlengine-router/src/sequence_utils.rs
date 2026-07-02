@@ -87,6 +87,7 @@ impl Sequence {
                 slots: None,        // Not used in dlengine-router
                 vision_slots: None, // Not used in dlengine-router
                 completion_logprobs: None,
+                affinity_key: 0, // 0 = no explicit session (schema default)
             },
         )
     }
