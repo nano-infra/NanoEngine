@@ -196,7 +196,7 @@ void bind_scheduler_utils(py::module_& m)
         .def_readonly("attention_dp", &Scheduler::attention_dp_)
         .def_readwrite("waiting", &Scheduler::waiting)
         .def_readwrite("waiting_migration", &Scheduler::waiting_migration)
-        .def_readwrite("worker_state", &Scheduler::worker_state)
+        .def_readwrite("group_manager", &Scheduler::group_manager)
         .def_readwrite("to_be_migrated", &Scheduler::to_be_migrated)
         .def_readwrite("routing_strategy", &Scheduler::routing_strategy);
 }

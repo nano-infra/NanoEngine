@@ -17,7 +17,7 @@ namespace dlengine {
 // the routers rank candidates from, so strategies stay decoupled from the rest
 // of the scheduler internals.
 struct RouteContext {
-    const std::vector<std::shared_ptr<GroupManager>>& worker_state;
+    const std::vector<std::shared_ptr<GroupManager>>& group_manager;
     int                                               attention_dp;
 };
 
@@ -56,7 +56,7 @@ protected:
         std::vector<int> order(ctx.attention_dp);
         std::iota(order.begin(), order.end(), 0);
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-            return ctx.worker_state[a]->num_running_tokens() < ctx.worker_state[b]->num_running_tokens();
+            return ctx.group_manager[a]->num_running_tokens() < ctx.group_manager[b]->num_running_tokens();
         });
         return order;
     }
@@ -108,7 +108,7 @@ public:
         std::vector<int> out(ctx.attention_dp);
         std::iota(out.begin(), out.end(), 0);
         auto load = [&](int i) {
-            return by_tokens_ ? ctx.worker_state[i]->num_running_tokens() : ctx.worker_state[i]->num_running_seqs();
+            return by_tokens_ ? ctx.group_manager[i]->num_running_tokens() : ctx.group_manager[i]->num_running_seqs();
         };
         std::stable_sort(out.begin(), out.end(), [&](int a, int b) { return load(a) < load(b); });
         return out;
@@ -164,7 +164,7 @@ public:
         int preferred = -1;
         int best      = 0;
         for (int i = 0; i < ctx.attention_dp; ++i) {
-            const int m = ctx.worker_state[i]->matched_prefix_blocks(const_cast<Sequence&>(seq));
+            const int m = ctx.group_manager[i]->matched_prefix_blocks(const_cast<Sequence&>(seq));
             if (m > best) {
                 best      = m;
                 preferred = i;
