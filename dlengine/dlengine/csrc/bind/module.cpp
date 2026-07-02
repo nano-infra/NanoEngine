@@ -6,8 +6,6 @@ namespace py = pybind11;
 #include "dlengine/csrc/bind/sequence_metric_binding.h"
 #include "dlengine/csrc/common/logging.h"
 void bind_server_metric(py::module_& m);
-void bind_block_manager(py::module_& m);
-void bind_group_manager(py::module_& m);
 void bind_scheduler_utils(py::module_& m);
 void bind_model_runner_utils(py::module_& m);
 
@@ -20,8 +18,6 @@ PYBIND11_MODULE(_dlengine_cpp, m)
 
     // DLEngine-specific bindings
     bind_server_metric(m);
-    bind_block_manager(m);
-    bind_group_manager(m);
     bind_scheduler_utils(m);
     bind_model_runner_utils(m);
 

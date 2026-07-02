@@ -92,6 +92,7 @@ class Config(BaseModel):
     # ``repr(Config)`` — e.g. Ray's actor-error formatting — crash with
     # "Object of type dtype is not JSON serializable", masking the real error.
     hf_config: Any = Field(default=None, repr=False)
+    cache_plan: Any = Field(default=None, repr=False)
     eos: List[int] = []
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = 15000

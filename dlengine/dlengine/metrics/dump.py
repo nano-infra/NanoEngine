@@ -82,10 +82,7 @@ def _rounded_list(values: Any) -> list[float]:
 
 
 def _prompt_token_ids(seq: Any) -> list[int]:
-    try:
-        return list(seq.prompt_token_ids)
-    except Exception:  # noqa: BLE001 - tolerate older Sequence wrappers
-        return list(seq.token_ids)[: seq.num_prompt_tokens]
+    return list(seq.prompt_token_ids)
 
 
 def _decode_prompt(tokenizer: Any, prompt_ids: list[int]) -> str:
@@ -96,13 +93,7 @@ def _decode_prompt(tokenizer: Any, prompt_ids: list[int]) -> str:
 
 
 def _completion_token_ids(seq: Any) -> list[int]:
-    try:
-        return list(seq.completion_token_ids)
-    except Exception:  # noqa: BLE001 - tolerate older Sequence wrappers
-        try:
-            return list(seq.token_ids)[seq.num_prompt_tokens :]
-        except Exception:
-            return []
+    return list(seq.completion_token_ids)
 
 
 class MetricDumper:
@@ -240,7 +231,7 @@ class EngineMetricDumper:
             seq_id=seq.seq_id,
             model=self._model,
             affinity_key=str(getattr(seq, "affinity_key", 0)),
-            prompt_len=seq.num_prompt_tokens,
+            prompt_len=len(prompt_ids),
             token_ids=prompt_ids,
             prompt_text=_decode_prompt(tokenizer, prompt_ids),
         )
@@ -260,7 +251,7 @@ class EngineMetricDumper:
             seq_id=seq.seq_id,
             model=self._model,
             affinity_key=str(getattr(seq, "affinity_key", 0)),
-            prompt_len=seq.num_prompt_tokens,
+            prompt_len=metric.num_prompt_tokens,
             cached_len=cached_len,
             output_len=metric.num_generated_tokens,
             completion_token_ids=completion_ids,

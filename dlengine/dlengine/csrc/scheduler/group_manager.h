@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "dlengine/csrc/cache/block_manager.h"
+#include "dlengine/csrc/cache/cache_plan.h"
 #include "dlengine/csrc/cache/compressed_block_manager.h"
 #include "dlengine/csrc/cache/gdn_state_manager.h"
 #include "dlengine/csrc/cache/hisparse_slot_manager.h"
@@ -31,14 +32,6 @@ enum class RoutingStrategy {
 struct AllocResult {
     int chunk_end;   // num_tokens boundary for the current batch
     int new_tokens;  // budget consumed (= chunk_end - num_cached_tokens)
-};
-
-// DSv4: configuration for one compression ratio's page pool.
-struct CompressedPoolConfig {
-    int ratio;               // e.g. 4 or 128
-    int num_pages;           // pool size (number of pages)
-    int page_size;           // tokens per page (e.g. 2 for 16-byte alignment)
-    int max_blocks_per_seq;  // hard cap per sequence
 };
 
 class GroupManager {
@@ -214,7 +207,7 @@ public:
         return it->second->matched_prefix_blocks(seq);
     }
 
-    GDNStateManager gdn_state_manager_;
+    GDNStateManager     gdn_state_manager_;
     HiSparseSlotManager hisparse_slot_manager_;
 
     // DSv4: per-compression-ratio paged allocator for compressed KV cache.
@@ -223,9 +216,9 @@ public:
     // Stored as unique_ptr so map<int, V> doesn't need V to be default-ctible.
     std::unordered_map<int, std::unique_ptr<CompressedBlockManager>> compressed_block_managers_;
 
-    // Configure DSv4 compressed pools.  Replaces any previous configuration.
-    // Each entry creates a new CompressedBlockManager for its `ratio`.
-    void configure_compressed_pools(const std::vector<CompressedPoolConfig>& configs);
+    // Configure DSv4 HCA/CSA compressed pools. Replaces any previous
+    // configuration.
+    void configure_compressed_pools(const CachePlan& cache_plan);
 
     // Toggle cross-request prefix caching on every block manager in this group
     // (disabled for linear-attention models; see BlockManager header).
@@ -237,6 +230,7 @@ public:
     }
 
     std::deque<std::shared_ptr<Sequence>>  running;
+    std::deque<std::shared_ptr<Sequence>>  prefilling;
     std::vector<std::shared_ptr<Sequence>> dummy_seqs;
 
     RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;

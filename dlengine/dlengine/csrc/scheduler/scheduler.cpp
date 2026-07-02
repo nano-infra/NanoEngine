@@ -6,7 +6,9 @@
 #include <thread>
 #include <unordered_set>
 
+#include "dlengine/csrc/common/logging.h"
 #include "dlengine/csrc/metrics/sequence_metric.h"
+#include "dlengine/csrc/metrics/server_metric.h"
 #include "dlengine/csrc/sequence/sequence.h"
 #include "sequence_generated.h"
 
@@ -51,10 +53,39 @@ Scheduler::Scheduler(const std::string& engine_id,
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
 }
 
-void Scheduler::configure_compressed_pools(const std::vector<CompressedPoolConfig>& configs)
+Scheduler::Scheduler(const SchedulerConfig& config):
+    Scheduler(config.engine_id,
+              config.num_speculative_tokens,
+              config.max_num_seqs,
+              config.max_num_batched_tokens,
+              config.max_model_len,
+              config.eos_ids,
+              config.attention_dp,
+              config.group_size,
+              config.num_kvcache_blocks,
+              config.kvcache_block_size,
+              config.mode)
 {
-    for (auto& gm : group_manager) {
-        gm->configure_compressed_pools(configs);
+    routing_strategy = config.routing_strategy;
+    if (config.cache_plan.has_linear_attention()) {
+        set_prefix_caching_enabled(false);
+        NANOCOMMON_LOG_INFO(
+            "Cache plan includes GDN state: scheduler disabled cross-request prefix caching to keep linear-attention "
+            "recurrent state correct.");
+    }
+    if ((config.cache_plan.has_hca() && config.cache_plan.hca.compression_ratio > 0)
+        || (config.cache_plan.has_csa() && config.cache_plan.csa.compression_ratio > 0)) {
+        for (auto& gm : group_manager) {
+            gm->configure_compressed_pools(config.cache_plan);
+        }
+        NANOCOMMON_LOG_INFO("Scheduler configured compressed cache from cache plan: ",
+                            config.cache_plan.to_json_string());
+    }
+    if (config.gdn_state_cache_slots > 0) {
+        NANOCOMMON_LOG_WARN("gdn_state_cache_slots=",
+                            config.gdn_state_cache_slots,
+                            " requested but session-scoped GDN state caching is muted: it requires token-exact prompt "
+                            "continuation, which re-rendering agent clients do not provide. Ignoring.");
     }
 }
 
@@ -103,34 +134,210 @@ bool Scheduler::is_finished() const
     const auto& wait_queue = (mode_ != "decode") ? waiting : waiting_migration;
     if (!wait_queue.empty())
         return false;
-    if (!prefilling.empty())
-        return false;
 
     for (const auto& ws : group_manager) {
+        if (!ws->prefilling.empty())
+            return false;
         if (!ws->is_empty())
             return false;
     }
     return true;
 }
 
-std::deque<std::shared_ptr<Sequence>>& Scheduler::running(int dp_idx)
+int Scheduler::num_waiting() const
 {
-    return group_manager[dp_idx]->running;
+    return static_cast<int>(waiting.size());
 }
 
-const std::deque<std::shared_ptr<Sequence>>& Scheduler::running(int dp_idx) const
+int Scheduler::num_waiting_migration() const
 {
-    return group_manager[dp_idx]->running;
+    return static_cast<int>(waiting_migration.size());
 }
 
-std::unordered_map<int, std::shared_ptr<BlockManager>>& Scheduler::block_manager(int dp_idx)
+int Scheduler::waiting_migration_head_num_tokens() const
 {
-    return group_manager[dp_idx]->block_manager;
+    if (waiting_migration.empty()) {
+        return -1;
+    }
+    return waiting_migration.front()->num_tokens();
 }
 
-const std::unordered_map<int, std::shared_ptr<BlockManager>>& Scheduler::block_manager(int dp_idx) const
+int Scheduler::total_blocks_per_dp() const
 {
-    return group_manager[dp_idx]->block_manager;
+    return num_kvcache_blocks_ * group_size_;
+}
+
+std::vector<int> Scheduler::running_counts() const
+{
+    std::vector<int> counts;
+    counts.reserve(group_manager.size());
+    for (const auto& gm : group_manager) {
+        counts.push_back(static_cast<int>(gm->running.size()));
+    }
+    return counts;
+}
+
+std::vector<uint64_t> Scheduler::dummy_seq_ids() const
+{
+    std::vector<uint64_t> ids;
+    for (const auto& gm : group_manager) {
+        for (const auto& seq : gm->dummy_seqs) {
+            ids.push_back(seq->seq_id());
+        }
+    }
+    return ids;
+}
+
+std::vector<std::vector<int>> Scheduler::free_blocks() const
+{
+    std::vector<std::vector<int>> blocks;
+    blocks.reserve(group_manager.size());
+    for (const auto& gm : group_manager) {
+        std::vector<int> per_group;
+        per_group.reserve(group_size_);
+        for (int group_id = 0; group_id < group_size_; ++group_id) {
+            per_group.push_back(gm->block_manager[group_id]->num_free_blocks());
+        }
+        blocks.push_back(std::move(per_group));
+    }
+    return blocks;
+}
+
+std::vector<int> Scheduler::used_blocks_per_dp() const
+{
+    std::vector<int> used;
+    used.reserve(group_manager.size());
+    const int blocks_per_dp = total_blocks_per_dp();
+    for (const auto& per_group : free_blocks()) {
+        int free_count = 0;
+        for (int count : per_group) {
+            free_count += count;
+        }
+        used.push_back(blocks_per_dp - free_count);
+    }
+    return used;
+}
+
+SchedulerMetricSnapshot Scheduler::metric_snapshot() const
+{
+    SchedulerMetricSnapshot snapshot;
+    snapshot.running_per_dp                = running_counts();
+    snapshot.total_waiting                 = num_waiting();
+    snapshot.total_waiting_migration       = num_waiting_migration();
+    snapshot.waiting_migration_head_tokens = waiting_migration_head_num_tokens();
+    snapshot.total_blocks_per_dp           = total_blocks_per_dp();
+    snapshot.free_blocks                   = free_blocks();
+    snapshot.used_blocks_per_dp            = used_blocks_per_dp();
+    return snapshot;
+}
+
+SchedulerMetricSnapshot Scheduler::update_server_metric(ServerMetric& metric, const ScheduleResult& result) const
+{
+    auto snapshot = metric_snapshot();
+
+    const auto running_per_dp = running_counts();
+    int        total_running  = 0;
+    for (int count : running_per_dp) {
+        total_running += count;
+    }
+    metric.update_running_requests(total_running);
+    metric.update_waiting_requests(num_waiting());
+    metric.update_waiting_migration_requests(num_waiting_migration());
+    metric.update_group_stats(result.group_send_counts, result.group_recv_counts);
+    metric.update_waiting_blocks(result.waiting_head_blocks, result.waiting_total_blocks);
+    return snapshot;
+}
+
+StepMetricSnapshot Scheduler::record_step_metric(ServerMetric&                                     metric,
+                                                 const ScheduleResult&                             result,
+                                                 const std::vector<std::vector<std::vector<int>>>& dp_group_token_ids)
+{
+    StepMetricSnapshot snapshot;
+    snapshot.prefill_tokens_per_dp.assign(attention_dp_, 0);
+    snapshot.decode_tokens_per_dp.assign(attention_dp_, 0);
+    snapshot.prefix_cached_tokens_per_dp.assign(attention_dp_, 0);
+    snapshot.prefix_prompt_tokens_per_dp.assign(attention_dp_, 0);
+
+    std::unordered_set<uint64_t> dummy_ids;
+    for (uint64_t seq_id : dummy_seq_ids()) {
+        dummy_ids.insert(seq_id);
+    }
+
+    for (int dp_idx = 0; dp_idx < static_cast<int>(result.dp_seqs.size()); ++dp_idx) {
+        long long tokens_in_dp = 0;
+        for (const auto& seq : result.dp_seqs[dp_idx]) {
+            tokens_in_dp += seq->num_tokens();
+            if (!dummy_ids.count(seq->seq_id())) {
+                snapshot.real_bs += 1;
+            }
+        }
+        metric.update_token_usage(dp_idx, tokens_in_dp);
+    }
+
+    if (result.is_prefill) {
+        for (int dp_idx = 0; dp_idx < static_cast<int>(result.dp_seqs.size()); ++dp_idx) {
+            for (const auto& seq : result.dp_seqs[dp_idx]) {
+                const uint64_t seq_id = seq->seq_id();
+                if (dummy_ids.count(seq_id)) {
+                    continue;
+                }
+                snapshot.prefill_tokens_per_dp[dp_idx] += seq->num_tokens();
+                snapshot.prefill_tokens += seq->num_tokens();
+                prefix_cached_tokens_by_seq_.emplace(seq_id, seq->num_cached_tokens());
+                if (prefix_counted_seq_ids_.insert(seq_id).second) {
+                    const auto it    = prefix_cached_tokens_by_seq_.find(seq_id);
+                    const int cached = it != prefix_cached_tokens_by_seq_.end() ? it->second : seq->num_cached_tokens();
+                    snapshot.prefix_cached_tokens_per_dp[dp_idx] += cached;
+                    snapshot.prefix_prompt_tokens_per_dp[dp_idx] += seq->num_prompt_tokens();
+                }
+            }
+        }
+    }
+    else if (!dp_group_token_ids.empty()) {
+        for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+            for (int group_id = 0; group_id < group_size_; ++group_id) {
+                const int group_idx = dp_idx * group_size_ + group_id;
+                if (group_idx >= static_cast<int>(result.filtered_dp_group_seqs.size())
+                    || group_idx >= static_cast<int>(dp_group_token_ids.size())) {
+                    continue;
+                }
+                const auto& group_seqs   = result.filtered_dp_group_seqs[group_idx];
+                const auto& group_tokens = dp_group_token_ids[group_idx];
+                const int   n            = std::min(group_seqs.size(), group_tokens.size());
+                for (int i = 0; i < n; ++i) {
+                    if (!dummy_ids.count(group_seqs[i]->seq_id())) {
+                        const int n_tokens = static_cast<int>(group_tokens[i].size());
+                        snapshot.decode_tokens_per_dp[dp_idx] += n_tokens;
+                        snapshot.decode_tokens += n_tokens;
+                    }
+                }
+            }
+        }
+    }
+    else {
+        for (int dp_idx = 0; dp_idx < static_cast<int>(result.dp_seqs.size()); ++dp_idx) {
+            for (const auto& seq : result.dp_seqs[dp_idx]) {
+                if (!dummy_ids.count(seq->seq_id())) {
+                    snapshot.decode_tokens_per_dp[dp_idx] += 1;
+                    snapshot.decode_tokens += 1;
+                }
+            }
+        }
+    }
+
+    return snapshot;
+}
+
+int Scheduler::prefix_cached_tokens(uint64_t seq_id) const
+{
+    const auto it = prefix_cached_tokens_by_seq_.find(seq_id);
+    return it == prefix_cached_tokens_by_seq_.end() ? 0 : it->second;
+}
+
+void Scheduler::clear_finished_metric_state(uint64_t seq_id)
+{
+    prefix_counted_seq_ids_.erase(seq_id);
+    prefix_cached_tokens_by_seq_.erase(seq_id);
 }
 
 int Scheduler::next_dp_idx()
@@ -325,38 +532,44 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
     auto& waiting_queue = (mode_ != "decode") ? waiting : waiting_migration;
 
     // -----------------------------------------------------------------------
-    // Step 1: Schedule PREFILLING sequences (hold allocated blocks, higher
-    // priority).  Process before fresh WAITING sequences.
+    // Step 1: Schedule per-DP PREFILLING continuations (hold allocated
+    // blocks, higher priority). Process before fresh WAITING sequences.
     // -----------------------------------------------------------------------
-    std::deque<std::shared_ptr<Sequence>> not_scheduled_prefilling;
-    while (!prefilling.empty()) {
-        auto seq = prefilling.front();
-        prefilling.pop_front();
-        auto& block_ctx    = seq->block_ctx(BlockContextSlot::ACTIVE);
-        int   dp_idx       = block_ctx.dp_idx;
-        int   master_group = block_ctx.master_group_id;
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        auto&                                 prefilling_queue = group_manager[dp_idx]->prefilling;
+        std::deque<std::shared_ptr<Sequence>> not_scheduled_prefilling;
+        while (!prefilling_queue.empty()) {
+            auto seq = prefilling_queue.front();
+            prefilling_queue.pop_front();
+            auto& block_ctx    = seq->block_ctx(BlockContextSlot::ACTIVE);
+            int   master_group = block_ctx.master_group_id;
+            if (block_ctx.dp_idx != dp_idx) {
+                throw std::runtime_error("Prefill continuation is queued on DP " + std::to_string(dp_idx)
+                                         + " but owns blocks on DP " + std::to_string(block_ctx.dp_idx));
+            }
 
-        int prev_tokens      = seq->num_tokens();
-        int budget_remaining = max_num_batched_tokens_ - num_batched_tokens[dp_idx][master_group];
-        int new_tokens       = std::min(budget_remaining, seq->num_prompt_tokens() - prev_tokens);
-        if (new_tokens <= 0) {
-            not_scheduled_prefilling.push_back(seq);
-            continue;
+            int prev_tokens      = seq->num_tokens();
+            int budget_remaining = max_num_batched_tokens_ - num_batched_tokens[dp_idx][master_group];
+            int new_tokens       = std::min(budget_remaining, seq->num_prompt_tokens() - prev_tokens);
+            if (new_tokens <= 0) {
+                not_scheduled_prefilling.push_back(seq);
+                continue;
+            }
+
+            // Advance num_tokens to the new chunk endpoint (blocks pre-allocated at admission)
+            seq->set_num_tokens(prev_tokens + new_tokens);
+            block_ctx.num_dispatched_tokens[master_group] = seq->num_tokens();
+
+            num_seqs[dp_idx][master_group] += 1;
+            num_batched_tokens[dp_idx][master_group] += new_tokens;
+
+            group_manager[dp_idx]->running.push_back(seq);
+            scheduled_seqs[dp_idx].push_back(seq);
         }
-
-        // Advance num_tokens to the new chunk endpoint (blocks pre-allocated at admission)
-        seq->set_num_tokens(prev_tokens + new_tokens);
-        block_ctx.num_dispatched_tokens[master_group] = seq->num_tokens();
-
-        num_seqs[dp_idx][master_group] += 1;
-        num_batched_tokens[dp_idx][master_group] += new_tokens;
-
-        group_manager[dp_idx]->running.push_back(seq);
-        scheduled_seqs[dp_idx].push_back(seq);
+        // Put back budget-exhausted prefilling sequences at the front (preserve order)
+        for (auto it = not_scheduled_prefilling.rbegin(); it != not_scheduled_prefilling.rend(); ++it)
+            prefilling_queue.push_front(*it);
     }
-    // Put back budget-exhausted prefilling sequences at the front (preserve order)
-    for (auto it = not_scheduled_prefilling.rbegin(); it != not_scheduled_prefilling.rend(); ++it)
-        prefilling.push_front(*it);
 
     // -----------------------------------------------------------------------
     // Step 2: Schedule fresh WAITING sequences with chunking
@@ -768,9 +981,13 @@ void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequen
         to_be_migrated[seq_shared->seq_id()] = {seq_shared, dp_idx};
     }
 
-    // Route non-final prefill chunks back to the prefilling queue
+    // Route non-final prefill chunks back to their owning DP's continuation queue.
     for (auto& seq : result.continuations) {
-        prefilling.push_back(seq);
+        int dp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).dp_idx;
+        if (dp_idx < 0 || dp_idx >= attention_dp_) {
+            throw std::runtime_error("Invalid DP index for prefill continuation: " + std::to_string(dp_idx));
+        }
+        group_manager[dp_idx]->prefilling.push_back(seq);
     }
 }
 
@@ -822,16 +1039,16 @@ bool Scheduler::abort(uint64_t seq_id)
     }
 
     // 2) Mid-prompt (prefilling) sequences hold ACTIVE blocks on their dp_idx.
-    for (auto it = prefilling.begin(); it != prefilling.end(); ++it) {
-        if ((*it)->seq_id() == seq_id) {
-            auto seq    = *it;
-            int  dp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).dp_idx;
-            seq->set_status(SequenceStatus::FINISHED);
-            if (dp_idx >= 0 && dp_idx < attention_dp_) {
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        auto& prefilling_queue = group_manager[dp_idx]->prefilling;
+        for (auto it = prefilling_queue.begin(); it != prefilling_queue.end(); ++it) {
+            if ((*it)->seq_id() == seq_id) {
+                auto seq = *it;
+                seq->set_status(SequenceStatus::FINISHED);
                 group_manager[dp_idx]->deallocate(*seq);
+                prefilling_queue.erase(it);
+                return finish_abort();
             }
-            prefilling.erase(it);
-            return finish_abort();
         }
     }
 

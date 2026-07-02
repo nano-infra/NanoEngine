@@ -218,12 +218,8 @@ class BackendService:
             return
 
         try:
-            # Check if sequence has MIGRATE slot with BlockContext
-            from dlengine._cpp import BlockContextSlot
-
-            migrate_ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
-            if migrate_ctx and migrate_ctx.engine_id:
-                source_engine_id = migrate_ctx.engine_id
+            source_engine_id = seq.migrate_engine_id()
+            if source_engine_id:
                 logger.info(
                     f"Sequence {seq.seq_id} sending P2P free to source engine {source_engine_id}"
                 )
@@ -410,13 +406,11 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
 
             # Early free: Process only newly appeared sequences (much faster than full iteration)
             if newly_appeared_seqs:
-                from dlengine._cpp import BlockContextSlot
-
                 for seq in newly_appeared_seqs:
-                    migrate_ctx = seq.block_ctx(BlockContextSlot.MIGRATE)
-                    if migrate_ctx and migrate_ctx.engine_id:
+                    source_engine_id = seq.migrate_engine_id()
+                    if source_engine_id:
                         logger.info(
-                            f"Early free: seq {seq.seq_id} migrated from {migrate_ctx.engine_id}"
+                            f"Early free: seq {seq.seq_id} migrated from {source_engine_id}"
                         )
                         service._send_p2p_free_if_migrated(seq)
 

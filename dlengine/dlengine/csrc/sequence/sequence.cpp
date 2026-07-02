@@ -143,6 +143,21 @@ int Sequence::dp_idx(BlockContextSlot slot)
     return block_ctx(slot).dp_idx;
 }
 
+int Sequence::master_group_id(BlockContextSlot slot) const
+{
+    return block_ctx(slot).master_group_id;
+}
+
+void Sequence::set_master_group_id(BlockContextSlot slot, int master_group_id)
+{
+    block_ctx(slot).master_group_id = master_group_id;
+}
+
+std::string Sequence::migrate_engine_id() const
+{
+    return block_ctx(BlockContextSlot::MIGRATE).engine_id;
+}
+
 int Sequence::state_slot(BlockContextSlot slot) const
 {
     return block_ctx(slot).state_slot;

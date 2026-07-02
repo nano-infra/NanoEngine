@@ -119,7 +119,10 @@ public:
     const BlockContext& block_ctx(BlockContextSlot slot = BlockContextSlot::ACTIVE) const;
     std::vector<int>&   block_table(BlockContextSlot slot = BlockContextSlot::ACTIVE, int group_id = 0);
 
-    int dp_idx(BlockContextSlot slot);
+    int         dp_idx(BlockContextSlot slot);
+    int         master_group_id(BlockContextSlot slot = BlockContextSlot::ACTIVE) const;
+    void        set_master_group_id(BlockContextSlot slot, int master_group_id);
+    std::string migrate_engine_id() const;
 
     // State management
     int  state_slot(BlockContextSlot slot = BlockContextSlot::ACTIVE) const;

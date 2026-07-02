@@ -1,11 +1,20 @@
-"""Compatibility import path for the Rust runtime.
+from dlengine.logging import get_logger
 
-Historically Python imported pybind11 symbols from ``dlengine._cpp``. The C++
-runtime has been replaced by the Rust/PyO3 extension, but keeping this package
-lets existing Python code migrate without touching every import site at once.
-"""
+logger = get_logger("dlengine")
 
-from dlengine._rust import *
+try:
+    try:
+        from _dlengine_rust import *
+    except ImportError:
+        from dlengine._dlengine_rust import *
+except ImportError as e:
+    logger.error(f"Failed to import dlengine._dlengine_rust: {e}")
+    logger.error(
+        "Build it with: cargo build --manifest-path "
+        "'dlengine/rust/_dlengine_rust/Cargo.toml' --release"
+    )
+    raise e
+
 
 __all__ = [
     "CachePlan",
@@ -20,8 +29,8 @@ __all__ = [
     "RoutingStrategy",
     "ScheduleResult",
     "Scheduler",
-    "SchedulerConfig",
     "SchedulerMetricSnapshot",
+    "SchedulerConfig",
     "SamplingParams",
     "Sequence",
     "SequenceMetric",

@@ -373,7 +373,6 @@ std::optional<AllocResult> GroupManager::try_allocate(Sequence&                 
     return AllocResult{chunk_end, new_tokens};
 }
 
-
 void GroupManager::allocate(Sequence& seq)
 {
     auto& block_ctx       = seq.block_ctx(BlockContextSlot::ACTIVE);
@@ -424,14 +423,22 @@ void GroupManager::allocate(Sequence& seq)
     num_running_tokens_per_group_[master_group_id] += seq.num_tokens();
 }
 
-void GroupManager::configure_compressed_pools(const std::vector<CompressedPoolConfig>& configs)
+void GroupManager::configure_compressed_pools(const CachePlan& cache_plan)
 {
     compressed_block_managers_.clear();
-    for (const auto& cfg : configs) {
+    if (cache_plan.has_hca() && cache_plan.hca.compression_ratio > 0) {
+        const auto& hca = cache_plan.hca;
         compressed_block_managers_.emplace(
-            cfg.ratio,
+            hca.compression_ratio,
             std::make_unique<CompressedBlockManager>(
-                engine_id_, cfg.ratio, cfg.num_pages, cfg.page_size, cfg.max_blocks_per_seq));
+                engine_id_, hca.compression_ratio, hca.num_pages, hca.page_size, hca.max_blocks_per_seq));
+    }
+    if (cache_plan.has_csa() && cache_plan.csa.compression_ratio > 0) {
+        const auto& csa = cache_plan.csa;
+        compressed_block_managers_.emplace(
+            csa.compression_ratio,
+            std::make_unique<CompressedBlockManager>(
+                engine_id_, csa.compression_ratio, csa.num_pages, csa.page_size, csa.max_blocks_per_seq));
     }
 }
 

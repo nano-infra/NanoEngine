@@ -2,45 +2,52 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dlengine._cpp import cache_plan_flag, CachePlan, CachePlanFlag
 
 
-@dataclass(frozen=True)
-class CachePlan:
-    primary: str
-    components: tuple[str, ...]
-
-    def has(self, component: str) -> bool:
-        return component in self.components
+def cache_plan(
+    flags: tuple[CachePlanFlag, ...],
+) -> CachePlan:
+    raw_flags = 0
+    for flag in flags:
+        raw_flags |= cache_plan_flag(flag)
+    return CachePlan(flags=raw_flags)
 
 
 def gqa_cache_plan() -> CachePlan:
-    return CachePlan(primary="gqa", components=("gqa",))
+    return cache_plan(flags=(CachePlanFlag.Gqa,))
 
 
 def qwen35_cache_plan() -> CachePlan:
-    return CachePlan(primary="gqa", components=("gqa", "gdn"))
+    return cache_plan(flags=(CachePlanFlag.Gqa, CachePlanFlag.Gdn))
 
 
 def deepseek_mla_cache_plan(
     *, use_indexer: bool = False, use_hisparse: bool = False
 ) -> CachePlan:
-    components = ["mla"]
+    flags = [CachePlanFlag.Mla]
     if use_indexer:
-        components.append("indexer")
+        flags.append(CachePlanFlag.Indexer)
     if use_hisparse:
-        components.append("hisparse")
-    return CachePlan(primary="mla", components=tuple(components))
+        flags.append(CachePlanFlag.Hisparse)
+    return cache_plan(flags=tuple(flags))
+
+
+def hca_csa_cache_plan() -> CachePlan:
+    return cache_plan(flags=(CachePlanFlag.Hca, CachePlanFlag.Csa))
 
 
 def deepseek_v4_cache_plan() -> CachePlan:
-    return CachePlan(primary="dsv4", components=("hca", "csa"))
+    return hca_csa_cache_plan()
 
 
 __all__ = [
     "CachePlan",
+    "CachePlanFlag",
+    "cache_plan",
     "deepseek_mla_cache_plan",
     "deepseek_v4_cache_plan",
     "gqa_cache_plan",
+    "hca_csa_cache_plan",
     "qwen35_cache_plan",
 ]

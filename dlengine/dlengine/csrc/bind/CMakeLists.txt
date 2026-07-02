@@ -7,8 +7,6 @@ set(BINDING_SOURCES
     metric_binding.cpp
     sequence_metric_binding.cpp
     sequence_binding.cpp
-    block_manager_binding.cpp
-    group_manager_binding.cpp
     scheduler_binding.cpp
     model_runner_binding.cpp
 )

@@ -4,6 +4,7 @@
 #include <pybind11/stl.h>
 
 #include "dlengine/csrc/engine/serialization.h"
+#include "dlengine/csrc/sequence/sequence.h"
 #include "dlengine/csrc/worker/model_runner_utils.h"
 
 namespace py = pybind11;
@@ -84,6 +85,20 @@ void bind_model_runner_utils(py::module_& m)
             return py::bytes(reinterpret_cast<const char*>(buf.data()), buf.size());
         },
         py::arg("seqs"),
+        py::arg("is_prefill"));
+
+    m.def(
+        "serialize_dummy_run_batch",
+        [](const std::string& engine_id, int num_kvcache_blocks, bool is_prefill) -> py::bytes {
+            auto dummy_seq = std::make_shared<Sequence>(std::vector<int>{0}, SamplingParams{});
+            dummy_seq->active(engine_id, 1, 1, num_kvcache_blocks);
+            dummy_seq->set_master_group_id(BlockContextSlot::ACTIVE, 0);
+            std::vector<Sequence*> seqs{dummy_seq.get()};
+            auto                   buf = serialize_run_batch(seqs, is_prefill);
+            return py::bytes(reinterpret_cast<const char*>(buf.data()), buf.size());
+        },
+        py::arg("engine_id"),
+        py::arg("num_kvcache_blocks"),
         py::arg("is_prefill"));
 
     m.def(

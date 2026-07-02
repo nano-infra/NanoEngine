@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "dlengine/csrc/cache/cache_plan.h"
 #include "dlengine/csrc/sequence/sequence.h"
 
 #include "group_manager.h"
@@ -19,6 +20,7 @@ namespace dlengine {
 
 // Forward declaration
 class MetricsManager;
+class ServerMetric;
 
 // Type alias for migration list: vector<pair<sequence pointer, target DP index>>
 using MigrationList = std::vector<std::pair<std::shared_ptr<Sequence>, int>>;
@@ -29,9 +31,22 @@ struct PostprocessResult {
     std::vector<std::shared_ptr<Sequence>> continuations;  // non-final prefill chunks
 };
 
-typedef struct {
-
-} schduler_config_t;
+struct SchedulerConfig {
+    std::string      engine_id;
+    int              num_speculative_tokens = 0;
+    int              max_num_seqs           = 0;
+    int              max_num_batched_tokens = 0;
+    int              max_model_len          = 0;
+    std::vector<int> eos_ids;
+    int              attention_dp          = 1;
+    int              group_size            = 1;
+    int              num_kvcache_blocks    = 0;
+    int              kvcache_block_size    = 0;
+    std::string      mode                  = "hybrid";
+    RoutingStrategy  routing_strategy      = RoutingStrategy::RoundRobin;
+    int              gdn_state_cache_slots = 0;
+    CachePlan        cache_plan;
+};
 
 // Result of a single scheduling step.
 // This struct is returned by `schedule()` and summarizes which sequences
@@ -84,6 +99,27 @@ struct ScheduleResult {
     int waiting_total_blocks = 0;
 };
 
+struct StepMetricSnapshot {
+    int prefill_tokens = 0;
+    int decode_tokens  = 0;
+    int real_bs        = 0;
+
+    std::vector<int> prefill_tokens_per_dp;
+    std::vector<int> decode_tokens_per_dp;
+    std::vector<int> prefix_cached_tokens_per_dp;
+    std::vector<int> prefix_prompt_tokens_per_dp;
+};
+
+struct SchedulerMetricSnapshot {
+    std::vector<int>              running_per_dp;
+    int                           total_waiting                 = 0;
+    int                           total_waiting_migration       = 0;
+    int                           waiting_migration_head_tokens = -1;
+    int                           total_blocks_per_dp           = 0;
+    std::vector<int>              used_blocks_per_dp;
+    std::vector<std::vector<int>> free_blocks;
+};
+
 class Scheduler {
 public:
     Scheduler(const std::string& engine_id,
@@ -97,14 +133,10 @@ public:
               int                num_kvcache_blocks,
               int                kvcache_block_size,
               const std::string& mode);
+    explicit Scheduler(const SchedulerConfig& config);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
-
-    // DSv4: configure per-compression-ratio compressed-cache pools across
-    // all DP workers.  Must be called once after construction (before any
-    // allocate()) when the model has compressed layers.
-    void configure_compressed_pools(const std::vector<CompressedPoolConfig>& configs);
 
     // Disable/enable cross-request prefix caching across all DP workers. Must
     // be called once after construction (before any allocate()). Disabled for
@@ -134,7 +166,16 @@ public:
                      const std::vector<std::vector<std::vector<float>>>& dp_group_token_logprobs = {});
 
     // State queries
-    bool is_finished() const;
+    bool                    is_finished() const;
+    int                     num_waiting() const;
+    int                     num_waiting_migration() const;
+    SchedulerMetricSnapshot metric_snapshot() const;
+    SchedulerMetricSnapshot update_server_metric(ServerMetric& metric, const ScheduleResult& result) const;
+    StepMetricSnapshot      record_step_metric(ServerMetric&                                     metric,
+                                               const ScheduleResult&                             result,
+                                               const std::vector<std::vector<std::vector<int>>>& dp_group_token_ids = {});
+    int                     prefix_cached_tokens(uint64_t seq_id) const;
+    void                    clear_finished_metric_state(uint64_t seq_id);
 
     // Preemption
     void preempt(int dp_idx, std::shared_ptr<Sequence> seq);
@@ -151,14 +192,6 @@ public:
     // MUST be called between steps (no forward in flight), since it mutates the
     // running deques and frees blocks — same constraint as free_to_be_migrated.
     bool abort(uint64_t seq_id);
-
-    // Access to running sequences
-    std::deque<std::shared_ptr<Sequence>>&       running(int dp_idx);
-    const std::deque<std::shared_ptr<Sequence>>& running(int dp_idx) const;
-
-    // Access to block managers
-    std::unordered_map<int, std::shared_ptr<BlockManager>>&       block_manager(int dp_idx);
-    const std::unordered_map<int, std::shared_ptr<BlockManager>>& block_manager(int dp_idx) const;
 
     // Public members exposed to Python
     std::string engine_id_;
@@ -179,7 +212,6 @@ public:
 
     std::deque<std::shared_ptr<Sequence>>                              waiting;
     std::deque<std::shared_ptr<Sequence>>                              waiting_migration;
-    std::deque<std::shared_ptr<Sequence>>                              prefilling;  // mid-prompt sequences
     std::vector<std::shared_ptr<GroupManager>>                         group_manager;
     std::unordered_map<int, std::pair<std::shared_ptr<Sequence>, int>> to_be_migrated;
 
@@ -206,7 +238,13 @@ private:
     RoutingStrategy         router_built_for_ = RoutingStrategy::RoundRobin;
 
     // Round-robin counter for DP
-    int next_dp_idx();
+    int                           next_dp_idx();
+    std::vector<uint64_t>         dummy_seq_ids() const;
+    int                           waiting_migration_head_num_tokens() const;
+    int                           total_blocks_per_dp() const;
+    std::vector<int>              running_counts() const;
+    std::vector<std::vector<int>> free_blocks() const;
+    std::vector<int>              used_blocks_per_dp() const;
 
     // Postprocessing internal types
     struct PostprocessTask {
@@ -255,6 +293,9 @@ private:
     int dp_rr_counter_ = 0;
 
     std::unique_ptr<ThreadPool> thread_pool_;
+
+    std::unordered_set<uint64_t>      prefix_counted_seq_ids_;
+    std::unordered_map<uint64_t, int> prefix_cached_tokens_by_seq_;
 };
 
 }  // namespace dlengine

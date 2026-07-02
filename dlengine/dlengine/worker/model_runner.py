@@ -8,6 +8,7 @@ import torch.distributed as dist
 from dlengine._cpp import (
     extract_aux_from_bytes,
     extract_vision_slots_from_bytes,
+    serialize_dummy_run_batch,
     serialize_run_batch,
 )
 from dlengine.config import Config
@@ -485,6 +486,9 @@ class ModelRunner:
         return self.config.num_kvcache_blocks
 
     def _get_model_cache_plan(self) -> CachePlan:
+        cache_plan = getattr(self.config, "cache_plan", None)
+        if cache_plan is not None:
+            return cache_plan
         get_plan = getattr(self.model, "get_cache_plan", None)
         if callable(get_plan):
             return get_plan()
@@ -519,7 +523,7 @@ class ModelRunner:
         cache_context = get_cache_context()
         cache_context.allocate_kvcache(num_kvcache_blocks)
 
-        if self.cache_plan.has("hca"):
+        if self.cache_plan.has_hca():
             self._wire_dsv4_caches(cache_context)
         else:
             layer_id = 0
@@ -538,14 +542,14 @@ class ModelRunner:
                     layer_id += 1
 
         # Allocate NSA indexer cache (V3.2 only)
-        if self.cache_plan.has("indexer") and cache_context.index_head_dim > 0:
+        if self.cache_plan.has_indexer() and cache_context.index_head_dim > 0:
             cache_context.allocate_indexer_cache(self.config.hf_config)
             # Wire indexer cache to each layer's Indexer module
             for module in self.model.modules():
                 if hasattr(module, "indexer") and module.indexer is not None:
                     module.indexer.indexer_cache = cache_context.indexer_cache
 
-        if self.cache_plan.has("hisparse"):
+        if self.cache_plan.has_hisparse():
             initialize_hisparse_context(
                 self.config.max_num_seqs,
                 cache_context.device,
@@ -913,7 +917,7 @@ class ModelRunner:
         hf_config = config.hf_config
 
         cache_plan = self.cache_plan
-        mode = cache_plan.primary
+        mode = cache_plan.cache_mode()
         kv_lora_rank = (
             hf_config.kv_lora_rank if hasattr(hf_config, "kv_lora_rank") else 0
         )
@@ -946,7 +950,7 @@ class ModelRunner:
             config, "enable_mla_reference_fallback", False
         )
         is_fp8_kvcache = (
-            cache_plan.has("indexer") and index_head_dim > 0
+            cache_plan.has_indexer() and index_head_dim > 0
         ) and not getattr(config, "disable_nsa", False)
         if is_fp8_kvcache and enable_mla_reference_fallback and not flash_mla_supported:
             logger.warning(
@@ -955,7 +959,7 @@ class ModelRunner:
                 mla_head_dim,
             )
             is_fp8_kvcache = False
-        if cache_plan.has("hisparse") and not is_fp8_kvcache:
+        if cache_plan.has_hisparse() and not is_fp8_kvcache:
             raise RuntimeError("HiSparse requires FP8 MLA KV cache")
 
         head_dim = getattr(hf_config, "head_dim", None) or (
@@ -966,7 +970,7 @@ class ModelRunner:
         # utilization target on hybrid models.
         reserved_state_bytes = 0
         gdn_cache_slots = max(0, getattr(config, "gdn_state_cache_slots", 0))
-        if cache_plan.has("gdn") and layer_types is not None:
+        if cache_plan.has_gdn() and layer_types is not None:
             reserved_state_bytes = CacheContext.estimate_gdn_state_bytes(
                 hf_config,
                 layer_types,
@@ -995,9 +999,18 @@ class ModelRunner:
             reserved_state_bytes=reserved_state_bytes,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
+        self._sync_cache_plan_from_context(
+            cache_plan,
+            cache_context,
+            num_kv_layers,
+            head_dim,
+            index_head_dim,
+            reserved_state_bytes,
+            gdn_cache_slots,
+        )
 
         # Allocate GDN state buffers for linear_attention layers
-        if cache_plan.has("gdn") and layer_types is not None:
+        if cache_plan.has_gdn() and layer_types is not None:
             cache_context.allocate_gdn_states(
                 hf_config,
                 layer_types,
@@ -1007,6 +1020,64 @@ class ModelRunner:
             )
 
         self._init_peer_agent_context(cache_context)
+
+    def _sync_cache_plan_from_context(
+        self,
+        cache_plan: CachePlan,
+        cache_context: CacheContext,
+        num_kv_layers: int,
+        head_dim: int,
+        index_head_dim: int,
+        reserved_state_bytes: int,
+        gdn_cache_slots: int,
+    ) -> None:
+        max_blocks_per_seq = (
+            self.config.max_model_len + cache_context.block_size - 1
+        ) // cache_context.block_size
+
+        if cache_plan.has_gqa():
+            cache_plan.gqa.num_pages = cache_context.num_local_kvcache_blocks
+            cache_plan.gqa.page_size = cache_context.block_size
+            cache_plan.gqa.max_blocks_per_seq = max_blocks_per_seq
+            cache_plan.gqa.num_layers = num_kv_layers
+            cache_plan.gqa.num_kv_heads = cache_context.num_kv_heads
+            cache_plan.gqa.head_dim = head_dim
+
+        if cache_plan.has_mla():
+            cache_plan.mla.num_pages = cache_context.num_local_kvcache_blocks
+            cache_plan.mla.page_size = cache_context.block_size
+            cache_plan.mla.max_blocks_per_seq = max_blocks_per_seq
+            cache_plan.mla.num_layers = num_kv_layers
+            cache_plan.mla.kv_lora_rank = cache_context.kv_lora_rank
+            cache_plan.mla.qk_rope_head_dim = cache_context.qk_rope_head_dim
+            cache_plan.mla.head_dim = head_dim
+
+        if cache_plan.has_indexer():
+            cache_plan.indexer.num_pages = cache_context.num_local_kvcache_blocks
+            cache_plan.indexer.page_size = cache_context.block_size
+            cache_plan.indexer.max_blocks_per_seq = max_blocks_per_seq
+            cache_plan.indexer.index_head_dim = index_head_dim
+            if index_head_dim > 0:
+                cache_plan.indexer.bytes_per_token = (
+                    index_head_dim + index_head_dim // 128 * 4
+                )
+
+        if cache_plan.has_gdn():
+            cache_plan.gdn.state_slots = self.config.max_num_seqs + gdn_cache_slots
+            cache_plan.gdn.state_bytes = reserved_state_bytes
+
+        if cache_plan.has_hisparse():
+            cache_plan.hisparse.max_num_seqs = self.config.max_num_seqs
+            cache_plan.hisparse.device_buffer_size = (
+                self.config.hisparse_device_buffer_size
+            )
+            cache_plan.hisparse.host_to_device_ratio = (
+                self.config.hisparse_host_to_device_ratio
+            )
+            cache_plan.hisparse.swap_in_block_size = (
+                self.config.hisparse_swap_in_block_size
+            )
+            cache_plan.hisparse.dummy_slot = self.config.max_num_seqs
 
     def _init_peer_agent_context(self, cache_context):
         """Start the worker-owned PeerAgent and inject it into RDMA users."""
@@ -1222,17 +1293,11 @@ class ModelRunner:
         is_dummy = False
         if num_seqs == 0:
             is_dummy = True
-            from dlengine._cpp import SamplingParams, Sequence as _Seq
-
-            dummy_seq = _Seq([0], SamplingParams())
-            dummy_seq.block_ctx().reset(
+            data = serialize_dummy_run_batch(
                 self.engine_id,
-                1,
-                1,
                 get_cache_context().num_local_kvcache_blocks,
+                is_prefill,
             )
-            dummy_seq.block_ctx().master_group_id = 0
-            data = serialize_run_batch([dummy_seq], is_prefill)
             aux = extract_aux_from_bytes(data, sp_rank)
             num_seqs = aux.num_group_seqs
 

@@ -1,5 +1,4 @@
 import atexit
-import os
 import time
 import uuid
 from dataclasses import dataclass, fields
@@ -11,8 +10,9 @@ import numpy as np
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-from dlengine._cpp import BlockContextSlot, init_scheduler, Sequence, SequenceStatus
+from dlengine._cpp import Sequence
 from dlengine.config import Config
+from dlengine.engine.scheduler import ensure_cache_plan, init_scheduler
 from dlengine.logging import get_logger, set_log_level
 from dlengine.metrics import MetricsManager
 from dlengine.metrics.dump import EngineMetricDumper
@@ -79,12 +79,10 @@ class PendingStep:
     """
 
     dp_seqs: list
+    schedule_result: Any
     is_prefill: bool
     filtered_dp_group_seqs: list
-    dummy_seq_ids: set
-    running_per_dp: list
-    total_waiting: int
-    total_waiting_migration: int
+    scheduler_metric: Any
     sch_begin: float
     sch_end: float
     # executor run_async handle (None = migrate path)
@@ -119,6 +117,7 @@ class LLMEngine:
         self.ps = []
         self.events = []
 
+        ensure_cache_plan(config)
         self.executor = _build_executor(config)
         self.update_num_kvcache_blocks()
 
@@ -156,24 +155,6 @@ class LLMEngine:
             stream=config.dump_requests_stream,
             maxlen=config.dump_requests_maxlen,
         )
-
-        # Seq ids whose prefix-cache hit has already been counted. A prompt is
-        # admitted once but (under chunked prefill) appears in several prefill
-        # steps, so we tally num_cached_tokens exactly once per sequence and
-        # drop the id again when the sequence finishes.
-        self._prefix_counted_seq_ids: set[int] = set()
-        # Snapshot of each sequence's prefix-cache hit (num_cached_tokens) taken
-        # at its first prefill step. The BlockManager zeroes num_cached_tokens
-        # when a finished sequence is deallocated, which happens before the
-        # completion record is dumped; without this snapshot the dumped
-        # ``cached_len`` would always read 0. Keyed by seq_id, cleared on finish.
-        self._prefix_cached_tokens_by_seq: dict[int, int] = {}
-        # Per-sequence prefix-cache hit logging (debug): set
-        # DLENGINE_LOG_PREFIX_HITS=1 to emit one INFO line per admitted prompt
-        # with its dp rank, affinity key and cached/prompt token counts.
-        self._log_prefix_hits = os.environ.get(
-            "DLENGINE_LOG_PREFIX_HITS", ""
-        ).strip().lower() in ("1", "true", "yes", "on")
 
         atexit.register(self.exit)
 
@@ -245,13 +226,8 @@ class LLMEngine:
         if isinstance(seqs, Sequence):
             seqs = [seqs]
         for seq in seqs:
-            # Debug: log received sequence info
-            if self.config.mode == "decode":
-                logger.info(
-                    f"[DEBUG] Decode engine received seq {seq.seq_id}: last_token={seq.last_token}, num_tokens={seq.num_tokens}, token_ids_len={len(seq.token_ids)}, token_ids_last10={seq.token_ids[-10:] if seq.token_ids else []}"
-                )
             seq.metric = self.metrics_manager.create_sequence_metric(
-                seq.seq_id, seq.num_prompt_tokens
+                seq.seq_id, len(seq.prompt_token_ids)
             )
             self._metric_dumper.record_request(seq, self.tokenizer)
             self.scheduler.add(seq)
@@ -272,8 +248,7 @@ class LLMEngine:
         for seq_id in seq_ids:
             seq_id = int(seq_id)
             if self.scheduler.abort(seq_id):
-                self._prefix_counted_seq_ids.discard(seq_id)
-                self._prefix_cached_tokens_by_seq.pop(seq_id, None)
+                self.scheduler.clear_finished_metric_state(seq_id)
                 aborted.append(seq_id)
         return aborted
 
@@ -295,43 +270,15 @@ class LLMEngine:
         dp_group_seqs = sch_res.dp_group_seqs
         filtered_dp_group_seqs = sch_res.filtered_dp_group_seqs
 
-        # Build dummy seq id set for filtering
-        dummy_seq_ids = set()
-        for ws in self.scheduler.group_manager:
-            for d in ws.dummy_seqs:
-                dummy_seq_ids.add(d.seq_id)
-
-        # Snapshot the prefix-cache hit (num_cached_tokens) here, immediately
-        # after scheduling. This is the only point where the value is reliable:
-        # the BlockManager sets it in allocate() during schedule(), but
-        # scheduler.postprocess() (in step_finish) frees finished sequences and
-        # deallocate() resets it to 0 *before* step_complete() reads it. Captured
-        # once per sequence (first prefill chunk); consumed by the heartbeat
-        # tally and the completion dump, cleared when the sequence finishes.
-        if is_prefill:
-            for seqs in dp_seqs:
-                for seq in seqs:
-                    if seq.seq_id in dummy_seq_ids:
-                        continue
-                    self._prefix_cached_tokens_by_seq.setdefault(
-                        seq.seq_id, seq.num_cached_tokens
-                    )
-
-        # Actual number of in-flight sequences (admitted, not yet finished),
-        # independent of whether this step is a prefill or a decode step. The
-        # current step's batch (dp_seqs) is exposed separately as real_bs.
-        running_per_dp = [len(ws.running) for ws in self.scheduler.group_manager]
-        total_running = sum(running_per_dp)
-        total_waiting = len(self.scheduler.waiting)
-        total_waiting_migration = len(self.scheduler.waiting_migration)
-        self.metrics_manager.server_metric.update_running_requests(total_running)
-        self.metrics_manager.server_metric.update_waiting_requests(total_waiting)
-        self.metrics_manager.server_metric.update_waiting_migration_requests(
-            total_waiting_migration
+        scheduler_metric = self.scheduler.update_server_metric(
+            self.metrics_manager.server_metric, sch_res
         )
 
-        if self.scheduler.waiting_migration:
-            logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
+        waiting_migration_head_num_tokens = (
+            scheduler_metric.waiting_migration_head_tokens
+        )
+        if waiting_migration_head_num_tokens >= 0:
+            logger.info(f"{waiting_migration_head_num_tokens=}")
 
         dp_group_tp_seqs = [seqs for seqs in dp_group_seqs for _ in range(tp_size)]
 
@@ -351,16 +298,8 @@ class LLMEngine:
         group_q_matrix = sch_res.group_q_matrix
         # group_res_matrix = sch_res.group_res_matrix
 
-        # Update metrics with raw counts
-        self.metrics_manager.server_metric.update_group_stats(
-            group_send_counts, group_recv_counts
-        )
-
         waiting_head_blocks = sch_res.waiting_head_blocks
         waiting_total_blocks = sch_res.waiting_total_blocks
-        self.metrics_manager.server_metric.update_waiting_blocks(
-            waiting_head_blocks, waiting_total_blocks
-        )
 
         logger.debug(
             {
@@ -374,13 +313,7 @@ class LLMEngine:
                 # "group_comm_matrix": group_comm_matrix,
                 "group_q_matrix": group_q_matrix,
                 # "group_res_matrix": group_res_matrix,
-                "free_blocks": [
-                    [
-                        group_manager.block_manager[i].num_free_blocks
-                        for i in range(self.scheduler.group_size)
-                    ]
-                    for group_manager in self.scheduler.group_manager
-                ],
+                "free_blocks": scheduler_metric.free_blocks,
             }
         )
 
@@ -388,12 +321,10 @@ class LLMEngine:
 
         pending = PendingStep(
             dp_seqs=dp_seqs,
+            schedule_result=sch_res,
             is_prefill=is_prefill,
             filtered_dp_group_seqs=filtered_dp_group_seqs,
-            dummy_seq_ids=dummy_seq_ids,
-            running_per_dp=running_per_dp,
-            total_waiting=total_waiting,
-            total_waiting_migration=total_waiting_migration,
+            scheduler_metric=scheduler_metric,
             sch_begin=sch_begin,
             sch_end=sch_end,
         )
@@ -476,75 +407,17 @@ class LLMEngine:
         after the next step has been scheduled and submitted, so the backend
         loop calls this in the shadow of the next GPU forward.
         """
-        dp_size = self.config.attention_dp
-        sp_size = self.config.attention_sp
         dp_seqs = pending.dp_seqs
-        dummy_seq_ids = pending.dummy_seq_ids
         token_ids = pending.token_ids
 
         outputs = []
-        prefill_tokens_per_dp = [0] * dp_size
-        decode_tokens_per_dp = [0] * dp_size
-
-        for dp_idx, seqs in enumerate(dp_seqs):
-            num_tokens_in_dp = sum(len(seq) for seq in seqs)
-            self.metrics_manager.server_metric.update_token_usage(
-                dp_idx, num_tokens_in_dp
-            )
-
-        # Prefix-cache accounting (prefill only): tally each newly admitted
-        # prompt's cached vs. total prompt tokens exactly once. Tracked per DP
-        # rank since each rank owns its own block managers / prefix cache.
-        prefix_cached_tokens_per_dp = [0] * dp_size
-        prefix_prompt_tokens_per_dp = [0] * dp_size
-
-        if pending.is_prefill:
-            for dp_idx, seqs in enumerate(dp_seqs):
-                prefill_tokens_per_dp[dp_idx] += sum(
-                    len(seq) for seq in seqs if seq.seq_id not in dummy_seq_ids
-                )
-                for seq in seqs:
-                    if seq.seq_id in dummy_seq_ids:
-                        continue
-                    if seq.seq_id in self._prefix_counted_seq_ids:
-                        continue
-                    self._prefix_counted_seq_ids.add(seq.seq_id)
-                    # Use the schedule-time snapshot: seq.num_cached_tokens has
-                    # already been zeroed by deallocate() for finished seqs by
-                    # the time this (deferred) accounting runs.
-                    _cached = self._prefix_cached_tokens_by_seq.get(
-                        seq.seq_id, seq.num_cached_tokens
-                    )
-                    prefix_cached_tokens_per_dp[dp_idx] += _cached
-                    prefix_prompt_tokens_per_dp[dp_idx] += seq.num_prompt_tokens
-                    if self._log_prefix_hits:
-                        _prompt = seq.num_prompt_tokens
-                        logger.info(
-                            "[prefix-hit] seq_id=%s dp=%d affinity_key=%s "
-                            "cached=%d/%d (%.1f%%)",
-                            seq.seq_id,
-                            dp_idx,
-                            getattr(seq, "affinity_key", 0),
-                            _cached,
-                            _prompt,
-                            (_cached / _prompt * 100.0) if _prompt else 0.0,
-                        )
-        elif token_ids is not None:
-            for dp_idx in range(dp_size):
-                for sp_idx in range(sp_size):
-                    group_idx = dp_idx * sp_size + sp_idx
-                    group_seqs = pending.filtered_dp_group_seqs[group_idx]
-                    group_tokens = token_ids[group_idx]
-                    for seq, seq_tokens in zip(group_seqs, group_tokens):
-                        if seq.seq_id not in dummy_seq_ids:
-                            decode_tokens_per_dp[dp_idx] += len(seq_tokens)
-        else:
-            for dp_idx, seqs in enumerate(dp_seqs):
-                num_real = sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
-                decode_tokens_per_dp[dp_idx] += num_real
-
-        result.prefill_tokens = sum(prefill_tokens_per_dp)
-        result.decode_tokens = sum(decode_tokens_per_dp)
+        metric_snapshot = self.scheduler.record_step_metric(
+            self.metrics_manager.server_metric,
+            pending.schedule_result,
+            token_ids or [],
+        )
+        result.prefill_tokens = metric_snapshot.prefill_tokens
+        result.decode_tokens = metric_snapshot.decode_tokens
 
         # Collect finished/migrated sequences after postprocess
         for seqs in dp_seqs:
@@ -557,33 +430,20 @@ class LLMEngine:
                     if self._metric_dumper.enabled and seq.is_finished:
                         self._metric_dumper.record_completion(
                             seq,
-                            cached_len=self._prefix_cached_tokens_by_seq.get(
-                                seq.seq_id, getattr(seq, "num_cached_tokens", 0)
-                            ),
+                            cached_len=self.scheduler.prefix_cached_tokens(seq.seq_id),
                         )
-                    self._prefix_counted_seq_ids.discard(seq.seq_id)
-                    self._prefix_cached_tokens_by_seq.pop(seq.seq_id, None)
+                    self.scheduler.clear_finished_metric_state(seq.seq_id)
                     outputs.append(seq)
         result.outputs = outputs
-        result.real_bs = sum(
-            sum(1 for seq in seqs if seq.seq_id not in dummy_seq_ids)
-            for seqs in dp_seqs
-        )
+        result.real_bs = metric_snapshot.real_bs
 
         # Periodic engine status report (throttling/accounting live in the
         # metrics manager; this path drives step() directly, bypassing
         # generate(), so it is what produces the serve-mode heartbeat).
         try:
-            group_size = self.scheduler.group_size
-            # Each DP rank owns group_size block managers, each with
-            # num_kvcache_blocks blocks. Report KV usage per DP rank so the
-            # heartbeat shows attention_dp separate values.
-            blocks_per_dp = self.config.num_kvcache_blocks * group_size
-            used_blocks_per_dp = [
-                blocks_per_dp
-                - sum(ws.block_manager[i].num_free_blocks for i in range(group_size))
-                for ws in self.scheduler.group_manager
-            ]
+            resource_metric = self.scheduler.metric_snapshot()
+            blocks_per_dp = resource_metric.total_blocks_per_dp
+            used_blocks_per_dp = resource_metric.used_blocks_per_dp
         except Exception:  # noqa: BLE001
             blocks_per_dp = self.config.num_kvcache_blocks
             used_blocks_per_dp = None
@@ -598,15 +458,15 @@ class LLMEngine:
         self.metrics_manager.maybe_report_engine_status(
             engine_id=self.engine_id,
             mode=self.config.mode,
-            running_per_dp=pending.running_per_dp,
-            waiting=pending.total_waiting,
-            waiting_migration=pending.total_waiting_migration,
+            running_per_dp=pending.scheduler_metric.running_per_dp,
+            waiting=pending.scheduler_metric.total_waiting,
+            waiting_migration=pending.scheduler_metric.total_waiting_migration,
             used_blocks_per_dp=used_blocks_per_dp,
             total_blocks=blocks_per_dp,
-            prefill_tokens_per_dp=prefill_tokens_per_dp,
-            decode_tokens_per_dp=decode_tokens_per_dp,
-            prefix_cached_tokens_per_dp=prefix_cached_tokens_per_dp,
-            prefix_prompt_tokens_per_dp=prefix_prompt_tokens_per_dp,
+            prefill_tokens_per_dp=metric_snapshot.prefill_tokens_per_dp,
+            decode_tokens_per_dp=metric_snapshot.decode_tokens_per_dp,
+            prefix_cached_tokens_per_dp=metric_snapshot.prefix_cached_tokens_per_dp,
+            prefix_prompt_tokens_per_dp=metric_snapshot.prefix_prompt_tokens_per_dp,
             schedule_ms=result.schedule_latency_ms,
             forward_ms=forward_latency_ms,
             postprocess_ms=result.postprocess_latency_ms,
@@ -640,7 +500,7 @@ class LLMEngine:
         log_metrics_interval: int = 10,
         return_serialized: bool = False,
     ) -> list[Sequence] | list[bytes]:
-        num_reqs = len(self.scheduler.waiting)
+        num_reqs = self.scheduler.num_waiting()
         if use_tqdm:
             pbar = tqdm(total=num_reqs, desc="Generating", dynamic_ncols=True)
 

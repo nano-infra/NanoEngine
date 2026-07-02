@@ -122,12 +122,14 @@ class OpenAIServer:
         served_model_name: str,
         model_path: str,
         default_max_tokens: int = 512,
+        max_model_len: int = 16384,
     ) -> None:
         self.worker = worker
         self.tokenizer = tokenizer
         self.served_model_name = served_model_name
         self.model_path = model_path.rstrip("/")
         self.default_max_tokens = default_max_tokens
+        self.max_model_len = int(max_model_len)
         self._model_aliases = self._build_model_aliases()
         from dlengine.server.tool_parser import detect_parser_name, get_tool_parser
 
@@ -381,6 +383,33 @@ class OpenAIServer:
             f"prompt_len={len(prompt_ids)} max_tokens={sampling_params.max_tokens}"
         )
         return req
+
+    def validate_request_length(
+        self, prompt_ids: list[int], sampling_params: Any
+    ) -> Optional[JSONResponse]:
+        prompt_len = len(prompt_ids)
+        max_tokens = int(getattr(sampling_params, "max_tokens", 0) or 0)
+        max_model_len = self.max_model_len
+        total_len = prompt_len + max_tokens
+        if prompt_len <= max_model_len and total_len <= max_model_len:
+            return None
+
+        message = (
+            f"Requested token length exceeds max_model_len={max_model_len}: "
+            f"prompt_tokens={prompt_len}, max_tokens={max_tokens}, "
+            f"prompt_tokens+max_tokens={total_len}."
+        )
+        logger.warning("Rejected request (400): " + message)
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                }
+            },
+        )
 
     def submit_migrated(self, seq: Any) -> _Request:
         """Submit a deserialized prefilled sequence to a decode engine (PD).
@@ -721,6 +750,9 @@ def build_app(server: OpenAIServer):
         prompt_ids, reasoning_open = server._encode_chat(
             messages, tools=tools, tool_choice=tool_choice
         )
+        length_error = server.validate_request_length(prompt_ids, sampling_params)
+        if length_error is not None:
+            return length_error
         affinity_key = server.session_affinity_key(request, body)
 
         created = int(time.time())
@@ -1101,6 +1133,9 @@ def build_app(server: OpenAIServer):
         max_tokens = sampling_params.max_tokens
         stop = server._parse_stop(body)
         prompt_ids = server.tokenizer.encode(prompt)
+        length_error = server.validate_request_length(prompt_ids, sampling_params)
+        if length_error is not None:
+            return length_error
         affinity_key = server.session_affinity_key(request, body)
 
         created = int(time.time())
@@ -1441,6 +1476,7 @@ def run_server(
         tokenizer=tokenizer,
         served_model_name=served_model_name,
         model_path=config.model,
+        max_model_len=config.max_model_len,
     )
     app = build_app(server)
 
