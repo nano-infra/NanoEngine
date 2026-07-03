@@ -13,9 +13,9 @@ task fans incoming StepOut/Migration packets back into each request's asyncio
 queue with ``put_nowait``.
 
 Wire protocol (FlatBuffers ZmqPacket, see ``zmq_protocol``):
-- client -> engine: action 1 = ADD (serialized Sequence), 2 = GET_INFO,
+- client -> engine: action 1 = ADD (Rust bincode AddRequest/MigrationRequest), 2 = GET_INFO,
   3 = FREE (FreeSequences).
-- engine -> client: action 0 = StepOut, 1 = Migration (serialized Sequence),
+- engine -> client: action 0 = StepOut, 1 = Migration (Rust bincode MigrationRequest),
   2 = engine_info (JSON).
 """
 
@@ -108,10 +108,17 @@ class ZmqEngineWorker:
     # -- outbound --------------------------------------------------------
 
     def submit(self, req: Any) -> None:
-        """Serialize ``req.seq`` and queue an ADD packet for the engine."""
-        seq = req.seq
-        payload = pd.serialize_seq(seq)
-        self._active[seq.seq_id] = req
+        """Encode request protocol bytes and queue an ADD packet for the engine."""
+        if getattr(req, "migration_payload", None):
+            payload = base64.b64decode(req.migration_payload)
+        else:
+            payload = pd.encode_add_request(
+                req.seq_id,
+                req.prompt_ids or [],
+                req.sampling_params,
+                req.affinity_key,
+            )
+        self._active[req.seq_id] = req
         self._outbox.put_nowait((_ACTION_ADD, payload))
 
     def free_sequences(self, seq_ids: list[int]) -> None:
@@ -249,25 +256,19 @@ class ZmqEngineWorker:
 
     def _handle_migration(self, payload: bytes) -> None:
         try:
-            seqs = pd.deserialize_seqs(payload)
+            seq_id, first_token = pd.decode_migration_metadata(payload)
         except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to deserialize migration payload: {e}")
+            logger.error(f"Failed to decode migration metadata: {e}")
             return
-        if not seqs:
-            logger.warning("Migration packet had no sequence")
-            return
-        seq = seqs[0]
-        seq_id = seq.seq_id
         req = self._active.get(seq_id)
         if req is None:
             return
-        comp = getattr(seq, "completion_token_ids", None) or []
         b64 = base64.b64encode(payload).decode("ascii")
         self._push(
             req,
             {
                 "migration": b64,
-                "first_token": comp[-1] if comp else None,
+                "first_token": first_token,
                 "seq_id": seq_id,
             },
         )

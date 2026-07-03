@@ -1,10 +1,11 @@
 use super::metadata::MigrateSequenceView;
 use super::wire::{
-    bytes_arg, decode_binary, encode_binary, encode_wire, run_result_tuple,
-    sequence_to_migrate_wire, sequence_to_wire, wire_to_sequence, WireBatch, WireMigrateSequence,
-    WireRunResult, WireSequence,
+    add_request_to_sequence, bytes_arg, decode_binary, encode_binary, encode_wire,
+    migration_request_to_sequence, run_result_tuple, sequence_to_migrate_wire,
+    sequence_to_migration_request, sequence_to_wire, wire_to_sequence, WireAddRequest, WireBatch,
+    WireMigrateSequence, WireMigrationRequest, WireRunResult, WireSamplingParams, WireSequence,
 };
-use crate::sequence::Sequence;
+use crate::sequence::{SamplingParams, Sequence};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -126,6 +127,76 @@ pub(super) fn decode_run_result(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyRe
     let data = bytes_arg(data)?;
     let result: WireRunResult = decode_binary(&data, "run result")?;
     run_result_tuple(py, result)
+}
+
+#[pyfunction]
+#[pyo3(signature = (seq_id, prompt_token_ids, sampling_params, affinity_key = 0))]
+pub(super) fn encode_add_request(
+    py: Python<'_>,
+    seq_id: u64,
+    prompt_token_ids: Vec<i32>,
+    sampling_params: Py<SamplingParams>,
+    affinity_key: u64,
+) -> PyResult<PyObject> {
+    let sampling_params = sampling_params.borrow(py);
+    let request = WireAddRequest {
+        seq_id,
+        prompt_token_ids,
+        sampling_params: WireSamplingParams::from(&*sampling_params),
+        affinity_key,
+    };
+    let bytes = encode_binary(&vec![request], "add request")?;
+    Ok(PyBytes::new(py, &bytes).into())
+}
+
+#[pyfunction]
+#[pyo3(signature = (data))]
+pub(super) fn decode_add_requests(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+) -> PyResult<Vec<Py<Sequence>>> {
+    let data = bytes_arg(data)?;
+    let requests: Vec<WireAddRequest> = decode_binary(&data, "add request")?;
+    requests
+        .into_iter()
+        .map(|request| add_request_to_sequence(py, request))
+        .collect()
+}
+
+#[pyfunction]
+#[pyo3(signature = (seq))]
+pub(super) fn encode_migration_request(py: Python<'_>, seq: Py<Sequence>) -> PyResult<PyObject> {
+    let request = sequence_to_migration_request(py, &seq);
+    let bytes = encode_binary(&request, "migration request")?;
+    Ok(PyBytes::new(py, &bytes).into())
+}
+
+#[pyfunction]
+#[pyo3(signature = (data))]
+pub(super) fn decode_migration_request(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+) -> PyResult<Py<Sequence>> {
+    let data = bytes_arg(data)?;
+    let request: WireMigrationRequest = decode_binary(&data, "migration request")?;
+    migration_request_to_sequence(py, request)
+}
+
+#[pyfunction]
+#[pyo3(signature = (data))]
+pub(super) fn decode_migration_metadata(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+) -> PyResult<PyObject> {
+    let data = bytes_arg(data)?;
+    let request: WireMigrationRequest = decode_binary(&data, "migration request")?;
+    let first_token = request
+        .token_ids
+        .get(request.num_prompt_tokens.max(0) as usize..)
+        .and_then(|tokens| tokens.last())
+        .copied()
+        .unwrap_or(request.last_token);
+    Ok((request.seq_id, first_token).into_pyobject(py)?.unbind().into())
 }
 
 #[pyfunction]

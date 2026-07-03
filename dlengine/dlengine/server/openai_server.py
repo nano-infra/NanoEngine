@@ -52,9 +52,13 @@ _seq_id_counter = itertools.count(_SEQ_ID_BASE)
 class _Request:
     """In-flight request state shared between the HTTP and engine threads."""
 
-    seq: Any
+    seq_id: int
     aqueue: "asyncio.Queue[Optional[dict]]"
     loop: asyncio.AbstractEventLoop
+    prompt_ids: Optional[list[int]] = None
+    sampling_params: Any = None
+    affinity_key: int = 0
+    migration_payload: Optional[str] = None
     emitted: int = 0
 
 
@@ -369,17 +373,19 @@ class OpenAIServer:
     def submit(
         self, prompt_ids: list[int], sampling_params: Any, affinity_key: int = 0
     ) -> _Request:
-        from dlengine import Sequence
-
-        seq = Sequence(prompt_ids, sampling_params=sampling_params)
-        seq.seq_id = next(_seq_id_counter)
-        if affinity_key:
-            seq.affinity_key = affinity_key
+        seq_id = next(_seq_id_counter)
         loop = asyncio.get_running_loop()
-        req = _Request(seq=seq, aqueue=asyncio.Queue(), loop=loop)
+        req = _Request(
+            seq_id=seq_id,
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            affinity_key=affinity_key,
+            aqueue=asyncio.Queue(),
+            loop=loop,
+        )
         self.worker.submit(req)
         logger.info(
-            f"Submitted request to engine: seq_id={seq.seq_id} "
+            f"Submitted request to engine: seq_id={seq_id} "
             f"prompt_len={len(prompt_ids)} max_tokens={sampling_params.max_tokens}"
         )
         return req
@@ -411,19 +417,22 @@ class OpenAIServer:
             },
         )
 
-    def submit_migrated(self, seq: Any) -> _Request:
-        """Submit a deserialized prefilled sequence to a decode engine (PD).
+    def submit_migrated(self, migration_payload: str, seq_id: int) -> _Request:
+        """Submit an opaque prefilled migration payload to a decode engine (PD).
 
-        The sequence keeps its original seq_id and its MIGRATE BlockContext, so
-        the decode engine routes it to ``waiting_migration`` and RDMA-pulls the
-        KV cache from the prefill engine on the next step. Already-generated
-        completion tokens (the prefill token) are streamed back too, so the
-        decode response carries the full answer.
+        The engine process decodes the Rust-owned migration protocol into its
+        scheduler compatibility state. The HTTP process deliberately does not
+        materialize ``Sequence`` for migration.
         """
         loop = asyncio.get_running_loop()
-        req = _Request(seq=seq, aqueue=asyncio.Queue(), loop=loop)
+        req = _Request(
+            seq_id=seq_id,
+            migration_payload=migration_payload,
+            aqueue=asyncio.Queue(),
+            loop=loop,
+        )
         self.worker.submit(req)
-        logger.info(f"Submitted migrated request to engine: seq_id={seq.seq_id}")
+        logger.info(f"Submitted migrated request to engine: seq_id={seq_id}")
         return req
 
     async def await_migration(self, req: _Request) -> dict:
@@ -600,9 +609,9 @@ class OpenAIServer:
     def _abort_request(self, req: _Request) -> None:
         """Best-effort engine-side abort for a request that hit a stop string."""
         try:
-            self.worker.abort(req.seq.seq_id)
+            self.worker.abort(req.seq_id)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"abort failed for seq_id={req.seq.seq_id}: {e}")
+            logger.warning(f"abort failed for seq_id={req.seq_id}: {e}")
 
     def _spawn_disconnect_monitor(self, request: "Request", req: _Request):
         """Abort the engine sequence if the HTTP client disconnects mid-generation.
@@ -622,7 +631,7 @@ class OpenAIServer:
                 while True:
                     if await request.is_disconnected():
                         logger.info(
-                            f"client disconnected; aborting seq_id={req.seq.seq_id}"
+                            f"client disconnected; aborting seq_id={req.seq_id}"
                         )
                         self._abort_request(req)
                         return
@@ -631,7 +640,7 @@ class OpenAIServer:
                 return
             except Exception as e:  # noqa: BLE001 - monitor must never crash
                 logger.debug(
-                    f"disconnect monitor error for seq_id={req.seq.seq_id}: {e}"
+                    f"disconnect monitor error for seq_id={req.seq_id}: {e}"
                 )
                 return
 
@@ -834,10 +843,10 @@ def build_app(server: OpenAIServer):
 
         # PD decode stage: resume a prefilled sequence pulled from a prefill node.
         if kv_transfer.get("migration"):
-            from dlengine.server.pd import decode_migration
-
             try:
-                migrated_seq = decode_migration(kv_transfer["migration"])
+                migrated_seq_id = int(kv_transfer.get("seq_id") or 0)
+                if migrated_seq_id <= 0:
+                    raise ValueError("missing positive seq_id")
             except Exception as e:  # noqa: BLE001
                 return JSONResponse(
                     status_code=400,
@@ -848,7 +857,7 @@ def build_app(server: OpenAIServer):
                         }
                     },
                 )
-            req = server.submit_migrated(migrated_seq)
+            req = server.submit_migrated(kv_transfer["migration"], migrated_seq_id)
         else:
             req = server.submit(prompt_ids, sampling_params, affinity_key=affinity_key)
 
@@ -1202,10 +1211,10 @@ def build_app(server: OpenAIServer):
 
         # PD decode stage: resume a prefilled sequence.
         if kv_transfer.get("migration"):
-            from dlengine.server.pd import decode_migration
-
             try:
-                migrated_seq = decode_migration(kv_transfer["migration"])
+                migrated_seq_id = int(kv_transfer.get("seq_id") or 0)
+                if migrated_seq_id <= 0:
+                    raise ValueError("missing positive seq_id")
             except Exception as e:  # noqa: BLE001
                 return JSONResponse(
                     status_code=400,
@@ -1216,7 +1225,7 @@ def build_app(server: OpenAIServer):
                         }
                     },
                 )
-            req = server.submit_migrated(migrated_seq)
+            req = server.submit_migrated(kv_transfer["migration"], migrated_seq_id)
         else:
             req = server.submit(prompt_ids, sampling_params, affinity_key=affinity_key)
 

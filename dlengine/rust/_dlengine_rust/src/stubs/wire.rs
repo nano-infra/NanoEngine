@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct WireBatch {
@@ -20,11 +21,33 @@ pub(super) struct WireBatch {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct WireSamplingParams {
-    temperature: f64,
-    max_tokens: i32,
-    ignore_eos: bool,
-    return_completion_logprobs: bool,
+pub(super) struct WireSamplingParams {
+    pub(super) temperature: f64,
+    pub(super) max_tokens: i32,
+    pub(super) ignore_eos: bool,
+    pub(super) return_completion_logprobs: bool,
+}
+
+impl From<&SamplingParams> for WireSamplingParams {
+    fn from(value: &SamplingParams) -> Self {
+        Self {
+            temperature: value.temperature,
+            max_tokens: value.max_tokens,
+            ignore_eos: value.ignore_eos,
+            return_completion_logprobs: value.return_completion_logprobs,
+        }
+    }
+}
+
+impl WireSamplingParams {
+    fn to_sampling_params(&self) -> SamplingParams {
+        SamplingParams::new(
+            self.temperature,
+            self.max_tokens,
+            self.ignore_eos,
+            self.return_completion_logprobs,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -37,6 +60,47 @@ pub(super) struct WireSequence {
     num_cached_tokens: i32,
     affinity_key: u64,
     sampling_params: WireSamplingParams,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct WireAddRequest {
+    pub(super) seq_id: u64,
+    pub(super) prompt_token_ids: Vec<i32>,
+    pub(super) sampling_params: WireSamplingParams,
+    pub(super) affinity_key: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct WireMigrationRequest {
+    pub(super) seq_id: u64,
+    pub(super) status: i32,
+    pub(super) token_ids: Vec<i32>,
+    pub(super) last_token: i32,
+    pub(super) num_tokens: i32,
+    pub(super) num_prompt_tokens: i32,
+    pub(super) num_checkpointed_tokens: i32,
+    pub(super) num_cached_tokens: i32,
+    pub(super) affinity_key: u64,
+    pub(super) sampling_params: WireSamplingParams,
+    pub(super) completion_logprobs: Vec<f32>,
+    pub(super) active_block_table: Vec<i32>,
+    pub(super) active_block_tables: HashMap<i32, Vec<i32>>,
+    pub(super) active_dispatched_tokens: Vec<i32>,
+    pub(super) active_dp_idx: i32,
+    pub(super) active_group_id: i32,
+    pub(super) active_state_slot: i32,
+    pub(super) active_compressed_block_tables: HashMap<i32, Vec<i32>>,
+    pub(super) active_hisparse_slot: i32,
+    pub(super) migrate_block_table: Vec<i32>,
+    pub(super) migrate_block_tables: HashMap<i32, Vec<i32>>,
+    pub(super) migrate_engine_id: String,
+    pub(super) migrate_num_kvcache_blocks: i32,
+    pub(super) migrate_group_size: i32,
+    pub(super) migrate_dp_idx: i32,
+    pub(super) migrate_group_id: i32,
+    pub(super) migrate_state_slot: i32,
+    pub(super) migrate_compressed_block_tables: HashMap<i32, Vec<i32>>,
+    pub(super) migrate_hisparse_slot: i32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -133,22 +197,12 @@ pub(super) fn sequence_to_wire(py: Python<'_>, seq: &Py<Sequence>) -> WireSequen
         num_prompt_tokens: seq.num_prompt_tokens,
         num_cached_tokens: seq.num_cached_tokens,
         affinity_key: seq.affinity_key,
-        sampling_params: WireSamplingParams {
-            temperature: seq.sampling_params.temperature,
-            max_tokens: seq.sampling_params.max_tokens,
-            ignore_eos: seq.sampling_params.ignore_eos,
-            return_completion_logprobs: seq.sampling_params.return_completion_logprobs,
-        },
+        sampling_params: WireSamplingParams::from(&seq.sampling_params),
     }
 }
 
 pub(super) fn wire_to_sequence(py: Python<'_>, wire: WireSequence) -> PyResult<Py<Sequence>> {
-    let sampling_params = SamplingParams::new(
-        wire.sampling_params.temperature,
-        wire.sampling_params.max_tokens,
-        wire.sampling_params.ignore_eos,
-        wire.sampling_params.return_completion_logprobs,
-    );
+    let sampling_params = wire.sampling_params.to_sampling_params();
     let mut seq = Sequence::new(wire.token_ids, Some(sampling_params));
     seq.seq_id = wire.seq_id;
     seq.status = wire.status;
@@ -156,6 +210,95 @@ pub(super) fn wire_to_sequence(py: Python<'_>, wire: WireSequence) -> PyResult<P
     seq.num_prompt_tokens = wire.num_prompt_tokens;
     seq.num_cached_tokens = wire.num_cached_tokens;
     seq.affinity_key = wire.affinity_key;
+    Py::new(py, seq)
+}
+
+pub(super) fn add_request_to_sequence(
+    py: Python<'_>,
+    request: WireAddRequest,
+) -> PyResult<Py<Sequence>> {
+    let mut seq = Sequence::new(
+        request.prompt_token_ids,
+        Some(request.sampling_params.to_sampling_params()),
+    );
+    seq.seq_id = request.seq_id;
+    seq.affinity_key = request.affinity_key;
+    Py::new(py, seq)
+}
+
+pub(super) fn sequence_to_migration_request(
+    py: Python<'_>,
+    seq: &Py<Sequence>,
+) -> WireMigrationRequest {
+    let seq = seq.borrow(py);
+    WireMigrationRequest {
+        seq_id: seq.seq_id,
+        status: seq.status,
+        token_ids: seq.token_ids.clone(),
+        last_token: seq.last_token,
+        num_tokens: seq.num_tokens,
+        num_prompt_tokens: seq.num_prompt_tokens,
+        num_checkpointed_tokens: seq.num_checkpointed_tokens,
+        num_cached_tokens: seq.num_cached_tokens,
+        affinity_key: seq.affinity_key,
+        sampling_params: WireSamplingParams::from(&seq.sampling_params),
+        completion_logprobs: seq.completion_logprobs.clone(),
+        active_block_table: seq.active_block_table.clone(),
+        active_block_tables: seq.active_block_tables.clone(),
+        active_dispatched_tokens: seq.active_dispatched_tokens.clone(),
+        active_dp_idx: seq.active_dp_idx,
+        active_group_id: seq.active_group_id,
+        active_state_slot: seq.active_state_slot,
+        active_compressed_block_tables: seq.active_compressed_block_tables.clone(),
+        active_hisparse_slot: seq.active_hisparse_slot,
+        migrate_block_table: seq.migrate_block_table.clone(),
+        migrate_block_tables: seq.migrate_block_tables.clone(),
+        migrate_engine_id: seq.migrate_engine_id.clone(),
+        migrate_num_kvcache_blocks: seq.migrate_num_kvcache_blocks,
+        migrate_group_size: seq.migrate_group_size,
+        migrate_dp_idx: seq.migrate_dp_idx,
+        migrate_group_id: seq.migrate_group_id,
+        migrate_state_slot: seq.migrate_state_slot,
+        migrate_compressed_block_tables: seq.migrate_compressed_block_tables.clone(),
+        migrate_hisparse_slot: seq.migrate_hisparse_slot,
+    }
+}
+
+pub(super) fn migration_request_to_sequence(
+    py: Python<'_>,
+    request: WireMigrationRequest,
+) -> PyResult<Py<Sequence>> {
+    let mut seq = Sequence::new(
+        request.token_ids,
+        Some(request.sampling_params.to_sampling_params()),
+    );
+    seq.seq_id = request.seq_id;
+    seq.status = request.status;
+    seq.last_token = request.last_token;
+    seq.num_tokens = request.num_tokens;
+    seq.num_prompt_tokens = request.num_prompt_tokens;
+    seq.num_checkpointed_tokens = request.num_checkpointed_tokens;
+    seq.num_cached_tokens = request.num_cached_tokens;
+    seq.affinity_key = request.affinity_key;
+    seq.completion_logprobs = request.completion_logprobs;
+    seq.active_block_table = request.active_block_table;
+    seq.active_block_tables = request.active_block_tables;
+    seq.active_dispatched_tokens = request.active_dispatched_tokens;
+    seq.active_dp_idx = request.active_dp_idx;
+    seq.active_group_id = request.active_group_id;
+    seq.active_state_slot = request.active_state_slot;
+    seq.active_compressed_block_tables = request.active_compressed_block_tables;
+    seq.active_hisparse_slot = request.active_hisparse_slot;
+    seq.migrate_block_table = request.migrate_block_table;
+    seq.migrate_block_tables = request.migrate_block_tables;
+    seq.migrate_engine_id = request.migrate_engine_id;
+    seq.migrate_num_kvcache_blocks = request.migrate_num_kvcache_blocks;
+    seq.migrate_group_size = request.migrate_group_size.max(1);
+    seq.migrate_dp_idx = request.migrate_dp_idx;
+    seq.migrate_group_id = request.migrate_group_id;
+    seq.migrate_state_slot = request.migrate_state_slot;
+    seq.migrate_compressed_block_tables = request.migrate_compressed_block_tables;
+    seq.migrate_hisparse_slot = request.migrate_hisparse_slot;
     Py::new(py, seq)
 }
 

@@ -1,5 +1,4 @@
 import asyncio
-import ctypes
 import os
 import traceback
 from collections import defaultdict
@@ -9,7 +8,7 @@ import flatbuffers
 import zmq
 import zmq.asyncio
 
-from dlengine._cpp import deserialize as deserialize_cpp, serialize
+from dlengine._cpp import Sequence
 from dlengine.config import Config
 
 # FlatBuffers imports
@@ -81,11 +80,12 @@ class BackendService:
 
     def _handle_add_request(self, payload: bytes):
         logger.info(f"Handling ADD request, payload size: {len(payload)}")
-        c_buffer = ctypes.create_string_buffer(payload, len(payload))
-        ptr = ctypes.addressof(c_buffer)
-        length = len(payload)
+        from dlengine.server import pd
 
-        sequences = deserialize_cpp(ptr, length)
+        try:
+            sequences = pd.decode_add_requests(payload)
+        except Exception:
+            sequences = [pd.decode_migration_bytes(payload)]
         logger.info(f"Deserialized {len(sequences) if sequences else 0} sequences")
         if not sequences:
             logger.warning("No sequences after deserialization")
@@ -135,9 +135,6 @@ class BackendService:
             logger.info(
                 f"Received P2P free request from {source_engine_id} for {len(seq_ids)} sequences: {seq_ids}"
             )
-
-            # Free sequences from scheduler
-            from dlengine.engine.sequence import Sequence
 
             for seq_id in seq_ids:
                 try:
@@ -198,15 +195,10 @@ class BackendService:
             self._send_response(action=_ACTION_STEPOUT_BATCH, payload=entries)
 
     def _send_migration(self, seq):
-        buffer_size = (
-            1024 * 1024 * 16
-        )  # 16MB buffer to prevent overflow during large history migrations
-        buffer = ctypes.create_string_buffer(buffer_size)
-        ptr = ctypes.addressof(buffer)
-
         try:
-            payload_size = serialize(ptr, buffer_size, [seq], False)
-            payload = buffer.raw[:payload_size]
+            from dlengine._cpp import encode_migration_request
+
+            payload = bytes(encode_migration_request(seq))
             self._send_response(action=1, payload=payload)
         except Exception as e:
             logger.error(f"Migration Serialize Error: {e}")
