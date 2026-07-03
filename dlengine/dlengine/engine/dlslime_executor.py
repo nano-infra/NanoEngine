@@ -8,7 +8,7 @@ from dlengine.engine.dlslime_protocol import (
     decode_run_result,
     encode_run_request,
     ModelRunnerRpcService,
-    unpack_reply_header,
+    server_handler_ns,
 )
 from dlengine.engine.ray_executor import RayExecutor
 from dlengine.logging import get_logger
@@ -139,7 +139,7 @@ class DLSLimeExecutor(RayExecutor):
         # inside run_batch, so the snapshot must straddle submit + wait_all.
         wwi_ns0_list, imm_ns0_list = self._probe_per_proxy()
         futures = [
-            proxy.run_batch(encode_run_request(data, is_prefill))
+            proxy.run_batch(encode_run_request(data))
             for proxy, data in zip(self._proxies, batch_bytes)
         ]
         _t2 = _time.perf_counter()
@@ -181,12 +181,12 @@ class DLSLimeExecutor(RayExecutor):
         result = [decode_run_result(data) for data in replies]
         _t4 = _time.perf_counter()
         # Pure network latency = client round trip - remote handler time. Each
-        # reply carries the server-side handler duration (decode + forward) in
-        # its 8-byte header; shards run in parallel so the slowest one bounds
-        # the compute overlapped with this step.
+        # RunnerOut reply carries the server-side handler duration (decode +
+        # forward); shards run in parallel so the slowest one bounds the
+        # compute overlapped with this step.
         server_compute_ms = 0.0
         if replies:
-            server_compute_ms = max(unpack_reply_header(d) for d in replies) / 1e6
+            server_compute_ms = max(server_handler_ns(d) for d in replies) / 1e6
         self.last_run_server_compute_ms = server_compute_ms
         # transfer (round-trip wall clock) minus remote compute ≈ wire +
         # queueing + dispatch, with no GPU compute or pump idle pollution.

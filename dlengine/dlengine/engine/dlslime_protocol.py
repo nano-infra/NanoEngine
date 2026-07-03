@@ -1,38 +1,19 @@
 import ctypes
-import struct
 import time as _time
 
 from dlslime.rpc import method
 
-from dlengine._rust.proto import RunnerOut
-
-# Each run_batch reply is prefixed with an 8-byte little-endian uint64 holding
-# the server-side handler duration in nanoseconds (decode + forward). The
-# client subtracts this from the measured round trip to derive a "pure" network
-# latency (wire + queueing), excluding remote GPU compute.
-_REPLY_HEADER = struct.Struct("<Q")
-REPLY_HEADER_SIZE = _REPLY_HEADER.size
+from dlengine._rust.proto import RunnerIn, RunnerOut
 
 
-def pack_reply_header(server_handler_ns: int) -> bytes:
-    return _REPLY_HEADER.pack(int(server_handler_ns))
-
-
-def unpack_reply_header(data) -> int:
-    """Read the server handler nanoseconds from the start of a reply buffer."""
-    return _REPLY_HEADER.unpack_from(data, 0)[0]
-
-
-def encode_run_request(data: bytes, is_prefill: bool) -> bytes:
-    return bytes((1 if is_prefill else 0,)) + data
+def encode_run_request(data: bytes) -> bytes:
+    return RunnerIn.from_bytes(data).to_bytes()
 
 
 def decode_run_request(ptr: int, nbytes: int) -> tuple[bytes, bool]:
     buf = (ctypes.c_char * nbytes).from_address(ptr)
-    payload = bytes(buf)
-    if not payload:
-        raise ValueError("Empty run request payload")
-    return payload[1:], bool(payload[0])
+    runner_in = RunnerIn.from_bytes(bytes(buf))
+    return runner_in.to_bytes(), bool(runner_in.is_prefill)
 
 
 def encode_run_result(result, server_handler_ns: int = 0) -> bytes:
@@ -50,18 +31,21 @@ def encode_run_result(result, server_handler_ns: int = 0) -> bytes:
     else:
         token_ids, logprobs = result, None
 
-    return bytes(RunnerOut(token_ids, logprobs, server_handler_ns).to_bytes())
+    return RunnerOut(token_ids, logprobs, server_handler_ns).to_bytes()
 
 
 def decode_run_result(data: bytes):
     """Decode a worker result.
 
-    Returns ``(list[list[int]], list[list[float]] | None)``. The 8-byte
-    server-timing header prepended by encode_run_result is skipped inside the
-    Rust decoder, which keeps the per-seq/per-token decode loop out of Python
-    on the per-step hot path.
+    Returns ``(list[list[int]], list[list[float]] | None)``. The Rust decoder
+    keeps the per-seq/per-token loop out of Python on the per-step hot path.
     """
     return RunnerOut.from_bytes(data).result
+
+
+def server_handler_ns(data: bytes) -> int:
+    """Read the remote decode + forward duration from a RunnerOut payload."""
+    return int(RunnerOut.from_bytes(data).server_handler_ns)
 
 
 class ModelRunnerRpcService:
@@ -73,7 +57,7 @@ class ModelRunnerRpcService:
         if self._runner is None:
             raise RuntimeError("ModelRunnerRpcService is not attached to a runner")
         # Always measure the handler duration (decode + forward); it is shipped
-        # back in the reply header so the client can isolate network latency.
+        # back in RunnerOut so the client can isolate network latency.
         t0 = _time.perf_counter()
         data, is_prefill = decode_run_request(ptr, nbytes)
         t1 = _time.perf_counter()

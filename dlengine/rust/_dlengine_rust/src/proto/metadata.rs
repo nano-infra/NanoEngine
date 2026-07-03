@@ -271,6 +271,12 @@ impl RunnerIn {
         PyBytes::new(py, &self.payload)
     }
 
+    #[getter]
+    fn is_prefill(&self) -> PyResult<bool> {
+        let batch: WireBatch = decode_binary(&self.payload, "run batch")?;
+        Ok(batch.is_prefill)
+    }
+
     #[pyo3(signature = (sp_rank = 0))]
     fn aux(&self, sp_rank: usize) -> PyResult<BatchAuxData> {
         super::prepare::runner_in_aux(&self.payload, sp_rank)

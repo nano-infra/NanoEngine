@@ -551,6 +551,7 @@ class DeepseekV2Attention(nn.Module):
         layer_idx: int = 0,
     ):
         super().__init__()
+        self.config = config
         self.q_lora_rank = config.q_lora_rank
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -926,7 +927,8 @@ class DeepseekV2Attention(nn.Module):
             k_pe_3d = k_pe.unsqueeze(1)  # (q_len, 1, rope_dim)
             k_pe_3d = _interleaved_to_half(k_pe_3d)
             q_pe, k_pe_3d = self.rotary_emb(positions, q_pe, k_pe_3d)
-            q_full[..., self.qk_nope_head_dim :] = q_pe  # write RoPE'd q_pe back
+            # write RoPE'd q_pe back
+            q_full[..., self.qk_nope_head_dim :] = q_pe
 
             # Also write RoPE'd k_pe into key_states for KV cache storage
             key_states_3d = key_states.unsqueeze(1)  # (q_len, 1, 576)
@@ -1030,7 +1032,8 @@ class DeepseekV2Attention(nn.Module):
 
                     out, _, _ = sparse_fwd(
                         query_states,  # (s_q, H, 576)
-                        key_states_3d,  # (s_kv, 1, 576) compressed latent + RoPE'd k_pe
+                        # (s_kv, 1, 576) compressed latent + RoPE'd k_pe
+                        key_states_3d,
                         topk_indices.unsqueeze(1),  # (s_q, 1, topk)
                         self.softmax_scale,
                         d_v=self.kv_lora_rank,
