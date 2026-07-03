@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 mod cache_plan;
 mod common;
 mod l3;
+mod logging;
 mod metrics;
 mod scheduler;
 mod sequence;
@@ -14,6 +15,7 @@ mod stubs;
 #[pymodule]
 fn _dlengine_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     cache_plan::register(m)?;
+    logging::register(m)?;
     sequence::register(m)?;
     l3::register(m)?;
     metrics::register(m)?;

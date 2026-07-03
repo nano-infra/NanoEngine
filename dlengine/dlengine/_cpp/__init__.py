@@ -44,4 +44,5 @@ __all__ = [
     "serialize_dummy_run_batch",
     "serialize_migrate_batch",
     "serialize_run_batch",
+    "set_log_level",
 ]

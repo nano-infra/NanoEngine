@@ -179,15 +179,15 @@ def set_log_level(level: str | int) -> None:
             h.setLevel(level)
 
     try:
-        from dlengine import _dlengine_cpp
+        from dlengine._dlengine_rust import set_log_level as _rust_set_log_level
 
-        # Map logging levels to C++ (0=ERROR, 1=INFO/WARN, 2=DEBUG)
-        cpp_level = 0
+        # Map logging levels to Rust runtime (0=ERROR, 1=INFO/WARN, 2=DEBUG)
+        rust_level = 0
         if numeric_level <= logging.DEBUG:
-            cpp_level = 2
+            rust_level = 2
         elif numeric_level <= logging.INFO:
-            cpp_level = 1
-        _dlengine_cpp.set_log_level(cpp_level)
+            rust_level = 1
+        _rust_set_log_level(rust_level)
     except ImportError:
         pass
 
