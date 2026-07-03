@@ -12,9 +12,9 @@ from typing import Optional
 
 import numpy as np
 
-from dlengine._cpp import (
-    SequenceMetric as _CppSequenceMetric,
-    ServerMetric as _CppServerMetric,
+from dlengine._rust.core import (
+    SequenceMetric as _RustSequenceMetric,
+    ServerMetric as _RustServerMetric,
 )
 from dlengine.logging import get_logger
 
@@ -41,7 +41,7 @@ def _human_bytes(n: float) -> str:
     return f"{step:.1f}GiB"
 
 
-class SequenceMetric(_CppSequenceMetric):
+class SequenceMetric(_RustSequenceMetric):
     def log_metrics(self):
         """Log all metrics for this sequence."""
 
@@ -81,7 +81,7 @@ class SequenceMetric(_CppSequenceMetric):
         )
 
 
-ServerMetric = _CppServerMetric
+ServerMetric = _RustServerMetric
 
 
 class MetricsManager:
@@ -201,7 +201,7 @@ class MetricsManager:
             self.server_metric.add_tokens(num_generated=metric.num_generated_tokens)
             self.server_metric.add_completed_request()
             # Aggregate TTFT / TPOT for the Prometheus summaries. Both are
-            # reported by the C++ metric in milliseconds and may be None for
+            # reported by the Rust metric in milliseconds and may be None for
             # degenerate sequences (no first token / single-token outputs).
             ttft_ms = metric.ttft
             if ttft_ms is not None:
@@ -671,7 +671,7 @@ class MetricsManager:
                 f"n={len(arr)}"
             )
 
-        # Per-token ITL w/o first token (from itl_samples collected in C++)
+        # Per-token ITL w/o first token (from itl_samples collected in Rust)
         all_itl = []
         for m in self.sequence_metrics.values():
             if m.itl_samples:

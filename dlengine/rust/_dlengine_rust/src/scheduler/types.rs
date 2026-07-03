@@ -1,4 +1,4 @@
-use crate::cache_plan::CachePlan;
+use crate::config::CachePlan;
 use crate::sequence::Sequence;
 use pyo3::prelude::*;
 use pyo3::types::PyType;

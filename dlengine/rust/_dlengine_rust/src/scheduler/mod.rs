@@ -1,11 +1,11 @@
 use crate::metrics::{SequenceMetric, ServerMetric};
-use crate::sequence::{set_sequence_block_size, Sequence};
-use crate::snapshots::{SchedulerMetricSnapshot, StepMetricSnapshot};
-use crate::stubs::wire::{
+use crate::proto::wire::{
     add_request_to_sequence, bytes_arg, decode_binary, migration_request_to_sequence,
-    sequence_migrate_batch_bytes, sequence_run_batch_bytes, sequence_to_migration_request,
-    WireAddRequest, WireMigrationRequest,
+    sequence_migrate_batch_bytes, sequence_runner_in_bytes, sequence_to_migration_request,
+    WireRequestIn, WireRequestMigrate, WireSamplingParams, WireVisionSlot,
 };
+use crate::sequence::{set_sequence_block_size, SamplingParams, Sequence};
+use crate::snapshots::{SchedulerMetricSnapshot, StepMetricSnapshot};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::{HashMap, HashSet};
@@ -147,13 +147,57 @@ impl Scheduler {
         }
     }
 
+    #[pyo3(signature = (seq_id, prompt_token_ids, sampling_params, affinity_key = 0, vision_slots = None))]
+    fn add_request(
+        &mut self,
+        py: Python<'_>,
+        seq_id: u64,
+        prompt_token_ids: Vec<i32>,
+        sampling_params: Py<SamplingParams>,
+        affinity_key: u64,
+        vision_slots: Option<Vec<(String, i32, i32, i32, i32)>>,
+    ) -> PyResult<(u64, i32)> {
+        let prompt_len = prompt_token_ids.len() as i32;
+        let sampling_params = sampling_params.borrow(py);
+        let request = WireRequestIn {
+            seq_id,
+            prompt_token_ids,
+            sampling_params: WireSamplingParams::from(&*sampling_params),
+            affinity_key,
+            vision_slots: vision_slots
+                .unwrap_or_default()
+                .into_iter()
+                .map(
+                    |(
+                        encoder_engine_id,
+                        slot_idx,
+                        num_tokens,
+                        hidden_size,
+                        max_tokens_per_slot,
+                    )| {
+                        WireVisionSlot {
+                            encoder_engine_id,
+                            slot_idx,
+                            num_tokens,
+                            hidden_size,
+                            max_tokens_per_slot,
+                        }
+                    },
+                )
+                .collect(),
+        };
+        let seq = add_request_to_sequence(py, request)?;
+        self.add(seq);
+        Ok((seq_id, prompt_len))
+    }
+
     fn add_request_bytes(
         &mut self,
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<(u64, i32)>> {
         let data = bytes_arg(data)?;
-        if let Ok(requests) = decode_binary::<Vec<WireAddRequest>>(&data, "add request") {
+        if let Ok(requests) = decode_binary::<Vec<WireRequestIn>>(&data, "add request") {
             let mut added = Vec::with_capacity(requests.len());
             for request in requests {
                 let seq_id = request.seq_id;
@@ -165,7 +209,7 @@ impl Scheduler {
             return Ok(added);
         }
 
-        let request: WireMigrationRequest = decode_binary(&data, "migration request")?;
+        let request: WireRequestMigrate = decode_binary(&data, "migration request")?;
         let seq_id = request.seq_id;
         let prompt_len = request.num_prompt_tokens;
         let seq = migration_request_to_sequence(py, request)?;
@@ -304,7 +348,7 @@ impl Scheduler {
         let mut out = Vec::with_capacity(dp_group_seqs.len() * tp_size.max(1));
         for seqs in dp_group_seqs {
             for _ in 0..tp_size.max(1) {
-                let bytes = sequence_run_batch_bytes(
+                let bytes = sequence_runner_in_bytes(
                     py,
                     seqs.iter().map(|seq| seq.clone_ref(py)).collect(),
                     is_prefill,
@@ -404,7 +448,7 @@ impl Scheduler {
                 event.set_item("vision_slots", vision_list)?;
                 if is_to_be_migrated {
                     let migration = sequence_to_migration_request(py, &seq);
-                    let bytes = crate::stubs::wire::encode_binary(&migration, "migration request")?;
+                    let bytes = crate::proto::wire::encode_binary(&migration, "migration request")?;
                     event.set_item("migration_payload", PyBytes::new(py, &bytes))?;
                 }
                 if !vision_slots.is_empty() {

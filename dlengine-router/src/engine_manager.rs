@@ -15,6 +15,9 @@ pub struct ModelPool {
     pub prefill_engines: Vec<Arc<Mutex<EngineAdapter>>>,
     pub decode_engines: Vec<Arc<Mutex<EngineAdapter>>>,
     pub encoder_engines: Vec<Arc<Mutex<EncoderAdapter>>>,
+    pub http_hybrid_engines: Vec<String>,
+    pub http_prefill_engines: Vec<String>,
+    pub http_decode_engines: Vec<String>,
     /// Lazily loaded tokenizer; None until an engine with model_path arrives.
     pub tokenizer_slot: Arc<RwLock<Option<Arc<TokenizerService>>>>,
 }
@@ -25,6 +28,9 @@ impl ModelPool {
             prefill_engines: Vec::new(),
             decode_engines: Vec::new(),
             encoder_engines: Vec::new(),
+            http_hybrid_engines: Vec::new(),
+            http_prefill_engines: Vec::new(),
+            http_decode_engines: Vec::new(),
             tokenizer_slot: Arc::new(RwLock::new(None)),
         }
     }
@@ -40,6 +46,18 @@ impl ModelPool {
     pub fn get_next_encoder(&self) -> Option<Arc<Mutex<EncoderAdapter>>> {
         self.encoder_engines.first().cloned()
     }
+
+    pub fn get_next_http_hybrid(&self) -> Option<&str> {
+        self.http_hybrid_engines.first().map(String::as_str)
+    }
+
+    pub fn get_next_http_prefill(&self) -> Option<&str> {
+        self.http_prefill_engines.first().map(String::as_str)
+    }
+
+    pub fn get_next_http_decode(&self) -> Option<&str> {
+        self.http_decode_engines.first().map(String::as_str)
+    }
 }
 
 /// Parsed fields from an engine info JSON value.
@@ -49,6 +67,12 @@ struct ParsedEngineInfo {
     connect_addr: String,
     world_size: i32,
     num_blocks: i32,
+}
+
+struct HttpEngineInfo {
+    engine_id: String,
+    role: String,
+    url: String,
 }
 
 pub struct EngineManager {
@@ -91,10 +115,50 @@ impl EngineManager {
     pub fn total_engine_counts(&self) -> (usize, usize, usize) {
         self.model_pools.values().fold((0, 0, 0), |acc, p| {
             (
-                acc.0 + p.prefill_engines.len(),
-                acc.1 + p.decode_engines.len(),
+                acc.0
+                    + p.prefill_engines.len()
+                    + p.http_prefill_engines.len()
+                    + p.http_hybrid_engines.len(),
+                acc.1
+                    + p.decode_engines.len()
+                    + p.http_decode_engines.len()
+                    + p.http_hybrid_engines.len(),
                 acc.2 + p.encoder_engines.len(),
             )
+        })
+    }
+
+    fn parse_http_engine_info(info: &serde_json::Value) -> Option<HttpEngineInfo> {
+        if info.get("kind").and_then(|v| v.as_str()) != Some("dlengine") {
+            return None;
+        }
+        let endpoint = info.get("endpoint")?.as_object()?;
+        let protocol = endpoint
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("http");
+        if protocol != "http" && protocol != "https" {
+            return None;
+        }
+        let host = endpoint.get("host")?.as_str()?;
+        let port = endpoint.get("port")?.as_u64()?;
+        let connect_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+        let metadata = info.get("metadata").and_then(|v| v.as_object());
+        let role = metadata
+            .and_then(|m| m.get("role"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("hybrid")
+            .to_ascii_lowercase();
+        let engine_id = info
+            .get("entity_id")
+            .or_else(|| info.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        Some(HttpEngineInfo {
+            engine_id,
+            role,
+            url: format!("{}://{}:{}", protocol, connect_host, port),
         })
     }
 
@@ -216,6 +280,66 @@ impl EngineManager {
             .insert(engine_id.to_string(), model_key.to_string());
     }
 
+    fn model_aliases_from_metadata(
+        metadata: &serde_json::Map<String, serde_json::Value>,
+    ) -> Vec<String> {
+        let mut aliases = Vec::new();
+        let mut add = |value: Option<&str>| {
+            let Some(value) = value else {
+                return;
+            };
+            let key = value.trim().trim_end_matches('/');
+            if !key.is_empty() && !aliases.iter().any(|x| x == key) {
+                aliases.push(key.to_string());
+            }
+        };
+
+        add(metadata.get("served_model_name").and_then(|v| v.as_str()));
+        if let Some(model_path) = metadata.get("model_path").and_then(|v| v.as_str()) {
+            add(Some(model_path));
+            add(model_path.trim_end_matches('/').rsplit('/').next());
+        }
+        aliases
+    }
+
+    fn insert_http_engine(&mut self, info: &HttpEngineInfo, model_key: &str) {
+        let pool = self
+            .model_pools
+            .entry(model_key.to_string())
+            .or_insert_with(ModelPool::new);
+        match info.role.as_str() {
+            "prefill" => {
+                if !pool.http_prefill_engines.contains(&info.url) {
+                    pool.http_prefill_engines.push(info.url.clone());
+                }
+                info!(
+                    "Added HTTP prefill engine: {} -> {} for model {}",
+                    info.engine_id, info.url, model_key
+                );
+            }
+            "decode" => {
+                if !pool.http_decode_engines.contains(&info.url) {
+                    pool.http_decode_engines.push(info.url.clone());
+                }
+                info!(
+                    "Added HTTP decode engine: {} -> {} for model {}",
+                    info.engine_id, info.url, model_key
+                );
+            }
+            _ => {
+                if !pool.http_hybrid_engines.contains(&info.url) {
+                    pool.http_hybrid_engines.push(info.url.clone());
+                }
+                info!(
+                    "Added HTTP hybrid engine: {} -> {} for model {}",
+                    info.engine_id, info.url, model_key
+                );
+            }
+        }
+        self.engine_model_map
+            .insert(info.engine_id.clone(), model_key.to_string());
+    }
+
     // ─── NanoCtrl API ────────────────────────────────────────────────
 
     /// Get Redis URL from NanoCtrl API
@@ -296,22 +420,11 @@ impl EngineManager {
     /// rest of this module expects. Returns None if the entity is not a
     /// service entity with a metadata dict.
     fn entity_to_engine_info(entity: &serde_json::Value) -> Option<serde_json::Value> {
-        let metadata = entity.get("metadata")?.as_object()?.clone();
-        let mut engine_info = serde_json::Value::Object(metadata);
-        let id = entity
-            .get("entity_id")
-            .or_else(|| entity.get("id"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::String("unknown".to_string()));
-        engine_info["id"] = id;
-        if let Some(kind) = entity.get("kind").cloned() {
-            // "role" is the legacy name used by parse_engine_info; fall back
-            // to the new "kind" field when metadata doesn't already carry it.
-            if engine_info.get("role").is_none() {
-                engine_info["role"] = kind;
-            }
+        if entity.get("kind").and_then(|v| v.as_str()) == Some("dlengine") {
+            return Some(entity.clone());
         }
-        Some(engine_info)
+        debug!("Skipping non-DLEngine service entity: {}", entity);
+        None
     }
 
     // ─── Redis snapshot ──────────────────────────────────────────────
@@ -387,6 +500,32 @@ impl EngineManager {
 
     /// Add engine from engine info JSON (used by snapshot and NanoCtrl API paths).
     async fn add_engine_from_info(&mut self, engine_info: serde_json::Value) -> anyhow::Result<()> {
+        if let Some(http_info) = Self::parse_http_engine_info(&engine_info) {
+            let metadata = engine_info
+                .get("metadata")
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| anyhow::anyhow!("HTTP dlengine entity missing metadata"))?;
+            let model_path = metadata
+                .get("model_path")
+                .and_then(|v| v.as_str())
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("HTTP dlengine entity missing model_path"))?;
+            let aliases = Self::model_aliases_from_metadata(metadata);
+            if aliases.is_empty() {
+                self.insert_http_engine(&http_info, &Self::normalize_model_key(model_path));
+            } else {
+                for alias in aliases {
+                    self.insert_http_engine(&http_info, &alias);
+                }
+            }
+            self.engine_model_map.insert(
+                http_info.engine_id.clone(),
+                Self::normalize_model_key(model_path),
+            );
+            self.maybe_spawn_tokenizer_load(Some(model_path));
+            return Ok(());
+        }
+
         let parsed = Self::parse_engine_info(&engine_info)?;
 
         let model_path = match engine_info["model_path"].as_str() {

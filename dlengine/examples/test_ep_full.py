@@ -4,7 +4,7 @@ Tests the complete pipeline:
   EncoderEngine (encode → EmbeddingPool → RDMA MR)
     ↓ VisionSlotMeta
   LLM Engine (protocol vision_slots → serialize → ModelRunner
-        → extract_vision_slots_from_bytes → _fetch_vision_embeds_rdma
+        → runner_vision_slots → _fetch_vision_embeds_rdma
         → _inject_vision_embeds → prefill forward → decode → output)
     ↓ P2P FreeVisionSlots (Action=4)
   EncoderEngine (free_slots → pool reclaim)

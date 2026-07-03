@@ -2,21 +2,6 @@ mod config;
 mod engine_manager;
 mod engine_watcher;
 mod zmq_packet;
-#[allow(warnings)]
-pub mod fbs {
-    #[allow(clippy::all)]
-    mod sequence_generated {
-        include!(concat!(env!("OUT_DIR"), "/sequence_generated.rs"));
-    }
-
-    #[allow(clippy::all)]
-    mod packet_generated {
-        include!(concat!(env!("OUT_DIR"), "/packet_generated.rs"));
-    }
-
-    pub use self::packet_generated::dlengine::fbs::*;
-    pub use self::sequence_generated::dlengine::fbs::*;
-}
 
 mod encoder_adapter;
 mod engine_adapter;

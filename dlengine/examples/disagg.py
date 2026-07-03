@@ -19,7 +19,7 @@ import os
 import sys
 
 import ray
-from dlengine._cpp import SamplingParams, decode_migration_metadata
+from dlengine._rust.proto import MigrationRequest, SamplingParams
 from dlengine.config import Config
 from dlengine.llm_component import LLMComponent
 from jsonargparse import ActionConfigFile, ArgumentParser
@@ -134,7 +134,7 @@ def main():
 
     migrated_seq_ids = []
     for i, blob in enumerate(migration_payloads):
-        seq_id, first_token = decode_migration_metadata(blob)
+        seq_id, first_token = MigrationRequest.from_bytes(blob).metadata
         migrated_seq_ids.append(int(seq_id))
         print(
             f"  [{i}] seq_id={seq_id}, first_token={first_token}, payload={len(blob)} bytes"

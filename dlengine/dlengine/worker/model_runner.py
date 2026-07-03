@@ -5,11 +5,7 @@ import time as _time
 import ray
 import torch
 import torch.distributed as dist
-from dlengine._cpp import (
-    extract_aux_from_bytes,
-    extract_vision_slots_from_bytes,
-    serialize_dummy_run_batch,
-)
+from dlengine._rust.proto import RunnerIn
 from dlengine.config import Config
 from dlengine.context_v2.batch import get_batch_context
 from dlengine.context_v2.batch_out import get_batch_out_context
@@ -52,7 +48,7 @@ class _StepTimer:
     """Lightweight host timer capturing intra-step phase boundaries.
 
     Phases logged (decode):
-        rpc_in       — extract_aux_from_bytes (deserialize input bytes)
+        rpc_in       — RunnerIn.aux (deserialize input bytes)
         prep         — prepare_decode_bytes (positions/slot_mapping/block_table)
         forward      — run_model (graph.replay) + GPU-side execution
         sample       — _standard_sample (sampler kernel + GPU execution)
@@ -775,7 +771,7 @@ class ModelRunner:
         except Exception as e:  # pragma: no cover - warmup must never crash boot
             logger.warning(f"[startup] r{self.rank} deep_gemm MoE warmup skipped: {e}")
         # Empty warmup batch, built without exposing Sequence serializers.
-        warmup_data = serialize_dummy_run_batch("", 0, True)
+        warmup_data = RunnerIn.dummy("", 0, True).to_bytes()
         self.run_from_bytes(warmup_data, True)
         torch.cuda.empty_cache()
 
@@ -1247,7 +1243,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_from_bytes(self, data: bytes, is_prefill: bool):
-        """Run model from lean RunBatchInput bytes (completely Sequence-free)."""
+        """Run model from lean RunnerIn bytes (completely Sequence-free)."""
         _rcfg = get_runner_config()
         _timing = _rcfg.step_timing
         _timer = _StepTimer() if _timing else None
@@ -1279,7 +1275,8 @@ class ModelRunner:
             _gap_start_evt.record()
             _gap_report = (self.run_count + 1) % _rcfg.step_timing_interval == 0
         sp_rank = get_dist_context().attn_sp_rank
-        aux = extract_aux_from_bytes(data, sp_rank)
+        runner_in = RunnerIn.from_bytes(data)
+        aux = runner_in.aux(sp_rank)
         num_seqs = aux.num_group_seqs
         if _timer is not None:
             _timer.mark("rpc_in")
@@ -1287,12 +1284,13 @@ class ModelRunner:
         is_dummy = False
         if num_seqs == 0:
             is_dummy = True
-            data = serialize_dummy_run_batch(
+            runner_in = RunnerIn.dummy(
                 self.engine_id,
                 get_cache_context().num_local_kvcache_blocks,
                 is_prefill,
             )
-            aux = extract_aux_from_bytes(data, sp_rank)
+            data = runner_in.to_bytes()
+            aux = runner_in.aux(sp_rank)
             num_seqs = aux.num_group_seqs
 
         if is_prefill and self.mtp_runner is not None:
@@ -1307,7 +1305,7 @@ class ModelRunner:
         has_lazy_verify = False
         if is_prefill:
             if not self.vision_manager.has_embeds:
-                vision_slots = extract_vision_slots_from_bytes(data)
+                vision_slots = runner_in.vision_slots()
                 if vision_slots:
                     self.vision_manager.fetch_rdma(
                         vision_slots, self.model.model.embed_tokens.weight.dtype

@@ -4,16 +4,12 @@ import time as _time
 
 from dlslime.rpc import method
 
-from dlengine._cpp import (
-    decode_run_result as _decode_run_result_cpp,
-    encode_run_result as _encode_run_result_cpp,
-)
+from dlengine._rust.proto import RunnerOut
 
 # Each run_batch reply is prefixed with an 8-byte little-endian uint64 holding
 # the server-side handler duration in nanoseconds (decode + forward). The
 # client subtracts this from the measured round trip to derive a "pure" network
-# latency (wire + queueing), excluding remote GPU compute. The FlatBuffers root
-# therefore starts at byte offset 8 (see decode_run_result).
+# latency (wire + queueing), excluding remote GPU compute.
 _REPLY_HEADER = struct.Struct("<Q")
 REPLY_HEADER_SIZE = _REPLY_HEADER.size
 
@@ -40,25 +36,21 @@ def decode_run_request(ptr: int, nbytes: int) -> tuple[bytes, bool]:
 
 
 def encode_run_result(result, server_handler_ns: int = 0) -> bytes:
-    """Encode the per-step worker result as raw FlatBuffers bytes.
+    """Encode the per-step worker result as Rust protocol bytes.
 
     Accepts either the legacy ``list[list[int]]`` (token_ids only) or the
     tuple ``(token_ids: list[list[int]], logprobs: list[list[float]] | None)``
     shipped when SamplingParams.return_completion_logprobs is on.
 
-    The returned buffer is prefixed with an 8-byte server-handler-ns header
-    (see _REPLY_HEADER); the FlatBuffers root starts at REPLY_HEADER_SIZE.
-
-    Encoding runs in C++ (dlengine._cpp.encode_run_result) to keep the
-    per-seq loop out of the interpreter on the per-step hot path; the wire
-    format is unchanged.
+    Encoding runs in Rust to keep the
+    per-seq loop out of the interpreter on the per-step hot path.
     """
     if isinstance(result, tuple):
         token_ids, logprobs = result
     else:
         token_ids, logprobs = result, None
 
-    return _encode_run_result_cpp(token_ids, logprobs, server_handler_ns)
+    return bytes(RunnerOut(token_ids, logprobs, server_handler_ns).to_bytes())
 
 
 def decode_run_result(data: bytes):
@@ -66,11 +58,10 @@ def decode_run_result(data: bytes):
 
     Returns ``(list[list[int]], list[list[float]] | None)``. The 8-byte
     server-timing header prepended by encode_run_result is skipped inside the
-    C++ decoder (dlengine._cpp.decode_run_result), which replaces the former
-    per-seq/per-token Python flatbuffers accessor loop on the per-step hot
-    path; the wire format is unchanged.
+    Rust decoder, which keeps the per-seq/per-token decode loop out of Python
+    on the per-step hot path.
     """
-    return _decode_run_result_cpp(data)
+    return RunnerOut.from_bytes(data).result
 
 
 class ModelRunnerRpcService:

@@ -158,7 +158,7 @@ class LLMComponent(LLM):
         lazy P2P connection.
 
         Args:
-            remote_engine_info: JSON string or FlatBuffers bytes (for backward compatibility)
+            remote_engine_info: JSON string from the engine registry.
         """
         info_dict = json.loads(remote_engine_info)
 
@@ -209,19 +209,9 @@ class LLMComponent(LLM):
             target_encoder_id: Encoder engine ID to send free instruction to
             slot_indices: List of slot indices to free in the encoder's EmbeddingPool
         """
-        import flatbuffers
-        import numpy as np
         import zmq
 
-        from dlengine.fbs.FreeVisionSlots import (
-            FreeVisionSlotsAddEncoderEngineId,
-            FreeVisionSlotsAddSlotIndices,
-            FreeVisionSlotsAddSourceEngineId,
-            FreeVisionSlotsEnd,
-            FreeVisionSlotsStart,
-            FreeVisionSlotsStartSlotIndicesVector,
-        )
-        from dlengine.server.zmq_protocol import encode_packet
+        from dlengine.server.wire import encode_free_vision_slots, encode_packet
 
         if not slot_indices:
             return
@@ -259,24 +249,9 @@ class LLMComponent(LLM):
         else:
             client_socket = self._p2p_clients[target_encoder_id]
 
-        # Build FreeVisionSlots FlatBuffer
-        builder = flatbuffers.Builder(256)
-        encoder_id_off = builder.CreateString(target_encoder_id)
-        source_id_off = builder.CreateString(self.engine_id)
-
-        FreeVisionSlotsStartSlotIndicesVector(builder, len(slot_indices))
-        for idx in reversed(slot_indices):
-            builder.PrependInt32(idx)
-        slot_vec = builder.EndVector()
-
-        FreeVisionSlotsStart(builder)
-        FreeVisionSlotsAddEncoderEngineId(builder, encoder_id_off)
-        FreeVisionSlotsAddSlotIndices(builder, slot_vec)
-        FreeVisionSlotsAddSourceEngineId(builder, source_id_off)
-        free_req = FreeVisionSlotsEnd(builder)
-        builder.Finish(free_req)
-
-        payload = bytes(builder.Output())
+        payload = encode_free_vision_slots(
+            target_encoder_id, slot_indices, self.engine_id
+        )
 
         # Send via P2P (Action 4 = FreeVisionSlots)
         packet = encode_packet(action=4, payload=payload)
@@ -302,17 +277,9 @@ class LLMComponent(LLM):
             target_engine_id: Engine ID to send free instruction to
             seq_ids: List of sequence IDs to free
         """
-        import flatbuffers
-        import numpy as np
         import zmq
 
-        from dlengine.fbs.FreeSequences import (
-            FreeSequencesAddSeqIds,
-            FreeSequencesAddSourceEngineId,
-            FreeSequencesEnd,
-            FreeSequencesStart,
-        )
-        from dlengine.server.zmq_protocol import encode_packet
+        from dlengine.server.wire import encode_free_sequences, encode_packet
 
         if not seq_ids:
             logger.warning(f"No sequence IDs to free for engine {target_engine_id}")
@@ -354,18 +321,7 @@ class LLMComponent(LLM):
         else:
             client_socket = self._p2p_clients[target_engine_id]
 
-        # Build FreeSequences FlatBuffer
-        builder = flatbuffers.Builder(256)
-        seq_ids_vec = builder.CreateNumpyVector(np.array(seq_ids, dtype=np.uint64))
-        source_id_offset = builder.CreateString(self.engine_id)
-
-        FreeSequencesStart(builder)
-        FreeSequencesAddSeqIds(builder, seq_ids_vec)
-        FreeSequencesAddSourceEngineId(builder, source_id_offset)
-        free_req = FreeSequencesEnd(builder)
-        builder.Finish(free_req)
-
-        payload = bytes(builder.Output())
+        payload = encode_free_sequences(seq_ids, self.engine_id)
 
         # Send via P2P (Action 3)
         packet = encode_packet(action=3, payload=payload)

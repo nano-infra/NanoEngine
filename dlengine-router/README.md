@@ -4,12 +4,12 @@ High-performance Inference Router written in Rust.
 
 ## Architecture
 
-dlengine-router acts as the request routing layer for distributed inference. It exposes an OpenAI-compatible HTTP API and connects to Python Inference Engines via **ZMQ**, with dynamic service discovery powered by **dlslime-ctrl + Redis**.
+dlengine-router acts as the request routing layer for distributed inference. It exposes an OpenAI-compatible HTTP API and connects to Python Inference Engines via the DLEngine wire protocol over **ZMQ**, with dynamic service discovery powered by **dlslime-ctrl + Redis**.
 
 ### Key Components
 
 - **HTTP Layer**: Axum-based REST API (`/health`, `/v1/chat/completions`). Supports both streaming (SSE) and non-streaming responses.
-- **Engine Adapter**: ZMQ DEALER socket for low-latency communication with inference engines. Wire format is a single FlatBuffers `ZmqPacket` (schema: `dlengine-proto/packet.fbs`) containing `action` enum + `payload` bytes. Inner payloads (SequenceList, StepOut, etc.) are defined in `dlengine-proto/sequence.fbs`.
+- **Engine Adapter**: ZMQ DEALER socket for low-latency communication with inference engines. The outer packet matches `dlengine.server.wire` JSON (`action` + `payload` bytes). Add/migration payloads use the Rust-owned DLEngine bincode structs, while StepOut/free control messages use the small JSON helpers shared with the Python server.
 - **Engine Manager**: Manages ZMQ connections to engines discovered via the dlslime-ctrl API and Redis. Supports prefill/decode disaggregation.
 - **Engine Watcher**: Redis pub/sub listener for real-time engine add/remove/update events, with gap detection and automatic full-sync recovery.
 - **Tokenizer**: HuggingFace `tokenizers` + `minijinja` for ChatML template rendering.
@@ -26,7 +26,6 @@ dlengine-router acts as the request routing layer for distributed inference. It 
 ### Prerequisites
 
 - Rust Toolchain (latest stable)
-- FlatBuffers Compiler (`flatc`)
 - A running **dlslime-ctrl** instance (provides Redis URL and engine registry)
 - A running **Redis** instance (used for engine discovery pub/sub)
 

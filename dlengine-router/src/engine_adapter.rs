@@ -1,15 +1,17 @@
-use crate::fbs::{
-    FreeSequences, FreeSequencesArgs, SamplingParams, SamplingParamsArgs, Sequence, SequenceArgs,
-    SequenceList, SequenceListArgs, SequenceStatus, StepOut, VisionSlot, VisionSlotArgs,
-};
 use crate::zmq_packet::ZmqPacket;
-use flatbuffers::FlatBufferBuilder;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use tokio::sync::{mpsc as tokio_mpsc, Mutex};
 use tracing::{info, warn};
+
+const ACTION_STEPOUT: u32 = 0;
+const ACTION_ADD_OR_MIGRATE: u32 = 1;
+const ACTION_FREE: u32 = 3;
+const STATUS_RUNNING: i32 = 1;
+const STATUS_FINISHED: i32 = 2;
 
 pub struct EngineAdapter {
     pub request_tx: Option<mpsc::SyncSender<ZmqPacket>>,
@@ -38,6 +40,104 @@ pub enum StreamEvent {
 pub struct RequestState {
     pub sender: tokio_mpsc::UnboundedSender<StreamEvent>,
     pub accumulated_tokens: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WireSamplingParams {
+    temperature: f64,
+    max_tokens: i32,
+    ignore_eos: bool,
+    return_completion_logprobs: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WireVisionSlot {
+    encoder_engine_id: String,
+    slot_idx: i32,
+    num_tokens: i32,
+    hidden_size: i32,
+    max_tokens_per_slot: i32,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WireAddRequest {
+    seq_id: u64,
+    prompt_token_ids: Vec<i32>,
+    sampling_params: WireSamplingParams,
+    affinity_key: u64,
+    vision_slots: Vec<WireVisionSlot>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct WireMigrationRequest {
+    seq_id: u64,
+    status: i32,
+    token_ids: Vec<i32>,
+    last_token: i32,
+    num_tokens: i32,
+    num_prompt_tokens: i32,
+    num_checkpointed_tokens: i32,
+    num_cached_tokens: i32,
+    affinity_key: u64,
+    sampling_params: WireSamplingParams,
+    completion_logprobs: Vec<f32>,
+    active_block_table: Vec<i32>,
+    active_block_tables: HashMap<i32, Vec<i32>>,
+    active_dispatched_tokens: Vec<i32>,
+    active_dp_idx: i32,
+    active_group_id: i32,
+    active_state_slot: i32,
+    active_compressed_block_tables: HashMap<i32, Vec<i32>>,
+    active_hisparse_slot: i32,
+    migrate_block_table: Vec<i32>,
+    migrate_block_tables: HashMap<i32, Vec<i32>>,
+    migrate_engine_id: String,
+    migrate_num_kvcache_blocks: i32,
+    migrate_group_size: i32,
+    migrate_dp_idx: i32,
+    migrate_group_id: i32,
+    migrate_state_slot: i32,
+    migrate_compressed_block_tables: HashMap<i32, Vec<i32>>,
+    migrate_hisparse_slot: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct StepOut {
+    seq_id: u64,
+    #[serde(default)]
+    token_id: Option<u32>,
+    #[serde(default)]
+    token_ids: Vec<u32>,
+    status: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct FreeSequences {
+    seq_ids: Vec<u64>,
+    source_engine_id: String,
+}
+
+fn encode_add_requests(requests: &[WireAddRequest]) -> anyhow::Result<Vec<u8>> {
+    bincode::serialize(requests).map_err(|e| anyhow::anyhow!("failed to encode add request: {e}"))
+}
+
+fn decode_migration_seq_id(payload: &[u8]) -> anyhow::Result<u64> {
+    let request: WireMigrationRequest = bincode::deserialize(payload)
+        .map_err(|e| anyhow::anyhow!("failed to decode migration request: {e}"))?;
+    Ok(request.seq_id)
+}
+
+fn decode_stepout(payload: &[u8]) -> anyhow::Result<StepOut> {
+    serde_json::from_slice(payload).map_err(|e| anyhow::anyhow!("failed to decode stepout: {e}"))
+}
+
+fn encode_free_sequences(seq_ids: Vec<u64>, source_engine_id: &str) -> anyhow::Result<Vec<u8>> {
+    serde_json::to_vec(&FreeSequences {
+        seq_ids,
+        source_engine_id: source_engine_id.to_string(),
+    })
+    .map_err(|e| anyhow::anyhow!("failed to encode free request: {e}"))
 }
 
 impl EngineAdapter {
@@ -185,36 +285,25 @@ impl EngineAdapter {
                     info!("Received packet: action={}, payload_size={}", action, payload.len());
                 }
 
-                // Action 1: Migration response (SequenceList payload)
-                if action == 1 {
-                    let sl = match flatbuffers::root::<SequenceList>(&payload) {
+                // Action 1: Migration response (Rust-owned bincode payload)
+                if action == ACTION_ADD_OR_MIGRATE {
+                    let seq_id = match decode_migration_seq_id(&payload) {
                         Ok(v) => v,
                         Err(e) => {
-                            warn!("Failed to safely parse SequenceList flatbuffer: {}", e);
+                            warn!("Failed to parse migration payload: {}", e);
                             continue;
                         }
                     };
-                    let seq_id = sl.sequences().and_then(|seqs| {
-                        if seqs.is_empty() {
-                            None
-                        } else {
-                            Some(seqs.get(0).seq_id())
-                        }
-                    });
-                    if let Some(seq_id) = seq_id {
-                        if seq_id > 0 {
-                            let mut map = pending.lock().await;
-                            let map_size = map.len();
-                            if let Some(state) = map.remove(&seq_id) {
-                                if state.sender.send(StreamEvent::Migrate(payload)).is_err() {
-                                    warn!("Migration event send failed (client disconnected) for seq_id={}", seq_id);
-                                }
-                            } else {
-                                warn!("Migration response for seq_id={} not found in pending_requests (map_size={})", seq_id, map_size);
+                    if seq_id > 0 {
+                        let mut map = pending.lock().await;
+                        let map_size = map.len();
+                        if let Some(state) = map.remove(&seq_id) {
+                            if state.sender.send(StreamEvent::Migrate(payload)).is_err() {
+                                warn!("Migration event send failed (client disconnected) for seq_id={}", seq_id);
                             }
+                        } else {
+                            warn!("Migration response for seq_id={} not found in pending_requests (map_size={})", seq_id, map_size);
                         }
-                    } else {
-                        warn!("Migration response with no seq_id in SequenceList");
                     }
                     continue;
                 }
@@ -222,27 +311,29 @@ impl EngineAdapter {
 
 
                 // Action 0: StepOut (token streaming)
-                if action == 0 {
-                    let step_out = match flatbuffers::root::<StepOut>(&payload) {
+                if action == ACTION_STEPOUT {
+                    let step_out = match decode_stepout(&payload) {
                         Ok(v) => v,
                         Err(e) => {
-                            warn!("Failed to safely parse StepOut flatbuffer: {}", e);
+                            warn!("Failed to parse StepOut payload: {}", e);
                             continue;
                         }
                     };
-                    let seq_id = step_out.seq_id();
-                    let status = step_out.status();
+                    let seq_id = step_out.seq_id;
+                    let status = step_out.status;
 
-                    // Extract tokens: prefer token_ids vector over single token_id
-                    let tokens: Vec<u32> = step_out.token_ids()
-                        .map(|ids| ids.iter().collect())
-                        .unwrap_or_else(|| {
-                            let token_id = step_out.token_id();
-                            if token_id > 0 { vec![token_id] } else { vec![] }
-                        });
+                    let tokens: Vec<u32> = if step_out.token_ids.is_empty() {
+                        step_out
+                            .token_id
+                            .filter(|token_id| *token_id > 0)
+                            .into_iter()
+                            .collect()
+                    } else {
+                        step_out.token_ids
+                    };
 
                     let mut map = pending.lock().await;
-                    if status == SequenceStatus::FINISHED {
+                    if status == STATUS_FINISHED {
                         if let Some(final_state) = map.remove(&seq_id) {
                             // Log finish with total token count
                             let total_tokens = final_state.accumulated_tokens.len() + tokens.len();
@@ -260,7 +351,7 @@ impl EngineAdapter {
                         } else {
                             warn!("Sequence {} finished but not found in pending_requests (map_size={})", seq_id, map.len());
                         }
-                    } else if matches!(status, SequenceStatus::RUNNING) {
+                    } else if status == STATUS_RUNNING {
                         if let Some(state) = map.get_mut(&seq_id) {
                             // Only log at the beginning (first token)
                             let is_first = state.accumulated_tokens.is_empty();
@@ -331,7 +422,7 @@ impl EngineAdapter {
             seq_id,
             payload.len()
         );
-        self.send_packet(1, payload)?;
+        self.send_packet(ACTION_ADD_OR_MIGRATE, payload)?;
         Ok(rx)
     }
 
@@ -363,75 +454,31 @@ impl EngineAdapter {
         ignore_eos: bool,
         vision_slots_info: Option<&[crate::encoder_adapter::VisionSlotInfo]>,
     ) -> anyhow::Result<tokio_mpsc::UnboundedReceiver<StreamEvent>> {
-        let mut builder = FlatBufferBuilder::new();
         let token_ids_i32: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
-        let t_vec = builder.create_vector(&token_ids_i32);
-
-        let sampling_params = SamplingParams::create(
-            &mut builder,
-            &SamplingParamsArgs {
+        let vision_slots = vision_slots_info
+            .unwrap_or_default()
+            .iter()
+            .map(|slot| WireVisionSlot {
+                encoder_engine_id: slot.encoder_engine_id.clone(),
+                slot_idx: slot.slot_idx as i32,
+                num_tokens: slot.num_tokens as i32,
+                hidden_size: slot.hidden_size as i32,
+                max_tokens_per_slot: slot.max_tokens_per_slot as i32,
+            })
+            .collect();
+        let request = WireAddRequest {
+            seq_id,
+            prompt_token_ids: token_ids_i32,
+            sampling_params: WireSamplingParams {
                 temperature: temperature as f64,
                 max_tokens,
                 ignore_eos,
                 return_completion_logprobs: false,
             },
-        );
-
-        // Build vision_slots if provided
-        let vision_slots_vec =
-            vision_slots_info.map(|slots: &[crate::encoder_adapter::VisionSlotInfo]| {
-                let vs: Vec<_> = slots
-                    .iter()
-                    .map(|s| {
-                        let eid = builder.create_string(&s.encoder_engine_id);
-                        VisionSlot::create(
-                            &mut builder,
-                            &VisionSlotArgs {
-                                encoder_engine_id: Some(eid),
-                                slot_idx: s.slot_idx as i32,
-                                num_tokens: s.num_tokens as i32,
-                                hidden_size: s.hidden_size as i32,
-                                max_tokens_per_slot: s.max_tokens_per_slot as i32,
-                            },
-                        )
-                    })
-                    .collect();
-                builder.create_vector(&vs)
-            });
-
-        let num_tokens = token_ids.len() as i32;
-        let last_token = if num_tokens > 0 {
-            token_ids_i32[num_tokens as usize - 1]
-        } else {
-            0
+            affinity_key: 0,
+            vision_slots,
         };
-
-        let seq = Sequence::create(
-            &mut builder,
-            &SequenceArgs {
-                seq_id,
-                status: SequenceStatus::WAITING,
-                token_ids: Some(t_vec),
-                num_tokens,
-                num_prompt_tokens: num_tokens,
-                num_checkpointed_tokens: num_tokens,
-                last_token,
-                sampling_params: Some(sampling_params),
-                vision_slots: vision_slots_vec,
-                ..Default::default()
-            },
-        );
-
-        let seqs = builder.create_vector(&[seq]);
-        let root = SequenceList::create(
-            &mut builder,
-            &SequenceListArgs {
-                sequences: Some(seqs),
-            },
-        );
-
-        builder.finish(root, None);
-        let payload = builder.finished_data().to_vec();
+        let payload = encode_add_requests(&[request])?;
 
         let (tx, rx) = tokio_mpsc::unbounded_channel();
         {
@@ -446,31 +493,19 @@ impl EngineAdapter {
         }
         info!(
             "Sending ADD request for seq {} with {} tokens, max_tokens={}",
-            seq_id, num_tokens, max_tokens
+            seq_id,
+            token_ids.len(),
+            max_tokens
         );
-        self.send_packet(1, payload)?;
+        self.send_packet(ACTION_ADD_OR_MIGRATE, payload)?;
         Ok(rx)
     }
 
     pub async fn send_free_request(&mut self, seq_id: u64) -> anyhow::Result<()> {
-        let mut builder = FlatBufferBuilder::new();
-        let seq_ids_vec = builder.create_vector(&[seq_id]);
-
-        // source_engine_id: Identify that the router triggered the free
-        let source_id = builder.create_string("router");
-
-        let free_req = FreeSequences::create(
-            &mut builder,
-            &FreeSequencesArgs {
-                seq_ids: Some(seq_ids_vec),
-                source_engine_id: Some(source_id),
-            },
-        );
-        builder.finish(free_req, None);
-        let payload = builder.finished_data().to_vec();
+        let payload = encode_free_sequences(vec![seq_id], "router")?;
 
         info!("Sending FREE request for seq {} from router", seq_id);
-        self.send_packet(3, payload)?;
+        self.send_packet(ACTION_FREE, payload)?;
 
         // Remove from pending completely
         let mut map = self.pending_requests.lock().await;

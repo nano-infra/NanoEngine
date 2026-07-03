@@ -90,7 +90,7 @@ class VisionEmbedManager:
 
         Args:
             vision_slot_views: List of VisionSlotView from
-                ``extract_vision_slots_from_bytes``.
+                ``RunnerIn.vision_slots``.
             model_dtype: dtype of the model's embedding layer weights.
         """
         if not vision_slot_views:

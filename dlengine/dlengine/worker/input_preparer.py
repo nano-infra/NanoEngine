@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import torch
-from dlengine._cpp import prepare_decode_from_bytes, prepare_prefill_from_bytes
+from dlengine._rust.proto import RunnerIn
 from dlengine.config import Config
 from dlengine.context_v2.batch import get_batch_context, set_batch_context
 from dlengine.context_v2.cache import get_cache_context
@@ -33,8 +33,7 @@ class InputPreparer:
         sp_size = get_dist_context().attn_sp_world_size
         block_size = self.config.kvcache_block_size
 
-        meta = prepare_prefill_from_bytes(
-            data,
+        meta = RunnerIn.from_bytes(data).prefill(
             sp_rank,
             sp_size,
             block_size,
@@ -44,7 +43,7 @@ class InputPreparer:
 
         if len(meta.input_ids) == 0:
             logger.critical(
-                "prepare_prefill_from_bytes returned empty input_ids! "
+                "RunnerIn.prefill returned empty input_ids! "
                 "is_dummy=%s block_size=%s max_num_seqs=%s",
                 is_dummy,
                 block_size,
@@ -106,7 +105,7 @@ class InputPreparer:
 
             # DSv4 compressed-cache block tables — indexed by state_slot.
             # aux.compressed_block_tables[ratio]: list[list[int]] in master-group
-            # seq order; aux.state_slots[i] is the C++ slot id for that seq.
+            # seq order; aux.state_slots[i] is the Rust scheduler slot id for that seq.
             # Build [max_num_seqs+1, max_blocks] tensors per ratio, scattering
             # each seq's page ids into row state_slot. Row max_num_seqs is the
             # dummy (matches dsv4_state_slots dummy convention).
@@ -175,8 +174,7 @@ class InputPreparer:
         block_size = self.config.kvcache_block_size
 
         try:
-            meta = prepare_decode_from_bytes(
-                data,
+            meta = RunnerIn.from_bytes(data).decode(
                 sp_rank,
                 sp_size,
                 block_size,
@@ -185,7 +183,7 @@ class InputPreparer:
             )
         except (IndexError, ValueError, RuntimeError) as e:
             logger.error(
-                "prepare_decode_from_bytes failed: %s (block_size=%s max_num_seqs=%s)",
+                "RunnerIn.decode failed: %s (block_size=%s max_num_seqs=%s)",
                 str(e),
                 block_size,
                 self.config.max_num_seqs,

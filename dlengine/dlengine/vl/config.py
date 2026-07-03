@@ -1,7 +1,7 @@
 """VLConfig – configuration for Vision-Language inference.
 
-Extends DLEngine's ``Config`` with vision-specific parameters while
-keeping backward compatibility with the LLM engine.
+Extends DLEngine's ``Config`` with vision-specific parameters for the
+same networked engine path used by the LLM engine.
 """
 
 from __future__ import annotations

@@ -1,28 +1,15 @@
-import ctypes
 import math
 
-from dlengine._cpp import (
-    CachePlan,
-    decode_run_result,
-    encode_run_result,
-    parse_migrate_batch,
-    prepare_decode_from_bytes,
-    prepare_prefill_from_bytes,
-    SamplingParams,
-    Scheduler,
-    SchedulerConfig,
-    Sequence,
-    SequenceMetric,
-    serialize,
-    serialize_migrate_batch,
-    serialize_run_batch,
-)
+from dlengine._rust.config import CachePlan, SchedulerConfig
+from dlengine._rust.core import Scheduler, SequenceMetric
+from dlengine._rust.proto import MigrationIn, RequestIn, RunnerIn, SamplingParams
+from dlengine.engine.dlslime_protocol import decode_run_result, encode_run_result
 
 
 def _scheduler() -> Scheduler:
     return Scheduler(
         SchedulerConfig(
-            engine_id="strong-type-test",
+            engine_id="protocol-test",
             max_num_seqs=4,
             max_num_batched_tokens=16,
             max_model_len=64,
@@ -35,51 +22,63 @@ def _scheduler() -> Scheduler:
     )
 
 
-def test_scheduler_sequence_metric_and_wire_roundtrip():
-    sched = _scheduler()
-    seq = Sequence(
-        [1, 2, 3], SamplingParams(max_tokens=2, return_completion_logprobs=True)
+def _add_request(sched: Scheduler, seq_id: int, tokens: list[int]) -> None:
+    added = sched.add_request(
+        seq_id,
+        tokens,
+        SamplingParams(max_tokens=2, return_completion_logprobs=True),
+        0,
+        None,
     )
-    seq.metric = SequenceMetric(seq.seq_id, seq.num_prompt_tokens)
+    assert added == (seq_id, len(tokens))
+    assert sched.set_sequence_metric(seq_id, SequenceMetric(seq_id, len(tokens)))
 
-    sched.add(seq)
+
+def test_ipc_add_request_bytes_roundtrip():
+    sched = _scheduler()
+    request = RequestIn(3003, [8, 9], SamplingParams(), 0, None)
+    payload = request.to_bytes()
+    assert sched.add_request_bytes(payload) == [(3003, 2)]
+    decoded = RequestIn.from_bytes(payload)
+    assert decoded.seq_id == 3003
+    assert decoded.prompt_token_ids == [8, 9]
+
+
+def test_scheduler_protocol_roundtrip_without_public_sequence_construction():
+    sched = _scheduler()
+    _add_request(sched, 1001, [1, 2, 3])
+
     result = sched.schedule()
     assert result.is_prefill
-    assert len(result.dp_seqs) == 1
-    assert len(result.dp_seqs[0]) == 1
 
-    batch = serialize_run_batch(result.dp_seqs[0], True)
-    meta = prepare_prefill_from_bytes(batch, 0, 1, 4, 4, 16)
+    batch = sched.serialize_run_batches(result.dp_group_seqs, result.is_prefill, 1)[0]
+    meta = RunnerIn.from_bytes(batch).prefill(0, 1, 4, 4, 16)
     assert meta.input_ids == [1, 2, 3]
     assert meta.positions == [0, 1, 2]
 
     sched.postprocess(result.dp_group_seqs, [[[10]]], None, [[[0.5]]])
-    assert seq.token_ids == [1, 2, 3, 10]
-    assert seq.metric.num_generated_tokens == 1
 
-    encoded = encode_run_result([[11]], [[0.1]], 7)
+    result = sched.schedule()
+    assert not result.is_prefill
+    batch = sched.serialize_run_batches(result.dp_group_seqs, result.is_prefill, 1)[0]
+    meta = RunnerIn.from_bytes(batch).decode(0, 1, 4, 4, 16)
+    assert meta.input_ids == [10]
+    assert meta.positions == [3]
+
+    encoded = encode_run_result(([[11]], [[0.1]]), 7)
     token_ids, logprobs = decode_run_result(encoded)
     assert token_ids == [[11]]
     assert math.isclose(logprobs[0][0], 0.1, rel_tol=1e-6)
 
-    buffer = (ctypes.c_ubyte * 4096)()
-    nbytes = serialize(ctypes.addressof(buffer), len(buffer), [seq], True)
-    restored = __import__("dlengine._cpp", fromlist=["deserialize"]).deserialize(
-        ctypes.addressof(buffer), nbytes
-    )
-    assert len(restored) == 1
-    assert restored[0].seq_id == seq.seq_id
-    assert restored[0].token_ids == seq.token_ids
 
-    migrated = parse_migrate_batch(serialize_migrate_batch([seq]))
+def test_migration_batch_is_a_protocol_product():
+    sched = _scheduler()
+    _add_request(sched, 2002, [4, 5, 6])
+
+    result = sched.schedule()
+    sched.postprocess(result.dp_group_seqs, [[[-2]]], None, None)
+
+    migrate_bytes = sched.serialize_migrate_batches(result.dp_group_seqs, 1)[0]
+    migrated = MigrationIn.from_bytes(migrate_bytes)
     assert len(migrated) == 1
-    assert migrated[0].seq_id == seq.seq_id
-
-
-def test_decode_batch_uses_typed_sequence_fields():
-    seq = Sequence([4, 5, 6], SamplingParams())
-    seq.set_active_group_block_table(0, [7])
-    batch = serialize_run_batch([seq], False)
-    meta = prepare_decode_from_bytes(batch, 0, 1, 4, 4, 16)
-    assert meta.input_ids == [6]
-    assert meta.positions == [2]
+    assert migrated[0].seq_id == 2002

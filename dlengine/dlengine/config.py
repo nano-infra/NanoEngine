@@ -423,7 +423,7 @@ class Config(BaseModel):
                     f"(num_nextn_predict_layers / mtp_num_hidden_layers not found)"
                 )
             # KV-cache reservation for the extra MTP tokens per decode step is
-            # handled in the C++ scheduler directly from num_speculative_tokens;
+            # handled in the Rust scheduler directly from num_speculative_tokens;
             # nothing to inflate here. The decode loop always runs a single
             # iteration — MTP produces its extra tokens within that one step.
 

@@ -8,7 +8,6 @@ from typing import Any, Optional, Set
 from tqdm.auto import tqdm
 from transformers import PreTrainedTokenizerFast
 
-from dlengine._cpp import encode_add_request
 from dlengine.config import Config
 from dlengine.engine.scheduler import ensure_cache_plan, init_scheduler
 from dlengine.logging import get_logger, set_log_level
@@ -243,25 +242,30 @@ class LLMEngine:
         affinity_key: int = 0,
         vision_slots: list | None = None,
     ) -> int:
-        """Submit one request through the Rust-owned protocol boundary."""
+        """Submit one local request directly into the Rust scheduler."""
         if seq_id is None:
             seq_id = uuid.uuid4().int & ((1 << 63) - 1)
             if seq_id < 8:
                 seq_id += 8
-        payload = bytes(
-            encode_add_request(
-                int(seq_id),
-                [int(t) for t in prompt_token_ids],
-                sampling_params,
-                int(affinity_key),
-                [_vision_slot_tuple(slot) for slot in (vision_slots or [])],
-            )
+        added_seq_id, prompt_len = self.scheduler.add_request(
+            int(seq_id),
+            [int(t) for t in prompt_token_ids],
+            sampling_params,
+            int(affinity_key),
+            [_vision_slot_tuple(slot) for slot in (vision_slots or [])],
         )
-        self.add_request_payload(payload)
+        self._register_added_requests([(added_seq_id, prompt_len)])
         return int(seq_id)
 
     def add_request_payload(self, payload: bytes):
         added = self.scheduler.add_request_bytes(payload)
+        self._register_added_requests(added)
+
+    def add_migration_request(self, request):
+        added = self.scheduler.add_request_bytes(request.payload)
+        self._register_added_requests(added)
+
+    def _register_added_requests(self, added):
         for seq_id, prompt_len in added:
             metric = self.metrics_manager.create_sequence_metric(seq_id, prompt_len)
             self.scheduler.set_sequence_metric(seq_id, metric)

@@ -418,3 +418,105 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BlockManager>()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sequence::{set_sequence_block_size, SamplingParams, Sequence};
+
+    const BS: i32 = 4;
+
+    fn make_seq(py: Python<'_>, tokens: Vec<i32>) -> Py<Sequence> {
+        set_sequence_block_size(BS);
+        let mut seq = Sequence::new(
+            tokens.clone(),
+            Some(SamplingParams::new(1.0, 16, false, false)),
+        );
+        seq.active_context.engine_id = "engine".to_string();
+        seq.active_context.group_size = 1;
+        seq.active_context.attention_dp = 1;
+        seq.active_context.num_kvcache_blocks = 16;
+        seq.active_context.num_dispatched_tokens = vec![tokens.len() as i32];
+        Py::new(py, seq).unwrap()
+    }
+
+    #[test]
+    fn l3_is_inert_when_disabled() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
+            let seq = make_seq(py, (0..8).collect());
+            bm.allocate(seq.borrow_mut(py), -1).unwrap();
+            bm.deallocate(seq.borrow_mut(py), ACTIVE_SLOT);
+            assert!(bm.drain_pending_offloads().is_empty());
+            assert!(bm.drain_pending_loads().is_empty());
+        });
+    }
+
+    #[test]
+    fn evicted_full_blocks_are_queued_for_l3_offload() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
+            bm.set_l3_enabled(true);
+            let seq = make_seq(py, (0..8).collect());
+            let hashes = bm.compute_block_hashes(seq.borrow(py));
+            assert_eq!(hashes.len(), 2);
+
+            bm.allocate(seq.borrow_mut(py), -1).unwrap();
+            bm.deallocate(seq.borrow_mut(py), ACTIVE_SLOT);
+
+            let mut offloads = bm.drain_pending_offloads();
+            offloads.sort_by_key(|(hash, _)| *hash);
+            let mut expected = hashes;
+            expected.sort();
+            assert_eq!(
+                offloads.iter().map(|(hash, _)| *hash).collect::<Vec<_>>(),
+                expected
+            );
+        });
+    }
+
+    #[test]
+    fn l3_resident_prefix_queues_loads_and_counts_cached_tokens() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
+            bm.set_l3_enabled(true);
+            let seq = make_seq(py, (0..8).collect());
+            let hashes = bm.compute_block_hashes(seq.borrow(py));
+            bm.set_l3_resident_hashes(hashes.clone());
+
+            let hint = bm.can_allocate(seq.borrow(py));
+            bm.allocate(seq.borrow_mut(py), hint).unwrap();
+
+            let loads = bm.drain_pending_loads();
+            assert_eq!(loads.len(), 2);
+            assert_eq!(seq.borrow(py).num_cached_tokens, 7);
+            assert_eq!(
+                loads.iter().map(|(hash, _)| *hash).collect::<Vec<_>>(),
+                hashes
+            );
+        });
+    }
+
+    #[test]
+    fn gpu_prefix_hit_takes_precedence_over_l3_load() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
+            bm.set_l3_enabled(true);
+            let seq1 = make_seq(py, (0..8).collect());
+            let hashes = bm.compute_block_hashes(seq1.borrow(py));
+            bm.set_l3_resident_hashes(hashes);
+            bm.allocate(seq1.borrow_mut(py), -1).unwrap();
+            bm.drain_pending_loads();
+
+            let seq2 = make_seq(py, (0..8).collect());
+            let hint = bm.can_allocate(seq2.borrow(py));
+            bm.allocate(seq2.borrow_mut(py), hint).unwrap();
+            assert!(bm.drain_pending_loads().is_empty());
+            assert_eq!(seq2.borrow(py).num_cached_tokens, 7);
+        });
+    }
+}

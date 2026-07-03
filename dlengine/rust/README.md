@@ -1,14 +1,12 @@
 # dlengine Rust Runtime
 
 This directory contains the Rust/PyO3 runtime extension used by `dlengine`.
-It provides the Python-facing control plane that used to live behind the
-`dlengine._cpp` pybind11 module: sequences, scheduler state, cache plans,
-metrics, binary request serialization, and L3 block-management hooks.
+It provides the Python-facing control plane: scheduler state, cache plans,
+metrics, binary request serialization, and L3 block-management logic.
 
-Python imports continue to use `dlengine._cpp` for compatibility, but that
-module now re-exports the Rust extension. New code may import from
-`dlengine._rust` or `dlengine._dlengine_rust` directly when it wants to be
-explicit.
+Python code imports the curated wrapper `dlengine._rust`. The native PyO3
+extension is installed as `dlengine._dlengine_rust` and is intentionally kept
+one layer below the package-facing API.
 
 ## Layout
 
@@ -16,11 +14,11 @@ explicit.
   types.
 - `_dlengine_rust/src/scheduler/`: scheduler, resource allocation, lifecycle,
   routing, metrics, and session-state cache logic.
-- `_dlengine_rust/src/cache_plan.rs`: cache-plan specs shared by engine and
+- `_dlengine_rust/src/config/`: cache-plan specs shared by engine and
   context setup.
-- `_dlengine_rust/src/stubs/`: binary wire format helpers and batch metadata
+- `_dlengine_rust/src/proto/`: binary wire format helpers and batch metadata
   preparation for model runners.
-- `_dlengine_rust/src/l3.rs`: L3 prefix-cache block manager compatibility API.
+- `_dlengine_rust/src/l3.rs`: L3 prefix-cache block manager internals.
 - `dlengine/_dlengine_rust.pyi`: Python type stubs for IDE completion and type
   checkers.
 

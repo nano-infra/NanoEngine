@@ -12,10 +12,10 @@ FastAPI asyncio event loop: an outbound queue serializes sends and a single recv
 task fans incoming StepOut/Migration packets back into each request's asyncio
 queue with ``put_nowait``.
 
-Wire protocol (FlatBuffers ZmqPacket, see ``zmq_protocol``):
-- client -> engine: action 1 = ADD (Rust bincode AddRequest/MigrationRequest), 2 = GET_INFO,
+Wire protocol (JSON packet, see ``dlengine.server.wire``):
+- client -> engine: action 1 = ADD (Rust bincode RequestIn/RequestMigrate), 2 = GET_INFO,
   3 = FREE (FreeSequences).
-- engine -> client: action 0 = StepOut, 1 = Migration (Rust bincode MigrationRequest),
+- engine -> client: action 0 = StepOut, 1 = Migration (Rust bincode RequestMigrate),
   2 = engine_info (JSON).
 """
 
@@ -29,11 +29,15 @@ from typing import Any, Optional
 import zmq
 import zmq.asyncio
 
-from dlengine.fbs.SequenceStatus import SequenceStatus
-from dlengine.fbs.StepOut import StepOut
 from dlengine.logging import get_logger
 from dlengine.server import pd
-from dlengine.server.zmq_protocol import decode_packet, encode_packet
+from dlengine.server.wire import (
+    decode_packet,
+    decode_stepout,
+    encode_free_sequences,
+    encode_packet,
+    SequenceStatus,
+)
 
 logger = get_logger("dlengine.server")
 
@@ -108,11 +112,13 @@ class ZmqEngineWorker:
     # -- outbound --------------------------------------------------------
 
     def submit(self, req: Any) -> None:
-        """Encode request protocol bytes and queue an ADD packet for the engine."""
+        """Queue an ADD request for the engine socket."""
         if getattr(req, "migration_payload", None):
-            payload = base64.b64decode(req.migration_payload)
+            payload = pd.RequestMigrate.from_bytes(
+                base64.b64decode(req.migration_payload)
+            )
         else:
-            payload = pd.encode_add_request(
+            payload = pd.RequestIn(
                 req.seq_id,
                 req.prompt_ids or [],
                 req.sampling_params,
@@ -166,31 +172,16 @@ class ZmqEngineWorker:
             self._metrics_future = None
 
     def _build_free_payload(self, seq_ids: list[int]) -> bytes:
-        import flatbuffers
-        import numpy as np
-
-        from dlengine.fbs.FreeSequences import (
-            FreeSequencesAddSeqIds,
-            FreeSequencesAddSourceEngineId,
-            FreeSequencesEnd,
-            FreeSequencesStart,
-        )
-
-        builder = flatbuffers.Builder(256)
-        seq_ids_vec = builder.CreateNumpyVector(np.array(seq_ids, dtype=np.uint64))
-        source_id_off = builder.CreateString(self.engine_id or "")
-        FreeSequencesStart(builder)
-        FreeSequencesAddSeqIds(builder, seq_ids_vec)
-        FreeSequencesAddSourceEngineId(builder, source_id_off)
-        free_req = FreeSequencesEnd(builder)
-        builder.Finish(free_req)
-        return bytes(builder.Output())
+        return encode_free_sequences(seq_ids, self.engine_id or "")
 
     async def _send_loop(self) -> None:
         assert self._socket is not None
         while True:
-            action, payload = await self._outbox.get()
+            action, item = await self._outbox.get()
             try:
+                payload = item.to_bytes() if isinstance(item, pd.RequestIn) else item
+                if isinstance(item, pd.RequestMigrate):
+                    payload = item.to_bytes()
                 await self._socket.send(encode_packet(action, payload))
             except asyncio.CancelledError:
                 raise
@@ -234,21 +225,17 @@ class ZmqEngineWorker:
         req.aqueue.put_nowait(item)
 
     def _handle_stepout(self, payload: bytes) -> None:
-        step = StepOut.GetRootAs(payload, 0)
-        seq_id = step.SeqId()
+        step = decode_stepout(payload)
+        seq_id = step.seq_id
         req = self._active.get(seq_id)
         if req is None:
             return
 
-        n = step.TokenIdsLength()
-        if n > 0:
-            tokens = [int(step.TokenIds(i)) for i in range(n)]
-        else:
-            tokens = [int(step.TokenId())]
+        tokens = step.token_ids or [step.token_id]
         if tokens:
             self._push(req, {"tokens": tokens})
 
-        if step.Status() == SequenceStatus.FINISHED:
+        if step.status == SequenceStatus.FINISHED:
             self._push(req, {"finish": True})
             self._push(req, None)
             self._active.pop(seq_id, None)
@@ -256,7 +243,8 @@ class ZmqEngineWorker:
 
     def _handle_migration(self, payload: bytes) -> None:
         try:
-            seq_id, first_token = pd.decode_migration_metadata(payload)
+            migration = pd.RequestMigrate.from_bytes(payload)
+            seq_id, first_token = migration.metadata
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to decode migration metadata: {e}")
             return

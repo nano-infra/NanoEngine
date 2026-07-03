@@ -327,7 +327,7 @@ class EncoderEngine:
         """
         import time
 
-        from dlengine.server.zmq_protocol import decode_packet, encode_packet
+        from dlengine.server.wire import decode_packet, encode_packet
 
         t_recv = time.perf_counter()
         try:
@@ -356,7 +356,7 @@ class EncoderEngine:
         import httpx as _httpx
         from PIL import Image as _Image
 
-        from dlengine.server.zmq_protocol import encode_packet
+        from dlengine.server.wire import encode_packet
 
         assert self._processor is not None
         t0 = time.perf_counter()
@@ -459,7 +459,7 @@ class EncoderEngine:
         return encode_packet(action=6, payload=resp)
 
     def _encode_error_response(self, error_msg: str) -> bytes:
-        from dlengine.server.zmq_protocol import encode_packet
+        from dlengine.server.wire import encode_packet
 
         resp = json.dumps({"error": error_msg}).encode()
         return encode_packet(action=6, payload=resp)
@@ -498,7 +498,7 @@ class EncoderEngine:
     def _handle_p2p_message(self, raw: bytes):
         """Decode a ZmqPacket and handle FreeVisionSlots action."""
         try:
-            from dlengine.server.zmq_protocol import decode_packet
+            from dlengine.server.wire import decode_packet
 
             action, payload = decode_packet(raw)
             if action == 4:  # FreeVisionSlots
@@ -509,17 +509,11 @@ class EncoderEngine:
             logger.error(f"Error handling P2P message: {e}", exc_info=True)
 
     def _handle_free_vision_slots(self, payload: bytes):
-        """Handle FreeVisionSlots FlatBuffer message."""
+        """Handle FreeVisionSlots control message."""
 
-        from dlengine.fbs.FreeVisionSlots import FreeVisionSlots
+        from dlengine.server.wire import decode_free_vision_slots
 
-        buf = bytearray(payload)
-        msg = FreeVisionSlots.GetRootAs(buf, 0)
-        n = msg.SlotIndicesLength()
-        slot_indices = [msg.SlotIndices(i) for i in range(n)]
-        source = msg.SourceEngineId()
-        if source:
-            source = source.decode("utf-8") if isinstance(source, bytes) else source
+        _encoder_engine_id, slot_indices, source = decode_free_vision_slots(payload)
 
         logger.info(f"Received FreeVisionSlots from {source}: slots={slot_indices}")
         self.free_slots(slot_indices)

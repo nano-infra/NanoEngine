@@ -335,8 +335,8 @@ class RayExecutor:
         return self.collective_rpc("l3_stats")
 
     def run_batch_bytes_async(self, batch_bytes: List[bytes], is_prefill: bool) -> dict:
-        """Submit serialized RunBatchInput bytes without waiting."""
-        # Bytes sent to the runners this forward (serialized RunBatch input).
+        """Submit serialized RunnerIn bytes without waiting."""
+        # Bytes sent to the runners this forward (serialized RunnerIn input).
         self.last_run_request_bytes = sum(len(b) for b in batch_bytes)
         ray_futures = [
             getattr(worker, "run_from_bytes").remote(b, is_prefill)

@@ -1,1 +1,1 @@
-from dlengine._cpp import SamplingParams
+from dlengine._rust.proto import SamplingParams

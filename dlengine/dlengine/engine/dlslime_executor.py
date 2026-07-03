@@ -84,7 +84,7 @@ class DLSLimeExecutor(RayExecutor):
         logger.info(f"DLSLime transport ready for {len(self._worker_aliases)} workers")
 
     def _probe_totals(self) -> tuple[int, int, int, int]:
-        """Sum the C++ RpcSession timing probes across all DP-shard proxies.
+        """Sum the transport RpcSession timing probes across all DP-shard proxies.
 
         Returns cumulative (write_with_imm_ns, write_with_imm_count,
         imm_recv_ns, imm_recv_count). Missing/older sessions (no probe
@@ -123,7 +123,7 @@ class DLSLimeExecutor(RayExecutor):
         return wwi, imm
 
     def run_batch_bytes_async(self, batch_bytes: list[bytes], is_prefill: bool) -> dict:
-        """Submit serialized RunBatchInput bytes without waiting.
+        """Submit serialized RunnerIn bytes without waiting.
 
         Returns an opaque handle for :meth:`run_wait`. Splitting submit from
         wait lets the driver overlap its own bookkeeping (stepout emission,
@@ -133,7 +133,7 @@ class DLSLimeExecutor(RayExecutor):
 
         _t0 = _time.perf_counter()
         _t1 = _time.perf_counter()
-        # Snapshot the C++ RPC timing probes before issuing the forward so we
+        # Snapshot the RPC timing probes before issuing the forward so we
         # can attribute the writeWithImm (send) / immRecv (recv) cost to this
         # step. On the no-pump fast path both verbs complete synchronously
         # inside run_batch, so the snapshot must straddle submit + wait_all.
@@ -159,7 +159,7 @@ class DLSLimeExecutor(RayExecutor):
         import time as _time
 
         is_prefill = handle["is_prefill"]
-        # Bytes sent to the runners this forward (serialized RunBatch input).
+        # Bytes sent to the runners this forward (serialized RunnerIn input).
         self.last_run_request_bytes = handle["request_bytes"]
         replies = self._wait_all(handle["futures"])
         _t3 = _time.perf_counter()

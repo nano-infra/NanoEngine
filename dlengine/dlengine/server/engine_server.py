@@ -4,26 +4,20 @@ import traceback
 from collections import defaultdict
 from typing import Optional
 
-import flatbuffers
 import zmq
 import zmq.asyncio
 
 from dlengine.config import Config
-
-# FlatBuffers imports
-from dlengine.fbs.SequenceStatus import SequenceStatus
-from dlengine.fbs.StepOut import (
-    StepOutAddSeqId,
-    StepOutAddStatus,
-    StepOutAddTokenId,
-    StepOutAddTokenIds,
-    StepOutEnd,
-    StepOutStart,
-    StepOutStartTokenIdsVector,
-)
 from dlengine.llm_component import LLMComponent
 from dlengine.logging import get_logger
-from dlengine.server.zmq_protocol import decode_packet, encode_packet
+from dlengine.server import pd
+from dlengine.server.wire import (
+    decode_free_sequences,
+    decode_packet,
+    encode_packet,
+    encode_stepout,
+    SequenceStatus,
+)
 
 logger = get_logger()
 
@@ -34,7 +28,7 @@ logger = get_logger()
 _ACTION_STEPOUT_BATCH = 4
 
 # client -> engine: ABORT (stop generating for the given seq_ids and free their
-# KV blocks). Reuses the FreeSequences flatbuffer payload (seq_ids list).
+# KV blocks). Reuses the JSON FreeSequences control payload.
 _ACTION_ABORT = 5
 
 # client -> engine: fetch Prometheus-format metrics from the backend process.
@@ -42,26 +36,8 @@ _ACTION_GET_METRICS = 6
 
 
 def build_stepout_payload(seq_id, token_ids, status) -> bytes:
-    """Build a StepOut flatbuffer payload for one sequence."""
-    if isinstance(token_ids, int):
-        token_ids = [token_ids]
-
-    builder = flatbuffers.Builder(256)
-
-    StepOutStartTokenIdsVector(builder, len(token_ids))
-    for token_id in reversed(token_ids):  # FlatBuffers builds vectors in reverse
-        builder.PrependUint32(token_id)
-    token_ids_vector = builder.EndVector()
-
-    StepOutStart(builder)
-    StepOutAddSeqId(builder, seq_id)
-    if token_ids:
-        StepOutAddTokenId(builder, token_ids[-1])  # Backward compatibility
-    StepOutAddTokenIds(builder, token_ids_vector)
-    StepOutAddStatus(builder, status)
-    step_out = StepOutEnd(builder)
-    builder.Finish(step_out)
-    return builder.Output()
+    """Build a StepOut payload for one sequence."""
+    return encode_stepout(seq_id, token_ids, status)
 
 
 class BackendService:
@@ -77,11 +53,31 @@ class BackendService:
     def _send_response(self, action: int, payload: bytes):
         self.results_queue.put((action, payload))
 
-    def _handle_add_request(self, payload: bytes):
-        logger.info(f"Handling ADD request, payload size: {len(payload)}")
+    def _handle_add_request(self, request):
+        if isinstance(request, pd.RequestIn):
+            logger.info(
+                "Handling ADD request: seq_id=%s prompt_len=%s",
+                request.seq_id,
+                len(request.prompt_token_ids),
+            )
+            self.engine.add_request(
+                request.prompt_token_ids,
+                request.sampling_params,
+                seq_id=request.seq_id,
+                affinity_key=request.affinity_key,
+                vision_slots=request.vision_slots,
+            )
+            logger.info("Request added to engine successfully")
+            return
 
-        self.engine.add_request_payload(payload)
-        logger.info("Request payload added to engine successfully")
+        if isinstance(request, pd.RequestMigrate):
+            seq_id, _first_token = request.metadata
+            logger.info("Handling migration request: seq_id=%s", seq_id)
+            self.engine.add_migration_request(request)
+            logger.info("Migration request added to engine successfully")
+            return
+
+        raise TypeError(f"unsupported ADD request type: {type(request)!r}")
 
     def _handle_get_info(self):
         resp_payload = self.engine.get_engine_info().encode("utf-8")
@@ -103,20 +99,7 @@ class BackendService:
     def _handle_free_sequences(self, payload: bytes):
         """Handle P2P free sequence request."""
         try:
-            from dlengine.fbs.FreeSequences import FreeSequences
-
-            free_req = FreeSequences.GetRootAs(payload, 0)
-
-            seq_ids = []
-            seq_ids_length = free_req.SeqIdsLength()
-            if seq_ids_length > 0:
-                seq_ids = [free_req.SeqIds(i) for i in range(seq_ids_length)]
-
-            source_engine_id = (
-                free_req.SourceEngineId().decode("utf-8")
-                if free_req.SourceEngineId()
-                else ""
-            )
+            seq_ids, source_engine_id = decode_free_sequences(payload)
 
             logger.info(
                 f"Received P2P free request from {source_engine_id} for {len(seq_ids)} sequences: {seq_ids}"
@@ -139,11 +122,7 @@ class BackendService:
         in flight, since aborting frees KV blocks the forward may still touch).
         """
         try:
-            from dlengine.fbs.FreeSequences import FreeSequences
-
-            abort_req = FreeSequences.GetRootAs(payload, 0)
-            n = abort_req.SeqIdsLength()
-            seq_ids = [abort_req.SeqIds(i) for i in range(n)] if n > 0 else []
+            seq_ids, _source_engine_id = decode_free_sequences(payload)
             if not seq_ids:
                 return
 
@@ -170,7 +149,7 @@ class BackendService:
         """Send one step's worth of stepouts as a single queue put.
 
         ``entries`` is a list of (seq_id, token_ids, status) tuples. Batching
-        moves the per-seq flatbuffer building and zmq sends to the frontend
+        moves per-seq payload building and zmq sends to the frontend
         process, off the engine step loop's critical path (one mp.Queue put
         per step instead of one per running sequence).
         """
@@ -198,9 +177,7 @@ class BackendService:
                 # Mark as freed to prevent duplicates
                 self._freed_sequences.add(seq_id)
             else:
-                logger.debug(
-                    f"Sequence {seq_id} has no MIGRATE context (not migrated)"
-                )
+                logger.debug(f"Sequence {seq_id} has no MIGRATE context (not migrated)")
         except Exception as e:
             logger.error(f"Error sending P2P free for seq {seq_id}: {e}")
             traceback.print_exc()
@@ -330,9 +307,7 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
 
             logger.debug(f"Engine step completed: {result.real_bs} running sequences")
             # Single-pass optimization: merge all sequence processing into one loop.
-            # NOTE: avoid seq.token_ids here -- each access copies the full C++
-            # token vector into a Python list, which costs tens of ms/step at
-            # full batch. Use scalar properties (seq_id/last_token/num_tokens).
+            # Use scalar event fields instead of materializing full token vectors.
             current_running_seqs = set()
             newly_appeared_seqs = []  # Store newly appeared sequences for early free
             stepout_batch = []  # (seq_id, token_id, status) for this step
@@ -490,6 +465,13 @@ class EngineServer:
                 try:
                     data = await socket.recv()
                     action, payload = decode_packet(bytes(data))
+                    if action == 1:
+                        try:
+                            item = pd.RequestIn.from_bytes(payload)
+                        except Exception:
+                            item = pd.RequestMigrate.from_bytes(payload)
+                        self.requests_queue.put_nowait((action, item))
+                        continue
                     self.requests_queue.put_nowait((action, payload))
                 except zmq.ZMQError as e:
                     if e.errno != zmq.ETERM:

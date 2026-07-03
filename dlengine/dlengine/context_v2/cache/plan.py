@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dlengine._cpp import cache_plan_flag, CachePlan, CachePlanFlag
+from dlengine._rust.config import cache_plan_flag, CachePlan, CachePlanFlag
 
 
 def cache_plan(

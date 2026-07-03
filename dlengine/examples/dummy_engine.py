@@ -2,8 +2,7 @@ import socket
 import struct
 import time
 
-import flatbuffers
-from dlengine.fbs import SequenceStatus, StepOut
+from dlengine.server.wire import encode_stepout, SequenceStatus
 
 # Spoke Protocol Constants
 MAGIC = 0x504F4B45
@@ -53,17 +52,7 @@ def start_dummy_engine(host="127.0.0.1", port=5000):
                 # In real scenario, we parse payload as SequenceList.
                 # Here we just blindly response with a StepOut.
 
-                builder = flatbuffers.Builder(1024)
-                StepOut.StepOutStart(builder)
-                StepOut.StepOutAddSeqId(builder, 123)  # Simulated SeqID
-                StepOut.StepOutAddTokenId(builder, 9999)  # Simulated Token 9999
-                StepOut.StepOutAddStatus(
-                    builder, SequenceStatus.SequenceStatus.FINISHED
-                )
-                step_out = StepOut.StepOutEnd(builder)
-                builder.Finish(step_out)
-
-                resp_payload = builder.Output()
+                resp_payload = encode_stepout(123, [9999], SequenceStatus.FINISHED)
 
                 print(f"Generating StepOut. Size: {len(resp_payload)}")
 

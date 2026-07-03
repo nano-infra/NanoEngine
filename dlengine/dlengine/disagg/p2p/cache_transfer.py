@@ -741,9 +741,9 @@ class P2PCacheTransfer:
 
     def migrate_from_bytes(self, data: bytes):
         """Migrate KV cache using lean MigrateBatchInput protocol (no Sequence objects)."""
-        from dlengine._cpp import parse_migrate_batch
+        from dlengine._rust.proto import MigrationIn
 
-        views = parse_migrate_batch(data)
+        views = MigrationIn.from_bytes(data).sequences
 
         if self.peer_agent_context is None:
             logger.error("migrate_from_bytes called but PeerAgent not initialized")

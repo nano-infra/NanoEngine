@@ -1,11 +1,7 @@
 import json
 
-from dlengine._cpp import (
-    CachePlan,
-    RoutingStrategy,
-    Scheduler as CppScheduler,
-    SchedulerConfig,
-)
+from dlengine._rust.config import CachePlan, RoutingStrategy, SchedulerConfig
+from dlengine._rust.core import Scheduler as RustScheduler
 from dlengine.config import Config
 from dlengine.context_v2.cache.plan import (
     deepseek_mla_cache_plan,
@@ -19,10 +15,10 @@ from dlengine.models.trait import has_gdn_component, has_hca_csa_cache
 logger = get_logger("dlengine")
 
 
-def init_scheduler(config: Config) -> CppScheduler:
+def init_scheduler(config: Config) -> RustScheduler:
     cache_plan = ensure_cache_plan(config)
     scheduler_config = build_scheduler_config(config, cache_plan)
-    return CppScheduler(scheduler_config)
+    return RustScheduler(scheduler_config)
 
 
 def build_scheduler_config(
@@ -135,7 +131,7 @@ def _configure_hca_csa_cache_plan(plan: CachePlan, config: Config) -> None:
             plan.csa = spec
 
 
-def Scheduler(config: Config) -> CppScheduler:
+def Scheduler(config: Config) -> RustScheduler:
     return init_scheduler(config)
 
 

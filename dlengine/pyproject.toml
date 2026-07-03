@@ -22,7 +22,6 @@ dependencies = [
     "uvloop>=0.21.0",
     "ray>=2.50.1",
     "transformers>=4.51.0",
-    "flatbuffers",
     "jsonargparse>=4.27",
     "redis>=4.0",
     "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2",
@@ -73,4 +72,4 @@ dlenginevl-serve = "dlengine.vl.server.vl_engine_server:main"
 module-name = "dlengine._dlengine_rust"
 python-source = "."
 bindings = "pyo3"
-features = ["pyo3/extension-module"]
+features = ["extension-module"]
