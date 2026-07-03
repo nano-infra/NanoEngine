@@ -1,11 +1,11 @@
-"""Standalone unit test for the L3 (3FS) hooks in the C++ BlockManager.
+"""Standalone unit test for the L3 (3FS) hooks in the Rust BlockManager.
 
 Pure-logic test (no GPU / model / 3FS needed): exercises offload-on-evict,
 load-on-prefix-miss, hash revalidation on reuse, and inert-when-disabled.
 
 Run with:
   python tests/test_l3_block_manager.py
-Exits 0 on success (or if the C++ extension is unavailable).
+Exits 0 on success (or if the Rust extension is unavailable).
 """
 
 from __future__ import annotations
@@ -41,7 +41,9 @@ def main() -> int:
     try:
         from dlengine._cpp import BlockContextSlot, BlockManager, Sequence
     except Exception as e:  # pragma: no cover
-        return _skip(f"dlengine._cpp not importable: {type(e).__name__}: {e}")
+        return _skip(
+            f"dlengine._cpp compatibility module not importable: {type(e).__name__}: {e}"
+        )
 
     Sequence.set_block_size(BS)
 

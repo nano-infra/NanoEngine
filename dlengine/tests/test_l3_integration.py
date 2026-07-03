@@ -1,4 +1,4 @@
-"""End-to-end L3 round-trip: C++ BlockManager hooks + Hf3fsL3Store on real 3FS.
+"""End-to-end L3 round-trip: Rust BlockManager hooks + Hf3fsL3Store on real 3FS.
 
 Simulates the engine's offload-then-load path WITHOUT a model forward or Ray,
 exercising the exact (hash, block_id) contract the driver wiring uses:

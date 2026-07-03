@@ -1,3 +1,4 @@
+use crate::metrics::SequenceMetric;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
@@ -23,7 +24,7 @@ pub struct SamplingParams {
 impl SamplingParams {
     #[new]
     #[pyo3(signature = (temperature = 1.0, max_tokens = 256, ignore_eos = false, return_completion_logprobs = false))]
-    fn new(
+    pub(crate) fn new(
         temperature: f64,
         max_tokens: i32,
         ignore_eos: bool,
@@ -56,7 +57,7 @@ impl SequenceStatus {
 }
 
 #[derive(Clone)]
-struct VisionSlot {
+pub(crate) struct VisionSlot {
     encoder_engine_id: String,
     slot_idx: i32,
     num_tokens: i32,
@@ -64,48 +65,102 @@ struct VisionSlot {
     max_tokens_per_slot: i32,
 }
 
+#[pyclass(module = "dlengine._dlengine_rust")]
+#[derive(Clone)]
+pub struct BlockContext {
+    #[pyo3(get, set)]
+    pub engine_id: String,
+    #[pyo3(get, set)]
+    pub dp_idx: i32,
+    #[pyo3(get, set)]
+    pub master_group_id: i32,
+    #[pyo3(get, set)]
+    pub group_size: i32,
+    #[pyo3(get, set)]
+    pub attention_dp: i32,
+    #[pyo3(get, set)]
+    pub num_kvcache_blocks: i32,
+    #[pyo3(get, set)]
+    pub num_dispatched_tokens: Vec<i32>,
+}
+
+#[pymethods]
+impl BlockContext {
+    #[new]
+    #[pyo3(signature = (
+        engine_id = String::new(),
+        dp_idx = 0,
+        master_group_id = 0,
+        group_size = 1,
+        attention_dp = 1,
+        num_kvcache_blocks = 0,
+        num_dispatched_tokens = Vec::new()
+    ))]
+    fn new(
+        engine_id: String,
+        dp_idx: i32,
+        master_group_id: i32,
+        group_size: i32,
+        attention_dp: i32,
+        num_kvcache_blocks: i32,
+        num_dispatched_tokens: Vec<i32>,
+    ) -> Self {
+        Self {
+            engine_id,
+            dp_idx,
+            master_group_id,
+            group_size: group_size.max(1),
+            attention_dp: attention_dp.max(1),
+            num_kvcache_blocks,
+            num_dispatched_tokens,
+        }
+    }
+}
+
 #[pyclass(module = "dlengine._dlengine_rust", unsendable)]
 pub struct Sequence {
-    seq_id: u64,
-    status: i32,
-    token_ids: Vec<i32>,
-    last_token: i32,
-    num_tokens: i32,
-    num_prompt_tokens: i32,
+    pub(crate) seq_id: u64,
+    pub(crate) status: i32,
+    pub(crate) token_ids: Vec<i32>,
+    pub(crate) last_token: i32,
+    pub(crate) num_tokens: i32,
+    pub(crate) num_prompt_tokens: i32,
     #[allow(dead_code)]
-    num_checkpointed_tokens: i32,
+    pub(crate) num_checkpointed_tokens: i32,
     #[allow(dead_code)]
-    num_cached_tokens: i32,
-    affinity_key: u64,
-    sampling_params: SamplingParams,
-    completion_logprobs: Vec<f32>,
-    vision_slots: Vec<VisionSlot>,
-    metric: Option<Py<PyAny>>,
-    active_block_table: Vec<i32>,
-    active_block_tables: HashMap<i32, Vec<i32>>,
-    active_dispatched_tokens: Vec<i32>,
-    migrate_block_table: Vec<i32>,
-    migrate_block_tables: HashMap<i32, Vec<i32>>,
-    migrate_engine_id: String,
-    migrate_num_kvcache_blocks: i32,
-    migrate_group_size: i32,
-    migrate_dp_idx: i32,
-    active_dp_idx: i32,
-    active_group_id: i32,
-    migrate_group_id: i32,
-    active_state_slot: i32,
-    migrate_state_slot: i32,
-    active_compressed_block_tables: HashMap<i32, Vec<i32>>,
-    migrate_compressed_block_tables: HashMap<i32, Vec<i32>>,
-    active_hisparse_slot: i32,
-    migrate_hisparse_slot: i32,
+    pub(crate) num_cached_tokens: i32,
+    pub(crate) affinity_key: u64,
+    pub(crate) sampling_params: SamplingParams,
+    pub(crate) completion_logprobs: Vec<f32>,
+    pub(crate) vision_slots: Vec<VisionSlot>,
+    pub(crate) metric: Option<Py<SequenceMetric>>,
+    pub(crate) active_block_table: Vec<i32>,
+    pub(crate) active_block_tables: HashMap<i32, Vec<i32>>,
+    pub(crate) active_dispatched_tokens: Vec<i32>,
+    pub(crate) migrate_block_table: Vec<i32>,
+    pub(crate) migrate_block_tables: HashMap<i32, Vec<i32>>,
+    pub(crate) migrate_engine_id: String,
+    pub(crate) migrate_num_kvcache_blocks: i32,
+    pub(crate) migrate_group_size: i32,
+    pub(crate) migrate_dp_idx: i32,
+    pub(crate) active_dp_idx: i32,
+    pub(crate) active_group_id: i32,
+    pub(crate) migrate_group_id: i32,
+    pub(crate) active_state_slot: i32,
+    pub(crate) migrate_state_slot: i32,
+    pub(crate) active_compressed_block_tables: HashMap<i32, Vec<i32>>,
+    pub(crate) migrate_compressed_block_tables: HashMap<i32, Vec<i32>>,
+    pub(crate) active_hisparse_slot: i32,
+    pub(crate) migrate_hisparse_slot: i32,
+    pub(crate) active_context: BlockContext,
+    pub(crate) migrate_context: BlockContext,
 }
 
 #[pymethods]
 impl Sequence {
     #[new]
     #[pyo3(signature = (token_ids, sampling_params = None))]
-    fn new(token_ids: Vec<i32>, sampling_params: Option<SamplingParams>) -> Self {
+    pub(crate) fn new(token_ids: Vec<i32>, sampling_params: Option<SamplingParams>) -> Self {
         let last_token = token_ids.last().copied().unwrap_or(-1);
         let num_tokens = token_ids.len() as i32;
         Self {
@@ -141,6 +196,8 @@ impl Sequence {
             migrate_compressed_block_tables: HashMap::new(),
             active_hisparse_slot: -1,
             migrate_hisparse_slot: -1,
+            active_context: BlockContext::new(String::new(), 0, 0, 1, 1, 0, Vec::new()),
+            migrate_context: BlockContext::new(String::new(), 0, 0, 1, 1, 0, Vec::new()),
         }
     }
 
@@ -242,12 +299,12 @@ impl Sequence {
     }
 
     #[getter]
-    fn metric(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+    fn metric(&self, py: Python<'_>) -> Option<Py<SequenceMetric>> {
         self.metric.as_ref().map(|m| m.clone_ref(py))
     }
 
     #[setter]
-    fn set_metric(&mut self, metric: Option<Py<PyAny>>) {
+    fn set_metric(&mut self, metric: Option<Py<SequenceMetric>>) {
         self.metric = metric;
     }
 
@@ -523,11 +580,48 @@ impl Sequence {
         self.active_group_id = max_group;
         self.migrate_group_id = max_group;
         self.active_dispatched_tokens = tokens;
+        self.active_context.num_dispatched_tokens = self.active_dispatched_tokens.clone();
     }
 
     #[getter]
     fn active_dispatched_tokens(&self) -> Vec<i32> {
         self.active_dispatched_tokens.clone()
+    }
+
+    fn active(
+        &mut self,
+        engine_id: String,
+        group_size: i32,
+        attention_dp: i32,
+        num_kvcache_blocks: i32,
+    ) -> i32 {
+        let group_size = group_size.max(1);
+        self.active_context = BlockContext::new(
+            engine_id,
+            self.active_dp_idx,
+            self.active_group_id,
+            group_size,
+            attention_dp,
+            num_kvcache_blocks,
+            vec![0; group_size as usize],
+        );
+        self.active_dispatched_tokens = vec![0; group_size as usize];
+        0
+    }
+
+    #[pyo3(signature = (_slot = 0))]
+    fn block_ctx(&self, _slot: i32) -> BlockContext {
+        if _slot == 1 {
+            self.migrate_context.clone()
+        } else {
+            self.active_context.clone()
+        }
+    }
+
+    #[pyo3(signature = (_slot = 0, _group_id = 0))]
+    fn num_blocks(&self, _slot: i32, _group_id: i32) -> i32 {
+        let block_size = BLOCK_SIZE.load(Ordering::Relaxed).max(1);
+        (self.num_tokens.max(1) + block_size - 1) / block_size
     }
 
     fn clear_vision_slots(&mut self) {
@@ -580,6 +674,7 @@ impl Sequence {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SamplingParams>()?;
     m.add_class::<SequenceStatus>()?;
+    m.add_class::<BlockContext>()?;
     m.add_class::<Sequence>()?;
     Ok(())
 }

@@ -1,0 +1,187 @@
+use super::metadata::{BatchAuxData, DecodeMeta, PrefillMeta};
+use super::wire::{bytes_arg, decode_wire};
+use pyo3::prelude::*;
+
+#[pyfunction]
+#[pyo3(signature = (data, _sp_rank = 0))]
+pub(super) fn extract_aux_from_bytes(
+    data: &Bound<'_, PyAny>,
+    _sp_rank: usize,
+) -> PyResult<BatchAuxData> {
+    let data = bytes_arg(data)?;
+    let batch = decode_wire(&data)?;
+    Ok(BatchAuxData {
+        num_group_seqs: batch.num_group_seqs(),
+        temperatures: batch.temperatures,
+        state_slots: batch.state_slots,
+        compressed_block_tables: batch.compressed_block_tables,
+        hisparse_slots: batch.hisparse_slots,
+        any_return_completion_logprobs: false,
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (data, _sp_rank, _sp_size, _block_size, _max_num_seqs, _num_kvcache_blocks))]
+pub(super) fn prepare_prefill_from_bytes(
+    data: &Bound<'_, PyAny>,
+    _sp_rank: usize,
+    _sp_size: usize,
+    _block_size: usize,
+    _max_num_seqs: usize,
+    _num_kvcache_blocks: usize,
+) -> PyResult<PrefillMeta> {
+    let data = bytes_arg(data)?;
+    let batch = decode_wire(&data)?;
+    let mut cu = Vec::with_capacity(batch.seq_lens.len() + 1);
+    cu.push(0);
+    let mut total = 0i32;
+    let mut max_len = 0usize;
+    let max_blocks = batch
+        .block_tables
+        .iter()
+        .map(|blocks| blocks.len())
+        .max()
+        .unwrap_or(0);
+    let mut block_tables_flat = Vec::new();
+    if !batch.is_dummy && max_blocks > 0 {
+        block_tables_flat.resize(_sp_size * _max_num_seqs.max(1) * max_blocks, 0);
+        for sp in 0.._sp_size {
+            for (seq_idx, blocks) in batch.block_tables.iter().enumerate() {
+                if seq_idx >= _max_num_seqs {
+                    break;
+                }
+                let base = (sp * _max_num_seqs.max(1) + seq_idx) * max_blocks;
+                for (block_idx, block) in blocks.iter().copied().enumerate() {
+                    block_tables_flat[base + block_idx] = block;
+                }
+            }
+        }
+    }
+    let mut sampling_token_indices = Vec::new();
+    let mut sampling_seq_indices = Vec::new();
+    for (idx, len) in batch.seq_lens.iter().copied().enumerate() {
+        let len_usize = len.max(0) as usize;
+        total += len.max(0);
+        cu.push(total);
+        max_len = max_len.max(len_usize);
+        if len > 0 {
+            sampling_token_indices.push((total - 1) as i64);
+            sampling_seq_indices.push(idx as i64);
+        }
+    }
+    let mut token_seq_indices = Vec::with_capacity(total.max(0) as usize);
+    for (seq_idx, len) in batch.seq_lens.iter().copied().enumerate() {
+        for _ in 0..len.max(0) {
+            token_seq_indices.push(seq_idx);
+        }
+    }
+    Ok(PrefillMeta {
+        input_ids: batch.input_ids,
+        positions: batch.positions.clone(),
+        cu_seqlens_q: cu.clone(),
+        cu_seqlens_k: cu,
+        slot_mapping: if batch.is_dummy {
+            vec![-1; total.max(0) as usize]
+        } else {
+            batch
+                .positions
+                .iter()
+                .enumerate()
+                .map(|(idx, pos)| {
+                    let seq_idx = token_seq_indices.get(idx).copied().unwrap_or(0);
+                    let block_table = batch.block_tables.get(seq_idx).cloned().unwrap_or_default();
+                    let block_size = _block_size.max(1) as i64;
+                    let logical_block = (*pos / block_size).max(0) as usize;
+                    let offset = (*pos % block_size) as i32;
+                    block_table
+                        .get(logical_block)
+                        .copied()
+                        .map(|block| block * _block_size.max(1) as i32 + offset)
+                        .unwrap_or(idx as i32)
+                })
+                .collect()
+        },
+        use_block_tables: !block_tables_flat.is_empty(),
+        block_tables_flat,
+        max_num_blocks: max_blocks,
+        max_seqlen_q: max_len,
+        max_seqlen_k: max_len,
+        sampling_token_indices,
+        sampling_seq_indices,
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (data, _sp_rank, sp_size, _block_size, max_num_seqs, _num_kvcache_blocks))]
+pub(super) fn prepare_decode_from_bytes(
+    data: &Bound<'_, PyAny>,
+    _sp_rank: usize,
+    sp_size: usize,
+    _block_size: usize,
+    max_num_seqs: usize,
+    _num_kvcache_blocks: usize,
+) -> PyResult<DecodeMeta> {
+    let data = bytes_arg(data)?;
+    let batch = decode_wire(&data)?;
+    let num = batch.num_group_seqs();
+    let max_num_blocks = batch
+        .block_tables
+        .iter()
+        .map(|blocks| blocks.len())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let mut block_tables_flat = vec![0; sp_size * num.max(1) * max_num_blocks];
+    if !batch.is_dummy {
+        for sp in 0..sp_size {
+            for seq_idx in 0..num.max(1) {
+                let base = (sp * num.max(1) + seq_idx) * max_num_blocks;
+                if let Some(blocks) = batch.block_tables.get(seq_idx) {
+                    for (block_idx, block) in blocks.iter().copied().enumerate() {
+                        block_tables_flat[base + block_idx] = block;
+                    }
+                }
+            }
+        }
+    }
+    let mut context_lens_flat = vec![0; sp_size * max_num_seqs];
+    for i in 0..num.min(max_num_seqs) {
+        context_lens_flat[i] = batch.positions.get(i).copied().unwrap_or(0) as i32 + 1;
+    }
+    Ok(DecodeMeta {
+        input_ids: batch.input_ids,
+        positions: batch.positions.clone(),
+        slot_mapping: if batch.is_dummy {
+            vec![-1; num]
+        } else {
+            batch
+                .positions
+                .iter()
+                .enumerate()
+                .map(|(idx, pos)| {
+                    let block_table = batch.block_tables.get(idx).cloned().unwrap_or_default();
+                    let block_size = _block_size.max(1) as i64;
+                    let logical_block = (*pos / block_size).max(0) as usize;
+                    let offset = (*pos % block_size) as i32;
+                    block_table
+                        .get(logical_block)
+                        .copied()
+                        .map(|block| block * _block_size.max(1) as i32 + offset)
+                        .unwrap_or(idx as i32)
+                })
+                .collect()
+        },
+        context_lens_flat,
+        block_tables_flat: if batch.is_dummy {
+            Vec::new()
+        } else {
+            block_tables_flat
+        },
+        max_num_blocks: if batch.is_dummy { 0 } else { max_num_blocks },
+    })
+}
+
+#[pyfunction]
+pub(super) fn extract_vision_slots_from_bytes(_data: &Bound<'_, PyAny>) -> PyResult<Vec<PyObject>> {
+    Ok(Vec::new())
+}

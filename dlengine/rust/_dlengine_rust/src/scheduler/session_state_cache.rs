@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::Scheduler;
+use crate::sequence::Sequence;
 use pyo3::prelude::*;
 
 pub(super) struct ParkedSession {
@@ -19,18 +20,14 @@ impl Scheduler {
     pub(super) fn try_adopt_session(
         &mut self,
         py: Python<'_>,
-        seq: &Py<PyAny>,
+        seq: &Py<Sequence>,
         dp_idx: usize,
         batch_tokens: &[i32],
     ) -> PyResult<Option<i32>> {
         if self.config.gdn_state_cache_slots <= 0 || self.group() != 1 {
             return Ok(None);
         }
-        let obj = seq.bind(py);
-        let affinity = obj
-            .getattr("affinity_key")
-            .and_then(|v| v.extract::<u64>())
-            .unwrap_or(0);
+        let affinity = seq.borrow(py).affinity_key;
         if affinity == 0 {
             return Ok(None);
         }
@@ -40,8 +37,10 @@ impl Scheduler {
         if parked.dp_idx != dp_idx {
             return Ok(None);
         }
-        let full_len = self.prompt_target(&obj);
-        let token_ids = obj.getattr("token_ids")?.extract::<Vec<i32>>()?;
+        let (full_len, token_ids, seq_id) = {
+            let s = seq.borrow(py);
+            (self.prompt_target(&s), s.token_ids.clone(), s.seq_id)
+        };
         let prefix_ok = parked.length > 0
             && parked.length < full_len
             && token_ids.len() >= parked.length as usize
@@ -58,7 +57,6 @@ impl Scheduler {
         }
         let mut parked = self.parked_sessions.remove(&affinity).unwrap();
         self.parked_lru.retain(|key| *key != affinity);
-        let seq_id = obj.getattr("seq_id")?.extract::<u64>()?;
         self.seq_assignment
             .insert(seq_id, (dp_idx, parked.group_id));
         if let Some(blocks) = parked.block_tables.remove(&(parked.group_id as i32)) {
@@ -66,43 +64,47 @@ impl Scheduler {
             self.group_resources[flat]
                 .seq_blocks
                 .insert(seq_id, blocks.clone());
-            obj.call_method1(
-                "set_active_group_block_table",
-                (parked.group_id as i32, blocks.clone()),
-            )?;
-            obj.call_method1(
-                "set_migrate_group_block_table",
-                (parked.group_id as i32, blocks),
-            )?;
+            let mut s = seq.borrow_mut(py);
+            let group_id = parked.group_id as i32;
+            s.active_group_id = group_id;
+            s.active_block_table = blocks.clone();
+            s.active_block_tables.insert(group_id, blocks.clone());
+            s.migrate_group_id = group_id;
+            s.migrate_block_table = blocks.clone();
+            s.migrate_block_tables.insert(group_id, blocks);
         }
         if parked.state_slot >= 0 {
             self.seq_state_slots.insert(seq_id, parked.state_slot);
-            obj.setattr("active_state_slot", parked.state_slot)?;
-            obj.setattr("migrate_state_slot", parked.state_slot)?;
+            let mut s = seq.borrow_mut(py);
+            s.active_state_slot = parked.state_slot;
+            s.migrate_state_slot = parked.state_slot;
         }
         if parked.hisparse_slot >= 0 {
             self.seq_hisparse_slots.insert(seq_id, parked.hisparse_slot);
-            obj.setattr("active_hisparse_slot", parked.hisparse_slot)?;
-            obj.setattr("migrate_hisparse_slot", parked.hisparse_slot)?;
+            let mut s = seq.borrow_mut(py);
+            s.active_hisparse_slot = parked.hisparse_slot;
+            s.migrate_hisparse_slot = parked.hisparse_slot;
         }
         for (ratio, pages) in parked.compressed_tables {
             if let Some(pool) = self.compressed_pools.get_mut(&ratio) {
                 pool.seq_pages.insert(seq_id, pages.clone());
             }
-            obj.call_method1("set_active_compressed_block_table", (ratio, pages.clone()))?;
-            obj.call_method1("set_migrate_compressed_block_table", (ratio, pages))?;
+            let mut s = seq.borrow_mut(py);
+            s.active_compressed_block_tables
+                .insert(ratio, pages.clone());
+            s.migrate_compressed_block_tables.insert(ratio, pages);
         }
 
         let new_tokens = (full_len - parked.length).min(budget).max(0);
         let chunk_end = parked.length + new_tokens;
-        obj.setattr("num_cached_tokens", parked.length)?;
-        obj.setattr("num_tokens", chunk_end)?;
-        obj.setattr("active_dp_idx", dp_idx as i32)?;
-        obj.setattr("active_group_id", parked.group_id as i32)?;
-        obj.call_method1(
-            "set_active_dispatched_tokens",
-            (self.dispatch_for_master(parked.group_id, chunk_end),),
-        )?;
+        {
+            let mut s = seq.borrow_mut(py);
+            s.num_cached_tokens = parked.length;
+            s.num_tokens = chunk_end;
+            s.active_dp_idx = dp_idx as i32;
+            s.active_group_id = parked.group_id as i32;
+            s.active_dispatched_tokens = self.dispatch_for_master(parked.group_id, chunk_end);
+        }
         self.ensure_group_blocks(py, seq, seq_id, dp_idx, parked.group_id, full_len, false)?;
         self.prefix_cached_tokens_by_seq
             .insert(seq_id, parked.length);
@@ -129,16 +131,11 @@ impl Scheduler {
         }
     }
 
-    pub(super) fn park_or_release(&mut self, py: Python<'_>, seq: &Py<PyAny>) {
-        let obj = seq.bind(py);
-        let seq_id = obj
-            .getattr("seq_id")
-            .and_then(|v| v.extract::<u64>())
-            .unwrap_or(0);
-        let affinity = obj
-            .getattr("affinity_key")
-            .and_then(|v| v.extract::<u64>())
-            .unwrap_or(0);
+    pub(super) fn park_or_release(&mut self, py: Python<'_>, seq: &Py<Sequence>) {
+        let (seq_id, affinity) = {
+            let s = seq.borrow(py);
+            (s.seq_id, s.affinity_key)
+        };
         if self.config.gdn_state_cache_slots <= 0 || self.group() != 1 || affinity == 0 {
             self.release_seq(seq_id);
             return;
@@ -160,14 +157,10 @@ impl Scheduler {
                 compressed_tables.insert(*ratio, pages);
             }
         }
-        let token_ids = obj
-            .getattr("token_ids")
-            .and_then(|v| v.extract::<Vec<i32>>())
-            .unwrap_or_default();
-        let length = obj
-            .getattr("num_tokens")
-            .and_then(|v| v.extract::<i32>())
-            .unwrap_or(token_ids.len() as i32);
+        let (token_ids, length) = {
+            let s = seq.borrow(py);
+            (s.token_ids.clone(), s.num_tokens)
+        };
         let parked = ParkedSession {
             affinity_key: affinity,
             state_slot,

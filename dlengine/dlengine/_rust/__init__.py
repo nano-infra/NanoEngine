@@ -3,16 +3,10 @@ from dlengine.logging import get_logger
 logger = get_logger("dlengine")
 
 try:
-    try:
-        from _dlengine_rust import *
-    except ImportError:
-        from dlengine._dlengine_rust import *
+    from dlengine._dlengine_rust import *
 except ImportError as e:
     logger.error(f"Failed to import dlengine._dlengine_rust: {e}")
-    logger.error(
-        "Build it with: cargo build --manifest-path "
-        "'dlengine/rust/_dlengine_rust/Cargo.toml' --release"
-    )
+    logger.error("Build it with: maturin develop")
     raise e
 
 
@@ -25,6 +19,9 @@ __all__ = [
     "HcaCacheSpec",
     "HiSparseCacheSpec",
     "IndexerCacheSpec",
+    "BlockContextSlot",
+    "BlockContext",
+    "BlockManager",
     "MlaCacheSpec",
     "RoutingStrategy",
     "ScheduleResult",

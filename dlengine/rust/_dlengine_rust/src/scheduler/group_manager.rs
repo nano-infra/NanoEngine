@@ -1,4 +1,5 @@
 use super::Scheduler;
+use crate::sequence::{SamplingParams, Sequence};
 use pyo3::prelude::*;
 use std::cmp::Reverse;
 
@@ -52,17 +53,16 @@ impl Scheduler {
         out
     }
 
-    pub(super) fn make_dummy_seq(&self, py: Python<'_>, group_id: i32) -> PyResult<Py<PyAny>> {
-        let module = py.import("dlengine._dlengine_rust")?;
-        let sp = module.getattr("SamplingParams")?.call0()?;
-        let seq = module.getattr("Sequence")?.call1((vec![0i32], sp))?;
-        seq.setattr("status", 1)?;
-        seq.setattr("active_group_id", group_id)?;
-        seq.call_method1(
-            "set_active_dispatched_tokens",
-            (self.dispatch_for_master(group_id as usize, 1),),
-        )?;
-        Ok(seq.unbind())
+    pub(super) fn make_dummy_seq(&self, py: Python<'_>, group_id: i32) -> PyResult<Py<Sequence>> {
+        let mut seq = Sequence::new(
+            vec![0i32],
+            Some(SamplingParams::new(1.0, 256, false, false)),
+        );
+        seq.status = 1;
+        seq.active_group_id = group_id.max(0);
+        seq.migrate_group_id = group_id.max(0);
+        seq.active_dispatched_tokens = self.dispatch_for_master(group_id.max(0) as usize, 1);
+        Py::new(py, seq)
     }
 
     pub(super) fn blocks_needed_for_tokens(&self, tokens: i32) -> usize {
@@ -73,16 +73,9 @@ impl Scheduler {
     pub(super) fn group_loads(&self, py: Python<'_>, dp_idx: usize) -> Vec<i32> {
         let mut loads = vec![0; self.group()];
         for seq in &self.running[dp_idx] {
-            let obj = seq.bind(py);
-            let gid = obj
-                .getattr("active_group_id")
-                .and_then(|v| v.extract::<usize>())
-                .unwrap_or(0)
-                .min(self.group() - 1);
-            loads[gid] += obj
-                .getattr("num_tokens")
-                .and_then(|v| v.extract::<i32>())
-                .unwrap_or(0);
+            let s = seq.borrow(py);
+            let gid = (s.active_group_id.max(0) as usize).min(self.group() - 1);
+            loads[gid] += s.num_tokens;
         }
         loads
     }

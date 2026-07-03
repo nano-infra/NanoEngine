@@ -58,19 +58,19 @@ impl SequenceMetric {
         }
     }
 
-    fn record_arrival(&mut self) {
+    pub(crate) fn record_arrival(&mut self) {
         self.arrival_time = Some(now_seconds());
     }
-    fn record_first_scheduled(&mut self) {
+    pub(crate) fn record_first_scheduled(&mut self) {
         self.first_scheduled_time = Some(now_seconds());
     }
-    fn record_decode_arrival(&mut self) {
+    pub(crate) fn record_decode_arrival(&mut self) {
         self.decode_arrival_time = Some(now_seconds());
     }
-    fn record_decode_scheduled(&mut self) {
+    pub(crate) fn record_decode_scheduled(&mut self) {
         self.decode_scheduled_time = Some(now_seconds());
     }
-    fn record_first_token(&mut self) {
+    pub(crate) fn record_first_token(&mut self) {
         let now = now_seconds();
         if self.first_token_time.is_none() {
             self.first_token_time = Some(now);
@@ -78,7 +78,7 @@ impl SequenceMetric {
         self.last_token_time = Some(now);
         self.num_generated_tokens += 1;
     }
-    fn record_token(&mut self) {
+    pub(crate) fn record_token(&mut self) {
         let now = now_seconds();
         if let Some(last) = self.last_token_time {
             self.itl_samples.push((now - last) * 1000.0);
@@ -86,10 +86,10 @@ impl SequenceMetric {
         self.last_token_time = Some(now);
         self.num_generated_tokens += 1;
     }
-    fn record_completion(&mut self) {
+    pub(crate) fn record_completion(&mut self) {
         self.completion_time = Some(now_seconds());
     }
-    fn record_prefill_chunk(&mut self) {
+    pub(crate) fn record_prefill_chunk(&mut self) {
         let now = now_seconds();
         let last = self
             .last_chunk_time

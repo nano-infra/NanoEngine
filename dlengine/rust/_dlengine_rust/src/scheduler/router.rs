@@ -1,4 +1,5 @@
 use super::{RoutingStrategy, Scheduler};
+use crate::sequence::Sequence;
 use pyo3::prelude::*;
 
 impl Scheduler {
@@ -29,12 +30,7 @@ impl Scheduler {
             .into_iter()
             .flatten()
             .chain(self.prefilling.get(dp_idx).into_iter().flatten())
-            .map(|seq| {
-                seq.bind(py)
-                    .getattr("num_tokens")
-                    .and_then(|v| v.extract::<i32>())
-                    .unwrap_or(0)
-            })
+            .map(|seq| seq.borrow(py).num_tokens)
             .sum()
     }
 
@@ -43,17 +39,12 @@ impl Scheduler {
             + self.prefilling.get(dp_idx).map(|v| v.len()).unwrap_or(0) as i32
     }
 
-    pub(super) fn route_candidates(&mut self, py: Python<'_>, seq: &Py<PyAny>) -> Vec<usize> {
+    pub(super) fn route_candidates(&mut self, py: Python<'_>, seq: &Py<Sequence>) -> Vec<usize> {
         let dp = self.dp();
-        let obj = seq.bind(py);
-        let seq_id = obj
-            .getattr("seq_id")
-            .and_then(|v| v.extract::<u64>())
-            .unwrap_or(0);
-        let affinity = obj
-            .getattr("affinity_key")
-            .and_then(|v| v.extract::<u64>())
-            .unwrap_or(0);
+        let (seq_id, affinity) = {
+            let s = seq.borrow(py);
+            (s.seq_id, s.affinity_key)
+        };
 
         let mut order: Vec<usize> = (0..dp).collect();
         match self.routing_strategy {
