@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 static NEXT_SEQ_ID: AtomicU64 = AtomicU64::new(0);
 static BLOCK_SIZE: AtomicI32 = AtomicI32::new(256);
 
+pub(crate) fn set_sequence_block_size(block_size: i32) {
+    BLOCK_SIZE.store(block_size.max(1), Ordering::Relaxed);
+}
+
 #[pyclass(module = "dlengine._dlengine_rust")]
 #[derive(Clone)]
 pub struct SamplingParams {
@@ -58,11 +62,11 @@ impl SequenceStatus {
 
 #[derive(Clone)]
 pub(crate) struct VisionSlot {
-    encoder_engine_id: String,
-    slot_idx: i32,
-    num_tokens: i32,
-    hidden_size: i32,
-    max_tokens_per_slot: i32,
+    pub(crate) encoder_engine_id: String,
+    pub(crate) slot_idx: i32,
+    pub(crate) num_tokens: i32,
+    pub(crate) hidden_size: i32,
+    pub(crate) max_tokens_per_slot: i32,
 }
 
 #[pyclass(module = "dlengine._dlengine_rust")]
@@ -675,6 +679,5 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SamplingParams>()?;
     m.add_class::<SequenceStatus>()?;
     m.add_class::<BlockContext>()?;
-    m.add_class::<Sequence>()?;
     Ok(())
 }

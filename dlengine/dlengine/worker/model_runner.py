@@ -9,7 +9,6 @@ from dlengine._cpp import (
     extract_aux_from_bytes,
     extract_vision_slots_from_bytes,
     serialize_dummy_run_batch,
-    serialize_run_batch,
 )
 from dlengine.config import Config
 from dlengine.context_v2.batch import get_batch_context
@@ -263,11 +262,6 @@ class ModelRunner:
         self.weight_context = None
         self.weight_update_engine = None
         self.l3_store = None  # Hf3fsL3Store, created in allocate_kvcache when enabled
-
-        # Sync C++ Sequence.block_size with Python kvcache_block_size
-        from dlengine._cpp import Sequence as _Seq
-
-        _Seq.set_block_size(config.kvcache_block_size)
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -780,8 +774,8 @@ class ModelRunner:
             self._warmup_deep_gemm_moe(max_num_batched_tokens)
         except Exception as e:  # pragma: no cover - warmup must never crash boot
             logger.warning(f"[startup] r{self.rank} deep_gemm MoE warmup skipped: {e}")
-        # empty for warmup — serialize empty batch into bytes
-        warmup_data = serialize_run_batch([], True)
+        # Empty warmup batch, built without exposing Sequence serializers.
+        warmup_data = serialize_dummy_run_batch("", 0, True)
         self.run_from_bytes(warmup_data, True)
         torch.cuda.empty_cache()
 

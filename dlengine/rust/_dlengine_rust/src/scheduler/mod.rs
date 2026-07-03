@@ -1,7 +1,13 @@
-use crate::metrics::ServerMetric;
-use crate::sequence::Sequence;
+use crate::metrics::{SequenceMetric, ServerMetric};
+use crate::sequence::{set_sequence_block_size, Sequence};
 use crate::snapshots::{SchedulerMetricSnapshot, StepMetricSnapshot};
+use crate::stubs::wire::{
+    add_request_to_sequence, bytes_arg, decode_binary, migration_request_to_sequence,
+    sequence_migrate_batch_bytes, sequence_run_batch_bytes, sequence_to_migration_request,
+    WireAddRequest, WireMigrationRequest,
+};
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::{HashMap, HashSet};
 
 mod group_manager;
@@ -49,6 +55,7 @@ pub struct Scheduler {
 impl Scheduler {
     #[new]
     fn new(config: SchedulerConfig) -> Self {
+        set_sequence_block_size(config.kvcache_block_size);
         let dp = config.attention_dp.max(1) as usize;
         let group = config.group_size.max(1) as usize;
         let num_blocks = config.num_kvcache_blocks.max(0);
@@ -138,6 +145,41 @@ impl Scheduler {
         } else {
             self.waiting.push(seq);
         }
+    }
+
+    fn add_request_bytes(
+        &mut self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<(u64, i32)>> {
+        let data = bytes_arg(data)?;
+        if let Ok(requests) = decode_binary::<Vec<WireAddRequest>>(&data, "add request") {
+            let mut added = Vec::with_capacity(requests.len());
+            for request in requests {
+                let seq_id = request.seq_id;
+                let prompt_len = request.prompt_token_ids.len() as i32;
+                let seq = add_request_to_sequence(py, request)?;
+                self.add(seq);
+                added.push((seq_id, prompt_len));
+            }
+            return Ok(added);
+        }
+
+        let request: WireMigrationRequest = decode_binary(&data, "migration request")?;
+        let seq_id = request.seq_id;
+        let prompt_len = request.num_prompt_tokens;
+        let seq = migration_request_to_sequence(py, request)?;
+        self.add(seq);
+        Ok(vec![(seq_id, prompt_len)])
+    }
+
+    fn set_sequence_metric(
+        &mut self,
+        py: Python<'_>,
+        seq_id: u64,
+        metric: Py<SequenceMetric>,
+    ) -> bool {
+        self.set_sequence_metric_impl(py, seq_id, metric)
     }
 
     fn schedule(&mut self, py: Python<'_>) -> PyResult<ScheduleResult> {
@@ -246,6 +288,132 @@ impl Scheduler {
 
     fn free_to_be_migrated(&mut self, py: Python<'_>, seqs: &Bound<'_, PyAny>) -> PyResult<()> {
         self.free_to_be_migrated_impl(py, seqs)
+    }
+
+    fn free_to_be_migrated_ids(&mut self, py: Python<'_>, seq_ids: Vec<u64>) {
+        self.free_to_be_migrated_ids_impl(py, seq_ids)
+    }
+
+    fn serialize_run_batches(
+        &self,
+        py: Python<'_>,
+        dp_group_seqs: Vec<Vec<Py<Sequence>>>,
+        is_prefill: bool,
+        tp_size: usize,
+    ) -> PyResult<Vec<PyObject>> {
+        let mut out = Vec::with_capacity(dp_group_seqs.len() * tp_size.max(1));
+        for seqs in dp_group_seqs {
+            for _ in 0..tp_size.max(1) {
+                let bytes = sequence_run_batch_bytes(
+                    py,
+                    seqs.iter().map(|seq| seq.clone_ref(py)).collect(),
+                    is_prefill,
+                )?;
+                out.push(PyBytes::new(py, &bytes).into());
+            }
+        }
+        Ok(out)
+    }
+
+    fn serialize_migrate_batches(
+        &self,
+        py: Python<'_>,
+        dp_group_seqs: Vec<Vec<Py<Sequence>>>,
+        tp_size: usize,
+    ) -> PyResult<Vec<PyObject>> {
+        let mut out = Vec::with_capacity(dp_group_seqs.len() * tp_size.max(1));
+        for seqs in dp_group_seqs {
+            for _ in 0..tp_size.max(1) {
+                let bytes = sequence_migrate_batch_bytes(
+                    py,
+                    seqs.iter().map(|s| s.clone_ref(py)).collect(),
+                )?;
+                out.push(PyBytes::new(py, &bytes).into());
+            }
+        }
+        Ok(out)
+    }
+
+    fn collect_sequence_events(
+        &mut self,
+        py: Python<'_>,
+        dp_seqs: Vec<Vec<Py<Sequence>>>,
+        track_running: bool,
+        previous_running: std::collections::HashSet<u64>,
+    ) -> PyResult<Vec<PyObject>> {
+        let mut out = Vec::new();
+        for seqs in dp_seqs {
+            for seq in seqs {
+                let (
+                    seq_id,
+                    last_token,
+                    num_tokens,
+                    is_finished,
+                    is_to_be_migrated,
+                    source_engine_id,
+                    vision_slots,
+                ) = {
+                    let s = seq.borrow(py);
+                    (
+                        s.seq_id,
+                        s.last_token,
+                        s.num_tokens,
+                        s.status == 2,
+                        s.status == 3,
+                        s.migrate_engine_id.clone(),
+                        s.vision_slots
+                            .iter()
+                            .map(|slot| {
+                                (
+                                    slot.encoder_engine_id.clone(),
+                                    slot.slot_idx,
+                                    slot.num_tokens,
+                                    slot.hidden_size,
+                                    slot.max_tokens_per_slot,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                if seq_id < 8 {
+                    continue;
+                }
+                let event = PyDict::new(py);
+                event.set_item("seq_id", seq_id)?;
+                event.set_item("last_token", last_token)?;
+                event.set_item("num_tokens", num_tokens)?;
+                event.set_item("is_finished", is_finished)?;
+                event.set_item("is_to_be_migrated", is_to_be_migrated)?;
+                event.set_item(
+                    "is_new_running",
+                    track_running && !previous_running.contains(&seq_id),
+                )?;
+                event.set_item("source_engine_id", source_engine_id)?;
+                let vision_list = PyList::empty(py);
+                for (encoder_engine_id, slot_idx, num_tokens, hidden_size, max_tokens_per_slot) in
+                    &vision_slots
+                {
+                    let d = PyDict::new(py);
+                    d.set_item("encoder_engine_id", encoder_engine_id)?;
+                    d.set_item("slot_idx", slot_idx)?;
+                    d.set_item("num_tokens", num_tokens)?;
+                    d.set_item("hidden_size", hidden_size)?;
+                    d.set_item("max_tokens_per_slot", max_tokens_per_slot)?;
+                    vision_list.append(d)?;
+                }
+                event.set_item("vision_slots", vision_list)?;
+                if is_to_be_migrated {
+                    let migration = sequence_to_migration_request(py, &seq);
+                    let bytes = crate::stubs::wire::encode_binary(&migration, "migration request")?;
+                    event.set_item("migration_payload", PyBytes::new(py, &bytes))?;
+                }
+                if !vision_slots.is_empty() {
+                    seq.borrow_mut(py).vision_slots.clear();
+                }
+                out.push(event.unbind().into());
+            }
+        }
+        Ok(out)
     }
 }
 

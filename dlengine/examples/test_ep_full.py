@@ -3,7 +3,7 @@
 Tests the complete pipeline:
   EncoderEngine (encode → EmbeddingPool → RDMA MR)
     ↓ VisionSlotMeta
-  LLM Engine (Sequence.add_vision_slot → serialize → ModelRunner
+  LLM Engine (protocol vision_slots → serialize → ModelRunner
         → extract_vision_slots_from_bytes → _fetch_vision_embeds_rdma
         → _inject_vision_embeds → prefill forward → decode → output)
     ↓ P2P FreeVisionSlots (Action=4)
@@ -139,7 +139,6 @@ def step_llm(args, slot_metas, token_ids) -> list:
     """Run LLM engine: prefill (with RDMA fetch) + decode in single engine."""
     import ray
     from dlengine.config import Config
-    from dlengine.engine.sequence import Sequence
     from dlengine.llm_component import LLMComponent
     from dlengine.sampling_params import SamplingParams
 
@@ -164,51 +163,28 @@ def step_llm(args, slot_metas, token_ids) -> list:
     llm = LLMComponent.as_remote(config)
     print(f"[LLM] Engine ready in {time.time() - t0:.1f}s")
 
-    # Build sequence with vision slots attached
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=0.1,
         ignore_eos=False,
     )
-    seq = Sequence(token_ids, sampling_params=sampling_params)
-
-    # Attach vision slot metadata from encoder
-    for m in slot_metas:
-        seq.add_vision_slot(
-            encoder_engine_id=m.encoder_engine_id,
-            slot_idx=m.slot_idx,
-            num_tokens=m.num_tokens,
-            hidden_size=m.hidden_size,
-            max_tokens_per_slot=m.max_tokens_per_slot,
-        )
     print(
-        f"[LLM] Sequence: {len(token_ids)} tokens, " f"{len(slot_metas)} vision slot(s)"
+        f"[LLM] Request: {len(token_ids)} tokens, " f"{len(slot_metas)} vision slot(s)"
     )
 
     # Run prefill + decode
-    ray.get(llm.add_request.remote([seq]))
+    ray.get(
+        llm.add_request.remote(
+            token_ids,
+            sampling_params=sampling_params,
+            vision_slots=slot_metas,
+        )
+    )
     print("[LLM] Generating (prefill + decode)…")
     t0 = time.time()
     finished = ray.get(llm.generate.remote())
     elapsed = time.time() - t0
-    print(f"[LLM] Done in {elapsed:.1f}s, {len(finished)} sequence(s)")
-
-    # Free vision slots on encoder via P2P (engine_server does this automatically,
-    # but generate() path doesn't, so do it manually in the test)
-    from collections import defaultdict
-
-    vision_free_by_encoder: dict[str, list[int]] = defaultdict(list)
-    for s in finished:
-        vs_list = s.vision_slots
-        if not vs_list:
-            continue
-        for vs in vs_list:
-            vision_free_by_encoder[vs["encoder_engine_id"]].append(vs["slot_idx"])
-        s.clear_vision_slots()
-
-    for encoder_id, slot_indices in vision_free_by_encoder.items():
-        print(f"[LLM] Sending P2P free for encoder={encoder_id}, slots={slot_indices}")
-        ray.get(llm.send_free_vision_slots.remote(encoder_id, slot_indices))
+    print(f"[LLM] Done in {elapsed:.1f}s, {len(finished)} output(s)")
 
     return finished
 

@@ -1,4 +1,4 @@
-use crate::sequence::{SamplingParams, Sequence};
+use crate::sequence::{SamplingParams, Sequence, VisionSlot};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
@@ -21,11 +21,11 @@ pub(super) struct WireBatch {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(super) struct WireSamplingParams {
-    pub(super) temperature: f64,
-    pub(super) max_tokens: i32,
-    pub(super) ignore_eos: bool,
-    pub(super) return_completion_logprobs: bool,
+pub(crate) struct WireSamplingParams {
+    pub(crate) temperature: f64,
+    pub(crate) max_tokens: i32,
+    pub(crate) ignore_eos: bool,
+    pub(crate) return_completion_logprobs: bool,
 }
 
 impl From<&SamplingParams> for WireSamplingParams {
@@ -51,76 +51,74 @@ impl WireSamplingParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(super) struct WireSequence {
-    seq_id: u64,
-    status: i32,
-    token_ids: Vec<i32>,
-    last_token: i32,
-    num_prompt_tokens: i32,
-    num_cached_tokens: i32,
-    affinity_key: u64,
-    sampling_params: WireSamplingParams,
+pub(crate) struct WireAddRequest {
+    pub(crate) seq_id: u64,
+    pub(crate) prompt_token_ids: Vec<i32>,
+    pub(crate) sampling_params: WireSamplingParams,
+    pub(crate) affinity_key: u64,
+    pub(crate) vision_slots: Vec<WireVisionSlot>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(super) struct WireAddRequest {
-    pub(super) seq_id: u64,
-    pub(super) prompt_token_ids: Vec<i32>,
-    pub(super) sampling_params: WireSamplingParams,
-    pub(super) affinity_key: u64,
+pub(crate) struct WireVisionSlot {
+    pub(crate) encoder_engine_id: String,
+    pub(crate) slot_idx: i32,
+    pub(crate) num_tokens: i32,
+    pub(crate) hidden_size: i32,
+    pub(crate) max_tokens_per_slot: i32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(super) struct WireMigrationRequest {
-    pub(super) seq_id: u64,
-    pub(super) status: i32,
-    pub(super) token_ids: Vec<i32>,
-    pub(super) last_token: i32,
-    pub(super) num_tokens: i32,
-    pub(super) num_prompt_tokens: i32,
-    pub(super) num_checkpointed_tokens: i32,
-    pub(super) num_cached_tokens: i32,
-    pub(super) affinity_key: u64,
-    pub(super) sampling_params: WireSamplingParams,
-    pub(super) completion_logprobs: Vec<f32>,
-    pub(super) active_block_table: Vec<i32>,
-    pub(super) active_block_tables: HashMap<i32, Vec<i32>>,
-    pub(super) active_dispatched_tokens: Vec<i32>,
-    pub(super) active_dp_idx: i32,
-    pub(super) active_group_id: i32,
-    pub(super) active_state_slot: i32,
-    pub(super) active_compressed_block_tables: HashMap<i32, Vec<i32>>,
-    pub(super) active_hisparse_slot: i32,
-    pub(super) migrate_block_table: Vec<i32>,
-    pub(super) migrate_block_tables: HashMap<i32, Vec<i32>>,
-    pub(super) migrate_engine_id: String,
-    pub(super) migrate_num_kvcache_blocks: i32,
-    pub(super) migrate_group_size: i32,
-    pub(super) migrate_dp_idx: i32,
-    pub(super) migrate_group_id: i32,
-    pub(super) migrate_state_slot: i32,
-    pub(super) migrate_compressed_block_tables: HashMap<i32, Vec<i32>>,
-    pub(super) migrate_hisparse_slot: i32,
+pub(crate) struct WireMigrationRequest {
+    pub(crate) seq_id: u64,
+    pub(crate) status: i32,
+    pub(crate) token_ids: Vec<i32>,
+    pub(crate) last_token: i32,
+    pub(crate) num_tokens: i32,
+    pub(crate) num_prompt_tokens: i32,
+    pub(crate) num_checkpointed_tokens: i32,
+    pub(crate) num_cached_tokens: i32,
+    pub(crate) affinity_key: u64,
+    pub(crate) sampling_params: WireSamplingParams,
+    pub(crate) completion_logprobs: Vec<f32>,
+    pub(crate) active_block_table: Vec<i32>,
+    pub(crate) active_block_tables: HashMap<i32, Vec<i32>>,
+    pub(crate) active_dispatched_tokens: Vec<i32>,
+    pub(crate) active_dp_idx: i32,
+    pub(crate) active_group_id: i32,
+    pub(crate) active_state_slot: i32,
+    pub(crate) active_compressed_block_tables: HashMap<i32, Vec<i32>>,
+    pub(crate) active_hisparse_slot: i32,
+    pub(crate) migrate_block_table: Vec<i32>,
+    pub(crate) migrate_block_tables: HashMap<i32, Vec<i32>>,
+    pub(crate) migrate_engine_id: String,
+    pub(crate) migrate_num_kvcache_blocks: i32,
+    pub(crate) migrate_group_size: i32,
+    pub(crate) migrate_dp_idx: i32,
+    pub(crate) migrate_group_id: i32,
+    pub(crate) migrate_state_slot: i32,
+    pub(crate) migrate_compressed_block_tables: HashMap<i32, Vec<i32>>,
+    pub(crate) migrate_hisparse_slot: i32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct WireMigrateSequence {
-    pub(super) seq_id: u64,
-    pub(super) migrate_engine_id: String,
-    pub(super) migrate_num_kvcache_blocks: i32,
-    pub(super) migrate_group_size: i32,
-    pub(super) migrate_dp_idx: i32,
-    pub(super) migrate_block_location: Vec<(i32, i32)>,
-    pub(super) migrate_state_slot: i32,
-    pub(super) migrate_compressed_block_tables: std::collections::HashMap<i32, Vec<i32>>,
-    pub(super) active_block_location: Vec<(i32, i32)>,
-    pub(super) active_state_slot: i32,
-    pub(super) active_compressed_block_tables: std::collections::HashMap<i32, Vec<i32>>,
+    pub(crate) seq_id: u64,
+    pub(crate) migrate_engine_id: String,
+    pub(crate) migrate_num_kvcache_blocks: i32,
+    pub(crate) migrate_group_size: i32,
+    pub(crate) migrate_dp_idx: i32,
+    pub(crate) migrate_block_location: Vec<(i32, i32)>,
+    pub(crate) migrate_state_slot: i32,
+    pub(crate) migrate_compressed_block_tables: std::collections::HashMap<i32, Vec<i32>>,
+    pub(crate) active_block_location: Vec<(i32, i32)>,
+    pub(crate) active_state_slot: i32,
+    pub(crate) active_compressed_block_tables: std::collections::HashMap<i32, Vec<i32>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct WireRunResult {
-    pub(super) token_ids: Vec<Vec<i64>>,
+    pub(crate) token_ids: Vec<Vec<i64>>,
     pub(super) logprobs: Option<Vec<Vec<f32>>>,
     pub(super) server_handler_ns: u64,
 }
@@ -161,12 +159,12 @@ impl WireBatch {
     }
 }
 
-pub(super) fn encode_binary<T: Serialize>(value: &T, what: &str) -> PyResult<Vec<u8>> {
+pub(crate) fn encode_binary<T: Serialize>(value: &T, what: &str) -> PyResult<Vec<u8>> {
     bincode::serialize(value)
         .map_err(|e| PyValueError::new_err(format!("failed to encode {what}: {e}")))
 }
 
-pub(super) fn decode_binary<T: DeserializeOwned>(data: &[u8], what: &str) -> PyResult<T> {
+pub(crate) fn decode_binary<T: DeserializeOwned>(data: &[u8], what: &str) -> PyResult<T> {
     bincode::deserialize(data)
         .map_err(|e| PyValueError::new_err(format!("failed to decode {what}: {e}")))
 }
@@ -176,44 +174,106 @@ pub(super) fn encode_wire(py: Python<'_>, batch: &WireBatch) -> PyResult<PyObjec
     Ok(PyBytes::new(py, &bytes).into())
 }
 
+pub(crate) fn sequence_run_batch_bytes(
+    py: Python<'_>,
+    seqs: Vec<Py<Sequence>>,
+    is_prefill: bool,
+) -> PyResult<Vec<u8>> {
+    if seqs.is_empty() {
+        return encode_binary(&WireBatch::empty(is_prefill), "run batch");
+    }
+
+    let mut input_ids = Vec::new();
+    let mut positions = Vec::new();
+    let mut seq_lens = Vec::new();
+    let mut block_tables = Vec::new();
+    let mut temperatures = Vec::new();
+    let mut state_slots = Vec::new();
+    let mut compressed_block_tables: HashMap<i32, Vec<Vec<i32>>> = HashMap::new();
+    let mut hisparse_slots = Vec::new();
+
+    for item in seqs {
+        let item = item.borrow(py);
+        let tokens: Vec<i64> = item.token_ids.iter().copied().map(i64::from).collect();
+        let prompt_len = (item.num_prompt_tokens.max(0) as usize).min(tokens.len());
+        let block_table = item.active_block_table.clone();
+        let compressed_tables = item.active_compressed_block_tables.clone();
+        let temperature = item.sampling_params.temperature as f32;
+
+        if is_prefill {
+            let start = (item.num_cached_tokens.max(0) as usize).min(tokens.len());
+            let chunk_end = item.num_tokens.max(0) as usize;
+            let end = chunk_end.min(prompt_len).min(tokens.len()).max(start);
+            let slice = &tokens[start..end];
+            seq_lens.push(slice.len() as i32);
+            for (offset, token) in slice.iter().enumerate() {
+                input_ids.push(*token);
+                positions.push((start + offset) as i64);
+            }
+        } else {
+            let token = i64::from(item.last_token);
+            input_ids.push(token);
+            positions.push(tokens.len().saturating_sub(1) as i64);
+            seq_lens.push(1);
+        }
+        block_tables.push(block_table);
+        temperatures.push(temperature);
+        state_slots.push(i64::from(item.active_state_slot));
+        hisparse_slots.push(i64::from(item.active_hisparse_slot));
+        for (ratio, blocks) in compressed_tables {
+            let rows = compressed_block_tables.entry(ratio).or_default();
+            while rows.len() + 1 < seq_lens.len() {
+                rows.push(Vec::new());
+            }
+            rows.push(blocks);
+        }
+        for rows in compressed_block_tables.values_mut() {
+            while rows.len() < seq_lens.len() {
+                rows.push(Vec::new());
+            }
+        }
+    }
+
+    encode_binary(
+        &WireBatch {
+            is_prefill,
+            input_ids,
+            positions,
+            seq_lens,
+            block_tables,
+            temperatures,
+            state_slots,
+            compressed_block_tables,
+            hisparse_slots,
+            is_dummy: false,
+        },
+        "run batch",
+    )
+}
+
+pub(crate) fn sequence_migrate_batch_bytes(
+    py: Python<'_>,
+    seqs: Vec<Py<Sequence>>,
+) -> PyResult<Vec<u8>> {
+    let mut wire = Vec::with_capacity(seqs.len());
+    for seq in seqs {
+        wire.push(sequence_to_migrate_wire(py, &seq));
+    }
+    encode_binary(&wire, "migrate batch")
+}
+
 pub(super) fn decode_wire(data: &[u8]) -> PyResult<WireBatch> {
     decode_binary(data, "run batch")
 }
 
-pub(super) fn bytes_arg(data: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+pub(crate) fn bytes_arg(data: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     if let Ok(bytes) = data.downcast::<PyBytes>() {
         return Ok(bytes.as_bytes().to_vec());
     }
     data.extract::<Vec<u8>>()
 }
 
-pub(super) fn sequence_to_wire(py: Python<'_>, seq: &Py<Sequence>) -> WireSequence {
-    let seq = seq.borrow(py);
-    WireSequence {
-        seq_id: seq.seq_id,
-        status: seq.status,
-        token_ids: seq.token_ids.clone(),
-        last_token: seq.last_token,
-        num_prompt_tokens: seq.num_prompt_tokens,
-        num_cached_tokens: seq.num_cached_tokens,
-        affinity_key: seq.affinity_key,
-        sampling_params: WireSamplingParams::from(&seq.sampling_params),
-    }
-}
-
-pub(super) fn wire_to_sequence(py: Python<'_>, wire: WireSequence) -> PyResult<Py<Sequence>> {
-    let sampling_params = wire.sampling_params.to_sampling_params();
-    let mut seq = Sequence::new(wire.token_ids, Some(sampling_params));
-    seq.seq_id = wire.seq_id;
-    seq.status = wire.status;
-    seq.last_token = wire.last_token;
-    seq.num_prompt_tokens = wire.num_prompt_tokens;
-    seq.num_cached_tokens = wire.num_cached_tokens;
-    seq.affinity_key = wire.affinity_key;
-    Py::new(py, seq)
-}
-
-pub(super) fn add_request_to_sequence(
+pub(crate) fn add_request_to_sequence(
     py: Python<'_>,
     request: WireAddRequest,
 ) -> PyResult<Py<Sequence>> {
@@ -223,10 +283,21 @@ pub(super) fn add_request_to_sequence(
     );
     seq.seq_id = request.seq_id;
     seq.affinity_key = request.affinity_key;
+    seq.vision_slots = request
+        .vision_slots
+        .into_iter()
+        .map(|slot| VisionSlot {
+            encoder_engine_id: slot.encoder_engine_id,
+            slot_idx: slot.slot_idx,
+            num_tokens: slot.num_tokens,
+            hidden_size: slot.hidden_size,
+            max_tokens_per_slot: slot.max_tokens_per_slot,
+        })
+        .collect();
     Py::new(py, seq)
 }
 
-pub(super) fn sequence_to_migration_request(
+pub(crate) fn sequence_to_migration_request(
     py: Python<'_>,
     seq: &Py<Sequence>,
 ) -> WireMigrationRequest {
@@ -264,7 +335,7 @@ pub(super) fn sequence_to_migration_request(
     }
 }
 
-pub(super) fn migration_request_to_sequence(
+pub(crate) fn migration_request_to_sequence(
     py: Python<'_>,
     request: WireMigrationRequest,
 ) -> PyResult<Py<Sequence>> {

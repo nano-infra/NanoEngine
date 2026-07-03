@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 mod metadata;
 mod prepare;
 mod serialization;
-mod wire;
+pub(crate) mod wire;
 
 use metadata::{BatchAuxData, DecodeMeta, MigrateSequenceView, PrefillMeta};
 
@@ -12,15 +12,11 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PrefillMeta>()?;
     m.add_class::<DecodeMeta>()?;
     m.add_class::<MigrateSequenceView>()?;
-    m.add_function(wrap_pyfunction!(serialization::serialize, m)?)?;
-    m.add_function(wrap_pyfunction!(serialization::deserialize, m)?)?;
     m.add_function(wrap_pyfunction!(serialization::encode_add_request, m)?)?;
-    m.add_function(wrap_pyfunction!(serialization::decode_add_requests, m)?)?;
-    m.add_function(wrap_pyfunction!(serialization::encode_migration_request, m)?)?;
-    m.add_function(wrap_pyfunction!(serialization::decode_migration_request, m)?)?;
-    m.add_function(wrap_pyfunction!(serialization::decode_migration_metadata, m)?)?;
-    m.add_function(wrap_pyfunction!(serialization::serialize_run_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(serialization::serialize_migrate_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        serialization::decode_migration_metadata,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(serialization::parse_migrate_batch, m)?)?;
     m.add_function(wrap_pyfunction!(prepare::extract_aux_from_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(

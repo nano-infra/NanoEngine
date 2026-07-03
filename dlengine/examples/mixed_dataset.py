@@ -3,7 +3,6 @@ import os
 import random
 
 from dlengine import LLM, SamplingParams
-from dlengine.engine.sequence import Sequence
 from transformers import PreTrainedTokenizerFast
 
 
@@ -50,7 +49,6 @@ def main():
 
     # 读取数据集并生成序列
     print("preparing dataset begin...")
-    sequences = []
     with open(data_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -71,13 +69,13 @@ def main():
                 ignore_eos=base_sampling_params.ignore_eos,
             )
 
-            # 创建序列对象
-            seq = Sequence(prompt_token_ids, sampling_params=sample_sampling_params)
-            sequences.append(seq)
+            decode.add_request(
+                prompt_token_ids,
+                sampling_params=sample_sampling_params,
+            )
     print("preparing dataset done...")
 
     # 提交请求并生成
-    decode.add_request(sequences)
     decode.generate()
 
     # # 输出结果

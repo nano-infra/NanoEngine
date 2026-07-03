@@ -1,7 +1,6 @@
 import os
 
 import numpy as np
-from dlengine.engine.sequence import Sequence
 from dlengine.llm_component import LLM
 from dlengine.sampling_params import SamplingParams
 from transformers import AutoTokenizer
@@ -44,27 +43,20 @@ def main():
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=256, ignore_eos=True)
 
-    long_seqs = [
-        Sequence(
-            np.random.randint(0, 10001, size=400000).tolist(),
-            # [0] * 400000,
-            sampling_params=sampling_params,
-        )
+    long_prompts = [
+        np.random.randint(0, 10001, size=400000).tolist(),
+        # [0] * 400000,
     ]
-    long_seqs = []
+    long_prompts = []
 
-    short_seqs = [
-        Sequence(
-            np.random.randint(0, 10001, size=2048).tolist(),
-            # [0] * 2048,
-            sampling_params=sampling_params,
-        )
+    short_prompts = [
+        np.random.randint(0, 10001, size=2048).tolist()
+        # [0] * 2048,
         for _ in range(512)
     ]
 
-    seqs = long_seqs + short_seqs
-
-    decode.add_request(seqs)
+    for prompt in long_prompts + short_prompts:
+        decode.add_request(prompt, sampling_params=sampling_params)
     decode.generate()
 
 

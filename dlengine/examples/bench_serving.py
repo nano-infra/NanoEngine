@@ -7,7 +7,6 @@ from random import randint, seed
 import numpy as np
 import pandas as pd
 from dlengine import LLM, SamplingParams
-from dlengine.engine.sequence import Sequence
 from tqdm.auto import tqdm
 
 # Constants
@@ -185,10 +184,11 @@ def print_model_config(engine):
 
 def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requests):
     """Runs the main benchmark loop."""
-    seq_map = {}
+    submit_times = {}
     requests_sent = 0
     start_time = time.perf_counter()
     completed_latencies = []
+    completed = set()
 
     with tqdm(total=num_requests, desc="Processing Requests") as pbar:
         while requests_sent < num_requests or not engine.is_finished():
@@ -204,9 +204,8 @@ def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requ
                 prompt = prompts[requests_sent]
                 sp = sampling_params_list[requests_sent]
 
-                seq = Sequence(token_ids=prompt, sampling_params=sp)
-                engine.add_request(seq)
-                seq_map[seq.seq_id] = seq
+                seq_id = engine.add_request(prompt, sampling_params=sp)
+                submit_times[seq_id] = time.perf_counter()
                 requests_sent += 1
 
             # Engine step
@@ -214,24 +213,25 @@ def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requ
                 result = engine.step()
 
                 # Update progress bar with latency info
-                updated = False
-                for seqs in result.dp_seqs:
-                    for seq in seqs:
-                        if seq.seq_id in seq_map:
-                            tracked = seq_map[seq.seq_id]
-                            if tracked.metric and tracked.metric.e2e_latency:
-                                completed_latencies.append(
-                                    tracked.metric.e2e_latency / 1000
-                                )
-                                avg_lat = np.mean(completed_latencies)
-                                pbar.set_postfix({"Avg Latency": f"{avg_lat:.2f}s"})
-                                updated = True
-                            pbar.update(1)
+                for event in result.outputs:
+                    seq_id = int(event["seq_id"])
+                    if (
+                        seq_id in submit_times
+                        and seq_id not in completed
+                        and (event["is_finished"] or event["is_to_be_migrated"])
+                    ):
+                        completed.add(seq_id)
+                        completed_latencies.append(
+                            time.perf_counter() - submit_times[seq_id]
+                        )
+                        avg_lat = np.mean(completed_latencies)
+                        pbar.set_postfix({"Avg Latency": f"{avg_lat:.2f}s"})
+                        pbar.update(1)
             else:
                 time.sleep(0.001)
 
     total_time = time.perf_counter() - start_time
-    return total_time, seq_map
+    return total_time, submit_times
 
 
 def calculate_and_print_metrics(total_time, seq_map, requests_sent):

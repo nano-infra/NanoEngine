@@ -3,7 +3,6 @@ import uuid
 
 import ray
 
-from dlengine._cpp import Sequence, serialize_migrate_batch, serialize_run_batch
 from dlengine.config import Config
 from dlengine.engine.dlslime_protocol import (
     decode_run_result,
@@ -123,8 +122,8 @@ class DLSLimeExecutor(RayExecutor):
             imm.append(getattr(session, "imm_recv_ns_total", 0))
         return wwi, imm
 
-    def run_async(self, dp_seqs: list[list[Sequence]], is_prefill: bool) -> dict:
-        """Serialize and submit one forward to all DP shards without waiting.
+    def run_batch_bytes_async(self, batch_bytes: list[bytes], is_prefill: bool) -> dict:
+        """Submit serialized RunBatchInput bytes without waiting.
 
         Returns an opaque handle for :meth:`run_wait`. Splitting submit from
         wait lets the driver overlap its own bookkeeping (stepout emission,
@@ -133,7 +132,6 @@ class DLSLimeExecutor(RayExecutor):
         import time as _time
 
         _t0 = _time.perf_counter()
-        batch_bytes = [serialize_run_batch(seqs, is_prefill) for seqs in dp_seqs]
         _t1 = _time.perf_counter()
         # Snapshot the C++ RPC timing probes before issuing the forward so we
         # can attribute the writeWithImm (send) / immRecv (recv) cost to this
@@ -214,23 +212,22 @@ class DLSLimeExecutor(RayExecutor):
 
     def run(
         self,
-        dp_seqs: list[list[Sequence]],
+        batch_bytes: list[bytes],
         is_prefill: bool,
         timeout: float | None = None,
     ) -> list[list[list[int]]]:
-        return self.run_wait(self.run_async(dp_seqs, is_prefill))
+        return self.run_wait(self.run_batch_bytes_async(batch_bytes, is_prefill))
 
-    def migrate(
+    def migrate_batch_bytes(
         self,
-        dp_seqs: list[list[Sequence]],
+        batch_bytes: list[bytes],
         timeout: float | None = None,
     ) -> list[int]:
-        batch_bytes = [serialize_migrate_batch(seqs) for seqs in dp_seqs]
         futures = [
             proxy.migrate_batch(data) for proxy, data in zip(self._proxies, batch_bytes)
         ]
         self._wait_all(futures)
-        return [0 for _ in dp_seqs]
+        return [0 for _ in batch_bytes]
 
     def __del__(self):
         # Guard against partial initialization (e.g., __init__ raised before

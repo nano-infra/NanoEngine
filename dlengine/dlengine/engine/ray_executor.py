@@ -8,7 +8,6 @@ from urllib.parse import urlparse
 import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 
-from dlengine._cpp import Sequence, serialize_migrate_batch, serialize_run_batch
 from dlengine.config import Config
 from dlengine.logging import get_logger
 from dlengine.worker.model_runner import ModelRunner
@@ -46,16 +45,6 @@ def _register_config_module_pickler() -> None:
 
 
 _register_config_module_pickler()
-
-
-def _serialize_run(seqs: list[Sequence], is_prefill: bool) -> bytes:
-    """Serialize sequences into lean RunBatchInput bytes."""
-    return serialize_run_batch(seqs, is_prefill)
-
-
-def _serialize_migrate(seqs: list[Sequence]) -> bytes:
-    """Serialize sequences into lean MigrateBatchInput bytes."""
-    return serialize_migrate_batch(seqs)
 
 
 def _collect_dsv4_debug_env() -> dict[str, str] | None:
@@ -296,13 +285,11 @@ class RayExecutor:
             timeout=timeout,
         )
 
-    def migrate(
+    def migrate_batch_bytes(
         self,
-        dp_seqs: List[List[Sequence]],
+        batch_bytes: List[bytes],
         timeout: float | None = None,
     ) -> list[int]:
-        # Serialize into lean MigrateBatchInput bytes, send bytes instead of Sequence objects
-        batch_bytes = [_serialize_migrate(seqs) for seqs in dp_seqs]
         return ray.get(
             [
                 getattr(worker, "migrate_from_bytes").remote(b)
@@ -347,10 +334,8 @@ class RayExecutor:
     def l3_stats(self) -> list[dict]:
         return self.collective_rpc("l3_stats")
 
-    def run_async(self, dp_seqs: List[List[Sequence]], is_prefill: bool) -> dict:
-        """Serialize and submit one forward without waiting (see run_wait)."""
-        # Serialize into lean RunBatchInput bytes, send bytes instead of Sequence objects
-        batch_bytes = [_serialize_run(seqs, is_prefill) for seqs in dp_seqs]
+    def run_batch_bytes_async(self, batch_bytes: List[bytes], is_prefill: bool) -> dict:
+        """Submit serialized RunBatchInput bytes without waiting."""
         # Bytes sent to the runners this forward (serialized RunBatch input).
         self.last_run_request_bytes = sum(len(b) for b in batch_bytes)
         ray_futures = [
@@ -364,11 +349,11 @@ class RayExecutor:
 
     def run(
         self,
-        dp_seqs: List[List[Sequence]],
+        batch_bytes: List[bytes],
         is_prefill: bool,
         timeout: float | None = None,
     ) -> list[list[list[int]]]:
-        handle = self.run_async(dp_seqs, is_prefill)
+        handle = self.run_batch_bytes_async(batch_bytes, is_prefill)
         return ray.get(
             handle["futures"],
             timeout=timeout,

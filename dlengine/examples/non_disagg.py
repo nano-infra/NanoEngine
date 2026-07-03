@@ -8,7 +8,6 @@ Usage:
 import os
 import sys
 
-from dlengine import Sequence
 from dlengine.config import Config
 from dlengine.llm_component import LLM
 from dlengine.sampling_params import SamplingParams
@@ -63,18 +62,17 @@ def main():
             )
         return tokenizer.encode(prompt)
 
-    seqs = [
-        Sequence(
+    seq_ids = [
+        llm.add_request(
             encode_prompt(p),
             sampling_params=sampling_params,
         )
         for p in prompts
     ]
-    llm.add_request(seqs)
-    llm.generate()
+    outputs = {out["seq_id"]: out for out in llm.generate()}
 
-    for prompt, seq in zip(prompts, seqs):
-        token_ids = seq.completion_token_ids
+    for prompt, seq_id in zip(prompts, seq_ids):
+        token_ids = outputs.get(seq_id, {}).get("token_ids", [])
         print(f"Prompt: {prompt!r}")
         print(f"Completion: {llm.tokenizer.decode(token_ids)!r}")
 

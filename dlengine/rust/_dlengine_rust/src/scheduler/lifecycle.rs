@@ -1,4 +1,5 @@
 use super::Scheduler;
+use crate::metrics::SequenceMetric;
 use crate::sequence::Sequence;
 use pyo3::prelude::*;
 
@@ -182,5 +183,45 @@ impl Scheduler {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn free_to_be_migrated_ids_impl(&mut self, py: Python<'_>, seq_ids: Vec<u64>) {
+        for seq_id in seq_ids {
+            if let Some((seq, _dp_idx)) = self.to_be_migrated.remove(&seq_id) {
+                self.release_seq(seq_id);
+                seq.borrow_mut(py).status = 2;
+            } else {
+                self.release_seq(seq_id);
+            }
+        }
+    }
+
+    pub(super) fn set_sequence_metric_impl(
+        &mut self,
+        py: Python<'_>,
+        seq_id: u64,
+        metric: Py<SequenceMetric>,
+    ) -> bool {
+        for queue in [&mut self.waiting, &mut self.waiting_migration] {
+            for seq in queue.iter() {
+                if seq.borrow(py).seq_id == seq_id {
+                    seq.borrow_mut(py).metric = Some(metric.clone_ref(py));
+                    return true;
+                }
+            }
+        }
+        for queue in self.running.iter_mut().chain(self.prefilling.iter_mut()) {
+            for seq in queue.iter() {
+                if seq.borrow(py).seq_id == seq_id {
+                    seq.borrow_mut(py).metric = Some(metric.clone_ref(py));
+                    return true;
+                }
+            }
+        }
+        if let Some((seq, _)) = self.to_be_migrated.get(&seq_id) {
+            seq.borrow_mut(py).metric = Some(metric);
+            return true;
+        }
+        false
     }
 }

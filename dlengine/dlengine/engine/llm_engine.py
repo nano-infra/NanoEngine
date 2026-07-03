@@ -1,16 +1,14 @@
 import atexit
 import time
 import uuid
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from time import perf_counter
-from typing import Any, Dict, List, Literal, Optional, Set
+from typing import Any, Optional, Set
 
-import flatbuffers
-import numpy as np
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast
 
-from dlengine._cpp import Sequence
+from dlengine._cpp import encode_add_request
 from dlengine.config import Config
 from dlengine.engine.scheduler import ensure_cache_plan, init_scheduler
 from dlengine.logging import get_logger, set_log_level
@@ -18,6 +16,24 @@ from dlengine.metrics import MetricsManager
 from dlengine.metrics.dump import EngineMetricDumper
 
 logger = get_logger()
+
+
+def _vision_slot_tuple(slot) -> tuple[str, int, int, int, int]:
+    if isinstance(slot, dict):
+        return (
+            str(slot["encoder_engine_id"]),
+            int(slot["slot_idx"]),
+            int(slot["num_tokens"]),
+            int(slot["hidden_size"]),
+            int(slot["max_tokens_per_slot"]),
+        )
+    return (
+        str(slot.encoder_engine_id),
+        int(slot.slot_idx),
+        int(slot.num_tokens),
+        int(slot.hidden_size),
+        int(slot.max_tokens_per_slot),
+    )
 
 
 def _split_run_result(per_dp_results):
@@ -110,9 +126,6 @@ class LLMEngine:
         # Set log level globally first
         if self.config.log_level:
             set_log_level(self.config.log_level)
-
-        # Sync C++ Sequence.block_size with Python kvcache_block_size
-        Sequence.set_block_size(config.kvcache_block_size)
 
         self.ps = []
         self.events = []
@@ -222,18 +235,41 @@ class LLMEngine:
             (manifest_blob, train_alias),
         )
 
-    def add_request(self, seqs: Sequence | list[Sequence]):
-        if isinstance(seqs, Sequence):
-            seqs = [seqs]
-        for seq in seqs:
-            seq.metric = self.metrics_manager.create_sequence_metric(
-                seq.seq_id, len(seq.prompt_token_ids)
+    def add_request(
+        self,
+        prompt_token_ids: list[int],
+        sampling_params,
+        seq_id: int | None = None,
+        affinity_key: int = 0,
+        vision_slots: list | None = None,
+    ) -> int:
+        """Submit one request through the Rust-owned protocol boundary."""
+        if seq_id is None:
+            seq_id = uuid.uuid4().int & ((1 << 63) - 1)
+            if seq_id < 8:
+                seq_id += 8
+        payload = bytes(
+            encode_add_request(
+                int(seq_id),
+                [int(t) for t in prompt_token_ids],
+                sampling_params,
+                int(affinity_key),
+                [_vision_slot_tuple(slot) for slot in (vision_slots or [])],
             )
-            self._metric_dumper.record_request(seq, self.tokenizer)
-            self.scheduler.add(seq)
+        )
+        self.add_request_payload(payload)
+        return int(seq_id)
 
-    def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
-        self.scheduler.free_to_be_migrated(seqs)
+    def add_request_payload(self, payload: bytes):
+        added = self.scheduler.add_request_bytes(payload)
+        for seq_id, prompt_len in added:
+            metric = self.metrics_manager.create_sequence_metric(seq_id, prompt_len)
+            self.scheduler.set_sequence_metric(seq_id, metric)
+
+    def free_to_be_migrated_ids(self, seq_ids: int | list[int]):
+        if isinstance(seq_ids, int):
+            seq_ids = [seq_ids]
+        self.scheduler.free_to_be_migrated_ids([int(seq_id) for seq_id in seq_ids])
 
     def abort(self, seq_ids: int | list[int]) -> list[int]:
         """Stop generating for the given sequences and free their KV blocks.
@@ -280,9 +316,6 @@ class LLMEngine:
         if waiting_migration_head_num_tokens >= 0:
             logger.info(f"{waiting_migration_head_num_tokens=}")
 
-        dp_group_tp_seqs = [seqs for seqs in dp_group_seqs for _ in range(tp_size)]
-
-        dp_group_tp_seqs = [seqs for seqs in dp_group_seqs for _ in range(tp_size)]
         # dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
         group_batch_sizes = [
             [
@@ -332,7 +365,12 @@ class LLMEngine:
         if not (is_prefill and self.config.mode == "decode"):
             # Normal execution: prefill engine runs prefill, or decode engine
             # runs decode. Submit only; step_finish() waits for the replies.
-            pending.handle = self.executor.run_async(dp_group_tp_seqs, is_prefill)
+            batch_bytes = self.scheduler.serialize_run_batches(
+                dp_group_seqs, is_prefill, tp_size
+            )
+            pending.handle = self.executor.run_batch_bytes_async(
+                batch_bytes, is_prefill
+            )
         else:
             # PD disaggregation: decode engine receives prefill request
             # DO NOT run prefill on decode engine - KV cache will be migrated from prefill engine
@@ -343,7 +381,10 @@ class LLMEngine:
             # migrate batch. With attention_tp > 1 (GQA) each TP rank holds a
             # distinct KV-head shard and must run its own RDMA reads; sending
             # only dp_group_seqs would leave tp_idx > 0 ranks unmigrated.
-            self.executor.migrate(dp_group_tp_seqs)
+            batch_bytes = self.scheduler.serialize_migrate_batches(
+                dp_group_seqs, tp_size
+            )
+            self.executor.migrate_batch_bytes(batch_bytes)
         return pending
 
     def step_finish(self, pending: PendingStep) -> StepResult:
@@ -400,7 +441,13 @@ class LLMEngine:
             * 1000,
         )
 
-    def step_complete(self, pending: PendingStep, result: StepResult) -> StepResult:
+    def step_complete(
+        self,
+        pending: PendingStep,
+        result: StepResult,
+        track_running: bool = False,
+        previous_running: Set[int] | None = None,
+    ) -> StepResult:
         """Token accounting, finished-seq collection, and heartbeat for one step.
 
         Pure bookkeeping over already-postprocessed sequences: safe to run
@@ -410,7 +457,6 @@ class LLMEngine:
         dp_seqs = pending.dp_seqs
         token_ids = pending.token_ids
 
-        outputs = []
         metric_snapshot = self.scheduler.record_step_metric(
             self.metrics_manager.server_metric,
             pending.schedule_result,
@@ -419,22 +465,15 @@ class LLMEngine:
         result.prefill_tokens = metric_snapshot.prefill_tokens
         result.decode_tokens = metric_snapshot.decode_tokens
 
-        # Collect finished/migrated sequences after postprocess
-        for seqs in dp_seqs:
-            for seq in seqs:
-                if seq.is_finished or seq.is_to_be_migrated:
-                    self.metrics_manager.complete_sequence(seq.seq_id)
-                    # complete_sequence() stamps completion_time; dump after it so
-                    # e2e is populated. Only FINISHED requests have full metrics
-                    # (migration handoffs are dumped by the decode engine).
-                    if self._metric_dumper.enabled and seq.is_finished:
-                        self._metric_dumper.record_completion(
-                            seq,
-                            cached_len=self.scheduler.prefix_cached_tokens(seq.seq_id),
-                        )
-                    self.scheduler.clear_finished_metric_state(seq.seq_id)
-                    outputs.append(seq)
-        result.outputs = outputs
+        events = self.scheduler.collect_sequence_events(
+            dp_seqs, track_running, previous_running or set()
+        )
+        for event in events:
+            seq_id = event["seq_id"]
+            if event["is_finished"] or event["is_to_be_migrated"]:
+                self.metrics_manager.complete_sequence(seq_id)
+                self.scheduler.clear_finished_metric_state(seq_id)
+        result.outputs = events
         result.real_bs = metric_snapshot.real_bs
 
         # Periodic engine status report (throttling/accounting live in the
@@ -499,12 +538,14 @@ class LLMEngine:
         use_tqdm: bool = True,
         log_metrics_interval: int = 10,
         return_serialized: bool = False,
-    ) -> list[Sequence] | list[bytes]:
+    ) -> list[dict] | list[bytes]:
         num_reqs = self.scheduler.num_waiting()
         if use_tqdm:
             pbar = tqdm(total=num_reqs, desc="Generating", dynamic_ncols=True)
 
-        finished_seqs = []
+        outputs_by_seq: dict[int, dict] = {}
+        serialized_outputs: list[bytes] = []
+        completed_seq_ids: set[int] = set()
         prefill_throughput = decode_throughput = 0.0
         step_count = 0
 
@@ -556,48 +597,40 @@ class LLMEngine:
                         "step": f"{step_count}",
                     }
                 )
-            for seq in result.outputs:
-                finished_seqs.append(seq)
-                if use_tqdm:
-                    pbar.update(1)
+            for event in result.outputs:
+                seq_id = int(event["seq_id"])
+                if event["num_tokens"] > 0 and not event["is_to_be_migrated"]:
+                    output = outputs_by_seq.setdefault(
+                        seq_id,
+                        {
+                            "seq_id": seq_id,
+                            "token_ids": [],
+                            "is_finished": False,
+                        },
+                    )
+                    output["token_ids"].append(int(event["last_token"]))
+                if event["is_to_be_migrated"] and event.get("migration_payload"):
+                    serialized_outputs.append(bytes(event["migration_payload"]))
+                if event["is_finished"] or event["is_to_be_migrated"]:
+                    outputs_by_seq.setdefault(
+                        seq_id,
+                        {
+                            "seq_id": seq_id,
+                            "token_ids": [],
+                            "is_finished": bool(event["is_finished"]),
+                        },
+                    )["is_finished"] = bool(event["is_finished"])
+                    if seq_id in completed_seq_ids:
+                        continue
+                    completed_seq_ids.add(seq_id)
+                    if use_tqdm:
+                        pbar.update(1)
         if use_tqdm:
             pbar.close()
 
         self.metrics_manager.log_final_summary()
 
-        # Workaround for SIGSEGV during Ray serialization of migrated sequences
-        # Use FlatBuffers serialization directly to avoid pickle issues
         if return_serialized:
-            logger.info(
-                "Serializing sequences using FlatBuffers to avoid Ray pickle issues..."
-            )
-            import numpy as np
+            return serialized_outputs
 
-            from dlengine._cpp import deserialize, serialize
-
-            serialized_seqs = []
-            for seq in finished_seqs:
-                try:
-                    # Allocate buffer for serialization
-                    buffer_size = 1024 * 1024  # 1MB should be enough
-                    buffer = np.zeros(buffer_size, dtype=np.uint8)
-                    data_ptr = buffer.ctypes.data
-
-                    # Serialize using FlatBuffers
-                    actual_size = serialize(data_ptr, buffer_size, [seq], False)
-
-                    # Extract the used portion
-                    serialized_bytes = bytes(buffer[:actual_size])
-                    serialized_seqs.append(serialized_bytes)
-                    logger.debug(
-                        f"Serialized sequence {seq.seq_id} ({actual_size} bytes)"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to serialize sequence {seq.seq_id}: {e}", exc_info=True
-                    )
-                    raise
-            logger.info(f"Successfully serialized {len(serialized_seqs)} sequences")
-            return serialized_seqs
-
-        return finished_seqs
+        return list(outputs_by_seq.values())

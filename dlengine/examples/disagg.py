@@ -18,9 +18,8 @@ Usage:
 import os
 import sys
 
-import numpy as np
 import ray
-from dlengine._cpp import deserialize, SamplingParams, Sequence
+from dlengine._cpp import SamplingParams, decode_migration_metadata
 from dlengine.config import Config
 from dlengine.llm_component import LLMComponent
 from jsonargparse import ActionConfigFile, ArgumentParser
@@ -120,41 +119,43 @@ def main():
             text = prompt
         return tokenizer.encode(text)
 
-    seqs = [
-        Sequence(
-            encode_prompt(args.prompt),
-            sampling_params=sampling_params,
-        )
-    ]
+    prompt_token_ids = encode_prompt(args.prompt)
 
     # --- Prefill ---
-    ray.get(prefill.add_request.remote(seqs))
-    serialized_seqs = ray.get(prefill.generate.remote(return_serialized=True))
+    ray.get(
+        prefill.add_request.remote(
+            prompt_token_ids,
+            sampling_params=sampling_params,
+        )
+    )
+    migration_payloads = ray.get(prefill.generate.remote(return_serialized=True))
 
-    print(f"\nPrefill returned {len(serialized_seqs)} serialized sequences.")
+    print(f"\nPrefill returned {len(migration_payloads)} migration payloads.")
 
-    migrated_seqs = []
-    for i, blob in enumerate(serialized_seqs):
-        buf = np.frombuffer(blob, dtype=np.uint8)
-        deserialized = deserialize(buf.ctypes.data, len(buf))
-        migrated_seqs.extend(deserialized)
-        print(f"  [{i}] Deserialized {len(deserialized)} seq(s) from {len(blob)} bytes")
+    migrated_seq_ids = []
+    for i, blob in enumerate(migration_payloads):
+        seq_id, first_token = decode_migration_metadata(blob)
+        migrated_seq_ids.append(int(seq_id))
+        print(
+            f"  [{i}] seq_id={seq_id}, first_token={first_token}, payload={len(blob)} bytes"
+        )
 
-    if not migrated_seqs:
+    if not migration_payloads:
         print("No sequences migrated from prefill. Exiting.")
         return
 
     # --- Decode ---
-    ray.get(decode.add_request.remote(migrated_seqs))
-    finished_seqs = ray.get(decode.generate.remote())
+    for payload in migration_payloads:
+        ray.get(decode.add_request_payload.remote(payload))
+    outputs = ray.get(decode.generate.remote())
 
     # Free migrated sequences in prefill engine
-    ray.get(prefill.free_to_be_migrated.remote(migrated_seqs))
+    ray.get(prefill.free_to_be_migrated_ids.remote(migrated_seq_ids))
 
     # Print results
-    for seq in finished_seqs:
-        token_ids = seq.completion_token_ids
-        print(f"\nSeq ID: {seq.seq_id}")
+    for output in outputs:
+        token_ids = output["token_ids"]
+        print(f"\nSeq ID: {output['seq_id']}")
         print(f"Completion: {tokenizer.decode(token_ids)!r}")
 
 

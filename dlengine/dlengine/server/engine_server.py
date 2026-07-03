@@ -8,7 +8,6 @@ import flatbuffers
 import zmq
 import zmq.asyncio
 
-from dlengine._cpp import Sequence
 from dlengine.config import Config
 
 # FlatBuffers imports
@@ -80,22 +79,9 @@ class BackendService:
 
     def _handle_add_request(self, payload: bytes):
         logger.info(f"Handling ADD request, payload size: {len(payload)}")
-        from dlengine.server import pd
 
-        try:
-            sequences = pd.decode_add_requests(payload)
-        except Exception:
-            sequences = [pd.decode_migration_bytes(payload)]
-        logger.info(f"Deserialized {len(sequences) if sequences else 0} sequences")
-        if not sequences:
-            logger.warning("No sequences after deserialization")
-            return
-
-        logger.info(
-            f"Adding {len(sequences)} sequences to engine. First seq_id: {sequences[0].seq_id if sequences else 'N/A'}"
-        )
-        self.engine.add_request(sequences)
-        logger.info(f"Sequences added to engine successfully")
+        self.engine.add_request_payload(payload)
+        logger.info("Request payload added to engine successfully")
 
     def _handle_get_info(self):
         resp_payload = self.engine.get_engine_info().encode("utf-8")
@@ -138,10 +124,7 @@ class BackendService:
 
             for seq_id in seq_ids:
                 try:
-                    # Create minimal sequence object with just seq_id for lookup
-                    seq = Sequence([])
-                    seq.seq_id = seq_id
-                    self.engine.free_to_be_migrated(seq)
+                    self.engine.free_to_be_migrated_ids(int(seq_id))
                 except Exception as e:
                     logger.warning(f"Failed to free sequence {seq_id}: {e}")
 
@@ -194,36 +177,32 @@ class BackendService:
         if entries:
             self._send_response(action=_ACTION_STEPOUT_BATCH, payload=entries)
 
-    def _send_migration(self, seq):
+    def _send_migration_payload(self, payload: bytes):
         try:
-            from dlengine._cpp import encode_migration_request
-
-            payload = bytes(encode_migration_request(seq))
             self._send_response(action=1, payload=payload)
         except Exception as e:
-            logger.error(f"Migration Serialize Error: {e}")
+            logger.error(f"Migration Send Error: {e}")
 
-    def _send_p2p_free_if_migrated(self, seq):
+    def _send_p2p_free_if_migrated(self, seq_id: int, source_engine_id: str):
         """Send P2P free instruction to source engine if sequence was migrated."""
         # Skip if already freed (prevents duplicate free requests)
-        if seq.seq_id in self._freed_sequences:
+        if seq_id in self._freed_sequences:
             return
 
         try:
-            source_engine_id = seq.migrate_engine_id()
             if source_engine_id:
                 logger.info(
-                    f"Sequence {seq.seq_id} sending P2P free to source engine {source_engine_id}"
+                    f"Sequence {seq_id} sending P2P free to source engine {source_engine_id}"
                 )
-                self.engine.send_free_sequences(source_engine_id, [seq.seq_id])
+                self.engine.send_free_sequences(source_engine_id, [seq_id])
                 # Mark as freed to prevent duplicates
-                self._freed_sequences.add(seq.seq_id)
+                self._freed_sequences.add(seq_id)
             else:
                 logger.debug(
-                    f"Sequence {seq.seq_id} has no MIGRATE context (not migrated)"
+                    f"Sequence {seq_id} has no MIGRATE context (not migrated)"
                 )
         except Exception as e:
-            logger.error(f"Error sending P2P free for seq {seq.seq_id}: {e}")
+            logger.error(f"Error sending P2P free for seq {seq_id}: {e}")
             traceback.print_exc()
 
 
@@ -341,70 +320,70 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                 pending = engine.step_begin()
 
             _t_emit = time.perf_counter()
-            engine.step_complete(done, result)
+            track_running = engine.config.mode == "decode"
+            result = engine.step_complete(
+                done,
+                result,
+                track_running=track_running,
+                previous_running=service._previous_running_seqs,
+            )
 
             logger.debug(f"Engine step completed: {result.real_bs} running sequences")
             # Single-pass optimization: merge all sequence processing into one loop.
             # NOTE: avoid seq.token_ids here -- each access copies the full C++
             # token vector into a Python list, which costs tens of ms/step at
             # full batch. Use scalar properties (seq_id/last_token/num_tokens).
-            track_running = engine.config.mode == "decode"
             current_running_seqs = set()
             newly_appeared_seqs = []  # Store newly appeared sequences for early free
             stepout_batch = []  # (seq_id, token_id, status) for this step
             vision_free_by_encoder: dict[str, list[int]] = defaultdict(list)
 
-            for seqs in result.dp_seqs:
-                for seq in seqs:
-                    seq_id = seq.seq_id
+            for event in result.outputs:
+                seq_id = int(event["seq_id"])
 
-                    # Free vision embedding slots on encoder after prefill consumes
-                    # them (EP-separated mode: encoder reclaims EmbeddingPool slots)
-                    vs_list = seq.vision_slots
-                    if vs_list:
-                        for vs in vs_list:
-                            vision_free_by_encoder[vs["encoder_engine_id"]].append(
-                                vs["slot_idx"]
-                            )
-                        seq.clear_vision_slots()
+                # Free vision embedding slots on encoder after prefill consumes
+                # them (EP-separated mode: encoder reclaims EmbeddingPool slots)
+                for vs in event.get("vision_slots", []):
+                    vision_free_by_encoder[vs["encoder_engine_id"]].append(
+                        vs["slot_idx"]
+                    )
 
-                    if track_running:
-                        current_running_seqs.add(seq_id)
+                if track_running:
+                    current_running_seqs.add(seq_id)
 
-                    # Skip system sequences
-                    if seq_id < 8:
-                        continue
+                # Track newly appeared sequences for early free (decode only)
+                if event.get("is_new_running", False):
+                    newly_appeared_seqs.append(
+                        (seq_id, event.get("source_engine_id", ""))
+                    )
 
-                    # Track newly appeared sequences for early free (decode only)
-                    if track_running and seq_id not in service._previous_running_seqs:
-                        newly_appeared_seqs.append(seq)
-
-                    # Send stepout/migration based on sequence state
-                    if seq.is_finished:
-                        stepout_batch.append(
-                            (seq_id, seq.last_token, SequenceStatus.FINISHED)
-                        )
-                        # Clean up tracking to prevent memory leak
-                        service._freed_sequences.discard(seq_id)
-                    elif seq.is_to_be_migrated:
-                        service._send_migration(seq)
-                    elif seq.num_tokens > 0:
-                        # Send last token for all running sequences (1 token per step in decode)
-                        stepout_batch.append(
-                            (seq_id, seq.last_token, SequenceStatus.RUNNING)
-                        )
+                # Send stepout/migration based on scheduler-owned state
+                if event["is_finished"]:
+                    stepout_batch.append(
+                        (seq_id, event["last_token"], SequenceStatus.FINISHED)
+                    )
+                    # Clean up tracking to prevent memory leak
+                    service._freed_sequences.discard(seq_id)
+                elif event["is_to_be_migrated"]:
+                    payload = event.get("migration_payload")
+                    if payload is not None:
+                        service._send_migration_payload(bytes(payload))
+                elif event["num_tokens"] > 0:
+                    # Send last token for all running sequences (1 token per step in decode)
+                    stepout_batch.append(
+                        (seq_id, event["last_token"], SequenceStatus.RUNNING)
+                    )
 
             service._send_stepout_batch(stepout_batch)
 
             # Early free: Process only newly appeared sequences (much faster than full iteration)
             if newly_appeared_seqs:
-                for seq in newly_appeared_seqs:
-                    source_engine_id = seq.migrate_engine_id()
+                for seq_id, source_engine_id in newly_appeared_seqs:
                     if source_engine_id:
                         logger.info(
-                            f"Early free: seq {seq.seq_id} migrated from {source_engine_id}"
+                            f"Early free: seq {seq_id} migrated from {source_engine_id}"
                         )
-                        service._send_p2p_free_if_migrated(seq)
+                        service._send_p2p_free_if_migrated(seq_id, source_engine_id)
 
             for encoder_id, slot_indices in vision_free_by_encoder.items():
                 try:
