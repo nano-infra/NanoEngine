@@ -5,7 +5,7 @@
 | Component                            | Language   | Description          | Key Features                                                                                    |
 | ------------------------------------ | ---------- | -------------------- | ----------------------------------------------------------------------------------------------- |
 | [dlengine](./dlengine)               | Python/C++ | LLM inference engine | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
-| [dlengine-router](./dlengine-router) | Rust       | HTTP load balancer   | OpenAI-compatible API, tool calls, routing strategies, engine discovery                         |
+| [dlengine-router](./rust/src/router) | Rust       | HTTP load balancer   | OpenAI-compatible API, routing strategies, engine discovery                                     |
 
 ## 🧠 Supported Models
 
@@ -108,10 +108,10 @@ pip install ".[dlenginevl]" # DLEngine + vision-language extras (dlengine.vl sub
 
 ```bash
 # Build DLEngine C++ extensions in-place (GPU kernels ship in dlengine.kernel)
-cd dlengine && pip install -e . && cd ..
+pip install -e .
 
-# Build dlengine-router (Rust)
-cd dlengine-router && cargo build --release && cd ..
+# Build Rust extension and dlengine-router
+cargo build --release
 
 # Build dlslime-ctrl (Rust) from the DLSlime checkout
 cd /path/to/DLSlime/dlslime-ctrl && cargo build --release && cd -
@@ -143,7 +143,7 @@ Batch generation without HTTP serving.
 #### Single node (no dlslime-ctrl needed)
 
 ```bash
-python dlengine/examples/non_disagg.py \
+python examples/non_disagg.py \
     --model /models/Qwen3-235B-A22B \
     --ray_address <node0-ip>:7078 \
     --master_address <node0-ip>:6006 \
@@ -164,7 +164,7 @@ dlslime-ctrl server --redis-url redis://127.0.0.1:6379
 ##### 3. Launch engines
 
 ```bash
-python dlengine/examples/disagg.py \
+python examples/disagg.py \
     --model /models/Qwen3-235B-A22B \
     --ray_address <node0-ip>:7078 \
     --ctrl_address <node0-ip>:4479 \
@@ -269,14 +269,14 @@ dlslime-ctrl server --redis-url redis://127.0.0.1:6379
 ##### 3. Start dlengine-router
 
 ```bash
-cd dlengine-router && cargo run --release    # edit config.toml to set ctrl_address
+dlengine-router --ctrl-address http://<node0-ip>:4479
 ```
 
 ##### 4. Launch engines
 
 ```bash
 # Terminal 1 — Decode engine
-python dlengine/dlengine/server/engine_server.py \
+python dlengine/server/engine_server.py \
     --model /models/Qwen3-235B-A22B \
     --mode decode \
     --ray_address <node0-ip>:7078 \
@@ -289,7 +289,7 @@ python dlengine/dlengine/server/engine_server.py \
     --max_num_batched_tokens 16384 --max_model_len 16384
 
 # Terminal 2 — Prefill engine
-python dlengine/dlengine/server/engine_server.py \
+python dlengine/server/engine_server.py \
     --model /models/Qwen3-235B-A22B \
     --mode prefill \
     --ray_address <node0-ip>:7078 \

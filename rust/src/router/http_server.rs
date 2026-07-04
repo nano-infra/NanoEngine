@@ -1,0 +1,375 @@
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{header::CONTENT_TYPE, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::{
+    extract::{Json, State},
+    routing::{get, post},
+    Router,
+};
+use futures::StreamExt;
+use serde_json::Value;
+use tokio::sync::Mutex;
+use tower_http::trace::TraceLayer;
+
+use super::engine_manager::{EngineManager, ModelPool};
+
+pub struct AppState {
+    pub engine_manager: Arc<Mutex<EngineManager>>,
+    pub http_client: reqwest::Client,
+}
+
+enum HttpRoute {
+    Hybrid(String),
+    Pd {
+        prefill_url: String,
+        decode_url: String,
+    },
+}
+
+fn request_model(payload: &Value) -> Option<String> {
+    payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_end_matches('/').to_string())
+}
+
+fn request_stream(payload: &Value) -> bool {
+    payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn sanitize_http_payload(mut payload: Value) -> Value {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.retain(|_k, v| !v.is_null());
+    }
+    payload
+}
+
+fn check_engine_availability(pool: &ModelPool) -> Option<Response> {
+    if pool.get_next_http_hybrid().is_some() {
+        return None;
+    }
+    if pool.get_next_http_prefill().is_some() && pool.get_next_http_decode().is_some() {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No HTTP DLEngine nodes available",
+        )
+            .into_response(),
+    )
+}
+
+async fn upstream_response_to_axum(upstream: reqwest::Response, stream: bool) -> Response {
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+
+    if stream {
+        builder = builder.header(CONTENT_TYPE, "text/event-stream");
+        return builder
+            .body(Body::from_stream(upstream.bytes_stream()))
+            .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response());
+    }
+
+    let content_type = upstream
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let body = upstream.bytes().await.unwrap_or_default();
+    builder
+        .header(CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+}
+
+async fn forward_http_payload(
+    client: reqwest::Client,
+    base_url: String,
+    payload: Value,
+    stream: bool,
+) -> Response {
+    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    match client.post(url).json(&payload).send().await {
+        Ok(upstream) => upstream_response_to_axum(upstream, stream).await,
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("HTTP DLEngine upstream error: {}", e),
+        )
+            .into_response(),
+    }
+}
+
+async fn free_http_prefill(client: reqwest::Client, prefill_url: String, seq_id: Value) {
+    let url = format!("{}/pd/free", prefill_url.trim_end_matches('/'));
+    let _ = client
+        .post(url)
+        .json(&serde_json::json!({ "seq_ids": [seq_id] }))
+        .send()
+        .await;
+}
+
+fn completion_as_sse(completion: Value) -> Response {
+    let body = format!("data: {}\n\ndata: [DONE]\n\n", completion);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+}
+
+async fn forward_http_pd(
+    client: reqwest::Client,
+    prefill_url: String,
+    decode_url: String,
+    payload: Value,
+    stream: bool,
+) -> Response {
+    let mut prefill_payload = sanitize_http_payload(payload.clone());
+    if let Some(obj) = prefill_payload.as_object_mut() {
+        obj.insert("stream".to_string(), Value::Bool(false));
+        obj.insert(
+            "kv_transfer_params".to_string(),
+            serde_json::json!({ "do_remote_decode": true }),
+        );
+    }
+
+    let prefill_endpoint = format!("{}/v1/chat/completions", prefill_url.trim_end_matches('/'));
+    let prefill_resp = match client
+        .post(prefill_endpoint)
+        .json(&prefill_payload)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp,
+        Ok(resp) => return upstream_response_to_axum(resp, false).await,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("HTTP DLEngine prefill error: {}", e),
+            )
+                .into_response()
+        }
+    };
+
+    let prefill_info: Value = match prefill_resp.json().await {
+        Ok(value) => value,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Invalid DLEngine prefill response: {}", e),
+            )
+                .into_response()
+        }
+    };
+
+    let kv = prefill_info
+        .get("kv_transfer_params")
+        .and_then(|v| v.as_object());
+    let migration = kv.and_then(|m| m.get("migration")).cloned();
+    let seq_id = kv.and_then(|m| m.get("seq_id")).cloned();
+
+    let Some(migration) = migration else {
+        if prefill_info.get("choices").is_some() {
+            return if stream {
+                completion_as_sse(prefill_info)
+            } else {
+                Json(prefill_info).into_response()
+            };
+        }
+        return (
+            StatusCode::BAD_GATEWAY,
+            "DLEngine prefill response missing migration payload",
+        )
+            .into_response();
+    };
+
+    let mut decode_payload = sanitize_http_payload(payload);
+    if let Some(obj) = decode_payload.as_object_mut() {
+        obj.insert(
+            "kv_transfer_params".to_string(),
+            serde_json::json!({ "migration": migration }),
+        );
+        obj.insert("stream".to_string(), Value::Bool(stream));
+    }
+
+    if !stream {
+        let response =
+            forward_http_payload(client.clone(), decode_url, decode_payload, false).await;
+        if let Some(seq_id) = seq_id {
+            free_http_prefill(client, prefill_url, seq_id).await;
+        }
+        return response;
+    }
+
+    let decode_endpoint = format!("{}/v1/chat/completions", decode_url.trim_end_matches('/'));
+    match client
+        .post(decode_endpoint)
+        .json(&decode_payload)
+        .send()
+        .await
+    {
+        Ok(upstream) => {
+            let status =
+                StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            if !status.is_success() {
+                return upstream_response_to_axum(upstream, false).await;
+            }
+            let mut bytes_stream = upstream.bytes_stream();
+            let free_client = client.clone();
+            let free_prefill_url = prefill_url.clone();
+            let stream = async_stream::stream! {
+                while let Some(chunk) = bytes_stream.next().await {
+                    match chunk {
+                        Ok(bytes) => yield Ok::<_, std::io::Error>(bytes),
+                        Err(e) => {
+                            yield Err(std::io::Error::other(e));
+                            return;
+                        }
+                    }
+                }
+                if let Some(seq_id) = seq_id {
+                    free_http_prefill(free_client, free_prefill_url, seq_id).await;
+                }
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("HTTP DLEngine decode error: {}", e),
+        )
+            .into_response(),
+    }
+}
+
+async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Value>,
+) -> Response {
+    let Some(model_key) = request_model(&payload) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Missing required string field: model",
+        )
+            .into_response();
+    };
+    let stream = request_stream(&payload);
+
+    let route = {
+        let mgr = state.engine_manager.lock().await;
+        let pool = match mgr.model_pools.get(&model_key) {
+            Some(pool) => pool,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "Model '{}' not found. Available: [{}]",
+                        model_key,
+                        mgr.available_model_keys().join(", ")
+                    ),
+                )
+                    .into_response()
+            }
+        };
+        if let Some(err) = check_engine_availability(pool) {
+            return err;
+        }
+        if let Some(url) = pool.get_next_http_hybrid() {
+            HttpRoute::Hybrid(url.to_string())
+        } else {
+            let prefill_url = pool
+                .get_next_http_prefill()
+                .expect("prefill checked above")
+                .to_string();
+            let decode_url = pool
+                .get_next_http_decode()
+                .expect("decode checked above")
+                .to_string();
+            HttpRoute::Pd {
+                prefill_url,
+                decode_url,
+            }
+        }
+    };
+
+    match route {
+        HttpRoute::Hybrid(url) => {
+            tracing::info!("Forwarding request to HTTP DLEngine hybrid node: {}", url);
+            forward_http_payload(
+                state.http_client.clone(),
+                url,
+                sanitize_http_payload(payload),
+                stream,
+            )
+            .await
+        }
+        HttpRoute::Pd {
+            prefill_url,
+            decode_url,
+        } => {
+            tracing::info!(
+                "Forwarding request to HTTP DLEngine PD nodes: prefill={} decode={}",
+                prefill_url,
+                decode_url
+            );
+            forward_http_pd(
+                state.http_client.clone(),
+                prefill_url,
+                decode_url,
+                payload,
+                stream,
+            )
+            .await
+        }
+    }
+}
+
+async fn health() -> &'static str {
+    "OK"
+}
+
+pub async fn start_server(
+    port: u16,
+    engine_manager: Arc<Mutex<EngineManager>>,
+) -> anyhow::Result<()> {
+    let state = Arc::new(AppState {
+        engine_manager,
+        http_client: reqwest::Client::new(),
+    });
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/v1/chat/completions", post(chat_completions))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    let addr = format!("0.0.0.0:{}", port);
+    tracing::info!("Listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::warn!("Failed to install Ctrl-C handler: {}", e);
+        return;
+    }
+
+    tracing::info!("Shutdown signal received, stopping HTTP server");
+}
