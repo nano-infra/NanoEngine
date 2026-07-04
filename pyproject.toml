@@ -74,3 +74,5 @@ module-name = "dlengine._engine"
 python-source = "."
 bindings = "pyo3"
 features = ["extension-module"]
+compatibility = "linux"
+auditwheel = "skip"
