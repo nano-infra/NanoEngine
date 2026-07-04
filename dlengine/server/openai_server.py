@@ -24,7 +24,6 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import itertools
 import json
@@ -40,7 +39,6 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from dlengine.config import Config
 from dlengine.logging import get_logger
-from dlengine.server import pd
 
 logger = get_logger("dlengine.server")
 
@@ -52,19 +50,9 @@ _seq_id_counter = itertools.count(_SEQ_ID_BASE)
 
 def _migration_metadata(kv_transfer: dict) -> tuple[int, int | None]:
     seq_id = int(kv_transfer.get("seq_id") or 0)
-    first_token = kv_transfer.get("first_token")
-    if seq_id <= 0 or first_token is None:
-        migration_payload = kv_transfer.get("migration")
-        if not migration_payload:
-            raise ValueError("missing migration payload")
-        migration = pd.RequestMigrate.from_bytes(base64.b64decode(migration_payload))
-        payload_seq_id, payload_first_token = migration.metadata
-        if seq_id <= 0:
-            seq_id = int(payload_seq_id)
-        if first_token is None:
-            first_token = int(payload_first_token)
     if seq_id <= 0:
         raise ValueError("missing positive seq_id")
+    first_token = kv_transfer.get("first_token")
     return seq_id, None if first_token is None else int(first_token)
 
 
