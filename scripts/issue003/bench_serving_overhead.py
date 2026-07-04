@@ -29,19 +29,6 @@ seed(SEED)
 np.random.seed(SEED)
 
 
-def env_int(name, default):
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
-    if parsed <= 0:
-        raise ValueError(f"{name} must be positive, got {parsed}")
-    return parsed
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Serving benchmark for NanoDeploy.")
     parser.add_argument("--num-requests", type=int, default=256, help="Number of requests.")
@@ -198,15 +185,15 @@ def print_model_config(engine):
 
 def run_warmup(engine, max_num_seqs, world_size):
     """Runs warmup phase before the actual benchmark."""
-    warmup_input_len = env_int("NANODEPLOY_WARMUP_INPUT_LEN", 512)
-    warmup_output_len = env_int("NANODEPLOY_WARMUP_OUTPUT_LEN", 256)
-    num_warmup_requests = env_int("NANODEPLOY_WARMUP_REQUESTS", 256)
+    warmup_input_len = 512
+    warmup_output_len = 256
+    num_warmup_requests = 256
     
     print(f"\n{'=' * 60}")
     print(f"Running Warmup Phase: {num_warmup_requests} requests")
     print(f"  Input tokens: {warmup_input_len}")
     print(f"  Output tokens: {warmup_output_len}")
-    print(f"  Warmup requests: {num_warmup_requests}")
+    print("  Fixed warmup requests: 256")
     print(f"{'=' * 60}\n")
     
     # Generate warmup requests
