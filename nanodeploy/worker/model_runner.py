@@ -37,6 +37,13 @@ from nanodeploy.worker.sp_context import set_sp_context
 logger = get_logger()
 
 
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
@@ -53,6 +60,9 @@ class ModelRunner:
         self.enforce_eager = config.enforce_eager
         self.world_size = config.attn_world_size
         self.rank = rank
+        self.log_decode_a2a_masks = _env_flag_enabled(
+            "NANODEPLOY_LOG_DECODE_A2A_MASKS", default=False
+        )
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -725,7 +735,8 @@ class ModelRunner:
                     input_ids, positions = self.update_decode(
                         input_ids, positions, dp_seqs
                     )
-                self._log_decode_a2a_masks(loop_idx=i, is_dummy=is_dummy)
+                if self.log_decode_a2a_masks:
+                    self._log_decode_a2a_masks(loop_idx=i, is_dummy=is_dummy)
 
             logits = self.run_model(input_ids, positions, is_prefill)
 

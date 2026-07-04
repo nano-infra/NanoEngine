@@ -24,6 +24,7 @@ ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="${USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER:-0}"
 DYNAMIC_SP_SIZE_STRATEGY="${DYNAMIC_SP_SIZE_STRATEGY:-legacy}"
 LONG_REQUEST_SP_THRESHOLD="${LONG_REQUEST_SP_THRESHOLD:-100000}"
+LONG_REQUEST_SP_SIZE="${LONG_REQUEST_SP_SIZE:-0}"
 SWEEP_STRATEGY="${SWEEP_STRATEGY:-dp4sp8}"
 SWEEP_ROUTING="${SWEEP_ROUTING:-LeastBatch}"
 
@@ -321,6 +322,7 @@ run_one_attempt() {
     if [[ -n "${DYNAMIC_SP_SIZE_STRATEGY:-}" ]]; then
         sp_strategy_args+=(--dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY")
         sp_strategy_args+=(--long-request-sp-threshold "$LONG_REQUEST_SP_THRESHOLD")
+        sp_strategy_args+=(--long-request-sp-size "$LONG_REQUEST_SP_SIZE")
     fi
     # shellcheck disable=SC2086
     BASE_LOG_DIR="$BASE_LOG_DIR" bash "$START_BENCH_SH" \

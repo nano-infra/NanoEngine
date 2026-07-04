@@ -65,6 +65,8 @@ def parse_args():
                         help="SP size selection policy for the legacy dynamic-SP path.")
     parser.add_argument("--long-request-sp-threshold", type=int, default=100000,
                         help="Prompt length threshold for long_short_sp8: prompt_len > threshold -> SP=8.")
+    parser.add_argument("--long-request-sp-size", type=int, default=0,
+                        help="SP size for long requests in long_short_sp8 (0 = attention_sp).")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
@@ -417,6 +419,7 @@ def main():
         use_new_decode_dynamic_sp_scheduler=args.use_new_decode_dynamic_sp_scheduler,
         dynamic_sp_size_strategy=args.dynamic_sp_size_strategy,
         dynamic_sp_long_request_threshold=args.long_request_sp_threshold,
+        dynamic_sp_long_request_size=args.long_request_sp_size,
     )
     
     # Print Config

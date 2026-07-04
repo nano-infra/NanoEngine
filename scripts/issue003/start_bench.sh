@@ -32,6 +32,7 @@ DEFAULT_ENFORCE_EAGER=0
 DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=0
 DEFAULT_DYNAMIC_SP_SIZE_STRATEGY="legacy"
 DEFAULT_LONG_REQUEST_SP_THRESHOLD=100000
+DEFAULT_LONG_REQUEST_SP_SIZE=0
 DISABLE_NON_UNIFORM_SPLIT=""  # 开关变量，非空时启用
 DEFAULT_MAX_INPUT_LEN=""  # 为空表示不过滤
 # ===================================================================
@@ -63,6 +64,7 @@ ENFORCE_EAGER="$DEFAULT_ENFORCE_EAGER"
 USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="$DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 DYNAMIC_SP_SIZE_STRATEGY="$DEFAULT_DYNAMIC_SP_SIZE_STRATEGY"
 LONG_REQUEST_SP_THRESHOLD="$DEFAULT_LONG_REQUEST_SP_THRESHOLD"
+LONG_REQUEST_SP_SIZE="$DEFAULT_LONG_REQUEST_SP_SIZE"
 
 # 用于存储位置参数（Rates）
 RATES=()
@@ -94,6 +96,7 @@ usage() {
     echo "  --use-new-decode-dynamic-sp-scheduler  Use the new decode dynamic SP scheduler"
     echo "  --dynamic-sp-size-strategy <str>  legacy | long_short_sp8 (default: $DEFAULT_DYNAMIC_SP_SIZE_STRATEGY)"
     echo "  --long-request-sp-threshold <int> Prompt len threshold for long_short_sp8 (default: $DEFAULT_LONG_REQUEST_SP_THRESHOLD)"
+    echo "  --long-request-sp-size <int>      SP size for long requests (0 = SP size, default: $DEFAULT_LONG_REQUEST_SP_SIZE)"
     echo "  --enforce-eager           Disable cudagraph capture and enforce eager mode"
     echo "  --disable-non-uniform-split  Disable non-uniform split (flag)"
     echo "  --help                    Show this help message"
@@ -127,6 +130,7 @@ while [[ $# -gt 0 ]]; do
         --use-new-decode-dynamic-sp-scheduler) USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=1; shift ;;
         --dynamic-sp-size-strategy) DYNAMIC_SP_SIZE_STRATEGY="$2"; shift 2 ;;
         --long-request-sp-threshold) LONG_REQUEST_SP_THRESHOLD="$2"; shift 2 ;;
+        --long-request-sp-size) LONG_REQUEST_SP_SIZE="$2"; shift 2 ;;
         --enforce-eager)    ENFORCE_EAGER=1; shift ;;
         --disable-non-uniform-split) DISABLE_NON_UNIFORM_SPLIT="true"; shift ;;
         --help)             usage ;;
@@ -264,6 +268,9 @@ for rate in "${RATES[@]}"; do
     fi
     if [[ "$DYNAMIC_SP_SIZE_STRATEGY" != "legacy" ]]; then
         extra_tags="${extra_tags}_${DYNAMIC_SP_SIZE_STRATEGY}_thr${LONG_REQUEST_SP_THRESHOLD}"
+        if [[ "$LONG_REQUEST_SP_SIZE" -ne 0 ]]; then
+            extra_tags="${extra_tags}_sp${LONG_REQUEST_SP_SIZE}"
+        fi
     fi
     STRATEGY_STR="dp${DP}sp${SP}_seg${seg_short}_n${NUM_REQUESTS}_r${rate}_bs${BATCH_SIZE}_${rt_short}_${sc_short}${maxin_tag}${extra_tags}"
 
@@ -300,6 +307,7 @@ for rate in "${RATES[@]}"; do
         --fixed-sp-segments "$FIXED_SP_SEGMENTS"
         --dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY"
         --long-request-sp-threshold "$LONG_REQUEST_SP_THRESHOLD"
+        --long-request-sp-size "$LONG_REQUEST_SP_SIZE"
     )
 
     # 如果启用了 disable_non_uniform_split

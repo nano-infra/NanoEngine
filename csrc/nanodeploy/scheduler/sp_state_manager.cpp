@@ -93,6 +93,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                bool               enable_dynamic_sp_size,
                                const std::string& dynamic_sp_size_strategy,
                                int                dynamic_sp_long_request_threshold,
+                               int                dynamic_sp_long_request_size,
                                bool               enable_dynamic_sp_bucket_policy,
                                const std::string& dynamic_sp_bucket_policy,
                                double             attention_cost_a,
@@ -120,6 +121,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     segment_size_(segment_size),
     dynamic_sp_size_strategy_(DynamicSPSizeStrategy::Legacy),
     long_request_sp_threshold_(dynamic_sp_long_request_threshold),
+    long_request_sp_size_(dynamic_sp_long_request_size > 0 ? dynamic_sp_long_request_size : attention_sp),
     enable_dynamic_sp_bucket_policy_(enable_dynamic_sp_bucket_policy),
     num_recv_seqs_per_sp_(attention_sp, 0),
     enable_dynamic_sp_size_(enable_dynamic_sp_size),
@@ -171,6 +173,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
               << ", fixed_sp_segments=" << fixed_sp_segments_
               << ", dynamic_sp_size_strategy=" << dynamic_sp_size_strategy_name(dynamic_sp_size_strategy_)
               << ", dynamic_sp_long_request_threshold=" << long_request_sp_threshold_
+              << ", dynamic_sp_long_request_size=" << long_request_sp_size_
               << ", enable_dynamic_sp_bucket_policy=" << enable_dynamic_sp_bucket_policy_
               << std::endl;
 
@@ -948,7 +951,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             recompute_segments_for_forced_sp = true;
         } else if (dynamic_sp_size_strategy_ == DynamicSPSizeStrategy::LongShortSP8) {
             const bool is_long_request = seq.num_prompt_tokens > long_request_sp_threshold_;
-            const int forced_num_ranks = is_long_request ? attention_sp_ : 1;
+            const int forced_num_ranks = is_long_request ? long_request_sp_size_ : 1;
             start_ranks = forced_num_ranks;
             end_ranks = forced_num_ranks;
             recompute_segments_for_forced_sp = true;

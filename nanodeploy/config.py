@@ -90,6 +90,9 @@ class Config:
     # "bucket": choose CP size directly from a configured seq-len bucket policy.
     dynamic_sp_size_strategy: Literal["legacy", "long_short_sp8", "bucket"] = "legacy"
     dynamic_sp_long_request_threshold: int = 100000
+    # 0 is normalized in __post_init__ to preserve the historical behavior:
+    # long requests use attention_sp.
+    dynamic_sp_long_request_size: int = 0
     enable_dynamic_sp_bucket_policy: bool = False
     dynamic_sp_bucket_policy: str = ""
     dynamic_sp_bucket_preset: Literal["none", "deepseek_v3"] = "none"
@@ -136,6 +139,17 @@ class Config:
         if self.dynamic_sp_bucket_preset not in {"none", "deepseek_v3"}:
             raise ValueError(
                 "dynamic_sp_bucket_preset must be one of: none, deepseek_v3"
+            )
+        if self.dynamic_sp_long_request_size < 0:
+            raise ValueError("dynamic_sp_long_request_size must be >= 0")
+        if self.dynamic_sp_long_request_size == 0:
+            self.dynamic_sp_long_request_size = self.attention_sp
+        if (
+            self.dynamic_sp_long_request_size < 1
+            or self.dynamic_sp_long_request_size > self.attention_sp
+        ):
+            raise ValueError(
+                "dynamic_sp_long_request_size must be in [1, attention_sp]"
             )
         preset_policy = ""
         if self.dynamic_sp_bucket_preset == "deepseek_v3":
