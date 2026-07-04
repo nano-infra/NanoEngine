@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Optional
 
 # Some clients/proxies fold the Anthropic ``x-anthropic-billing-header`` HTTP
@@ -238,6 +239,14 @@ def build_sampling_params(body: dict) -> Any:
     return SamplingParams(
         temperature=float(temperature), max_tokens=int(max_tokens), ignore_eos=False
     )
+
+
+def _migration_metadata(kv_transfer: dict) -> tuple[int, int | None]:
+    seq_id = int(kv_transfer.get("seq_id") or 0)
+    if seq_id <= 0:
+        raise AnthropicError(400, "missing positive seq_id")
+    first_token = kv_transfer.get("first_token")
+    return seq_id, None if first_token is None else int(first_token)
 
 
 def parse_stop_sequences(body: dict) -> list[str]:
@@ -486,8 +495,63 @@ async def handle_messages(server: Any, request: Any, body: dict):  # noqa: ANN20
         messages, tools=tools if use_tools else None, tool_choice=tool_choice
     )
     affinity_key = server.session_affinity_key(request, body)
-    req = server.submit(prompt_ids, sampling_params, affinity_key=affinity_key)
     input_tokens = len(prompt_ids)
+    kv_transfer = body.get("kv_transfer_params") or {}
+    if not isinstance(kv_transfer, dict):
+        kv_transfer = {}
+
+    if kv_transfer.get("do_remote_decode"):
+        preq = server.submit(prompt_ids, sampling_params, affinity_key=affinity_key)
+        try:
+            mig = await server.await_migration(preq)
+        except RuntimeError as e:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": str(e)},
+                },
+            )
+        if not mig.get("migration"):
+            done_tokens = mig.get("tokens") or []
+            text = server.tokenizer.decode(done_tokens, skip_special_tokens=True)
+            gen = SimpleNamespace(token_ids=done_tokens, finish_reason="stop")
+            return JSONResponse(
+                format_messages_response(
+                    server,
+                    model=model,
+                    text=text,
+                    gen=gen,
+                    use_tools=use_tools,
+                    input_tokens=input_tokens,
+                )
+            )
+
+        response = format_messages_response(
+            server,
+            model=model,
+            text="",
+            gen=None,
+            use_tools=use_tools,
+            input_tokens=input_tokens,
+        )
+        response["kv_transfer_params"] = {
+            "migration": mig["migration"],
+            "first_token": mig.get("first_token"),
+            "seq_id": mig.get("seq_id"),
+        }
+        return JSONResponse(response)
+
+    if kv_transfer.get("migration"):
+        try:
+            migrated_seq_id, first_token = _migration_metadata(kv_transfer)
+        except AnthropicError as e:
+            return e.to_response()
+        req = server.submit_migrated(
+            kv_transfer["migration"], migrated_seq_id, first_token
+        )
+    else:
+        req = server.submit(prompt_ids, sampling_params, affinity_key=affinity_key)
 
     if bool(body.get("stream", False)):
         return StreamingResponse(

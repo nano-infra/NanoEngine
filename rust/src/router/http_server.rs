@@ -93,10 +93,11 @@ async fn upstream_response_to_axum(upstream: reqwest::Response, stream: bool) ->
 async fn forward_http_payload(
     client: reqwest::Client,
     base_url: String,
+    endpoint: &'static str,
     payload: Value,
     stream: bool,
 ) -> Response {
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
     match client.post(url).json(&payload).send().await {
         Ok(upstream) => upstream_response_to_axum(upstream, stream).await,
         Err(e) => (
@@ -129,6 +130,7 @@ async fn forward_http_pd(
     client: reqwest::Client,
     prefill_url: String,
     decode_url: String,
+    endpoint: &'static str,
     payload: Value,
     stream: bool,
 ) -> Response {
@@ -141,7 +143,7 @@ async fn forward_http_pd(
         );
     }
 
-    let prefill_endpoint = format!("{}/v1/chat/completions", prefill_url.trim_end_matches('/'));
+    let prefill_endpoint = format!("{}{}", prefill_url.trim_end_matches('/'), endpoint);
     let prefill_resp = match client
         .post(prefill_endpoint)
         .json(&prefill_payload)
@@ -216,12 +218,12 @@ async fn forward_http_pd(
 
     if !stream {
         let response =
-            forward_http_payload(client.clone(), decode_url, decode_payload, false).await;
+            forward_http_payload(client.clone(), decode_url, endpoint, decode_payload, false).await;
         free_http_prefill(client, prefill_url, seq_id).await;
         return response;
     }
 
-    let decode_endpoint = format!("{}/v1/chat/completions", decode_url.trim_end_matches('/'));
+    let decode_endpoint = format!("{}{}", decode_url.trim_end_matches('/'), endpoint);
     match client
         .post(decode_endpoint)
         .json(&decode_payload)
@@ -264,9 +266,10 @@ async fn forward_http_pd(
     }
 }
 
-async fn chat_completions(
+async fn route_generation_request(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<Value>,
+    endpoint: &'static str,
 ) -> Response {
     let Some(model_key) = request_model(&payload) else {
         return (
@@ -320,6 +323,7 @@ async fn chat_completions(
             forward_http_payload(
                 state.http_client.clone(),
                 url,
+                endpoint,
                 sanitize_http_payload(payload),
                 stream,
             )
@@ -338,12 +342,83 @@ async fn chat_completions(
                 state.http_client.clone(),
                 prefill_url,
                 decode_url,
+                endpoint,
                 payload,
                 stream,
             )
             .await
         }
     }
+}
+
+async fn chat_completions(
+    state: State<Arc<AppState>>,
+    payload: Json<Value>,
+) -> Response {
+    route_generation_request(state, payload, "/v1/chat/completions").await
+}
+
+async fn anthropic_messages(
+    state: State<Arc<AppState>>,
+    payload: Json<Value>,
+) -> Response {
+    route_generation_request(state, payload, "/v1/messages").await
+}
+
+async fn anthropic_count_tokens(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Value>,
+) -> Response {
+    let Some(model_key) = request_model(&payload) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Missing required string field: model",
+        )
+            .into_response();
+    };
+
+    let route = {
+        let mgr = state.engine_manager.lock().await;
+        let pool = match mgr.model_pools.get(&model_key) {
+            Some(pool) => pool,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "Model '{}' not found. Available: [{}]",
+                        model_key,
+                        mgr.available_model_keys().join(", ")
+                    ),
+                )
+                    .into_response()
+            }
+        };
+        pool.get_next_http_hybrid()
+            .or_else(|| pool.get_next_http_prefill())
+            .or_else(|| pool.get_next_http_decode())
+            .map(str::to_string)
+    };
+
+    let Some(url) = route else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No HTTP DLEngine nodes available",
+        )
+            .into_response();
+    };
+
+    tracing::info!(
+        "Forwarding Anthropic count_tokens request to HTTP DLEngine node: {}",
+        url
+    );
+    forward_http_payload(
+        state.http_client.clone(),
+        url,
+        "/v1/messages/count_tokens",
+        sanitize_http_payload(payload),
+        false,
+    )
+    .await
 }
 
 async fn health() -> &'static str {
@@ -362,6 +437,8 @@ pub async fn start_server(
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
