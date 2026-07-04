@@ -175,6 +175,7 @@ async fn forward_http_pd(
         .and_then(|v| v.as_object());
     let migration = kv.and_then(|m| m.get("migration")).cloned();
     let seq_id = kv.and_then(|m| m.get("seq_id")).cloned();
+    let first_token = kv.and_then(|m| m.get("first_token")).cloned();
 
     let Some(migration) = migration else {
         if prefill_info.get("choices").is_some() {
@@ -190,22 +191,33 @@ async fn forward_http_pd(
         )
             .into_response();
     };
+    let Some(seq_id) = seq_id else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "DLEngine prefill response missing migration seq_id",
+        )
+            .into_response();
+    };
 
     let mut decode_payload = sanitize_http_payload(payload);
     if let Some(obj) = decode_payload.as_object_mut() {
-        obj.insert(
-            "kv_transfer_params".to_string(),
-            serde_json::json!({ "migration": migration }),
-        );
+        let mut kv_transfer_params = serde_json::json!({
+            "migration": migration,
+            "seq_id": seq_id.clone(),
+        });
+        if let (Some(params), Some(first_token)) =
+            (kv_transfer_params.as_object_mut(), first_token)
+        {
+            params.insert("first_token".to_string(), first_token);
+        }
+        obj.insert("kv_transfer_params".to_string(), kv_transfer_params);
         obj.insert("stream".to_string(), Value::Bool(stream));
     }
 
     if !stream {
         let response =
             forward_http_payload(client.clone(), decode_url, decode_payload, false).await;
-        if let Some(seq_id) = seq_id {
-            free_http_prefill(client, prefill_url, seq_id).await;
-        }
+        free_http_prefill(client, prefill_url, seq_id).await;
         return response;
     }
 
@@ -225,6 +237,7 @@ async fn forward_http_pd(
             let mut bytes_stream = upstream.bytes_stream();
             let free_client = client.clone();
             let free_prefill_url = prefill_url.clone();
+            let free_seq_id = seq_id.clone();
             let stream = async_stream::stream! {
                 while let Some(chunk) = bytes_stream.next().await {
                     match chunk {
@@ -235,9 +248,7 @@ async fn forward_http_pd(
                         }
                     }
                 }
-                if let Some(seq_id) = seq_id {
-                    free_http_prefill(free_client, free_prefill_url, seq_id).await;
-                }
+                free_http_prefill(free_client, free_prefill_url, free_seq_id).await;
             };
             Response::builder()
                 .status(StatusCode::OK)
