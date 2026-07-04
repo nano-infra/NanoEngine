@@ -207,8 +207,7 @@ async fn forward_http_pd(
             "migration": migration,
             "seq_id": seq_id.clone(),
         });
-        if let (Some(params), Some(first_token)) =
-            (kv_transfer_params.as_object_mut(), first_token)
+        if let (Some(params), Some(first_token)) = (kv_transfer_params.as_object_mut(), first_token)
         {
             params.insert("first_token".to_string(), first_token);
         }
@@ -351,17 +350,11 @@ async fn route_generation_request(
     }
 }
 
-async fn chat_completions(
-    state: State<Arc<AppState>>,
-    payload: Json<Value>,
-) -> Response {
+async fn chat_completions(state: State<Arc<AppState>>, payload: Json<Value>) -> Response {
     route_generation_request(state, payload, "/v1/chat/completions").await
 }
 
-async fn anthropic_messages(
-    state: State<Arc<AppState>>,
-    payload: Json<Value>,
-) -> Response {
+async fn anthropic_messages(state: State<Arc<AppState>>, payload: Json<Value>) -> Response {
     route_generation_request(state, payload, "/v1/messages").await
 }
 

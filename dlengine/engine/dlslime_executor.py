@@ -6,6 +6,7 @@ import ray
 from dlengine.config import Config
 from dlengine.engine.dlslime_protocol import (
     decode_run_result,
+    decode_runner_out,
     encode_run_request,
     ModelRunnerRpcService,
     server_handler_ns,
@@ -156,6 +157,11 @@ class DLSLimeExecutor(RayExecutor):
 
     def run_wait(self, handle: dict) -> list[list[list[int]]]:
         """Wait for a forward submitted via :meth:`run_async` and decode it."""
+        runner_outs = self.run_wait_runner_outs(handle)
+        return [out.result for out in runner_outs]
+
+    def run_wait_runner_outs(self, handle: dict):
+        """Wait for a forward submitted via :meth:`run_async` and return RunnerOuts."""
         import time as _time
 
         is_prefill = handle["is_prefill"]
@@ -178,7 +184,7 @@ class DLSLimeExecutor(RayExecutor):
         self.last_run_wwi_ms = max(wwi_delta, 0) / 1e6
         self.last_run_immrecv_ms = max(imm_delta, 0) / 1e6
         self.last_run_reply_bytes = sum(len(d) for d in replies)
-        result = [decode_run_result(data) for data in replies]
+        result = [decode_runner_out(data) for data in replies]
         _t4 = _time.perf_counter()
         # Pure network latency = client round trip - remote handler time. Each
         # RunnerOut reply carries the server-side handler duration (decode +

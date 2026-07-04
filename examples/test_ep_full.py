@@ -137,8 +137,10 @@ def step_encoder(args) -> tuple:
 
 def step_llm(args, slot_metas, token_ids) -> list:
     """Run LLM engine: prefill (with RDMA fetch) + decode in single engine."""
+    import uuid
+
     import ray
-    from dlengine._rust.proto import SamplingParams
+    from dlengine._rust.proto import RequestIn, SamplingParams
     from dlengine.config import Config
     from dlengine.llm_component import LLMComponent
 
@@ -173,11 +175,26 @@ def step_llm(args, slot_metas, token_ids) -> list:
     )
 
     # Run prefill + decode
+    seq_id = uuid.uuid4().int & ((1 << 63) - 1)
+    vision_slots = [
+        (
+            str(m.encoder_engine_id),
+            int(m.slot_idx),
+            int(m.num_tokens),
+            int(m.hidden_size),
+            int(m.max_tokens_per_slot),
+        )
+        for m in slot_metas
+    ]
     ray.get(
-        llm.add_request.remote(
-            token_ids,
-            sampling_params=sampling_params,
-            vision_slots=slot_metas,
+        llm.add_request_payload.remote(
+            RequestIn(
+                seq_id,
+                token_ids,
+                sampling_params,
+                0,
+                vision_slots,
+            ).to_bytes()
         )
     )
     print("[LLM] Generating (prefill + decode)…")

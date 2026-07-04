@@ -61,9 +61,7 @@ impl Scheduler {
             .insert(seq_id, (dp_idx, parked.group_id));
         if let Some(blocks) = parked.block_tables.remove(&(parked.group_id as i32)) {
             let flat = self.flat_idx(dp_idx, parked.group_id);
-            self.group_resources[flat]
-                .seq_blocks
-                .insert(seq_id, blocks.clone());
+            self.hbm_pools[flat].insert_existing(seq_id, blocks.clone());
             let mut s = seq.borrow_mut(py);
             let group_id = parked.group_id as i32;
             s.active_group_id = group_id;
@@ -74,13 +72,14 @@ impl Scheduler {
             s.migrate_block_tables.insert(group_id, blocks);
         }
         if parked.state_slot >= 0 {
-            self.seq_state_slots.insert(seq_id, parked.state_slot);
+            self.state_slots.insert_existing(seq_id, parked.state_slot);
             let mut s = seq.borrow_mut(py);
             s.active_state_slot = parked.state_slot;
             s.migrate_state_slot = parked.state_slot;
         }
         if parked.hisparse_slot >= 0 {
-            self.seq_hisparse_slots.insert(seq_id, parked.hisparse_slot);
+            self.hisparse_slots
+                .insert_existing(seq_id, parked.hisparse_slot);
             let mut s = seq.borrow_mut(py);
             s.active_hisparse_slot = parked.hisparse_slot;
             s.migrate_hisparse_slot = parked.hisparse_slot;
@@ -114,16 +113,10 @@ impl Scheduler {
     pub(super) fn release_seq(&mut self, seq_id: u64) {
         if let Some((dp_idx, group_id)) = self.seq_assignment.remove(&seq_id) {
             let flat = self.flat_idx(dp_idx, group_id);
-            if let Some(mut blocks) = self.group_resources[flat].seq_blocks.remove(&seq_id) {
-                self.group_resources[flat].free_blocks.append(&mut blocks);
-            }
+            self.hbm_pools[flat].remove_seq(seq_id);
         }
-        if let Some(slot) = self.seq_state_slots.remove(&seq_id) {
-            self.state_free.push(slot);
-        }
-        if let Some(slot) = self.seq_hisparse_slots.remove(&seq_id) {
-            self.hisparse_free.push(slot);
-        }
+        self.state_slots.remove(seq_id);
+        self.hisparse_slots.remove(seq_id);
         for pool in self.compressed_pools.values_mut() {
             if let Some(mut pages) = pool.seq_pages.remove(&seq_id) {
                 pool.free_pages.append(&mut pages);
@@ -145,12 +138,12 @@ impl Scheduler {
             return;
         };
         let flat = self.flat_idx(dp_idx, group_id);
-        let blocks = self.group_resources[flat]
-            .seq_blocks
-            .remove(&seq_id)
-            .unwrap_or_default();
-        let state_slot = self.seq_state_slots.remove(&seq_id).unwrap_or(-1);
-        let hisparse_slot = self.seq_hisparse_slots.remove(&seq_id).unwrap_or(-1);
+        let blocks = self.hbm_pools[flat].take_seq_without_release(seq_id);
+        let state_slot = self.state_slots.take_without_release(seq_id).unwrap_or(-1);
+        let hisparse_slot = self
+            .hisparse_slots
+            .take_without_release(seq_id)
+            .unwrap_or(-1);
         let mut compressed_tables = HashMap::new();
         for (ratio, pool) in self.compressed_pools.iter_mut() {
             if let Some(pages) = pool.seq_pages.remove(&seq_id) {
@@ -198,15 +191,13 @@ impl Scheduler {
         };
         if let Some(blocks) = parked.block_tables.get(&(parked.group_id as i32)) {
             let flat = self.flat_idx(parked.dp_idx, parked.group_id);
-            self.group_resources[flat]
-                .free_blocks
-                .extend(blocks.iter().copied());
+            self.hbm_pools[flat].release_blocks_without_owner(blocks);
         }
         if parked.state_slot >= 0 {
-            self.state_free.push(parked.state_slot);
+            self.state_slots.release_slot(parked.state_slot);
         }
         if parked.hisparse_slot >= 0 {
-            self.hisparse_free.push(parked.hisparse_slot);
+            self.hisparse_slots.release_slot(parked.hisparse_slot);
         }
         for (ratio, pages) in parked.compressed_tables {
             if let Some(pool) = self.compressed_pools.get_mut(&ratio) {

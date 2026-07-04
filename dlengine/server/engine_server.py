@@ -53,31 +53,20 @@ class BackendService:
     def _send_response(self, action: int, payload: bytes):
         self.results_queue.put((action, payload))
 
-    def _handle_add_request(self, request):
-        if isinstance(request, pd.RequestIn):
+    def _handle_add_request(self, payload: bytes):
+        try:
+            request = pd.RequestIn.from_bytes(payload)
             logger.info(
                 "Handling ADD request: seq_id=%s prompt_len=%s",
                 request.seq_id,
                 len(request.prompt_token_ids),
             )
-            self.engine.add_request(
-                request.prompt_token_ids,
-                request.sampling_params,
-                seq_id=request.seq_id,
-                affinity_key=request.affinity_key,
-                vision_slots=request.vision_slots,
-            )
-            logger.info("Request added to engine successfully")
-            return
-
-        if isinstance(request, pd.RequestMigrate):
+        except Exception:
+            request = pd.RequestMigrate.from_bytes(payload)
             seq_id, _first_token = request.metadata
             logger.info("Handling migration request: seq_id=%s", seq_id)
-            self.engine.add_migration_request(request)
-            logger.info("Migration request added to engine successfully")
-            return
-
-        raise TypeError(f"unsupported ADD request type: {type(request)!r}")
+        self.engine.add_request_payload(payload)
+        logger.info("Request payload added to engine successfully")
 
     def _handle_get_info(self):
         resp_payload = self.engine.get_engine_info().encode("utf-8")
@@ -465,13 +454,6 @@ class EngineServer:
                 try:
                     data = await socket.recv()
                     action, payload = decode_packet(bytes(data))
-                    if action == 1:
-                        try:
-                            item = pd.RequestIn.from_bytes(payload)
-                        except Exception:
-                            item = pd.RequestMigrate.from_bytes(payload)
-                        self.requests_queue.put_nowait((action, item))
-                        continue
                     self.requests_queue.put_nowait((action, payload))
                 except zmq.ZMQError as e:
                     if e.errno != zmq.ETERM:

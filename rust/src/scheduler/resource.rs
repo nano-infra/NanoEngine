@@ -1,22 +1,7 @@
-use std::collections::HashMap;
-
 use super::Scheduler;
 use crate::sequence::Sequence;
+use crate::table::block::CompressedPool;
 use pyo3::prelude::*;
-
-#[derive(Default)]
-pub(super) struct GroupResource {
-    pub(super) free_blocks: Vec<i32>,
-    pub(super) seq_blocks: HashMap<u64, Vec<i32>>,
-}
-
-pub(super) struct CompressedPool {
-    pub(super) ratio: i32,
-    pub(super) page_size: i32,
-    pub(super) max_blocks_per_seq: i32,
-    pub(super) free_pages: Vec<i32>,
-    pub(super) seq_pages: HashMap<u64, Vec<i32>>,
-}
 
 impl Scheduler {
     pub(super) fn ensure_group_blocks(
@@ -31,21 +16,15 @@ impl Scheduler {
     ) -> PyResult<Vec<i32>> {
         let needed_blocks = self.blocks_needed_for_tokens(tokens);
         let flat = self.flat_idx(dp_idx, group_id);
-        let blocks = {
-            let resource = &mut self.group_resources[flat];
-            let blocks = resource.seq_blocks.entry(seq_id).or_default();
-            while blocks.len() < needed_blocks {
-                let Some(block) = resource.free_blocks.pop() else {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "out of KV cache blocks: seq_id={seq_id} dp_idx={dp_idx} group_id={group_id} need={} have={}",
-                        needed_blocks,
-                        blocks.len()
-                    )));
-                };
-                blocks.push(block);
-            }
-            blocks.clone()
-        };
+        let token_ids = seq.borrow(py).token_ids.clone();
+        let use_prefix_cache = set_migrate && self.group() == 1 && self.config.mode != "decode";
+        let blocks = self.hbm_pools[flat]
+            .ensure_blocks(seq_id, &token_ids, tokens, use_prefix_cache)
+            .map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "out of KV cache blocks: seq_id={seq_id} dp_idx={dp_idx} group_id={group_id} need={needed_blocks}"
+                ))
+            })?;
         {
             let mut s = seq.borrow_mut(py);
             let group_id = group_id as i32;
@@ -98,21 +77,15 @@ impl Scheduler {
             }
         };
         let flat = self.flat_idx(dp_idx, group_id);
-        let blocks = {
-            let resource = &mut self.group_resources[flat];
-            let blocks = resource.seq_blocks.entry(seq_id).or_default();
-            while blocks.len() < needed_blocks {
-                let Some(block) = resource.free_blocks.pop() else {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "out of KV cache blocks: seq_id={seq_id} dp_idx={dp_idx} group_id={group_id} need={} have={}",
-                        needed_blocks,
-                        blocks.len()
-                    )));
-                };
-                blocks.push(block);
-            }
-            blocks.clone()
-        };
+        let token_ids = seq.borrow(py).token_ids.clone();
+        let use_prefix_cache = is_prefill && self.group() == 1 && self.config.mode != "decode";
+        let blocks = self.hbm_pools[flat]
+            .ensure_blocks(seq_id, &token_ids, needed_tokens, use_prefix_cache)
+            .map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "out of KV cache blocks: seq_id={seq_id} dp_idx={dp_idx} group_id={group_id} need={needed_blocks}"
+                ))
+            })?;
         {
             let mut s = seq.borrow_mut(py);
             let group_id = group_id as i32;
@@ -136,10 +109,10 @@ impl Scheduler {
             s.migrate_num_kvcache_blocks = self.config.num_kvcache_blocks;
             s.migrate_group_size = self.config.group_size.max(1);
             s.migrate_dp_idx = dp_idx as i32;
-            if let Some(slot) = self.seq_state_slots.get(&seq_id).copied() {
+            if let Some(slot) = self.state_slots.get(seq_id) {
                 s.migrate_state_slot = slot;
             }
-            if let Some(slot) = self.seq_hisparse_slots.get(&seq_id).copied() {
+            if let Some(slot) = self.hisparse_slots.get(seq_id) {
                 s.migrate_hisparse_slot = slot;
             }
             for (ratio, pool) in &self.compressed_pools {
@@ -161,17 +134,10 @@ impl Scheduler {
         if self.config.cache_plan.flags & ((1 << 2) | (1 << 3) | (1 << 4)) == 0 {
             return Ok(());
         }
-        let slot = match self.seq_state_slots.get(&seq_id).copied() {
-            Some(slot) => slot,
-            None => {
-                let Some(slot) = self.state_free.pop() else {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "out of state slots: seq_id={seq_id}"
-                    )));
-                };
-                self.seq_state_slots.insert(seq_id, slot);
-                slot
-            }
+        let Some(slot) = self.state_slots.ensure(seq_id) else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "out of state slots: seq_id={seq_id}"
+            )));
         };
         seq.borrow_mut(py).active_state_slot = slot;
         Ok(())
@@ -186,17 +152,10 @@ impl Scheduler {
         if self.config.cache_plan.flags & (1 << 6) == 0 {
             return Ok(());
         }
-        let slot = match self.seq_hisparse_slots.get(&seq_id).copied() {
-            Some(slot) => slot,
-            None => {
-                let Some(slot) = self.hisparse_free.pop() else {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "out of HiSparse slots: seq_id={seq_id}"
-                    )));
-                };
-                self.seq_hisparse_slots.insert(seq_id, slot);
-                slot
-            }
+        let Some(slot) = self.hisparse_slots.ensure(seq_id) else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "out of HiSparse slots: seq_id={seq_id}"
+            )));
         };
         seq.borrow_mut(py).active_hisparse_slot = slot;
         Ok(())

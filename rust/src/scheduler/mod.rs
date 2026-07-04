@@ -4,8 +4,11 @@ use crate::proto::wire::{
     sequence_migrate_batch_bytes, sequence_runner_in_bytes, sequence_to_migration_request,
     WireRequestIn, WireRequestMigrate, WireSamplingParams, WireVisionSlot,
 };
+use crate::proto::RunnerOut;
 use crate::sequence::{set_sequence_block_size, SamplingParams, Sequence};
 use crate::snapshots::{SchedulerMetricSnapshot, StepMetricSnapshot};
+use crate::table::block::{BlockPool, CompressedPool};
+use crate::table::slot::SlotPool;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::{HashMap, HashSet};
@@ -19,7 +22,6 @@ mod schedule;
 mod session_state_cache;
 mod types;
 
-use resource::{CompressedPool, GroupResource};
 use session_state_cache::ParkedSession;
 pub use types::{RoutingStrategy, ScheduleResult, SchedulerConfig};
 
@@ -35,18 +37,17 @@ pub struct Scheduler {
     running: Vec<Vec<Py<Sequence>>>,
     prefilling: Vec<Vec<Py<Sequence>>>,
     to_be_migrated: HashMap<u64, (Py<Sequence>, usize)>,
-    group_resources: Vec<GroupResource>,
+    hbm_pools: Vec<BlockPool>,
     seq_assignment: HashMap<u64, (usize, usize)>,
     rr_cursor: usize,
     session_affinity: HashMap<u64, usize>,
     session_wait: HashMap<u64, i32>,
     parked_sessions: HashMap<u64, ParkedSession>,
     parked_lru: Vec<u64>,
-    state_free: Vec<i32>,
-    seq_state_slots: HashMap<u64, i32>,
-    hisparse_free: Vec<i32>,
-    seq_hisparse_slots: HashMap<u64, i32>,
+    state_slots: SlotPool,
+    hisparse_slots: SlotPool,
     compressed_pools: HashMap<i32, CompressedPool>,
+    prefix_caching_allowed: bool,
     prefix_cached_tokens_by_seq: HashMap<u64, i32>,
     prefix_counted_seq_ids: HashSet<u64>,
 }
@@ -59,12 +60,16 @@ impl Scheduler {
         let dp = config.attention_dp.max(1) as usize;
         let group = config.group_size.max(1) as usize;
         let num_blocks = config.num_kvcache_blocks.max(0);
-        let group_resources = (0..(dp * group))
-            .map(|_| GroupResource {
-                free_blocks: (0..num_blocks).rev().collect(),
-                seq_blocks: HashMap::new(),
-            })
-            .collect();
+        let prefix_caching_allowed =
+            config.enable_prefix_cache && config.cache_plan.flags & (1 << 2) == 0;
+        let mut hbm_pools = (0..(dp * group))
+            .map(|_| BlockPool::new(num_blocks, config.kvcache_block_size))
+            .collect::<Vec<_>>();
+        if !prefix_caching_allowed {
+            for pool in &mut hbm_pools {
+                pool.set_prefix_caching_enabled(false);
+            }
+        }
         let mut compressed_pools = HashMap::new();
         if config.cache_plan.flags & ((1 << 3) | (1 << 4)) != 0 {
             for spec in [
@@ -122,18 +127,17 @@ impl Scheduler {
             running: (0..dp).map(|_| Vec::new()).collect(),
             prefilling: (0..dp).map(|_| Vec::new()).collect(),
             to_be_migrated: HashMap::new(),
-            group_resources,
+            hbm_pools,
             seq_assignment: HashMap::new(),
             rr_cursor: 0,
             session_affinity: HashMap::new(),
             session_wait: HashMap::new(),
             parked_sessions: HashMap::new(),
             parked_lru: Vec::new(),
-            state_free: (0..state_slots.max(0)).rev().collect(),
-            seq_state_slots: HashMap::new(),
-            hisparse_free: (0..hisparse_slots.max(0)).rev().collect(),
-            seq_hisparse_slots: HashMap::new(),
+            state_slots: SlotPool::new(state_slots),
+            hisparse_slots: SlotPool::new(hisparse_slots),
             compressed_pools,
+            prefix_caching_allowed,
             prefix_cached_tokens_by_seq: HashMap::new(),
             prefix_counted_seq_ids: HashSet::new(),
         }
@@ -245,7 +249,12 @@ impl Scheduler {
         self.config.gdn_state_cache_slots = capacity.max(0);
     }
 
-    fn set_prefix_caching_enabled(&mut self, _enabled: bool) {}
+    fn set_prefix_caching_enabled(&mut self, enabled: bool) {
+        let enabled = enabled && self.prefix_caching_allowed;
+        for pool in &mut self.hbm_pools {
+            pool.set_prefix_caching_enabled(enabled);
+        }
+    }
 
     fn preempt(&mut self, py: Python<'_>, dp_idx: usize, seq: Py<Sequence>) -> PyResult<()> {
         self.preempt_impl(py, dp_idx, seq)
@@ -283,6 +292,18 @@ impl Scheduler {
         );
     }
 
+    #[pyo3(signature = (dp_group_seqs, runner_outs, _update_metrics=None))]
+    fn postprocess_runner_outs(
+        &mut self,
+        py: Python<'_>,
+        dp_group_seqs: Vec<Vec<Py<Sequence>>>,
+        runner_outs: Vec<RunnerOut>,
+        _update_metrics: Option<bool>,
+    ) {
+        let (token_ids, token_logprobs) = Self::runner_outs_to_step_output(&runner_outs);
+        self.postprocess_impl(py, dp_group_seqs, token_ids, token_logprobs);
+    }
+
     fn is_finished(&self) -> bool {
         self.waiting.is_empty()
             && self.waiting_migration.is_empty()
@@ -316,6 +337,17 @@ impl Scheduler {
         dp_group_token_ids: Option<Vec<Vec<Vec<i32>>>>,
     ) -> StepMetricSnapshot {
         self.record_step_metric_impl(py, metric, result, dp_group_token_ids)
+    }
+
+    fn record_step_metric_runner_outs(
+        &mut self,
+        py: Python<'_>,
+        metric: &mut ServerMetric,
+        result: &ScheduleResult,
+        runner_outs: Vec<RunnerOut>,
+    ) -> StepMetricSnapshot {
+        let (token_ids, _) = Self::runner_outs_to_step_output(&runner_outs);
+        self.record_step_metric_impl(py, metric, result, Some(token_ids))
     }
 
     fn prefix_cached_tokens(&self, seq_id: u64) -> i32 {
@@ -473,6 +505,29 @@ impl Scheduler {
     fn flat_idx(&self, dp_idx: usize, group_id: usize) -> usize {
         dp_idx * self.group() + group_id
     }
+
+    fn runner_outs_to_step_output(
+        runner_outs: &[RunnerOut],
+    ) -> (Vec<Vec<Vec<i32>>>, Option<Vec<Vec<Vec<f32>>>>) {
+        let mut token_ids = Vec::with_capacity(runner_outs.len());
+        let mut logprobs = Vec::with_capacity(runner_outs.len());
+        let mut any_logprobs = false;
+        for out in runner_outs {
+            token_ids.push(
+                out.token_ids
+                    .iter()
+                    .map(|seq_tokens| seq_tokens.iter().copied().map(|t| t as i32).collect())
+                    .collect(),
+            );
+            if let Some(values) = &out.logprobs {
+                logprobs.push(values.clone());
+                any_logprobs = true;
+            } else {
+                logprobs.push(Vec::new());
+            }
+        }
+        (token_ids, any_logprobs.then_some(logprobs))
+    }
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -481,4 +536,215 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ScheduleResult>()?;
     m.add_class::<Scheduler>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CachePlan;
+    use crate::metrics::ServerMetric;
+
+    fn make_scheduler() -> Scheduler {
+        make_scheduler_with_flags(1)
+    }
+
+    fn make_scheduler_with_flags(flags: u32) -> Scheduler {
+        make_scheduler_with_flags_and_prefix_cache(flags, true)
+    }
+
+    fn make_scheduler_with_flags_and_prefix_cache(
+        flags: u32,
+        enable_prefix_cache: bool,
+    ) -> Scheduler {
+        Scheduler::new(SchedulerConfig {
+            engine_id: "engine".to_string(),
+            num_speculative_tokens: 0,
+            max_num_seqs: 8,
+            max_num_batched_tokens: 64,
+            max_model_len: 128,
+            eos_ids: Vec::new(),
+            attention_dp: 1,
+            group_size: 1,
+            num_kvcache_blocks: 16,
+            kvcache_block_size: 4,
+            mode: "hybrid".to_string(),
+            routing_strategy: RoutingStrategy::RoundRobin,
+            gdn_state_cache_slots: 0,
+            enable_prefix_cache,
+            cache_plan: CachePlan::new(flags),
+        })
+    }
+
+    fn add_tokens(
+        py: Python<'_>,
+        scheduler: &mut Scheduler,
+        seq_id: u64,
+        tokens: Vec<i32>,
+    ) -> PyResult<()> {
+        let sampling = Py::new(py, SamplingParams::new(1.0, 16, false, false))?;
+        scheduler.add_request(py, seq_id, tokens, sampling, 0, None)?;
+        Ok(())
+    }
+
+    fn run_one_prefill(py: Python<'_>, scheduler: &mut Scheduler) -> PyResult<Vec<Py<Sequence>>> {
+        let scheduled = scheduler.schedule_prefill(py)?;
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].len(), 1);
+        let seqs = scheduled[0]
+            .iter()
+            .map(|seq| seq.clone_ref(py))
+            .collect::<Vec<_>>();
+        let postprocess_seqs = seqs.iter().map(|seq| seq.clone_ref(py)).collect();
+        scheduler.postprocess_impl(py, vec![postprocess_seqs], vec![vec![Vec::new()]], None);
+        Ok(seqs)
+    }
+
+    fn server_metric() -> ServerMetric {
+        ServerMetric {
+            total_tokens: 0,
+            total_prompt_tokens: 0,
+            total_generated_tokens: 0,
+            num_running_requests: 0,
+            num_waiting_requests: 0,
+            num_waiting_migration_requests: 0,
+            num_completed_requests: 0,
+            num_waiting_head_blocks: 0,
+            num_waiting_total_blocks: 0,
+            prefill_throughput_samples: Vec::new(),
+            decode_throughput_samples: Vec::new(),
+            token_usage_by_dp: std::collections::HashMap::new(),
+            group_send_request_counts: std::collections::HashMap::new(),
+            group_recv_request_counts: std::collections::HashMap::new(),
+            start_time: 0.0,
+        }
+    }
+
+    #[test]
+    fn scheduler_reuses_hbm_prefix_after_release() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut scheduler = make_scheduler();
+            add_tokens(py, &mut scheduler, 100, (0..8).collect()).unwrap();
+            let first = run_one_prefill(py, &mut scheduler).unwrap();
+            let first_table = first[0].borrow(py).active_block_table.clone();
+            scheduler.release_seq(first[0].borrow(py).seq_id);
+
+            add_tokens(py, &mut scheduler, 101, (0..8).collect()).unwrap();
+            let second = run_one_prefill(py, &mut scheduler).unwrap();
+            assert_eq!(second[0].borrow(py).active_block_table, first_table);
+            assert_eq!(scheduler.prefix_cached_tokens_impl(101), 7);
+        });
+    }
+
+    #[test]
+    fn scheduler_prefix_cache_can_be_disabled() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut scheduler = make_scheduler();
+            add_tokens(py, &mut scheduler, 100, (0..8).collect()).unwrap();
+            let first = run_one_prefill(py, &mut scheduler).unwrap();
+            scheduler.release_seq(first[0].borrow(py).seq_id);
+
+            scheduler.set_prefix_caching_enabled(false);
+            add_tokens(py, &mut scheduler, 101, (0..8).collect()).unwrap();
+            run_one_prefill(py, &mut scheduler).unwrap();
+            assert_eq!(scheduler.prefix_cached_tokens_impl(101), 0);
+        });
+    }
+
+    #[test]
+    fn step_metric_reports_prefix_cache_hits_per_dp() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut scheduler = make_scheduler();
+            add_tokens(py, &mut scheduler, 100, (0..8).collect()).unwrap();
+            let first = run_one_prefill(py, &mut scheduler).unwrap();
+            scheduler.release_seq(first[0].borrow(py).seq_id);
+
+            add_tokens(py, &mut scheduler, 101, (0..8).collect()).unwrap();
+            let scheduled = scheduler.schedule_prefill(py).unwrap();
+            assert_eq!(scheduled[0].len(), 1);
+            let result = ScheduleResult {
+                dp_seqs: vec![vec![scheduled[0][0].clone_ref(py)]],
+                is_prefill: true,
+                ..ScheduleResult::default()
+            };
+            let mut metric = server_metric();
+            let snapshot = scheduler.record_step_metric_impl(py, &mut metric, &result, None);
+            assert_eq!(snapshot.prefill_tokens_per_dp, vec![1]);
+            assert_eq!(snapshot.prefix_cached_tokens_per_dp, vec![7]);
+            assert_eq!(snapshot.prefix_prompt_tokens_per_dp, vec![8]);
+        });
+    }
+
+    #[test]
+    fn gdn_scheduler_never_enables_prefix_cache() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut scheduler = make_scheduler_with_flags(1 << 2);
+            scheduler.set_prefix_caching_enabled(true);
+            add_tokens(py, &mut scheduler, 100, (0..8).collect()).unwrap();
+            let first = run_one_prefill(py, &mut scheduler).unwrap();
+            scheduler.release_seq(first[0].borrow(py).seq_id);
+
+            add_tokens(py, &mut scheduler, 101, (0..8).collect()).unwrap();
+            run_one_prefill(py, &mut scheduler).unwrap();
+            assert_eq!(scheduler.prefix_cached_tokens_impl(101), 0);
+        });
+    }
+
+    #[test]
+    fn scheduler_config_can_disable_prefix_cache() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut scheduler = make_scheduler_with_flags_and_prefix_cache(1, false);
+            scheduler.set_prefix_caching_enabled(true);
+            add_tokens(py, &mut scheduler, 100, (0..8).collect()).unwrap();
+            let first = run_one_prefill(py, &mut scheduler).unwrap();
+            scheduler.release_seq(first[0].borrow(py).seq_id);
+
+            add_tokens(py, &mut scheduler, 101, (0..8).collect()).unwrap();
+            run_one_prefill(py, &mut scheduler).unwrap();
+            assert_eq!(scheduler.prefix_cached_tokens_impl(101), 0);
+        });
+    }
+
+    #[test]
+    fn runner_out_postprocess_and_metrics_entrypoints_work() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let mut scheduler = make_scheduler();
+            add_tokens(py, &mut scheduler, 100, vec![1, 2, 3]).unwrap();
+            let scheduled = scheduler.schedule_prefill(py).unwrap();
+            let seq = scheduled[0][0].clone_ref(py);
+            let runner_out = RunnerOut {
+                token_ids: vec![vec![4]],
+                logprobs: Some(vec![vec![0.25]]),
+                server_handler_ns: 0,
+            };
+            scheduler.postprocess_runner_outs(
+                py,
+                vec![vec![seq.clone_ref(py)]],
+                vec![runner_out.clone()],
+                None,
+            );
+            assert_eq!(seq.borrow(py).last_token, 4);
+            assert_eq!(seq.borrow(py).completion_logprobs, vec![0.25]);
+
+            let result = ScheduleResult {
+                dp_seqs: vec![vec![seq]],
+                is_prefill: false,
+                ..ScheduleResult::default()
+            };
+            let mut metric = server_metric();
+            let snapshot = scheduler.record_step_metric_runner_outs(
+                py,
+                &mut metric,
+                &result,
+                vec![runner_out],
+            );
+            assert_eq!(snapshot.decode_tokens, 1);
+            assert_eq!(snapshot.decode_tokens_per_dp, vec![1]);
+        });
+    }
 }

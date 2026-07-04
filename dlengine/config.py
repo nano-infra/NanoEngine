@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any, List, Literal, Optional
 
@@ -30,6 +31,10 @@ class Config(BaseModel):
     routing_strategy: Literal[
         "RoundRobin", "LeastBatch", "LeastCache", "SessionPrefix"
     ] = "RoundRobin"
+    # HBM KV prefix cache for attention KV blocks. Enabled by default for
+    # attention-only models; GDN/linear-attention cache plans force it off
+    # because recurrent state cannot be reused from KV prefix blocks alone.
+    enable_prefix_cache: bool = True
 
     # Session-scoped GatedDeltaNet (linear-attention) state caching. When a
     # request from a session (affinity_key) finishes, its KV blocks and GDN
@@ -54,7 +59,7 @@ class Config(BaseModel):
     gdn_state_cache_slots: int = 0
 
     # Debug: dump per-request data to a Redis stream (engine-side, so it works
-    # for ``dlengine serve`` AND offline ``generate()``). Two record kinds keyed
+    # for ``dlengine serve`` AND offline generation). Two record kinds keyed
     # on seq_id: ``kind="request"`` (tokenized prompt, for prefix-cache
     # divergence inspection) and ``kind="complete"`` (latency: ttft/tpot/e2e,
     # queue/prefill time, per-chunk prefill latencies, ITL avg/p50/p99). See
@@ -209,6 +214,9 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
+        if not self.engine_id:
+            self.engine_id = str(uuid.uuid4())
+
         # Normalise ctrl_address (add scheme if missing)
         if (
             self.ctrl_address

@@ -9,8 +9,8 @@ impl Scheduler {
         if self.routing_strategy == RoutingStrategy::LeastCache {
             let mut best = 0usize;
             let mut best_free = i32::MIN;
-            for (idx, res) in self.group_resources.iter().enumerate() {
-                let free = res.free_blocks.len() as i32;
+            for (idx, pool) in self.hbm_pools.iter().enumerate() {
+                let free = pool.num_free_blocks() as i32;
                 if free > best_free {
                     best = idx;
                     best_free = free;

@@ -1,6 +1,7 @@
 use crate::config::CachePlan;
 use crate::sequence::Sequence;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use pyo3::types::PyType;
 
 #[pyclass(module = "dlengine._engine")]
@@ -59,6 +60,8 @@ pub struct SchedulerConfig {
     #[pyo3(get, set)]
     pub gdn_state_cache_slots: i32,
     #[pyo3(get, set)]
+    pub enable_prefix_cache: bool,
+    #[pyo3(get, set)]
     pub cache_plan: CachePlan,
 }
 
@@ -79,6 +82,7 @@ impl SchedulerConfig {
         mode = String::from("hybrid"),
         routing_strategy = RoutingStrategy::RoundRobin,
         gdn_state_cache_slots = 0,
+        enable_prefix_cache = true,
         cache_plan = CachePlan::new(0)
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -96,6 +100,7 @@ impl SchedulerConfig {
         mode: String,
         routing_strategy: i32,
         gdn_state_cache_slots: i32,
+        enable_prefix_cache: bool,
         cache_plan: CachePlan,
     ) -> Self {
         Self {
@@ -112,6 +117,7 @@ impl SchedulerConfig {
             mode,
             routing_strategy,
             gdn_state_cache_slots,
+            enable_prefix_cache,
             cache_plan,
         }
     }
@@ -145,5 +151,38 @@ impl ScheduleResult {
     #[new]
     fn new() -> Self {
         Self::default()
+    }
+
+    fn debug_summary(
+        &self,
+        py: Python<'_>,
+        dp_size: usize,
+        sp_size: usize,
+        free_blocks: Vec<Vec<i32>>,
+    ) -> PyResult<PyObject> {
+        let dict = PyDict::new(py);
+        let mut group_batch_sizes = Vec::with_capacity(dp_size);
+        for dp_idx in 0..dp_size {
+            let mut per_sp = Vec::with_capacity(sp_size);
+            for sp_idx in 0..sp_size {
+                let idx = dp_idx * sp_size + sp_idx;
+                per_sp.push(
+                    self.filtered_dp_group_seqs
+                        .get(idx)
+                        .map(|seqs| seqs.len() as i32)
+                        .unwrap_or(0),
+                );
+            }
+            group_batch_sizes.push(per_sp);
+        }
+        dict.set_item("mode", if self.is_prefill { "prefill" } else { "decode" })?;
+        dict.set_item("group_batch_sizes", group_batch_sizes)?;
+        dict.set_item("group_send_counts", self.group_send_counts.clone())?;
+        dict.set_item("group_recv_counts", self.group_recv_counts.clone())?;
+        dict.set_item("waiting_head_blocks", self.waiting_head_blocks)?;
+        dict.set_item("waiting_total_blocks", self.waiting_total_blocks)?;
+        dict.set_item("group_q_matrix", self.group_q_matrix.clone())?;
+        dict.set_item("free_blocks", free_blocks)?;
+        Ok(dict.into())
     }
 }

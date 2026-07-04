@@ -4,8 +4,8 @@ This lives in the engine (``LLMEngine``) rather than the HTTP server so that it
 captures every request regardless of how the engine is driven:
 
 - ``dlengine serve`` (the engine runs in its own process), and
-- offline scripts that construct ``LLM`` / ``LLMEngine`` directly and call
-  ``generate()`` (no HTTP server, no asyncio event loop).
+- offline scripts that construct ``LLM`` directly and drive it via
+  ``dlengine.offline.generate`` (no HTTP server, no asyncio event loop).
 
 Because the engine step loop is synchronous and on the latency-critical path,
 writes are handed to a background daemon thread via a bounded queue and never

@@ -1,12 +1,14 @@
 import argparse
 import os
 import time
+import uuid
 from dataclasses import asdict
 from random import randint, seed
 
 import numpy as np
 import pandas as pd
 from dlengine import LLM, SamplingParams
+from dlengine._rust.proto import RequestIn
 from tqdm.auto import tqdm
 
 # Constants
@@ -204,7 +206,8 @@ def run_benchmark(engine, prompts, sampling_params_list, arrival_times, num_requ
                 prompt = prompts[requests_sent]
                 sp = sampling_params_list[requests_sent]
 
-                seq_id = engine.add_request(prompt, sampling_params=sp)
+                seq_id = uuid.uuid4().int & ((1 << 63) - 1)
+                engine.add_request_payload(RequestIn(seq_id, prompt, sp, 0).to_bytes())
                 submit_times[seq_id] = time.perf_counter()
                 requests_sent += 1
 

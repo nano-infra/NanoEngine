@@ -57,6 +57,7 @@ impl Scheduler {
                 };
 
                 if cur_tokens < prefill_target {
+                    self.commit_hbm_blocks(py, seq, cur_tokens);
                     let metric = {
                         let mut s = seq.borrow_mut(py);
                         s.num_cached_tokens = cur_tokens;
@@ -75,6 +76,9 @@ impl Scheduler {
                     if s.status == 4 {
                         s.status = 1;
                     }
+                }
+                if cur_tokens >= prefill_target {
+                    self.commit_hbm_blocks(py, seq, prefill_target);
                 }
 
                 for (token_offset, token) in tokens.iter().copied().enumerate() {
@@ -223,5 +227,22 @@ impl Scheduler {
             return true;
         }
         false
+    }
+
+    fn commit_hbm_blocks(&mut self, py: Python<'_>, seq: &Py<Sequence>, committed_tokens: i32) {
+        let (seq_id, dp_idx, group_id, token_ids) = {
+            let s = seq.borrow(py);
+            (
+                s.seq_id,
+                s.active_dp_idx.max(0) as usize,
+                s.active_group_id.max(0) as usize,
+                s.token_ids.clone(),
+            )
+        };
+        if dp_idx >= self.dp() || group_id >= self.group() {
+            return;
+        }
+        let flat = self.flat_idx(dp_idx, group_id);
+        self.hbm_pools[flat].commit_ready(seq_id, &token_ids, committed_tokens);
     }
 }

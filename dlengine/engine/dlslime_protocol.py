@@ -43,6 +43,10 @@ def decode_run_result(data: bytes):
     return RunnerOut.from_bytes(data).result
 
 
+def decode_runner_out(data: bytes) -> RunnerOut:
+    return RunnerOut.from_bytes(data)
+
+
 def server_handler_ns(data: bytes) -> int:
     """Read the remote decode + forward duration from a RunnerOut payload."""
     return int(RunnerOut.from_bytes(data).server_handler_ns)

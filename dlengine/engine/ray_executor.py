@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 
+from dlengine._rust.proto import RunnerOut
 from dlengine.config import Config
 from dlengine.logging import get_logger
 from dlengine.worker.model_runner import ModelRunner
@@ -347,6 +348,9 @@ class RayExecutor:
     def run_wait(self, handle: dict) -> list[list[list[int]]]:
         return ray.get(handle["futures"])
 
+    def run_wait_runner_outs(self, handle: dict) -> list[RunnerOut]:
+        return [self._to_runner_out(result) for result in ray.get(handle["futures"])]
+
     def run(
         self,
         batch_bytes: List[bytes],
@@ -358,6 +362,14 @@ class RayExecutor:
             handle["futures"],
             timeout=timeout,
         )
+
+    @staticmethod
+    def _to_runner_out(result) -> RunnerOut:
+        if isinstance(result, tuple):
+            token_ids, logprobs = result
+        else:
+            token_ids, logprobs = result, None
+        return RunnerOut(token_ids, logprobs, 0)
 
     def update_kvcache_blocks(self):
         num_cache_blocks = min(self.collective_rpc("num_kvcache_blocks"))

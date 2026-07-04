@@ -12,6 +12,7 @@ mod router;
 mod scheduler;
 mod sequence;
 mod snapshots;
+mod table;
 
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {

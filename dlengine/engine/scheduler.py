@@ -39,6 +39,7 @@ def build_scheduler_config(
         mode=config.mode,
         routing_strategy=RoutingStrategy[config.routing_strategy],
         gdn_state_cache_slots=max(0, getattr(config, "gdn_state_cache_slots", 0)),
+        enable_prefix_cache=bool(getattr(config, "enable_prefix_cache", True)),
         cache_plan=cache_plan,
     )
 

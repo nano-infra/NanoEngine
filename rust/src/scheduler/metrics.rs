@@ -27,8 +27,7 @@ impl Scheduler {
                         (0..group)
                             .map(|group_id| {
                                 let idx = dp_idx * group + group_id;
-                                self.config.num_kvcache_blocks.max(0)
-                                    - self.group_resources[idx].free_blocks.len() as i32
+                                self.hbm_pools[idx].num_used_blocks()
                             })
                             .sum()
                     })
@@ -42,7 +41,7 @@ impl Scheduler {
                         (0..group)
                             .map(|group_id| {
                                 let idx = dp_idx * group + group_id;
-                                self.group_resources[idx].free_blocks.len() as i32
+                                self.hbm_pools[idx].num_free_blocks() as i32
                             })
                             .collect()
                     })
@@ -76,6 +75,12 @@ impl Scheduler {
         dp_group_token_ids: Option<Vec<Vec<Vec<i32>>>>,
     ) -> StepMetricSnapshot {
         let mut snapshot = StepMetricSnapshot::default();
+        let dp = self.config.attention_dp.max(1) as usize;
+        snapshot.prefill_tokens_per_dp = vec![0; dp];
+        snapshot.decode_tokens_per_dp = vec![0; dp];
+        snapshot.prefix_cached_tokens_per_dp = vec![0; dp];
+        snapshot.prefix_prompt_tokens_per_dp = vec![0; dp];
+
         metric.update_running_requests(self.running.iter().map(|seqs| seqs.len() as i32).sum());
         metric.update_waiting_requests(self.waiting.len() as i32);
         metric.update_waiting_migration_requests(self.waiting_migration.len() as i32);
@@ -106,11 +111,18 @@ impl Scheduler {
                 .flat_map(|group| group.iter())
                 .map(|seq_tokens| seq_tokens.len() as i32)
                 .sum();
+            let group = self.config.group_size.max(1) as usize;
+            for (group_idx, group_tokens) in tokens.iter().enumerate() {
+                let dp_idx = group_idx / group;
+                if dp_idx >= snapshot.decode_tokens_per_dp.len() {
+                    continue;
+                }
+                snapshot.decode_tokens_per_dp[dp_idx] += group_tokens
+                    .iter()
+                    .map(|seq_tokens| seq_tokens.len() as i32)
+                    .sum::<i32>();
+            }
         }
-        snapshot.prefill_tokens_per_dp = vec![0; self.config.attention_dp.max(1) as usize];
-        snapshot.decode_tokens_per_dp = vec![0; self.config.attention_dp.max(1) as usize];
-        snapshot.prefix_cached_tokens_per_dp = vec![0; self.config.attention_dp.max(1) as usize];
-        snapshot.prefix_prompt_tokens_per_dp = vec![0; self.config.attention_dp.max(1) as usize];
         snapshot
     }
 }

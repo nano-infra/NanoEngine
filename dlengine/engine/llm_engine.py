@@ -1,64 +1,17 @@
 import atexit
+import logging
 import time
-import uuid
 from dataclasses import dataclass
-from time import perf_counter
 from typing import Any, Optional, Set
-
-from tqdm.auto import tqdm
-from transformers import PreTrainedTokenizerFast
 
 from dlengine.config import Config
 from dlengine.engine.scheduler import ensure_cache_plan, init_scheduler
 from dlengine.logging import get_logger, set_log_level
 from dlengine.metrics import MetricsManager
 from dlengine.metrics.dump import EngineMetricDumper
+from dlengine.models.trait import load_tokenizer_and_eos
 
 logger = get_logger()
-
-
-def _vision_slot_tuple(slot) -> tuple[str, int, int, int, int]:
-    if isinstance(slot, dict):
-        return (
-            str(slot["encoder_engine_id"]),
-            int(slot["slot_idx"]),
-            int(slot["num_tokens"]),
-            int(slot["hidden_size"]),
-            int(slot["max_tokens_per_slot"]),
-        )
-    return (
-        str(slot.encoder_engine_id),
-        int(slot.slot_idx),
-        int(slot.num_tokens),
-        int(slot.hidden_size),
-        int(slot.max_tokens_per_slot),
-    )
-
-
-def _split_run_result(per_dp_results):
-    """Normalise the executor's per-DP result list.
-
-    Each element is either ``list[list[int]]`` (legacy or logprobs
-    disabled) or ``(list[list[int]], list[list[float]] | None)`` when
-    SamplingParams.return_completion_logprobs is on for any seq in the
-    batch. We return ``(token_ids, logprobs)`` where ``logprobs`` is None
-    iff *no* DP shard shipped logprobs (matches the scheduler's empty
-    fallback that skips Sequence.completion_logprobs population).
-    """
-    token_ids = []
-    logprobs = []
-    any_logprobs = False
-    for r in per_dp_results:
-        if isinstance(r, tuple):
-            ids, lp = r
-            token_ids.append(ids)
-            logprobs.append(lp if lp is not None else [])
-            if lp is not None:
-                any_logprobs = True
-        else:
-            token_ids.append(r)
-            logprobs.append([])
-    return token_ids, (logprobs if any_logprobs else None)
 
 
 def _build_executor(config: Config):
@@ -104,6 +57,7 @@ class PendingStep:
     handle: Optional[dict] = None
     # Filled by step_finish():
     token_ids: Optional[list] = None
+    runner_outs: Optional[list] = None
     post_sch_begin: float = 0.0
     post_sch_end: float = 0.0
     forward_tx_bytes: int = 0
@@ -117,39 +71,18 @@ class PendingStep:
 
 class LLMEngine:
     def __init__(self, config: Config):
-        self.engine_id = str(uuid.uuid4())
-
         self.config = config
-        self.config.engine_id = self.engine_id
+        self.engine_id = self.config.engine_id
 
         # Set log level globally first
         if self.config.log_level:
             set_log_level(self.config.log_level)
 
-        self.ps = []
-        self.events = []
-
         ensure_cache_plan(config)
         self.executor = _build_executor(config)
         self.update_num_kvcache_blocks()
 
-        self.tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
-        eos_ids = set()
-        if self.tokenizer.eos_token_id is not None:
-            eos_ids.add(self.tokenizer.eos_token_id)
-        # Prefer generation_config.json eos_token_id (may differ from tokenizer)
-        try:
-            from transformers import GenerationConfig
-
-            gen_config = GenerationConfig.from_pretrained(config.model)
-            gen_eos = gen_config.eos_token_id
-            if isinstance(gen_eos, list):
-                eos_ids.update(gen_eos)
-            elif gen_eos is not None:
-                eos_ids.add(gen_eos)
-        except Exception:
-            pass
-        config.eos = sorted(eos_ids)
+        self.tokenizer, config.eos = load_tokenizer_and_eos(config.model)
 
         self.scheduler = init_scheduler(config)
         logger.info(
@@ -158,7 +91,7 @@ class LLMEngine:
         self.metrics_manager = MetricsManager()
 
         # Engine-side request/metric dumper (Redis). Lives here (not in the HTTP
-        # server) so it also fires for offline ``generate()`` usage. Captures the
+        # server) so it also fires for offline generation usage. Captures the
         # exact tokenized prompt at admission and per-request latency (incl.
         # chunk-prefill timing) at completion. No-op unless enabled.
         self._metric_dumper = EngineMetricDumper(
@@ -204,10 +137,6 @@ class LLMEngine:
     def get_attn_world_size(self):
         return self.config.attn_world_size
 
-    def get_peer_agent_addrs(self) -> list[str]:
-        """Get peer agent addresses from all workers."""
-        return self.executor.get_peer_agent_addrs()
-
     def update_weights(self, named_tensors: dict[str, "torch.Tensor"]) -> list[dict]:
         """Apply HF-named full tensors to the live model on every worker.
 
@@ -234,36 +163,10 @@ class LLMEngine:
             (manifest_blob, train_alias),
         )
 
-    def add_request(
-        self,
-        prompt_token_ids: list[int],
-        sampling_params,
-        seq_id: int | None = None,
-        affinity_key: int = 0,
-        vision_slots: list | None = None,
-    ) -> int:
-        """Submit one local request directly into the Rust scheduler."""
-        if seq_id is None:
-            seq_id = uuid.uuid4().int & ((1 << 63) - 1)
-            if seq_id < 8:
-                seq_id += 8
-        added_seq_id, prompt_len = self.scheduler.add_request(
-            int(seq_id),
-            [int(t) for t in prompt_token_ids],
-            sampling_params,
-            int(affinity_key),
-            [_vision_slot_tuple(slot) for slot in (vision_slots or [])],
-        )
-        self._register_added_requests([(added_seq_id, prompt_len)])
-        return int(seq_id)
-
     def add_request_payload(self, payload: bytes):
         added = self.scheduler.add_request_bytes(payload)
         self._register_added_requests(added)
-
-    def add_migration_request(self, request):
-        added = self.scheduler.add_request_bytes(request.payload)
-        self._register_added_requests(added)
+        return added
 
     def _register_added_requests(self, added):
         for seq_id, prompt_len in added:
@@ -300,67 +203,32 @@ class LLMEngine:
         request on a decode engine) runs synchronously here since it has no
         forward to overlap.
         """
-        dp_size = self.config.attention_dp
-        sp_size = self.config.attention_sp
         tp_size = self.config.attention_tp
         sch_begin = time.time()
         sch_res = self.scheduler.schedule()
-        dp_seqs = sch_res.dp_seqs
         is_prefill = sch_res.is_prefill
         dp_group_seqs = sch_res.dp_group_seqs
-        filtered_dp_group_seqs = sch_res.filtered_dp_group_seqs
 
         scheduler_metric = self.scheduler.update_server_metric(
             self.metrics_manager.server_metric, sch_res
         )
 
-        waiting_migration_head_num_tokens = (
-            scheduler_metric.waiting_migration_head_tokens
-        )
-        if waiting_migration_head_num_tokens >= 0:
-            logger.info(f"{waiting_migration_head_num_tokens=}")
-
-        # dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
-        group_batch_sizes = [
-            [
-                len(filtered_dp_group_seqs[dp_idx * sp_size + sp_idx])
-                for sp_idx in range(sp_size)
-            ]
-            for dp_idx in range(dp_size)
-        ]
-
-        group_send_counts = sch_res.group_send_counts
-        group_recv_counts = sch_res.group_recv_counts
-        # group_comm_matrix = sch_res.group_comm_matrix
-        group_q_matrix = sch_res.group_q_matrix
-        # group_res_matrix = sch_res.group_res_matrix
-
-        waiting_head_blocks = sch_res.waiting_head_blocks
-        waiting_total_blocks = sch_res.waiting_total_blocks
-
-        logger.debug(
-            {
-                "mode": "prefill" if is_prefill else "decode",
-                # "dp_batch_sizes": dp_batch_sizes,
-                "group_batch_sizes": group_batch_sizes,
-                "group_send_counts": group_send_counts,
-                "group_recv_counts": group_recv_counts,
-                "waiting_head_blocks": waiting_head_blocks,
-                "waiting_total_blocks": waiting_total_blocks,
-                # "group_comm_matrix": group_comm_matrix,
-                "group_q_matrix": group_q_matrix,
-                # "group_res_matrix": group_res_matrix,
-                "free_blocks": scheduler_metric.free_blocks,
-            }
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                sch_res.debug_summary(
+                    self.config.attention_dp,
+                    self.config.attention_sp,
+                    scheduler_metric.free_blocks,
+                )
+            )
 
         sch_end = time.time()
 
         pending = PendingStep(
-            dp_seqs=dp_seqs,
+            dp_seqs=sch_res.dp_seqs,
             schedule_result=sch_res,
             is_prefill=is_prefill,
-            filtered_dp_group_seqs=filtered_dp_group_seqs,
+            filtered_dp_group_seqs=sch_res.filtered_dp_group_seqs,
             scheduler_metric=scheduler_metric,
             sch_begin=sch_begin,
             sch_end=sch_end,
@@ -399,13 +267,12 @@ class LLMEngine:
         step_complete() so they can be overlapped with the next forward.
         """
         tp_size = self.config.attention_tp
-        token_ids = None
-        token_logprobs = None
+        runner_outs = None
         if pending.handle is not None:
             # Each per-DP result is either ``list[list[int]]`` (legacy /
             # logprobs disabled) or ``(list[list[int]], list[list[float]])``
             # when SamplingParams.return_completion_logprobs is on.
-            raw = self.executor.run_wait(pending.handle)[::tp_size]
+            runner_outs = self.executor.run_wait_runner_outs(pending.handle)[::tp_size]
             pending.forward_tx_bytes = getattr(
                 self.executor, "last_run_request_bytes", 0
             )
@@ -415,24 +282,20 @@ class LLMEngine:
             pending.immrecv_ms = getattr(self.executor, "last_run_immrecv_ms", 0.0)
             pending.net_ms = getattr(self.executor, "last_run_net_ms", 0.0)
             pending.serialize_ms = getattr(self.executor, "last_run_serialize_ms", 0.0)
-            token_ids, token_logprobs = _split_run_result(raw)
             pending.post_sch_begin = time.time()
-            if token_logprobs is not None:
-                self.scheduler.postprocess(
-                    pending.filtered_dp_group_seqs,
-                    token_ids,
-                    True,
-                    token_logprobs,
-                )
-            else:
-                self.scheduler.postprocess(
-                    pending.filtered_dp_group_seqs, token_ids, True
-                )
+            self.scheduler.postprocess_runner_outs(
+                pending.filtered_dp_group_seqs,
+                runner_outs,
+                True,
+            )
             pending.post_sch_end = time.time()
         else:
             pending.post_sch_begin = time.time()
             pending.post_sch_end = pending.post_sch_begin
-        pending.token_ids = token_ids
+        pending.runner_outs = runner_outs
+        pending.token_ids = (
+            [out.token_ids for out in runner_outs] if runner_outs else None
+        )
 
         return StepResult(
             dp_seqs=pending.dp_seqs,
@@ -459,13 +322,18 @@ class LLMEngine:
         loop calls this in the shadow of the next GPU forward.
         """
         dp_seqs = pending.dp_seqs
-        token_ids = pending.token_ids
-
-        metric_snapshot = self.scheduler.record_step_metric(
-            self.metrics_manager.server_metric,
-            pending.schedule_result,
-            token_ids or [],
-        )
+        if pending.runner_outs is not None:
+            metric_snapshot = self.scheduler.record_step_metric_runner_outs(
+                self.metrics_manager.server_metric,
+                pending.schedule_result,
+                pending.runner_outs,
+            )
+        else:
+            metric_snapshot = self.scheduler.record_step_metric(
+                self.metrics_manager.server_metric,
+                pending.schedule_result,
+                pending.token_ids or [],
+            )
         result.prefill_tokens = metric_snapshot.prefill_tokens
         result.decode_tokens = metric_snapshot.decode_tokens
 
@@ -481,8 +349,8 @@ class LLMEngine:
         result.real_bs = metric_snapshot.real_bs
 
         # Periodic engine status report (throttling/accounting live in the
-        # metrics manager; this path drives step() directly, bypassing
-        # generate(), so it is what produces the serve-mode heartbeat).
+        # metrics manager). The serve loop reaches this path directly, so this
+        # is what produces the serve-mode heartbeat.
         try:
             resource_metric = self.scheduler.metric_snapshot()
             blocks_per_dp = resource_metric.total_blocks_per_dp
@@ -526,8 +394,8 @@ class LLMEngine:
     def step(self):
         """Synchronous one-step execution (schedule + forward + bookkeeping).
 
-        Kept for generate() and other non-pipelined callers; the backend
-        server loop uses step_begin/step_finish/step_complete directly to
+        Kept for offline generation and other non-pipelined callers; the
+        backend server loop uses step_begin/step_finish/step_complete directly to
         overlap driver bookkeeping with the next GPU forward.
         """
         pending = self.step_begin()
@@ -536,105 +404,3 @@ class LLMEngine:
 
     def is_finished(self):
         return self.scheduler.is_finished()
-
-    def generate(
-        self,
-        use_tqdm: bool = True,
-        log_metrics_interval: int = 10,
-        return_serialized: bool = False,
-    ) -> list[dict] | list[bytes]:
-        num_reqs = self.scheduler.num_waiting()
-        if use_tqdm:
-            pbar = tqdm(total=num_reqs, desc="Generating", dynamic_ncols=True)
-
-        outputs_by_seq: dict[int, dict] = {}
-        serialized_outputs: list[bytes] = []
-        completed_seq_ids: set[int] = set()
-        prefill_throughput = decode_throughput = 0.0
-        step_count = 0
-
-        # Window-based throughput tracking
-        window_start = perf_counter()
-        window_tokens = 0
-        window_interval = 5.0  # seconds
-        last_tqdm_update = perf_counter()
-        tqdm_interval = 1.0  # seconds
-
-        while not self.is_finished():
-            t = perf_counter()
-            result = self.step()
-            step_count += 1
-            step_duration = perf_counter() - t
-
-            if result.prefill_tokens > 0:
-                prefill_throughput = result.prefill_tokens / step_duration
-                self.metrics_manager.server_metric.record_prefill_throughput(
-                    result.prefill_tokens, step_duration
-                )
-            if result.decode_tokens > 0:
-                self.metrics_manager.server_metric.record_decode_throughput(
-                    result.decode_tokens, step_duration
-                )
-                window_tokens += result.decode_tokens
-
-            # Periodic throughput reporting
-            now = perf_counter()
-            window_elapsed = now - window_start
-            if window_elapsed >= window_interval and window_tokens > 0:
-                decode_throughput = window_tokens / window_elapsed
-                logger.info(
-                    f"[Throughput] {decode_throughput:.0f} tok/s "
-                    f"({window_tokens} tokens in {window_elapsed:.1f}s, "
-                    f"bs={result.real_bs}, step={step_count})"
-                )
-                window_start = now
-                window_tokens = 0
-
-            # Update tqdm periodically (not every step)
-            if use_tqdm and (now - last_tqdm_update >= tqdm_interval):
-                last_tqdm_update = now
-                pbar.set_postfix(
-                    {
-                        "bs": f"{result.real_bs}",
-                        "Prefill": f"{int(prefill_throughput)}tok/s",
-                        "Decode": f"{int(decode_throughput)}tok/s",
-                        "step": f"{step_count}",
-                    }
-                )
-            for event in result.outputs:
-                seq_id = int(event["seq_id"])
-                if event["num_tokens"] > 0 and not event["is_to_be_migrated"]:
-                    output = outputs_by_seq.setdefault(
-                        seq_id,
-                        {
-                            "seq_id": seq_id,
-                            "token_ids": [],
-                            "is_finished": False,
-                        },
-                    )
-                    output["token_ids"].append(int(event["last_token"]))
-                if event["is_to_be_migrated"] and event.get("migration_payload"):
-                    serialized_outputs.append(bytes(event["migration_payload"]))
-                if event["is_finished"] or event["is_to_be_migrated"]:
-                    outputs_by_seq.setdefault(
-                        seq_id,
-                        {
-                            "seq_id": seq_id,
-                            "token_ids": [],
-                            "is_finished": bool(event["is_finished"]),
-                        },
-                    )["is_finished"] = bool(event["is_finished"])
-                    if seq_id in completed_seq_ids:
-                        continue
-                    completed_seq_ids.add(seq_id)
-                    if use_tqdm:
-                        pbar.update(1)
-        if use_tqdm:
-            pbar.close()
-
-        self.metrics_manager.log_final_summary()
-
-        if return_serialized:
-            return serialized_outputs
-
-        return list(outputs_by_seq.values())

@@ -7,10 +7,12 @@ Usage:
 
 import os
 import sys
+import uuid
 
-from dlengine._rust.proto import SamplingParams
+from dlengine._rust.proto import RequestIn, SamplingParams
 from dlengine.config import Config
 from dlengine.llm_component import LLM
+from dlengine.offline import generate
 from jsonargparse import ActionConfigFile, ArgumentParser
 from transformers import PreTrainedTokenizerFast
 
@@ -62,14 +64,18 @@ def main():
             )
         return tokenizer.encode(prompt)
 
-    seq_ids = [
-        llm.add_request(
-            encode_prompt(p),
-            sampling_params=sampling_params,
-        )
-        for p in prompts
-    ]
-    outputs = {out["seq_id"]: out for out in llm.generate()}
+    seq_ids = []
+    for prompt in prompts:
+        seq_id = uuid.uuid4().int & ((1 << 63) - 1)
+        payload = RequestIn(
+            seq_id,
+            encode_prompt(prompt),
+            sampling_params,
+            0,
+        ).to_bytes()
+        llm.add_request_payload(payload)
+        seq_ids.append(seq_id)
+    outputs = {out["seq_id"]: out for out in generate(llm)}
 
     for prompt, seq_id in zip(prompts, seq_ids):
         token_ids = outputs.get(seq_id, {}).get("token_ids", [])

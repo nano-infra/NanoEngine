@@ -45,8 +45,42 @@ def has_layer_type(hf_config: Any, layer_type: str) -> bool:
     return visit(hf_config)
 
 
+def resolve_eos_token_ids(model: str, tokenizer: Any) -> list[int]:
+    """Resolve all EOS token ids declared by tokenizer and generation config."""
+    eos_ids: set[int] = set()
+    tokenizer_eos = getattr(tokenizer, "eos_token_id", None)
+    if tokenizer_eos is not None:
+        eos_ids.add(int(tokenizer_eos))
+
+    try:
+        from transformers import GenerationConfig
+
+        gen_config = GenerationConfig.from_pretrained(model)
+    except Exception:
+        gen_config = None
+
+    if gen_config is not None:
+        gen_eos = getattr(gen_config, "eos_token_id", None)
+        if isinstance(gen_eos, list):
+            eos_ids.update(int(eos) for eos in gen_eos if eos is not None)
+        elif gen_eos is not None:
+            eos_ids.add(int(gen_eos))
+
+    return sorted(eos_ids)
+
+
+def load_tokenizer_and_eos(model: str) -> tuple[Any, list[int]]:
+    """Load the fast tokenizer and resolve model EOS token ids together."""
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(model)
+    return tokenizer, resolve_eos_token_ids(model, tokenizer)
+
+
 __all__ = [
     "has_gdn_component",
     "has_hca_csa_cache",
     "has_layer_type",
+    "load_tokenizer_and_eos",
+    "resolve_eos_token_ids",
 ]

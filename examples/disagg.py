@@ -17,9 +17,10 @@ Usage:
 
 import os
 import sys
+import uuid
 
 import ray
-from dlengine._rust.proto import RequestMigrate, SamplingParams
+from dlengine._rust.proto import RequestIn, RequestMigrate, SamplingParams
 from dlengine.config import Config
 from dlengine.llm_component import LLMComponent
 from jsonargparse import ActionConfigFile, ArgumentParser
@@ -120,14 +121,16 @@ def main():
         return tokenizer.encode(text)
 
     prompt_token_ids = encode_prompt(args.prompt)
+    seq_id = uuid.uuid4().int & ((1 << 63) - 1)
+    request_payload = RequestIn(
+        seq_id,
+        prompt_token_ids,
+        sampling_params,
+        0,
+    ).to_bytes()
 
     # --- Prefill ---
-    ray.get(
-        prefill.add_request.remote(
-            prompt_token_ids,
-            sampling_params=sampling_params,
-        )
-    )
+    ray.get(prefill.add_request_payload.remote(request_payload))
     migration_payloads = ray.get(prefill.generate.remote(return_serialized=True))
 
     print(f"\nPrefill returned {len(migration_payloads)} migration payloads.")

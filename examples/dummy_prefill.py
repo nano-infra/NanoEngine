@@ -1,8 +1,10 @@
 import os
+import uuid
 
 import numpy as np
-from dlengine._rust.proto import SamplingParams
+from dlengine._rust.proto import RequestIn, SamplingParams
 from dlengine.llm_component import LLM
+from dlengine.offline import generate
 from transformers import AutoTokenizer
 
 
@@ -56,8 +58,11 @@ def main():
     ]
 
     for prompt in long_prompts + short_prompts:
-        decode.add_request(prompt, sampling_params=sampling_params)
-    decode.generate()
+        seq_id = uuid.uuid4().int & ((1 << 63) - 1)
+        decode.add_request_payload(
+            RequestIn(seq_id, prompt, sampling_params, 0).to_bytes()
+        )
+    generate(decode)
 
 
 if __name__ == "__main__":

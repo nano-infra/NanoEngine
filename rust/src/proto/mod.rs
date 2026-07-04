@@ -5,7 +5,7 @@ mod prepare;
 mod serialization;
 pub(crate) mod wire;
 
-use metadata::{
+pub(crate) use metadata::{
     BatchAuxData, DecodeMeta, FreeSequences, FreeVisionSlots, MigrateSequenceView, MigrationIn,
     Packet, PrefillMeta, RequestIn, RequestMigrate, RunnerIn, RunnerOut, StepOut,
 };

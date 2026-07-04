@@ -1,169 +1,11 @@
+use super::runner::RunnerMetricSource;
+use super::stats::average;
 use crate::common::now_seconds;
+use crate::proto::RunnerOut;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
 
-#[pyclass(module = "dlengine._engine", subclass)]
-pub struct SequenceMetric {
-    #[pyo3(get, set)]
-    pub seq_id: u64,
-    #[pyo3(get, set)]
-    pub arrival_time: Option<f64>,
-    #[pyo3(get, set)]
-    pub first_scheduled_time: Option<f64>,
-    #[pyo3(get, set)]
-    pub decode_arrival_time: Option<f64>,
-    #[pyo3(get, set)]
-    pub decode_scheduled_time: Option<f64>,
-    #[pyo3(get, set)]
-    pub first_token_time: Option<f64>,
-    #[pyo3(get, set)]
-    pub completion_time: Option<f64>,
-    #[pyo3(get, set)]
-    pub num_prompt_tokens: i32,
-    #[pyo3(get, set)]
-    pub num_generated_tokens: i32,
-    #[pyo3(get, set)]
-    pub itl_samples: Vec<f64>,
-    #[pyo3(get, set)]
-    pub last_token_time: Option<f64>,
-    #[pyo3(get, set)]
-    pub num_prefill_chunks: i32,
-    #[pyo3(get, set)]
-    pub prefill_chunk_samples: Vec<f64>,
-    #[pyo3(get, set)]
-    pub last_chunk_time: Option<f64>,
-}
-
-#[pymethods]
-impl SequenceMetric {
-    #[new]
-    #[pyo3(signature = (seq_id, num_prompt_tokens = 0))]
-    fn new(seq_id: u64, num_prompt_tokens: i32) -> Self {
-        Self {
-            seq_id,
-            arrival_time: None,
-            first_scheduled_time: None,
-            decode_arrival_time: None,
-            decode_scheduled_time: None,
-            first_token_time: None,
-            completion_time: None,
-            num_prompt_tokens,
-            num_generated_tokens: 0,
-            itl_samples: Vec::new(),
-            last_token_time: None,
-            num_prefill_chunks: 0,
-            prefill_chunk_samples: Vec::new(),
-            last_chunk_time: None,
-        }
-    }
-
-    pub(crate) fn record_arrival(&mut self) {
-        self.arrival_time = Some(now_seconds());
-    }
-    pub(crate) fn record_first_scheduled(&mut self) {
-        self.first_scheduled_time = Some(now_seconds());
-    }
-    pub(crate) fn record_decode_arrival(&mut self) {
-        self.decode_arrival_time = Some(now_seconds());
-    }
-    pub(crate) fn record_decode_scheduled(&mut self) {
-        self.decode_scheduled_time = Some(now_seconds());
-    }
-    pub(crate) fn record_first_token(&mut self) {
-        let now = now_seconds();
-        if self.first_token_time.is_none() {
-            self.first_token_time = Some(now);
-        }
-        self.last_token_time = Some(now);
-        self.num_generated_tokens += 1;
-    }
-    pub(crate) fn record_token(&mut self) {
-        let now = now_seconds();
-        if let Some(last) = self.last_token_time {
-            self.itl_samples.push((now - last) * 1000.0);
-        }
-        self.last_token_time = Some(now);
-        self.num_generated_tokens += 1;
-    }
-    pub(crate) fn record_completion(&mut self) {
-        self.completion_time = Some(now_seconds());
-    }
-    pub(crate) fn record_prefill_chunk(&mut self) {
-        let now = now_seconds();
-        let last = self
-            .last_chunk_time
-            .or(self.first_scheduled_time)
-            .unwrap_or(now);
-        self.prefill_chunk_samples.push((now - last) * 1000.0);
-        self.last_chunk_time = Some(now);
-        self.num_prefill_chunks += 1;
-    }
-
-    #[getter]
-    fn ttft(&self) -> Option<f64> {
-        Some((self.first_token_time? - self.arrival_time?) * 1000.0)
-    }
-    #[getter]
-    fn e2e_latency(&self) -> Option<f64> {
-        Some((self.completion_time? - self.arrival_time?) * 1000.0)
-    }
-    #[getter]
-    fn avg_tpot_wo_queueing(&self) -> Option<f64> {
-        if self.itl_samples.is_empty() {
-            None
-        } else {
-            Some(self.itl_samples.iter().sum::<f64>() / self.itl_samples.len() as f64)
-        }
-    }
-    #[getter]
-    fn avg_tpot_with_queueing(&self) -> Option<f64> {
-        let total = (self.completion_time? - self.arrival_time?) * 1000.0;
-        if self.num_generated_tokens <= 0 {
-            None
-        } else {
-            Some(total / self.num_generated_tokens as f64)
-        }
-    }
-    #[getter]
-    fn queueing_time_ms(&self) -> Option<f64> {
-        Some((self.first_scheduled_time? - self.arrival_time?) * 1000.0)
-    }
-    #[getter]
-    fn decode_queue_time_ms(&self) -> Option<f64> {
-        Some((self.decode_scheduled_time? - self.decode_arrival_time?) * 1000.0)
-    }
-    #[getter]
-    fn avg_itl(&self) -> Option<f64> {
-        self.avg_tpot_wo_queueing()
-    }
-    #[getter]
-    fn p50_itl(&self) -> Option<f64> {
-        percentile(&self.itl_samples, 0.50)
-    }
-    #[getter]
-    fn p99_itl(&self) -> Option<f64> {
-        percentile(&self.itl_samples, 0.99)
-    }
-    #[getter]
-    fn prefill_time_ms(&self) -> Option<f64> {
-        if self.prefill_chunk_samples.is_empty() {
-            None
-        } else {
-            Some(self.prefill_chunk_samples.iter().sum())
-        }
-    }
-}
-
-fn percentile(values: &[f64], q: f64) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
-    sorted.get(idx).copied()
-}
 #[pyclass(module = "dlengine._engine")]
 pub struct ServerMetric {
     #[pyo3(get, set)]
@@ -233,7 +75,7 @@ impl ServerMetric {
         self.num_waiting_migration_requests = count;
     }
 
-    fn add_completed_request(&mut self) {
+    pub(crate) fn add_completed_request(&mut self) {
         self.num_completed_requests += 1;
     }
 
@@ -243,27 +85,31 @@ impl ServerMetric {
     }
 
     #[pyo3(signature = (num_prompt = 0, num_generated = 0))]
-    fn add_tokens(&mut self, num_prompt: i64, num_generated: i64) {
+    pub(crate) fn add_tokens(&mut self, num_prompt: i64, num_generated: i64) {
         self.total_prompt_tokens += num_prompt;
         self.total_generated_tokens += num_generated;
         self.total_tokens += num_prompt + num_generated;
     }
 
-    fn record_prefill_throughput(&mut self, num_tokens: i64, duration: f64) {
+    pub(crate) fn add_runner_out_tokens(&mut self, runner_out: &RunnerOut) {
+        self.add_tokens(0, runner_out.generated_token_count());
+    }
+
+    pub(crate) fn record_prefill_throughput(&mut self, num_tokens: i64, duration: f64) {
         if duration > 0.0 {
             self.prefill_throughput_samples
                 .push(num_tokens as f64 / duration);
         }
     }
 
-    fn record_decode_throughput(&mut self, num_tokens: i64, duration: f64) {
+    pub(crate) fn record_decode_throughput(&mut self, num_tokens: i64, duration: f64) {
         if duration > 0.0 {
             self.decode_throughput_samples
                 .push(num_tokens as f64 / duration);
         }
     }
 
-    fn update_token_usage(&mut self, dp_idx: i32, num_tokens: i64) {
+    pub(crate) fn update_token_usage(&mut self, dp_idx: i32, num_tokens: i64) {
         *self.token_usage_by_dp.entry(dp_idx).or_insert(0) += num_tokens;
     }
 
@@ -289,17 +135,17 @@ impl ServerMetric {
     }
 
     #[getter]
-    fn total_token_usage(&self) -> i64 {
+    pub(crate) fn total_token_usage(&self) -> i64 {
         self.token_usage_by_dp.values().sum()
     }
 
     #[getter]
-    fn uptime(&self) -> f64 {
+    pub(crate) fn uptime(&self) -> f64 {
         now_seconds() - self.start_time
     }
 
     #[getter]
-    fn current_prefill_throughput(&self) -> f64 {
+    pub(crate) fn current_prefill_throughput(&self) -> f64 {
         self.prefill_throughput_samples
             .last()
             .copied()
@@ -307,7 +153,7 @@ impl ServerMetric {
     }
 
     #[getter]
-    fn current_decode_throughput(&self) -> f64 {
+    pub(crate) fn current_decode_throughput(&self) -> f64 {
         self.decode_throughput_samples
             .last()
             .copied()
@@ -315,12 +161,12 @@ impl ServerMetric {
     }
 
     #[getter]
-    fn avg_prefill_throughput(&self) -> f64 {
+    pub(crate) fn avg_prefill_throughput(&self) -> f64 {
         average(&self.prefill_throughput_samples)
     }
 
     #[getter]
-    fn avg_decode_throughput(&self) -> f64 {
+    pub(crate) fn avg_decode_throughput(&self) -> f64 {
         average(&self.decode_throughput_samples)
     }
 
@@ -371,18 +217,4 @@ impl ServerMetric {
         summary.set_item("num_waiting_total_blocks", self.num_waiting_total_blocks)?;
         Ok(summary.into())
     }
-}
-
-fn average(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        0.0
-    } else {
-        values.iter().sum::<f64>() / values.len() as f64
-    }
-}
-
-pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<SequenceMetric>()?;
-    m.add_class::<ServerMetric>()?;
-    Ok(())
 }

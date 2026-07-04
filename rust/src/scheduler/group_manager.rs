@@ -31,11 +31,7 @@ impl Scheduler {
                 .min_by_key(|gid| {
                     (
                         loads[*gid],
-                        Reverse(
-                            self.group_resources[self.flat_idx(dp_idx, *gid)]
-                                .free_blocks
-                                .len(),
-                        ),
+                        Reverse(self.hbm_pools[self.flat_idx(dp_idx, *gid)].num_free_blocks()),
                     )
                 })
                 .unwrap_or(master);
@@ -94,11 +90,7 @@ impl Scheduler {
                 batch_seqs.get(*gid).copied().unwrap_or(0),
                 loads.get(*gid).copied().unwrap_or(0)
                     + batch_tokens.get(*gid).copied().unwrap_or(0),
-                Reverse(
-                    self.group_resources[self.flat_idx(dp_idx, *gid)]
-                        .free_blocks
-                        .len(),
-                ),
+                Reverse(self.hbm_pools[self.flat_idx(dp_idx, *gid)].num_free_blocks()),
             )
         });
         candidates.into_iter().find(|gid| {

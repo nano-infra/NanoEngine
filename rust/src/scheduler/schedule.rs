@@ -211,7 +211,7 @@ impl Scheduler {
         batch_seqs: &[i32],
         batch_tokens: &[i32],
     ) -> PyResult<Option<i32>> {
-        let (seq_id, full_len, cached) = {
+        let (seq_id, full_len, mut cached) = {
             let s = seq.borrow(py);
             if self.config.mode == "decode" {
                 (s.seq_id, s.num_tokens, s.num_tokens)
@@ -225,6 +225,12 @@ impl Scheduler {
         let Some(master) = self.choose_master_group(py, dp_idx, batch_seqs, batch_tokens) else {
             return Ok(None);
         };
+        if self.config.mode != "decode" && self.group() == 1 {
+            let token_ids = seq.borrow(py).token_ids.clone();
+            let flat = self.flat_idx(dp_idx, master);
+            cached = self.hbm_pools[flat].cached_tokens_for(&token_ids, full_len);
+            seq.borrow_mut(py).num_cached_tokens = cached;
+        }
         let budget = (self.config.max_num_batched_tokens.max(1)
             - batch_tokens.get(master).copied().unwrap_or(0))
         .max(0);
@@ -281,10 +287,10 @@ impl Scheduler {
         self.ensure_compressed_pages(py, seq, seq_id, full_len)?;
         if self.config.mode != "decode" {
             let mut s = seq.borrow_mut(py);
-            if let Some(slot) = self.seq_state_slots.get(&seq_id).copied() {
+            if let Some(slot) = self.state_slots.get(seq_id) {
                 s.migrate_state_slot = slot;
             }
-            if let Some(slot) = self.seq_hisparse_slots.get(&seq_id).copied() {
+            if let Some(slot) = self.hisparse_slots.get(seq_id) {
                 s.migrate_hisparse_slot = slot;
             }
             for (ratio, pool) in &self.compressed_pools {

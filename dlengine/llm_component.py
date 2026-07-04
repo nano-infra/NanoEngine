@@ -17,6 +17,8 @@ logger = get_logger("dlengine")
 class LLM(LLMEngine):
     """LLM class with Ray remote execution support."""
 
+    from dlengine.offline.generate import generate
+
     @classmethod
     def as_remote(cls, config):
         ray_address = getattr(config, "ray_address", "127.0.0.1:6379")
@@ -391,7 +393,7 @@ class LLMComponent(LLM):
         else:
             zmq_host = self.config.host
 
-        peer_addrs = self.get_peer_agent_addrs()
+        peer_addrs = self.executor.get_peer_agent_addrs()
         # Compute gdn_num_slots to match allocate_gdn_states logic. The active
         # region includes gdn_state_cache_slots parked slots for session-scoped
         # state caching, so active = max_num_seqs + gdn_state_cache_slots:

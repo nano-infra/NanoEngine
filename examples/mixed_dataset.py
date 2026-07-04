@@ -1,8 +1,11 @@
 import csv
 import os
 import random
+import uuid
 
 from dlengine import LLM, SamplingParams
+from dlengine._rust.proto import RequestIn
+from dlengine.offline import generate
 from transformers import PreTrainedTokenizerFast
 
 
@@ -69,14 +72,19 @@ def main():
                 ignore_eos=base_sampling_params.ignore_eos,
             )
 
-            decode.add_request(
-                prompt_token_ids,
-                sampling_params=sample_sampling_params,
+            seq_id = uuid.uuid4().int & ((1 << 63) - 1)
+            decode.add_request_payload(
+                RequestIn(
+                    seq_id,
+                    prompt_token_ids,
+                    sample_sampling_params,
+                    0,
+                ).to_bytes()
             )
     print("preparing dataset done...")
 
     # 提交请求并生成
-    decode.generate()
+    generate(decode)
 
     # # 输出结果
     # for i, seq in enumerate(sequences):
