@@ -683,8 +683,8 @@ def build_app(server: OpenAIServer):
 
         # Fallback for in-process engine
         engine = getattr(server.worker, "engine", None)
-        metrics_manager = getattr(engine, "metrics_manager", None)
-        if metrics_manager is None:
+        scheduler = getattr(engine, "scheduler", None)
+        if scheduler is None:
             return PlainTextResponse(
                 "# HELP dlengine_up DLEngine metrics exporter health.\n"
                 "# TYPE dlengine_up gauge\n"
@@ -692,7 +692,7 @@ def build_app(server: OpenAIServer):
                 media_type="text/plain; version=0.0.4; charset=utf-8",
             )
         return PlainTextResponse(
-            metrics_manager.to_prometheus(),
+            scheduler.metrics_prometheus(),
             media_type="text/plain; version=0.0.4; charset=utf-8",
         )
 

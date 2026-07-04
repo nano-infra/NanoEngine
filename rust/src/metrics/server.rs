@@ -44,23 +44,7 @@ pub struct ServerMetric {
 impl ServerMetric {
     #[new]
     fn new() -> Self {
-        Self {
-            total_tokens: 0,
-            total_prompt_tokens: 0,
-            total_generated_tokens: 0,
-            num_running_requests: 0,
-            num_waiting_requests: 0,
-            num_waiting_migration_requests: 0,
-            num_completed_requests: 0,
-            num_waiting_head_blocks: 0,
-            num_waiting_total_blocks: 0,
-            prefill_throughput_samples: Vec::new(),
-            decode_throughput_samples: Vec::new(),
-            token_usage_by_dp: HashMap::new(),
-            group_send_request_counts: HashMap::new(),
-            group_recv_request_counts: HashMap::new(),
-            start_time: now_seconds(),
-        }
+        Self::default()
     }
 
     pub fn update_running_requests(&mut self, count: i32) {
@@ -170,7 +154,7 @@ impl ServerMetric {
         average(&self.decode_throughput_samples)
     }
 
-    fn get_metric_report(&self, include_detailed: bool) -> String {
+    pub(crate) fn get_metric_report(&self, include_detailed: bool) -> String {
         let mut report = format!(
             "ServerMetric - Running/Waiting/Waiting migration: {}/{}/{}, Completed: {}, Total tokens: {}",
             self.num_running_requests,
@@ -188,7 +172,7 @@ impl ServerMetric {
         report
     }
 
-    fn get_summary(&self, py: Python<'_>) -> PyResult<PyObject> {
+    pub(crate) fn get_summary(&self, py: Python<'_>) -> PyResult<PyObject> {
         let summary = PyDict::new(py);
         summary.set_item("uptime_seconds", self.uptime())?;
         summary.set_item("total_tokens", self.total_tokens)?;
@@ -216,5 +200,27 @@ impl ServerMetric {
         summary.set_item("num_waiting_head_blocks", self.num_waiting_head_blocks)?;
         summary.set_item("num_waiting_total_blocks", self.num_waiting_total_blocks)?;
         Ok(summary.into())
+    }
+}
+
+impl Default for ServerMetric {
+    fn default() -> Self {
+        Self {
+            total_tokens: 0,
+            total_prompt_tokens: 0,
+            total_generated_tokens: 0,
+            num_running_requests: 0,
+            num_waiting_requests: 0,
+            num_waiting_migration_requests: 0,
+            num_completed_requests: 0,
+            num_waiting_head_blocks: 0,
+            num_waiting_total_blocks: 0,
+            prefill_throughput_samples: Vec::new(),
+            decode_throughput_samples: Vec::new(),
+            token_usage_by_dp: HashMap::new(),
+            group_send_request_counts: HashMap::new(),
+            group_recv_request_counts: HashMap::new(),
+            start_time: now_seconds(),
+        }
     }
 }

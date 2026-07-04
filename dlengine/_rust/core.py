@@ -11,6 +11,8 @@ __all__ = [
     "SequenceMetric",
     "ServerMetric",
     "RuntimeMetrics",
+    "PostprocessTiming",
+    "StepResult",
     "StepMetricSnapshot",
 ]
 

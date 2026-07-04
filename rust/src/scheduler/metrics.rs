@@ -1,5 +1,7 @@
 use super::{ScheduleResult, Scheduler};
-use crate::metrics::ServerMetric;
+use crate::logging;
+use crate::metrics::{RuntimeMetrics, ServerMetric};
+use crate::proto::RunnerOut;
 use crate::snapshots::{SchedulerMetricSnapshot, StepMetricSnapshot};
 use pyo3::prelude::*;
 
@@ -67,6 +69,26 @@ impl Scheduler {
         snapshot
     }
 
+    pub(super) fn update_server_metric_and_log_impl(
+        &self,
+        py: Python<'_>,
+        metric: &mut ServerMetric,
+        result: &ScheduleResult,
+    ) -> PyResult<SchedulerMetricSnapshot> {
+        let snapshot = self.update_server_metric_impl(metric, result);
+        if logging::get_log_level() >= 2 {
+            let debug = result.debug_summary(
+                py,
+                self.config.attention_dp.max(1) as usize,
+                self.config.group_size.max(1) as usize,
+                snapshot.free_blocks.clone(),
+            )?;
+            let repr = debug.bind(py).repr()?.to_str()?.to_owned();
+            eprintln!("[DLENGINE][DEBUG] scheduler - {repr}");
+        }
+        Ok(snapshot)
+    }
+
     pub(super) fn record_step_metric_impl(
         &mut self,
         py: Python<'_>,
@@ -124,5 +146,51 @@ impl Scheduler {
             }
         }
         snapshot
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_step_metrics_and_report_impl(
+        &mut self,
+        py: Python<'_>,
+        runtime: &mut RuntimeMetrics,
+        metric: &mut ServerMetric,
+        scheduler_metric: &SchedulerMetricSnapshot,
+        result: &ScheduleResult,
+        postprocess_ms: f64,
+        post_sch_begin: f64,
+        runner_outs: Option<Vec<RunnerOut>>,
+    ) -> (StepMetricSnapshot, Option<String>) {
+        let token_ids = runner_outs.as_ref().map(|outs| {
+            outs.iter()
+                .map(|out| {
+                    out.token_ids
+                        .iter()
+                        .map(|seq_tokens| seq_tokens.iter().copied().map(|t| t as i32).collect())
+                        .collect()
+                })
+                .collect()
+        });
+        let step_metric = self.record_step_metric_impl(py, metric, result, token_ids);
+        let resource_metric = self.metric_snapshot_impl();
+        let message = runtime.maybe_report_step_status(
+            metric,
+            self.config.engine_id.clone(),
+            self.config.mode.clone(),
+            scheduler_metric,
+            &resource_metric,
+            &step_metric,
+            result.schedule_latency_ms,
+            postprocess_ms,
+            result.schedule_end_s,
+            post_sch_begin,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        );
+        (step_metric, message)
     }
 }

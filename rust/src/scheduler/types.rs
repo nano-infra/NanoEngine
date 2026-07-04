@@ -1,5 +1,6 @@
 use crate::config::CachePlan;
 use crate::sequence::Sequence;
+use crate::snapshots::SchedulerMetricSnapshot;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::types::PyType;
@@ -127,6 +128,16 @@ impl SchedulerConfig {
 #[derive(Default)]
 pub struct ScheduleResult {
     #[pyo3(get, set)]
+    pub scheduler_metric: Option<SchedulerMetricSnapshot>,
+    #[pyo3(get, set)]
+    pub postprocess_timing: Option<PostprocessTiming>,
+    #[pyo3(get, set)]
+    pub schedule_begin_s: f64,
+    #[pyo3(get, set)]
+    pub schedule_end_s: f64,
+    #[pyo3(get, set)]
+    pub schedule_latency_ms: f64,
+    #[pyo3(get, set)]
     pub dp_seqs: Vec<Vec<Py<Sequence>>>,
     #[pyo3(get, set)]
     pub dp_group_seqs: Vec<Vec<Py<Sequence>>>,
@@ -146,6 +157,39 @@ pub struct ScheduleResult {
     pub waiting_total_blocks: i32,
 }
 
+#[pyclass(module = "dlengine._engine", unsendable)]
+pub struct StepResult {
+    #[pyo3(get, set)]
+    pub outputs: Vec<PyObject>,
+    #[pyo3(get, set)]
+    pub prefill_tokens: i32,
+    #[pyo3(get, set)]
+    pub decode_tokens: i32,
+    #[pyo3(get, set)]
+    pub real_bs: i32,
+    #[pyo3(get, set)]
+    pub schedule_latency_ms: f64,
+    #[pyo3(get, set)]
+    pub postprocess_latency_ms: f64,
+    #[pyo3(get, set)]
+    pub status_message: Option<String>,
+    #[pyo3(get, set)]
+    pub log_messages: Vec<String>,
+    #[pyo3(get, set)]
+    pub completed_seq_ids: Vec<u64>,
+}
+
+#[pyclass(module = "dlengine._engine")]
+#[derive(Clone, Default)]
+pub struct PostprocessTiming {
+    #[pyo3(get, set)]
+    pub begin_s: f64,
+    #[pyo3(get, set)]
+    pub end_s: f64,
+    #[pyo3(get, set)]
+    pub latency_ms: f64,
+}
+
 #[pymethods]
 impl ScheduleResult {
     #[new]
@@ -153,7 +197,7 @@ impl ScheduleResult {
         Self::default()
     }
 
-    fn debug_summary(
+    pub(crate) fn debug_summary(
         &self,
         py: Python<'_>,
         dp_size: usize,

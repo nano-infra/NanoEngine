@@ -7,7 +7,7 @@ mod stats;
 use pyo3::prelude::*;
 
 pub(crate) use manager::RuntimeMetrics;
-pub(crate) use sequence::SequenceMetric;
+pub(crate) use sequence::{sequence_metric_new, SequenceMetric};
 pub(crate) use server::ServerMetric;
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

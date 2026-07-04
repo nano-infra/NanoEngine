@@ -43,14 +43,13 @@ def generate(
 
         if result.prefill_tokens > 0:
             prefill_throughput = result.prefill_tokens / step_duration
-            engine.metrics_manager.server_metric.record_prefill_throughput(
-                result.prefill_tokens, step_duration
-            )
         if result.decode_tokens > 0:
-            engine.metrics_manager.server_metric.record_decode_throughput(
-                result.decode_tokens, step_duration
-            )
             window_tokens += result.decode_tokens
+        engine.scheduler.record_step_throughput(
+            result.prefill_tokens,
+            result.decode_tokens,
+            step_duration,
+        )
 
         now = perf_counter()
         window_elapsed = now - window_start
@@ -105,7 +104,7 @@ def generate(
     if pbar is not None:
         pbar.close()
 
-    engine.metrics_manager.log_final_summary()
+    logger.info(engine.scheduler.final_metric_report())
 
     if return_serialized:
         return serialized_outputs

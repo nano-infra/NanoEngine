@@ -2,6 +2,7 @@ use super::Scheduler;
 use crate::metrics::SequenceMetric;
 use crate::sequence::Sequence;
 use pyo3::prelude::*;
+use std::collections::HashSet;
 
 impl Scheduler {
     pub(super) fn preempt_impl(
@@ -33,7 +34,28 @@ impl Scheduler {
         dp_group_token_logprobs: Option<Vec<Vec<Vec<f32>>>>,
     ) {
         let eos_ids = self.config.eos_ids.clone();
-        let mut next_running: Vec<Vec<Py<Sequence>>> = (0..self.dp()).map(|_| Vec::new()).collect();
+        let mut scheduled_ids: Vec<HashSet<u64>> = (0..self.dp()).map(|_| HashSet::new()).collect();
+        for (group_idx, seqs) in dp_group_seqs.iter().enumerate() {
+            let dp_idx = group_idx / self.group();
+            if dp_idx >= scheduled_ids.len() {
+                continue;
+            }
+            for seq in seqs {
+                scheduled_ids[dp_idx].insert(seq.borrow(py).seq_id);
+            }
+        }
+
+        let mut next_running: Vec<Vec<Py<Sequence>>> = self
+            .running
+            .iter()
+            .enumerate()
+            .map(|(dp_idx, seqs)| {
+                seqs.iter()
+                    .filter(|seq| !scheduled_ids[dp_idx].contains(&seq.borrow(py).seq_id))
+                    .map(|seq| seq.clone_ref(py))
+                    .collect()
+            })
+            .collect();
 
         for (group_idx, seqs) in dp_group_seqs.iter().enumerate() {
             let dp_idx = group_idx / self.group();
@@ -155,6 +177,31 @@ impl Scheduler {
     }
 
     pub(super) fn abort_impl(&mut self, seq_id: u64) -> bool {
+        let found = self.seq_assignment.contains_key(&seq_id)
+            || self.to_be_migrated.contains_key(&seq_id)
+            || self.session_wait.contains_key(&seq_id)
+            || self
+                .waiting
+                .iter()
+                .any(|seq| Python::with_gil(|py| seq.borrow(py).seq_id == seq_id))
+            || self
+                .waiting_migration
+                .iter()
+                .any(|seq| Python::with_gil(|py| seq.borrow(py).seq_id == seq_id))
+            || self.running.iter().any(|queue| {
+                queue
+                    .iter()
+                    .any(|seq| Python::with_gil(|py| seq.borrow(py).seq_id == seq_id))
+            })
+            || self.prefilling.iter().any(|queue| {
+                queue
+                    .iter()
+                    .any(|seq| Python::with_gil(|py| seq.borrow(py).seq_id == seq_id))
+            });
+        if !found {
+            return false;
+        }
+
         self.release_seq(seq_id);
         self.waiting
             .retain(|seq| Python::with_gil(|py| seq.borrow(py).seq_id != seq_id));
@@ -168,7 +215,15 @@ impl Scheduler {
         }
         self.to_be_migrated.remove(&seq_id);
         self.session_wait.remove(&seq_id);
+        self.clear_finished_metric_state_impl(seq_id);
         true
+    }
+
+    pub(super) fn abort_many_impl(&mut self, seq_ids: Vec<u64>) -> Vec<u64> {
+        seq_ids
+            .into_iter()
+            .filter(|seq_id| self.abort_impl(*seq_id))
+            .collect()
     }
 
     pub(super) fn free_to_be_migrated_impl(

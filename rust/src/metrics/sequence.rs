@@ -39,22 +39,7 @@ impl SequenceMetric {
     #[new]
     #[pyo3(signature = (seq_id, num_prompt_tokens = 0))]
     fn new(seq_id: u64, num_prompt_tokens: i32) -> Self {
-        Self {
-            seq_id,
-            arrival_time: None,
-            first_scheduled_time: None,
-            decode_arrival_time: None,
-            decode_scheduled_time: None,
-            first_token_time: None,
-            completion_time: None,
-            num_prompt_tokens,
-            num_generated_tokens: 0,
-            itl_samples: Vec::new(),
-            last_token_time: None,
-            num_prefill_chunks: 0,
-            prefill_chunk_samples: Vec::new(),
-            last_chunk_time: None,
-        }
+        sequence_metric_new(seq_id, num_prompt_tokens)
     }
 
     pub(crate) fn record_arrival(&mut self) {
@@ -167,5 +152,48 @@ impl SequenceMetric {
         } else {
             Some(self.prefill_chunk_samples.iter().sum())
         }
+    }
+
+    pub(crate) fn metric_report(&self) -> String {
+        fn ms(value: Option<f64>) -> String {
+            value
+                .map(|v| format!("{v:.2}ms"))
+                .unwrap_or_else(|| "N/A".to_string())
+        }
+        format!(
+            "SequenceMetric [{}...] - TTFT: {}, E2E: {}, Prompt Length: {}, Output Length: {}, Queueing Time: {}, Decode Queueing Time: {}, ITL Wo Queue: {}, ITL With Queue: {}",
+            self.seq_id.to_string().chars().take(8).collect::<String>(),
+            ms(self.ttft()),
+            ms(self.e2e_latency()),
+            self.num_prompt_tokens,
+            self.num_generated_tokens,
+            ms(self.queueing_time_ms()),
+            ms(self.decode_queue_time_ms()),
+            ms(self.avg_tpot_wo_queueing()),
+            ms(self.avg_tpot_with_queueing()),
+        )
+    }
+
+    fn report(&self) -> String {
+        self.metric_report()
+    }
+}
+
+pub(crate) fn sequence_metric_new(seq_id: u64, num_prompt_tokens: i32) -> SequenceMetric {
+    SequenceMetric {
+        seq_id,
+        arrival_time: None,
+        first_scheduled_time: None,
+        decode_arrival_time: None,
+        decode_scheduled_time: None,
+        first_token_time: None,
+        completion_time: None,
+        num_prompt_tokens,
+        num_generated_tokens: 0,
+        itl_samples: Vec::new(),
+        last_token_time: None,
+        num_prefill_chunks: 0,
+        prefill_chunk_samples: Vec::new(),
+        last_chunk_time: None,
     }
 }

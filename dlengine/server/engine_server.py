@@ -73,13 +73,13 @@ class BackendService:
         self._send_response(action=2, payload=resp_payload)
 
     def _handle_get_metrics(self):
-        """Fetch Prometheus-format metrics from the engine metrics_manager."""
+        """Fetch Prometheus-format metrics from the engine scheduler."""
         try:
-            metrics_manager = getattr(self.engine, "metrics_manager", None)
-            if metrics_manager is None:
+            scheduler = getattr(self.engine, "scheduler", None)
+            if scheduler is None:
                 resp_payload = b""
             else:
-                resp_payload = metrics_manager.to_prometheus().encode("utf-8")
+                resp_payload = scheduler.metrics_prometheus().encode("utf-8")
             self._send_response(action=_ACTION_GET_METRICS, payload=resp_payload)
         except Exception as e:
             logger.error(f"Error getting metrics: {e}")
@@ -197,31 +197,15 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
 
     logger.info("Engine Loop Started in Backend Process")
 
-    # Loop-phase timing (outside engine.step(), which has its own breakdown in
-    # the heartbeat): drain = inbound request handling (add/deserialize),
-    # emit = step_complete + stepout/migration/vision-free emission. Logged
-    # every ~5s. With the pipelined loop below, drain and emit run while the
-    # next forward is already executing on the workers, so they no longer
-    # show up as GPU idle gap.
+    # Loop-phase timing outside engine.step(): drain is inbound request handling;
+    # emit is stepout/migration/vision-free emission after the serial step.
     _lp_drain_ms = 0.0
     _lp_emit_ms = 0.0
     _lp_steps = 0
     _lp_last_log = time.time()
 
-    # Pipelined step loop: after waiting on step N's replies and running the
-    # (cheap) postprocess, immediately schedule and submit step N+1 so the
-    # GPU starts working again; then do step N's bookkeeping (token counting,
-    # heartbeat, stepout emission) and the request-queue drain in the shadow
-    # of step N+1's forward. The serial critical path between two forwards
-    # shrinks to wait + postprocess + schedule + serialize + submit.
-    pending = None  # in-flight PendingStep (forward submitted, not yet waited)
-    deferred_frees = []  # free_sequences payloads parked while a forward is in flight
-    deferred_aborts = []  # abort payloads parked while a forward is in flight
-
     while True:
         try:
-            # Drain queue of all current requests (overlapped with the
-            # in-flight forward when pending is set)
             _t_drain = time.perf_counter()
             while True:
                 try:
@@ -234,21 +218,9 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                         elif action == _ACTION_GET_METRICS:
                             service._handle_get_metrics()
                         elif action == 3:
-                            # Freeing sequences mutates scheduler/block state;
-                            # unsafe while those seqs may be in the in-flight
-                            # batch. Park until the forward completes.
-                            if pending is not None:
-                                deferred_frees.append(payload)
-                            else:
-                                service._handle_free_sequences(payload)
+                            service._handle_free_sequences(payload)
                         elif action == _ACTION_ABORT:
-                            # Aborting frees KV blocks the in-flight forward may
-                            # still touch; park until the forward completes
-                            # (same constraint as free_sequences above).
-                            if pending is not None:
-                                deferred_aborts.append(payload)
-                            else:
-                                service._handle_abort(payload)
+                            service._handle_abort(payload)
                         else:
                             logger.warning(f"Unknown action: {action}")
                     except Exception as e:
@@ -258,55 +230,26 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                     break
             _lp_drain_ms += (time.perf_counter() - _t_drain) * 1000
 
-            if pending is None:
-                if engine.scheduler.is_finished():
-                    time.sleep(0.001)
-                    continue
-                pending = engine.step_begin()
-
-            # Wait for the in-flight forward and apply its tokens.
-            result = engine.step_finish(pending)
-            done = pending
-            pending = None
-
-            # No forward in flight: safe to apply parked frees/aborts before the
-            # next schedule sees (and could re-batch) those sequences.
-            if deferred_frees:
-                for payload in deferred_frees:
-                    service._handle_free_sequences(payload)
-                deferred_frees.clear()
-            if deferred_aborts:
-                for payload in deferred_aborts:
-                    service._handle_abort(payload)
-                deferred_aborts.clear()
-
-            # Kick off the next step's forward before doing step N's
-            # bookkeeping, so the GPU is busy while we count/emit below.
-            if not engine.scheduler.is_finished():
-                pending = engine.step_begin()
+            if engine.scheduler.is_finished():
+                time.sleep(0.001)
+                continue
 
             _t_emit = time.perf_counter()
             track_running = engine.config.mode == "decode"
-            result = engine.step_complete(
-                done,
-                result,
+            result = engine.step(
                 track_running=track_running,
                 previous_running=service._previous_running_seqs,
             )
 
             logger.debug(f"Engine step completed: {result.real_bs} running sequences")
-            # Single-pass optimization: merge all sequence processing into one loop.
-            # Use scalar event fields instead of materializing full token vectors.
             current_running_seqs = set()
-            newly_appeared_seqs = []  # Store newly appeared sequences for early free
-            stepout_batch = []  # (seq_id, token_id, status) for this step
+            newly_appeared_seqs = []
+            stepout_batch = []
             vision_free_by_encoder: dict[str, list[int]] = defaultdict(list)
 
             for event in result.outputs:
                 seq_id = int(event["seq_id"])
 
-                # Free vision embedding slots on encoder after prefill consumes
-                # them (EP-separated mode: encoder reclaims EmbeddingPool slots)
                 for vs in event.get("vision_slots", []):
                     vision_free_by_encoder[vs["encoder_engine_id"]].append(
                         vs["slot_idx"]
@@ -315,39 +258,33 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                 if track_running:
                     current_running_seqs.add(seq_id)
 
-                # Track newly appeared sequences for early free (decode only)
                 if event.get("is_new_running", False):
                     newly_appeared_seqs.append(
                         (seq_id, event.get("source_engine_id", ""))
                     )
 
-                # Send stepout/migration based on scheduler-owned state
                 if event["is_finished"]:
                     stepout_batch.append(
                         (seq_id, event["last_token"], SequenceStatus.FINISHED)
                     )
-                    # Clean up tracking to prevent memory leak
                     service._freed_sequences.discard(seq_id)
                 elif event["is_to_be_migrated"]:
                     payload = event.get("migration_payload")
                     if payload is not None:
                         service._send_migration_payload(bytes(payload))
                 elif event["num_tokens"] > 0:
-                    # Send last token for all running sequences (1 token per step in decode)
                     stepout_batch.append(
                         (seq_id, event["last_token"], SequenceStatus.RUNNING)
                     )
 
             service._send_stepout_batch(stepout_batch)
 
-            # Early free: Process only newly appeared sequences (much faster than full iteration)
-            if newly_appeared_seqs:
-                for seq_id, source_engine_id in newly_appeared_seqs:
-                    if source_engine_id:
-                        logger.info(
-                            f"Early free: seq {seq_id} migrated from {source_engine_id}"
-                        )
-                        service._send_p2p_free_if_migrated(seq_id, source_engine_id)
+            for seq_id, source_engine_id in newly_appeared_seqs:
+                if source_engine_id:
+                    logger.info(
+                        f"Early free: seq {seq_id} migrated from {source_engine_id}"
+                    )
+                    service._send_p2p_free_if_migrated(seq_id, source_engine_id)
 
             for encoder_id, slot_indices in vision_free_by_encoder.items():
                 try:
@@ -357,7 +294,6 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                         f"Failed to send vision slot free to {encoder_id}: {e}"
                     )
 
-            # Update tracking for next step
             service._previous_running_seqs = current_running_seqs
 
             _lp_emit_ms += (time.perf_counter() - _t_emit) * 1000
@@ -376,9 +312,6 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
         except Exception as e:
             logger.error(f"Engine Backend Loop Error: {e}")
             traceback.print_exc()
-            # Drop any in-flight step: its executor handle can no longer be
-            # safely waited on after an arbitrary failure.
-            pending = None
             time.sleep(1)
 
 

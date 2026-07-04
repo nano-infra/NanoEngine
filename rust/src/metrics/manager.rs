@@ -1,5 +1,6 @@
 use super::{SequenceMetric, ServerMetric};
 use crate::common::now_seconds;
+use crate::snapshots::{SchedulerMetricSnapshot, StepMetricSnapshot};
 use pyo3::prelude::*;
 
 const TTFT_BUCKETS: [f64; 12] = [
@@ -109,54 +110,10 @@ impl RuntimeMetrics {
     #[new]
     #[pyo3(signature = (report_interval_s = 5.0))]
     fn new(report_interval_s: f64) -> Self {
-        Self {
-            engine_id: String::new(),
-            engine_mode: String::new(),
-            running_per_dp: Vec::new(),
-            used_blocks_per_dp: Vec::new(),
-            total_blocks_per_dp: 0,
-            last_schedule_ms: 0.0,
-            last_forward_ms: 0.0,
-            last_postprocess_ms: 0.0,
-            last_step_count: 0,
-            last_forward_tx_bytes: 0,
-            last_forward_rx_bytes: 0,
-            last_transfer_ms: 0.0,
-            last_wwi_ms: 0.0,
-            last_immrecv_ms: 0.0,
-            last_net_ms: 0.0,
-            last_serialize_ms: 0.0,
-            last_prefix_cache_hit_rate: 0.0,
-            last_prefix_cache_hit_rate_per_dp: Vec::new(),
-            last_ttft_ms: 0.0,
-            last_tpot_ms: 0.0,
-            ttft_sum_s: 0.0,
-            ttft_count: 0,
-            tpot_sum_s: 0.0,
-            tpot_count: 0,
-            ttft_bucket_counts: vec![0; TTFT_BUCKETS.len()],
-            tpot_bucket_counts: vec![0; TPOT_BUCKETS.len()],
-            report_interval_s,
-            last_report_time: now_seconds(),
-            report_prefill_tokens_per_dp: None,
-            report_decode_tokens_per_dp: None,
-            report_step_count: 0,
-            report_sched_ms: 0.0,
-            report_forward_ms: 0.0,
-            report_post_ms: 0.0,
-            report_fwd_tx_bytes: 0,
-            report_fwd_rx_bytes: 0,
-            report_transfer_ms: 0.0,
-            report_wwi_ms: 0.0,
-            report_immrecv_ms: 0.0,
-            report_net_ms: 0.0,
-            report_serialize_ms: 0.0,
-            report_prefix_cached_tokens_per_dp: None,
-            report_prefix_prompt_tokens_per_dp: None,
-        }
+        runtime_metrics_with_report_interval(report_interval_s)
     }
 
-    fn record_sequence_completion(
+    pub(crate) fn record_sequence_completion(
         &mut self,
         metric: &mut SequenceMetric,
         server_metric: &mut ServerMetric,
@@ -187,6 +144,76 @@ impl RuntimeMetrics {
             }
         }
         metric.first_token_time.is_some() || metric.num_generated_tokens > 0
+    }
+
+    #[pyo3(signature = (
+        server_metric,
+        engine_id,
+        mode,
+        scheduler_metric,
+        resource_metric,
+        step_metric,
+        schedule_ms,
+        postprocess_ms,
+        sch_end,
+        post_sch_begin,
+        forward_tx_bytes=0,
+        forward_rx_bytes=0,
+        transfer_ms=0.0,
+        wwi_ms=0.0,
+        immrecv_ms=0.0,
+        net_ms=0.0,
+        serialize_ms=0.0
+    ))]
+    pub(crate) fn maybe_report_step_status(
+        &mut self,
+        server_metric: &mut ServerMetric,
+        engine_id: String,
+        mode: String,
+        scheduler_metric: &SchedulerMetricSnapshot,
+        resource_metric: &SchedulerMetricSnapshot,
+        step_metric: &StepMetricSnapshot,
+        schedule_ms: f64,
+        postprocess_ms: f64,
+        sch_end: f64,
+        post_sch_begin: f64,
+        forward_tx_bytes: i64,
+        forward_rx_bytes: i64,
+        transfer_ms: f64,
+        wwi_ms: f64,
+        immrecv_ms: f64,
+        net_ms: f64,
+        serialize_ms: f64,
+    ) -> Option<String> {
+        let forward_ms = if post_sch_begin != 0.0 {
+            (post_sch_begin - sch_end) * 1000.0
+        } else {
+            0.0
+        };
+        self.maybe_report_engine_status(
+            server_metric,
+            engine_id,
+            mode,
+            scheduler_metric.running_per_dp.clone(),
+            scheduler_metric.total_waiting,
+            scheduler_metric.total_waiting_migration,
+            Some(resource_metric.used_blocks_per_dp.clone()),
+            resource_metric.total_blocks_per_dp,
+            step_metric.prefill_tokens_per_dp.clone(),
+            step_metric.decode_tokens_per_dp.clone(),
+            Some(step_metric.prefix_cached_tokens_per_dp.clone()),
+            Some(step_metric.prefix_prompt_tokens_per_dp.clone()),
+            schedule_ms,
+            forward_ms,
+            postprocess_ms,
+            forward_tx_bytes,
+            forward_rx_bytes,
+            transfer_ms,
+            wwi_ms,
+            immrecv_ms,
+            net_ms,
+            serialize_ms,
+        )
     }
 
     #[pyo3(signature = (
@@ -528,7 +555,7 @@ impl RuntimeMetrics {
         )
     }
 
-    fn to_prometheus(&self, server_metric: &ServerMetric) -> String {
+    pub(crate) fn to_prometheus(&self, server_metric: &ServerMetric) -> String {
         let mut lines = vec![
             "# HELP dlengine_up DLEngine metrics exporter health.".to_string(),
             "# TYPE dlengine_up gauge".to_string(),
@@ -749,6 +776,60 @@ impl RuntimeMetrics {
             ));
         }
         lines.join("\n") + "\n"
+    }
+}
+
+impl Default for RuntimeMetrics {
+    fn default() -> Self {
+        runtime_metrics_with_report_interval(5.0)
+    }
+}
+
+fn runtime_metrics_with_report_interval(report_interval_s: f64) -> RuntimeMetrics {
+    RuntimeMetrics {
+        engine_id: String::new(),
+        engine_mode: String::new(),
+        running_per_dp: Vec::new(),
+        used_blocks_per_dp: Vec::new(),
+        total_blocks_per_dp: 0,
+        last_schedule_ms: 0.0,
+        last_forward_ms: 0.0,
+        last_postprocess_ms: 0.0,
+        last_step_count: 0,
+        last_forward_tx_bytes: 0,
+        last_forward_rx_bytes: 0,
+        last_transfer_ms: 0.0,
+        last_wwi_ms: 0.0,
+        last_immrecv_ms: 0.0,
+        last_net_ms: 0.0,
+        last_serialize_ms: 0.0,
+        last_prefix_cache_hit_rate: 0.0,
+        last_prefix_cache_hit_rate_per_dp: Vec::new(),
+        last_ttft_ms: 0.0,
+        last_tpot_ms: 0.0,
+        ttft_sum_s: 0.0,
+        ttft_count: 0,
+        tpot_sum_s: 0.0,
+        tpot_count: 0,
+        ttft_bucket_counts: vec![0; TTFT_BUCKETS.len()],
+        tpot_bucket_counts: vec![0; TPOT_BUCKETS.len()],
+        report_interval_s,
+        last_report_time: now_seconds(),
+        report_prefill_tokens_per_dp: None,
+        report_decode_tokens_per_dp: None,
+        report_step_count: 0,
+        report_sched_ms: 0.0,
+        report_forward_ms: 0.0,
+        report_post_ms: 0.0,
+        report_fwd_tx_bytes: 0,
+        report_fwd_rx_bytes: 0,
+        report_transfer_ms: 0.0,
+        report_wwi_ms: 0.0,
+        report_immrecv_ms: 0.0,
+        report_net_ms: 0.0,
+        report_serialize_ms: 0.0,
+        report_prefix_cached_tokens_per_dp: None,
+        report_prefix_prompt_tokens_per_dp: None,
     }
 }
 
