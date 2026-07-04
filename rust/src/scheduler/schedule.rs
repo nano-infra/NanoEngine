@@ -213,7 +213,11 @@ impl Scheduler {
     ) -> PyResult<Option<i32>> {
         let (seq_id, full_len, cached) = {
             let s = seq.borrow(py);
-            (s.seq_id, self.prompt_target(&s), s.num_cached_tokens)
+            if self.config.mode == "decode" {
+                (s.seq_id, s.num_tokens, s.num_tokens)
+            } else {
+                (s.seq_id, self.prompt_target(&s), s.num_cached_tokens)
+            }
         };
         if let Some(new_tokens) = self.try_adopt_session(py, seq, dp_idx, batch_tokens)? {
             return Ok(Some(new_tokens));
@@ -227,7 +231,11 @@ impl Scheduler {
         if budget <= 0 {
             return Ok(None);
         }
-        let new_tokens = (full_len - cached).min(budget).max(0);
+        let new_tokens = if self.config.mode == "decode" {
+            full_len.max(1)
+        } else {
+            (full_len - cached).min(budget).max(0)
+        };
         if new_tokens <= 0 {
             return Ok(None);
         }
@@ -238,25 +246,54 @@ impl Scheduler {
             let mut s = seq.borrow_mut(py);
             s.active_dp_idx = dp_idx as i32;
             s.active_group_id = master as i32;
-            s.migrate_group_id = master as i32;
-            s.num_tokens = chunk_end;
+            if self.config.mode != "decode" {
+                s.migrate_group_id = master as i32;
+            }
+            if self.config.mode != "decode" {
+                s.num_tokens = chunk_end;
+            }
             s.status = 1;
             s.active_dispatched_tokens = dispatch.clone();
         }
 
         for (gid, count) in dispatch.iter().copied().enumerate() {
             if count > 0 {
-                self.ensure_group_blocks(py, seq, seq_id, dp_idx, gid, count, true)?;
+                self.ensure_group_blocks(
+                    py,
+                    seq,
+                    seq_id,
+                    dp_idx,
+                    gid,
+                    count,
+                    self.config.mode != "decode",
+                )?;
             }
         }
         {
             let mut s = seq.borrow_mut(py);
             s.active_group_id = master as i32;
-            s.migrate_group_id = master as i32;
+            if self.config.mode != "decode" {
+                s.migrate_group_id = master as i32;
+            }
         }
         self.ensure_state_slot(py, seq, seq_id)?;
         self.ensure_hisparse_slot(py, seq, seq_id)?;
         self.ensure_compressed_pages(py, seq, seq_id, full_len)?;
+        if self.config.mode != "decode" {
+            let mut s = seq.borrow_mut(py);
+            if let Some(slot) = self.seq_state_slots.get(&seq_id).copied() {
+                s.migrate_state_slot = slot;
+            }
+            if let Some(slot) = self.seq_hisparse_slots.get(&seq_id).copied() {
+                s.migrate_hisparse_slot = slot;
+            }
+            for (ratio, pool) in &self.compressed_pools {
+                if let Some(pages) = pool.seq_pages.get(&seq_id) {
+                    s.migrate_compressed_block_tables
+                        .insert(*ratio, pages.clone());
+                }
+            }
+        }
         self.prefix_cached_tokens_by_seq.insert(seq_id, cached);
         Ok(Some(new_tokens))
     }

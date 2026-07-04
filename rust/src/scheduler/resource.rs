@@ -83,7 +83,7 @@ impl Scheduler {
             let s = seq.borrow(py);
             (s.seq_id, s.num_tokens)
         };
-        let needed_tokens = if is_prefill {
+        let needed_tokens = if is_prefill && self.config.mode != "decode" {
             num_tokens
         } else {
             num_tokens + 1
@@ -126,7 +126,7 @@ impl Scheduler {
         self.ensure_hisparse_slot(py, seq, seq_id)?;
         self.ensure_compressed_pages(py, seq, seq_id, needed_tokens)?;
 
-        if is_prefill {
+        if is_prefill && self.config.mode != "decode" {
             let mut s = seq.borrow_mut(py);
             let group_id = group_id as i32;
             s.migrate_group_id = group_id.max(0);

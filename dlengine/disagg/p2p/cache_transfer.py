@@ -31,11 +31,36 @@ _KV_CACHE_BUFFER_ID = "kv_cache"
 _ENGINE_INFO_CACHE_TTL = float("inf")
 
 
+def _tensor_storage_span_num_bytes(tensor: torch.Tensor) -> int:
+    """Bytes addressable from tensor.data_ptr() through its strided view.
+
+    Non-contiguous cache views, notably FP8 MLA KV cache, intentionally keep
+    padding rows in the underlying storage. RDMA offsets are computed from
+    tensor strides, so the registered MR must cover the full strided span, not
+    only tensor.numel().
+    """
+    if tensor.numel() == 0:
+        return 0
+    max_element_offset = int(tensor.storage_offset())
+    for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
+        if size > 0:
+            max_element_offset += (int(size) - 1) * int(stride)
+    first_element_offset = int(tensor.storage_offset())
+    return (max_element_offset - first_element_offset + 1) * tensor.element_size()
+
+
 def select_peer_device() -> str:
     available_nics = dlslime.available_nic()
     selected_nic_idx = dist.get_rank() % len(available_nics)
     selected_nic = available_nics[selected_nic_idx]
     assert selected_nic
+    logger.info(
+        "Selected PeerAgent NIC: rank=%s local_rank=%s available=%s selected=%s",
+        dist.get_rank() if dist.is_initialized() else "n/a",
+        get_dist_context().local_rank if dist.is_initialized() else "n/a",
+        available_nics,
+        selected_nic,
+    )
     return selected_nic
 
 
@@ -115,7 +140,7 @@ class P2PCacheTransfer:
                 return
 
             # Register KV cache
-            kv_size = self.kv_cache.numel() * self.kv_cache.itemsize
+            kv_size = _tensor_storage_span_num_bytes(self.kv_cache)
             self._local_mr_handler = peer_agent.register_memory_region(
                 _KV_CACHE_BUFFER_ID,
                 self.kv_cache.data_ptr(),
