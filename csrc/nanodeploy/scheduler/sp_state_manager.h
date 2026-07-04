@@ -28,7 +28,7 @@ enum class SPMasterSelector {
 
 enum class DynamicSPSizeStrategy {
     Legacy,
-    LongShort,
+    LongShortSP8,
     Bucket
 };
 
@@ -100,7 +100,6 @@ public:
                    bool               enable_dynamic_sp_size,
                    const std::string& dynamic_sp_size_strategy,
                    int                dynamic_sp_long_request_threshold,
-                   int                dynamic_sp_long_request_size,
                    bool               enable_dynamic_sp_bucket_policy,
                    const std::string& dynamic_sp_bucket_policy,
                    double             attention_cost_a,
@@ -267,7 +266,6 @@ private:
     int segment_size_;
     DynamicSPSizeStrategy dynamic_sp_size_strategy_;
     int                   long_request_sp_threshold_;
-    int                   long_request_sp_size_;
     bool                  enable_dynamic_sp_bucket_policy_;
     std::vector<SPBucketInterval> dynamic_sp_bucket_policy_;
 

@@ -29,7 +29,6 @@ Scheduler::Scheduler(const std::string& engine_id,
                      bool               use_new_decode_dynamic_sp_scheduler,
                      const std::string& dynamic_sp_size_strategy,
                      int                dynamic_sp_long_request_threshold,
-                     int                dynamic_sp_long_request_size,
                      bool               enable_dynamic_sp_bucket_policy,
                      const std::string& dynamic_sp_bucket_policy,
                      double             attention_cost_a,
@@ -63,7 +62,6 @@ Scheduler::Scheduler(const std::string& engine_id,
     use_new_decode_dynamic_sp_scheduler_(use_new_decode_dynamic_sp_scheduler),
     dynamic_sp_size_strategy_(dynamic_sp_size_strategy),
     dynamic_sp_long_request_threshold_(dynamic_sp_long_request_threshold),
-    dynamic_sp_long_request_size_(dynamic_sp_long_request_size),
     enable_non_uniform_split_(enable_non_uniform_split),
     sp_debug_(sp_debug),
     sp_master_selector_(sp_master_selector)
@@ -77,7 +75,6 @@ Scheduler::Scheduler(const std::string& engine_id,
             max_num_seqs_, max_num_batched_tokens_, max_num_recv_seqs_,
             reserved_blocks_per_req_, segment_size_, enable_dynamic_sp_size_,
             dynamic_sp_size_strategy_, dynamic_sp_long_request_threshold_,
-            dynamic_sp_long_request_size_,
             enable_dynamic_sp_bucket_policy, dynamic_sp_bucket_policy,
             attention_cost_a, attention_cost_b,
             q_cost_a, q_cost_b,
@@ -102,7 +99,6 @@ Scheduler::Scheduler(const std::string& engine_id,
               << ", use_new_decode_dynamic_sp_scheduler=" << use_new_decode_dynamic_sp_scheduler_
               << ", dynamic_sp_size_strategy=" << dynamic_sp_size_strategy_
               << ", dynamic_sp_long_request_threshold=" << dynamic_sp_long_request_threshold_
-              << ", dynamic_sp_long_request_size=" << dynamic_sp_long_request_size_
               << ", scheduler_mode=" << (scheduler_mode_ == SchedulerMode::DECENTRALIZED ? "decentralized" : "centralized")
               << std::endl;
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);

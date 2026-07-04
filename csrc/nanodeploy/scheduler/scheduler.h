@@ -97,7 +97,6 @@ public:
               bool               use_new_decode_dynamic_sp_scheduler,
               const std::string& dynamic_sp_size_strategy,
               int                dynamic_sp_long_request_threshold,
-              int                dynamic_sp_long_request_size,
               bool               enable_dynamic_sp_bucket_policy,
               const std::string& dynamic_sp_bucket_policy,
               double             attention_cost_a,
@@ -194,7 +193,6 @@ private:
     bool        use_new_decode_dynamic_sp_scheduler_;
     std::string dynamic_sp_size_strategy_;
     int         dynamic_sp_long_request_threshold_;
-    int         dynamic_sp_long_request_size_;
     bool        enable_non_uniform_split_;
     bool        sp_debug_;
 

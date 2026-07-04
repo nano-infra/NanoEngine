@@ -65,7 +65,6 @@ STOP_THRESHOLD_MS="${STOP_THRESHOLD_MS:-100}"
 SLEEP_BETWEEN_RUNS="${SLEEP_BETWEEN_RUNS:-20}"
 MAX_RETRIES="${MAX_RETRIES:-5}"
 LONG_REQUEST_SP_THRESHOLD="${LONG_REQUEST_SP_THRESHOLD:-100000}"
-LONG_REQUEST_SP_SIZE="${LONG_REQUEST_SP_SIZE:-8}"
 REUSE_SWEEP_LOG_ROOT="${REUSE_SWEEP_LOG_ROOT:-$ROOT_DIR/bench_logs/issue001_issue003_mixed60k_longshort_dp4dp32_bs256_20260408_165526}"
 GEMINI_ISSUES_DPSK_DP4_LOG_DIR="${GEMINI_ISSUES_DPSK_DP4_LOG_DIR:-$REUSE_SWEEP_LOG_ROOT/longshort_gemini_issues_deepseek_v3_r2_8}"
 ISSUE005_DPSK_DP4_LOG_DIR="${ISSUE005_DPSK_DP4_LOG_DIR:-$REUSE_SWEEP_LOG_ROOT/longshort_issue005_random_deepseek_v3_r10_190}"
@@ -106,9 +105,8 @@ run_stage() {
     local stage_batch_size="${12:-$BATCH_SIZE}"
     local max_rate="${13:-$MAX_RATE}"
     local routing_strategy="${14:-LeastBatch}"
-    local stage_long_request_sp_size="${15:-$LONG_REQUEST_SP_SIZE}"
 
-    log "START phase=$phase model=$model_key dataset=$dataset_key strategy=$strategy sweep=$sweep_strategy routing=$routing_strategy dynamic_sp=$enable_dynamic_sp_size long_sp_size=$stage_long_request_sp_size start_rate=$start_rate step_rate=$step_rate max_rate=$max_rate batch_size=$stage_batch_size"
+    log "START phase=$phase model=$model_key dataset=$dataset_key strategy=$strategy sweep=$sweep_strategy routing=$routing_strategy dynamic_sp=$enable_dynamic_sp_size start_rate=$start_rate step_rate=$step_rate max_rate=$max_rate batch_size=$stage_batch_size"
 
     env \
         RAY_ADDR="$RAY_ADDR" \
@@ -137,13 +135,12 @@ run_stage() {
         USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=0 \
         DYNAMIC_SP_SIZE_STRATEGY="$strategy" \
         LONG_REQUEST_SP_THRESHOLD="$LONG_REQUEST_SP_THRESHOLD" \
-        LONG_REQUEST_SP_SIZE="$stage_long_request_sp_size" \
         SWEEP_STRATEGY="$sweep_strategy" \
         SWEEP_ROUTING="$routing_strategy" \
         bash "$SWEEP_SCRIPT"
 
     record_stage "$phase" "$model_key" "$dataset_key" "$base_log_dir" "done"
-    log "DONE phase=$phase model=$model_key dataset=$dataset_key strategy=$strategy sweep=$sweep_strategy routing=$routing_strategy dynamic_sp=$enable_dynamic_sp_size long_sp_size=$stage_long_request_sp_size start_rate=$start_rate step_rate=$step_rate max_rate=$max_rate batch_size=$stage_batch_size"
+    log "DONE phase=$phase model=$model_key dataset=$dataset_key strategy=$strategy sweep=$sweep_strategy routing=$routing_strategy dynamic_sp=$enable_dynamic_sp_size start_rate=$start_rate step_rate=$step_rate max_rate=$max_rate batch_size=$stage_batch_size"
 }
 
 ensure_headers
@@ -152,43 +149,19 @@ log "CHAIN_TAG=$RUN_TAG"
 log "RAY_ADDR=$RAY_ADDR MASTER_ADDR=$MASTER_ADDR"
 # log "BATCH_SIZE(plan)=$BATCH_SIZE GPU_UTIL=$GPU_UTIL ENFORCE_EAGER=$ENFORCE_EAGER"
 # log "RATE_PLAN mixed60k=90 | issue001=35 | issue003_random=2.5,22.5,25 | issue005_random=2.5,17.5 | gemini_issues=1.75 | kimi_issue005_random_dp4=5,10,15,20,25,30,35,40 | kimi_issue005_random_dp32=5,10,15,20,25,30,35,40 | kimi_issue003_random_dp4=5,10,15,20,25,30,35,40 | kimi_issue003_random_dp32=5,10,15,20,25,30,35,40 | STOP_THRESHOLD_MS=$STOP_THRESHOLD_MS"
-# log "ORDER=long_short(dp4sp8,mixed60k/deepseek_v3,r90) -> long_short(dp4sp8,issue001/deepseek_v3,r35) -> long_short(dp4sp8,issue003_random/deepseek_v3,r2.5,22.5,25) -> long_short(dp4sp8,issue005_random/deepseek_v3,r2.5,17.5) -> long_short(dp4sp8,gemini_issues/deepseek_v3,r1.75) -> long_short(dp4sp8,issue005_random/kimi_k2,r5,10,15,20,25,30,35,40) -> dp32sp1(issue005_random/kimi_k2,r5,10,15,20,25,30,35,40) -> long_short(dp4sp8,issue003_random/kimi_k2,r5,10,15,20,25,30,35,40) -> dp32sp1(issue003_random/kimi_k2,r5,10,15,20,25,30,35,40)"
+# log "ORDER=long_short_sp8(dp4sp8,mixed60k/deepseek_v3,r90) -> long_short_sp8(dp4sp8,issue001/deepseek_v3,r35) -> long_short_sp8(dp4sp8,issue003_random/deepseek_v3,r2.5,22.5,25) -> long_short_sp8(dp4sp8,issue005_random/deepseek_v3,r2.5,17.5) -> long_short_sp8(dp4sp8,gemini_issues/deepseek_v3,r1.75) -> long_short_sp8(dp4sp8,issue005_random/kimi_k2,r5,10,15,20,25,30,35,40) -> dp32sp1(issue005_random/kimi_k2,r5,10,15,20,25,30,35,40) -> long_short_sp8(dp4sp8,issue003_random/kimi_k2,r5,10,15,20,25,30,35,40) -> dp32sp1(issue003_random/kimi_k2,r5,10,15,20,25,30,35,40)"
 
 ##### 全短
 # for rate in 90; do
 #     rate_tag="${rate//./p}"
-#     run_stage "longshort" "deepseek_v3" "mixed60k" "$DEEPSEEK_MODEL" "$MIXED60K_DATASET" "long_short" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_mixed60k_deepseek_v3_r${rate_tag}" "$BATCH_SIZE" "$rate"
+#     run_stage "longshort" "deepseek_v3" "mixed60k" "$DEEPSEEK_MODEL" "$MIXED60K_DATASET" "long_short_sp8" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_mixed60k_deepseek_v3_r${rate_tag}" "$BATCH_SIZE" "$rate"
 # done
 
 ##### 1%
 # for rate in 35; do
 #     rate_tag="${rate//./p}"
-#     run_stage "longshort" "deepseek_v3" "issue001" "$DEEPSEEK_MODEL" "$ISSUE001_DATASET" "long_short" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_issue001_deepseek_v3_r${rate_tag}" "$BATCH_SIZE" "$rate"
+#     run_stage "longshort" "deepseek_v3" "issue001" "$DEEPSEEK_MODEL" "$ISSUE001_DATASET" "long_short_sp8" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_issue001_deepseek_v3_r${rate_tag}" "$BATCH_SIZE" "$rate"
 # done
-
-##### issue001 DPSK long_short SP size sweep
-for long_sp_size in 4; do
-# for long_sp_size in 2 4; do
-    for rate in 40 60 80; do
-        rate_tag="${rate//./p}"
-        run_stage \
-            "longshort" \
-            "deepseek_v3" \
-            "issue001" \
-            "$DEEPSEEK_MODEL" \
-            "$ISSUE001_DATASET" \
-            "long_short" \
-            "dp4sp8" \
-            "1" \
-            "$rate" \
-            "1" \
-            "$CHAIN_LOG_DIR/longshort_issue001_deepseek_v3_sp${long_sp_size}_r${rate_tag}" \
-            "$BATCH_SIZE" \
-            "$rate" \
-            "LeastBatch" \
-            "$long_sp_size"
-    done
-done
 
 ##### DPSK issue001 dp32 LeastBatch rate 100
 # for rate in 100; do
@@ -199,13 +172,13 @@ done
 ##### 3%
 # for rate in 2.5 22.5 25; do
 #     rate_tag="${rate//./p}"
-#     run_stage "longshort" "deepseek_v3" "issue003_random" "$DEEPSEEK_MODEL" "$ISSUE003_DATASET" "long_short" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_issue003_random_deepseek_v3_r${rate_tag}" "$BATCH_SIZE" "$rate"
+#     run_stage "longshort" "deepseek_v3" "issue003_random" "$DEEPSEEK_MODEL" "$ISSUE003_DATASET" "long_short_sp8" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_issue003_random_deepseek_v3_r${rate_tag}" "$BATCH_SIZE" "$rate"
 # done
 
 ##### 5% dp4sp8
 # for rate in 2.5 17.5; do
 #     rate_tag="${rate//./p}"
-#     run_stage "longshort" "deepseek_v3" "issue005_random" "$DEEPSEEK_MODEL" "$ISSUE005_DATASET" "long_short" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_issue005_random_deepseek_v3_r${rate_tag}" "$BATCH_SIZE" "$rate"
+#     run_stage "longshort" "deepseek_v3" "issue005_random" "$DEEPSEEK_MODEL" "$ISSUE005_DATASET" "long_short_sp8" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_issue005_random_deepseek_v3_r${rate_tag}" "$BATCH_SIZE" "$rate"
 # done
 
 ##### 5% dp32 LeastBatch
@@ -217,14 +190,14 @@ done
 ##### 全长
 # for rate in 1.75; do
 #     rate_tag="${rate//./p}"
-#     run_stage "longshort" "deepseek_v3" "gemini_issues" "$DEEPSEEK_MODEL" "$GEMINI_ISSUES_DATASET" "long_short" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_gemini_issues_deepseek_v3_r${rate_tag}" "$BATCH_SIZE" "$rate"
+#     run_stage "longshort" "deepseek_v3" "gemini_issues" "$DEEPSEEK_MODEL" "$GEMINI_ISSUES_DATASET" "long_short_sp8" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_gemini_issues_deepseek_v3_r${rate_tag}" "$BATCH_SIZE" "$rate"
 # done
 
 ##### KIMI 5%
-# for rate in  50 ; do
-#     rate_tag="${rate//./p}"
-#     run_stage "longshort" "kimi_k2" "issue005_random" "$KIMI_MODEL" "$ISSUE005_DATASET" "long_short" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_issue005_random_kimi_k2_r${rate_tag}" "$BATCH_SIZE" "$rate"
-# done
+for rate in  50 ; do
+    rate_tag="${rate//./p}"
+    run_stage "longshort" "kimi_k2" "issue005_random" "$KIMI_MODEL" "$ISSUE005_DATASET" "long_short_sp8" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_issue005_random_kimi_k2_r${rate_tag}" "$BATCH_SIZE" "$rate"
+done
 
 ##### KIMI 5% dp32
 # for rate in 2.5 ; do
@@ -235,7 +208,7 @@ done
 ##### KIMI 3%
 # for rate in 2.5; do
 #     rate_tag="${rate//./p}"
-#     run_stage "longshort" "kimi_k2" "issue003_random" "$KIMI_MODEL" "$ISSUE003_DATASET" "long_short" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_issue003_random_kimi_k2_r${rate_tag}" "$BATCH_SIZE" "$rate"
+#     run_stage "longshort" "kimi_k2" "issue003_random" "$KIMI_MODEL" "$ISSUE003_DATASET" "long_short_sp8" "dp4sp8" "1" "$rate" "1" "$CHAIN_LOG_DIR/longshort_issue003_random_kimi_k2_r${rate_tag}" "$BATCH_SIZE" "$rate"
 # done
 
 ##### KIMI 3% dp32

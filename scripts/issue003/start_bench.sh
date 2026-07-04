@@ -32,7 +32,6 @@ DEFAULT_ENFORCE_EAGER=0
 DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=0
 DEFAULT_DYNAMIC_SP_SIZE_STRATEGY="legacy"
 DEFAULT_LONG_REQUEST_SP_THRESHOLD=100000
-DEFAULT_LONG_REQUEST_SP_SIZE=""
 DISABLE_NON_UNIFORM_SPLIT=""  # 开关变量，非空时启用
 DEFAULT_MAX_INPUT_LEN=""  # 为空表示不过滤
 # ===================================================================
@@ -64,7 +63,6 @@ ENFORCE_EAGER="$DEFAULT_ENFORCE_EAGER"
 USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="$DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 DYNAMIC_SP_SIZE_STRATEGY="$DEFAULT_DYNAMIC_SP_SIZE_STRATEGY"
 LONG_REQUEST_SP_THRESHOLD="$DEFAULT_LONG_REQUEST_SP_THRESHOLD"
-LONG_REQUEST_SP_SIZE="$DEFAULT_LONG_REQUEST_SP_SIZE"
 
 # 用于存储位置参数（Rates）
 RATES=()
@@ -94,9 +92,8 @@ usage() {
     echo "  --enable-dynamic-sp-size  Enable dynamic SP size"
     echo "  --max-input-len <int>     Filter out CSV rows with prompt_len >= this value"
     echo "  --use-new-decode-dynamic-sp-scheduler  Use the new decode dynamic SP scheduler"
-    echo "  --dynamic-sp-size-strategy <str>  legacy | long_short | long_short_sp8 (default: $DEFAULT_DYNAMIC_SP_SIZE_STRATEGY)"
-    echo "  --long-request-sp-threshold <int> Prompt len threshold for long_short (default: $DEFAULT_LONG_REQUEST_SP_THRESHOLD)"
-    echo "  --long-request-sp-size <int>  Long-request participant count for long_short (default: --sp-size)"
+    echo "  --dynamic-sp-size-strategy <str>  legacy | long_short_sp8 (default: $DEFAULT_DYNAMIC_SP_SIZE_STRATEGY)"
+    echo "  --long-request-sp-threshold <int> Prompt len threshold for long_short_sp8 (default: $DEFAULT_LONG_REQUEST_SP_THRESHOLD)"
     echo "  --enforce-eager           Disable cudagraph capture and enforce eager mode"
     echo "  --disable-non-uniform-split  Disable non-uniform split (flag)"
     echo "  --help                    Show this help message"
@@ -130,7 +127,6 @@ while [[ $# -gt 0 ]]; do
         --use-new-decode-dynamic-sp-scheduler) USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=1; shift ;;
         --dynamic-sp-size-strategy) DYNAMIC_SP_SIZE_STRATEGY="$2"; shift 2 ;;
         --long-request-sp-threshold) LONG_REQUEST_SP_THRESHOLD="$2"; shift 2 ;;
-        --long-request-sp-size) LONG_REQUEST_SP_SIZE="$2"; shift 2 ;;
         --enforce-eager)    ENFORCE_EAGER=1; shift ;;
         --disable-non-uniform-split) DISABLE_NON_UNIFORM_SPLIT="true"; shift ;;
         --help)             usage ;;
@@ -144,10 +140,6 @@ done
 # 如果未指定 num-requests，则计算默认值
 if [ -z "$NUM_REQUESTS" ]; then
     NUM_REQUESTS=$((DP * SP * BATCH_SIZE))
-fi
-
-if [[ -z "$LONG_REQUEST_SP_SIZE" || "$LONG_REQUEST_SP_SIZE" == "0" ]]; then
-    LONG_REQUEST_SP_SIZE="$SP"
 fi
 
 # 检查是否有 Rate 参数
@@ -166,26 +158,6 @@ case "$SCHEDULER_MODE" in
     decentralized|centralized) ;;
     *) echo "Error: Invalid scheduler mode '$SCHEDULER_MODE'."; exit 1 ;;
 esac
-
-case "$DYNAMIC_SP_SIZE_STRATEGY" in
-    legacy|long_short|long_short_sp8) ;;
-    *) echo "Error: Invalid dynamic SP size strategy '$DYNAMIC_SP_SIZE_STRATEGY'."; exit 1 ;;
-esac
-
-if ! [[ "$LONG_REQUEST_SP_THRESHOLD" =~ ^[0-9]+$ ]]; then
-    echo "Error: Invalid long request SP threshold '$LONG_REQUEST_SP_THRESHOLD'."
-    exit 1
-fi
-
-if ! [[ "$LONG_REQUEST_SP_SIZE" =~ ^[0-9]+$ ]]; then
-    echo "Error: Invalid long request SP size '$LONG_REQUEST_SP_SIZE'."
-    exit 1
-fi
-
-if (( LONG_REQUEST_SP_SIZE < 1 || LONG_REQUEST_SP_SIZE > SP )); then
-    echo "Error: long request SP size must be in [1, SP=$SP], got '$LONG_REQUEST_SP_SIZE'."
-    exit 1
-fi
 
 # ================= 准备基础信息 (Preparation) =================
 DATASET_NAME=$(basename "$CSV_PATH" .csv)
@@ -227,7 +199,6 @@ echo "Enable Dynamic SP Size: $ENABLE_DYNAMIC_SP_SIZE"
 echo "New Decode Dynamic SP Scheduler: $USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 echo "Dynamic SP Size Strategy: $DYNAMIC_SP_SIZE_STRATEGY"
 echo "Long Request SP Threshold: $LONG_REQUEST_SP_THRESHOLD"
-echo "Long Request SP Size: $LONG_REQUEST_SP_SIZE"
 echo "Enforce Eager: $ENFORCE_EAGER"
 echo "Model Path  : $MODEL_PATH"
 echo "Rates       : ${RATES[*]}"
@@ -241,7 +212,6 @@ log_progress "EnableDynamicSPSize=$ENABLE_DYNAMIC_SP_SIZE"
 log_progress "UseNewDecodeDynamicSPScheduler=$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 log_progress "DynamicSPSizeStrategy=$DYNAMIC_SP_SIZE_STRATEGY"
 log_progress "LongRequestSPThreshold=$LONG_REQUEST_SP_THRESHOLD"
-log_progress "LongRequestSPSize=$LONG_REQUEST_SP_SIZE"
 log_progress "EnforceEager=$ENFORCE_EAGER"
 log_progress "GPU: ${GPU_MEM}GB, Util=$GPU_UTIL | Routing=$ROUTING_STRATEGY | Loop=$LOOP_COUNT"
 log_progress "LeastBatchTokenCandidateRatio=$LEASTBATCH_TOKEN_CANDIDATE_RATIO"
@@ -292,9 +262,7 @@ for rate in "${RATES[@]}"; do
     if [[ "$FIXED_SP_SEGMENTS" -ne 0 ]]; then
         extra_tags="${extra_tags}_fsp${FIXED_SP_SEGMENTS}"
     fi
-    if [[ "$DYNAMIC_SP_SIZE_STRATEGY" == "long_short" || "$DYNAMIC_SP_SIZE_STRATEGY" == "long_short_sp8" ]]; then
-        extra_tags="${extra_tags}_long_short_sp${LONG_REQUEST_SP_SIZE}_thr${LONG_REQUEST_SP_THRESHOLD}"
-    elif [[ "$DYNAMIC_SP_SIZE_STRATEGY" != "legacy" ]]; then
+    if [[ "$DYNAMIC_SP_SIZE_STRATEGY" != "legacy" ]]; then
         extra_tags="${extra_tags}_${DYNAMIC_SP_SIZE_STRATEGY}_thr${LONG_REQUEST_SP_THRESHOLD}"
     fi
     STRATEGY_STR="dp${DP}sp${SP}_seg${seg_short}_n${NUM_REQUESTS}_r${rate}_bs${BATCH_SIZE}_${rt_short}_${sc_short}${maxin_tag}${extra_tags}"
@@ -332,7 +300,6 @@ for rate in "${RATES[@]}"; do
         --fixed-sp-segments "$FIXED_SP_SEGMENTS"
         --dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY"
         --long-request-sp-threshold "$LONG_REQUEST_SP_THRESHOLD"
-        --long-request-sp-size "$LONG_REQUEST_SP_SIZE"
     )
 
     # 如果启用了 disable_non_uniform_split
