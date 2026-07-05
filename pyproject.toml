@@ -1,27 +1,78 @@
 [build-system]
-requires = ["setuptools>=60"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
 
 [project]
-name = "nanoinfra"
-version = "0.1.0"
-description = "NanoInfra monorepo meta-package"
+name = "dlengine"
+version = "0.2.0"
 authors = [{ name = "DeepLink-MLSysResearch" }]
+license = "MIT"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []
+description = "a lightweight LMDeploy implementation built from scratch"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    # "torch>=2.4.0",
+    # "triton>=3.0.0",
+    # "flash-attn",
+    # "flashinfer",
+    "numpy",
+    "pydantic",
+    "pyzmq>=25.0",
+    "httpx",
+    "uvloop>=0.21.0",
+    "ray>=2.50.1",
+    "transformers>=4.51.0",
+    "jsonargparse>=4.27",
+    "redis>=4.0",
+    "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2",
+    "tqdm",
+    "dlslime>=0.1.16",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
 
-# Install individual components:
-#   pip install ".[dlengine]"
-#   pip install ".[dlenginevl]"   # Vision-Language support (dlengine.vl subpackage)
-#   pip install ".[all]"
-#
-# The optional-dependencies are generated dynamically in setup.py so the
-# local monorepo subpackages can be referenced via *absolute* `file://` URLs.
-# Relative PEP 508 direct references (e.g. `file:dlengine`) are
-# rejected by modern `packaging` (>=24) with "Invalid URL given".
-dynamic = ["optional-dependencies"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Unix",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+]
 
-[tool.setuptools]
-# No Python packages to install from the root itself
-py-modules = []
+[project.optional-dependencies]
+cuda-devel = [
+    "cuda-tile",
+    "cuda-python==12.9.4",
+    "nvidia-cudnn-frontend>=1.13.0",
+    "nvidia-cutlass-dsl>=4.4.2",
+    "nvidia-ml-py",
+]
+# Vision-Language support (dlengine.vl). Install with: pip install "dlengine[vl]"
+vl = [
+    "Pillow",
+    "safetensors",
+]
+vl-dev = [
+    "qwen-vl-utils",
+]
+
+[project.urls]
+Homepage = "https://github.com/nanodeploy-project/nano-deploy"
+
+[project.scripts]
+dlengine = "dlengine.server.cli:main"
+dlengine-router = "dlengine.router:main"
+dlenginevl-serve = "dlengine.vl.server.vl_engine_server:main"
+
+[tool.maturin]
+module-name = "dlengine._engine"
+python-source = "."
+bindings = "pyo3"
+features = ["extension-module"]
+compatibility = "linux"
+auditwheel = "skip"
