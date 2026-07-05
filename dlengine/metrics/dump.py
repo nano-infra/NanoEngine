@@ -81,19 +81,11 @@ def _rounded_list(values: Any) -> list[float]:
         return []
 
 
-def _prompt_token_ids(seq: Any) -> list[int]:
-    return list(seq.prompt_token_ids)
-
-
 def _decode_prompt(tokenizer: Any, prompt_ids: list[int]) -> str:
     try:
         return tokenizer.decode(prompt_ids, skip_special_tokens=False)
     except Exception:  # noqa: BLE001 - prompt text is best-effort debug data
         return ""
-
-
-def _completion_token_ids(seq: Any) -> list[int]:
-    return list(seq.completion_token_ids)
 
 
 class MetricDumper:
@@ -220,37 +212,49 @@ class EngineMetricDumper:
     def close(self) -> None:
         self._writer.close()
 
-    def record_request(self, seq: Any, tokenizer: Any) -> None:
+    def record_request(
+        self,
+        *,
+        seq_id: int,
+        prompt_ids: list[int],
+        tokenizer: Any,
+        affinity_key: int = 0,
+    ) -> None:
         """Dump the admitted request's tokenized prompt."""
         if not self.enabled:
             return
-        prompt_ids = _prompt_token_ids(seq)
         self._writer.dump(
             kind="request",
             ts=time.time(),
-            seq_id=seq.seq_id,
+            seq_id=seq_id,
             model=self._model,
-            affinity_key=str(getattr(seq, "affinity_key", 0)),
+            affinity_key=str(affinity_key),
             prompt_len=len(prompt_ids),
             token_ids=prompt_ids,
             prompt_text=_decode_prompt(tokenizer, prompt_ids),
         )
 
-    def record_completion(self, seq: Any, cached_len: int) -> None:
-        """Dump per-request latency metrics from ``SequenceMetric``."""
+    def record_completion(
+        self,
+        *,
+        seq_id: int,
+        affinity_key: int,
+        metric: Any,
+        completion_ids: list[int],
+        cached_len: int,
+    ) -> None:
+        """Dump per-request latency metrics from explicit engine fields."""
         if not self.enabled:
             return
-        metric = getattr(seq, "metric", None)
         if metric is None:
             return
-        completion_ids = _completion_token_ids(seq)
 
         self._writer.dump(
             kind="complete",
             ts=time.time(),
-            seq_id=seq.seq_id,
+            seq_id=seq_id,
             model=self._model,
-            affinity_key=str(getattr(seq, "affinity_key", 0)),
+            affinity_key=str(affinity_key),
             prompt_len=metric.num_prompt_tokens,
             cached_len=cached_len,
             output_len=metric.num_generated_tokens,

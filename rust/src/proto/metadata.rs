@@ -3,7 +3,7 @@ use super::wire::{
     WireMigrateSequence, WirePacket, WireRequestIn, WireRequestMigrate, WireRunResult,
     WireSamplingParams, WireStepOut, WireVisionSlot,
 };
-use crate::sequence::SamplingParams;
+use crate::sampling::SamplingParams;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple, PyType};
 

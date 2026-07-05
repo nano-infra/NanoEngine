@@ -1,6 +1,6 @@
 use super::Scheduler;
-use crate::sequence::{SamplingParams, Sequence};
-use pyo3::prelude::*;
+use crate::sampling::SamplingParams;
+use crate::sequence::Sequence;
 use std::cmp::Reverse;
 
 impl Scheduler {
@@ -12,19 +12,13 @@ impl Scheduler {
         out
     }
 
-    pub(super) fn compute_dispatch(
-        &self,
-        py: Python<'_>,
-        dp_idx: usize,
-        master: usize,
-        tokens: i32,
-    ) -> Vec<i32> {
+    pub(super) fn compute_dispatch(&self, dp_idx: usize, master: usize, tokens: i32) -> Vec<i32> {
         let group = self.group();
         if group <= 1 || tokens <= 256 {
             return self.dispatch_for_master(master, tokens);
         }
         let mut out = vec![0; group];
-        let mut loads = self.group_loads(py, dp_idx);
+        let mut loads = self.group_loads(dp_idx);
         let mut remaining = tokens;
         while remaining > 0 {
             let gid = (0..group)
@@ -49,16 +43,20 @@ impl Scheduler {
         out
     }
 
-    pub(super) fn make_dummy_seq(&self, py: Python<'_>, group_id: i32) -> PyResult<Py<Sequence>> {
+    pub(super) fn make_dummy_seq_id(&mut self, dp_idx: usize, group_id: usize) -> u64 {
+        let seq_id = u64::MAX - (dp_idx * self.group() + group_id) as u64;
         let mut seq = Sequence::new(
             vec![0i32],
             Some(SamplingParams::new(1.0, 256, false, false)),
         );
+        seq.seq_id = seq_id;
         seq.status = 1;
-        seq.active_group_id = group_id.max(0);
-        seq.migrate_group_id = group_id.max(0);
-        seq.active_dispatched_tokens = self.dispatch_for_master(group_id.max(0) as usize, 1);
-        Py::new(py, seq)
+        seq.active_group_id = group_id as i32;
+        seq.migrate_group_id = group_id as i32;
+        seq.active_dispatched_tokens = self.dispatch_for_master(group_id, 1);
+        self.dummy_seq_ids.insert(seq_id);
+        self.seq_table.insert(seq_id, seq);
+        seq_id
     }
 
     pub(super) fn blocks_needed_for_tokens(&self, tokens: i32) -> usize {
@@ -66,10 +64,12 @@ impl Scheduler {
         ((tokens.max(1) + block_size - 1) / block_size) as usize
     }
 
-    pub(super) fn group_loads(&self, py: Python<'_>, dp_idx: usize) -> Vec<i32> {
+    pub(super) fn group_loads(&self, dp_idx: usize) -> Vec<i32> {
         let mut loads = vec![0; self.group()];
-        for seq in &self.running[dp_idx] {
-            let s = seq.borrow(py);
+        for seq_id in &self.running[dp_idx] {
+            let Some(s) = self.seq_table.get(seq_id) else {
+                continue;
+            };
             let gid = (s.active_group_id.max(0) as usize).min(self.group() - 1);
             loads[gid] += s.num_tokens;
         }
@@ -78,13 +78,12 @@ impl Scheduler {
 
     pub(super) fn choose_master_group(
         &self,
-        py: Python<'_>,
         dp_idx: usize,
         batch_seqs: &[i32],
         batch_tokens: &[i32],
     ) -> Option<usize> {
         let mut candidates: Vec<usize> = (0..self.group()).collect();
-        let loads = self.group_loads(py, dp_idx);
+        let loads = self.group_loads(dp_idx);
         candidates.sort_by_key(|gid| {
             (
                 batch_seqs.get(*gid).copied().unwrap_or(0),

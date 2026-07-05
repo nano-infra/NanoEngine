@@ -265,6 +265,7 @@ impl RuntimeMetrics {
         net_ms: f64,
         serialize_ms: f64,
     ) -> Option<String> {
+        let force_report = prefill_tokens_per_dp.iter().any(|tokens| *tokens > 0);
         if self.report_prefill_tokens_per_dp.is_none() {
             self.report_prefill_tokens_per_dp = Some(vec![0; prefill_tokens_per_dp.len()]);
             self.report_decode_tokens_per_dp = Some(vec![0; decode_tokens_per_dp.len()]);
@@ -320,7 +321,7 @@ impl RuntimeMetrics {
 
         let now = now_seconds();
         let elapsed = now - self.last_report_time;
-        if elapsed < self.report_interval_s {
+        if !force_report && elapsed < self.report_interval_s {
             return None;
         }
         let steps = self.report_step_count.max(1);
@@ -504,20 +505,20 @@ impl RuntimeMetrics {
                     .as_ref()
                     .cloned()
                     .unwrap_or_else(|| vec![0; prompt.len()]);
-                let hit_str = cached
+                let ratio_str = cached
                     .iter()
                     .zip(prompt.iter())
                     .map(|(c, p)| {
-                        if *p > 0 {
-                            format!("{:.0}", *c as f64 / *p as f64 * 100.0)
-                        } else {
-                            "0".to_string()
-                        }
+                        let miss = (*p - *c).max(0);
+                        format!("{c}/{miss}")
                     })
                     .collect::<Vec<_>>()
                     .join("|");
-                let overall = cached.iter().sum::<i32>() as f64 / total_prompt as f64 * 100.0;
-                cache_str = format!(" | prefix-cache {hit_str} % ({overall:.1}% all)");
+                let total_cached = cached.iter().sum::<i32>();
+                let total_miss = (total_prompt - total_cached).max(0);
+                cache_str = format!(
+                    " | prefix-cache hit/miss {ratio_str} ({total_cached}/{total_miss} all)"
+                );
             }
         }
         let total_ms = avg_schedule_ms + avg_forward_ms + avg_postprocess_ms;
@@ -867,5 +868,49 @@ impl RuntimeMetrics {
             self.last_prefix_cache_hit_rate =
                 cached.iter().sum::<i32>() as f64 / total_prompt as f64;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report_once(runtime: &mut RuntimeMetrics, prefill: Vec<i32>, decode: Vec<i32>) -> bool {
+        let mut server_metric = ServerMetric::default();
+        runtime
+            .maybe_report_engine_status(
+                &mut server_metric,
+                "engine".to_string(),
+                "hybrid".to_string(),
+                vec![0; prefill.len().max(decode.len())],
+                0,
+                0,
+                Some(vec![0; prefill.len().max(decode.len())]),
+                10,
+                prefill,
+                decode,
+                None,
+                None,
+                0.0,
+                0.0,
+                0.0,
+                0,
+                0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            .is_some()
+    }
+
+    #[test]
+    fn prefill_reports_immediately_decode_respects_interval() {
+        let mut runtime = runtime_metrics_with_report_interval(60.0);
+
+        assert!(!report_once(&mut runtime, vec![0], vec![1]));
+        assert!(report_once(&mut runtime, vec![8], vec![0]));
+        assert!(!report_once(&mut runtime, vec![0], vec![1]));
     }
 }

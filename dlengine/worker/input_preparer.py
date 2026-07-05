@@ -10,6 +10,7 @@ from dlengine.context_v2.cache import get_cache_context
 from dlengine.context_v2.cache.hca import get_hca_context
 from dlengine.context_v2.cache.hisparse import get_hisparse_context
 from dlengine.context_v2.distributed import get_dist_context
+from dlengine.context_v2.graph import PagedAttentionStrategy
 from dlengine.logging import get_logger
 
 logger = get_logger("DLENGINE")
@@ -165,6 +166,11 @@ class InputPreparer:
             dsv4_compressed_block_tables=dsv4_compressed_block_tables,
             sampling_token_indices=sampling_token_indices,
             sampling_seq_indices=sampling_seq_indices,
+            paged_attention_strategy=(
+                PagedAttentionStrategy.AUTO
+                if block_tables is not None
+                else PagedAttentionStrategy.FLASH_ATTN
+            ),
         )
         return input_ids, positions
 
@@ -205,6 +211,13 @@ class InputPreparer:
             .reshape(sp_size, self.config.max_num_seqs)
             .cuda(non_blocking=True)
         )
+        local_context_lens = meta.context_lens_flat[: self.config.max_num_seqs][
+            : aux.num_group_seqs
+        ]
+        decode_page_plan_key = tuple(
+            (int(seq_len) + block_size - 1) // block_size
+            for seq_len in local_context_lens
+        )
 
         if len(meta.block_tables_flat) == 0:
             block_tables = torch.empty((1, 0, 0), dtype=torch.int32).cuda(
@@ -220,6 +233,7 @@ class InputPreparer:
         config = self.config
         hf_config = config.hf_config
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
+        is_dsv4 = hf_config.architectures[0] == "DeepseekV4ForCausalLM"
         if is_mla:
             import flash_mla
 
@@ -315,6 +329,16 @@ class InputPreparer:
             hisparse_slots=hisparse_slots,
             hisparse_slot_mapping=hisparse_slot_mapping,
             hisparse_num_real_reqs=hisparse_num_real_reqs,
+            paged_attention_strategy=(
+                PagedAttentionStrategy.FLASH_MLA
+                if is_mla or is_dsv4
+                else (
+                    PagedAttentionStrategy.FLASHINFER
+                    if getattr(self.config, "use_flashinfer_decode", False)
+                    else PagedAttentionStrategy.FLASH_ATTN
+                )
+            ),
+            decode_page_plan_key=decode_page_plan_key,
         )
         get_hca_context().tile_scheduler_metadata = new_tile_scheduler_metadata
 

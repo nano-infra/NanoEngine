@@ -1,4 +1,6 @@
 import ctypes
+import itertools
+import struct
 import time as _time
 
 from dlslime.rpc import method
@@ -55,6 +57,8 @@ def server_handler_ns(data: bytes) -> int:
 class ModelRunnerRpcService:
     def __init__(self, runner=None):
         self._runner = runner
+        self._prepared = {}
+        self._prepare_ids = itertools.count(1)
 
     @method(raw=True)
     def run_batch(self, channel, ptr: int, nbytes: int) -> bytes:
@@ -87,6 +91,28 @@ class ModelRunnerRpcService:
                     f"resp_bytes={len(encoded)}"
                 )
         return encoded
+
+    @method(raw=True)
+    def prepare_batch(self, channel, ptr: int, nbytes: int) -> bytes:
+        if self._runner is None:
+            raise RuntimeError("ModelRunnerRpcService is not attached to a runner")
+        data, is_prefill = decode_run_request(ptr, nbytes)
+        handle = next(self._prepare_ids)
+        self._prepared[handle] = self._runner.prepare_from_bytes(data, is_prefill)
+        return struct.pack("<Q", handle)
+
+    @method(raw=True)
+    def run_prepared(self, channel, ptr: int, nbytes: int) -> bytes:
+        if self._runner is None:
+            raise RuntimeError("ModelRunnerRpcService is not attached to a runner")
+        if nbytes != 8:
+            raise ValueError(f"run_prepared expects an 8-byte handle, got {nbytes}")
+        t0 = _time.perf_counter()
+        handle = struct.unpack("<Q", (ctypes.c_char * nbytes).from_address(ptr))[0]
+        prepared = self._prepared.pop(handle)
+        result = self._runner.run_prepared(prepared)
+        handler_ns = int((_time.perf_counter() - t0) * 1e9)
+        return encode_run_result(result, handler_ns)
 
     @method(raw=True)
     def migrate_batch(self, channel, ptr: int, nbytes: int) -> bytes:

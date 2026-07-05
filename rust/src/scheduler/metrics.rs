@@ -91,7 +91,7 @@ impl Scheduler {
 
     pub(super) fn record_step_metric_impl(
         &mut self,
-        py: Python<'_>,
+        _py: Python<'_>,
         metric: &mut ServerMetric,
         result: &ScheduleResult,
         dp_group_token_ids: Option<Vec<Vec<Vec<i32>>>>,
@@ -106,15 +106,17 @@ impl Scheduler {
         metric.update_running_requests(self.running.iter().map(|seqs| seqs.len() as i32).sum());
         metric.update_waiting_requests(self.waiting.len() as i32);
         metric.update_waiting_migration_requests(self.waiting_migration.len() as i32);
-        snapshot.real_bs = result.dp_seqs.iter().map(|seqs| seqs.len() as i32).sum();
+        snapshot.real_bs = result.dp_seq_ids.iter().map(|seqs| seqs.len() as i32).sum();
         if result.is_prefill {
-            for (dp_idx, seqs) in result.dp_seqs.iter().enumerate() {
-                for seq in seqs {
-                    let s = seq.borrow(py);
+            for (dp_idx, seqs) in result.dp_seq_ids.iter().enumerate() {
+                for seq_id in seqs {
+                    let Some(s) = self.seq_table.get(seq_id) else {
+                        continue;
+                    };
                     let seq_id = s.seq_id;
                     let n = s.num_tokens;
                     let cached = s.num_cached_tokens;
-                    let new_tokens = (n - cached).max(0);
+                    let new_tokens = (n - s.prefill_start_offset).max(0);
                     snapshot.prefill_tokens += new_tokens;
                     if dp_idx < snapshot.prefill_tokens_per_dp.len() {
                         snapshot.prefill_tokens_per_dp[dp_idx] += new_tokens;

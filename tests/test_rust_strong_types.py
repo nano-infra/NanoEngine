@@ -65,17 +65,20 @@ def test_scheduler_protocol_roundtrip_without_public_sequence_construction():
 
     result = sched.schedule()
     assert result.is_prefill
+    assert result.dp_seq_ids == [[1001]]
+    assert result.dp_group_seq_ids == [[1001]]
 
-    batch = sched.serialize_run_batches(result.dp_group_seqs, result.is_prefill, 1)[0]
+    batch = sched.serialize_run_batches_for_result(result, 1)[0]
     meta = RunnerIn.from_bytes(batch).prefill(0, 1, 4, 4, 16)
     assert meta.input_ids == [1, 2, 3]
     assert meta.positions == [0, 1, 2]
 
-    sched.postprocess(result.dp_group_seqs, [[[10]]], None, [[[0.5]]])
+    sched.postprocess(result.filtered_dp_group_seq_ids, [[[10]]], None, [[[0.5]]])
 
     result = sched.schedule()
     assert not result.is_prefill
-    batch = sched.serialize_run_batches(result.dp_group_seqs, result.is_prefill, 1)[0]
+    assert result.dp_seq_ids == [[1001]]
+    batch = sched.serialize_run_batches_for_result(result, 1)[0]
     meta = RunnerIn.from_bytes(batch).decode(0, 1, 4, 4, 16)
     assert meta.input_ids == [10]
     assert meta.positions == [3]
@@ -91,9 +94,9 @@ def test_migration_batch_is_a_protocol_product():
     _add_request(sched, 2002, [4, 5, 6])
 
     result = sched.schedule()
-    sched.postprocess(result.dp_group_seqs, [[[-2]]], None, None)
+    sched.postprocess(result.filtered_dp_group_seq_ids, [[[-2]]], None, None)
 
-    migrate_bytes = sched.serialize_migrate_batches(result.dp_group_seqs, 1)[0]
+    migrate_bytes = sched.serialize_migrate_batches_for_result(result, 1)[0]
     migrated = MigrationIn.from_bytes(migrate_bytes)
     assert len(migrated) == 1
     assert migrated[0].seq_id == 2002

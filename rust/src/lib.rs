@@ -9,6 +9,7 @@ mod logging;
 mod metrics;
 mod proto;
 mod router;
+mod sampling;
 mod scheduler;
 mod sequence;
 mod snapshots;
@@ -18,7 +19,7 @@ mod table;
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     config::register(m)?;
     logging::register(m)?;
-    sequence::register(m)?;
+    sampling::register(m)?;
     l3::register(m)?;
     metrics::register(m)?;
     snapshots::register(m)?;

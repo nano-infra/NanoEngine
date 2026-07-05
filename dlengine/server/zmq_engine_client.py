@@ -24,6 +24,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import time
 from typing import Any, Optional
 
 import zmq
@@ -40,6 +42,7 @@ from dlengine.server.wire import (
 )
 
 logger = get_logger("dlengine.server")
+_TTFT_DEBUG = os.environ.get("DLENGINE_TTFT_DEBUG", "0") == "1"
 
 # Action codes (must match engine_server.BackendService).
 _ACTION_STEPOUT = 0
@@ -179,10 +182,22 @@ class ZmqEngineWorker:
         while True:
             action, item = await self._outbox.get()
             try:
+                seq_id = getattr(item, "seq_id", None)
                 payload = item.to_bytes() if isinstance(item, pd.RequestIn) else item
                 if isinstance(item, pd.RequestMigrate):
                     payload = item.to_bytes()
                 await self._socket.send(encode_packet(action, payload))
+                if action == _ACTION_ADD and seq_id is not None:
+                    req = self._active.get(int(seq_id))
+                    if req is not None:
+                        now = time.perf_counter()
+                        setattr(req, "zmq_sent_at", now)
+                        if _TTFT_DEBUG:
+                            logger.info(
+                                "[ttft] seq_id=%s zmq_add_sent submit_to_send=%.2fms",
+                                seq_id,
+                                (now - getattr(req, "submitted_at", now)) * 1000,
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -233,6 +248,20 @@ class ZmqEngineWorker:
 
         tokens = step.token_ids or [step.token_id]
         if tokens:
+            if getattr(req, "zmq_first_stepout_at", 0.0) == 0.0:
+                now = time.perf_counter()
+                setattr(req, "zmq_first_stepout_at", now)
+                sent_at = getattr(req, "zmq_sent_at", 0.0)
+                if _TTFT_DEBUG:
+                    logger.info(
+                        "[ttft] seq_id=%s zmq_first_stepout send_to_recv=%.2fms "
+                        "submit_to_recv=%.2fms tokens=%s status=%s",
+                        seq_id,
+                        (now - sent_at) * 1000 if sent_at else -1.0,
+                        (now - getattr(req, "submitted_at", now)) * 1000,
+                        len(tokens),
+                        step.status,
+                    )
             self._push(req, {"tokens": tokens})
 
         if step.status == SequenceStatus.FINISHED:

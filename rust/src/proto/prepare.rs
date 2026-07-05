@@ -23,10 +23,14 @@ pub(crate) fn runner_in_prefill(
     _num_kvcache_blocks: usize,
 ) -> PyResult<PrefillMeta> {
     let batch = decode_wire(data)?;
-    let mut cu = Vec::with_capacity(batch.seq_lens.len() + 1);
-    cu.push(0);
-    let mut total = 0i32;
-    let mut max_len = 0usize;
+    let mut cu_q = Vec::with_capacity(batch.seq_lens.len() + 1);
+    let mut cu_k = Vec::with_capacity(batch.seq_lens.len() + 1);
+    cu_q.push(0);
+    cu_k.push(0);
+    let mut total_q = 0i32;
+    let mut total_k = 0i32;
+    let mut max_len_q = 0usize;
+    let mut max_len_k = 0usize;
     let max_blocks = batch
         .block_tables
         .iter()
@@ -51,16 +55,31 @@ pub(crate) fn runner_in_prefill(
     let mut sampling_token_indices = Vec::new();
     let mut sampling_seq_indices = Vec::new();
     for (idx, len) in batch.seq_lens.iter().copied().enumerate() {
-        let len_usize = len.max(0) as usize;
-        total += len.max(0);
-        cu.push(total);
-        max_len = max_len.max(len_usize);
+        let q_len = len.max(0);
+        let q_len_usize = q_len as usize;
+        total_q += q_len;
+        let pos_end = if q_len > 0 {
+            batch
+                .positions
+                .get(total_q as usize - 1)
+                .copied()
+                .unwrap_or(i64::from(total_q - 1))
+                .saturating_add(1)
+                .max(0) as i32
+        } else {
+            0
+        };
+        total_k += pos_end;
+        cu_q.push(total_q);
+        cu_k.push(total_k);
+        max_len_q = max_len_q.max(q_len_usize);
+        max_len_k = max_len_k.max(pos_end.max(0) as usize);
         if len > 0 {
-            sampling_token_indices.push((total - 1) as i64);
+            sampling_token_indices.push((total_q - 1) as i64);
             sampling_seq_indices.push(idx as i64);
         }
     }
-    let mut token_seq_indices = Vec::with_capacity(total.max(0) as usize);
+    let mut token_seq_indices = Vec::with_capacity(total_q.max(0) as usize);
     for (seq_idx, len) in batch.seq_lens.iter().copied().enumerate() {
         for _ in 0..len.max(0) {
             token_seq_indices.push(seq_idx);
@@ -69,10 +88,10 @@ pub(crate) fn runner_in_prefill(
     Ok(PrefillMeta {
         input_ids: batch.input_ids,
         positions: batch.positions.clone(),
-        cu_seqlens_q: cu.clone(),
-        cu_seqlens_k: cu,
+        cu_seqlens_q: cu_q,
+        cu_seqlens_k: cu_k,
         slot_mapping: if batch.is_dummy {
-            vec![-1; total.max(0) as usize]
+            vec![-1; total_q.max(0) as usize]
         } else {
             batch
                 .positions
@@ -95,8 +114,8 @@ pub(crate) fn runner_in_prefill(
         use_block_tables: !block_tables_flat.is_empty(),
         block_tables_flat,
         max_num_blocks: max_blocks,
-        max_seqlen_q: max_len,
-        max_seqlen_k: max_len,
+        max_seqlen_q: max_len_q,
+        max_seqlen_k: max_len_k,
         sampling_token_indices,
         sampling_seq_indices,
     })

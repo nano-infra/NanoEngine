@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 
 from dlengine.context_v2 import BaseContext
+from dlengine.context_v2.graph import PagedAttentionStrategy
 
 
 @dataclass
@@ -20,6 +21,9 @@ class BatchContext(BaseContext):
     num_tokens_per_seq: int = 1
     sampling_token_indices: torch.Tensor | None = None
     sampling_seq_indices: torch.Tensor | None = None
+    paged_attention_strategy: PagedAttentionStrategy | None = None
+    graph_attention_strategy: PagedAttentionStrategy | None = None
+    decode_page_plan_key: tuple[int, ...] | None = None
 
     # TODO(context_v2): move these backend-specific fields to their own
     # attention contexts after all call sites use BatchContext directly.
@@ -80,6 +84,9 @@ def set_batch_context(
     num_tokens_per_seq: int = 1,
     sampling_token_indices: Optional[torch.Tensor] = None,
     sampling_seq_indices: Optional[torch.Tensor] = None,
+    paged_attention_strategy: PagedAttentionStrategy | None = None,
+    graph_attention_strategy: PagedAttentionStrategy | None = None,
+    decode_page_plan_key: tuple[int, ...] | None = None,
 ) -> BatchContext:
     global _CONTEXT
     _CONTEXT = BatchContext(
@@ -96,6 +103,9 @@ def set_batch_context(
         num_tokens_per_seq=num_tokens_per_seq,
         sampling_token_indices=sampling_token_indices,
         sampling_seq_indices=sampling_seq_indices,
+        paged_attention_strategy=paged_attention_strategy,
+        graph_attention_strategy=graph_attention_strategy,
+        decode_page_plan_key=decode_page_plan_key,
         gdn_conv_states=gdn_conv_states,
         gdn_recurrent_states=gdn_recurrent_states,
         gdn_state_slots=gdn_state_slots,

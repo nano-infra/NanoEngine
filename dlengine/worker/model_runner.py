@@ -1,15 +1,17 @@
 import os
 import threading
 import time as _time
+from dataclasses import dataclass
 
 import ray
 import torch
 import torch.distributed as dist
 from dlengine._rust.proto import RunnerIn
 from dlengine.config import Config
-from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.batch import BatchContext, get_batch_context, set_batch_context
 from dlengine.context_v2.batch_out import get_batch_out_context
 from dlengine.context_v2.cache import CacheContext, get_cache_context, set_cache_context
+from dlengine.context_v2.cache.hca import get_hca_context
 from dlengine.context_v2.cache.hisparse import initialize_hisparse_context
 from dlengine.context_v2.cache.plan import CachePlan, gqa_cache_plan
 from dlengine.context_v2.distributed import get_dist_context, set_dist_context
@@ -156,6 +158,26 @@ class _CudaForwardTimer:
 logger = get_logger("DLENGINE")
 
 
+@dataclass
+class _PreparedRun:
+    """State produced by prepare_from_bytes and consumed by run_prepared."""
+
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    aux: object
+    num_seqs: int
+    is_prefill: bool
+    is_dummy: bool
+    has_lazy_verify: bool
+    batch_context: BatchContext
+    hca_tile_scheduler_metadata: object | None
+    runner_config: object
+    timer: _StepTimer | None
+    fwd_timer: _CudaForwardTimer | None
+    gap_start_evt: torch.cuda.Event | None
+    gap_report: bool
+
+
 @ray.remote(num_cpus=0.1, num_gpus=1)
 class ModelRunner:
     def __init__(
@@ -173,6 +195,12 @@ class ModelRunner:
             set_log_level(config.log_level)
 
         self.config = config
+        os.environ["DLENGINE_USE_FLASHINFER_DECODE"] = (
+            "1" if getattr(config, "use_flashinfer_decode", False) else "0"
+        )
+        os.environ["DLENGINE_USE_FLASHINFER_PREFILL"] = (
+            "1" if getattr(config, "use_flashinfer_prefill", False) else "0"
+        )
         self.engine_id = self.config.engine_id
         hf_config = config.hf_config
         enable_mla_reference_fallback = getattr(
@@ -1069,7 +1097,16 @@ class ModelRunner:
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        flashinfer_decode_eager = (
+            not is_prefill
+            and os.environ.get("DLENGINE_FLASHINFER_EAGER_DECODE", "0") == "1"
+        )
+        if (
+            is_prefill
+            or self.enforce_eager
+            or flashinfer_decode_eager
+            or input_ids.size(0) > 512
+        ):
             context = get_batch_context()
             inputs_embeds = None
             if is_prefill and self.vision_manager.has_embeds:
@@ -1122,6 +1159,10 @@ class ModelRunner:
 
             # Normal decode (seqlen_q=1)
             outputs = self.decode_graph_runner.run(input_ids, positions, context)
+            if self.decode_graph_runner.returns_logits and self.mtp_runner is None:
+                self._mark_fwd("model")
+                self._mark_fwd("logits")
+                return outputs
             if self.mtp_runner is not None:
                 self.mtp_runner.last_hidden = outputs.clone()
             self._mark_fwd("model")
@@ -1177,6 +1218,12 @@ class ModelRunner:
         want_lp = bool(getattr(aux, "any_return_completion_logprobs", False))
         logprobs = None
         if tp_rank == 0:
+            greedy_only = not want_lp and all(
+                float(t) < 1e-5 for t in getattr(aux, "temperatures", ())
+            )
+            if greedy_only:
+                return logits.argmax(dim=-1), None
+
             temperatures = prepare_sample_from_aux(aux)
             context = get_batch_context()
             if is_prefill and context.sampling_seq_indices is not None:
@@ -1220,8 +1267,8 @@ class ModelRunner:
         return input_ids, logprobs
 
     @torch.inference_mode()
-    def run_from_bytes(self, data: bytes, is_prefill: bool):
-        """Run model from lean RunnerIn bytes (completely Sequence-free)."""
+    def prepare_from_bytes(self, data: bytes, is_prefill: bool) -> _PreparedRun:
+        """Prepare a RunnerIn payload into tensors/context for a later run."""
         _rcfg = get_runner_config()
         _timing = _rcfg.step_timing
         _timer = _StepTimer() if _timing else None
@@ -1237,7 +1284,6 @@ class ModelRunner:
                 (self.run_count + 1) % _rcfg.step_timing_interval == 0
             ):
                 _fwd_timer = _CudaForwardTimer()
-        self._fwd_timer = _fwd_timer
         # GPU-idle probe: record a start event before any GPU op of this step.
         # Combined with the previous step's end event it yields the inter-step
         # GPU-idle gap (no host sync on the hot path; one sync only on report
@@ -1320,6 +1366,72 @@ class ModelRunner:
                 num_seqs,
             )
 
+        return _PreparedRun(
+            input_ids=input_ids,
+            positions=positions,
+            aux=aux,
+            num_seqs=num_seqs,
+            is_prefill=is_prefill,
+            is_dummy=is_dummy,
+            has_lazy_verify=has_lazy_verify,
+            batch_context=get_batch_context(),
+            hca_tile_scheduler_metadata=get_hca_context().tile_scheduler_metadata,
+            runner_config=_rcfg,
+            timer=_timer,
+            fwd_timer=_fwd_timer,
+            gap_start_evt=_gap_start_evt,
+            gap_report=_gap_report,
+        )
+
+    def _activate_prepared_context(self, prepared: _PreparedRun) -> None:
+        """Restore runtime context captured by prepare_from_bytes."""
+        context = prepared.batch_context
+        set_batch_context(
+            is_prefill=context.is_prefill,
+            max_bs=context.max_bs,
+            cu_seqlens_q=context.cu_seqlens_q,
+            cu_seqlens_k=context.cu_seqlens_k,
+            max_seqlen_q=context.max_seqlen_q,
+            max_seqlen_k=context.max_seqlen_k,
+            slot_mapping=context.slot_mapping,
+            context_lens=context.context_lens,
+            block_tables=context.block_tables,
+            is_dummy=context.is_dummy,
+            gdn_conv_states=context.gdn_conv_states,
+            gdn_recurrent_states=context.gdn_recurrent_states,
+            gdn_state_slots=context.gdn_state_slots,
+            dsv4_state_slots=context.dsv4_state_slots,
+            dsv4_compressed_block_tables=context.dsv4_compressed_block_tables,
+            hisparse_slots=context.hisparse_slots,
+            hisparse_slot_mapping=context.hisparse_slot_mapping,
+            hisparse_num_real_reqs=context.hisparse_num_real_reqs,
+            num_tokens_per_seq=context.num_tokens_per_seq,
+            sampling_token_indices=context.sampling_token_indices,
+            sampling_seq_indices=context.sampling_seq_indices,
+            paged_attention_strategy=context.paged_attention_strategy,
+            graph_attention_strategy=context.graph_attention_strategy,
+            decode_page_plan_key=context.decode_page_plan_key,
+        )
+        get_hca_context().tile_scheduler_metadata = prepared.hca_tile_scheduler_metadata
+
+    @torch.inference_mode()
+    def run_prepared(self, prepared: _PreparedRun):
+        """Run a previously prepared payload and build the wire result."""
+        self._activate_prepared_context(prepared)
+        input_ids = prepared.input_ids
+        positions = prepared.positions
+        aux = prepared.aux
+        num_seqs = prepared.num_seqs
+        is_prefill = prepared.is_prefill
+        is_dummy = prepared.is_dummy
+        has_lazy_verify = prepared.has_lazy_verify
+        _rcfg = prepared.runner_config
+        _timer = prepared.timer
+        _fwd_timer = prepared.fwd_timer
+        _gap_start_evt = prepared.gap_start_evt
+        _gap_report = prepared.gap_report
+        self._fwd_timer = _fwd_timer
+
         # --- Forward ---
         if _fwd_timer is not None:
             _fwd_timer.mark("fwd_start")
@@ -1384,7 +1496,9 @@ class ModelRunner:
         logprobs_per_seq = None
         if batch_out.step_logprobs:
             logprobs_per_seq = torch.cat(batch_out.step_logprobs, dim=0).T.tolist()
-        if self.mtp_runner is not None:
+        if self.mtp_runner is None and logprobs_per_seq is None:
+            result = [[int(token)] for token in input_ids.tolist()]
+        elif self.mtp_runner is not None:
             result = self.mtp_runner.build_output_tokens(self.rank)
         else:
             result = torch.cat(batch_out.token_ids, dim=0).T.tolist()
@@ -1428,6 +1542,12 @@ class ModelRunner:
                 )
             self._gap_prev_end_evt = _gap_end_evt
         return result
+
+    @torch.inference_mode()
+    def run_from_bytes(self, data: bytes, is_prefill: bool):
+        """Run model from lean RunnerIn bytes (completely Sequence-free)."""
+        prepared = self.prepare_from_bytes(data, is_prefill)
+        return self.run_prepared(prepared)
 
     def _init_graph_runners(self):
         """Initialize CUDAGraph runners for decode, MTP, and lazy verify."""

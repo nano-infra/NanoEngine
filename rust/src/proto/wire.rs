@@ -1,4 +1,5 @@
-use crate::sequence::{SamplingParams, Sequence, VisionSlot};
+use crate::sampling::SamplingParams;
+use crate::sequence::{Sequence, VisionSlot};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -195,9 +196,8 @@ pub(crate) fn decode_binary<T: DeserializeOwned>(data: &[u8], what: &str) -> PyR
         .map_err(|e| PyValueError::new_err(format!("failed to decode {what}: {e}")))
 }
 
-pub(crate) fn sequence_runner_in_bytes(
-    py: Python<'_>,
-    seqs: Vec<Py<Sequence>>,
+pub(crate) fn sequence_refs_runner_in_bytes(
+    seqs: Vec<&Sequence>,
     is_prefill: bool,
 ) -> PyResult<Vec<u8>> {
     if seqs.is_empty() {
@@ -214,7 +214,6 @@ pub(crate) fn sequence_runner_in_bytes(
     let mut hisparse_slots = Vec::new();
 
     for item in seqs {
-        let item = item.borrow(py);
         let tokens: Vec<i64> = item.token_ids.iter().copied().map(i64::from).collect();
         let prompt_len = (item.num_prompt_tokens.max(0) as usize).min(tokens.len());
         let block_table = item.active_block_table.clone();
@@ -222,7 +221,7 @@ pub(crate) fn sequence_runner_in_bytes(
         let temperature = item.sampling_params.temperature as f32;
 
         if is_prefill {
-            let start = (item.num_cached_tokens.max(0) as usize).min(tokens.len());
+            let start = (item.prefill_start_offset.max(0) as usize).min(tokens.len());
             let chunk_end = item.num_tokens.max(0) as usize;
             let end = chunk_end.min(prompt_len).min(tokens.len()).max(start);
             let slice = &tokens[start..end];
@@ -272,13 +271,10 @@ pub(crate) fn sequence_runner_in_bytes(
     )
 }
 
-pub(crate) fn sequence_migrate_batch_bytes(
-    py: Python<'_>,
-    seqs: Vec<Py<Sequence>>,
-) -> PyResult<Vec<u8>> {
+pub(crate) fn sequence_refs_migrate_batch_bytes(seqs: Vec<&Sequence>) -> PyResult<Vec<u8>> {
     let mut wire = Vec::with_capacity(seqs.len());
     for seq in seqs {
-        wire.push(sequence_to_migrate_wire(py, &seq));
+        wire.push(sequence_to_migrate_wire_ref(seq));
     }
     encode_binary(&wire, "migrate batch")
 }
@@ -294,10 +290,7 @@ pub(crate) fn bytes_arg(data: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     data.extract::<Vec<u8>>()
 }
 
-pub(crate) fn add_request_to_sequence(
-    py: Python<'_>,
-    request: WireRequestIn,
-) -> PyResult<Py<Sequence>> {
+pub(crate) fn request_to_sequence(request: WireRequestIn) -> Sequence {
     let mut seq = Sequence::new(
         request.prompt_token_ids,
         Some(request.sampling_params.to_sampling_params()),
@@ -315,14 +308,10 @@ pub(crate) fn add_request_to_sequence(
             max_tokens_per_slot: slot.max_tokens_per_slot,
         })
         .collect();
-    Py::new(py, seq)
+    seq
 }
 
-pub(crate) fn sequence_to_migration_request(
-    py: Python<'_>,
-    seq: &Py<Sequence>,
-) -> WireRequestMigrate {
-    let seq = seq.borrow(py);
+pub(crate) fn sequence_to_migration_request_ref(seq: &Sequence) -> WireRequestMigrate {
     WireRequestMigrate {
         seq_id: seq.seq_id,
         status: seq.status,
@@ -356,10 +345,7 @@ pub(crate) fn sequence_to_migration_request(
     }
 }
 
-pub(crate) fn migration_request_to_sequence(
-    py: Python<'_>,
-    request: WireRequestMigrate,
-) -> PyResult<Py<Sequence>> {
+pub(crate) fn migrate_request_to_sequence(request: WireRequestMigrate) -> Sequence {
     let mut seq = Sequence::new(
         request.token_ids,
         Some(request.sampling_params.to_sampling_params()),
@@ -391,7 +377,7 @@ pub(crate) fn migration_request_to_sequence(
     seq.migrate_state_slot = request.migrate_state_slot;
     seq.migrate_compressed_block_tables = request.migrate_compressed_block_tables;
     seq.migrate_hisparse_slot = request.migrate_hisparse_slot;
-    Py::new(py, seq)
+    seq
 }
 
 fn block_locations(group_id: i32, blocks: &[i32]) -> Vec<(i32, i32)> {
@@ -402,8 +388,7 @@ fn block_locations(group_id: i32, blocks: &[i32]) -> Vec<(i32, i32)> {
         .collect()
 }
 
-pub(super) fn sequence_to_migrate_wire(py: Python<'_>, seq: &Py<Sequence>) -> WireMigrateSequence {
-    let seq = seq.borrow(py);
+pub(super) fn sequence_to_migrate_wire_ref(seq: &Sequence) -> WireMigrateSequence {
     let migrate_blocks = seq
         .migrate_block_tables
         .get(&seq.migrate_group_id)

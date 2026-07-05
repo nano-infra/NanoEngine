@@ -1,106 +1,106 @@
 use super::Scheduler;
 use crate::metrics::SequenceMetric;
-use crate::sequence::Sequence;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 
 impl Scheduler {
     pub(super) fn preempt_impl(
         &mut self,
-        py: Python<'_>,
+        _py: Python<'_>,
         dp_idx: usize,
-        seq: Py<Sequence>,
+        seq_id: u64,
     ) -> PyResult<()> {
-        let seq_id = {
-            let mut s = seq.borrow_mut(py);
-            let seq_id = s.seq_id;
-            s.status = 0;
-            let total_tokens = s.token_ids.len() as i32;
-            s.num_tokens = total_tokens;
-            s.num_checkpointed_tokens = total_tokens;
-            seq_id
-        };
+        if let Some(seq) = self.seq_table.get_mut(&seq_id) {
+            seq.status = 0;
+            let total_tokens = seq.token_ids.len() as i32;
+            seq.num_tokens = total_tokens;
+            seq.num_checkpointed_tokens = total_tokens;
+            seq.prefill_start_offset = 0;
+        }
         self.release_seq(seq_id);
-        self.running[dp_idx].retain(|s| s.borrow(py).seq_id != seq_id);
-        self.waiting.insert(0, seq);
+        self.running[dp_idx].retain(|id| *id != seq_id);
+        self.waiting.insert(0, seq_id);
         Ok(())
     }
 
     pub(super) fn postprocess_impl(
         &mut self,
         py: Python<'_>,
-        dp_group_seqs: Vec<Vec<Py<Sequence>>>,
+        dp_group_seq_ids: Vec<Vec<u64>>,
         dp_group_token_ids: Vec<Vec<Vec<i32>>>,
         dp_group_token_logprobs: Option<Vec<Vec<Vec<f32>>>>,
     ) {
-        let eos_ids = self.config.eos_ids.clone();
         let mut scheduled_ids: Vec<HashSet<u64>> = (0..self.dp()).map(|_| HashSet::new()).collect();
-        for (group_idx, seqs) in dp_group_seqs.iter().enumerate() {
+        for (group_idx, seq_ids) in dp_group_seq_ids.iter().enumerate() {
             let dp_idx = group_idx / self.group();
             if dp_idx >= scheduled_ids.len() {
                 continue;
             }
-            for seq in seqs {
-                scheduled_ids[dp_idx].insert(seq.borrow(py).seq_id);
+            for seq_id in seq_ids {
+                scheduled_ids[dp_idx].insert(*seq_id);
             }
         }
 
-        let mut next_running: Vec<Vec<Py<Sequence>>> = self
+        let mut next_running: Vec<Vec<u64>> = self
             .running
             .iter()
             .enumerate()
             .map(|(dp_idx, seqs)| {
                 seqs.iter()
-                    .filter(|seq| !scheduled_ids[dp_idx].contains(&seq.borrow(py).seq_id))
-                    .map(|seq| seq.clone_ref(py))
+                    .copied()
+                    .filter(|seq_id| !scheduled_ids[dp_idx].contains(seq_id))
                     .collect()
             })
             .collect();
 
-        for (group_idx, seqs) in dp_group_seqs.iter().enumerate() {
+        for (group_idx, seq_ids) in dp_group_seq_ids.iter().enumerate() {
             let dp_idx = group_idx / self.group();
             let Some(group_tokens) = dp_group_token_ids.get(group_idx) else {
                 continue;
             };
 
-            for (seq_idx, seq) in seqs.iter().enumerate() {
+            for (seq_idx, seq_id) in seq_ids.iter().copied().enumerate() {
+                if self.dummy_seq_ids.contains(&seq_id) {
+                    continue;
+                }
                 let Some(tokens) = group_tokens.get(seq_idx) else {
-                    next_running[dp_idx].push(seq.clone_ref(py));
+                    next_running[dp_idx].push(seq_id);
                     continue;
                 };
 
-                let (seq_id, prefill_target, cur_tokens) = {
-                    let s = seq.borrow(py);
+                let (prefill_target, cur_tokens) = {
+                    let Some(seq) = self.seq_table.get(&seq_id) else {
+                        continue;
+                    };
                     (
-                        s.seq_id,
-                        s.num_prompt_tokens.max(s.num_checkpointed_tokens),
-                        s.num_tokens,
+                        seq.num_prompt_tokens.max(seq.num_checkpointed_tokens),
+                        seq.num_tokens,
                     )
                 };
 
                 if cur_tokens < prefill_target {
-                    self.commit_hbm_blocks(py, seq, cur_tokens);
+                    self.commit_hbm_blocks(seq_id, cur_tokens);
                     let metric = {
-                        let mut s = seq.borrow_mut(py);
-                        s.num_cached_tokens = cur_tokens;
-                        s.status = 4;
-                        s.metric.as_ref().map(|m| m.clone_ref(py))
+                        let Some(seq) = self.seq_table.get_mut(&seq_id) else {
+                            continue;
+                        };
+                        seq.status = 4;
+                        self.sequence_metrics.get(&seq_id).map(|m| m.clone_ref(py))
                     };
                     if let Some(metric) = metric {
                         metric.borrow_mut(py).record_prefill_chunk();
                     }
-                    self.prefilling[dp_idx].push(seq.clone_ref(py));
+                    self.prefilling[dp_idx].push(seq_id);
                     continue;
                 }
 
-                {
-                    let mut s = seq.borrow_mut(py);
-                    if s.status == 4 {
-                        s.status = 1;
+                if let Some(seq) = self.seq_table.get_mut(&seq_id) {
+                    if seq.status == 4 {
+                        seq.status = 1;
                     }
                 }
-                if cur_tokens >= prefill_target {
-                    self.commit_hbm_blocks(py, seq, prefill_target);
+                if cur_tokens == prefill_target {
+                    self.commit_hbm_blocks(seq_id, prefill_target);
                 }
 
                 for (token_offset, token) in tokens.iter().copied().enumerate() {
@@ -111,16 +111,18 @@ impl Scheduler {
                         .and_then(|values| values.get(token_offset))
                         .copied();
                     let (generated, metric) = {
-                        let mut s = seq.borrow_mut(py);
-                        s.token_ids.push(token);
-                        s.last_token = token;
+                        let Some(seq) = self.seq_table.get_mut(&seq_id) else {
+                            continue;
+                        };
+                        seq.token_ids.push(token);
+                        seq.last_token = token;
                         if let Some(logprob) = logprob {
-                            s.completion_logprobs.push(logprob);
+                            seq.completion_logprobs.push(logprob);
                         }
-                        s.num_tokens = s.token_ids.len() as i32;
+                        seq.num_tokens = seq.token_ids.len() as i32;
                         (
-                            s.num_tokens - s.num_prompt_tokens,
-                            s.metric.as_ref().map(|m| m.clone_ref(py)),
+                            seq.num_tokens - seq.num_prompt_tokens,
+                            self.sequence_metrics.get(&seq_id).map(|m| m.clone_ref(py)),
                         )
                     };
                     if let Some(metric) = metric {
@@ -134,29 +136,36 @@ impl Scheduler {
                 }
 
                 let (max_tokens, ignore_eos, num_tokens, generated, last_token) = {
-                    let s = seq.borrow(py);
+                    let Some(seq) = self.seq_table.get(&seq_id) else {
+                        continue;
+                    };
                     (
-                        s.sampling_params.max_tokens,
-                        s.sampling_params.ignore_eos,
-                        s.num_tokens,
-                        s.num_tokens - s.num_prompt_tokens,
-                        s.last_token,
+                        seq.sampling_params.max_tokens,
+                        seq.sampling_params.ignore_eos,
+                        seq.num_tokens,
+                        seq.num_tokens - seq.num_prompt_tokens,
+                        seq.last_token,
                     )
                 };
-                let hit_eos = !ignore_eos && eos_ids.contains(&last_token);
+                let hit_eos = !ignore_eos && self.config.eos_ids.contains(&last_token);
                 let hit_limit = generated >= max_tokens || num_tokens >= self.config.max_model_len;
 
                 if hit_eos || hit_limit {
-                    seq.borrow_mut(py).status = 2;
-                    self.park_or_release(py, seq);
+                    if let Some(seq) = self.seq_table.get_mut(&seq_id) {
+                        seq.status = 2;
+                    }
+                    self.park_or_release(py, seq_id);
                 } else if self.config.mode == "prefill" {
-                    seq.borrow_mut(py).status = 3;
-                    self.to_be_migrated
-                        .insert(seq_id, (seq.clone_ref(py), dp_idx));
+                    if let Some(seq) = self.seq_table.get_mut(&seq_id) {
+                        seq.status = 3;
+                    }
+                    self.to_be_migrated.insert(seq_id, dp_idx);
                 } else {
-                    let _ = self.ensure_blocks_for_seq(py, seq, false);
-                    seq.borrow_mut(py).status = 1;
-                    next_running[dp_idx].push(seq.clone_ref(py));
+                    let _ = self.ensure_blocks_for_seq(py, seq_id, false);
+                    if let Some(seq) = self.seq_table.get_mut(&seq_id) {
+                        seq.status = 1;
+                    }
+                    next_running[dp_idx].push(seq_id);
                 }
             }
         }
@@ -177,41 +186,26 @@ impl Scheduler {
     }
 
     pub(super) fn abort_impl(&mut self, seq_id: u64) -> bool {
-        let found = self.seq_assignment.contains_key(&seq_id)
-            || self.to_be_migrated.contains_key(&seq_id)
-            || self.session_wait.contains_key(&seq_id)
-            || self
-                .waiting
-                .iter()
-                .any(|seq| Python::with_gil(|py| seq.borrow(py).seq_id == seq_id))
-            || self
-                .waiting_migration
-                .iter()
-                .any(|seq| Python::with_gil(|py| seq.borrow(py).seq_id == seq_id))
-            || self.running.iter().any(|queue| {
-                queue
-                    .iter()
-                    .any(|seq| Python::with_gil(|py| seq.borrow(py).seq_id == seq_id))
-            })
-            || self.prefilling.iter().any(|queue| {
-                queue
-                    .iter()
-                    .any(|seq| Python::with_gil(|py| seq.borrow(py).seq_id == seq_id))
-            });
+        let found = self.seq_table.contains_key(&seq_id)
+            && (self.seq_assignment.contains_key(&seq_id)
+                || self.to_be_migrated.contains_key(&seq_id)
+                || self.session_wait.contains_key(&seq_id)
+                || self.waiting.contains(&seq_id)
+                || self.waiting_migration.contains(&seq_id)
+                || self.running.iter().any(|queue| queue.contains(&seq_id))
+                || self.prefilling.iter().any(|queue| queue.contains(&seq_id)));
         if !found {
             return false;
         }
 
         self.release_seq(seq_id);
-        self.waiting
-            .retain(|seq| Python::with_gil(|py| seq.borrow(py).seq_id != seq_id));
-        self.waiting_migration
-            .retain(|seq| Python::with_gil(|py| seq.borrow(py).seq_id != seq_id));
+        self.waiting.retain(|id| *id != seq_id);
+        self.waiting_migration.retain(|id| *id != seq_id);
         for queue in &mut self.running {
-            queue.retain(|seq| Python::with_gil(|py| seq.borrow(py).seq_id != seq_id));
+            queue.retain(|id| *id != seq_id);
         }
         for queue in &mut self.prefilling {
-            queue.retain(|seq| Python::with_gil(|py| seq.borrow(py).seq_id != seq_id));
+            queue.retain(|id| *id != seq_id);
         }
         self.to_be_migrated.remove(&seq_id);
         self.session_wait.remove(&seq_id);
@@ -226,29 +220,13 @@ impl Scheduler {
             .collect()
     }
 
-    pub(super) fn free_to_be_migrated_impl(
-        &mut self,
-        py: Python<'_>,
-        seqs: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        let seqs: Vec<Py<Sequence>> = seqs.extract()?;
-        for seq in seqs {
-            let seq_id = seq.borrow(py).seq_id;
-            if let Some((seq, _dp_idx)) = self.to_be_migrated.remove(&seq_id) {
-                self.release_seq(seq_id);
-                seq.borrow_mut(py).status = 2;
-            } else {
-                self.release_seq(seq_id);
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn free_to_be_migrated_ids_impl(&mut self, py: Python<'_>, seq_ids: Vec<u64>) {
+    pub(super) fn free_to_be_migrated_ids_impl(&mut self, _py: Python<'_>, seq_ids: Vec<u64>) {
         for seq_id in seq_ids {
-            if let Some((seq, _dp_idx)) = self.to_be_migrated.remove(&seq_id) {
+            if self.to_be_migrated.remove(&seq_id).is_some() {
                 self.release_seq(seq_id);
-                seq.borrow_mut(py).status = 2;
+                if let Some(seq) = self.seq_table.get_mut(&seq_id) {
+                    seq.status = 2;
+                }
             } else {
                 self.release_seq(seq_id);
             }
@@ -257,41 +235,26 @@ impl Scheduler {
 
     pub(super) fn set_sequence_metric_impl(
         &mut self,
-        py: Python<'_>,
+        _py: Python<'_>,
         seq_id: u64,
         metric: Py<SequenceMetric>,
     ) -> bool {
-        for queue in [&mut self.waiting, &mut self.waiting_migration] {
-            for seq in queue.iter() {
-                if seq.borrow(py).seq_id == seq_id {
-                    seq.borrow_mut(py).metric = Some(metric.clone_ref(py));
-                    return true;
-                }
-            }
+        if !self.seq_table.contains_key(&seq_id) {
+            return false;
         }
-        for queue in self.running.iter_mut().chain(self.prefilling.iter_mut()) {
-            for seq in queue.iter() {
-                if seq.borrow(py).seq_id == seq_id {
-                    seq.borrow_mut(py).metric = Some(metric.clone_ref(py));
-                    return true;
-                }
-            }
-        }
-        if let Some((seq, _)) = self.to_be_migrated.get(&seq_id) {
-            seq.borrow_mut(py).metric = Some(metric);
-            return true;
-        }
-        false
+        self.sequence_metrics.insert(seq_id, metric);
+        true
     }
 
-    fn commit_hbm_blocks(&mut self, py: Python<'_>, seq: &Py<Sequence>, committed_tokens: i32) {
-        let (seq_id, dp_idx, group_id, token_ids) = {
-            let s = seq.borrow(py);
+    fn commit_hbm_blocks(&mut self, seq_id: u64, committed_tokens: i32) {
+        let (dp_idx, group_id, token_ids) = {
+            let Some(seq) = self.seq_table.get(&seq_id) else {
+                return;
+            };
             (
-                s.seq_id,
-                s.active_dp_idx.max(0) as usize,
-                s.active_group_id.max(0) as usize,
-                s.token_ids.clone(),
+                seq.active_dp_idx.max(0) as usize,
+                seq.active_group_id.max(0) as usize,
+                seq.token_ids.clone(),
             )
         };
         if dp_idx >= self.dp() || group_id >= self.group() {

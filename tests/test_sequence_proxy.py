@@ -27,6 +27,6 @@ def test_python_uses_protocol_not_sequence_container_proxies():
     assert sched.add_request_bytes(payload) == [(1, 3)]
 
     result = sched.schedule()
-    batch = sched.serialize_run_batches(result.dp_group_seqs, result.is_prefill, 1)[0]
+    batch = sched.serialize_run_batches_for_result(result, 1)[0]
     meta = RunnerIn.from_bytes(batch).prefill(0, 1, 4, 2, 8)
     assert meta.input_ids == [7, 8, 9]

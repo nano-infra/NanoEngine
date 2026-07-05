@@ -1,5 +1,4 @@
 use crate::config::CachePlan;
-use crate::sequence::Sequence;
 use crate::snapshots::SchedulerMetricSnapshot;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -138,11 +137,11 @@ pub struct ScheduleResult {
     #[pyo3(get, set)]
     pub schedule_latency_ms: f64,
     #[pyo3(get, set)]
-    pub dp_seqs: Vec<Vec<Py<Sequence>>>,
+    pub dp_seq_ids: Vec<Vec<u64>>,
     #[pyo3(get, set)]
-    pub dp_group_seqs: Vec<Vec<Py<Sequence>>>,
+    pub dp_group_seq_ids: Vec<Vec<u64>>,
     #[pyo3(get, set)]
-    pub filtered_dp_group_seqs: Vec<Vec<Py<Sequence>>>,
+    pub filtered_dp_group_seq_ids: Vec<Vec<u64>>,
     #[pyo3(get, set)]
     pub is_prefill: bool,
     #[pyo3(get, set)]
@@ -211,7 +210,7 @@ impl ScheduleResult {
             for sp_idx in 0..sp_size {
                 let idx = dp_idx * sp_size + sp_idx;
                 per_sp.push(
-                    self.filtered_dp_group_seqs
+                    self.filtered_dp_group_seq_ids
                         .get(idx)
                         .map(|seqs| seqs.len() as i32)
                         .unwrap_or(0),

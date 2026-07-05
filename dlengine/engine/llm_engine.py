@@ -145,8 +145,8 @@ class LLMEngine:
         runner_outs = None
 
         if not (schedule_result.is_prefill and self.config.mode == "decode"):
-            batch_bytes = self.scheduler.serialize_run_batches(
-                schedule_result.dp_group_seqs, schedule_result.is_prefill, tp_size
+            batch_bytes = self.scheduler.serialize_run_batches_for_result(
+                schedule_result, tp_size
             )
             handle = self.executor.run_batch_bytes_async(
                 batch_bytes, schedule_result.is_prefill
@@ -159,8 +159,8 @@ class LLMEngine:
             )
         else:
             logger.info("Decode engine receiving prefill request, migrating KV only")
-            batch_bytes = self.scheduler.serialize_migrate_batches(
-                schedule_result.dp_group_seqs, tp_size
+            batch_bytes = self.scheduler.serialize_migrate_batches_for_result(
+                schedule_result, tp_size
             )
             self.executor.migrate_batch_bytes(batch_bytes)
 

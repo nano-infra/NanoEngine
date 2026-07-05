@@ -11,6 +11,8 @@ Provides:
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.distributed as dist
 from dlengine.context_v2.batch import Context, get_batch_context, set_batch_context
@@ -19,10 +21,32 @@ from dlengine.context_v2.cache.hisparse import get_hisparse_context
 from dlengine.context_v2.cache.mla import get_mla_context
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.context_v2.expert import ExpertContext, set_expert_context
+from dlengine.context_v2.graph import (
+    DecodeGraphContext,
+    FlashInferDecodeGraphConfig,
+    get_graph_context,
+    PagedAttentionStrategy,
+)
 from dlengine.context_v2.management import reset_runtime_contexts
 from dlengine.logging import get_logger
 
 logger = get_logger("DLENGINE")
+
+
+def _flashinfer_decode_enabled() -> bool:
+    return os.environ.get("DLENGINE_USE_FLASHINFER_DECODE", "1") == "1"
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    return os.environ.get(name, "1" if default else "0") == "1"
+
+
+def _capture_logits_enabled() -> bool:
+    return os.environ.get("DLENGINE_DECODE_GRAPH_CAPTURE_LOGITS", "1") == "1"
+
+
+def _reuse_flashinfer_plan_enabled() -> bool:
+    return os.environ.get("DLENGINE_FLASHINFER_REUSE_PAGE_PLAN", "1") == "1"
 
 
 def _make_bs_list(max_bs: int) -> list[int]:
@@ -52,6 +76,14 @@ class DecodeGraphRunner:
         self._context_lens = torch.zeros(1, max_bs, dtype=torch.int32)
         self._block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
         self._outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        self._returns_logits = (
+            _capture_logits_enabled() and get_dist_context().attn_tp_world_size == 1
+        )
+        self._logits = (
+            torch.zeros(max_bs, hf_config.vocab_size, dtype=cache_ctx.kv_cache.dtype)
+            if self._returns_logits
+            else None
+        )
         self._hisparse_slots = torch.full((max_bs,), max_bs, dtype=torch.int64)
 
         # MLA-specific: per-BS FlashMLASchedMeta created during capture
@@ -106,21 +138,117 @@ class DecodeGraphRunner:
         self._is_mla = is_mla
         self._is_dsv4 = is_dsv4
         self._max_num_seqs = config.max_num_seqs
+        self._block_size = block_size
+        self._num_heads = getattr(hf_config, "num_attention_heads")
+        self._num_kv_heads = getattr(hf_config, "num_key_value_heads", self._num_heads)
+        self._head_dim = getattr(
+            hf_config, "head_dim", getattr(hf_config, "hidden_size") // self._num_heads
+        )
+        self._decode_dtype = cache_ctx.kv_cache.dtype
+        self._flashinfer_decode_enabled = (
+            _flashinfer_decode_enabled() and not is_mla and not is_dsv4
+        )
+        self._flashinfer_use_tensor_cores = _env_flag(
+            "DLENGINE_FLASHINFER_GRAPH_TENSOR_CORES", False
+        )
+        self._flashinfer_disable_split_kv = _env_flag(
+            "DLENGINE_FLASHINFER_GRAPH_DISABLE_SPLIT_KV", True
+        )
+        self._flashinfer_fixed_split_size = max(
+            0, int(os.environ.get("DLENGINE_FLASHINFER_GRAPH_FIXED_SPLIT_SIZE", "0"))
+        )
+        self._flashinfer_reuse_page_plan = _reuse_flashinfer_plan_enabled()
+        self._graph_ctx = get_graph_context()
 
         self._bs_list = _make_bs_list(max_bs)
         self._graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._graph_map: dict[int, list[int]] = {}
-        self._graph_pool = None
+        self._decode_ctx = self._graph_ctx.set_decode(
+            DecodeGraphContext(
+                max_num_seqs=self._max_num_seqs,
+                block_size=self._block_size,
+                max_num_blocks=max_num_blocks,
+                is_mla=self._is_mla,
+                is_dsv4=self._is_dsv4,
+                has_indexer=self._has_indexer,
+                input_ids=self._input_ids,
+                positions=self._positions,
+                slot_mapping=self._slot_mapping,
+                context_lens=self._context_lens,
+                block_tables=self._block_tables,
+                outputs=self._outputs,
+                returns_logits=self._returns_logits,
+                logits=self._logits,
+                hisparse_slots=self._hisparse_slots,
+                gdn_state_slots=self._gdn_state_slots,
+                dummy_gdn_slot=self._dummy_gdn_slot,
+                dsv4_state_slots=self._dsv4_state_slots,
+                dummy_dsv4_slot=self._dummy_dsv4_slot,
+                dsv4_compressed_block_tables=self._dsv4_compressed_block_tables,
+                dsv4_compressed_dummy_pages=self._dsv4_compressed_dummy_pages,
+                sched_metas=self._sched_metas,
+                sparse_sched_metas=self._sparse_sched_metas,
+                graphs=self._graphs,
+                graph_map=self._graph_map,
+            )
+        )
+        self._graph_ctx.set_flashinfer_decode(
+            FlashInferDecodeGraphConfig(
+                enabled=self._flashinfer_decode_enabled,
+                max_num_blocks=max_num_blocks,
+                block_size=block_size,
+                num_heads=self._num_heads,
+                num_kv_heads=self._num_kv_heads,
+                head_dim=self._head_dim,
+                dtype=self._decode_dtype,
+                use_tensor_cores=self._flashinfer_use_tensor_cores,
+                disable_split_kv=self._flashinfer_disable_split_kv,
+                fixed_split_size=self._flashinfer_fixed_split_size,
+                reuse_page_plan=self._flashinfer_reuse_page_plan,
+            )
+            if self._flashinfer_decode_enabled
+            else None
+        )
 
     # -- public properties --------------------------------------------------
 
     @property
     def graph_pool(self):
-        return self._graph_pool
+        return self._decode_ctx.graph_pool
 
     @property
     def bs_list(self):
         return self._bs_list
+
+    @property
+    def returns_logits(self) -> bool:
+        return self._decode_ctx.returns_logits
+
+    def _ensure_flashinfer_graph_wrapper(self, master_bs: int):
+        if not self._flashinfer_decode_enabled:
+            return None
+        state = self._graph_ctx.flashinfer_decode
+        return state.ensure_wrapper(master_bs) if state is not None else None
+
+    def _plan_flashinfer_graph_wrapper(
+        self,
+        master_bs: int,
+        bs: int,
+        page_plan_key: tuple[int, ...] | None = None,
+    ) -> object | None:
+        if not self._flashinfer_decode_enabled:
+            return None
+        state = self._graph_ctx.flashinfer_decode
+        if state is None:
+            return None
+        g = self._decode_ctx
+        return state.plan(
+            master_bs,
+            bs,
+            g.block_tables[0, :bs],
+            g.context_lens[0, :bs],
+            page_plan_key=page_plan_key,
+        )
 
     # -- capture ------------------------------------------------------------
 
@@ -132,10 +260,11 @@ class DecodeGraphRunner:
             The ``torch.cuda.graphs.MemPool`` for sharing with other runners.
         """
         logger.info("Capturing decode CUDAGraphs...")
+        g = self._decode_ctx
 
         for master_bs in reversed(self._bs_list):
             attn_bs = master_bs
-            self._graph_map[master_bs] = [attn_bs]
+            g.graph_map[master_bs] = [attn_bs]
 
             logger.info(f"Capturing graph - (master_bs={master_bs}, attn_bs={attn_bs})")
 
@@ -144,54 +273,67 @@ class DecodeGraphRunner:
             sparse_sched_meta = None
             if self._is_mla or self._is_dsv4:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
-                self._sched_metas[master_bs] = sched_meta
+                g.sched_metas[master_bs] = sched_meta
             if self._has_indexer:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
-                self._sparse_sched_metas[master_bs] = sparse_sched_meta
+                g.sparse_sched_metas[master_bs] = sparse_sched_meta
                 # Indexer needs non-zero context_lens during warmup so that
                 # deep_gemm MQA-logits and topk operate on valid data.
-                self._context_lens[:, :master_bs] = 1
+                g.context_lens[:, :master_bs] = 1
+            if self._flashinfer_decode_enabled:
+                g.context_lens[:, :master_bs] = 1
 
             hisparse_ctx = get_hisparse_context()
             if hisparse_ctx.num_real_reqs is not None:
                 hisparse_ctx.num_real_reqs.fill_(master_bs)
 
-            set_batch_context(
+            context = set_batch_context(
                 is_prefill=False,
                 max_bs=self._max_num_seqs,
-                slot_mapping=self._slot_mapping[:master_bs],
-                context_lens=self._context_lens,
-                block_tables=self._block_tables,
+                slot_mapping=g.slot_mapping[:master_bs],
+                context_lens=g.context_lens,
+                block_tables=g.block_tables,
                 gdn_conv_states=cache_ctx.gdn_conv_states,
                 gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
                 gdn_state_slots=(
-                    self._gdn_state_slots[:master_bs]
-                    if self._gdn_state_slots is not None
+                    g.gdn_state_slots[:master_bs]
+                    if g.gdn_state_slots is not None
                     else None
                 ),
                 dsv4_state_slots=(
-                    self._dsv4_state_slots[:master_bs]
-                    if self._dsv4_state_slots is not None
+                    g.dsv4_state_slots[:master_bs]
+                    if g.dsv4_state_slots is not None
                     else None
                 ),
                 # Pass FULL [max_bs+1, max_blocks] table — indexed by state_slot
                 # (which can be up to max_bs = max_num_seqs for the dummy).
                 dsv4_compressed_block_tables=(
-                    dict(self._dsv4_compressed_block_tables)
-                    if self._dsv4_compressed_block_tables
+                    dict(g.dsv4_compressed_block_tables)
+                    if g.dsv4_compressed_block_tables
                     else None
                 ),
-                hisparse_slots=self._hisparse_slots[:master_bs],
-                hisparse_slot_mapping=self._slot_mapping[:master_bs],
+                hisparse_slots=g.hisparse_slots[:master_bs],
+                hisparse_slot_mapping=g.slot_mapping[:master_bs],
                 hisparse_num_real_reqs=get_hisparse_context().num_real_reqs,
+                graph_attention_strategy=(
+                    PagedAttentionStrategy.FLASHINFER
+                    if self._flashinfer_decode_enabled
+                    else None
+                ),
             )
             get_hca_context().tile_scheduler_metadata = sched_meta
             get_mla_context().sparse_tile_scheduler_metadata = sparse_sched_meta
+            flashinfer_wrapper = self._plan_flashinfer_graph_wrapper(
+                master_bs, master_bs
+            )
+            self._graph_ctx.set_active_flashinfer_decode_wrapper(flashinfer_wrapper)
 
             # Warmup
-            self._outputs[:master_bs] = model(
-                self._input_ids[:master_bs], self._positions[:master_bs]
-            )
+            hidden = model(g.input_ids[:master_bs], g.positions[:master_bs])
+            if g.returns_logits:
+                g.logits[:master_bs] = model.compute_logits(hidden)
+            else:
+                g.outputs[:master_bs] = hidden
 
             # Create a fresh FlashMLASchedMeta so that the scheduling
             # metadata kernel (get_decoding_sched_meta) is captured in the
@@ -200,7 +342,7 @@ class DecodeGraphRunner:
             # reset the graph would replay with stale scheduling data.
             if self._is_mla or self._is_dsv4:
                 sched_meta, _ = self._flash_mla.get_mla_metadata()
-                self._sched_metas[master_bs] = sched_meta
+                g.sched_metas[master_bs] = sched_meta
                 get_hca_context().tile_scheduler_metadata = sched_meta
             if self._is_dsv4:
                 # DSv4 uses per-layer sched_metas (mixed compress_ratio configs).
@@ -214,27 +356,34 @@ class DecodeGraphRunner:
                         m._dsv4_sched_metas.pop(master_bs, None)
             if self._has_indexer:
                 sparse_sched_meta, _ = self._flash_mla.get_mla_metadata()
-                self._sparse_sched_metas[master_bs] = sparse_sched_meta
+                g.sparse_sched_metas[master_bs] = sparse_sched_meta
                 get_mla_context().sparse_tile_scheduler_metadata = sparse_sched_meta
+            flashinfer_wrapper = self._plan_flashinfer_graph_wrapper(
+                master_bs, master_bs
+            )
+            self._graph_ctx.set_active_flashinfer_decode_wrapper(flashinfer_wrapper)
 
             # Capture
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, self._graph_pool):
-                self._outputs[:master_bs] = model(
-                    self._input_ids[:master_bs], self._positions[:master_bs]
-                )
+            with torch.cuda.graph(graph, g.graph_pool):
+                hidden = model(g.input_ids[:master_bs], g.positions[:master_bs])
+                if g.returns_logits:
+                    g.logits[:master_bs] = model.compute_logits(hidden)
+                else:
+                    g.outputs[:master_bs] = hidden
 
-            if self._graph_pool is None:
-                self._graph_pool = graph.pool()
+            if g.graph_pool is None:
+                g.graph_pool = graph.pool()
 
-            self._graphs[(master_bs, attn_bs)] = graph
+            g.graphs[(master_bs, attn_bs)] = graph
 
             torch.cuda.synchronize()
             dist.barrier(group=get_dist_context().cuda_world_group)
+            self._graph_ctx.clear_step_context()
             reset_runtime_contexts()
 
-        logger.info(f"Finished capturing {len(self._graphs)} decode CUDAGraphs")
-        return self._graph_pool
+        logger.info(f"Finished capturing {len(g.graphs)} decode CUDAGraphs")
+        return g.graph_pool
 
     # -- replay -------------------------------------------------------------
 
@@ -242,51 +391,52 @@ class DecodeGraphRunner:
         self, input_ids: torch.Tensor, positions: torch.Tensor, context: Context
     ) -> torch.Tensor:
         """Copy inputs into captured buffers, select graph, replay."""
+        g = self._decode_ctx
         bs = input_ids.size(0)
         master_bs = next(x for x in self._bs_list if x >= bs)
 
         attn_bs = bs
-        valid = self._graph_map.get(master_bs)
+        valid = g.graph_map.get(master_bs)
         if valid is None:
             raise RuntimeError(f"No graph map for master_bs={master_bs}")
         attn_bs = next(x for x in valid if x >= attn_bs)
 
         # Copy inputs
-        self._input_ids[:bs] = input_ids
-        self._positions[:bs] = positions
-        self._slot_mapping.fill_(-1)
-        self._slot_mapping[:bs] = context.slot_mapping
-        self._hisparse_slots.fill_(self._max_num_seqs)
+        g.input_ids[:bs] = input_ids
+        g.positions[:bs] = positions
+        g.slot_mapping.fill_(-1)
+        g.slot_mapping[:bs] = context.slot_mapping
+        g.hisparse_slots.fill_(g.max_num_seqs)
         if context.hisparse_slots is not None:
-            self._hisparse_slots[:bs].copy_(context.hisparse_slots[:bs])
+            g.hisparse_slots[:bs].copy_(context.hisparse_slots[:bs])
         hisparse_ctx = get_hisparse_context()
         if hisparse_ctx.num_real_reqs is not None:
             hisparse_ctx.num_real_reqs.fill_(bs)
-        self._context_lens.zero_()
-        self._context_lens[:, : context.context_lens.shape[1]].copy_(
-            context.context_lens
-        )
-        self._block_tables.zero_()
-        self._block_tables[
+        g.context_lens.zero_()
+        g.context_lens[:, : context.context_lens.shape[1]].copy_(context.context_lens)
+        g.block_tables.zero_()
+        g.block_tables[
             :, : context.block_tables.size(1), : context.block_tables.size(2)
         ] = context.block_tables
+        if self._flashinfer_decode_enabled and bs < master_bs:
+            g.context_lens[:, bs:master_bs] = 1
 
         if self._is_mla:
             pass  # FlashMLASchedMeta is managed internally by the kernel; no copy needed
 
-        if self._gdn_state_slots is not None:
-            self._gdn_state_slots.fill_(self._dummy_gdn_slot)
+        if g.gdn_state_slots is not None:
+            g.gdn_state_slots.fill_(g.dummy_gdn_slot)
             if context.gdn_state_slots is not None:
-                self._gdn_state_slots[:bs].copy_(context.gdn_state_slots)
+                g.gdn_state_slots[:bs].copy_(context.gdn_state_slots)
 
-        if self._dsv4_state_slots is not None:
-            self._dsv4_state_slots.fill_(self._dummy_dsv4_slot)
+        if g.dsv4_state_slots is not None:
+            g.dsv4_state_slots.fill_(g.dummy_dsv4_slot)
             if context.dsv4_state_slots is not None:
-                self._dsv4_state_slots[:bs].copy_(context.dsv4_state_slots)
+                g.dsv4_state_slots[:bs].copy_(context.dsv4_state_slots)
 
-        if self._dsv4_compressed_block_tables:
-            for ratio, persistent in self._dsv4_compressed_block_tables.items():
-                persistent.fill_(self._dsv4_compressed_dummy_pages[ratio])
+        if g.dsv4_compressed_block_tables:
+            for ratio, persistent in g.dsv4_compressed_block_tables.items():
+                persistent.fill_(g.dsv4_compressed_dummy_pages[ratio])
                 src = (context.dsv4_compressed_block_tables or {}).get(ratio)
                 if src is not None:
                     # Source is also [max_bs+1, max_blocks] (state-slot indexed).
@@ -295,8 +445,17 @@ class DecodeGraphRunner:
                     n = min(src.shape[0], persistent.shape[0])
                     persistent[:n].copy_(src[:n])
 
-        self._graphs[(master_bs, attn_bs)].replay()
-        return self._outputs[:bs]
+        page_plan_key = context.decode_page_plan_key
+        if page_plan_key is not None:
+            page_plan_key = page_plan_key[:bs] + (1,) * max(0, master_bs - bs)
+
+        self._plan_flashinfer_graph_wrapper(
+            master_bs, master_bs, page_plan_key=page_plan_key
+        )
+        g.graphs[(master_bs, attn_bs)].replay()
+        if g.returns_logits:
+            return g.logits[:bs]
+        return g.outputs[:bs]
 
 
 # ---------------------------------------------------------------------------

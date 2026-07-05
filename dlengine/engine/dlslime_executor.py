@@ -155,6 +155,58 @@ class DLSLimeExecutor(RayExecutor):
             "imm_ns0_list": imm_ns0_list,
         }
 
+    def prepare_batch_bytes_async(
+        self, batch_bytes: list[bytes], is_prefill: bool
+    ) -> dict:
+        """Submit the prepare half of a forward to all workers."""
+        import time as _time
+
+        _t0 = _time.perf_counter()
+        futures = [
+            proxy.prepare_batch(encode_run_request(data))
+            for proxy, data in zip(self._proxies, batch_bytes)
+        ]
+        _t1 = _time.perf_counter()
+        return {
+            "futures": futures,
+            "is_prefill": is_prefill,
+            "request_bytes": sum(len(b) for b in batch_bytes),
+            "t0": _t0,
+            "t1": _t1,
+        }
+
+    def prepare_wait(self, handle: dict) -> list[bytes]:
+        """Wait for prepare_batch_bytes_async and return worker-local handles."""
+        return self._wait_all(handle["futures"])
+
+    def run_prepared_bytes_async(
+        self,
+        prepared_handles: list[bytes],
+        is_prefill: bool,
+        request_bytes: int = 0,
+    ) -> dict:
+        """Submit the run half for worker-local prepare handles."""
+        import time as _time
+
+        _t0 = _time.perf_counter()
+        _t1 = _time.perf_counter()
+        wwi_ns0_list, imm_ns0_list = self._probe_per_proxy()
+        futures = [
+            proxy.run_prepared(handle)
+            for proxy, handle in zip(self._proxies, prepared_handles)
+        ]
+        _t2 = _time.perf_counter()
+        return {
+            "futures": futures,
+            "is_prefill": is_prefill,
+            "request_bytes": request_bytes,
+            "t0": _t0,
+            "t1": _t1,
+            "t2": _t2,
+            "wwi_ns0_list": wwi_ns0_list,
+            "imm_ns0_list": imm_ns0_list,
+        }
+
     def run_wait(self, handle: dict) -> list[list[list[int]]]:
         """Wait for a forward submitted via :meth:`run_async` and decode it."""
         runner_outs = self.run_wait_runner_outs(handle)

@@ -18,12 +18,14 @@ impl BlockContextSlot {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct Block {
     ref_count: i32,
     hash: i64,
     token_ids: Vec<i32>,
 }
 
+#[allow(dead_code)]
 impl Block {
     fn new() -> Self {
         Self {
@@ -48,6 +50,7 @@ impl Block {
 }
 
 #[pyclass(module = "dlengine._engine")]
+#[allow(dead_code)]
 pub struct BlockManager {
     #[pyo3(get)]
     engine_id: String,
@@ -66,6 +69,9 @@ pub struct BlockManager {
 }
 
 #[pymethods]
+#[allow(dead_code)]
+#[allow(dead_code)]
+#[allow(dead_code)]
 impl BlockManager {
     #[new]
     #[pyo3(signature = (engine_id, group_id, num_blocks, block_size))]
@@ -116,12 +122,52 @@ impl BlockManager {
         self.l3_resident_hashes.contains(&hash)
     }
 
-    fn compute_block_hashes(&self, seq: PyRef<'_, Sequence>) -> Vec<i64> {
-        self.compute_block_hashes_inner(&seq)
+    fn drain_pending_loads(&mut self) -> Vec<(i64, i32)> {
+        let mut out = Vec::new();
+        for (hash, block_id) in self.pending_loads.drain(..) {
+            if self
+                .blocks
+                .get(block_id as usize)
+                .map(|block| block.hash == hash)
+                .unwrap_or(false)
+            {
+                out.push((hash, block_id));
+            }
+        }
+        out
     }
 
-    #[pyo3(signature = (seq, _prefix_hint = -1))]
-    fn allocate(&mut self, mut seq: PyRefMut<'_, Sequence>, _prefix_hint: i32) -> PyResult<()> {
+    fn drain_pending_offloads(&mut self) -> Vec<(i64, i32)> {
+        let mut out = Vec::new();
+        for (hash, block_id) in self.pending_offloads.drain(..) {
+            if self
+                .blocks
+                .get(block_id as usize)
+                .map(|block| block.hash == hash)
+                .unwrap_or(false)
+            {
+                out.push((hash, block_id));
+            }
+        }
+        out
+    }
+
+    fn free_block_ids(&self) -> Vec<i32> {
+        self.free_block_ids.iter().copied().collect()
+    }
+
+    fn num_free_blocks(&self) -> i32 {
+        self.free_block_ids.len() as i32
+    }
+}
+
+#[allow(dead_code)]
+impl BlockManager {
+    fn compute_block_hashes(&self, seq: &Sequence) -> Vec<i64> {
+        self.compute_block_hashes_inner(seq)
+    }
+
+    fn allocate(&mut self, seq: &mut Sequence, _prefix_hint: i32) -> PyResult<()> {
         let group_id = self.group_id.max(0);
         if seq
             .active_block_tables
@@ -199,8 +245,7 @@ impl BlockManager {
         Ok(())
     }
 
-    #[pyo3(signature = (seq, _slot = ACTIVE_SLOT))]
-    fn deallocate(&mut self, mut seq: PyRefMut<'_, Sequence>, _slot: i32) {
+    fn deallocate(&mut self, seq: &mut Sequence, _slot: i32) {
         let group_id = self.group_id.max(0);
         let table = seq
             .active_block_tables
@@ -213,9 +258,9 @@ impl BlockManager {
         seq.num_cached_tokens = 0;
     }
 
-    fn can_allocate(&self, seq: PyRef<'_, Sequence>) -> i32 {
-        let hits = self.count_active_prefix_hits_inner(&seq);
-        let needed = self.num_blocks_for_seq(&seq).saturating_sub(hits as usize);
+    fn can_allocate(&self, seq: &Sequence) -> i32 {
+        let hits = self.count_active_prefix_hits_inner(seq);
+        let needed = self.num_blocks_for_seq(seq).saturating_sub(hits as usize);
         if self.free_block_ids.len() >= needed {
             hits
         } else {
@@ -223,12 +268,11 @@ impl BlockManager {
         }
     }
 
-    fn count_active_prefix_hits(&self, seq: PyRef<'_, Sequence>) -> i32 {
-        self.count_active_prefix_hits_inner(&seq)
+    fn count_active_prefix_hits(&self, seq: &Sequence) -> i32 {
+        self.count_active_prefix_hits_inner(seq)
     }
 
-    #[pyo3(signature = (seq, scan_cap = 512))]
-    fn matched_prefix_blocks(&self, seq: PyRef<'_, Sequence>, scan_cap: i32) -> i32 {
+    fn matched_prefix_blocks(&self, seq: &Sequence, scan_cap: i32) -> i32 {
         if !self.prefix_caching_enabled {
             return 0;
         }
@@ -259,47 +303,6 @@ impl BlockManager {
         }
         matched
     }
-
-    fn drain_pending_loads(&mut self) -> Vec<(i64, i32)> {
-        let mut out = Vec::new();
-        for (hash, block_id) in self.pending_loads.drain(..) {
-            if self
-                .blocks
-                .get(block_id as usize)
-                .map(|block| block.hash == hash)
-                .unwrap_or(false)
-            {
-                out.push((hash, block_id));
-            }
-        }
-        out
-    }
-
-    fn drain_pending_offloads(&mut self) -> Vec<(i64, i32)> {
-        let mut out = Vec::new();
-        for (hash, block_id) in self.pending_offloads.drain(..) {
-            if self
-                .blocks
-                .get(block_id as usize)
-                .map(|block| block.hash == hash)
-                .unwrap_or(false)
-            {
-                out.push((hash, block_id));
-            }
-        }
-        out
-    }
-
-    fn free_block_ids(&self) -> Vec<i32> {
-        self.free_block_ids.iter().copied().collect()
-    }
-
-    fn num_free_blocks(&self) -> i32 {
-        self.free_block_ids.len() as i32
-    }
-}
-
-impl BlockManager {
     fn allocate_fresh_block(&mut self) -> PyResult<i32> {
         let Some(block_id) = self.free_block_ids.pop_front() else {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -397,6 +400,7 @@ impl BlockManager {
     }
 }
 
+#[allow(dead_code)]
 fn compute_hash(tokens: &[i32], prefix: i64) -> i64 {
     compute_block_hash(tokens, prefix)
 }
@@ -410,101 +414,84 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sequence::{set_sequence_block_size, SamplingParams, Sequence};
+    use crate::sampling::SamplingParams;
+    use crate::sequence::{set_sequence_block_size, Sequence};
 
     const BS: i32 = 4;
 
-    fn make_seq(py: Python<'_>, tokens: Vec<i32>) -> Py<Sequence> {
+    fn make_seq(tokens: Vec<i32>) -> Sequence {
         set_sequence_block_size(BS);
-        let mut seq = Sequence::new(
+        Sequence::new(
             tokens.clone(),
             Some(SamplingParams::new(1.0, 16, false, false)),
-        );
-        seq.active_context.engine_id = "engine".to_string();
-        seq.active_context.group_size = 1;
-        seq.active_context.attention_dp = 1;
-        seq.active_context.num_kvcache_blocks = 16;
-        seq.active_context.num_dispatched_tokens = vec![tokens.len() as i32];
-        Py::new(py, seq).unwrap()
+        )
     }
 
     #[test]
     fn l3_is_inert_when_disabled() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
-            let seq = make_seq(py, (0..8).collect());
-            bm.allocate(seq.borrow_mut(py), -1).unwrap();
-            bm.deallocate(seq.borrow_mut(py), ACTIVE_SLOT);
-            assert!(bm.drain_pending_offloads().is_empty());
-            assert!(bm.drain_pending_loads().is_empty());
-        });
+        let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
+        let mut seq = make_seq((0..8).collect());
+        bm.allocate(&mut seq, -1).unwrap();
+        bm.deallocate(&mut seq, ACTIVE_SLOT);
+        assert!(bm.drain_pending_offloads().is_empty());
+        assert!(bm.drain_pending_loads().is_empty());
     }
 
     #[test]
     fn evicted_full_blocks_are_queued_for_l3_offload() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
-            bm.set_l3_enabled(true);
-            let seq = make_seq(py, (0..8).collect());
-            let hashes = bm.compute_block_hashes(seq.borrow(py));
-            assert_eq!(hashes.len(), 2);
+        let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
+        bm.set_l3_enabled(true);
+        let mut seq = make_seq((0..8).collect());
+        let hashes = bm.compute_block_hashes(&seq);
+        assert_eq!(hashes.len(), 2);
 
-            bm.allocate(seq.borrow_mut(py), -1).unwrap();
-            bm.deallocate(seq.borrow_mut(py), ACTIVE_SLOT);
+        bm.allocate(&mut seq, -1).unwrap();
+        bm.deallocate(&mut seq, ACTIVE_SLOT);
 
-            let mut offloads = bm.drain_pending_offloads();
-            offloads.sort_by_key(|(hash, _)| *hash);
-            let mut expected = hashes;
-            expected.sort();
-            assert_eq!(
-                offloads.iter().map(|(hash, _)| *hash).collect::<Vec<_>>(),
-                expected
-            );
-        });
+        let mut offloads = bm.drain_pending_offloads();
+        offloads.sort_by_key(|(hash, _)| *hash);
+        let mut expected = hashes;
+        expected.sort();
+        assert_eq!(
+            offloads.iter().map(|(hash, _)| *hash).collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
     fn l3_resident_prefix_queues_loads_and_counts_cached_tokens() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
-            bm.set_l3_enabled(true);
-            let seq = make_seq(py, (0..8).collect());
-            let hashes = bm.compute_block_hashes(seq.borrow(py));
-            bm.set_l3_resident_hashes(hashes.clone());
+        let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
+        bm.set_l3_enabled(true);
+        let mut seq = make_seq((0..8).collect());
+        let hashes = bm.compute_block_hashes(&seq);
+        bm.set_l3_resident_hashes(hashes.clone());
 
-            let hint = bm.can_allocate(seq.borrow(py));
-            bm.allocate(seq.borrow_mut(py), hint).unwrap();
+        let hint = bm.can_allocate(&seq);
+        bm.allocate(&mut seq, hint).unwrap();
 
-            let loads = bm.drain_pending_loads();
-            assert_eq!(loads.len(), 2);
-            assert_eq!(seq.borrow(py).num_cached_tokens, 7);
-            assert_eq!(
-                loads.iter().map(|(hash, _)| *hash).collect::<Vec<_>>(),
-                hashes
-            );
-        });
+        let loads = bm.drain_pending_loads();
+        assert_eq!(loads.len(), 2);
+        assert_eq!(seq.num_cached_tokens, 7);
+        assert_eq!(
+            loads.iter().map(|(hash, _)| *hash).collect::<Vec<_>>(),
+            hashes
+        );
     }
 
     #[test]
     fn gpu_prefix_hit_takes_precedence_over_l3_load() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
-            bm.set_l3_enabled(true);
-            let seq1 = make_seq(py, (0..8).collect());
-            let hashes = bm.compute_block_hashes(seq1.borrow(py));
-            bm.set_l3_resident_hashes(hashes);
-            bm.allocate(seq1.borrow_mut(py), -1).unwrap();
-            bm.drain_pending_loads();
+        let mut bm = BlockManager::new("engine".to_string(), 0, 16, BS);
+        bm.set_l3_enabled(true);
+        let mut seq1 = make_seq((0..8).collect());
+        let hashes = bm.compute_block_hashes(&seq1);
+        bm.set_l3_resident_hashes(hashes);
+        bm.allocate(&mut seq1, -1).unwrap();
+        bm.drain_pending_loads();
 
-            let seq2 = make_seq(py, (0..8).collect());
-            let hint = bm.can_allocate(seq2.borrow(py));
-            bm.allocate(seq2.borrow_mut(py), hint).unwrap();
-            assert!(bm.drain_pending_loads().is_empty());
-            assert_eq!(seq2.borrow(py).num_cached_tokens, 7);
-        });
+        let mut seq2 = make_seq((0..8).collect());
+        let hint = bm.can_allocate(&seq2);
+        bm.allocate(&mut seq2, hint).unwrap();
+        assert!(bm.drain_pending_loads().is_empty());
+        assert_eq!(seq2.num_cached_tokens, 7);
     }
 }

@@ -48,6 +48,10 @@ _SEQ_ID_BASE = 1024
 _seq_id_counter = itertools.count(_SEQ_ID_BASE)
 
 
+def _is_token_id_list(value: Any) -> bool:
+    return isinstance(value, list) and all(type(item) is int for item in value)
+
+
 def _migration_metadata(kv_transfer: dict) -> tuple[int, int | None]:
     seq_id = int(kv_transfer.get("seq_id") or 0)
     if seq_id <= 0:
@@ -1143,13 +1147,33 @@ def build_app(server: OpenAIServer):
                     }
                 },
             )
-        prompt = body.get("prompt", "")
-        if isinstance(prompt, list):
-            prompt = prompt[0] if prompt else ""
         sampling_params = server._build_sampling_params(body)
         max_tokens = sampling_params.max_tokens
         stop = server._parse_stop(body)
-        prompt_ids = server.tokenizer.encode(prompt)
+        input_ids = body.get("input_ids")
+        if input_ids is not None:
+            if not _is_token_id_list(input_ids):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": "input_ids must be a list of integer token ids",
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+            prompt_ids = list(input_ids)
+        else:
+            prompt = body.get("prompt", "")
+            if _is_token_id_list(prompt):
+                prompt_ids = list(prompt)
+            elif isinstance(prompt, list):
+                # Batched completions are not implemented here; preserve the
+                # previous behavior of serving the first prompt.
+                prompt = prompt[0] if prompt else ""
+                prompt_ids = server.tokenizer.encode(prompt)
+            else:
+                prompt_ids = server.tokenizer.encode(prompt)
         length_error = server.validate_request_length(prompt_ids, sampling_params)
         if length_error is not None:
             return length_error

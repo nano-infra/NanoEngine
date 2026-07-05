@@ -21,7 +21,16 @@ except ImportError:
     flash_attn_with_kvcache = None  # type: ignore
     _HAS_FA2 = False
 
+try:
+    import flashinfer
+
+    _HAS_FLASHINFER = True
+except ImportError:
+    flashinfer = None  # type: ignore
+    _HAS_FLASHINFER = False
+
 from dlengine.context_v2.batch import get_batch_context
+from dlengine.context_v2.graph import get_graph_context
 from dlengine.kernel.triton.generic.kv_store import store_kvcache
 from dlengine.kernel.triton.generic.paged_gather import (
     build_paged_gather_indices as _build_paged_gather_indices,
@@ -30,6 +39,252 @@ from dlengine.layers.base_backend import AttentionBase
 from dlengine.logging import get_logger
 
 logger = get_logger()
+
+
+_FLASHINFER_WORKSPACE_BYTES = 128 * 1024 * 1024
+_FLASHINFER_DECODE_CACHE: dict[tuple, object] = {}
+_FLASHINFER_PREFILL_CACHE: dict[tuple, object] = {}
+
+
+def _flashinfer_enabled() -> bool:
+    import os
+
+    return os.environ.get("DLENGINE_USE_FLASHINFER_DECODE", "1") == "1"
+
+
+def _flashinfer_prefill_enabled() -> bool:
+    import os
+
+    return os.environ.get("DLENGINE_USE_FLASHINFER_PREFILL", "1") == "1"
+
+
+def _flashinfer_fixed_split_size() -> int:
+    import os
+
+    return max(0, int(os.environ.get("DLENGINE_FLASHINFER_FIXED_SPLIT_SIZE", "0")))
+
+
+def _flashinfer_disable_split_kv() -> bool:
+    import os
+
+    return os.environ.get("DLENGINE_FLASHINFER_DISABLE_SPLIT_KV", "1") == "1"
+
+
+def _has_cached_prefill(context) -> bool:
+    return context.max_seqlen_k > context.max_seqlen_q
+
+
+def _paged_prefill_metadata(
+    block_tables: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    num_seqs: int,
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    seq_lens = (cu_seqlens_k[1 : num_seqs + 1] - cu_seqlens_k[:num_seqs]).to(
+        torch.int32
+    )
+    pages_per_seq = torch.div(
+        seq_lens + page_size - 1, page_size, rounding_mode="floor"
+    )
+    indptr = torch.empty(num_seqs + 1, device=seq_lens.device, dtype=torch.int32)
+    indptr[0] = 0
+    indptr[1:] = torch.cumsum(pages_per_seq, dim=0)
+
+    max_pages = block_tables.shape[1]
+    page_offsets = torch.arange(
+        max_pages, device=block_tables.device, dtype=torch.int32
+    )
+    mask = page_offsets.unsqueeze(0) < pages_per_seq.unsqueeze(1)
+    indices = block_tables[:num_seqs, :max_pages][mask].contiguous()
+
+    last_page_len = seq_lens % page_size
+    last_page_len = torch.where(
+        last_page_len == 0,
+        torch.full_like(last_page_len, page_size),
+        last_page_len,
+    )
+    return indptr, indices, last_page_len
+
+
+def _paged_decode_metadata(
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    bs: int,
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    seq_lens = context_lens[:bs].to(torch.int32)
+    pages_per_seq = torch.div(
+        seq_lens + page_size - 1, page_size, rounding_mode="floor"
+    )
+    indptr = torch.empty(bs + 1, device=seq_lens.device, dtype=torch.int32)
+    indptr[0] = 0
+    indptr[1:] = torch.cumsum(pages_per_seq, dim=0)
+
+    max_pages = block_tables.shape[1]
+    page_offsets = torch.arange(
+        max_pages, device=block_tables.device, dtype=torch.int32
+    )
+    mask = page_offsets.unsqueeze(0) < pages_per_seq.unsqueeze(1)
+    indices = block_tables[:bs, :max_pages][mask].contiguous()
+
+    last_page_len = seq_lens % page_size
+    last_page_len = torch.where(
+        last_page_len == 0,
+        torch.full_like(last_page_len, page_size),
+        last_page_len,
+    )
+    return indptr, indices, last_page_len
+
+
+def _flashinfer_prefill_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    num_seqs: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    scale: float,
+) -> torch.Tensor:
+    key = (
+        q.device.index,
+        q.dtype,
+        k_cache.dtype,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        block_tables.data_ptr(),
+        cu_seqlens_q.data_ptr(),
+        cu_seqlens_k.data_ptr(),
+    )
+    wrapper = _FLASHINFER_PREFILL_CACHE.get(key)
+    if wrapper is None:
+        workspace = torch.empty(
+            _FLASHINFER_WORKSPACE_BYTES,
+            dtype=torch.uint8,
+            device=q.device,
+        )
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(  # type: ignore[union-attr]
+            workspace,
+            kv_layout="NHD",
+        )
+        _FLASHINFER_PREFILL_CACHE.clear()
+        _FLASHINFER_PREFILL_CACHE[key] = wrapper
+
+    context = get_batch_context()
+    plan_key = (key, id(context))
+    if getattr(context, "_flashinfer_prefill_plan_key", None) != plan_key:
+        indptr, indices, last_page_len = _paged_prefill_metadata(
+            block_tables, cu_seqlens_k, num_seqs, page_size
+        )
+        plan_kwargs = {}
+        fixed_split_size = _flashinfer_fixed_split_size()
+        if fixed_split_size > 0:
+            plan_kwargs["fixed_split_size"] = fixed_split_size
+        if _flashinfer_disable_split_kv():
+            plan_kwargs["disable_split_kv"] = True
+        wrapper.plan(
+            cu_seqlens_q,
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            page_size=page_size,
+            causal=True,
+            q_data_type=q.dtype,
+            kv_data_type=k_cache.dtype,
+            o_data_type=q.dtype,
+            sm_scale=scale,
+            **plan_kwargs,
+        )
+        context._flashinfer_prefill_plan_key = plan_key
+
+    return wrapper.run(q, (k_cache, v_cache))
+
+
+def _flashinfer_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    bs: int,
+    ntps: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    scale: float,
+) -> torch.Tensor:
+    if ntps != 1:
+        raise NotImplementedError(
+            "flashinfer decode fast path only supports one token/seq"
+        )
+
+    graph_wrapper = get_graph_context().active_flashinfer_decode_wrapper
+    if graph_wrapper is not None:
+        return graph_wrapper.run(q.reshape(bs, num_heads, head_dim), (k_cache, v_cache))
+
+    context = get_batch_context()
+    key = (
+        q.device.index,
+        q.dtype,
+        k_cache.dtype,
+        bs,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        block_tables.data_ptr(),
+        context_lens.data_ptr(),
+    )
+    wrapper = _FLASHINFER_DECODE_CACHE.get(key)
+    if wrapper is None:
+        workspace = torch.empty(
+            _FLASHINFER_WORKSPACE_BYTES,
+            dtype=torch.uint8,
+            device=q.device,
+        )
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(  # type: ignore[union-attr]
+            workspace,
+            kv_layout="NHD",
+            use_tensor_cores=False,
+        )
+        _FLASHINFER_DECODE_CACHE.clear()
+        _FLASHINFER_DECODE_CACHE[key] = wrapper
+
+    # BatchContext is recreated for every scheduler step, so storing the plan
+    # marker here shares one plan across layers without reusing stale metadata
+    # across decode steps as context_lens advances.
+    plan_key = (key, id(context))
+    if getattr(context, "_flashinfer_decode_plan_key", None) != plan_key:
+        indptr, indices, last_page_len = _paged_decode_metadata(
+            block_tables, context_lens, bs, page_size
+        )
+        wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            pos_encoding_mode="NONE",
+            q_data_type=q.dtype,
+            kv_data_type=k_cache.dtype,
+            o_data_type=q.dtype,
+            sm_scale=scale,
+        )
+        context._flashinfer_decode_plan_key = plan_key
+
+    return wrapper.run(q.reshape(bs, num_heads, head_dim), (k_cache, v_cache))
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +417,25 @@ class _FA2AttentionImpl:
             if context.block_tables is not None:
                 num_seqs = context.cu_seqlens_k.shape[0] - 1
                 bt = context.block_tables[0, :num_seqs, :]
+                if (
+                    _HAS_FLASHINFER
+                    and _flashinfer_prefill_enabled()
+                    and _has_cached_prefill(context)
+                ):
+                    return _flashinfer_prefill_paged(
+                        q,
+                        k_cache,
+                        v_cache,
+                        bt,
+                        context.cu_seqlens_q,
+                        context.cu_seqlens_k,
+                        num_seqs,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        k_cache.shape[1],
+                        self.scale,
+                    )
                 k, v = _gather_kv_cached_concat(
                     k_cache,
                     v_cache,
@@ -191,6 +465,22 @@ class _FA2AttentionImpl:
         bs = total_tokens // ntps
         context_lens = context.context_lens[0, :bs]
         block_tables = context.block_tables[0, :bs]
+
+        if _HAS_FLASHINFER and _flashinfer_enabled() and ntps == 1:
+            return _flashinfer_decode(
+                q,
+                k_cache,
+                v_cache,
+                block_tables,
+                context_lens,
+                bs,
+                ntps,
+                num_head,
+                self.num_kv_heads,
+                head_dim,
+                k_cache.shape[1],
+                self.scale,
+            )
 
         # FA2's ``flash_attn_with_kvcache`` takes the same logical args as
         # FA3 but names the paged-KV table ``block_table`` (FA3: ``page_table``).

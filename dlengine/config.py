@@ -80,6 +80,14 @@ class Config(BaseModel):
 
     # runner config
     enforce_eager: bool = False
+    use_flashinfer_decode: bool = Field(
+        default_factory=lambda: os.environ.get("DLENGINE_USE_FLASHINFER_DECODE", "1")
+        == "1"
+    )
+    use_flashinfer_prefill: bool = Field(
+        default_factory=lambda: os.environ.get("DLENGINE_USE_FLASHINFER_PREFILL", "1")
+        == "1"
+    )
     # Globally disable ``torch.compile`` (run all compiled paths eagerly).
     # ``enforce_eager`` only skips CUDAGraph capture; several layers
     # (rotary embedding, activation, sampler, ...) still wrap their forward

@@ -22,7 +22,7 @@ def test_standalone_rust_protocol_serialization():
     assert sched.add_request_bytes(payload) == [(999, 4)]
 
     result = sched.schedule()
-    batch = sched.serialize_run_batches(result.dp_group_seqs, result.is_prefill, 1)[0]
+    batch = sched.serialize_run_batches_for_result(result, 1)[0]
     meta = RunnerIn.from_bytes(batch).prefill(0, 1, 4, 2, 8)
     assert meta.input_ids == [101, 202, 303, 404]
     assert meta.positions == [0, 1, 2, 3]

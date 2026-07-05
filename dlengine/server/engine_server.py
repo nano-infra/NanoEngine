@@ -207,11 +207,13 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
     while True:
         try:
             _t_drain = time.perf_counter()
+            drained_add_request = False
             while True:
                 try:
                     action, payload = requests_queue.get_nowait()
                     try:
                         if action == 1:
+                            drained_add_request = True
                             service._handle_add_request(payload)
                         elif action == 2:
                             service._handle_get_info()
@@ -228,6 +230,55 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                         traceback.print_exc()
                 except queue.Empty:
                     break
+
+            # Give near-simultaneous arrivals a tiny admission window before
+            # the next prefill/decode step. This avoids starting a singleton
+            # prefill when sibling requests land a few milliseconds later.
+            if drained_add_request:
+                deadline = time.perf_counter() + 0.005
+                while time.perf_counter() < deadline:
+                    try:
+                        action, payload = requests_queue.get(timeout=0.001)
+                    except queue.Empty:
+                        continue
+                    try:
+                        if action == 1:
+                            service._handle_add_request(payload)
+                        elif action == 2:
+                            service._handle_get_info()
+                        elif action == _ACTION_GET_METRICS:
+                            service._handle_get_metrics()
+                        elif action == 3:
+                            service._handle_free_sequences(payload)
+                        elif action == _ACTION_ABORT:
+                            service._handle_abort(payload)
+                        else:
+                            logger.warning(f"Unknown action: {action}")
+                    except Exception as e:
+                        logger.error(f"Error handling request action {action}: {e}")
+                        traceback.print_exc()
+
+                while True:
+                    try:
+                        action, payload = requests_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        if action == 1:
+                            service._handle_add_request(payload)
+                        elif action == 2:
+                            service._handle_get_info()
+                        elif action == _ACTION_GET_METRICS:
+                            service._handle_get_metrics()
+                        elif action == 3:
+                            service._handle_free_sequences(payload)
+                        elif action == _ACTION_ABORT:
+                            service._handle_abort(payload)
+                        else:
+                            logger.warning(f"Unknown action: {action}")
+                    except Exception as e:
+                        logger.error(f"Error handling request action {action}: {e}")
+                        traceback.print_exc()
             _lp_drain_ms += (time.perf_counter() - _t_drain) * 1000
 
             if engine.scheduler.is_finished():

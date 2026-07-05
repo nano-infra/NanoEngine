@@ -25,7 +25,7 @@ def test_protocol_batch_size_with_scheduler_state():
         assert sched.add_request_bytes(payload) == [(seq_id + 1, len(tokens))]
 
     result = sched.schedule()
-    batches = sched.serialize_run_batches(result.dp_group_seqs, result.is_prefill, 1)
+    batches = sched.serialize_run_batches_for_result(result, 1)
     assert batches
     assert sum(len(batch) for batch in batches) > 0
 
