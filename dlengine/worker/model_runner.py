@@ -1222,6 +1222,8 @@ class ModelRunner:
                 float(t) < 1e-5 for t in getattr(aux, "temperatures", ())
             )
             if greedy_only:
+                if str(logits.dtype).startswith("torch.float8"):
+                    logits = logits.float()
                 return logits.argmax(dim=-1), None
 
             temperatures = prepare_sample_from_aux(aux)

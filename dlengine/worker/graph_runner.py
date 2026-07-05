@@ -79,8 +79,13 @@ class DecodeGraphRunner:
         self._returns_logits = (
             _capture_logits_enabled() and get_dist_context().attn_tp_world_size == 1
         )
+        logits_dtype = getattr(hf_config, "dtype", torch.get_default_dtype())
+        if getattr(logits_dtype, "is_floating_point", False) and str(
+            logits_dtype
+        ).startswith("torch.float8"):
+            logits_dtype = torch.bfloat16
         self._logits = (
-            torch.zeros(max_bs, hf_config.vocab_size, dtype=cache_ctx.kv_cache.dtype)
+            torch.zeros(max_bs, hf_config.vocab_size, dtype=logits_dtype)
             if self._returns_logits
             else None
         )
