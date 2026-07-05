@@ -120,6 +120,7 @@ void bind_sp_state_manager(py::module_& m)
                          bool               enable_dynamic_sp_size,
                          const std::string& dynamic_sp_size_strategy,
                          int                dynamic_sp_long_request_threshold,
+                         int                dynamic_sp_long_request_size,
                          bool               enable_dynamic_sp_bucket_policy,
                          const std::string& dynamic_sp_bucket_policy,
                          double             attention_cost_a,
@@ -134,7 +135,9 @@ void bind_sp_state_manager(py::module_& m)
                          int                res_bytes_per_edge,
                          int                lse_bytes_per_edge,
                          bool               enable_non_uniform_split,
-                         const std::string& sp_master_selector) {
+                         const std::string& sp_master_selector,
+                         bool               sp_debug,
+                         int                fixed_sp_segments) {
                  return std::make_shared<SPStateManager>(engine_id,
                                                          attention_sp,
                                                          num_kvcache_blocks,
@@ -147,6 +150,7 @@ void bind_sp_state_manager(py::module_& m)
                                                          enable_dynamic_sp_size,
                                                          dynamic_sp_size_strategy,
                                                          dynamic_sp_long_request_threshold,
+                                                         dynamic_sp_long_request_size,
                                                          enable_dynamic_sp_bucket_policy,
                                                          dynamic_sp_bucket_policy,
                                                          attention_cost_a,
@@ -161,7 +165,9 @@ void bind_sp_state_manager(py::module_& m)
                                                          res_bytes_per_edge,
                                                          lse_bytes_per_edge,
                                                          enable_non_uniform_split,
-                                                         sp_master_selector);
+                                                         sp_master_selector,
+                                                         sp_debug,
+                                                         fixed_sp_segments);
              }),
              py::arg("engine_id"),
              py::arg("attention_sp"),
@@ -175,6 +181,7 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("enable_dynamic_sp_size"),
              py::arg("dynamic_sp_size_strategy") = "legacy",
              py::arg("dynamic_sp_long_request_threshold") = 100000,
+             py::arg("dynamic_sp_long_request_size") = 0,
              py::arg("enable_dynamic_sp_bucket_policy") = false,
              py::arg("dynamic_sp_bucket_policy") = "",
              py::arg("attention_cost_a") = 1.0,
@@ -189,7 +196,9 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("res_bytes_per_edge") = 1,
              py::arg("lse_bytes_per_edge") = 1,
              py::arg("enable_non_uniform_split"),
-             py::arg("sp_master_selector"))
+             py::arg("sp_master_selector"),
+             py::arg("sp_debug") = false,
+             py::arg("fixed_sp_segments") = 0)
 
         .def_property_readonly("is_empty", &SPStateManager::is_empty)
 

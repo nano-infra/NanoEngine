@@ -1,4 +1,5 @@
 import atexit
+import os
 import time
 import uuid
 from dataclasses import fields
@@ -20,6 +21,13 @@ from nanodeploy.metrics import MetricsManager
 logger = get_logger()
 
 
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class LLMEngine:
     def __init__(self, model, **kwargs):
         self.engine_id = str(uuid.uuid4())
@@ -32,6 +40,9 @@ class LLMEngine:
         self.config.engine_id = self.engine_id
         self.ps = []
         self.events = []
+        self.log_decode_step_detail = _env_flag_enabled(
+            "NANODEPLOY_LOG_DECODE_STEP_DETAIL", default=False
+        )
 
         self.executor = RayExecutor(config=config)
         self.update_num_kvcache_blocks()
@@ -85,7 +96,7 @@ class LLMEngine:
             total_waiting_migration
         )
 
-        if total_waiting_migration > 0:
+        if self.log_decode_step_detail and total_waiting_migration > 0:
             # In decentralized mode, we can't directly access waiting_migration[0]
             # This is just for logging, so we skip it in decentralized mode
             if hasattr(self.scheduler, 'waiting_migration') and self.scheduler.waiting_migration:
@@ -128,15 +139,6 @@ class LLMEngine:
         waiting_head_blocks = sch_res.waiting_head_blocks
         waiting_total_blocks = sch_res.waiting_total_blocks
         self.metrics_manager.server_metric.update_waiting_blocks(waiting_head_blocks, waiting_total_blocks)
-
-        # Per-SP-rank seq_lens: organized as [dp_idx][sp_idx] -> list of seq lens on that GPU
-        sp_seq_lens = [
-            [
-                [len(seq) for seq in filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx]]
-                for sp_idx in range(sp_size)
-            ]
-            for dp_idx in range(dp_size)
-        ]
 
         sch_end = time.perf_counter()
         post_sch_begin = 0
@@ -201,35 +203,83 @@ class LLMEngine:
         # Calculate and log ITL for this step
         if not is_prefill:
             itl = step_duration_ms / self.config.loop_count
-            logger.info(
-                {
-                    "mode": "prefill" if is_prefill else "decode",
-                    "itl": f"{itl:.2f}ms",
-                    "sch_ovhd": f"{(sch_end - sch_begin) * 1000:.2f}ms",
-                    "post_sch_ovhd": f"{(post_sch_end - post_sch_begin) * 1000:.2f}ms",
-                    "waiting_reqs": total_waiting,
-                    "sp_seq_lens": sp_seq_lens,  # Per-GPU seq lens
-                    # "dp_batch_sizes": dp_batch_sizes,
-                    "sp_batch_sizes": sp_batch_sizes,
-                    "sp_send_counts": sp_send_counts,
-                    "sp_recv_counts": sp_recv_counts,
-                    "sp_size_hist_global": sp_size_hist_global,
-                    "sp_size_hist_per_dp": sp_size_hist_per_dp,
-                    "waiting_head_blocks": waiting_head_blocks,
-                    "waiting_total_blocks": waiting_total_blocks,
-                    # "sp_comm_matrix": sp_comm_matrix,
-                    "sp_q_matrix": sp_q_matrix,
-                    "sp_res_matrix": sp_res_matrix,
-                    "free_blocks": [
+            free_blocks = [
+                [
+                    len(worker_state.block_manager[i].free_block_ids)
+                    for i in range(self.scheduler.attention_sp)
+                ]
+                for worker_state in self.scheduler.worker_state
+            ]
+            if self.log_decode_step_detail:
+                # Per-SP-rank seq_lens: [dp_idx][sp_idx] -> list of seq lens on that GPU.
+                sp_seq_lens = [
+                    [
                         [
-                            len(worker_state.block_manager[i].free_block_ids)
-                            for i in range(self.scheduler.attention_sp)
+                            len(seq)
+                            for seq in filtered_dp_sp_seqs[dp_idx * sp_size + sp_idx]
                         ]
-                        for worker_state in self.scheduler.worker_state
-                    ],
-                }
-            )
-        
+                        for sp_idx in range(sp_size)
+                    ]
+                    for dp_idx in range(dp_size)
+                ]
+                logger.info(
+                    {
+                        "mode": "decode",
+                        "itl": f"{itl:.2f}ms",
+                        "sch_ovhd": f"{(sch_end - sch_begin) * 1000:.2f}ms",
+                        "post_sch_ovhd": f"{(post_sch_end - post_sch_begin) * 1000:.2f}ms",
+                        "waiting_reqs": total_waiting,
+                        "sp_seq_lens": sp_seq_lens,
+                        "sp_batch_sizes": sp_batch_sizes,
+                        "sp_send_counts": sp_send_counts,
+                        "sp_recv_counts": sp_recv_counts,
+                        "sp_size_hist_global": sp_size_hist_global,
+                        "sp_size_hist_per_dp": sp_size_hist_per_dp,
+                        "waiting_head_blocks": waiting_head_blocks,
+                        "waiting_total_blocks": waiting_total_blocks,
+                        "sp_q_matrix": sp_q_matrix,
+                        "sp_res_matrix": sp_res_matrix,
+                        "free_blocks": free_blocks,
+                    }
+                )
+            else:
+                flat_sp_batch_sizes = [
+                    batch_size
+                    for dp_batch_sizes in sp_batch_sizes
+                    for batch_size in dp_batch_sizes
+                ]
+                flat_free_blocks = [
+                    num_free_blocks
+                    for dp_free_blocks in free_blocks
+                    for num_free_blocks in dp_free_blocks
+                ]
+                min_free_blocks = min(flat_free_blocks) if flat_free_blocks else 0
+                max_kv_util_pct = (
+                    100.0
+                    * (self.config.num_kvcache_blocks - min_free_blocks)
+                    / self.config.num_kvcache_blocks
+                    if self.config.num_kvcache_blocks > 0
+                    else 0.0
+                )
+                logger.info(
+                    {
+                        "mode": "decode",
+                        "itl": f"{itl:.2f}ms",
+                        "sch_ovhd": f"{(sch_end - sch_begin) * 1000:.2f}ms",
+                        "post_sch_ovhd": f"{(post_sch_end - post_sch_begin) * 1000:.2f}ms",
+                        "waiting_reqs": total_waiting,
+                        "total_batch_size": sum(flat_sp_batch_sizes),
+                        "max_sp_batch_size": (
+                            max(flat_sp_batch_sizes) if flat_sp_batch_sizes else 0
+                        ),
+                        "min_free_blocks": min_free_blocks,
+                        "max_kv_util_pct": f"{max_kv_util_pct:.2f}",
+                        "sp_size_hist_global": sp_size_hist_global,
+                        "waiting_head_blocks_sum": sum(waiting_head_blocks),
+                        "waiting_total_blocks_sum": sum(waiting_total_blocks),
+                    }
+                )
+
         return (
             outputs,
             num_tokens,
