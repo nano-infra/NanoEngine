@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from collections import defaultdict
 from typing import Literal
 
@@ -8,6 +9,15 @@ import torch.distributed as dist
 from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.worker.distributed import get_dist_context
+
+
+def _get_slime_qp_num() -> int:
+    raw = os.environ.get("SLIME_QP_NUM", "1")
+    try:
+        num_qp = int(raw)
+    except ValueError:
+        return 1
+    return max(num_qp, 1)
 
 
 @dataclasses.dataclass
@@ -142,8 +152,11 @@ class CacheContext:
         endpoints = self.endpoints[remote_engine_name] = {}
         endpoints_info = {}
         self.num_remote_kvcache_blocks[remote_engine_name] = num_kv_blocks
+        num_qp = _get_slime_qp_num()
         for i in range(remote_world_size):
-            endpoint = dlslime.RDMAEndpoint(device_name=self.selected_nic, num_qp=1)
+            endpoint = dlslime.RDMAEndpoint(
+                device_name=self.selected_nic, num_qp=num_qp
+            )
             if i == 0:
                 endpoint.register_memory_region(
                     get_dist_context().rank,
