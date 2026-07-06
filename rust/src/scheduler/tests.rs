@@ -157,7 +157,7 @@ fn preempted_sequence_restores_from_host_without_prefill() {
         assert_eq!(scheduler.pending_swap_out_tasks[0].len(), 1);
         let swap_out = scheduler.pending_swap_out_tasks.clone();
         scheduler.complete_host_swap_outs_impl(swap_out);
-        assert!(scheduler.seq_has_host_blocks(42));
+        assert!(scheduler.cache_seq_has_host_blocks(42));
 
         scheduler.current_step += 3;
         let scheduled = scheduler.schedule_prefill(py).unwrap();
@@ -167,7 +167,7 @@ fn preempted_sequence_restores_from_host_without_prefill() {
 
         let swap_in = scheduler.pending_swap_in_tasks.clone();
         scheduler.complete_host_swap_ins_impl(swap_in);
-        assert!(!scheduler.seq_has_host_blocks(42));
+        assert!(!scheduler.cache_seq_has_host_blocks(42));
     });
 }
 
@@ -203,9 +203,9 @@ fn host_swap_restore_respects_cooldown_and_capacity() {
         let swap_out = scheduler.pending_swap_out_tasks.clone();
         scheduler.complete_host_swap_outs_impl(swap_out);
 
-        assert!(!scheduler.try_restore_host_blocks(42, 0).unwrap());
+        assert!(!scheduler.cache_try_restore_host_blocks(42, 0).unwrap());
         scheduler.current_step += 3;
-        assert!(scheduler.try_restore_host_blocks(42, 0).unwrap());
+        assert!(scheduler.cache_try_restore_host_blocks(42, 0).unwrap());
     });
 }
 
@@ -231,8 +231,8 @@ fn host_swap_victim_uses_oldest_scheduled_sequence() {
             .last_scheduled_step = 10;
 
         assert!(scheduler.preempt_one_for_allocation(py, 0, 999).unwrap());
-        assert!(scheduler.seq_has_host_blocks(21));
-        assert!(!scheduler.seq_has_host_blocks(20));
+        assert!(scheduler.cache_seq_has_host_blocks(21));
+        assert!(!scheduler.cache_seq_has_host_blocks(20));
     });
 }
 

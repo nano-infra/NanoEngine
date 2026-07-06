@@ -1,69 +1,8 @@
-use super::{Scheduler, HOST_PREFIX_CACHE_SEQ_ID, HOST_SWAP_IN_COOLDOWN_STEPS};
+use super::Scheduler;
 use crate::table::block::{compute_block_hash, CompressedPool, EvictedBlock};
 use pyo3::prelude::*;
 
 impl Scheduler {
-    pub(super) fn seq_has_host_blocks(&self, seq_id: u64) -> bool {
-        self.seq_table
-            .get(&seq_id)
-            .map(|seq| !seq.host_block_table.is_empty())
-            .unwrap_or(false)
-    }
-
-    pub(super) fn try_restore_host_blocks(&mut self, seq_id: u64, dp_idx: usize) -> PyResult<bool> {
-        let (original_dp, group_id, host_blocks, last_swapped_out_step) = {
-            let Some(seq) = self.seq_table.get(&seq_id) else {
-                return Ok(false);
-            };
-            let original_dp = seq.active_dp_idx.max(0) as usize;
-            let group_id = (seq.active_group_id.max(0) as usize).min(self.group() - 1);
-            let host_blocks = seq
-                .host_block_tables
-                .get(&(group_id as i32))
-                .cloned()
-                .filter(|blocks| !blocks.is_empty())
-                .unwrap_or_else(|| seq.host_block_table.clone());
-            (
-                original_dp,
-                group_id,
-                host_blocks,
-                seq.last_swapped_out_step,
-            )
-        };
-        if host_blocks.is_empty() || dp_idx != original_dp {
-            return Ok(false);
-        }
-        if self.current_step <= last_swapped_out_step.saturating_add(HOST_SWAP_IN_COOLDOWN_STEPS) {
-            return Ok(false);
-        }
-
-        let flat = self.flat_idx(dp_idx, group_id);
-        if self.hbm_pools[flat].num_free_blocks() < host_blocks.len() {
-            return Ok(false);
-        }
-        let tokens = (host_blocks.len() as i32) * self.config.kvcache_block_size.max(1);
-        let gpu_blocks = self.hbm_pools[flat]
-            .ensure_blocks(seq_id, &[], tokens, false)
-            .map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "out of KV cache blocks while restoring host KV: seq_id={seq_id} dp_idx={dp_idx} group_id={group_id}"
-                ))
-            })?;
-        self.seq_assignment.insert(seq_id, (dp_idx, group_id));
-        if let Some(seq) = self.seq_table.get_mut(&seq_id) {
-            seq.active_dp_idx = dp_idx as i32;
-            seq.active_group_id = group_id as i32;
-            seq.active_block_table = gpu_blocks.clone();
-            seq.active_block_tables
-                .insert(group_id as i32, gpu_blocks.clone());
-            seq.status = 1;
-        }
-        if let Some(tasks) = self.pending_swap_in_tasks.get_mut(flat) {
-            tasks.push((seq_id, host_blocks, gpu_blocks));
-        }
-        Ok(true)
-    }
-
     pub(super) fn ensure_group_blocks(
         &mut self,
         _py: Python<'_>,
@@ -207,20 +146,7 @@ impl Scheduler {
         flat: usize,
         evicted: Option<EvictedBlock>,
     ) -> PyResult<()> {
-        let Some(evicted) = evicted else {
-            return Ok(());
-        };
-        if self.config.num_host_kvcache_blocks <= 0 {
-            return Ok(());
-        }
-        let host_block =
-            self.host_pools[flat].store_ready_cache_block(evicted.hash, &evicted.token_ids)?;
-        self.pending_swap_out_tasks[flat].push((
-            HOST_PREFIX_CACHE_SEQ_ID,
-            vec![evicted.block_id],
-            vec![host_block],
-        ));
-        Ok(())
+        self.cache_write_back_evicted_prefix(flat, evicted)
     }
 
     pub(super) fn cached_tokens_for_with_host_prefix(
@@ -257,12 +183,7 @@ impl Scheduler {
         let gqa_hisparse = self.config.cache_plan.flags & (1 << 0) != 0
             && self.config.cache_plan.flags & (1 << 6) != 0;
         if gqa_hisparse {
-            let tail = self
-                .config
-                .cache_plan
-                .hisparse
-                .swap_in_block_size
-                .max(1);
+            let tail = self.config.cache_plan.hisparse.swap_in_block_size.max(1);
             cached.min((tokens - tail).max(0))
         } else {
             cached
