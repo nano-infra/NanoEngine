@@ -8,7 +8,10 @@ from dlengine.config import Config
 from dlengine.context_v2.batch import get_batch_context, set_batch_context
 from dlengine.context_v2.cache import get_cache_context
 from dlengine.context_v2.cache.hca import get_hca_context
-from dlengine.context_v2.cache.hisparse import get_hisparse_context
+from dlengine.context_v2.cache.hisparse import (
+    build_hot_slot_mapping,
+    get_hisparse_context,
+)
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.context_v2.graph import PagedAttentionStrategy
 from dlengine.logging import get_logger
@@ -149,6 +152,22 @@ class InputPreparer:
                 meta.sampling_seq_indices, dtype=torch.int64, pin_memory=True
             ).cuda(non_blocking=True)
 
+        hisparse_slots = None
+        hisparse_num_real_reqs = None
+        if getattr(self.config, "enable_hisparse", False):
+            hisparse_ctx = get_hisparse_context()
+            dummy_slot = self.config.max_num_seqs
+            raw_slots = list(getattr(aux, "hisparse_slots", []))[:num_seqs]
+            raw_slots.extend([dummy_slot] * max(0, num_seqs - len(raw_slots)))
+            hisparse_slots = torch.tensor(
+                [s if 0 <= s < dummy_slot else dummy_slot for s in raw_slots],
+                dtype=torch.int64,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            hisparse_num_real_reqs = hisparse_ctx.num_real_reqs
+            if hisparse_num_real_reqs is not None:
+                hisparse_num_real_reqs.fill_(num_seqs)
+
         set_batch_context(
             is_prefill=True,
             max_bs=self.config.max_num_seqs,
@@ -166,6 +185,8 @@ class InputPreparer:
             dsv4_compressed_block_tables=dsv4_compressed_block_tables,
             sampling_token_indices=sampling_token_indices,
             sampling_seq_indices=sampling_seq_indices,
+            hisparse_slots=hisparse_slots,
+            hisparse_num_real_reqs=hisparse_num_real_reqs,
             paged_attention_strategy=(
                 PagedAttentionStrategy.AUTO
                 if block_tables is not None
@@ -309,7 +330,13 @@ class InputPreparer:
                 dtype=torch.int64,
                 pin_memory=True,
             ).cuda(non_blocking=True)
-            hisparse_slot_mapping = slot_mapping
+            cache_plan = getattr(self.config, "cache_plan", None)
+            if cache_plan is not None and cache_plan.has_gqa():
+                hisparse_slot_mapping = build_hot_slot_mapping(
+                    hisparse_slots, positions
+                )
+            else:
+                hisparse_slot_mapping = slot_mapping
             hisparse_num_real_reqs = hisparse_ctx.num_real_reqs
             if hisparse_num_real_reqs is not None:
                 hisparse_num_real_reqs.fill_(aux.num_group_seqs)

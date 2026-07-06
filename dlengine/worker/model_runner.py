@@ -12,7 +12,10 @@ from dlengine.context_v2.batch import BatchContext, get_batch_context, set_batch
 from dlengine.context_v2.batch_out import get_batch_out_context
 from dlengine.context_v2.cache import CacheContext, get_cache_context, set_cache_context
 from dlengine.context_v2.cache.hca import get_hca_context
-from dlengine.context_v2.cache.hisparse import initialize_hisparse_context
+from dlengine.context_v2.cache.hisparse import (
+    allocate_gqa_hot_buffer,
+    initialize_hisparse_context,
+)
 from dlengine.context_v2.cache.plan import CachePlan, gqa_cache_plan
 from dlengine.context_v2.distributed import get_dist_context, set_dist_context
 from dlengine.context_v2.expert import ExpertContext
@@ -476,6 +479,8 @@ class ModelRunner:
             MTPRunner(config, mtp_model, self.sampler) if mtp_model else None
         )
 
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         self.preallocate_kvcache()
 
     def num_kvcache_blocks(self):
@@ -529,6 +534,12 @@ class ModelRunner:
             layer_id = 0
             for module in self.model.modules():
                 allocated = False
+                if getattr(module, "use_paged_kv_cache", True) is False:
+                    if hasattr(module, "k_cache"):
+                        module.k_cache = torch.tensor([], device=cache_context.device)
+                    if hasattr(module, "v_cache"):
+                        module.v_cache = torch.tensor([], device=cache_context.device)
+                    continue
                 if hasattr(module, "k_cache"):
                     module.k_cache = cache_context.kv_cache[0][layer_id]
                     allocated = True
@@ -550,23 +561,53 @@ class ModelRunner:
                     module.indexer.indexer_cache = cache_context.indexer_cache
 
         if self.cache_plan.has_hisparse():
-            initialize_hisparse_context(
+            hisparse_ctx = initialize_hisparse_context(
                 self.config.max_num_seqs,
                 cache_context.device,
                 self.config.hisparse_device_buffer_size,
             )
-            if not self.config.dummy_prefill:
-                raise RuntimeError("HiSparse Phase 1 requires dummy_prefill=True")
-            with torch.no_grad():
-                cache_context.kv_cache.zero_()
-                if cache_context.indexer_cache is not None:
-                    cache_context.indexer_cache.buffer.zero_()
+            if self.cache_plan.has_gqa():
+                total_tokens = hisparse_ctx.tokens_per_seq * max(
+                    1, hisparse_ctx.max_num_seqs
+                )
+                for module in self.model.modules():
+                    if not (
+                        hasattr(module, "hisparse_k_cache")
+                        and hasattr(module, "hisparse_v_cache")
+                    ):
+                        continue
+                    num_kv_heads = getattr(
+                        module, "num_kv_heads", cache_context.num_local_kv_heads
+                    )
+                    head_dim = getattr(module, "head_dim", cache_context.head_dim)
+                    module.hisparse_k_cache = torch.empty(
+                        total_tokens,
+                        num_kv_heads,
+                        head_dim,
+                        dtype=cache_context.dtype,
+                        device=cache_context.device,
+                    )
+                    module.hisparse_v_cache = torch.empty_like(module.hisparse_k_cache)
+            else:
+                if not self.config.dummy_prefill:
+                    raise RuntimeError(
+                        "HiSparse MLA Phase 1 requires dummy_prefill=True"
+                    )
+                with torch.no_grad():
+                    cache_context.kv_cache.zero_()
+                    if cache_context.indexer_cache is not None:
+                        cache_context.indexer_cache.buffer.zero_()
             logger.info(
-                "HiSparse Phase 1 initialized: dummy-prefill deterministic zero "
-                "KV/indexer cache, device_buffer_size=%s, swap_in_block_size=%s",
+                "HiSparse initialized: device_buffer_size=%s, tokens_per_seq=%s, "
+                "swap_in_block_size=%s",
                 self.config.hisparse_device_buffer_size,
+                hisparse_ctx.tokens_per_seq,
                 self.config.hisparse_swap_in_block_size,
             )
+
+        wire_shared_kv_caches = getattr(self.model, "wire_shared_kv_caches", None)
+        if callable(wire_shared_kv_caches):
+            wire_shared_kv_caches()
 
         # Register memory regions after KV/indexer tensors exist. The PeerAgent
         # itself is started during preallocate_kvcache().
@@ -925,10 +966,32 @@ class ModelRunner:
             hf_config.qk_rope_head_dim if hasattr(hf_config, "qk_rope_head_dim") else 0
         )
 
-        # For mixed attention models (Qwen3.5-MoE), only full_attention layers
-        # need KV cache. Count the number of full_attention layers.
+        # For linear-attention hybrids (Qwen3.5-MoE), only full_attention
+        # layers need paged KV cache. Gemma4 sliding/full layers are both GQA
+        # attention layers, so they each need a cache slice.
         layer_types = getattr(hf_config, "layer_types", None)
-        if layer_types is not None:
+        arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        if (
+            arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration")
+            and layer_types is not None
+        ):
+            first_shared = hf_config.num_hidden_layers - getattr(
+                hf_config, "num_kv_shared_layers", 0
+            )
+            first_shared = max(0, first_shared)
+            if cache_plan.has_hisparse() and cache_plan.has_gqa():
+                num_kv_layers = sum(
+                    1
+                    for i, lt in enumerate(layer_types)
+                    if i < first_shared and lt == "full_attention"
+                )
+            else:
+                num_kv_layers = sum(
+                    1 for i, _lt in enumerate(layer_types) if i < first_shared
+                )
+        elif layer_types is not None and any(
+            lt == "linear_attention" for lt in layer_types
+        ):
             num_kv_layers = sum(1 for lt in layer_types if lt == "full_attention")
         else:
             num_kv_layers = hf_config.num_hidden_layers
@@ -959,12 +1022,23 @@ class ModelRunner:
                 mla_head_dim,
             )
             is_fp8_kvcache = False
-        if cache_plan.has_hisparse() and not is_fp8_kvcache:
+        if cache_plan.has_hisparse() and cache_plan.has_mla() and not is_fp8_kvcache:
             raise RuntimeError("HiSparse requires FP8 MLA KV cache")
 
         head_dim = getattr(hf_config, "head_dim", None) or (
             hf_config.hidden_size // hf_config.num_attention_heads
         )
+        if (
+            arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration")
+            and cache_plan.has_hisparse()
+            and cache_plan.has_gqa()
+            and getattr(hf_config, "global_head_dim", None)
+        ):
+            # Gemma4 uses 256-dim sliding-window heads and 512-dim global heads.
+            # In HiSparse mode paged KV is only used by non-shared full layers;
+            # SWA layers use the hot buffer, so the paged cache shape must match
+            # the full-attention global head dim.
+            head_dim = hf_config.global_head_dim
         # Reserve memory for GDN linear-attention state buffers (allocated below
         # via allocate_gdn_states) so KV-cache sizing stays within the
         # utilization target on hybrid models.
@@ -978,6 +1052,10 @@ class ModelRunner:
                 need_backup=config.num_speculative_tokens > 0,
                 cache_slots=gdn_cache_slots,
             )
+        if getattr(config, "use_flashinfer_decode", False):
+            reserved_state_bytes += 128 * 1024 * 1024
+        if getattr(config, "use_flashinfer_prefill", False):
+            reserved_state_bytes += 128 * 1024 * 1024
         cache_context = set_cache_context(
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=head_dim,
@@ -1037,48 +1115,56 @@ class ModelRunner:
         ) // cache_context.block_size
 
         if cache_plan.has_gqa():
-            cache_plan.gqa.num_pages = cache_context.num_local_kvcache_blocks
-            cache_plan.gqa.page_size = cache_context.block_size
-            cache_plan.gqa.max_blocks_per_seq = max_blocks_per_seq
-            cache_plan.gqa.num_layers = num_kv_layers
-            cache_plan.gqa.num_kv_heads = cache_context.num_kv_heads
-            cache_plan.gqa.head_dim = head_dim
+            gqa = cache_plan.gqa
+            gqa.num_pages = cache_context.num_local_kvcache_blocks
+            gqa.page_size = cache_context.block_size
+            gqa.max_blocks_per_seq = max_blocks_per_seq
+            gqa.num_layers = num_kv_layers
+            gqa.num_kv_heads = cache_context.num_kv_heads
+            gqa.head_dim = head_dim
+            cache_plan.gqa = gqa
 
         if cache_plan.has_mla():
-            cache_plan.mla.num_pages = cache_context.num_local_kvcache_blocks
-            cache_plan.mla.page_size = cache_context.block_size
-            cache_plan.mla.max_blocks_per_seq = max_blocks_per_seq
-            cache_plan.mla.num_layers = num_kv_layers
-            cache_plan.mla.kv_lora_rank = cache_context.kv_lora_rank
-            cache_plan.mla.qk_rope_head_dim = cache_context.qk_rope_head_dim
-            cache_plan.mla.head_dim = head_dim
+            mla = cache_plan.mla
+            mla.num_pages = cache_context.num_local_kvcache_blocks
+            mla.page_size = cache_context.block_size
+            mla.max_blocks_per_seq = max_blocks_per_seq
+            mla.num_layers = num_kv_layers
+            mla.kv_lora_rank = cache_context.kv_lora_rank
+            mla.qk_rope_head_dim = cache_context.qk_rope_head_dim
+            mla.head_dim = head_dim
+            cache_plan.mla = mla
 
         if cache_plan.has_indexer():
-            cache_plan.indexer.num_pages = cache_context.num_local_kvcache_blocks
-            cache_plan.indexer.page_size = cache_context.block_size
-            cache_plan.indexer.max_blocks_per_seq = max_blocks_per_seq
-            cache_plan.indexer.index_head_dim = index_head_dim
+            indexer = cache_plan.indexer
+            indexer.num_pages = cache_context.num_local_kvcache_blocks
+            indexer.page_size = cache_context.block_size
+            indexer.max_blocks_per_seq = max_blocks_per_seq
+            indexer.index_head_dim = index_head_dim
             if index_head_dim > 0:
-                cache_plan.indexer.bytes_per_token = (
-                    index_head_dim + index_head_dim // 128 * 4
-                )
+                indexer.bytes_per_token = index_head_dim + index_head_dim // 128 * 4
+            cache_plan.indexer = indexer
 
         if cache_plan.has_gdn():
-            cache_plan.gdn.state_slots = self.config.max_num_seqs + gdn_cache_slots
-            cache_plan.gdn.state_bytes = reserved_state_bytes
+            gdn = cache_plan.gdn
+            gdn.state_slots = self.config.max_num_seqs + gdn_cache_slots
+            gdn.state_bytes = reserved_state_bytes
+            cache_plan.gdn = gdn
 
         if cache_plan.has_hisparse():
-            cache_plan.hisparse.max_num_seqs = self.config.max_num_seqs
-            cache_plan.hisparse.device_buffer_size = (
-                self.config.hisparse_device_buffer_size
-            )
-            cache_plan.hisparse.host_to_device_ratio = (
-                self.config.hisparse_host_to_device_ratio
-            )
-            cache_plan.hisparse.swap_in_block_size = (
-                self.config.hisparse_swap_in_block_size
-            )
-            cache_plan.hisparse.dummy_slot = self.config.max_num_seqs
+            hisparse = cache_plan.hisparse
+            hisparse.max_num_seqs = self.config.max_num_seqs
+            hisparse.device_buffer_size = self.config.hisparse_device_buffer_size
+            hisparse.host_to_device_ratio = self.config.hisparse_host_to_device_ratio
+            if cache_plan.has_gqa():
+                hisparse.swap_in_block_size = int(
+                    getattr(self.config.hf_config, "sliding_window", 0)
+                    or self.config.hisparse_swap_in_block_size
+                )
+            else:
+                hisparse.swap_in_block_size = self.config.hisparse_swap_in_block_size
+            hisparse.dummy_slot = self.config.max_num_seqs
+            cache_plan.hisparse = hisparse
 
     def _init_peer_agent_context(self, cache_context):
         """Start the worker-owned PeerAgent and inject it into RDMA users."""

@@ -390,47 +390,54 @@ class Config(BaseModel):
         if self.host_utilization_per_device < 0:
             raise ValueError("host_utilization_per_device must be >= 0")
 
-        # HiSparse Phase 1 guard. This first implementation is decode-only
-        # and intentionally requires dummy_prefill so it cannot be accidentally
-        # used as a production sparse/offload path before real cache migration
-        # is wired in.
         if self.enable_hisparse:
             arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
-            if arch != "DeepseekV32ForCausalLM":
-                raise ValueError(
-                    "enable_hisparse Phase 1 only supports DeepseekV32ForCausalLM; "
-                    f"got {arch!r}"
-                )
-            if self.mode != "decode":
-                raise ValueError(
-                    f"enable_hisparse Phase 1 requires mode='decode'; got {self.mode!r}"
-                )
-            if not self.dummy_prefill:
-                raise ValueError(
-                    "enable_hisparse Phase 1 requires dummy_prefill=True "
-                    "to keep it out of production traffic."
-                )
             if self.attention_sp != 1:
                 raise ValueError(
-                    "enable_hisparse Phase 1 rejects attention_sp > 1 until "
+                    "enable_hisparse rejects attention_sp > 1 until "
                     "per-rank block-table and slot semantics are validated."
                 )
             if self.attention_tp != 1:
                 raise ValueError("enable_hisparse requires attention_tp == 1")
             if self.num_speculative_tokens != 0:
-                raise ValueError("enable_hisparse Phase 1 does not support MTP")
-            if self.disable_nsa:
-                raise ValueError("enable_hisparse requires NSA/indexer to be enabled")
-            if getattr(self.hf_config, "index_head_dim", 0) <= 0:
-                raise ValueError("enable_hisparse requires DSV3.2 index_head_dim > 0")
-            if getattr(self.hf_config, "index_topk", 0) <= 0:
-                raise ValueError("enable_hisparse requires DSV3.2 index_topk > 0")
+                raise ValueError("enable_hisparse does not support MTP")
             if self.hisparse_device_buffer_size <= 0:
                 raise ValueError("hisparse_device_buffer_size must be positive")
             if self.hisparse_host_to_device_ratio < 1:
                 raise ValueError("hisparse_host_to_device_ratio must be >= 1")
             if self.hisparse_swap_in_block_size <= 0:
                 raise ValueError("hisparse_swap_in_block_size must be positive")
+            if arch == "DeepseekV32ForCausalLM":
+                if self.mode != "decode":
+                    raise ValueError(
+                        "enable_hisparse MLA Phase 1 requires mode='decode'; "
+                        f"got {self.mode!r}"
+                    )
+                if not self.dummy_prefill:
+                    raise ValueError(
+                        "enable_hisparse MLA Phase 1 requires dummy_prefill=True"
+                    )
+                if self.disable_nsa:
+                    raise ValueError(
+                        "enable_hisparse requires NSA/indexer to be enabled"
+                    )
+                if getattr(self.hf_config, "index_head_dim", 0) <= 0:
+                    raise ValueError(
+                        "enable_hisparse requires DSV3.2 index_head_dim > 0"
+                    )
+                if getattr(self.hf_config, "index_topk", 0) <= 0:
+                    raise ValueError("enable_hisparse requires DSV3.2 index_topk > 0")
+            elif arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
+                layer_types = getattr(self.hf_config, "layer_types", None) or []
+                if "sliding_attention" not in layer_types:
+                    raise ValueError(
+                        "enable_hisparse for Gemma4 requires sliding_attention layers"
+                    )
+            else:
+                raise ValueError(
+                    "enable_hisparse currently supports DeepseekV32ForCausalLM "
+                    f"or Gemma4ForCausalLM; got {arch!r}"
+                )
 
         # MTP validation
         if self.num_speculative_tokens > 0:

@@ -191,7 +191,7 @@ impl CachePlan {
     fn cache_mode(&self) -> &'static str {
         if self.has_hca() || self.has_csa() {
             "dsv4"
-        } else if self.has_mla() || self.has_indexer() || self.has_hisparse() {
+        } else if self.has_mla() || self.has_indexer() {
             "mla"
         } else {
             "gqa"

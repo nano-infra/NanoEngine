@@ -104,8 +104,7 @@ def build_hot_slot_mapping(
     slots = hisparse_slots.to(torch.int64)
     pos = positions[: slots.numel()].to(torch.int64)
     hot = slots * ctx.tokens_per_seq + (pos % ctx.tokens_per_seq)
-    dummy = ctx.max_num_seqs * ctx.tokens_per_seq
-    hot = torch.where(slots < ctx.max_num_seqs, hot, dummy)
+    hot = torch.where(slots < ctx.max_num_seqs, hot, -1)
     return hot.to(torch.int32)
 
 
