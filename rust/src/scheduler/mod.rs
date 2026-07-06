@@ -71,6 +71,7 @@ pub struct Scheduler {
 mod api;
 mod api_control;
 mod api_metrics;
+mod cache_coordinator;
 
 fn average_f64(values: &[f64]) -> f64 {
     if values.is_empty() {
