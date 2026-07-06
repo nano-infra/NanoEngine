@@ -118,7 +118,7 @@ impl Scheduler {
             s.active_group_id = parked.group_id as i32;
             s.active_dispatched_tokens = dispatch;
         }
-        self.ensure_group_blocks(py, seq_id, dp_idx, parked.group_id, full_len, false)?;
+        self.cache_ensure_group_blocks(py, seq_id, dp_idx, parked.group_id, full_len, false)?;
         self.prefix_cached_tokens_by_seq
             .insert(seq_id, parked.length);
         Ok(Some(new_tokens))
