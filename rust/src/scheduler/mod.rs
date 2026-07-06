@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod group_manager;
 mod lifecycle;
-mod metrics;
+mod observability;
 mod resource;
 mod router;
 mod schedule;
