@@ -21,6 +21,7 @@ except ImportError:
 
 from dlengine.context_v2.batch import get_batch_context
 from dlengine.context_v2.cache.hca import get_hca_context
+from dlengine.context_v2.cache.hisparse import get_hisparse_context
 from dlengine.context_v2.cache.mla import get_mla_context
 from dlengine.kernel.triton.generic.kv_store import store_kcache, store_kvcache
 from dlengine.kernel.triton.generic.paged_gather import (
@@ -170,6 +171,168 @@ def _gather_cache_cached_only(
     return flat[cached_indices], cached_lens, cu_cached
 
 
+def _hisparse_swa_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    hot_k_cache: torch.Tensor,
+    hot_v_cache: torch.Tensor,
+    sliding_window: int,
+    num_heads: int,
+    num_kv_heads: int,
+    scale: float,
+) -> torch.Tensor | None:
+    context = get_batch_context()
+    hisparse_ctx = get_hisparse_context()
+    if (
+        context.is_prefill
+        or context.hisparse_slots is None
+        or context.hisparse_slot_mapping is None
+        or hot_k_cache.numel() == 0
+        or hot_v_cache.numel() == 0
+        or hisparse_ctx.tokens_per_seq <= 0
+    ):
+        return None
+
+    ntps = context.num_tokens_per_seq
+    if ntps != 1:
+        return None
+
+    bs = q.shape[0]
+    slots = context.hisparse_slots[:bs].to(torch.int64)
+    valid_seq = slots < hisparse_ctx.max_num_seqs
+
+    store_kvcache(k, v, hot_k_cache, hot_v_cache, context.hisparse_slot_mapping[:bs])
+
+    window = min(int(sliding_window), int(hisparse_ctx.tokens_per_seq))
+    if window <= 0:
+        return None
+
+    context_lens = context.context_lens[0, :bs].to(torch.int64)
+    win_lens = context_lens.clamp(min=1, max=window)
+    offsets = torch.arange(window, device=q.device, dtype=torch.int64)
+    logical = context_lens.unsqueeze(1) - win_lens.unsqueeze(1) + offsets.unsqueeze(0)
+    valid_tok = offsets.unsqueeze(0) < win_lens.unsqueeze(1)
+    physical = slots.unsqueeze(1) * hisparse_ctx.tokens_per_seq
+    physical = physical + torch.remainder(logical, hisparse_ctx.tokens_per_seq)
+    physical = torch.where(valid_seq.unsqueeze(1) & valid_tok, physical, 0)
+
+    k_win = hot_k_cache[physical.reshape(-1)].view(bs, window, num_kv_heads, -1)
+    v_win = hot_v_cache[physical.reshape(-1)].view(bs, window, num_kv_heads, -1)
+    if num_heads != num_kv_heads:
+        repeat = num_heads // num_kv_heads
+        k_win = k_win.repeat_interleave(repeat, dim=2)
+        v_win = v_win.repeat_interleave(repeat, dim=2)
+
+    valid = valid_seq.unsqueeze(1) & valid_tok
+    scores = torch.einsum("bhd,bshd->bhs", q, k_win) * scale
+    scores = scores.masked_fill(~valid.unsqueeze(1), -1.0e30)
+    probs = torch.softmax(scores, dim=-1)
+    out = torch.einsum("bhs,bshd->bhd", probs, v_win)
+    return torch.where(valid_seq.view(bs, 1, 1), out, torch.zeros_like(out))
+
+
+def _hisparse_promote_swa_suffix(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    hot_k_cache: torch.Tensor,
+    hot_v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    sliding_window: int,
+) -> None:
+    context = get_batch_context()
+    hisparse_ctx = get_hisparse_context()
+    if (
+        context.hisparse_slots is None
+        or hot_k_cache.numel() == 0
+        or hot_v_cache.numel() == 0
+        or hisparse_ctx.tokens_per_seq <= 0
+        or block_tables is None
+        or block_tables.numel() == 0
+    ):
+        return
+
+    bs = min(context.hisparse_slots.numel(), cu_seqlens_k.numel() - 1)
+    if bs <= 0:
+        return
+
+    slots = context.hisparse_slots[:bs].to(torch.int64)
+    valid_seq = slots < hisparse_ctx.max_num_seqs
+    if not bool(valid_seq.any().item()):
+        return
+
+    seq_lens = (cu_seqlens_k[1 : bs + 1] - cu_seqlens_k[:bs]).to(torch.int64)
+    window = min(int(sliding_window), int(hisparse_ctx.tokens_per_seq))
+    win_lens = seq_lens.clamp(min=0, max=window)
+    if not bool((win_lens > 0).any().item()):
+        return
+
+    offsets = torch.arange(window, device=k_cache.device, dtype=torch.int64)
+    logical = seq_lens.unsqueeze(1) - win_lens.unsqueeze(1) + offsets.unsqueeze(0)
+    valid_tok = offsets.unsqueeze(0) < win_lens.unsqueeze(1)
+    page_size = k_cache.shape[1]
+    page_idx = torch.div(logical.clamp(min=0), page_size, rounding_mode="floor")
+    page_idx_safe = page_idx.clamp(0, block_tables.shape[1] - 1)
+    page_blocks = block_tables[:bs].to(torch.int64).gather(1, page_idx_safe)
+    physical = page_blocks * page_size + torch.remainder(
+        logical.clamp(min=0), page_size
+    )
+    valid = valid_seq.unsqueeze(1) & valid_tok
+    physical = torch.where(valid, physical, 0)
+
+    k_suffix = k_cache.reshape(-1, *k_cache.shape[2:])[physical.reshape(-1)]
+    v_suffix = v_cache.reshape(-1, *v_cache.shape[2:])[physical.reshape(-1)]
+    hot = slots.unsqueeze(1) * hisparse_ctx.tokens_per_seq
+    hot = hot + torch.remainder(logical.clamp(min=0), hisparse_ctx.tokens_per_seq)
+    hot = torch.where(valid, hot, 0).reshape(-1)
+    valid_flat = valid.reshape(-1)
+    if bool(valid_flat.any().item()):
+        hot_k_cache[hot[valid_flat]] = k_suffix[valid_flat]
+        hot_v_cache[hot[valid_flat]] = v_suffix[valid_flat]
+
+
+def _hisparse_prefill_fresh_slot_mapping(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+) -> torch.Tensor | None:
+    context = get_batch_context()
+    hisparse_ctx = get_hisparse_context()
+    if context.hisparse_slots is None or hisparse_ctx.tokens_per_seq <= 0:
+        return None
+
+    total_q = int(cu_seqlens_q[-1].item())
+    if total_q <= 0:
+        return None
+
+    idx = torch.arange(total_q, device=cu_seqlens_q.device, dtype=torch.int64)
+    cu_q = cu_seqlens_q.to(torch.int64)
+    cu_k = cu_seqlens_k.to(torch.int64)
+    seq_idx = torch.searchsorted(cu_q, idx, right=True) - 1
+    q_lens = cu_q[1:] - cu_q[:-1]
+    start_pos = cu_k[1:] - q_lens
+    logical = start_pos[seq_idx] + (idx - cu_q[seq_idx])
+    slots = context.hisparse_slots.to(torch.int64)
+    seq_slots = slots[seq_idx]
+    hot = seq_slots * hisparse_ctx.tokens_per_seq
+    hot = hot + torch.remainder(logical, hisparse_ctx.tokens_per_seq)
+    hot = torch.where(seq_slots < hisparse_ctx.max_num_seqs, hot, -1)
+    return hot.to(torch.int32)
+
+
+def _hisparse_store_swa_fresh(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    hot_k_cache: torch.Tensor,
+    hot_v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+) -> None:
+    slot_mapping = _hisparse_prefill_fresh_slot_mapping(cu_seqlens_q, cu_seqlens_k)
+    if slot_mapping is not None:
+        store_kvcache(k, v, hot_k_cache, hot_v_cache, slot_mapping)
+
+
 class FlashAttentionImpl:
 
     def __init__(
@@ -178,12 +341,14 @@ class FlashAttentionImpl:
         head_dim,
         scale,
         num_kv_heads,
+        sliding_window=None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
+        self.sliding_window = sliding_window
 
     def forward(
         self,
@@ -193,14 +358,78 @@ class FlashAttentionImpl:
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         sparse_indices: torch.Tensor | None = None,
+        hot_k_cache: torch.Tensor | None = None,
+        hot_v_cache: torch.Tensor | None = None,
     ):
         context = get_batch_context()
+        if (
+            self.sliding_window is not None
+            and hot_k_cache is not None
+            and hot_v_cache is not None
+        ):
+            out = _hisparse_swa_decode(
+                q,
+                k,
+                v,
+                hot_k_cache,
+                hot_v_cache,
+                self.sliding_window,
+                self.num_heads,
+                self.num_kv_heads,
+                self.scale,
+            )
+            if out is not None:
+                return out
+
         if k_cache.numel() and v_cache.numel() and not get_batch_context().is_dummy:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
+            if (
+                self.sliding_window is not None
+                and k_cache.numel() == 0
+                and hot_k_cache is not None
+                and hot_v_cache is not None
+                and hot_k_cache.numel() > 0
+            ):
+                _hisparse_store_swa_fresh(
+                    k,
+                    v,
+                    hot_k_cache,
+                    hot_v_cache,
+                    context.cu_seqlens_q,
+                    context.cu_seqlens_k,
+                )
+                o = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    max_seqlen_q=context.max_seqlen_q,
+                    cu_seqlens_q=context.cu_seqlens_q,
+                    max_seqlen_k=context.max_seqlen_q,
+                    cu_seqlens_k=context.cu_seqlens_q,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    window_size=(int(self.sliding_window) - 1, 0),
+                )
+                return o
+
             if context.block_tables is not None:
                 num_seqs = context.cu_seqlens_k.shape[0] - 1
                 bt = context.block_tables[0, :num_seqs, :]
+                if (
+                    self.sliding_window is not None
+                    and hot_k_cache is not None
+                    and hot_v_cache is not None
+                ):
+                    _hisparse_promote_swa_suffix(
+                        k_cache,
+                        v_cache,
+                        hot_k_cache,
+                        hot_v_cache,
+                        bt,
+                        context.cu_seqlens_k,
+                        self.sliding_window,
+                    )
                 k, v = _gather_kv_cached_concat(
                     k_cache,
                     v_cache,
@@ -211,6 +440,9 @@ class FlashAttentionImpl:
                     context.cu_seqlens_k,
                     k_cache.shape[1],
                 )
+            attn_kwargs = {}
+            if self.sliding_window is not None:
+                attn_kwargs["window_size"] = (int(self.sliding_window) - 1, 0)
             o = flash_attn_varlen_func(
                 q,
                 k,
@@ -221,6 +453,7 @@ class FlashAttentionImpl:
                 cu_seqlens_k=context.cu_seqlens_k,
                 softmax_scale=self.scale,
                 causal=True,
+                **attn_kwargs,
             )
         else:  # decode
             ntps = context.num_tokens_per_seq
@@ -440,6 +673,7 @@ class HopperAttention(AttentionBase):
         v_head_dim,
         attention_type: str = "MLA",
         nsa_index_topk: int = 0,
+        sliding_window: int | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -447,6 +681,7 @@ class HopperAttention(AttentionBase):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.hisparse_k_cache = self.hisparse_v_cache = torch.tensor([])
         self.forward_method = None
 
         if attention_type == "MLA":
@@ -464,6 +699,7 @@ class HopperAttention(AttentionBase):
                 head_dim,
                 scale,
                 num_kv_heads,
+                sliding_window=sliding_window,
             )
         else:
             raise ValueError(f"Unknown attention type: {attention_type}")
@@ -477,5 +713,12 @@ class HopperAttention(AttentionBase):
     ):
         """forward."""
         return self.impl.forward(
-            q, k, v, self.k_cache, self.v_cache, sparse_indices=sparse_indices
+            q,
+            k,
+            v,
+            self.k_cache,
+            self.v_cache,
+            sparse_indices=sparse_indices,
+            hot_k_cache=self.hisparse_k_cache,
+            hot_v_cache=self.hisparse_v_cache,
         )

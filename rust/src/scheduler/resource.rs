@@ -253,7 +253,20 @@ impl Scheduler {
             }
             matched += 1;
         }
-        (matched * self.config.kvcache_block_size.max(1)).min((tokens - 1).max(0))
+        let cached = (matched * self.config.kvcache_block_size.max(1)).min((tokens - 1).max(0));
+        let gqa_hisparse = self.config.cache_plan.flags & (1 << 0) != 0
+            && self.config.cache_plan.flags & (1 << 6) != 0;
+        if gqa_hisparse {
+            let tail = self
+                .config
+                .cache_plan
+                .hisparse
+                .swap_in_block_size
+                .max(1);
+            cached.min((tokens - tail).max(0))
+        } else {
+            cached
+        }
     }
 
     fn block_token_view<'a>(&self, token_ids: &'a [i32], block_idx: usize) -> &'a [i32] {

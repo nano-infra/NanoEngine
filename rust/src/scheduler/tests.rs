@@ -82,6 +82,29 @@ fn make_scheduler_with_host_prefix_cache() -> Scheduler {
     })
 }
 
+fn make_scheduler_with_gqa_hisparse_tail(tail_tokens: i32) -> Scheduler {
+    let mut plan = CachePlan::new((1 << 0) | (1 << 6));
+    plan.hisparse.swap_in_block_size = tail_tokens;
+    Scheduler::new(SchedulerConfig {
+        engine_id: "engine".to_string(),
+        num_speculative_tokens: 0,
+        max_num_seqs: 8,
+        max_num_batched_tokens: 64,
+        max_model_len: 128,
+        eos_ids: Vec::new(),
+        attention_dp: 1,
+        group_size: 1,
+        num_kvcache_blocks: 16,
+        num_host_kvcache_blocks: 0,
+        kvcache_block_size: 4,
+        mode: "hybrid".to_string(),
+        routing_strategy: RoutingStrategy::RoundRobin,
+        gdn_state_cache_slots: 0,
+        enable_prefix_cache: true,
+        cache_plan: plan,
+    })
+}
+
 fn add_tokens(
     py: Python<'_>,
     scheduler: &mut Scheduler,
@@ -288,6 +311,25 @@ fn chunked_prefill_keeps_prefix_hit_separate_from_chunk_offset() {
         assert_eq!(snapshot.prefill_tokens_per_dp, vec![1]);
         assert_eq!(snapshot.prefix_cached_tokens_per_dp, vec![11]);
         assert_eq!(snapshot.prefix_prompt_tokens_per_dp, vec![12]);
+    });
+}
+
+#[test]
+fn gqa_hisparse_prefix_hit_recomputes_sliding_tail() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_scheduler_with_gqa_hisparse_tail(4);
+        add_tokens(py, &mut scheduler, 110, (0..12).collect()).unwrap();
+        let first = run_prefill_until_ready(py, &mut scheduler).unwrap();
+        scheduler.release_seq(first);
+
+        add_tokens(py, &mut scheduler, 111, (0..13).collect()).unwrap();
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        let second = scheduled[0][0];
+        let seq = &scheduler.seq_table[&second];
+        assert_eq!(seq.num_cached_tokens, 9);
+        assert_eq!(seq.prefill_start_offset, 9);
+        assert_eq!(seq.num_tokens, 13);
     });
 }
 

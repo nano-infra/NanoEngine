@@ -18,6 +18,10 @@ def gqa_cache_plan() -> CachePlan:
     return cache_plan(flags=(CachePlanFlag.Gqa,))
 
 
+def gqa_hisparse_cache_plan() -> CachePlan:
+    return cache_plan(flags=(CachePlanFlag.Gqa, CachePlanFlag.Hisparse))
+
+
 def qwen35_cache_plan() -> CachePlan:
     return cache_plan(flags=(CachePlanFlag.Gqa, CachePlanFlag.Gdn))
 
@@ -48,6 +52,7 @@ __all__ = [
     "deepseek_mla_cache_plan",
     "deepseek_v4_cache_plan",
     "gqa_cache_plan",
+    "gqa_hisparse_cache_plan",
     "hca_csa_cache_plan",
     "qwen35_cache_plan",
 ]

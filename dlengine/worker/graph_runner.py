@@ -17,7 +17,10 @@ import torch
 import torch.distributed as dist
 from dlengine.context_v2.batch import Context, get_batch_context, set_batch_context
 from dlengine.context_v2.cache.hca import get_hca_context
-from dlengine.context_v2.cache.hisparse import get_hisparse_context
+from dlengine.context_v2.cache.hisparse import (
+    build_hot_slot_mapping,
+    get_hisparse_context,
+)
 from dlengine.context_v2.cache.mla import get_mla_context
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.context_v2.expert import ExpertContext, set_expert_context
@@ -318,7 +321,14 @@ class DecodeGraphRunner:
                     else None
                 ),
                 hisparse_slots=g.hisparse_slots[:master_bs],
-                hisparse_slot_mapping=g.slot_mapping[:master_bs],
+                hisparse_slot_mapping=(
+                    build_hot_slot_mapping(
+                        g.hisparse_slots[:master_bs], g.positions[:master_bs]
+                    )
+                    if getattr(self.config, "cache_plan", None) is not None
+                    and self.config.cache_plan.has_gqa()
+                    else g.slot_mapping[:master_bs]
+                ),
                 hisparse_num_real_reqs=get_hisparse_context().num_real_reqs,
                 graph_attention_strategy=(
                     PagedAttentionStrategy.FLASHINFER

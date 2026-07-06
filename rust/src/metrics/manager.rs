@@ -55,6 +55,10 @@ pub struct RuntimeMetrics {
     #[pyo3(get)]
     pub total_host_blocks_per_dp: i32,
     #[pyo3(get)]
+    pub used_hisparse_slots: i32,
+    #[pyo3(get)]
+    pub total_hisparse_slots: i32,
+    #[pyo3(get)]
     pub last_schedule_ms: f64,
     #[pyo3(get)]
     pub last_forward_ms: f64,
@@ -219,6 +223,8 @@ impl RuntimeMetrics {
             serialize_ms,
             Some(resource_metric.used_host_blocks_per_dp.clone()),
             resource_metric.total_host_blocks_per_dp,
+            resource_metric.used_hisparse_slots,
+            resource_metric.total_hisparse_slots,
         )
     }
 
@@ -246,7 +252,9 @@ impl RuntimeMetrics {
         net_ms=0.0,
         serialize_ms=0.0,
         used_host_blocks_per_dp=None,
-        total_host_blocks=0
+        total_host_blocks=0,
+        used_hisparse_slots=0,
+        total_hisparse_slots=0
     ))]
     fn maybe_report_engine_status(
         &mut self,
@@ -274,6 +282,8 @@ impl RuntimeMetrics {
         serialize_ms: f64,
         used_host_blocks_per_dp: Option<Vec<i32>>,
         total_host_blocks: i32,
+        used_hisparse_slots: i32,
+        total_hisparse_slots: i32,
     ) -> Option<String> {
         let force_report = prefill_tokens_per_dp.iter().any(|tokens| *tokens > 0);
         if self.report_prefill_tokens_per_dp.is_none() {
@@ -369,6 +379,8 @@ impl RuntimeMetrics {
             prompt,
             used_host_blocks_per_dp,
             total_host_blocks,
+            used_hisparse_slots,
+            total_hisparse_slots,
         );
         self.last_report_time = now;
         self.reset_window();
@@ -402,7 +414,9 @@ impl RuntimeMetrics {
         prefix_cached_tokens_per_dp=None,
         prefix_prompt_tokens_per_dp=None,
         used_host_blocks_per_dp=None,
-        total_host_blocks=0
+        total_host_blocks=0,
+        used_hisparse_slots=0,
+        total_hisparse_slots=0
     ))]
     fn log_engine_status(
         &mut self,
@@ -432,6 +446,8 @@ impl RuntimeMetrics {
         prefix_prompt_tokens_per_dp: Option<Vec<i32>>,
         used_host_blocks_per_dp: Option<Vec<i32>>,
         total_host_blocks: i32,
+        used_hisparse_slots: i32,
+        total_hisparse_slots: i32,
     ) -> String {
         let prefill_tokens: i32 = prefill_tokens_per_dp.iter().sum();
         let decode_tokens: i32 = decode_tokens_per_dp.iter().sum();
@@ -449,6 +465,8 @@ impl RuntimeMetrics {
         self.total_blocks_per_dp = total_blocks;
         self.used_host_blocks_per_dp = used_host_blocks_per_dp.clone().unwrap_or_default();
         self.total_host_blocks_per_dp = total_host_blocks;
+        self.used_hisparse_slots = used_hisparse_slots;
+        self.total_hisparse_slots = total_hisparse_slots;
         self.last_schedule_ms = prom_value(avg_schedule_ms);
         self.last_forward_ms = prom_value(avg_forward_ms);
         self.last_postprocess_ms = prom_value(avg_postprocess_ms);
@@ -494,6 +512,11 @@ impl RuntimeMetrics {
             })
             .unwrap_or_else(|| "?".to_string());
         let host_kv = format!("{host_str}/{total_host_blocks}");
+        let hisparse_str = if total_hisparse_slots > 0 {
+            format!(" hisparse_hot={used_hisparse_slots}/{total_hisparse_slots} slot")
+        } else {
+            String::new()
+        };
         let run_str = running_per_dp
             .iter()
             .map(|x| x.to_string())
@@ -576,7 +599,7 @@ impl RuntimeMetrics {
             xfer_str.push_str(&format!(" net={avg_net_ms:.2} ms/step"));
         }
         format!(
-            "[engine {} {mode}] run={run_str} wait={waiting} mig={waiting_migration} | kv={kv} blk host={host_kv} blk | tput pf={pf_str} dec={dec_str} tok/s ({elapsed:.0}s) | done={} tok={}p/{}g{cache_str}{lat_str}{xfer_str}",
+            "[engine {} {mode}] run={run_str} wait={waiting} mig={waiting_migration} | kv={kv} blk host={host_kv} blk{hisparse_str} | tput pf={pf_str} dec={dec_str} tok/s ({elapsed:.0}s) | done={} tok={}p/{}g{cache_str}{lat_str}{xfer_str}",
             engine_id.chars().take(8).collect::<String>(),
             server_metric.num_completed_requests,
             server_metric.total_prompt_tokens,
@@ -823,6 +846,8 @@ fn runtime_metrics_with_report_interval(report_interval_s: f64) -> RuntimeMetric
         total_blocks_per_dp: 0,
         used_host_blocks_per_dp: Vec::new(),
         total_host_blocks_per_dp: 0,
+        used_hisparse_slots: 0,
+        total_hisparse_slots: 0,
         last_schedule_ms: 0.0,
         last_forward_ms: 0.0,
         last_postprocess_ms: 0.0,
@@ -932,6 +957,8 @@ mod tests {
                 0.0,
                 0.0,
                 None,
+                0,
+                0,
                 0,
             )
             .is_some()
