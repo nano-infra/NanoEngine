@@ -220,22 +220,23 @@ impl Scheduler {
     }
 
     pub(super) fn prefix_cached_tokens_impl(&self, seq_id: u64) -> i32 {
-        self.prefix_cached_tokens_by_seq
+        self.cache
+            .prefix_cached_tokens_by_seq
             .get(&seq_id)
             .copied()
             .unwrap_or(0)
     }
 
     pub(super) fn clear_finished_metric_state_impl(&mut self, seq_id: u64) {
-        self.prefix_counted_seq_ids.remove(&seq_id);
-        self.prefix_cached_tokens_by_seq.remove(&seq_id);
+        self.cache.prefix_counted_seq_ids.remove(&seq_id);
+        self.cache.prefix_cached_tokens_by_seq.remove(&seq_id);
     }
 
     pub(super) fn abort_impl(&mut self, seq_id: u64) -> bool {
         let found = self.seq_table.contains_key(&seq_id)
-            && (self.seq_assignment.contains_key(&seq_id)
+            && (self.cache.seq_assignment.contains_key(&seq_id)
                 || self.to_be_migrated.contains_key(&seq_id)
-                || self.session_wait.contains_key(&seq_id)
+                || self.cache.session_wait.contains_key(&seq_id)
                 || self.waiting.contains(&seq_id)
                 || self.waiting_migration.contains(&seq_id)
                 || self.running.iter().any(|queue| queue.contains(&seq_id))
@@ -254,7 +255,7 @@ impl Scheduler {
             queue.retain(|id| *id != seq_id);
         }
         self.to_be_migrated.remove(&seq_id);
-        self.session_wait.remove(&seq_id);
+        self.cache.session_wait.remove(&seq_id);
         self.clear_finished_metric_state_impl(seq_id);
         true
     }
@@ -307,6 +308,6 @@ impl Scheduler {
             return;
         }
         let flat = self.flat_idx(dp_idx, group_id);
-        self.hbm_pools[flat].commit_ready(seq_id, &token_ids, committed_tokens);
+        self.cache.hbm_pools[flat].commit_ready(seq_id, &token_ids, committed_tokens);
     }
 }

@@ -20,76 +20,7 @@ impl Scheduler {
         set_sequence_block_size(config.kvcache_block_size);
         let dp = config.attention_dp.max(1) as usize;
         let group = config.group_size.max(1) as usize;
-        let num_blocks = config.num_kvcache_blocks.max(0);
-        let prefix_caching_allowed =
-            config.enable_prefix_cache && config.cache_plan.flags & (1 << 2) == 0;
-        let mut hbm_pools = (0..(dp * group))
-            .map(|_| BlockPool::new(num_blocks, config.kvcache_block_size))
-            .collect::<Vec<_>>();
-        let mut host_pools = (0..(dp * group))
-            .map(|_| {
-                BlockPool::new(
-                    config.num_host_kvcache_blocks.max(0),
-                    config.kvcache_block_size,
-                )
-            })
-            .collect::<Vec<_>>();
-        if !prefix_caching_allowed {
-            for pool in &mut hbm_pools {
-                pool.set_prefix_caching_enabled(false);
-            }
-        }
-        for pool in &mut host_pools {
-            pool.set_prefix_caching_enabled(false);
-        }
-        let mut compressed_pools = HashMap::new();
-        if config.cache_plan.flags & ((1 << 3) | (1 << 4)) != 0 {
-            for spec in [
-                (
-                    config.cache_plan.hca.compression_ratio,
-                    config.cache_plan.hca.num_pages,
-                    config.cache_plan.hca.page_size,
-                    config.cache_plan.hca.max_blocks_per_seq,
-                ),
-                (
-                    config.cache_plan.csa.compression_ratio,
-                    config.cache_plan.csa.num_pages,
-                    config.cache_plan.csa.page_size,
-                    config.cache_plan.csa.max_blocks_per_seq,
-                ),
-            ] {
-                let (ratio, num_pages, page_size, max_blocks_per_seq) = spec;
-                if ratio > 0 && num_pages > 0 && page_size > 0 && max_blocks_per_seq > 0 {
-                    compressed_pools.insert(
-                        ratio,
-                        CompressedPool {
-                            ratio,
-                            page_size,
-                            max_blocks_per_seq,
-                            free_pages: (0..num_pages).rev().collect(),
-                            seq_pages: HashMap::new(),
-                        },
-                    );
-                }
-            }
-        }
-        let state_slots = if config.cache_plan.flags & ((1 << 2) | (1 << 3) | (1 << 4)) != 0 {
-            let configured = config.cache_plan.gdn.state_slots;
-            configured
-                .max(config.max_num_seqs + config.gdn_state_cache_slots)
-                .max(config.max_num_seqs)
-        } else {
-            0
-        };
-        let hisparse_slots = if config.cache_plan.flags & (1 << 6) != 0 {
-            config
-                .cache_plan
-                .hisparse
-                .max_num_seqs
-                .max(config.max_num_seqs)
-        } else {
-            0
-        };
+        let cache = CacheState::new(&config, dp, group);
         Self {
             engine_id_: config.engine_id.clone(),
             routing_strategy: config.routing_strategy,
@@ -101,25 +32,9 @@ impl Scheduler {
             prefilling: (0..dp).map(|_| Vec::new()).collect(),
             to_be_migrated: HashMap::new(),
             dummy_seq_ids: HashSet::new(),
-            hbm_pools,
-            host_pools,
-            pending_host_swaps: HashMap::new(),
-            pending_swap_out_tasks: (0..(dp * group)).map(|_| Vec::new()).collect(),
-            pending_swap_in_tasks: (0..(dp * group)).map(|_| Vec::new()).collect(),
+            cache,
             current_step: 0,
-            seq_assignment: HashMap::new(),
             rr_cursor: 0,
-            session_affinity: HashMap::new(),
-            session_wait: HashMap::new(),
-            parked_sessions: HashMap::new(),
-            parked_lru: Vec::new(),
-            state_slots: SlotPool::new(state_slots),
-            hisparse_slots: SlotPool::new(hisparse_slots),
-            compressed_pools,
-            prefix_caching_allowed,
-            prefix_caching_enabled: prefix_caching_allowed,
-            prefix_cached_tokens_by_seq: HashMap::new(),
-            prefix_counted_seq_ids: HashSet::new(),
             server_metric: ServerMetric::default(),
             runtime_metrics: RuntimeMetrics::default(),
             sequence_metrics: HashMap::new(),

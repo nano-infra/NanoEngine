@@ -8,7 +8,7 @@ impl Scheduler {
         if self.routing_strategy == RoutingStrategy::LeastCache {
             let mut best = 0usize;
             let mut best_free = i32::MIN;
-            for (idx, pool) in self.hbm_pools.iter().enumerate() {
+            for (idx, pool) in self.cache.hbm_pools.iter().enumerate() {
                 let free = pool.num_free_blocks() as i32;
                 if free > best_free {
                     best = idx;
@@ -63,15 +63,15 @@ impl Scheduler {
             x if x == RoutingStrategy::SessionPrefix => {
                 order.sort_by_key(|rank| self.dp_running_tokens(py, *rank));
                 if affinity != 0 {
-                    if let Some(preferred) = self.session_affinity.get(&affinity).copied() {
-                        let waited = self.session_wait.entry(seq_id).or_insert(0);
+                    if let Some(preferred) = self.cache.session_affinity.get(&affinity).copied() {
+                        let waited = self.cache.session_wait.entry(seq_id).or_insert(0);
                         if *waited < 3 {
                             *waited += 1;
                             return vec![preferred.min(dp.saturating_sub(1))];
                         }
                         order.retain(|rank| *rank != preferred);
                         order.insert(0, preferred.min(dp.saturating_sub(1)));
-                    } else if let Some(parked) = self.parked_sessions.get(&affinity) {
+                    } else if let Some(parked) = self.cache.parked_sessions.get(&affinity) {
                         order.retain(|rank| *rank != parked.dp_idx);
                         order.insert(0, parked.dp_idx.min(dp.saturating_sub(1)));
                     }

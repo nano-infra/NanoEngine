@@ -84,9 +84,9 @@ impl Scheduler {
                             .map(|s| s.affinity_key)
                             .unwrap_or(0);
                         if affinity != 0 {
-                            self.session_affinity.insert(affinity, dp_idx);
+                            self.cache.session_affinity.insert(affinity, dp_idx);
                         }
-                        self.session_wait.remove(&seq_id);
+                        self.cache.session_wait.remove(&seq_id);
                         placed = true;
                         break;
                     }
@@ -120,9 +120,9 @@ impl Scheduler {
                         .map(|s| s.affinity_key)
                         .unwrap_or(0);
                     if affinity != 0 {
-                        self.session_affinity.insert(affinity, dp_idx);
+                        self.cache.session_affinity.insert(affinity, dp_idx);
                     }
-                    self.session_wait.remove(&seq_id);
+                    self.cache.session_wait.remove(&seq_id);
                     placed = true;
                     break;
                 }
@@ -188,8 +188,8 @@ impl Scheduler {
         let mut result = ScheduleResult::default();
         result.is_prefill = is_prefill;
         result.dp_seq_ids = dp_seq_ids.clone();
-        result.swap_out_tasks = self.pending_swap_out_tasks.clone();
-        result.swap_in_tasks = self.pending_swap_in_tasks.clone();
+        result.swap_out_tasks = self.cache.pending_swap_out_tasks.clone();
+        result.swap_in_tasks = self.cache.pending_swap_in_tasks.clone();
         result.dp_group_seq_ids = Vec::with_capacity(dp * group);
         result.filtered_dp_group_seq_ids = Vec::with_capacity(dp * group);
         result.group_send_counts = vec![vec![0; group]; dp];
@@ -282,7 +282,7 @@ impl Scheduler {
         let Some(master) = self.choose_master_group(dp_idx, batch_seqs, batch_tokens) else {
             return Ok(None);
         };
-        if self.config.mode != "decode" && self.group() == 1 && self.prefix_caching_enabled {
+        if self.config.mode != "decode" && self.group() == 1 && self.cache.prefix_caching_enabled {
             let token_ids = self
                 .seq_table
                 .get(&seq_id)
@@ -310,7 +310,7 @@ impl Scheduler {
             return Ok(None);
         }
         let chunk_end = cached + new_tokens;
-        self.seq_assignment.insert(seq_id, (dp_idx, master));
+        self.cache.seq_assignment.insert(seq_id, (dp_idx, master));
         let dispatch = self.compute_dispatch(dp_idx, master, full_len);
         {
             let Some(s) = self.seq_table.get_mut(&seq_id) else {
@@ -339,7 +339,7 @@ impl Scheduler {
                     count,
                     self.config.mode != "decode",
                 ) {
-                    self.seq_assignment.remove(&seq_id);
+                    self.cache.seq_assignment.remove(&seq_id);
                     if let Some(s) = self.seq_table.get_mut(&seq_id) {
                         s.status = 0;
                         s.active_block_table.clear();
@@ -367,20 +367,22 @@ impl Scheduler {
             let Some(s) = self.seq_table.get_mut(&seq_id) else {
                 return Ok(None);
             };
-            if let Some(slot) = self.state_slots.get(seq_id) {
+            if let Some(slot) = self.cache.state_slots.get(seq_id) {
                 s.migrate_state_slot = slot;
             }
-            if let Some(slot) = self.hisparse_slots.get(seq_id) {
+            if let Some(slot) = self.cache.hisparse_slots.get(seq_id) {
                 s.migrate_hisparse_slot = slot;
             }
-            for (ratio, pool) in &self.compressed_pools {
+            for (ratio, pool) in &self.cache.compressed_pools {
                 if let Some(pages) = pool.seq_pages.get(&seq_id) {
                     s.migrate_compressed_block_tables
                         .insert(*ratio, pages.clone());
                 }
             }
         }
-        self.prefix_cached_tokens_by_seq.insert(seq_id, cached);
+        self.cache
+            .prefix_cached_tokens_by_seq
+            .insert(seq_id, cached);
         Ok(Some(new_tokens))
     }
 }
