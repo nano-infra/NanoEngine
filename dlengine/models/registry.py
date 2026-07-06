@@ -49,6 +49,12 @@ def _deepseek_mtp_cls():
     return DeepSeekMTP
 
 
+def _gemma4_cls():
+    from dlengine.models.gemma4.gemma4 import Gemma4ForCausalLM
+
+    return Gemma4ForCausalLM
+
+
 def _qwen3_5_mtp_cls():
     from dlengine.models.qwen3_5_moe.qwen3_5_moe_mtp import Qwen3_5MTP
 
@@ -64,6 +70,8 @@ architecture_loaders = {
     "DeepseekV4ForCausalLM": _deepseek_v4_cls,
     "GlmMoeDsaForCausalLM": _deepseek_v2_cls,
     "Qwen3_5MoeForConditionalGeneration": _qwen3_5_moe_cls,
+    "Gemma4ForCausalLM": _gemma4_cls,
+    "Gemma4ForConditionalGeneration": _gemma4_cls,
 }
 
 architecture_mtp_loaders = {
