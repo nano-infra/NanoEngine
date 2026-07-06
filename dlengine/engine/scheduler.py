@@ -6,6 +6,7 @@ from dlengine.config import Config
 from dlengine.context_v2.cache.plan import (
     deepseek_mla_cache_plan,
     gqa_cache_plan,
+    gqa_hisparse_cache_plan,
     hca_csa_cache_plan,
     qwen35_cache_plan,
 )
@@ -69,6 +70,7 @@ def build_cache_plan(config: Config) -> CachePlan:
 
 def _build_cache_plan_with_reason(config: Config) -> tuple[CachePlan, str]:
     hf_config = config.hf_config
+    arch = (getattr(hf_config, "architectures", None) or [""])[0]
 
     if has_hca_csa_cache(hf_config):
         plan = hca_csa_cache_plan()
@@ -77,6 +79,14 @@ def _build_cache_plan_with_reason(config: Config) -> tuple[CachePlan, str]:
 
     if has_gdn_component(hf_config):
         return qwen35_cache_plan(), "layer_types contains linear_attention"
+
+    if arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration") and bool(
+        getattr(config, "enable_hisparse", False)
+    ):
+        return (
+            gqa_hisparse_cache_plan(),
+            "Gemma4 enable_hisparse requires SWA hot-buffer cache",
+        )
 
     kv_lora_rank = getattr(hf_config, "kv_lora_rank", 0) or 0
     qk_rope_head_dim = getattr(hf_config, "qk_rope_head_dim", 0) or 0
