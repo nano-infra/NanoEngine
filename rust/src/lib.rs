@@ -2,6 +2,7 @@
 
 use pyo3::prelude::*;
 
+mod cache;
 mod common;
 mod config;
 mod l3;
@@ -13,7 +14,6 @@ mod sampling;
 mod scheduler;
 mod sequence;
 mod snapshots;
-mod table;
 
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {

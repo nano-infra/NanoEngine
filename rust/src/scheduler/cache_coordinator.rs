@@ -1,5 +1,5 @@
 use super::{PendingHostSwap, Scheduler, HOST_PREFIX_CACHE_SEQ_ID, HOST_SWAP_IN_COOLDOWN_STEPS};
-use crate::table::block::{compute_block_hash, CompressedPool, EvictedBlock};
+use crate::cache::table::block::{compute_block_hash, CompressedPool, EvictedBlock};
 use pyo3::prelude::*;
 
 impl Scheduler {

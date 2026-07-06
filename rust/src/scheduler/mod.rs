@@ -1,9 +1,9 @@
+use crate::cache::table::block::{BlockPool, CompressedPool};
+use crate::cache::table::slot::SlotPool;
 use crate::metrics::{RuntimeMetrics, SequenceMetric, ServerMetric};
 use crate::proto::wire::sequence_to_migration_request_ref;
 use crate::proto::RunnerOut;
 use crate::sequence::Sequence;
-use crate::table::block::{BlockPool, CompressedPool};
-use crate::table::slot::SlotPool;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::{HashMap, HashSet};
