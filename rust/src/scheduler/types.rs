@@ -52,6 +52,8 @@ pub struct SchedulerConfig {
     #[pyo3(get, set)]
     pub num_kvcache_blocks: i32,
     #[pyo3(get, set)]
+    pub num_host_kvcache_blocks: i32,
+    #[pyo3(get, set)]
     pub kvcache_block_size: i32,
     #[pyo3(get, set)]
     pub mode: String,
@@ -78,6 +80,7 @@ impl SchedulerConfig {
         attention_dp = 1,
         group_size = 1,
         num_kvcache_blocks = 0,
+        num_host_kvcache_blocks = 0,
         kvcache_block_size = 0,
         mode = String::from("hybrid"),
         routing_strategy = RoutingStrategy::RoundRobin,
@@ -96,6 +99,7 @@ impl SchedulerConfig {
         attention_dp: i32,
         group_size: i32,
         num_kvcache_blocks: i32,
+        num_host_kvcache_blocks: i32,
         kvcache_block_size: i32,
         mode: String,
         routing_strategy: i32,
@@ -113,6 +117,7 @@ impl SchedulerConfig {
             attention_dp,
             group_size,
             num_kvcache_blocks,
+            num_host_kvcache_blocks,
             kvcache_block_size,
             mode,
             routing_strategy,
@@ -154,6 +159,10 @@ pub struct ScheduleResult {
     pub waiting_head_blocks: i32,
     #[pyo3(get, set)]
     pub waiting_total_blocks: i32,
+    #[pyo3(get, set)]
+    pub swap_out_tasks: Vec<Vec<(u64, Vec<i32>, Vec<i32>)>>,
+    #[pyo3(get, set)]
+    pub swap_in_tasks: Vec<Vec<(u64, Vec<i32>, Vec<i32>)>>,
 }
 
 #[pyclass(module = "dlengine._engine", unsendable)]

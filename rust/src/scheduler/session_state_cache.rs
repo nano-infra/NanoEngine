@@ -125,9 +125,16 @@ impl Scheduler {
     }
 
     pub(super) fn release_seq(&mut self, seq_id: u64) {
+        if let Some(pending) = self.pending_host_swaps.remove(&seq_id) {
+            let flat = self.flat_idx(pending.dp_idx, pending.group_id);
+            self.host_pools[flat].remove_seq(seq_id);
+        }
         if let Some((dp_idx, group_id)) = self.seq_assignment.remove(&seq_id) {
             let flat = self.flat_idx(dp_idx, group_id);
             self.hbm_pools[flat].remove_seq(seq_id);
+        }
+        for pool in &mut self.host_pools {
+            pool.remove_seq(seq_id);
         }
         self.state_slots.remove(seq_id);
         self.hisparse_slots.remove(seq_id);

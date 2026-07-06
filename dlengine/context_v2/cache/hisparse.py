@@ -11,6 +11,8 @@ class HiSparseContext(BaseContext):
     max_num_seqs: int = 0
     dummy_slot: int = -1
     device_buffer_size: int = 0
+    tokens_per_seq: int = 0
+    hot_kv_cache: torch.Tensor | None = None
     num_real_reqs: torch.Tensor | None = None
 
     @classmethod
@@ -26,6 +28,8 @@ class HiSparseContext(BaseContext):
         self.max_num_seqs = 0
         self.dummy_slot = -1
         self.device_buffer_size = 0
+        self.tokens_per_seq = 0
+        self.hot_kv_cache = None
         self.num_real_reqs = None
 
     def reset_context(self) -> None:
@@ -52,8 +56,35 @@ def initialize_hisparse_context(
     ctx.max_num_seqs = max_num_seqs
     ctx.dummy_slot = max_num_seqs
     ctx.device_buffer_size = device_buffer_size
+    ctx.tokens_per_seq = max(1, device_buffer_size // max(1, max_num_seqs))
     ctx.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
     return ctx
+
+
+def allocate_gqa_hot_buffer(
+    *,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device,
+) -> torch.Tensor | None:
+    ctx = get_hisparse_context()
+    if not ctx.enabled or ctx.device_buffer_size <= 0:
+        ctx.hot_kv_cache = None
+        return None
+
+    total_tokens = ctx.tokens_per_seq * max(1, ctx.max_num_seqs)
+    ctx.hot_kv_cache = torch.empty(
+        2,
+        num_layers,
+        total_tokens,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    return ctx.hot_kv_cache
 
 
 def remap_slot_mapping(slot_mapping: torch.Tensor | None) -> torch.Tensor | None:
@@ -63,12 +94,29 @@ def remap_slot_mapping(slot_mapping: torch.Tensor | None) -> torch.Tensor | None
     return slot_mapping
 
 
+def build_hot_slot_mapping(
+    hisparse_slots: torch.Tensor | None,
+    positions: torch.Tensor | None,
+) -> torch.Tensor | None:
+    ctx = get_hisparse_context()
+    if hisparse_slots is None or positions is None or ctx.tokens_per_seq <= 0:
+        return None
+    slots = hisparse_slots.to(torch.int64)
+    pos = positions[: slots.numel()].to(torch.int64)
+    hot = slots * ctx.tokens_per_seq + (pos % ctx.tokens_per_seq)
+    dummy = ctx.max_num_seqs * ctx.tokens_per_seq
+    hot = torch.where(slots < ctx.max_num_seqs, hot, dummy)
+    return hot.to(torch.int32)
+
+
 def remap_sparse_indices(sparse_indices: torch.Tensor | None) -> torch.Tensor | None:
     return sparse_indices
 
 
 __all__ = [
     "HiSparseContext",
+    "allocate_gqa_hot_buffer",
+    "build_hot_slot_mapping",
     "get_hisparse_context",
     "initialize_hisparse_context",
     "remap_slot_mapping",

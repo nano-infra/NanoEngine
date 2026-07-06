@@ -119,6 +119,7 @@ impl BlockPool {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn matched_prefix_blocks(&self, token_ids: &[i32], tokens: i32) -> i32 {
         if !self.prefix_caching_enabled {
             return 0;
@@ -145,6 +146,7 @@ impl BlockPool {
         matched
     }
 
+    #[cfg(test)]
     pub(crate) fn cached_tokens_for(&self, token_ids: &[i32], tokens: i32) -> i32 {
         let matched = self.matched_prefix_blocks(token_ids, tokens);
         (matched * self.block_size).min((tokens - 1).max(0))

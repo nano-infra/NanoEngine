@@ -53,6 +53,7 @@ class CacheContext(KVCacheAllocatorMixin):
     attention_tp: int
     gpu_memory_utilization: float
     gpu_memory_limit_gb: float | None = None
+    host_utilization_per_device: float = 0.0
     # Bytes to reserve out of the utilization budget for state buffers allocated
     # *after* KV sizing (e.g. GDN linear-attention conv/recurrent states).
     reserved_state_bytes: int = 0
@@ -60,7 +61,9 @@ class CacheContext(KVCacheAllocatorMixin):
     dtype: torch.dtype = torch.bfloat16
     mode: Literal["gqa", "mla", "dsv4"] = "gqa"
     num_local_kvcache_blocks = -1
+    num_host_kvcache_blocks = 0
     num_remote_kvcache_blocks: dict[str, int] = None
+    host_kv_cache: torch.Tensor | None = None
 
     # used for MLA mode
     kv_lora_rank: int = 0
@@ -245,14 +248,31 @@ class CacheContext(KVCacheAllocatorMixin):
             )
             // block_bytes
         )
+        self.num_host_kvcache_blocks, host_budget_bytes = (
+            self._compute_host_kvcache_blocks(block_bytes)
+        )
 
         logger.debug(
             f"Rank{dist.get_rank()} num_local_kvcache_blocks: {self.num_local_kvcache_blocks}"
         )
+        if self.num_host_kvcache_blocks > 0:
+            logger.info(
+                "Rank%s host KV cache: %s blocks (%.2f GiB budget)",
+                dist.get_rank(),
+                self.num_host_kvcache_blocks,
+                host_budget_bytes / 1024**3,
+            )
 
         assert self.num_local_kvcache_blocks > 0
 
         initialize_gdn_cache_state(self)
+
+    def _compute_host_kvcache_blocks(self, block_bytes: int) -> tuple[int, int]:
+        budget_gib = max(0.0, float(self.host_utilization_per_device or 0.0))
+        if budget_gib <= 0 or block_bytes <= 0:
+            return 0, 0
+        budget_bytes = int(budget_gib * 1024**3)
+        return max(0, budget_bytes // block_bytes), budget_bytes
 
 
 _CACHE_CONTEXT: CacheContext
@@ -270,6 +290,7 @@ def set_cache_context(
     attention_tp: int,
     gpu_memory_utilization: float,
     gpu_memory_limit_gb: float | None = None,
+    host_utilization_per_device: float = 0.0,
     kv_lora_rank: int = 0,
     qk_rope_head_dim: int = 0,
     index_head_dim: int = 0,
@@ -296,6 +317,7 @@ def set_cache_context(
         attention_tp=attention_tp,
         gpu_memory_utilization=gpu_memory_utilization,
         gpu_memory_limit_gb=gpu_memory_limit_gb,
+        host_utilization_per_device=host_utilization_per_device,
         device=device,
         dtype=dtype,
         mode=mode,

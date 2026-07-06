@@ -18,6 +18,26 @@ class KVCacheAllocatorMixin:
         self.num_local_kvcache_blocks = num_kvcache_blocks
         get_cache_backend(self.mode).allocate(self)
 
+    def allocate_host_kvcache(self, num_host_kvcache_blocks: int):
+        self.num_host_kvcache_blocks = max(0, int(num_host_kvcache_blocks))
+        if self.num_host_kvcache_blocks <= 0:
+            self.host_kv_cache = None
+            return
+
+        backend = get_cache_backend(self.mode)
+        gpu_kv_cache = self.kv_cache
+        local_blocks = self.num_local_kvcache_blocks
+        device = self.device
+        try:
+            self.num_local_kvcache_blocks = self.num_host_kvcache_blocks
+            self.device = "cpu"
+            backend.allocate(self)
+            self.host_kv_cache = self.kv_cache
+        finally:
+            self.kv_cache = gpu_kv_cache
+            self.num_local_kvcache_blocks = local_blocks
+            self.device = device
+
     def allocate_dsv4_compressed_caches(
         self,
         compress_ratios: list[int],

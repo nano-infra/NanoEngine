@@ -332,6 +332,32 @@ class RayExecutor:
             timeout=timeout,
         )
 
+    def swap_out_blocks_to_host(
+        self,
+        per_worker_tasks: List[List[tuple]],
+        timeout: float | None = None,
+    ) -> list[int]:
+        return ray.get(
+            [
+                getattr(w, "swap_out_blocks_to_host").remote(tasks)
+                for tasks, w in zip(per_worker_tasks, self.workers)
+            ],
+            timeout=timeout,
+        )
+
+    def swap_in_blocks_from_host(
+        self,
+        per_worker_tasks: List[List[tuple]],
+        timeout: float | None = None,
+    ) -> list[int]:
+        return ray.get(
+            [
+                getattr(w, "swap_in_blocks_from_host").remote(tasks)
+                for tasks, w in zip(per_worker_tasks, self.workers)
+            ],
+            timeout=timeout,
+        )
+
     def l3_stats(self) -> list[dict]:
         return self.collective_rpc("l3_stats")
 
@@ -373,7 +399,11 @@ class RayExecutor:
 
     def update_kvcache_blocks(self):
         num_cache_blocks = min(self.collective_rpc("num_kvcache_blocks"))
+        num_host_cache_blocks = min(self.collective_rpc("num_host_kvcache_blocks"))
         logger.info(f"Set {num_cache_blocks=}")
+        if num_host_cache_blocks > 0:
+            logger.info(f"Set {num_host_cache_blocks=}")
+        self.config.num_host_kvcache_blocks = num_host_cache_blocks
         self.collective_rpc("allocate_kvcache", (num_cache_blocks,))
         return num_cache_blocks
 

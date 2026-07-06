@@ -28,6 +28,9 @@ class Config(BaseModel):
     max_model_len: int = 16384
     gpu_memory_utilization: float = 0.9
     gpu_memory_limit_gb: Optional[float] = None
+    # CPU KV spill tier for preempted decode requests. GiB budget per local
+    # worker/rank; 0 disables it.
+    host_utilization_per_device: float = 0.0
     routing_strategy: Literal[
         "RoundRobin", "LeastBatch", "LeastCache", "SessionPrefix"
     ] = "RoundRobin"
@@ -109,6 +112,7 @@ class Config(BaseModel):
     eos: List[int] = []
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = 15000
+    num_host_kvcache_blocks: int = 0
 
     # deployment config
     engine_id: Optional[str] = None
@@ -383,6 +387,8 @@ class Config(BaseModel):
 
         # With chunked prefill, max_num_batched_tokens may be smaller than max_model_len.
         assert self.max_num_batched_tokens >= 1
+        if self.host_utilization_per_device < 0:
+            raise ValueError("host_utilization_per_device must be >= 0")
 
         # HiSparse Phase 1 guard. This first implementation is decode-only
         # and intentionally requires dummy_prefill so it cannot be accidentally

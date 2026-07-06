@@ -481,6 +481,9 @@ class ModelRunner:
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
 
+    def num_host_kvcache_blocks(self):
+        return get_cache_context().num_host_kvcache_blocks
+
     def _get_model_cache_plan(self) -> CachePlan:
         cache_plan = getattr(self.config, "cache_plan", None)
         if cache_plan is not None:
@@ -518,6 +521,7 @@ class ModelRunner:
         self.config.num_kvcache_blocks = num_kvcache_blocks
         cache_context = get_cache_context()
         cache_context.allocate_kvcache(num_kvcache_blocks)
+        cache_context.allocate_host_kvcache(cache_context.num_host_kvcache_blocks)
 
         if self.cache_plan.has_hca():
             self._wire_dsv4_caches(cache_context)
@@ -982,6 +986,7 @@ class ModelRunner:
             attention_tp=config.attention_tp,
             gpu_memory_utilization=config.gpu_memory_utilization,
             gpu_memory_limit_gb=config.gpu_memory_limit_gb,
+            host_utilization_per_device=config.host_utilization_per_device,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             index_head_dim=index_head_dim,
@@ -1196,6 +1201,99 @@ class ModelRunner:
 
     def l3_stats(self) -> dict:
         return self.l3_store.stats() if self.l3_store is not None else {}
+
+    def swap_out_blocks_to_host(
+        self, tasks: list[tuple[int, list[int], list[int]]]
+    ) -> int:
+        """Copy GPU KV blocks into the worker-local host KV cache.
+
+        Each task is ``(seq_id, gpu_blocks, host_blocks)``. Scheduler owns the
+        table state; the worker only moves the bytes for its rank-local shard.
+        """
+        cache_context = get_cache_context()
+        if cache_context.host_kv_cache is None:
+            if tasks:
+                raise RuntimeError("host KV cache is not allocated")
+            return 0
+
+        copied = 0
+        for _seq_id, gpu_blocks, host_blocks in tasks:
+            if len(gpu_blocks) != len(host_blocks):
+                raise ValueError(
+                    "swap_out_blocks_to_host requires same-size GPU/host tables"
+                )
+            for gpu_block, host_block in zip(gpu_blocks, host_blocks):
+                self._copy_kv_block_to_host(
+                    cache_context, int(gpu_block), int(host_block)
+                )
+                copied += 1
+        if copied:
+            torch.cuda.synchronize()
+        return copied
+
+    def swap_in_blocks_from_host(
+        self, tasks: list[tuple[int, list[int], list[int]]]
+    ) -> int:
+        """Copy worker-local host KV blocks back into newly allocated GPU blocks.
+
+        Each task is ``(seq_id, host_blocks, gpu_blocks)``.
+        """
+        cache_context = get_cache_context()
+        if cache_context.host_kv_cache is None:
+            if tasks:
+                raise RuntimeError("host KV cache is not allocated")
+            return 0
+
+        copied = 0
+        for _seq_id, host_blocks, gpu_blocks in tasks:
+            if len(host_blocks) != len(gpu_blocks):
+                raise ValueError(
+                    "swap_in_blocks_from_host requires same-size host/GPU tables"
+                )
+            for host_block, gpu_block in zip(host_blocks, gpu_blocks):
+                self._copy_kv_block_from_host(
+                    cache_context, int(host_block), int(gpu_block)
+                )
+                copied += 1
+        if copied:
+            torch.cuda.synchronize()
+        return copied
+
+    @staticmethod
+    def _copy_kv_block_to_host(cache_context, gpu_block: int, host_block: int) -> None:
+        gpu_kv_cache = cache_context.kv_cache
+        host_kv_cache = cache_context.host_kv_cache
+        if cache_context.mode == "dsv4":
+            host_kv_cache[:, host_block].copy_(
+                gpu_kv_cache[:, gpu_block], non_blocking=True
+            )
+        elif cache_context.mode == "mla":
+            host_kv_cache[:, :, host_block].copy_(
+                gpu_kv_cache[:, :, gpu_block], non_blocking=True
+            )
+        else:
+            host_kv_cache[:, :, host_block].copy_(
+                gpu_kv_cache[:, :, gpu_block], non_blocking=True
+            )
+
+    @staticmethod
+    def _copy_kv_block_from_host(
+        cache_context, host_block: int, gpu_block: int
+    ) -> None:
+        gpu_kv_cache = cache_context.kv_cache
+        host_kv_cache = cache_context.host_kv_cache
+        if cache_context.mode == "dsv4":
+            gpu_kv_cache[:, gpu_block].copy_(
+                host_kv_cache[:, host_block], non_blocking=True
+            )
+        elif cache_context.mode == "mla":
+            gpu_kv_cache[:, :, gpu_block].copy_(
+                host_kv_cache[:, :, host_block], non_blocking=True
+            )
+        else:
+            gpu_kv_cache[:, :, gpu_block].copy_(
+                host_kv_cache[:, :, host_block], non_blocking=True
+            )
 
     def _standard_sample(
         self,

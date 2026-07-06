@@ -11,7 +11,11 @@ impl Scheduler {
 
     pub(super) fn set_prefix_caching_enabled_api(&mut self, enabled: bool) {
         let enabled = enabled && self.prefix_caching_allowed;
+        self.prefix_caching_enabled = enabled;
         for pool in &mut self.hbm_pools {
+            pool.set_prefix_caching_enabled(enabled);
+        }
+        for pool in &mut self.host_pools {
             pool.set_prefix_caching_enabled(enabled);
         }
     }

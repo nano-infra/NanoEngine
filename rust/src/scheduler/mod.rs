@@ -21,6 +21,15 @@ mod types;
 use session_state_cache::ParkedSession;
 pub use types::{PostprocessTiming, RoutingStrategy, ScheduleResult, SchedulerConfig, StepResult};
 
+const HOST_SWAP_IN_COOLDOWN_STEPS: u64 = 2;
+const HOST_PREFIX_CACHE_SEQ_ID: u64 = u64::MAX;
+
+#[derive(Clone, Debug)]
+struct PendingHostSwap {
+    dp_idx: usize,
+    group_id: usize,
+}
+
 #[pyclass(module = "dlengine._engine", unsendable)]
 pub struct Scheduler {
     #[pyo3(get)]
@@ -36,6 +45,11 @@ pub struct Scheduler {
     to_be_migrated: HashMap<u64, usize>,
     dummy_seq_ids: HashSet<u64>,
     hbm_pools: Vec<BlockPool>,
+    host_pools: Vec<BlockPool>,
+    pending_host_swaps: HashMap<u64, PendingHostSwap>,
+    pending_swap_out_tasks: Vec<Vec<(u64, Vec<i32>, Vec<i32>)>>,
+    pending_swap_in_tasks: Vec<Vec<(u64, Vec<i32>, Vec<i32>)>>,
+    current_step: u64,
     seq_assignment: HashMap<u64, (usize, usize)>,
     rr_cursor: usize,
     session_affinity: HashMap<u64, usize>,
@@ -46,6 +60,7 @@ pub struct Scheduler {
     hisparse_slots: SlotPool,
     compressed_pools: HashMap<i32, CompressedPool>,
     prefix_caching_allowed: bool,
+    prefix_caching_enabled: bool,
     prefix_cached_tokens_by_seq: HashMap<u64, i32>,
     prefix_counted_seq_ids: HashSet<u64>,
     server_metric: ServerMetric,

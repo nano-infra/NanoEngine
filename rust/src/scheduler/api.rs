@@ -26,10 +26,21 @@ impl Scheduler {
         let mut hbm_pools = (0..(dp * group))
             .map(|_| BlockPool::new(num_blocks, config.kvcache_block_size))
             .collect::<Vec<_>>();
+        let mut host_pools = (0..(dp * group))
+            .map(|_| {
+                BlockPool::new(
+                    config.num_host_kvcache_blocks.max(0),
+                    config.kvcache_block_size,
+                )
+            })
+            .collect::<Vec<_>>();
         if !prefix_caching_allowed {
             for pool in &mut hbm_pools {
                 pool.set_prefix_caching_enabled(false);
             }
+        }
+        for pool in &mut host_pools {
+            pool.set_prefix_caching_enabled(false);
         }
         let mut compressed_pools = HashMap::new();
         if config.cache_plan.flags & ((1 << 3) | (1 << 4)) != 0 {
@@ -91,6 +102,11 @@ impl Scheduler {
             to_be_migrated: HashMap::new(),
             dummy_seq_ids: HashSet::new(),
             hbm_pools,
+            host_pools,
+            pending_host_swaps: HashMap::new(),
+            pending_swap_out_tasks: (0..(dp * group)).map(|_| Vec::new()).collect(),
+            pending_swap_in_tasks: (0..(dp * group)).map(|_| Vec::new()).collect(),
+            current_step: 0,
             seq_assignment: HashMap::new(),
             rr_cursor: 0,
             session_affinity: HashMap::new(),
@@ -101,6 +117,7 @@ impl Scheduler {
             hisparse_slots: SlotPool::new(hisparse_slots),
             compressed_pools,
             prefix_caching_allowed,
+            prefix_caching_enabled: prefix_caching_allowed,
             prefix_cached_tokens_by_seq: HashMap::new(),
             prefix_counted_seq_ids: HashSet::new(),
             server_metric: ServerMetric::default(),
@@ -182,6 +199,7 @@ impl Scheduler {
     fn schedule(&mut self, py: Python<'_>) -> PyResult<ScheduleResult> {
         let schedule_begin_s = unix_time_s();
         let schedule_begin = Instant::now();
+        self.current_step = self.current_step.saturating_add(1);
         let prefill = self.schedule_prefill(py)?;
         let has_prefill = prefill.iter().any(|seqs| !seqs.is_empty());
         let dp_seq_ids = if has_prefill {
@@ -330,6 +348,14 @@ impl Scheduler {
         tp_size: usize,
     ) -> PyResult<Vec<PyObject>> {
         self.serialize_migrate_batches(py, result.dp_group_seq_ids.clone(), tp_size)
+    }
+
+    fn complete_host_swap_outs(&mut self, tasks: Vec<Vec<(u64, Vec<i32>, Vec<i32>)>>) {
+        self.complete_host_swap_outs_impl(tasks)
+    }
+
+    fn complete_host_swap_ins(&mut self, tasks: Vec<Vec<(u64, Vec<i32>, Vec<i32>)>>) {
+        self.complete_host_swap_ins_impl(tasks)
     }
 
     fn collect_sequence_events(

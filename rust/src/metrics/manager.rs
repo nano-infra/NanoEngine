@@ -51,6 +51,10 @@ pub struct RuntimeMetrics {
     #[pyo3(get)]
     pub total_blocks_per_dp: i32,
     #[pyo3(get)]
+    pub used_host_blocks_per_dp: Vec<i32>,
+    #[pyo3(get)]
+    pub total_host_blocks_per_dp: i32,
+    #[pyo3(get)]
     pub last_schedule_ms: f64,
     #[pyo3(get)]
     pub last_forward_ms: f64,
@@ -213,6 +217,8 @@ impl RuntimeMetrics {
             immrecv_ms,
             net_ms,
             serialize_ms,
+            Some(resource_metric.used_host_blocks_per_dp.clone()),
+            resource_metric.total_host_blocks_per_dp,
         )
     }
 
@@ -238,7 +244,9 @@ impl RuntimeMetrics {
         wwi_ms=0.0,
         immrecv_ms=0.0,
         net_ms=0.0,
-        serialize_ms=0.0
+        serialize_ms=0.0,
+        used_host_blocks_per_dp=None,
+        total_host_blocks=0
     ))]
     fn maybe_report_engine_status(
         &mut self,
@@ -264,6 +272,8 @@ impl RuntimeMetrics {
         immrecv_ms: f64,
         net_ms: f64,
         serialize_ms: f64,
+        used_host_blocks_per_dp: Option<Vec<i32>>,
+        total_host_blocks: i32,
     ) -> Option<String> {
         let force_report = prefill_tokens_per_dp.iter().any(|tokens| *tokens > 0);
         if self.report_prefill_tokens_per_dp.is_none() {
@@ -357,6 +367,8 @@ impl RuntimeMetrics {
             self.report_serialize_ms / steps as f64,
             cached,
             prompt,
+            used_host_blocks_per_dp,
+            total_host_blocks,
         );
         self.last_report_time = now;
         self.reset_window();
@@ -388,7 +400,9 @@ impl RuntimeMetrics {
         avg_net_ms=0.0,
         avg_serialize_ms=0.0,
         prefix_cached_tokens_per_dp=None,
-        prefix_prompt_tokens_per_dp=None
+        prefix_prompt_tokens_per_dp=None,
+        used_host_blocks_per_dp=None,
+        total_host_blocks=0
     ))]
     fn log_engine_status(
         &mut self,
@@ -416,6 +430,8 @@ impl RuntimeMetrics {
         avg_serialize_ms: f64,
         prefix_cached_tokens_per_dp: Option<Vec<i32>>,
         prefix_prompt_tokens_per_dp: Option<Vec<i32>>,
+        used_host_blocks_per_dp: Option<Vec<i32>>,
+        total_host_blocks: i32,
     ) -> String {
         let prefill_tokens: i32 = prefill_tokens_per_dp.iter().sum();
         let decode_tokens: i32 = decode_tokens_per_dp.iter().sum();
@@ -431,6 +447,8 @@ impl RuntimeMetrics {
         self.running_per_dp = running_per_dp.clone();
         self.used_blocks_per_dp = used_blocks_per_dp.clone().unwrap_or_default();
         self.total_blocks_per_dp = total_blocks;
+        self.used_host_blocks_per_dp = used_host_blocks_per_dp.clone().unwrap_or_default();
+        self.total_host_blocks_per_dp = total_host_blocks;
         self.last_schedule_ms = prom_value(avg_schedule_ms);
         self.last_forward_ms = prom_value(avg_forward_ms);
         self.last_postprocess_ms = prom_value(avg_postprocess_ms);
@@ -466,6 +484,16 @@ impl RuntimeMetrics {
             })
             .unwrap_or_else(|| "?".to_string());
         let kv = format!("{used_str}/{total_blocks}");
+        let host_str = used_host_blocks_per_dp
+            .as_ref()
+            .map(|v| {
+                v.iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .unwrap_or_else(|| "?".to_string());
+        let host_kv = format!("{host_str}/{total_host_blocks}");
         let run_str = running_per_dp
             .iter()
             .map(|x| x.to_string())
@@ -548,7 +576,7 @@ impl RuntimeMetrics {
             xfer_str.push_str(&format!(" net={avg_net_ms:.2} ms/step"));
         }
         format!(
-            "[engine {} {mode}] run={run_str} wait={waiting} mig={waiting_migration} | kv={kv} blk | tput pf={pf_str} dec={dec_str} tok/s ({elapsed:.0}s) | done={} tok={}p/{}g{cache_str}{lat_str}{xfer_str}",
+            "[engine {} {mode}] run={run_str} wait={waiting} mig={waiting_migration} | kv={kv} blk host={host_kv} blk | tput pf={pf_str} dec={dec_str} tok/s ({elapsed:.0}s) | done={} tok={}p/{}g{cache_str}{lat_str}{xfer_str}",
             engine_id.chars().take(8).collect::<String>(),
             server_metric.num_completed_requests,
             server_metric.total_prompt_tokens,
@@ -793,6 +821,8 @@ fn runtime_metrics_with_report_interval(report_interval_s: f64) -> RuntimeMetric
         running_per_dp: Vec::new(),
         used_blocks_per_dp: Vec::new(),
         total_blocks_per_dp: 0,
+        used_host_blocks_per_dp: Vec::new(),
+        total_host_blocks_per_dp: 0,
         last_schedule_ms: 0.0,
         last_forward_ms: 0.0,
         last_postprocess_ms: 0.0,
@@ -901,6 +931,8 @@ mod tests {
                 0.0,
                 0.0,
                 0.0,
+                None,
+                0,
             )
             .is_some()
     }
