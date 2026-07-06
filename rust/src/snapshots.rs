@@ -43,6 +43,10 @@ pub struct SchedulerMetricSnapshot {
     #[pyo3(get, set)]
     pub used_blocks_per_dp: Vec<i32>,
     #[pyo3(get, set)]
+    pub total_host_blocks_per_dp: i32,
+    #[pyo3(get, set)]
+    pub used_host_blocks_per_dp: Vec<i32>,
+    #[pyo3(get, set)]
     pub free_blocks: Vec<Vec<i32>>,
 }
 

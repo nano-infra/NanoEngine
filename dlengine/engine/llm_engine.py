@@ -143,6 +143,8 @@ class LLMEngine:
     def _run_scheduled_step(self, schedule_result):
         tp_size = self.config.attention_tp
         runner_outs = None
+        self._run_host_swap_outs(schedule_result, tp_size)
+        self._run_host_swap_ins(schedule_result, tp_size)
 
         if not (schedule_result.is_prefill and self.config.mode == "decode"):
             batch_bytes = self.scheduler.serialize_run_batches_for_result(
@@ -165,6 +167,44 @@ class LLMEngine:
             self.executor.migrate_batch_bytes(batch_bytes)
 
         return runner_outs
+
+    def _run_host_swap_outs(self, schedule_result, tp_size: int) -> None:
+        tasks = getattr(schedule_result, "swap_out_tasks", None) or []
+        if not any(tasks):
+            return
+        num_seqs = sum(len(group_tasks) for group_tasks in tasks)
+        num_blocks = sum(
+            len(gpu_blocks)
+            for group_tasks in tasks
+            for _seq_id, gpu_blocks, _host_blocks in group_tasks
+        )
+        logger.info("host swap-out begin: seqs=%d blocks=%d", num_seqs, num_blocks)
+        per_worker_tasks = []
+        for group_tasks in tasks:
+            for _ in range(max(1, tp_size)):
+                per_worker_tasks.append(group_tasks)
+        self.executor.swap_out_blocks_to_host(per_worker_tasks)
+        self.scheduler.complete_host_swap_outs(tasks)
+        logger.info("host swap-out done: seqs=%d blocks=%d", num_seqs, num_blocks)
+
+    def _run_host_swap_ins(self, schedule_result, tp_size: int) -> None:
+        tasks = getattr(schedule_result, "swap_in_tasks", None) or []
+        if not any(tasks):
+            return
+        num_seqs = sum(len(group_tasks) for group_tasks in tasks)
+        num_blocks = sum(
+            len(host_blocks)
+            for group_tasks in tasks
+            for _seq_id, host_blocks, _gpu_blocks in group_tasks
+        )
+        logger.info("host swap-in begin: seqs=%d blocks=%d", num_seqs, num_blocks)
+        per_worker_tasks = []
+        for group_tasks in tasks:
+            for _ in range(max(1, tp_size)):
+                per_worker_tasks.append(group_tasks)
+        self.executor.swap_in_blocks_from_host(per_worker_tasks)
+        self.scheduler.complete_host_swap_ins(tasks)
+        logger.info("host swap-in done: seqs=%d blocks=%d", num_seqs, num_blocks)
 
     def step(
         self,

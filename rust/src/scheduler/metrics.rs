@@ -21,6 +21,7 @@ impl Scheduler {
             total_waiting_migration: self.waiting_migration.len() as i32,
             waiting_migration_head_tokens: -1,
             total_blocks_per_dp: self.config.num_kvcache_blocks * self.config.group_size,
+            total_host_blocks_per_dp: self.config.num_host_kvcache_blocks * self.config.group_size,
             used_blocks_per_dp: {
                 let dp = self.config.attention_dp.max(1) as usize;
                 let group = self.config.group_size.max(1) as usize;
@@ -30,6 +31,20 @@ impl Scheduler {
                             .map(|group_id| {
                                 let idx = dp_idx * group + group_id;
                                 self.hbm_pools[idx].num_used_blocks()
+                            })
+                            .sum()
+                    })
+                    .collect()
+            },
+            used_host_blocks_per_dp: {
+                let dp = self.config.attention_dp.max(1) as usize;
+                let group = self.config.group_size.max(1) as usize;
+                (0..dp)
+                    .map(|dp_idx| {
+                        (0..group)
+                            .map(|group_id| {
+                                let idx = dp_idx * group + group_id;
+                                self.host_pools[idx].num_used_blocks()
                             })
                             .sum()
                     })

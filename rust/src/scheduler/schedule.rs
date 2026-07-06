@@ -2,6 +2,12 @@ use super::{ScheduleResult, Scheduler};
 use pyo3::prelude::*;
 
 impl Scheduler {
+    fn mark_scheduled(&mut self, seq_id: u64) {
+        if let Some(seq) = self.seq_table.get_mut(&seq_id) {
+            seq.last_scheduled_step = self.current_step;
+        }
+    }
+
     pub(super) fn prompt_target(&self, seq: &crate::sequence::Sequence) -> i32 {
         seq.num_prompt_tokens.max(seq.num_checkpointed_tokens)
     }
@@ -47,6 +53,7 @@ impl Scheduler {
                 num_tokens[dp_idx][group_id] += new_tokens;
                 self.running[dp_idx].push(seq_id);
                 scheduled[dp_idx].push(seq_id);
+                self.mark_scheduled(seq_id);
             }
             self.prefilling[dp_idx] = rest;
         }
@@ -63,6 +70,28 @@ impl Scheduler {
             };
             let mut placed = false;
             for dp_idx in self.route_candidates(py, seq_id) {
+                if self.seq_has_host_blocks(seq_id) {
+                    if self.try_restore_host_blocks(seq_id, dp_idx)? {
+                        if use_migration_queue {
+                            self.waiting_migration.remove(0);
+                        } else {
+                            self.waiting.remove(0);
+                        }
+                        self.running[dp_idx].push(seq_id);
+                        let affinity = self
+                            .seq_table
+                            .get(&seq_id)
+                            .map(|s| s.affinity_key)
+                            .unwrap_or(0);
+                        if affinity != 0 {
+                            self.session_affinity.insert(affinity, dp_idx);
+                        }
+                        self.session_wait.remove(&seq_id);
+                        placed = true;
+                        break;
+                    }
+                    continue;
+                }
                 if let Some(new_tokens) = self.try_allocate_prefill(
                     py,
                     seq_id,
@@ -84,6 +113,7 @@ impl Scheduler {
                     }
                     self.running[dp_idx].push(seq_id);
                     scheduled[dp_idx].push(seq_id);
+                    self.mark_scheduled(seq_id);
                     let affinity = self
                         .seq_table
                         .get(&seq_id)
@@ -134,6 +164,7 @@ impl Scheduler {
                     .map(|s| s.num_tokens)
                     .unwrap_or(0);
                 scheduled[dp_idx].push(seq_id);
+                self.mark_scheduled(seq_id);
                 skipped.push(seq_id);
             }
             self.running[dp_idx] = skipped;
@@ -157,6 +188,8 @@ impl Scheduler {
         let mut result = ScheduleResult::default();
         result.is_prefill = is_prefill;
         result.dp_seq_ids = dp_seq_ids.clone();
+        result.swap_out_tasks = self.pending_swap_out_tasks.clone();
+        result.swap_in_tasks = self.pending_swap_in_tasks.clone();
         result.dp_group_seq_ids = Vec::with_capacity(dp * group);
         result.filtered_dp_group_seq_ids = Vec::with_capacity(dp * group);
         result.group_send_counts = vec![vec![0; group]; dp];
@@ -249,14 +282,14 @@ impl Scheduler {
         let Some(master) = self.choose_master_group(dp_idx, batch_seqs, batch_tokens) else {
             return Ok(None);
         };
-        if self.config.mode != "decode" && self.group() == 1 {
+        if self.config.mode != "decode" && self.group() == 1 && self.prefix_caching_enabled {
             let token_ids = self
                 .seq_table
                 .get(&seq_id)
                 .map(|s| s.token_ids.clone())
                 .unwrap_or_default();
             let flat = self.flat_idx(dp_idx, master);
-            cached = self.hbm_pools[flat].cached_tokens_for(&token_ids, full_len);
+            cached = self.cached_tokens_for_with_host_prefix(flat, &token_ids, full_len);
             if let Some(s) = self.seq_table.get_mut(&seq_id) {
                 s.num_cached_tokens = cached;
                 s.prefill_start_offset = cached;
@@ -298,14 +331,25 @@ impl Scheduler {
 
         for (gid, count) in dispatch.iter().copied().enumerate() {
             if count > 0 {
-                self.ensure_group_blocks(
+                if let Err(err) = self.ensure_group_blocks(
                     py,
                     seq_id,
                     dp_idx,
                     gid,
                     count,
                     self.config.mode != "decode",
-                )?;
+                ) {
+                    self.seq_assignment.remove(&seq_id);
+                    if let Some(s) = self.seq_table.get_mut(&seq_id) {
+                        s.status = 0;
+                        s.active_block_table.clear();
+                        s.active_block_tables.clear();
+                    }
+                    if self.preempt_one_for_allocation(py, dp_idx, seq_id)? {
+                        return Ok(None);
+                    }
+                    return Err(err);
+                }
             }
         }
         {

@@ -30,12 +30,55 @@ fn make_scheduler_with_flags_prefix_cache_and_batch_tokens(
         attention_dp: 1,
         group_size: 1,
         num_kvcache_blocks: 16,
+        num_host_kvcache_blocks: 0,
         kvcache_block_size: 4,
         mode: "hybrid".to_string(),
         routing_strategy: RoutingStrategy::RoundRobin,
         gdn_state_cache_slots: 0,
         enable_prefix_cache,
         cache_plan: CachePlan::new(flags),
+    })
+}
+
+fn make_scheduler_with_host_blocks() -> Scheduler {
+    Scheduler::new(SchedulerConfig {
+        engine_id: "engine".to_string(),
+        num_speculative_tokens: 0,
+        max_num_seqs: 8,
+        max_num_batched_tokens: 64,
+        max_model_len: 128,
+        eos_ids: Vec::new(),
+        attention_dp: 1,
+        group_size: 1,
+        num_kvcache_blocks: 16,
+        num_host_kvcache_blocks: 16,
+        kvcache_block_size: 4,
+        mode: "hybrid".to_string(),
+        routing_strategy: RoutingStrategy::RoundRobin,
+        gdn_state_cache_slots: 0,
+        enable_prefix_cache: true,
+        cache_plan: CachePlan::new(1),
+    })
+}
+
+fn make_scheduler_with_host_prefix_cache() -> Scheduler {
+    Scheduler::new(SchedulerConfig {
+        engine_id: "engine".to_string(),
+        num_speculative_tokens: 0,
+        max_num_seqs: 8,
+        max_num_batched_tokens: 64,
+        max_model_len: 128,
+        eos_ids: Vec::new(),
+        attention_dp: 1,
+        group_size: 1,
+        num_kvcache_blocks: 3,
+        num_host_kvcache_blocks: 8,
+        kvcache_block_size: 4,
+        mode: "hybrid".to_string(),
+        routing_strategy: RoutingStrategy::RoundRobin,
+        gdn_state_cache_slots: 0,
+        enable_prefix_cache: true,
+        cache_plan: CachePlan::new(1),
     })
 }
 
@@ -77,6 +120,125 @@ fn run_prefill_until_ready(py: Python<'_>, scheduler: &mut Scheduler) -> PyResul
         }
     }
     seq_id.ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("no prefill scheduled"))
+}
+
+#[test]
+fn preempted_sequence_restores_from_host_without_prefill() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_scheduler_with_host_blocks();
+        add_tokens(py, &mut scheduler, 42, (0..8).collect()).unwrap();
+        assert_eq!(run_one_prefill(py, &mut scheduler).unwrap(), vec![42]);
+
+        scheduler.preempt_impl(py, 0, 42).unwrap();
+        assert_eq!(scheduler.pending_swap_out_tasks[0].len(), 1);
+        let swap_out = scheduler.pending_swap_out_tasks.clone();
+        scheduler.complete_host_swap_outs_impl(swap_out);
+        assert!(scheduler.seq_has_host_blocks(42));
+
+        scheduler.current_step += 3;
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        assert!(scheduled[0].is_empty());
+        assert_eq!(scheduler.pending_swap_in_tasks[0].len(), 1);
+        assert_eq!(scheduler.running[0], vec![42]);
+
+        let swap_in = scheduler.pending_swap_in_tasks.clone();
+        scheduler.complete_host_swap_ins_impl(swap_in);
+        assert!(!scheduler.seq_has_host_blocks(42));
+    });
+}
+
+#[test]
+fn host_swap_preempted_sequence_waits_behind_new_request() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_scheduler_with_host_blocks();
+        add_tokens(py, &mut scheduler, 10, (0..8).collect()).unwrap();
+        assert_eq!(run_one_prefill(py, &mut scheduler).unwrap(), vec![10]);
+        add_tokens(py, &mut scheduler, 11, (0..8).collect()).unwrap();
+        assert_eq!(run_one_prefill(py, &mut scheduler).unwrap(), vec![11]);
+        add_tokens(py, &mut scheduler, 12, (0..8).collect()).unwrap();
+
+        scheduler.preempt_impl(py, 0, 10).unwrap();
+
+        assert_eq!(scheduler.waiting.first().copied(), Some(12));
+        assert_eq!(scheduler.waiting.last().copied(), Some(10));
+        assert_eq!(scheduler.pending_swap_out_tasks[0].len(), 1);
+    });
+}
+
+#[test]
+fn host_swap_restore_respects_cooldown_and_capacity() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_scheduler_with_host_blocks();
+        add_tokens(py, &mut scheduler, 42, (0..8).collect()).unwrap();
+        assert_eq!(run_one_prefill(py, &mut scheduler).unwrap(), vec![42]);
+
+        scheduler.current_step = 10;
+        scheduler.preempt_impl(py, 0, 42).unwrap();
+        let swap_out = scheduler.pending_swap_out_tasks.clone();
+        scheduler.complete_host_swap_outs_impl(swap_out);
+
+        assert!(!scheduler.try_restore_host_blocks(42, 0).unwrap());
+        scheduler.current_step += 3;
+        assert!(scheduler.try_restore_host_blocks(42, 0).unwrap());
+    });
+}
+
+#[test]
+fn host_swap_victim_uses_oldest_scheduled_sequence() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_scheduler_with_host_blocks();
+        add_tokens(py, &mut scheduler, 20, (0..8).collect()).unwrap();
+        assert_eq!(run_one_prefill(py, &mut scheduler).unwrap(), vec![20]);
+        add_tokens(py, &mut scheduler, 21, (0..8).collect()).unwrap();
+        assert_eq!(run_one_prefill(py, &mut scheduler).unwrap(), vec![21]);
+
+        scheduler
+            .seq_table
+            .get_mut(&20)
+            .unwrap()
+            .last_scheduled_step = 100;
+        scheduler
+            .seq_table
+            .get_mut(&21)
+            .unwrap()
+            .last_scheduled_step = 10;
+
+        assert!(scheduler.preempt_one_for_allocation(py, 0, 999).unwrap());
+        assert!(scheduler.seq_has_host_blocks(21));
+        assert!(!scheduler.seq_has_host_blocks(20));
+    });
+}
+
+#[test]
+fn evicted_device_prefix_writes_back_and_promotes_from_host() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_scheduler_with_host_prefix_cache();
+        let prefix: Vec<i32> = (0..8).collect();
+        add_tokens(py, &mut scheduler, 30, prefix.clone()).unwrap();
+        let a = run_one_prefill(py, &mut scheduler).unwrap()[0];
+        scheduler.release_seq(a);
+
+        add_tokens(py, &mut scheduler, 31, (100..112).collect()).unwrap();
+        let b = run_one_prefill(py, &mut scheduler).unwrap()[0];
+        assert_eq!(scheduler.pending_swap_out_tasks[0].len(), 2);
+        let swap_out = scheduler.pending_swap_out_tasks.clone();
+        scheduler.complete_host_swap_outs_impl(swap_out);
+        scheduler.release_seq(b);
+
+        let mut round_two = prefix.clone();
+        round_two.push(999);
+        add_tokens(py, &mut scheduler, 32, round_two).unwrap();
+        let scheduled = scheduler.schedule_prefill(py).unwrap();
+        assert_eq!(scheduled[0].len(), 1);
+        let seq_id = scheduled[0][0];
+        assert_eq!(scheduler.seq_table[&seq_id].num_cached_tokens, 8);
+        assert_eq!(scheduler.pending_swap_in_tasks[0].len(), 2);
+    });
 }
 
 fn server_metric() -> ServerMetric {

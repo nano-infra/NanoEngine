@@ -35,6 +35,7 @@ def build_scheduler_config(
         attention_dp=config.attention_dp,
         group_size=config.attention_sp,
         num_kvcache_blocks=config.num_kvcache_blocks,
+        num_host_kvcache_blocks=config.num_host_kvcache_blocks,
         kvcache_block_size=config.kvcache_block_size,
         mode=config.mode,
         routing_strategy=RoutingStrategy[config.routing_strategy],

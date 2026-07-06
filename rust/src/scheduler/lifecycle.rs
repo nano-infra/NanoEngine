@@ -1,3 +1,4 @@
+use super::PendingHostSwap;
 use super::Scheduler;
 use crate::metrics::SequenceMetric;
 use pyo3::prelude::*;
@@ -17,10 +18,120 @@ impl Scheduler {
             seq.num_checkpointed_tokens = total_tokens;
             seq.prefill_start_offset = 0;
         }
-        self.release_seq(seq_id);
+        let swapped_to_host = self.prepare_host_swap_out(seq_id);
+        if !swapped_to_host {
+            self.release_seq(seq_id);
+        }
         self.running[dp_idx].retain(|id| *id != seq_id);
-        self.waiting.insert(0, seq_id);
+        if swapped_to_host {
+            self.waiting.push(seq_id);
+        } else {
+            self.waiting.insert(0, seq_id);
+        }
         Ok(())
+    }
+
+    pub(super) fn preempt_one_for_allocation(
+        &mut self,
+        py: Python<'_>,
+        dp_idx: usize,
+        exclude_seq_id: u64,
+    ) -> PyResult<bool> {
+        let victim = self.running.get(dp_idx).and_then(|queue| {
+            queue
+                .iter()
+                .copied()
+                .filter(|seq_id| *seq_id != exclude_seq_id && !self.dummy_seq_ids.contains(seq_id))
+                .min_by_key(|seq_id| {
+                    self.seq_table
+                        .get(seq_id)
+                        .map(|seq| seq.last_scheduled_step)
+                        .unwrap_or(0)
+                })
+        });
+        let Some(victim) = victim else {
+            return Ok(false);
+        };
+        self.preempt_impl(py, dp_idx, victim)?;
+        Ok(true)
+    }
+
+    fn prepare_host_swap_out(&mut self, seq_id: u64) -> bool {
+        if self.config.num_host_kvcache_blocks <= 0 || self.pending_host_swaps.contains_key(&seq_id)
+        {
+            return false;
+        }
+        let Some((dp_idx, group_id)) = self.seq_assignment.get(&seq_id).copied() else {
+            return false;
+        };
+        let flat = self.flat_idx(dp_idx, group_id);
+        let gpu_blocks = self
+            .seq_table
+            .get(&seq_id)
+            .map(|seq| seq.active_block_table.clone())
+            .unwrap_or_default();
+        if gpu_blocks.is_empty() {
+            return false;
+        }
+        let tokens = (gpu_blocks.len() as i32) * self.config.kvcache_block_size.max(1);
+        let Ok(host_blocks) = self.host_pools[flat].ensure_blocks(seq_id, &[], tokens, false)
+        else {
+            return false;
+        };
+        self.pending_host_swaps
+            .insert(seq_id, PendingHostSwap { dp_idx, group_id });
+        if let Some(tasks) = self.pending_swap_out_tasks.get_mut(flat) {
+            tasks.push((seq_id, gpu_blocks, host_blocks.clone()));
+        }
+        if let Some(seq) = self.seq_table.get_mut(&seq_id) {
+            seq.host_block_table = host_blocks.clone();
+            seq.host_block_tables.insert(group_id as i32, host_blocks);
+            seq.last_swapped_out_step = self.current_step;
+        }
+        true
+    }
+
+    pub(super) fn complete_host_swap_outs_impl(
+        &mut self,
+        tasks: Vec<Vec<(u64, Vec<i32>, Vec<i32>)>>,
+    ) {
+        for group_tasks in tasks {
+            for (seq_id, _gpu_blocks, _host_blocks) in group_tasks {
+                let Some(pending) = self.pending_host_swaps.remove(&seq_id) else {
+                    continue;
+                };
+                let flat = self.flat_idx(pending.dp_idx, pending.group_id);
+                self.hbm_pools[flat].remove_seq(seq_id);
+                self.seq_assignment.remove(&seq_id);
+                if let Some(seq) = self.seq_table.get_mut(&seq_id) {
+                    seq.active_block_table.clear();
+                    seq.active_block_tables.clear();
+                }
+            }
+        }
+        for tasks in &mut self.pending_swap_out_tasks {
+            tasks.clear();
+        }
+    }
+
+    pub(super) fn complete_host_swap_ins_impl(
+        &mut self,
+        tasks: Vec<Vec<(u64, Vec<i32>, Vec<i32>)>>,
+    ) {
+        for (flat, group_tasks) in tasks.into_iter().enumerate() {
+            for (seq_id, _host_blocks, _gpu_blocks) in group_tasks {
+                if let Some(pool) = self.host_pools.get_mut(flat) {
+                    pool.remove_seq(seq_id);
+                }
+                if let Some(seq) = self.seq_table.get_mut(&seq_id) {
+                    seq.host_block_table.clear();
+                    seq.host_block_tables.clear();
+                }
+            }
+        }
+        for tasks in &mut self.pending_swap_in_tasks {
+            tasks.clear();
+        }
     }
 
     pub(super) fn postprocess_impl(
