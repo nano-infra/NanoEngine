@@ -70,8 +70,8 @@ impl Scheduler {
             };
             let mut placed = false;
             for dp_idx in self.route_candidates(py, seq_id) {
-                if self.seq_has_host_blocks(seq_id) {
-                    if self.try_restore_host_blocks(seq_id, dp_idx)? {
+                if self.cache_seq_has_host_blocks(seq_id) {
+                    if self.cache_try_restore_host_blocks(seq_id, dp_idx)? {
                         if use_migration_queue {
                             self.waiting_migration.remove(0);
                         } else {
@@ -153,7 +153,7 @@ impl Scheduler {
                     skipped.push(seq_id);
                     continue;
                 }
-                if let Err(_e) = self.ensure_blocks_for_seq(py, seq_id, false) {
+                if let Err(_e) = self.cache_ensure_blocks_for_seq(py, seq_id, false) {
                     self.preempt_impl(py, dp_idx, seq_id)?;
                     continue;
                 }
@@ -289,7 +289,7 @@ impl Scheduler {
                 .map(|s| s.token_ids.clone())
                 .unwrap_or_default();
             let flat = self.flat_idx(dp_idx, master);
-            cached = self.cached_tokens_for_with_host_prefix(flat, &token_ids, full_len);
+            cached = self.cache_cached_tokens_for_prefix(flat, &token_ids, full_len);
             if let Some(s) = self.seq_table.get_mut(&seq_id) {
                 s.num_cached_tokens = cached;
                 s.prefill_start_offset = cached;
@@ -331,7 +331,7 @@ impl Scheduler {
 
         for (gid, count) in dispatch.iter().copied().enumerate() {
             if count > 0 {
-                if let Err(err) = self.ensure_group_blocks(
+                if let Err(err) = self.cache_ensure_group_blocks(
                     py,
                     seq_id,
                     dp_idx,
@@ -360,9 +360,9 @@ impl Scheduler {
                 }
             }
         }
-        self.ensure_state_slot(py, seq_id)?;
-        self.ensure_hisparse_slot(py, seq_id)?;
-        self.ensure_compressed_pages(py, seq_id, full_len)?;
+        self.cache_ensure_state_slot(py, seq_id)?;
+        self.cache_ensure_hisparse_slot(py, seq_id)?;
+        self.cache_ensure_compressed_pages(py, seq_id, full_len)?;
         if self.config.mode != "decode" {
             let Some(s) = self.seq_table.get_mut(&seq_id) else {
                 return Ok(None);
