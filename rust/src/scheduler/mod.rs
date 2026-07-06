@@ -1,5 +1,4 @@
-use crate::cache::table::block::{BlockPool, CompressedPool};
-use crate::cache::table::slot::SlotPool;
+use crate::cache::CacheState;
 use crate::metrics::{RuntimeMetrics, SequenceMetric, ServerMetric};
 use crate::proto::wire::sequence_to_migration_request_ref;
 use crate::proto::RunnerOut;
@@ -15,20 +14,12 @@ mod observability;
 mod resource;
 mod router;
 mod schedule;
-mod session_state_cache;
 mod types;
 
-use session_state_cache::ParkedSession;
 pub use types::{PostprocessTiming, RoutingStrategy, ScheduleResult, SchedulerConfig, StepResult};
 
 const HOST_SWAP_IN_COOLDOWN_STEPS: u64 = 2;
 const HOST_PREFIX_CACHE_SEQ_ID: u64 = u64::MAX;
-
-#[derive(Clone, Debug)]
-struct PendingHostSwap {
-    dp_idx: usize,
-    group_id: usize,
-}
 
 #[pyclass(module = "dlengine._engine", unsendable)]
 pub struct Scheduler {
@@ -44,25 +35,9 @@ pub struct Scheduler {
     prefilling: Vec<Vec<u64>>,
     to_be_migrated: HashMap<u64, usize>,
     dummy_seq_ids: HashSet<u64>,
-    hbm_pools: Vec<BlockPool>,
-    host_pools: Vec<BlockPool>,
-    pending_host_swaps: HashMap<u64, PendingHostSwap>,
-    pending_swap_out_tasks: Vec<Vec<(u64, Vec<i32>, Vec<i32>)>>,
-    pending_swap_in_tasks: Vec<Vec<(u64, Vec<i32>, Vec<i32>)>>,
+    cache: CacheState,
     current_step: u64,
-    seq_assignment: HashMap<u64, (usize, usize)>,
     rr_cursor: usize,
-    session_affinity: HashMap<u64, usize>,
-    session_wait: HashMap<u64, i32>,
-    parked_sessions: HashMap<u64, ParkedSession>,
-    parked_lru: Vec<u64>,
-    state_slots: SlotPool,
-    hisparse_slots: SlotPool,
-    compressed_pools: HashMap<i32, CompressedPool>,
-    prefix_caching_allowed: bool,
-    prefix_caching_enabled: bool,
-    prefix_cached_tokens_by_seq: HashMap<u64, i32>,
-    prefix_counted_seq_ids: HashSet<u64>,
     server_metric: ServerMetric,
     runtime_metrics: RuntimeMetrics,
     sequence_metrics: HashMap<u64, Py<SequenceMetric>>,
@@ -71,7 +46,7 @@ pub struct Scheduler {
 mod api;
 mod api_control;
 mod api_metrics;
-mod cache_coordinator;
+mod coordinator;
 
 fn average_f64(values: &[f64]) -> f64 {
     if values.is_empty() {

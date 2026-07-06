@@ -30,7 +30,7 @@ impl Scheduler {
                         (0..group)
                             .map(|group_id| {
                                 let idx = dp_idx * group + group_id;
-                                self.hbm_pools[idx].num_used_blocks()
+                                self.cache.hbm_pools[idx].num_used_blocks()
                             })
                             .sum()
                     })
@@ -44,7 +44,7 @@ impl Scheduler {
                         (0..group)
                             .map(|group_id| {
                                 let idx = dp_idx * group + group_id;
-                                self.host_pools[idx].num_used_blocks()
+                                self.cache.host_pools[idx].num_used_blocks()
                             })
                             .sum()
                     })
@@ -58,14 +58,14 @@ impl Scheduler {
                         (0..group)
                             .map(|group_id| {
                                 let idx = dp_idx * group + group_id;
-                                self.hbm_pools[idx].num_free_blocks() as i32
+                                self.cache.hbm_pools[idx].num_free_blocks() as i32
                             })
                             .collect()
                     })
                     .collect()
             },
-            used_hisparse_slots: self.hisparse_slots.num_used_slots(),
-            total_hisparse_slots: self.hisparse_slots.num_slots(),
+            used_hisparse_slots: self.cache.hisparse_slots.num_used_slots(),
+            total_hisparse_slots: self.cache.hisparse_slots.num_slots(),
         }
     }
 
@@ -137,10 +137,12 @@ impl Scheduler {
                     snapshot.prefill_tokens += new_tokens;
                     if dp_idx < snapshot.prefill_tokens_per_dp.len() {
                         snapshot.prefill_tokens_per_dp[dp_idx] += new_tokens;
-                        if !self.prefix_counted_seq_ids.insert(seq_id) {
+                        if !self.cache.prefix_counted_seq_ids.insert(seq_id) {
                             continue;
                         }
-                        self.prefix_cached_tokens_by_seq.insert(seq_id, cached);
+                        self.cache
+                            .prefix_cached_tokens_by_seq
+                            .insert(seq_id, cached);
                         snapshot.prefix_cached_tokens_per_dp[dp_idx] += cached;
                         snapshot.prefix_prompt_tokens_per_dp[dp_idx] += s.num_prompt_tokens;
                     }

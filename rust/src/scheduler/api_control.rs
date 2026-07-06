@@ -10,29 +10,19 @@ impl Scheduler {
     }
 
     pub(super) fn set_prefix_caching_enabled_api(&mut self, enabled: bool) {
-        let enabled = enabled && self.prefix_caching_allowed;
-        self.prefix_caching_enabled = enabled;
-        for pool in &mut self.hbm_pools {
-            pool.set_prefix_caching_enabled(enabled);
-        }
-        for pool in &mut self.host_pools {
-            pool.set_prefix_caching_enabled(enabled);
-        }
+        self.cache.set_prefix_caching_enabled(enabled);
     }
 
     pub(super) fn num_parked_sessions_api(&self) -> i32 {
-        self.parked_sessions.len() as i32
+        self.cache.num_parked_sessions()
     }
 
     pub(super) fn parked_session_keys_api(&self) -> Vec<u64> {
-        self.parked_lru.clone()
+        self.cache.parked_session_keys()
     }
 
     pub(super) fn clear_session_cache_api(&mut self) {
-        let keys = self.parked_lru.clone();
-        for key in keys {
-            self.evict_parked_by_key(key);
-        }
+        self.cache.clear_session_cache(self.group());
     }
 
     pub(super) fn is_finished_api(&self) -> bool {

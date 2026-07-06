@@ -154,18 +154,18 @@ fn preempted_sequence_restores_from_host_without_prefill() {
         assert_eq!(run_one_prefill(py, &mut scheduler).unwrap(), vec![42]);
 
         scheduler.preempt_impl(py, 0, 42).unwrap();
-        assert_eq!(scheduler.pending_swap_out_tasks[0].len(), 1);
-        let swap_out = scheduler.pending_swap_out_tasks.clone();
+        assert_eq!(scheduler.cache.pending_swap_out_tasks[0].len(), 1);
+        let swap_out = scheduler.cache.pending_swap_out_tasks.clone();
         scheduler.complete_host_swap_outs_impl(swap_out);
         assert!(scheduler.cache_seq_has_host_blocks(42));
 
         scheduler.current_step += 3;
         let scheduled = scheduler.schedule_prefill(py).unwrap();
         assert!(scheduled[0].is_empty());
-        assert_eq!(scheduler.pending_swap_in_tasks[0].len(), 1);
+        assert_eq!(scheduler.cache.pending_swap_in_tasks[0].len(), 1);
         assert_eq!(scheduler.running[0], vec![42]);
 
-        let swap_in = scheduler.pending_swap_in_tasks.clone();
+        let swap_in = scheduler.cache.pending_swap_in_tasks.clone();
         scheduler.complete_host_swap_ins_impl(swap_in);
         assert!(!scheduler.cache_seq_has_host_blocks(42));
     });
@@ -186,7 +186,7 @@ fn host_swap_preempted_sequence_waits_behind_new_request() {
 
         assert_eq!(scheduler.waiting.first().copied(), Some(12));
         assert_eq!(scheduler.waiting.last().copied(), Some(10));
-        assert_eq!(scheduler.pending_swap_out_tasks[0].len(), 1);
+        assert_eq!(scheduler.cache.pending_swap_out_tasks[0].len(), 1);
     });
 }
 
@@ -200,7 +200,7 @@ fn host_swap_restore_respects_cooldown_and_capacity() {
 
         scheduler.current_step = 10;
         scheduler.preempt_impl(py, 0, 42).unwrap();
-        let swap_out = scheduler.pending_swap_out_tasks.clone();
+        let swap_out = scheduler.cache.pending_swap_out_tasks.clone();
         scheduler.complete_host_swap_outs_impl(swap_out);
 
         assert!(!scheduler.cache_try_restore_host_blocks(42, 0).unwrap());
@@ -248,8 +248,8 @@ fn evicted_device_prefix_writes_back_and_promotes_from_host() {
 
         add_tokens(py, &mut scheduler, 31, (100..112).collect()).unwrap();
         let b = run_one_prefill(py, &mut scheduler).unwrap()[0];
-        assert_eq!(scheduler.pending_swap_out_tasks[0].len(), 2);
-        let swap_out = scheduler.pending_swap_out_tasks.clone();
+        assert_eq!(scheduler.cache.pending_swap_out_tasks[0].len(), 2);
+        let swap_out = scheduler.cache.pending_swap_out_tasks.clone();
         scheduler.complete_host_swap_outs_impl(swap_out);
         scheduler.release_seq(b);
 
@@ -260,7 +260,7 @@ fn evicted_device_prefix_writes_back_and_promotes_from_host() {
         assert_eq!(scheduled[0].len(), 1);
         let seq_id = scheduled[0][0];
         assert_eq!(scheduler.seq_table[&seq_id].num_cached_tokens, 8);
-        assert_eq!(scheduler.pending_swap_in_tasks[0].len(), 2);
+        assert_eq!(scheduler.cache.pending_swap_in_tasks[0].len(), 2);
     });
 }
 
