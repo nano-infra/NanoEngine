@@ -207,7 +207,7 @@ impl Scheduler {
                     }
                     self.to_be_migrated.insert(seq_id, dp_idx);
                 } else {
-                    let _ = self.ensure_blocks_for_seq(py, seq_id, false);
+                    let _ = self.cache_ensure_blocks_for_seq(py, seq_id, false);
                     if let Some(seq) = self.seq_table.get_mut(&seq_id) {
                         seq.status = 1;
                     }

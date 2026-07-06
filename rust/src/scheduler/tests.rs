@@ -342,7 +342,9 @@ fn prefix_cache_survives_decode_growth_and_release() {
         let first = run_prefill_until_ready(py, &mut scheduler).unwrap();
 
         scheduler.seq_table.get_mut(&first).unwrap().last_token = 11;
-        scheduler.ensure_blocks_for_seq(py, first, false).unwrap();
+        scheduler
+            .cache_ensure_blocks_for_seq(py, first, false)
+            .unwrap();
         scheduler
             .seq_table
             .get_mut(&first)
