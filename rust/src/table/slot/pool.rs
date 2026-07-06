@@ -4,6 +4,7 @@ use std::collections::HashMap;
 pub(crate) struct SlotPool {
     free_slots: Vec<i32>,
     seq_slots: HashMap<u64, i32>,
+    num_slots: i32,
 }
 
 impl SlotPool {
@@ -11,6 +12,7 @@ impl SlotPool {
         Self {
             free_slots: (0..num_slots.max(0)).rev().collect(),
             seq_slots: HashMap::new(),
+            num_slots: num_slots.max(0),
         }
     }
 
@@ -46,6 +48,14 @@ impl SlotPool {
         if slot >= 0 && !self.free_slots.contains(&slot) {
             self.free_slots.push(slot);
         }
+    }
+
+    pub(crate) fn num_used_slots(&self) -> i32 {
+        self.seq_slots.len() as i32
+    }
+
+    pub(crate) fn num_slots(&self) -> i32 {
+        self.num_slots
     }
 }
 

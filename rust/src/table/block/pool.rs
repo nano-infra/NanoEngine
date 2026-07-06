@@ -3,6 +3,13 @@ use std::collections::HashMap;
 
 use super::prefix::compute_block_hash;
 
+#[derive(Clone, Debug)]
+pub(crate) struct EvictedBlock {
+    pub(crate) block_id: i32,
+    pub(crate) hash: i64,
+    pub(crate) token_ids: Vec<i32>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BlockState {
     Empty,
@@ -47,6 +54,7 @@ pub(crate) struct BlockPool {
     free_blocks: Vec<i32>,
     seq_blocks: HashMap<u64, Vec<i32>>,
     hash_to_block_id: HashMap<i64, i32>,
+    ready_lru: Vec<i64>,
     prefix_caching_enabled: bool,
 }
 
@@ -58,6 +66,7 @@ impl BlockPool {
             free_blocks: (0..num_blocks.max(0)).rev().collect(),
             seq_blocks: HashMap::new(),
             hash_to_block_id: HashMap::new(),
+            ready_lru: Vec::new(),
             prefix_caching_enabled: true,
         }
     }
@@ -75,6 +84,17 @@ impl BlockPool {
     }
 
     pub(crate) fn insert_existing(&mut self, seq_id: u64, blocks: Vec<i32>) {
+        for block_id in &blocks {
+            self.free_blocks.retain(|id| id != block_id);
+        }
+        self.seq_blocks.insert(seq_id, blocks);
+    }
+
+    pub(crate) fn has_seq(&self, seq_id: u64) -> bool {
+        self.seq_blocks.contains_key(&seq_id)
+    }
+
+    pub(crate) fn insert_seq_blocks(&mut self, seq_id: u64, blocks: Vec<i32>) {
         for block_id in &blocks {
             self.free_blocks.retain(|id| id != block_id);
         }
@@ -142,7 +162,34 @@ impl BlockPool {
             return self.grow_existing(seq_id, needed);
         }
 
-        let mut out = Vec::with_capacity(needed);
+        let plan = self.plan_new_blocks(token_ids, needed, use_prefix_cache)?;
+        let fresh_needed = plan.iter().filter(|block_id| block_id.is_none()).count();
+        if self.free_blocks.len() < fresh_needed {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "out of KV cache blocks",
+            ));
+        }
+
+        let mut out = Vec::with_capacity(plan.len());
+        for planned in plan {
+            if let Some(block_id) = planned {
+                self.retain_block(block_id)?;
+                out.push(block_id);
+            } else {
+                out.push(self.allocate_fresh()?);
+            }
+        }
+        self.seq_blocks.insert(seq_id, out.clone());
+        Ok(out)
+    }
+
+    fn plan_new_blocks(
+        &self,
+        token_ids: &[i32],
+        needed: usize,
+        use_prefix_cache: bool,
+    ) -> PyResult<Vec<Option<i32>>> {
+        let mut plan = Vec::with_capacity(needed);
         let mut h = -1i64;
         let mut cache_miss = !use_prefix_cache || !self.prefix_caching_enabled;
         for block_idx in 0..needed {
@@ -151,17 +198,14 @@ impl BlockPool {
             if full && !cache_miss {
                 h = compute_block_hash(view, h);
                 if let Some(block_id) = self.lookup_ready_block(h, view) {
-                    self.retain_block(block_id)?;
-                    out.push(block_id);
+                    plan.push(Some(block_id));
                     continue;
                 }
             }
             cache_miss = true;
-            let block_id = self.allocate_fresh()?;
-            out.push(block_id);
+            plan.push(None);
         }
-        self.seq_blocks.insert(seq_id, out.clone());
-        Ok(out)
+        Ok(plan)
     }
 
     pub(crate) fn commit_ready(&mut self, seq_id: u64, token_ids: &[i32], committed_tokens: i32) {
@@ -189,7 +233,67 @@ impl BlockPool {
             block.token_ids.extend_from_slice(view);
             block.state = BlockState::Ready;
             self.hash_to_block_id.insert(h, block_id);
+            self.touch_ready_hash(h);
         }
+    }
+
+    pub(crate) fn lookup_ready_prefix_block(&mut self, hash: i64, tokens: &[i32]) -> Option<i32> {
+        let block_id = self.lookup_ready_block(hash, tokens)?;
+        self.touch_ready_hash(hash);
+        Some(block_id)
+    }
+
+    pub(crate) fn retain_ready_prefix_block(&mut self, block_id: i32) -> PyResult<()> {
+        self.retain_block(block_id)
+    }
+
+    pub(crate) fn allocate_pending_fresh(&mut self) -> PyResult<(i32, Option<EvictedBlock>)> {
+        self.allocate_fresh_with_eviction()
+    }
+
+    pub(crate) fn allocate_promoted_ready(
+        &mut self,
+        hash: i64,
+        tokens: &[i32],
+    ) -> PyResult<(i32, Option<EvictedBlock>)> {
+        let (block_id, evicted) = self.allocate_fresh_with_eviction()?;
+        let block = &mut self.blocks[block_id as usize];
+        block.ref_count = 1;
+        block.hash = hash;
+        block.token_ids.clear();
+        block.token_ids.extend_from_slice(tokens);
+        block.state = BlockState::Ready;
+        self.hash_to_block_id.insert(hash, block_id);
+        self.touch_ready_hash(hash);
+        Ok((block_id, evicted))
+    }
+
+    pub(crate) fn store_ready_cache_block(&mut self, hash: i64, tokens: &[i32]) -> PyResult<i32> {
+        if let Some(block_id) = self.lookup_ready_block(hash, tokens) {
+            self.touch_ready_hash(hash);
+            return Ok(block_id);
+        }
+        let block_id = match self.free_blocks.pop() {
+            Some(block_id) => block_id,
+            None => self.evict_ready_cache_block().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("out of host KV cache blocks")
+            })?,
+        };
+        if let Some(block) = self.blocks.get(block_id as usize) {
+            if block.hash != -1 && self.hash_to_block_id.get(&block.hash) == Some(&block_id) {
+                self.hash_to_block_id.remove(&block.hash);
+                self.ready_lru.retain(|h| *h != block.hash);
+            }
+        }
+        let block = &mut self.blocks[block_id as usize];
+        block.ref_count = 0;
+        block.hash = hash;
+        block.token_ids.clear();
+        block.token_ids.extend_from_slice(tokens);
+        block.state = BlockState::Ready;
+        self.hash_to_block_id.insert(hash, block_id);
+        self.touch_ready_hash(hash);
+        Ok(block_id)
     }
 
     fn grow_existing(&mut self, seq_id: u64, needed: usize) -> PyResult<Vec<i32>> {
@@ -198,7 +302,7 @@ impl BlockPool {
             if len >= needed {
                 break;
             }
-            let block_id = self.allocate_fresh()?;
+            let (block_id, _evicted) = self.allocate_fresh_with_eviction()?;
             self.seq_blocks.entry(seq_id).or_default().push(block_id);
         }
         Ok(self.seq_blocks.get(&seq_id).cloned().unwrap_or_default())
@@ -226,19 +330,23 @@ impl BlockPool {
     }
 
     fn allocate_fresh(&mut self) -> PyResult<i32> {
+        Ok(self.allocate_fresh_with_eviction()?.0)
+    }
+
+    fn allocate_fresh_with_eviction(&mut self) -> PyResult<(i32, Option<EvictedBlock>)> {
         let Some(block_id) = self.free_blocks.pop() else {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "out of KV cache blocks",
             ));
         };
-        if let Some(block) = self.blocks.get(block_id as usize) {
-            if block.hash != -1 && self.hash_to_block_id.get(&block.hash) == Some(&block_id) {
-                self.hash_to_block_id.remove(&block.hash);
-            }
+        let evicted = self.evicted_ready_meta(block_id);
+        if let Some(evicted) = &evicted {
+            self.hash_to_block_id.remove(&evicted.hash);
+            self.ready_lru.retain(|hash| *hash != evicted.hash);
         }
         let block = &mut self.blocks[block_id as usize];
         block.reset_pending();
-        Ok(block_id)
+        Ok((block_id, evicted))
     }
 
     fn release_one(&mut self, block_id: i32) {
@@ -251,6 +359,46 @@ impl BlockPool {
         if block.ref_count == 0 && !self.free_blocks.contains(&block_id) {
             self.free_blocks.push(block_id);
         }
+    }
+
+    fn evicted_ready_meta(&self, block_id: i32) -> Option<EvictedBlock> {
+        let block = self.blocks.get(block_id as usize)?;
+        if block.state != BlockState::Ready || block.hash == -1 || block.token_ids.is_empty() {
+            return None;
+        }
+        Some(EvictedBlock {
+            block_id,
+            hash: block.hash,
+            token_ids: block.token_ids.clone(),
+        })
+    }
+
+    fn evict_ready_cache_block(&mut self) -> Option<i32> {
+        while let Some(hash) = self.ready_lru.first().copied() {
+            self.ready_lru.remove(0);
+            let Some(block_id) = self.hash_to_block_id.remove(&hash) else {
+                continue;
+            };
+            let Some(block) = self.blocks.get_mut(block_id as usize) else {
+                continue;
+            };
+            if block.ref_count == 0 && block.state == BlockState::Ready {
+                block.hash = -1;
+                block.token_ids.clear();
+                block.state = BlockState::Empty;
+                return Some(block_id);
+            }
+            self.hash_to_block_id.insert(hash, block_id);
+        }
+        None
+    }
+
+    fn touch_ready_hash(&mut self, hash: i64) {
+        if hash == -1 {
+            return;
+        }
+        self.ready_lru.retain(|h| *h != hash);
+        self.ready_lru.push(hash);
     }
 
     fn num_blocks_for_tokens(&self, tokens: i32) -> usize {
