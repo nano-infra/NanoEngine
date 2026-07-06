@@ -1,5 +1,5 @@
+use crate::cache::table::block::compute_block_hash;
 use crate::sequence::Sequence;
-use crate::table::block::compute_block_hash;
 use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
