@@ -320,6 +320,14 @@ class Config(BaseModel):
                 if getattr(self.hf_config, "dtype", None) is None:
                     self.hf_config.__dict__["dtype"] = text_dtype
 
+        for attr in (
+            "enable_hisparse",
+            "hisparse_device_buffer_size",
+            "hisparse_host_to_device_ratio",
+            "hisparse_swap_in_block_size",
+        ):
+            setattr(self.hf_config, attr, getattr(self, attr, None))
+
         if self.hf_config.architectures[0] in (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
@@ -438,6 +446,27 @@ class Config(BaseModel):
                     "enable_hisparse currently supports DeepseekV32ForCausalLM "
                     f"or Gemma4ForCausalLM; got {arch!r}"
                 )
+        else:
+            arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
+            if arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
+                head_dim = getattr(self.hf_config, "head_dim", None)
+                global_head_dim = getattr(self.hf_config, "global_head_dim", None)
+                layer_types = getattr(self.hf_config, "layer_types", None) or []
+                has_sliding = "sliding_attention" in layer_types
+                has_full = "full_attention" in layer_types
+                if (
+                    has_sliding
+                    and has_full
+                    and global_head_dim is not None
+                    and head_dim is not None
+                    and int(global_head_dim) != int(head_dim)
+                ):
+                    raise ValueError(
+                        "Gemma4 mixes sliding/global attention head_dim "
+                        f"({head_dim} vs {global_head_dim}); enable_hisparse is "
+                        "required so sliding-window KV uses the hot buffer instead "
+                        "of the uniform paged KV cache."
+                    )
 
         # MTP validation
         if self.num_speculative_tokens > 0:
