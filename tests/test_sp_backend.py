@@ -323,6 +323,66 @@ def test_nccl_static_q_uses_fixed_exchange_and_packs_with_offsets(monkeypatch):
     assert torch.equal(output, expected)
 
 
+def test_nccl_static_q_uses_mask_width_as_comm_bs(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    adapter = sp_backend.NcclStaticAllToAllBufferAdapter(
+        max_dispatch_per_msg=2,
+        max_bs=5,
+        rank=1,
+        world_size=2,
+        buffer_size_bytes=2 * 5 * 2 * torch.float32.itemsize,
+    )
+    adapter.connect_full_mesh(SimpleNamespace())
+
+    calls = {"value": 0}
+
+    def fake_all_to_all_single(output, input, group=None):
+        del group
+        calls["value"] += 1
+        if input.dtype == torch.float32:
+            assert input.shape == (2, 3, 2)
+            output.copy_(
+                torch.tensor(
+                    [
+                        [[101.0, 1010.0], [0.0, 0.0], [202.0, 2020.0]],
+                        [[0.0, 0.0], [303.0, 3030.0], [0.0, 0.0]],
+                    ]
+                )
+            )
+            return
+
+        assert input.dtype == torch.int32
+        assert input.shape == (2, 3)
+        output.copy_(torch.tensor([[1, 0, 1], [0, 0, 0]], dtype=torch.int32))
+
+    monkeypatch.setattr(sp_backend.dist, "all_to_all_single", fake_all_to_all_single)
+
+    local_patch = adapter.local_buffer.view(torch.float32).view(10, 2)
+    local_patch.zero_()
+    local_patch[2].copy_(torch.tensor([9.0, 90.0]))
+
+    output = adapter.all_to_all_ll(
+        torch.tensor([[1.0, 10.0], [2.0, 20.0]]),
+        mask=torch.tensor([[1, 0, 0], [0, 1, 0]], dtype=torch.int32),
+        offsets=torch.tensor([0, 2, 3], dtype=torch.int32),
+    )
+
+    expected = torch.tensor(
+        [
+            [101.0, 1010.0],
+            [202.0, 2020.0],
+            [9.0, 90.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+        ]
+    )
+    assert calls["value"] == 2
+    assert output.shape == (6, 2)
+    assert torch.equal(output, expected)
+
+
 def test_nccl_static_transpose_uses_fixed_exchange_and_local_patch(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 

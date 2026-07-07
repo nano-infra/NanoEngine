@@ -341,11 +341,7 @@ class NcclStaticAllToAllBufferAdapter:
             raise RuntimeError("NCCL static all-to-all buffer is not connected to a group.")
         if x.ndim != 2:
             raise ValueError(f"NCCL static all-to-all expects 2D input, got {x.ndim}D")
-        if mask is not None and mask.shape != (self.world_size, self.max_bs):
-            raise ValueError(
-                "NCCL static all-to-all expects mask shape "
-                f"[world_size, max_bs], got {tuple(mask.shape)}"
-            )
+        comm_bs = self._get_comm_bs(mask, x, is_transpose=is_transpose)
         if offsets is not None and offsets.numel() != self.world_size + 1:
             raise ValueError(
                 "NCCL static all-to-all expects offsets shape [world_size + 1], "
@@ -356,23 +352,60 @@ class NcclStaticAllToAllBufferAdapter:
 
         msg_dim = x.size(1)
         if is_transpose:
-            send = self._build_transpose_send_buffer(x, mask, msg_dim)
+            send = self._build_transpose_send_buffer(x, mask, msg_dim, comm_bs)
             recv = self._all_to_all_equal(send, "transpose_recv")
-            output = recv.view(self.world_size * self.max_bs, msg_dim)
+            output = recv.view(self.world_size * comm_bs, msg_dim)
             output.add_(self._local_patch(output))
             return output
 
-        send = self._build_non_transpose_send_buffer(x, mask, msg_dim)
+        send = self._build_non_transpose_send_buffer(x, mask, msg_dim, comm_bs)
         recv = self._all_to_all_equal(send, "q_recv")
         if offsets is None:
-            output = recv.view(self.world_size * self.max_bs, msg_dim)
+            output = recv.view(self.world_size * comm_bs, msg_dim)
             output.add_(self._local_patch(output))
             return output
 
         if mask is None:
             raise ValueError("NCCL static Q all-to-all with offsets requires a mask.")
-        recv_mask = self._all_to_all_mask(mask)
-        return self._pack_q_output(recv, recv_mask, offsets, msg_dim)
+        recv_mask = self._all_to_all_mask(mask, comm_bs)
+        return self._pack_q_output(recv, recv_mask, offsets, msg_dim, comm_bs)
+
+    def _get_comm_bs(
+        self,
+        mask: torch.Tensor | None,
+        x: torch.Tensor,
+        *,
+        is_transpose: bool,
+    ) -> int:
+        if mask is not None:
+            if mask.ndim != 2 or mask.size(0) != self.world_size:
+                raise ValueError(
+                    "NCCL static all-to-all expects mask shape "
+                    f"[world_size, comm_bs], got {tuple(mask.shape)}"
+                )
+            if mask.size(1) > self.max_bs:
+                raise ValueError(
+                    "NCCL static all-to-all mask comm_bs must be <= max_bs, "
+                    f"got comm_bs={mask.size(1)} max_bs={self.max_bs}"
+                )
+            return int(mask.size(1))
+
+        if is_transpose:
+            if x.size(0) % self.world_size != 0:
+                raise ValueError(
+                    "NCCL static transpose input rows must be divisible by world_size, "
+                    f"got rows={x.size(0)} world_size={self.world_size}"
+                )
+            comm_bs = x.size(0) // self.world_size
+        else:
+            comm_bs = x.size(0)
+
+        if comm_bs > self.max_bs:
+            raise ValueError(
+                "NCCL static all-to-all comm_bs must be <= max_bs, "
+                f"got comm_bs={comm_bs} max_bs={self.max_bs}"
+            )
+        return int(comm_bs)
 
     def _scratch_tensor(
         self,
@@ -393,16 +426,17 @@ class NcclStaticAllToAllBufferAdapter:
         x: torch.Tensor,
         mask: torch.Tensor | None,
         msg_dim: int,
+        comm_bs: int,
     ) -> torch.Tensor:
-        if x.size(0) > self.max_bs:
+        if x.size(0) > comm_bs:
             raise ValueError(
-                "NCCL static non-transpose input rows must be <= max_bs, "
-                f"got rows={x.size(0)} max_bs={self.max_bs}"
+                "NCCL static non-transpose input rows must be <= comm_bs, "
+                f"got rows={x.size(0)} comm_bs={comm_bs}"
             )
 
         padded = self._scratch_tensor(
             "q_padded",
-            (self.max_bs, msg_dim),
+            (comm_bs, msg_dim),
             x.dtype,
             x.device,
         )
@@ -411,7 +445,7 @@ class NcclStaticAllToAllBufferAdapter:
 
         send = self._scratch_tensor(
             "q_send",
-            (self.world_size, self.max_bs, msg_dim),
+            (self.world_size, comm_bs, msg_dim),
             x.dtype,
             x.device,
         )
@@ -425,21 +459,22 @@ class NcclStaticAllToAllBufferAdapter:
         x: torch.Tensor,
         mask: torch.Tensor | None,
         msg_dim: int,
+        comm_bs: int,
     ) -> torch.Tensor:
-        expected_rows = self.world_size * self.max_bs
+        expected_rows = self.world_size * comm_bs
         if x.size(0) != expected_rows:
             raise ValueError(
-                "NCCL static transpose input rows must equal world_size * max_bs, "
+                "NCCL static transpose input rows must equal world_size * comm_bs, "
                 f"got rows={x.size(0)} expected={expected_rows}"
             )
 
         send = self._scratch_tensor(
             "transpose_send",
-            (self.world_size, self.max_bs, msg_dim),
+            (self.world_size, comm_bs, msg_dim),
             x.dtype,
             x.device,
         )
-        send.copy_(x.view(self.world_size, self.max_bs, msg_dim))
+        send.copy_(x.view(self.world_size, comm_bs, msg_dim))
         if mask is not None:
             send.masked_fill_(mask.to(device=x.device).unsqueeze(-1) == 0, 0)
         return send
@@ -450,11 +485,11 @@ class NcclStaticAllToAllBufferAdapter:
         dist.all_to_all_single(recv, send.contiguous(), group=self._group)
         return recv
 
-    def _all_to_all_mask(self, mask: torch.Tensor) -> torch.Tensor:
+    def _all_to_all_mask(self, mask: torch.Tensor, comm_bs: int) -> torch.Tensor:
         send_mask = mask.to(device=self.local_buffer.device, dtype=torch.int32).contiguous()
         recv_mask = self._scratch_tensor(
             "recv_mask",
-            (self.world_size, self.max_bs),
+            (self.world_size, comm_bs),
             torch.int32,
             send_mask.device,
         )
@@ -468,10 +503,11 @@ class NcclStaticAllToAllBufferAdapter:
         recv_mask: torch.Tensor,
         offsets: torch.Tensor,
         msg_dim: int,
+        comm_bs: int,
     ) -> torch.Tensor:
         output = self._scratch_tensor(
             "q_packed_output",
-            (self.world_size * self.max_bs, msg_dim),
+            (self.world_size * comm_bs, msg_dim),
             recv.dtype,
             recv.device,
         )

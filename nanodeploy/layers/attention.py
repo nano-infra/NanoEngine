@@ -16,6 +16,33 @@ from torch import nn
 logger = get_logger()
 
 
+def _get_sp_comm_bs(sp_context, context) -> int:
+    if sp_context.backend == "nccl" and context.sp_comm_bs is not None:
+        return int(context.sp_comm_bs)
+    return sp_context.max_num_seqs
+
+
+def _narrow_sp_matrix_for_comm(tensor: torch.Tensor, comm_bs: int) -> torch.Tensor:
+    if tensor.size(1) == comm_bs:
+        return tensor
+    return tensor[:, :comm_bs]
+
+
+def _remap_sp_stride_indices(
+    indices: torch.Tensor,
+    *,
+    old_stride: int,
+    new_stride: int,
+) -> torch.Tensor:
+    if old_stride == new_stride:
+        return indices
+    valid = indices >= 0
+    ranks = torch.div(indices, old_stride, rounding_mode="floor")
+    seq_ids = indices - ranks * old_stride
+    remapped = ranks * new_stride + seq_ids
+    return torch.where(valid, remapped, indices)
+
+
 class FlashAttentionImpl:
 
     def __init__(
@@ -64,12 +91,18 @@ class FlashAttentionImpl:
             if use_sp_a2a:
                 sp_context = get_sp_context()
                 max_num_seqs = sp_context.max_num_seqs
+                comm_bs = _get_sp_comm_bs(sp_context, context)
+                q_mask = (
+                    _narrow_sp_matrix_for_comm(context.q_mask, comm_bs)
+                    if sp_context.backend == "nccl"
+                    else context.q_mask
+                )
                 q_buffer = sp_context.q_buffer
 
                 # Q copy
                 local_q_buffer_3d = q_buffer.local_buffer.view(sp_context.dtype)[
-                    : sp_size * max_num_seqs * num_head * head_dim
-                ].view(sp_size * max_num_seqs, num_head, head_dim)
+                    : sp_size * comm_bs * num_head * head_dim
+                ].view(sp_size * comm_bs, num_head, head_dim)
                 if sp_context.backend == "nccl":
                     local_q_buffer_3d.zero_()
                 copy_batch_indexed_triton(
@@ -87,9 +120,9 @@ class FlashAttentionImpl:
 
                 q = q_buffer.all_to_all_ll(
                     q.view([bs, -1]),
-                    mask=context.q_mask,
+                    mask=q_mask,
                     offsets=context.q_offsets,
-                ).view([sp_size * max_num_seqs, num_head, head_dim])
+                ).view([sp_size * comm_bs, num_head, head_dim])
 
                 q = q[: context.attention_compute_bs]
                 context_lens = context.context_lens_for_attn[
@@ -115,6 +148,35 @@ class FlashAttentionImpl:
 
             if use_sp_a2a:
                 sp_context = get_sp_context()
+                comm_bs = _get_sp_comm_bs(sp_context, context)
+                res_lse_mask = (
+                    _narrow_sp_matrix_for_comm(context.res_lse_mask, comm_bs)
+                    if sp_context.backend == "nccl"
+                    else context.res_lse_mask
+                )
+                global_context_lens = (
+                    _narrow_sp_matrix_for_comm(context.global_context_lens, comm_bs)
+                    if sp_context.backend == "nccl"
+                    else context.global_context_lens
+                )
+                res_slice_fill_to_buffer_output = (
+                    _remap_sp_stride_indices(
+                        context.res_slice_fill_to_buffer_output,
+                        old_stride=max_num_seqs,
+                        new_stride=comm_bs,
+                    )
+                    if sp_context.backend == "nccl"
+                    else context.res_slice_fill_to_buffer_output
+                )
+                res_slice_fill_to_buffer_input = (
+                    _remap_sp_stride_indices(
+                        context.res_slice_fill_to_buffer_input,
+                        old_stride=max_num_seqs,
+                        new_stride=comm_bs,
+                    )
+                    if sp_context.backend == "nccl"
+                    else context.res_slice_fill_to_buffer_input
+                )
                 res_buffer = sp_context.res_buffer
                 lse_buffer = sp_context.lse_buffer
                 lse = lse.to(torch.bfloat16)
@@ -124,8 +186,8 @@ class FlashAttentionImpl:
                 # 1. 拷贝 gathered_o 到 res_local_buffer
                 res_local_buffer_3d = res_buffer.local_buffer.view(
                     sp_context.dtype
-                )[: sp_size * max_num_seqs * num_head * head_dim].view(
-                    sp_size * max_num_seqs, num_head, head_dim
+                )[: sp_size * comm_bs * num_head * head_dim].view(
+                    sp_size * comm_bs, num_head, head_dim
                 )
                 if sp_context.backend == "nccl":
                     res_local_buffer_3d.zero_()
@@ -133,15 +195,15 @@ class FlashAttentionImpl:
                     gathered_o.view(-1, num_head, head_dim),
                     res_local_buffer_3d,
                     context.res_slice_get_to_buffer_output,
-                    context.res_slice_fill_to_buffer_output,
+                    res_slice_fill_to_buffer_output,
                     context.res_to_buffer_output_mask,
                 )
 
                 # 2. Copy gathered_lse to lse_local_buffer
                 lse_local_buffer_3d = lse_buffer.local_buffer.view(
                     sp_context.dtype
-                )[: sp_size * max_num_seqs * num_head * 1].view(
-                    sp_size * max_num_seqs, num_head, 1
+                )[: sp_size * comm_bs * num_head * 1].view(
+                    sp_size * comm_bs, num_head, 1
                 )
                 if sp_context.backend == "nccl":
                     lse_local_buffer_3d.zero_()
@@ -149,18 +211,18 @@ class FlashAttentionImpl:
                     gathered_lse.view(-1, num_head, 1),
                     lse_local_buffer_3d,
                     context.res_slice_get_to_buffer_output,
-                    context.res_slice_fill_to_buffer_output,
+                    res_slice_fill_to_buffer_output,
                     context.res_to_buffer_output_mask,
                 )
 
                 # 3. Allocate All-to-All Input Buffer
                 res_all_to_all_input_buffer = torch.empty(
-                    (sp_size * max_num_seqs, num_head, head_dim),
+                    (sp_size * comm_bs, num_head, head_dim),
                     dtype=gathered_o.dtype,
                     device=gathered_o.device,
                 )
                 lse_all_to_all_input_buffer = torch.empty(
-                    (sp_size * max_num_seqs, num_head, 1),
+                    (sp_size * comm_bs, num_head, 1),
                     dtype=gathered_lse.dtype,
                     device=gathered_lse.device,
                 )
@@ -170,7 +232,7 @@ class FlashAttentionImpl:
                     gathered_o.view(-1, num_head, head_dim),
                     res_all_to_all_input_buffer,
                     context.res_slice_get_to_buffer_input,
-                    context.res_slice_fill_to_buffer_input,
+                    res_slice_fill_to_buffer_input,
                     context.res_to_buffer_input_mask,
                 )
 
@@ -179,30 +241,30 @@ class FlashAttentionImpl:
                     gathered_lse.view(-1, num_head, 1),
                     lse_all_to_all_input_buffer,
                     context.res_slice_get_to_buffer_input,
-                    context.res_slice_fill_to_buffer_input,
+                    res_slice_fill_to_buffer_input,
                     context.res_to_buffer_input_mask,
                 )
 
                 all_ranks_res_output_combine = res_buffer.all_to_all_ll(
-                    res_all_to_all_input_buffer.view(sp_size * max_num_seqs, -1),
-                    mask=context.res_lse_mask,
+                    res_all_to_all_input_buffer.view(sp_size * comm_bs, -1),
+                    mask=res_lse_mask,
                     is_transpose=True,
-                ).view(sp_size, max_num_seqs, num_head, head_dim)
+                ).view(sp_size, comm_bs, num_head, head_dim)
                 all_ranks_lse_output_combine = lse_buffer.all_to_all_ll(
-                    lse_all_to_all_input_buffer.view(sp_size * max_num_seqs, -1),
-                    mask=context.res_lse_mask,
+                    lse_all_to_all_input_buffer.view(sp_size * comm_bs, -1),
+                    mask=res_lse_mask,
                     is_transpose=True,
-                ).view(sp_size, max_num_seqs, num_head, 1)
+                ).view(sp_size, comm_bs, num_head, 1)
 
                 o = inter_rank_gqa_fwd_batch_decode_combine_kv(
                     all_ranks_res_output_combine,
                     all_ranks_lse_output_combine,
-                    context.global_context_lens,
+                    global_context_lens,
                     num_head,
                     head_dim,
-                    sp_context.max_num_seqs,
+                    comm_bs,
                     sp_size,
-                ).view([max_num_seqs, num_head, head_dim])[:bs]
+                ).view([comm_bs, num_head, head_dim])[:bs]
         
         return o
 
@@ -254,11 +316,17 @@ class FlashMLAImpl:
             if use_sp_a2a:
                 sp_context = get_sp_context()
                 max_num_seqs = sp_context.max_num_seqs
+                comm_bs = _get_sp_comm_bs(sp_context, context)
+                q_mask = (
+                    _narrow_sp_matrix_for_comm(context.q_mask, comm_bs)
+                    if sp_context.backend == "nccl"
+                    else context.q_mask
+                )
                 q_buffer = sp_context.q_buffer
 
                 local_q_buffer_3d = q_buffer.local_buffer.view(sp_context.dtype)[
-                    : sp_size * max_num_seqs * num_head * head_dim
-                ].view(sp_size * max_num_seqs, num_head, head_dim)
+                    : sp_size * comm_bs * num_head * head_dim
+                ].view(sp_size * comm_bs, num_head, head_dim)
                 if sp_context.backend == "nccl":
                     local_q_buffer_3d.zero_()
                 copy_batch_indexed_triton(
@@ -271,9 +339,9 @@ class FlashMLAImpl:
 
                 q = q_buffer.all_to_all_ll(
                     q.view([bs, -1]),
-                    mask=context.q_mask,
+                    mask=q_mask,
                     offsets=context.q_offsets,
-                ).view([sp_size * max_num_seqs, num_head, head_dim])
+                ).view([sp_size * comm_bs, num_head, head_dim])
 
                 q = q[: context.attention_compute_bs]
                 context_lens = context.context_lens_for_attn[
@@ -315,6 +383,35 @@ class FlashMLAImpl:
                 _, num_head, v_head_dim = o.shape
 
                 sp_context = get_sp_context()
+                comm_bs = _get_sp_comm_bs(sp_context, context)
+                res_lse_mask = (
+                    _narrow_sp_matrix_for_comm(context.res_lse_mask, comm_bs)
+                    if sp_context.backend == "nccl"
+                    else context.res_lse_mask
+                )
+                global_context_lens = (
+                    _narrow_sp_matrix_for_comm(context.global_context_lens, comm_bs)
+                    if sp_context.backend == "nccl"
+                    else context.global_context_lens
+                )
+                res_slice_fill_to_buffer_output = (
+                    _remap_sp_stride_indices(
+                        context.res_slice_fill_to_buffer_output,
+                        old_stride=max_num_seqs,
+                        new_stride=comm_bs,
+                    )
+                    if sp_context.backend == "nccl"
+                    else context.res_slice_fill_to_buffer_output
+                )
+                res_slice_fill_to_buffer_input = (
+                    _remap_sp_stride_indices(
+                        context.res_slice_fill_to_buffer_input,
+                        old_stride=max_num_seqs,
+                        new_stride=comm_bs,
+                    )
+                    if sp_context.backend == "nccl"
+                    else context.res_slice_fill_to_buffer_input
+                )
                 res_buffer = sp_context.res_buffer
                 lse_buffer = sp_context.lse_buffer
                 lse = lse.to(torch.bfloat16)
@@ -326,8 +423,8 @@ class FlashMLAImpl:
                 # 1. 拷贝 gathered_o 到 res_local_buffer
                 res_local_buffer_3d = res_buffer.local_buffer.view(
                     sp_context.dtype
-                )[: sp_size * max_num_seqs * num_head * v_head_dim].view(
-                    sp_size * max_num_seqs, num_head, v_head_dim
+                )[: sp_size * comm_bs * num_head * v_head_dim].view(
+                    sp_size * comm_bs, num_head, v_head_dim
                 )
                 if sp_context.backend == "nccl":
                     res_local_buffer_3d.zero_()
@@ -336,15 +433,15 @@ class FlashMLAImpl:
                     gathered_o.view(-1, num_head, v_head_dim),
                     res_local_buffer_3d,
                     context.res_slice_get_to_buffer_output,
-                    context.res_slice_fill_to_buffer_output,
+                    res_slice_fill_to_buffer_output,
                     context.res_to_buffer_output_mask,
                 )
 
                 # 2. 拷贝 gathered_lse 到 lse_local_buffer
                 lse_local_buffer_3d = lse_buffer.local_buffer.view(
                     sp_context.dtype
-                )[: sp_size * max_num_seqs * num_head * 1].view(
-                    sp_size * max_num_seqs, num_head, 1
+                )[: sp_size * comm_bs * num_head * 1].view(
+                    sp_size * comm_bs, num_head, 1
                 )
                 if sp_context.backend == "nccl":
                     lse_local_buffer_3d.zero_()
@@ -353,18 +450,18 @@ class FlashMLAImpl:
                     gathered_lse.view(-1, num_head, 1),
                     lse_local_buffer_3d,
                     context.res_slice_get_to_buffer_output,
-                    context.res_slice_fill_to_buffer_output,
+                    res_slice_fill_to_buffer_output,
                     context.res_to_buffer_output_mask,
                 )
 
                 # 3. 分配 All-to-All Input Buffer
                 res_all_to_all_input_buffer = torch.empty(
-                    (sp_size * max_num_seqs, num_head, v_head_dim),
+                    (sp_size * comm_bs, num_head, v_head_dim),
                     dtype=gathered_o.dtype,
                     device=gathered_o.device,
                 )
                 lse_all_to_all_input_buffer = torch.empty(
-                    (sp_size * max_num_seqs, num_head, 1),
+                    (sp_size * comm_bs, num_head, 1),
                     dtype=gathered_lse.dtype,
                     device=gathered_lse.device,
                 )
@@ -374,7 +471,7 @@ class FlashMLAImpl:
                     gathered_o.view(-1, num_head, v_head_dim),
                     res_all_to_all_input_buffer,
                     context.res_slice_get_to_buffer_input,
-                    context.res_slice_fill_to_buffer_input,
+                    res_slice_fill_to_buffer_input,
                     context.res_to_buffer_input_mask,
                 )
 
@@ -383,30 +480,30 @@ class FlashMLAImpl:
                     gathered_lse.view(-1, num_head, 1),
                     lse_all_to_all_input_buffer,
                     context.res_slice_get_to_buffer_input,
-                    context.res_slice_fill_to_buffer_input,
+                    res_slice_fill_to_buffer_input,
                     context.res_to_buffer_input_mask,
                 )
 
                 all_ranks_res_output_combine = res_buffer.all_to_all_ll(
-                    res_all_to_all_input_buffer.view(sp_size * max_num_seqs, -1),
-                    mask=context.res_lse_mask,
+                    res_all_to_all_input_buffer.view(sp_size * comm_bs, -1),
+                    mask=res_lse_mask,
                     is_transpose=True,
-                ).view(sp_size, max_num_seqs, num_head, v_head_dim)
+                ).view(sp_size, comm_bs, num_head, v_head_dim)
                 all_ranks_lse_output_combine = lse_buffer.all_to_all_ll(
-                    lse_all_to_all_input_buffer.view(sp_size * max_num_seqs, -1),
-                    mask=context.res_lse_mask,
+                    lse_all_to_all_input_buffer.view(sp_size * comm_bs, -1),
+                    mask=res_lse_mask,
                     is_transpose=True,
-                ).view(sp_size, max_num_seqs, num_head, 1)
+                ).view(sp_size, comm_bs, num_head, 1)
 
                 o = inter_rank_gqa_fwd_batch_decode_combine_kv(
                     all_ranks_res_output_combine,
                     all_ranks_lse_output_combine,
-                    context.global_context_lens,
+                    global_context_lens,
                     num_head,
                     v_head_dim,
-                    sp_context.max_num_seqs,
+                    comm_bs,
                     sp_size,
-                ).view([max_num_seqs, num_head, v_head_dim])[:bs]
+                ).view([comm_bs, num_head, v_head_dim])[:bs]
 
         return o
 

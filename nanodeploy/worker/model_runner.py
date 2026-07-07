@@ -364,6 +364,12 @@ class ModelRunner:
             block_size,
             self.config.max_num_seqs,
         )
+        sp_master_batch_sizes = [0 for _ in range(sp_size)]
+        for seq in dp_seqs:
+            master_sp_idx = seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
+            if 0 <= master_sp_idx < sp_size:
+                sp_master_batch_sizes[master_sp_idx] += 1
+        sp_comm_bs = max(sp_master_batch_sizes, default=0)
 
         input_ids = torch.tensor(
             meta.input_ids, dtype=torch.int64, pin_memory=True
@@ -467,6 +473,7 @@ class ModelRunner:
             is_dummy=is_dummy,
             context_lens_for_attn=context_lens_for_attn,
             attention_compute_bs=attention_compute_bs,
+            sp_comm_bs=sp_comm_bs,
             q_slice_get=q_slice_get,
             q_slice_fill=q_slice_fill,
             q_copy_mask=q_copy_mask,
@@ -557,6 +564,7 @@ class ModelRunner:
                 "tp_rank": dist_context.attn_tp_rank,
                 "cp_size": dist_context.attn_sp_world_size,
                 "max_bs": int(context.q_mask.shape[1]),
+                "sp_comm_bs": context.sp_comm_bs,
                 "is_dummy": is_dummy,
                 "q_offsets": context.q_offsets.detach().cpu().tolist(),
                 "q_mask": context.q_mask.detach().cpu().tolist(),
@@ -576,6 +584,17 @@ class ModelRunner:
             master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
 
             if context.use_sp_a2a:
+                if self.config.sp_backend == "nccl" and context.sp_comm_bs is not None:
+                    nccl_min_master_bs = max(bs, context.sp_comm_bs)
+                    try:
+                        master_bs = next(
+                            x for x in self.graph_master_rank_bs if x >= nccl_min_master_bs
+                        )
+                    except StopIteration:
+                        raise RuntimeError(
+                            f"NCCL SP communication batch {nccl_min_master_bs} exceeds "
+                            f"max captured master_bs ({self.graph_master_rank_bs[-1]})"
+                        )
                 ac_bs = context.attention_compute_bs
                 if ac_bs is None:
                     ac_bs = bs
@@ -949,6 +968,7 @@ class ModelRunner:
                 res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
                 res_to_buffer_input_mask=res_to_buffer_input_mask,
                 attention_compute_bs=attn_bs,
+                sp_comm_bs=master_bs,
                 context_lens_for_attn=context_lens_for_attn,
                 q_offsets=q_offsets,
                 tile_scheduler_metadata=tile_scheduler_metadata_buffer,
@@ -991,9 +1011,13 @@ class ModelRunner:
                 current_attn_bs_candidates = []
                 curr = master_bs
                 limit = master_bs + config.max_num_recv_seqs
+                if config.sp_backend == "nccl":
+                    limit = min(limit, sp_world_size * master_bs)
                 while curr <= limit:
                     current_attn_bs_candidates.append(curr)
                     curr += self.attn_bs_step
+                if current_attn_bs_candidates[-1] != limit:
+                    current_attn_bs_candidates.append(limit)
 
                 for attn_bs in reversed(current_attn_bs_candidates):
                     logger.info(
