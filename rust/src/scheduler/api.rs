@@ -20,7 +20,7 @@ impl Scheduler {
         set_sequence_block_size(config.kvcache_block_size);
         let dp = config.attention_dp.max(1) as usize;
         let group = config.group_size.max(1) as usize;
-        let cache = CacheState::new(&config, dp, group);
+        let cache = PrefixCacheCoordinator::new(&config, dp, group);
         Self {
             engine_id_: config.engine_id.clone(),
             routing_strategy: config.routing_strategy,

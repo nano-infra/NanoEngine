@@ -1,31 +1,9 @@
 use super::{Scheduler, HOST_PREFIX_CACHE_SEQ_ID, HOST_SWAP_IN_COOLDOWN_STEPS};
-use crate::cache::table::block::{compute_block_hash, CompressedPool, EvictedBlock};
-use crate::cache::{CacheHit, PendingHostSwap};
+use crate::cache::table::block::{compute_block_hash, EvictedBlock};
+use crate::cache::PrefixCacheCoordinator;
 use pyo3::prelude::*;
 
-mod default;
-mod hisparse;
-mod maybe_hybrid;
-mod snapshot;
-mod strategy;
-
-use default::DefaultCoordinator;
-use hisparse::HisparseCoordinator;
-use strategy::{CacheCoordinator, CoordinatorKind};
-
 impl Scheduler {
-    fn use_hisparse_cache_coordinator(&self) -> bool {
-        self.config.cache_plan.flags & (1 << 6) != 0
-    }
-
-    fn active_cache_coordinator(&self) -> CoordinatorKind {
-        if self.use_hisparse_cache_coordinator() {
-            CoordinatorKind::Hisparse
-        } else {
-            CoordinatorKind::Default
-        }
-    }
-
     pub(super) fn cache_seq_has_host_blocks(&self, seq_id: u64) -> bool {
         self.seq_table
             .get(&seq_id)
@@ -65,18 +43,18 @@ impl Scheduler {
         }
 
         let flat = self.flat_idx(dp_idx, group_id);
-        if self.cache.hbm_pools[flat].num_free_blocks() < host_blocks.len() {
+        if self.cache.hbm_num_free_blocks(flat) < host_blocks.len() {
             return Ok(false);
         }
         let tokens = (host_blocks.len() as i32) * self.config.kvcache_block_size.max(1);
-        let gpu_blocks = self.cache.hbm_pools[flat]
-            .ensure_blocks(seq_id, &[], tokens, false)
+        let gpu_blocks = self.cache
+            .ensure_hbm_blocks(flat, seq_id, &[], tokens, false)
             .map_err(|_| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "out of KV cache blocks while restoring host KV: seq_id={seq_id} dp_idx={dp_idx} group_id={group_id}"
                 ))
             })?;
-        self.cache.seq_assignment.insert(seq_id, (dp_idx, group_id));
+        self.cache.assign_seq(seq_id, dp_idx, group_id);
         if let Some(seq) = self.seq_table.get_mut(&seq_id) {
             seq.active_dp_idx = dp_idx as i32;
             seq.active_group_id = group_id as i32;
@@ -85,19 +63,16 @@ impl Scheduler {
                 .insert(group_id as i32, gpu_blocks.clone());
             seq.status = 1;
         }
-        if let Some(tasks) = self.cache.pending_swap_in_tasks.get_mut(flat) {
-            tasks.push((seq_id, host_blocks, gpu_blocks));
-        }
+        self.cache
+            .push_pending_swap_in(flat, seq_id, host_blocks, gpu_blocks);
         Ok(true)
     }
 
     pub(super) fn cache_prepare_host_swap_out(&mut self, seq_id: u64) -> bool {
-        if self.config.num_host_kvcache_blocks <= 0
-            || self.cache.pending_host_swaps.contains_key(&seq_id)
-        {
+        if self.config.num_host_kvcache_blocks <= 0 || self.cache.has_pending_host_swap(seq_id) {
             return false;
         }
-        let Some((dp_idx, group_id)) = self.cache.seq_assignment.get(&seq_id).copied() else {
+        let Some((dp_idx, group_id)) = self.cache.assignment(seq_id) else {
             return false;
         };
         let flat = self.flat_idx(dp_idx, group_id);
@@ -110,16 +85,16 @@ impl Scheduler {
             return false;
         }
         let tokens = (gpu_blocks.len() as i32) * self.config.kvcache_block_size.max(1);
-        let Ok(host_blocks) = self.cache.host_pools[flat].ensure_blocks(seq_id, &[], tokens, false)
+        let Ok(host_blocks) = self
+            .cache
+            .ensure_host_blocks(flat, seq_id, &[], tokens, false)
         else {
             return false;
         };
         self.cache
-            .pending_host_swaps
-            .insert(seq_id, PendingHostSwap { dp_idx, group_id });
-        if let Some(tasks) = self.cache.pending_swap_out_tasks.get_mut(flat) {
-            tasks.push((seq_id, gpu_blocks, host_blocks.clone()));
-        }
+            .insert_pending_host_swap(seq_id, dp_idx, group_id);
+        self.cache
+            .push_pending_swap_out(flat, seq_id, gpu_blocks, host_blocks.clone());
         if let Some(seq) = self.seq_table.get_mut(&seq_id) {
             seq.host_block_table = host_blocks.clone();
             seq.host_block_tables.insert(group_id as i32, host_blocks);
@@ -134,21 +109,19 @@ impl Scheduler {
     ) {
         for group_tasks in tasks {
             for (seq_id, _gpu_blocks, _host_blocks) in group_tasks {
-                let Some(pending) = self.cache.pending_host_swaps.remove(&seq_id) else {
+                let Some(pending) = self.cache.take_pending_host_swap(seq_id) else {
                     continue;
                 };
                 let flat = self.flat_idx(pending.dp_idx, pending.group_id);
-                self.cache.hbm_pools[flat].remove_seq(seq_id);
-                self.cache.seq_assignment.remove(&seq_id);
+                self.cache.remove_hbm_seq(flat, seq_id);
+                self.cache.remove_assignment(seq_id);
                 if let Some(seq) = self.seq_table.get_mut(&seq_id) {
                     seq.active_block_table.clear();
                     seq.active_block_tables.clear();
                 }
             }
         }
-        for tasks in &mut self.cache.pending_swap_out_tasks {
-            tasks.clear();
-        }
+        self.cache.clear_pending_swap_out_tasks();
     }
 
     pub(super) fn cache_complete_host_swap_ins(
@@ -157,18 +130,14 @@ impl Scheduler {
     ) {
         for (flat, group_tasks) in tasks.into_iter().enumerate() {
             for (seq_id, _host_blocks, _gpu_blocks) in group_tasks {
-                if let Some(pool) = self.cache.host_pools.get_mut(flat) {
-                    pool.remove_seq(seq_id);
-                }
+                self.cache.remove_host_seq(flat, seq_id);
                 if let Some(seq) = self.seq_table.get_mut(&seq_id) {
                     seq.host_block_table.clear();
                     seq.host_block_tables.clear();
                 }
             }
         }
-        for tasks in &mut self.cache.pending_swap_in_tasks {
-            tasks.clear();
-        }
+        self.cache.clear_pending_swap_in_tasks();
     }
 
     pub(super) fn cache_write_back_evicted_prefix(
@@ -176,20 +145,12 @@ impl Scheduler {
         flat: usize,
         evicted: Option<EvictedBlock>,
     ) -> PyResult<()> {
-        let Some(evicted) = evicted else {
-            return Ok(());
-        };
-        if self.config.num_host_kvcache_blocks <= 0 {
-            return Ok(());
-        }
-        let host_block = self.cache.host_pools[flat]
-            .store_ready_cache_block(evicted.hash, &evicted.token_ids)?;
-        self.cache.pending_swap_out_tasks[flat].push((
+        self.cache.write_back_evicted_prefix(
+            flat,
+            evicted,
+            self.config.num_host_kvcache_blocks > 0,
             HOST_PREFIX_CACHE_SEQ_ID,
-            vec![evicted.block_id],
-            vec![host_block],
-        ));
-        Ok(())
+        )
     }
 
     pub(super) fn cache_cached_tokens_for_prefix(
@@ -198,38 +159,20 @@ impl Scheduler {
         token_ids: &[i32],
         tokens: i32,
     ) -> i32 {
-        let block_size = self.config.kvcache_block_size.max(1) as usize;
-        let mut hash = -1i64;
-        let mut matched = 0i32;
-        for block_idx in 0..self.blocks_needed_for_tokens(tokens) {
-            let view = self.cache_block_token_view(token_ids, block_idx);
-            if view.len() != block_size {
-                break;
-            }
-            hash = compute_block_hash(view, hash);
-            let hbm_hit = self.cache.hbm_pools[flat]
-                .lookup_ready_prefix_block(hash, view)
-                .is_some();
-            let host_hit = if hbm_hit {
-                false
-            } else {
-                self.cache.host_pools[flat]
-                    .lookup_ready_prefix_block(hash, view)
-                    .is_some()
-            };
-            if !hbm_hit && !host_hit {
-                break;
-            }
-            matched += 1;
-        }
-        let cached = (matched * self.config.kvcache_block_size.max(1)).min((tokens - 1).max(0));
-        match self.active_cache_coordinator() {
-            CoordinatorKind::Default => {
-                DefaultCoordinator::adjust_prefix_cached_tokens(self, tokens, cached)
-            }
-            CoordinatorKind::Hisparse => {
-                HisparseCoordinator::adjust_prefix_cached_tokens(self, tokens, cached)
-            }
+        let cached = self.cache.cached_tokens_for_prefix(
+            flat,
+            token_ids,
+            tokens,
+            self.config.kvcache_block_size,
+            self.blocks_needed_for_tokens(tokens),
+        );
+        let gqa_hisparse = self.config.cache_plan.flags & (1 << 0) != 0
+            && self.config.cache_plan.flags & (1 << 6) != 0;
+        if gqa_hisparse {
+            let tail = self.config.cache_plan.hisparse.swap_in_block_size.max(1);
+            cached.min((tokens - tail).max(0))
+        } else {
+            cached
         }
     }
 
@@ -248,7 +191,7 @@ impl Scheduler {
             && self.group() == 1
             && self.config.mode != "decode"
             && self.cache.prefix_caching_enabled;
-        if use_prefix_cache && !self.cache.hbm_pools[flat].has_seq(seq_id) {
+        if use_prefix_cache && !self.cache.hbm_has_seq(flat, seq_id) {
             return self.cache_ensure_group_blocks_with_host_prefix(
                 seq_id,
                 dp_idx,
@@ -265,8 +208,8 @@ impl Scheduler {
         } else {
             &[]
         };
-        let blocks = self.cache.hbm_pools[flat]
-            .ensure_blocks(seq_id, token_ids, tokens, use_prefix_cache)
+        let blocks = self.cache
+            .ensure_hbm_blocks(flat, seq_id, token_ids, tokens, use_prefix_cache)
             .map_err(|_| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "out of KV cache blocks: seq_id={seq_id} dp_idx={dp_idx} group_id={group_id} need={needed_blocks}"
@@ -299,7 +242,7 @@ impl Scheduler {
         let needed_blocks = self.blocks_needed_for_tokens(needed_tokens);
         if !is_prefill
             && self.config.cache_plan.flags & ((1 << 2) | (1 << 3) | (1 << 4) | (1 << 6)) == 0
-            && self.cache.compressed_pools.is_empty()
+            && self.cache.compressed_pools_empty()
         {
             let has_blocks = self
                 .seq_table
@@ -310,11 +253,11 @@ impl Scheduler {
                 return Ok(());
             }
         }
-        let (dp_idx, group_id) = match self.cache.seq_assignment.get(&seq_id).copied() {
+        let (dp_idx, group_id) = match self.cache.assignment(seq_id) {
             Some(assignment) => assignment,
             None => {
                 let assignment = self.choose_assignment();
-                self.cache.seq_assignment.insert(seq_id, assignment);
+                self.cache.assign_seq(seq_id, assignment.0, assignment.1);
                 assignment
             }
         };
@@ -331,8 +274,8 @@ impl Scheduler {
         } else {
             &[]
         };
-        let blocks = self.cache.hbm_pools[flat]
-            .ensure_blocks(seq_id, token_ids, needed_tokens, use_prefix_cache)
+        let blocks = self.cache
+            .ensure_hbm_blocks(flat, seq_id, token_ids, needed_tokens, use_prefix_cache)
             .map_err(|_| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "out of KV cache blocks: seq_id={seq_id} dp_idx={dp_idx} group_id={group_id} need={needed_blocks}"
@@ -349,17 +292,14 @@ impl Scheduler {
             let Some(s) = self.seq_table.get_mut(&seq_id) else {
                 return Ok(());
             };
-            if let Some(slot) = self.cache.state_slots.get(seq_id) {
+            if let Some(slot) = self.cache.state_slot(seq_id) {
                 s.migrate_state_slot = slot;
             }
-            if let Some(slot) = self.cache.hisparse_slots.get(seq_id) {
+            if let Some(slot) = self.cache.hisparse_slot(seq_id) {
                 s.migrate_hisparse_slot = slot;
             }
-            for (ratio, pool) in &self.cache.compressed_pools {
-                if let Some(pages) = pool.seq_pages.get(&seq_id) {
-                    s.migrate_compressed_block_tables
-                        .insert(*ratio, pages.clone());
-                }
+            for (ratio, pages) in self.cache.compressed_pages(seq_id) {
+                s.migrate_compressed_block_tables.insert(ratio, pages);
             }
         }
         Ok(())
@@ -369,7 +309,7 @@ impl Scheduler {
         if self.config.cache_plan.flags & ((1 << 2) | (1 << 3) | (1 << 4)) == 0 {
             return Ok(());
         }
-        let Some(slot) = self.cache.state_slots.ensure(seq_id) else {
+        let Some(slot) = self.cache.ensure_state_slot(seq_id) else {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "out of state slots: seq_id={seq_id}"
             )));
@@ -388,7 +328,7 @@ impl Scheduler {
         if self.config.cache_plan.flags & (1 << 6) == 0 {
             return Ok(());
         }
-        let Some(slot) = self.cache.hisparse_slots.ensure(seq_id) else {
+        let Some(slot) = self.cache.ensure_hisparse_slot(seq_id) else {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "out of HiSparse slots: seq_id={seq_id}"
             )));
@@ -405,29 +345,13 @@ impl Scheduler {
         seq_id: u64,
         needed_tokens: i32,
     ) -> PyResult<()> {
-        if self.cache.compressed_pools.is_empty() {
+        if self.cache.compressed_pools_empty() {
             return Ok(());
         }
+        let active_tables = self.cache.ensure_compressed_pages(seq_id, needed_tokens)?;
         if let Some(seq) = self.seq_table.get_mut(&seq_id) {
             seq.active_compressed_block_tables.clear();
-        }
-        for (ratio, pool) in self.cache.compressed_pools.iter_mut() {
-            let needed_pages = Self::cache_compressed_pages_needed_for_tokens(pool, needed_tokens);
-            let pages = pool.seq_pages.entry(seq_id).or_default();
-            while pages.len() < needed_pages {
-                let Some(page) = pool.free_pages.pop() else {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "out of compressed cache pages: seq_id={seq_id} ratio={ratio} need={} have={}",
-                        needed_pages,
-                        pages.len()
-                    )));
-                };
-                pages.push(page);
-            }
-            if let Some(seq) = self.seq_table.get_mut(&seq_id) {
-                seq.active_compressed_block_tables
-                    .insert(*ratio, pages.clone());
-            }
+            seq.active_compressed_block_tables = active_tables;
         }
         Ok(())
     }
@@ -455,34 +379,32 @@ impl Scheduler {
             let full = view.len() == self.config.kvcache_block_size.max(1) as usize;
             if full && !cache_miss {
                 hash = compute_block_hash(view, hash);
-                if let Some(block_id) =
-                    self.cache.hbm_pools[flat].lookup_ready_prefix_block(hash, view)
-                {
-                    self.cache.hbm_pools[flat].retain_ready_prefix_block(block_id)?;
+                if let Some(block_id) = self.cache.lookup_hbm_ready_prefix(flat, hash, view) {
+                    self.cache.retain_hbm_ready_prefix(flat, block_id)?;
                     blocks.push(block_id);
                     continue;
                 }
-                if let Some(host_block) =
-                    self.cache.host_pools[flat].lookup_ready_prefix_block(hash, view)
-                {
+                if let Some(host_block) = self.cache.lookup_host_ready_prefix(flat, hash, view) {
                     let (gpu_block, evicted) =
-                        self.cache.hbm_pools[flat].allocate_promoted_ready(hash, view)?;
+                        self.cache.allocate_hbm_promoted_ready(flat, hash, view)?;
                     self.cache_write_back_evicted_prefix(flat, evicted)?;
-                    self.cache.pending_swap_in_tasks[flat].push((
+                    self.cache.push_pending_swap_in(
+                        flat,
                         seq_id,
                         vec![host_block],
                         vec![gpu_block],
-                    ));
+                    );
                     blocks.push(gpu_block);
                     continue;
                 }
             }
             cache_miss = true;
-            let (block_id, evicted) = self.cache.hbm_pools[flat].allocate_pending_fresh()?;
+            let (block_id, evicted) = self.cache.allocate_hbm_pending_fresh(flat)?;
             self.cache_write_back_evicted_prefix(flat, evicted)?;
             blocks.push(block_id);
         }
-        self.cache.hbm_pools[flat].insert_seq_blocks(seq_id, blocks.clone());
+        self.cache
+            .insert_hbm_seq_blocks(flat, seq_id, blocks.clone());
         self.cache_attach_active_blocks(seq_id, dp_idx, group_id, &blocks);
         if set_migrate {
             self.cache_attach_migrate_blocks(seq_id, dp_idx, group_id, &blocks);
@@ -537,12 +459,6 @@ impl Scheduler {
             &token_ids[start..end]
         }
     }
-
-    fn cache_compressed_pages_needed_for_tokens(pool: &CompressedPool, tokens: i32) -> usize {
-        let compressed_tokens = ((tokens.max(1) + pool.ratio - 1) / pool.ratio).max(1);
-        let pages = (compressed_tokens + pool.page_size - 1) / pool.page_size;
-        pages.min(pool.max_blocks_per_seq).max(1) as usize
-    }
 }
 
 impl Scheduler {
@@ -552,25 +468,143 @@ impl Scheduler {
         seq_id: u64,
         dp_idx: usize,
         batch_tokens: &[i32],
-    ) -> PyResult<CacheHit> {
-        match self.active_cache_coordinator() {
-            CoordinatorKind::Default => {
-                DefaultCoordinator::try_adopt_session(self, py, seq_id, dp_idx, batch_tokens)
-            }
-            CoordinatorKind::Hisparse => {
-                HisparseCoordinator::try_adopt_session(self, py, seq_id, dp_idx, batch_tokens)
+    ) -> PyResult<Option<i32>> {
+        let group = self.group();
+        if !PrefixCacheCoordinator::session_snapshot_enabled(
+            self.config.gdn_state_cache_slots,
+            group,
+        ) {
+            return Ok(None);
+        }
+        let affinity = self
+            .seq_table
+            .get(&seq_id)
+            .map(|seq| seq.affinity_key)
+            .unwrap_or(0);
+        if affinity == 0 {
+            return Ok(None);
+        }
+        let Some(parked) = self.cache.parked_session(affinity) else {
+            return Ok(None);
+        };
+        if parked.dp_idx != dp_idx {
+            return Ok(None);
+        }
+        let (full_len, token_ids, seq_id) = {
+            let Some(s) = self.seq_table.get(&seq_id) else {
+                return Ok(None);
+            };
+            (self.prompt_target(s), s.token_ids.clone(), s.seq_id)
+        };
+        let prefix_ok = parked.length > 0
+            && parked.length < full_len
+            && token_ids.len() >= parked.length as usize
+            && token_ids[..parked.length as usize] == parked.token_ids[..];
+        if !prefix_ok {
+            let group = self.group();
+            self.cache.evict_parked_by_key(affinity, group);
+            return Ok(None);
+        }
+        let budget = (self.config.max_num_batched_tokens.max(1)
+            - batch_tokens.first().copied().unwrap_or(0))
+        .max(0);
+        if budget <= 0 {
+            return Ok(None);
+        }
+        let Some(snapshot) = self
+            .cache
+            .take_matching_session_snapshot(group, seq_id, dp_idx, affinity, full_len, &token_ids)
+        else {
+            return Ok(None);
+        };
+        if let Some(blocks) = &snapshot.block_table {
+            let Some(s) = self.seq_table.get_mut(&seq_id) else {
+                return Ok(None);
+            };
+            let group_id = snapshot.group_id as i32;
+            s.active_group_id = group_id;
+            s.active_block_table = blocks.clone();
+            s.active_block_tables.insert(group_id, blocks.clone());
+            s.migrate_group_id = group_id;
+            s.migrate_block_table = blocks.clone();
+            s.migrate_block_tables.insert(group_id, blocks.clone());
+        }
+        if snapshot.state_slot >= 0 {
+            if let Some(s) = self.seq_table.get_mut(&seq_id) {
+                s.active_state_slot = snapshot.state_slot;
+                s.migrate_state_slot = snapshot.state_slot;
             }
         }
+        if snapshot.hisparse_slot >= 0 {
+            if let Some(s) = self.seq_table.get_mut(&seq_id) {
+                s.active_hisparse_slot = snapshot.hisparse_slot;
+                s.migrate_hisparse_slot = snapshot.hisparse_slot;
+            }
+        }
+        for (ratio, pages) in snapshot.compressed_tables {
+            if let Some(s) = self.seq_table.get_mut(&seq_id) {
+                s.active_compressed_block_tables
+                    .insert(ratio, pages.clone());
+                s.migrate_compressed_block_tables.insert(ratio, pages);
+            }
+        }
+
+        let new_tokens = (full_len - snapshot.length).min(budget).max(0);
+        let chunk_end = snapshot.length + new_tokens;
+        let dispatch = self.dispatch_for_master(snapshot.group_id, chunk_end);
+        {
+            let Some(s) = self.seq_table.get_mut(&seq_id) else {
+                return Ok(None);
+            };
+            s.num_cached_tokens = snapshot.length;
+            s.prefill_start_offset = snapshot.length;
+            s.num_tokens = chunk_end;
+            s.active_dp_idx = dp_idx as i32;
+            s.active_group_id = snapshot.group_id as i32;
+            s.active_dispatched_tokens = dispatch;
+        }
+        self.cache_ensure_group_blocks(py, seq_id, dp_idx, snapshot.group_id, full_len, false)?;
+        self.cache.set_prefix_cached_tokens(seq_id, snapshot.length);
+        Ok(Some(new_tokens))
     }
 
     pub(super) fn release_seq(&mut self, seq_id: u64) {
-        self.cache.release_seq(seq_id, self.group());
+        let group = self.group();
+        self.cache.release_seq(seq_id, group);
     }
 
-    pub(super) fn park_or_release(&mut self, py: Python<'_>, seq_id: u64) {
-        match self.active_cache_coordinator() {
-            CoordinatorKind::Default => DefaultCoordinator::park_or_release(self, py, seq_id),
-            CoordinatorKind::Hisparse => HisparseCoordinator::park_or_release(self, py, seq_id),
+    pub(super) fn park_or_release(&mut self, _py: Python<'_>, seq_id: u64) {
+        let (seq_id, affinity) = {
+            let Some(s) = self.seq_table.get(&seq_id) else {
+                return;
+            };
+            (s.seq_id, s.affinity_key)
+        };
+        let group = self.group();
+        if !PrefixCacheCoordinator::session_snapshot_enabled(
+            self.config.gdn_state_cache_slots,
+            group,
+        ) || affinity == 0
+        {
+            self.release_seq(seq_id);
+            return;
+        }
+        let (token_ids, length) = {
+            let Some(s) = self.seq_table.get(&seq_id) else {
+                return;
+            };
+            (s.token_ids.clone(), s.num_tokens)
+        };
+        let parked = self.cache.park_session_snapshot(
+            group,
+            seq_id,
+            affinity,
+            token_ids,
+            length,
+            self.config.gdn_state_cache_slots,
+        );
+        if !parked {
+            self.release_seq(seq_id);
         }
     }
 }

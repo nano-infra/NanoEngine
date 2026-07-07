@@ -1,5 +1,4 @@
 use super::{ScheduleResult, Scheduler};
-use crate::cache::CacheHit;
 use pyo3::prelude::*;
 
 impl Scheduler {
@@ -277,15 +276,12 @@ impl Scheduler {
                 (s.seq_id, self.prompt_target(&s), s.num_cached_tokens)
             }
         };
-        match self.try_adopt_session(py, seq_id, dp_idx, batch_tokens)? {
-            CacheHit::Session { new_tokens } => return Ok(Some(new_tokens)),
-            CacheHit::Prefix { .. } => unreachable!("session adoption cannot return prefix hits"),
-            CacheHit::None => {}
+        if let Some(new_tokens) = self.try_adopt_session(py, seq_id, dp_idx, batch_tokens)? {
+            return Ok(Some(new_tokens));
         }
         let Some(master) = self.choose_master_group(dp_idx, batch_seqs, batch_tokens) else {
             return Ok(None);
         };
-        let mut cache_hit = CacheHit::None;
         if self.config.mode != "decode" && self.group() == 1 && self.cache.prefix_caching_enabled {
             let token_ids = self
                 .seq_table
@@ -294,16 +290,10 @@ impl Scheduler {
                 .unwrap_or_default();
             let flat = self.flat_idx(dp_idx, master);
             cached = self.cache_cached_tokens_for_prefix(flat, &token_ids, full_len);
-            cache_hit = CacheHit::Prefix {
-                cached_tokens: cached,
-            };
             if let Some(s) = self.seq_table.get_mut(&seq_id) {
                 s.num_cached_tokens = cached;
                 s.prefill_start_offset = cached;
             }
-        }
-        if let CacheHit::Prefix { cached_tokens } = cache_hit {
-            cached = cached_tokens;
         }
         let budget = (self.config.max_num_batched_tokens.max(1)
             - batch_tokens.get(master).copied().unwrap_or(0))
@@ -320,7 +310,7 @@ impl Scheduler {
             return Ok(None);
         }
         let chunk_end = cached + new_tokens;
-        self.cache.seq_assignment.insert(seq_id, (dp_idx, master));
+        self.cache.assign_seq(seq_id, dp_idx, master);
         let dispatch = self.compute_dispatch(dp_idx, master, full_len);
         {
             let Some(s) = self.seq_table.get_mut(&seq_id) else {
@@ -349,7 +339,7 @@ impl Scheduler {
                     count,
                     self.config.mode != "decode",
                 ) {
-                    self.cache.seq_assignment.remove(&seq_id);
+                    self.cache.remove_assignment(seq_id);
                     if let Some(s) = self.seq_table.get_mut(&seq_id) {
                         s.status = 0;
                         s.active_block_table.clear();
@@ -377,22 +367,17 @@ impl Scheduler {
             let Some(s) = self.seq_table.get_mut(&seq_id) else {
                 return Ok(None);
             };
-            if let Some(slot) = self.cache.state_slots.get(seq_id) {
+            if let Some(slot) = self.cache.state_slot(seq_id) {
                 s.migrate_state_slot = slot;
             }
-            if let Some(slot) = self.cache.hisparse_slots.get(seq_id) {
+            if let Some(slot) = self.cache.hisparse_slot(seq_id) {
                 s.migrate_hisparse_slot = slot;
             }
-            for (ratio, pool) in &self.cache.compressed_pools {
-                if let Some(pages) = pool.seq_pages.get(&seq_id) {
-                    s.migrate_compressed_block_tables
-                        .insert(*ratio, pages.clone());
-                }
+            for (ratio, pages) in self.cache.compressed_pages(seq_id) {
+                s.migrate_compressed_block_tables.insert(ratio, pages);
             }
         }
-        self.cache
-            .prefix_cached_tokens_by_seq
-            .insert(seq_id, cached);
+        self.cache.set_prefix_cached_tokens(seq_id, cached);
         Ok(Some(new_tokens))
     }
 }
