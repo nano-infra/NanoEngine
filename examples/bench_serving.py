@@ -30,6 +30,13 @@ def parse_args():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization.")
     parser.add_argument("--gpu-memory-limit-gb", type=float, default=None, help="GPU memory limit in GB.")
     parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager mode.")
+    parser.add_argument(
+        "--cuda-graph-mode",
+        type=str,
+        default="full",
+        choices=["full", "piecewise"],
+        help="CUDA Graph mode for decode.",
+    )
     parser.add_argument("--dataset", type=str, default="random", choices=["random", "csv"], help="Dataset type.")
     parser.add_argument("--csv-path", type=str, default=None, help="Path to CSV file.")
     parser.add_argument("--itl-log-path", type=str, default="itl_samples.jsonl", help="Path to save ITL samples (JSONL).")
@@ -382,6 +389,7 @@ def main():
     engine = LLM(
         args.model_path,
         enforce_eager=args.enforce_eager,
+        cuda_graph_mode=args.cuda_graph_mode,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         gpu_memory_limit_gb=args.gpu_memory_limit_gb,

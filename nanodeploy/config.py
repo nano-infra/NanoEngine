@@ -40,6 +40,7 @@ class Config:
 
     # runner config
     enforce_eager: bool = False
+    cuda_graph_mode: Literal["full", "piecewise"] = "full"
     hf_config: Any = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -192,6 +193,8 @@ class Config:
                 "use_new_decode_dynamic_sp_scheduler=True"
             )
         hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+        if self.cuda_graph_mode not in {"full", "piecewise"}:
+            raise ValueError("cuda_graph_mode must be one of: full, piecewise")
         # Convert custom config classes (e.g., kimi_k2 which maps to DeepseekV3ForCausalLM)
         # to the equivalent standard transformers config so Ray can pickle/unpickle without
         # needing the dynamic transformers_modules module on worker processes.
@@ -210,6 +213,13 @@ class Config:
             config_dict.pop("model_type", None)
             hf_config = AutoConfig.for_model(std_model_type, **config_dict)
         self.hf_config = hf_config
+        if (
+            self.cuda_graph_mode == "piecewise"
+            and self.hf_config.architectures[0] != "DeepseekV3ForCausalLM"
+        ):
+            raise ValueError(
+                "cuda_graph_mode='piecewise' currently supports DeepseekV3ForCausalLM only"
+            )
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             assert self.kvcache_block_size == 64
             assert self.attention_tp == 1
