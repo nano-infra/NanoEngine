@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
     parser.add_argument("--sp-backend", type=str, default="hao_basic",
-                        choices=["legacy_ll", "hao_basic"],
+                        choices=["legacy_ll", "hao_basic", "nccl"],
                         help="SP all-to-all backend.")
     parser.add_argument("--enable-dynamic-sp-size", action="store_true",
                         help="Enable dynamic SP size scheduling.")

@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 
 
-SPBackend = Literal["legacy_ll", "hao_basic"]
+SPBackend = Literal["legacy_ll", "hao_basic", "nccl"]
 
 
 @runtime_checkable
@@ -302,6 +302,196 @@ class HaoAllToAllBufferAdapter:
         output[self.rank].copy_(staging[self.rank])
 
 
+class NcclStaticAllToAllBufferAdapter:
+    def __init__(
+        self,
+        *,
+        max_dispatch_per_msg: int,
+        max_bs: int,
+        rank: int,
+        world_size: int,
+        buffer_size_bytes: int,
+    ):
+        self.max_dispatch_per_msg = max_dispatch_per_msg
+        self.max_bs = max_bs
+        self.rank = rank
+        self.world_size = world_size
+        self.buffer_size_bytes = buffer_size_bytes
+        self._group: dist.ProcessGroup | None = None
+        self._scratch: dict[tuple[str, tuple[int, ...], torch.dtype, torch.device], torch.Tensor] = {}
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._local_buffer = torch.zeros(buffer_size_bytes, dtype=torch.uint8, device=device)
+
+    @property
+    def local_buffer(self) -> torch.Tensor:
+        return self._local_buffer
+
+    def connect_full_mesh(self, group: dist.ProcessGroup) -> None:
+        self._group = group
+
+    def all_to_all_ll(
+        self,
+        x: torch.Tensor,
+        is_transpose: bool = False,
+        mask: torch.Tensor | None = None,
+        offsets: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self._group is None:
+            raise RuntimeError("NCCL static all-to-all buffer is not connected to a group.")
+        if x.ndim != 2:
+            raise ValueError(f"NCCL static all-to-all expects 2D input, got {x.ndim}D")
+        if mask is not None and mask.shape != (self.world_size, self.max_bs):
+            raise ValueError(
+                "NCCL static all-to-all expects mask shape "
+                f"[world_size, max_bs], got {tuple(mask.shape)}"
+            )
+        if offsets is not None and offsets.numel() != self.world_size + 1:
+            raise ValueError(
+                "NCCL static all-to-all expects offsets shape [world_size + 1], "
+                f"got {tuple(offsets.shape)}"
+            )
+        if offsets is not None and is_transpose:
+            raise NotImplementedError("NCCL static offsets only support Q all-to-all.")
+
+        msg_dim = x.size(1)
+        if is_transpose:
+            send = self._build_transpose_send_buffer(x, mask, msg_dim)
+            recv = self._all_to_all_equal(send, "transpose_recv")
+            output = recv.view(self.world_size * self.max_bs, msg_dim)
+            output.add_(self._local_patch(output))
+            return output
+
+        send = self._build_non_transpose_send_buffer(x, mask, msg_dim)
+        recv = self._all_to_all_equal(send, "q_recv")
+        if offsets is None:
+            output = recv.view(self.world_size * self.max_bs, msg_dim)
+            output.add_(self._local_patch(output))
+            return output
+
+        if mask is None:
+            raise ValueError("NCCL static Q all-to-all with offsets requires a mask.")
+        recv_mask = self._all_to_all_mask(mask)
+        return self._pack_q_output(recv, recv_mask, offsets, msg_dim)
+
+    def _scratch_tensor(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (name, shape, dtype, device)
+        tensor = self._scratch.get(key)
+        if tensor is None:
+            tensor = torch.empty(shape, dtype=dtype, device=device)
+            self._scratch[key] = tensor
+        return tensor
+
+    def _build_non_transpose_send_buffer(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None,
+        msg_dim: int,
+    ) -> torch.Tensor:
+        if x.size(0) > self.max_bs:
+            raise ValueError(
+                "NCCL static non-transpose input rows must be <= max_bs, "
+                f"got rows={x.size(0)} max_bs={self.max_bs}"
+            )
+
+        padded = self._scratch_tensor(
+            "q_padded",
+            (self.max_bs, msg_dim),
+            x.dtype,
+            x.device,
+        )
+        padded.zero_()
+        padded[: x.size(0)].copy_(x)
+
+        send = self._scratch_tensor(
+            "q_send",
+            (self.world_size, self.max_bs, msg_dim),
+            x.dtype,
+            x.device,
+        )
+        send.copy_(padded.unsqueeze(0).expand(self.world_size, -1, -1))
+        if mask is not None:
+            send.masked_fill_(mask.to(device=x.device).unsqueeze(-1) == 0, 0)
+        return send
+
+    def _build_transpose_send_buffer(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None,
+        msg_dim: int,
+    ) -> torch.Tensor:
+        expected_rows = self.world_size * self.max_bs
+        if x.size(0) != expected_rows:
+            raise ValueError(
+                "NCCL static transpose input rows must equal world_size * max_bs, "
+                f"got rows={x.size(0)} expected={expected_rows}"
+            )
+
+        send = self._scratch_tensor(
+            "transpose_send",
+            (self.world_size, self.max_bs, msg_dim),
+            x.dtype,
+            x.device,
+        )
+        send.copy_(x.view(self.world_size, self.max_bs, msg_dim))
+        if mask is not None:
+            send.masked_fill_(mask.to(device=x.device).unsqueeze(-1) == 0, 0)
+        return send
+
+    def _all_to_all_equal(self, send: torch.Tensor, scratch_name: str) -> torch.Tensor:
+        recv = self._scratch_tensor(scratch_name, tuple(send.shape), send.dtype, send.device)
+        assert self._group is not None
+        dist.all_to_all_single(recv, send.contiguous(), group=self._group)
+        return recv
+
+    def _all_to_all_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        send_mask = mask.to(device=self.local_buffer.device, dtype=torch.int32).contiguous()
+        recv_mask = self._scratch_tensor(
+            "recv_mask",
+            (self.world_size, self.max_bs),
+            torch.int32,
+            send_mask.device,
+        )
+        assert self._group is not None
+        dist.all_to_all_single(recv_mask, send_mask, group=self._group)
+        return recv_mask
+
+    def _pack_q_output(
+        self,
+        recv: torch.Tensor,
+        recv_mask: torch.Tensor,
+        offsets: torch.Tensor,
+        msg_dim: int,
+    ) -> torch.Tensor:
+        output = self._scratch_tensor(
+            "q_packed_output",
+            (self.world_size * self.max_bs, msg_dim),
+            recv.dtype,
+            recv.device,
+        )
+        output.zero_()
+
+        valid = recv_mask.to(device=recv.device) != 0
+        prefix = torch.cumsum(valid.to(torch.int32), dim=1) - 1
+        offsets = offsets.to(device=recv.device, dtype=torch.int32)
+        destinations = offsets[:-1].view(self.world_size, 1) + prefix
+        destinations = torch.where(valid, destinations, torch.zeros_like(destinations))
+
+        values = recv * valid.unsqueeze(-1).to(dtype=recv.dtype)
+        output.index_add_(0, destinations.reshape(-1).to(torch.long), values.view(-1, msg_dim))
+        output.add_(self._local_patch(output))
+        return output
+
+    def _local_patch(self, output: torch.Tensor) -> torch.Tensor:
+        return self.local_buffer.view(dtype=output.dtype)[: output.numel()].view_as(output)
+
+
 class LegacyIntraLLBackendFactory:
     @staticmethod
     def get_buffer_size_hint(
@@ -364,6 +554,34 @@ class HaoBasicBackendFactory:
         )
 
 
+class NcclStaticBackendFactory:
+    @staticmethod
+    def get_buffer_size_hint(
+        max_dispatch_per_msg: int,
+        max_bs: int,
+        max_msg_size: int,
+        itemsize: int,
+    ) -> int:
+        return max_dispatch_per_msg * max_bs * max_msg_size * itemsize
+
+    def create_buffer(
+        self,
+        *,
+        max_dispatch_per_msg: int,
+        max_bs: int,
+        rank: int,
+        world_size: int,
+        buffer_size_bytes: int,
+    ) -> MLAAllToAllBufferProtocol:
+        return NcclStaticAllToAllBufferAdapter(
+            max_dispatch_per_msg=max_dispatch_per_msg,
+            max_bs=max_bs,
+            rank=rank,
+            world_size=world_size,
+            buffer_size_bytes=buffer_size_bytes,
+        )
+
+
 def create_sp_backend_factory(
     backend: SPBackend,
 ) -> MLAAllToAllBackendFactoryProtocol:
@@ -371,4 +589,6 @@ def create_sp_backend_factory(
         return LegacyIntraLLBackendFactory()
     if backend == "hao_basic":
         return HaoBasicBackendFactory()
+    if backend == "nccl":
+        return NcclStaticBackendFactory()
     raise ValueError(f"Unsupported SP backend: {backend}")

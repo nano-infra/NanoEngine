@@ -93,7 +93,7 @@ usage() {
     echo "  --scheduler-mode <str>    Scheduler Mode (default: $DEFAULT_SCHEDULER_MODE)"
     echo "  --loop-count <int>        Loop count (default: $DEFAULT_LOOP_COUNT)"
     echo "  --fixed-sp-segments <int> Fixed SP segments (default: $DEFAULT_FIXED_SP_SEGMENTS)"
-    echo "  --sp-backend <str>        legacy_ll | hao_basic (default: $DEFAULT_SP_BACKEND)"
+    echo "  --sp-backend <str>        legacy_ll | hao_basic | nccl (default: $DEFAULT_SP_BACKEND)"
     echo "  --enable-dynamic-sp-size  Enable dynamic SP size"
     echo "  --max-input-len <int>     Filter out CSV rows with prompt_len >= this value"
     echo "  --use-new-decode-dynamic-sp-scheduler  Use the new decode dynamic SP scheduler"
@@ -168,7 +168,7 @@ case "$SCHEDULER_MODE" in
 esac
 
 case "$SP_BACKEND" in
-    legacy_ll|hao_basic) ;;
+    legacy_ll|hao_basic|nccl) ;;
     *) echo "Error: Invalid SP backend '$SP_BACKEND'."; exit 1 ;;
 esac
 

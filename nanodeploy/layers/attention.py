@@ -62,13 +62,16 @@ class FlashAttentionImpl:
         else:  # decode
             bs, num_head, head_dim = q.shape
             if use_sp_a2a:
-                max_num_seqs = get_sp_context().max_num_seqs
-                q_buffer = get_sp_context().q_buffer
+                sp_context = get_sp_context()
+                max_num_seqs = sp_context.max_num_seqs
+                q_buffer = sp_context.q_buffer
 
                 # Q copy
-                local_q_buffer_3d = q_buffer.local_buffer.view(get_sp_context().dtype)[
+                local_q_buffer_3d = q_buffer.local_buffer.view(sp_context.dtype)[
                     : sp_size * max_num_seqs * num_head * head_dim
                 ].view(sp_size * max_num_seqs, num_head, head_dim)
+                if sp_context.backend == "nccl":
+                    local_q_buffer_3d.zero_()
                 copy_batch_indexed_triton(
                     q,
                     local_q_buffer_3d,
@@ -111,18 +114,21 @@ class FlashAttentionImpl:
             )[:2]
 
             if use_sp_a2a:
-                res_buffer = get_sp_context().res_buffer
-                lse_buffer = get_sp_context().lse_buffer
+                sp_context = get_sp_context()
+                res_buffer = sp_context.res_buffer
+                lse_buffer = sp_context.lse_buffer
                 lse = lse.to(torch.bfloat16)
                 gathered_o = o.view([context.attention_compute_bs, num_head, head_dim])
                 gathered_lse = lse.view([context.attention_compute_bs, num_head, 1])
 
                 # 1. 拷贝 gathered_o 到 res_local_buffer
                 res_local_buffer_3d = res_buffer.local_buffer.view(
-                    get_sp_context().dtype
+                    sp_context.dtype
                 )[: sp_size * max_num_seqs * num_head * head_dim].view(
                     sp_size * max_num_seqs, num_head, head_dim
                 )
+                if sp_context.backend == "nccl":
+                    res_local_buffer_3d.zero_()
                 copy_batch_indexed_triton(
                     gathered_o.view(-1, num_head, head_dim),
                     res_local_buffer_3d,
@@ -133,10 +139,12 @@ class FlashAttentionImpl:
 
                 # 2. Copy gathered_lse to lse_local_buffer
                 lse_local_buffer_3d = lse_buffer.local_buffer.view(
-                    get_sp_context().dtype
+                    sp_context.dtype
                 )[: sp_size * max_num_seqs * num_head * 1].view(
                     sp_size * max_num_seqs, num_head, 1
                 )
+                if sp_context.backend == "nccl":
+                    lse_local_buffer_3d.zero_()
                 copy_batch_indexed_triton(
                     gathered_lse.view(-1, num_head, 1),
                     lse_local_buffer_3d,
@@ -192,7 +200,7 @@ class FlashAttentionImpl:
                     context.global_context_lens,
                     num_head,
                     head_dim,
-                    get_sp_context().max_num_seqs,
+                    sp_context.max_num_seqs,
                     sp_size,
                 ).view([max_num_seqs, num_head, head_dim])[:bs]
         
@@ -244,12 +252,15 @@ class FlashMLAImpl:
         if not context.is_prefill:  # decode
             bs, num_head, head_dim = q.shape
             if use_sp_a2a:
-                max_num_seqs = get_sp_context().max_num_seqs
-                q_buffer = get_sp_context().q_buffer
+                sp_context = get_sp_context()
+                max_num_seqs = sp_context.max_num_seqs
+                q_buffer = sp_context.q_buffer
 
-                local_q_buffer_3d = q_buffer.local_buffer.view(get_sp_context().dtype)[
+                local_q_buffer_3d = q_buffer.local_buffer.view(sp_context.dtype)[
                     : sp_size * max_num_seqs * num_head * head_dim
                 ].view(sp_size * max_num_seqs, num_head, head_dim)
+                if sp_context.backend == "nccl":
+                    local_q_buffer_3d.zero_()
                 copy_batch_indexed_triton(
                     q.view(bs, num_head, head_dim),
                     local_q_buffer_3d,
@@ -303,8 +314,9 @@ class FlashMLAImpl:
             if use_sp_a2a:
                 _, num_head, v_head_dim = o.shape
 
-                res_buffer = get_sp_context().res_buffer
-                lse_buffer = get_sp_context().lse_buffer
+                sp_context = get_sp_context()
+                res_buffer = sp_context.res_buffer
+                lse_buffer = sp_context.lse_buffer
                 lse = lse.to(torch.bfloat16)
                 gathered_o = o.view(
                     [context.attention_compute_bs, num_head, v_head_dim]
@@ -313,10 +325,12 @@ class FlashMLAImpl:
 
                 # 1. 拷贝 gathered_o 到 res_local_buffer
                 res_local_buffer_3d = res_buffer.local_buffer.view(
-                    get_sp_context().dtype
+                    sp_context.dtype
                 )[: sp_size * max_num_seqs * num_head * v_head_dim].view(
                     sp_size * max_num_seqs, num_head, v_head_dim
                 )
+                if sp_context.backend == "nccl":
+                    res_local_buffer_3d.zero_()
 
                 copy_batch_indexed_triton(
                     gathered_o.view(-1, num_head, v_head_dim),
@@ -328,10 +342,12 @@ class FlashMLAImpl:
 
                 # 2. 拷贝 gathered_lse 到 lse_local_buffer
                 lse_local_buffer_3d = lse_buffer.local_buffer.view(
-                    get_sp_context().dtype
+                    sp_context.dtype
                 )[: sp_size * max_num_seqs * num_head * 1].view(
                     sp_size * max_num_seqs, num_head, 1
                 )
+                if sp_context.backend == "nccl":
+                    lse_local_buffer_3d.zero_()
 
                 copy_batch_indexed_triton(
                     gathered_lse.view(-1, num_head, 1),
@@ -388,7 +404,7 @@ class FlashMLAImpl:
                     context.global_context_lens,
                     num_head,
                     v_head_dim,
-                    get_sp_context().max_num_seqs,
+                    sp_context.max_num_seqs,
                     sp_size,
                 ).view([max_num_seqs, num_head, v_head_dim])[:bs]
 
