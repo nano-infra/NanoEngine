@@ -383,6 +383,46 @@ def test_nccl_static_q_uses_mask_width_as_comm_bs(monkeypatch):
     assert torch.equal(output, expected)
 
 
+def test_nccl_static_scratch_reuses_max_storage_across_comm_bs(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    adapter = sp_backend.NcclStaticAllToAllBufferAdapter(
+        max_dispatch_per_msg=2,
+        max_bs=5,
+        rank=0,
+        world_size=2,
+        buffer_size_bytes=2 * 5 * 4 * torch.float32.itemsize,
+    )
+
+    cases = [
+        ("q_padded", (3, 4), (5, 4), torch.float32, (5, 4)),
+        ("q_send", (2, 3, 4), (2, 5, 4), torch.float32, (10, 4)),
+        ("q_recv", (2, 3, 4), (2, 5, 4), torch.float32, (10, 4)),
+        ("transpose_send", (2, 3, 4), (2, 5, 4), torch.float32, (10, 4)),
+        ("transpose_recv", (2, 3, 4), (2, 5, 4), torch.float32, (10, 4)),
+        ("recv_mask", (2, 3), (2, 5), torch.int32, (10,)),
+        ("q_packed_output", (6, 4), (10, 4), torch.float32, (10, 4)),
+    ]
+
+    for name, small_shape, large_shape, dtype, storage_shape in cases:
+        small = adapter._scratch_tensor(name, small_shape, dtype, torch.device("cpu"))
+        large = adapter._scratch_tensor(name, large_shape, dtype, torch.device("cpu"))
+        smaller_again = adapter._scratch_tensor(name, small_shape, dtype, torch.device("cpu"))
+
+        assert small.shape == small_shape
+        assert large.shape == large_shape
+        assert small.is_contiguous()
+        assert large.is_contiguous()
+        assert (
+            small.untyped_storage().data_ptr()
+            == large.untyped_storage().data_ptr()
+            == smaller_again.untyped_storage().data_ptr()
+        )
+        assert (name, storage_shape, dtype, torch.device("cpu")) in adapter._scratch
+
+    assert len(adapter._scratch) == len(cases)
+
+
 def test_nccl_static_transpose_uses_fixed_exchange_and_local_patch(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 

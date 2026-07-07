@@ -318,7 +318,9 @@ class NcclStaticAllToAllBufferAdapter:
         self.world_size = world_size
         self.buffer_size_bytes = buffer_size_bytes
         self._group: dist.ProcessGroup | None = None
-        self._scratch: dict[tuple[str, tuple[int, ...], torch.dtype, torch.device], torch.Tensor] = {}
+        self._scratch: dict[
+            tuple[str, tuple[int, ...], torch.dtype, torch.device], torch.Tensor
+        ] = {}
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self._local_buffer = torch.zeros(buffer_size_bytes, dtype=torch.uint8, device=device)
@@ -414,11 +416,81 @@ class NcclStaticAllToAllBufferAdapter:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        key = (name, shape, dtype, device)
+        storage_shape = self._scratch_storage_shape(name, shape)
+        key = (name, storage_shape, dtype, device)
         tensor = self._scratch.get(key)
         if tensor is None:
-            tensor = torch.empty(shape, dtype=dtype, device=device)
+            tensor = torch.empty(storage_shape, dtype=dtype, device=device)
             self._scratch[key] = tensor
+        return self._scratch_view(name, tensor, shape)
+
+    def _scratch_storage_shape(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        if name in {"q_send", "q_recv", "transpose_send", "transpose_recv"}:
+            if len(shape) != 3 or shape[0] != self.world_size:
+                raise ValueError(f"Invalid NCCL scratch shape for {name}: {shape}")
+            if shape[1] > self.max_bs:
+                raise ValueError(
+                    f"Invalid NCCL scratch comm_bs for {name}: "
+                    f"comm_bs={shape[1]} max_bs={self.max_bs}"
+                )
+            return (self.world_size * self.max_bs, shape[2])
+
+        if name == "recv_mask":
+            if len(shape) != 2 or shape[0] != self.world_size:
+                raise ValueError(f"Invalid NCCL scratch shape for {name}: {shape}")
+            if shape[1] > self.max_bs:
+                raise ValueError(
+                    f"Invalid NCCL scratch comm_bs for {name}: "
+                    f"comm_bs={shape[1]} max_bs={self.max_bs}"
+                )
+            return (self.world_size * self.max_bs,)
+
+        if name == "q_padded":
+            if len(shape) != 2:
+                raise ValueError(f"Invalid NCCL scratch shape for {name}: {shape}")
+            if shape[0] > self.max_bs:
+                raise ValueError(
+                    f"Invalid NCCL scratch comm_bs for {name}: "
+                    f"comm_bs={shape[0]} max_bs={self.max_bs}"
+                )
+            return (self.max_bs, shape[1])
+
+        if name == "q_packed_output":
+            if len(shape) != 2:
+                raise ValueError(f"Invalid NCCL scratch shape for {name}: {shape}")
+            if shape[0] > self.world_size * self.max_bs:
+                raise ValueError(
+                    f"Invalid NCCL scratch rows for {name}: "
+                    f"rows={shape[0]} max_rows={self.world_size * self.max_bs}"
+                )
+            return (self.world_size * self.max_bs, shape[1])
+
+        return shape
+
+    def _scratch_view(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        if name in {"q_send", "q_recv", "transpose_send", "transpose_recv"}:
+            rows = shape[0] * shape[1]
+            return tensor[:rows].view(shape)
+
+        if name == "recv_mask":
+            rows = shape[0] * shape[1]
+            return tensor[:rows].view(shape)
+
+        if name == "q_padded":
+            return tensor[: shape[0], : shape[1]]
+
+        if name == "q_packed_output":
+            return tensor[: shape[0], : shape[1]]
+
         return tensor
 
     def _build_non_transpose_send_buffer(
