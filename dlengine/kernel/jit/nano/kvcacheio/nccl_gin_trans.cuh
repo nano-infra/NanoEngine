@@ -8,12 +8,16 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <thread>
+
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/extra/c_env_api.h>
 
 #define CUDA_CHECK(cmd)                                                                                                \
     do {                                                                                                               \
@@ -269,6 +273,59 @@ remote_dram_to_hbm_kernel(ncclDevComm dev_comm, ncclWindow_t host_win, ncclWindo
     bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
 
+namespace dlengine::nano::gin {
+
+static ncclDevComm as_dev_comm(int64_t handle)
+{
+    return reinterpret_cast<ncclDevComm>(static_cast<uintptr_t>(handle));
+}
+
+static ncclWindow_t as_window(int64_t handle)
+{
+    return reinterpret_cast<ncclWindow_t>(static_cast<uintptr_t>(handle));
+}
+
+static void hbm_to_remote_dram(int64_t dev_comm_handle,
+                               int64_t dev_win_handle,
+                               int64_t host_win_handle,
+                               int64_t nbytes,
+                               int32_t peer,
+                               const tvm::ffi::TensorView stream_anchor)
+{
+    if (nbytes <= 0) {
+        return;
+    }
+    const auto device = stream_anchor.device();
+    auto       stream = static_cast<cudaStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
+    hbm_to_remote_dram_kernel<<<1, 128, 0, stream>>>(as_dev_comm(dev_comm_handle),
+                                                     as_window(dev_win_handle),
+                                                     as_window(host_win_handle),
+                                                     static_cast<int>(nbytes),
+                                                     static_cast<int>(peer));
+}
+
+static void remote_dram_to_hbm(int64_t dev_comm_handle,
+                               int64_t host_win_handle,
+                               int64_t dev_win_handle,
+                               int64_t nbytes,
+                               int32_t peer,
+                               const tvm::ffi::TensorView stream_anchor)
+{
+    if (nbytes <= 0) {
+        return;
+    }
+    const auto device = stream_anchor.device();
+    auto       stream = static_cast<cudaStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
+    remote_dram_to_hbm_kernel<<<1, 128, 0, stream>>>(as_dev_comm(dev_comm_handle),
+                                                     as_window(host_win_handle),
+                                                     as_window(dev_win_handle),
+                                                     static_cast<int>(nbytes),
+                                                     static_cast<int>(peer));
+}
+
+}  // namespace dlengine::nano::gin
+
+#ifdef DLENGINE_NANO_GIN_STANDALONE
 int main(int argc, char** argv)
 {
     const int    rank       = env_int("RANK", 0);
@@ -436,3 +493,4 @@ int main(int argc, char** argv)
     NCCL_CHECK(ncclCommDestroy(comm));
     return (ok_put && ok_get) ? 0 : 3;
 }
+#endif  // DLENGINE_NANO_GIN_STANDALONE
