@@ -110,7 +110,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
                                bool               enable_non_uniform_split,
                                const std::string& sp_master_selector,
                                bool               sp_debug,
-                               int                fixed_sp_segments) :
+                               int                fixed_sp_size) :
     engine_id_(engine_id),
     attention_sp_(attention_sp),
     max_num_seqs_(max_num_seqs),
@@ -134,7 +134,7 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     traffic_model_{q_bytes_per_edge, res_bytes_per_edge, lse_bytes_per_edge},
     enable_non_uniform_split_(enable_non_uniform_split),
     sp_debug_(sp_debug),
-    fixed_sp_segments_(fixed_sp_segments)
+    fixed_sp_size_(fixed_sp_size)
 {
     // Initialize Strategy
     if (sp_master_selector == "LeastBatch") {
@@ -157,6 +157,24 @@ SPStateManager::SPStateManager(const std::string& engine_id,
     }
     dynamic_sp_bucket_policy_ = parse_bucket_policy(dynamic_sp_bucket_policy, attention_sp_);
 
+    if (attention_sp_ <= 0) {
+        throw std::runtime_error("attention_sp must be positive to prevent division by zero");
+    }
+    if (kvcache_block_size_ <= 0) {
+        throw std::runtime_error("kvcache_block_size must be positive to prevent division by zero");
+    }
+    if (fixed_sp_size_ < 0 || fixed_sp_size_ > attention_sp_) {
+        throw std::runtime_error("fixed_sp_size must be in [0, attention_sp]");
+    }
+    if (fixed_sp_size_ > 0
+        && (enable_dynamic_sp_size_
+            || dynamic_sp_size_strategy_ != DynamicSPSizeStrategy::Legacy
+            || enable_dynamic_sp_bucket_policy_
+            || sp_debug_)) {
+        throw std::runtime_error(
+            "fixed_sp_size cannot be combined with dynamic SP size strategies");
+    }
+
     // Initialize Running Load Counter
     master_seq_counts_.assign(attention_sp_, 0);
 
@@ -170,19 +188,22 @@ SPStateManager::SPStateManager(const std::string& engine_id,
               << ", kvcache_block_size=" << kvcache_block_size_
               << ", reserved_blocks_per_req=" << reserved_blocks_per_req_ 
               << ", segment_size=" << segment_size_
-              << ", fixed_sp_segments=" << fixed_sp_segments_
+              << ", fixed_sp_size=" << fixed_sp_size_
               << ", dynamic_sp_size_strategy=" << dynamic_sp_size_strategy_name(dynamic_sp_size_strategy_)
               << ", dynamic_sp_long_request_threshold=" << long_request_sp_threshold_
               << ", dynamic_sp_long_request_size=" << long_request_sp_size_
               << ", enable_dynamic_sp_bucket_policy=" << enable_dynamic_sp_bucket_policy_
               << std::endl;
 
-    if (attention_sp_ <= 0) {
-        throw std::runtime_error("attention_sp must be positive to prevent division by zero");
+}
+
+int SPStateManager::effective_target_sp_size(int requested_sp_size, int num_tokens) const
+{
+    int target_sp_size = std::max(1, std::min(requested_sp_size, attention_sp_));
+    if (fixed_sp_size_ > 0) {
+        target_sp_size = std::min(target_sp_size, std::max(1, num_tokens));
     }
-    if (kvcache_block_size_ <= 0) {
-        throw std::runtime_error("kvcache_block_size must be positive to prevent division by zero");
-    }
+    return target_sp_size;
 }
 
 std::optional<int> SPStateManager::select_bucket_sp_size(int seq_len) const
@@ -359,6 +380,10 @@ std::optional<SPStateManager::DecodeBatchPlan> SPStateManager::plan_decode_batch
 
     auto allowed_sp_sizes = [&]() {
         std::vector<int> sizes;
+        if (fixed_sp_size_ > 0) {
+            sizes.push_back(fixed_sp_size_);
+            return sizes;
+        }
         sizes.push_back(1);
         for (int s = 2; s <= attention_sp_; s *= 2) {
             sizes.push_back(s);
@@ -646,6 +671,9 @@ std::optional<SPStateManager::DecodeBatchPlan> SPStateManager::plan_decode_batch
                                int target_sp,
                                std::optional<int> fixed_master = std::nullopt)
         -> std::optional<PlannedPlacement> {
+        if (fixed_sp_size_ > 0) {
+            target_sp = effective_target_sp_size(target_sp, seq.num_tokens);
+        }
         PlanningState state = state_template;
         int master_sp_idx = fixed_master.has_value() ? *fixed_master : choose_master(state, seq);
         if (master_sp_idx < 0) {
@@ -911,8 +939,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
         
         int num_tokens            = seq.num_tokens;
-        // Use fixed_sp_segments if set, otherwise calculate based on segment_size
-        int num_segments          = (fixed_sp_segments_ > 0) ? fixed_sp_segments_ : (num_tokens + segment_size_ - 1) / segment_size_;
+        int num_segments          = (num_tokens + segment_size_ - 1) / segment_size_;
         int num_segments_per_rank = (num_segments + attention_sp_ - 1) / attention_sp_;
         int initial_num_ranks     = (num_segments + num_segments_per_rank - 1) / num_segments_per_rank;
 
@@ -940,7 +967,11 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         int start_ranks = initial_num_ranks;
         int end_ranks   = enable_dynamic_sp_size_ ? attention_sp_ : initial_num_ranks;
         bool recompute_segments_for_forced_sp = false;
-        if (dynamic_sp_size_strategy_ == DynamicSPSizeStrategy::Bucket) {
+        if (fixed_sp_size_ > 0) {
+            const int forced_num_ranks = effective_target_sp_size(fixed_sp_size_, seq.num_tokens);
+            start_ranks = forced_num_ranks;
+            end_ranks = forced_num_ranks;
+        } else if (dynamic_sp_size_strategy_ == DynamicSPSizeStrategy::Bucket) {
             const int forced_num_ranks = std::max(
                 1,
                 std::min(
@@ -980,7 +1011,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             // =================================================================
             // [New Feature] Non-Uniform Split (Water-filling / Valley-filling)
             // =================================================================
-            if (enable_non_uniform_split_) {
+            if (enable_non_uniform_split_ && fixed_sp_size_ == 0) {
                 // 1. Collect free blocks info for all participating ranks (including master)
                 std::vector<std::pair<int, int>> sorted_ranks; // {sp_idx, free_blocks}
                 for (int sp_idx : top_most_free_ranks) {
@@ -1066,11 +1097,27 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
                 // =================================================================
                 // Standard Feature: Uniform Split
                 // =================================================================
-                int total_token_unalloc = seq.num_tokens;
-                for (int sp_idx : top_most_free_ranks) {
-                    int tokens_to_dispatch                  = std::min(total_token_unalloc, target_num_segments_per_rank * segment_size_);
-                    block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
-                    total_token_unalloc -= tokens_to_dispatch;
+                if (fixed_sp_size_ > 0) {
+                    int participating_ranks = static_cast<int>(top_most_free_ranks.size());
+                    if (participating_ranks <= 0) {
+                        return false;
+                    }
+                    int base_tokens = seq.num_tokens / participating_ranks;
+                    int extra_tokens = seq.num_tokens % participating_ranks;
+                    for (int i = 0; i < participating_ranks; ++i) {
+                        int sp_idx = top_most_free_ranks[i];
+                        block_ctx.num_dispatched_tokens[sp_idx] =
+                            base_tokens + (i < extra_tokens ? 1 : 0);
+                    }
+                } else {
+                    int total_token_unalloc = seq.num_tokens;
+                    for (int sp_idx : top_most_free_ranks) {
+                        int tokens_to_dispatch = std::min(
+                            total_token_unalloc,
+                            target_num_segments_per_rank * segment_size_);
+                        block_ctx.num_dispatched_tokens[sp_idx] = tokens_to_dispatch;
+                        total_token_unalloc -= tokens_to_dispatch;
+                    }
                 }
             }
 
@@ -1129,8 +1176,7 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         block_ctx.num_dispatched_tokens.assign(attention_sp_, 0);
 
         int num_tokens            = seq.num_tokens;
-        // Use fixed_sp_segments if set, otherwise calculate based on segment_size
-        int num_segments          = (fixed_sp_segments_ > 0) ? fixed_sp_segments_ : (num_tokens + segment_size_ - 1) / segment_size_;
+        int num_segments          = (num_tokens + segment_size_ - 1) / segment_size_;
         int num_segments_per_rank = (num_segments + attention_sp_ - 1) / attention_sp_;
         int num_ranks             = (num_segments + num_segments_per_rank - 1) / num_segments_per_rank;
 

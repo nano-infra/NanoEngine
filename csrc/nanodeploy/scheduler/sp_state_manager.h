@@ -117,7 +117,7 @@ public:
                    bool               enable_non_uniform_split,
                    const std::string& sp_master_selector,
                    bool               sp_debug = false,
-                   int                fixed_sp_segments = 0);
+                   int                fixed_sp_size = 0);
 
     void set_dp_idx(int dp_idx)
     {
@@ -249,6 +249,7 @@ private:
 
     void initialize_dummy_seqs();
     int  select_master_rank();
+    int  effective_target_sp_size(int requested_sp_size, int num_tokens) const;
     std::optional<int> select_bucket_sp_size(int seq_len) const;
     void add_communication(PlanningState& state,
                            int            master_sp_idx,
@@ -281,7 +282,7 @@ private:
     TrafficModel traffic_model_;
     bool enable_non_uniform_split_;
     bool sp_debug_;
-    int  fixed_sp_segments_;
+    int  fixed_sp_size_;
 
     SPMasterSelector master_selector_;
     std::vector<int> master_seq_counts_;

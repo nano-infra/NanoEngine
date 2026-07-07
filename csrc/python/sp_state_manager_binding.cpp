@@ -137,7 +137,7 @@ void bind_sp_state_manager(py::module_& m)
                          bool               enable_non_uniform_split,
                          const std::string& sp_master_selector,
                          bool               sp_debug,
-                         int                fixed_sp_segments) {
+                         int                fixed_sp_size) {
                  return std::make_shared<SPStateManager>(engine_id,
                                                          attention_sp,
                                                          num_kvcache_blocks,
@@ -167,7 +167,7 @@ void bind_sp_state_manager(py::module_& m)
                                                          enable_non_uniform_split,
                                                          sp_master_selector,
                                                          sp_debug,
-                                                         fixed_sp_segments);
+                                                         fixed_sp_size);
              }),
              py::arg("engine_id"),
              py::arg("attention_sp"),
@@ -198,7 +198,7 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("enable_non_uniform_split"),
              py::arg("sp_master_selector"),
              py::arg("sp_debug") = false,
-             py::arg("fixed_sp_segments") = 0)
+             py::arg("fixed_sp_size") = 0)
 
         .def_property_readonly("is_empty", &SPStateManager::is_empty)
 

@@ -144,7 +144,7 @@ void bind_scheduler_utils(py::module_& m)
                           bool               enable_non_uniform_split,
                           const std::string& sp_master_selector,
                           bool               sp_debug,
-                          int                fixed_sp_segments,
+                          int                fixed_sp_size,
                           const std::string& scheduler_mode) {
                  return std::make_shared<Scheduler>(engine_id,
                                                     loop_count,
@@ -180,7 +180,7 @@ void bind_scheduler_utils(py::module_& m)
                                                      enable_non_uniform_split,
                                                      sp_master_selector,
                                                      sp_debug,
-                                                     fixed_sp_segments,
+                                                     fixed_sp_size,
                                                      scheduler_mode);
               }),
              py::arg("engine_id"),
@@ -217,7 +217,7 @@ void bind_scheduler_utils(py::module_& m)
               py::arg("enable_non_uniform_split"),
               py::arg("sp_master_selector"),
               py::arg("sp_debug") = false,
-              py::arg("fixed_sp_segments") = 0,
+              py::arg("fixed_sp_size") = 0,
               py::arg("scheduler_mode") = "centralized")
 
         // Queue management

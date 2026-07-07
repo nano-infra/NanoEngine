@@ -127,12 +127,29 @@ class Config:
     # Debug mode for SP allocation (uses simplified RoundRobin + segment-based allocation)
     sp_debug: bool = False
 
-    # Fixed number of SP segments per request (overrides segment_size calculation)
-    # When set to a value > 0, all requests will be split into exactly this many segments
-    fixed_sp_segments: int = 0
+    # Fixed number of participating SP ranks per request.
+    # 0 keeps the segment-size / dynamic-SP scheduling behavior.
+    fixed_sp_size: int = 0
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
+        if self.fixed_sp_size < 0:
+            raise ValueError("fixed_sp_size must be >= 0")
+        if self.fixed_sp_size > self.attention_sp:
+            raise ValueError("fixed_sp_size must be in [0, attention_sp]")
+        if self.fixed_sp_size > 0 and (
+            self.enable_dynamic_sp_size
+            or self.use_new_decode_dynamic_sp_scheduler
+            or self.dynamic_sp_size_strategy != "legacy"
+            or self.enable_dynamic_sp_bucket_policy
+            or bool(self.dynamic_sp_bucket_policy.strip())
+            or self.dynamic_sp_bucket_preset != "none"
+            or self.sp_debug
+        ):
+            raise ValueError(
+                "fixed_sp_size is a baseline scheduling mode and cannot be "
+                "combined with dynamic SP size strategies"
+            )
         if self.dynamic_sp_size_strategy not in {"legacy", "long_short_sp8", "bucket"}:
             raise ValueError(
                 "dynamic_sp_size_strategy must be one of: legacy, long_short_sp8, bucket"

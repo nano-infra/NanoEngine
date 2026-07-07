@@ -46,7 +46,7 @@ Scheduler::Scheduler(const std::string& engine_id,
                      bool               enable_non_uniform_split,
                      const std::string& sp_master_selector,
                      bool               sp_debug,
-                     int                fixed_sp_segments,
+                     int                fixed_sp_size,
                      const std::string& scheduler_mode) :
     engine_id_(engine_id),
     loop_count_(loop_count),
@@ -85,7 +85,7 @@ Scheduler::Scheduler(const std::string& engine_id,
             lse_cost_a, lse_cost_b,
             q_bytes_per_edge, res_bytes_per_edge, lse_bytes_per_edge,
             enable_non_uniform_split,
-            sp_master_selector, sp_debug_, fixed_sp_segments);
+            sp_master_selector, sp_debug_, fixed_sp_size);
         
         sp_manager->set_dp_idx(dp_idx);
         worker_state.push_back(sp_manager);
@@ -98,7 +98,7 @@ Scheduler::Scheduler(const std::string& engine_id,
     }
     
     std::cerr << "[Scheduler] Initialized with segment_size=" << segment_size_ 
-              << ", fixed_sp_segments=" << fixed_sp_segments
+              << ", fixed_sp_size=" << fixed_sp_size
               << ", use_new_decode_dynamic_sp_scheduler=" << use_new_decode_dynamic_sp_scheduler_
               << ", dynamic_sp_size_strategy=" << dynamic_sp_size_strategy_
               << ", dynamic_sp_long_request_threshold=" << dynamic_sp_long_request_threshold_
