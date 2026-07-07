@@ -27,6 +27,7 @@ DEFAULT_ROUTING="LeastBatch"
 DEFAULT_SCHEDULER_MODE="centralized"
 DEFAULT_LOOP_COUNT=16
 DEFAULT_FIXED_SP_SEGMENTS=0
+DEFAULT_SP_BACKEND="hao_basic"
 DEFAULT_ENABLE_DYNAMIC_SP_SIZE=1
 DEFAULT_ENFORCE_EAGER=0
 DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=0
@@ -58,6 +59,7 @@ ROUTING_STRATEGY="$DEFAULT_ROUTING"
 SCHEDULER_MODE="$DEFAULT_SCHEDULER_MODE"
 LOOP_COUNT="$DEFAULT_LOOP_COUNT"
 FIXED_SP_SEGMENTS="$DEFAULT_FIXED_SP_SEGMENTS"
+SP_BACKEND="${SP_BACKEND:-$DEFAULT_SP_BACKEND}"
 ENABLE_DYNAMIC_SP_SIZE="$DEFAULT_ENABLE_DYNAMIC_SP_SIZE"
 MAX_INPUT_LEN="$DEFAULT_MAX_INPUT_LEN"
 ENFORCE_EAGER="$DEFAULT_ENFORCE_EAGER"
@@ -91,6 +93,7 @@ usage() {
     echo "  --scheduler-mode <str>    Scheduler Mode (default: $DEFAULT_SCHEDULER_MODE)"
     echo "  --loop-count <int>        Loop count (default: $DEFAULT_LOOP_COUNT)"
     echo "  --fixed-sp-segments <int> Fixed SP segments (default: $DEFAULT_FIXED_SP_SEGMENTS)"
+    echo "  --sp-backend <str>        legacy_ll | hao_basic (default: $DEFAULT_SP_BACKEND)"
     echo "  --enable-dynamic-sp-size  Enable dynamic SP size"
     echo "  --max-input-len <int>     Filter out CSV rows with prompt_len >= this value"
     echo "  --use-new-decode-dynamic-sp-scheduler  Use the new decode dynamic SP scheduler"
@@ -125,6 +128,7 @@ while [[ $# -gt 0 ]]; do
         --scheduler-mode)   SCHEDULER_MODE="$2"; shift 2 ;;
         --loop-count)       LOOP_COUNT="$2"; shift 2 ;;
         --fixed-sp-segments) FIXED_SP_SEGMENTS="$2"; shift 2 ;;
+        --sp-backend)       SP_BACKEND="$2"; shift 2 ;;
         --enable-dynamic-sp-size) ENABLE_DYNAMIC_SP_SIZE=1; shift ;;
         --max-input-len)    MAX_INPUT_LEN="$2"; shift 2 ;;
         --use-new-decode-dynamic-sp-scheduler) USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=1; shift ;;
@@ -163,6 +167,11 @@ case "$SCHEDULER_MODE" in
     *) echo "Error: Invalid scheduler mode '$SCHEDULER_MODE'."; exit 1 ;;
 esac
 
+case "$SP_BACKEND" in
+    legacy_ll|hao_basic) ;;
+    *) echo "Error: Invalid SP backend '$SP_BACKEND'."; exit 1 ;;
+esac
+
 # ================= 准备基础信息 (Preparation) =================
 DATASET_NAME=$(basename "$CSV_PATH" .csv)
 MODEL_NAME=$(basename "$MODEL_PATH")
@@ -199,6 +208,7 @@ echo "GPU Mem     : ${GPU_MEM}GB"
 echo "Max Len     : $MAX_MODEL_LEN"
 echo "Max Input   : ${MAX_INPUT_LEN:-unlimited}"
 echo "Fixed SP Seg: $FIXED_SP_SEGMENTS"
+echo "SP Backend  : $SP_BACKEND"
 echo "Enable Dynamic SP Size: $ENABLE_DYNAMIC_SP_SIZE"
 echo "New Decode Dynamic SP Scheduler: $USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 echo "Dynamic SP Size Strategy: $DYNAMIC_SP_SIZE_STRATEGY"
@@ -212,6 +222,7 @@ log_progress "=== NEW BATCH STARTED ==="
 log_progress "Model: $MODEL_NAME | Dataset: $DATASET_NAME"
 log_progress "Parallel: DP=$DP, SP=$SP, EP=$EP, TP=$TP | Scheduler: $SCHEDULER_MODE"
 log_progress "SegSize=$SEG_SIZE | BatchSize=$BATCH_SIZE | MaxLen=$MAX_MODEL_LEN | MaxInput=${MAX_INPUT_LEN:-unlimited} | FixedSP=$FIXED_SP_SEGMENTS"
+log_progress "SPBackend=$SP_BACKEND"
 log_progress "EnableDynamicSPSize=$ENABLE_DYNAMIC_SP_SIZE"
 log_progress "UseNewDecodeDynamicSPScheduler=$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 log_progress "DynamicSPSizeStrategy=$DYNAMIC_SP_SIZE_STRATEGY"
@@ -266,6 +277,7 @@ for rate in "${RATES[@]}"; do
     if [[ "$FIXED_SP_SEGMENTS" -ne 0 ]]; then
         extra_tags="${extra_tags}_fsp${FIXED_SP_SEGMENTS}"
     fi
+    extra_tags="${extra_tags}_${SP_BACKEND}"
     if [[ "$DYNAMIC_SP_SIZE_STRATEGY" != "legacy" ]]; then
         extra_tags="${extra_tags}_${DYNAMIC_SP_SIZE_STRATEGY}_thr${LONG_REQUEST_SP_THRESHOLD}"
         if [[ "$LONG_REQUEST_SP_SIZE" -ne 0 ]]; then
@@ -303,6 +315,7 @@ for rate in "${RATES[@]}"; do
         --routing-strategy "$ROUTING_STRATEGY"
         --itl-log-path "$JSON_FILE"
         --segment-size "$SEG_SIZE"
+        --sp-backend "$SP_BACKEND"
         --scheduler-mode "$SCHEDULER_MODE"
         --fixed-sp-segments "$FIXED_SP_SEGMENTS"
         --dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY"

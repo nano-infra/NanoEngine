@@ -32,6 +32,11 @@ def main():
     parser.add_argument("--dp", type=int, default=1)
     parser.add_argument("--sp", type=int, default=8)
     parser.add_argument("--ep", type=int, default=8)
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default="/mnt/nvme1n1/ml_research/chenjiefei/models/deepseek-v3",
+    )
     parser.add_argument("--master-address", type=str, default="10.102.252.174:26444")
     parser.add_argument("--ray-address", type=str, default="10.102.252.174:7799")
     parser.add_argument("--enforce-eager", action="store_true")
@@ -49,8 +54,7 @@ def main():
     parser.add_argument("--profiler-start-time", type=float, default=None)
     parser.add_argument("--profiling-duration", type=float, default=None)
     args = parser.parse_args()
-    # path = os.path.expanduser("/mnt/nvme1n1/ml_research/models/models--moonshotai--Kimi-K2-Instruct-0905/snapshots/7152993552508c9f22042b3bb93b5e6acd06ce73")
-    path = os.path.expanduser("/models/deepseek-v3")
+    path = os.path.expanduser(args.model_path)
 
     decode = LLM(
         path,

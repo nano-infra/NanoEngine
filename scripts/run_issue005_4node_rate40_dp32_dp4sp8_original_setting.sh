@@ -36,6 +36,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-1000000}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-1000000}"
 LOOP_COUNT="${LOOP_COUNT:-16}"
 FIXED_SP_SEGMENTS="${FIXED_SP_SEGMENTS:-0}"
+SP_BACKEND="${SP_BACKEND:-hao_basic}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 DP4_START_RATE="${DP4_START_RATE:-10}"
 DP4_STEP_RATE="${DP4_STEP_RATE:-10}"
@@ -130,6 +131,7 @@ run_stage() {
         MAX_INPUT_LEN="$MAX_INPUT_LEN" \
         LOOP_COUNT="$LOOP_COUNT" \
         FIXED_SP_SEGMENTS="$FIXED_SP_SEGMENTS" \
+        SP_BACKEND="$SP_BACKEND" \
         ENFORCE_EAGER="$ENFORCE_EAGER" \
         START_RATE="$start_rate" \
         STEP_RATE="$step_rate" \
@@ -161,6 +163,7 @@ ensure_headers
 log "CHAIN_TAG=$RUN_TAG"
 log "RAY_ADDR=$RAY_ADDR MASTER_ADDR=$MASTER_ADDR"
 log "NODE_PLAN=$NODE_PLAN"
+log "SP_BACKEND=$SP_BACKEND"
 # log "BATCH_SIZE(plan)=$BATCH_SIZE GPU_UTIL=$GPU_UTIL ENFORCE_EAGER=$ENFORCE_EAGER"
 # log "RATE_PLAN mixed60k=90 | issue001=35 | issue003_random=2.5,22.5,25 | issue005_random=2.5,17.5 | gemini_issues=1.75 | kimi_issue005_random_dp4=5,10,15,20,25,30,35,40 | kimi_issue005_random_dp32=5,10,15,20,25,30,35,40 | kimi_issue003_random_dp4=5,10,15,20,25,30,35,40 | kimi_issue003_random_dp32=5,10,15,20,25,30,35,40 | STOP_THRESHOLD_MS=$STOP_THRESHOLD_MS"
 # log "ORDER=long_short(dp4sp8,mixed60k/deepseek_v3,r90) -> long_short(dp4sp8,issue001/deepseek_v3,r35) -> long_short(dp4sp8,issue003_random/deepseek_v3,r2.5,22.5,25) -> long_short(dp4sp8,issue005_random/deepseek_v3,r2.5,17.5) -> long_short(dp4sp8,gemini_issues/deepseek_v3,r1.75) -> long_short(dp4sp8,issue005_random/kimi_k2,r5,10,15,20,25,30,35,40) -> dp32sp1(issue005_random/kimi_k2,r5,10,15,20,25,30,35,40) -> long_short(dp4sp8,issue003_random/kimi_k2,r5,10,15,20,25,30,35,40) -> dp32sp1(issue003_random/kimi_k2,r5,10,15,20,25,30,35,40)"

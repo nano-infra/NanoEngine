@@ -59,7 +59,10 @@ def parse_args():
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
     parser.add_argument("--segment-size", type=int, default=65536, help="Segment size for SP.")
-    parser.add_argument("--disable-non-uniform-split", action="store_true", 
+    parser.add_argument("--sp-backend", type=str, default="hao_basic",
+                        choices=["legacy_ll", "hao_basic"],
+                        help="SP all-to-all backend.")
+    parser.add_argument("--disable-non-uniform-split", action="store_true",
                         help="Disable non-uniform KVCache partitioning for load balancing (enabled by default).")
     parser.add_argument("--fixed-sp-segments", type=int, default=0,
                         help="Fixed number of SP segments per request (0 = disabled, use segment-size).")
@@ -486,6 +489,7 @@ def main():
         profiling_duration=args.profiling_duration,
         enable_non_uniform_split=not args.disable_non_uniform_split,
         fixed_sp_segments=args.fixed_sp_segments,
+        sp_backend=args.sp_backend,
         use_new_decode_dynamic_sp_scheduler=args.use_new_decode_dynamic_sp_scheduler,
         dynamic_sp_size_strategy=args.dynamic_sp_size_strategy,
         dynamic_sp_long_request_threshold=args.long_request_sp_threshold,
