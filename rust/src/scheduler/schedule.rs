@@ -1,4 +1,5 @@
 use super::{ScheduleResult, Scheduler};
+use crate::cache::CacheHit;
 use pyo3::prelude::*;
 
 impl Scheduler {
@@ -276,12 +277,15 @@ impl Scheduler {
                 (s.seq_id, self.prompt_target(&s), s.num_cached_tokens)
             }
         };
-        if let Some(new_tokens) = self.try_adopt_session(py, seq_id, dp_idx, batch_tokens)? {
-            return Ok(Some(new_tokens));
+        match self.try_adopt_session(py, seq_id, dp_idx, batch_tokens)? {
+            CacheHit::Session { new_tokens } => return Ok(Some(new_tokens)),
+            CacheHit::Prefix { .. } => unreachable!("session adoption cannot return prefix hits"),
+            CacheHit::None => {}
         }
         let Some(master) = self.choose_master_group(dp_idx, batch_seqs, batch_tokens) else {
             return Ok(None);
         };
+        let mut cache_hit = CacheHit::None;
         if self.config.mode != "decode" && self.group() == 1 && self.cache.prefix_caching_enabled {
             let token_ids = self
                 .seq_table
@@ -290,10 +294,16 @@ impl Scheduler {
                 .unwrap_or_default();
             let flat = self.flat_idx(dp_idx, master);
             cached = self.cache_cached_tokens_for_prefix(flat, &token_ids, full_len);
+            cache_hit = CacheHit::Prefix {
+                cached_tokens: cached,
+            };
             if let Some(s) = self.seq_table.get_mut(&seq_id) {
                 s.num_cached_tokens = cached;
                 s.prefill_start_offset = cached;
             }
+        }
+        if let CacheHit::Prefix { cached_tokens } = cache_hit {
+            cached = cached_tokens;
         }
         let budget = (self.config.max_num_batched_tokens.max(1)
             - batch_tokens.get(master).copied().unwrap_or(0))
