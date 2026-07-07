@@ -310,7 +310,7 @@ impl Scheduler {
             return Ok(None);
         }
         let chunk_end = cached + new_tokens;
-        self.cache.seq_assignment.insert(seq_id, (dp_idx, master));
+        self.cache.assign_seq(seq_id, dp_idx, master);
         let dispatch = self.compute_dispatch(dp_idx, master, full_len);
         {
             let Some(s) = self.seq_table.get_mut(&seq_id) else {
@@ -339,7 +339,7 @@ impl Scheduler {
                     count,
                     self.config.mode != "decode",
                 ) {
-                    self.cache.seq_assignment.remove(&seq_id);
+                    self.cache.remove_assignment(seq_id);
                     if let Some(s) = self.seq_table.get_mut(&seq_id) {
                         s.status = 0;
                         s.active_block_table.clear();
@@ -367,22 +367,17 @@ impl Scheduler {
             let Some(s) = self.seq_table.get_mut(&seq_id) else {
                 return Ok(None);
             };
-            if let Some(slot) = self.cache.state_slots.get(seq_id) {
+            if let Some(slot) = self.cache.state_slot(seq_id) {
                 s.migrate_state_slot = slot;
             }
-            if let Some(slot) = self.cache.hisparse_slots.get(seq_id) {
+            if let Some(slot) = self.cache.hisparse_slot(seq_id) {
                 s.migrate_hisparse_slot = slot;
             }
-            for (ratio, pool) in &self.cache.compressed_pools {
-                if let Some(pages) = pool.seq_pages.get(&seq_id) {
-                    s.migrate_compressed_block_tables
-                        .insert(*ratio, pages.clone());
-                }
+            for (ratio, pages) in self.cache.compressed_pages(seq_id) {
+                s.migrate_compressed_block_tables.insert(ratio, pages);
             }
         }
-        self.cache
-            .prefix_cached_tokens_by_seq
-            .insert(seq_id, cached);
+        self.cache.set_prefix_cached_tokens(seq_id, cached);
         Ok(Some(new_tokens))
     }
 }

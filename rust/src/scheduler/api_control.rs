@@ -22,7 +22,8 @@ impl Scheduler {
     }
 
     pub(super) fn clear_session_cache_api(&mut self) {
-        self.cache.clear_session_cache(self.group());
+        let group = self.group();
+        self.cache.clear_session_cache(group);
     }
 
     pub(super) fn is_finished_api(&self) -> bool {

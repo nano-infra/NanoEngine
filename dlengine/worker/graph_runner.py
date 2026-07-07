@@ -66,6 +66,7 @@ class DecodeGraphRunner:
     """CUDAGraph capture / replay for standard decode (one token per seq)."""
 
     def __init__(self, config, hf_config, cache_ctx):
+        self.config = config
         max_bs = min(config.max_num_seqs, 512)
         block_size = cache_ctx.block_size
         max_num_blocks = (config.max_model_len + block_size - 1) // block_size

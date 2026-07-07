@@ -1,4 +1,4 @@
-use crate::cache::CacheState;
+use crate::cache::PrefixCacheCoordinator;
 use crate::metrics::{RuntimeMetrics, SequenceMetric, ServerMetric};
 use crate::proto::wire::sequence_to_migration_request_ref;
 use crate::proto::RunnerOut;
@@ -35,7 +35,7 @@ pub struct Scheduler {
     prefilling: Vec<Vec<u64>>,
     to_be_migrated: HashMap<u64, usize>,
     dummy_seq_ids: HashSet<u64>,
-    cache: CacheState,
+    cache: PrefixCacheCoordinator,
     current_step: u64,
     rr_cursor: usize,
     server_metric: ServerMetric,
@@ -46,7 +46,7 @@ pub struct Scheduler {
 mod api;
 mod api_control;
 mod api_metrics;
-mod coordinator;
+mod cache_flow;
 
 fn average_f64(values: &[f64]) -> f64 {
     if values.is_empty() {

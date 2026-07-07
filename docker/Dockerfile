@@ -78,7 +78,7 @@ RUN python3 -m pip install --break-system-packages --default-timeout=600 --retri
         "scikit-build-core>=0.10" \
         "maturin>=1.0,<2.0"
 
-COPY dlengine/pyproject.toml /tmp/dlengine-pyproject.toml
+COPY pyproject.toml /tmp/dlengine-pyproject.toml
 
 RUN python3 -c 'import subprocess, sys, tomllib; data = tomllib.load(open("/tmp/dlengine-pyproject.toml", "rb")); deps = list(data["project"]["dependencies"]); deps += data["project"].get("optional-dependencies", {}).get("cuda-devel", []); skip = {"dlslime"}; deps = [d for d in deps if d.split(";", 1)[0].split("[", 1)[0].split("<", 1)[0].split(">", 1)[0].split("=", 1)[0].strip().lower().replace("_", "-") not in skip]; subprocess.check_call([sys.executable, "-m", "pip", "install", "--break-system-packages", "--default-timeout=600", "--retries=20", "--progress-bar", "off", *deps])'
 
