@@ -580,17 +580,17 @@ class ModelRunner:
         master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
         if (
             context.use_sp_a2a
-            and self.config.sp_backend == "nccl"
+            and (self.config.sp_backend == "nccl" or self.config.fixed_sp_size > 0)
             and context.sp_comm_bs is not None
         ):
-            nccl_min_master_bs = max(bs, context.sp_comm_bs)
+            comm_min_master_bs = max(bs, context.sp_comm_bs)
             try:
                 master_bs = next(
-                    x for x in self.graph_master_rank_bs if x >= nccl_min_master_bs
+                    x for x in self.graph_master_rank_bs if x >= comm_min_master_bs
                 )
             except StopIteration:
                 raise RuntimeError(
-                    f"NCCL SP communication batch {nccl_min_master_bs} exceeds "
+                    f"SP communication batch {comm_min_master_bs} exceeds "
                     f"max captured master_bs ({self.graph_master_rank_bs[-1]})"
                 )
         return master_bs
@@ -666,6 +666,31 @@ class ModelRunner:
         if not graph_bs or graph_bs[-1] != max_bs:
             graph_bs.append(max_bs)
         return graph_bs
+
+    def _build_sp_graph_attn_bs_candidates(
+        self, master_bs: int, sp_world_size: int
+    ) -> list[int]:
+        config = self.config
+        fixed_sp_graph = sp_world_size > 1 and config.fixed_sp_size > 0
+        fixed_full_sp_graph = fixed_sp_graph and config.fixed_sp_size == sp_world_size
+
+        if fixed_full_sp_graph:
+            return [sp_world_size * master_bs]
+
+        limit = master_bs + config.max_num_recv_seqs
+        if fixed_sp_graph:
+            limit = sp_world_size * master_bs
+        elif config.sp_backend == "nccl":
+            limit = min(limit, sp_world_size * master_bs)
+
+        current_attn_bs_candidates = []
+        curr = master_bs
+        while curr <= limit:
+            current_attn_bs_candidates.append(curr)
+            curr += self.attn_bs_step
+        if current_attn_bs_candidates[-1] != limit:
+            current_attn_bs_candidates.append(limit)
+        return current_attn_bs_candidates
 
     @torch.inference_mode()
     def run_model(
@@ -1016,7 +1041,17 @@ class ModelRunner:
             config.max_model_len, hf_config.max_position_embeddings
         )
         max_bs = min(self.config.max_num_seqs, 512)
-        max_attention_comp_seqs = max_bs + config.max_num_recv_seqs
+        fixed_sp_graph = sp_world_size > 1 and config.fixed_sp_size > 0
+        max_attention_comp_seqs = (
+            sp_world_size * max_bs
+            if fixed_sp_graph
+            else max_bs + config.max_num_recv_seqs
+        )
+        max_remote_attention_comp_seqs = (
+            max_attention_comp_seqs
+            if fixed_sp_graph
+            else config.max_num_recv_seqs
+        )
         block_size = get_cache_context().block_size
         max_num_blocks = (config.max_model_len + block_size - 1) // block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
@@ -1039,13 +1074,13 @@ class ModelRunner:
         res_slice_fill_to_buffer_output = torch.full((max_bs,), -1, dtype=torch.int32)
         res_to_buffer_output_mask = torch.zeros(max_bs, dtype=torch.int32)
         res_slice_get_to_buffer_input = torch.full(
-            (config.max_num_recv_seqs,), -1, dtype=torch.int32
+            (max_remote_attention_comp_seqs,), -1, dtype=torch.int32
         )
         res_slice_fill_to_buffer_input = torch.full(
-            (config.max_num_recv_seqs,), -1, dtype=torch.int32
+            (max_remote_attention_comp_seqs,), -1, dtype=torch.int32
         )
         res_to_buffer_input_mask = torch.zeros(
-            config.max_num_recv_seqs, dtype=torch.int32
+            max_remote_attention_comp_seqs, dtype=torch.int32
         )
         q_offsets = torch.zeros(sp_world_size + 1, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
@@ -1136,17 +1171,9 @@ class ModelRunner:
             for master_bs in reversed(self.graph_master_rank_bs):
                 self.sp_graph_map[master_bs] = []
 
-                current_attn_bs_candidates = []
-                curr = master_bs
-                limit = master_bs + config.max_num_recv_seqs
-                if config.sp_backend == "nccl":
-                    limit = min(limit, sp_world_size * master_bs)
-                while curr <= limit:
-                    current_attn_bs_candidates.append(curr)
-                    curr += self.attn_bs_step
-                if current_attn_bs_candidates[-1] != limit:
-                    current_attn_bs_candidates.append(limit)
-
+                current_attn_bs_candidates = self._build_sp_graph_attn_bs_candidates(
+                    master_bs, sp_world_size
+                )
                 for attn_bs in reversed(current_attn_bs_candidates):
                     logger.info(
                         f"正在捕获 SP 图 - (master_bs={master_bs}, attn_bs={attn_bs})"
