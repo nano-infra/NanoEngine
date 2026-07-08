@@ -170,6 +170,10 @@ class Config:
             raise ValueError(
                 "loongserve_decode_scheduler currently supports scheduler_mode='centralized' only"
             )
+        if self.loongserve_decode_scheduler and self.cuda_graph_mode != "full":
+            raise ValueError(
+                "loongserve_decode_scheduler currently supports cuda_graph_mode='full' only"
+            )
         if self.dynamic_sp_size_strategy not in {"legacy", "long_short_sp8", "bucket"}:
             raise ValueError(
                 "dynamic_sp_size_strategy must be one of: legacy, long_short_sp8, bucket"
