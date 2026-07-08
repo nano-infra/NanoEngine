@@ -179,6 +179,12 @@ class Config:
                 "loongserve_decode_scheduler currently supports no-migration "
                 "scale-up/down only; set loongserve_enable_kv_migration=False"
             )
+        if self.loongserve_decode_scheduler and self.sp_backend != "nccl":
+            raise ValueError(
+                "loongserve_decode_scheduler currently requires sp_backend='nccl' "
+                "because no-migration scale-up/down produces asymmetric Q offsets "
+                "that DLSlime legacy_ll/hao_basic do not pack in receiver order"
+            )
         if self.dynamic_sp_size_strategy not in {"legacy", "long_short_sp8", "bucket"}:
             raise ValueError(
                 "dynamic_sp_size_strategy must be one of: legacy, long_short_sp8, bucket"
