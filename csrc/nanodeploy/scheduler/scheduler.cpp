@@ -989,6 +989,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
         int chunk_size = ((int)candidates.size() + (int)append_instances.size() - 1) / (int)append_instances.size();
 
         std::vector<int> master_scheduled_counts(attention_sp_, 0);
+        std::vector<int> remote_recv_scheduled_counts(attention_sp_, 0);
         std::vector<int> sp_lens(attention_sp_, 0);
         std::deque<std::shared_ptr<Sequence>> skipped;
 
@@ -1029,6 +1030,22 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
             }
 
             if (master_scheduled_counts[current_master] >= max_num_seqs_) {
+                skipped.push_back(seq);
+                continue;
+            }
+
+            const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
+            bool exceeds_remote_recv_capacity = false;
+            for (int sp_idx = 0; sp_idx < std::min(attention_sp_, (int)tokens.size()); ++sp_idx) {
+                if (sp_idx == current_master || tokens[sp_idx] <= 0) {
+                    continue;
+                }
+                if (remote_recv_scheduled_counts[sp_idx] >= max_num_recv_seqs_) {
+                    exceeds_remote_recv_capacity = true;
+                    break;
+                }
+            }
+            if (exceeds_remote_recv_capacity) {
                 skipped.push_back(seq);
                 continue;
             }
@@ -1076,6 +1093,11 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
             }
 
             master_scheduled_counts[current_master]++;
+            for (int sp_idx = 0; sp_idx < std::min(attention_sp_, (int)tokens.size()); ++sp_idx) {
+                if (sp_idx != current_master && tokens[sp_idx] > 0) {
+                    remote_recv_scheduled_counts[sp_idx]++;
+                }
+            }
             scheduled_seqs[dp_idx].push_back(seq);
             sp_lens[current_master] += seq->num_tokens;
         }

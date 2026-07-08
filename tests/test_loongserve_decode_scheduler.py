@@ -13,13 +13,14 @@ def _make_scheduler(
     min_batch=2,
     loop_count=1,
     scheduler_mode="centralized",
+    max_recv=8,
 ):
     return Scheduler(
         "",
         loop_count,
         8,  # max_num_seqs
         1024,
-        8,
+        max_recv,
         -1,
         1,  # attention_dp
         attention_sp,
@@ -68,6 +69,17 @@ def _running_seq(token_ids, attention_sp, master_sp):
         len(token_ids) if sp_idx == master_sp else 0
         for sp_idx in range(attention_sp)
     ]
+    seq.status = SequenceStatus.RUNNING
+    return seq
+
+
+def _distributed_running_seq(token_ids, attention_sp, master_sp, dispatched_tokens):
+    seq = Sequence(token_ids, 1.0, 32, False)
+    seq.active("", attention_sp, 1)
+    ctx = seq.block_ctx(BlockContextSlot.ACTIVE)
+    ctx.dp_idx = 0
+    ctx.master_sp_idx = master_sp
+    ctx.num_dispatched_tokens = dispatched_tokens
     seq.status = SequenceStatus.RUNNING
     return seq
 
@@ -203,6 +215,28 @@ def test_loongserve_draining_rank_releases_after_request_finish_without_migratio
     next_result = scheduler.schedule()
     assert list(next_result.loongserve_occupied_instances[0]) == [0]
     assert list(next_result.loongserve_draining_instances[0]) == []
+
+
+def test_loongserve_decode_scheduler_respects_remote_recv_capacity_for_full_graph():
+    scheduler = _make_scheduler(attention_sp=2, block_size=4, min_batch=8, max_recv=1)
+    worker = scheduler.worker_state[0]
+    seqs = [
+        _distributed_running_seq([1, 2, 3, 4, 5], 2, 0, [1, 4])
+        for _ in range(3)
+    ]
+    for seq in seqs:
+        worker.allocate(seq)
+        worker.running.append(seq)
+
+    result = scheduler.schedule()
+
+    scheduled_real = [seq for seq in seqs if seq in list(result.dp_seqs[0])]
+    assert len(scheduled_real) == 1
+    assert result.sp_recv_counts[0][1] == 1
+
+    meta_peer = prepare_decode_cpp(result.dp_seqs[0], 1, 2, 4, 8)
+    assert len(meta_peer.res_slice_get_to_buffer_input) == 1
+    assert len(meta_peer.res_slice_fill_to_buffer_input) == 1
 
 
 def test_loongserve_decode_scheduler_requires_single_token_steps():
