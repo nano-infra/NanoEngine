@@ -85,6 +85,9 @@ Scheduler::Scheduler(const std::string& engine_id,
             "loongserve_decode_scheduler requires loop_count=1 because no-migration elastic "
             "scale-up/down changes decode KV ownership at scheduler-step granularity");
     }
+    if (loongserve_decode_scheduler_ && scheduler_mode != "centralized") {
+        throw std::runtime_error("loongserve_decode_scheduler currently supports centralized scheduler_mode only");
+    }
 
     Sequence::block_size = kvcache_block_size;
     // Initialize worker states
@@ -862,6 +865,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
         }
 
         if (candidates.empty()) {
+            decode_batch_state_by_dp_.erase(dp_idx);
             for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
                 scheduled_seqs[dp_idx].push_back(worker->dummy_seqs[sp_idx]);
             }

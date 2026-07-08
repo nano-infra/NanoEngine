@@ -166,6 +166,10 @@ class Config:
                 "loongserve_decode_scheduler requires loop_count=1 because elastic "
                 "decode scale-up/down changes KV ownership once per scheduler step"
             )
+        if self.loongserve_decode_scheduler and self.scheduler_mode != "centralized":
+            raise ValueError(
+                "loongserve_decode_scheduler currently supports scheduler_mode='centralized' only"
+            )
         if self.dynamic_sp_size_strategy not in {"legacy", "long_short_sp8", "bucket"}:
             raise ValueError(
                 "dynamic_sp_size_strategy must be one of: legacy, long_short_sp8, bucket"

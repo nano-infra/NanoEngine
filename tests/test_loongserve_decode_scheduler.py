@@ -7,7 +7,13 @@ from nanodeploy._cpp import (
 )
 
 
-def _make_scheduler(attention_sp=4, block_size=4, min_batch=2, loop_count=1):
+def _make_scheduler(
+    attention_sp=4,
+    block_size=4,
+    min_batch=2,
+    loop_count=1,
+    scheduler_mode="centralized",
+):
     return Scheduler(
         "",
         loop_count,
@@ -44,7 +50,7 @@ def _make_scheduler(attention_sp=4, block_size=4, min_batch=2, loop_count=1):
         "RoundRobin",
         False,
         0,
-        "centralized",
+        scheduler_mode,
         True,
         False,
         "block",
@@ -149,6 +155,33 @@ def test_loongserve_decode_scheduler_requires_single_token_steps():
         assert "loop_count=1" in str(exc)
     else:
         raise AssertionError("expected loop_count guard for LoongServe decode scheduler")
+
+
+def test_loongserve_decode_scheduler_rejects_decentralized_mode():
+    try:
+        _make_scheduler(attention_sp=2, block_size=4, min_batch=2, scheduler_mode="decentralized")
+    except RuntimeError as exc:
+        assert "centralized" in str(exc)
+    else:
+        raise AssertionError("expected centralized scheduler_mode guard")
+
+
+def test_loongserve_decode_scheduler_clears_state_for_empty_decode_batch():
+    scheduler = _make_scheduler(attention_sp=2, block_size=4, min_batch=4)
+    worker = scheduler.worker_state[0]
+    seq = _running_seq([1, 2, 3, 4], 2, 0)
+    worker.allocate(seq)
+    worker.running.append(seq)
+
+    result = scheduler.schedule()
+    assert list(result.loongserve_occupied_instances[0]) == [0]
+
+    worker.running.remove(seq)
+
+    empty_result = scheduler.schedule()
+    assert list(empty_result.loongserve_occupied_instances[0]) == []
+    assert list(empty_result.loongserve_append_instances[0]) == []
+    assert list(empty_result.loongserve_draining_instances[0]) == []
 
 
 def test_decode_kv_accounting_uses_num_dispatched_tokens():
