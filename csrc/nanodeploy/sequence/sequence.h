@@ -36,6 +36,7 @@ struct BlockContext {
     std::string engine_id_;
     int         dp_idx_        = -1;
     int         master_sp_idx_ = 0;
+    int         append_sp_idx_ = -1;
     int         attention_sp_  = 1;
     int         attention_dp_  = 1;
 
@@ -73,12 +74,14 @@ struct BlockContext {
                int,
                int,
                int,
+               int,
                std::vector<std::pair<int, int>>,
                std::vector<std::vector<int>>,
                std::vector<int>>
     getstate() const;
 
     static BlockContext setstate(const std::tuple<std::string,
+                                                  int,
                                                   int,
                                                   int,
                                                   int,

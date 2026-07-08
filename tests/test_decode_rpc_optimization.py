@@ -45,6 +45,7 @@ def _make_seq(
     *,
     seq_id: int,
     master_sp_idx: int,
+    append_sp_idx: int = -1,
     num_dispatched_tokens: list[int],
     sp_block_tables: dict[int, list[int]],
     block_location: list[tuple[int, int]],
@@ -62,6 +63,7 @@ def _make_seq(
     ctx = seq.block_ctx(BlockContextSlot.ACTIVE)
     ctx.dp_idx = 0
     ctx.master_sp_idx = master_sp_idx
+    ctx.append_sp_idx = append_sp_idx
     ctx.num_dispatched_tokens = num_dispatched_tokens
     ctx.block_location.clear()
     for pair in block_location:
@@ -99,6 +101,7 @@ def _build_regression_case() -> list[Sequence]:
         _make_seq(
             seq_id=12,
             master_sp_idx=1,
+            append_sp_idx=0,
             num_dispatched_tokens=[1, 4],
             sp_block_tables={0: [120], 1: [220]},
             block_location=[(0, 120), (1, 220)],
@@ -176,6 +179,7 @@ def test_decode_optimize_roundtrip_trims_only_target_rank_heavy_fields():
         assert restored_ctx.engine_id == original_ctx.engine_id
         assert restored_ctx.dp_idx == original_ctx.dp_idx
         assert restored_ctx.master_sp_idx == original_ctx.master_sp_idx
+        assert restored_ctx.append_sp_idx == original_ctx.append_sp_idx
         assert restored_ctx.attention_sp == original_ctx.attention_sp
         assert restored_ctx.attention_dp == original_ctx.attention_dp
         assert restored_ctx.num_dispatched_tokens == original_ctx.num_dispatched_tokens

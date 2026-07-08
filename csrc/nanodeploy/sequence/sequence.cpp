@@ -22,14 +22,17 @@ void BlockContext::reset(const std::string& engine_id, int attention_sp, int att
     engine_id_     = engine_id;
     dp_idx_        = 0;
     master_sp_idx_ = 0;
+    append_sp_idx_ = -1;
     attention_sp_  = attention_sp;
     attention_dp_  = attention_dp;
 
-    sp_block_table.resize(attention_sp, {});
-    num_dispatched_tokens.resize(attention_sp, 0);
+    block_location.clear();
+    sp_block_table.assign(attention_sp, {});
+    num_dispatched_tokens.assign(attention_sp, 0);
 }
 
 std::tuple<std::string,
+           int,
            int,
            int,
            int,
@@ -48,6 +51,7 @@ BlockContext::getstate() const
     return std::make_tuple(engine_id_,
                            dp_idx_,
                            master_sp_idx_,
+                           append_sp_idx_,
                            attention_sp_,
                            attention_dp_,
                            std::vector<std::pair<int, int>>(block_location.begin(), block_location.end()),
@@ -60,6 +64,7 @@ BlockContext BlockContext::setstate(const std::tuple<std::string,
                                                      int,
                                                      int,
                                                      int,
+                                                     int,
                                                      std::vector<std::pair<int, int>>,
                                                      std::vector<std::vector<int>>,
                                                      std::vector<int>>& state)
@@ -68,17 +73,18 @@ BlockContext BlockContext::setstate(const std::tuple<std::string,
     ctx.engine_id_     = std::get<0>(state);
     ctx.dp_idx_        = std::get<1>(state);
     ctx.master_sp_idx_ = std::get<2>(state);
-    ctx.attention_sp_  = std::get<3>(state);
-    ctx.attention_dp_  = std::get<4>(state);
-    ctx.block_location = BlockContext::BlockLocationList(std::get<5>(state).begin(), std::get<5>(state).end());
+    ctx.append_sp_idx_ = std::get<3>(state);
+    ctx.attention_sp_  = std::get<4>(state);
+    ctx.attention_dp_  = std::get<5>(state);
+    ctx.block_location = BlockContext::BlockLocationList(std::get<6>(state).begin(), std::get<6>(state).end());
 
-    auto block_table = std::get<6>(state);
+    auto block_table = std::get<7>(state);
     ctx.sp_block_table.resize(block_table.size(), {});
     for (size_t i = 0; i < block_table.size(); ++i) {
         ctx.sp_block_table[i] = BlockContext::BlockIdList(block_table[i].begin(), block_table[i].end());
     }
 
-    ctx.num_dispatched_tokens = std::get<7>(state);
+    ctx.num_dispatched_tokens = std::get<8>(state);
     return ctx;
 }
 

@@ -127,6 +127,7 @@ void bind_sequence(py::module_& m)
         .def_readwrite("engine_id", &BlockContext::engine_id_)
         .def_readwrite("dp_idx", &BlockContext::dp_idx_)
         .def_readwrite("master_sp_idx", &BlockContext::master_sp_idx_)
+        .def_readwrite("append_sp_idx", &BlockContext::append_sp_idx_)
         .def_readwrite("attention_sp", &BlockContext::attention_sp_)
         .def_readwrite("attention_dp", &BlockContext::attention_dp_)
         .def_property("num_dispatched_tokens",
@@ -145,6 +146,7 @@ void bind_sequence(py::module_& m)
         .def("reset", &BlockContext::reset, py::arg("engine_id"), py::arg("attention_sp"), py::arg("attention_dp"))
         .def(py::pickle([](const BlockContext& p) { return p.getstate(); },
                         [](const std::tuple<std::string,
+                                            int,
                                             int,
                                             int,
                                             int,

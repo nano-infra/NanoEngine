@@ -66,7 +66,19 @@ def _running_seq(token_ids, attention_sp, master_sp):
     return seq
 
 
-def test_loongserve_decode_scheduler_splits_compute_bound_batch_across_masters():
+def _append_target(seq):
+    ctx = seq.block_ctx(BlockContextSlot.ACTIVE)
+    return ctx.append_sp_idx if ctx.append_sp_idx >= 0 else ctx.master_sp_idx
+
+
+def _token_ids_for(result):
+    return [
+        [[1000 + sp_idx * 100 + seq_idx] for seq_idx, _seq in enumerate(sp_seqs)]
+        for sp_idx, sp_seqs in enumerate(result.filtered_dp_sp_seqs)
+    ]
+
+
+def test_loongserve_decode_scheduler_scales_out_new_kv_without_migration():
     scheduler = _make_scheduler(attention_sp=4, block_size=4, min_batch=2)
     worker = scheduler.worker_state[0]
     seqs = [_running_seq([1, 2, 3, 4], 4, 0) for _ in range(6)]
@@ -78,10 +90,24 @@ def test_loongserve_decode_scheduler_splits_compute_bound_batch_across_masters()
 
     assert result.is_prefill is False
     masters = {seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx for seq in seqs}
-    assert len(masters) >= 3
+    append_targets = {_append_target(seq) for seq in seqs}
+    assert masters == {0}
+    assert len(append_targets) >= 3
     for seq in seqs:
-        master = seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
-        assert len(seq.block_table(BlockContextSlot.ACTIVE, master)) >= 1
+        target = _append_target(seq)
+        assert len(seq.block_table(BlockContextSlot.ACTIVE, target)) >= 1
+
+    scheduler.postprocess(result.filtered_dp_sp_seqs, _token_ids_for(result), False, 0.0, 1)
+
+    masters_after_append = {seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx for seq in seqs}
+    assert masters_after_append == append_targets
+    for seq in seqs:
+        assert seq.block_ctx(BlockContextSlot.ACTIVE).append_sp_idx == -1
+
+    next_result = scheduler.schedule()
+    assert next_result.is_prefill is False
+    next_masters = {seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx for seq in seqs}
+    assert len(next_masters) >= 3
 
 
 def test_decode_kv_accounting_uses_num_dispatched_tokens():

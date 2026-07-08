@@ -968,18 +968,29 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
         }
 
         int chunk_size = ((int)candidates.size() + (int)masters.size() - 1) / (int)masters.size();
-        for (size_t master_idx = 0; master_idx < masters.size(); ++master_idx) {
-            int begin = static_cast<int>(master_idx) * chunk_size;
-            int end = std::min(static_cast<int>(candidates.size()), begin + chunk_size);
-            if (begin < end) {
-                batch_state.master_sp_for_step.push_back(masters[master_idx]);
-                batch_state.mini_batch_ranges.push_back({begin, end});
-            }
-        }
 
         std::vector<int> master_scheduled_counts(attention_sp_, 0);
         std::vector<int> sp_lens(attention_sp_, 0);
         std::deque<std::shared_ptr<Sequence>> skipped;
+
+        auto choose_current_master = [&](const Sequence& seq) {
+            const auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
+            const auto& tokens = block_ctx.num_dispatched_tokens;
+            int current_master = block_ctx.master_sp_idx_;
+            if (current_master >= 0 && current_master < attention_sp_
+                && current_master < (int)tokens.size() && tokens[current_master] > 0) {
+                return current_master;
+            }
+            int fallback = -1;
+            int max_tokens = -1;
+            for (int sp_idx = 0; sp_idx < std::min(attention_sp_, (int)tokens.size()); ++sp_idx) {
+                if (tokens[sp_idx] > 0 && tokens[sp_idx] > max_tokens) {
+                    fallback = sp_idx;
+                    max_tokens = tokens[sp_idx];
+                }
+            }
+            return fallback;
+        };
 
         for (size_t seq_idx = 0; seq_idx < candidates.size(); ++seq_idx) {
             auto& seq = candidates[seq_idx];
@@ -987,26 +998,8 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
                 static_cast<int>(masters.size()) - 1,
                 static_cast<int>(seq_idx) / std::max(1, chunk_size));
 
-            int selected_master = -1;
-            bool has_step_slot = false;
-            for (int attempt = 0; attempt < static_cast<int>(masters.size()); ++attempt) {
-                int master = masters[(preferred_master_idx + attempt) % masters.size()];
-                if (master_scheduled_counts[master] >= max_num_seqs_) {
-                    continue;
-                }
-                has_step_slot = true;
-                if (!worker->can_append_on_sp(*seq, master, loop_count_)) {
-                    continue;
-                }
-                selected_master = master;
-                break;
-            }
-
-            if (selected_master < 0) {
-                if (!has_step_slot) {
-                    skipped.push_back(seq);
-                    continue;
-                }
+            int current_master = choose_current_master(*seq);
+            if (current_master < 0 || current_master >= attention_sp_) {
                 if (loongserve_enable_kv_migration_) {
                     DecodeKVMigrationPlan plan;
                     plan.dp_idx = dp_idx;
@@ -1016,15 +1009,74 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
                 continue;
             }
 
-            worker->set_decode_master(*seq, selected_master);
-            if (!worker->may_append_on_sp(*seq, selected_master, loop_count_)) {
+            if (master_scheduled_counts[current_master] >= max_num_seqs_) {
+                skipped.push_back(seq);
+                continue;
+            }
+
+            int selected_append_sp = -1;
+            if (loop_count_ == 1) {
+                for (int attempt = 0; attempt < static_cast<int>(masters.size()); ++attempt) {
+                    int append_sp = masters[(preferred_master_idx + attempt) % masters.size()];
+                    if (!worker->can_append_on_sp(*seq, append_sp, loop_count_)) {
+                        continue;
+                    }
+                    selected_append_sp = append_sp;
+                    break;
+                }
+            }
+            else if (worker->can_append_on_sp(*seq, current_master, loop_count_)) {
+                selected_append_sp = current_master;
+            }
+
+            if (selected_append_sp < 0) {
+                if (worker->can_append_on_sp(*seq, current_master, loop_count_)) {
+                    selected_append_sp = current_master;
+                }
+                else if (loongserve_enable_kv_migration_) {
+                    DecodeKVMigrationPlan plan;
+                    plan.dp_idx = dp_idx;
+                    pending_decode_kv_migration_plans_.push_back(std::move(plan));
+                }
+            }
+
+            if (selected_append_sp < 0) {
                 preempt(dp_idx, seq);
                 continue;
             }
 
-            master_scheduled_counts[selected_master]++;
+            worker->set_decode_master(*seq, current_master);
+
+            auto& block_ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
+            block_ctx.append_sp_idx_ = selected_append_sp != current_master ? selected_append_sp : -1;
+
+            if (!worker->may_append_on_sp(*seq, selected_append_sp, loop_count_)) {
+                block_ctx.append_sp_idx_ = -1;
+                preempt(dp_idx, seq);
+                continue;
+            }
+
+            master_scheduled_counts[current_master]++;
             scheduled_seqs[dp_idx].push_back(seq);
-            sp_lens[selected_master] += seq->num_tokens;
+            sp_lens[current_master] += seq->num_tokens;
+        }
+
+        int range_begin = -1;
+        int range_master = -1;
+        for (int seq_idx = 0; seq_idx < static_cast<int>(scheduled_seqs[dp_idx].size()); ++seq_idx) {
+            int master = scheduled_seqs[dp_idx][seq_idx]->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+            if (master != range_master) {
+                if (range_begin >= 0) {
+                    batch_state.master_sp_for_step.push_back(range_master);
+                    batch_state.mini_batch_ranges.push_back({range_begin, seq_idx});
+                }
+                range_begin = seq_idx;
+                range_master = master;
+            }
+        }
+        if (range_begin >= 0) {
+            batch_state.master_sp_for_step.push_back(range_master);
+            batch_state.mini_batch_ranges.push_back({range_begin, static_cast<int>(scheduled_seqs[dp_idx].size())});
         }
 
         for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {

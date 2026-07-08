@@ -76,9 +76,22 @@ static void worker_func(std::shared_ptr<SPStateManager> state_manager,
                                              + " for seq_id=" + std::to_string(seq->seq_id));
                 }
 
-                seq->append_token(token_id, BlockContextSlot::ACTIVE, task.sp_idx);
-                state_manager->add_running_tokens(task.sp_idx, 1);
+                auto& block_ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
+                int   append_sp_idx = block_ctx.append_sp_idx_ >= 0 ? block_ctx.append_sp_idx_ : master_sp_idx;
+                if (append_sp_idx < 0 || append_sp_idx >= block_ctx.attention_sp_) {
+                    throw std::runtime_error("append_sp_idx out of range: append_sp_idx="
+                                             + std::to_string(append_sp_idx)
+                                             + " for seq_id=" + std::to_string(seq->seq_id));
+                }
+
+                seq->append_token(token_id, BlockContextSlot::ACTIVE, append_sp_idx);
+                state_manager->add_running_tokens(append_sp_idx, 1);
                 seq_tokens_this_step[seq]++;
+
+                if (append_sp_idx != master_sp_idx) {
+                    state_manager->set_decode_master(*seq, append_sp_idx);
+                    block_ctx.append_sp_idx_ = -1;
+                }
 
                 bool finished =
                     (!seq->ignore_eos && token_id == eos_id) || (seq->num_completed_tokens() >= seq->max_tokens);

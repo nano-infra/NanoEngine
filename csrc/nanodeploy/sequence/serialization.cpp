@@ -63,6 +63,7 @@ void serialize_block_context(uintptr_t      base,
     // Primitives
     write_raw(base, off, max, ctx.dp_idx_);
     write_raw(base, off, max, ctx.master_sp_idx_);
+    write_raw(base, off, max, ctx.append_sp_idx_);
     write_raw(base, off, max, ctx.attention_sp_);
     write_raw(base, off, max, ctx.attention_dp_);
 
@@ -114,6 +115,7 @@ void deserialize_block_context(uintptr_t base, size_t& off, size_t max, BlockCon
 
     ctx.dp_idx_        = read_raw<int>(base, off, max);
     ctx.master_sp_idx_ = read_raw<int>(base, off, max);
+    ctx.append_sp_idx_ = read_raw<int>(base, off, max);
     ctx.attention_sp_  = read_raw<int>(base, off, max);
     ctx.attention_dp_  = read_raw<int>(base, off, max);
 
