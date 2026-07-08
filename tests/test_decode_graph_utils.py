@@ -4,9 +4,27 @@ import pytest
 import torch
 
 from nanodeploy.worker.decode_graph_utils import (
+    copy_tensor_to_graph_buffer,
     select_decode_graph_master_bs,
     validate_decode_graph_copy_capacity,
 )
+
+
+def test_copy_tensor_to_graph_buffer_pads_dynamic_metadata():
+    source = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    target = torch.full((3, 2), -1, dtype=torch.int32)
+
+    copy_tensor_to_graph_buffer("tile_scheduler_metadata", source, target)
+
+    assert target.tolist() == [[1, 2], [3, 4], [0, 0]]
+
+
+def test_copy_tensor_to_graph_buffer_rejects_oversized_metadata():
+    source = torch.empty((3, 2), dtype=torch.int32)
+    target = torch.empty((2, 2), dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="tile_scheduler_metadata"):
+        copy_tensor_to_graph_buffer("tile_scheduler_metadata", source, target)
 
 
 def test_select_decode_graph_master_bs_accounts_for_dynamic_sp_attention_rows():

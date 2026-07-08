@@ -5,6 +5,35 @@ from typing import Any
 import torch
 
 
+def copy_tensor_to_graph_buffer(
+    name: str,
+    source: torch.Tensor,
+    target: torch.Tensor,
+) -> None:
+    if source.ndim != target.ndim:
+        raise RuntimeError(
+            "Decode CUDA graph buffer rank mismatch for dynamic metadata: "
+            f"{name} source ndim={source.ndim}, target ndim={target.ndim}."
+        )
+    if any(
+        source_dim > target_dim
+        for source_dim, target_dim in zip(source.shape, target.shape)
+    ):
+        raise RuntimeError(
+            "Decode CUDA graph buffer is too small for dynamic metadata: "
+            f"{name} requires shape={tuple(source.shape)}, "
+            f"captured shape={tuple(target.shape)}."
+        )
+
+    target.zero_()
+    if source.shape == target.shape:
+        target.copy_(source)
+        return
+
+    target_slices = tuple(slice(0, dim) for dim in source.shape)
+    target[target_slices].copy_(source)
+
+
 def select_decode_graph_master_bs(
     graph_master_rank_bs: list[int],
     sp_graph_map: dict[int, list[int]] | None,

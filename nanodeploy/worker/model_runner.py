@@ -26,6 +26,7 @@ from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.cache import get_cache_context, set_cache_context
 from nanodeploy.worker.context import get_context, reset_context, set_context
 from nanodeploy.worker.decode_graph_utils import (
+    copy_tensor_to_graph_buffer,
     select_decode_graph_master_bs,
     validate_decode_graph_copy_capacity,
 )
@@ -597,6 +598,37 @@ class ModelRunner:
     ) -> None:
         validate_decode_graph_copy_capacity(graph_vars, context)
 
+    def _compute_mla_metadata(self, context_lens_for_attn: torch.Tensor):
+        hf_config = self.config.hf_config
+        return flash_mla.get_mla_metadata(
+            context_lens_for_attn,
+            hf_config.num_attention_heads // hf_config.num_key_value_heads,
+            hf_config.num_key_value_heads,
+        )
+
+    def _copy_mla_metadata_to_graph_vars(
+        self,
+        graph_vars: dict[str, torch.Tensor | None],
+        graph_attention_bs: int,
+    ) -> None:
+        tile_scheduler_metadata = graph_vars.get("tile_scheduler_metadata")
+        num_splits = graph_vars.get("num_splits")
+        if tile_scheduler_metadata is None or num_splits is None:
+            return
+        if self.config.hf_config.num_key_value_heads != 1:
+            return
+
+        context_lens = graph_vars["context_lens_for_attn"][:graph_attention_bs]
+        current_tile_scheduler_metadata, current_num_splits = self._compute_mla_metadata(
+            context_lens
+        )
+        copy_tensor_to_graph_buffer(
+            "tile_scheduler_metadata",
+            current_tile_scheduler_metadata,
+            tile_scheduler_metadata,
+        )
+        copy_tensor_to_graph_buffer("num_splits", current_num_splits, num_splits)
+
     def _copy_decode_context_to_graph_vars(
         self,
         graph_vars: dict[str, torch.Tensor | None],
@@ -604,6 +636,7 @@ class ModelRunner:
         positions: torch.Tensor,
         bs: int,
         context,
+        graph_attention_bs: int | None = None,
     ) -> None:
         self._validate_decode_graph_copy_capacity(graph_vars, context)
 
@@ -629,16 +662,14 @@ class ModelRunner:
             : context.block_tables.size(0), : context.block_tables.size(1)  # type: ignore
         ] = context.block_tables
 
-        config = self.config
-        hf_config = config.hf_config
-        if hf_config.num_key_value_heads == 1 and graph_vars.get("tile_scheduler_metadata") is not None:
-            graph_vars["tile_scheduler_metadata"].zero_()
-            graph_vars["num_splits"].zero_()
-
         graph_vars["context_lens_for_attn"].zero_()
         graph_vars["context_lens_for_attn"][
             : context.context_lens_for_attn.shape[0]
         ].copy_(context.context_lens_for_attn)  # type: ignore
+        self._copy_mla_metadata_to_graph_vars(
+            graph_vars,
+            graph_attention_bs or int(context.attention_compute_bs or bs),
+        )
 
         graph_vars["q_slice_get"].fill_(-1)
         graph_vars["q_slice_fill"].fill_(-1)
@@ -732,7 +763,12 @@ class ModelRunner:
 
         graph_vars = self.graph_vars
         self._copy_decode_context_to_graph_vars(
-            graph_vars, input_ids, positions, bs, context
+            graph_vars,
+            input_ids,
+            positions,
+            bs,
+            context,
+            graph_attention_bs=attn_bs if context.use_sp_a2a else master_bs,
         )
         graph.replay()
         return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -750,7 +786,12 @@ class ModelRunner:
         graph_vars = self.piecewise_graph_vars[master_bs]
 
         self._copy_decode_context_to_graph_vars(
-            graph_vars, input_ids, positions, bs, context
+            graph_vars,
+            input_ids,
+            positions,
+            bs,
+            context,
+            graph_attention_bs=master_bs,
         )
 
         temp_context_fields = {
@@ -1114,6 +1155,21 @@ class ModelRunner:
 
         def capture_graph(master_bs: int, attn_bs: int, use_sp_a2a: bool):
             graph = torch.cuda.CUDAGraph()
+            if tile_scheduler_metadata_buffer is not None and num_splits_buffer is not None:
+                (
+                    current_tile_scheduler_metadata,
+                    current_num_splits,
+                ) = self._compute_mla_metadata(context_lens_for_attn[:attn_bs])
+                copy_tensor_to_graph_buffer(
+                    "tile_scheduler_metadata",
+                    current_tile_scheduler_metadata,
+                    tile_scheduler_metadata_buffer,
+                )
+                copy_tensor_to_graph_buffer(
+                    "num_splits",
+                    current_num_splits,
+                    num_splits_buffer,
+                )
             set_context(
                 is_prefill=False,
                 max_bs=self.config.max_num_seqs,

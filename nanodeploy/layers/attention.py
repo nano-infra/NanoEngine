@@ -359,11 +359,15 @@ class FlashMLAImpl:
                 # tile_scheduler_metadata = context.tile_scheduler_metadata
                 # num_splits = context.num_splits[: context.attention_compute_bs + 1]
 
-            tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
-                context_lens,
-                self.num_heads // self.num_kv_heads,
-                self.num_kv_heads,
-            )
+            if context.tile_scheduler_metadata is not None and context.num_splits is not None:
+                tile_scheduler_metadata = context.tile_scheduler_metadata
+                num_splits = context.num_splits[: context.attention_compute_bs + 1]
+            else:
+                tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
+                    context_lens,
+                    self.num_heads // self.num_kv_heads,
+                    self.num_kv_heads,
+                )
 
             o, lse = flash_mla.flash_mla_with_kvcache(
                 q.unsqueeze(1),
