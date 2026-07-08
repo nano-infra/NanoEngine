@@ -58,6 +58,17 @@ static void build_block_tables_packed(const std::vector<Sequence*>& dp_seqs,
     }
 }
 
+static int decode_context_len_for_step(Sequence* seq, int sp_rank)
+{
+    int ctx_len = seq->context_len(BlockContextSlot::ACTIVE, sp_rank);
+    if (ctx_len == 0
+        && seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_ == sp_rank
+        && !seq->block_table(BlockContextSlot::ACTIVE, sp_rank).empty()) {
+        return 1;
+    }
+    return ctx_len;
+}
+
 // Helper for dense block tables (keep for prefill if needed, or implement inline)
 static void build_block_tables_dense(const std::vector<Sequence*>& dp_seqs,
                                      int                           sp_rank,
@@ -235,7 +246,7 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
         for (int seq_id = 0; seq_id < max_num_seqs; ++seq_id) {
             if (seq_id < (int)batch_seqs.size()) {
                 Sequence* seq     = batch_seqs[seq_id];
-                int       ctx_len = seq->context_len(BlockContextSlot::ACTIVE, sp_rank);
+                int       ctx_len = decode_context_len_for_step(seq, sp_rank);
                 meta.context_lens_flat[sp_idx * max_num_seqs + seq_id] = ctx_len;
 
                 if (ctx_len > 0) {
@@ -253,7 +264,7 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
             if (seq_id < (int)my_master_seqs.size()) {
                 Sequence* seq = my_master_seqs[seq_id];
                 meta.global_context_lens_flat[sp_idx * max_num_seqs + seq_id] =
-                    seq->context_len(BlockContextSlot::ACTIVE, sp_idx);
+                    decode_context_len_for_step(seq, sp_idx);
             }
         }
     }
@@ -265,7 +276,7 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
     for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
         const auto& batch_seqs = sp_seqs[sp_idx];
         for (int seq_id = 0; seq_id < (int)batch_seqs.size(); ++seq_id) {
-            int ctx_len = batch_seqs[seq_id]->context_len(BlockContextSlot::ACTIVE, sp_rank);
+            int ctx_len = decode_context_len_for_step(batch_seqs[seq_id], sp_rank);
             if (ctx_len > 0) {
                 meta.context_lens_for_attn.push_back(ctx_len);
             }
@@ -277,7 +288,7 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
     // q_slice_get: seq_id for my rank where ctx_len > 0
     const auto& my_sp_seqs = sp_seqs[sp_rank];
     for (int seq_id = 0; seq_id < (int)my_sp_seqs.size(); ++seq_id) {
-        int ctx_len = my_sp_seqs[seq_id]->context_len(BlockContextSlot::ACTIVE, sp_rank);
+        int ctx_len = decode_context_len_for_step(my_sp_seqs[seq_id], sp_rank);
         if (ctx_len > 0) {
             meta.q_slice_get.push_back(seq_id);
         }
@@ -319,7 +330,7 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
 
         const auto& batch_seqs = sp_seqs[sp_idx];
         for (int seq_id = 0; seq_id < (int)batch_seqs.size(); ++seq_id) {
-            int ctx_len = batch_seqs[seq_id]->context_len(BlockContextSlot::ACTIVE, sp_rank);
+            int ctx_len = decode_context_len_for_step(batch_seqs[seq_id], sp_rank);
             if (ctx_len > 0) {
                 meta.res_slice_get_to_buffer_input.push_back(current_attention_pos);
                 meta.res_slice_fill_to_buffer_input.push_back(sp_idx * max_num_seqs + seq_id);

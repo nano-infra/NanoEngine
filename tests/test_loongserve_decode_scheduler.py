@@ -126,6 +126,9 @@ def test_loongserve_decode_scheduler_scales_out_new_kv_without_migration():
     moved_block = moved_seq.block_table(BlockContextSlot.ACTIVE, moved_master)[0]
     assert meta_new_master.use_sp_a2a is True
     assert meta_new_master.slot_mapping[moved_idx] == moved_block * 4
+    assert meta_new_master.context_lens_flat[moved_master * 8 + moved_idx] == 1
+    assert meta_new_master.global_context_lens_flat[moved_master * 8 + moved_idx] == 1
+    assert moved_idx in list(meta_new_master.q_slice_get)
 
     meta_old_owner = prepare_decode_cpp(result.dp_seqs[0], 0, 4, 4, 8)
     assert meta_old_owner.use_sp_a2a is True
@@ -339,3 +342,8 @@ def test_prepare_decode_accepts_master_with_preallocated_empty_kv_block():
     block_id = seq.block_table(BlockContextSlot.ACTIVE, 1)[0]
     assert meta.use_sp_a2a is True
     assert meta.slot_mapping == [block_id * 4]
+    assert meta.context_lens_for_attn == [1]
+    assert meta.context_lens_flat[8] == 1
+    assert meta.global_context_lens_flat[:2] == [4, 0]
+    assert meta.global_context_lens_flat[8:10] == [1, 0]
+    assert meta.q_slice_get == [0]
