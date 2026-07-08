@@ -730,7 +730,7 @@ def create_test_data(
     # 实际上，block_tables应该是每个rank按照自己处理的segment_len来创建
     # 但由于所有ranks都创建相同的test_data结构，我们使用segment_len（第一个rank的长度）来创建
     segment_len_per_rank = seq_len // sp_size  # 每个rank处理的token数量（均匀分配时）
-    num_pages_per_rank = segment_len_per_rank // page_size  # 每个rank的pages数量
+    num_pages_per_rank = (segment_len_per_rank + page_size - 1) // page_size
     block_tables = torch.arange(
         batch_size * num_pages_per_rank, device=device, dtype=torch.int32
     ).view(batch_size, num_pages_per_rank)
