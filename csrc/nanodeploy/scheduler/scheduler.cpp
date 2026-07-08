@@ -988,6 +988,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
         int chunk_size = ((int)candidates.size() + (int)append_instances.size() - 1) / (int)append_instances.size();
 
         std::vector<int> master_scheduled_counts(attention_sp_, 0);
+        std::vector<int> append_scheduled_counts(attention_sp_, 0);
         std::vector<int> remote_recv_scheduled_counts(attention_sp_, 0);
         std::vector<int> sp_lens(attention_sp_, 0);
         std::deque<std::shared_ptr<Sequence>> skipped;
@@ -1028,24 +1029,30 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
                 continue;
             }
 
-            int selected_master_sp = -1;
+            int selected_master_sp = current_kv_owner;
+            int selected_append_sp = -1;
             if (loop_count_ == 1) {
                 for (int attempt = 0; attempt < static_cast<int>(append_instances.size()); ++attempt) {
                     int append_sp = append_instances[(preferred_master_idx + attempt) % append_instances.size()];
+                    if (append_scheduled_counts[append_sp] >= max_num_seqs_) {
+                        continue;
+                    }
                     if (!worker->can_append_on_sp(*seq, append_sp, loop_count_)) {
                         continue;
                     }
-                    selected_master_sp = append_sp;
+                    selected_append_sp = append_sp;
                     break;
                 }
             }
-            else if (worker->can_append_on_sp(*seq, current_kv_owner, loop_count_)) {
-                selected_master_sp = current_kv_owner;
+            else if (append_scheduled_counts[current_kv_owner] < max_num_seqs_
+                     && worker->can_append_on_sp(*seq, current_kv_owner, loop_count_)) {
+                selected_append_sp = current_kv_owner;
             }
 
-            if (selected_master_sp < 0) {
-                if (worker->can_append_on_sp(*seq, current_kv_owner, loop_count_)) {
-                    selected_master_sp = current_kv_owner;
+            if (selected_append_sp < 0) {
+                if (append_scheduled_counts[current_kv_owner] < max_num_seqs_
+                    && worker->can_append_on_sp(*seq, current_kv_owner, loop_count_)) {
+                    selected_append_sp = current_kv_owner;
                 }
                 else if (loongserve_enable_kv_migration_) {
                     DecodeKVMigrationPlan plan;
@@ -1054,7 +1061,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
                 }
             }
 
-            if (selected_master_sp < 0) {
+            if (selected_append_sp < 0) {
                 preempt(dp_idx, seq);
                 continue;
             }
@@ -1080,15 +1087,17 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
                 continue;
             }
 
-            if (!worker->may_append_on_sp(*seq, selected_master_sp, loop_count_)) {
+            if (!worker->may_append_on_sp(*seq, selected_append_sp, loop_count_)) {
                 preempt(dp_idx, seq);
                 continue;
             }
 
             worker->set_decode_master(*seq, selected_master_sp);
-            seq->block_ctx(BlockContextSlot::ACTIVE).append_sp_idx_ = -1;
+            seq->block_ctx(BlockContextSlot::ACTIVE).append_sp_idx_ =
+                selected_append_sp == selected_master_sp ? -1 : selected_append_sp;
 
             master_scheduled_counts[selected_master_sp]++;
+            append_scheduled_counts[selected_append_sp]++;
             for (int sp_idx = 0; sp_idx < std::min(attention_sp_, (int)tokens.size()); ++sp_idx) {
                 if (sp_idx != selected_master_sp && tokens[sp_idx] > 0) {
                     remote_recv_scheduled_counts[sp_idx]++;

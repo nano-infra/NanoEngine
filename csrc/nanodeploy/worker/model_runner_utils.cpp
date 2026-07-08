@@ -60,13 +60,7 @@ static void build_block_tables_packed(const std::vector<Sequence*>& dp_seqs,
 
 static int decode_context_len_for_step(Sequence* seq, int sp_rank)
 {
-    int ctx_len = seq->context_len(BlockContextSlot::ACTIVE, sp_rank);
-    if (ctx_len == 0
-        && seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_ == sp_rank
-        && !seq->block_table(BlockContextSlot::ACTIVE, sp_rank).empty()) {
-        return 1;
-    }
-    return ctx_len;
+    return seq->context_len(BlockContextSlot::ACTIVE, sp_rank);
 }
 
 // Helper for dense block tables (keep for prefill if needed, or implement inline)
@@ -209,16 +203,10 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
             int page_id = -1;
             int offset = 0;
             if (current_dispatched <= 0) {
-                const auto& bt = seq->block_table(BlockContextSlot::ACTIVE, sp_rank);
-                if (bt.empty()) {
-                    throw std::runtime_error("decode master has no preallocated KV block");
-                }
-                page_id = bt.front();
-                offset = 0;
-            } else {
-                page_id = seq->last_block_page_id(BlockContextSlot::ACTIVE, sp_rank);
-                offset  = seq->last_block_num_tokens(BlockContextSlot::ACTIVE, sp_rank) - 1;
+                throw std::runtime_error("decode master has no dispatched KV tokens");
             }
+            page_id = seq->last_block_page_id(BlockContextSlot::ACTIVE, sp_rank);
+            offset  = seq->last_block_num_tokens(BlockContextSlot::ACTIVE, sp_rank) - 1;
             meta.slot_mapping.push_back(page_id * block_size + offset);
         }
     }
