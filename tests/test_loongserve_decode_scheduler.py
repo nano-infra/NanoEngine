@@ -148,6 +148,63 @@ def test_loongserve_decode_scheduler_scales_down_by_draining_append_targets():
     assert next_result.sp_res_matrix[0][0][1] + next_result.sp_res_matrix[0][1][0] >= 1
 
 
+def test_loongserve_draining_rank_decode_metadata_keeps_remote_kv_peer():
+    scheduler = _make_scheduler(attention_sp=2, block_size=4, min_batch=4)
+    worker = scheduler.worker_state[0]
+    seq_on_0 = _running_seq([1, 2, 3, 4], 2, 0)
+    seq_on_1 = _running_seq([5, 6, 7, 8], 2, 1)
+    for seq in [seq_on_0, seq_on_1]:
+        worker.allocate(seq)
+        worker.running.append(seq)
+
+    result = scheduler.schedule()
+    scheduler.postprocess(result.filtered_dp_sp_seqs, _token_ids_for(result), False, 0.0, 1)
+
+    assert seq_on_1.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == 0
+    assert seq_on_1.block_ctx(BlockContextSlot.ACTIVE).num_dispatched_tokens == [1, 4]
+
+    meta_master = prepare_decode_cpp([seq_on_0, seq_on_1], 0, 2, 4, 8)
+    assert meta_master.use_sp_a2a is True
+    assert meta_master.input_ids == [seq_on_0.last_token, seq_on_1.last_token]
+    assert meta_master.context_lens_for_attn == [5, 1]
+    assert meta_master.q_slice_get == [0, 1]
+    assert meta_master.q_slice_fill == [0, 1]
+    assert meta_master.q_offsets == [0, 2, 2]
+    assert meta_master.global_context_lens_flat[:8] == [5, 1, 0, 0, 0, 0, 0, 0]
+    assert meta_master.global_context_lens_flat[8:16] == [0, 4, 0, 0, 0, 0, 0, 0]
+
+    meta_draining = prepare_decode_cpp([seq_on_0, seq_on_1], 1, 2, 4, 8)
+    assert meta_draining.use_sp_a2a is True
+    assert meta_draining.input_ids == []
+    assert meta_draining.context_lens_for_attn == [4]
+    assert meta_draining.q_slice_get == []
+    assert meta_draining.q_slice_fill == []
+    assert meta_draining.res_slice_get_to_buffer_input == [0]
+    assert meta_draining.res_slice_fill_to_buffer_input == [1]
+    assert meta_draining.q_offsets == [0, 1, 1]
+
+
+def test_loongserve_draining_rank_releases_after_request_finish_without_migration():
+    scheduler = _make_scheduler(attention_sp=2, block_size=4, min_batch=4)
+    worker = scheduler.worker_state[0]
+    seq_on_0 = _running_seq([1, 2, 3, 4], 2, 0)
+    seq_on_1 = _running_seq([5, 6, 7, 8], 2, 1)
+    seq_on_1.max_tokens = 1
+    for seq in [seq_on_0, seq_on_1]:
+        worker.allocate(seq)
+        worker.running.append(seq)
+
+    result = scheduler.schedule()
+    scheduler.postprocess(result.filtered_dp_sp_seqs, _token_ids_for(result), False, 0.0, 1)
+
+    assert seq_on_1.status == SequenceStatus.FINISHED
+    assert seq_on_1.block_ctx(BlockContextSlot.ACTIVE).num_dispatched_tokens == [0, 0]
+
+    next_result = scheduler.schedule()
+    assert list(next_result.loongserve_occupied_instances[0]) == [0]
+    assert list(next_result.loongserve_draining_instances[0]) == []
+
+
 def test_loongserve_decode_scheduler_requires_single_token_steps():
     try:
         _make_scheduler(attention_sp=2, block_size=4, min_batch=2, loop_count=2)
