@@ -1022,8 +1022,8 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
                 static_cast<int>(append_instances.size()) - 1,
                 static_cast<int>(seq_idx) / std::max(1, chunk_size));
 
-            int current_master = choose_current_master(*seq);
-            if (current_master < 0 || current_master >= attention_sp_) {
+            int current_kv_owner = choose_current_master(*seq);
+            if (current_kv_owner < 0 || current_kv_owner >= attention_sp_) {
                 if (loongserve_enable_kv_migration_) {
                     DecodeKVMigrationPlan plan;
                     plan.dp_idx = dp_idx;
@@ -1033,7 +1033,38 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
                 continue;
             }
 
-            if (master_scheduled_counts[current_master] >= max_num_seqs_) {
+            int selected_master_sp = -1;
+            if (loop_count_ == 1) {
+                for (int attempt = 0; attempt < static_cast<int>(append_instances.size()); ++attempt) {
+                    int append_sp = append_instances[(preferred_master_idx + attempt) % append_instances.size()];
+                    if (!worker->can_append_on_sp(*seq, append_sp, loop_count_)) {
+                        continue;
+                    }
+                    selected_master_sp = append_sp;
+                    break;
+                }
+            }
+            else if (worker->can_append_on_sp(*seq, current_kv_owner, loop_count_)) {
+                selected_master_sp = current_kv_owner;
+            }
+
+            if (selected_master_sp < 0) {
+                if (worker->can_append_on_sp(*seq, current_kv_owner, loop_count_)) {
+                    selected_master_sp = current_kv_owner;
+                }
+                else if (loongserve_enable_kv_migration_) {
+                    DecodeKVMigrationPlan plan;
+                    plan.dp_idx = dp_idx;
+                    pending_decode_kv_migration_plans_.push_back(std::move(plan));
+                }
+            }
+
+            if (selected_master_sp < 0) {
+                preempt(dp_idx, seq);
+                continue;
+            }
+
+            if (master_scheduled_counts[selected_master_sp] >= max_num_seqs_) {
                 skipped.push_back(seq);
                 continue;
             }
@@ -1041,7 +1072,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
             const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
             bool exceeds_remote_recv_capacity = false;
             for (int sp_idx = 0; sp_idx < std::min(attention_sp_, (int)tokens.size()); ++sp_idx) {
-                if (sp_idx == current_master || tokens[sp_idx] <= 0) {
+                if (sp_idx == selected_master_sp || tokens[sp_idx] <= 0) {
                     continue;
                 }
                 if (remote_recv_scheduled_counts[sp_idx] >= max_num_recv_seqs_) {
@@ -1054,56 +1085,22 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
                 continue;
             }
 
-            int selected_append_sp = -1;
-            if (loop_count_ == 1) {
-                for (int attempt = 0; attempt < static_cast<int>(append_instances.size()); ++attempt) {
-                    int append_sp = append_instances[(preferred_master_idx + attempt) % append_instances.size()];
-                    if (!worker->can_append_on_sp(*seq, append_sp, loop_count_)) {
-                        continue;
-                    }
-                    selected_append_sp = append_sp;
-                    break;
-                }
-            }
-            else if (worker->can_append_on_sp(*seq, current_master, loop_count_)) {
-                selected_append_sp = current_master;
-            }
-
-            if (selected_append_sp < 0) {
-                if (worker->can_append_on_sp(*seq, current_master, loop_count_)) {
-                    selected_append_sp = current_master;
-                }
-                else if (loongserve_enable_kv_migration_) {
-                    DecodeKVMigrationPlan plan;
-                    plan.dp_idx = dp_idx;
-                    pending_decode_kv_migration_plans_.push_back(std::move(plan));
-                }
-            }
-
-            if (selected_append_sp < 0) {
+            if (!worker->may_append_on_sp(*seq, selected_master_sp, loop_count_)) {
                 preempt(dp_idx, seq);
                 continue;
             }
 
-            worker->set_decode_master(*seq, current_master);
+            worker->set_decode_master(*seq, selected_master_sp);
+            seq->block_ctx(BlockContextSlot::ACTIVE).append_sp_idx_ = -1;
 
-            auto& block_ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
-            block_ctx.append_sp_idx_ = selected_append_sp != current_master ? selected_append_sp : -1;
-
-            if (!worker->may_append_on_sp(*seq, selected_append_sp, loop_count_)) {
-                block_ctx.append_sp_idx_ = -1;
-                preempt(dp_idx, seq);
-                continue;
-            }
-
-            master_scheduled_counts[current_master]++;
+            master_scheduled_counts[selected_master_sp]++;
             for (int sp_idx = 0; sp_idx < std::min(attention_sp_, (int)tokens.size()); ++sp_idx) {
-                if (sp_idx != current_master && tokens[sp_idx] > 0) {
+                if (sp_idx != selected_master_sp && tokens[sp_idx] > 0) {
                     remote_recv_scheduled_counts[sp_idx]++;
                 }
             }
             scheduled_seqs[dp_idx].push_back(seq);
-            sp_lens[current_master] += seq->num_tokens;
+            sp_lens[selected_master_sp] += seq->num_tokens;
         }
 
         int range_begin = -1;

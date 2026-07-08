@@ -100,7 +100,7 @@ def _token_ids_for(result):
 def test_loongserve_decode_scheduler_scales_out_new_kv_without_migration():
     scheduler = _make_scheduler(attention_sp=4, block_size=4, min_batch=2)
     worker = scheduler.worker_state[0]
-    seqs = [_running_seq([1, 2, 3, 4], 4, 0) for _ in range(6)]
+    seqs = [_running_seq([idx, 2, 3, 100 + idx], 4, 0) for idx in range(6)]
     for seq in seqs:
         worker.allocate(seq)
         worker.running.append(seq)
@@ -109,17 +109,37 @@ def test_loongserve_decode_scheduler_scales_out_new_kv_without_migration():
 
     assert result.is_prefill is False
     masters = {seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx for seq in seqs}
-    append_targets = {_append_target(seq) for seq in seqs}
-    assert masters == {0}
-    assert len(append_targets) >= 3
+    assert len(masters) >= 3
     for seq in seqs:
-        target = _append_target(seq)
-        assert len(seq.block_table(BlockContextSlot.ACTIVE, target)) >= 1
+        ctx = seq.block_ctx(BlockContextSlot.ACTIVE)
+        assert ctx.append_sp_idx == -1
+        assert len(seq.block_table(BlockContextSlot.ACTIVE, ctx.master_sp_idx)) >= 1
+
+    moved_seq = next(
+        seq for seq in seqs if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx != 0
+    )
+    moved_master = moved_seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
+    assert moved_seq.block_ctx(BlockContextSlot.ACTIVE).num_dispatched_tokens[moved_master] == 0
+
+    meta_new_master = prepare_decode_cpp(result.dp_seqs[0], moved_master, 4, 4, 8)
+    moved_idx = meta_new_master.input_ids.index(moved_seq.last_token)
+    moved_block = moved_seq.block_table(BlockContextSlot.ACTIVE, moved_master)[0]
+    assert meta_new_master.use_sp_a2a is True
+    assert meta_new_master.slot_mapping[moved_idx] == moved_block * 4
+
+    meta_old_owner = prepare_decode_cpp(result.dp_seqs[0], 0, 4, 4, 8)
+    assert meta_old_owner.use_sp_a2a is True
+    assert (
+        meta_old_owner.q_offsets[moved_master + 1]
+        - meta_old_owner.q_offsets[moved_master]
+        >= 1
+    )
 
     scheduler.postprocess(result.filtered_dp_sp_seqs, _token_ids_for(result), False, 0.0, 1)
 
     masters_after_append = {seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx for seq in seqs}
-    assert masters_after_append == append_targets
+    assert masters_after_append == masters
+    assert moved_seq.block_ctx(BlockContextSlot.ACTIVE).num_dispatched_tokens[moved_master] == 1
     for seq in seqs:
         assert seq.block_ctx(BlockContextSlot.ACTIVE).append_sp_idx == -1
 
@@ -145,6 +165,7 @@ def test_loongserve_decode_scheduler_scales_down_by_draining_append_targets():
     assert list(result.loongserve_draining_instances[0]) == [1]
     assert _append_target(seq_on_0) == 0
     assert _append_target(seq_on_1) == 0
+    assert seq_on_1.block_ctx(BlockContextSlot.ACTIVE).num_dispatched_tokens == [0, 4]
 
     scheduler.postprocess(result.filtered_dp_sp_seqs, _token_ids_for(result), False, 0.0, 1)
 
@@ -233,9 +254,9 @@ def test_loongserve_decode_scheduler_respects_remote_recv_capacity_for_full_grap
 
     scheduled_real = [seq for seq in seqs if seq in list(result.dp_seqs[0])]
     assert len(scheduled_real) == 1
-    assert result.sp_recv_counts[0][1] == 1
+    assert result.sp_recv_counts[0][0] == 1
 
-    meta_peer = prepare_decode_cpp(result.dp_seqs[0], 1, 2, 4, 8)
+    meta_peer = prepare_decode_cpp(result.dp_seqs[0], 0, 2, 4, 8)
     assert len(meta_peer.res_slice_get_to_buffer_input) == 1
     assert len(meta_peer.res_slice_fill_to_buffer_input) == 1
 
@@ -312,4 +333,5 @@ def test_prepare_decode_accepts_master_with_preallocated_empty_kv_block():
 
     meta = prepare_decode_cpp([seq], 1, 2, 4, 8)
     block_id = seq.block_table(BlockContextSlot.ACTIVE, 1)[0]
+    assert meta.use_sp_a2a is True
     assert meta.slot_mapping == [block_id * 4]
