@@ -13,6 +13,27 @@
 
 namespace nanodeploy {
 
+static int active_kv_rank_count(const std::vector<int>& tokens, int attention_sp)
+{
+    int active_ranks = 0;
+    for (int sp_idx = 0; sp_idx < std::min(attention_sp, (int)tokens.size()); ++sp_idx) {
+        if (tokens[sp_idx] > 0) {
+            active_ranks++;
+        }
+    }
+    return active_ranks;
+}
+
+static bool has_remote_kv_owner(const std::vector<int>& tokens, int master_sp_idx, int attention_sp)
+{
+    for (int sp_idx = 0; sp_idx < std::min(attention_sp, (int)tokens.size()); ++sp_idx) {
+        if (sp_idx != master_sp_idx && tokens[sp_idx] > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 Scheduler::Scheduler(const std::string& engine_id,
                      int                loop_count,
                      int                max_num_seqs,
@@ -376,14 +397,9 @@ ScheduleResult Scheduler::schedule()
             int         send_count = 0;
             const auto& sp_seqs    = result.filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx];
             for (const auto& seq : sp_seqs) {
-                const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
-                int         active_ranks = 0;
-                for (int count : tokens) {
-                    if (count > 0)
-                        active_ranks++;
-                }
-
-                if (active_ranks > 1) {
+                const auto& block_ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
+                const auto& tokens = block_ctx.num_dispatched_tokens;
+                if (has_remote_kv_owner(tokens, block_ctx.master_sp_idx_, attention_sp_)) {
                     send_count++;
                 }
             }
@@ -404,16 +420,9 @@ ScheduleResult Scheduler::schedule()
                 if (!is_dummy) {
                     const auto& block_ctx    = seq->block_ctx(BlockContextSlot::ACTIVE);
                     const auto& tokens       = block_ctx.num_dispatched_tokens;
-                    
-                    int         active_ranks = 0;
-                    for (int count : tokens) {
-                        if (count > 0)
-                            active_ranks++;
-                    }
-
                     int master_sp_idx = block_ctx.master_sp_idx_;
 
-                    if (active_ranks > 1 && tokens[sp_idx] > 0 && master_sp_idx != sp_idx) {
+                    if (sp_idx < (int)tokens.size() && tokens[sp_idx] > 0 && master_sp_idx != sp_idx) {
                         recv_count++;
                     }
                 }
@@ -435,12 +444,7 @@ ScheduleResult Scheduler::schedule()
             }
 
             const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
-            int         active_ranks = 0;
-            for (int count : tokens) {
-                if (count > 0) {
-                    active_ranks++;
-                }
-            }
+            int active_ranks = active_kv_rank_count(tokens, attention_sp_);
 
             if (active_ranks >= 0 && active_ranks <= attention_sp_) {
                 result.sp_size_hist_per_dp[dp_idx][active_ranks]++;
@@ -469,26 +473,17 @@ ScheduleResult Scheduler::schedule()
                 continue;
 
             const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
-            int         active_ranks = 0;
-            for (int count : tokens) {
-                if (count > 0)
-                    active_ranks++;
-            }
+            int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
 
-            // Only count if SP is truly enabled (distributed across > 1 ranks)
-            if (active_ranks > 1) {
-                int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
-
+            if (has_remote_kv_owner(tokens, master_sp_idx, attention_sp_)) {
                 // For each participating rank:
                 for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-                    if (tokens[sp_idx] > 0) {
-                        if (sp_idx != master_sp_idx) {
-                            // Q Matrix: Master sends Q to each participant.
-                            result.sp_q_matrix[dp_idx][master_sp_idx][sp_idx]++;
+                    if (sp_idx < (int)tokens.size() && tokens[sp_idx] > 0 && sp_idx != master_sp_idx) {
+                        // Q Matrix: Master sends Q to each participant.
+                        result.sp_q_matrix[dp_idx][master_sp_idx][sp_idx]++;
 
-                            // Res Matrix: Each participant sends one result back to the master.
-                            result.sp_res_matrix[dp_idx][sp_idx][master_sp_idx]++;
-                        }
+                        // Res Matrix: Each participant sends one result back to the master.
+                        result.sp_res_matrix[dp_idx][sp_idx][master_sp_idx]++;
                     }
                 }
             }
@@ -1287,13 +1282,9 @@ ScheduleResult Scheduler::_schedule_decentralized()
             int send_count = 0;
             const auto& sp_seqs = result.filtered_dp_sp_seqs[dp_idx * attention_sp_ + sp_idx];
             for (const auto& seq : sp_seqs) {
-                const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
-                int         active_ranks = 0;
-                for (int count : tokens) {
-                    if (count > 0)
-                        active_ranks++;
-                }
-                if (active_ranks > 1) {
+                const auto& block_ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
+                const auto& tokens = block_ctx.num_dispatched_tokens;
+                if (has_remote_kv_owner(tokens, block_ctx.master_sp_idx_, attention_sp_)) {
                     send_count++;
                 }
             }
@@ -1312,13 +1303,8 @@ ScheduleResult Scheduler::_schedule_decentralized()
                 if (!is_dummy) {
                     const auto& block_ctx    = seq->block_ctx(BlockContextSlot::ACTIVE);
                     const auto& tokens       = block_ctx.num_dispatched_tokens;
-                    int         active_ranks = 0;
-                    for (int count : tokens) {
-                        if (count > 0)
-                            active_ranks++;
-                    }
                     int master_sp_idx = block_ctx.master_sp_idx_;
-                    if (active_ranks > 1 && tokens[sp_idx] > 0 && master_sp_idx != sp_idx) {
+                    if (sp_idx < (int)tokens.size() && tokens[sp_idx] > 0 && master_sp_idx != sp_idx) {
                         recv_count++;
                     }
                 }
@@ -1339,12 +1325,7 @@ ScheduleResult Scheduler::_schedule_decentralized()
             }
 
             const auto& tokens = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
-            int         active_ranks = 0;
-            for (int count : tokens) {
-                if (count > 0) {
-                    active_ranks++;
-                }
-            }
+            int active_ranks = active_kv_rank_count(tokens, attention_sp_);
             if (active_ranks >= 0 && active_ranks <= attention_sp_) {
                 result.sp_size_hist_per_dp[dp_idx][active_ranks]++;
             }
@@ -1366,16 +1347,10 @@ ScheduleResult Scheduler::_schedule_decentralized()
                 continue;
 
             const auto& tokens       = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
-            int         active_ranks = 0;
-            for (int count : tokens) {
-                if (count > 0)
-                    active_ranks++;
-            }
-
-            if (active_ranks > 1) {
-                int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+            int master_sp_idx = seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+            if (has_remote_kv_owner(tokens, master_sp_idx, attention_sp_)) {
                 for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-                    if (tokens[sp_idx] > 0 && sp_idx != master_sp_idx) {
+                    if (sp_idx < (int)tokens.size() && tokens[sp_idx] > 0 && sp_idx != master_sp_idx) {
                         result.sp_q_matrix[dp_idx][master_sp_idx][sp_idx]++;
                         result.sp_res_matrix[dp_idx][sp_idx][master_sp_idx]++;
                     }

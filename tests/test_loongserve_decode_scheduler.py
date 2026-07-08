@@ -134,6 +134,10 @@ def test_loongserve_decode_scheduler_scales_out_new_kv_without_migration():
         - meta_old_owner.q_offsets[moved_master]
         >= 1
     )
+    assert result.sp_send_counts[0][moved_master] >= 1
+    assert result.sp_recv_counts[0][0] >= 1
+    assert result.sp_q_matrix[0][moved_master][0] >= 1
+    assert result.sp_res_matrix[0][0][moved_master] >= 1
 
     scheduler.postprocess(result.filtered_dp_sp_seqs, _token_ids_for(result), False, 0.0, 1)
 
