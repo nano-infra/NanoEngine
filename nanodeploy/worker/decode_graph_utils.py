@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -32,6 +33,30 @@ def copy_tensor_to_graph_buffer(
 
     target_slices = tuple(slice(0, dim) for dim in source.shape)
     target[target_slices].copy_(source)
+
+
+def copy_mla_metadata_to_graph_vars(
+    graph_vars: dict[str, torch.Tensor | None],
+    graph_attention_bs: int,
+    compute_metadata: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+    *,
+    num_key_value_heads: int,
+) -> None:
+    tile_scheduler_metadata = graph_vars.get("tile_scheduler_metadata")
+    num_splits = graph_vars.get("num_splits")
+    if tile_scheduler_metadata is None or num_splits is None:
+        return
+    if num_key_value_heads != 1:
+        return
+
+    context_lens = graph_vars["context_lens_for_attn"][:graph_attention_bs]
+    current_tile_scheduler_metadata, current_num_splits = compute_metadata(context_lens)
+    copy_tensor_to_graph_buffer(
+        "tile_scheduler_metadata",
+        current_tile_scheduler_metadata,
+        tile_scheduler_metadata,
+    )
+    copy_tensor_to_graph_buffer("num_splits", current_num_splits, num_splits)
 
 
 def select_decode_graph_master_bs(

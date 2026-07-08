@@ -26,6 +26,7 @@ from nanodeploy.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanodeploy.worker.cache import get_cache_context, set_cache_context
 from nanodeploy.worker.context import get_context, reset_context, set_context
 from nanodeploy.worker.decode_graph_utils import (
+    copy_mla_metadata_to_graph_vars,
     copy_tensor_to_graph_buffer,
     select_decode_graph_master_bs,
     validate_decode_graph_copy_capacity,
@@ -611,23 +612,12 @@ class ModelRunner:
         graph_vars: dict[str, torch.Tensor | None],
         graph_attention_bs: int,
     ) -> None:
-        tile_scheduler_metadata = graph_vars.get("tile_scheduler_metadata")
-        num_splits = graph_vars.get("num_splits")
-        if tile_scheduler_metadata is None or num_splits is None:
-            return
-        if self.config.hf_config.num_key_value_heads != 1:
-            return
-
-        context_lens = graph_vars["context_lens_for_attn"][:graph_attention_bs]
-        current_tile_scheduler_metadata, current_num_splits = self._compute_mla_metadata(
-            context_lens
+        copy_mla_metadata_to_graph_vars(
+            graph_vars,
+            graph_attention_bs,
+            self._compute_mla_metadata,
+            num_key_value_heads=self.config.hf_config.num_key_value_heads,
         )
-        copy_tensor_to_graph_buffer(
-            "tile_scheduler_metadata",
-            current_tile_scheduler_metadata,
-            tile_scheduler_metadata,
-        )
-        copy_tensor_to_graph_buffer("num_splits", current_num_splits, num_splits)
 
     def _copy_decode_context_to_graph_vars(
         self,
