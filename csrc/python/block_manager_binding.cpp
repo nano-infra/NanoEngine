@@ -35,9 +35,13 @@ void bind_block_manager(py::module_& m)
              py::arg("token_idx_from") = -1,
              py::arg("token_idx_to")   = -1)
         .def("deallocate", &BlockManager::deallocate)
+        .def("allocate_fresh_blocks", &BlockManager::allocate_fresh_blocks, py::arg("num_blocks"))
+        .def("attach_blocks", &BlockManager::attach_blocks, py::arg("seq"), py::arg("slot"), py::arg("block_ids"))
+        .def("release_blocks", &BlockManager::release_blocks, py::arg("seq"), py::arg("slot"), py::arg("block_ids"))
         .def("can_append", &BlockManager::can_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def("may_append", &BlockManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def_property_readonly("free_block_ids", &BlockManager::free_block_ids)
         .def_property_readonly("num_free_blocks", &BlockManager::num_free_blocks)
+        .def_property_readonly("block_size", &BlockManager::block_size)
         .def_property_readonly("blocks", &BlockManager::blocks);
 }

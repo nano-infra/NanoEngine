@@ -138,6 +138,9 @@ public:
     // Block management delegation
     bool can_append(Sequence& seq, int num_tokens = 1);
     bool may_append(Sequence& seq, int num_tokens = 1);
+    bool can_append_on_sp(Sequence& seq, int sp_idx, int num_tokens = 1) const;
+    bool may_append_on_sp(Sequence& seq, int sp_idx, int num_tokens = 1);
+    int  free_tokens(int sp_idx) const;
 
     // Allocation logic
     // num_seqs and num_batched_tokens are maps from dp_idx to count/tokens
@@ -154,6 +157,19 @@ public:
         const std::vector<std::shared_ptr<Sequence>>& pending_seqs) const;
 
     void apply_planned_placement(Sequence& seq, const PlannedPlacement& placement);
+    void set_decode_master(Sequence& seq, int master_sp_idx);
+
+    std::vector<int> decode_total_used_tokens_per_sp() const;
+    std::vector<int> decode_batch_used_tokens_per_sp(
+        const std::vector<std::shared_ptr<Sequence>>& seqs) const;
+    std::vector<int> decode_free_tokens_per_sp() const;
+    std::vector<int> decode_occupied_instances(
+        const std::vector<int>& batch_used_tokens_per_sp,
+        const std::vector<int>& reserved_masters = {}) const;
+    std::vector<int> select_decode_scale_up_ranks(
+        const std::vector<int>& total_used_tokens_per_sp,
+        const std::vector<int>& occupied_instances,
+        int                    min_extra_tokens) const;
 
     // Build and reuse immutable running-state snapshots within a single
     // scheduler step. This avoids rescanning all running sequences for each

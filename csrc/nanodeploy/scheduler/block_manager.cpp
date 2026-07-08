@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 #include "nanodeploy/sequence/sequence.h"
 #include "xxhash.hpp"
@@ -146,6 +147,64 @@ void BlockManager::deallocate(Sequence& seq, BlockContextSlot slot)
     }
     seq.num_cached_tokens = 0;
     table.clear();
+}
+
+std::vector<int> BlockManager::allocate_fresh_blocks(int num_blocks)
+{
+    if (num_blocks < 0) {
+        throw std::runtime_error("num_blocks must be non-negative");
+    }
+    if (static_cast<int>(free_block_ids_.size()) < num_blocks) {
+        throw std::runtime_error("No free blocks available");
+    }
+
+    std::vector<int> block_ids;
+    block_ids.reserve(num_blocks);
+    for (int i = 0; i < num_blocks; ++i) {
+        int block_id = free_block_ids_.front();
+        allocate_block(block_id);
+        block_ids.push_back(block_id);
+    }
+    return block_ids;
+}
+
+void BlockManager::attach_blocks(Sequence& seq, BlockContextSlot slot, const std::vector<int>& block_ids)
+{
+    auto& table = seq.block_table(slot, sp_idx_);
+    for (int block_id : block_ids) {
+        if (block_id < 0 || block_id >= static_cast<int>(blocks_.size())) {
+            throw std::runtime_error("block_id out of range");
+        }
+        if (!used_block_ids_.count(block_id)) {
+            throw std::runtime_error("cannot attach a free block");
+        }
+        seq.block_ctx(slot).block_location.emplace_back(sp_idx_, block_id);
+        table.push_back(block_id);
+    }
+}
+
+void BlockManager::release_blocks(Sequence& seq, BlockContextSlot slot, const std::vector<int>& block_ids)
+{
+    auto& table = seq.block_table(slot, sp_idx_);
+    for (int block_id : block_ids) {
+        auto table_it = std::find(table.begin(), table.end(), block_id);
+        if (table_it == table.end()) {
+            throw std::runtime_error("block_id not found in sequence block table");
+        }
+        table.erase(table_it);
+
+        auto& locations = seq.block_ctx(slot).block_location;
+        auto loc_it = std::find(locations.begin(), locations.end(), std::make_pair(sp_idx_, block_id));
+        if (loc_it != locations.end()) {
+            locations.erase(loc_it);
+        }
+
+        Block& block = blocks_[block_id];
+        block.ref_count--;
+        if (block.ref_count == 0) {
+            deallocate_block(block_id);
+        }
+    }
 }
 
 bool BlockManager::can_append(Sequence& seq, int num_tokens) const

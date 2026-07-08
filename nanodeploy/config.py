@@ -118,6 +118,12 @@ class Config:
     dynamic_sp_res_bytes_per_edge: int = 0
     dynamic_sp_lse_bytes_per_edge: int = 0
 
+    # LoongServe-style elastic decode scheduler for attention/KV only.
+    loongserve_decode_scheduler: bool = False
+    loongserve_enable_kv_migration: bool = False
+    loongserve_migration_granularity: Literal["block"] = "block"
+    loongserve_min_comp_bound_batch_size: int = 16
+
     # Enable non-uniform KVCache partitioning for load balancing
     enable_non_uniform_split: bool = False
 
@@ -140,6 +146,7 @@ class Config:
         if self.fixed_sp_size > 0 and (
             self.enable_dynamic_sp_size
             or self.use_new_decode_dynamic_sp_scheduler
+            or self.loongserve_decode_scheduler
             or self.dynamic_sp_size_strategy != "legacy"
             or self.enable_dynamic_sp_bucket_policy
             or bool(self.dynamic_sp_bucket_policy.strip())
@@ -150,6 +157,10 @@ class Config:
                 "fixed_sp_size is a baseline scheduling mode and cannot be "
                 "combined with dynamic SP size strategies"
             )
+        if self.loongserve_migration_granularity != "block":
+            raise ValueError("loongserve_migration_granularity currently only supports 'block'")
+        if self.loongserve_min_comp_bound_batch_size < 1:
+            raise ValueError("loongserve_min_comp_bound_batch_size must be >= 1")
         if self.dynamic_sp_size_strategy not in {"legacy", "long_short_sp8", "bucket"}:
             raise ValueError(
                 "dynamic_sp_size_strategy must be one of: legacy, long_short_sp8, bucket"

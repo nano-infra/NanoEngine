@@ -823,6 +823,9 @@ class ModelRunner:
     def migrate(self, seqs: list[Sequence]) -> None:
         get_cache_context().migrate(seqs=seqs)
 
+    def migrate_decode_kv_blocks(self, migration_plans: list[dict]) -> None:
+        get_cache_context().migrate_decode_kv_blocks(migration_plans)
+
     def run(
         self, dp_seqs: list[Sequence], is_prefill: bool, enable_rpc: bool = False, send_timestamp: float = 0.0
     ) -> list[list[int]]:

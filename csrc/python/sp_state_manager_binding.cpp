@@ -204,6 +204,30 @@ void bind_sp_state_manager(py::module_& m)
 
         .def("can_append", &SPStateManager::can_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def("may_append", &SPStateManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)
+        .def("can_append_on_sp",
+             &SPStateManager::can_append_on_sp,
+             py::arg("seq"),
+             py::arg("sp_idx"),
+             py::arg("num_tokens") = 1)
+        .def("may_append_on_sp",
+             &SPStateManager::may_append_on_sp,
+             py::arg("seq"),
+             py::arg("sp_idx"),
+             py::arg("num_tokens") = 1)
+        .def("free_tokens", &SPStateManager::free_tokens, py::arg("sp_idx"))
+        .def("set_decode_master", &SPStateManager::set_decode_master, py::arg("seq"), py::arg("master_sp_idx"))
+        .def("decode_total_used_tokens_per_sp", &SPStateManager::decode_total_used_tokens_per_sp)
+        .def("decode_batch_used_tokens_per_sp", &SPStateManager::decode_batch_used_tokens_per_sp, py::arg("seqs"))
+        .def("decode_free_tokens_per_sp", &SPStateManager::decode_free_tokens_per_sp)
+        .def("decode_occupied_instances",
+             &SPStateManager::decode_occupied_instances,
+             py::arg("batch_used_tokens_per_sp"),
+             py::arg("reserved_masters") = std::vector<int>{})
+        .def("select_decode_scale_up_ranks",
+             &SPStateManager::select_decode_scale_up_ranks,
+             py::arg("total_used_tokens_per_sp"),
+             py::arg("occupied_instances"),
+             py::arg("min_extra_tokens"))
 
         .def("can_allocate",
              &SPStateManager::can_allocate,

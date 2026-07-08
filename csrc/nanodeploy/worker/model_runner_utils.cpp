@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <iostream>
+#include <stdexcept>
 
 #include "nanodeploy/sequence/sequence.h"
 
@@ -195,9 +196,21 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
             meta.input_ids.push_back(seq->last_token);
             meta.positions.push_back(seq->num_tokens - 1);
 
-            int page_id = seq->last_block_page_id(BlockContextSlot::ACTIVE, sp_rank);
-            int offset  = seq->last_block_num_tokens(BlockContextSlot::ACTIVE, sp_rank);
-            meta.slot_mapping.push_back(page_id * block_size + offset - 1);
+            int current_dispatched = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_rank];
+            int page_id = -1;
+            int offset = 0;
+            if (current_dispatched <= 0) {
+                const auto& bt = seq->block_table(BlockContextSlot::ACTIVE, sp_rank);
+                if (bt.empty()) {
+                    throw std::runtime_error("decode master has no preallocated KV block");
+                }
+                page_id = bt.front();
+                offset = 0;
+            } else {
+                page_id = seq->last_block_page_id(BlockContextSlot::ACTIVE, sp_rank);
+                offset  = seq->last_block_num_tokens(BlockContextSlot::ACTIVE, sp_rank) - 1;
+            }
+            meta.slot_mapping.push_back(page_id * block_size + offset);
         }
     }
 

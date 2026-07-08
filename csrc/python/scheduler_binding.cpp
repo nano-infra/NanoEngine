@@ -145,7 +145,11 @@ void bind_scheduler_utils(py::module_& m)
                           const std::string& sp_master_selector,
                           bool               sp_debug,
                           int                fixed_sp_size,
-                          const std::string& scheduler_mode) {
+                          const std::string& scheduler_mode,
+                          bool               loongserve_decode_scheduler,
+                          bool               loongserve_enable_kv_migration,
+                          const std::string& loongserve_migration_granularity,
+                          int                loongserve_min_comp_bound_batch_size) {
                  return std::make_shared<Scheduler>(engine_id,
                                                     loop_count,
                                                     max_num_seqs,
@@ -181,7 +185,11 @@ void bind_scheduler_utils(py::module_& m)
                                                      sp_master_selector,
                                                      sp_debug,
                                                      fixed_sp_size,
-                                                     scheduler_mode);
+                                                     scheduler_mode,
+                                                     loongserve_decode_scheduler,
+                                                     loongserve_enable_kv_migration,
+                                                     loongserve_migration_granularity,
+                                                     loongserve_min_comp_bound_batch_size);
               }),
              py::arg("engine_id"),
              py::arg("loop_count"),
@@ -218,7 +226,11 @@ void bind_scheduler_utils(py::module_& m)
               py::arg("sp_master_selector"),
               py::arg("sp_debug") = false,
               py::arg("fixed_sp_size") = 0,
-              py::arg("scheduler_mode") = "centralized")
+              py::arg("scheduler_mode") = "centralized",
+              py::arg("loongserve_decode_scheduler") = false,
+              py::arg("loongserve_enable_kv_migration") = false,
+              py::arg("loongserve_migration_granularity") = "block",
+              py::arg("loongserve_min_comp_bound_batch_size") = 16)
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))

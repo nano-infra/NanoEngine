@@ -27,6 +27,9 @@ public:
     bool can_allocate(Sequence& seq) const;
     void allocate(Sequence& seq, int token_idx_from = -1, int token_idx_to = -1);
     void deallocate(Sequence& seq, BlockContextSlot slot);
+    std::vector<int> allocate_fresh_blocks(int num_blocks);
+    void attach_blocks(Sequence& seq, BlockContextSlot slot, const std::vector<int>& block_ids);
+    void release_blocks(Sequence& seq, BlockContextSlot slot, const std::vector<int>& block_ids);
 
     // Append related
     bool can_append(Sequence& seq, int num_tokens = 1) const;
@@ -40,6 +43,10 @@ public:
     int num_free_blocks() const
     {
         return static_cast<int>(free_block_ids_.size());
+    }
+    int block_size() const
+    {
+        return block_size_;
     }
     const std::vector<Block>& blocks() const
     {

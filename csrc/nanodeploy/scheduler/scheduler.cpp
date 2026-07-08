@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 
 #include "nanodeploy/metrics/sequence_metric.h"
@@ -47,7 +48,11 @@ Scheduler::Scheduler(const std::string& engine_id,
                      const std::string& sp_master_selector,
                      bool               sp_debug,
                      int                fixed_sp_size,
-                     const std::string& scheduler_mode) :
+                     const std::string& scheduler_mode,
+                     bool               loongserve_decode_scheduler,
+                     bool               loongserve_enable_kv_migration,
+                     const std::string& loongserve_migration_granularity,
+                     int                loongserve_min_comp_bound_batch_size) :
     engine_id_(engine_id),
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
@@ -66,8 +71,16 @@ Scheduler::Scheduler(const std::string& engine_id,
     dynamic_sp_long_request_size_(dynamic_sp_long_request_size),
     enable_non_uniform_split_(enable_non_uniform_split),
     sp_debug_(sp_debug),
-    sp_master_selector_(sp_master_selector)
+    sp_master_selector_(sp_master_selector),
+    loongserve_decode_scheduler_(loongserve_decode_scheduler),
+    loongserve_enable_kv_migration_(loongserve_enable_kv_migration),
+    loongserve_migration_granularity_(loongserve_migration_granularity),
+    loongserve_min_comp_bound_batch_size_(std::max(1, loongserve_min_comp_bound_batch_size))
 {
+    if (loongserve_migration_granularity_ != "block") {
+        throw std::runtime_error("loongserve_migration_granularity currently only supports 'block'");
+    }
+
     Sequence::block_size = kvcache_block_size;
     // Initialize worker states
     worker_state.reserve(attention_dp_);
@@ -104,6 +117,9 @@ Scheduler::Scheduler(const std::string& engine_id,
               << ", dynamic_sp_long_request_threshold=" << dynamic_sp_long_request_threshold_
               << ", dynamic_sp_long_request_size=" << dynamic_sp_long_request_size_
               << ", scheduler_mode=" << (scheduler_mode_ == SchedulerMode::DECENTRALIZED ? "decentralized" : "centralized")
+              << ", loongserve_decode_scheduler=" << loongserve_decode_scheduler_
+              << ", loongserve_enable_kv_migration=" << loongserve_enable_kv_migration_
+              << ", loongserve_min_comp_bound_batch_size=" << loongserve_min_comp_bound_batch_size_
               << std::endl;
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
 }
@@ -726,6 +742,10 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_prefill
 
 std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode()
 {
+    if (mode_ == "decode" && attention_sp_ > 1 && loongserve_decode_scheduler_) {
+        return _schedule_loongserve_decode();
+    }
+
     std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled_seqs(attention_dp_);
 
     for (int selected_dp_idx = 0; selected_dp_idx < attention_dp_; ++selected_dp_idx) {
@@ -796,6 +816,241 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
                 scheduled_seqs[selected_dp_idx].push_back(worker_state[selected_dp_idx]->dummy_seqs[sp_idx]);
             }
         }
+    }
+
+    return scheduled_seqs;
+}
+
+std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongserve_decode()
+{
+    std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled_seqs(attention_dp_);
+    pending_decode_kv_migration_plans_.clear();
+
+    auto contains_rank = [](const std::vector<int>& ranks, int rank) {
+        return std::find(ranks.begin(), ranks.end(), rank) != ranks.end();
+    };
+
+    for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+        auto& worker = worker_state[dp_idx];
+        auto& running_queue = worker->running;
+
+        std::vector<std::shared_ptr<Sequence>> candidates;
+        candidates.reserve(running_queue.size());
+        while (!running_queue.empty()) {
+            candidates.push_back(running_queue.front());
+            running_queue.pop_front();
+        }
+
+        if (candidates.empty()) {
+            for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                scheduled_seqs[dp_idx].push_back(worker->dummy_seqs[sp_idx]);
+            }
+            continue;
+        }
+
+        DecodeBatchState batch_state;
+        batch_state.batch_id = static_cast<uint64_t>(dp_idx);
+        batch_state.dp_idx = dp_idx;
+        batch_state.seqs = candidates;
+        batch_state.batch_used_tokens_per_sp = worker->decode_batch_used_tokens_per_sp(candidates);
+
+        std::vector<int> total_used_tokens_per_sp = worker->decode_total_used_tokens_per_sp();
+        std::vector<int> free_tokens_per_sp = worker->decode_free_tokens_per_sp();
+        std::vector<int> occupied = worker->decode_occupied_instances(batch_state.batch_used_tokens_per_sp);
+
+        if (occupied.empty()) {
+            std::vector<int> all_ranks(attention_sp_);
+            std::iota(all_ranks.begin(), all_ranks.end(), 0);
+            std::sort(all_ranks.begin(), all_ranks.end(), [&](int lhs, int rhs) {
+                if (free_tokens_per_sp[lhs] != free_tokens_per_sp[rhs]) {
+                    return free_tokens_per_sp[lhs] > free_tokens_per_sp[rhs];
+                }
+                return lhs < rhs;
+            });
+            if (!all_ranks.empty()) {
+                occupied.push_back(all_ranks.front());
+            }
+        }
+
+        int decode_tokens_needed = static_cast<int>(candidates.size()) * std::max(1, loop_count_);
+        int occupied_free_tokens = 0;
+        for (int sp_idx : occupied) {
+            occupied_free_tokens += free_tokens_per_sp[sp_idx];
+        }
+
+        if (occupied_free_tokens < decode_tokens_needed) {
+            auto scale_up_ranks = worker->select_decode_scale_up_ranks(
+                total_used_tokens_per_sp,
+                occupied,
+                decode_tokens_needed - occupied_free_tokens);
+            for (int sp_idx : scale_up_ranks) {
+                if (!contains_rank(occupied, sp_idx)) {
+                    occupied.push_back(sp_idx);
+                }
+            }
+        }
+
+        int desired_compute_masters = 1;
+        if ((int)candidates.size() >= loongserve_min_comp_bound_batch_size_) {
+            desired_compute_masters =
+                ((int)candidates.size() + loongserve_min_comp_bound_batch_size_ - 1)
+                / loongserve_min_comp_bound_batch_size_;
+            desired_compute_masters = std::min(desired_compute_masters, attention_sp_);
+        }
+        if ((int)occupied.size() < desired_compute_masters) {
+            std::vector<int> compute_scale_up_candidates;
+            for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                if (!contains_rank(occupied, sp_idx) && free_tokens_per_sp[sp_idx] > 0) {
+                    compute_scale_up_candidates.push_back(sp_idx);
+                }
+            }
+            std::sort(compute_scale_up_candidates.begin(), compute_scale_up_candidates.end(), [&](int lhs, int rhs) {
+                bool lhs_idle = lhs < (int)total_used_tokens_per_sp.size() && total_used_tokens_per_sp[lhs] == 0;
+                bool rhs_idle = rhs < (int)total_used_tokens_per_sp.size() && total_used_tokens_per_sp[rhs] == 0;
+                if (lhs_idle != rhs_idle) {
+                    return lhs_idle;
+                }
+                if (free_tokens_per_sp[lhs] != free_tokens_per_sp[rhs]) {
+                    return free_tokens_per_sp[lhs] > free_tokens_per_sp[rhs];
+                }
+                return lhs < rhs;
+            });
+            for (int sp_idx : compute_scale_up_candidates) {
+                if ((int)occupied.size() >= desired_compute_masters) {
+                    break;
+                }
+                occupied.push_back(sp_idx);
+            }
+        }
+
+        std::sort(occupied.begin(), occupied.end(), [&](int lhs, int rhs) {
+            if (free_tokens_per_sp[lhs] != free_tokens_per_sp[rhs]) {
+                return free_tokens_per_sp[lhs] > free_tokens_per_sp[rhs];
+            }
+            int lhs_used = lhs < (int)batch_state.batch_used_tokens_per_sp.size()
+                               ? batch_state.batch_used_tokens_per_sp[lhs]
+                               : 0;
+            int rhs_used = rhs < (int)batch_state.batch_used_tokens_per_sp.size()
+                               ? batch_state.batch_used_tokens_per_sp[rhs]
+                               : 0;
+            if (lhs_used != rhs_used) {
+                return lhs_used < rhs_used;
+            }
+            return lhs < rhs;
+        });
+
+        int target_masters = desired_compute_masters;
+
+        int memory_masters = 0;
+        int covered_tokens = 0;
+        for (int sp_idx : occupied) {
+            memory_masters++;
+            covered_tokens += free_tokens_per_sp[sp_idx];
+            if (covered_tokens >= decode_tokens_needed) {
+                break;
+            }
+        }
+        target_masters = std::max(target_masters, memory_masters);
+        target_masters = std::max(1, std::min(target_masters, static_cast<int>(occupied.size())));
+
+        std::vector<int> masters;
+        masters.reserve(target_masters);
+        for (int i = 0; i < target_masters; ++i) {
+            masters.push_back(occupied[i]);
+        }
+
+        if (masters.empty()) {
+            for (const auto& seq : candidates) {
+                preempt(dp_idx, seq);
+            }
+            decode_batch_state_by_dp_[dp_idx] = std::move(batch_state);
+            continue;
+        }
+
+        int chunk_size = ((int)candidates.size() + (int)masters.size() - 1) / (int)masters.size();
+        for (size_t master_idx = 0; master_idx < masters.size(); ++master_idx) {
+            int begin = static_cast<int>(master_idx) * chunk_size;
+            int end = std::min(static_cast<int>(candidates.size()), begin + chunk_size);
+            if (begin < end) {
+                batch_state.master_sp_for_step.push_back(masters[master_idx]);
+                batch_state.mini_batch_ranges.push_back({begin, end});
+            }
+        }
+
+        std::vector<int> master_scheduled_counts(attention_sp_, 0);
+        std::vector<int> sp_lens(attention_sp_, 0);
+        std::deque<std::shared_ptr<Sequence>> skipped;
+
+        for (size_t seq_idx = 0; seq_idx < candidates.size(); ++seq_idx) {
+            auto& seq = candidates[seq_idx];
+            int preferred_master_idx = std::min(
+                static_cast<int>(masters.size()) - 1,
+                static_cast<int>(seq_idx) / std::max(1, chunk_size));
+
+            int selected_master = -1;
+            bool has_step_slot = false;
+            for (int attempt = 0; attempt < static_cast<int>(masters.size()); ++attempt) {
+                int master = masters[(preferred_master_idx + attempt) % masters.size()];
+                if (master_scheduled_counts[master] >= max_num_seqs_) {
+                    continue;
+                }
+                has_step_slot = true;
+                if (!worker->can_append_on_sp(*seq, master, loop_count_)) {
+                    continue;
+                }
+                selected_master = master;
+                break;
+            }
+
+            if (selected_master < 0) {
+                if (!has_step_slot) {
+                    skipped.push_back(seq);
+                    continue;
+                }
+                if (loongserve_enable_kv_migration_) {
+                    DecodeKVMigrationPlan plan;
+                    plan.dp_idx = dp_idx;
+                    pending_decode_kv_migration_plans_.push_back(std::move(plan));
+                }
+                preempt(dp_idx, seq);
+                continue;
+            }
+
+            worker->set_decode_master(*seq, selected_master);
+            if (!worker->may_append_on_sp(*seq, selected_master, loop_count_)) {
+                preempt(dp_idx, seq);
+                continue;
+            }
+
+            master_scheduled_counts[selected_master]++;
+            scheduled_seqs[dp_idx].push_back(seq);
+            sp_lens[selected_master] += seq->num_tokens;
+        }
+
+        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+            bool is_master = contains_rank(masters, sp_idx);
+            bool has_batch_kv = sp_idx < (int)batch_state.batch_used_tokens_per_sp.size()
+                                && batch_state.batch_used_tokens_per_sp[sp_idx] > 0;
+            if ((has_batch_kv || is_master) && !contains_rank(batch_state.occupied_instances, sp_idx)) {
+                batch_state.occupied_instances.push_back(sp_idx);
+            }
+        }
+        std::sort(batch_state.occupied_instances.begin(), batch_state.occupied_instances.end());
+
+        for (auto it = scheduled_seqs[dp_idx].rbegin(); it != scheduled_seqs[dp_idx].rend(); ++it) {
+            running_queue.push_front(*it);
+        }
+        for (auto it = skipped.rbegin(); it != skipped.rend(); ++it) {
+            running_queue.push_front(*it);
+        }
+
+        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+            if (sp_lens[sp_idx] == 0) {
+                scheduled_seqs[dp_idx].push_back(worker->dummy_seqs[sp_idx]);
+            }
+        }
+
+        decode_batch_state_by_dp_[dp_idx] = std::move(batch_state);
     }
 
     return scheduled_seqs;

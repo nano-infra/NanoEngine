@@ -1,7 +1,7 @@
 import dataclasses
 import os
 from collections import defaultdict
-from typing import Literal
+from typing import Any, Literal
 
 import dlslime
 import torch
@@ -217,6 +217,64 @@ class CacheContext:
                     )
 
             [future.wait() for future in futures]
+
+    def migrate_decode_kv_blocks(self, migration_plans: list[dict[str, Any]]):
+        """Copy decode KV cache blocks between SP ranks within the same DP group."""
+        if not migration_plans:
+            return
+
+        dist_context = get_dist_context()
+        dp_rank = dist_context.attn_dp_rank
+        sp_rank = dist_context.attn_sp_rank
+        tp_rank = dist_context.attn_tp_rank
+        sp_size = dist_context.attn_sp_world_size
+        tp_size = dist_context.attn_tp_world_size
+
+        send_tensors: list[torch.Tensor] = []
+        recv_assignments: list[tuple[torch.Tensor, torch.Tensor]] = []
+        ops: list[dist.P2POp] = []
+
+        def global_rank_for(dp_idx: int, sp_idx: int) -> int:
+            return dp_idx * sp_size * tp_size + sp_idx * tp_size + tp_rank
+
+        for plan in migration_plans:
+            plan_dp_idx = int(plan.get("dp_idx", -1))
+            if plan_dp_idx != dp_rank:
+                continue
+
+            for item in plan.get("items", []):
+                src_sp = int(item["src_sp"])
+                dst_sp = int(item["dst_sp"])
+                src_blocks = list(item.get("src_block_ids", []))
+                dst_blocks = list(item.get("dst_block_ids", []))
+                if len(src_blocks) != len(dst_blocks):
+                    raise ValueError("src_block_ids and dst_block_ids length mismatch")
+
+                if sp_rank == src_sp:
+                    dst_rank = global_rank_for(plan_dp_idx, dst_sp)
+                    for src_block in src_blocks:
+                        payload = self.kv_cache[:, :, src_block : src_block + 1].contiguous()
+                        send_tensors.append(payload)
+                        ops.append(dist.P2POp(dist.isend, payload, dst_rank))
+
+                if sp_rank == dst_sp:
+                    src_rank = global_rank_for(plan_dp_idx, src_sp)
+                    for dst_block in dst_blocks:
+                        dst_view = self.kv_cache[:, :, dst_block : dst_block + 1]
+                        recv_buffer = torch.empty_like(
+                            dst_view, memory_format=torch.contiguous_format
+                        )
+                        recv_assignments.append((recv_buffer, dst_view))
+                        ops.append(dist.P2POp(dist.irecv, recv_buffer, src_rank))
+
+        if not ops:
+            return
+
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+        for recv_buffer, dst_view in recv_assignments:
+            dst_view.copy_(recv_buffer)
 
 
 _CACHE_CONTEXT: CacheContext

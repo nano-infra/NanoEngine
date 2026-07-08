@@ -1,11 +1,13 @@
 #pragma once
 
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "nanodeploy/sequence/sequence.h"
@@ -78,6 +80,30 @@ struct ScheduleResult {
     std::vector<int> waiting_total_blocks;
 };
 
+struct DecodeKVMigrationItem {
+    uint64_t         seq_id = 0;
+    int              src_sp = -1;
+    int              dst_sp = -1;
+    std::vector<int> src_block_ids;
+    std::vector<int> dst_block_ids;
+    int              migrated_tokens = 0;
+};
+
+struct DecodeKVMigrationPlan {
+    int                                dp_idx = -1;
+    std::vector<DecodeKVMigrationItem> items;
+};
+
+struct DecodeBatchState {
+    uint64_t                                      batch_id = 0;
+    int                                           dp_idx = -1;
+    std::vector<std::shared_ptr<Sequence>>        seqs;
+    std::vector<int>                              occupied_instances;
+    std::vector<int>                              batch_used_tokens_per_sp;
+    std::vector<int>                              master_sp_for_step;
+    std::vector<std::pair<int, int>>              mini_batch_ranges;
+};
+
 class Scheduler {
 public:
     Scheduler(const std::string& engine_id,
@@ -115,7 +141,11 @@ public:
               const std::string& sp_master_selector,
               bool               sp_debug,
               int                fixed_sp_size,
-              const std::string& scheduler_mode = "centralized");
+              const std::string& scheduler_mode = "centralized",
+              bool               loongserve_decode_scheduler = false,
+              bool               loongserve_enable_kv_migration = false,
+              const std::string& loongserve_migration_granularity = "block",
+              int                loongserve_min_comp_bound_batch_size = 16);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -165,6 +195,7 @@ private:
     // Internal scheduling logic
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
+    std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_loongserve_decode();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode_prefill_latency_aware();
     
     // Decentralized scheduling logic
@@ -199,12 +230,18 @@ private:
     bool        sp_debug_;
 
     std::string sp_master_selector_;
+    bool        loongserve_decode_scheduler_;
+    bool        loongserve_enable_kv_migration_;
+    std::string loongserve_migration_granularity_;
+    int         loongserve_min_comp_bound_batch_size_;
     
     SchedulerMode scheduler_mode_ = SchedulerMode::CENTRALIZED;
 
     int dp_rr_counter_ = 0;
 
     std::unique_ptr<ThreadPool> thread_pool_;
+    std::unordered_map<int, DecodeBatchState> decode_batch_state_by_dp_;
+    std::vector<DecodeKVMigrationPlan>        pending_decode_kv_migration_plans_;
 };
 
 }  // namespace nanodeploy

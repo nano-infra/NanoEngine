@@ -227,6 +227,11 @@ class RayExecutor:
             timeout=timeout,
         )
 
+    def migrate_decode_kv(
+        self, plans: list[dict[str, Any]], timeout: float | None = None
+    ) -> list[None]:
+        return self.collective_rpc("migrate_decode_kv_blocks", (plans,), timeout=timeout)
+
     def run(
         self,
         dp_seqs: List[List[Sequence]],

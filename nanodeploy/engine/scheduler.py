@@ -59,7 +59,11 @@ class Scheduler(_CppScheduler):
             config.sp_master_selector,
             config.sp_debug,
             config.fixed_sp_size,
-            config.scheduler_mode
+            config.scheduler_mode,
+            config.loongserve_decode_scheduler,
+            config.loongserve_enable_kv_migration,
+            config.loongserve_migration_granularity,
+            config.loongserve_min_comp_bound_batch_size,
         )
         # Store config for compatibility
         self.engine_id = config.engine_id
