@@ -88,6 +88,10 @@ Scheduler::Scheduler(const std::string& engine_id,
     if (loongserve_decode_scheduler_ && scheduler_mode != "centralized") {
         throw std::runtime_error("loongserve_decode_scheduler currently supports centralized scheduler_mode only");
     }
+    if (loongserve_decode_scheduler_ && loongserve_enable_kv_migration_) {
+        throw std::runtime_error(
+            "loongserve_decode_scheduler currently supports no-migration scale-up/down only");
+    }
 
     Sequence::block_size = kvcache_block_size;
     // Initialize worker states

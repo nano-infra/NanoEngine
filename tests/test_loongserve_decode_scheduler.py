@@ -14,6 +14,7 @@ def _make_scheduler(
     loop_count=1,
     scheduler_mode="centralized",
     max_recv=8,
+    enable_kv_migration=False,
 ):
     return Scheduler(
         "",
@@ -53,7 +54,7 @@ def _make_scheduler(
         0,
         scheduler_mode,
         True,
-        False,
+        enable_kv_migration,
         "block",
         min_batch,
     )
@@ -255,6 +256,15 @@ def test_loongserve_decode_scheduler_rejects_decentralized_mode():
         assert "centralized" in str(exc)
     else:
         raise AssertionError("expected centralized scheduler_mode guard")
+
+
+def test_loongserve_decode_scheduler_rejects_kv_migration_flag():
+    try:
+        _make_scheduler(attention_sp=2, block_size=4, min_batch=2, enable_kv_migration=True)
+    except RuntimeError as exc:
+        assert "no-migration" in str(exc)
+    else:
+        raise AssertionError("expected no-migration guard for LoongServe decode scheduler")
 
 
 def test_loongserve_decode_scheduler_clears_state_for_empty_decode_batch():
