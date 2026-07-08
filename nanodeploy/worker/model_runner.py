@@ -765,20 +765,24 @@ class ModelRunner:
 
         try:
             layers = self.model.model.layers
+            workspace = graph_set["workspace"]
+            query_states = workspace["query_states"][:master_bs]
+            key_states = workspace["key_states"][:master_bs]
+            value_states = workspace["value_states"][:master_bs]
+            attn_input = workspace["attn_output"][:master_bs]
             for layer_idx, layer_graph in enumerate(graph_set["layers"]):
                 layer_graph["pre"].replay()
                 layer = layers[layer_idx]
                 attn_output = layer.self_attn.attention_core(
-                    layer_graph["query_states"],
-                    layer_graph["key_states"],
-                    layer_graph["value_states"],
+                    query_states,
+                    key_states,
+                    value_states,
                 )
                 if attn_output.size(0) > master_bs:
                     raise RuntimeError(
                         "Piecewise attention output exceeds graph master_bs: "
                         f"rows={attn_output.size(0)} master_bs={master_bs}"
                     )
-                attn_input = layer_graph["attn_output"]
                 if attn_output.size(0) < master_bs:
                     attn_input.zero_()
                 attn_input[: attn_output.size(0)].copy_(attn_output)
@@ -789,7 +793,7 @@ class ModelRunner:
             for name, value in saved_context_fields.items():
                 setattr(context, name, value)
 
-        return self.model.compute_logits(graph_set["final_hidden"][:bs])
+        return self.model.compute_logits(graph_set["workspace"]["final_hidden"][:bs])
 
     def migrate(self, seqs: list[Sequence]) -> None:
         get_cache_context().migrate(seqs=seqs)
@@ -1211,20 +1215,20 @@ class ModelRunner:
 
         def capture_one_graph(fn):
             graph = torch.cuda.CUDAGraph()
-            outputs = fn()
+            fn()
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs = fn()
+                fn()
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             torch.cuda.synchronize()
             dist.barrier(group=get_dist_context().cuda_world_group)
-            return graph, outputs
+            return graph
 
-        def make_decode_graph_vars(master_bs: int):
+        def make_decode_graph_vars():
             return dict(
-                input_ids=torch.zeros(master_bs, dtype=torch.int64),
-                positions=torch.zeros(master_bs, dtype=torch.int64),
-                slot_mapping=torch.full((master_bs,), -1, dtype=torch.int32),
+                input_ids=torch.zeros(max_bs, dtype=torch.int64),
+                positions=torch.zeros(max_bs, dtype=torch.int64),
+                slot_mapping=torch.full((max_bs,), -1, dtype=torch.int32),
                 context_lens=torch.zeros(sp_world_size, max_bs, dtype=torch.int32),
                 block_tables=torch.zeros(
                     max_attention_comp_seqs, max_num_blocks, dtype=torch.int32
@@ -1239,16 +1243,16 @@ class ModelRunner:
                 context_lens_for_attn=torch.zeros(
                     max_attention_comp_seqs, dtype=torch.int32
                 ),
-                q_slice_get=torch.full((master_bs,), -1, dtype=torch.int32),
-                q_slice_fill=torch.full((master_bs,), -1, dtype=torch.int32),
-                q_copy_mask=torch.zeros(master_bs, dtype=torch.int32),
+                q_slice_get=torch.full((max_bs,), -1, dtype=torch.int32),
+                q_slice_fill=torch.full((max_bs,), -1, dtype=torch.int32),
+                q_copy_mask=torch.zeros(max_bs, dtype=torch.int32),
                 res_slice_get_to_buffer_output=torch.full(
-                    (master_bs,), -1, dtype=torch.int32
+                    (max_bs,), -1, dtype=torch.int32
                 ),
                 res_slice_fill_to_buffer_output=torch.full(
-                    (master_bs,), -1, dtype=torch.int32
+                    (max_bs,), -1, dtype=torch.int32
                 ),
-                res_to_buffer_output_mask=torch.zeros(master_bs, dtype=torch.int32),
+                res_to_buffer_output_mask=torch.zeros(max_bs, dtype=torch.int32),
                 res_slice_get_to_buffer_input=torch.full(
                     (config.max_num_recv_seqs,), -1, dtype=torch.int32
                 ),
@@ -1261,78 +1265,149 @@ class ModelRunner:
                 q_offsets=torch.zeros(sp_world_size + 1, dtype=torch.int32),
             )
 
+        def set_piecewise_capture_context(master_bs: int, graph_vars: dict):
+            set_context(
+                is_prefill=False,
+                max_bs=self.config.max_num_seqs,
+                slot_mapping=graph_vars["slot_mapping"][:master_bs],
+                context_lens=graph_vars["context_lens"],
+                block_tables=graph_vars["block_tables"],
+                global_context_lens=graph_vars["global_context_lens"],
+                q_mask=graph_vars["q_mask"],
+                res_lse_mask=graph_vars["res_lse_mask"],
+                use_sp_a2a=False,
+                q_slice_get=graph_vars["q_slice_get"][:master_bs],
+                q_slice_fill=graph_vars["q_slice_fill"][:master_bs],
+                q_copy_mask=graph_vars["q_copy_mask"][:master_bs],
+                res_slice_get_to_buffer_output=graph_vars[
+                    "res_slice_get_to_buffer_output"
+                ][:master_bs],
+                res_slice_fill_to_buffer_output=graph_vars[
+                    "res_slice_fill_to_buffer_output"
+                ][:master_bs],
+                res_to_buffer_output_mask=graph_vars["res_to_buffer_output_mask"][
+                    :master_bs
+                ],
+                res_slice_get_to_buffer_input=graph_vars[
+                    "res_slice_get_to_buffer_input"
+                ],
+                res_slice_fill_to_buffer_input=graph_vars[
+                    "res_slice_fill_to_buffer_input"
+                ],
+                res_to_buffer_input_mask=graph_vars["res_to_buffer_input_mask"],
+                attention_compute_bs=master_bs,
+                sp_comm_bs=master_bs,
+                context_lens_for_attn=graph_vars["context_lens_for_attn"],
+                q_offsets=graph_vars["q_offsets"],
+                tile_scheduler_metadata=graph_vars["tile_scheduler_metadata"],
+                num_splits=graph_vars["num_splits"],
+            )
+
         logger.info("Starting piecewise CUDAGraph capture...")
         total_graphs = 0
         model = self.model.model
+        graph_vars = make_decode_graph_vars()
+        input_ids = graph_vars["input_ids"]
+        positions = graph_vars["positions"]
+        workspace = dict(
+            hidden_states=torch.zeros(max_bs, hf_config.hidden_size),
+            residual=torch.zeros(max_bs, hf_config.hidden_size),
+            layer_residual=torch.zeros(max_bs, hf_config.hidden_size),
+            query_states=torch.zeros(
+                max_bs,
+                hf_config.num_attention_heads,
+                hf_config.kv_lora_rank + hf_config.qk_rope_head_dim,
+            ),
+            key_states=torch.zeros(
+                max_bs,
+                getattr(hf_config, "num_key_value_heads", 1),
+                hf_config.kv_lora_rank + hf_config.qk_rope_head_dim,
+            ),
+            value_states=torch.zeros(
+                max_bs,
+                getattr(hf_config, "num_key_value_heads", 1),
+                hf_config.kv_lora_rank,
+            ),
+            attn_output=torch.zeros(
+                max_bs,
+                hf_config.num_attention_heads,
+                hf_config.kv_lora_rank,
+            ),
+            final_hidden=torch.zeros(max_bs, hf_config.hidden_size),
+        )
 
         for master_bs in reversed(self.graph_master_rank_bs):
             logger.info(f"正在捕获 Piecewise 图 - (master_bs={master_bs})")
-            graph_vars = make_decode_graph_vars(master_bs)
-            input_ids = graph_vars["input_ids"]
-            positions = graph_vars["positions"]
             layers = []
-            hidden_states = None
-            residual = None
+            set_piecewise_capture_context(master_bs, graph_vars)
+            input_ids_view = input_ids[:master_bs]
+            positions_view = positions[:master_bs]
+            hidden_states = workspace["hidden_states"][:master_bs]
+            residual = workspace["residual"][:master_bs]
+            layer_residual_workspace = workspace["layer_residual"][:master_bs]
+            query_workspace = workspace["query_states"][:master_bs]
+            key_workspace = workspace["key_states"][:master_bs]
+            value_workspace = workspace["value_states"][:master_bs]
+            attn_output_workspace = workspace["attn_output"][:master_bs]
+            final_hidden = workspace["final_hidden"][:master_bs]
 
             for layer_idx, layer in enumerate(model.layers):
                 if layer_idx == 0:
                     def pre_fn(layer=layer):
-                        embedded = model.embed_tokens(input_ids)
-                        return layer.piecewise_pre_attention(
-                            embedded, positions, residual=None
+                        embedded = model.embed_tokens(input_ids_view)
+                        query_states, key_states, value_states, layer_residual = (
+                            layer.piecewise_pre_attention(
+                                embedded, positions_view, residual=None
+                            )
                         )
+                        query_workspace.copy_(query_states)
+                        key_workspace.copy_(key_states)
+                        value_workspace.copy_(value_states)
+                        layer_residual_workspace.copy_(layer_residual)
                 else:
-                    def pre_fn(
-                        layer=layer,
-                        hidden_states=hidden_states,
-                        residual=residual,
-                    ):
-                        return layer.piecewise_pre_attention(
-                            hidden_states, positions, residual
+                    def pre_fn(layer=layer):
+                        query_states, key_states, value_states, layer_residual = (
+                            layer.piecewise_pre_attention(
+                                hidden_states, positions_view, residual
+                            )
                         )
+                        query_workspace.copy_(query_states)
+                        key_workspace.copy_(key_states)
+                        value_workspace.copy_(value_states)
+                        layer_residual_workspace.copy_(layer_residual)
 
-                pre_graph, pre_outputs = capture_one_graph(pre_fn)
-                query_states, key_states, value_states, layer_residual = pre_outputs
-
-                attn_output = torch.zeros(
-                    master_bs,
-                    layer.self_attn.num_heads,
-                    layer.self_attn.kv_lora_rank,
-                    dtype=torch.get_default_dtype(),
-                )
+                pre_graph = capture_one_graph(pre_fn)
 
                 def post_fn(
                     layer=layer,
-                    attn_output=attn_output,
-                    layer_residual=layer_residual,
                 ):
-                    return layer.piecewise_post_attention(
-                        attn_output, layer_residual
+                    next_hidden_states, next_residual = (
+                        layer.piecewise_post_attention(
+                            attn_output_workspace,
+                            layer_residual_workspace,
+                        )
                     )
+                    hidden_states.copy_(next_hidden_states)
+                    residual.copy_(next_residual)
 
-                post_graph, post_outputs = capture_one_graph(post_fn)
-                hidden_states, residual = post_outputs
+                post_graph = capture_one_graph(post_fn)
                 layers.append(
                     dict(
                         pre=pre_graph,
                         post=post_graph,
-                        query_states=query_states,
-                        key_states=key_states,
-                        value_states=value_states,
-                        attn_output=attn_output,
                     )
                 )
                 total_graphs += 2
 
-            def final_fn(hidden_states=hidden_states, residual=residual):
-                return model.piecewise_finalize(hidden_states, residual)
+            def final_fn():
+                final_hidden.copy_(model.piecewise_finalize(hidden_states, residual))
 
-            final_graph, final_hidden = capture_one_graph(final_fn)
+            final_graph = capture_one_graph(final_fn)
             total_graphs += 1
             self.piecewise_graphs[master_bs] = dict(
                 layers=layers,
                 final=final_graph,
-                final_hidden=final_hidden,
+                workspace=workspace,
             )
             self.piecewise_graph_vars[master_bs] = graph_vars
 
