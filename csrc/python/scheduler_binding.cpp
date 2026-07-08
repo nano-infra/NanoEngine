@@ -108,7 +108,10 @@ void bind_scheduler_utils(py::module_& m)
         .def_readonly("sp_q_matrix", &ScheduleResult::sp_q_matrix)
         .def_readonly("sp_res_matrix", &ScheduleResult::sp_res_matrix)
         .def_readonly("waiting_head_blocks", &ScheduleResult::waiting_head_blocks)
-        .def_readonly("waiting_total_blocks", &ScheduleResult::waiting_total_blocks);    // Bind the Scheduler class
+        .def_readonly("waiting_total_blocks", &ScheduleResult::waiting_total_blocks)
+        .def_readonly("loongserve_occupied_instances", &ScheduleResult::loongserve_occupied_instances)
+        .def_readonly("loongserve_append_instances", &ScheduleResult::loongserve_append_instances)
+        .def_readonly("loongserve_draining_instances", &ScheduleResult::loongserve_draining_instances);    // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
         .def(py::init([](const std::string& engine_id,
                          int                loop_count,

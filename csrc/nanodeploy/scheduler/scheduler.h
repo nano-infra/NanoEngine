@@ -78,6 +78,13 @@ struct ScheduleResult {
     // Metrics for waiting queue blocks (per DP worker)
     std::vector<int> waiting_head_blocks;
     std::vector<int> waiting_total_blocks;
+
+    // LoongServe-style decode state snapshots. For no-migration scale-down,
+    // draining ranks still participate in attention if they own KV, but they
+    // are not selected as append targets for newly generated decode KV.
+    std::vector<std::vector<int>> loongserve_occupied_instances;
+    std::vector<std::vector<int>> loongserve_append_instances;
+    std::vector<std::vector<int>> loongserve_draining_instances;
 };
 
 struct DecodeKVMigrationItem {
@@ -101,6 +108,8 @@ struct DecodeBatchState {
     std::vector<int>                              occupied_instances;
     std::vector<int>                              batch_used_tokens_per_sp;
     std::vector<int>                              master_sp_for_step;
+    std::vector<int>                              append_sp_for_step;
+    std::vector<int>                              draining_instances;
     std::vector<std::pair<int, int>>              mini_batch_ranges;
 };
 

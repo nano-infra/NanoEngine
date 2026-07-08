@@ -7,10 +7,10 @@ from nanodeploy._cpp import (
 )
 
 
-def _make_scheduler(attention_sp=4, block_size=4, min_batch=2):
+def _make_scheduler(attention_sp=4, block_size=4, min_batch=2, loop_count=1):
     return Scheduler(
         "",
-        1,  # loop_count
+        loop_count,
         8,  # max_num_seqs
         1024,
         8,
@@ -108,6 +108,47 @@ def test_loongserve_decode_scheduler_scales_out_new_kv_without_migration():
     assert next_result.is_prefill is False
     next_masters = {seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx for seq in seqs}
     assert len(next_masters) >= 3
+
+
+def test_loongserve_decode_scheduler_scales_down_by_draining_append_targets():
+    scheduler = _make_scheduler(attention_sp=2, block_size=4, min_batch=4)
+    worker = scheduler.worker_state[0]
+    seq_on_0 = _running_seq([1, 2, 3, 4], 2, 0)
+    seq_on_1 = _running_seq([5, 6, 7, 8], 2, 1)
+    for seq in [seq_on_0, seq_on_1]:
+        worker.allocate(seq)
+        worker.running.append(seq)
+
+    result = scheduler.schedule()
+
+    assert list(result.loongserve_occupied_instances[0]) == [0, 1]
+    assert list(result.loongserve_append_instances[0]) == [0]
+    assert list(result.loongserve_draining_instances[0]) == [1]
+    assert _append_target(seq_on_0) == 0
+    assert _append_target(seq_on_1) == 0
+
+    scheduler.postprocess(result.filtered_dp_sp_seqs, _token_ids_for(result), False, 0.0, 1)
+
+    assert seq_on_1.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == 0
+    assert seq_on_1.block_ctx(BlockContextSlot.ACTIVE).num_dispatched_tokens == [1, 4]
+
+    next_result = scheduler.schedule()
+    next_append = list(next_result.loongserve_append_instances[0])
+    next_draining = list(next_result.loongserve_draining_instances[0])
+    assert len(next_append) == 1
+    assert len(next_draining) == 1
+    assert sorted(next_append + next_draining) == [0, 1]
+    assert next_result.sp_q_matrix[0][0][1] + next_result.sp_q_matrix[0][1][0] >= 1
+    assert next_result.sp_res_matrix[0][0][1] + next_result.sp_res_matrix[0][1][0] >= 1
+
+
+def test_loongserve_decode_scheduler_requires_single_token_steps():
+    try:
+        _make_scheduler(attention_sp=2, block_size=4, min_batch=2, loop_count=2)
+    except RuntimeError as exc:
+        assert "loop_count=1" in str(exc)
+    else:
+        raise AssertionError("expected loop_count guard for LoongServe decode scheduler")
 
 
 def test_decode_kv_accounting_uses_num_dispatched_tokens():

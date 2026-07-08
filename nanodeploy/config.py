@@ -161,6 +161,11 @@ class Config:
             raise ValueError("loongserve_migration_granularity currently only supports 'block'")
         if self.loongserve_min_comp_bound_batch_size < 1:
             raise ValueError("loongserve_min_comp_bound_batch_size must be >= 1")
+        if self.loongserve_decode_scheduler and self.loop_count != 1:
+            raise ValueError(
+                "loongserve_decode_scheduler requires loop_count=1 because elastic "
+                "decode scale-up/down changes KV ownership once per scheduler step"
+            )
         if self.dynamic_sp_size_strategy not in {"legacy", "long_short_sp8", "bucket"}:
             raise ValueError(
                 "dynamic_sp_size_strategy must be one of: legacy, long_short_sp8, bucket"

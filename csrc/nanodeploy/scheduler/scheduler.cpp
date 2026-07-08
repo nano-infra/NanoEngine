@@ -80,6 +80,11 @@ Scheduler::Scheduler(const std::string& engine_id,
     if (loongserve_migration_granularity_ != "block") {
         throw std::runtime_error("loongserve_migration_granularity currently only supports 'block'");
     }
+    if (loongserve_decode_scheduler_ && loop_count_ != 1) {
+        throw std::runtime_error(
+            "loongserve_decode_scheduler requires loop_count=1 because no-migration elastic "
+            "scale-up/down changes decode KV ownership at scheduler-step granularity");
+    }
 
     Sequence::block_size = kvcache_block_size;
     // Initialize worker states
@@ -502,6 +507,21 @@ ScheduleResult Scheduler::schedule()
     result.waiting_head_blocks.resize(attention_dp_, head_blocks);
     result.waiting_total_blocks.resize(attention_dp_, total_blocks);
 
+    result.loongserve_occupied_instances.resize(attention_dp_);
+    result.loongserve_append_instances.resize(attention_dp_);
+    result.loongserve_draining_instances.resize(attention_dp_);
+    if (loongserve_decode_scheduler_) {
+        for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+            auto it = decode_batch_state_by_dp_.find(dp_idx);
+            if (it == decode_batch_state_by_dp_.end()) {
+                continue;
+            }
+            result.loongserve_occupied_instances[dp_idx] = it->second.occupied_instances;
+            result.loongserve_append_instances[dp_idx] = it->second.append_sp_for_step;
+            result.loongserve_draining_instances[dp_idx] = it->second.draining_instances;
+        }
+    }
+
     return result;
 }
 
@@ -856,39 +876,9 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
 
         std::vector<int> total_used_tokens_per_sp = worker->decode_total_used_tokens_per_sp();
         std::vector<int> free_tokens_per_sp = worker->decode_free_tokens_per_sp();
-        std::vector<int> occupied = worker->decode_occupied_instances(batch_state.batch_used_tokens_per_sp);
-
-        if (occupied.empty()) {
-            std::vector<int> all_ranks(attention_sp_);
-            std::iota(all_ranks.begin(), all_ranks.end(), 0);
-            std::sort(all_ranks.begin(), all_ranks.end(), [&](int lhs, int rhs) {
-                if (free_tokens_per_sp[lhs] != free_tokens_per_sp[rhs]) {
-                    return free_tokens_per_sp[lhs] > free_tokens_per_sp[rhs];
-                }
-                return lhs < rhs;
-            });
-            if (!all_ranks.empty()) {
-                occupied.push_back(all_ranks.front());
-            }
-        }
+        std::vector<int> existing_kv_ranks = worker->decode_occupied_instances(batch_state.batch_used_tokens_per_sp);
 
         int decode_tokens_needed = static_cast<int>(candidates.size()) * std::max(1, loop_count_);
-        int occupied_free_tokens = 0;
-        for (int sp_idx : occupied) {
-            occupied_free_tokens += free_tokens_per_sp[sp_idx];
-        }
-
-        if (occupied_free_tokens < decode_tokens_needed) {
-            auto scale_up_ranks = worker->select_decode_scale_up_ranks(
-                total_used_tokens_per_sp,
-                occupied,
-                decode_tokens_needed - occupied_free_tokens);
-            for (int sp_idx : scale_up_ranks) {
-                if (!contains_rank(occupied, sp_idx)) {
-                    occupied.push_back(sp_idx);
-                }
-            }
-        }
 
         int desired_compute_masters = 1;
         if ((int)candidates.size() >= loongserve_min_comp_bound_batch_size_) {
@@ -897,33 +887,21 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
                 / loongserve_min_comp_bound_batch_size_;
             desired_compute_masters = std::min(desired_compute_masters, attention_sp_);
         }
-        if ((int)occupied.size() < desired_compute_masters) {
-            std::vector<int> compute_scale_up_candidates;
-            for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-                if (!contains_rank(occupied, sp_idx) && free_tokens_per_sp[sp_idx] > 0) {
-                    compute_scale_up_candidates.push_back(sp_idx);
-                }
-            }
-            std::sort(compute_scale_up_candidates.begin(), compute_scale_up_candidates.end(), [&](int lhs, int rhs) {
-                bool lhs_idle = lhs < (int)total_used_tokens_per_sp.size() && total_used_tokens_per_sp[lhs] == 0;
-                bool rhs_idle = rhs < (int)total_used_tokens_per_sp.size() && total_used_tokens_per_sp[rhs] == 0;
-                if (lhs_idle != rhs_idle) {
-                    return lhs_idle;
-                }
-                if (free_tokens_per_sp[lhs] != free_tokens_per_sp[rhs]) {
-                    return free_tokens_per_sp[lhs] > free_tokens_per_sp[rhs];
-                }
-                return lhs < rhs;
-            });
-            for (int sp_idx : compute_scale_up_candidates) {
-                if ((int)occupied.size() >= desired_compute_masters) {
-                    break;
-                }
-                occupied.push_back(sp_idx);
-            }
-        }
 
-        std::sort(occupied.begin(), occupied.end(), [&](int lhs, int rhs) {
+        std::vector<int> append_instances;
+        int append_free_tokens = 0;
+        auto add_append_instance = [&](int sp_idx) {
+            if (sp_idx < 0 || sp_idx >= attention_sp_ || free_tokens_per_sp[sp_idx] <= 0
+                || contains_rank(append_instances, sp_idx)) {
+                return false;
+            }
+            append_instances.push_back(sp_idx);
+            append_free_tokens += free_tokens_per_sp[sp_idx];
+            return true;
+        };
+
+        std::vector<int> existing_append_candidates = existing_kv_ranks;
+        std::sort(existing_append_candidates.begin(), existing_append_candidates.end(), [&](int lhs, int rhs) {
             if (free_tokens_per_sp[lhs] != free_tokens_per_sp[rhs]) {
                 return free_tokens_per_sp[lhs] > free_tokens_per_sp[rhs];
             }
@@ -934,32 +912,69 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
                                ? batch_state.batch_used_tokens_per_sp[rhs]
                                : 0;
             if (lhs_used != rhs_used) {
-                return lhs_used < rhs_used;
+                return lhs_used > rhs_used;
             }
             return lhs < rhs;
         });
 
-        int target_masters = desired_compute_masters;
-
-        int memory_masters = 0;
-        int covered_tokens = 0;
-        for (int sp_idx : occupied) {
-            memory_masters++;
-            covered_tokens += free_tokens_per_sp[sp_idx];
-            if (covered_tokens >= decode_tokens_needed) {
+        for (int sp_idx : existing_append_candidates) {
+            if ((int)append_instances.size() >= desired_compute_masters
+                && append_free_tokens >= decode_tokens_needed) {
                 break;
             }
-        }
-        target_masters = std::max(target_masters, memory_masters);
-        target_masters = std::max(1, std::min(target_masters, static_cast<int>(occupied.size())));
-
-        std::vector<int> masters;
-        masters.reserve(target_masters);
-        for (int i = 0; i < target_masters; ++i) {
-            masters.push_back(occupied[i]);
+            add_append_instance(sp_idx);
         }
 
-        if (masters.empty()) {
+        if ((int)append_instances.size() < desired_compute_masters
+            || append_free_tokens < decode_tokens_needed) {
+            std::vector<int> scale_up_candidates;
+            for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                if (!contains_rank(append_instances, sp_idx) && free_tokens_per_sp[sp_idx] > 0) {
+                    scale_up_candidates.push_back(sp_idx);
+                }
+            }
+            std::sort(scale_up_candidates.begin(), scale_up_candidates.end(), [&](int lhs, int rhs) {
+                bool lhs_has_batch_kv = contains_rank(existing_kv_ranks, lhs);
+                bool rhs_has_batch_kv = contains_rank(existing_kv_ranks, rhs);
+                if (lhs_has_batch_kv != rhs_has_batch_kv) {
+                    return lhs_has_batch_kv;
+                }
+                bool lhs_idle = lhs < (int)total_used_tokens_per_sp.size() && total_used_tokens_per_sp[lhs] == 0;
+                bool rhs_idle = rhs < (int)total_used_tokens_per_sp.size() && total_used_tokens_per_sp[rhs] == 0;
+                if (lhs_idle != rhs_idle) {
+                    return lhs_idle;
+                }
+                if (free_tokens_per_sp[lhs] != free_tokens_per_sp[rhs]) {
+                    return free_tokens_per_sp[lhs] > free_tokens_per_sp[rhs];
+                }
+                return lhs < rhs;
+            });
+            for (int sp_idx : scale_up_candidates) {
+                if ((int)append_instances.size() >= desired_compute_masters
+                    && append_free_tokens >= decode_tokens_needed) {
+                    break;
+                }
+                add_append_instance(sp_idx);
+            }
+        }
+
+        std::vector<int> occupied = existing_kv_ranks;
+        for (int sp_idx : append_instances) {
+            if (!contains_rank(occupied, sp_idx)) {
+                occupied.push_back(sp_idx);
+            }
+        }
+        std::sort(occupied.begin(), occupied.end());
+
+        batch_state.append_sp_for_step = append_instances;
+        for (int sp_idx : existing_kv_ranks) {
+            if (!contains_rank(append_instances, sp_idx)) {
+                batch_state.draining_instances.push_back(sp_idx);
+            }
+        }
+        std::sort(batch_state.draining_instances.begin(), batch_state.draining_instances.end());
+
+        if (append_instances.empty()) {
             for (const auto& seq : candidates) {
                 preempt(dp_idx, seq);
             }
@@ -967,7 +982,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
             continue;
         }
 
-        int chunk_size = ((int)candidates.size() + (int)masters.size() - 1) / (int)masters.size();
+        int chunk_size = ((int)candidates.size() + (int)append_instances.size() - 1) / (int)append_instances.size();
 
         std::vector<int> master_scheduled_counts(attention_sp_, 0);
         std::vector<int> sp_lens(attention_sp_, 0);
@@ -995,7 +1010,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
         for (size_t seq_idx = 0; seq_idx < candidates.size(); ++seq_idx) {
             auto& seq = candidates[seq_idx];
             int preferred_master_idx = std::min(
-                static_cast<int>(masters.size()) - 1,
+                static_cast<int>(append_instances.size()) - 1,
                 static_cast<int>(seq_idx) / std::max(1, chunk_size));
 
             int current_master = choose_current_master(*seq);
@@ -1016,8 +1031,8 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
 
             int selected_append_sp = -1;
             if (loop_count_ == 1) {
-                for (int attempt = 0; attempt < static_cast<int>(masters.size()); ++attempt) {
-                    int append_sp = masters[(preferred_master_idx + attempt) % masters.size()];
+                for (int attempt = 0; attempt < static_cast<int>(append_instances.size()); ++attempt) {
+                    int append_sp = append_instances[(preferred_master_idx + attempt) % append_instances.size()];
                     if (!worker->can_append_on_sp(*seq, append_sp, loop_count_)) {
                         continue;
                     }
@@ -1080,10 +1095,10 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
         }
 
         for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-            bool is_master = contains_rank(masters, sp_idx);
+            bool is_append_instance = contains_rank(append_instances, sp_idx);
             bool has_batch_kv = sp_idx < (int)batch_state.batch_used_tokens_per_sp.size()
                                 && batch_state.batch_used_tokens_per_sp[sp_idx] > 0;
-            if ((has_batch_kv || is_master) && !contains_rank(batch_state.occupied_instances, sp_idx)) {
+            if ((has_batch_kv || is_append_instance) && !contains_rank(batch_state.occupied_instances, sp_idx)) {
                 batch_state.occupied_instances.push_back(sp_idx);
             }
         }
