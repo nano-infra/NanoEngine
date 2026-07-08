@@ -32,7 +32,7 @@ class LinearBase(nn.Module):
     ):
         super().__init__()
 
-        self.quantization_config = quantization_config or QuantizationConfig
+        self.quantization_config = quantization_config or QuantizationConfig()
 
         self.tp_dim = tp_dim
         self.tp_rank = get_dist_context().attn_tp_rank
@@ -58,11 +58,11 @@ class LinearBase(nn.Module):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
-        
-        n_blk_size, k_blk_size = quantization_config.block_size
+
         if scale_tensor is not None:
             self.weight_scale_inv = nn.Parameter(scale_tensor)
-        elif quantization_config.quant_method == "fp8":
+        elif self.quantization_config.quant_method == "fp8":
+            n_blk_size, k_blk_size = self.quantization_config.block_size
             self.weight_scale_inv = nn.Parameter(
                 torch.empty(
                     (output_size + n_blk_size - 1) // n_blk_size,
@@ -274,7 +274,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         weight_tensor: torch.Tensor | None = None,
         bias_tensor: torch.Tensor | None = None,
         scale_tensor: torch.Tensor | None = None,
-        quantization_config: QuantizationConfig = QuantizationConfig,
+        quantization_config: QuantizationConfig = None,
     ):
         tp_size = get_dist_context().attn_tp_world_size
         total_num_kv_heads = total_num_kv_heads or total_num_heads

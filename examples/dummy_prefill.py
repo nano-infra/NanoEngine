@@ -3,10 +3,6 @@ import os
 
 import numpy as np
 
-from nanodeploy import LLM, SamplingParams
-from nanodeploy.engine.sequence import Sequence
-from transformers import AutoTokenizer
-
 
 def main():
     parser = argparse.ArgumentParser(description="Dummy prefill test with scheduler mode selection")
@@ -40,9 +36,22 @@ def main():
     parser.add_argument("--master-address", type=str, default="10.102.252.174:26444")
     parser.add_argument("--ray-address", type=str, default="10.102.252.174:7799")
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--cuda-graph-mode",
+        type=str,
+        default="full",
+        choices=["full", "piecewise"],
+    )
+    parser.add_argument(
+        "--sp-backend",
+        type=str,
+        default="legacy_ll",
+        choices=["legacy_ll", "hao_basic", "nccl"],
+    )
     parser.add_argument("--max-num-send-seqs", type=int, default=128)
     parser.add_argument("--max-num-recv-seqs", type=int, default=130)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--kvcache-block-size", type=int, default=64)
     parser.add_argument("--loop-count", type=int, default=48)
     parser.add_argument("--max-model-len", type=int, default=200_000)
     parser.add_argument("--max-num-batched-tokens", type=int, default=200_000)
@@ -53,12 +62,22 @@ def main():
     parser.add_argument("--profiler-dir", type=str, default="./profiler_logs")
     parser.add_argument("--profiler-start-time", type=float, default=None)
     parser.add_argument("--profiling-duration", type=float, default=None)
+    parser.add_argument("--loongserve-decode-scheduler", action="store_true")
+    parser.add_argument(
+        "--loongserve-min-comp-bound-batch-size",
+        type=int,
+        default=16,
+    )
     args = parser.parse_args()
     path = os.path.expanduser(args.model_path)
+
+    from nanodeploy import LLM, SamplingParams
+    from nanodeploy.engine.sequence import Sequence
 
     decode = LLM(
         path,
         enforce_eager=args.enforce_eager,
+        cuda_graph_mode=args.cuda_graph_mode,
         attention_dp=args.dp,
         attention_sp=args.sp,
         attention_tp=1,
@@ -77,7 +96,7 @@ def main():
         loop_count=args.loop_count,
         max_num_send_seqs=args.max_num_send_seqs,
         max_num_recv_seqs=args.max_num_recv_seqs,
-        kvcache_block_size=64,
+        kvcache_block_size=args.kvcache_block_size,
         enable_profiler=args.enable_profiler,
         profiler_start_step=args.profiler_start_step,
         profiling_step=args.profiling_step,
@@ -87,8 +106,13 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         scheduler_mode=args.scheduler_mode,
         routing_strategy=args.routing_strategy,
+        sp_backend=args.sp_backend,
+        loongserve_decode_scheduler=args.loongserve_decode_scheduler,
+        loongserve_min_comp_bound_batch_size=(
+            args.loongserve_min_comp_bound_batch_size
+        ),
     )
-    
+
     print(f"Starting with scheduler_mode={args.scheduler_mode}, routing_strategy={args.routing_strategy}")
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=args.max_tokens, ignore_eos=True)
