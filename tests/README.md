@@ -2,14 +2,15 @@
 
 ## `test_mla_sp_backend_correctness.py`
 
-这个脚本用于对比 NanoDeploy 里的两个 MLA SP all2all 后端是否一致：
+这个脚本用于对比 NanoDeploy 里的 MLA SP all2all 后端是否一致：
 
 - `legacy_ll`
 - `hao_basic`
+- `nccl`
 
 脚本会走仓库里的正式后端切换路径：
 
-`set_sp_context(..., backend="legacy_ll" | "hao_basic")`
+`set_sp_context(..., backend="legacy_ll" | "hao_basic" | "nccl")`
 
 覆盖三类 MLA 通信：
 
@@ -22,7 +23,7 @@
 - eager 结果正确
 - CUDAGraph replay 结果正确
 - eager 和 graph 一致
-- `legacy_ll` 和 `hao_basic` 一致
+- `hao_basic` 和 `nccl` 一致
 
 默认还会在每次 all2all 前插一个 `all_reduce` 作为同步前导，用来让多 rank 的 launch 更稳定，尤其是 graph 模式下的 8 卡场景。
 
@@ -31,7 +32,7 @@
 先进入仓库根目录：
 
 ```bash
-cd /mnt/nvme1n1/ml_research/linbinbin1/NanoDeploy-April
+cd /mnt/nvme1n1/ml_research/chenjiefei/NanoDeploy-new
 ```
 
 然后用 `torchrun` 启动。这里脚本把 `WORLD_SIZE` 直接当作本次测试的 `SP size`，所以：
@@ -44,6 +45,15 @@ cd /mnt/nvme1n1/ml_research/linbinbin1/NanoDeploy-April
 
 ```bash
 torchrun --nproc_per_node=8 tests/test_mla_sp_backend_correctness.py --mode both
+```
+
+显式对比 DLSlime hao 和 NCCL+Padding：
+
+```bash
+torchrun --nproc_per_node=8 tests/test_mla_sp_backend_correctness.py \
+  --reference-backend hao_basic \
+  --candidate-backend nccl \
+  --mode both
 ```
 
 只测 eager：
@@ -104,8 +114,8 @@ done
 ## 常用参数
 
 - `--mode {eager,graph,both}`：测试 eager、graph，或者两者都测
-- `--reference-backend`：基准后端，默认 `legacy_ll`
-- `--candidate-backend`：待验证后端，默认 `hao_basic`
+- `--reference-backend`：基准后端，默认 `hao_basic`
+- `--candidate-backend`：待验证后端，默认 `nccl`
 - `--dtype {float16,bfloat16}`：默认 `bfloat16`
 - `--max-num-seqs`：SP buffer 的 `max_num_seqs`
 - `--num-requests`：本轮激活的请求数，要求 `num_requests <= max_num_seqs`
@@ -137,9 +147,9 @@ torchrun --nproc_per_node=4 tests/test_mla_sp_backend_correctness.py --mode both
 
 正常通过时，日志里会看到类似输出：
 
-- `[legacy_ll] Q passed ...`
-- `[hao_basic] Res passed ...`
-- `[compare] Lse graph: legacy_ll == hao_basic`
+- `[hao_basic] Q passed ...`
+- `[nccl] Res passed ...`
+- `[compare] Lse graph: hao_basic == nccl`
 - `All MLA SP all-to-all backend checks passed.`
 
 如果失败，脚本会直接抛出 mismatch，并打印：
@@ -151,10 +161,11 @@ torchrun --nproc_per_node=4 tests/test_mla_sp_backend_correctness.py --mode both
 
 ## `benchmark_mla_sp_backend.py`
 
-这个脚本用于在 NanoDeploy 仓库内直接对比两种 MLA SP all2all 后端的性能：
+这个脚本用于在 NanoDeploy 仓库内直接对比 MLA SP all2all 后端的性能：
 
 - `legacy_ll`
 - `hao_basic`
+- `nccl`
 
 它和上面的 correctness 脚本不同点在于：
 
@@ -181,7 +192,7 @@ torchrun --nproc_per_node=8 tests/benchmark_mla_sp_backend.py \
   --cp-sizes 2,4,8 \
   --patterns fan_out,uniform,fan_in \
   --batch-sizes 1,2,4,8,16,32 \
-  --backends legacy_ll,hao_basic \
+  --backends hao_basic,nccl \
   --mode graph
 ```
 

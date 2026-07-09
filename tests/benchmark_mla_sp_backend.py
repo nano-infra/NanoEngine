@@ -19,7 +19,7 @@ from nanodeploy.worker.sp_context import get_sp_context, set_sp_context
 
 
 MASTER_RANK = 0
-BACKEND_CHOICES: tuple[SPBackend, SPBackend] = ("legacy_ll", "hao_basic")
+BACKEND_CHOICES: tuple[SPBackend, ...] = ("legacy_ll", "hao_basic", "nccl")
 PAYLOAD_CHOICES = ("Q", "Res", "Lse")
 PATTERN_CHOICES = ("fan_out", "uniform", "fan_in")
 
@@ -63,6 +63,7 @@ class PayloadCase:
 class BuiltPayload:
     x: torch.Tensor
     mask: torch.Tensor
+    offsets: torch.Tensor | None
     expected: torch.Tensor
     local_owned_seqs: int
     local_compute_slots: int
@@ -107,6 +108,7 @@ class BufferRunner(BaseRunner):
         buffer,
         x: torch.Tensor,
         mask: torch.Tensor,
+        offsets: torch.Tensor | None,
         is_transpose: bool,
     ) -> None:
         super().__init__(
@@ -118,6 +120,7 @@ class BufferRunner(BaseRunner):
         self.buffer = buffer
         self.x = x
         self.mask = mask
+        self.offsets = offsets
         self.is_transpose = is_transpose
         self.output: torch.Tensor | None = None
 
@@ -128,6 +131,7 @@ class BufferRunner(BaseRunner):
                 self.x,
                 is_transpose=self.is_transpose,
                 mask=self.mask,
+                offsets=self.offsets,
             )
 
 
@@ -252,9 +256,8 @@ class FanInPattern(BaseTrafficPattern):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark NanoDeploy MLA SP all-to-all backends (`legacy_ll` vs "
-            "`hao_basic`) under traffic patterns that approximate DeepSeek V3 "
-            "decode routing."
+            "Benchmark NanoDeploy MLA SP all-to-all backends under traffic "
+            "patterns that approximate DeepSeek V3 decode routing."
         )
     )
     parser.add_argument(
@@ -266,7 +269,7 @@ def parse_args():
     parser.add_argument(
         "--backends",
         type=str,
-        default="legacy_ll,hao_basic",
+        default="hao_basic,nccl",
         help="Comma-separated backends to benchmark.",
     )
     parser.add_argument(
@@ -599,50 +602,72 @@ def build_q_case(
         (pattern.sp_size, pattern.max_num_seqs), dtype=torch.int32, device=device
     )
     expected = torch.zeros(
-        (pattern.sp_size, pattern.max_num_seqs, feature_dim),
+        (pattern.sp_size * pattern.max_num_seqs, feature_dim),
         dtype=dtype,
         device=device,
     )
+    offsets = torch.zeros(pattern.sp_size + 1, dtype=torch.int32, device=device)
 
     buffer.local_buffer.zero_()
-    local = local_buffer_view(
+    local_flat = local_buffer_view(
         buffer,
         world_size=pattern.sp_size,
         max_num_seqs=pattern.max_num_seqs,
         feature_dim=feature_dim,
         dtype=dtype,
-    )
+    ).view(pattern.sp_size * pattern.max_num_seqs, feature_dim)
 
     local_owned_seqs = pattern.owned_seq_count(rank)
     local_compute_slots = 0
+    receive_counts: list[int] = []
     for owner_rank in pattern.owner_ranks():
         owned_seqs = pattern.owned_seq_count(owner_rank)
+        receive_count = 0
         for seq_idx in range(owned_seqs):
             participants = pattern.participants_for(owner_rank, seq_idx)
             if rank in participants:
                 local_compute_slots += 1
+                receive_count += 1
+        receive_counts.append(receive_count if 0 <= owner_rank < pattern.sp_size else 0)
+
+    running = 0
+    for src_rank in range(pattern.sp_size):
+        offsets[src_rank] = running
+        if src_rank in pattern.owner_ranks():
+            owner_idx = pattern.owner_ranks().index(src_rank)
+            running += receive_counts[owner_idx]
+    offsets[pattern.sp_size] = running
 
     for seq_idx in range(local_owned_seqs):
         value = q_seq_value(rank, seq_idx)
         participants = pattern.participants_for(rank, seq_idx)
         x[seq_idx].fill_(value)
         if rank in participants:
-            local[rank, seq_idx].fill_(value)
+            local_idx = sum(
+                1
+                for prev_seq in range(seq_idx)
+                if rank in pattern.participants_for(rank, prev_seq)
+            )
+            local_flat[int(offsets[rank].item()) + local_idx].fill_(value)
         for target_rank in participants:
             if target_rank != rank:
                 mask[target_rank, seq_idx] = 1
 
-    for owner_rank in pattern.owner_ranks():
-        owned_seqs = pattern.owned_seq_count(owner_rank)
+    for src_rank in range(pattern.sp_size):
+        owned_seqs = pattern.owned_seq_count(src_rank)
+        local_idx = 0
         for seq_idx in range(owned_seqs):
-            if rank in pattern.participants_for(owner_rank, seq_idx):
-                expected[owner_rank, seq_idx].fill_(q_seq_value(owner_rank, seq_idx))
+            if rank in pattern.participants_for(src_rank, seq_idx):
+                packed_idx = int(offsets[src_rank].item()) + local_idx
+                expected[packed_idx].fill_(q_seq_value(src_rank, seq_idx))
+                local_idx += 1
 
     local_send_tokens = int(mask.sum().item())
     local_send_targets = sum(1 for count in mask.sum(dim=1).tolist() if count > 0)
     return BuiltPayload(
         x=x,
         mask=mask,
+        offsets=offsets,
         expected=expected,
         local_owned_seqs=local_owned_seqs,
         local_compute_slots=local_compute_slots,
@@ -706,6 +731,7 @@ def build_reduce_case(
     return BuiltPayload(
         x=x,
         mask=mask,
+        offsets=None,
         expected=expected,
         local_owned_seqs=local_owned_seqs,
         local_compute_slots=local_compute_slots,
@@ -774,6 +800,12 @@ def build_payload_cases(args) -> dict[str, PayloadCase]:
     }
 
 
+def canonical_compare_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim >= 2:
+        return tensor.reshape(-1, tensor.shape[-1])
+    return tensor.reshape(-1)
+
+
 def validate_output(
     *,
     name: str,
@@ -782,16 +814,22 @@ def validate_output(
     group: dist.ProcessGroup,
     device: torch.device,
 ) -> None:
-    local_ok = actual.shape == expected.shape and bool(torch.equal(actual, expected))
+    actual_cmp = canonical_compare_tensor(actual)
+    expected_cmp = canonical_compare_tensor(expected)
+    local_ok = actual_cmp.shape == expected_cmp.shape and bool(
+        torch.equal(actual_cmp, expected_cmp)
+    )
     ok_tensor = torch.tensor([1 if local_ok else 0], dtype=torch.int32, device=device)
     dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN, group=group)
     if ok_tensor.item() == 1:
         return
     max_diff = 0.0
-    if actual.shape == expected.shape:
-        max_diff = float((actual.float() - expected.float()).abs().max().item())
+    if actual_cmp.shape == expected_cmp.shape:
+        max_diff = float((actual_cmp.float() - expected_cmp.float()).abs().max().item())
     raise RuntimeError(
-        f"Validation failed for {name} on rank={dist.get_rank(group=group)} max_diff={max_diff}"
+        f"Validation failed for {name} on rank={dist.get_rank(group=group)} "
+        f"actual_shape={tuple(actual.shape)} expected_shape={tuple(expected.shape)} "
+        f"max_diff={max_diff}"
     )
 
 
@@ -854,10 +892,31 @@ def matches_preamble_kernel(low_name: str, preamble: str) -> bool:
 
 
 def matches_all_to_all_kernel(low_name: str) -> bool:
+    excluded_collectives = (
+        "allreduce",
+        "all_reduce",
+        "allgather",
+        "all_gather",
+        "broadcast",
+        "reducescatter",
+        "reduce_scatter",
+    )
+    if any(token in low_name for token in excluded_collectives):
+        return False
+
     return (
         "all_to_all_intra_ll_kernel" in low_name
         or "all_to_all_intra_ll" in low_name
-        or ("alltoall" in low_name and ("intra" in low_name or "slime" in low_name))
+        or "alltoall" in low_name
+        or "all_to_all" in low_name
+        or (
+            "nccl" in low_name
+            and (
+                "sendrecv" in low_name
+                or "send" in low_name
+                or "recv" in low_name
+            )
+        )
     )
 
 
@@ -1078,6 +1137,7 @@ def benchmark_payload(
         buffer=buffer,
         x=built.x,
         mask=built.mask,
+        offsets=built.offsets,
         is_transpose=payload.is_transpose,
     )
 

@@ -12,7 +12,7 @@ Covered cases:
 The script initializes `SPContext` twice, once per backend, so the exercised path
 matches NanoDeploy's startup-time backend selection:
 
-`set_sp_context(..., backend="legacy_ll" | "hao_basic")`
+`set_sp_context(..., backend="legacy_ll" | "hao_basic" | "nccl")`
 
 Usage:
 `torchrun --nproc_per_node=8 tests/test_mla_sp_backend_correctness.py --mode both`
@@ -34,7 +34,7 @@ from nanodeploy.worker.sp_context import get_sp_context, set_sp_context
 
 
 MASTER_RANK = 0
-BACKEND_CHOICES: tuple[SPBackend, SPBackend] = ("legacy_ll", "hao_basic")
+BACKEND_CHOICES: tuple[SPBackend, ...] = ("legacy_ll", "hao_basic", "nccl")
 MODE_CHOICES = ("eager", "graph", "both")
 
 
@@ -77,21 +77,21 @@ class PreambleState:
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Validate that NanoDeploy's legacy_ll and hao_basic MLA SP all-to-all "
-            "backends produce identical outputs."
+            "Validate that NanoDeploy's MLA SP all-to-all backends produce "
+            "identical outputs."
         )
     )
     parser.add_argument(
         "--reference-backend",
         type=str,
-        default="legacy_ll",
+        default="hao_basic",
         choices=BACKEND_CHOICES,
         help="Known-good backend to compare against.",
     )
     parser.add_argument(
         "--candidate-backend",
         type=str,
-        default="hao_basic",
+        default="nccl",
         choices=BACKEND_CHOICES,
         help="Backend under validation.",
     )
@@ -407,28 +407,38 @@ def build_lse_case(
     )
 
 
+def canonical_compare_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim >= 2:
+        return tensor.reshape(-1, tensor.shape[-1])
+    return tensor.reshape(-1)
+
+
 def mismatch_summary(name: str, actual: torch.Tensor, expected: torch.Tensor) -> dict:
+    actual_cmp = canonical_compare_tensor(actual)
+    expected_cmp = canonical_compare_tensor(expected)
     summary = {
         "name": name,
         "rank": dist.get_rank(),
         "actual_shape": tuple(actual.shape),
         "expected_shape": tuple(expected.shape),
+        "actual_compare_shape": tuple(actual_cmp.shape),
+        "expected_compare_shape": tuple(expected_cmp.shape),
     }
 
-    if actual.shape != expected.shape:
+    if actual_cmp.shape != expected_cmp.shape:
         return summary
 
-    matches = torch.eq(actual, expected)
+    matches = torch.eq(actual_cmp, expected_cmp)
     if bool(matches.all()):
         summary["max_diff"] = 0.0
         return summary
 
     mismatch_index = (~matches).nonzero(as_tuple=False)[0].tolist()
-    actual_value = float(actual[mismatch_index[0], mismatch_index[1], mismatch_index[2]].float().item())
-    expected_value = float(
-        expected[mismatch_index[0], mismatch_index[1], mismatch_index[2]].float().item()
+    actual_value = float(actual_cmp[tuple(mismatch_index)].float().item())
+    expected_value = float(expected_cmp[tuple(mismatch_index)].float().item())
+    summary["max_diff"] = float(
+        (actual_cmp.float() - expected_cmp.float()).abs().max().item()
     )
-    summary["max_diff"] = float((actual.float() - expected.float()).abs().max().item())
     summary["first_mismatch_index"] = mismatch_index
     summary["actual_value"] = actual_value
     summary["expected_value"] = expected_value
@@ -443,7 +453,11 @@ def assert_tensors_equal(
     group: dist.ProcessGroup,
     device: torch.device,
 ) -> None:
-    local_ok = actual.shape == expected.shape and bool(torch.equal(actual, expected))
+    actual_cmp = canonical_compare_tensor(actual)
+    expected_cmp = canonical_compare_tensor(expected)
+    local_ok = actual_cmp.shape == expected_cmp.shape and bool(
+        torch.equal(actual_cmp, expected_cmp)
+    )
     ok_tensor = torch.tensor([1 if local_ok else 0], dtype=torch.int32, device=device)
     dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN, group=group)
     if ok_tensor.item() == 1:
