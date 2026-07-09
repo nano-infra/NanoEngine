@@ -580,7 +580,10 @@ class ModelRunner:
         master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
         if (
             context.use_sp_a2a
-            and (self.config.sp_backend == "nccl" or self.config.fixed_sp_size > 0)
+            and (
+                self.config.sp_backend in {"nccl", "nccl_compact"}
+                or self.config.fixed_sp_size > 0
+            )
             and context.sp_comm_bs is not None
         ):
             comm_min_master_bs = max(bs, context.sp_comm_bs)

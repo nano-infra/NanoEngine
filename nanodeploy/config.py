@@ -69,7 +69,7 @@ class Config:
 
     # performance optimization
     use_dlslime_rpc: bool = True
-    sp_backend: Literal["legacy_ll", "hao_basic", "nccl"] = "legacy_ll"
+    sp_backend: Literal["legacy_ll", "hao_basic", "nccl", "nccl_compact"] = "legacy_ll"
     # Optimize Block Table transmission in Decode phase: if True, only send BlockTable
     # for sequences that have KVCache on the target rank; if False, send all BlockTables
     optimize_decode_block_table: bool = True
@@ -212,6 +212,15 @@ class Config:
         hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         if self.cuda_graph_mode not in {"full", "piecewise"}:
             raise ValueError("cuda_graph_mode must be one of: full, piecewise")
+        if (
+            self.sp_backend == "nccl_compact"
+            and not self.enforce_eager
+            and self.cuda_graph_mode != "piecewise"
+        ):
+            raise ValueError(
+                "sp_backend='nccl_compact' uses variable split-size NCCL and "
+                "requires enforce_eager=True or cuda_graph_mode='piecewise'"
+            )
         # Convert custom config classes (e.g., kimi_k2 which maps to DeepseekV3ForCausalLM)
         # to the equivalent standard transformers config so Ray can pickle/unpickle without
         # needing the dynamic transformers_modules module on worker processes.

@@ -16,8 +16,12 @@ from torch import nn
 logger = get_logger()
 
 
+def _uses_nccl_comm_bs(sp_context) -> bool:
+    return sp_context.backend in {"nccl", "nccl_compact"}
+
+
 def _get_sp_comm_bs(sp_context, context) -> int:
-    if sp_context.backend == "nccl" and context.sp_comm_bs is not None:
+    if _uses_nccl_comm_bs(sp_context) and context.sp_comm_bs is not None:
         return int(context.sp_comm_bs)
     return sp_context.max_num_seqs
 
@@ -94,7 +98,7 @@ class FlashAttentionImpl:
                 comm_bs = _get_sp_comm_bs(sp_context, context)
                 q_mask = (
                     _narrow_sp_matrix_for_comm(context.q_mask, comm_bs)
-                    if sp_context.backend == "nccl"
+                    if _uses_nccl_comm_bs(sp_context)
                     else context.q_mask
                 )
                 q_buffer = sp_context.q_buffer
@@ -103,7 +107,7 @@ class FlashAttentionImpl:
                 local_q_buffer_3d = q_buffer.local_buffer.view(sp_context.dtype)[
                     : sp_size * comm_bs * num_head * head_dim
                 ].view(sp_size * comm_bs, num_head, head_dim)
-                if sp_context.backend == "nccl":
+                if _uses_nccl_comm_bs(sp_context):
                     local_q_buffer_3d.zero_()
                 copy_batch_indexed_triton(
                     q,
@@ -151,12 +155,12 @@ class FlashAttentionImpl:
                 comm_bs = _get_sp_comm_bs(sp_context, context)
                 res_lse_mask = (
                     _narrow_sp_matrix_for_comm(context.res_lse_mask, comm_bs)
-                    if sp_context.backend == "nccl"
+                    if _uses_nccl_comm_bs(sp_context)
                     else context.res_lse_mask
                 )
                 global_context_lens = (
                     _narrow_sp_matrix_for_comm(context.global_context_lens, comm_bs)
-                    if sp_context.backend == "nccl"
+                    if _uses_nccl_comm_bs(sp_context)
                     else context.global_context_lens
                 )
                 res_slice_fill_to_buffer_output = (
@@ -165,7 +169,7 @@ class FlashAttentionImpl:
                         old_stride=max_num_seqs,
                         new_stride=comm_bs,
                     )
-                    if sp_context.backend == "nccl"
+                    if _uses_nccl_comm_bs(sp_context)
                     else context.res_slice_fill_to_buffer_output
                 )
                 res_slice_fill_to_buffer_input = (
@@ -174,7 +178,7 @@ class FlashAttentionImpl:
                         old_stride=max_num_seqs,
                         new_stride=comm_bs,
                     )
-                    if sp_context.backend == "nccl"
+                    if _uses_nccl_comm_bs(sp_context)
                     else context.res_slice_fill_to_buffer_input
                 )
                 res_buffer = sp_context.res_buffer
@@ -189,7 +193,7 @@ class FlashAttentionImpl:
                 )[: sp_size * comm_bs * num_head * head_dim].view(
                     sp_size * comm_bs, num_head, head_dim
                 )
-                if sp_context.backend == "nccl":
+                if _uses_nccl_comm_bs(sp_context):
                     res_local_buffer_3d.zero_()
                 copy_batch_indexed_triton(
                     gathered_o.view(-1, num_head, head_dim),
@@ -205,7 +209,7 @@ class FlashAttentionImpl:
                 )[: sp_size * comm_bs * num_head * 1].view(
                     sp_size * comm_bs, num_head, 1
                 )
-                if sp_context.backend == "nccl":
+                if _uses_nccl_comm_bs(sp_context):
                     lse_local_buffer_3d.zero_()
                 copy_batch_indexed_triton(
                     gathered_lse.view(-1, num_head, 1),
@@ -319,7 +323,7 @@ class FlashMLAImpl:
                 comm_bs = _get_sp_comm_bs(sp_context, context)
                 q_mask = (
                     _narrow_sp_matrix_for_comm(context.q_mask, comm_bs)
-                    if sp_context.backend == "nccl"
+                    if _uses_nccl_comm_bs(sp_context)
                     else context.q_mask
                 )
                 q_buffer = sp_context.q_buffer
@@ -327,7 +331,7 @@ class FlashMLAImpl:
                 local_q_buffer_3d = q_buffer.local_buffer.view(sp_context.dtype)[
                     : sp_size * comm_bs * num_head * head_dim
                 ].view(sp_size * comm_bs, num_head, head_dim)
-                if sp_context.backend == "nccl":
+                if _uses_nccl_comm_bs(sp_context):
                     local_q_buffer_3d.zero_()
                 copy_batch_indexed_triton(
                     q.view(bs, num_head, head_dim),
@@ -386,12 +390,12 @@ class FlashMLAImpl:
                 comm_bs = _get_sp_comm_bs(sp_context, context)
                 res_lse_mask = (
                     _narrow_sp_matrix_for_comm(context.res_lse_mask, comm_bs)
-                    if sp_context.backend == "nccl"
+                    if _uses_nccl_comm_bs(sp_context)
                     else context.res_lse_mask
                 )
                 global_context_lens = (
                     _narrow_sp_matrix_for_comm(context.global_context_lens, comm_bs)
-                    if sp_context.backend == "nccl"
+                    if _uses_nccl_comm_bs(sp_context)
                     else context.global_context_lens
                 )
                 res_slice_fill_to_buffer_output = (
@@ -400,7 +404,7 @@ class FlashMLAImpl:
                         old_stride=max_num_seqs,
                         new_stride=comm_bs,
                     )
-                    if sp_context.backend == "nccl"
+                    if _uses_nccl_comm_bs(sp_context)
                     else context.res_slice_fill_to_buffer_output
                 )
                 res_slice_fill_to_buffer_input = (
@@ -409,7 +413,7 @@ class FlashMLAImpl:
                         old_stride=max_num_seqs,
                         new_stride=comm_bs,
                     )
-                    if sp_context.backend == "nccl"
+                    if _uses_nccl_comm_bs(sp_context)
                     else context.res_slice_fill_to_buffer_input
                 )
                 res_buffer = sp_context.res_buffer
@@ -426,7 +430,7 @@ class FlashMLAImpl:
                 )[: sp_size * comm_bs * num_head * v_head_dim].view(
                     sp_size * comm_bs, num_head, v_head_dim
                 )
-                if sp_context.backend == "nccl":
+                if _uses_nccl_comm_bs(sp_context):
                     res_local_buffer_3d.zero_()
 
                 copy_batch_indexed_triton(
@@ -443,7 +447,7 @@ class FlashMLAImpl:
                 )[: sp_size * comm_bs * num_head * 1].view(
                     sp_size * comm_bs, num_head, 1
                 )
-                if sp_context.backend == "nccl":
+                if _uses_nccl_comm_bs(sp_context):
                     lse_local_buffer_3d.zero_()
 
                 copy_batch_indexed_triton(

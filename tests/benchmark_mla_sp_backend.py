@@ -19,7 +19,12 @@ from nanodeploy.worker.sp_context import get_sp_context, set_sp_context
 
 
 MASTER_RANK = 0
-BACKEND_CHOICES: tuple[SPBackend, ...] = ("legacy_ll", "hao_basic", "nccl")
+BACKEND_CHOICES: tuple[SPBackend, ...] = (
+    "legacy_ll",
+    "hao_basic",
+    "nccl",
+    "nccl_compact",
+)
 PAYLOAD_CHOICES = ("Q", "Res", "Lse")
 PATTERN_CHOICES = ("fan_out", "uniform", "fan_in")
 
@@ -1553,6 +1558,11 @@ def main() -> None:
     cp_sizes = parse_cp_sizes(args.cp_sizes)
     batch_sizes = parse_batch_sizes(args)
     backends = parse_backends(args.backends)
+    if "nccl_compact" in backends and args.mode != "eager":
+        raise ValueError(
+            "nccl_compact uses variable split-size NCCL collectives and only "
+            "supports --mode eager in this microbenchmark."
+        )
     pattern_names = parse_patterns(args.patterns)
     payload_names = parse_payloads(args.payloads)
 
