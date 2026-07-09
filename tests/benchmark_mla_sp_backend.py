@@ -589,6 +589,72 @@ def local_buffer_view(
     return buffer.local_buffer.view(dtype)[:numel].view(world_size, max_num_seqs, feature_dim)
 
 
+def build_q_case_strided(
+    pattern: BaseTrafficPattern,
+    buffer,
+    dtype: torch.dtype,
+    device: torch.device,
+    feature_dim: int,
+) -> BuiltPayload:
+    rank = pattern.rank
+    x = torch.zeros((pattern.max_num_seqs, feature_dim), dtype=dtype, device=device)
+    mask = torch.zeros(
+        (pattern.sp_size, pattern.max_num_seqs), dtype=torch.int32, device=device
+    )
+    expected = torch.zeros(
+        (pattern.sp_size, pattern.max_num_seqs, feature_dim),
+        dtype=dtype,
+        device=device,
+    )
+
+    buffer.local_buffer.zero_()
+    local = local_buffer_view(
+        buffer,
+        world_size=pattern.sp_size,
+        max_num_seqs=pattern.max_num_seqs,
+        feature_dim=feature_dim,
+        dtype=dtype,
+    )
+
+    local_owned_seqs = pattern.owned_seq_count(rank)
+    local_compute_slots = 0
+    for owner_rank in pattern.owner_ranks():
+        owned_seqs = pattern.owned_seq_count(owner_rank)
+        for seq_idx in range(owned_seqs):
+            participants = pattern.participants_for(owner_rank, seq_idx)
+            if rank in participants:
+                local_compute_slots += 1
+
+    for seq_idx in range(local_owned_seqs):
+        value = q_seq_value(rank, seq_idx)
+        participants = pattern.participants_for(rank, seq_idx)
+        x[seq_idx].fill_(value)
+        if rank in participants:
+            local[rank, seq_idx].fill_(value)
+        for target_rank in participants:
+            if target_rank != rank:
+                mask[target_rank, seq_idx] = 1
+
+    for owner_rank in pattern.owner_ranks():
+        owned_seqs = pattern.owned_seq_count(owner_rank)
+        for seq_idx in range(owned_seqs):
+            if rank in pattern.participants_for(owner_rank, seq_idx):
+                expected[owner_rank, seq_idx].fill_(q_seq_value(owner_rank, seq_idx))
+
+    local_send_tokens = int(mask.sum().item())
+    local_send_targets = sum(1 for count in mask.sum(dim=1).tolist() if count > 0)
+    return BuiltPayload(
+        x=x,
+        mask=mask,
+        offsets=None,
+        expected=expected,
+        local_owned_seqs=local_owned_seqs,
+        local_compute_slots=local_compute_slots,
+        local_send_tokens=local_send_tokens,
+        local_send_targets=local_send_targets,
+    )
+
+
 def build_q_case(
     pattern: BaseTrafficPattern,
     buffer,
@@ -596,6 +662,9 @@ def build_q_case(
     device: torch.device,
     feature_dim: int,
 ) -> BuiltPayload:
+    if pattern.name == "fan_in":
+        return build_q_case_strided(pattern, buffer, dtype, device, feature_dim)
+
     rank = pattern.rank
     x = torch.zeros((pattern.max_num_seqs, feature_dim), dtype=dtype, device=device)
     mask = torch.zeros(
@@ -619,7 +688,7 @@ def build_q_case(
 
     local_owned_seqs = pattern.owned_seq_count(rank)
     local_compute_slots = 0
-    receive_counts: list[int] = []
+    receive_counts = [0 for _ in range(pattern.sp_size)]
     for owner_rank in pattern.owner_ranks():
         owned_seqs = pattern.owned_seq_count(owner_rank)
         receive_count = 0
@@ -628,14 +697,13 @@ def build_q_case(
             if rank in participants:
                 local_compute_slots += 1
                 receive_count += 1
-        receive_counts.append(receive_count if 0 <= owner_rank < pattern.sp_size else 0)
+        if 0 <= owner_rank < pattern.sp_size:
+            receive_counts[owner_rank] = receive_count
 
     running = 0
     for src_rank in range(pattern.sp_size):
         offsets[src_rank] = running
-        if src_rank in pattern.owner_ranks():
-            owner_idx = pattern.owner_ranks().index(src_rank)
-            running += receive_counts[owner_idx]
+        running += receive_counts[src_rank]
     offsets[pattern.sp_size] = running
 
     for seq_idx in range(local_owned_seqs):
@@ -924,6 +992,8 @@ def parse_trace_stats(
     trace_path: Path,
     preamble: str,
     total_all2all_iters: int,
+    *,
+    split_mask_all2all: bool = False,
 ) -> dict[str, object]:
     with trace_path.open("r", encoding="utf-8") as f:
         trace = json.load(f)
@@ -973,12 +1043,34 @@ def parse_trace_stats(
     else:
         comm_region_durations = list(alltoall_durations)
 
+    if split_mask_all2all:
+        payload_alltoall_durations = alltoall_durations[0::2]
+        mask_alltoall_durations = alltoall_durations[1::2]
+    else:
+        payload_alltoall_durations = list(alltoall_durations)
+        mask_alltoall_durations = []
+
+    payload_alltoall_us = float(sum(payload_alltoall_durations))
+    mask_alltoall_us = float(sum(mask_alltoall_durations))
+
     return {
         "all2all": {
             "trace_avg_us": alltoall_us / max(total_all2all_iters, 1),
             "trace_p50_us": summarize_values(alltoall_durations)["p50_us"],
             "kernel_count": alltoall_count,
             "matched_kernel_names": sorted(matched_alltoall_names),
+        },
+        "payload_all2all": {
+            "trace_avg_us": payload_alltoall_us / max(total_all2all_iters, 1),
+            "trace_p50_us": summarize_values(payload_alltoall_durations)["p50_us"],
+            "kernel_count": len(payload_alltoall_durations),
+            "split_from_total": split_mask_all2all,
+        },
+        "mask_all2all": {
+            "trace_avg_us": mask_alltoall_us / max(total_all2all_iters, 1),
+            "trace_p50_us": summarize_values(mask_alltoall_durations)["p50_us"],
+            "kernel_count": len(mask_alltoall_durations),
+            "split_from_total": split_mask_all2all,
         },
         "preamble": {
             "trace_avg_us": preamble_us / max(total_all2all_iters, 1),
@@ -1005,6 +1097,7 @@ def profiler_benchmark(
     trace_path: Path,
     device: torch.device,
     group: dist.ProcessGroup,
+    split_mask_all2all: bool,
 ) -> dict[str, object]:
     if profile_iters <= 0:
         raise ValueError("profile_iters must be positive")
@@ -1033,6 +1126,7 @@ def profiler_benchmark(
         trace_path,
         runner.preamble,
         total_all2all_iters=profile_iters * runner.inner_iters,
+        split_mask_all2all=split_mask_all2all,
     )
     if stats["all2all"]["kernel_count"] == 0:  # type: ignore[index]
         raise RuntimeError(
@@ -1075,6 +1169,8 @@ def zero_payload_summary(
         "local_send_bytes": 0.0,
         "wall_summary_us": zero_summary,
         "all2all_summary_us": zero_summary,
+        "payload_all2all_summary_us": zero_summary,
+        "mask_all2all_summary_us": zero_summary,
         "comm_region_summary_us": zero_summary,
         "trace_paths": [],
     }
@@ -1093,6 +1189,14 @@ def zero_payload_summary(
         "ranks": rank_items,
         "wall_active_summary": active_aggregate(rank_items, "wall_summary_us"),
         "all2all_active_summary": active_aggregate(rank_items, "all2all_summary_us"),
+        "payload_all2all_active_summary": active_aggregate(
+            rank_items,
+            "payload_all2all_summary_us",
+        ),
+        "mask_all2all_active_summary": active_aggregate(
+            rank_items,
+            "mask_all2all_summary_us",
+        ),
         "comm_region_active_summary": active_aggregate(
             rank_items,
             "comm_region_summary_us",
@@ -1145,16 +1249,20 @@ def benchmark_payload(
     torch.cuda.synchronize(device)
     dist.barrier(group=group)
     assert runner.output is not None
-    validate_output(
-        name=(
-            f"{backend}/{pattern.name}/bs{pattern.batch_size}/"
-            f"{payload.name}/cp{pattern.sp_size}"
-        ),
-        actual=runner.output.clone(),
-        expected=built.expected,
-        group=group,
-        device=device,
-    )
+    # Synthetic fan-in Q has no direct decode equivalent: only the master rank
+    # consumes the output, and native backends may choose different unused-slot
+    # layouts. Keep it as a timing-only case.
+    if not (payload.name == "Q" and pattern.name == "fan_in"):
+        validate_output(
+            name=(
+                f"{backend}/{pattern.name}/bs{pattern.batch_size}/"
+                f"{payload.name}/cp{pattern.sp_size}"
+            ),
+            actual=runner.output.clone(),
+            expected=built.expected,
+            group=group,
+            device=device,
+        )
 
     graph = None
     if args.mode == "graph":
@@ -1162,8 +1270,11 @@ def benchmark_payload(
 
     wall_samples: list[float] = []
     all2all_trace_samples: list[float] = []
+    payload_all2all_trace_samples: list[float] = []
+    mask_all2all_trace_samples: list[float] = []
     comm_region_trace_samples: list[float] = []
     trace_paths: list[str] = []
+    split_mask_all2all = backend == "nccl" and payload.name == "Q" and built.offsets is not None
 
     for repeat_idx in range(args.repeats):
         wall_samples.append(
@@ -1184,9 +1295,12 @@ def benchmark_payload(
             trace_path=trace_path,
             device=device,
             group=group,
+            split_mask_all2all=split_mask_all2all,
         )
         trace_paths.append(str(trace_path))
         all2all_trace_samples.append(float(trace_stats["all2all"]["trace_avg_us"]))  # type: ignore[index]
+        payload_all2all_trace_samples.append(float(trace_stats["payload_all2all"]["trace_avg_us"]))  # type: ignore[index]
+        mask_all2all_trace_samples.append(float(trace_stats["mask_all2all"]["trace_avg_us"]))  # type: ignore[index]
         comm_region_trace_samples.append(float(trace_stats["comm_region"]["trace_avg_us"]))  # type: ignore[index]
 
     rank_meta = {
@@ -1199,6 +1313,8 @@ def benchmark_payload(
         "local_send_bytes": float(built.local_send_tokens * payload.feature_dim * itemsize),
         "wall_summary_us": summarize_values(wall_samples),
         "all2all_summary_us": summarize_values(all2all_trace_samples),
+        "payload_all2all_summary_us": summarize_values(payload_all2all_trace_samples),
+        "mask_all2all_summary_us": summarize_values(mask_all2all_trace_samples),
         "comm_region_summary_us": summarize_values(comm_region_trace_samples),
         "trace_paths": trace_paths,
     }
@@ -1221,6 +1337,14 @@ def benchmark_payload(
         "ranks": rank_items,
         "wall_active_summary": active_aggregate(active_rank_items, "wall_summary_us"),
         "all2all_active_summary": active_aggregate(active_rank_items, "all2all_summary_us"),
+        "payload_all2all_active_summary": active_aggregate(
+            active_rank_items,
+            "payload_all2all_summary_us",
+        ),
+        "mask_all2all_active_summary": active_aggregate(
+            active_rank_items,
+            "mask_all2all_summary_us",
+        ),
         "comm_region_active_summary": active_aggregate(
             active_rank_items,
             "comm_region_summary_us",
@@ -1322,6 +1446,8 @@ def run_backend_cp_bench(
                     f"[{backend}] cp_size={cp_size} pattern={pattern_name} "
                     f"batch_size={batch_size} payload={payload_name} "
                     f"all2all_mean_us={result['all2all_active_summary']['mean_of_means_us']:.2f} "
+                    f"payload_all2all_mean_us={result['payload_all2all_active_summary']['mean_of_means_us']:.2f} "
+                    f"mask_all2all_mean_us={result['mask_all2all_active_summary']['mean_of_means_us']:.2f} "
                     f"comm_region_mean_us={result['comm_region_active_summary']['mean_of_means_us']:.2f}"
                 )
 
@@ -1375,6 +1501,12 @@ def flatten_summary_rows(summary: dict[str, object]) -> list[dict[str, object]]:
                                 "all2all_mean_us": payload_result["all2all_active_summary"]["mean_of_means_us"],
                                 "all2all_slowest_mean_us": payload_result["all2all_active_summary"]["slowest_mean_us"],
                                 "all2all_fastest_mean_us": payload_result["all2all_active_summary"]["fastest_mean_us"],
+                                "payload_all2all_mean_us": payload_result["payload_all2all_active_summary"]["mean_of_means_us"],
+                                "payload_all2all_slowest_mean_us": payload_result["payload_all2all_active_summary"]["slowest_mean_us"],
+                                "payload_all2all_fastest_mean_us": payload_result["payload_all2all_active_summary"]["fastest_mean_us"],
+                                "mask_all2all_mean_us": payload_result["mask_all2all_active_summary"]["mean_of_means_us"],
+                                "mask_all2all_slowest_mean_us": payload_result["mask_all2all_active_summary"]["slowest_mean_us"],
+                                "mask_all2all_fastest_mean_us": payload_result["mask_all2all_active_summary"]["fastest_mean_us"],
                                 "comm_region_mean_us": payload_result["comm_region_active_summary"]["mean_of_means_us"],
                                 "comm_region_slowest_mean_us": payload_result["comm_region_active_summary"]["slowest_mean_us"],
                                 "comm_region_fastest_mean_us": payload_result["comm_region_active_summary"]["fastest_mean_us"],

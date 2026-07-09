@@ -234,6 +234,8 @@ CSV 里会带这些关键字段，便于后续画曲线：
 - `batch_size`
 - `payload`
 - `all2all_mean_us`
+- `payload_all2all_mean_us`
+- `mask_all2all_mean_us`
 - `comm_region_mean_us`
 - `local_send_bytes_sum`
 
