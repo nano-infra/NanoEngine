@@ -70,6 +70,9 @@ class ModelRunner:
         self.log_decode_a2a_masks = _env_flag_enabled(
             "NANODEPLOY_LOG_DECODE_A2A_MASKS", default=False
         )
+        self.log_input_transfer_latency = _env_flag_enabled(
+            "NANODEPLOY_LOG_INPUT_TRANSFER_LATENCY", default=False
+        )
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -868,7 +871,7 @@ class ModelRunner:
         if enable_rpc:
             dp_seqs = self.endpoint.recv_seqs()
 
-        if send_timestamp > 0:
+        if self.log_input_transfer_latency and send_timestamp > 0:
             latency = (time.time() - send_timestamp) * 1000
             logger.info(f"[METRIC] Rank {self.rank} Input Transfer Latency: {latency:.4f} ms")
         sp_rank = get_dist_context().attn_sp_rank

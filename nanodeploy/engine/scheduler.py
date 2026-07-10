@@ -64,6 +64,11 @@ class Scheduler(_CppScheduler):
             config.loongserve_enable_kv_migration,
             config.loongserve_migration_granularity,
             config.loongserve_min_comp_bound_batch_size,
+            config.loongserve_max_local_decode_sp,
+            config.loongserve_decode_profile_path,
+            config.loongserve_decode_profile_near_optimal_ratio,
+            config.loongserve_decode_profile_abs_gain_ms,
+            config.loongserve_decode_cross_node_sp,
         )
         # Store config for compatibility
         self.engine_id = config.engine_id

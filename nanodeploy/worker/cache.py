@@ -1,5 +1,4 @@
 import dataclasses
-import os
 from collections import defaultdict
 from typing import Any, Literal
 
@@ -10,14 +9,11 @@ from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.worker.distributed import get_dist_context
 
+SLIME_QP_NUM = 4
+
 
 def _get_slime_qp_num() -> int:
-    raw = os.environ.get("SLIME_QP_NUM", "1")
-    try:
-        num_qp = int(raw)
-    except ValueError:
-        return 1
-    return max(num_qp, 1)
+    return SLIME_QP_NUM
 
 
 @dataclasses.dataclass

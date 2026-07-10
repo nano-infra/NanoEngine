@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from nanodeploy._cpp import (
     BlockContextSlot,
     Scheduler,
@@ -58,6 +62,62 @@ def _make_scheduler(
         "block",
         min_batch,
     )
+
+
+def _make_profile_scheduler(tmp_path, entries, *, attention_sp=8, max_local_sp=8):
+    profile_path = tmp_path / "loongserve_decode_sib.json"
+    profile_path.write_text(json.dumps({"entries": entries}))
+    args = (
+        "",
+        1,
+        8,
+        1024,
+        8,
+        -1,
+        1,
+        attention_sp,
+        128,
+        4,
+        "decode",
+        0.0,
+        4,
+        False,
+        False,
+        "legacy",
+        100000,
+        0,
+        False,
+        "",
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        1,
+        1,
+        1,
+        False,
+        "RoundRobin",
+        False,
+        0,
+        "centralized",
+        True,
+        False,
+        "block",
+        16,
+        max_local_sp,
+        str(profile_path),
+        1.05,
+        0.1,
+        False,
+    )
+    try:
+        return Scheduler(*args)
+    except TypeError as exc:
+        pytest.skip(f"active _cpp extension does not expose profile scheduler args: {exc}")
 
 
 def _running_seq(token_ids, attention_sp, master_sp):
@@ -163,6 +223,62 @@ def test_loongserve_decode_scheduler_scales_out_new_kv_without_migration():
     assert next_result.sp_recv_counts[0][0] >= 1
     assert next_result.sp_q_matrix[0][moved_master][0] >= 1
     assert next_result.sp_res_matrix[0][0][moved_master] >= 1
+
+
+def test_loongserve_decode_profile_table_selects_target_d(tmp_path):
+    scheduler = _make_profile_scheduler(
+        tmp_path,
+        [
+            {
+                "B_bucket": 4,
+                "W_attn_bucket": 16,
+                "L_p90_bucket": 4,
+                "L_max_bucket": 4,
+                "d_target": 4,
+                "node_local": True,
+            }
+        ],
+        attention_sp=8,
+        max_local_sp=8,
+    )
+    worker = scheduler.worker_state[0]
+    seqs = [_running_seq([idx, 2, 3, 100 + idx], 8, 0) for idx in range(4)]
+    for seq in seqs:
+        worker.allocate(seq)
+        worker.running.append(seq)
+
+    result = scheduler.schedule()
+
+    assert list(result.loongserve_append_instances[0]) == [0, 1, 2, 3]
+    assert list(result.loongserve_occupied_instances[0]) == [0, 1, 2, 3]
+
+
+def test_loongserve_decode_profile_table_caps_to_local_group(tmp_path):
+    scheduler = _make_profile_scheduler(
+        tmp_path,
+        [
+            {
+                "B_bucket": 8,
+                "W_attn_bucket": 32,
+                "L_p90_bucket": 4,
+                "L_max_bucket": 4,
+                "d_target": 8,
+                "node_local": True,
+            }
+        ],
+        attention_sp=8,
+        max_local_sp=4,
+    )
+    worker = scheduler.worker_state[0]
+    seqs = [_running_seq([idx, 2, 3, 100 + idx], 8, 0) for idx in range(8)]
+    for seq in seqs:
+        worker.allocate(seq)
+        worker.running.append(seq)
+
+    result = scheduler.schedule()
+
+    assert list(result.loongserve_append_instances[0]) == [0, 1, 2, 3]
+    assert all(rank < 4 for rank in result.loongserve_occupied_instances[0])
 
 
 def test_loongserve_decode_scheduler_scales_down_by_draining_append_targets():

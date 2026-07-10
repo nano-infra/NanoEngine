@@ -1,5 +1,4 @@
 import dataclasses
-import os
 
 import torch
 from dlslime import _slime_c
@@ -8,18 +7,11 @@ from nanodeploy.logging import get_logger
 
 logger = get_logger("NANODEPLOY")
 
+SLIME_QP_NUM = 4
+
 
 def _get_slime_qp_num() -> int:
-    raw = os.environ.get("SLIME_QP_NUM", "1")
-    try:
-        num_qp = int(raw)
-    except ValueError:
-        logger.warning("Invalid SLIME_QP_NUM=%r; falling back to 1", raw)
-        return 1
-    if num_qp < 1:
-        logger.warning("Invalid SLIME_QP_NUM=%r; falling back to 1", raw)
-        return 1
-    return num_qp
+    return SLIME_QP_NUM
 
 
 @dataclasses.dataclass

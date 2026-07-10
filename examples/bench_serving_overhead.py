@@ -30,8 +30,16 @@ def parse_args():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization.")
     parser.add_argument("--gpu-memory-limit-gb", type=float, default=None, help="GPU memory limit in GB.")
     parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager mode.")
+    parser.add_argument(
+        "--cuda-graph-mode",
+        type=str,
+        default="full",
+        choices=["full", "piecewise"],
+        help="CUDA Graph mode for decode.",
+    )
     parser.add_argument("--dataset", type=str, default="random", choices=["random", "csv"], help="Dataset type.")
     parser.add_argument("--csv-path", type=str, default=None, help="Path to CSV file.")
+    parser.add_argument("--max-input-len", type=int, default=None, help="Filter out CSV rows with prompt_len >= this value.")
     parser.add_argument("--itl-log-path", type=str, default="itl_samples.jsonl", help="Path to save ITL samples (JSONL).")
     
     # Distributed / Cluster arguments
@@ -46,6 +54,7 @@ def parse_args():
     
     # Engine args
     parser.add_argument("--max-num-seqs", type=int, default=128, help="Max sequences per iteration.")
+    parser.add_argument("--max-num-recv-seqs", type=int, default=16, help="Max remote receive sequences per SP rank.")
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
     parser.add_argument("--segment-size", type=int, default=65536, help="Segment size for SP.")
@@ -67,6 +76,16 @@ def parse_args():
                         help="Prompt length threshold for long_short_sp8: prompt_len > threshold -> SP=8.")
     parser.add_argument("--long-request-sp-size", type=int, default=0,
                         help="SP size for long requests in long_short_sp8 (0 = attention_sp).")
+    parser.add_argument("--loongserve-decode-scheduler", action="store_true",
+                        help="Enable LoongServe-style elastic decode scheduler.")
+    parser.add_argument("--loongserve-min-comp-bound-batch-size", type=int, default=16,
+                        help="Fallback batch threshold used by LoongServe scale-up.")
+    parser.add_argument("--loongserve-max-local-decode-sp", type=int, default=8,
+                        help="Max local SP ranks for LoongServe decode.")
+    parser.add_argument("--loongserve-decode-profile-path", type=str, default="",
+                        help="Optional LoongServe decode profile/SIB table path. Empty means fallback.")
+    parser.add_argument("--loongserve-decode-cross-node-sp", action="store_true",
+                        help="Allow LoongServe decode to use cross-node SP candidates.")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
@@ -110,6 +129,13 @@ def get_dataset_generator(args):
 
     if "prompt_len" not in df.columns or "output_len" not in df.columns:
         raise ValueError("CSV file must contain 'prompt_len' and 'output_len' columns")
+
+    if args.max_input_len is not None:
+        orig_len = len(df)
+        df = df[df["prompt_len"] < args.max_input_len].reset_index(drop=True)
+        print(f"Filtered by max_input_len={args.max_input_len}: {orig_len} -> {len(df)} rows")
+        if len(df) == 0:
+            raise ValueError("No CSV rows remain after max_input_len filtering")
 
     if len(df) < args.num_requests:
         print(f"Warning: CSV has {len(df)} rows, requested {args.num_requests}. Cycling data to meet request count.")
@@ -220,13 +246,12 @@ def run_warmup(engine, max_num_seqs, world_size):
 
 
 def run_benchmark(engine, request_generator, arrival_times, num_requests):
-    """Runs the main benchmark loop."""
+    """Runs the main benchmark loop with rate-controlled request submission."""
     seq_map = {}
-    requests_sent = 0
     completed_latencies = []
 
-    # Add all requests to the queue at once
-    print(f"Adding {num_requests} requests to engine...")
+    print(f"Preparing {num_requests} requests for rate-controlled submission...")
+    all_seqs = []
     for _ in range(num_requests):
         try:
             prompt, sp = next(request_generator)
@@ -234,21 +259,25 @@ def run_benchmark(engine, request_generator, arrival_times, num_requests):
             break
 
         seq = Sequence(token_ids=prompt, sampling_params=sp)
-        engine.add_request(seq)
+        all_seqs.append(seq)
         seq_map[seq.seq_id] = seq
-        requests_sent += 1
-    
-    print(f"Added {requests_sent} requests.")
-    
+
+    requests_to_send = len(all_seqs)
+    print(f"Prepared {requests_to_send} requests. Submitting according to arrival_times.")
+
+    next_idx = 0
     start_time = time.perf_counter()
 
-    with tqdm(total=requests_sent, desc="Processing Requests") as pbar:
-        while not engine.is_finished():
-            # Engine step
+    with tqdm(total=requests_to_send, desc="Processing Requests") as pbar:
+        while next_idx < requests_to_send or not engine.is_finished():
+            now = time.perf_counter() - start_time
+
+            while next_idx < requests_to_send and arrival_times[next_idx] <= now:
+                engine.add_request(all_seqs[next_idx])
+                next_idx += 1
+
             if not engine.is_finished():
                 outputs, _, _, _, _ = engine.step()
-                
-                # Update progress bar with latency info
                 for seq_id, _ in outputs:
                     if seq_id in seq_map:
                         seq = seq_map[seq_id]
@@ -258,7 +287,12 @@ def run_benchmark(engine, request_generator, arrival_times, num_requests):
                             pbar.set_postfix({"Avg Latency": f"{avg_lat:.2f}s"})
                         pbar.update(1)
             else:
-                time.sleep(0.001)
+                if next_idx < requests_to_send:
+                    wait = arrival_times[next_idx] - (time.perf_counter() - start_time)
+                    if wait > 0:
+                        time.sleep(min(wait, 0.005))
+                else:
+                    break
 
     total_time = time.perf_counter() - start_time
     return total_time, seq_map
@@ -306,6 +340,28 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path
             "p95": np.percentile(tpot_wq_samples, 95),
             "p99": np.percentile(tpot_wq_samples, 99)
         }
+
+    queueing_samples = [s.metric.queueing_time_ms for s in completed_seqs if s.metric.queueing_time_ms]
+    queueing_stats = {}
+    if queueing_samples:
+        queueing_stats = {
+            "avg": np.mean(queueing_samples),
+            "p50": np.percentile(queueing_samples, 50),
+            "p90": np.percentile(queueing_samples, 90),
+            "p95": np.percentile(queueing_samples, 95),
+            "p99": np.percentile(queueing_samples, 99)
+        }
+
+    decode_queue_samples = [s.metric.decode_queue_time_ms for s in completed_seqs if s.metric.decode_queue_time_ms]
+    decode_queue_stats = {}
+    if decode_queue_samples:
+        decode_queue_stats = {
+            "avg": np.mean(decode_queue_samples),
+            "p50": np.percentile(decode_queue_samples, 50),
+            "p90": np.percentile(decode_queue_samples, 90),
+            "p95": np.percentile(decode_queue_samples, 95),
+            "p99": np.percentile(decode_queue_samples, 99)
+        }
          
     # Goodput
     slo_threshold = 100 # ms
@@ -346,6 +402,24 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path
         print(f"  P99:  {np.percentile(itls_with_dq, 99):.2f}")
         print()
 
+    if queueing_stats:
+        print("--- Queueing Time (ms) ---")
+        print(f"  Avg:  {queueing_stats.get('avg', 0):.2f}")
+        print(f"  P50:  {queueing_stats.get('p50', 0):.2f}")
+        print(f"  P90:  {queueing_stats.get('p90', 0):.2f}")
+        print(f"  P95:  {queueing_stats.get('p95', 0):.2f}")
+        print(f"  P99:  {queueing_stats.get('p99', 0):.2f}")
+        print()
+
+    if decode_queue_stats:
+        print("--- Decode Queue Time (ms) ---")
+        print(f"  Avg:  {decode_queue_stats.get('avg', 0):.2f}")
+        print(f"  P50:  {decode_queue_stats.get('p50', 0):.2f}")
+        print(f"  P90:  {decode_queue_stats.get('p90', 0):.2f}")
+        print(f"  P95:  {decode_queue_stats.get('p95', 0):.2f}")
+        print(f"  P99:  {decode_queue_stats.get('p99', 0):.2f}")
+        print()
+
     print("--- Goodput (SLO: TPOT with queueing < 100ms) ---")
     print(f"  SLO Success: {slo_success}/{total_seqs}")
     print(f"  Goodput: {goodput:.2f}%")
@@ -357,11 +431,13 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path
         for s in completed_seqs:
             if s.metric and s.metric.itl_samples:
                 data.append({
-                    "seq_id": s.seq_id, 
+                    "seq_id": s.seq_id,
                     "itl_samples": s.metric.itl_samples,
                     "prompt_len": s.metric.num_prompt_tokens,
                     "output_len": s.metric.num_generated_tokens,
-                    "queueing_time_ms": s.metric.queueing_time_ms
+                    "queueing_time_ms": s.metric.queueing_time_ms,
+                    "decode_queue_time_ms": s.metric.decode_queue_time_ms,
+                    "avg_itl_with_decode_queue_ms": s.metric.avg_itl_with_decode_queue
                 })
         
         if data:
@@ -382,6 +458,7 @@ def main():
     engine = LLM(
         args.model_path,
         enforce_eager=args.enforce_eager,
+        cuda_graph_mode=args.cuda_graph_mode,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         gpu_memory_limit_gb=args.gpu_memory_limit_gb,
@@ -404,7 +481,7 @@ def main():
         scheduler_mode=args.scheduler_mode,
         segment_size=args.segment_size,
         kvcache_block_size=64,
-        max_num_recv_seqs=16,
+        max_num_recv_seqs=args.max_num_recv_seqs,
         max_num_send_seqs=16,
         enable_profiler=args.enable_profiler,
         profiler_start_step=args.profiler_start_step,
@@ -420,6 +497,11 @@ def main():
         dynamic_sp_size_strategy=args.dynamic_sp_size_strategy,
         dynamic_sp_long_request_threshold=args.long_request_sp_threshold,
         dynamic_sp_long_request_size=args.long_request_sp_size,
+        loongserve_decode_scheduler=args.loongserve_decode_scheduler,
+        loongserve_min_comp_bound_batch_size=args.loongserve_min_comp_bound_batch_size,
+        loongserve_max_local_decode_sp=args.loongserve_max_local_decode_sp,
+        loongserve_decode_profile_path=args.loongserve_decode_profile_path,
+        loongserve_decode_cross_node_sp=args.loongserve_decode_cross_node_sp,
     )
     
     # Print Config

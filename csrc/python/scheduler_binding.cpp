@@ -152,7 +152,12 @@ void bind_scheduler_utils(py::module_& m)
                           bool               loongserve_decode_scheduler,
                           bool               loongserve_enable_kv_migration,
                           const std::string& loongserve_migration_granularity,
-                          int                loongserve_min_comp_bound_batch_size) {
+                          int                loongserve_min_comp_bound_batch_size,
+                          int                loongserve_max_local_decode_sp,
+                          const std::string& loongserve_decode_profile_path,
+                          double             loongserve_decode_profile_near_optimal_ratio,
+                          double             loongserve_decode_profile_abs_gain_ms,
+                          bool               loongserve_decode_cross_node_sp) {
                  return std::make_shared<Scheduler>(engine_id,
                                                     loop_count,
                                                     max_num_seqs,
@@ -192,7 +197,12 @@ void bind_scheduler_utils(py::module_& m)
                                                      loongserve_decode_scheduler,
                                                      loongserve_enable_kv_migration,
                                                      loongserve_migration_granularity,
-                                                     loongserve_min_comp_bound_batch_size);
+                                                     loongserve_min_comp_bound_batch_size,
+                                                     loongserve_max_local_decode_sp,
+                                                     loongserve_decode_profile_path,
+                                                     loongserve_decode_profile_near_optimal_ratio,
+                                                     loongserve_decode_profile_abs_gain_ms,
+                                                     loongserve_decode_cross_node_sp);
               }),
              py::arg("engine_id"),
              py::arg("loop_count"),
@@ -233,7 +243,12 @@ void bind_scheduler_utils(py::module_& m)
               py::arg("loongserve_decode_scheduler") = false,
               py::arg("loongserve_enable_kv_migration") = false,
               py::arg("loongserve_migration_granularity") = "block",
-              py::arg("loongserve_min_comp_bound_batch_size") = 16)
+              py::arg("loongserve_min_comp_bound_batch_size") = 16,
+              py::arg("loongserve_max_local_decode_sp") = 8,
+              py::arg("loongserve_decode_profile_path") = "",
+              py::arg("loongserve_decode_profile_near_optimal_ratio") = 1.05,
+              py::arg("loongserve_decode_profile_abs_gain_ms") = 0.1,
+              py::arg("loongserve_decode_cross_node_sp") = false)
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))

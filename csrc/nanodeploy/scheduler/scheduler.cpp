@@ -1,8 +1,14 @@
 #include <algorithm>
+#include <cmath>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <optional>
+#include <regex>
+#include <sstream>
 #include <stdexcept>
+#include <tuple>
 
 #include "nanodeploy/metrics/sequence_metric.h"
 #include "nanodeploy/sequence/sequence.h"
@@ -32,6 +38,127 @@ static bool has_remote_kv_owner(const std::vector<int>& tokens, int master_sp_id
         }
     }
     return false;
+}
+
+static std::string read_text_file(const std::string& path)
+{
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("failed to open loongserve decode profile: " + path);
+    }
+    std::ostringstream ss;
+    ss << input.rdbuf();
+    return ss.str();
+}
+
+static std::optional<int64_t> json_int_value(const std::string& object, const std::vector<std::string>& keys)
+{
+    for (const auto& key : keys) {
+        std::regex pattern("\"" + key + "\"\\s*:\\s*(-?[0-9]+)");
+        std::smatch match;
+        if (std::regex_search(object, match, pattern)) {
+            return std::stoll(match[1].str());
+        }
+    }
+    return std::nullopt;
+}
+
+static std::optional<bool> json_bool_value(const std::string& object, const std::string& key)
+{
+    std::regex pattern("\"" + key + "\"\\s*:\\s*(true|false)");
+    std::smatch match;
+    if (!std::regex_search(object, match, pattern)) {
+        return std::nullopt;
+    }
+    return match[1].str() == "true";
+}
+
+static bool is_loongserve_valid_d(int d)
+{
+    return d == 1 || d == 2 || d == 4 || d == 8;
+}
+
+static void set_int_range_from_json(const std::string& object,
+                                    const std::string& exact_key,
+                                    const std::string& bucket_key,
+                                    const std::string& min_key,
+                                    const std::string& max_key,
+                                    int& min_value,
+                                    int& max_value)
+{
+    auto min_explicit = json_int_value(object, {min_key});
+    auto max_explicit = json_int_value(object, {max_key});
+    if (min_explicit || max_explicit) {
+        min_value = static_cast<int>(min_explicit.value_or(0));
+        max_value = static_cast<int>(max_explicit.value_or(std::numeric_limits<int>::max()));
+        return;
+    }
+    if (auto bucket = json_int_value(object, {bucket_key})) {
+        min_value = 0;
+        max_value = static_cast<int>(*bucket);
+        return;
+    }
+    if (auto exact = json_int_value(object, {exact_key})) {
+        min_value = static_cast<int>(*exact);
+        max_value = static_cast<int>(*exact);
+        return;
+    }
+}
+
+static void set_i64_range_from_json(const std::string& object,
+                                    const std::string& exact_key,
+                                    const std::string& bucket_key,
+                                    const std::string& min_key,
+                                    const std::string& max_key,
+                                    int64_t& min_value,
+                                    int64_t& max_value)
+{
+    auto min_explicit = json_int_value(object, {min_key});
+    auto max_explicit = json_int_value(object, {max_key});
+    if (min_explicit || max_explicit) {
+        min_value = min_explicit.value_or(0);
+        max_value = max_explicit.value_or(std::numeric_limits<int64_t>::max());
+        return;
+    }
+    if (auto bucket = json_int_value(object, {bucket_key})) {
+        min_value = 0;
+        max_value = *bucket;
+        return;
+    }
+    if (auto exact = json_int_value(object, {exact_key})) {
+        min_value = *exact;
+        max_value = *exact;
+    }
+}
+
+static std::optional<LoongServeDecodeProfileEntry> parse_loongserve_profile_entry(const std::string& object)
+{
+    auto d_target = json_int_value(object, {"d_target"});
+    if (!d_target) {
+        return std::nullopt;
+    }
+    LoongServeDecodeProfileEntry entry;
+    entry.d_target = static_cast<int>(*d_target);
+    if (!is_loongserve_valid_d(entry.d_target)) {
+        throw std::runtime_error("loongserve decode profile d_target must be one of {1,2,4,8}");
+    }
+
+    set_int_range_from_json(object, "B", "B_bucket", "B_min", "B_max", entry.b_min, entry.b_max);
+    set_i64_range_from_json(
+        object, "W_attn", "W_attn_bucket", "W_attn_min", "W_attn_max", entry.w_attn_min, entry.w_attn_max);
+    set_int_range_from_json(
+        object, "L_p90", "L_p90_bucket", "L_p90_min", "L_p90_max", entry.l_p90_min, entry.l_p90_max);
+    set_int_range_from_json(
+        object, "L_max", "L_max_bucket", "L_max_min", "L_max_max", entry.l_max_min, entry.l_max_max);
+    entry.node_local = json_bool_value(object, "node_local").value_or(true);
+
+    if (entry.b_min < 0 || entry.b_max < entry.b_min || entry.w_attn_min < 0
+        || entry.w_attn_max < entry.w_attn_min || entry.l_p90_min < 0
+        || entry.l_p90_max < entry.l_p90_min || entry.l_max_min < 0
+        || entry.l_max_max < entry.l_max_min) {
+        throw std::runtime_error("invalid loongserve decode profile bucket range");
+    }
+    return entry;
 }
 
 Scheduler::Scheduler(const std::string& engine_id,
@@ -73,7 +200,12 @@ Scheduler::Scheduler(const std::string& engine_id,
                      bool               loongserve_decode_scheduler,
                      bool               loongserve_enable_kv_migration,
                      const std::string& loongserve_migration_granularity,
-                     int                loongserve_min_comp_bound_batch_size) :
+                     int                loongserve_min_comp_bound_batch_size,
+                     int                loongserve_max_local_decode_sp,
+                     const std::string& loongserve_decode_profile_path,
+                     double             loongserve_decode_profile_near_optimal_ratio,
+                     double             loongserve_decode_profile_abs_gain_ms,
+                     bool               loongserve_decode_cross_node_sp) :
     engine_id_(engine_id),
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
@@ -96,7 +228,12 @@ Scheduler::Scheduler(const std::string& engine_id,
     loongserve_decode_scheduler_(loongserve_decode_scheduler),
     loongserve_enable_kv_migration_(loongserve_enable_kv_migration),
     loongserve_migration_granularity_(loongserve_migration_granularity),
-    loongserve_min_comp_bound_batch_size_(std::max(1, loongserve_min_comp_bound_batch_size))
+    loongserve_min_comp_bound_batch_size_(std::max(1, loongserve_min_comp_bound_batch_size)),
+    loongserve_max_local_decode_sp_(std::max(1, loongserve_max_local_decode_sp)),
+    loongserve_decode_profile_path_(loongserve_decode_profile_path),
+    loongserve_decode_profile_near_optimal_ratio_(loongserve_decode_profile_near_optimal_ratio),
+    loongserve_decode_profile_abs_gain_ms_(loongserve_decode_profile_abs_gain_ms),
+    loongserve_decode_cross_node_sp_(loongserve_decode_cross_node_sp)
 {
     if (loongserve_migration_granularity_ != "block") {
         throw std::runtime_error("loongserve_migration_granularity currently only supports 'block'");
@@ -112,6 +249,18 @@ Scheduler::Scheduler(const std::string& engine_id,
     if (loongserve_decode_scheduler_ && loongserve_enable_kv_migration_) {
         throw std::runtime_error(
             "loongserve_decode_scheduler currently supports no-migration scale-up/down only");
+    }
+    if (loongserve_decode_scheduler_ && loongserve_max_local_decode_sp_ < 1) {
+        throw std::runtime_error("loongserve_max_local_decode_sp must be >= 1");
+    }
+    if (loongserve_decode_scheduler_ && loongserve_decode_profile_near_optimal_ratio_ < 1.0) {
+        throw std::runtime_error("loongserve_decode_profile_near_optimal_ratio must be >= 1.0");
+    }
+    if (loongserve_decode_scheduler_ && loongserve_decode_profile_abs_gain_ms_ < 0.0) {
+        throw std::runtime_error("loongserve_decode_profile_abs_gain_ms must be >= 0");
+    }
+    if (!loongserve_decode_profile_path_.empty()) {
+        _load_loongserve_decode_profile(loongserve_decode_profile_path_);
     }
 
     Sequence::block_size = kvcache_block_size;
@@ -153,8 +302,130 @@ Scheduler::Scheduler(const std::string& engine_id,
               << ", loongserve_decode_scheduler=" << loongserve_decode_scheduler_
               << ", loongserve_enable_kv_migration=" << loongserve_enable_kv_migration_
               << ", loongserve_min_comp_bound_batch_size=" << loongserve_min_comp_bound_batch_size_
+              << ", loongserve_max_local_decode_sp=" << loongserve_max_local_decode_sp_
+              << ", loongserve_decode_profile_entries=" << loongserve_decode_profile_entries_.size()
+              << ", loongserve_decode_cross_node_sp=" << loongserve_decode_cross_node_sp_
               << std::endl;
     thread_pool_ = std::make_unique<ThreadPool>(attention_dp_);
+}
+
+void Scheduler::_load_loongserve_decode_profile(const std::string& profile_path)
+{
+    const std::string text = read_text_file(profile_path);
+    std::regex object_pattern("\\{[^{}]*\\}");
+    auto begin = std::sregex_iterator(text.begin(), text.end(), object_pattern);
+    auto end = std::sregex_iterator();
+    for (auto it = begin; it != end; ++it) {
+        if (auto entry = parse_loongserve_profile_entry(it->str())) {
+            loongserve_decode_profile_entries_.push_back(*entry);
+        }
+    }
+    if (loongserve_decode_profile_entries_.empty()) {
+        throw std::runtime_error("loongserve decode profile has no entries with d_target: " + profile_path);
+    }
+    std::sort(
+        loongserve_decode_profile_entries_.begin(),
+        loongserve_decode_profile_entries_.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.b_max,
+                            lhs.w_attn_max,
+                            lhs.l_p90_max,
+                            lhs.l_max_max,
+                            lhs.d_target)
+                   < std::tie(rhs.b_max,
+                              rhs.w_attn_max,
+                              rhs.l_p90_max,
+                              rhs.l_max_max,
+                              rhs.d_target);
+        });
+}
+
+int Scheduler::_fallback_loongserve_desired_compute_masters(int batch_size) const
+{
+    int desired_compute_masters = 1;
+    if (batch_size >= loongserve_min_comp_bound_batch_size_) {
+        desired_compute_masters =
+            (batch_size + loongserve_min_comp_bound_batch_size_ - 1)
+            / loongserve_min_comp_bound_batch_size_;
+    }
+    desired_compute_masters = std::max(1, std::min(desired_compute_masters, attention_sp_));
+    if (!loongserve_decode_cross_node_sp_) {
+        desired_compute_masters =
+            std::min(desired_compute_masters, std::min(loongserve_max_local_decode_sp_, attention_sp_));
+    }
+    return desired_compute_masters;
+}
+
+int Scheduler::_select_loongserve_desired_compute_masters(
+    const std::vector<std::shared_ptr<Sequence>>& candidates) const
+{
+    const int fallback = _fallback_loongserve_desired_compute_masters(static_cast<int>(candidates.size()));
+    if (loongserve_decode_profile_entries_.empty()) {
+        return fallback;
+    }
+
+    std::vector<int> lengths;
+    lengths.reserve(candidates.size());
+    int64_t w_attn = 0;
+    for (const auto& seq : candidates) {
+        const int length = std::max(0, seq->num_tokens);
+        lengths.push_back(length);
+        w_attn += length;
+    }
+    if (lengths.empty()) {
+        return fallback;
+    }
+    std::sort(lengths.begin(), lengths.end());
+    const int p90_idx = std::max(
+        0,
+        std::min(
+            static_cast<int>(lengths.size()) - 1,
+            static_cast<int>(std::ceil(0.90 * static_cast<double>(lengths.size()))) - 1));
+    const int b = static_cast<int>(candidates.size());
+    const int l_p90 = lengths[p90_idx];
+    const int l_max = lengths.back();
+
+    for (const auto& entry : loongserve_decode_profile_entries_) {
+        if (!loongserve_decode_cross_node_sp_ && !entry.node_local) {
+            continue;
+        }
+        if (b < entry.b_min || b > entry.b_max || w_attn < entry.w_attn_min
+            || w_attn > entry.w_attn_max || l_p90 < entry.l_p90_min
+            || l_p90 > entry.l_p90_max || l_max < entry.l_max_min
+            || l_max > entry.l_max_max) {
+            continue;
+        }
+        int target = std::max(1, std::min(entry.d_target, attention_sp_));
+        if (!loongserve_decode_cross_node_sp_) {
+            target = std::min(target, std::min(loongserve_max_local_decode_sp_, attention_sp_));
+        }
+        return target;
+    }
+    return fallback;
+}
+
+std::vector<int> Scheduler::_loongserve_local_rank_group(const std::vector<int>& existing_kv_ranks) const
+{
+    std::vector<int> allowed;
+    if (loongserve_decode_cross_node_sp_ || loongserve_max_local_decode_sp_ >= attention_sp_) {
+        allowed.reserve(attention_sp_);
+        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+            allowed.push_back(sp_idx);
+        }
+        return allowed;
+    }
+
+    int anchor = 0;
+    if (!existing_kv_ranks.empty()) {
+        anchor = *std::min_element(existing_kv_ranks.begin(), existing_kv_ranks.end());
+    }
+    const int group_size = std::max(1, loongserve_max_local_decode_sp_);
+    const int group_begin = (anchor / group_size) * group_size;
+    const int group_end = std::min(attention_sp_, group_begin + group_size);
+    for (int sp_idx = group_begin; sp_idx < group_end; ++sp_idx) {
+        allowed.push_back(sp_idx);
+    }
+    return allowed;
 }
 
 void Scheduler::add(std::shared_ptr<Sequence> seq)
@@ -883,19 +1154,17 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
 
         int decode_tokens_needed = static_cast<int>(candidates.size()) * std::max(1, loop_count_);
 
-        int desired_compute_masters = 1;
-        if ((int)candidates.size() >= loongserve_min_comp_bound_batch_size_) {
-            desired_compute_masters =
-                ((int)candidates.size() + loongserve_min_comp_bound_batch_size_ - 1)
-                / loongserve_min_comp_bound_batch_size_;
-            desired_compute_masters = std::min(desired_compute_masters, attention_sp_);
-        }
+        int desired_compute_masters = _select_loongserve_desired_compute_masters(candidates);
+        std::vector<int> allowed_local_ranks = _loongserve_local_rank_group(existing_kv_ranks);
+        auto rank_is_local = [&](int sp_idx) {
+            return contains_rank(allowed_local_ranks, sp_idx);
+        };
 
         std::vector<int> append_instances;
         int append_free_tokens = 0;
         auto add_append_instance = [&](int sp_idx) {
             if (sp_idx < 0 || sp_idx >= attention_sp_ || free_tokens_per_sp[sp_idx] <= 0
-                || contains_rank(append_instances, sp_idx)) {
+                || contains_rank(append_instances, sp_idx) || !rank_is_local(sp_idx)) {
                 return false;
             }
             append_instances.push_back(sp_idx);
@@ -932,7 +1201,8 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
             || append_free_tokens < decode_tokens_needed) {
             std::vector<int> scale_up_candidates;
             for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-                if (!contains_rank(append_instances, sp_idx) && free_tokens_per_sp[sp_idx] > 0) {
+                if (!contains_rank(append_instances, sp_idx) && free_tokens_per_sp[sp_idx] > 0
+                    && rank_is_local(sp_idx)) {
                     scale_up_candidates.push_back(sp_idx);
                 }
             }
@@ -1045,12 +1315,14 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_loongse
                 }
             }
             else if (append_scheduled_counts[current_kv_owner] < max_num_seqs_
+                     && rank_is_local(current_kv_owner)
                      && worker->can_append_on_sp(*seq, current_kv_owner, loop_count_)) {
                 selected_append_sp = current_kv_owner;
             }
 
             if (selected_append_sp < 0) {
                 if (append_scheduled_counts[current_kv_owner] < max_num_seqs_
+                    && rank_is_local(current_kv_owner)
                     && worker->can_append_on_sp(*seq, current_kv_owner, loop_count_)) {
                     selected_append_sp = current_kv_owner;
                 }

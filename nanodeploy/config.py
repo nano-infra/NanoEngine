@@ -123,6 +123,11 @@ class Config:
     loongserve_enable_kv_migration: bool = False
     loongserve_migration_granularity: Literal["block"] = "block"
     loongserve_min_comp_bound_batch_size: int = 16
+    loongserve_max_local_decode_sp: int = 8
+    loongserve_decode_profile_path: str = ""
+    loongserve_decode_profile_near_optimal_ratio: float = 1.05
+    loongserve_decode_profile_abs_gain_ms: float = 0.1
+    loongserve_decode_cross_node_sp: bool = False
 
     # Enable non-uniform KVCache partitioning for load balancing
     enable_non_uniform_split: bool = False
@@ -161,6 +166,21 @@ class Config:
             raise ValueError("loongserve_migration_granularity currently only supports 'block'")
         if self.loongserve_min_comp_bound_batch_size < 1:
             raise ValueError("loongserve_min_comp_bound_batch_size must be >= 1")
+        if self.loongserve_max_local_decode_sp < 1:
+            raise ValueError("loongserve_max_local_decode_sp must be >= 1")
+        if self.loongserve_decode_profile_near_optimal_ratio < 1.0:
+            raise ValueError(
+                "loongserve_decode_profile_near_optimal_ratio must be >= 1.0"
+            )
+        if self.loongserve_decode_profile_abs_gain_ms < 0:
+            raise ValueError("loongserve_decode_profile_abs_gain_ms must be >= 0")
+        if self.loongserve_decode_profile_path and not os.path.isfile(
+            self.loongserve_decode_profile_path
+        ):
+            raise ValueError(
+                "loongserve_decode_profile_path does not exist: "
+                f"{self.loongserve_decode_profile_path}"
+            )
         if self.loongserve_decode_scheduler and self.loop_count != 1:
             raise ValueError(
                 "loongserve_decode_scheduler requires loop_count=1 because elastic "

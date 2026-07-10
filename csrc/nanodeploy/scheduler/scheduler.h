@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -113,6 +114,19 @@ struct DecodeBatchState {
     std::vector<std::pair<int, int>>              mini_batch_ranges;
 };
 
+struct LoongServeDecodeProfileEntry {
+    int      b_min = 0;
+    int      b_max = std::numeric_limits<int>::max();
+    int64_t  w_attn_min = 0;
+    int64_t  w_attn_max = std::numeric_limits<int64_t>::max();
+    int      l_p90_min = 0;
+    int      l_p90_max = std::numeric_limits<int>::max();
+    int      l_max_min = 0;
+    int      l_max_max = std::numeric_limits<int>::max();
+    int      d_target = 1;
+    bool     node_local = true;
+};
+
 class Scheduler {
 public:
     Scheduler(const std::string& engine_id,
@@ -154,7 +168,12 @@ public:
               bool               loongserve_decode_scheduler = false,
               bool               loongserve_enable_kv_migration = false,
               const std::string& loongserve_migration_granularity = "block",
-              int                loongserve_min_comp_bound_batch_size = 16);
+              int                loongserve_min_comp_bound_batch_size = 16,
+              int                loongserve_max_local_decode_sp = 8,
+              const std::string& loongserve_decode_profile_path = "",
+              double             loongserve_decode_profile_near_optimal_ratio = 1.05,
+              double             loongserve_decode_profile_abs_gain_ms = 0.1,
+              bool               loongserve_decode_cross_node_sp = false);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -206,6 +225,10 @@ private:
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_loongserve_decode();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode_prefill_latency_aware();
+    void _load_loongserve_decode_profile(const std::string& profile_path);
+    int  _fallback_loongserve_desired_compute_masters(int batch_size) const;
+    int  _select_loongserve_desired_compute_masters(const std::vector<std::shared_ptr<Sequence>>& candidates) const;
+    std::vector<int> _loongserve_local_rank_group(const std::vector<int>& existing_kv_ranks) const;
     
     // Decentralized scheduling logic
     ScheduleResult _schedule_decentralized();
@@ -243,6 +266,12 @@ private:
     bool        loongserve_enable_kv_migration_;
     std::string loongserve_migration_granularity_;
     int         loongserve_min_comp_bound_batch_size_;
+    int         loongserve_max_local_decode_sp_;
+    std::string loongserve_decode_profile_path_;
+    double      loongserve_decode_profile_near_optimal_ratio_;
+    double      loongserve_decode_profile_abs_gain_ms_;
+    bool        loongserve_decode_cross_node_sp_;
+    std::vector<LoongServeDecodeProfileEntry> loongserve_decode_profile_entries_;
     
     SchedulerMode scheduler_mode_ = SchedulerMode::CENTRALIZED;
 
