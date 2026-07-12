@@ -40,7 +40,8 @@ import torch
 import torch.nn as nn
 from fast_hadamard_transform import hadamard_transform
 
-from dlengine.kernel.tilelang.deepseek.fp8_index import fp8_index
+from dlengine.kernel.triton.generic.fp8_ue8m0_quant import store_indexer_key_fp8_fused
+from dlengine.kernel.triton.hopper.block_gemm_fp8 import quant_fp8
 from dlengine.layers import get_backend
 from dlengine.layers.base_backend import ReplicatedLinearBase
 from dlengine.layers.rotary_embedding import get_rope
@@ -116,8 +117,8 @@ class IndexerCache:
         self.num_pages = num_pages
         self.page_size = page_size
         self.head_dim = head_dim
-        quant_block_size = INDEXER_QUANT_BLOCK_SIZE
-        self.bytes_per_token = head_dim + head_dim // quant_block_size * 4
+        self.quant_block_size = INDEXER_QUANT_BLOCK_SIZE
+        self.bytes_per_token = head_dim + head_dim // self.quant_block_size * 4
         # Single contiguous buffer: (num_layers, num_pages, page_size * bytes_per_token)
         self.buffer = torch.zeros(
             (num_layers, num_pages, page_size * self.bytes_per_token),
@@ -150,6 +151,17 @@ class IndexerCache:
         head_dim = self.head_dim
         page_size = self.page_size
         bpt = self.bytes_per_token
+
+        if key_bf16.is_cuda:
+            store_indexer_key_fp8_fused(
+                key_bf16.contiguous(),
+                buf,
+                slot_mapping,
+                page_size,
+                group_size=self.quant_block_size,
+                eps=1e-4,
+            )
+            return
 
         # Quantize: per-token FP8 with UE8M0 scale (graph-safe)
         key_fp8, key_scale = _per_token_cast_to_fp8_ue8m0(key_bf16)
@@ -333,7 +345,7 @@ class Indexer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Compute indexer key only (K-path of _compute_q_k).
 
         Used during prefill to store keys without running the full scoring pipeline.
@@ -489,8 +501,9 @@ class Indexer(nn.Module):
             slot_mapping: (num_tokens,) int — flat slot indices for cache write
 
         Returns:
-            topk_indices: (num_tokens, index_topk) int32 — selected logical token
-                indices, or physical cache slots when translate_topk is True
+            topk_indices: (num_tokens, index_topk) int32 selected logical token
+                indices. When translate_topk is True, returns
+                (logical_indices, physical_cache_slots).
         """
         assert self.indexer_cache is not None, "IndexerCache not initialized"
         num_tokens = hidden_states.shape[0]
@@ -503,7 +516,12 @@ class Indexer(nn.Module):
         # query: (N, n_heads, head_dim=128) -> reshape for per-token quantization
         # deep_gemm expects (N, D) for per_token_cast_to_fp8
         q_flat = query.reshape(num_tokens * self.n_heads, self.head_dim)
-        q_fp8, q_scale = _per_token_cast_to_fp8_ue8m0(q_flat)
+        q_fp8, q_scale = quant_fp8(
+            q_flat.contiguous(),
+            self.head_dim,
+            round_ue8m0=True,
+            min_absmax=1e-4,
+        )
         # q_fp8: (N*H, 128) FP8, q_scale: (N*H, 1) FP32
         q_fp8 = q_fp8.view(num_tokens, self.n_heads, self.head_dim)
         q_scale_for_gate = q_scale.view(num_tokens, self.n_heads, 1)
@@ -579,6 +597,7 @@ class Indexer(nn.Module):
                 dtype=torch.int32,
                 device=logits.device,
             )
+            logical_indices = torch.empty_like(physical_indices)
             topk_transform(
                 logits,
                 seq_lens,
@@ -586,8 +605,9 @@ class Indexer(nn.Module):
                 physical_indices,
                 topk_page_size,
                 self.index_topk,
+                logical_indices,
             )
-            return physical_indices
+            return logical_indices, physical_indices
 
         # Portable fallback: explicitly clean the logits because DeepGEMM cannot
         # enable clean_logits for 2D context_lens.

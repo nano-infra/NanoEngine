@@ -1229,7 +1229,7 @@ class DeepseekV2Attention(nn.Module):
                 use_fused_topk = fused_kernels_enabled() and (
                     self.indexer.index_topk in (512, 2048)
                 )
-                topk_indices = self.indexer(
+                topk_result = self.indexer(
                     hidden_states,
                     q_lora,
                     positions,
@@ -1240,8 +1240,9 @@ class DeepseekV2Attention(nn.Module):
                     topk_page_size=block_size,
                 )
                 if use_fused_topk:
-                    sparse_indices = topk_indices
+                    topk_indices, sparse_indices = topk_result
                 else:
+                    topk_indices = topk_result
                     # Convert logical token indices → physical paged indices.
                     # For ntps>1 (lazy verify), repeat bt per token.
                     if ntps > 1:

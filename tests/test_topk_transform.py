@@ -28,6 +28,7 @@ def test_topk_transform_matches_torch(top_k):
         max_context_len // page_size, dtype=torch.int32, device="cuda"
     ).repeat(seq_lens.numel(), 1)
     output = torch.empty((seq_lens.numel(), top_k), dtype=torch.int32, device="cuda")
+    raw_output = torch.empty_like(output)
 
     topk_transform(
         scores,
@@ -36,6 +37,7 @@ def test_topk_transform_matches_torch(top_k):
         output,
         page_size,
         top_k,
+        raw_output,
     )
 
     for row, seq_len_tensor in enumerate(seq_lens):
@@ -53,4 +55,11 @@ def test_topk_transform_matches_torch(top_k):
             rtol=0,
             atol=0,
         )
+        torch.testing.assert_close(
+            raw_output[row, :valid_k].sort().values,
+            expected_raw.to(torch.int32).sort().values,
+            rtol=0,
+            atol=0,
+        )
         assert (output[row, valid_k:] == -1).all()
+        assert (raw_output[row, valid_k:] == -1).all()
