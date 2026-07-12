@@ -80,3 +80,22 @@ def test_mla_slot_loader_is_cuda_graph_capturable():
     torch.cuda.synchronize()
     assert remapped.cpu().tolist() == [[0, 1]]
     assert hot_outputs.cpu().tolist() == [4]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="MLA HiSparse requires CUDA")
+def test_mla_dummy_slots_produce_all_invalid_indices():
+    reset_hisparse_context()
+    ctx = initialize_hisparse_context(2, "cuda", 4)
+    ctx.num_real_reqs.fill_(2)
+    cold = torch.zeros(1, 1, 2, 4, 1, 1).pin_memory()
+    initialize_mla_hisparse_cache(cold, max_num_seqs=2, device_buffer_size=4)
+    indices = torch.zeros((2, 4), dtype=torch.int32, device="cuda")
+    dummy_slots = torch.full((2,), 2, dtype=torch.int64, device="cuda")
+    output_slots = torch.zeros(2, dtype=torch.int32, device="cuda")
+
+    remapped, hot_outputs = stage_mla_sparse_indices(
+        0, indices, dummy_slots, output_slots
+    )
+    torch.cuda.synchronize()
+    assert remapped.cpu().tolist() == [[-1] * 4, [-1] * 4]
+    assert hot_outputs.cpu().tolist() == [-1, -1]

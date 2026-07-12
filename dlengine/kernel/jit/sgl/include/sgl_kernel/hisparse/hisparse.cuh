@@ -77,8 +77,15 @@ __global__ void load_mla_slot_kernel(const int32_t* __restrict__ indices,
     if (row >= real)
         return;
     const int64_t slot = request_slots[row];
-    if (slot < 0 || slot >= max_num_seqs)
+    if (slot < 0 || slot >= max_num_seqs) {
+        for (int64_t i = threadIdx.x; i < topk; i += blockDim.x) {
+            output[row * topk + i] = -1;
+        }
+        if (threadIdx.x == 0) {
+            hot_output_slots[row] = -1;
+        }
         return;
+    }
     const int64_t hot_base = slot * slot_stride_tokens;
 
     for (int64_t i = threadIdx.x; i < topk; i += blockDim.x) {
