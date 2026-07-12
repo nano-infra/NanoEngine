@@ -4,8 +4,6 @@ use crate::cache::table::block::{BlockPool, CompressedPool};
 use crate::cache::table::slot::SlotPool;
 use crate::scheduler::SchedulerConfig;
 
-use super::ParkedSession;
-
 #[derive(Clone, Debug)]
 pub(crate) struct PendingHostSwap {
     pub(crate) dp_idx: usize,
@@ -21,8 +19,6 @@ pub(crate) struct CacheState {
     pub(crate) seq_assignment: HashMap<u64, (usize, usize)>,
     pub(crate) session_affinity: HashMap<u64, usize>,
     pub(crate) session_wait: HashMap<u64, i32>,
-    pub(crate) parked_sessions: HashMap<u64, ParkedSession>,
-    pub(crate) parked_lru: Vec<u64>,
     pub(crate) state_slots: SlotPool,
     pub(crate) hisparse_slots: SlotPool,
     pub(crate) compressed_pools: HashMap<i32, CompressedPool>,
@@ -91,9 +87,7 @@ impl CacheState {
 
         let state_slots = if config.cache_plan.flags & ((1 << 2) | (1 << 3) | (1 << 4)) != 0 {
             let configured = config.cache_plan.gdn.state_slots;
-            configured
-                .max(config.max_num_seqs + config.gdn_state_cache_slots)
-                .max(config.max_num_seqs)
+            configured.max(config.max_num_seqs)
         } else {
             0
         };
@@ -116,8 +110,6 @@ impl CacheState {
             seq_assignment: HashMap::new(),
             session_affinity: HashMap::new(),
             session_wait: HashMap::new(),
-            parked_sessions: HashMap::new(),
-            parked_lru: Vec::new(),
             state_slots: SlotPool::new(state_slots),
             hisparse_slots: SlotPool::new(hisparse_slots),
             compressed_pools,
@@ -139,21 +131,6 @@ impl CacheState {
         }
     }
 
-    pub(crate) fn num_parked_sessions(&self) -> i32 {
-        self.parked_sessions.len() as i32
-    }
-
-    pub(crate) fn parked_session_keys(&self) -> Vec<u64> {
-        self.parked_lru.clone()
-    }
-
-    pub(crate) fn clear_session_cache(&mut self, group: usize) {
-        let keys = self.parked_lru.clone();
-        for key in keys {
-            self.evict_parked_by_key(key, group);
-        }
-    }
-
     pub(crate) fn release_seq(&mut self, seq_id: u64, group: usize) {
         if let Some(pending) = self.pending_host_swaps.remove(&seq_id) {
             let flat = Self::flat_idx(group, pending.dp_idx, pending.group_id);
@@ -171,44 +148,6 @@ impl CacheState {
         for pool in self.compressed_pools.values_mut() {
             if let Some(mut pages) = pool.seq_pages.remove(&seq_id) {
                 pool.free_pages.append(&mut pages);
-            }
-        }
-    }
-
-    pub(crate) fn insert_parked(&mut self, parked: ParkedSession, capacity: i32, group: usize) {
-        let key = parked.affinity_key;
-        if self.parked_sessions.contains_key(&key) {
-            self.evict_parked_by_key(key, group);
-        }
-        self.parked_lru.push(key);
-        self.parked_sessions.insert(key, parked);
-        while self.parked_sessions.len() > capacity.max(0) as usize {
-            if let Some(key) = self.parked_lru.first().copied() {
-                self.evict_parked_by_key(key, group);
-            } else {
-                break;
-            }
-        }
-    }
-
-    pub(crate) fn evict_parked_by_key(&mut self, key: u64, group: usize) {
-        self.parked_lru.retain(|k| *k != key);
-        let Some(parked) = self.parked_sessions.remove(&key) else {
-            return;
-        };
-        if let Some(blocks) = parked.block_tables.get(&(parked.group_id as i32)) {
-            let flat = Self::flat_idx(group, parked.dp_idx, parked.group_id);
-            self.hbm_pools[flat].release_blocks_without_owner(blocks);
-        }
-        if parked.state_slot >= 0 {
-            self.state_slots.release_slot(parked.state_slot);
-        }
-        if parked.hisparse_slot >= 0 {
-            self.hisparse_slots.release_slot(parked.hisparse_slot);
-        }
-        for (ratio, pages) in parked.compressed_tables {
-            if let Some(pool) = self.compressed_pools.get_mut(&ratio) {
-                pool.free_pages.extend(pages);
             }
         }
     }

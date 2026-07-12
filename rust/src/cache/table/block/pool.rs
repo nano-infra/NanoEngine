@@ -83,13 +83,6 @@ impl BlockPool {
         self.blocks.len() as i32 - self.free_blocks.len() as i32
     }
 
-    pub(crate) fn insert_existing(&mut self, seq_id: u64, blocks: Vec<i32>) {
-        for block_id in &blocks {
-            self.free_blocks.retain(|id| id != block_id);
-        }
-        self.seq_blocks.insert(seq_id, blocks);
-    }
-
     pub(crate) fn has_seq(&self, seq_id: u64) -> bool {
         self.seq_blocks.contains_key(&seq_id)
     }
@@ -107,16 +100,6 @@ impl BlockPool {
             self.release_one(*block_id);
         }
         Some(blocks)
-    }
-
-    pub(crate) fn take_seq_without_release(&mut self, seq_id: u64) -> Vec<i32> {
-        self.seq_blocks.remove(&seq_id).unwrap_or_default()
-    }
-
-    pub(crate) fn release_blocks_without_owner(&mut self, blocks: &[i32]) {
-        for block_id in blocks {
-            self.release_one(*block_id);
-        }
     }
 
     #[cfg(test)]

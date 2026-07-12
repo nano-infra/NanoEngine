@@ -16,7 +16,7 @@ impl RoutingStrategy {
     #[classattr]
     pub const LeastCache: i32 = 2;
     #[classattr]
-    pub const SessionPrefix: i32 = 3;
+    pub const Affinity: i32 = 3;
 
     #[classmethod]
     fn __class_getitem__(_cls: &Bound<'_, PyType>, name: &str) -> PyResult<i32> {
@@ -24,7 +24,7 @@ impl RoutingStrategy {
             "RoundRobin" => Ok(Self::RoundRobin),
             "LeastBatch" => Ok(Self::LeastBatch),
             "LeastCache" => Ok(Self::LeastCache),
-            "SessionPrefix" => Ok(Self::SessionPrefix),
+            "Affinity" | "SessionPrefix" => Ok(Self::Affinity),
             _ => Err(pyo3::exceptions::PyKeyError::new_err(name.to_string())),
         }
     }

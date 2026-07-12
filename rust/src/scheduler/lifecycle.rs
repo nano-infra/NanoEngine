@@ -200,7 +200,7 @@ impl Scheduler {
                     if let Some(seq) = self.seq_table.get_mut(&seq_id) {
                         seq.status = 2;
                     }
-                    self.park_or_release(py, seq_id);
+                    self.release_seq(seq_id);
                 } else if self.config.mode == "prefill" {
                     if let Some(seq) = self.seq_table.get_mut(&seq_id) {
                         seq.status = 3;

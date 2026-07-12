@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 use crate::cache::table::block::{compute_block_hash, CompressedPool, EvictedBlock};
 use crate::scheduler::SchedulerConfig;
 
-use super::{CacheState, ParkedSession, PendingHostSwap};
+use super::{CacheState, PendingHostSwap};
 
 /// Prefix-cache coordination boundary between scheduling and cache ownership.
 ///
@@ -32,15 +32,6 @@ pub(crate) struct PrefixCacheCoordinator {
     state: CacheState,
 }
 
-pub(crate) struct AdoptedSessionSnapshot {
-    pub(crate) group_id: usize,
-    pub(crate) length: i32,
-    pub(crate) block_table: Option<Vec<i32>>,
-    pub(crate) state_slot: i32,
-    pub(crate) hisparse_slot: i32,
-    pub(crate) compressed_tables: HashMap<i32, Vec<i32>>,
-}
-
 impl PrefixCacheCoordinator {
     pub(crate) fn new(config: &SchedulerConfig, dp: usize, group: usize) -> Self {
         Self {
@@ -52,38 +43,8 @@ impl PrefixCacheCoordinator {
         self.state.set_prefix_caching_enabled(enabled);
     }
 
-    pub(crate) fn num_parked_sessions(&self) -> i32 {
-        self.state.num_parked_sessions()
-    }
-
-    pub(crate) fn parked_session_keys(&self) -> Vec<u64> {
-        self.state.parked_session_keys()
-    }
-
-    pub(crate) fn clear_session_cache(&mut self, group: usize) {
-        self.state.clear_session_cache(group);
-    }
-
     pub(crate) fn release_seq(&mut self, seq_id: u64, group: usize) {
         self.state.release_seq(seq_id, group);
-    }
-
-    pub(crate) fn insert_parked(&mut self, parked: ParkedSession, capacity: i32, group: usize) {
-        self.state.insert_parked(parked, capacity, group);
-    }
-
-    pub(crate) fn evict_parked_by_key(&mut self, key: u64, group: usize) {
-        self.state.evict_parked_by_key(key, group);
-    }
-
-    pub(crate) fn parked_session(&self, key: u64) -> Option<&ParkedSession> {
-        self.state.parked_sessions.get(&key)
-    }
-
-    pub(crate) fn take_parked_session(&mut self, key: u64) -> Option<ParkedSession> {
-        let parked = self.state.parked_sessions.remove(&key)?;
-        self.state.parked_lru.retain(|stored| *stored != key);
-        Some(parked)
     }
 
     pub(crate) fn assignment(&self, seq_id: u64) -> Option<(usize, usize)> {
@@ -299,19 +260,6 @@ impl PrefixCacheCoordinator {
         self.state.hbm_pools[flat].insert_seq_blocks(seq_id, blocks);
     }
 
-    pub(crate) fn insert_existing_hbm_blocks(
-        &mut self,
-        flat: usize,
-        seq_id: u64,
-        blocks: Vec<i32>,
-    ) {
-        self.state.hbm_pools[flat].insert_existing(seq_id, blocks);
-    }
-
-    pub(crate) fn take_hbm_seq_without_release(&mut self, flat: usize, seq_id: u64) -> Vec<i32> {
-        self.state.hbm_pools[flat].take_seq_without_release(seq_id)
-    }
-
     pub(crate) fn compressed_pools_empty(&self) -> bool {
         self.state.compressed_pools.is_empty()
     }
@@ -330,22 +278,6 @@ impl PrefixCacheCoordinator {
 
     pub(crate) fn ensure_hisparse_slot(&mut self, seq_id: u64) -> Option<i32> {
         self.state.hisparse_slots.ensure(seq_id)
-    }
-
-    pub(crate) fn insert_existing_state_slot(&mut self, seq_id: u64, slot: i32) {
-        self.state.state_slots.insert_existing(seq_id, slot);
-    }
-
-    pub(crate) fn insert_existing_hisparse_slot(&mut self, seq_id: u64, slot: i32) {
-        self.state.hisparse_slots.insert_existing(seq_id, slot);
-    }
-
-    pub(crate) fn take_state_slot_without_release(&mut self, seq_id: u64) -> Option<i32> {
-        self.state.state_slots.take_without_release(seq_id)
-    }
-
-    pub(crate) fn take_hisparse_slot_without_release(&mut self, seq_id: u64) -> Option<i32> {
-        self.state.hisparse_slots.take_without_release(seq_id)
     }
 
     pub(crate) fn compressed_pages(&self, seq_id: u64) -> HashMap<i32, Vec<i32>> {
@@ -384,132 +316,10 @@ impl PrefixCacheCoordinator {
         Ok(active_tables)
     }
 
-    pub(crate) fn insert_existing_compressed_pages(
-        &mut self,
-        seq_id: u64,
-        ratio: i32,
-        pages: Vec<i32>,
-    ) {
-        if let Some(pool) = self.state.compressed_pools.get_mut(&ratio) {
-            pool.seq_pages.insert(seq_id, pages);
-        }
-    }
-
-    pub(crate) fn take_compressed_pages(&mut self, seq_id: u64) -> HashMap<i32, Vec<i32>> {
-        let mut compressed_tables = HashMap::new();
-        for (ratio, pool) in self.state.compressed_pools.iter_mut() {
-            if let Some(pages) = pool.seq_pages.remove(&seq_id) {
-                compressed_tables.insert(*ratio, pages);
-            }
-        }
-        compressed_tables
-    }
-
     pub(crate) fn set_prefix_cached_tokens(&mut self, seq_id: u64, tokens: i32) {
         self.state
             .prefix_cached_tokens_by_seq
             .insert(seq_id, tokens);
-    }
-
-    pub(crate) fn session_snapshot_enabled(gdn_state_cache_slots: i32, group: usize) -> bool {
-        gdn_state_cache_slots > 0 && group == 1
-    }
-
-    pub(crate) fn take_matching_session_snapshot(
-        &mut self,
-        group: usize,
-        seq_id: u64,
-        dp_idx: usize,
-        affinity: u64,
-        full_len: i32,
-        token_ids: &[i32],
-    ) -> Option<AdoptedSessionSnapshot> {
-        let Some(parked) = self.parked_session(affinity) else {
-            return None;
-        };
-        if parked.dp_idx != dp_idx {
-            return None;
-        }
-        if !Self::session_snapshot_prefix_matches(parked, full_len, token_ids) {
-            self.evict_parked_by_key(affinity, group);
-            return None;
-        }
-
-        let mut parked = self.take_parked_session(affinity)?;
-        self.assign_seq(seq_id, dp_idx, parked.group_id);
-
-        let block_table = parked.block_tables.remove(&(parked.group_id as i32));
-        if let Some(blocks) = &block_table {
-            let flat = Self::flat_idx(group, dp_idx, parked.group_id);
-            self.insert_existing_hbm_blocks(flat, seq_id, blocks.clone());
-        }
-        if parked.state_slot >= 0 {
-            self.insert_existing_state_slot(seq_id, parked.state_slot);
-        }
-        if parked.hisparse_slot >= 0 {
-            self.insert_existing_hisparse_slot(seq_id, parked.hisparse_slot);
-        }
-        for (ratio, pages) in &parked.compressed_tables {
-            self.insert_existing_compressed_pages(seq_id, *ratio, pages.clone());
-        }
-
-        Some(AdoptedSessionSnapshot {
-            group_id: parked.group_id,
-            length: parked.length,
-            block_table,
-            state_slot: parked.state_slot,
-            hisparse_slot: parked.hisparse_slot,
-            compressed_tables: parked.compressed_tables,
-        })
-    }
-
-    pub(crate) fn park_session_snapshot(
-        &mut self,
-        group: usize,
-        seq_id: u64,
-        affinity: u64,
-        token_ids: Vec<i32>,
-        length: i32,
-        capacity: i32,
-    ) -> bool {
-        let Some((dp_idx, group_id)) = self.remove_assignment(seq_id) else {
-            return false;
-        };
-        let flat = Self::flat_idx(group, dp_idx, group_id);
-        let blocks = self.take_hbm_seq_without_release(flat, seq_id);
-        let state_slot = self.take_state_slot_without_release(seq_id).unwrap_or(-1);
-        let hisparse_slot = self
-            .take_hisparse_slot_without_release(seq_id)
-            .unwrap_or(-1);
-        let compressed_tables = self.take_compressed_pages(seq_id);
-        let parked = ParkedSession {
-            affinity_key: affinity,
-            state_slot,
-            hisparse_slot,
-            dp_idx,
-            group_id,
-            length,
-            token_ids: token_ids.into_iter().take(length.max(0) as usize).collect(),
-            block_tables: HashMap::from([(group_id as i32, blocks)]),
-            compressed_tables,
-        };
-        self.insert_parked(parked, capacity, group);
-        true
-    }
-
-    fn session_snapshot_prefix_matches(
-        parked: &ParkedSession,
-        full_len: i32,
-        token_ids: &[i32],
-    ) -> bool {
-        parked.length > 0
-            && parked.length < full_len
-            && token_ids.len() >= parked.length as usize
-            && token_ids[..parked.length as usize] == parked.token_ids[..]
-    }
-
-    fn flat_idx(group: usize, dp_idx: usize, group_id: usize) -> usize {
-        dp_idx * group + group_id
     }
 
     fn compressed_pages_needed_for_tokens(pool: &CompressedPool, tokens: i32) -> usize {
