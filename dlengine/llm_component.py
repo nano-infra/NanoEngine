@@ -78,9 +78,9 @@ class LLMComponent(LLM):
             else []
         )
 
-        # For ZMQ connection: use 127.0.0.1 if host is 0.0.0.0 (localhost mode),
-        # otherwise use the specified host IP (distributed mode)
-        zmq_host = "127.0.0.1" if self.config.host == "0.0.0.0" else self.config.host
+        from dlengine.utils.network import get_advertise_host
+
+        zmq_host = get_advertise_host(self.config.host)
 
         engine_info = {
             "id": self.engine_id,
@@ -371,12 +371,9 @@ class LLMComponent(LLM):
                 self.config.ctrl_address, self.config.ctrl_scope
             )
 
-        if self.config.host in ("0.0.0.0", ""):
-            from dlengine.context_v2.distributed import get_local_ip
+        from dlengine.utils.network import get_advertise_host
 
-            zmq_host = get_local_ip()
-        else:
-            zmq_host = self.config.host
+        zmq_host = get_advertise_host(self.config.host)
 
         peer_addrs = self.executor.get_peer_agent_addrs()
         # Compute gdn_num_slots to match allocate_gdn_states logic. The active

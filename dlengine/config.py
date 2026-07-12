@@ -100,7 +100,8 @@ class Config(BaseModel):
     engine_id: Optional[str] = None
     mode: Literal["prefill", "decode", "hybrid"] = "hybrid"
     host: str = "0.0.0.0"
-    port: int = 5000
+    # 0 asks the OS to allocate an available service port at bind time.
+    port: int = 0
 
     # Monitoring. When enabled, ``dlengine serve`` exposes Prometheus metrics
     # at /metrics. If docker CLI is available it also starts a local

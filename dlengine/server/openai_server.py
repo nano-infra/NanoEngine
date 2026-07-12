@@ -1390,14 +1390,13 @@ def build_app(server: OpenAIServer):
 # ----------------------------------------------------------------------------
 
 CTRL_ENTITY_KIND = "dlengine"
+DEFAULT_CTRL_ADDRESS = "http://127.0.0.1:4479"
 
 
 def _advertise_host(host: str) -> str:
-    if host in ("0.0.0.0", ""):
-        from dlengine.context_v2.distributed import get_local_ip
+    from dlengine.utils.network import get_advertise_host
 
-        return get_local_ip()
-    return host
+    return get_advertise_host(host)
 
 
 def register_with_ctrl(
@@ -1452,6 +1451,7 @@ def register_with_ctrl(
         )
     else:
         logger.error("dlslime-ctrl registration failed; node will not be discoverable")
+        return None
     return client
 
 
@@ -1471,16 +1471,36 @@ def run_server(
     import uvicorn
     from transformers import PreTrainedTokenizerFast
 
-    host = config.host
-    port = config.port
+    from dlengine.utils.network import get_bind_host
+
+    host = get_bind_host(config.host)
+    # Bind before starting the engine so port=0 is resolved exactly once and
+    # the already-reserved socket can be handed to Uvicorn without a
+    # probe-then-bind race.
+    uvicorn_config = uvicorn.Config(app=None, host=host, port=config.port)
+    http_socket = uvicorn_config.bind_socket()
+    port = int(http_socket.getsockname()[1])
+    config.port = port
+    advertise_host = _advertise_host(host)
+    discovery_ctrl_address = (
+        ctrl_address or os.environ.get("DLSLIME_CTRL_ADDRESS") or DEFAULT_CTRL_ADDRESS
+    )
+    discovery_ctrl_scope = ctrl_scope or os.environ.get("DLSLIME_CTRL_SCOPE")
+    ctrl_is_implicit = ctrl_address is None and not os.environ.get(
+        "DLSLIME_CTRL_ADDRESS"
+    )
 
     logger.info("=" * 72)
     logger.info("DLEngine OpenAI Server")
     logger.info(f"  model:             {config.model}")
     logger.info(f"  served-model-name: {served_model_name}")
-    logger.info(f"  http:              {host}:{port}")
+    logger.info(f"  http bind:         {host}:{port}")
+    logger.info(f"  http advertise:    {advertise_host}:{port}")
     logger.info(f"  mode:              {config.mode}")
-    logger.info(f"  ctrl-address:      {ctrl_address or '(disabled)'}")
+    logger.info(
+        f"  ctrl-address:      {discovery_ctrl_address}"
+        f"{' (auto)' if ctrl_is_implicit else ''}"
+    )
     logger.info(
         f"  monitor:           {'enabled' if config.enable_monitor else 'disabled'}"
     )
@@ -1611,20 +1631,45 @@ def run_server(
                     "for Prometheus scrape: %s",
                     e,
                 )
-        if ctrl_address:
-            try:
-                ctrl_client = register_with_ctrl(
-                    ctrl_address=ctrl_address,
-                    ctrl_scope=ctrl_scope,
-                    host=host,
-                    port=port,
-                    served_model_name=served_model_name,
-                    model_path=config.model,
-                    role=config.mode,
-                    engine_id=engine_id,
+        try:
+            ctrl_client = register_with_ctrl(
+                ctrl_address=discovery_ctrl_address,
+                ctrl_scope=discovery_ctrl_scope,
+                host=host,
+                port=port,
+                served_model_name=served_model_name,
+                model_path=config.model,
+                role=config.mode,
+                engine_id=engine_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            if ctrl_is_implicit:
+                logger.warning(
+                    "Automatic dlslime-ctrl discovery at %s is unavailable: %s",
+                    discovery_ctrl_address,
+                    e,
                 )
-            except Exception as e:  # noqa: BLE001
+            else:
                 logger.error(f"Could not register with dlslime-ctrl: {e}")
+
+        logger.info("=" * 72)
+        logger.info("DLEngine READY: http://%s:%s", advertise_host, port)
+        if ctrl_client is not None:
+            logger.info(
+                "Router discovery: registered with %s (scope=%s)",
+                discovery_ctrl_address,
+                discovery_ctrl_scope or "default",
+            )
+        else:
+            logger.warning(
+                "Router discovery: NOT REGISTERED. Direct endpoint remains "
+                "available at http://%s:%s; start dlslime-ctrl at %s or pass "
+                "--ctrl_address explicitly.",
+                advertise_host,
+                port,
+                discovery_ctrl_address,
+            )
+        logger.info("=" * 72)
 
     _cleanup_done = {"v": False}
 
@@ -1664,6 +1709,10 @@ def run_server(
                 os.unlink(sock_path)
             except OSError:
                 pass
+        try:
+            http_socket.close()
+        except OSError:
+            pass
 
     @app.on_event("shutdown")
     async def _on_shutdown() -> None:  # noqa: ANN202
@@ -1685,7 +1734,8 @@ def run_server(
         _cleanup()
         os._exit(0)
 
-    server_uv = uvicorn.Server(uvicorn.Config(app, host=host, port=port))
+    uvicorn_config.app = app
+    server_uv = uvicorn.Server(uvicorn_config)
     server_uv.install_signal_handlers = lambda: None
     # Plain handlers cover the window before the event loop is running. Once the
     # loop is up we ALSO register via loop.add_signal_handler in the startup
@@ -1695,6 +1745,6 @@ def run_server(
     signal.signal(signal.SIGINT, _signal_cleanup)
     signal.signal(signal.SIGTERM, _signal_cleanup)
     try:
-        server_uv.run()
+        server_uv.run(sockets=[http_socket])
     finally:
         _cleanup()
