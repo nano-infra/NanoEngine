@@ -549,50 +549,25 @@ class Indexer(nn.Module):
             block_tables.to(torch.int32),
             schedule_meta,
             max_context_len,
-            clean_logits=False,
+            clean_logits=True,
         )
 
         # Step 9: TopK selection
-        # logits: (batch * ntps, max_context_len) — mask invalid positions
-        total_q = batch_size * ntps
+        # clean_logits=True has already filled positions beyond each sequence's
+        # context length with -inf.
         ctx_expanded = context_lens_i32.repeat_interleave(ntps).unsqueeze(
             1
-        )  # (total_q, 1)
+        )  # (batch_size * ntps, 1)
 
-        # Mask invalid positions (beyond actual sequence length)
-        arange = torch.arange(max_context_len, device=logits.device).unsqueeze(0)
-        logits = logits.masked_fill(arange >= ctx_expanded, float("-inf"))
-
-        # deep_gemm's fp8_paged_mqa_logits is called with clean_logits=False, so it
-        # leaves non-finite / uninitialized values in the output (sglang notes the
-        # logits "should be cleaned in topk_transform"). A handful of NaN/+inf or
-        # fp32-saturated (~3e38) entries would otherwise dominate the top-k and
-        # corrupt the sparse selection once context exceeds index_topk. Replace any
-        # non-finite or absurdly-large-magnitude score with -inf so it is never
-        # selected. Real indexer logits are O(100s).
-        logits = torch.where(
-            torch.isfinite(logits) & (logits.abs() < 1e30),
-            logits,
-            float("-inf"),
+        # TopK: select exactly index_topk token positions.
+        assert max_context_len >= self.index_topk, (
+            f"max_context_len ({max_context_len}) must be >= "
+            f"index_topk ({self.index_topk})"
         )
-
-        # TopK: select top index_topk token positions
-        # actual_topk is constant (block_table capacity >= index_topk in practice)
-        actual_topk = min(self.index_topk, max_context_len)
-        _, topk_indices = torch.topk(logits, k=actual_topk, dim=-1)
+        _, topk_indices = torch.topk(logits, k=self.index_topk, dim=-1)
         topk_indices = topk_indices.to(torch.int32)
 
         # Mark out-of-range indices as -1 (they had -inf logits but topk still returns them)
         topk_indices = torch.where(topk_indices < ctx_expanded, topk_indices, -1)
-
-        # Pad to index_topk if needed (with -1 for invalid)
-        if actual_topk < self.index_topk:
-            padding = torch.full(
-                (total_q, self.index_topk - actual_topk),
-                -1,
-                dtype=torch.int32,
-                device=topk_indices.device,
-            )
-            topk_indices = torch.cat([topk_indices, padding], dim=-1)
 
         return topk_indices
