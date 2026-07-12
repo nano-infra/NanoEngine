@@ -184,7 +184,8 @@ def dequantize_and_unpack_mla(
 def _store_kcache_fp8_kernel(
     # Pointers
     kv_ptr,  # [N, D_TOTAL] bfloat16 source (NoPE+RoPE)
-    cache_ptr,  # flat paged cache, uint8
+    cache_fp8_ptr,  # paged cache, float8_e4m3fn
+    cache_bytes_ptr,  # same storage reinterpreted as uint8
     slot_mapping_ptr,
     # Strides
     kv_row_stride,
@@ -203,11 +204,6 @@ def _store_kcache_fp8_kernel(
     slot = tl.load(slot_mapping_ptr + pid)
     if slot == -1:
         return
-
-    # -- Read NoPE [D_NOPE] as float32 --
-    nope_offs = tl.arange(0, D_NOPE_C)
-    nope_bf16 = tl.load(kv_ptr + pid * kv_row_stride + nope_offs)
-    nope_f32 = nope_bf16.to(tl.float32)
 
     cache_block = slot // BLOCK_SIZE_C
     cache_offset = slot % BLOCK_SIZE_C
@@ -230,11 +226,11 @@ def _store_kcache_fp8_kernel(
         quantized = (tile_vals / scale).to(tl.float8e4nv)
 
         # Store FP8 nope
-        tl.store(cache_ptr + cache_base + tile_offs, quantized)
+        tl.store(cache_fp8_ptr + cache_base + tile_offs, quantized)
 
         # Store scale as float32 (4 bytes)
         scale_offset = cache_base + D_NOPE_C + tile_idx * 4
-        scale_ptr = (cache_ptr + scale_offset).to(tl.pointer_type(tl.float32))
+        scale_ptr = (cache_bytes_ptr + scale_offset).to(tl.pointer_type(tl.float32))
         tl.store(scale_ptr, scale)
 
     # -- copy RoPE as-is (bfloat16 → 2 bytes each) --
@@ -242,7 +238,7 @@ def _store_kcache_fp8_kernel(
     rope_bf16 = tl.load(kv_ptr + pid * kv_row_stride + D_NOPE_C + rope_offs)
     rope_out_offset = cache_base + D_NOPE_C + SCALE_BYTES_C
     # Cast to bfloat16* so pointer arithmetic advances by 2 bytes per element
-    rope_ptr = (cache_ptr + rope_out_offset).to(tl.pointer_type(tl.bfloat16))
+    rope_ptr = (cache_bytes_ptr + rope_out_offset).to(tl.pointer_type(tl.bfloat16))
     tl.store(rope_ptr + rope_offs, rope_bf16)
 
 
@@ -265,6 +261,7 @@ def store_kcache_fp8(
     cache_bytes = k_cache.view(torch.uint8)
     _store_kcache_fp8_kernel[(N,)](
         key_2d,
+        k_cache,
         cache_bytes,
         slot_mapping,
         key_2d.stride(0),
