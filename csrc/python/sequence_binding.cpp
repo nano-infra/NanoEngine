@@ -129,6 +129,9 @@ void bind_sequence(py::module_& m)
         .def_readwrite("master_sp_idx", &BlockContext::master_sp_idx_)
         .def_readwrite("attention_sp", &BlockContext::attention_sp_)
         .def_readwrite("attention_dp", &BlockContext::attention_dp_)
+        .def_property("num_dispatched_tokens",
+                      [](const BlockContext& self) { return self.num_dispatched_tokens; },
+                      [](BlockContext& self, const std::vector<int>& value) { self.num_dispatched_tokens = value; })
         .def_property(
             "block_location",
             [](BlockContext& self) -> BlockContext::BlockLocationList& { return self.block_location; },

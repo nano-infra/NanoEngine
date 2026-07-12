@@ -49,7 +49,11 @@ inline void read_bytes(uintptr_t base, size_t& off, size_t max_size, void* dst, 
 
 // ==================== 对象级逻辑实现 ====================
 
-void serialize_block_context(uintptr_t base, size_t& off, size_t max, const BlockContext& ctx)
+void serialize_block_context(uintptr_t      base,
+                             size_t&        off,
+                             size_t         max,
+                             const BlockContext& ctx,
+                             int            target_sp_rank = -1)
 {
     // String
     size_t s_len = ctx.engine_id_.size();
@@ -62,10 +66,28 @@ void serialize_block_context(uintptr_t base, size_t& off, size_t max, const Bloc
     write_raw(base, off, max, ctx.attention_sp_);
     write_raw(base, off, max, ctx.attention_dp_);
 
+    // In decode optimize mode, keep the sequence skeleton intact and only trim
+    // per-target heavy fields inside the block context.
+    BlockContext::BlockLocationList filtered_locations;
+    const bool                      trim_for_target = target_sp_rank >= 0;
+    if (trim_for_target) {
+        filtered_locations.reserve(ctx.block_location.size());
+        for (const auto& loc : ctx.block_location) {
+            if (loc.first == target_sp_rank) {
+                filtered_locations.push_back(loc);
+            }
+        }
+    }
+
     // Vector<pair<int, int>> - 直接块拷贝
-    size_t loc_count = ctx.block_location.size();
+    size_t loc_count = trim_for_target ? filtered_locations.size() : ctx.block_location.size();
     write_raw(base, off, max, loc_count);
-    write_bytes(base, off, max, ctx.block_location.data(), loc_count * sizeof(std::pair<int, int>));
+    if (trim_for_target) {
+        write_bytes(base, off, max, filtered_locations.data(), loc_count * sizeof(std::pair<int, int>));
+    }
+    else {
+        write_bytes(base, off, max, ctx.block_location.data(), loc_count * sizeof(std::pair<int, int>));
+    }
 
     // Vector<int>
     size_t disp_count = ctx.num_dispatched_tokens.size();
@@ -75,8 +97,10 @@ void serialize_block_context(uintptr_t base, size_t& off, size_t max, const Bloc
     // Nested Vector<Vector<int>>
     size_t table_size = ctx.sp_block_table.size();
     write_raw(base, off, max, table_size);
-    for (const auto& inner : ctx.sp_block_table) {
-        size_t inner_sz = inner.size();
+    for (size_t sp_idx = 0; sp_idx < table_size; ++sp_idx) {
+        const auto& inner = ctx.sp_block_table[sp_idx];
+        size_t      inner_sz =
+            (trim_for_target && static_cast<int>(sp_idx) != target_sp_rank) ? 0 : inner.size();
         write_raw(base, off, max, inner_sz);
         write_bytes(base, off, max, inner.data(), inner_sz * sizeof(int));
     }
@@ -123,34 +147,23 @@ size_t serialize_sequences(uintptr_t                                     data_pt
 {
     size_t off = 0;
 
-    // 在Decode阶段，先过滤出需要传输的序列（即在该rank上有KVCache的序列）
-    std::vector<std::shared_ptr<Sequence>> filtered_seqs;
-    if (!is_prefill && sp_rank >= 0 && sp_size > 0) {
-        // Decode阶段：只传输在该rank上有KVCache的序列
-        for (const auto& seq_ptr : seqs) {
-            if (!seq_ptr)
-                continue;
-            // 检查该序列是否在目标rank上有KVCache
-            // 注意：seq_ptr是shared_ptr，解引用后使用非const的context_len方法
-            int ctx_len = seq_ptr->context_len(BlockContextSlot::ACTIVE, std::optional<int>(sp_rank));
-            if (ctx_len > 0) {
-                filtered_seqs.push_back(seq_ptr);
-            }
-        }
-    } else {
-        // Prefill阶段或未提供sp_rank/sp_size：传输所有序列
-        for (const auto& seq_ptr : seqs) {
-            if (seq_ptr) {
-                filtered_seqs.push_back(seq_ptr);
-            }
+    const bool trim_decode_heavy_fields = !is_prefill && sp_rank >= 0 && sp_size > 0;
+
+    // Always preserve the full decode sequence skeleton and ordering. In the
+    // optimized decode path we only trim heavy per-sequence fields.
+    std::vector<std::shared_ptr<Sequence>> serialized_seqs;
+    serialized_seqs.reserve(seqs.size());
+    for (const auto& seq_ptr : seqs) {
+        if (seq_ptr) {
+            serialized_seqs.push_back(seq_ptr);
         }
     }
 
-    // 写入数量（过滤后的序列数量）
-    size_t count = filtered_seqs.size();
+    // 写入数量（保持原始 sequence skeleton）
+    size_t count = serialized_seqs.size();
     write_raw(data_ptr, off, buffer_size, count);
 
-    for (const auto& seq_ptr : filtered_seqs) {
+    for (const auto& seq_ptr : serialized_seqs) {
         const auto& seq = *seq_ptr;
 
         write_raw(data_ptr, off, buffer_size, seq.seq_id);
@@ -178,9 +191,12 @@ size_t serialize_sequences(uintptr_t                                     data_pt
         }
 
         // Slots (BlockContexts)
-        // 在Decode阶段，我们已经过滤了序列，所以传输的序列肯定有KVCache，需要传输完整的BlockContext
         for (size_t i = 0; i < (size_t)BlockContextSlot::_COUNT; ++i) {
-            serialize_block_context(data_ptr, off, buffer_size, seq.slots_[i]);
+            serialize_block_context(data_ptr,
+                                    off,
+                                    buffer_size,
+                                    seq.slots_[i],
+                                    trim_decode_heavy_fields ? sp_rank : -1);
         }
     }
     return off;

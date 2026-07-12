@@ -1,4 +1,5 @@
 import dataclasses
+import os
 
 import torch
 from dlslime import _slime_c
@@ -6,6 +7,19 @@ from nanodeploy._cpp import deserialize, Sequence, serialize
 from nanodeploy.logging import get_logger
 
 logger = get_logger("NANODEPLOY")
+
+
+def _get_slime_qp_num() -> int:
+    raw = os.environ.get("SLIME_QP_NUM", "1")
+    try:
+        num_qp = int(raw)
+    except ValueError:
+        logger.warning("Invalid SLIME_QP_NUM=%r; falling back to 1", raw)
+        return 1
+    if num_qp < 1:
+        logger.warning("Invalid SLIME_QP_NUM=%r; falling back to 1", raw)
+        return 1
+    return num_qp
 
 
 @dataclasses.dataclass
@@ -24,13 +38,16 @@ class RPCServerEndpoint:
         self.optimize_decode_block_table = optimize_decode_block_table
 
         self.devices = _slime_c.available_nic()
+        self.num_qp = _get_slime_qp_num()
         self.server_bindings: list[EndpointBinding] = []
 
     def init_server_endpoint(self):
         self.server_bindings.clear()
         endpoint_info = []
         for i in range(self.world_size):
-            endpoint = _slime_c.RDMAEndpoint(self.devices[i % len(self.devices)])
+            endpoint = _slime_c.RDMAEndpoint(
+                self.devices[i % len(self.devices)], num_qp=self.num_qp
+            )
             buffer = torch.empty([self.buffer_size], dtype=torch.int8)
             endpoint.register_memory_region(
                 buffer.data_ptr(), buffer.data_ptr(), buffer.numel()
@@ -57,15 +74,16 @@ class RPCServerEndpoint:
             buffer = binding.buffer
             buffer_ptr = buffer.data_ptr() + buffer.storage_offset()
             
-            # 计算目标rank的sp_rank和sp_size
-            # 如果启用优化且在Decode阶段，才进行过滤；否则传输全量BlockTable
+            # Decode optimize path still sends the full sequence skeleton.
+            # The serializer only trims heavy per-target fields inside each
+            # BlockContext (for example non-target block tables).
             if not is_prefill and self.optimize_decode_block_table:
                 # rank = dp_rank * (attention_sp * attention_tp) + sp_rank * attention_tp + tp_rank
                 # 所以 sp_rank = (rank // attention_tp) % attention_sp
                 sp_rank = (i // self.attention_tp) % self.attention_sp
                 sp_size = self.attention_sp
             else:
-                # Prefill阶段或未启用优化：传输全量BlockTable
+                # Prefill阶段或未启用优化：传输完整 BlockContext
                 sp_rank = -1
                 sp_size = -1
             
@@ -92,11 +110,12 @@ class RPCClientEndpoint:
         self.rank = rank
 
         self.devices = _slime_c.available_nic()
+        self.num_qp = _get_slime_qp_num()
         self.client_binding: EndpointBinding
 
     def init_client_endpoint(self):
         endpoint_info = []
-        endpoint = _slime_c.RDMAEndpoint(self.devices[0])
+        endpoint = _slime_c.RDMAEndpoint(self.devices[0], num_qp=self.num_qp)
         buffer = torch.empty(
             [self.buffer_size], dtype=torch.int8, device="cpu", pin_memory=True
         )

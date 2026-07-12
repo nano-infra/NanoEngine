@@ -24,7 +24,7 @@ class Scheduler(_CppScheduler):
     def __init__(self, config: Config):
         # C++ Scheduler expects individual parameters, not Config object
         super().__init__(
-            config.engine_id,
+            config.engine_id or "",
             config.loop_count,
             config.max_num_seqs,
             config.max_num_batched_tokens,
@@ -38,10 +38,27 @@ class Scheduler(_CppScheduler):
             config.reserved_blocks_per_req,
             config.segment_size,
             config.enable_dynamic_sp_size,
+            config.use_new_decode_dynamic_sp_scheduler,
+            config.dynamic_sp_size_strategy,
+            config.dynamic_sp_long_request_threshold,
+            config.dynamic_sp_long_request_size,
+            config.enable_dynamic_sp_bucket_policy,
+            config.dynamic_sp_bucket_policy,
+            config.dynamic_sp_attention_cost_a,
+            config.dynamic_sp_attention_cost_b,
+            config.dynamic_sp_q_cost_a,
+            config.dynamic_sp_q_cost_b,
+            config.dynamic_sp_res_cost_a,
+            config.dynamic_sp_res_cost_b,
+            config.dynamic_sp_lse_cost_a,
+            config.dynamic_sp_lse_cost_b,
+            config.dynamic_sp_q_bytes_per_edge,
+            config.dynamic_sp_res_bytes_per_edge,
+            config.dynamic_sp_lse_bytes_per_edge,
             config.enable_non_uniform_split,
             config.sp_master_selector,
             config.sp_debug,
-            config.fixed_sp_segments,
+            config.fixed_sp_size,
             config.scheduler_mode
         )
         # Store config for compatibility

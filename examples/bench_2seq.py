@@ -48,6 +48,13 @@ def parse_args():
     parser.add_argument("--max-num-seqs", type=int, default=128, help="Max sequences per iteration.")
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
+    parser.add_argument("--sp-backend", type=str, default="hao_basic",
+                        choices=["legacy_ll", "hao_basic", "nccl", "nccl_compact"],
+                        help="SP all-to-all backend.")
+    parser.add_argument("--enable-dynamic-sp-size", action="store_true",
+                        help="Enable dynamic SP size scheduling.")
+    parser.add_argument("--use-new-decode-dynamic-sp-scheduler", action="store_true",
+                        help="Use the new decode-only dynamic SP scheduler.")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
@@ -374,6 +381,9 @@ def main():
         max_num_batched_tokens=1024000,
         loop_count=args.loop_count,
         routing_strategy=args.routing_strategy,
+        sp_backend=args.sp_backend,
+        enable_dynamic_sp_size=args.enable_dynamic_sp_size,
+        use_new_decode_dynamic_sp_scheduler=args.use_new_decode_dynamic_sp_scheduler,
     )
     
     # Print Config
@@ -429,8 +439,4 @@ def main():
 
 
 if __name__ == "__main__":
-<<<<<<< HEAD
     main()
-=======
-    main()
->>>>>>> feat/sp-scheduler-enhancement

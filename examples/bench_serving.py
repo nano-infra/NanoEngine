@@ -30,6 +30,13 @@ def parse_args():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization.")
     parser.add_argument("--gpu-memory-limit-gb", type=float, default=None, help="GPU memory limit in GB.")
     parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager mode.")
+    parser.add_argument(
+        "--cuda-graph-mode",
+        type=str,
+        default="full",
+        choices=["full", "piecewise"],
+        help="CUDA Graph mode for decode.",
+    )
     parser.add_argument("--dataset", type=str, default="random", choices=["random", "csv"], help="Dataset type.")
     parser.add_argument("--csv-path", type=str, default=None, help="Path to CSV file.")
     parser.add_argument("--itl-log-path", type=str, default="itl_samples.jsonl", help="Path to save ITL samples (JSONL).")
@@ -49,10 +56,17 @@ def parse_args():
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
     parser.add_argument("--segment-size", type=int, default=65536, help="Segment size for SP.")
+    parser.add_argument("--sp-backend", type=str, default="hao_basic",
+                        choices=["legacy_ll", "hao_basic", "nccl", "nccl_compact"],
+                        help="SP all-to-all backend.")
     parser.add_argument("--disable-non-uniform-split", action="store_true", 
                         help="Disable non-uniform KVCache partitioning for load balancing (enabled by default).")
-    parser.add_argument("--fixed-sp-segments", type=int, default=0,
-                        help="Fixed number of SP segments per request (0 = disabled, use segment-size).")
+    parser.add_argument("--fixed-sp-size", type=int, default=0,
+                        help="Fixed number of participating SP ranks per request (0 = disabled).")
+    parser.add_argument("--enable-dynamic-sp-size", action="store_true",
+                        help="Enable dynamic SP size scheduling.")
+    parser.add_argument("--use-new-decode-dynamic-sp-scheduler", action="store_true",
+                        help="Use the new decode-only dynamic SP scheduler.")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
@@ -160,7 +174,7 @@ def print_model_config(engine):
 def run_warmup(engine, max_num_seqs, world_size):
     """Runs warmup phase before the actual benchmark."""
     warmup_input_len = 512
-    warmup_output_len = 256
+    warmup_output_len = 64
     num_warmup_requests = max_num_seqs * world_size
     
     print(f"\n{'=' * 60}")
@@ -375,6 +389,7 @@ def main():
     engine = LLM(
         args.model_path,
         enforce_eager=args.enforce_eager,
+        cuda_graph_mode=args.cuda_graph_mode,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         gpu_memory_limit_gb=args.gpu_memory_limit_gb,
@@ -406,7 +421,12 @@ def main():
         profiler_start_time=args.profiler_start_time,
         profiling_duration=args.profiling_duration,
         enable_non_uniform_split=not args.disable_non_uniform_split,
-        fixed_sp_segments=args.fixed_sp_segments
+        fixed_sp_size=args.fixed_sp_size,
+        sp_backend=args.sp_backend,
+        enable_dynamic_sp_size=args.enable_dynamic_sp_size,
+        use_new_decode_dynamic_sp_scheduler=args.use_new_decode_dynamic_sp_scheduler,
+        use_dlslime_rpc=True,
+        optimize_decode_block_table=True
     )
     
     # Print Config

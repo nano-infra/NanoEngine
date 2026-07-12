@@ -53,6 +53,10 @@ struct ScheduleResult {
     // SP counts
     std::vector<std::vector<int>> sp_send_counts;
     std::vector<std::vector<int>> sp_recv_counts;
+    // Per-DP histogram of active SP sizes.
+    // Dimensions: [dp_idx][sp_size], where sp_size is the number of
+    // non-zero entries in num_dispatched_tokens for a request.
+    std::vector<std::vector<int>> sp_size_hist_per_dp;
 
     // Matrix of SP communication counts.
     // Dimensions: [dp_idx][master_sp_rank][participant_sp_rank]
@@ -67,7 +71,7 @@ struct ScheduleResult {
     // Matrix of Res communication counts (Participant -> Master).
     // Dimensions: [dp_idx][participant_sp_rank][master_sp_rank]
     // Value: Number of Res requests sent from participant_sp_rank to master_sp_rank.
-    // std::vector<std::vector<std::vector<int>>> sp_res_matrix;
+    std::vector<std::vector<std::vector<int>>> sp_res_matrix;
 
     // Metrics for waiting queue blocks (per DP worker)
     std::vector<int> waiting_head_blocks;
@@ -90,10 +94,27 @@ public:
               double             reserved_blocks_per_req,
               int                segment_size,
               bool               enable_dynamic_sp_size,
+              bool               use_new_decode_dynamic_sp_scheduler,
+              const std::string& dynamic_sp_size_strategy,
+              int                dynamic_sp_long_request_threshold,
+              int                dynamic_sp_long_request_size,
+              bool               enable_dynamic_sp_bucket_policy,
+              const std::string& dynamic_sp_bucket_policy,
+              double             attention_cost_a,
+              double             attention_cost_b,
+              double             q_cost_a,
+              double             q_cost_b,
+              double             res_cost_a,
+              double             res_cost_b,
+              double             lse_cost_a,
+              double             lse_cost_b,
+              int                q_bytes_per_edge,
+              int                res_bytes_per_edge,
+              int                lse_bytes_per_edge,
               bool               enable_non_uniform_split,
               const std::string& sp_master_selector,
               bool               sp_debug,
-              int                fixed_sp_segments,
+              int                fixed_sp_size,
               const std::string& scheduler_mode = "centralized");
 
     // Queue management
@@ -144,6 +165,7 @@ private:
     // Internal scheduling logic
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
+    std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode_prefill_latency_aware();
     
     // Decentralized scheduling logic
     ScheduleResult _schedule_decentralized();
@@ -169,6 +191,10 @@ private:
     double      reserved_blocks_per_req_;
     int         segment_size_;
     bool        enable_dynamic_sp_size_;
+    bool        use_new_decode_dynamic_sp_scheduler_;
+    std::string dynamic_sp_size_strategy_;
+    int         dynamic_sp_long_request_threshold_;
+    int         dynamic_sp_long_request_size_;
     bool        enable_non_uniform_split_;
     bool        sp_debug_;
 

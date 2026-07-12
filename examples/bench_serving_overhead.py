@@ -49,10 +49,24 @@ def parse_args():
     parser.add_argument("--dummy-prefill", action="store_true", help="Use dummy prefill.")
     parser.add_argument("--loop-count", type=int, default=16, help="Steps per iteration.")
     parser.add_argument("--segment-size", type=int, default=65536, help="Segment size for SP.")
+    parser.add_argument("--sp-backend", type=str, default="hao_basic",
+                        choices=["legacy_ll", "hao_basic", "nccl", "nccl_compact"],
+                        help="SP all-to-all backend.")
     parser.add_argument("--disable-non-uniform-split", action="store_true", 
                         help="Disable non-uniform KVCache partitioning for load balancing (enabled by default).")
-    parser.add_argument("--fixed-sp-segments", type=int, default=0,
-                        help="Fixed number of SP segments per request (0 = disabled, use segment-size).")
+    parser.add_argument("--fixed-sp-size", type=int, default=0,
+                        help="Fixed number of participating SP ranks per request (0 = disabled).")
+    parser.add_argument("--enable-dynamic-sp-size", action="store_true",
+                        help="Enable dynamic SP size scheduling.")
+    parser.add_argument("--use-new-decode-dynamic-sp-scheduler", action="store_true",
+                        help="Use the new decode-only dynamic SP scheduler.")
+    parser.add_argument("--dynamic-sp-size-strategy", type=str, default="legacy",
+                        choices=["legacy", "long_short_sp8"],
+                        help="SP size selection policy for the legacy dynamic-SP path.")
+    parser.add_argument("--long-request-sp-threshold", type=int, default=100000,
+                        help="Prompt length threshold for long_short_sp8: prompt_len > threshold -> SP=8.")
+    parser.add_argument("--long-request-sp-size", type=int, default=0,
+                        help="SP size for long requests in long_short_sp8 (0 = attention_sp).")
 
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
@@ -399,7 +413,13 @@ def main():
         profiler_start_time=args.profiler_start_time,
         profiling_duration=args.profiling_duration,
         enable_non_uniform_split=not args.disable_non_uniform_split,
-        fixed_sp_segments=args.fixed_sp_segments
+        fixed_sp_size=args.fixed_sp_size,
+        sp_backend=args.sp_backend,
+        enable_dynamic_sp_size=args.enable_dynamic_sp_size,
+        use_new_decode_dynamic_sp_scheduler=args.use_new_decode_dynamic_sp_scheduler,
+        dynamic_sp_size_strategy=args.dynamic_sp_size_strategy,
+        dynamic_sp_long_request_threshold=args.long_request_sp_threshold,
+        dynamic_sp_long_request_size=args.long_request_sp_size,
     )
     
     # Print Config

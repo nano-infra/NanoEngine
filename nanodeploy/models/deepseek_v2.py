@@ -380,6 +380,32 @@ class DeepseekV2DecoderLayer(nn.Module):
         outputs = (hidden_states, residual)
         return outputs
 
+    def piecewise_pre_attention(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        query_states, key_states, value_states = self.self_attn.project_for_attention(
+            positions, hidden_states
+        )
+        return query_states, key_states, value_states, residual
+
+    def piecewise_post_attention(
+        self,
+        attn_output: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = self.self_attn.output_from_attention(attn_output)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
 
 # 已改
 
@@ -415,6 +441,14 @@ class DeepseekV2Model(nn.Module):
         residual = None
         for idx, decoder_layer in enumerate(self.layers):
             hidden_states, residual = decoder_layer(hidden_states, positions, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
+    def piecewise_finalize(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -672,17 +706,12 @@ class DeepseekV2Attention(nn.Module):
 
         return query_states, key_states, value_states, q_pe, k_pe
 
-    def forward(
+    def project_for_attention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ):
-        """Rewrite of LlamaAttention.forward."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_heads = self.num_heads
-        nope_size = self.kv_lora_rank
-        q_len = hidden_states.size(0)
-
-        # qkv_proj
 
         query_states, key_states, value_states, q_pe, k_pe = self._qkv_proj(
             hidden_states, num_heads=num_heads
@@ -695,15 +724,34 @@ class DeepseekV2Attention(nn.Module):
         # query_states[..., nope_size:] = q_pe
         # key_states[..., nope_size:] = k_pe
 
-        attn_output = self.attn_fwd(
-            query_states,
-            key_states,
-            value_states,
-        )
+        return query_states, key_states, value_states
 
+    def attention_core(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.attn_fwd(query_states, key_states, value_states)
+
+    def output_from_attention(self, attn_output: torch.Tensor) -> torch.Tensor:
+        q_len = attn_output.size(0)
+        num_heads = self.num_heads
         attn_bmm_out = attn_output.new_empty(q_len, num_heads, self.v_head_dim)
 
         self.vc(attn_output, attn_bmm_out)
         attn_output = attn_bmm_out.reshape(attn_bmm_out.size(0), -1)
         attn_output = self.o_proj(attn_output)
         return attn_output
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
+        """Rewrite of LlamaAttention.forward."""
+        query_states, key_states, value_states = self.project_for_attention(
+            positions, hidden_states
+        )
+        attn_output = self.attention_core(query_states, key_states, value_states)
+        return self.output_from_attention(attn_output)

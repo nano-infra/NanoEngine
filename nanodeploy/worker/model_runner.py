@@ -37,6 +37,13 @@ from nanodeploy.worker.sp_context import set_sp_context
 logger = get_logger()
 
 
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 architectures = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
@@ -51,8 +58,12 @@ class ModelRunner:
         self.engine_id = self.config.engine_id
         hf_config = config.hf_config
         self.enforce_eager = config.enforce_eager
+        self.cuda_graph_mode = config.cuda_graph_mode
         self.world_size = config.attn_world_size
         self.rank = rank
+        self.log_decode_a2a_masks = _env_flag_enabled(
+            "NANODEPLOY_LOG_DECODE_A2A_MASKS", default=False
+        )
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -105,12 +116,13 @@ class ModelRunner:
                     + self.config.hf_config.qk_rope_head_dim
                 )
             set_sp_context(
-                config.max_num_seqs,
-                max_head_dim,
-                hf_config.num_attention_heads,
-                torch.get_default_dtype(),
-                sp_size,
-                sp_rank,
+                max_num_seqs=config.max_num_seqs,
+                head_size=max_head_dim,
+                num_attention_heads=hf_config.num_attention_heads,
+                dtype=torch.get_default_dtype(),
+                rank=sp_rank,
+                sp_size=sp_size,
+                backend=config.sp_backend,
             )
 
         self.run_count = 0
@@ -155,7 +167,7 @@ class ModelRunner:
 
             self.profiler = torch.profiler.profile(
                 activities=[
-                    torch.profiler.ProfilerActivity.CPU,
+                    # torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
                 schedule=None,
@@ -192,7 +204,7 @@ class ModelRunner:
         # self.warmup_model()
         self.preallocate_kvcache()
 
-        self.endpoint = RPCClientEndpoint(4*32_000_000, get_dist_context().rank)
+        self.endpoint = RPCClientEndpoint(32*32_000_000, get_dist_context().rank)
 
     def init_rpc_endpoint(self, server_info):
         client_info = self.endpoint.init_client_endpoint()
@@ -238,7 +250,10 @@ class ModelRunner:
 
     def exit(self):
         if not self.enforce_eager:
-            del self.local_graphs, self.sp_graphs, self.sp_graph_map, self.graph_pool
+            if self.cuda_graph_mode == "piecewise":
+                del self.piecewise_graphs, self.piecewise_graph_vars, self.graph_pool
+            else:
+                del self.local_graphs, self.sp_graphs, self.sp_graph_map, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -353,6 +368,12 @@ class ModelRunner:
             block_size,
             self.config.max_num_seqs,
         )
+        sp_master_batch_sizes = [0 for _ in range(sp_size)]
+        for seq in dp_seqs:
+            master_sp_idx = seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
+            if 0 <= master_sp_idx < sp_size:
+                sp_master_batch_sizes[master_sp_idx] += 1
+        sp_comm_bs = max(sp_master_batch_sizes, default=0)
 
         input_ids = torch.tensor(
             meta.input_ids, dtype=torch.int64, pin_memory=True
@@ -456,6 +477,7 @@ class ModelRunner:
             is_dummy=is_dummy,
             context_lens_for_attn=context_lens_for_attn,
             attention_compute_bs=attention_compute_bs,
+            sp_comm_bs=sp_comm_bs,
             q_slice_get=q_slice_get,
             q_slice_fill=q_slice_fill,
             q_copy_mask=q_copy_mask,
@@ -527,92 +549,279 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         return temperatures
 
+    def _log_decode_a2a_masks(self, loop_idx: int, is_dummy: bool) -> None:
+        context = get_context()
+        if context.use_sp_a2a is not True:
+            return
+        if context.q_mask is None or context.res_lse_mask is None or context.q_offsets is None:
+            return
+
+        dist_context = get_dist_context()
+        logger.info(
+            {
+                "mode": "decode_a2a_masks",
+                "global_run_count": self.run_count,
+                "loop_idx": loop_idx,
+                "global_rank": self.rank,
+                "dp_rank": dist_context.attn_dp_rank,
+                "sp_rank": dist_context.attn_sp_rank,
+                "tp_rank": dist_context.attn_tp_rank,
+                "cp_size": dist_context.attn_sp_world_size,
+                "max_bs": int(context.q_mask.shape[1]),
+                "sp_comm_bs": context.sp_comm_bs,
+                "is_dummy": is_dummy,
+                "q_offsets": context.q_offsets.detach().cpu().tolist(),
+                "q_mask": context.q_mask.detach().cpu().tolist(),
+                "res_lse_mask": context.res_lse_mask.detach().cpu().tolist(),
+            }
+        )
+
+    def _select_decode_graph_master_bs(self, bs: int, context) -> int:
+        master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
+        if (
+            context.use_sp_a2a
+            and (
+                self.config.sp_backend in {"nccl", "nccl_compact"}
+                or self.config.fixed_sp_size > 0
+            )
+            and context.sp_comm_bs is not None
+        ):
+            comm_min_master_bs = max(bs, context.sp_comm_bs)
+            try:
+                master_bs = next(
+                    x for x in self.graph_master_rank_bs if x >= comm_min_master_bs
+                )
+            except StopIteration:
+                raise RuntimeError(
+                    f"SP communication batch {comm_min_master_bs} exceeds "
+                    f"max captured master_bs ({self.graph_master_rank_bs[-1]})"
+                )
+        return master_bs
+
+    def _copy_decode_context_to_graph_vars(
+        self,
+        graph_vars: dict[str, torch.Tensor | None],
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        bs: int,
+        context,
+    ) -> None:
+        if graph_vars.get("input_ids") is not None:
+            graph_vars["input_ids"].zero_()
+            graph_vars["input_ids"][:bs] = input_ids
+        if graph_vars.get("positions") is not None:
+            graph_vars["positions"].zero_()
+            graph_vars["positions"][:bs] = positions
+
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][: context.slot_mapping.shape[0]] = context.slot_mapping  # type: ignore
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"].copy_(context.context_lens)  # type: ignore
+        graph_vars["global_context_lens"].zero_()
+        graph_vars["global_context_lens"].copy_(context.global_context_lens)  # type: ignore
+        graph_vars["q_mask"].zero_()
+        graph_vars["q_mask"].copy_(context.q_mask)  # type: ignore
+        graph_vars["res_lse_mask"].zero_()
+        graph_vars["res_lse_mask"].copy_(context.res_lse_mask)  # type: ignore
+        graph_vars["block_tables"].zero_()
+        graph_vars["block_tables"][
+            : context.block_tables.size(0), : context.block_tables.size(1)  # type: ignore
+        ] = context.block_tables
+
+        config = self.config
+        hf_config = config.hf_config
+        if hf_config.num_key_value_heads == 1 and graph_vars.get("tile_scheduler_metadata") is not None:
+            graph_vars["tile_scheduler_metadata"].zero_()
+            graph_vars["num_splits"].zero_()
+
+        graph_vars["context_lens_for_attn"].zero_()
+        graph_vars["context_lens_for_attn"][
+            : context.context_lens_for_attn.shape[0]
+        ].copy_(context.context_lens_for_attn)  # type: ignore
+
+        graph_vars["q_slice_get"].fill_(-1)
+        graph_vars["q_slice_fill"].fill_(-1)
+        graph_vars["q_copy_mask"].zero_()
+        graph_vars["q_slice_get"][: context.q_slice_get.shape[0]] = context.q_slice_get  # type: ignore
+        graph_vars["q_slice_fill"][: context.q_slice_fill.shape[0]] = context.q_slice_fill  # type: ignore
+        graph_vars["q_copy_mask"][: context.q_copy_mask.shape[0]] = context.q_copy_mask  # type: ignore
+
+        graph_vars["res_slice_get_to_buffer_output"].fill_(-1)
+        graph_vars["res_slice_fill_to_buffer_output"].fill_(-1)
+        graph_vars["res_to_buffer_output_mask"].zero_()
+        graph_vars["res_slice_get_to_buffer_output"][: context.res_slice_get_to_buffer_output.shape[0]] = context.res_slice_get_to_buffer_output  # type: ignore
+        graph_vars["res_slice_fill_to_buffer_output"][: context.res_slice_fill_to_buffer_output.shape[0]] = context.res_slice_fill_to_buffer_output  # type: ignore
+        graph_vars["res_to_buffer_output_mask"][: context.res_to_buffer_output_mask.shape[0]] = context.res_to_buffer_output_mask  # type: ignore
+
+        graph_vars["res_slice_get_to_buffer_input"].fill_(-1)
+        graph_vars["res_slice_fill_to_buffer_input"].fill_(-1)
+        graph_vars["res_to_buffer_input_mask"].zero_()
+        graph_vars["res_slice_get_to_buffer_input"][: context.res_slice_get_to_buffer_input.shape[0]].copy_(context.res_slice_get_to_buffer_input)  # type: ignore
+        graph_vars["res_slice_fill_to_buffer_input"][: context.res_slice_fill_to_buffer_input.shape[0]].copy_(context.res_slice_fill_to_buffer_input)  # type: ignore
+        graph_vars["res_to_buffer_input_mask"][: context.res_to_buffer_input_mask.shape[0]].copy_(context.res_to_buffer_input_mask)  # type: ignore
+
+        graph_vars["q_offsets"].zero_()
+        graph_vars["q_offsets"].copy_(context.q_offsets)  # type: ignore
+
+    def _build_graph_master_rank_bs(self, max_bs: int) -> list[int]:
+        graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        graph_bs = [bs for bs in graph_bs if bs <= max_bs]
+        if not graph_bs or graph_bs[-1] != max_bs:
+            graph_bs.append(max_bs)
+        return graph_bs
+
+    def _build_sp_graph_attn_bs_candidates(
+        self, master_bs: int, sp_world_size: int
+    ) -> list[int]:
+        config = self.config
+        fixed_sp_graph = sp_world_size > 1 and config.fixed_sp_size > 0
+        fixed_full_sp_graph = fixed_sp_graph and config.fixed_sp_size == sp_world_size
+
+        if fixed_full_sp_graph:
+            return [sp_world_size * master_bs]
+
+        limit = master_bs + config.max_num_recv_seqs
+        if fixed_sp_graph:
+            limit = sp_world_size * master_bs
+        elif config.sp_backend == "nccl":
+            limit = min(limit, sp_world_size * master_bs)
+
+        current_attn_bs_candidates = []
+        curr = master_bs
+        while curr <= limit:
+            current_attn_bs_candidates.append(curr)
+            curr += self.attn_bs_step
+        if current_attn_bs_candidates[-1] != limit:
+            current_attn_bs_candidates.append(limit)
+        return current_attn_bs_candidates
+
     @torch.inference_mode()
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
+
+        if self.cuda_graph_mode == "piecewise":
+            return self.run_model_piecewise_cudagraph(input_ids, positions)
+
+        bs = input_ids.size(0)
+        context = get_context()
+        master_bs = self._select_decode_graph_master_bs(bs, context)
+
+        if context.use_sp_a2a:
+            ac_bs = context.attention_compute_bs
+            if ac_bs is None:
+                ac_bs = bs
+            valid_attn_bs_list = self.sp_graph_map.get(master_bs)
+            if valid_attn_bs_list is None:
+                raise RuntimeError(f"No SP graph map found for master_bs={master_bs}")
+
+            try:
+                attn_bs = next(x for x in valid_attn_bs_list if x >= ac_bs)
+            except StopIteration:
+                raise RuntimeError(
+                    f"Input attention_compute_bs {ac_bs} exceeds max captured attn_bs "
+                    f"({valid_attn_bs_list[-1]}) for master_bs {master_bs}"
+                )
+
+            graph = self.sp_graphs[(master_bs, attn_bs)]
         else:
-            bs = input_ids.size(0)
-            context = get_context()
-            master_bs = next(x for x in self.graph_master_rank_bs if x >= bs)
+            graph = self.local_graphs[master_bs]
 
-            if context.use_sp_a2a:
-                ac_bs = context.attention_compute_bs
-                if ac_bs is None:
-                    ac_bs = bs
-                valid_attn_bs_list = self.sp_graph_map.get(master_bs)
-                if valid_attn_bs_list is None:
-                    raise RuntimeError(f"No SP graph map found for master_bs={master_bs}")
+        graph_vars = self.graph_vars
+        self._copy_decode_context_to_graph_vars(
+            graph_vars, input_ids, positions, bs, context
+        )
+        graph.replay()
+        return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-                try:
-                    attn_bs = next(x for x in valid_attn_bs_list if x >= ac_bs)
-                except StopIteration:
+    @torch.inference_mode()
+    def run_model_piecewise_cudagraph(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ):
+        bs = input_ids.size(0)
+        context = get_context()
+        master_bs = self._select_decode_graph_master_bs(bs, context)
+        graph_set = self.piecewise_graphs[master_bs]
+        graph_vars = self.piecewise_graph_vars[master_bs]
+
+        self._copy_decode_context_to_graph_vars(
+            graph_vars, input_ids, positions, bs, context
+        )
+
+        temp_context_fields = {
+            "slot_mapping": graph_vars["slot_mapping"][:master_bs],
+            "context_lens": graph_vars["context_lens"],
+            "block_tables": graph_vars["block_tables"],
+            "global_context_lens": graph_vars["global_context_lens"],
+            "q_mask": graph_vars["q_mask"],
+            "res_lse_mask": graph_vars["res_lse_mask"],
+            "tile_scheduler_metadata": graph_vars["tile_scheduler_metadata"],
+            "num_splits": graph_vars["num_splits"],
+            "q_slice_get": graph_vars["q_slice_get"][:master_bs],
+            "q_slice_fill": graph_vars["q_slice_fill"][:master_bs],
+            "q_copy_mask": graph_vars["q_copy_mask"][:master_bs],
+            "res_slice_get_to_buffer_output": graph_vars[
+                "res_slice_get_to_buffer_output"
+            ][:master_bs],
+            "res_slice_fill_to_buffer_output": graph_vars[
+                "res_slice_fill_to_buffer_output"
+            ][:master_bs],
+            "res_to_buffer_output_mask": graph_vars["res_to_buffer_output_mask"][
+                :master_bs
+            ],
+            "res_slice_get_to_buffer_input": graph_vars[
+                "res_slice_get_to_buffer_input"
+            ],
+            "res_slice_fill_to_buffer_input": graph_vars[
+                "res_slice_fill_to_buffer_input"
+            ],
+            "res_to_buffer_input_mask": graph_vars["res_to_buffer_input_mask"],
+            "attention_compute_bs": context.attention_compute_bs,
+            "sp_comm_bs": master_bs,
+            "q_offsets": graph_vars["q_offsets"],
+            "context_lens_for_attn": graph_vars["context_lens_for_attn"],
+        }
+        saved_context_fields = {
+            name: getattr(context, name) for name in temp_context_fields
+        }
+        for name, value in temp_context_fields.items():
+            setattr(context, name, value)
+
+        try:
+            layers = self.model.model.layers
+            workspace = graph_set["workspace"]
+            query_states = workspace["query_states"][:master_bs]
+            key_states = workspace["key_states"][:master_bs]
+            value_states = workspace["value_states"][:master_bs]
+            attn_input = workspace["attn_output"][:master_bs]
+            for layer_idx, layer_graph in enumerate(graph_set["layers"]):
+                layer_graph["pre"].replay()
+                layer = layers[layer_idx]
+                attn_output = layer.self_attn.attention_core(
+                    query_states,
+                    key_states,
+                    value_states,
+                )
+                if attn_output.size(0) > master_bs:
                     raise RuntimeError(
-                        f"Input attention_compute_bs {ac_bs} exceeds max captured attn_bs "
-                        f"({valid_attn_bs_list[-1]}) for master_bs {master_bs}"
+                        "Piecewise attention output exceeds graph master_bs: "
+                        f"rows={attn_output.size(0)} master_bs={master_bs}"
                     )
+                if attn_output.size(0) < master_bs:
+                    attn_input.zero_()
+                attn_input[: attn_output.size(0)].copy_(attn_output)
+                layer_graph["post"].replay()
 
-                graph = self.sp_graphs[(master_bs, attn_bs)]
-            else:
-                graph = self.local_graphs[master_bs]
+            graph_set["final"].replay()
+        finally:
+            for name, value in saved_context_fields.items():
+                setattr(context, name, value)
 
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping  # type: ignore
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"].copy_(context.context_lens)  # type: ignore
-            graph_vars["global_context_lens"].zero_()
-            graph_vars["global_context_lens"].copy_(context.global_context_lens)  # type: ignore
-            graph_vars["q_mask"].zero_()
-            graph_vars["q_mask"].copy_(context.q_mask)  # type: ignore
-            graph_vars["res_lse_mask"].zero_()
-            graph_vars["res_lse_mask"].copy_(context.res_lse_mask)  # type: ignore
-            graph_vars["block_tables"].zero_()
-            graph_vars["block_tables"][
-                : context.block_tables.size(0), : context.block_tables.size(1)  # type: ignore
-            ] = context.block_tables
-
-            config = self.config
-            hf_config = config.hf_config
-            if hf_config.num_key_value_heads == 1:
-                graph_vars["tile_scheduler_metadata"].zero_()
-                graph_vars["num_splits"].zero_()
-                # graph_vars["tile_scheduler_metadata"].copy_(context.tile_scheduler_metadata)  # type: ignore
-                # graph_vars["num_splits"][:context.num_splits.shape[0]].copy_(context.num_splits)  # type: ignore
-
-
-            graph_vars["context_lens_for_attn"].zero_()
-            graph_vars["context_lens_for_attn"][: context.context_lens_for_attn.shape[0]].copy_(context.context_lens_for_attn)  # type: ignore
-            
-            graph_vars["q_slice_get"].fill_(-1)
-            graph_vars["q_slice_fill"].fill_(-1)
-            graph_vars["q_copy_mask"].zero_()
-            graph_vars["q_slice_get"][: context.q_slice_get.shape[0]] = context.q_slice_get  # type: ignore
-            graph_vars["q_slice_fill"][: context.q_slice_fill.shape[0]] = context.q_slice_fill  # type: ignore
-            graph_vars["q_copy_mask"][: context.q_copy_mask.shape[0]] = context.q_copy_mask  # type: ignore
-
-            graph_vars["res_slice_get_to_buffer_output"].fill_(-1)
-            graph_vars["res_slice_fill_to_buffer_output"].fill_(-1)
-            graph_vars["res_to_buffer_output_mask"].zero_()
-            graph_vars["res_slice_get_to_buffer_output"][: context.res_slice_get_to_buffer_output.shape[0]] = context.res_slice_get_to_buffer_output  # type: ignore
-            graph_vars["res_slice_fill_to_buffer_output"][: context.res_slice_fill_to_buffer_output.shape[0]] = context.res_slice_fill_to_buffer_output  # type: ignore
-            graph_vars["res_to_buffer_output_mask"][: context.res_to_buffer_output_mask.shape[0]] = context.res_to_buffer_output_mask  # type: ignore
-
-            graph_vars["res_slice_get_to_buffer_input"].fill_(-1)
-            graph_vars["res_slice_fill_to_buffer_input"].fill_(-1)
-            graph_vars["res_to_buffer_input_mask"].zero_()
-            graph_vars["res_slice_get_to_buffer_input"][: context.res_slice_get_to_buffer_input.shape[0]].copy_(context.res_slice_get_to_buffer_input)  # type: ignore
-            graph_vars["res_slice_fill_to_buffer_input"][: context.res_slice_fill_to_buffer_input.shape[0]].copy_(context.res_slice_fill_to_buffer_input)  # type: ignore
-            graph_vars["res_to_buffer_input_mask"][: context.res_to_buffer_input_mask.shape[0]].copy_(context.res_to_buffer_input_mask)  # type: ignore
-
-            graph_vars["q_offsets"].zero_()
-            graph_vars["q_offsets"].copy_(context.q_offsets)  # type: ignore
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+        return self.model.compute_logits(graph_set["workspace"]["final_hidden"][:bs])
 
     def migrate(self, seqs: list[Sequence]) -> None:
         get_cache_context().migrate(seqs=seqs)
@@ -698,6 +907,8 @@ class ModelRunner:
                     input_ids, positions = self.update_decode(
                         input_ids, positions, dp_seqs
                     )
+                if self.log_decode_a2a_masks:
+                    self._log_decode_a2a_masks(loop_idx=i, is_dummy=is_dummy)
 
             logits = self.run_model(input_ids, positions, is_prefill)
 
@@ -823,6 +1034,9 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        if self.cuda_graph_mode == "piecewise":
+            return self.capture_piecewise_cudagraph()
+
         sp_world_size = get_dist_context().attn_sp_world_size
         config = self.config
         hf_config = config.hf_config
@@ -830,7 +1044,17 @@ class ModelRunner:
             config.max_model_len, hf_config.max_position_embeddings
         )
         max_bs = min(self.config.max_num_seqs, 512)
-        max_attention_comp_seqs = max_bs + config.max_num_recv_seqs
+        fixed_sp_graph = sp_world_size > 1 and config.fixed_sp_size > 0
+        max_attention_comp_seqs = (
+            sp_world_size * max_bs
+            if fixed_sp_graph
+            else max_bs + config.max_num_recv_seqs
+        )
+        max_remote_attention_comp_seqs = (
+            max_attention_comp_seqs
+            if fixed_sp_graph
+            else config.max_num_recv_seqs
+        )
         block_size = get_cache_context().block_size
         max_num_blocks = (config.max_model_len + block_size - 1) // block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
@@ -853,13 +1077,13 @@ class ModelRunner:
         res_slice_fill_to_buffer_output = torch.full((max_bs,), -1, dtype=torch.int32)
         res_to_buffer_output_mask = torch.zeros(max_bs, dtype=torch.int32)
         res_slice_get_to_buffer_input = torch.full(
-            (config.max_num_recv_seqs,), -1, dtype=torch.int32
+            (max_remote_attention_comp_seqs,), -1, dtype=torch.int32
         )
         res_slice_fill_to_buffer_input = torch.full(
-            (config.max_num_recv_seqs,), -1, dtype=torch.int32
+            (max_remote_attention_comp_seqs,), -1, dtype=torch.int32
         )
         res_to_buffer_input_mask = torch.zeros(
-            config.max_num_recv_seqs, dtype=torch.int32
+            max_remote_attention_comp_seqs, dtype=torch.int32
         )
         q_offsets = torch.zeros(sp_world_size + 1, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
@@ -877,7 +1101,7 @@ class ModelRunner:
         else:
             tile_scheduler_metadata_buffer, num_splits_buffer = None, None
 
-        self.graph_master_rank_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_master_rank_bs = self._build_graph_master_rank_bs(max_bs)
         self.local_graphs = {}
         self.sp_graphs = {}
         self.graph_pool = None
@@ -910,6 +1134,7 @@ class ModelRunner:
                 res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
                 res_to_buffer_input_mask=res_to_buffer_input_mask,
                 attention_compute_bs=attn_bs,
+                sp_comm_bs=master_bs,
                 context_lens_for_attn=context_lens_for_attn,
                 q_offsets=q_offsets,
                 tile_scheduler_metadata=tile_scheduler_metadata_buffer,
@@ -949,13 +1174,9 @@ class ModelRunner:
             for master_bs in reversed(self.graph_master_rank_bs):
                 self.sp_graph_map[master_bs] = []
 
-                current_attn_bs_candidates = []
-                curr = master_bs
-                limit = master_bs + config.max_num_recv_seqs
-                while curr <= limit:
-                    current_attn_bs_candidates.append(curr)
-                    curr += self.attn_bs_step
-
+                current_attn_bs_candidates = self._build_sp_graph_attn_bs_candidates(
+                    master_bs, sp_world_size
+                )
                 for attn_bs in reversed(current_attn_bs_candidates):
                     logger.info(
                         f"正在捕获 SP 图 - (master_bs={master_bs}, attn_bs={attn_bs})"
@@ -1000,3 +1221,239 @@ class ModelRunner:
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             q_offsets=q_offsets,
         )
+
+    @torch.inference_mode()
+    def capture_piecewise_cudagraph(self):
+        sp_world_size = get_dist_context().attn_sp_world_size
+        config = self.config
+        hf_config = config.hf_config
+        if hf_config.architectures[0] != "DeepseekV3ForCausalLM":
+            raise RuntimeError("Piecewise CUDA Graph only supports DeepseekV3ForCausalLM")
+
+        hf_config.max_position_embeddings = max(
+            config.max_model_len, hf_config.max_position_embeddings
+        )
+        max_bs = min(self.config.max_num_seqs, 512)
+        fixed_sp_graph = sp_world_size > 1 and config.fixed_sp_size > 0
+        max_attention_comp_seqs = (
+            sp_world_size * max_bs
+            if fixed_sp_graph
+            else max_bs + config.max_num_recv_seqs
+        )
+        max_remote_attention_comp_seqs = (
+            max_attention_comp_seqs
+            if fixed_sp_graph
+            else config.max_num_recv_seqs
+        )
+        block_size = get_cache_context().block_size
+        max_num_blocks = (config.max_model_len + block_size - 1) // block_size
+
+        self.graph_master_rank_bs = self._build_graph_master_rank_bs(max_bs)
+        self.piecewise_graphs = {}
+        self.piecewise_graph_vars = {}
+        self.graph_pool = None
+
+        def capture_one_graph(fn):
+            graph = torch.cuda.CUDAGraph()
+            fn()
+            with torch.cuda.graph(graph, self.graph_pool):
+                fn()
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+            torch.cuda.synchronize()
+            dist.barrier(group=get_dist_context().cuda_world_group)
+            return graph
+
+        def make_decode_graph_vars():
+            return dict(
+                input_ids=torch.zeros(max_bs, dtype=torch.int64),
+                positions=torch.zeros(max_bs, dtype=torch.int64),
+                slot_mapping=torch.full((max_bs,), -1, dtype=torch.int32),
+                context_lens=torch.zeros(sp_world_size, max_bs, dtype=torch.int32),
+                block_tables=torch.zeros(
+                    max_attention_comp_seqs, max_num_blocks, dtype=torch.int32
+                ),
+                global_context_lens=torch.zeros(
+                    sp_world_size, max_bs, dtype=torch.int32
+                ),
+                q_mask=torch.zeros(sp_world_size, max_bs, dtype=torch.int32),
+                res_lse_mask=torch.zeros(sp_world_size, max_bs, dtype=torch.int32),
+                tile_scheduler_metadata=None,
+                num_splits=None,
+                context_lens_for_attn=torch.zeros(
+                    max_attention_comp_seqs, dtype=torch.int32
+                ),
+                q_slice_get=torch.full((max_bs,), -1, dtype=torch.int32),
+                q_slice_fill=torch.full((max_bs,), -1, dtype=torch.int32),
+                q_copy_mask=torch.zeros(max_bs, dtype=torch.int32),
+                res_slice_get_to_buffer_output=torch.full(
+                    (max_bs,), -1, dtype=torch.int32
+                ),
+                res_slice_fill_to_buffer_output=torch.full(
+                    (max_bs,), -1, dtype=torch.int32
+                ),
+                res_to_buffer_output_mask=torch.zeros(max_bs, dtype=torch.int32),
+                res_slice_get_to_buffer_input=torch.full(
+                    (max_remote_attention_comp_seqs,), -1, dtype=torch.int32
+                ),
+                res_slice_fill_to_buffer_input=torch.full(
+                    (max_remote_attention_comp_seqs,), -1, dtype=torch.int32
+                ),
+                res_to_buffer_input_mask=torch.zeros(
+                    max_remote_attention_comp_seqs, dtype=torch.int32
+                ),
+                q_offsets=torch.zeros(sp_world_size + 1, dtype=torch.int32),
+            )
+
+        def set_piecewise_capture_context(master_bs: int, graph_vars: dict):
+            set_context(
+                is_prefill=False,
+                max_bs=self.config.max_num_seqs,
+                slot_mapping=graph_vars["slot_mapping"][:master_bs],
+                context_lens=graph_vars["context_lens"],
+                block_tables=graph_vars["block_tables"],
+                global_context_lens=graph_vars["global_context_lens"],
+                q_mask=graph_vars["q_mask"],
+                res_lse_mask=graph_vars["res_lse_mask"],
+                use_sp_a2a=False,
+                q_slice_get=graph_vars["q_slice_get"][:master_bs],
+                q_slice_fill=graph_vars["q_slice_fill"][:master_bs],
+                q_copy_mask=graph_vars["q_copy_mask"][:master_bs],
+                res_slice_get_to_buffer_output=graph_vars[
+                    "res_slice_get_to_buffer_output"
+                ][:master_bs],
+                res_slice_fill_to_buffer_output=graph_vars[
+                    "res_slice_fill_to_buffer_output"
+                ][:master_bs],
+                res_to_buffer_output_mask=graph_vars["res_to_buffer_output_mask"][
+                    :master_bs
+                ],
+                res_slice_get_to_buffer_input=graph_vars[
+                    "res_slice_get_to_buffer_input"
+                ],
+                res_slice_fill_to_buffer_input=graph_vars[
+                    "res_slice_fill_to_buffer_input"
+                ],
+                res_to_buffer_input_mask=graph_vars["res_to_buffer_input_mask"],
+                attention_compute_bs=master_bs,
+                sp_comm_bs=master_bs,
+                context_lens_for_attn=graph_vars["context_lens_for_attn"],
+                q_offsets=graph_vars["q_offsets"],
+                tile_scheduler_metadata=graph_vars["tile_scheduler_metadata"],
+                num_splits=graph_vars["num_splits"],
+            )
+
+        logger.info("Starting piecewise CUDAGraph capture...")
+        total_graphs = 0
+        model = self.model.model
+        graph_vars = make_decode_graph_vars()
+        input_ids = graph_vars["input_ids"]
+        positions = graph_vars["positions"]
+        workspace = dict(
+            hidden_states=torch.zeros(max_bs, hf_config.hidden_size),
+            residual=torch.zeros(max_bs, hf_config.hidden_size),
+            layer_residual=torch.zeros(max_bs, hf_config.hidden_size),
+            query_states=torch.zeros(
+                max_bs,
+                hf_config.num_attention_heads,
+                hf_config.kv_lora_rank + hf_config.qk_rope_head_dim,
+            ),
+            key_states=torch.zeros(
+                max_bs,
+                getattr(hf_config, "num_key_value_heads", 1),
+                hf_config.kv_lora_rank + hf_config.qk_rope_head_dim,
+            ),
+            value_states=torch.zeros(
+                max_bs,
+                getattr(hf_config, "num_key_value_heads", 1),
+                hf_config.kv_lora_rank,
+            ),
+            attn_output=torch.zeros(
+                max_bs,
+                hf_config.num_attention_heads,
+                hf_config.kv_lora_rank,
+            ),
+            final_hidden=torch.zeros(max_bs, hf_config.hidden_size),
+        )
+
+        for master_bs in reversed(self.graph_master_rank_bs):
+            logger.info(f"正在捕获 Piecewise 图 - (master_bs={master_bs})")
+            layers = []
+            set_piecewise_capture_context(master_bs, graph_vars)
+            input_ids_view = input_ids[:master_bs]
+            positions_view = positions[:master_bs]
+            hidden_states = workspace["hidden_states"][:master_bs]
+            residual = workspace["residual"][:master_bs]
+            layer_residual_workspace = workspace["layer_residual"][:master_bs]
+            query_workspace = workspace["query_states"][:master_bs]
+            key_workspace = workspace["key_states"][:master_bs]
+            value_workspace = workspace["value_states"][:master_bs]
+            attn_output_workspace = workspace["attn_output"][:master_bs]
+            final_hidden = workspace["final_hidden"][:master_bs]
+
+            for layer_idx, layer in enumerate(model.layers):
+                if layer_idx == 0:
+                    def pre_fn(layer=layer):
+                        embedded = model.embed_tokens(input_ids_view)
+                        query_states, key_states, value_states, layer_residual = (
+                            layer.piecewise_pre_attention(
+                                embedded, positions_view, residual=None
+                            )
+                        )
+                        query_workspace.copy_(query_states)
+                        key_workspace.copy_(key_states)
+                        value_workspace.copy_(value_states)
+                        layer_residual_workspace.copy_(layer_residual)
+                else:
+                    def pre_fn(layer=layer):
+                        query_states, key_states, value_states, layer_residual = (
+                            layer.piecewise_pre_attention(
+                                hidden_states, positions_view, residual
+                            )
+                        )
+                        query_workspace.copy_(query_states)
+                        key_workspace.copy_(key_states)
+                        value_workspace.copy_(value_states)
+                        layer_residual_workspace.copy_(layer_residual)
+
+                pre_graph = capture_one_graph(pre_fn)
+
+                def post_fn(
+                    layer=layer,
+                ):
+                    next_hidden_states, next_residual = (
+                        layer.piecewise_post_attention(
+                            attn_output_workspace,
+                            layer_residual_workspace,
+                        )
+                    )
+                    hidden_states.copy_(next_hidden_states)
+                    residual.copy_(next_residual)
+
+                post_graph = capture_one_graph(post_fn)
+                layers.append(
+                    dict(
+                        pre=pre_graph,
+                        post=post_graph,
+                    )
+                )
+                total_graphs += 2
+
+            def final_fn():
+                final_hidden.copy_(model.piecewise_finalize(hidden_states, residual))
+
+            final_graph = capture_one_graph(final_fn)
+            total_graphs += 1
+            self.piecewise_graphs[master_bs] = dict(
+                layers=layers,
+                final=final_graph,
+                workspace=workspace,
+            )
+            self.piecewise_graph_vars[master_bs] = graph_vars
+
+        logger.info(
+            "Finished capturing piecewise graphs. "
+            f"Successfully captured {len(self.piecewise_graphs)} master_bs buckets, "
+            f"{total_graphs} graphs."
+        )
+        reset_context()
