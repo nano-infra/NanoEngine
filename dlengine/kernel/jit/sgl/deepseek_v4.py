@@ -12,10 +12,10 @@ Tier 1 + Tier 2 fused kernels exposed here:
                                       (drop-in for the activation in MLP /
                                       shared-expert paths)
 
-The upstream module also ships topk / mega-moe / kv-store kernels; those
-depend on ``sglang.srt.debug_utils`` and the compressor plan helpers
-which would drag in more of the upstream surface. Re-vendor selectively
-if/when those paths are needed.
+The upstream module also ships mega-moe / kv-store kernels; those depend on
+``sglang.srt.debug_utils`` and additional plan helpers which would drag in
+more of the upstream surface. Re-vendor selectively if/when those paths are
+needed.
 """
 
 from __future__ import annotations
@@ -150,16 +150,17 @@ def _jit_fused_rope_module():
 
 
 @cache_once
-def _jit_topk_module():
-    """sglang's NSA top-K=512 + page-table-translation kernel (radix-256
+def _jit_topk_module(top_k: int):
+    """NSA top-K + page-table-translation kernel (radix-256
     in shared memory). Replaces masked_fill + topk + where + (optional
     page transform) chain."""
+    assert top_k in (512, 2048)
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
-        _make_name("topk"),
+        _make_name(f"topk_{top_k}"),
         *args,
         cuda_files=["deepseek_v4/topk.cuh"],
-        cuda_wrappers=[("topk_transform", f"TopK512Kernel<{args}>::transform")],
+        cuda_wrappers=[("topk_transform", f"TopKKernel<{top_k}, {args}>::transform")],
     )
 
 
@@ -264,19 +265,20 @@ def fused_norm_rope_inplace(
     module.forward(kv, weight, positions, freq_cis_real, 2, eps, 0)
 
 
-def topk_transform_512(
+def topk_transform(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     page_tables: torch.Tensor,
     out_page_indices: torch.Tensor,
     page_size: int,
+    top_k: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    """sglang's NSA top-K=512 + page-table-translation kernel.
+    """NSA TopK + page-table-translation kernel for K=512 or K=2048.
 
     Single CUDA kernel that:
       1. Treats positions ``>= seq_lens[b]`` as ``-inf`` (implicit mask).
-      2. Selects the 512 highest-scoring positions per batch entry via a
+      2. Selects the highest-scoring positions per batch entry via a
          radix-256 sort in shared memory.
       3. Translates those raw token positions into physical page slots
          via ``page_tables`` (when caller wants page indices).
@@ -292,17 +294,40 @@ def topk_transform_512(
     seq_lens : [bs] int32 — actual context length per sequence.
     page_tables : [bs, max_pages] int32 — physical page id for each
         logical page slot.
-    out_page_indices : [bs, 512] int32 — pre-allocated output buffer
+    out_page_indices : [bs, top_k] int32 — pre-allocated output buffer
         for page-translated slot indices (set to ``-1`` for invalid
         positions).
     page_size : int — must be a power of 2.
-    out_raw_indices : optional [bs, 512] int32 — if supplied, also
+    top_k : int — supported values are 512 and 2048.
+    out_raw_indices : optional [bs, top_k] int32 — if supplied, also
         receives the pre-translation raw token positions. Pass ``None``
         when only page indices are needed.
     """
-    module = _jit_topk_module()
+    if top_k not in (512, 2048):
+        raise ValueError(f"top_k must be 512 or 2048, got {top_k}")
+    module = _jit_topk_module(top_k)
     module.topk_transform(
         scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+    )
+
+
+def topk_transform_512(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Backward-compatible TopK=512 wrapper."""
+    topk_transform(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        512,
+        out_raw_indices,
     )
 
 

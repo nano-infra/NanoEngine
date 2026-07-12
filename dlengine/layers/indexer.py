@@ -475,6 +475,8 @@ class Indexer(nn.Module):
         context_lens: torch.Tensor,
         block_tables: torch.Tensor,
         slot_mapping: torch.Tensor,
+        translate_topk: bool = False,
+        topk_page_size: int | None = None,
     ) -> torch.Tensor:
         """Run indexer to produce topk block indices for sparse attention.
 
@@ -487,7 +489,8 @@ class Indexer(nn.Module):
             slot_mapping: (num_tokens,) int — flat slot indices for cache write
 
         Returns:
-            topk_indices: (num_tokens, index_topk) int32 — selected token indices
+            topk_indices: (num_tokens, index_topk) int32 — selected logical token
+                indices, or physical cache slots when translate_topk is True
         """
         assert self.indexer_cache is not None, "IndexerCache not initialized"
         num_tokens = hidden_states.shape[0]
@@ -549,25 +552,65 @@ class Indexer(nn.Module):
             block_tables.to(torch.int32),
             schedule_meta,
             max_context_len,
-            clean_logits=True,
+            # DeepGEMM does not support clean_logits with the 2D context_lens
+            # required by the paged MQA decode path.
+            clean_logits=False,
         )
 
-        # Step 9: TopK selection
-        # clean_logits=True has already filled positions beyond each sequence's
-        # context length with -inf.
-        ctx_expanded = context_lens_i32.repeat_interleave(ntps).unsqueeze(
-            1
-        )  # (batch_size * ntps, 1)
+        # Step 9: TopK selection. On Hopper, fuse selection, invalid-index
+        # handling, and logical-to-physical page translation into one kernel.
+        if translate_topk:
+            if topk_page_size is None:
+                raise ValueError("topk_page_size is required when translate_topk=True")
+            from dlengine.kernel.jit.sgl.deepseek_v4 import topk_transform
 
-        # TopK: select exactly index_topk token positions.
-        assert max_context_len >= self.index_topk, (
-            f"max_context_len ({max_context_len}) must be >= "
-            f"index_topk ({self.index_topk})"
+            seq_lens = (
+                context_lens_i32
+                if ntps == 1
+                else context_lens_i32.repeat_interleave(ntps)
+            )
+            page_tables = (
+                block_tables
+                if ntps == 1
+                else block_tables.repeat_interleave(ntps, dim=0)
+            )
+            physical_indices = torch.empty(
+                (batch_size * ntps, self.index_topk),
+                dtype=torch.int32,
+                device=logits.device,
+            )
+            topk_transform(
+                logits,
+                seq_lens,
+                page_tables,
+                physical_indices,
+                topk_page_size,
+                self.index_topk,
+            )
+            return physical_indices
+
+        # Portable fallback: explicitly clean the logits because DeepGEMM cannot
+        # enable clean_logits for 2D context_lens.
+        ctx_expanded = context_lens_i32.repeat_interleave(ntps).unsqueeze(1)
+        logit_positions = torch.arange(max_context_len, device=logits.device).unsqueeze(
+            0
         )
-        _, topk_indices = torch.topk(logits, k=self.index_topk, dim=-1)
+        logits = logits.masked_fill(logit_positions >= ctx_expanded, float("-inf"))
+        logits = torch.where(
+            torch.isfinite(logits) & (logits.abs() < 1e30),
+            logits,
+            float("-inf"),
+        )
+        actual_topk = min(self.index_topk, max_context_len)
+        _, topk_indices = torch.topk(logits, k=actual_topk, dim=-1)
         topk_indices = topk_indices.to(torch.int32)
 
         # Mark out-of-range indices as -1 (they had -inf logits but topk still returns them)
         topk_indices = torch.where(topk_indices < ctx_expanded, topk_indices, -1)
+
+        if actual_topk < self.index_topk:
+            topk_indices = torch.nn.functional.pad(
+                topk_indices, (0, self.index_topk - actual_topk), value=-1
+            )
 
         return topk_indices

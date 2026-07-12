@@ -11,11 +11,9 @@
 
 namespace {
 
-constexpr uint32_t kTopK          = 512;
-constexpr uint32_t kTopKBlockSize = 512;
-constexpr uint32_t kSMEM          = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
+constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
 
-struct TopK512Params {
+struct TopKParams {
     const float* __restrict__ scores;
     const int32_t* __restrict__ seq_lens;
     const int32_t* __restrict__ page_table;
@@ -46,6 +44,7 @@ SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint3
     return (page_table[i >> page_bits] << page_bits) | (i & mask);
 }
 
+template<uint32_t kTopK, uint32_t kTopKBlockSize>
 [[maybe_unused]]
 SGL_DEVICE void naive_transform(const float* __restrict__,  // unused
                                 const int32_t* __restrict__ page_table,
@@ -54,21 +53,23 @@ SGL_DEVICE void naive_transform(const float* __restrict__,  // unused
                                 const uint32_t length,
                                 const uint32_t page_bits)
 {
-    static_assert(kTopK <= kTopKBlockSize);
-    if (const auto tx = threadIdx.x; tx < length) {
-        indices[tx] = page_to_indices(page_table, tx, page_bits);
-        if (raw_indices != nullptr) {
-            raw_indices[tx] = tx;
+    for (uint32_t i = threadIdx.x; i < kTopK; i += kTopKBlockSize) {
+        if (i < length) {
+            indices[i] = page_to_indices(page_table, i, page_bits);
+            if (raw_indices != nullptr) {
+                raw_indices[i] = i;
+            }
         }
-    }
-    else if (kTopK == kTopKBlockSize || tx < kTopK) {
-        indices[tx] = -1;  // fill invalid indices to -1
-        if (raw_indices != nullptr) {
-            raw_indices[tx] = -1;
+        else {
+            indices[i] = -1;  // fill invalid indices to -1
+            if (raw_indices != nullptr) {
+                raw_indices[i] = -1;
+            }
         }
     }
 }
 
+template<uint32_t kTopK, uint32_t kTopKBlockSize>
 [[maybe_unused]]
 SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const uint32_t length)
 {
@@ -234,8 +235,8 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
     }
 }
 
-template<bool kUsePDL>
-__global__ void topk_512_transform(const __grid_constant__ TopK512Params params)
+template<uint32_t kTopK, uint32_t kTopKBlockSize, bool kUsePDL>
+__global__ void topk_transform(const __grid_constant__ TopKParams params)
 {
     const auto& [scores,
                  seq_lens,
@@ -258,17 +259,15 @@ __global__ void topk_512_transform(const __grid_constant__ TopK512Params params)
     device::PDLWaitPrimary<kUsePDL>();
 
     if (seq_len <= kTopK) {
-        naive_transform(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits);
+        naive_transform<kTopK, kTopKBlockSize>(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits);
     }
     else {
         __shared__ int32_t s_topk_indices[kTopK];
-        radix_topk(score_ptr, s_topk_indices, seq_len);
-        static_assert(kTopK <= kTopKBlockSize);
-        const auto tx = threadIdx.x;
-        if (kTopK == kTopKBlockSize || tx < kTopK) {
-            indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
+        radix_topk<kTopK, kTopKBlockSize>(score_ptr, s_topk_indices, seq_len);
+        for (uint32_t i = threadIdx.x; i < kTopK; i += kTopKBlockSize) {
+            indices_ptr[i] = page_to_indices(page_ptr, s_topk_indices[i], page_bits);
             if (raw_indices_ptr != nullptr) {
-                raw_indices_ptr[tx] = s_topk_indices[tx];
+                raw_indices_ptr[i] = s_topk_indices[i];
             }
         }
     }
@@ -287,9 +286,11 @@ void setup_kernel_smem_once(host::DebugInfo where = {})
     host::RuntimeDeviceCheck(result, where);
 }
 
-template<bool kUsePDL>
-struct TopK512Kernel {
-    static constexpr auto kernel = topk_512_transform<kUsePDL>;
+template<uint32_t kTopK, bool kUsePDL>
+struct TopKKernel {
+    static_assert(kTopK == 512 || kTopK == 2048, "supported top-k sizes are 512 and 2048");
+    static constexpr uint32_t kTopKBlockSize = kTopK < 1024 ? kTopK : 1024;
+    static constexpr auto     kernel         = topk_transform<kTopK, kTopKBlockSize, kUsePDL>;
 
     static void transform(const tvm::ffi::TensorView                     scores,
                           const tvm::ffi::TensorView                     seq_lens,
@@ -319,14 +320,14 @@ struct TopK512Kernel {
             .with_dtype<int32_t>()
             .with_device(device)
             .verify(page_table);
-        TensorMatcher({B, 512})  // output, must be contiguous
+        TensorMatcher({B, kTopK})  // output, must be contiguous
             .with_dtype<int32_t>()
             .with_device(device)
             .verify(page_indices);
 
         int32_t* raw_indices_ptr = nullptr;
         if (raw_indices.has_value()) {
-            TensorMatcher({B, 512})  // optional raw indices output, must be contiguous
+            TensorMatcher({B, kTopK})  // optional raw indices output, must be contiguous
                 .with_dtype<int32_t>()
                 .with_device(device)
                 .verify(raw_indices.value());
@@ -336,7 +337,7 @@ struct TopK512Kernel {
         RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
         const auto page_bits  = static_cast<uint32_t>(std::countr_zero(page_size));
         const auto batch_size = static_cast<uint32_t>(B.unwrap());
-        const auto params     = TopK512Params{
+        const auto params     = TopKParams{
                 .scores            = static_cast<float*>(scores.data_ptr()),
                 .seq_lens          = static_cast<int32_t*>(seq_lens.data_ptr()),
                 .page_table        = static_cast<int32_t*>(page_table.data_ptr()),

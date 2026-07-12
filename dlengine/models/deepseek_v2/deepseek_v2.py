@@ -10,6 +10,7 @@ from transformers import DeepseekV3Config
 from dlengine.context_v2.batch import get_batch_context
 from dlengine.context_v2.cache.plan import deepseek_mla_cache_plan
 from dlengine.context_v2.distributed import get_dist_context
+from dlengine.kernel.jit.sgl import fused_kernels_enabled
 from dlengine.kernel.triton.generic.paged_gather import build_paged_gather_indices
 from dlengine.layers import get_backend
 from dlengine.layers.activation import SiluAndMul
@@ -1223,21 +1224,33 @@ class DeepseekV2Attention(nn.Module):
                 bs = total_tokens // ntps
                 ctx_lens = context.context_lens[0, :bs]
                 bt = context.block_tables[sp_rank, :bs]
-                topk_indices = self.indexer(
-                    hidden_states, q_lora, positions, ctx_lens, bt, context.slot_mapping
-                )
-                # Convert logical token indices → physical paged indices
                 k_cache = self.attn_fwd.k_cache
                 block_size = k_cache.shape[1]
-                # topk_indices: (bs*ntps, topk), bt: (bs, max_blocks)
-                # For ntps>1 (lazy verify), repeat bt per token
-                if ntps > 1:
-                    bt_expanded = bt.repeat_interleave(ntps, dim=0)
-                else:
-                    bt_expanded = bt
-                sparse_indices = topk_indices_to_physical(
-                    topk_indices, bt_expanded, block_size
+                use_fused_topk = fused_kernels_enabled() and (
+                    self.indexer.index_topk in (512, 2048)
                 )
+                topk_indices = self.indexer(
+                    hidden_states,
+                    q_lora,
+                    positions,
+                    ctx_lens,
+                    bt,
+                    context.slot_mapping,
+                    translate_topk=use_fused_topk,
+                    topk_page_size=block_size,
+                )
+                if use_fused_topk:
+                    sparse_indices = topk_indices
+                else:
+                    # Convert logical token indices → physical paged indices.
+                    # For ntps>1 (lazy verify), repeat bt per token.
+                    if ntps > 1:
+                        bt_expanded = bt.repeat_interleave(ntps, dim=0)
+                    else:
+                        bt_expanded = bt
+                    sparse_indices = topk_indices_to_physical(
+                        topk_indices, bt_expanded, block_size
+                    )
                 if getattr(self.config, "enable_hisparse", False):
                     from dlengine.context_v2.cache.hisparse import (
                         get_hisparse_context,
