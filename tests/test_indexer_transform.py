@@ -63,3 +63,48 @@ def test_indexer_qk_rope_inplace_matches_torch():
     )
     torch.testing.assert_close(query, expected_query, rtol=0, atol=0)
     torch.testing.assert_close(key, expected_key, rtol=0, atol=0)
+
+
+def test_indexer_q_rope_hadamard_quant_matches_reference():
+    pytest.importorskip("tvm_ffi")
+
+    from dlengine.kernel.jit.sgl.deepseek_v4 import indexer_q_rope_hadamard_quant
+    from dlengine.layers.rotary_embedding import RotaryEmbedding
+    from fast_hadamard_transform import hadamard_transform
+
+    torch.manual_seed(2)
+    tokens, heads, head_dim, rope_dim = 4, 8, 128, 64
+    query = torch.randn(tokens, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    gate = torch.randn(tokens, heads, dtype=torch.bfloat16, device="cuda")
+    positions = torch.tensor([0, 3, 29, 511], dtype=torch.int64, device="cuda")
+    rope = RotaryEmbedding(rope_dim, rope_dim, 1024, 10000).cuda()
+    weight_scale = 0.03125
+
+    reference = query.clone()
+    q_half = (
+        reference[..., :rope_dim]
+        .unflatten(-1, (-1, 2))
+        .transpose(-1, -2)
+        .contiguous()
+        .flatten(-2)
+    )
+    q_half, _ = rope(positions, q_half, q_half)
+    reference[..., :rope_dim] = q_half
+    reference = hadamard_transform(reference.contiguous(), scale=head_dim**-0.5)
+    flat = reference.view(-1, head_dim)
+    amax = flat.abs().float().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    expected_fp8 = (flat.float() / scale).to(torch.float8_e4m3fn).view_as(query)
+    expected_weights = (
+        gate.float().unsqueeze(-1) * weight_scale * scale.view(tokens, heads, 1)
+    )
+
+    actual_fp8, actual_weights = indexer_q_rope_hadamard_quant(
+        query,
+        gate,
+        weight_scale,
+        rope.cos_sin_cache,
+        positions,
+    )
+    assert torch.equal(actual_fp8.view(torch.uint8), expected_fp8.view(torch.uint8))
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=0, atol=0)

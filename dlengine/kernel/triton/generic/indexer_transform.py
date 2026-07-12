@@ -126,3 +126,28 @@ def indexer_qk_rope_inplace(
         ROPE_DIM=rope_dim,
         num_warps=1,
     )
+
+
+def indexer_k_rope_inplace(
+    key: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rope_dim: int,
+) -> None:
+    """Indexer half-layout conversion + RoPE for K only."""
+    if key.ndim != 2 or key.dtype != torch.bfloat16:
+        raise ValueError("key must be a bfloat16 [T, D] tensor")
+    if positions.numel() != key.shape[0]:
+        raise ValueError("key and positions must use the same token count")
+    _indexer_qk_rope_inplace_kernel[(key.shape[0], 1)](
+        key,
+        key,
+        positions,
+        cos_sin_cache,
+        key.stride(0),
+        key.stride(0),
+        key.stride(0),
+        NUM_Q_HEADS=0,
+        ROPE_DIM=rope_dim,
+        num_warps=1,
+    )

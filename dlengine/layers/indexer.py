@@ -40,8 +40,11 @@ import torch
 import torch.nn as nn
 from fast_hadamard_transform import hadamard_transform
 
+from dlengine.kernel.jit.sgl import fused_kernels_enabled
+from dlengine.kernel.jit.sgl.deepseek_v4 import indexer_q_rope_hadamard_quant
 from dlengine.kernel.triton.generic.fp8_ue8m0_quant import store_indexer_key_fp8_fused
 from dlengine.kernel.triton.generic.indexer_transform import (
+    indexer_k_rope_inplace,
     indexer_layer_norm_bf16,
     indexer_qk_rope_inplace,
 )
@@ -302,6 +305,7 @@ class Indexer(nn.Module):
         q_lora: torch.Tensor,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        defer_query_transform: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project and transform Q and K for indexer scoring.
 
@@ -329,13 +333,21 @@ class Indexer(nn.Module):
                 self.k_norm.bias,
                 self.k_norm.eps,
             )
-            indexer_qk_rope_inplace(
-                query,
-                key,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                self.rope_head_dim,
-            )
+            if defer_query_transform:
+                indexer_k_rope_inplace(
+                    key,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.rope_head_dim,
+                )
+            else:
+                indexer_qk_rope_inplace(
+                    query,
+                    key,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.rope_head_dim,
+                )
         else:
             key = self.k_norm(key.float()).to(key.dtype)
 
@@ -355,7 +367,8 @@ class Indexer(nn.Module):
             key[..., : self.rope_head_dim] = k_rope_3d.squeeze(1)
 
         # Hadamard rotation
-        query = _hadamard_rotate(query)
+        if not defer_query_transform:
+            query = _hadamard_rotate(query)
         key = _hadamard_rotate(key)
 
         return query, key
@@ -529,27 +542,39 @@ class Indexer(nn.Module):
         batch_size = context_lens.shape[0]
 
         # Step 1-4: Compute query and key (with RoPE + Hadamard)
-        query, key = self._compute_q_k(q_lora, hidden_states, positions)
-
-        # Step 5: Quantize query to FP8
-        # query: (N, n_heads, head_dim=128) -> reshape for per-token quantization
-        # deep_gemm expects (N, D) for per_token_cast_to_fp8
-        q_flat = query.reshape(num_tokens * self.n_heads, self.head_dim)
-        q_fp8, q_scale = quant_fp8(
-            q_flat.contiguous(),
-            self.head_dim,
-            round_ue8m0=True,
-            min_absmax=1e-4,
+        use_fused_query = fused_kernels_enabled()
+        query, key = self._compute_q_k(
+            q_lora,
+            hidden_states,
+            positions,
+            defer_query_transform=use_fused_query,
         )
-        # q_fp8: (N*H, 128) FP8, q_scale: (N*H, 1) FP32
-        q_fp8 = q_fp8.view(num_tokens, self.n_heads, self.head_dim)
-        q_scale_for_gate = q_scale.view(num_tokens, self.n_heads, 1)
+
+        # Step 5: RoPE + Hadamard + FP8 quantize query and scale gate weights.
+        if use_fused_query:
+            gate_weight = self.weights_proj(hidden_states)
+            q_fp8, weights = indexer_q_rope_hadamard_quant(
+                query,
+                gate_weight,
+                (self.n_heads**-0.5) * self.softmax_scale,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+            )
+            weights = weights.squeeze(-1)
+        else:
+            q_flat = query.reshape(num_tokens * self.n_heads, self.head_dim)
+            q_fp8, q_scale = quant_fp8(
+                q_flat.contiguous(),
+                self.head_dim,
+                round_ue8m0=True,
+                min_absmax=1e-4,
+            )
+            q_fp8 = q_fp8.view(num_tokens, self.n_heads, self.head_dim)
+            q_scale_for_gate = q_scale.view(num_tokens, self.n_heads, 1)
+            weights = self._compute_gate_weights(hidden_states, q_scale_for_gate)
 
         # Step 6: Store key to indexer cache
         self.indexer_cache.store_key_fp8(self.layer_id, key, slot_mapping)
-
-        # Step 7: Compute gate weights
-        weights = self._compute_gate_weights(hidden_states, q_scale_for_gate)
 
         # Step 8: Compute FP8 paged MQA logits
         # q_fp8 needs shape (batch, next_n, n_heads, head_dim) for deep_gemm

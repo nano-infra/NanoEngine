@@ -150,6 +150,22 @@ def _jit_fused_rope_module():
 
 
 @cache_once
+def _jit_indexer_q_rope_hadamard_quant_module(dtype: torch.dtype):
+    args = make_cpp_args(dtype, is_arch_support_pdl(), True, True)
+    return load_jit(
+        _make_name("indexer_q_rope_hadamard_quant"),
+        *args,
+        cuda_files=["deepseek_v4/indexer_q.cuh"],
+        cuda_wrappers=[
+            (
+                "forward",
+                f"FusedQIndexerRopeHadamardQuantKernel<{args}>::forward",
+            )
+        ],
+    )
+
+
+@cache_once
 def _jit_topk_module(top_k: int):
     """NSA top-K + page-table-translation kernel (radix-256
     in shared memory). Replaces masked_fill + topk + where + (optional
@@ -263,6 +279,40 @@ def fused_norm_rope_inplace(
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis_real.shape[-1])
     # mode=2 means "norm + rope in one pass, no compressor plan"
     module.forward(kv, weight, positions, freq_cis_real, 2, eps, 0)
+
+
+def indexer_q_rope_hadamard_quant(
+    query: torch.Tensor,
+    gate_weight: torch.Tensor,
+    weight_scale: float,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse RoPE-first, Hadamard-128, UE8M0 quant, and gate scaling."""
+    if query.shape[-1] != 128:
+        raise ValueError(f"Indexer query head dim must be 128, got {query.shape[-1]}")
+    if gate_weight.shape != query.shape[:-1]:
+        raise ValueError(
+            f"gate weight shape {tuple(gate_weight.shape)} does not match "
+            f"query shape {tuple(query.shape[:-1])}"
+        )
+    query = query.contiguous()
+    gate_weight = gate_weight.contiguous()
+    q_fp8 = torch.empty_like(query, dtype=torch.float8_e4m3fn)
+    weights_out = torch.empty(
+        (*query.shape[:-1], 1), dtype=torch.float32, device=query.device
+    )
+    module = _jit_indexer_q_rope_hadamard_quant_module(query.dtype)
+    module.forward(
+        query,
+        q_fp8,
+        gate_weight,
+        weights_out,
+        weight_scale,
+        cos_sin_cache.flatten(1),
+        positions,
+    )
+    return q_fp8, weights_out
 
 
 def topk_transform(
