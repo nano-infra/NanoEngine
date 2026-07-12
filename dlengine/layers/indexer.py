@@ -41,6 +41,10 @@ import torch.nn as nn
 from fast_hadamard_transform import hadamard_transform
 
 from dlengine.kernel.triton.generic.fp8_ue8m0_quant import store_indexer_key_fp8_fused
+from dlengine.kernel.triton.generic.indexer_transform import (
+    indexer_layer_norm_bf16,
+    indexer_qk_rope_inplace,
+)
 from dlengine.kernel.triton.hopper.block_gemm_fp8 import quant_fp8
 from dlengine.layers import get_backend
 from dlengine.layers.base_backend import ReplicatedLinearBase
@@ -318,22 +322,37 @@ class Indexer(nn.Module):
 
         # K projection + LayerNorm
         key = self.wk(hidden_states)
-        key = self.k_norm(key.float()).to(key.dtype)
+        if key.is_cuda:
+            key = indexer_layer_norm_bf16(
+                key.contiguous(),
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.eps,
+            )
+            indexer_qk_rope_inplace(
+                query,
+                key,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.rope_head_dim,
+            )
+        else:
+            key = self.k_norm(key.float()).to(key.dtype)
 
-        # Split rope / non-rope portions
-        q_rope = query[..., : self.rope_head_dim]
-        k_rope = key[..., : self.rope_head_dim]
+            # Split rope / non-rope portions
+            q_rope = query[..., : self.rope_head_dim]
+            k_rope = key[..., : self.rope_head_dim]
 
-        # Convert from interleaved to half format (consistent with main attention)
-        q_rope = _interleaved_to_half(q_rope)
-        k_rope_3d = _interleaved_to_half(k_rope.unsqueeze(1))
+            # Convert from interleaved to half format (consistent with main attention)
+            q_rope = _interleaved_to_half(q_rope)
+            k_rope_3d = _interleaved_to_half(k_rope.unsqueeze(1))
 
-        # Apply RoPE
-        q_rope, k_rope_3d = self.rotary_emb(positions, q_rope, k_rope_3d)
+            # Apply RoPE
+            q_rope, k_rope_3d = self.rotary_emb(positions, q_rope, k_rope_3d)
 
-        # Write back rotated values
-        query[..., : self.rope_head_dim] = q_rope
-        key[..., : self.rope_head_dim] = k_rope_3d.squeeze(1)
+            # Write back rotated values
+            query[..., : self.rope_head_dim] = q_rope
+            key[..., : self.rope_head_dim] = k_rope_3d.squeeze(1)
 
         # Hadamard rotation
         query = _hadamard_rotate(query)
@@ -345,7 +364,7 @@ class Indexer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Compute indexer key only (K-path of _compute_q_k).
 
         Used during prefill to store keys without running the full scoring pipeline.
@@ -489,7 +508,7 @@ class Indexer(nn.Module):
         slot_mapping: torch.Tensor,
         translate_topk: bool = False,
         topk_page_size: int | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run indexer to produce topk block indices for sparse attention.
 
         Args:
