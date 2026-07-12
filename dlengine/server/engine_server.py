@@ -18,6 +18,7 @@ from dlengine.server.wire import (
     encode_stepout,
     SequenceStatus,
 )
+from dlengine.utils.network import get_advertise_host, get_bind_host
 
 logger = get_logger()
 
@@ -381,8 +382,12 @@ class EngineServer:
         # Default binds a TCP port (disaggregated stack, Rust DLRouter client).
         # ``dlengine serve`` passes an ipc:// endpoint so the co-located OpenAI
         # HTTP server can connect without a port conflict.
-        listen_addr = bind_endpoint or f"tcp://*:{self.config.port}"
+        bind_host = get_bind_host(self.config.host)
+        listen_addr = bind_endpoint or f"tcp://{bind_host}:{self.config.port}"
         socket.bind(listen_addr)
+        if bind_endpoint is None:
+            listen_addr = socket.getsockopt_string(zmq.LAST_ENDPOINT)
+            self.config.port = int(listen_addr.rsplit(":", 1)[-1])
 
         # Create P2P socket for receiving free instructions (dynamic port)
         p2p_socket = ctx.socket(zmq.DEALER)
@@ -402,14 +407,14 @@ class EngineServer:
         self.backend_process.start()
 
         # Determine ZMQ connection host for registration logs
-        zmq_host = "127.0.0.1" if self.config.host == "0.0.0.0" else self.config.host
+        zmq_host = get_advertise_host(self.config.host)
 
         logger.info("=" * 80)
         logger.info("Engine Server (Frontend) Started - Configuration Summary")
         logger.info("=" * 80)
         logger.info(f"Mode:            {self.config.mode}")
         logger.info(f"Model:           {self.config.model}")
-        logger.info(f"Bind Address:    {listen_addr} (listening on all interfaces)")
+        logger.info(f"Bind Address:    {listen_addr}")
         logger.info(f"ZMQ Connect:     tcp://{zmq_host}:{self.config.port}")
         logger.info(f"P2P Connect:     tcp://{zmq_host}:{p2p_port}")
         logger.info(f"World Size:      {self.config.attn_world_size}")

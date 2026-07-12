@@ -7,7 +7,7 @@
 | `model`                  | str   | Required           | Model path or HuggingFace ID                                         |
 | `mode`                   | str   | `"hybrid"`         | Engine mode: `prefill`, `decode`, `hybrid`                           |
 | `host`                   | str   | `"0.0.0.0"`        | Bind address                                                         |
-| `port`                   | int   | `5000`             | ZMQ port                                                             |
+| `port`                   | int   | `0`                | Service port (`0` lets the OS allocate an available port)            |
 | `max_model_len`          | int   | `16384`            | Maximum sequence length                                              |
 | `max_num_batched_tokens` | int   | `16384`            | Max tokens per batch                                                 |
 | `max_num_seqs`           | int   | `256`              | Max concurrent sequences                                             |
@@ -22,3 +22,7 @@
 | `profiler_start_step`    | int   | `40`               | Step number to start profiling                                       |
 | `profiling_step`         | int   | `16`               | Number of steps to profile                                           |
 | `profiler_dir`           | str   | `"./profiler_res"` | Output directory for profiler traces                                 |
+
+When `port` is left at `0`, DLEngine binds an OS-assigned port and logs the
+resulting bind and advertise endpoints. NanoCtrl registration uses the
+advertise endpoint, never the wildcard bind address.
