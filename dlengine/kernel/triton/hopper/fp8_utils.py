@@ -184,10 +184,13 @@ def dequantize_and_unpack_mla(
 def _store_kcache_fp8_kernel(
     # Pointers
     kv_ptr,  # [N, D_TOTAL] bfloat16 source (NoPE+RoPE)
-    cache_ptr,  # flat paged cache, uint8
+    cache_fp8_ptr,  # paged cache, float8_e4m3fn
+    cache_bytes_ptr,  # same storage reinterpreted as uint8
     slot_mapping_ptr,
     # Strides
     kv_row_stride,
+    cache_block_stride,
+    cache_token_stride,
     # Constants
     BYTES_PER_TOKEN: tl.constexpr,
     D_NOPE_C: tl.constexpr,
@@ -195,18 +198,16 @@ def _store_kcache_fp8_kernel(
     TILE_SIZE_C: tl.constexpr,
     NUM_TILES_C: tl.constexpr,
     SCALE_BYTES_C: tl.constexpr,
+    BLOCK_SIZE_C: tl.constexpr,
 ):
     pid = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + pid)
     if slot == -1:
         return
 
-    # -- Read NoPE [D_NOPE] as float32 --
-    nope_offs = tl.arange(0, D_NOPE_C)
-    nope_bf16 = tl.load(kv_ptr + pid * kv_row_stride + nope_offs)
-    nope_f32 = nope_bf16.to(tl.float32)
-
-    cache_base = slot * BYTES_PER_TOKEN
+    cache_block = slot // BLOCK_SIZE_C
+    cache_offset = slot % BLOCK_SIZE_C
+    cache_base = cache_block * cache_block_stride + cache_offset * cache_token_stride
 
     # -- Per-tile quantize + store --
     for tile_idx in tl.static_range(NUM_TILES_C):
@@ -220,16 +221,16 @@ def _store_kcache_fp8_kernel(
         # UE8M0: round up to power of 2
         log2_val = tl.math.log2(scale_inv)
         log2_ceil = tl.math.ceil(log2_val)
-        scale = tl.math.pow2(log2_ceil)
+        scale = tl.exp2(log2_ceil)
 
         quantized = (tile_vals / scale).to(tl.float8e4nv)
 
         # Store FP8 nope
-        tl.store(cache_ptr + cache_base + tile_offs, quantized)
+        tl.store(cache_fp8_ptr + cache_base + tile_offs, quantized)
 
         # Store scale as float32 (4 bytes)
         scale_offset = cache_base + D_NOPE_C + tile_idx * 4
-        scale_ptr = (cache_ptr + scale_offset).to(tl.pointer_type(tl.float32))
+        scale_ptr = (cache_bytes_ptr + scale_offset).to(tl.pointer_type(tl.float32))
         tl.store(scale_ptr, scale)
 
     # -- copy RoPE as-is (bfloat16 → 2 bytes each) --
@@ -237,7 +238,7 @@ def _store_kcache_fp8_kernel(
     rope_bf16 = tl.load(kv_ptr + pid * kv_row_stride + D_NOPE_C + rope_offs)
     rope_out_offset = cache_base + D_NOPE_C + SCALE_BYTES_C
     # Cast to bfloat16* so pointer arithmetic advances by 2 bytes per element
-    rope_ptr = (cache_ptr + rope_out_offset).to(tl.pointer_type(tl.bfloat16))
+    rope_ptr = (cache_bytes_ptr + rope_out_offset).to(tl.pointer_type(tl.bfloat16))
     tl.store(rope_ptr + rope_offs, rope_bf16)
 
 
@@ -256,26 +257,22 @@ def store_kcache_fp8(
                       slot = block_idx * block_size + offset_in_block
     """
     N = key.shape[0]
-    block_size = k_cache.shape[1]
     key_2d = key.view(N, D_TOTAL)
-
-    fp8_nope, scales = quantize_nope_fp8(key_2d[:, :D_NOPE])
-    rope = key_2d[:, D_NOPE:]
-    packed = pack_mla_fp8(fp8_nope, scales, rope)  # [N, 656] uint8
-
-    # Convert packed uint8 → fp8 view for assignment to fp8 cache
-    packed_fp8 = packed.view(torch.float8_e4m3fn)  # [N, 656]
-
-    # Scatter into paged cache — use clamped indices for CUDA graph compatibility
-    # (boolean masking produces dynamic shapes, which breaks graph capture)
-    safe_slots = torch.where(
-        slot_mapping >= 0,
-        slot_mapping.long(),
-        torch.zeros_like(slot_mapping, dtype=torch.long),
+    cache_bytes = k_cache.view(torch.uint8)
+    _store_kcache_fp8_kernel[(N,)](
+        key_2d,
+        k_cache,
+        cache_bytes,
+        slot_mapping,
+        key_2d.stride(0),
+        cache_bytes.stride(0),
+        cache_bytes.stride(1),
+        BYTES_PER_TOKEN=FP8_BYTES_PER_TOKEN,
+        D_NOPE_C=D_NOPE,
+        D_ROPE_C=D_ROPE,
+        TILE_SIZE_C=TILE_SIZE,
+        NUM_TILES_C=NUM_TILES,
+        SCALE_BYTES_C=SCALE_BYTES,
+        BLOCK_SIZE_C=k_cache.shape[1],
+        num_warps=4,
     )
-    block_idx = safe_slots // block_size
-    offset_in_block = safe_slots % block_size
-
-    # Write all rows; invalid slots (originally -1) write to slot 0 harmlessly
-    # (they'll be overwritten by real data later)
-    k_cache[block_idx, offset_in_block, 0, :] = packed_fp8

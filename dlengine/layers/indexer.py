@@ -40,7 +40,16 @@ import torch
 import torch.nn as nn
 from fast_hadamard_transform import hadamard_transform
 
-from dlengine.kernel.tilelang.deepseek.fp8_index import fp8_index
+from dlengine.kernel.jit.sgl import fused_kernels_enabled
+from dlengine.kernel.jit.sgl.deepseek_v4 import indexer_q_rope_hadamard_quant
+from dlengine.kernel.triton.generic.fp8_ue8m0_quant import store_indexer_key_fp8_fused
+from dlengine.kernel.triton.generic.indexer_transform import (
+    indexer_k_rope_inplace,
+    indexer_k_transform_store_fp8,
+    indexer_layer_norm_bf16,
+    indexer_qk_rope_inplace,
+)
+from dlengine.kernel.triton.hopper.block_gemm_fp8 import quant_fp8
 from dlengine.layers import get_backend
 from dlengine.layers.base_backend import ReplicatedLinearBase
 from dlengine.layers.rotary_embedding import get_rope
@@ -116,8 +125,8 @@ class IndexerCache:
         self.num_pages = num_pages
         self.page_size = page_size
         self.head_dim = head_dim
-        quant_block_size = INDEXER_QUANT_BLOCK_SIZE
-        self.bytes_per_token = head_dim + head_dim // quant_block_size * 4
+        self.quant_block_size = INDEXER_QUANT_BLOCK_SIZE
+        self.bytes_per_token = head_dim + head_dim // self.quant_block_size * 4
         # Single contiguous buffer: (num_layers, num_pages, page_size * bytes_per_token)
         self.buffer = torch.zeros(
             (num_layers, num_pages, page_size * self.bytes_per_token),
@@ -150,6 +159,17 @@ class IndexerCache:
         head_dim = self.head_dim
         page_size = self.page_size
         bpt = self.bytes_per_token
+
+        if key_bf16.is_cuda:
+            store_indexer_key_fp8_fused(
+                key_bf16.contiguous(),
+                buf,
+                slot_mapping,
+                page_size,
+                group_size=self.quant_block_size,
+                eps=1e-4,
+            )
+            return
 
         # Quantize: per-token FP8 with UE8M0 scale (graph-safe)
         key_fp8, key_scale = _per_token_cast_to_fp8_ue8m0(key_bf16)
@@ -281,11 +301,23 @@ class Indexer(nn.Module):
         # Indexer cache reference (set externally after cache allocation)
         self.indexer_cache: IndexerCache | None = None
 
+    def build_schedule_metadata(self, context_lens: torch.Tensor) -> torch.Tensor:
+        """Build the per-step DeepGEMM schedule shared by all Indexer layers."""
+        assert self.indexer_cache is not None
+        context_lens = context_lens.to(torch.int32)
+        if context_lens.dim() == 1:
+            context_lens = context_lens[:, None]
+        return deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, self.indexer_cache.page_size, self.sm_count
+        )
+
     def _compute_q_k(
         self,
         q_lora: torch.Tensor,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        defer_query_transform: bool = False,
+        defer_key_transform: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project and transform Q and K for indexer scoring.
 
@@ -306,26 +338,51 @@ class Indexer(nn.Module):
 
         # K projection + LayerNorm
         key = self.wk(hidden_states)
-        key = self.k_norm(key.float()).to(key.dtype)
+        if key.is_cuda and not defer_key_transform:
+            key = indexer_layer_norm_bf16(
+                key.contiguous(),
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.eps,
+            )
+            if defer_query_transform:
+                indexer_k_rope_inplace(
+                    key,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.rope_head_dim,
+                )
+            else:
+                indexer_qk_rope_inplace(
+                    query,
+                    key,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.rope_head_dim,
+                )
+        elif not defer_key_transform:
+            key = self.k_norm(key.float()).to(key.dtype)
 
-        # Split rope / non-rope portions
-        q_rope = query[..., : self.rope_head_dim]
-        k_rope = key[..., : self.rope_head_dim]
+            # Split rope / non-rope portions
+            q_rope = query[..., : self.rope_head_dim]
+            k_rope = key[..., : self.rope_head_dim]
 
-        # Convert from interleaved to half format (consistent with main attention)
-        q_rope = _interleaved_to_half(q_rope)
-        k_rope_3d = _interleaved_to_half(k_rope.unsqueeze(1))
+            # Convert from interleaved to half format (consistent with main attention)
+            q_rope = _interleaved_to_half(q_rope)
+            k_rope_3d = _interleaved_to_half(k_rope.unsqueeze(1))
 
-        # Apply RoPE
-        q_rope, k_rope_3d = self.rotary_emb(positions, q_rope, k_rope_3d)
+            # Apply RoPE
+            q_rope, k_rope_3d = self.rotary_emb(positions, q_rope, k_rope_3d)
 
-        # Write back rotated values
-        query[..., : self.rope_head_dim] = q_rope
-        key[..., : self.rope_head_dim] = k_rope_3d.squeeze(1)
+            # Write back rotated values
+            query[..., : self.rope_head_dim] = q_rope
+            key[..., : self.rope_head_dim] = k_rope_3d.squeeze(1)
 
         # Hadamard rotation
-        query = _hadamard_rotate(query)
-        key = _hadamard_rotate(key)
+        if not defer_query_transform:
+            query = _hadamard_rotate(query)
+        if not defer_key_transform:
+            key = _hadamard_rotate(key)
 
         return query, key
 
@@ -475,7 +532,9 @@ class Indexer(nn.Module):
         context_lens: torch.Tensor,
         block_tables: torch.Tensor,
         slot_mapping: torch.Tensor,
-    ) -> torch.Tensor:
+        translate_topk: bool = False,
+        topk_page_size: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run indexer to produce topk block indices for sparse attention.
 
         Args:
@@ -487,29 +546,65 @@ class Indexer(nn.Module):
             slot_mapping: (num_tokens,) int — flat slot indices for cache write
 
         Returns:
-            topk_indices: (num_tokens, index_topk) int32 — selected token indices
+            topk_indices: (num_tokens, index_topk) int32 selected logical token
+                indices. When translate_topk is True, returns
+                (logical_indices, physical_cache_slots).
         """
         assert self.indexer_cache is not None, "IndexerCache not initialized"
         num_tokens = hidden_states.shape[0]
         batch_size = context_lens.shape[0]
 
         # Step 1-4: Compute query and key (with RoPE + Hadamard)
-        query, key = self._compute_q_k(q_lora, hidden_states, positions)
+        use_fused_query = fused_kernels_enabled()
+        use_fused_key = use_fused_query and hidden_states.is_cuda
+        query, key = self._compute_q_k(
+            q_lora,
+            hidden_states,
+            positions,
+            defer_query_transform=use_fused_query,
+            defer_key_transform=use_fused_key,
+        )
 
-        # Step 5: Quantize query to FP8
-        # query: (N, n_heads, head_dim=128) -> reshape for per-token quantization
-        # deep_gemm expects (N, D) for per_token_cast_to_fp8
-        q_flat = query.reshape(num_tokens * self.n_heads, self.head_dim)
-        q_fp8, q_scale = _per_token_cast_to_fp8_ue8m0(q_flat)
-        # q_fp8: (N*H, 128) FP8, q_scale: (N*H, 1) FP32
-        q_fp8 = q_fp8.view(num_tokens, self.n_heads, self.head_dim)
-        q_scale_for_gate = q_scale.view(num_tokens, self.n_heads, 1)
+        # Step 5: RoPE + Hadamard + FP8 quantize query and scale gate weights.
+        if use_fused_query:
+            gate_weight = self.weights_proj(hidden_states)
+            q_fp8, weights = indexer_q_rope_hadamard_quant(
+                query,
+                gate_weight,
+                (self.n_heads**-0.5) * self.softmax_scale,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+            )
+            weights = weights.squeeze(-1)
+        else:
+            q_flat = query.reshape(num_tokens * self.n_heads, self.head_dim)
+            q_fp8, q_scale = quant_fp8(
+                q_flat.contiguous(),
+                self.head_dim,
+                round_ue8m0=True,
+                min_absmax=1e-4,
+            )
+            q_fp8 = q_fp8.view(num_tokens, self.n_heads, self.head_dim)
+            q_scale_for_gate = q_scale.view(num_tokens, self.n_heads, 1)
+            weights = self._compute_gate_weights(hidden_states, q_scale_for_gate)
 
-        # Step 6: Store key to indexer cache
-        self.indexer_cache.store_key_fp8(self.layer_id, key, slot_mapping)
-
-        # Step 7: Compute gate weights
-        weights = self._compute_gate_weights(hidden_states, q_scale_for_gate)
+        # Step 6: transform and store K. The fused path consumes the raw WK
+        # output and performs LayerNorm, RoPE, Hadamard, quantization and the
+        # paged-cache write in one launch.
+        if use_fused_key:
+            indexer_k_transform_store_fp8(
+                key,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.eps,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.indexer_cache.get_buffer(self.layer_id),
+                slot_mapping,
+                self.indexer_cache.page_size,
+            )
+        else:
+            self.indexer_cache.store_key_fp8(self.layer_id, key, slot_mapping)
 
         # Step 8: Compute FP8 paged MQA logits
         # q_fp8 needs shape (batch, next_n, n_heads, head_dim) for deep_gemm
@@ -535,10 +630,13 @@ class Indexer(nn.Module):
         if context_lens_for_gemm.dim() == 1:
             context_lens_for_gemm = context_lens_for_gemm[:, None]
 
-        # Schedule metadata for deep_gemm
-        schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
-            context_lens_for_gemm, page_size, self.sm_count
-        )
+        # All layers share this schedule. The model builds it once per forward;
+        # retain the fallback for standalone Indexer calls and tests.
+        from dlengine.context_v2.batch import get_batch_context
+
+        schedule_meta = get_batch_context().indexer_schedule_meta
+        if schedule_meta is None:
+            schedule_meta = self.build_schedule_metadata(context_lens_for_gemm)
 
         # Compute logits: (batch * ntps, max_context_len) FP32
         logits = deep_gemm.fp8_paged_mqa_logits(
@@ -549,35 +647,57 @@ class Indexer(nn.Module):
             block_tables.to(torch.int32),
             schedule_meta,
             max_context_len,
+            # DeepGEMM does not support clean_logits with the 2D context_lens
+            # required by the paged MQA decode path.
             clean_logits=False,
         )
 
-        # Step 9: TopK selection
-        # logits: (batch * ntps, max_context_len) — mask invalid positions
-        total_q = batch_size * ntps
-        ctx_expanded = context_lens_i32.repeat_interleave(ntps).unsqueeze(
-            1
-        )  # (total_q, 1)
+        # Step 9: TopK selection. On Hopper, fuse selection, invalid-index
+        # handling, and logical-to-physical page translation into one kernel.
+        if translate_topk:
+            if topk_page_size is None:
+                raise ValueError("topk_page_size is required when translate_topk=True")
+            from dlengine.kernel.jit.sgl.deepseek_v4 import topk_transform
 
-        # Mask invalid positions (beyond actual sequence length)
-        arange = torch.arange(max_context_len, device=logits.device).unsqueeze(0)
-        logits = logits.masked_fill(arange >= ctx_expanded, float("-inf"))
+            seq_lens = (
+                context_lens_i32
+                if ntps == 1
+                else context_lens_i32.repeat_interleave(ntps)
+            )
+            page_tables = (
+                block_tables
+                if ntps == 1
+                else block_tables.repeat_interleave(ntps, dim=0)
+            )
+            physical_indices = torch.empty(
+                (batch_size * ntps, self.index_topk),
+                dtype=torch.int32,
+                device=logits.device,
+            )
+            logical_indices = torch.empty_like(physical_indices)
+            topk_transform(
+                logits,
+                seq_lens,
+                page_tables,
+                physical_indices,
+                topk_page_size,
+                self.index_topk,
+                logical_indices,
+            )
+            return logical_indices, physical_indices
 
-        # deep_gemm's fp8_paged_mqa_logits is called with clean_logits=False, so it
-        # leaves non-finite / uninitialized values in the output (sglang notes the
-        # logits "should be cleaned in topk_transform"). A handful of NaN/+inf or
-        # fp32-saturated (~3e38) entries would otherwise dominate the top-k and
-        # corrupt the sparse selection once context exceeds index_topk. Replace any
-        # non-finite or absurdly-large-magnitude score with -inf so it is never
-        # selected. Real indexer logits are O(100s).
+        # Portable fallback: explicitly clean the logits because DeepGEMM cannot
+        # enable clean_logits for 2D context_lens.
+        ctx_expanded = context_lens_i32.repeat_interleave(ntps).unsqueeze(1)
+        logit_positions = torch.arange(max_context_len, device=logits.device).unsqueeze(
+            0
+        )
+        logits = logits.masked_fill(logit_positions >= ctx_expanded, float("-inf"))
         logits = torch.where(
             torch.isfinite(logits) & (logits.abs() < 1e30),
             logits,
             float("-inf"),
         )
-
-        # TopK: select top index_topk token positions
-        # actual_topk is constant (block_table capacity >= index_topk in practice)
         actual_topk = min(self.index_topk, max_context_len)
         _, topk_indices = torch.topk(logits, k=actual_topk, dim=-1)
         topk_indices = topk_indices.to(torch.int32)
@@ -585,14 +705,9 @@ class Indexer(nn.Module):
         # Mark out-of-range indices as -1 (they had -inf logits but topk still returns them)
         topk_indices = torch.where(topk_indices < ctx_expanded, topk_indices, -1)
 
-        # Pad to index_topk if needed (with -1 for invalid)
         if actual_topk < self.index_topk:
-            padding = torch.full(
-                (total_q, self.index_topk - actual_topk),
-                -1,
-                dtype=torch.int32,
-                device=topk_indices.device,
+            topk_indices = torch.nn.functional.pad(
+                topk_indices, (0, self.index_topk - actual_topk), value=-1
             )
-            topk_indices = torch.cat([topk_indices, padding], dim=-1)
 
         return topk_indices

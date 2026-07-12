@@ -10,6 +10,7 @@ from transformers import DeepseekV3Config
 from dlengine.context_v2.batch import get_batch_context
 from dlengine.context_v2.cache.plan import deepseek_mla_cache_plan
 from dlengine.context_v2.distributed import get_dist_context
+from dlengine.kernel.jit.sgl import fused_kernels_enabled
 from dlengine.kernel.triton.generic.paged_gather import build_paged_gather_indices
 from dlengine.layers import get_backend
 from dlengine.layers.activation import SiluAndMul
@@ -478,6 +479,29 @@ class DeepseekV2Model(nn.Module):
         positions: Optional[torch.LongTensor] = None,
     ):
         """forward."""
+        context = get_batch_context()
+        context.indexer_schedule_meta = None
+        if not context.is_prefill and context.context_lens is not None:
+            # The DeepGEMM schedule depends on the per-request sequence lengths,
+            # but is identical for every Indexer layer. Build it once per model
+            # invocation (and therefore once per CUDA Graph replay) instead of
+            # launching the metadata kernel once per layer.
+            indexer = next(
+                (
+                    layer.self_attn.indexer
+                    for layer in self.layers
+                    if layer.self_attn.indexer is not None
+                    and layer.self_attn.indexer.indexer_cache is not None
+                ),
+                None,
+            )
+            if indexer is not None:
+                ntps = context.num_tokens_per_seq
+                batch_size = input_ids.numel() // ntps
+                context.indexer_schedule_meta = indexer.build_schedule_metadata(
+                    context.context_lens[0, :batch_size]
+                )
+
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for idx, decoder_layer in enumerate(self.layers):
@@ -1223,21 +1247,34 @@ class DeepseekV2Attention(nn.Module):
                 bs = total_tokens // ntps
                 ctx_lens = context.context_lens[0, :bs]
                 bt = context.block_tables[sp_rank, :bs]
-                topk_indices = self.indexer(
-                    hidden_states, q_lora, positions, ctx_lens, bt, context.slot_mapping
-                )
-                # Convert logical token indices → physical paged indices
                 k_cache = self.attn_fwd.k_cache
                 block_size = k_cache.shape[1]
-                # topk_indices: (bs*ntps, topk), bt: (bs, max_blocks)
-                # For ntps>1 (lazy verify), repeat bt per token
-                if ntps > 1:
-                    bt_expanded = bt.repeat_interleave(ntps, dim=0)
-                else:
-                    bt_expanded = bt
-                sparse_indices = topk_indices_to_physical(
-                    topk_indices, bt_expanded, block_size
+                use_fused_topk = fused_kernels_enabled() and (
+                    self.indexer.index_topk in (512, 2048)
                 )
+                topk_result = self.indexer(
+                    hidden_states,
+                    q_lora,
+                    positions,
+                    ctx_lens,
+                    bt,
+                    context.slot_mapping,
+                    translate_topk=use_fused_topk,
+                    topk_page_size=block_size,
+                )
+                if use_fused_topk:
+                    topk_indices, sparse_indices = topk_result
+                else:
+                    topk_indices = topk_result
+                    # Convert logical token indices → physical paged indices.
+                    # For ntps>1 (lazy verify), repeat bt per token.
+                    if ntps > 1:
+                        bt_expanded = bt.repeat_interleave(ntps, dim=0)
+                    else:
+                        bt_expanded = bt
+                    sparse_indices = topk_indices_to_physical(
+                        topk_indices, bt_expanded, block_size
+                    )
                 if getattr(self.config, "enable_hisparse", False):
                     from dlengine.context_v2.cache.hisparse import (
                         get_hisparse_context,

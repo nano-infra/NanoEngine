@@ -36,6 +36,7 @@ class BatchContext(BaseContext):
     hisparse_slots: torch.Tensor | None = None
     hisparse_slot_mapping: torch.Tensor | None = None
     hisparse_num_real_reqs: torch.Tensor | None = None
+    indexer_schedule_meta: torch.Tensor | None = None
 
     @classmethod
     def get_context_type(cls) -> str:

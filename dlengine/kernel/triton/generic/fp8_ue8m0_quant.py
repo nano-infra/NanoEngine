@@ -364,3 +364,106 @@ def store_dsv4_kv_fp8_fused(
         EPS=eps,
         BIAS=_UE8M0_BIAS,
     )
+
+
+@triton.jit
+def _store_indexer_key_fp8_kernel(
+    key_ptr,  # bf16 [T, HEAD_DIM]
+    cache_fp8_ptr,  # uint8 cache reinterpreted as fp8
+    cache_fp32_ptr,  # uint8 cache reinterpreted as fp32
+    slot_mapping_ptr,  # signed integer [T]
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BYTES_PER_TOKEN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Quantize one Indexer key group and store it in the paged cache.
+
+    The Indexer cache keeps all FP8 values for a page first, followed by
+    per-token FP32 scales::
+
+        [token FP8 data: PAGE_SIZE * HEAD_DIM]
+        [token scales:   PAGE_SIZE * NUM_GROUPS * 4]
+    """
+    token = tl.program_id(0)
+    group = tl.program_id(1)
+    cols = tl.arange(0, GROUP_SIZE)
+
+    x = tl.load(key_ptr + token * HEAD_DIM + group * GROUP_SIZE + cols).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), axis=0), EPS)
+    exponent = tl.ceil(tl.log2(amax / FP8_MAX))
+    scale = tl.exp2(exponent)
+    quant = tl.clamp(x / scale, -FP8_MAX, FP8_MAX)
+
+    slot = tl.load(slot_mapping_ptr + token)
+    slot = tl.where(slot >= 0, slot, 0)
+    page = slot // PAGE_SIZE
+    offset_in_page = slot % PAGE_SIZE
+    page_byte_base = page * PAGE_SIZE * BYTES_PER_TOKEN
+
+    fp8_offset = page_byte_base + offset_in_page * HEAD_DIM + group * GROUP_SIZE + cols
+    tl.store(cache_fp8_ptr + fp8_offset, quant.to(tl.float8e4nv))
+
+    scale_byte_offset = (
+        page_byte_base
+        + PAGE_SIZE * HEAD_DIM
+        + (offset_in_page * NUM_GROUPS + group) * 4
+    )
+    tl.store(cache_fp32_ptr + scale_byte_offset // 4, scale)
+
+
+def store_indexer_key_fp8_fused(
+    key_bf16: torch.Tensor,
+    cache_buf: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_size: int,
+    group_size: int = 128,
+    eps: float = 1e-4,
+) -> None:
+    """Quantize Indexer keys and write the split-layout paged cache in one launch."""
+    if key_bf16.numel() == 0:
+        return
+    if key_bf16.dtype != torch.bfloat16:
+        raise TypeError(f"key_bf16 must be bfloat16, got {key_bf16.dtype}")
+    if cache_buf.dtype != torch.uint8:
+        raise TypeError(f"cache_buf must be uint8, got {cache_buf.dtype}")
+    if key_bf16.ndim != 2 or key_bf16.shape[1] % group_size != 0:
+        raise ValueError(
+            f"key shape {tuple(key_bf16.shape)} must be [T, D] with D divisible "
+            f"by group_size={group_size}"
+        )
+    if not key_bf16.is_contiguous() or not cache_buf.is_contiguous():
+        raise RuntimeError("Indexer key and cache tensors must be contiguous")
+    if slot_mapping.numel() != key_bf16.shape[0]:
+        raise ValueError("slot_mapping must contain one entry per Indexer key")
+
+    num_tokens, head_dim = key_bf16.shape
+    num_groups = head_dim // group_size
+    bytes_per_token = head_dim + num_groups * 4
+    page_bytes = page_size * bytes_per_token
+    if cache_buf.numel() % page_bytes != 0:
+        raise ValueError(
+            f"cache size {cache_buf.numel()} is not divisible by page bytes "
+            f"{page_bytes}"
+        )
+
+    cache_flat = cache_buf.view(-1)
+    cache_fp8 = cache_flat.view(torch.float8_e4m3fn)
+    cache_fp32 = cache_flat.view(torch.float32)
+    _store_indexer_key_fp8_kernel[(num_tokens, num_groups)](
+        key_bf16,
+        cache_fp8,
+        cache_fp32,
+        slot_mapping,
+        PAGE_SIZE=page_size,
+        HEAD_DIM=head_dim,
+        GROUP_SIZE=group_size,
+        NUM_GROUPS=num_groups,
+        BYTES_PER_TOKEN=bytes_per_token,
+        FP8_MAX=_FP8_MAX,
+        EPS=eps,
+        num_warps=4,
+    )
