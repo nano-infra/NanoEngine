@@ -13,8 +13,29 @@ _SKIP_PATTERNS = (
     "rotary_emb.",
     "vision_tower.",
     "audio_tower.",
+    "model.embed_audio.",
+    "model.embed_vision.",
     "multi_modal_projector.",
 )
+
+_SHARED_KV_WEIGHT = re.compile(
+    r"^model\.layers\.(\d+)\.self_attn\.(?:k_proj|v_proj|k_norm)\.weight$"
+)
+
+
+def _is_unused_shared_kv_weight(model: nn.Module, weight_name: str) -> bool:
+    """Return whether a checkpoint tensor belongs to a KV-sharing layer.
+
+    Gemma4 checkpoints retain K/V projection tensors for every layer, while the
+    reference architecture intentionally does not instantiate them for the last
+    ``num_kv_shared_layers`` layers. Those layers consume K/V produced by the
+    last non-sharing layer of the same attention type.
+    """
+    match = _SHARED_KV_WEIGHT.match(weight_name)
+    if match is None:
+        return False
+    attention = model.get_submodule(f"model.layers.{int(match.group(1))}.self_attn")
+    return bool(getattr(attention, "is_kv_shared_layer", False))
 
 
 def load_weights(
@@ -29,6 +50,9 @@ def load_weights(
         if weight_name.startswith("language_model."):
             weight_name = weight_name[len("language_model.") :]
         if any(pattern in weight_name for pattern in _SKIP_PATTERNS):
+            skipped_count += 1
+            continue
+        if _is_unused_shared_kv_weight(model, weight_name):
             skipped_count += 1
             continue
 

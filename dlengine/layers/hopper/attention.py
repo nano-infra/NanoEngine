@@ -181,6 +181,7 @@ def _hisparse_swa_decode(
     num_heads: int,
     num_kv_heads: int,
     scale: float,
+    write_kv_cache: bool = True,
 ) -> torch.Tensor | None:
     context = get_batch_context()
     hisparse_ctx = get_hisparse_context()
@@ -202,7 +203,10 @@ def _hisparse_swa_decode(
     slots = context.hisparse_slots[:bs].to(torch.int64)
     valid_seq = slots < hisparse_ctx.max_num_seqs
 
-    store_kvcache(k, v, hot_k_cache, hot_v_cache, context.hisparse_slot_mapping[:bs])
+    if write_kv_cache:
+        store_kvcache(
+            k, v, hot_k_cache, hot_v_cache, context.hisparse_slot_mapping[:bs]
+        )
 
     window = min(int(sliding_window), int(hisparse_ctx.tokens_per_seq))
     if window <= 0:
@@ -225,10 +229,10 @@ def _hisparse_swa_decode(
         v_win = v_win.repeat_interleave(repeat, dim=2)
 
     valid = valid_seq.unsqueeze(1) & valid_tok
-    scores = torch.einsum("bhd,bshd->bhs", q, k_win) * scale
+    scores = torch.einsum("bhd,bshd->bhs", q.float(), k_win.float()) * scale
     scores = scores.masked_fill(~valid.unsqueeze(1), -1.0e30)
     probs = torch.softmax(scores, dim=-1)
-    out = torch.einsum("bhs,bshd->bhd", probs, v_win)
+    out = torch.einsum("bhs,bshd->bhd", probs, v_win.float()).to(q.dtype)
     return torch.where(valid_seq.view(bs, 1, 1), out, torch.zeros_like(out))
 
 
@@ -360,6 +364,7 @@ class FlashAttentionImpl:
         sparse_indices: torch.Tensor | None = None,
         hot_k_cache: torch.Tensor | None = None,
         hot_v_cache: torch.Tensor | None = None,
+        write_kv_cache: bool = True,
     ):
         context = get_batch_context()
         if (
@@ -377,11 +382,17 @@ class FlashAttentionImpl:
                 self.num_heads,
                 self.num_kv_heads,
                 self.scale,
+                write_kv_cache,
             )
             if out is not None:
                 return out
 
-        if k_cache.numel() and v_cache.numel() and not get_batch_context().is_dummy:
+        if (
+            write_kv_cache
+            and k_cache.numel()
+            and v_cache.numel()
+            and not get_batch_context().is_dummy
+        ):
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
             if (
@@ -558,6 +569,7 @@ class FlashMLAImpl:
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         sparse_indices: torch.Tensor | None = None,
+        write_kv_cache: bool = True,
     ):
 
         context = get_batch_context()
@@ -710,15 +722,26 @@ class HopperAttention(AttentionBase):
         k: torch.Tensor,
         v: torch.Tensor,
         sparse_indices: torch.Tensor | None = None,
+        write_kv_cache: bool = True,
     ):
         """forward."""
+        kwargs = {
+            "sparse_indices": sparse_indices,
+            "write_kv_cache": write_kv_cache,
+        }
+        # Hot GQA caches are a FlashAttention/HiSparse detail. Passing them to
+        # FlashMLAImpl breaks MLA graph capture because its forward signature
+        # intentionally has no hot-cache arguments.
+        if isinstance(self.impl, FlashAttentionImpl):
+            kwargs.update(
+                hot_k_cache=self.hisparse_k_cache,
+                hot_v_cache=self.hisparse_v_cache,
+            )
         return self.impl.forward(
             q,
             k,
             v,
             self.k_cache,
             self.v_cache,
-            sparse_indices=sparse_indices,
-            hot_k_cache=self.hisparse_k_cache,
-            hot_v_cache=self.hisparse_v_cache,
+            **kwargs,
         )

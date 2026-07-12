@@ -598,10 +598,10 @@ class ModelRunner:
                     if cache_context.indexer_cache is not None:
                         cache_context.indexer_cache.buffer.zero_()
             logger.info(
-                "HiSparse initialized: device_buffer_size=%s, tokens_per_seq=%s, "
-                "swap_in_block_size=%s",
+                "HiSparse initialized: device_buffer_size_per_seq=%s, "
+                "total_device_tokens=%s, swap_in_block_size=%s",
                 self.config.hisparse_device_buffer_size,
-                hisparse_ctx.tokens_per_seq,
+                hisparse_ctx.tokens_per_seq * max(1, hisparse_ctx.max_num_seqs),
                 self.config.hisparse_swap_in_block_size,
             )
 

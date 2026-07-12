@@ -30,6 +30,7 @@ class FlashInferDecodeGraphConfig:
     num_heads: int = 0
     num_kv_heads: int = 0
     head_dim: int = 0
+    softmax_scale: float = 1.0
     dtype: torch.dtype | None = None
     use_tensor_cores: bool = False
     disable_split_kv: bool = True
@@ -147,7 +148,7 @@ class FlashInferDecodeGraphState:
             q_data_type=self.config.dtype,
             kv_data_type=self.config.dtype,
             o_data_type=self.config.dtype,
-            sm_scale=self.config.head_dim**-0.5,
+            sm_scale=self.config.softmax_scale,
             **plan_kwargs,
         )
         return wrapper
@@ -170,6 +171,8 @@ class DecodeGraphContext:
     returns_logits: bool
     logits: torch.Tensor | None
     hisparse_slots: torch.Tensor
+    hisparse_slot_mapping: torch.Tensor
+    per_layer_token_part: torch.Tensor | None = None
     gdn_state_slots: torch.Tensor | None = None
     dummy_gdn_slot: int | None = None
     dsv4_state_slots: torch.Tensor | None = None

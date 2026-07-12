@@ -152,6 +152,8 @@ class Config(BaseModel):
     # NSA sparse attention (V3.2) — enabled by default for models with index_head_dim > 0
     disable_nsa: bool = False
     enable_hisparse: bool = False
+    # Number of hot token slots reserved for each active sequence. Total
+    # HiSparse device capacity is this value multiplied by max_num_seqs.
     hisparse_device_buffer_size: int = 4096
     hisparse_host_to_device_ratio: int = 2
     hisparse_swap_in_block_size: int = 960
@@ -445,6 +447,8 @@ class Config(BaseModel):
                     raise ValueError(
                         "enable_hisparse for Gemma4 requires sliding_attention layers"
                     )
+                if not self.enforce_eager:
+                    logger.warning("Gemma4 HiSparse CUDA Graph is experimental")
             else:
                 raise ValueError(
                     "enable_hisparse currently supports DeepseekV32ForCausalLM "

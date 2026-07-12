@@ -299,6 +299,7 @@ def _hisparse_swa_decode(
     num_heads: int,
     num_kv_heads: int,
     scale: float,
+    write_kv_cache: bool = True,
 ) -> torch.Tensor | None:
     context = get_batch_context()
     hisparse_ctx = get_hisparse_context()
@@ -320,7 +321,10 @@ def _hisparse_swa_decode(
     slots = context.hisparse_slots[:bs].to(torch.int64)
     valid_seq = slots < hisparse_ctx.max_num_seqs
 
-    store_kvcache(k, v, hot_k_cache, hot_v_cache, context.hisparse_slot_mapping[:bs])
+    if write_kv_cache:
+        store_kvcache(
+            k, v, hot_k_cache, hot_v_cache, context.hisparse_slot_mapping[:bs]
+        )
 
     window = min(int(sliding_window), int(hisparse_ctx.tokens_per_seq))
     if window <= 0:
@@ -343,10 +347,10 @@ def _hisparse_swa_decode(
         v_win = v_win.repeat_interleave(repeat, dim=2)
 
     valid = valid_seq.unsqueeze(1) & valid_tok
-    scores = torch.einsum("bhd,bshd->bhs", q, k_win) * scale
+    scores = torch.einsum("bhd,bshd->bhs", q.float(), k_win.float()) * scale
     scores = scores.masked_fill(~valid.unsqueeze(1), -1.0e30)
     probs = torch.softmax(scores, dim=-1)
-    out = torch.einsum("bhs,bshd->bhd", probs, v_win)
+    out = torch.einsum("bhs,bshd->bhd", probs, v_win.float()).to(q.dtype)
     out = torch.where(valid_seq.view(bs, 1, 1), out, torch.zeros_like(out))
     return out
 
@@ -429,7 +433,8 @@ def _hisparse_prefill_fresh_slot_mapping(
     cu_k = cu_seqlens_k.to(torch.int64)
     seq_idx = torch.searchsorted(cu_q, idx, right=True) - 1
     q_lens = cu_q[1:] - cu_q[:-1]
-    start_pos = cu_k[1:] - q_lens
+    k_lens = cu_k[1:] - cu_k[:-1]
+    start_pos = k_lens - q_lens
     logical = start_pos[seq_idx] + (idx - cu_q[seq_idx])
     slots = context.hisparse_slots.to(torch.int64)
     seq_slots = slots[seq_idx]
@@ -593,6 +598,34 @@ def _sdpa_varlen_func(
     return torch.cat(outs, dim=0)
 
 
+def _sdpa_fixed_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    num_tokens_per_seq: int,
+    scale: float,
+) -> torch.Tensor:
+    """Graph-safe SDPA for decode layers that intentionally own no KV cache."""
+    total_tokens, num_heads, head_dim = q.shape
+    bs = total_tokens // num_tokens_per_seq
+    q = q.view(bs, num_tokens_per_seq, num_heads, head_dim).transpose(1, 2)
+    k = k.view(bs, num_tokens_per_seq, k.shape[1], head_dim).transpose(1, 2)
+    v = v.view(bs, num_tokens_per_seq, v.shape[1], head_dim).transpose(1, 2)
+    if k.shape[1] != num_heads:
+        repeat = num_heads // k.shape[1]
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
+    out = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        is_causal=num_tokens_per_seq > 1,
+        scale=scale,
+    )
+    return out.transpose(1, 2).reshape(total_tokens, num_heads, head_dim)
+
+
 # ---------------------------------------------------------------------------
 # FA2-backed GQA implementation
 # ---------------------------------------------------------------------------
@@ -624,6 +657,7 @@ class _FA2AttentionImpl:
         sparse_indices: torch.Tensor | None = None,
         hot_k_cache: torch.Tensor | None = None,
         hot_v_cache: torch.Tensor | None = None,
+        write_kv_cache: bool = True,
     ):
         context = get_batch_context()
         if (
@@ -641,11 +675,17 @@ class _FA2AttentionImpl:
                 self.num_heads,
                 self.num_kv_heads,
                 self.scale,
+                write_kv_cache,
             )
             if out is not None:
                 return out
 
-        if k_cache.numel() and v_cache.numel() and not context.is_dummy:
+        if (
+            write_kv_cache
+            and k_cache.numel()
+            and v_cache.numel()
+            and not context.is_dummy
+        ):
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         if context.is_prefill:
@@ -783,19 +823,7 @@ class _FA2AttentionImpl:
         # FA2's ``flash_attn_with_kvcache`` takes the same logical args as
         # FA3 but names the paged-KV table ``block_table`` (FA3: ``page_table``).
         if not (k_cache.numel() and v_cache.numel()):
-            return _sdpa_varlen_func(
-                q,
-                k,
-                v,
-                torch.arange(
-                    0, total_tokens + 1, ntps, device=q.device, dtype=torch.int32
-                ),
-                torch.arange(
-                    0, total_tokens + 1, ntps, device=q.device, dtype=torch.int32
-                ),
-                self.scale,
-                sliding_window=self.sliding_window,
-            )
+            return _sdpa_fixed_decode(q, k, v, ntps, self.scale)
 
         out = flash_attn_with_kvcache(
             q.reshape(bs, ntps, num_head, head_dim),
@@ -863,6 +891,7 @@ class GenericAttention(AttentionBase):
         k: torch.Tensor,
         v: torch.Tensor,
         sparse_indices: torch.Tensor | None = None,
+        write_kv_cache: bool = True,
     ) -> torch.Tensor:
         return self.impl.forward(
             q,
@@ -873,4 +902,5 @@ class GenericAttention(AttentionBase):
             sparse_indices=sparse_indices,
             hot_k_cache=self.hisparse_k_cache,
             hot_v_cache=self.hisparse_v_cache,
+            write_kv_cache=write_kv_cache,
         )
