@@ -479,6 +479,29 @@ class DeepseekV2Model(nn.Module):
         positions: Optional[torch.LongTensor] = None,
     ):
         """forward."""
+        context = get_batch_context()
+        context.indexer_schedule_meta = None
+        if not context.is_prefill and context.context_lens is not None:
+            # The DeepGEMM schedule depends on the per-request sequence lengths,
+            # but is identical for every Indexer layer. Build it once per model
+            # invocation (and therefore once per CUDA Graph replay) instead of
+            # launching the metadata kernel once per layer.
+            indexer = next(
+                (
+                    layer.self_attn.indexer
+                    for layer in self.layers
+                    if layer.self_attn.indexer is not None
+                    and layer.self_attn.indexer.indexer_cache is not None
+                ),
+                None,
+            )
+            if indexer is not None:
+                ntps = context.num_tokens_per_seq
+                batch_size = input_ids.numel() // ntps
+                context.indexer_schedule_meta = indexer.build_schedule_metadata(
+                    context.context_lens[0, :batch_size]
+                )
+
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for idx, decoder_layer in enumerate(self.layers):

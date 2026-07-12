@@ -188,6 +188,8 @@ def _store_kcache_fp8_kernel(
     slot_mapping_ptr,
     # Strides
     kv_row_stride,
+    cache_block_stride,
+    cache_token_stride,
     # Constants
     BYTES_PER_TOKEN: tl.constexpr,
     D_NOPE_C: tl.constexpr,
@@ -195,6 +197,7 @@ def _store_kcache_fp8_kernel(
     TILE_SIZE_C: tl.constexpr,
     NUM_TILES_C: tl.constexpr,
     SCALE_BYTES_C: tl.constexpr,
+    BLOCK_SIZE_C: tl.constexpr,
 ):
     pid = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + pid)
@@ -206,7 +209,9 @@ def _store_kcache_fp8_kernel(
     nope_bf16 = tl.load(kv_ptr + pid * kv_row_stride + nope_offs)
     nope_f32 = nope_bf16.to(tl.float32)
 
-    cache_base = slot * BYTES_PER_TOKEN
+    cache_block = slot // BLOCK_SIZE_C
+    cache_offset = slot % BLOCK_SIZE_C
+    cache_base = cache_block * cache_block_stride + cache_offset * cache_token_stride
 
     # -- Per-tile quantize + store --
     for tile_idx in tl.static_range(NUM_TILES_C):
@@ -256,26 +261,21 @@ def store_kcache_fp8(
                       slot = block_idx * block_size + offset_in_block
     """
     N = key.shape[0]
-    block_size = k_cache.shape[1]
     key_2d = key.view(N, D_TOTAL)
-
-    fp8_nope, scales = quantize_nope_fp8(key_2d[:, :D_NOPE])
-    rope = key_2d[:, D_NOPE:]
-    packed = pack_mla_fp8(fp8_nope, scales, rope)  # [N, 656] uint8
-
-    # Convert packed uint8 → fp8 view for assignment to fp8 cache
-    packed_fp8 = packed.view(torch.float8_e4m3fn)  # [N, 656]
-
-    # Scatter into paged cache — use clamped indices for CUDA graph compatibility
-    # (boolean masking produces dynamic shapes, which breaks graph capture)
-    safe_slots = torch.where(
-        slot_mapping >= 0,
-        slot_mapping.long(),
-        torch.zeros_like(slot_mapping, dtype=torch.long),
+    cache_bytes = k_cache.view(torch.uint8)
+    _store_kcache_fp8_kernel[(N,)](
+        key_2d,
+        cache_bytes,
+        slot_mapping,
+        key_2d.stride(0),
+        cache_bytes.stride(0),
+        cache_bytes.stride(1),
+        BYTES_PER_TOKEN=FP8_BYTES_PER_TOKEN,
+        D_NOPE_C=D_NOPE,
+        D_ROPE_C=D_ROPE,
+        TILE_SIZE_C=TILE_SIZE,
+        NUM_TILES_C=NUM_TILES,
+        SCALE_BYTES_C=SCALE_BYTES,
+        BLOCK_SIZE_C=k_cache.shape[1],
+        num_warps=4,
     )
-    block_idx = safe_slots // block_size
-    offset_in_block = safe_slots % block_size
-
-    # Write all rows; invalid slots (originally -1) write to slot 0 harmlessly
-    # (they'll be overwritten by real data later)
-    k_cache[block_idx, offset_in_block, 0, :] = packed_fp8

@@ -108,3 +108,69 @@ def test_indexer_q_rope_hadamard_quant_matches_reference():
     )
     assert torch.equal(actual_fp8.view(torch.uint8), expected_fp8.view(torch.uint8))
     torch.testing.assert_close(actual_weights, expected_weights, rtol=0, atol=0)
+
+
+def test_indexer_k_transform_store_matches_reference():
+    from dlengine.kernel.triton.generic.indexer_transform import (
+        indexer_k_transform_store_fp8,
+    )
+    from dlengine.layers.rotary_embedding import RotaryEmbedding
+    from fast_hadamard_transform import hadamard_transform
+
+    torch.manual_seed(3)
+    tokens, head_dim, rope_dim, page_size = 4, 128, 64, 64
+    key = torch.randn(tokens, head_dim, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(head_dim, dtype=torch.float32, device="cuda")
+    bias = torch.randn(head_dim, dtype=torch.float32, device="cuda")
+    positions = torch.tensor([0, 5, 31, 511], dtype=torch.int64, device="cuda")
+    slots = torch.tensor([1, 65, 7, 130], dtype=torch.int32, device="cuda")
+    rope = RotaryEmbedding(rope_dim, rope_dim, 1024, 10000).cuda()
+    cache = torch.zeros(3, page_size * 132, dtype=torch.uint8, device="cuda")
+
+    expected = F.layer_norm(key.float(), (head_dim,), weight, bias, 1e-5).to(
+        torch.bfloat16
+    )
+    half = (
+        expected[:, :rope_dim]
+        .unsqueeze(1)
+        .unflatten(-1, (-1, 2))
+        .transpose(-1, -2)
+        .contiguous()
+        .flatten(-2)
+    )
+    _, half = rope(positions, half, half)
+    expected[:, :rope_dim] = half.squeeze(1)
+    expected = hadamard_transform(expected.contiguous(), scale=head_dim**-0.5)
+    scale = torch.exp2(
+        torch.ceil(
+            torch.log2(
+                expected.abs().float().amax(-1, keepdim=True).clamp(min=1e-4) / 448.0
+            )
+        )
+    )
+    expected_fp8 = (expected.float() / scale).to(torch.float8_e4m3fn)
+
+    indexer_k_transform_store_fp8(
+        key,
+        weight,
+        bias,
+        1e-5,
+        positions,
+        rope.cos_sin_cache,
+        cache,
+        slots,
+        page_size,
+    )
+    for token, slot in enumerate(slots.tolist()):
+        page, offset = divmod(slot, page_size)
+        base = page * page_size * 132
+        fp8_offset = base + offset * head_dim
+        scale_offset = base + page_size * head_dim + offset * 4
+        assert torch.equal(
+            cache.view(-1)[fp8_offset : fp8_offset + head_dim],
+            expected_fp8[token].view(torch.uint8),
+        )
+        assert torch.equal(
+            cache.view(-1)[scale_offset : scale_offset + 4],
+            scale[token].view(torch.uint8),
+        )

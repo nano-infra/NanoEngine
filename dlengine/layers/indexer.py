@@ -45,6 +45,7 @@ from dlengine.kernel.jit.sgl.deepseek_v4 import indexer_q_rope_hadamard_quant
 from dlengine.kernel.triton.generic.fp8_ue8m0_quant import store_indexer_key_fp8_fused
 from dlengine.kernel.triton.generic.indexer_transform import (
     indexer_k_rope_inplace,
+    indexer_k_transform_store_fp8,
     indexer_layer_norm_bf16,
     indexer_qk_rope_inplace,
 )
@@ -300,12 +301,23 @@ class Indexer(nn.Module):
         # Indexer cache reference (set externally after cache allocation)
         self.indexer_cache: IndexerCache | None = None
 
+    def build_schedule_metadata(self, context_lens: torch.Tensor) -> torch.Tensor:
+        """Build the per-step DeepGEMM schedule shared by all Indexer layers."""
+        assert self.indexer_cache is not None
+        context_lens = context_lens.to(torch.int32)
+        if context_lens.dim() == 1:
+            context_lens = context_lens[:, None]
+        return deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, self.indexer_cache.page_size, self.sm_count
+        )
+
     def _compute_q_k(
         self,
         q_lora: torch.Tensor,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         defer_query_transform: bool = False,
+        defer_key_transform: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project and transform Q and K for indexer scoring.
 
@@ -326,7 +338,7 @@ class Indexer(nn.Module):
 
         # K projection + LayerNorm
         key = self.wk(hidden_states)
-        if key.is_cuda:
+        if key.is_cuda and not defer_key_transform:
             key = indexer_layer_norm_bf16(
                 key.contiguous(),
                 self.k_norm.weight,
@@ -348,7 +360,7 @@ class Indexer(nn.Module):
                     self.rotary_emb.cos_sin_cache,
                     self.rope_head_dim,
                 )
-        else:
+        elif not defer_key_transform:
             key = self.k_norm(key.float()).to(key.dtype)
 
             # Split rope / non-rope portions
@@ -369,7 +381,8 @@ class Indexer(nn.Module):
         # Hadamard rotation
         if not defer_query_transform:
             query = _hadamard_rotate(query)
-        key = _hadamard_rotate(key)
+        if not defer_key_transform:
+            key = _hadamard_rotate(key)
 
         return query, key
 
@@ -543,11 +556,13 @@ class Indexer(nn.Module):
 
         # Step 1-4: Compute query and key (with RoPE + Hadamard)
         use_fused_query = fused_kernels_enabled()
+        use_fused_key = use_fused_query and hidden_states.is_cuda
         query, key = self._compute_q_k(
             q_lora,
             hidden_states,
             positions,
             defer_query_transform=use_fused_query,
+            defer_key_transform=use_fused_key,
         )
 
         # Step 5: RoPE + Hadamard + FP8 quantize query and scale gate weights.
@@ -573,8 +588,23 @@ class Indexer(nn.Module):
             q_scale_for_gate = q_scale.view(num_tokens, self.n_heads, 1)
             weights = self._compute_gate_weights(hidden_states, q_scale_for_gate)
 
-        # Step 6: Store key to indexer cache
-        self.indexer_cache.store_key_fp8(self.layer_id, key, slot_mapping)
+        # Step 6: transform and store K. The fused path consumes the raw WK
+        # output and performs LayerNorm, RoPE, Hadamard, quantization and the
+        # paged-cache write in one launch.
+        if use_fused_key:
+            indexer_k_transform_store_fp8(
+                key,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.eps,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.indexer_cache.get_buffer(self.layer_id),
+                slot_mapping,
+                self.indexer_cache.page_size,
+            )
+        else:
+            self.indexer_cache.store_key_fp8(self.layer_id, key, slot_mapping)
 
         # Step 8: Compute FP8 paged MQA logits
         # q_fp8 needs shape (batch, next_n, n_heads, head_dim) for deep_gemm
@@ -600,10 +630,13 @@ class Indexer(nn.Module):
         if context_lens_for_gemm.dim() == 1:
             context_lens_for_gemm = context_lens_for_gemm[:, None]
 
-        # Schedule metadata for deep_gemm
-        schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
-            context_lens_for_gemm, page_size, self.sm_count
-        )
+        # All layers share this schedule. The model builds it once per forward;
+        # retain the fallback for standalone Indexer calls and tests.
+        from dlengine.context_v2.batch import get_batch_context
+
+        schedule_meta = get_batch_context().indexer_schedule_meta
+        if schedule_meta is None:
+            schedule_meta = self.build_schedule_metadata(context_lens_for_gemm)
 
         # Compute logits: (batch * ntps, max_context_len) FP32
         logits = deep_gemm.fp8_paged_mqa_logits(

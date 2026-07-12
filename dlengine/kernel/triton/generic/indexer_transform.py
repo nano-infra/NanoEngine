@@ -151,3 +151,138 @@ def indexer_k_rope_inplace(
         ROPE_DIM=rope_dim,
         num_warps=1,
     )
+
+
+@triton.jit
+def _indexer_k_transform_store_kernel(
+    key_ptr,
+    weight_ptr,
+    bias_ptr,
+    positions_ptr,
+    cos_sin_ptr,
+    cache_fp8_ptr,
+    cache_fp32_ptr,
+    slots_ptr,
+    stride_row,
+    eps,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BYTES_PER_TOKEN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """LayerNorm + RoPE + normalized Hadamard + FP8 paged store."""
+    token = tl.program_id(0)
+    cols = tl.arange(0, HEAD_DIM)
+    x = tl.load(key_ptr + token * stride_row + cols).to(tl.float32)
+    mean = tl.sum(x, axis=0) / HEAD_DIM
+    centered = x - mean
+    variance = tl.sum(centered * centered, axis=0) / HEAD_DIM
+    inv_std = tl.rsqrt(variance + eps)
+
+    # Build the post-LayerNorm/RoPE vector directly from the GEMM output.
+    pair = cols % (ROPE_DIM // 2)
+    rope_src = pair * 2 + (cols >= ROPE_DIM // 2)
+    src = tl.where(cols < ROPE_DIM, rope_src, cols)
+    value = tl.load(key_ptr + token * stride_row + src).to(tl.float32)
+    value = (value - mean) * inv_std
+    value = (
+        (value * tl.load(weight_ptr + src) + tl.load(bias_ptr + src))
+        .to(tl.bfloat16)
+        .to(tl.float32)
+    )
+    position = tl.load(positions_ptr + token)
+    freq_base = position * ROPE_DIM
+    cosine = tl.load(cos_sin_ptr + freq_base + pair)
+    sine = tl.load(cos_sin_ptr + freq_base + ROPE_DIM // 2 + pair)
+    rotated = tl.where(
+        cols < ROPE_DIM // 2,
+        value * cosine
+        - (
+            (
+                (
+                    tl.load(key_ptr + token * stride_row + pair * 2 + 1).to(tl.float32)
+                    - mean
+                )
+                * inv_std
+                * tl.load(weight_ptr + pair * 2 + 1)
+                + tl.load(bias_ptr + pair * 2 + 1)
+            )
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        * sine,
+        value * cosine
+        + (
+            (
+                (tl.load(key_ptr + token * stride_row + pair * 2).to(tl.float32) - mean)
+                * inv_std
+                * tl.load(weight_ptr + pair * 2)
+                + tl.load(bias_ptr + pair * 2)
+            )
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        * sine,
+    )
+    value = tl.where(cols < ROPE_DIM, rotated.to(tl.bfloat16).to(tl.float32), value)
+
+    # H[output, input] = (-1)^popcount(output & input).
+    out_idx = tl.arange(0, HEAD_DIM)[:, None]
+    in_idx = cols[None, :]
+    bits = out_idx & in_idx
+    parity = bits ^ (bits >> 1)
+    parity = parity ^ (parity >> 2)
+    parity = parity ^ (parity >> 4)
+    parity = parity ^ (parity >> 8)
+    signs = 1.0 - 2.0 * (parity & 1).to(tl.float32)
+    transformed = tl.sum(value[None, :] * signs, axis=1) * 0.08838834764831845
+
+    amax = tl.maximum(tl.max(tl.abs(transformed), axis=0), 1.0e-4)
+    scale = tl.exp2(tl.ceil(tl.log2(amax / FP8_MAX)))
+    quantized = tl.clamp(transformed / scale, -FP8_MAX, FP8_MAX)
+    slot = tl.maximum(tl.load(slots_ptr + token), 0)
+    page = slot // PAGE_SIZE
+    offset = slot % PAGE_SIZE
+    page_base = page * PAGE_SIZE * BYTES_PER_TOKEN
+    tl.store(
+        cache_fp8_ptr + page_base + offset * HEAD_DIM + cols,
+        quantized.to(tl.float8e4nv),
+    )
+    scale_offset = page_base + PAGE_SIZE * HEAD_DIM + offset * 4
+    tl.store(cache_fp32_ptr + scale_offset // 4, scale)
+
+
+def indexer_k_transform_store_fp8(
+    key: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Fuse the complete decode-time Indexer K transform and cache store."""
+    if key.dtype != torch.bfloat16 or key.ndim != 2 or key.shape[1] != 128:
+        raise ValueError("fused Indexer K path requires a bfloat16 [T, 128] key")
+    cache_flat = cache.view(-1)
+    _indexer_k_transform_store_kernel[(key.shape[0],)](
+        key,
+        weight,
+        bias,
+        positions,
+        cos_sin_cache,
+        cache_flat.view(torch.float8_e4m3fn),
+        cache_flat.view(torch.float32),
+        slot_mapping,
+        key.stride(0),
+        eps,
+        PAGE_SIZE=page_size,
+        HEAD_DIM=128,
+        ROPE_DIM=64,
+        BYTES_PER_TOKEN=132,
+        FP8_MAX=448.0,
+        num_warps=8,
+    )
