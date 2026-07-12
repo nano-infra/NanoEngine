@@ -7,6 +7,26 @@ from dlengine.context_v2.cache.hisparse import (
     stage_mla_sparse_indices,
     writeback_mla_output_pages,
 )
+from dlengine.context_v2.cache.mla import allocate_mla_kvcache
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned cache requires CUDA")
+def test_cpu_mla_cache_is_cuda_pinned_and_preserves_padding_stride():
+    class Context:
+        device = "cpu"
+        is_fp8_kvcache = True
+        num_hidden_layers = 1
+        num_local_kvcache_blocks = 2
+        block_size = 4
+        num_local_kv_heads = 1
+        _fp8_head_dim = 8
+        dtype = torch.bfloat16
+
+    context = Context()
+    allocate_mla_kvcache(context)
+    assert context.kv_cache.is_pinned()
+    assert context.kv_cache.shape == (1, 1, 2, 4, 1, 8)
+    assert context.kv_cache.stride(2) == 5 * 8
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MLA HiSparse requires CUDA")

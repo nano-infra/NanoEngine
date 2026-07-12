@@ -78,6 +78,8 @@ def get_mla_block_bytes(context) -> int:
 
 
 def allocate_mla_kvcache(context) -> None:
+    device = torch.device(context.device)
+    cpu_pinned = device.type == "cpu" and torch.cuda.is_available()
     if context.is_fp8_kvcache:
         # FP8 MLA: allocate (block_size+1) rows per block for stride padding,
         # then slice back to block_size. This ensures the FlashMLA kernel
@@ -90,7 +92,8 @@ def allocate_mla_kvcache(context) -> None:
             1,
             context._fp8_head_dim,
             dtype=torch.float8_e4m3fn,
-            device=context.device,
+            device=device,
+            pin_memory=cpu_pinned,
         )
         context.kv_cache = kv_cache_padded[:, :, :, : context.block_size, :, :]
         return
@@ -103,7 +106,8 @@ def allocate_mla_kvcache(context) -> None:
         context.num_local_kv_heads,
         context.head_dim,
         dtype=context.dtype,
-        device=context.device,
+        device=device,
+        pin_memory=cpu_pinned,
     )
 
 
