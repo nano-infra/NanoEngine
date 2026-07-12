@@ -5,6 +5,7 @@ from dlengine.context_v2.cache.hisparse import (
     initialize_mla_hisparse_cache,
     reset_hisparse_context,
     stage_mla_sparse_indices,
+    update_mla_hisparse_slot_owners,
     writeback_mla_output_pages,
 )
 from dlengine.context_v2.cache.mla import allocate_mla_kvcache
@@ -46,11 +47,17 @@ def test_mla_stage_uses_fixed_per_request_slots():
     )
     slots = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
     output_slots = torch.tensor([6, 11], dtype=torch.int32, device="cuda")
-    remapped, hot_outputs = stage_mla_sparse_indices(0, indices, slots, output_slots)
+    logical_indices = torch.tensor(
+        [[0, 1, 2, -1], [0, 1, 2, -1]], dtype=torch.int32, device="cuda"
+    )
+    seq_lens = torch.tensor([4, 4], dtype=torch.int32, device="cuda")
+    remapped, hot_outputs = stage_mla_sparse_indices(
+        0, logical_indices, indices, slots, output_slots, seq_lens
+    )
 
     torch.cuda.synchronize()
     assert remapped.cpu().tolist() == [[0, 1, 2, -1], [12, 13, 14, -1]]
-    assert hot_outputs.cpu().tolist() == [8, 20]
+    assert hot_outputs.cpu().tolist() == [3, 15]
     assert hot[0, 0, 0, 0].item() == cold[0, 0, 1, 0].item()
     assert hot[0, 0, 0, 1].item() == cold[0, 0, 1, 1].item()
     assert hot[0, 0, 0, 2].item() == cold[0, 0, 3, 0].item()
@@ -76,6 +83,64 @@ def test_mla_writeback_persists_generated_token():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MLA HiSparse requires CUDA")
+def test_mla_slot_reassignment_clears_residency():
+    reset_hisparse_context()
+    ctx = initialize_hisparse_context(2, "cuda", 4)
+    cold = torch.zeros(1, 2, 2, 4, 1, 1).pin_memory()
+    initialize_mla_hisparse_cache(cold, max_num_seqs=2, device_buffer_size=4)
+    ctx.resident_tokens[:, 0].fill_(1)
+
+    update_mla_hisparse_slot_owners([0], [101])
+    torch.cuda.synchronize()
+    assert not ctx.resident_tokens[:, 0].any()
+
+    ctx.resident_tokens[:, 0].fill_(1)
+    update_mla_hisparse_slot_owners([0], [101])
+    torch.cuda.synchronize()
+    assert ctx.resident_tokens[:, 0].all()
+
+    update_mla_hisparse_slot_owners([0], [202])
+    torch.cuda.synchronize()
+    assert not ctx.resident_tokens[:, 0].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="MLA HiSparse requires CUDA")
+def test_mla_short_context_only_loads_newly_selected_tokens():
+    reset_hisparse_context()
+    ctx = initialize_hisparse_context(1, "cuda", 4)
+    ctx.num_real_reqs.fill_(1)
+    cold = torch.arange(8, dtype=torch.float32).reshape(1, 1, 2, 4, 1, 1).pin_memory()
+    hot = initialize_mla_hisparse_cache(cold, max_num_seqs=1, device_buffer_size=4)
+    slots = torch.tensor([0], dtype=torch.int64, device="cuda")
+    output_slots = torch.tensor([2], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([3], dtype=torch.int32, device="cuda")
+
+    stage_mla_sparse_indices(
+        0,
+        torch.tensor([[1]], dtype=torch.int32, device="cuda"),
+        torch.tensor([[1]], dtype=torch.int32, device="cuda"),
+        slots,
+        output_slots,
+        seq_lens,
+    )
+    torch.cuda.synchronize()
+    assert hot[0, 0, 0, 1].item() == 1
+
+    cold[0, 0, 0, 1] = 99
+    stage_mla_sparse_indices(
+        0,
+        torch.tensor([[1, 0]], dtype=torch.int32, device="cuda"),
+        torch.tensor([[1, 0]], dtype=torch.int32, device="cuda"),
+        slots,
+        output_slots,
+        seq_lens,
+    )
+    torch.cuda.synchronize()
+    assert hot[0, 0, 0, 1].item() == 1
+    assert hot[0, 0, 0, 0].item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="MLA HiSparse requires CUDA")
 def test_mla_slot_loader_is_cuda_graph_capturable():
     reset_hisparse_context()
     ctx = initialize_hisparse_context(1, "cuda", 4)
@@ -86,20 +151,22 @@ def test_mla_slot_loader_is_cuda_graph_capturable():
     indices = torch.tensor([[4, 9]], dtype=torch.int32, device="cuda")
     slots = torch.tensor([0], dtype=torch.int64, device="cuda")
     output_slots = torch.tensor([6], dtype=torch.int32, device="cuda")
+    logical_indices = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([3], dtype=torch.int32, device="cuda")
 
-    stage_mla_sparse_indices(0, indices, slots, output_slots)
+    stage_mla_sparse_indices(0, logical_indices, indices, slots, output_slots, seq_lens)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         remapped, hot_outputs = stage_mla_sparse_indices(
-            0, indices, slots, output_slots
+            0, logical_indices, indices, slots, output_slots, seq_lens
         )
 
     indices.copy_(torch.tensor([[0, 13]], dtype=torch.int32, device="cuda"))
     graph.replay()
     torch.cuda.synchronize()
     assert remapped.cpu().tolist() == [[0, 1]]
-    assert hot_outputs.cpu().tolist() == [4]
+    assert hot_outputs.cpu().tolist() == [2]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MLA HiSparse requires CUDA")
@@ -112,9 +179,11 @@ def test_mla_dummy_slots_produce_all_invalid_indices():
     indices = torch.zeros((2, 4), dtype=torch.int32, device="cuda")
     dummy_slots = torch.full((2,), 2, dtype=torch.int64, device="cuda")
     output_slots = torch.zeros(2, dtype=torch.int32, device="cuda")
+    logical_indices = torch.zeros((2, 4), dtype=torch.int32, device="cuda")
+    seq_lens = torch.ones(2, dtype=torch.int32, device="cuda")
 
     remapped, hot_outputs = stage_mla_sparse_indices(
-        0, indices, dummy_slots, output_slots
+        0, logical_indices, indices, dummy_slots, output_slots, seq_lens
     )
     torch.cuda.synchronize()
     assert remapped.cpu().tolist() == [[-1] * 4, [-1] * 4]

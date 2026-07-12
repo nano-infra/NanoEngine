@@ -619,6 +619,8 @@ pub struct BatchAuxData {
     #[pyo3(get, set)]
     pub hisparse_slots: Vec<i64>,
     #[pyo3(get, set)]
+    pub seq_ids: Vec<u64>,
+    #[pyo3(get, set)]
     pub any_return_completion_logprobs: bool,
 }
 
@@ -631,6 +633,7 @@ impl BatchAuxData {
         state_slots = Vec::new(),
         compressed_block_tables = std::collections::HashMap::new(),
         hisparse_slots = Vec::new(),
+        seq_ids = Vec::new(),
         any_return_completion_logprobs = false
     ))]
     fn new(
@@ -639,6 +642,7 @@ impl BatchAuxData {
         state_slots: Vec<i64>,
         compressed_block_tables: std::collections::HashMap<i32, Vec<Vec<i32>>>,
         hisparse_slots: Vec<i64>,
+        seq_ids: Vec<u64>,
         any_return_completion_logprobs: bool,
     ) -> Self {
         Self {
@@ -647,6 +651,7 @@ impl BatchAuxData {
             state_slots,
             compressed_block_tables,
             hisparse_slots,
+            seq_ids,
             any_return_completion_logprobs,
         }
     }

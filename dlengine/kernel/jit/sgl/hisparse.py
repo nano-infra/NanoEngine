@@ -39,8 +39,11 @@ def build_ring_slot_mapping(
 
 
 def load_mla_slot(
+    logical_indices: torch.Tensor,
     indices: torch.Tensor,
     request_slots: torch.Tensor,
+    seq_lens: torch.Tensor,
+    resident_tokens: torch.Tensor,
     cold: torch.Tensor,
     hot: torch.Tensor,
     output: torch.Tensor,
@@ -51,8 +54,11 @@ def load_mla_slot(
     slot_stride_tokens: int,
 ) -> None:
     _jit_hisparse_module().load_mla_slot(
+        logical_indices,
         indices,
         request_slots,
+        seq_lens,
+        resident_tokens,
         cold,
         hot,
         output,

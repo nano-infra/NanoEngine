@@ -43,8 +43,11 @@ struct HiSparseRingMappingKernel {
 };
 
 struct HiSparseMLASlotLoadKernel {
-    static void run(tvm::ffi::TensorView indices,
+    static void run(tvm::ffi::TensorView logical_indices,
+                    tvm::ffi::TensorView indices,
                     tvm::ffi::TensorView request_slots,
+                    tvm::ffi::TensorView seq_lens,
+                    tvm::ffi::TensorView resident_tokens,
                     tvm::ffi::TensorView cold,
                     tvm::ffi::TensorView hot,
                     tvm::ffi::TensorView output,
@@ -68,9 +71,15 @@ struct HiSparseMLASlotLoadKernel {
         auto HST  = SymbolicSize{"hot_token_stride"};
         auto cuda = SymbolicDevice{};
         cuda.set_options<kDLCUDA>();
-        TensorMatcher({R, K}).with_dtype<int32_t>().with_device(cuda).verify(indices).verify(output);
+        TensorMatcher({R, K})
+            .with_dtype<int32_t>()
+            .with_device(cuda)
+            .verify(logical_indices)
+            .verify(indices)
+            .verify(output);
         TensorMatcher({R}).with_dtype<int64_t>().with_device(cuda).verify(request_slots);
-        TensorMatcher({R}).with_dtype<int32_t>().with_device(cuda).verify(hot_output_slots);
+        TensorMatcher({R}).with_dtype<int32_t>().with_device(cuda).verify(seq_lens).verify(hot_output_slots);
+        TensorMatcher({max_num_seqs, hot_capacity}).with_dtype<uint8_t>().with_device(cuda).verify(resident_tokens);
         TensorMatcher({1}).with_dtype<int32_t>().with_device(cuda).verify(num_real_reqs);
         // cold intentionally remains a CPU tensor: PeerAgent registration pins
         // and CUDA-maps it for direct kernel reads.
@@ -80,8 +89,11 @@ struct HiSparseMLASlotLoadKernel {
         const int64_t element_bytes = cold.dtype().bits / 8;
         const int64_t item_bytes    = H.unwrap() * D.unwrap() * element_bytes;
         const auto    stream        = LaunchKernel::resolve_device(cuda.unwrap());
-        sgl_kernel::hisparse::launch_load_mla_slot(static_cast<const int32_t*>(indices.data_ptr()),
+        sgl_kernel::hisparse::launch_load_mla_slot(static_cast<const int32_t*>(logical_indices.data_ptr()),
+                                                   static_cast<const int32_t*>(indices.data_ptr()),
                                                    static_cast<const int64_t*>(request_slots.data_ptr()),
+                                                   static_cast<const int32_t*>(seq_lens.data_ptr()),
+                                                   static_cast<uint8_t*>(resident_tokens.data_ptr()),
                                                    cold.data_ptr(),
                                                    hot.data_ptr(),
                                                    static_cast<int32_t*>(output.data_ptr()),

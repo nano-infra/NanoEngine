@@ -16,6 +16,8 @@ class HiSparseContext(BaseContext):
     cold_kv_cache: torch.Tensor | None = None
     block_size: int = 0
     hot_blocks_per_seq: int = 0
+    resident_tokens: torch.Tensor | None = None
+    slot_owner_ids: list[int] | None = None
     num_real_reqs: torch.Tensor | None = None
 
     @classmethod
@@ -36,6 +38,8 @@ class HiSparseContext(BaseContext):
         self.cold_kv_cache = None
         self.block_size = 0
         self.hot_blocks_per_seq = 0
+        self.resident_tokens = None
+        self.slot_owner_ids = None
         self.num_real_reqs = None
 
     def reset_context(self) -> None:
@@ -108,14 +112,24 @@ def initialize_mla_hisparse_cache(
     ctx.block_size = block_size
     ctx.hot_blocks_per_seq = hot_blocks_per_seq
     ctx.tokens_per_seq = hot_blocks_per_seq * block_size
+    ctx.resident_tokens = torch.zeros(
+        cold_kv_cache.shape[1],
+        max_num_seqs,
+        ctx.device_buffer_size,
+        dtype=torch.uint8,
+        device=ctx.num_real_reqs.device,
+    )
+    ctx.slot_owner_ids = [-1] * max_num_seqs
     return ctx.hot_kv_cache
 
 
 def stage_mla_sparse_indices(
     layer_idx: int,
+    logical_indices: torch.Tensor,
     sparse_indices: torch.Tensor,
     hisparse_slots: torch.Tensor,
     output_slots: torch.Tensor,
+    seq_lens: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Load top-k tokens into their request slot using a graph-safe CUDA kernel."""
     ctx = get_hisparse_context()
@@ -137,8 +151,11 @@ def stage_mla_sparse_indices(
     result = torch.empty_like(sparse_indices, dtype=torch.int32)
     hot_output_slots = torch.empty_like(output_slots, dtype=torch.int32)
     load_mla_slot(
+        logical_indices.to(torch.int32),
         sparse_indices.to(torch.int32),
         hisparse_slots,
+        seq_lens.to(torch.int32),
+        ctx.resident_tokens[layer_idx],
         ctx.cold_kv_cache[0, layer_idx],
         ctx.hot_kv_cache[0, layer_idx],
         result,
@@ -149,6 +166,30 @@ def stage_mla_sparse_indices(
         ctx.tokens_per_seq,
     )
     return result, hot_output_slots
+
+
+def reset_mla_hisparse_slots(slots: list[int]) -> None:
+    ctx = get_hisparse_context()
+    if ctx.resident_tokens is None:
+        return
+    valid = sorted({int(slot) for slot in slots if 0 <= int(slot) < ctx.max_num_seqs})
+    if valid:
+        ctx.resident_tokens[:, valid] = 0
+
+
+def update_mla_hisparse_slot_owners(slots: list[int], seq_ids: list[int]) -> None:
+    """Clear residency when a scheduler slot is assigned to another sequence."""
+    ctx = get_hisparse_context()
+    if ctx.slot_owner_ids is None:
+        return
+    changed = []
+    for slot, seq_id in zip(slots, seq_ids):
+        slot = int(slot)
+        seq_id = int(seq_id)
+        if 0 <= slot < ctx.max_num_seqs and ctx.slot_owner_ids[slot] != seq_id:
+            ctx.slot_owner_ids[slot] = seq_id
+            changed.append(slot)
+    reset_mla_hisparse_slots(changed)
 
 
 def writeback_mla_output_pages(
@@ -262,6 +303,8 @@ __all__ = [
     "remap_slot_mapping",
     "remap_sparse_indices",
     "reset_hisparse_context",
+    "reset_mla_hisparse_slots",
     "stage_mla_sparse_indices",
+    "update_mla_hisparse_slot_owners",
     "writeback_mla_output_pages",
 ]

@@ -18,6 +18,7 @@ pub(super) struct WireBatch {
     pub(super) state_slots: Vec<i64>,
     pub(super) compressed_block_tables: std::collections::HashMap<i32, Vec<Vec<i32>>>,
     pub(super) hisparse_slots: Vec<i64>,
+    pub(super) seq_ids: Vec<u64>,
     pub(super) is_dummy: bool,
 }
 
@@ -162,6 +163,7 @@ impl WireBatch {
             state_slots: Vec::new(),
             compressed_block_tables: std::collections::HashMap::new(),
             hisparse_slots: Vec::new(),
+            seq_ids: Vec::new(),
             is_dummy: false,
         }
     }
@@ -177,6 +179,7 @@ impl WireBatch {
             state_slots: vec![-1],
             compressed_block_tables: std::collections::HashMap::new(),
             hisparse_slots: vec![-1],
+            seq_ids: vec![0],
             is_dummy: true,
         }
     }
@@ -212,6 +215,7 @@ pub(crate) fn sequence_refs_runner_in_bytes(
     let mut state_slots = Vec::new();
     let mut compressed_block_tables: HashMap<i32, Vec<Vec<i32>>> = HashMap::new();
     let mut hisparse_slots = Vec::new();
+    let mut seq_ids = Vec::new();
 
     for item in seqs {
         let tokens: Vec<i64> = item.token_ids.iter().copied().map(i64::from).collect();
@@ -240,6 +244,7 @@ pub(crate) fn sequence_refs_runner_in_bytes(
         temperatures.push(temperature);
         state_slots.push(i64::from(item.active_state_slot));
         hisparse_slots.push(i64::from(item.active_hisparse_slot));
+        seq_ids.push(item.seq_id);
         for (ratio, blocks) in compressed_tables {
             let rows = compressed_block_tables.entry(ratio).or_default();
             while rows.len() + 1 < seq_lens.len() {
@@ -265,6 +270,7 @@ pub(crate) fn sequence_refs_runner_in_bytes(
             state_slots,
             compressed_block_tables,
             hisparse_slots,
+            seq_ids,
             is_dummy: false,
         },
         "run batch",

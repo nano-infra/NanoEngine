@@ -11,6 +11,7 @@ from dlengine.context_v2.cache.hca import get_hca_context
 from dlengine.context_v2.cache.hisparse import (
     build_hot_slot_mapping,
     get_hisparse_context,
+    update_mla_hisparse_slot_owners,
 )
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.context_v2.graph import PagedAttentionStrategy
@@ -325,6 +326,9 @@ class InputPreparer:
             dummy_slot = self.config.max_num_seqs
             raw_slots = list(getattr(aux, "hisparse_slots", []))[: aux.num_group_seqs]
             raw_slots.extend([dummy_slot] * max(0, aux.num_group_seqs - len(raw_slots)))
+            update_mla_hisparse_slot_owners(
+                raw_slots, list(getattr(aux, "seq_ids", []))[: aux.num_group_seqs]
+            )
             hisparse_slots = torch.tensor(
                 [s if 0 <= s < dummy_slot else dummy_slot for s in raw_slots],
                 dtype=torch.int64,

@@ -1252,13 +1252,17 @@ class DeepseekV2Attention(nn.Module):
                                 "MLA HiSparse decode is missing scheduler slots"
                             )
                         seq_slots = context.hisparse_slots
+                        stage_seq_lens = ctx_lens
                         if ntps > 1:
                             seq_slots = seq_slots.repeat_interleave(ntps)
+                            stage_seq_lens = stage_seq_lens.repeat_interleave(ntps)
                         sparse_indices, hot_output_slots = stage_mla_sparse_indices(
                             self.layer_idx,
+                            topk_indices,
                             sparse_indices,
                             seq_slots,
                             context.slot_mapping,
+                            stage_seq_lens,
                         )
                         # The mapping is layer-specific because every NSA layer
                         # selects a different page set. FlashMLA consumes it

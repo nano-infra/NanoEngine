@@ -53,8 +53,11 @@ inline void launch_build_ring_slot_mapping(const int64_t* slots,
         slots, positions, output, num_real_reqs, num_tokens, max_num_seqs, tokens_per_seq);
 }
 
-__global__ void load_mla_slot_kernel(const int32_t* __restrict__ indices,
+__global__ void load_mla_slot_kernel(const int32_t* __restrict__ logical_indices,
+                                     const int32_t* __restrict__ indices,
                                      const int64_t* __restrict__ request_slots,
+                                     const int32_t* __restrict__ seq_lens,
+                                     uint8_t* __restrict__ resident_tokens,
                                      const char* __restrict__ cold,
                                      char* __restrict__ hot,
                                      int32_t* __restrict__ output,
@@ -73,53 +76,61 @@ __global__ void load_mla_slot_kernel(const int32_t* __restrict__ indices,
                                      int64_t item_size_bytes)
 {
     const int64_t row  = blockIdx.x;
+    const int64_t i    = blockIdx.y;
     const int64_t real = num_real_reqs == nullptr ? num_rows : *num_real_reqs;
     if (row >= real)
         return;
     const int64_t slot = request_slots[row];
     if (slot < 0 || slot >= max_num_seqs) {
-        for (int64_t i = threadIdx.x; i < topk; i += blockDim.x) {
-            output[row * topk + i] = -1;
-        }
         if (threadIdx.x == 0) {
-            hot_output_slots[row] = -1;
+            output[row * topk + i] = -1;
+            if (i == 0)
+                hot_output_slots[row] = -1;
         }
         return;
     }
-    const int64_t hot_base = slot * slot_stride_tokens;
+    const int64_t  hot_base       = slot * slot_stride_tokens;
+    const int32_t  seq_len        = seq_lens[row];
+    const bool     short_sequence = seq_len > 0 && seq_len <= hot_capacity;
+    uint8_t* const slot_resident  = resident_tokens + slot * hot_capacity;
 
-    for (int64_t i = threadIdx.x; i < topk; i += blockDim.x) {
-        const int32_t src      = indices[row * topk + i];
-        output[row * topk + i] = src < 0 ? -1 : static_cast<int32_t>(hot_base + i);
-    }
+    const int32_t src     = indices[row * topk + i];
+    const int32_t logical = logical_indices[row * topk + i];
+    const bool    valid   = src >= 0 && logical >= 0 && (!short_sequence || logical < seq_len);
     if (threadIdx.x == 0) {
-        hot_output_slots[row] = static_cast<int32_t>(hot_base + hot_capacity);
-    }
-    __syncthreads();
-
-    // Copy one selected token at a time with all threads collaborating on its
-    // byte payload. Source is CUDA-mapped host memory; destination is the
-    // request's fixed GPU HiSparse slot.
-    for (int64_t i = 0; i < topk; ++i) {
-        const int32_t src = indices[row * topk + i];
-        if (src < 0)
-            continue;
-        const int64_t src_block  = src / block_size;
-        const int64_t src_offset = src % block_size;
-        const int64_t dst        = hot_base + i;
-        const int64_t dst_block  = dst / block_size;
-        const int64_t dst_offset = dst % block_size;
-        const char*   src_ptr    = cold + src_block * cold_block_stride + src_offset * cold_token_stride;
-        char*         dst_ptr    = hot + dst_block * hot_block_stride + dst_offset * hot_token_stride;
-        for (int64_t byte = threadIdx.x; byte < item_size_bytes; byte += blockDim.x) {
-            dst_ptr[byte] = src_ptr[byte];
+        output[row * topk + i] = src < 0 || logical < 0 || (short_sequence && logical >= seq_len) ?
+                                     -1 :
+                                     static_cast<int32_t>(hot_base + (short_sequence ? logical : i));
+        if (i == 0) {
+            hot_output_slots[row] = static_cast<int32_t>(hot_base + (short_sequence ? seq_len - 1 : hot_capacity));
+            if (short_sequence) {
+                // store_kcache writes this token later on the same CUDA stream.
+                slot_resident[seq_len - 1] = 1;
+            }
         }
-        __syncthreads();
     }
+
+    if (!valid || (short_sequence && (slot_resident[logical] || logical == seq_len - 1)))
+        return;
+    const int64_t src_block  = src / block_size;
+    const int64_t src_offset = src % block_size;
+    const int64_t dst        = hot_base + (short_sequence ? logical : i);
+    const int64_t dst_block  = dst / block_size;
+    const int64_t dst_offset = dst % block_size;
+    const char*   src_ptr    = cold + src_block * cold_block_stride + src_offset * cold_token_stride;
+    char*         dst_ptr    = hot + dst_block * hot_block_stride + dst_offset * hot_token_stride;
+    for (int64_t byte = threadIdx.x; byte < item_size_bytes; byte += blockDim.x) {
+        dst_ptr[byte] = src_ptr[byte];
+    }
+    if (short_sequence && threadIdx.x == 0)
+        slot_resident[logical] = 1;
 }
 
-inline void launch_load_mla_slot(const int32_t* indices,
+inline void launch_load_mla_slot(const int32_t* logical_indices,
+                                 const int32_t* indices,
                                  const int64_t* request_slots,
+                                 const int32_t* seq_lens,
+                                 uint8_t*       resident_tokens,
                                  const void*    cold,
                                  void*          hot,
                                  int32_t*       output,
@@ -140,24 +151,27 @@ inline void launch_load_mla_slot(const int32_t* indices,
 {
     if (num_rows <= 0)
         return;
-    load_mla_slot_kernel<<<num_rows, 256, 0, stream>>>(indices,
-                                                       request_slots,
-                                                       static_cast<const char*>(cold),
-                                                       static_cast<char*>(hot),
-                                                       output,
-                                                       hot_output_slots,
-                                                       num_real_reqs,
-                                                       num_rows,
-                                                       topk,
-                                                       max_num_seqs,
-                                                       hot_capacity,
-                                                       slot_stride_tokens,
-                                                       block_size,
-                                                       cold_block_stride,
-                                                       cold_token_stride,
-                                                       hot_block_stride,
-                                                       hot_token_stride,
-                                                       item_size_bytes);
+    load_mla_slot_kernel<<<dim3(num_rows, topk), 256, 0, stream>>>(logical_indices,
+                                                                   indices,
+                                                                   request_slots,
+                                                                   seq_lens,
+                                                                   resident_tokens,
+                                                                   static_cast<const char*>(cold),
+                                                                   static_cast<char*>(hot),
+                                                                   output,
+                                                                   hot_output_slots,
+                                                                   num_real_reqs,
+                                                                   num_rows,
+                                                                   topk,
+                                                                   max_num_seqs,
+                                                                   hot_capacity,
+                                                                   slot_stride_tokens,
+                                                                   block_size,
+                                                                   cold_block_stride,
+                                                                   cold_token_stride,
+                                                                   hot_block_stride,
+                                                                   hot_token_stride,
+                                                                   item_size_bytes);
 }
 
 __global__ void writeback_mla_slot_kernel(const int32_t* logical_slots,
