@@ -228,7 +228,8 @@ dummy-prefill 的正确性目标是“服务链路能跑通并且 graph replay �
 新增配置：
 
 - `enable_hisparse: bool = False`
-- `hisparse_device_buffer_size: int = 4096`
+- `hisparse_device_buffer_size: int = 4096`（每个 sequence 的 hot token-slot
+  数；总 device buffer 为 `max_num_seqs * hisparse_device_buffer_size`）
 - `hisparse_host_to_device_ratio: int = 2`
 - `hisparse_swap_in_block_size: int = 960`
 

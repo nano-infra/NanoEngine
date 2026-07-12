@@ -93,7 +93,23 @@ class DecodeGraphRunner:
             if self._returns_logits
             else None
         )
-        self._hisparse_slots = torch.full((max_bs,), max_bs, dtype=torch.int64)
+        self._hisparse_slots = torch.full(
+            (max_bs,), config.max_num_seqs, dtype=torch.int64
+        )
+        self._hisparse_slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
+        hidden_size_per_layer_input = getattr(
+            hf_config, "hidden_size_per_layer_input", 0
+        )
+        self._per_layer_token_part = (
+            torch.empty(
+                max_bs,
+                hf_config.num_hidden_layers,
+                hidden_size_per_layer_input,
+                dtype=getattr(hf_config, "dtype", torch.get_default_dtype()),
+            )
+            if hidden_size_per_layer_input
+            else None
+        )
 
         # MLA-specific: per-BS FlashMLASchedMeta created during capture
         if is_mla or is_dsv4:
@@ -149,9 +165,17 @@ class DecodeGraphRunner:
         self._max_num_seqs = config.max_num_seqs
         self._block_size = block_size
         self._num_heads = getattr(hf_config, "num_attention_heads")
-        self._num_kv_heads = getattr(hf_config, "num_key_value_heads", self._num_heads)
-        self._head_dim = getattr(
-            hf_config, "head_dim", getattr(hf_config, "hidden_size") // self._num_heads
+        # Graph paged-decode metadata must describe the allocated cache, not
+        # necessarily the model's default attention shape. Gemma4, for example,
+        # keeps 256-dim sliding K/V in HiSparse while its paged global K/V cache
+        # uses global_head_dim=512.
+        self._num_kv_heads = cache_ctx.num_local_kv_heads
+        self._head_dim = cache_ctx.head_dim
+        self._softmax_scale = (
+            1.0
+            if hf_config.architectures[0]
+            in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration")
+            else self._head_dim**-0.5
         )
         self._decode_dtype = cache_ctx.kv_cache.dtype
         self._flashinfer_decode_enabled = (
@@ -189,6 +213,8 @@ class DecodeGraphRunner:
                 returns_logits=self._returns_logits,
                 logits=self._logits,
                 hisparse_slots=self._hisparse_slots,
+                hisparse_slot_mapping=self._hisparse_slot_mapping,
+                per_layer_token_part=self._per_layer_token_part,
                 gdn_state_slots=self._gdn_state_slots,
                 dummy_gdn_slot=self._dummy_gdn_slot,
                 dsv4_state_slots=self._dsv4_state_slots,
@@ -209,6 +235,7 @@ class DecodeGraphRunner:
                 num_heads=self._num_heads,
                 num_kv_heads=self._num_kv_heads,
                 head_dim=self._head_dim,
+                softmax_scale=self._softmax_scale,
                 dtype=self._decode_dtype,
                 use_tensor_cores=self._flashinfer_use_tensor_cores,
                 disable_split_kv=self._flashinfer_disable_split_kv,
@@ -269,6 +296,7 @@ class DecodeGraphRunner:
             The ``torch.cuda.graphs.MemPool`` for sharing with other runners.
         """
         logger.info("Capturing decode CUDAGraphs...")
+        self._model = model
         g = self._decode_ctx
 
         for master_bs in reversed(self._bs_list):
@@ -324,7 +352,9 @@ class DecodeGraphRunner:
                 hisparse_slots=g.hisparse_slots[:master_bs],
                 hisparse_slot_mapping=(
                     build_hot_slot_mapping(
-                        g.hisparse_slots[:master_bs], g.positions[:master_bs]
+                        g.hisparse_slots[:master_bs],
+                        g.positions[:master_bs],
+                        g.hisparse_slot_mapping[:master_bs],
                     )
                     if getattr(self.config, "cache_plan", None) is not None
                     and self.config.cache_plan.has_gqa()
@@ -344,8 +374,21 @@ class DecodeGraphRunner:
             )
             self._graph_ctx.set_active_flashinfer_decode_wrapper(flashinfer_wrapper)
 
+            model_kwargs = {}
+            if g.per_layer_token_part is not None:
+                token_part = model.model.prepare_decode_graph_token_part(
+                    g.input_ids[:master_bs],
+                    g.per_layer_token_part.device,
+                    g.per_layer_token_part.dtype,
+                )
+                g.per_layer_token_part[:master_bs].copy_(token_part)
+                model_kwargs["per_layer_token_part"] = g.per_layer_token_part[
+                    :master_bs
+                ]
             # Warmup
-            hidden = model(g.input_ids[:master_bs], g.positions[:master_bs])
+            hidden = model(
+                g.input_ids[:master_bs], g.positions[:master_bs], **model_kwargs
+            )
             if g.returns_logits:
                 g.logits[:master_bs] = model.compute_logits(hidden)
             else:
@@ -382,7 +425,9 @@ class DecodeGraphRunner:
             # Capture
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, g.graph_pool):
-                hidden = model(g.input_ids[:master_bs], g.positions[:master_bs])
+                hidden = model(
+                    g.input_ids[:master_bs], g.positions[:master_bs], **model_kwargs
+                )
                 if g.returns_logits:
                     g.logits[:master_bs] = model.compute_logits(hidden)
                 else:
@@ -420,6 +465,13 @@ class DecodeGraphRunner:
         # Copy inputs
         g.input_ids[:bs] = input_ids
         g.positions[:bs] = positions
+        if g.per_layer_token_part is not None:
+            token_part = self._model.model.prepare_decode_graph_token_part(
+                input_ids,
+                g.per_layer_token_part.device,
+                g.per_layer_token_part.dtype,
+            )
+            g.per_layer_token_part[:bs].copy_(token_part)
         g.slot_mapping.fill_(-1)
         g.slot_mapping[:bs] = context.slot_mapping
         g.hisparse_slots.fill_(g.max_num_seqs)
@@ -428,6 +480,12 @@ class DecodeGraphRunner:
         hisparse_ctx = get_hisparse_context()
         if hisparse_ctx.num_real_reqs is not None:
             hisparse_ctx.num_real_reqs.fill_(bs)
+        if context.hisparse_slot_mapping is not None:
+            build_hot_slot_mapping(
+                g.hisparse_slots[:master_bs],
+                g.positions[:master_bs],
+                g.hisparse_slot_mapping[:master_bs],
+            )
         g.context_lens.zero_()
         g.context_lens[:, : context.context_lens.shape[1]].copy_(context.context_lens)
         g.block_tables.zero_()

@@ -226,7 +226,7 @@ class Gemma4Attention(nn.Module):
             if self.store_full_length_kv:
                 shared_kv_states[self.layer_type] = (k, v)
         q, _ = self.rotary_emb(positions, q, k)
-        out = self.attn(q, k, v)
+        out = self.attn(q, k, v, write_kv_cache=not self.is_kv_shared_layer)
         return self.o_proj(out.flatten(1, -1))
 
 
@@ -374,18 +374,17 @@ class Gemma4Model(nn.Module):
             attn.attn.hisparse_v_cache = source.attn.hisparse_v_cache
 
     def _per_layer_inputs(
-        self, input_ids: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        token_part: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         if not self.hidden_size_per_layer_input:
             return None
-        token_part = self.embed_tokens_per_layer(
-            input_ids, hidden_states.device, hidden_states.dtype
-        )
-        token_part = token_part.view(
-            -1,
-            self.config.num_hidden_layers,
-            self.hidden_size_per_layer_input,
-        )
+        if token_part is None:
+            token_part = self.prepare_decode_graph_token_part(
+                input_ids, hidden_states.device, hidden_states.dtype
+            )
         model_part = self.per_layer_model_projection(hidden_states)
         model_part = model_part * self.per_layer_model_projection_scale
         model_part = model_part.view(
@@ -396,9 +395,27 @@ class Gemma4Model(nn.Module):
         model_part = self.per_layer_projection_norm(model_part)
         return (model_part + token_part) * self.per_layer_input_scale
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def prepare_decode_graph_token_part(
+        self, input_ids: torch.Tensor, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Prepare the CPU PLE lookup outside CUDA Graph capture/replay."""
+        token_part = self.embed_tokens_per_layer(input_ids, device, dtype)
+        return token_part.view(
+            -1,
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        per_layer_token_part: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        per_layer_inputs = self._per_layer_inputs(input_ids, hidden_states)
+        per_layer_inputs = self._per_layer_inputs(
+            input_ids, hidden_states, per_layer_token_part
+        )
         shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = UserDict()
         for i, layer in enumerate(self.layers):
             pli = per_layer_inputs[:, i, :] if per_layer_inputs is not None else None
@@ -416,8 +433,13 @@ class Gemma4ForCausalLM(nn.Module):
         else:
             self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        return self.model(input_ids, positions)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        per_layer_token_part: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model(input_ids, positions, per_layer_token_part)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head(hidden_states)
@@ -425,6 +447,9 @@ class Gemma4ForCausalLM(nn.Module):
         if softcap is not None:
             logits = torch.tanh(logits / softcap) * softcap
         return logits
+
+    def wire_shared_kv_caches(self) -> None:
+        self.model.wire_shared_kv_caches()
 
     def get_cache_plan(self):
         if getattr(self.config, "enable_hisparse", False):

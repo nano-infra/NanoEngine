@@ -55,8 +55,10 @@ def initialize_hisparse_context(
     ctx.enabled = True
     ctx.max_num_seqs = max_num_seqs
     ctx.dummy_slot = max_num_seqs
+    # ``device_buffer_size`` is a per-sequence capacity. Keeping this invariant
+    # makes a configured sliding window independent of scheduler concurrency.
     ctx.device_buffer_size = device_buffer_size
-    ctx.tokens_per_seq = max(1, device_buffer_size // max(1, max_num_seqs))
+    ctx.tokens_per_seq = device_buffer_size
     ctx.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
     return ctx
 
@@ -97,15 +99,43 @@ def remap_slot_mapping(slot_mapping: torch.Tensor | None) -> torch.Tensor | None
 def build_hot_slot_mapping(
     hisparse_slots: torch.Tensor | None,
     positions: torch.Tensor | None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     ctx = get_hisparse_context()
     if hisparse_slots is None or positions is None or ctx.tokens_per_seq <= 0:
         return None
     slots = hisparse_slots.to(torch.int64)
     pos = positions[: slots.numel()].to(torch.int64)
+    if (
+        slots.is_cuda
+        and pos.is_cuda
+        and ctx.num_real_reqs is not None
+        and slots.dtype == torch.int64
+        and pos.dtype == torch.int64
+    ):
+        if output is None:
+            output = torch.empty(slots.numel(), dtype=torch.int32, device=slots.device)
+        try:
+            from dlengine.kernel.jit.sgl.hisparse import build_ring_slot_mapping
+
+            return build_ring_slot_mapping(
+                slots,
+                pos,
+                output[: slots.numel()],
+                ctx.num_real_reqs,
+                ctx.max_num_seqs,
+                ctx.tokens_per_seq,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name != "tvm_ffi":
+                raise
     hot = slots * ctx.tokens_per_seq + (pos % ctx.tokens_per_seq)
     hot = torch.where(slots < ctx.max_num_seqs, hot, -1)
-    return hot.to(torch.int32)
+    hot = hot.to(torch.int32)
+    if output is not None:
+        output[: hot.numel()].copy_(hot)
+        return output[: hot.numel()]
+    return hot
 
 
 def remap_sparse_indices(sparse_indices: torch.Tensor | None) -> torch.Tensor | None:
