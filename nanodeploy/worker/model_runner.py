@@ -1234,7 +1234,17 @@ class ModelRunner:
             config.max_model_len, hf_config.max_position_embeddings
         )
         max_bs = min(self.config.max_num_seqs, 512)
-        max_attention_comp_seqs = max_bs + config.max_num_recv_seqs
+        fixed_sp_graph = sp_world_size > 1 and config.fixed_sp_size > 0
+        max_attention_comp_seqs = (
+            sp_world_size * max_bs
+            if fixed_sp_graph
+            else max_bs + config.max_num_recv_seqs
+        )
+        max_remote_attention_comp_seqs = (
+            max_attention_comp_seqs
+            if fixed_sp_graph
+            else config.max_num_recv_seqs
+        )
         block_size = get_cache_context().block_size
         max_num_blocks = (config.max_model_len + block_size - 1) // block_size
 
@@ -1284,13 +1294,13 @@ class ModelRunner:
                 ),
                 res_to_buffer_output_mask=torch.zeros(max_bs, dtype=torch.int32),
                 res_slice_get_to_buffer_input=torch.full(
-                    (config.max_num_recv_seqs,), -1, dtype=torch.int32
+                    (max_remote_attention_comp_seqs,), -1, dtype=torch.int32
                 ),
                 res_slice_fill_to_buffer_input=torch.full(
-                    (config.max_num_recv_seqs,), -1, dtype=torch.int32
+                    (max_remote_attention_comp_seqs,), -1, dtype=torch.int32
                 ),
                 res_to_buffer_input_mask=torch.zeros(
-                    config.max_num_recv_seqs, dtype=torch.int32
+                    max_remote_attention_comp_seqs, dtype=torch.int32
                 ),
                 q_offsets=torch.zeros(sp_world_size + 1, dtype=torch.int32),
             )

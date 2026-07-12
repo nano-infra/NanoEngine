@@ -748,17 +748,22 @@ class NcclCompactAllToAllBufferAdapter:
         valid_rows: int,
         comm_bs: int,
     ) -> tuple[list[int], list[int], list[int]]:
-        key = (
-            mask.data_ptr(),
-            offsets.data_ptr(),
-            int(getattr(mask, "_version", 0)),
-            int(getattr(offsets, "_version", 0)),
-            valid_rows,
-            comm_bs,
-        )
-        cached = self._q_split_cache.get(key)
-        if cached is not None:
-            return cached
+        try:
+            mask_version = int(mask._version)
+            offsets_version = int(offsets._version)
+            key = (
+                mask.data_ptr(),
+                offsets.data_ptr(),
+                mask_version,
+                offsets_version,
+                valid_rows,
+                comm_bs,
+            )
+            cached = self._q_split_cache.get(key)
+            if cached is not None:
+                return cached
+        except RuntimeError:
+            key = None
 
         input_split_sizes = self._mask_counts(mask, valid_rows)
         counts = (offsets[1:] - offsets[:-1]).to(dtype=torch.int64).cpu().tolist()
@@ -766,8 +771,9 @@ class NcclCompactAllToAllBufferAdapter:
         output_split_sizes[self.rank] = 0
         offsets_cpu = [int(x) for x in offsets.to(dtype=torch.int64).cpu().tolist()]
         cached = (input_split_sizes, output_split_sizes, offsets_cpu)
-        self._q_split_cache.clear()
-        self._q_split_cache[key] = cached
+        if key is not None:
+            self._q_split_cache.clear()
+            self._q_split_cache[key] = cached
         return cached
 
     def _all_to_all_variable(

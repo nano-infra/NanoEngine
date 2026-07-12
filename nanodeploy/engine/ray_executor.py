@@ -1,5 +1,6 @@
 import threading
 import time
+import os
 from typing import Any, Dict, List, Tuple
 
 from urllib.parse import urlparse
@@ -124,6 +125,13 @@ class RayExecutor:
         self.workers = []
         self.placement_groups = []
         assert config.attn_world_size == config.ffn_world_size
+        worker_env_vars = {}
+        for env_name in ("SLIME_QP_NUM",):
+            if env_name in os.environ:
+                worker_env_vars[env_name] = os.environ[env_name]
+        worker_runtime_env = (
+            {"env_vars": worker_env_vars} if worker_env_vars else None
+        )
 
         # 2. 获取所有节点的 NodeID
         nodes = get_available_nodes_with_master_first(config.master_address)
@@ -162,7 +170,10 @@ class RayExecutor:
             end_rank = min(start_rank + workers_per_node, config.attn_world_size)
 
             for rank in range(start_rank, end_rank):
-                worker = ModelRunner.options(placement_group=pg).remote(config, rank)
+                worker_options = {"placement_group": pg}
+                if worker_runtime_env is not None:
+                    worker_options["runtime_env"] = worker_runtime_env
+                worker = ModelRunner.options(**worker_options).remote(config, rank)
                 self.workers.append(worker)
 
         self.endpoint = RPCServerEndpoint(

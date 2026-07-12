@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ================= 默认配置 (Default Configuration) =================
-DEFAULT_RAY="10.102.98.166:7799"
-DEFAULT_MASTER="10.102.98.166:29500"
+DEFAULT_RAY="10.102.252.174:6379"
+DEFAULT_MASTER="10.102.252.174:29500"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # 默认路径
 DEFAULT_CSV_PATH="/mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/arxiv_400k_pure_20260106_162151.csv"
-DEFAULT_MODEL_PATH="/mnt/nvme1n1/ml_research/models/deepseek-v3"
+DEFAULT_MODEL_PATH="/mnt/nvme1n1/ml_research/chenjiefei/models/deepseek-v3"
 DEFAULT_BASE_LOG_DIR="$ROOT_DIR/bench_logs"
 
 # 默认并行与显存配置
@@ -29,7 +29,7 @@ DEFAULT_LOOP_COUNT=16
 DEFAULT_FIXED_SP_SIZE=0
 DEFAULT_SP_BACKEND="hao_basic"
 DEFAULT_CUDA_GRAPH_MODE="full"
-DEFAULT_ENABLE_DYNAMIC_SP_SIZE=1
+DEFAULT_ENABLE_DYNAMIC_SP_SIZE=0
 DEFAULT_ENFORCE_EAGER=0
 DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=0
 DEFAULT_DYNAMIC_SP_SIZE_STRATEGY="legacy"
@@ -96,7 +96,7 @@ usage() {
     echo "  --scheduler-mode <str>    Scheduler Mode (default: $DEFAULT_SCHEDULER_MODE)"
     echo "  --loop-count <int>        Loop count (default: $DEFAULT_LOOP_COUNT)"
     echo "  --fixed-sp-size <int>     Fixed SP size baseline (0 = disabled, default: $DEFAULT_FIXED_SP_SIZE)"
-    echo "  --sp-backend <str>        legacy_ll | hao_basic | nccl (default: $DEFAULT_SP_BACKEND)"
+    echo "  --sp-backend <str>        legacy_ll | hao_basic | nccl | nccl_compact (default: $DEFAULT_SP_BACKEND)"
     echo "  --cuda-graph-mode <str>   full | piecewise (default: $DEFAULT_CUDA_GRAPH_MODE)"
     echo "  --enable-dynamic-sp-size  Enable dynamic SP size"
     echo "  --max-input-len <int>     Filter out CSV rows with prompt_len >= this value"
@@ -314,7 +314,7 @@ for rate in "${RATES[@]}"; do
 
     # 构建 Python 命令
     CMD=(
-        python "$PYTHON_SCRIPT"
+        python -u "$PYTHON_SCRIPT"
         --dataset csv
         --csv-path "$CSV_PATH"
         --num-requests "$NUM_REQUESTS"
@@ -375,7 +375,7 @@ for rate in "${RATES[@]}"; do
         echo "Settings: $STRATEGY_STR"
         echo ""
         echo "================= Reproduce Command ================="
-        echo "RAY_DEDUP_LOGS=0 ${CMD[*]}"
+        echo "PYTHONUNBUFFERED=1 RAY_DEDUP_LOGS=0 ${CMD[*]}"
         echo "====================================================="
         echo ""
     } > "$LOG_FILE"
@@ -385,7 +385,7 @@ for rate in "${RATES[@]}"; do
     # 执行命令并捕获退出码
     cd "$ROOT_DIR"
     set -o pipefail
-    RAY_DEDUP_LOGS=0 "${CMD[@]}" 2>&1 | tee -a "$LOG_FILE"
+    PYTHONUNBUFFERED=1 RAY_DEDUP_LOGS=0 "${CMD[@]}" 2>&1 | tee -a "$LOG_FILE"
     EXIT_CODE=$?
     set +o pipefail
 
