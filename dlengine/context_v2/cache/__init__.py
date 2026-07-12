@@ -79,6 +79,10 @@ class CacheContext(KVCacheAllocatorMixin):
     )
     ctrl_scope: str | None = None  # Scope for multi-tenant isolation
     engine_id: str | None = None  # Engine ID for agent naming (format: EngineName:rank)
+    architecture: str | None = None
+    enable_hisparse: bool = False
+    max_num_seqs: int = 0
+    hisparse_device_buffer_size: int = 0
     # If ctrl_address is provided, engine_id will be fetched from NanoCtrl instead of config
 
     @property
@@ -234,23 +238,60 @@ class CacheContext(KVCacheAllocatorMixin):
 
         backend = get_cache_backend(self.mode)
         backend.configure(self)
-        block_bytes = backend.get_block_bytes(self)
+        kv_block_bytes = backend.get_block_bytes(self)
+        indexer_block_bytes = get_indexer_block_bytes(self)
+        gpu_cache_budget = int(
+            total * self.gpu_memory_utilization
+            - used
+            - peak
+            + current
+            - self.reserved_state_bytes
+        )
 
-        block_bytes += get_indexer_block_bytes(self)
-
-        self.num_local_kvcache_blocks = (
-            int(
-                total * self.gpu_memory_utilization
-                - used
-                - peak
-                + current
-                - self.reserved_state_bytes
+        is_mla_hisparse = (
+            self.enable_hisparse
+            and self.mode == "mla"
+            and indexer_block_bytes > 0
+            and bool(self.ctrl_address)
+        )
+        if is_mla_hisparse:
+            hot_blocks_per_seq = max(
+                1,
+                (
+                    self.hisparse_device_buffer_size
+                    + self.block_size
+                    + self.block_size
+                    - 1
+                )
+                // self.block_size,
             )
-            // block_bytes
-        )
-        self.num_host_kvcache_blocks, host_budget_bytes = (
-            self._compute_host_kvcache_blocks(block_bytes)
-        )
+            hot_blocks = max(1, self.max_num_seqs) * hot_blocks_per_seq
+            hot_tier_bytes = hot_blocks * kv_block_bytes
+            indexer_budget = max(0, gpu_cache_budget - hot_tier_bytes)
+            gpu_indexer_blocks = indexer_budget // indexer_block_bytes
+            host_blocks, host_budget_bytes = self._compute_host_kvcache_blocks(
+                kv_block_bytes
+            )
+            self.num_local_kvcache_blocks = min(host_blocks, gpu_indexer_blocks)
+            # Do not allocate cold pages which cannot be indexed. Logical,
+            # host-cold, and Indexer page counts deliberately stay identical.
+            self.num_host_kvcache_blocks = self.num_local_kvcache_blocks
+            logger.info(
+                "Rank%s MLA HiSparse capacity: logical=%s blocks, host=%s, "
+                "gpu_indexer=%s, hot=%s blocks (%.2f GiB)",
+                dist.get_rank(),
+                self.num_local_kvcache_blocks,
+                host_blocks,
+                gpu_indexer_blocks,
+                hot_blocks,
+                hot_tier_bytes / 1024**3,
+            )
+        else:
+            block_bytes = kv_block_bytes + indexer_block_bytes
+            self.num_local_kvcache_blocks = gpu_cache_budget // block_bytes
+            self.num_host_kvcache_blocks, host_budget_bytes = (
+                self._compute_host_kvcache_blocks(block_bytes)
+            )
 
         logger.debug(
             f"Rank{dist.get_rank()} num_local_kvcache_blocks: {self.num_local_kvcache_blocks}"
@@ -301,6 +342,10 @@ def set_cache_context(
     ctrl_address: str | None = None,
     ctrl_scope: str | None = None,
     engine_id: str | None = None,
+    architecture: str | None = None,
+    enable_hisparse: bool = False,
+    max_num_seqs: int = 0,
+    hisparse_device_buffer_size: int = 0,
     reserved_state_bytes: int = 0,
 ):
     global _CACHE_CONTEXT
@@ -324,5 +369,9 @@ def set_cache_context(
         ctrl_address=ctrl_address,
         ctrl_scope=ctrl_scope,
         engine_id=engine_id,
+        architecture=architecture,
+        enable_hisparse=enable_hisparse,
+        max_num_seqs=max_num_seqs,
+        hisparse_device_buffer_size=hisparse_device_buffer_size,
     )
     return _CACHE_CONTEXT

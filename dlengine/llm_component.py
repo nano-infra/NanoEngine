@@ -388,6 +388,13 @@ class LLMComponent(LLM):
             gdn_num_slots = max_bs * 2 + 1
         else:
             gdn_num_slots = max_bs + 1
+        architecture = (getattr(self.config.hf_config, "architectures", None) or [""])[
+            0
+        ]
+        is_nsa_mla_hisparse = bool(self.config.enable_hisparse) and architecture in (
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+        )
         metadata = {
             "role": self.config.mode,
             "world_size": self.config.attn_world_size,
@@ -400,6 +407,38 @@ class LLMComponent(LLM):
             "max_num_seqs": self.config.max_num_seqs,
             "gdn_num_slots": gdn_num_slots,
             "model_path": self.config.model,  # tokenizer directory = model directory
+            # Cache/topology compatibility contract consumed by PD migration.
+            # Keep these explicit: equal world_size is insufficient to prove
+            # that two DP+EP deployments shard attention/cache identically.
+            "architecture": architecture,
+            "attention_dp": self.config.attention_dp,
+            "attention_sp": self.config.attention_sp,
+            "attention_tp": self.config.attention_tp,
+            "ffn_ep": self.config.ffn_ep,
+            "num_local_kv_heads": (
+                getattr(self.config.hf_config, "num_key_value_heads", 1)
+                // self.config.attention_tp
+            ),
+            "kvcache_block_size": self.config.kvcache_block_size,
+            "num_host_blocks": self.config.num_host_kvcache_blocks,
+            "indexer_num_blocks": (
+                self.config.num_kvcache_blocks if is_nsa_mla_hisparse else 0
+            ),
+            "enable_hisparse": bool(self.config.enable_hisparse),
+            "hisparse_device_buffer_size": (
+                self.config.hisparse_device_buffer_size
+                if self.config.enable_hisparse
+                else 0
+            ),
+            "hisparse_cold_tier": ("decode_host" if is_nsa_mla_hisparse else "device"),
+            # Gemma4 SWA writes its bounded ring during prefill and therefore
+            # supports HiSparse in both phases. NSA/MLA models deliberately
+            # keep prefill ordinary and enable HiSparse only on decode.
+            "hisparse_phase": (
+                "decode_only"
+                if is_nsa_mla_hisparse
+                else "prefill_and_decode" if self.config.enable_hisparse else "disabled"
+            ),
         }
 
         ok = self._nanoctrl.register(

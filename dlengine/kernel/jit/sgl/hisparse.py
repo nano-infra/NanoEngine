@@ -10,7 +10,11 @@ def _jit_hisparse_module():
     return load_jit(
         "hisparse_ring_mapping",
         cuda_files=["hisparse/hisparse.cuh"],
-        cuda_wrappers=[("build_ring_slot_mapping", "HiSparseRingMappingKernel::run")],
+        cuda_wrappers=[
+            ("build_ring_slot_mapping", "HiSparseRingMappingKernel::run"),
+            ("load_mla_slot", "HiSparseMLASlotLoadKernel::run"),
+            ("writeback_mla_slot", "HiSparseMLASlotWritebackKernel::run"),
+        ],
     )
 
 
@@ -34,4 +38,46 @@ def build_ring_slot_mapping(
     return output
 
 
-__all__ = ["build_ring_slot_mapping"]
+def load_mla_slot(
+    indices: torch.Tensor,
+    request_slots: torch.Tensor,
+    cold: torch.Tensor,
+    hot: torch.Tensor,
+    output: torch.Tensor,
+    hot_output_slots: torch.Tensor,
+    num_real_reqs: torch.Tensor,
+    max_num_seqs: int,
+    hot_capacity: int,
+    slot_stride_tokens: int,
+) -> None:
+    _jit_hisparse_module().load_mla_slot(
+        indices,
+        request_slots,
+        cold,
+        hot,
+        output,
+        hot_output_slots,
+        num_real_reqs,
+        max_num_seqs,
+        hot_capacity,
+        slot_stride_tokens,
+    )
+
+
+def writeback_mla_slot(
+    logical_slots: torch.Tensor,
+    hot_slots: torch.Tensor,
+    hot: torch.Tensor,
+    cold: torch.Tensor,
+    num_real_reqs: torch.Tensor,
+) -> None:
+    _jit_hisparse_module().writeback_mla_slot(
+        logical_slots, hot_slots, hot, cold, num_real_reqs
+    )
+
+
+__all__ = [
+    "build_ring_slot_mapping",
+    "load_mla_slot",
+    "writeback_mla_slot",
+]

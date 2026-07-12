@@ -551,6 +551,7 @@ class DeepseekV2Attention(nn.Module):
         layer_idx: int = 0,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.config = config
         self.q_lora_rank = config.q_lora_rank
         self.hidden_size = config.hidden_size
@@ -1238,9 +1239,33 @@ class DeepseekV2Attention(nn.Module):
                     topk_indices, bt_expanded, block_size
                 )
                 if getattr(self.config, "enable_hisparse", False):
-                    from dlengine.context_v2.cache.hisparse import remap_sparse_indices
+                    from dlengine.context_v2.cache.hisparse import (
+                        get_hisparse_context,
+                        remap_sparse_indices,
+                        stage_mla_sparse_indices,
+                    )
 
-                    sparse_indices = remap_sparse_indices(sparse_indices)
+                    hisparse_ctx = get_hisparse_context()
+                    if hisparse_ctx.cold_kv_cache is not None:
+                        if context.hisparse_slots is None:
+                            raise RuntimeError(
+                                "MLA HiSparse decode is missing scheduler slots"
+                            )
+                        seq_slots = context.hisparse_slots
+                        if ntps > 1:
+                            seq_slots = seq_slots.repeat_interleave(ntps)
+                        sparse_indices, hot_output_slots = stage_mla_sparse_indices(
+                            self.layer_idx,
+                            sparse_indices,
+                            seq_slots,
+                            context.slot_mapping,
+                        )
+                        # The mapping is layer-specific because every NSA layer
+                        # selects a different page set. FlashMLA consumes it
+                        # immediately below before the next layer replaces it.
+                        context.hisparse_slot_mapping = hot_output_slots
+                    else:
+                        sparse_indices = remap_sparse_indices(sparse_indices)
 
             # value_states for MLA decode: same compressed latent (unused by FlashMLA decode)
             value_states = compressed_kv.unsqueeze(1)  # (q_len, 1, 512)
@@ -1251,6 +1276,18 @@ class DeepseekV2Attention(nn.Module):
                 value_states,  # (q_len, 1, 512)
                 sparse_indices=sparse_indices,
             )
+            if getattr(self.config, "enable_hisparse", False):
+                from dlengine.context_v2.cache.hisparse import (
+                    get_hisparse_context,
+                    writeback_mla_output_pages,
+                )
+
+                if get_hisparse_context().cold_kv_cache is not None:
+                    writeback_mla_output_pages(
+                        self.layer_idx,
+                        context.slot_mapping,
+                        context.hisparse_slot_mapping,
+                    )
 
             # Post-multiply by W_UV (vc BMM)
             attn_bmm_out = attn_output.new_empty(q_len, num_heads, self.v_head_dim)

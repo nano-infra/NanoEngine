@@ -404,15 +404,23 @@ class Config(BaseModel):
                 raise ValueError("hisparse_host_to_device_ratio must be >= 1")
             if self.hisparse_swap_in_block_size <= 0:
                 raise ValueError("hisparse_swap_in_block_size must be positive")
-            if arch == "DeepseekV32ForCausalLM":
+            if arch in ("DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"):
                 if self.mode != "decode":
                     raise ValueError(
-                        "enable_hisparse MLA Phase 1 requires mode='decode'; "
+                        "enable_hisparse NSA/MLA requires mode='decode'; "
                         f"got {self.mode!r}"
                     )
-                if not self.dummy_prefill:
+                # A standalone decode engine has no source for its cold tier,
+                # so retain the synthetic-cache guard.  A PD decode engine is
+                # populated by migration from the ordinary prefill engine.
+                if not self.dummy_prefill and not self.ctrl_address:
                     raise ValueError(
-                        "enable_hisparse MLA Phase 1 requires dummy_prefill=True"
+                        "enable_hisparse decode requires either dummy_prefill=True "
+                        "or ctrl_address for PD cold-cache migration"
+                    )
+                if self.ctrl_address and self.host_utilization_per_device <= 0:
+                    raise ValueError(
+                        "PD NSA/MLA HiSparse requires host_utilization_per_device > 0"
                     )
                 if self.disable_nsa:
                     raise ValueError(
@@ -425,6 +433,9 @@ class Config(BaseModel):
                 if getattr(self.hf_config, "index_topk", 0) <= 0:
                     raise ValueError("enable_hisparse requires DSV3.2 index_topk > 0")
             elif arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
+                # Gemma4 SWA is a bounded ring by construction. Unlike NSA/MLA,
+                # its prefill path can populate the HiSparse hot buffer directly,
+                # so do not apply the decode-only guard from the branch above.
                 layer_types = getattr(self.hf_config, "layer_types", None) or []
                 if "sliding_attention" not in layer_types:
                     raise ValueError(
@@ -434,8 +445,9 @@ class Config(BaseModel):
                     logger.warning("Gemma4 HiSparse CUDA Graph is experimental")
             else:
                 raise ValueError(
-                    "enable_hisparse currently supports DeepseekV32ForCausalLM "
-                    f"or Gemma4ForCausalLM; got {arch!r}"
+                    "enable_hisparse currently supports DeepseekV32ForCausalLM, "
+                    "GlmMoeDsaForCausalLM, or Gemma4ForCausalLM; "
+                    f"got {arch!r}"
                 )
         else:
             arch = (getattr(self.hf_config, "architectures", None) or [""])[0]

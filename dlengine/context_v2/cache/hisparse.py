@@ -13,6 +13,9 @@ class HiSparseContext(BaseContext):
     device_buffer_size: int = 0
     tokens_per_seq: int = 0
     hot_kv_cache: torch.Tensor | None = None
+    cold_kv_cache: torch.Tensor | None = None
+    block_size: int = 0
+    hot_blocks_per_seq: int = 0
     num_real_reqs: torch.Tensor | None = None
 
     @classmethod
@@ -30,6 +33,9 @@ class HiSparseContext(BaseContext):
         self.device_buffer_size = 0
         self.tokens_per_seq = 0
         self.hot_kv_cache = None
+        self.cold_kv_cache = None
+        self.block_size = 0
+        self.hot_blocks_per_seq = 0
         self.num_real_reqs = None
 
     def reset_context(self) -> None:
@@ -61,6 +67,110 @@ def initialize_hisparse_context(
     ctx.tokens_per_seq = device_buffer_size
     ctx.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
     return ctx
+
+
+def initialize_mla_hisparse_cache(
+    cold_kv_cache: torch.Tensor,
+    *,
+    max_num_seqs: int,
+    device_buffer_size: int,
+) -> torch.Tensor:
+    """Allocate the decode GPU hot tier using the MLA cache's exact layout.
+
+    The first implementation repacks every layer's selected pages on demand.
+    A request owns a fixed, disjoint hot-page range, which makes simultaneous
+    batches safe without requiring a global allocator.
+    """
+    if cold_kv_cache is None or cold_kv_cache.ndim != 6:
+        raise ValueError("MLA HiSparse requires a 6-D host cold KV cache")
+    ctx = get_hisparse_context()
+    block_size = int(cold_kv_cache.shape[3])
+    # One extra page is reserved for the newly generated token, matching the
+    # per-request HiSparse slot layout used by SGLang.
+    slot_stride_tokens = device_buffer_size + block_size
+    hot_blocks_per_seq = max(1, (slot_stride_tokens + block_size - 1) // block_size)
+    total_hot_blocks = max_num_seqs * hot_blocks_per_seq
+
+    # FP8 MLA uses one padding row between physical blocks. Mirror that layout
+    # because FlashMLA derives its block stride from the tensor view.
+    padded = torch.empty(
+        cold_kv_cache.shape[0],
+        cold_kv_cache.shape[1],
+        total_hot_blocks,
+        block_size + 1,
+        cold_kv_cache.shape[4],
+        cold_kv_cache.shape[5],
+        dtype=cold_kv_cache.dtype,
+        device=ctx.num_real_reqs.device,
+    )
+    ctx.cold_kv_cache = cold_kv_cache
+    ctx.hot_kv_cache = padded[:, :, :, :block_size, :, :]
+    ctx.block_size = block_size
+    ctx.hot_blocks_per_seq = hot_blocks_per_seq
+    ctx.tokens_per_seq = hot_blocks_per_seq * block_size
+    return ctx.hot_kv_cache
+
+
+def stage_mla_sparse_indices(
+    layer_idx: int,
+    sparse_indices: torch.Tensor,
+    hisparse_slots: torch.Tensor,
+    output_slots: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load top-k tokens into their request slot using a graph-safe CUDA kernel."""
+    ctx = get_hisparse_context()
+    if ctx.hot_kv_cache is None or ctx.cold_kv_cache is None:
+        raise RuntimeError("MLA HiSparse hot/cold cache is not initialized")
+    if sparse_indices.ndim != 2 or hisparse_slots.numel() != sparse_indices.shape[0]:
+        raise ValueError("HiSparse slots must contain one entry per sparse-index row")
+
+    if sparse_indices.shape[1] > ctx.device_buffer_size:
+        raise RuntimeError(
+            f"HiSparse top-k={sparse_indices.shape[1]} exceeds slot capacity "
+            f"{ctx.device_buffer_size}"
+        )
+    if not sparse_indices.is_cuda:
+        raise RuntimeError("MLA HiSparse slot loading requires CUDA")
+
+    from dlengine.kernel.jit.sgl.hisparse import load_mla_slot
+
+    result = torch.empty_like(sparse_indices, dtype=torch.int32)
+    hot_output_slots = torch.empty_like(output_slots, dtype=torch.int32)
+    load_mla_slot(
+        sparse_indices.to(torch.int32),
+        hisparse_slots,
+        ctx.cold_kv_cache[0, layer_idx],
+        ctx.hot_kv_cache[0, layer_idx],
+        result,
+        hot_output_slots,
+        ctx.num_real_reqs,
+        ctx.max_num_seqs,
+        ctx.device_buffer_size,
+        ctx.tokens_per_seq,
+    )
+    return result, hot_output_slots
+
+
+def writeback_mla_output_pages(
+    layer_idx: int,
+    logical_output_slots: torch.Tensor,
+    hot_output_slots: torch.Tensor,
+) -> None:
+    """Persist freshly appended decode KV from the hot tier to host cold KV."""
+    ctx = get_hisparse_context()
+    if ctx.hot_kv_cache is None or ctx.cold_kv_cache is None:
+        return
+    if not logical_output_slots.is_cuda:
+        raise RuntimeError("MLA HiSparse writeback requires CUDA")
+    from dlengine.kernel.jit.sgl.hisparse import writeback_mla_slot
+
+    writeback_mla_slot(
+        logical_output_slots.to(torch.int32),
+        hot_output_slots.to(torch.int32),
+        ctx.hot_kv_cache[0, layer_idx],
+        ctx.cold_kv_cache[0, layer_idx],
+        ctx.num_real_reqs,
+    )
 
 
 def allocate_gqa_hot_buffer(
@@ -148,7 +258,10 @@ __all__ = [
     "build_hot_slot_mapping",
     "get_hisparse_context",
     "initialize_hisparse_context",
+    "initialize_mla_hisparse_cache",
     "remap_slot_mapping",
     "remap_sparse_indices",
     "reset_hisparse_context",
+    "stage_mla_sparse_indices",
+    "writeback_mla_output_pages",
 ]

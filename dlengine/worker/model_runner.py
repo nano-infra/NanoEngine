@@ -15,6 +15,7 @@ from dlengine.context_v2.cache.hca import get_hca_context
 from dlengine.context_v2.cache.hisparse import (
     allocate_gqa_hot_buffer,
     initialize_hisparse_context,
+    initialize_mla_hisparse_cache,
 )
 from dlengine.context_v2.cache.plan import CachePlan, gqa_cache_plan
 from dlengine.context_v2.distributed import get_dist_context, set_dist_context
@@ -525,12 +526,22 @@ class ModelRunner:
         )
         self.config.num_kvcache_blocks = num_kvcache_blocks
         cache_context = get_cache_context()
-        cache_context.allocate_kvcache(num_kvcache_blocks)
+        pd_mla_hisparse = (
+            self.cache_plan.has_hisparse()
+            and self.cache_plan.has_mla()
+            and bool(self.config.ctrl_address)
+        )
+        if pd_mla_hisparse:
+            cache_context.num_local_kvcache_blocks = num_kvcache_blocks
+            cache_context.num_host_kvcache_blocks = num_kvcache_blocks
+            cache_context.kv_cache = torch.tensor([], device=cache_context.device)
+        else:
+            cache_context.allocate_kvcache(num_kvcache_blocks)
         cache_context.allocate_host_kvcache(cache_context.num_host_kvcache_blocks)
 
         if self.cache_plan.has_hca():
             self._wire_dsv4_caches(cache_context)
-        else:
+        elif not pd_mla_hisparse:
             layer_id = 0
             for module in self.model.modules():
                 allocated = False
@@ -551,6 +562,12 @@ class ModelRunner:
                     allocated = True
                 if allocated:
                     layer_id += 1
+        else:
+            for module in self.model.modules():
+                if hasattr(module, "k_cache"):
+                    module.k_cache = torch.tensor([], device=cache_context.device)
+                if hasattr(module, "v_cache"):
+                    module.v_cache = torch.tensor([], device=cache_context.device)
 
         # Allocate NSA indexer cache (V3.2 only)
         if self.cache_plan.has_indexer() and cache_context.index_head_dim > 0:
@@ -589,9 +606,53 @@ class ModelRunner:
                     )
                     module.hisparse_v_cache = torch.empty_like(module.hisparse_k_cache)
             else:
-                if not self.config.dummy_prefill:
+                if self.config.ctrl_address:
+                    if cache_context.host_kv_cache is None:
+                        raise RuntimeError(
+                            "PD MLA HiSparse requires decode host KV cache; set "
+                            "host_utilization_per_device high enough for cold KV"
+                        )
+                    # Release the provisional full GPU cache before allocating
+                    # the bounded hot tier; retaining both can defeat HiSparse
+                    # precisely when GPU memory is tight.
+                    for module in self.model.modules():
+                        if hasattr(module, "k_cache") and getattr(
+                            module, "use_paged_kv_cache", True
+                        ):
+                            module.k_cache = torch.tensor(
+                                [], device=cache_context.device
+                            )
+                            if hasattr(module, "v_cache"):
+                                module.v_cache = torch.tensor(
+                                    [], device=cache_context.device
+                                )
+                    cache_context.kv_cache = torch.tensor(
+                        [], device=cache_context.device
+                    )
+                    torch.cuda.empty_cache()
+                    hot_cache = initialize_mla_hisparse_cache(
+                        cache_context.host_kv_cache,
+                        max_num_seqs=self.config.max_num_seqs,
+                        device_buffer_size=self.config.hisparse_device_buffer_size,
+                    )
+                    layer_id = 0
+                    for module in self.model.modules():
+                        if hasattr(module, "k_cache") and getattr(
+                            module, "use_paged_kv_cache", True
+                        ):
+                            module.k_cache = hot_cache[0][layer_id]
+                            if hasattr(module, "v_cache"):
+                                module.v_cache = torch.tensor(
+                                    [], device=cache_context.device
+                                )
+                            layer_id += 1
+                    # Drop the full logical GPU MLA allocation. Scheduler block
+                    # IDs continue to name cold host pages; model layers and
+                    # CacheContext now expose only the bounded hot tier.
+                    cache_context.kv_cache = hot_cache
+                elif not self.config.dummy_prefill:
                     raise RuntimeError(
-                        "HiSparse MLA Phase 1 requires dummy_prefill=True"
+                        "HiSparse MLA requires PD host migration or dummy_prefill=True"
                     )
                 with torch.no_grad():
                     cache_context.kv_cache.zero_()
@@ -1075,6 +1136,10 @@ class ModelRunner:
             ctrl_address=config.ctrl_address,
             ctrl_scope=config.ctrl_scope,
             engine_id=engine_id,
+            architecture=(getattr(hf_config, "architectures", None) or [""])[0],
+            enable_hisparse=bool(config.enable_hisparse),
+            max_num_seqs=config.max_num_seqs,
+            hisparse_device_buffer_size=config.hisparse_device_buffer_size,
             reserved_state_bytes=reserved_state_bytes,
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks

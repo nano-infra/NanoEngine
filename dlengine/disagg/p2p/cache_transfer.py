@@ -26,6 +26,7 @@ logger = get_logger("dlengine")
 
 # PeerAgent path: buffer ID for kv_cache registration
 _KV_CACHE_BUFFER_ID = "kv_cache"
+_HISPARSE_COLD_KV_BUFFER_ID = "hisparse_cold_kv"
 
 # Cache TTL for engine_info from NanoCtrl (seconds); inf = never expire.
 _ENGINE_INFO_CACHE_TTL = float("inf")
@@ -73,6 +74,7 @@ def initialize_migration_state(context) -> None:
     context.remote_dsv4_max_slots = {}
     context.remote_dsv4_num_layers_per_ratio = {}
     context._local_mr_handler = None
+    context._local_hisparse_cold_mr_handler = None
     context._local_indexer_mr_handler = None
     context._local_gdn_conv_mr_handler = None
     context._local_gdn_recurrent_mr_handler = None
@@ -151,6 +153,32 @@ class P2PCacheTransfer:
                 f"PeerAgent started: alias={agent_alias}, server={server_url}, "
                 f"kv_cache MR handler={self._local_mr_handler}"
             )
+
+            # Decode-only NSA/MLA HiSparse receives the prefill KV directly
+            # into its CPU cold tier. The normal device MR remains registered
+            # for non-HiSparse migration and for backwards compatibility.
+            from dlengine.context_v2.cache.hisparse import get_hisparse_context
+
+            hisparse_ctx = get_hisparse_context()
+            if (
+                hisparse_ctx.enabled
+                and self.mode == "mla"
+                and self.host_kv_cache is not None
+            ):
+                cold_size = _tensor_storage_span_num_bytes(self.host_kv_cache)
+                self._local_hisparse_cold_mr_handler = (
+                    peer_agent.register_memory_region(
+                        _HISPARSE_COLD_KV_BUFFER_ID,
+                        self.host_kv_cache.data_ptr(),
+                        int(self.host_kv_cache.storage_offset()),
+                        cold_size,
+                    )
+                )
+                logger.info(
+                    "Registered HiSparse host cold KV MR: handler=%s, size=%.2f GiB",
+                    self._local_hisparse_cold_mr_handler,
+                    cold_size / 1024**3,
+                )
 
             # Register GDN states (if allocated)
             if (
@@ -518,6 +546,9 @@ class P2PCacheTransfer:
                     )
                     continue
                 local_mr_handler = self._local_mr_handler
+                use_hisparse_cold = self._local_hisparse_cold_mr_handler is not None
+                if use_hisparse_cold:
+                    local_mr_handler = self._local_hisparse_cold_mr_handler
 
                 # Build KV cache RDMA ops
                 rdma_ops: list[tuple] = []
@@ -528,9 +559,17 @@ class P2PCacheTransfer:
                     remote_block_idx,
                     source_block_idx,
                 ) in enumerate(assign_batch):
-                    local_off = self.layout.local_kv_stride(
-                        kv_idx, layer_idx, source_block_idx
-                    )
+                    if use_hisparse_cold:
+                        cold = self.host_kv_cache
+                        local_off = (
+                            kv_idx * cold.stride(0)
+                            + layer_idx * cold.stride(1)
+                            + source_block_idx * cold.stride(2)
+                        ) * cold.element_size()
+                    else:
+                        local_off = self.layout.local_kv_stride(
+                            kv_idx, layer_idx, source_block_idx
+                        )
                     remote_off = self.layout.remote_kv_stride(
                         kv_idx, layer_idx, remote_block_idx, engine_id
                     )
@@ -791,6 +830,27 @@ class P2PCacheTransfer:
         for v in views:
             engine_id = v.migrate_engine_id
             engine_info = engine_info_map.get(engine_id, {})
+            remote_arch = engine_info.get("architecture")
+            local_arch = getattr(self, "architecture", None)
+            if remote_arch and local_arch and remote_arch != local_arch:
+                raise RuntimeError(
+                    f"PD cache architecture mismatch for {engine_id}: "
+                    f"remote={remote_arch}, local={local_arch}"
+                )
+            remote_block_size = int(
+                engine_info.get("kvcache_block_size", self.block_size)
+            )
+            if remote_block_size != self.block_size:
+                raise RuntimeError(
+                    f"PD cache block-size mismatch for {engine_id}: "
+                    f"remote={remote_block_size}, local={self.block_size}"
+                )
+            remote_sp = int(engine_info.get("attention_sp", v.migrate_group_size))
+            if remote_sp != v.migrate_group_size:
+                raise RuntimeError(
+                    f"PD attention_sp metadata mismatch for {engine_id}: "
+                    f"registered={remote_sp}, migration={v.migrate_group_size}"
+                )
             remote_max_num_seqs = engine_info.get("max_num_seqs", 0)
             remote_gdn_num_slots = engine_info.get("gdn_num_slots", 0)
             # PD + GQA: remember the remote engine's attention_tp so peer
@@ -806,7 +866,7 @@ class P2PCacheTransfer:
                 engine_info.get("num_local_kv_heads", self.num_local_kv_heads)
             )
             if remote_nlkv != self.num_local_kv_heads:
-                logger.error(
+                raise RuntimeError(
                     f"KV-head shard mismatch for engine {engine_id}: "
                     f"remote num_local_kv_heads={remote_nlkv}, "
                     f"local={self.num_local_kv_heads}. PD KV migration requires "

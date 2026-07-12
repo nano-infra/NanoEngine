@@ -61,7 +61,7 @@ def get_mla_block_bytes(context) -> int:
         context._fp8_head_dim = nope_bytes + scale_bytes + rope_bytes
         return (
             context.num_hidden_layers
-            * context.block_size
+            * (context.block_size + 1)
             * 1  # num_kv_heads
             * context._fp8_head_dim
             * 1  # fp8 element size
