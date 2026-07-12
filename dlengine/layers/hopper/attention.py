@@ -722,16 +722,26 @@ class HopperAttention(AttentionBase):
         k: torch.Tensor,
         v: torch.Tensor,
         sparse_indices: torch.Tensor | None = None,
+        write_kv_cache: bool = True,
     ):
         """forward."""
+        kwargs = {
+            "sparse_indices": sparse_indices,
+            "write_kv_cache": write_kv_cache,
+        }
+        # Hot GQA caches are a FlashAttention/HiSparse detail. Passing them to
+        # FlashMLAImpl breaks MLA graph capture because its forward signature
+        # intentionally has no hot-cache arguments.
+        if isinstance(self.impl, FlashAttentionImpl):
+            kwargs.update(
+                hot_k_cache=self.hisparse_k_cache,
+                hot_v_cache=self.hisparse_v_cache,
+            )
         return self.impl.forward(
             q,
             k,
             v,
             self.k_cache,
             self.v_cache,
-            sparse_indices=sparse_indices,
-            hot_k_cache=self.hisparse_k_cache,
-            hot_v_cache=self.hisparse_v_cache,
-            write_kv_cache=write_kv_cache,
+            **kwargs,
         )
