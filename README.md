@@ -145,8 +145,7 @@ Batch generation without HTTP serving.
 ```bash
 python examples/non_disagg.py \
     --model /models/Qwen3-235B-A22B \
-    --ray_address <node0-ip>:7078 \
-    --master_address <node0-ip>:6006 \
+    --ray_address auto \
     --attention_dp 8 --ffn_ep 8 \
     --kvcache_block_size 256 \
     --prompt "1+1=?" --max_tokens 128
@@ -168,9 +167,7 @@ python examples/disagg.py \
     --model /models/Qwen3-235B-A22B \
     --ray_address <node0-ip>:7078 \
     --ctrl_address <node0-ip>:4479 \
-    --attention_dp 8 --ffn_ep 8 \
-    --prefill.master_address <node0-ip>:6006 \
-    --decode.master_address <node1-ip>:6006
+    --attention_dp 8 --ffn_ep 8
 ```
 
 ### Single-node serving (`dlengine serve`)
@@ -184,8 +181,7 @@ dlengine-router and no ZMQ engine servers required:
 # Same Config flags as engine_server.py (--host/--port bind HTTP for serve)
 dlengine serve /path/to/model \
   --host 0.0.0.0 --port 8100 \
-  --served-model-name Qwen3-4B \
-  --ray_address 127.0.0.1:7078
+  --served-model-name Qwen3-4B
 ```
 
 Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/completions`,
@@ -282,7 +278,6 @@ python dlengine/server/engine_server.py \
     --ray_address <node0-ip>:7078 \
     --ctrl_address <node0-ip>:4479 \
     --ctrl_scope nanoctrl-0 \
-    --master_address <node1-ip>:6006 \
     --host <node0-ip> --port 6001 \
     --attention_dp 8 --ffn_ep 8 \
     --kvcache_block_size 64 \
@@ -295,7 +290,6 @@ python dlengine/server/engine_server.py \
     --ray_address <node0-ip>:7078 \
     --ctrl_address <node0-ip>:4479 \
     --ctrl_scope nanoctrl-0 \
-    --master_address <node0-ip>:6006 \
     --host <node0-ip> --port 6002 \
     --attention_dp 8 --ffn_ep 8 \
     --kvcache_block_size 64 \

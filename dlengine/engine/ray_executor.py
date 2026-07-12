@@ -126,6 +126,21 @@ class RayExecutor:
 
         logger.info("All workers scheduled successfully.")
 
+    def _init_distributed_workers(self, master_address: str | None = None) -> None:
+        """Discover rank 0's address and initialize every worker together."""
+        if master_address is None:
+            worker_ip, free_port = ray.get(self.workers[0].get_node_info.remote())
+            master_address = f"{worker_ip}:{free_port}"
+            logger.info("Discovered distributed master at %s", master_address)
+        else:
+            logger.info("Using configured distributed master at %s", master_address)
+
+        self.config.master_address = master_address
+        # dist.init_process_group is collective: submit all actor calls before
+        # waiting for any one of them.
+        ray.get([w.init_dist.remote(master_address) for w in self.workers])
+        logger.info("All workers completed distributed init.")
+
     def _init_with_existing_pg(self, pg_id_hex: str):
         """Initialize workers using pre-created placement group from NanoOps.
 
@@ -140,10 +155,8 @@ class RayExecutor:
             f"Scheduling {self.config.attn_world_size} workers using Ray job's placement group"
         )
 
-        # --- Phase 1: create all workers with deferred dist init ----------
-        # The master_address from config points to the Ray head node, but
-        # workers may be on a different node.  We create them with
-        # defer_dist_init=True so they skip dist.init_process_group().
+        # Create every worker first with distributed initialization deferred;
+        # rank 0's actual placement determines the rendezvous address.
         for rank in range(self.config.attn_world_size):
             worker = ModelRunner.remote(
                 self.config,
@@ -153,38 +166,27 @@ class RayExecutor:
             )
             self.workers.append(worker)
 
-        # --- Phase 2: probe worker[0] for actual node IP + free port ------
-        worker_ip, free_port = ray.get(self.workers[0].get_node_info.remote())
-        master_address = f"{worker_ip}:{free_port}"
-        logger.info(
-            f"Probed worker node: master_address = {master_address} "
-            f"(was {self.config.master_address})"
-        )
-        self.config.master_address = master_address
-
-        # --- Phase 3: trigger dist init on ALL workers simultaneously -----
-        # dist.init_process_group is a collective call; all ranks must
-        # enter it together.
-        init_futures = [w.init_dist.remote(master_address) for w in self.workers]
-        ray.get(init_futures)
-        logger.info("All workers completed distributed init.")
+        # The external placement group decides where rank 0 lives, so always
+        # derive the rendezvous endpoint from that worker.
+        self._init_distributed_workers()
 
         # No placement group object to store - managed by Ray job runtime
         self.placement_groups = []
 
     def _init_with_new_pg(self):
         """Initialize workers by creating new placement groups (existing logic)."""
-        # 3. 定义每个节点上要运行的 worker 数量
+        # Define the maximum number of workers packed into one node-sized PG.
         workers_per_node = 8
 
-        # 2. 获取所有节点的 NodeID。每个节点至少要有 master 上所需的空闲 GPU 数
-        # （单节点 PD: prefill/decode 可以共驻同一节点，只要还有空闲卡）。
-        required_on_master = min(self.config.attn_world_size, workers_per_node)
-        nodes = get_available_nodes_with_master_first(
-            self.config.master_address, required_gpus=required_on_master
-        )
-        node_ids = [node["NodeID"] for node in nodes]
-        logger.debug(f"find nodes (NodeIDs): {node_ids}")
+        # A configured master is a legacy node-placement override. With the
+        # default None, PGs carry no node hint and Ray chooses available nodes.
+        node_ids = None
+        if self.config.master_address is not None:
+            required_on_master = min(self.config.attn_world_size, workers_per_node)
+            nodes = get_available_nodes_with_master_first(
+                self.config.master_address, required_gpus=required_on_master
+            )
+            node_ids = [node["NodeID"] for node in nodes]
 
         # When world size exceeds a single node, it must be a multiple of
         # workers_per_node so each node is fully packed.
@@ -201,15 +203,15 @@ class RayExecutor:
         num_nodes_needed = (
             self.config.attn_world_size + workers_per_node - 1
         ) // workers_per_node
-        if num_nodes_needed > len(node_ids):
+        if node_ids is not None and num_nodes_needed > len(node_ids):
             raise ValueError(
                 f"insufficient resources, {num_nodes_needed} on demand，but only find {len(node_ids)} nodes"
             )
 
         # 5. 为每个目标节点创建 Placement Group，并调度相应的 workers
         for node_idx in range(num_nodes_needed):
-            target_node_id = node_ids[node_idx]
-            logger.info(f"--- scheduling node: {target_node_id} ---")
+            target_node_id = node_ids[node_idx] if node_ids is not None else None
+            logger.info("--- scheduling worker group %s ---", node_idx)
 
             start_rank = node_idx * workers_per_node
             end_rank = min(start_rank + workers_per_node, self.config.attn_world_size)
@@ -220,12 +222,14 @@ class RayExecutor:
             # on the same node without colliding on a fixed ``pg-node-<id>`` name.
             # Fall back to the executor's object id if engine_id is unset.
             engine_tag = getattr(self.config, "engine_id", None) or id(self)
-            pg = placement_group(
+            pg_options = dict(
                 bundles=[{"CPU": 0.1, "GPU": 1.0} for _ in range(num_workers_on_node)],
                 strategy="STRICT_PACK",
-                name=f"pg-node-{node_ids[node_idx]}-{engine_tag}",
-                _soft_target_node_id=target_node_id,
+                name=f"pg-workers-{node_idx}-{engine_tag}",
             )
+            if target_node_id is not None:
+                pg_options["_soft_target_node_id"] = target_node_id
+            pg = placement_group(**pg_options)
 
             ray.get(pg.ready())
 
@@ -235,9 +239,12 @@ class RayExecutor:
                 worker = ModelRunner.options(placement_group=pg).remote(
                     self.config,
                     rank,
+                    defer_dist_init=True,
                     debug_env=self.worker_debug_env,
                 )
                 self.workers.append(worker)
+
+        self._init_distributed_workers(self.config.master_address)
 
     def __del__(self):
         if hasattr(self, "workers") and self.workers:
