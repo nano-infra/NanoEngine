@@ -4,11 +4,9 @@ from typing import List, Set, Tuple
 
 import ray
 from dlslime.ctrl import NanoCtrlClient
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from dlengine.config import Config
 from dlengine.engine.llm_engine import LLMEngine
-from dlengine.engine.ray_utils import get_available_nodes_with_master_first
 from dlengine.logging import get_logger
 
 logger = get_logger("dlengine")
@@ -21,27 +19,14 @@ class LLM(LLMEngine):
 
     @classmethod
     def as_remote(cls, config):
-        ray_address = getattr(config, "ray_address", "127.0.0.1:6379")
-        master_address = getattr(config, "master_address", "127.0.0.1:6006")
+        ray_address = getattr(config, "ray_address", "auto")
         ray.init(address=ray_address, ignore_reinit_error=True)
 
         # The LLMComponent actor is only the engine controller; its workers
-        # reserve GPUs later via RayExecutor placement groups. Do not require a
-        # free GPU here, or a colocated prefill/decode pair with GPU
-        # multiplexing can fail before the executor has a chance to request
-        # fractional GPU resources.
-        nodes = get_available_nodes_with_master_first(master_address, required_gpus=0)
-        target_node_id = nodes[0]["NodeID"]
-
-        return (
-            ray.remote(num_cpus=1, num_gpus=0)(cls)
-            .options(
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    node_id=target_node_id, soft=False
-                )
-            )
-            .remote(config)
-        )
+        # reserve GPUs later via RayExecutor placement groups. Let Ray place
+        # this CPU-only controller; it no longer needs to live on a user-chosen
+        # torch distributed master node.
+        return ray.remote(num_cpus=1, num_gpus=0)(cls).remote(config)
 
 
 class LLMComponent(LLM):

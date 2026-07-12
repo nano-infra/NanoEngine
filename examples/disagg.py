@@ -5,12 +5,10 @@ Common config is set at top-level; per-role overrides use
 
 Usage:
     python disagg.py --model /models/deepseek-v3 \\
-        --ray_address <node0-ip>:7078 \\
+        --ray_address auto \\
         --ctrl_address <node0-ip>:4479 \\
         --kvcache_block_size 64 \\
-        --attention_dp 8 --ffn_ep 8 \\
-        --prefill.master_address <node1-ip>:6006 \\
-        --decode.master_address <node0-ip>:6006
+        --attention_dp 8 --ffn_ep 8
 
     python disagg.py --config disagg_config.yaml
 """

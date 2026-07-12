@@ -7,7 +7,7 @@ API (same fields as ZMQ ``engine_server``, but used for uvicorn here)::
     dlengine serve /path/to/model \\
         --host 0.0.0.0 --port 8100 \\
         --served-model-name Qwen3-4B \\
-        --ctrl_address 127.0.0.1:4479 --ray_address 127.0.0.1:7078
+        --ctrl_address 127.0.0.1:4479 --ray_address auto
 
 ``monitor`` writes a Prometheus/Grafana stack with Prometheus on 9090 and
 Grafana on 3000::

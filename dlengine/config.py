@@ -138,8 +138,12 @@ class Config(BaseModel):
     ctrl_address: Optional[str] = None
 
     # dist config
-    master_address: str = "127.0.0.1:6006"
-    ray_address: str = "127.0.0.1:6379"
+    # Ray is the cluster entry point. ``auto`` connects to the local Ray
+    # cluster (or the address in RAY_ADDRESS). The torch distributed rendezvous
+    # address is discovered from rank 0 after Ray has placed the workers.
+    # ``master_address`` remains as an optional legacy override.
+    master_address: Optional[str] = None
+    ray_address: str = "auto"
     executor_backend: Literal["ray", "dlslime"] = "ray"
 
     # MTP (Multi-Token Prediction) speculative decoding
