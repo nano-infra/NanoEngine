@@ -225,7 +225,7 @@ def _store_kcache_fp8_kernel(
         # UE8M0: round up to power of 2
         log2_val = tl.math.log2(scale_inv)
         log2_ceil = tl.math.ceil(log2_val)
-        scale = tl.math.pow2(log2_ceil)
+        scale = tl.exp2(log2_ceil)
 
         quantized = (tile_vals / scale).to(tl.float8e4nv)
 
