@@ -97,10 +97,12 @@ __global__ void load_mla_slot_kernel(const int32_t* __restrict__ logical_indices
     const int32_t src     = indices[row * topk + i];
     const int32_t logical = logical_indices[row * topk + i];
     const bool    valid   = src >= 0 && logical >= 0 && (!short_sequence || logical < seq_len);
+    const bool    current = logical == seq_len - 1;
     if (threadIdx.x == 0) {
-        output[row * topk + i] = src < 0 || logical < 0 || (short_sequence && logical >= seq_len) ?
-                                     -1 :
-                                     static_cast<int32_t>(hot_base + (short_sequence ? logical : i));
+        output[row * topk + i] =
+            src < 0 || logical < 0 || (short_sequence && logical >= seq_len) ?
+                -1 :
+                static_cast<int32_t>(hot_base + (short_sequence ? logical : (current ? hot_capacity : i)));
         if (i == 0) {
             hot_output_slots[row] = static_cast<int32_t>(hot_base + (short_sequence ? seq_len - 1 : hot_capacity));
             if (short_sequence) {
@@ -110,7 +112,7 @@ __global__ void load_mla_slot_kernel(const int32_t* __restrict__ logical_indices
         }
     }
 
-    if (!valid || (short_sequence && (slot_resident[logical] || logical == seq_len - 1)))
+    if (!valid || current || (short_sequence && slot_resident[logical]))
         return;
     const int64_t src_block  = src / block_size;
     const int64_t src_offset = src % block_size;

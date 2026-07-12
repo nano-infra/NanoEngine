@@ -141,6 +141,29 @@ def test_mla_short_context_only_loads_newly_selected_tokens():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MLA HiSparse requires CUDA")
+def test_mla_long_context_maps_current_token_to_output_page():
+    reset_hisparse_context()
+    ctx = initialize_hisparse_context(1, "cuda", 4)
+    ctx.num_real_reqs.fill_(1)
+    cold = torch.arange(8, dtype=torch.float32).reshape(1, 1, 2, 4, 1, 1).pin_memory()
+    hot = initialize_mla_hisparse_cache(cold, max_num_seqs=1, device_buffer_size=4)
+    hot[0, 0, 1, 0] = 77
+
+    remapped, hot_outputs = stage_mla_sparse_indices(
+        0,
+        torch.tensor([[0, 4]], dtype=torch.int32, device="cuda"),
+        torch.tensor([[0, 4]], dtype=torch.int32, device="cuda"),
+        torch.tensor([0], dtype=torch.int64, device="cuda"),
+        torch.tensor([4], dtype=torch.int32, device="cuda"),
+        torch.tensor([5], dtype=torch.int32, device="cuda"),
+    )
+    torch.cuda.synchronize()
+    assert remapped.cpu().tolist() == [[0, 4]]
+    assert hot_outputs.cpu().tolist() == [4]
+    assert hot[0, 0, 1, 0].item() == 77
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="MLA HiSparse requires CUDA")
 def test_mla_slot_loader_is_cuda_graph_capturable():
     reset_hisparse_context()
     ctx = initialize_hisparse_context(1, "cuda", 4)
