@@ -312,24 +312,8 @@ impl Scheduler {
         self.num_waiting_migration_api()
     }
 
-    fn set_session_cache_slots(&mut self, capacity: i32) {
-        self.set_session_cache_slots_api(capacity)
-    }
-
     pub(super) fn set_prefix_caching_enabled(&mut self, enabled: bool) {
         self.set_prefix_caching_enabled_api(enabled)
-    }
-
-    fn num_parked_sessions(&self) -> i32 {
-        self.num_parked_sessions_api()
-    }
-
-    fn parked_session_keys(&self) -> Vec<u64> {
-        self.parked_session_keys_api()
-    }
-
-    fn clear_session_cache(&mut self) {
-        self.clear_session_cache_api()
     }
 
     fn is_finished(&self) -> bool {

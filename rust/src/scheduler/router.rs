@@ -60,7 +60,7 @@ impl Scheduler {
             x if x == RoutingStrategy::LeastCache => {
                 order.sort_by_key(|rank| self.dp_running_tokens(py, *rank));
             }
-            x if x == RoutingStrategy::SessionPrefix => {
+            x if x == RoutingStrategy::Affinity => {
                 order.sort_by_key(|rank| self.dp_running_tokens(py, *rank));
                 if affinity != 0 {
                     if let Some(preferred) = self.cache.session_affinity.get(&affinity).copied() {
@@ -71,9 +71,6 @@ impl Scheduler {
                         }
                         order.retain(|rank| *rank != preferred);
                         order.insert(0, preferred.min(dp.saturating_sub(1)));
-                    } else if let Some(parked) = self.cache.parked_sessions.get(&affinity) {
-                        order.retain(|rank| *rank != parked.dp_idx);
-                        order.insert(0, parked.dp_idx.min(dp.saturating_sub(1)));
                     }
                 }
             }

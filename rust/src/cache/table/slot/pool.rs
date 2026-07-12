@@ -29,19 +29,10 @@ impl SlotPool {
         self.seq_slots.get(&seq_id).copied()
     }
 
-    pub(crate) fn insert_existing(&mut self, seq_id: u64, slot: i32) {
-        self.free_slots.retain(|free| *free != slot);
-        self.seq_slots.insert(seq_id, slot);
-    }
-
     pub(crate) fn remove(&mut self, seq_id: u64) -> Option<i32> {
         let slot = self.seq_slots.remove(&seq_id)?;
         self.release_slot(slot);
         Some(slot)
-    }
-
-    pub(crate) fn take_without_release(&mut self, seq_id: u64) -> Option<i32> {
-        self.seq_slots.remove(&seq_id)
     }
 
     pub(crate) fn release_slot(&mut self, slot: i32) {
@@ -64,16 +55,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ensure_release_and_insert_existing() {
+    fn ensure_release_and_reuse() {
         let mut pool = SlotPool::new(2);
         let a = pool.ensure(10).unwrap();
         assert_eq!(pool.ensure(10), Some(a));
         assert_eq!(pool.remove(10), Some(a));
         let b = pool.ensure(11).unwrap();
         assert_eq!(b, a);
-        pool.insert_existing(12, 1);
-        assert_eq!(pool.get(12), Some(1));
-        assert_eq!(pool.take_without_release(12), Some(1));
-        pool.release_slot(1);
     }
 }

@@ -32,33 +32,15 @@ class Config(BaseModel):
     # worker/rank; 0 disables it.
     host_utilization_per_device: float = 0.0
     routing_strategy: Literal[
-        "RoundRobin", "LeastBatch", "LeastCache", "SessionPrefix"
+        "RoundRobin", "LeastBatch", "LeastCache", "Affinity", "SessionPrefix"
     ] = "RoundRobin"
     # HBM KV prefix cache for attention KV blocks. Enabled by default for
     # attention-only models; GDN/linear-attention cache plans force it off
     # because recurrent state cannot be reused from KV prefix blocks alone.
     enable_prefix_cache: bool = True
 
-    # Session-scoped GatedDeltaNet (linear-attention) state caching. When a
-    # request from a session (affinity_key) finishes, its KV blocks and GDN
-    # recurrent-state slot are PARKED keyed by the session instead of freed; the
-    # next turn from that session reuses them (skip recomputing the shared
-    # prefix). Only effective on linear-attention/hybrid models (which otherwise
-    # cannot do cross-request prefix caching) and with SessionPrefix routing.
-    # This many warm sessions are kept; each costs one GDN state slot plus its
-    # retained KV blocks (evicted LRU under capacity / KV pressure).
-    #
-    # DISABLED BY DEFAULT (0). Correct GDN state continuation requires the next
-    # turn's prompt to be a *token-exact* extension of the parked context
-    # (prompt + generated tokens), because the parked recurrent state covers
-    # exactly that many tokens (a shorter common prefix can't be used — it would
-    # double-process the divergent tail). In practice agent clients like Claude
-    # Code re-render each turn (the assistant generation prompt injects a
-    # transient ``<think>`` that disappears once the turn becomes history, and
-    # tool-result/system-reminder blocks are periodically rewritten), so the
-    # parked context is almost never an exact prefix of the next turn and
-    # adoption rejects. Leave at 0 unless your client appends verbatim
-    # (token-exact, no re-rendering) across turns.
+    # Legacy no-op kept for config compatibility. Session-scoped parked cache
+    # was removed; prefix reuse is now handled by the block hash prefix cache.
     gdn_state_cache_slots: int = 0
 
     # Debug: dump per-request data to a Redis stream (engine-side, so it works

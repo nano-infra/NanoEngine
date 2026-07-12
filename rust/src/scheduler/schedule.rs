@@ -276,9 +276,6 @@ impl Scheduler {
                 (s.seq_id, self.prompt_target(&s), s.num_cached_tokens)
             }
         };
-        if let Some(new_tokens) = self.try_adopt_session(py, seq_id, dp_idx, batch_tokens)? {
-            return Ok(Some(new_tokens));
-        }
         let Some(master) = self.choose_master_group(dp_idx, batch_seqs, batch_tokens) else {
             return Ok(None);
         };

@@ -5,25 +5,8 @@ impl Scheduler {
         self.waiting_migration.len() as i32
     }
 
-    pub(super) fn set_session_cache_slots_api(&mut self, capacity: i32) {
-        self.config.gdn_state_cache_slots = capacity.max(0);
-    }
-
     pub(super) fn set_prefix_caching_enabled_api(&mut self, enabled: bool) {
         self.cache.set_prefix_caching_enabled(enabled);
-    }
-
-    pub(super) fn num_parked_sessions_api(&self) -> i32 {
-        self.cache.num_parked_sessions()
-    }
-
-    pub(super) fn parked_session_keys_api(&self) -> Vec<u64> {
-        self.cache.parked_session_keys()
-    }
-
-    pub(super) fn clear_session_cache_api(&mut self) {
-        let group = self.group();
-        self.cache.clear_session_cache(group);
     }
 
     pub(super) fn is_finished_api(&self) -> bool {

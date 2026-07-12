@@ -343,18 +343,18 @@ class OpenAIServer:
         return [s for s in raw if isinstance(s, str) and s]
 
     # Headers a client/proxy can use to pin a conversation to a DP rank under
-    # the SessionPrefix routing strategy. Checked in order; first non-empty wins.
+    # the Affinity routing strategy. Checked in order; first non-empty wins.
     _SESSION_HEADERS = ("x-session-id", "x-dlengine-session", "anthropic-session-id")
 
     @staticmethod
     def session_affinity_key(request: Any, body: dict) -> int:
-        """Derive a 64-bit session affinity key for SessionPrefix routing.
+        """Derive a 64-bit session affinity key for Affinity routing.
 
         Priority: an explicit session header, then the OpenAI ``user`` field,
         then the Anthropic ``metadata.user_id`` field. Returns 0 ("no explicit
         session") when none is present, in which case the scheduler falls back to
         content-derived cache-aware routing. The key only matters under
-        ``--routing_strategy SessionPrefix``; it is carried on the serialized
+        ``--routing_strategy Affinity``; it is carried on the serialized
         Sequence so it reaches the engine process.
         """
         raw = None
