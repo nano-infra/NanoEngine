@@ -17,11 +17,11 @@ from nanodeploy.engine.sequence import Sequence
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare decode ITL for an 8-GPU DP+EP baseline and the "
-            "LoongServe-style LS-Decode-Core mode."
+            "Compare decode ITL for an 8-GPU DP+EP baseline, a forced "
+            "SP8+EP8 baseline, and the LoongServe-style LS-Decode-Core mode."
         )
     )
-    parser.add_argument("--case", choices=["dp_ep", "ls"], required=True)
+    parser.add_argument("--case", choices=["dp_ep", "sp8_ep", "ls"], required=True)
     parser.add_argument(
         "--model-path",
         default="/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3",
@@ -85,6 +85,7 @@ def summarize(values: list[float]) -> dict[str, float | int]:
 
 def build_engine(args: argparse.Namespace) -> LLM:
     is_ls = args.case == "ls"
+    is_forced_sp8 = args.case == "sp8_ep"
     if is_ls and args.loop_count != 1:
         raise ValueError("LS-Decode-Core requires --loop-count 1")
 
@@ -99,8 +100,9 @@ def build_engine(args: argparse.Namespace) -> LLM:
             args.num_requests * (args.prompt_len + args.max_tokens) + 1024,
         )
 
-    attention_dp = 1 if is_ls else 8
-    attention_sp = 8 if is_ls else 1
+    attention_dp = 1 if (is_ls or is_forced_sp8) else 8
+    attention_sp = 8 if (is_ls or is_forced_sp8) else 1
+    fixed_sp_size = 8 if is_forced_sp8 else 0
 
     return LLM(
         args.model_path,
@@ -126,7 +128,8 @@ def build_engine(args: argparse.Namespace) -> LLM:
         gpu_memory_utilization=args.gpu_memory_utilization,
         scheduler_mode="centralized",
         routing_strategy="RoundRobin",
-        sp_backend="hao_basic" if is_ls else "legacy_ll",
+        fixed_sp_size=fixed_sp_size,
+        sp_backend="hao_basic" if (is_ls or is_forced_sp8) else "legacy_ll",
         enable_ls_decode_core_scheduler=is_ls,
         ls_decode_initial_kv_dop=0,
         ls_decode_batch_per_master=args.ls_batch_per_master,
@@ -210,6 +213,11 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         "prompt_len": args.prompt_len,
         "max_tokens": args.max_tokens,
         "total_prompt_tokens": args.num_requests * args.prompt_len,
+        "attention_dp": 1 if args.case in {"ls", "sp8_ep"} else 8,
+        "attention_sp": 8 if args.case in {"ls", "sp8_ep"} else 1,
+        "ffn_ep": 8,
+        "fixed_sp_size": 8 if args.case == "sp8_ep" else 0,
+        "sp_backend": "hao_basic" if args.case in {"ls", "sp8_ep"} else "legacy_ll",
         "loop_count": args.loop_count,
         "discard_decode_steps": args.discard_decode_steps,
         "max_num_seqs": args.max_num_seqs,
