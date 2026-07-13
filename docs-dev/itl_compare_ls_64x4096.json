@@ -1,0 +1,115 @@
+{
+  "config": {
+    "case": "ls",
+    "model_path": "/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3",
+    "ray_address": "10.102.243.60:8776",
+    "master_address": "10.102.243.60:29681",
+    "num_requests": 64,
+    "prompt_len": 4096,
+    "max_tokens": 6,
+    "total_prompt_tokens": 262144,
+    "loop_count": 1,
+    "discard_decode_steps": 1,
+    "max_num_seqs": 64,
+    "max_num_recv_seqs": 128,
+    "ls_batch_per_master": 8,
+    "gpu_memory_utilization": 0.9
+  },
+  "total_duration_ms": 5670.949959894642,
+  "num_steps": 6,
+  "decode_steps": 5,
+  "all_decode_itl": {
+    "count": 5,
+    "mean_ms": 1133.8690086267889,
+    "median_ms": 324.64273599907756,
+    "p90_ms": 2744.824745226652,
+    "min_ms": 315.8233859576285,
+    "max_ms": 4305.052380077541
+  },
+  "steady_decode_itl": {
+    "count": 4,
+    "mean_ms": 341.07316576410085,
+    "median_ms": 321.9929920742288,
+    "p90_ms": 380.53112586494535,
+    "min_ms": 315.8233859576285,
+    "max_ms": 404.48329295031726
+  },
+  "steps": [
+    {
+      "step_idx": 0,
+      "phase": "prefill",
+      "duration_ms": 1.5053418464958668,
+      "num_tokens_returned": 262208,
+      "batch_size_returned": 64,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 0.4321651067584753,
+      "post_scheduler_latency_ms": 0
+    },
+    {
+      "step_idx": 1,
+      "phase": "decode",
+      "duration_ms": 4305.052380077541,
+      "num_tokens_returned": -64,
+      "batch_size_returned": 64,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 0.627818051725626,
+      "post_scheduler_latency_ms": 0.19493699073791504,
+      "decode_step_idx": 0,
+      "itl_ms": 4305.052380077541
+    },
+    {
+      "step_idx": 2,
+      "phase": "decode",
+      "duration_ms": 404.48329295031726,
+      "num_tokens_returned": -64,
+      "batch_size_returned": 64,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 0.46762311831116676,
+      "post_scheduler_latency_ms": 0.104513019323349,
+      "decode_step_idx": 1,
+      "itl_ms": 404.48329295031726
+    },
+    {
+      "step_idx": 3,
+      "phase": "decode",
+      "duration_ms": 324.64273599907756,
+      "num_tokens_returned": -64,
+      "batch_size_returned": 64,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 0.423553166911006,
+      "post_scheduler_latency_ms": 0.10386086069047451,
+      "decode_step_idx": 2,
+      "itl_ms": 324.64273599907756
+    },
+    {
+      "step_idx": 4,
+      "phase": "decode",
+      "duration_ms": 319.3432481493801,
+      "num_tokens_returned": -64,
+      "batch_size_returned": 64,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 0.39619579911231995,
+      "post_scheduler_latency_ms": 0.0948768574744463,
+      "decode_step_idx": 3,
+      "itl_ms": 319.3432481493801
+    },
+    {
+      "step_idx": 5,
+      "phase": "decode",
+      "duration_ms": 315.8233859576285,
+      "num_tokens_returned": -64,
+      "batch_size_returned": 64,
+      "outputs": 64,
+      "finished_requests": 64,
+      "scheduler_latency_ms": 0.3901619929820299,
+      "post_scheduler_latency_ms": 0.4598749801516533,
+      "decode_step_idx": 4,
+      "itl_ms": 315.8233859576285
+    }
+  ]
+}

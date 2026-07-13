@@ -1,0 +1,115 @@
+{
+  "config": {
+    "case": "dp_ep",
+    "model_path": "/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3",
+    "ray_address": "10.102.243.60:8776",
+    "master_address": "10.102.243.60:29680",
+    "num_requests": 64,
+    "prompt_len": 4096,
+    "max_tokens": 6,
+    "total_prompt_tokens": 262144,
+    "loop_count": 1,
+    "discard_decode_steps": 1,
+    "max_num_seqs": 64,
+    "max_num_recv_seqs": 128,
+    "ls_batch_per_master": 8,
+    "gpu_memory_utilization": 0.9
+  },
+  "total_duration_ms": 5679.469655035064,
+  "num_steps": 6,
+  "decode_steps": 5,
+  "all_decode_itl": {
+    "count": 5,
+    "mean_ms": 1135.5581670068204,
+    "median_ms": 267.0135051012039,
+    "p90_ms": 2874.439409980551,
+    "min_ms": 263.1720311474055,
+    "max_ms": 4610.874959966168
+  },
+  "steady_decode_itl": {
+    "count": 4,
+    "mean_ms": 266.7289687669836,
+    "median_ms": 266.9788794592023,
+    "p90_ms": 268.9543110318482,
+    "min_ms": 263.1720311474055,
+    "max_ms": 269.7860850021243
+  },
+  "steps": [
+    {
+      "step_idx": 0,
+      "phase": "prefill",
+      "duration_ms": 1.57241802662611,
+      "num_tokens_returned": 262208,
+      "batch_size_returned": 64,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 0.8932710625231266,
+      "post_scheduler_latency_ms": 0
+    },
+    {
+      "step_idx": 1,
+      "phase": "decode",
+      "duration_ms": 4610.874959966168,
+      "num_tokens_returned": -64,
+      "batch_size_returned": 64,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 0.07225503213703632,
+      "post_scheduler_latency_ms": 0.3205889370292425,
+      "decode_step_idx": 0,
+      "itl_ms": 4610.874959966168
+    },
+    {
+      "step_idx": 2,
+      "phase": "decode",
+      "duration_ms": 266.94425381720066,
+      "num_tokens_returned": -64,
+      "batch_size_returned": 64,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 0.12108008377254009,
+      "post_scheduler_latency_ms": 0.08743908256292343,
+      "decode_step_idx": 1,
+      "itl_ms": 266.94425381720066
+    },
+    {
+      "step_idx": 3,
+      "phase": "decode",
+      "duration_ms": 263.1720311474055,
+      "num_tokens_returned": -64,
+      "batch_size_returned": 64,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 0.10907487012445927,
+      "post_scheduler_latency_ms": 0.07016398012638092,
+      "decode_step_idx": 2,
+      "itl_ms": 263.1720311474055
+    },
+    {
+      "step_idx": 4,
+      "phase": "decode",
+      "duration_ms": 269.7860850021243,
+      "num_tokens_returned": -64,
+      "batch_size_returned": 64,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 0.08594896644353867,
+      "post_scheduler_latency_ms": 0.07547414861619473,
+      "decode_step_idx": 3,
+      "itl_ms": 269.7860850021243
+    },
+    {
+      "step_idx": 5,
+      "phase": "decode",
+      "duration_ms": 267.0135051012039,
+      "num_tokens_returned": -64,
+      "batch_size_returned": 64,
+      "outputs": 64,
+      "finished_requests": 64,
+      "scheduler_latency_ms": 0.08862093091011047,
+      "post_scheduler_latency_ms": 0.14583882875740528,
+      "decode_step_idx": 4,
+      "itl_ms": 267.0135051012039
+    }
+  ]
+}
