@@ -59,6 +59,10 @@ class Scheduler(_CppScheduler):
             config.sp_master_selector,
             config.sp_debug,
             config.fixed_sp_size,
+            config.enable_ls_decode_core_scheduler,
+            config.ls_decode_initial_kv_dop,
+            config.ls_decode_batch_per_master,
+            config.ls_decode_enable_memory_scale_up,
             config.scheduler_mode
         )
         # Store config for compatibility

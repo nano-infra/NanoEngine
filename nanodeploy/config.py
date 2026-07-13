@@ -131,8 +131,21 @@ class Config:
     # 0 keeps the segment-size / dynamic-SP scheduling behavior.
     fixed_sp_size: int = 0
 
+    # LoongServe-style Decode-only multi-master scheduler.
+    enable_ls_decode_core_scheduler: bool = False
+    # 0 selects the smallest feasible admission-time KV DoP automatically.
+    ls_decode_initial_kv_dop: int = 0
+    ls_decode_batch_per_master: int = 64
+    ls_decode_enable_memory_scale_up: bool = True
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
+        if not 0 <= self.ls_decode_initial_kv_dop <= self.attention_sp:
+            raise ValueError(
+                "ls_decode_initial_kv_dop must be in [0, attention_sp]"
+            )
+        if self.ls_decode_batch_per_master <= 0:
+            raise ValueError("ls_decode_batch_per_master must be > 0")
         if self.fixed_sp_size < 0:
             raise ValueError("fixed_sp_size must be >= 0")
         if self.fixed_sp_size > self.attention_sp:
@@ -209,6 +222,51 @@ class Config:
                 "and must not be combined with "
                 "use_new_decode_dynamic_sp_scheduler=True"
             )
+        if self.enable_ls_decode_core_scheduler:
+            unsupported = []
+            if self.mode != "decode":
+                unsupported.append("mode must be 'decode'")
+            if self.dummy_prefill is not True:
+                unsupported.append("dummy_prefill must be True")
+            if self.scheduler_mode != "centralized":
+                unsupported.append("scheduler_mode must be 'centralized'")
+            if self.loop_count != 1:
+                unsupported.append("loop_count must be 1")
+            if (
+                self.attention_dp,
+                self.attention_sp,
+                self.attention_tp,
+                self.ffn_ep,
+                self.ffn_dp,
+                self.ffn_tp,
+            ) != (4, 8, 1, 32, 1, 1):
+                unsupported.append(
+                    "parallel topology must be attention_dp=4, attention_sp=8, "
+                    "attention_tp=1, ffn_ep=32, ffn_dp=1, ffn_tp=1"
+                )
+            if not self.use_dlslime_rpc:
+                unsupported.append("use_dlslime_rpc must be True")
+            if self.sp_backend != "hao_basic":
+                unsupported.append("sp_backend must be 'hao_basic'")
+            if self.fixed_sp_size != 0:
+                unsupported.append("fixed_sp_size must be 0")
+            if self.enable_dynamic_sp_size:
+                unsupported.append("enable_dynamic_sp_size must be False")
+            if self.dynamic_sp_size_strategy != "legacy":
+                unsupported.append("dynamic_sp_size_strategy must be 'legacy'")
+            if self.use_new_decode_dynamic_sp_scheduler:
+                unsupported.append(
+                    "use_new_decode_dynamic_sp_scheduler must be False"
+                )
+            if self.enable_non_uniform_split:
+                unsupported.append("enable_non_uniform_split must be False")
+            if self.sp_debug:
+                unsupported.append("sp_debug must be False")
+            if unsupported:
+                raise ValueError(
+                    "LS-Decode-Core unsupported configuration: "
+                    + "; ".join(unsupported)
+                )
         hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         if self.cuda_graph_mode not in {"full", "piecewise"}:
             raise ValueError("cuda_graph_mode must be one of: full, piecewise")
@@ -239,6 +297,13 @@ class Config:
             config_dict.pop("model_type", None)
             hf_config = AutoConfig.for_model(std_model_type, **config_dict)
         self.hf_config = hf_config
+        if (
+            self.enable_ls_decode_core_scheduler
+            and self.hf_config.architectures[0] != "DeepseekV3ForCausalLM"
+        ):
+            raise ValueError(
+                "LS-Decode-Core only supports the DeepseekV3ForCausalLM model family"
+            )
         if (
             self.cuda_graph_mode == "piecewise"
             and self.hf_config.architectures[0] != "DeepseekV3ForCausalLM"
