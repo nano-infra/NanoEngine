@@ -26,7 +26,11 @@ public:
     // Block allocation and deallocation
     bool can_allocate(Sequence& seq) const;
     void allocate(Sequence& seq, int token_idx_from = -1, int token_idx_to = -1);
+    // LS-Decode-Core dummy admission deliberately bypasses prefix reuse so
+    // logical placement and physical capacity accounting remain identical.
+    void allocate_uncached(Sequence& seq);
     void deallocate(Sequence& seq, BlockContextSlot slot);
+    void trim_blocks_to_token_count(Sequence& seq, BlockContextSlot slot, int token_count);
 
     // Append related
     bool can_append(Sequence& seq, int num_tokens = 1) const;

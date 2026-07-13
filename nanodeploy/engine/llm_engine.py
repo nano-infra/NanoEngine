@@ -163,12 +163,23 @@ class LLMEngine:
                 for dp_idx, seqs in enumerate(dp_seqs):
                     for seq in seqs:
                         if not self.scheduler.worker_state[dp_idx].may_append(seq, 1):
+                            if self.config.enable_ls_decode_core_scheduler:
+                                raise RuntimeError(
+                                    "validated LS admission lost its provisional "
+                                    f"pending-token capacity for sequence {seq.seq_id}"
+                                )
                             logger.error(
                                 "Failed to allocate block for sequence %s during dummy prefill; skipping token append.",
                                 getattr(seq, "seq_id", "<unknown>"),
                             )
                             continue
                         seq.append_token(0, BlockContextSlot.ACTIVE)
+                        if self.config.enable_ls_decode_core_scheduler:
+                            seq.mark_last_token_pending(BlockContextSlot.ACTIVE)
+                            self.scheduler.worker_state[dp_idx].add_running_tokens(
+                                seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx,
+                                1,
+                            )
                 for seqs in dp_seqs:
                     for seq in seqs:
                         if seq.metric and seq.metric.num_generated_tokens == 0:
@@ -185,6 +196,66 @@ class LLMEngine:
                 step_duration_ms, self.config.loop_count
             )
             post_sch_end = time.perf_counter()
+
+        if self.config.enable_ls_decode_core_scheduler:
+            if is_prefill and sch_res.ls_initial_batch_ids:
+                logger.info(
+                    {
+                        "mode": "ls_decode_admission",
+                        "batch_ids": sch_res.ls_initial_batch_ids,
+                        "group_ids": sch_res.ls_initial_group_ids,
+                        "sequence_ids": sch_res.ls_initial_sequence_ids,
+                        "initial_kv_dops": sch_res.ls_initial_kv_dops,
+                        "initial_kv_ranks": sch_res.ls_initial_kv_ranks,
+                        "prompt_kv_tokens": sch_res.ls_initial_prompt_kv_tokens,
+                        "provisional_pending_targets": (
+                            sch_res.ls_initial_provisional_pending_targets
+                        ),
+                        "placement_strategy": "batch_uniform",
+                        "block_size": self.config.kvcache_block_size,
+                    }
+                )
+            elif not is_prefill and (
+                sch_res.ls_group_ids or sch_res.ls_preempted_sequence_ids
+            ):
+                logger.info(
+                    {
+                        "mode": "ls_decode_iteration",
+                        "group_ids": sch_res.ls_group_ids,
+                        "group_dp_indices": sch_res.ls_group_dp_indices,
+                        "real_batch_sizes": sch_res.ls_real_batch_sizes,
+                        "master_dops": sch_res.ls_master_dops,
+                        "kv_dops": sch_res.ls_kv_dops,
+                        "master_ranks": sch_res.ls_master_ranks,
+                        "master_batch_sizes": sch_res.ls_master_batch_sizes,
+                        "rank_allocations": sch_res.ls_group_rank_allocations,
+                        "iteration_sequence_ids": sch_res.ls_iteration_sequence_ids,
+                        "iteration_master_assignments": (
+                            sch_res.ls_iteration_master_assignments
+                        ),
+                        "group_used_kv_tokens": sch_res.ls_group_used_kv_tokens,
+                        "group_used_kv_blocks": sch_res.ls_group_used_kv_blocks,
+                        "pending_append_blocks_per_master": (
+                            sch_res.ls_pending_append_blocks_per_master
+                        ),
+                        "scale_reasons": sch_res.ls_scale_reasons,
+                        "new_master_ranks": sch_res.ls_new_master_ranks,
+                        "reused_passive_master_ranks": (
+                            sch_res.ls_reused_passive_master_ranks
+                        ),
+                        "source_greedy_target_chunks": (
+                            sch_res.ls_master_batch_sizes
+                        ),
+                        "historical_kv_migration_bytes": (
+                            sch_res.ls_historical_kv_migration_bytes
+                        ),
+                        "preempted_sequence_ids": sch_res.ls_preempted_sequence_ids,
+                        "preemption_reasons": sch_res.ls_preemption_reasons,
+                        "planning_latency_ms": sch_res.ls_planning_latency_ms,
+                        "model_runner_duration_ms": model_runner_duration_ms,
+                        "step_itl_ms": step_duration_ms,
+                    }
+                )
         outputs = []
         num_tokens = 0
 

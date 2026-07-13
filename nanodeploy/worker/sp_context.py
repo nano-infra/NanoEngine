@@ -98,7 +98,7 @@ def set_sp_context(
     rank: int,
     sp_size: int,
     backend: SPBackend = "legacy_ll",
-):
+) -> SPContext:
     global _SP_CONTEXT
     _SP_CONTEXT = SPContext(
         max_num_seqs=max_num_seqs,
@@ -109,6 +109,7 @@ def set_sp_context(
         sp_size=sp_size,
         backend=backend,
     )
+    return _SP_CONTEXT
 
 
 def reset_sp_context():

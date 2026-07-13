@@ -53,6 +53,17 @@ def main():
     parser.add_argument("--profiler-dir", type=str, default="./profiler_logs")
     parser.add_argument("--profiler-start-time", type=float, default=None)
     parser.add_argument("--profiling-duration", type=float, default=None)
+    parser.add_argument("--enable-ls-decode-core-scheduler", action="store_true")
+    parser.add_argument("--ls-decode-initial-kv-dop", type=int, default=0)
+    parser.add_argument("--ls-decode-batch-per-master", type=int, default=64)
+    parser.add_argument(
+        "--disable-ls-decode-memory-scale-up", action="store_true"
+    )
+    parser.add_argument(
+        "--sp-backend",
+        choices=["legacy_ll", "hao_basic", "nccl", "nccl_compact"],
+        default="legacy_ll",
+    )
     args = parser.parse_args()
     path = os.path.expanduser(args.model_path)
 
@@ -87,9 +98,24 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         scheduler_mode=args.scheduler_mode,
         routing_strategy=args.routing_strategy,
+        sp_backend=(
+            "hao_basic"
+            if args.enable_ls_decode_core_scheduler
+            else args.sp_backend
+        ),
+        enable_ls_decode_core_scheduler=args.enable_ls_decode_core_scheduler,
+        ls_decode_initial_kv_dop=args.ls_decode_initial_kv_dop,
+        ls_decode_batch_per_master=args.ls_decode_batch_per_master,
+        ls_decode_enable_memory_scale_up=(
+            not args.disable_ls_decode_memory_scale_up
+        ),
     )
     
-    print(f"Starting with scheduler_mode={args.scheduler_mode}, routing_strategy={args.routing_strategy}")
+    print(
+        f"Starting with scheduler_mode={args.scheduler_mode}, "
+        f"routing_strategy={args.routing_strategy}, "
+        f"ls_decode_core={args.enable_ls_decode_core_scheduler}"
+    )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=args.max_tokens, ignore_eos=True)
 

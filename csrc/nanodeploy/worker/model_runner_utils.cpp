@@ -164,24 +164,18 @@ prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size
     return meta;
 }
 
-DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
-                                  int                           sp_rank,
-                                  int                           sp_size,
-                                  int                           block_size,
-                                  int                           max_num_seqs)
+DecodeMetadata
+prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs)
 {
     DecodeMetadata meta;
 
     for (auto* seq : dp_seqs) {
-        const auto& dispatched = seq->block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens;
-        int         active_ranks = 0;
-        for (int idx = 0; idx < std::min(sp_size, (int)dispatched.size()); ++idx) {
-            if (dispatched[idx] > 0) {
-                active_ranks++;
-                if (active_ranks > 1) {
-                    meta.use_sp_a2a = true;
-                    break;
-                }
+        const auto& block_ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
+        int         master    = block_ctx.master_sp_idx_;
+        for (int idx = 0; idx < std::min(sp_size, (int)block_ctx.num_dispatched_tokens.size()); ++idx) {
+            if (idx != master && seq->committed_context_len(BlockContextSlot::ACTIVE, idx) > 0) {
+                meta.use_sp_a2a = true;
+                break;
             }
         }
         if (meta.use_sp_a2a) {
@@ -210,11 +204,19 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
         }
     }
 
+    // Native hao_basic writes each source rank into a fixed segment on every
+    // destination. Segment boundaries must depend only on source master batch
+    // sizes, so all SP ranks derive exactly the same offsets.
+    meta.q_native_offsets.resize(sp_size + 1, 0);
+    for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
+        meta.q_native_offsets[sp_idx + 1] = meta.q_native_offsets[sp_idx] + static_cast<int>(sp_seqs[sp_idx].size());
+    }
+
     // 2. Prepare context_lens, global_context_lens
     meta.context_lens_flat.assign(sp_size * max_num_seqs, 0);
     meta.global_context_lens_flat.assign(sp_size * max_num_seqs, 0);
 
-    // Used internally to calculate q_slice_fill and q_offsets
+    // Used internally to calculate compact attention/result positions.
     std::vector<int> sp_valid_request_counts(sp_size, 0);
 
     // context_lens
@@ -257,6 +259,7 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
             int ctx_len = batch_seqs[seq_id]->context_len(BlockContextSlot::ACTIVE, sp_rank);
             if (ctx_len > 0) {
                 meta.context_lens_for_attn.push_back(ctx_len);
+                meta.q_native_gather_indices.push_back(meta.q_native_offsets[sp_idx] + seq_id);
             }
         }
     }
@@ -269,26 +272,39 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
         int ctx_len = my_sp_seqs[seq_id]->context_len(BlockContextSlot::ACTIVE, sp_rank);
         if (ctx_len > 0) {
             meta.q_slice_get.push_back(seq_id);
+            meta.q_native_slice_fill.push_back(meta.q_native_offsets[sp_rank] + seq_id);
         }
     }
 
-    // q_slice_fill
+    // Receiver-local compact positions used by legacy/NCCL backends.
     int current_pos = 0;
-    for (int sp_idx = 0; sp_idx < sp_size; ++sp_idx) {
-        if (sp_idx == sp_rank) {
-            for (size_t k = 0; k < meta.q_slice_get.size(); ++k) {
-                meta.q_slice_fill.push_back(current_pos + k);
+    for (int source = 0; source < sp_size; ++source) {
+        if (source == sp_rank) {
+            for (size_t idx = 0; idx < meta.q_slice_get.size(); ++idx) {
+                meta.q_slice_fill.push_back(current_pos + static_cast<int>(idx));
             }
         }
-        current_pos += sp_valid_request_counts[sp_idx];
+        current_pos += sp_valid_request_counts[source];
     }
 
     // q_copy_mask
     meta.q_copy_mask.assign(meta.q_slice_get.size(), 1);
 
-    // res_slice_get_to_buffer_output (same logic as q_slice_fill logic for sp_rank in python code)
-    // In python: res_slice_get_to_buffer_output = q_slice_fill.copy()
-    meta.res_slice_get_to_buffer_output = meta.q_slice_fill;
+    // Attention consumes Q after q_gather_indices compacts the native buffer,
+    // so result source indices use compact rather than physical Q positions.
+    int compact_pos = 0;
+    for (int source = 0; source < sp_size; ++source) {
+        const auto& batch_seqs = sp_seqs[source];
+        for (int seq_id = 0; seq_id < (int)batch_seqs.size(); ++seq_id) {
+            if (batch_seqs[seq_id]->context_len(BlockContextSlot::ACTIVE, sp_rank) <= 0) {
+                continue;
+            }
+            if (source == sp_rank) {
+                meta.res_slice_get_to_buffer_output.push_back(compact_pos);
+            }
+            compact_pos++;
+        }
+    }
 
     // res_slice_fill_to_buffer_output
     for (int seq_index : meta.q_slice_get) {
@@ -320,11 +336,10 @@ DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
     // res_to_buffer_input_mask
     meta.res_to_buffer_input_mask.assign(meta.res_slice_get_to_buffer_input.size(), 1);
 
-    // q_offsets (cumsum of sp_valid_request_counts)
-    meta.q_offsets.resize(sp_size + 1);
-    meta.q_offsets[0] = 0;
-    for (int i = 0; i < sp_size; ++i) {
-        meta.q_offsets[i + 1] = meta.q_offsets[i] + sp_valid_request_counts[i];
+    // Receiver-local offsets remain the contract for non-native backends.
+    meta.q_offsets.resize(sp_size + 1, 0);
+    for (int source = 0; source < sp_size; ++source) {
+        meta.q_offsets[source + 1] = meta.q_offsets[source] + sp_valid_request_counts[source];
     }
 
     return meta;

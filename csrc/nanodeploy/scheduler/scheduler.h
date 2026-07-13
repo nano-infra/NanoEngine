@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -76,6 +77,57 @@ struct ScheduleResult {
     // Metrics for waiting queue blocks (per DP worker)
     std::vector<int> waiting_head_blocks;
     std::vector<int> waiting_total_blocks;
+
+    // LS-Decode-Core admission records (one entry per batch admitted in this
+    // scheduler step).
+    std::vector<uint64_t>                      ls_initial_batch_ids;
+    std::vector<uint64_t>                      ls_initial_group_ids;
+    std::vector<int>                           ls_initial_kv_dops;
+    std::vector<std::vector<int>>              ls_initial_kv_ranks;
+    std::vector<std::vector<uint64_t>>         ls_initial_sequence_ids;
+    std::vector<std::vector<std::vector<int>>> ls_initial_prompt_kv_tokens;
+    std::vector<std::vector<int>>              ls_initial_provisional_pending_targets;
+
+    // LS-Decode-Core per-iteration group records.
+    std::vector<uint64_t>              ls_group_ids;
+    std::vector<int>                   ls_group_dp_indices;
+    std::vector<int>                   ls_real_batch_sizes;
+    std::vector<int>                   ls_master_dops;
+    std::vector<int>                   ls_kv_dops;
+    std::vector<std::vector<int>>      ls_master_ranks;
+    std::vector<std::vector<int>>      ls_master_batch_sizes;
+    std::vector<std::vector<int>>      ls_group_rank_allocations;
+    std::vector<std::vector<int>>      ls_group_used_kv_tokens;
+    std::vector<std::vector<int>>      ls_group_used_kv_blocks;
+    std::vector<std::vector<uint64_t>> ls_iteration_sequence_ids;
+    std::vector<std::vector<int>>      ls_iteration_master_assignments;
+    std::vector<std::vector<int>>      ls_pending_append_blocks_per_master;
+    std::vector<std::vector<int>>      ls_new_master_ranks;
+    std::vector<std::vector<int>>      ls_reused_passive_master_ranks;
+    std::vector<std::string>           ls_scale_reasons;
+    std::vector<int64_t>               ls_historical_kv_migration_bytes;
+    std::vector<uint64_t>              ls_preempted_sequence_ids;
+    std::vector<std::string>           ls_preemption_reasons;
+    double                             ls_planning_latency_ms = 0.0;
+};
+
+struct InitialBatchPlacement {
+    uint64_t                      batch_id = 0;
+    uint64_t                      group_id = 0;
+    std::vector<uint64_t>         sequence_ids;
+    int                           initial_kv_dop = 0;
+    std::vector<int>              initial_kv_ranks;
+    std::vector<std::vector<int>> prompt_kv_tokens;
+    std::vector<int>              provisional_pending_targets;
+};
+
+struct DecodeGroupState {
+    uint64_t                               group_id = 0;
+    int                                    dp_idx   = -1;
+    std::vector<std::shared_ptr<Sequence>> sequences;
+    std::vector<InitialBatchPlacement>     initial_batch_placements;
+    std::vector<int>                       allocated_attention_ranks;
+    std::vector<int>                       last_iteration_masters;
 };
 
 class Scheduler {
@@ -115,7 +167,11 @@ public:
               const std::string& sp_master_selector,
               bool               sp_debug,
               int                fixed_sp_size,
-              const std::string& scheduler_mode = "centralized");
+              bool               enable_ls_decode_core_scheduler  = false,
+              int                ls_decode_initial_kv_dop         = 0,
+              int                ls_decode_batch_per_master       = 64,
+              bool               ls_decode_enable_memory_scale_up = true,
+              const std::string& scheduler_mode                   = "centralized");
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -132,7 +188,7 @@ public:
 
     // State queries
     bool is_finished() const;
-    
+
     // Get total waiting queue sizes (for metrics/logging)
     int get_total_waiting_size() const;
     int get_total_waiting_migration_size() const;
@@ -165,13 +221,25 @@ private:
     // Internal scheduling logic
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
+    std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_ls_decode_admission();
+    std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_ls_decode();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode_prefill_latency_aware();
-    
+    std::optional<std::pair<std::vector<int>, std::vector<std::vector<int>>>>
+                     _plan_ls_initial_placement(int                                           dp_idx,
+                                                const std::vector<std::shared_ptr<Sequence>>& batch,
+                                                const std::vector<int>&                       rank_pool,
+                                                const std::vector<std::shared_ptr<Sequence>>& existing_sequences = {},
+                                                const std::vector<int>&                       base_allocation = {}) const;
+    std::vector<int> _ls_unallocated_ranks(int dp_idx, std::optional<uint64_t> excluding_group = std::nullopt) const;
+    void             _merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id);
+    void             _remove_seq_from_ls_group(uint64_t seq_id);
+    void             _reconcile_ls_groups();
+
     // Decentralized scheduling logic
-    ScheduleResult _schedule_decentralized();
+    ScheduleResult                         _schedule_decentralized();
     std::vector<std::shared_ptr<Sequence>> _schedule_prefill_for_worker(int dp_idx);
     std::vector<std::shared_ptr<Sequence>> _schedule_decode_for_worker(int dp_idx);
-    
+
     // Routing function for decentralized mode
     int select_dp_worker_for_routing(Sequence& seq);
 
@@ -197,14 +265,31 @@ private:
     int         dynamic_sp_long_request_size_;
     bool        enable_non_uniform_split_;
     bool        sp_debug_;
+    bool        enable_ls_decode_core_scheduler_;
+    int         ls_decode_initial_kv_dop_;
+    int         ls_decode_batch_per_master_;
+    bool        ls_decode_enable_memory_scale_up_;
 
     std::string sp_master_selector_;
-    
+
     SchedulerMode scheduler_mode_ = SchedulerMode::CENTRALIZED;
 
     int dp_rr_counter_ = 0;
 
     std::unique_ptr<ThreadPool> thread_pool_;
+
+    uint64_t                                        next_ls_group_id_ = 0;
+    uint64_t                                        next_ls_batch_id_ = 0;
+    std::unordered_map<uint64_t, DecodeGroupState>  ls_groups_;
+    std::vector<std::vector<uint64_t>>              ls_group_ids_by_dp_;
+    std::unordered_map<uint64_t, uint64_t>          ls_seq_to_group_;
+    std::vector<InitialBatchPlacement>              ls_step_initial_records_;
+    std::vector<SPStateManager::LSDecodeMasterPlan> ls_step_group_plans_;
+    std::vector<uint64_t>                           ls_step_group_plan_ids_;
+    std::vector<std::vector<int>>                   ls_step_reused_passive_masters_;
+    std::vector<uint64_t>                           ls_step_preempted_sequence_ids_;
+    std::vector<std::string>                        ls_step_preemption_reasons_;
+    double                                          ls_step_planning_latency_ms_ = 0.0;
 };
 
 }  // namespace nanodeploy

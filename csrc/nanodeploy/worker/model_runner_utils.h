@@ -53,16 +53,18 @@ struct DecodeMetadata {
 
     std::vector<int> q_output_stride;
     std::vector<int> q_offsets;
+    // Native hao_basic uses DP-wide source segments rather than the
+    // receiver-local compact offsets used by the other SP backends.
+    std::vector<int> q_native_offsets;
+    std::vector<int> q_native_slice_fill;
+    std::vector<int> q_native_gather_indices;
 };
 
 PrefillMetadata
 prepare_prefill_cpp(const std::vector<Sequence*>& seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs);
 
-DecodeMetadata prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs,
-                                  int                           sp_rank,
-                                  int                           sp_size,
-                                  int                           block_size,
-                                  int                           max_num_seqs);
+DecodeMetadata
+prepare_decode_cpp(const std::vector<Sequence*>& dp_seqs, int sp_rank, int sp_size, int block_size, int max_num_seqs);
 
 void update_seqs_inner_loop(const std::vector<Sequence*>& sp_seqs, int sp_rank);
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from functools import lru_cache
 from typing import Literal, Protocol, runtime_checkable
 
@@ -81,6 +82,17 @@ def _maybe_get_local_buffer(buffer) -> torch.Tensor | None:
     return None
 
 
+def _callable_accepts_offsets(fn) -> bool:
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return "offsets" in (getattr(fn, "__doc__", "") or "")
+    return "offsets" in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
 class LegacyIntraLLBufferAdapter:
     def __init__(
         self,
@@ -147,6 +159,10 @@ class HaoAllToAllBufferAdapter:
         self._kernel_impl = kernel_impl.Basic
         self._native_local_buffer = _maybe_get_local_buffer(self._buffer)
         self._compat_mode = self._native_local_buffer is None
+        self._supports_native_q_offsets = (
+            not self._compat_mode
+            and _callable_accepts_offsets(self._buffer.all_to_all)
+        )
         self._non_transpose_input_scratch: torch.Tensor | None = None
 
         if self._native_local_buffer is None:
@@ -164,6 +180,10 @@ class HaoAllToAllBufferAdapter:
         assert self._staging_local_buffer is not None
         return self._staging_local_buffer
 
+    @property
+    def supports_native_q_offsets(self) -> bool:
+        return self._supports_native_q_offsets
+
     def connect_full_mesh(self, group: dist.ProcessGroup) -> None:
         my_handle_info = self._buffer.get_ipc_handle_info()
         all_handle_infos = [None for _ in range(_group_size(group))]
@@ -177,9 +197,10 @@ class HaoAllToAllBufferAdapter:
         mask: torch.Tensor | None = None,
         offsets: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if offsets is not None and self._compat_mode:
+        if offsets is not None and not self._supports_native_q_offsets:
             raise NotImplementedError(
-                "hao_basic offsets require a native DLSlime build; compat mode is unsupported."
+                "hao_basic offsets require a native DLSlime all_to_all(offsets=...) API; "
+                "compat mode and native builds without offsets are unsupported."
             )
         if offsets is not None and is_transpose:
             raise NotImplementedError(

@@ -49,6 +49,17 @@ class _FakeNativeHaoBuffer(_FakeCompatHaoBuffer):
         return self._native_local_buffer
 
 
+class _FakeNativeHaoBufferWithoutOffsets(_FakeNativeHaoBuffer):
+    def all_to_all(self, x, impl, is_transpose, mask):
+        return torch.zeros(
+            self.world_size,
+            self.max_bs,
+            x.size(1),
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+
 class _FakeCreatedBuffer:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -95,6 +106,7 @@ def test_hao_adapter_compat_mode_translates_mask_and_transpose(monkeypatch):
         world_size=2,
         buffer_size_bytes=2 * 3 * 2 * torch.tensor([], dtype=torch.float32).element_size(),
     )
+    assert adapter.supports_native_q_offsets is False
 
     x = torch.arange(12, dtype=torch.float32).view(6, 2)
     mask = torch.tensor([[0, 1, 0], [1, 0, 0]], dtype=torch.int32)
@@ -134,6 +146,7 @@ def test_hao_adapter_native_mode_passes_through_semantics(monkeypatch):
         world_size=2,
         buffer_size_bytes=64,
     )
+    assert adapter.supports_native_q_offsets is True
 
     x = torch.arange(6, dtype=torch.float32).view(3, 2)
     mask = torch.tensor([[0, 1, 0], [1, 0, 0]], dtype=torch.int32)
@@ -148,6 +161,34 @@ def test_hao_adapter_native_mode_passes_through_semantics(monkeypatch):
     assert torch.equal(call["mask"], mask)
     assert call["offsets"] is None
     assert output.shape == (2, 3, 2)
+
+
+def test_hao_adapter_rejects_native_build_without_offsets_api(monkeypatch):
+    monkeypatch.setattr(
+        sp_backend,
+        "_resolve_hao_symbols",
+        lambda: (_FakeNativeHaoBufferWithoutOffsets, _FakeKernelImpl),
+    )
+    adapter = sp_backend.HaoAllToAllBufferAdapter(
+        max_dispatch_per_msg=2,
+        max_bs=3,
+        rank=0,
+        world_size=2,
+        buffer_size_bytes=64,
+    )
+
+    assert adapter.supports_native_q_offsets is False
+    with torch.no_grad():
+        try:
+            adapter.all_to_all_ll(
+                torch.zeros(1, 2),
+                mask=torch.zeros(2, 3, dtype=torch.int32),
+                offsets=torch.tensor([0, 1, 1], dtype=torch.int32),
+            )
+        except NotImplementedError as exc:
+            assert "all_to_all(offsets=...)" in str(exc)
+        else:
+            raise AssertionError("Expected a native build without offsets to fail")
 
 
 def test_hao_adapter_native_mode_pads_masked_non_transpose_input(monkeypatch):

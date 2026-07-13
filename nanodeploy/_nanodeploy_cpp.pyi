@@ -4,7 +4,7 @@ NanoDeploy C++ Backend
 from __future__ import annotations
 import collections.abc
 import typing
-__all__: list[str] = ['ACTIVE', 'Block', 'BlockContext', 'BlockContextSlot', 'BlockIdList', 'BlockLocationList', 'BlockManager', 'BlockManagerMap', 'DecodeMetadata', 'DefaultIntDict', 'DefaultListDict', 'FINISHED', 'LeastBatch', 'LeastCache', 'MIGRATE', 'MigrationMap', 'PrefillMetadata', 'RUNNING', 'RoundRobin', 'RoutingStrategy', 'SPStateManager', 'SPStateManagerList', 'SWAP', 'ScheduleResult', 'Scheduler', 'Sequence', 'SequenceDeque', 'SequenceMetric', 'SequenceStatus', 'ServerMetric', 'TO_BE_MIGRATED', 'WAITING', 'deserialize', 'postprocess_sequences', 'prepare_decode_cpp', 'prepare_prefill_cpp', 'serialize', 'update_seqs_inner_loop']
+__all__: list[str] = ['ACTIVE', 'Block', 'BlockContext', 'BlockContextSlot', 'BlockIdList', 'BlockLocationList', 'BlockManager', 'BlockManagerMap', 'DecodeMetadata', 'DefaultIntDict', 'DefaultListDict', 'FINISHED', 'LSDecodeMasterPlan', 'LeastBatch', 'LeastCache', 'MIGRATE', 'MigrationMap', 'PrefillMetadata', 'RUNNING', 'RoundRobin', 'RoutingStrategy', 'SPStateManager', 'SPStateManagerList', 'SWAP', 'ScheduleResult', 'Scheduler', 'Sequence', 'SequenceDeque', 'SequenceMetric', 'SequenceStatus', 'ServerMetric', 'TO_BE_MIGRATED', 'WAITING', 'deserialize', 'postprocess_sequences', 'prepare_decode_cpp', 'prepare_prefill_cpp', 'serialize', 'update_seqs_inner_loop']
 class Block:
     def __init__(self, arg0: typing.SupportsInt) -> None:
         ...
@@ -40,11 +40,11 @@ class BlockContext:
     block_location: BlockLocationList
     engine_id: str
     sp_block_table: DefaultListDict
-    def __getstate__(self) -> tuple[str, int, int, int, int, list[tuple[int, int]], list[list[int]], list[int]]:
+    def __getstate__(self) -> tuple[str, int, int, int, int, bool, int, list[tuple[int, int]], list[list[int]], list[int]]:
         ...
     def __init__(self) -> None:
         ...
-    def __setstate__(self, arg0: tuple[str, typing.SupportsInt, typing.SupportsInt, typing.SupportsInt, typing.SupportsInt, collections.abc.Sequence[tuple[typing.SupportsInt, typing.SupportsInt]], collections.abc.Sequence[collections.abc.Sequence[typing.SupportsInt]], collections.abc.Sequence[typing.SupportsInt]]) -> None:
+    def __setstate__(self, arg0: tuple[str, typing.SupportsInt, typing.SupportsInt, typing.SupportsInt, typing.SupportsInt, bool, typing.SupportsInt, collections.abc.Sequence[tuple[typing.SupportsInt, typing.SupportsInt]], collections.abc.Sequence[collections.abc.Sequence[typing.SupportsInt]], collections.abc.Sequence[typing.SupportsInt]]) -> None:
         ...
     def reset(self, engine_id: str, attention_sp: typing.SupportsInt, attention_dp: typing.SupportsInt) -> None:
         ...
@@ -71,6 +71,18 @@ class BlockContext:
         ...
     @master_sp_idx.setter
     def master_sp_idx(self, arg0: typing.SupportsInt) -> None:
+        ...
+    @property
+    def pending_token_present(self) -> bool:
+        ...
+    @pending_token_present.setter
+    def pending_token_present(self, arg0: bool) -> None:
+        ...
+    @property
+    def pending_token_target_sp(self) -> int:
+        ...
+    @pending_token_target_sp.setter
+    def pending_token_target_sp(self, arg0: typing.SupportsInt) -> None:
         ...
 class BlockContextSlot:
     """
@@ -323,6 +335,8 @@ class BlockManager:
         ...
     def allocate(self, seq: typing.Sequence, token_idx_from: typing.SupportsInt = -1, token_idx_to: typing.SupportsInt = -1) -> None:
         ...
+    def allocate_uncached(self, seq: typing.Sequence) -> None:
+        ...
     def can_allocate(self, arg0: typing.Sequence) -> bool:
         ...
     def can_append(self, seq: typing.Sequence, num_tokens: typing.SupportsInt = 1) -> bool:
@@ -330,6 +344,8 @@ class BlockManager:
     def deallocate(self, arg0: typing.Sequence, arg1: BlockContextSlot) -> None:
         ...
     def may_append(self, seq: typing.Sequence, num_tokens: typing.SupportsInt = 1) -> bool:
+        ...
+    def trim_blocks_to_token_count(self, seq: typing.Sequence, slot: BlockContextSlot, token_count: typing.SupportsInt) -> None:
         ...
     @property
     def blocks(self) -> list[Block]:
@@ -400,6 +416,15 @@ class DecodeMetadata:
         ...
     @property
     def q_offsets(self) -> list[int]:
+        ...
+    @property
+    def q_native_gather_indices(self) -> list[int]:
+        ...
+    @property
+    def q_native_offsets(self) -> list[int]:
+        ...
+    @property
+    def q_native_slice_fill(self) -> list[int]:
         ...
     @property
     def q_slice_fill(self) -> list[int]:
@@ -545,6 +570,19 @@ class RoutingStrategy:
     @property
     def value(self) -> int:
         ...
+class LSDecodeMasterPlan:
+    allocation: list[int]
+    failure_reason: str
+    group_used_kv_blocks: list[int]
+    group_used_kv_tokens: list[int]
+    master_batch_sizes: list[int]
+    master_ranks: list[int]
+    new_allocation_ranks: list[int]
+    scale_reason: str
+    sequence_master_ranks: list[int]
+    success: bool
+    def __init__(self) -> None:
+        ...
 class SPStateManager:
     block_manager: BlockManagerMap
     routing_strategy: RoutingStrategy
@@ -553,13 +591,43 @@ class SPStateManager:
         ...
     def allocate(self, seq: typing.Sequence) -> None:
         ...
+    def allocate_ls_initial(self, seq: typing.Sequence) -> None:
+        ...
+    def add_running_tokens(self, sp_idx: typing.SupportsInt, count: typing.SupportsInt) -> None:
+        ...
     def can_allocate(self, seq: typing.Sequence, num_seqs: DefaultIntDict, num_batched_tokens: DefaultIntDict) -> bool:
         ...
     def can_append(self, seq: typing.Sequence, num_tokens: typing.SupportsInt = 1) -> bool:
         ...
+    def can_append_on_sp(self, seq: typing.Sequence, sp_idx: typing.SupportsInt, num_tokens: typing.SupportsInt = 1) -> bool:
+        ...
     def deallocate(self, seq: typing.Sequence, slot: BlockContextSlot) -> None:
         ...
+    def estimate_pending_append_capacity(self, rank: typing.SupportsInt, requests: collections.abc.Sequence[typing.Sequence], group_sequences: collections.abc.Sequence[typing.Sequence]) -> int:
+        ...
+    def get_active_master_count(self, seqs: collections.abc.Sequence[typing.Sequence]) -> int:
+        ...
+    def get_kv_participant_count(self, seqs: collections.abc.Sequence[typing.Sequence]) -> int:
+        ...
+    def group_used_kv_blocks(self, seqs: collections.abc.Sequence[typing.Sequence]) -> list[int]:
+        ...
+    def group_used_kv_tokens(self, seqs: collections.abc.Sequence[typing.Sequence]) -> list[int]:
+        ...
     def may_append(self, seq: typing.Sequence, num_tokens: typing.SupportsInt = 1) -> bool:
+        ...
+    def may_append_on_sp(self, seq: typing.Sequence, sp_idx: typing.SupportsInt, num_tokens: typing.SupportsInt = 1) -> bool:
+        ...
+    def plan_iteration_masters_source_greedy(self, requests: collections.abc.Sequence[typing.Sequence], allocation: collections.abc.Sequence[typing.SupportsInt], extra_ranks: collections.abc.Sequence[typing.SupportsInt], batch_per_master: typing.SupportsInt, enable_memory_scale_up: bool = True) -> LSDecodeMasterPlan:
+        ...
+    def reassign_pending_append(self, seq: typing.Sequence, target_sp_idx: typing.SupportsInt) -> None:
+        ...
+    def rebuild_decode_role_counters(self) -> None:
+        ...
+    def commit_iteration_master_plan(self, requests: collections.abc.Sequence[typing.Sequence], plan: LSDecodeMasterPlan) -> None:
+        ...
+    def set_decode_master(self, seq: typing.Sequence, master_sp_idx: typing.SupportsInt) -> None:
+        ...
+    def validate_iteration_master_plan(self, requests: collections.abc.Sequence[typing.Sequence], plan: LSDecodeMasterPlan) -> tuple[bool, str]:
         ...
     @property
     def dummy_seqs(self) -> list[typing.Sequence]:
@@ -583,6 +651,33 @@ class SPStateManagerList:
         ...
 class ScheduleResult:
     is_prefill: bool
+    ls_group_dp_indices: list[int]
+    ls_group_ids: list[int]
+    ls_group_rank_allocations: list[list[int]]
+    ls_group_used_kv_blocks: list[list[int]]
+    ls_group_used_kv_tokens: list[list[int]]
+    ls_historical_kv_migration_bytes: list[int]
+    ls_initial_batch_ids: list[int]
+    ls_initial_group_ids: list[int]
+    ls_initial_kv_dops: list[int]
+    ls_initial_kv_ranks: list[list[int]]
+    ls_initial_prompt_kv_tokens: list[list[list[int]]]
+    ls_initial_provisional_pending_targets: list[list[int]]
+    ls_initial_sequence_ids: list[list[int]]
+    ls_iteration_master_assignments: list[list[int]]
+    ls_iteration_sequence_ids: list[list[int]]
+    ls_kv_dops: list[int]
+    ls_master_batch_sizes: list[list[int]]
+    ls_master_dops: list[int]
+    ls_master_ranks: list[list[int]]
+    ls_new_master_ranks: list[list[int]]
+    ls_pending_append_blocks_per_master: list[list[int]]
+    ls_planning_latency_ms: float
+    ls_preempted_sequence_ids: list[int]
+    ls_preemption_reasons: list[str]
+    ls_real_batch_sizes: list[int]
+    ls_reused_passive_master_ranks: list[list[int]]
+    ls_scale_reasons: list[str]
     @property
     def dp_seqs(self) -> list[list[typing.Sequence]]:
         ...
@@ -621,7 +716,7 @@ class Scheduler:
     waiting: SequenceDeque
     waiting_migration: SequenceDeque
     worker_state: SPStateManagerList
-    def __init__(self, engine_id: str, loop_count: typing.SupportsInt, max_num_seqs: typing.SupportsInt, max_num_batched_tokens: typing.SupportsInt, eos: typing.SupportsInt, attention_dp: typing.SupportsInt, attention_sp: typing.SupportsInt, num_kvcache_blocks: typing.SupportsInt, kvcache_block_size: typing.SupportsInt, mode: str) -> None:
+    def __init__(self, *args: typing.Any, **kwargs: typing.Any) -> None:
         ...
     def add(self, seq: typing.Sequence) -> None:
         ...
@@ -668,6 +763,8 @@ class Sequence:
         ...
     def append_token(self: typing.Sequence, token_id: typing.SupportsInt, slot: BlockContextSlot, sp_idx: typing.SupportsInt | None = None) -> None:
         ...
+    def committed_context_len(self: typing.Sequence, slot: BlockContextSlot, sp_idx: typing.SupportsInt) -> int:
+        ...
     def block(self: typing.Sequence, i: typing.SupportsInt, slot: BlockContextSlot, sp_idx: typing.SupportsInt) -> list[int]:
         ...
     def block_ctx(self: typing.Sequence, slot: BlockContextSlot = ...) -> BlockContext:
@@ -683,6 +780,8 @@ class Sequence:
     def last_block_page_id(self: typing.Sequence, slot: BlockContextSlot, sp_idx: typing.SupportsInt) -> int:
         ...
     def migrate(self: typing.Sequence) -> int:
+        ...
+    def mark_last_token_pending(self: typing.Sequence, slot: BlockContextSlot = ..., sp_idx: typing.SupportsInt | None = None) -> None:
         ...
     def num_blocks(self: typing.Sequence, slot: BlockContextSlot, sp_idx: typing.SupportsInt) -> int:
         ...

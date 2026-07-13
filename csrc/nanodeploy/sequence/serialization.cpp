@@ -49,11 +49,7 @@ inline void read_bytes(uintptr_t base, size_t& off, size_t max_size, void* dst, 
 
 // ==================== 对象级逻辑实现 ====================
 
-void serialize_block_context(uintptr_t      base,
-                             size_t&        off,
-                             size_t         max,
-                             const BlockContext& ctx,
-                             int            target_sp_rank = -1)
+void serialize_block_context(uintptr_t base, size_t& off, size_t max, const BlockContext& ctx, int target_sp_rank = -1)
 {
     // String
     size_t s_len = ctx.engine_id_.size();
@@ -65,6 +61,8 @@ void serialize_block_context(uintptr_t      base,
     write_raw(base, off, max, ctx.master_sp_idx_);
     write_raw(base, off, max, ctx.attention_sp_);
     write_raw(base, off, max, ctx.attention_dp_);
+    write_raw(base, off, max, ctx.pending_token_present_);
+    write_raw(base, off, max, ctx.pending_token_target_sp_);
 
     // In decode optimize mode, keep the sequence skeleton intact and only trim
     // per-target heavy fields inside the block context.
@@ -98,9 +96,8 @@ void serialize_block_context(uintptr_t      base,
     size_t table_size = ctx.sp_block_table.size();
     write_raw(base, off, max, table_size);
     for (size_t sp_idx = 0; sp_idx < table_size; ++sp_idx) {
-        const auto& inner = ctx.sp_block_table[sp_idx];
-        size_t      inner_sz =
-            (trim_for_target && static_cast<int>(sp_idx) != target_sp_rank) ? 0 : inner.size();
+        const auto& inner    = ctx.sp_block_table[sp_idx];
+        size_t      inner_sz = (trim_for_target && static_cast<int>(sp_idx) != target_sp_rank) ? 0 : inner.size();
         write_raw(base, off, max, inner_sz);
         write_bytes(base, off, max, inner.data(), inner_sz * sizeof(int));
     }
@@ -112,10 +109,12 @@ void deserialize_block_context(uintptr_t base, size_t& off, size_t max, BlockCon
     ctx.engine_id_.assign(reinterpret_cast<const char*>(base + off), s_len);
     off += s_len;
 
-    ctx.dp_idx_        = read_raw<int>(base, off, max);
-    ctx.master_sp_idx_ = read_raw<int>(base, off, max);
-    ctx.attention_sp_  = read_raw<int>(base, off, max);
-    ctx.attention_dp_  = read_raw<int>(base, off, max);
+    ctx.dp_idx_                  = read_raw<int>(base, off, max);
+    ctx.master_sp_idx_           = read_raw<int>(base, off, max);
+    ctx.attention_sp_            = read_raw<int>(base, off, max);
+    ctx.attention_dp_            = read_raw<int>(base, off, max);
+    ctx.pending_token_present_   = read_raw<bool>(base, off, max);
+    ctx.pending_token_target_sp_ = read_raw<int>(base, off, max);
 
     size_t loc_count = read_raw<size_t>(base, off, max);
     ctx.block_location.resize(loc_count);
@@ -192,11 +191,7 @@ size_t serialize_sequences(uintptr_t                                     data_pt
 
         // Slots (BlockContexts)
         for (size_t i = 0; i < (size_t)BlockContextSlot::_COUNT; ++i) {
-            serialize_block_context(data_ptr,
-                                    off,
-                                    buffer_size,
-                                    seq.slots_[i],
-                                    trim_decode_heavy_fields ? sp_rank : -1);
+            serialize_block_context(data_ptr, off, buffer_size, seq.slots_[i], trim_decode_heavy_fields ? sp_rank : -1);
         }
     }
     return off;

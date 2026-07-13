@@ -33,8 +33,8 @@ enum class DynamicSPSizeStrategy {
 };
 
 struct SPBucketInterval {
-    int sp_size = 1;
-    int seq_len_low = 0;
+    int sp_size      = 1;
+    int seq_len_low  = 0;
     int seq_len_high = 0;
 };
 
@@ -58,19 +58,19 @@ public:
     };
 
     struct TrafficModel {
-        int q_bytes_per_edge = 1;
+        int q_bytes_per_edge   = 1;
         int res_bytes_per_edge = 1;
         int lse_bytes_per_edge = 1;
     };
 
     struct LatencyBreakdown {
-        double total = 0.0;
-        double attention = 0.0;
-        double q = 0.0;
-        double res = 0.0;
-        double lse = 0.0;
-        double max_tokens = 0.0;
-        double max_q_bytes = 0.0;
+        double total         = 0.0;
+        double attention     = 0.0;
+        double q             = 0.0;
+        double res           = 0.0;
+        double lse           = 0.0;
+        double max_tokens    = 0.0;
+        double max_q_bytes   = 0.0;
         double max_res_bytes = 0.0;
         double max_lse_bytes = 0.0;
     };
@@ -83,9 +83,23 @@ public:
     struct DecodeBatchPlan {
         std::vector<PlannedPlacement> placements;
         LatencyBreakdown              latency;
-        int                           max_tokens = 0;
-        int                           total_overflow = 0;
+        int                           max_tokens         = 0;
+        int                           total_overflow     = 0;
         int                           extra_participants = 0;
+    };
+
+    struct LSDecodeMasterPlan {
+        bool             success = false;
+        std::string      failure_reason;
+        std::string      scale_reason = "none";
+        std::vector<int> allocation;
+        std::vector<int> master_ranks;
+        std::vector<int> master_batch_sizes;
+        // Parallel to the stable request list passed to the planner.
+        std::vector<int> sequence_master_ranks;
+        std::vector<int> new_allocation_ranks;
+        std::vector<int> group_used_kv_tokens;
+        std::vector<int> group_used_kv_blocks;
     };
 
     SPStateManager(const std::string& engine_id,
@@ -116,7 +130,7 @@ public:
                    int                lse_bytes_per_edge,
                    bool               enable_non_uniform_split,
                    const std::string& sp_master_selector,
-                   bool               sp_debug = false,
+                   bool               sp_debug      = false,
                    int                fixed_sp_size = 0);
 
     void set_dp_idx(int dp_idx)
@@ -138,6 +152,8 @@ public:
     // Block management delegation
     bool can_append(Sequence& seq, int num_tokens = 1);
     bool may_append(Sequence& seq, int num_tokens = 1);
+    bool can_append_on_sp(Sequence& seq, int sp_idx, int num_tokens = 1) const;
+    bool may_append_on_sp(Sequence& seq, int sp_idx, int num_tokens = 1);
 
     // Allocation logic
     // num_seqs and num_batched_tokens are maps from dp_idx to count/tokens
@@ -150,10 +166,31 @@ public:
                       const std::unordered_map<int, int>& num_seqs,
                       const std::unordered_map<int, int>& num_batched_tokens);
 
-    std::optional<DecodeBatchPlan> plan_decode_batch(
-        const std::vector<std::shared_ptr<Sequence>>& pending_seqs) const;
+    std::optional<DecodeBatchPlan> plan_decode_batch(const std::vector<std::shared_ptr<Sequence>>& pending_seqs) const;
 
     void apply_planned_placement(Sequence& seq, const PlannedPlacement& placement);
+
+    void               allocate_ls_initial(Sequence& seq);
+    void               set_decode_master(Sequence& seq, int master_sp_idx);
+    int                estimate_pending_append_capacity(int                                           rank,
+                                                        const std::vector<std::shared_ptr<Sequence>>& requests,
+                                                        const std::vector<std::shared_ptr<Sequence>>& group_sequences) const;
+    LSDecodeMasterPlan plan_iteration_masters_source_greedy(const std::vector<std::shared_ptr<Sequence>>& requests,
+                                                            const std::vector<int>&                       allocation,
+                                                            const std::vector<int>&                       extra_ranks,
+                                                            int  batch_per_master,
+                                                            bool enable_memory_scale_up) const;
+    bool               validate_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
+                                                      const LSDecodeMasterPlan&                     plan,
+                                                      std::string*                                  error = nullptr) const;
+    bool               reassign_pending_append(Sequence& seq, int target_sp_idx);
+    bool               commit_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
+                                                    const LSDecodeMasterPlan&                     plan);
+    std::vector<int>   group_used_kv_tokens(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
+    std::vector<int>   group_used_kv_blocks(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
+    int                get_active_master_count(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
+    int                get_kv_participant_count(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
+    void               rebuild_decode_role_counters();
 
     // Build and reuse immutable running-state snapshots within a single
     // scheduler step. This avoids rescanning all running sequences for each
@@ -207,24 +244,24 @@ public:
     std::unordered_map<int, std::shared_ptr<BlockManager>> block_manager;
     std::deque<std::shared_ptr<Sequence>>                  running;
     std::vector<std::shared_ptr<Sequence>>                 dummy_seqs;
-    
+
     // Waiting queues for decentralized scheduler mode
-    std::deque<std::shared_ptr<Sequence>>                  waiting;
-    std::deque<std::shared_ptr<Sequence>>                  waiting_migration;
+    std::deque<std::shared_ptr<Sequence>> waiting;
+    std::deque<std::shared_ptr<Sequence>> waiting_migration;
 
     RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;
-    
+
     // Helper methods for decentralized scheduler
     bool is_waiting_empty() const
     {
         return waiting.empty() && waiting_migration.empty();
     }
-    
+
     int get_waiting_queue_size() const
     {
         return static_cast<int>(waiting.size() + waiting_migration.size());
     }
-    
+
     int get_total_load() const
     {
         return num_running_seqs_ + get_waiting_queue_size();
@@ -247,13 +284,11 @@ private:
         int              rr_cursor = 0;
     };
 
-    void initialize_dummy_seqs();
-    int  select_master_rank();
-    int  effective_target_sp_size(int requested_sp_size, int num_tokens) const;
+    void               initialize_dummy_seqs();
+    int                select_master_rank();
+    int                effective_target_sp_size(int requested_sp_size, int num_tokens) const;
     std::optional<int> select_bucket_sp_size(int seq_len) const;
-    void add_communication(PlanningState& state,
-                           int            master_sp_idx,
-                           const std::vector<int>& dispatched_tokens) const;
+    void add_communication(PlanningState& state, int master_sp_idx, const std::vector<int>& dispatched_tokens) const;
     PlanningState build_running_state_snapshot() const;
 
     std::string engine_id_;
@@ -264,12 +299,12 @@ private:
     int         max_num_recv_seqs_;
     double      reserved_blocks_per_req_;
 
-    int kvcache_block_size_;
-    int segment_size_;
-    DynamicSPSizeStrategy dynamic_sp_size_strategy_;
-    int                   long_request_sp_threshold_;
-    int                   long_request_sp_size_;
-    bool                  enable_dynamic_sp_bucket_policy_;
+    int                           kvcache_block_size_;
+    int                           segment_size_;
+    DynamicSPSizeStrategy         dynamic_sp_size_strategy_;
+    int                           long_request_sp_threshold_;
+    int                           long_request_sp_size_;
+    bool                          enable_dynamic_sp_bucket_policy_;
     std::vector<SPBucketInterval> dynamic_sp_bucket_policy_;
 
     int              sp_rr_counter_      = 0;
@@ -277,15 +312,15 @@ private:
     int              num_running_tokens_ = 0;
     std::vector<int> num_recv_seqs_per_sp_;
 
-    bool enable_dynamic_sp_size_;
-    CostModel cost_model_;
+    bool         enable_dynamic_sp_size_;
+    CostModel    cost_model_;
     TrafficModel traffic_model_;
-    bool enable_non_uniform_split_;
-    bool sp_debug_;
-    int  fixed_sp_size_;
+    bool         enable_non_uniform_split_;
+    bool         sp_debug_;
+    int          fixed_sp_size_;
 
-    SPMasterSelector master_selector_;
-    std::vector<int> master_seq_counts_;
+    SPMasterSelector                     master_selector_;
+    std::vector<int>                     master_seq_counts_;
     mutable std::optional<PlanningState> cached_running_state_;
 };
 

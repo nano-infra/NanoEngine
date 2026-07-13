@@ -34,7 +34,13 @@ void bind_block_manager(py::module_& m)
              py::arg("seq"),
              py::arg("token_idx_from") = -1,
              py::arg("token_idx_to")   = -1)
+        .def("allocate_uncached", &BlockManager::allocate_uncached, py::arg("seq"))
         .def("deallocate", &BlockManager::deallocate)
+        .def("trim_blocks_to_token_count",
+             &BlockManager::trim_blocks_to_token_count,
+             py::arg("seq"),
+             py::arg("slot"),
+             py::arg("token_count"))
         .def("can_append", &BlockManager::can_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def("may_append", &BlockManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def_property_readonly("free_block_ids", &BlockManager::free_block_ids)

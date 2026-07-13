@@ -25,14 +25,20 @@ void BlockContext::reset(const std::string& engine_id, int attention_sp, int att
     attention_sp_  = attention_sp;
     attention_dp_  = attention_dp;
 
-    sp_block_table.resize(attention_sp, {});
-    num_dispatched_tokens.resize(attention_sp, 0);
+    pending_token_present_   = false;
+    pending_token_target_sp_ = -1;
+
+    block_location.clear();
+    sp_block_table.assign(attention_sp, {});
+    num_dispatched_tokens.assign(attention_sp, 0);
 }
 
 std::tuple<std::string,
            int,
            int,
            int,
+           int,
+           bool,
            int,
            std::vector<std::pair<int, int>>,
            std::vector<std::vector<int>>,
@@ -50,6 +56,8 @@ BlockContext::getstate() const
                            master_sp_idx_,
                            attention_sp_,
                            attention_dp_,
+                           pending_token_present_,
+                           pending_token_target_sp_,
                            std::vector<std::pair<int, int>>(block_location.begin(), block_location.end()),
                            std::move(sp_block_table_state),
                            num_dispatched_tokens);
@@ -60,25 +68,29 @@ BlockContext BlockContext::setstate(const std::tuple<std::string,
                                                      int,
                                                      int,
                                                      int,
+                                                     bool,
+                                                     int,
                                                      std::vector<std::pair<int, int>>,
                                                      std::vector<std::vector<int>>,
                                                      std::vector<int>>& state)
 {
     BlockContext ctx;
-    ctx.engine_id_     = std::get<0>(state);
-    ctx.dp_idx_        = std::get<1>(state);
-    ctx.master_sp_idx_ = std::get<2>(state);
-    ctx.attention_sp_  = std::get<3>(state);
-    ctx.attention_dp_  = std::get<4>(state);
-    ctx.block_location = BlockContext::BlockLocationList(std::get<5>(state).begin(), std::get<5>(state).end());
+    ctx.engine_id_               = std::get<0>(state);
+    ctx.dp_idx_                  = std::get<1>(state);
+    ctx.master_sp_idx_           = std::get<2>(state);
+    ctx.attention_sp_            = std::get<3>(state);
+    ctx.attention_dp_            = std::get<4>(state);
+    ctx.pending_token_present_   = std::get<5>(state);
+    ctx.pending_token_target_sp_ = std::get<6>(state);
+    ctx.block_location = BlockContext::BlockLocationList(std::get<7>(state).begin(), std::get<7>(state).end());
 
-    auto block_table = std::get<6>(state);
+    auto block_table = std::get<8>(state);
     ctx.sp_block_table.resize(block_table.size(), {});
     for (size_t i = 0; i < block_table.size(); ++i) {
         ctx.sp_block_table[i] = BlockContext::BlockIdList(block_table[i].begin(), block_table[i].end());
     }
 
-    ctx.num_dispatched_tokens = std::get<7>(state);
+    ctx.num_dispatched_tokens = std::get<9>(state);
     return ctx;
 }
 
@@ -140,6 +152,36 @@ void Sequence::append_token(int token_id, BlockContextSlot slot, std::optional<i
     last_token = token_id;
     num_tokens++;
     ctx.num_dispatched_tokens[idx]++;
+}
+
+void Sequence::mark_last_token_pending(BlockContextSlot slot, std::optional<int> sp_idx)
+{
+    auto& ctx = block_ctx(slot);
+    int   idx = sp_idx.has_value() ? *sp_idx : ctx.master_sp_idx_;
+    if (idx < 0 || idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
+        throw std::out_of_range("pending token target SP rank out of range");
+    }
+    if (ctx.num_dispatched_tokens[idx] <= 0) {
+        throw std::runtime_error("pending token target has no dispatched token");
+    }
+    ctx.pending_token_present_   = true;
+    ctx.pending_token_target_sp_ = idx;
+}
+
+int Sequence::committed_context_len(BlockContextSlot slot, int sp_idx) const
+{
+    const auto& ctx = block_ctx(slot);
+    if (sp_idx < 0 || sp_idx >= static_cast<int>(ctx.num_dispatched_tokens.size())) {
+        throw std::out_of_range("committed context SP rank out of range");
+    }
+    int count = ctx.num_dispatched_tokens[sp_idx];
+    if (ctx.pending_token_present_ && ctx.pending_token_target_sp_ == sp_idx) {
+        count--;
+    }
+    if (count < 0) {
+        throw std::runtime_error("pending token frontier exceeds dispatched token count");
+    }
+    return count;
 }
 
 int Sequence::num_blocks(BlockContextSlot slot, int sp_idx)

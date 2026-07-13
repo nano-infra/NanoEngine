@@ -115,7 +115,7 @@ class ModelRunner:
                     self.config.hf_config.kv_lora_rank
                     + self.config.hf_config.qk_rope_head_dim
                 )
-            set_sp_context(
+            sp_context = set_sp_context(
                 max_num_seqs=config.max_num_seqs,
                 head_size=max_head_dim,
                 num_attention_heads=hf_config.num_attention_heads,
@@ -124,6 +124,20 @@ class ModelRunner:
                 sp_size=sp_size,
                 backend=config.sp_backend,
             )
+            if config.enable_ls_decode_core_scheduler:
+                buffers = (
+                    sp_context.q_buffer,
+                    sp_context.res_buffer,
+                    sp_context.lse_buffer,
+                )
+                if not all(
+                    getattr(buffer, "supports_native_q_offsets", False)
+                    for buffer in buffers
+                ):
+                    raise RuntimeError(
+                        "LS-Decode-Core requires native hao_basic Q-offset support; "
+                        "DLSlime compatibility mode is unsupported."
+                    )
 
         self.run_count = 0
         self.profiler = None
@@ -448,6 +462,15 @@ class ModelRunner:
         q_offsets = torch.tensor(
             meta.q_offsets, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+        q_native_offsets = torch.tensor(
+            meta.q_native_offsets, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        q_native_slice_fill = torch.tensor(
+            meta.q_native_slice_fill, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        q_native_gather_indices = torch.tensor(
+            meta.q_native_gather_indices, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
         attention_compute_bs = (
             context_lens_for_attn.numel() if use_sp_a2a else input_ids.size(0)
         )
@@ -488,6 +511,9 @@ class ModelRunner:
             res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             q_offsets=q_offsets,
+            q_native_offsets=q_native_offsets,
+            q_native_slice_fill=q_native_slice_fill,
+            q_native_gather_indices=q_native_gather_indices,
             tile_scheduler_metadata=new_tile_scheduler_metadata,
             num_splits=new_num_splits,
         )
@@ -662,6 +688,16 @@ class ModelRunner:
 
         graph_vars["q_offsets"].zero_()
         graph_vars["q_offsets"].copy_(context.q_offsets)  # type: ignore
+        graph_vars["q_native_offsets"].zero_()
+        graph_vars["q_native_offsets"].copy_(context.q_native_offsets)  # type: ignore
+        graph_vars["q_native_slice_fill"].fill_(-1)
+        graph_vars["q_native_slice_fill"][
+            : context.q_native_slice_fill.shape[0]
+        ].copy_(context.q_native_slice_fill)  # type: ignore
+        graph_vars["q_native_gather_indices"].zero_()
+        graph_vars["q_native_gather_indices"][
+            : context.q_native_gather_indices.shape[0]
+        ].copy_(context.q_native_gather_indices)  # type: ignore
 
     def _build_graph_master_rank_bs(self, max_bs: int) -> list[int]:
         graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
@@ -783,6 +819,9 @@ class ModelRunner:
             "attention_compute_bs": context.attention_compute_bs,
             "sp_comm_bs": master_bs,
             "q_offsets": graph_vars["q_offsets"],
+            "q_native_offsets": graph_vars["q_native_offsets"],
+            "q_native_slice_fill": graph_vars["q_native_slice_fill"][:master_bs],
+            "q_native_gather_indices": graph_vars["q_native_gather_indices"],
             "context_lens_for_attn": graph_vars["context_lens_for_attn"],
         }
         saved_context_fields = {
@@ -1086,6 +1125,11 @@ class ModelRunner:
             max_remote_attention_comp_seqs, dtype=torch.int32
         )
         q_offsets = torch.zeros(sp_world_size + 1, dtype=torch.int32)
+        q_native_offsets = torch.zeros(sp_world_size + 1, dtype=torch.int32)
+        q_native_slice_fill = torch.full((max_bs,), -1, dtype=torch.int32)
+        q_native_gather_indices = torch.zeros(
+            max_attention_comp_seqs, dtype=torch.int64
+        )
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
         if hf_config.num_key_value_heads == 1:
@@ -1137,6 +1181,9 @@ class ModelRunner:
                 sp_comm_bs=master_bs,
                 context_lens_for_attn=context_lens_for_attn,
                 q_offsets=q_offsets,
+                q_native_offsets=q_native_offsets,
+                q_native_slice_fill=q_native_slice_fill[:master_bs],
+                q_native_gather_indices=q_native_gather_indices,
                 tile_scheduler_metadata=tile_scheduler_metadata_buffer,
                 num_splits=num_splits_buffer,
             )
@@ -1220,6 +1267,9 @@ class ModelRunner:
             res_slice_fill_to_buffer_input=res_slice_fill_to_buffer_input,
             res_to_buffer_input_mask=res_to_buffer_input_mask,
             q_offsets=q_offsets,
+            q_native_offsets=q_native_offsets,
+            q_native_slice_fill=q_native_slice_fill,
+            q_native_gather_indices=q_native_gather_indices,
         )
 
     @torch.inference_mode()
@@ -1303,6 +1353,15 @@ class ModelRunner:
                     max_remote_attention_comp_seqs, dtype=torch.int32
                 ),
                 q_offsets=torch.zeros(sp_world_size + 1, dtype=torch.int32),
+                q_native_offsets=torch.zeros(
+                    sp_world_size + 1, dtype=torch.int32
+                ),
+                q_native_slice_fill=torch.full(
+                    (max_bs,), -1, dtype=torch.int32
+                ),
+                q_native_gather_indices=torch.zeros(
+                    max_attention_comp_seqs, dtype=torch.int64
+                ),
             )
 
         def set_piecewise_capture_context(master_bs: int, graph_vars: dict):
@@ -1339,6 +1398,9 @@ class ModelRunner:
                 sp_comm_bs=master_bs,
                 context_lens_for_attn=graph_vars["context_lens_for_attn"],
                 q_offsets=graph_vars["q_offsets"],
+                q_native_offsets=graph_vars["q_native_offsets"],
+                q_native_slice_fill=graph_vars["q_native_slice_fill"][:master_bs],
+                q_native_gather_indices=graph_vars["q_native_gather_indices"],
                 tile_scheduler_metadata=graph_vars["tile_scheduler_metadata"],
                 num_splits=graph_vars["num_splits"],
             )

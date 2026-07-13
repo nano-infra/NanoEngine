@@ -13,6 +13,19 @@ PYBIND11_MAKE_OPAQUE(std::deque<std::shared_ptr<Sequence>>);
 
 void bind_sp_state_manager(py::module_& m)
 {
+    py::class_<SPStateManager::LSDecodeMasterPlan>(m, "LSDecodeMasterPlan")
+        .def(py::init<>())
+        .def_readonly("success", &SPStateManager::LSDecodeMasterPlan::success)
+        .def_readonly("failure_reason", &SPStateManager::LSDecodeMasterPlan::failure_reason)
+        .def_readonly("scale_reason", &SPStateManager::LSDecodeMasterPlan::scale_reason)
+        .def_readonly("allocation", &SPStateManager::LSDecodeMasterPlan::allocation)
+        .def_readonly("master_ranks", &SPStateManager::LSDecodeMasterPlan::master_ranks)
+        .def_readonly("master_batch_sizes", &SPStateManager::LSDecodeMasterPlan::master_batch_sizes)
+        .def_readonly("sequence_master_ranks", &SPStateManager::LSDecodeMasterPlan::sequence_master_ranks)
+        .def_readonly("new_allocation_ranks", &SPStateManager::LSDecodeMasterPlan::new_allocation_ranks)
+        .def_readonly("group_used_kv_tokens", &SPStateManager::LSDecodeMasterPlan::group_used_kv_tokens)
+        .def_readonly("group_used_kv_blocks", &SPStateManager::LSDecodeMasterPlan::group_used_kv_blocks);
+
     // Bind RoutingStrategy
     py::enum_<RoutingStrategy>(m, "RoutingStrategy")
         .value("RoundRobin", RoutingStrategy::RoundRobin)
@@ -34,9 +47,9 @@ void bind_sp_state_manager(py::module_& m)
                     })
         .def_property_readonly_static("__members__", [](py::object /* self */) {
             py::dict m;
-            m["RoundRobin"] = RoutingStrategy::RoundRobin;
-            m["LeastBatch"] = RoutingStrategy::LeastBatch;
-            m["LeastCache"] = RoutingStrategy::LeastCache;
+            m["RoundRobin"]      = RoutingStrategy::RoundRobin;
+            m["LeastBatch"]      = RoutingStrategy::LeastBatch;
+            m["LeastCache"]      = RoutingStrategy::LeastCache;
             m["VLLMLoadBalance"] = RoutingStrategy::VLLMLoadBalance;
             return m;
         });
@@ -106,7 +119,7 @@ void bind_sp_state_manager(py::module_& m)
         .def(
             "__iter__",
             [](std::deque<std::shared_ptr<Sequence>>& d) { return py::make_iterator(d.begin(), d.end()); },
-            py::keep_alive<0, 1>());    // Bind SPStateManager
+            py::keep_alive<0, 1>());  // Bind SPStateManager
     py::class_<SPStateManager, std::shared_ptr<SPStateManager>>(m, "SPStateManager")
         .def(py::init([](const std::string& engine_id,
                          int                attention_sp,
@@ -179,31 +192,41 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("reserved_blocks_per_req"),
              py::arg("segment_size") = 65536,
              py::arg("enable_dynamic_sp_size"),
-             py::arg("dynamic_sp_size_strategy") = "legacy",
+             py::arg("dynamic_sp_size_strategy")          = "legacy",
              py::arg("dynamic_sp_long_request_threshold") = 100000,
-             py::arg("dynamic_sp_long_request_size") = 0,
-             py::arg("enable_dynamic_sp_bucket_policy") = false,
-             py::arg("dynamic_sp_bucket_policy") = "",
-             py::arg("attention_cost_a") = 1.0,
-             py::arg("attention_cost_b") = 0.0,
-             py::arg("q_cost_a") = 1.0,
-             py::arg("q_cost_b") = 0.0,
-             py::arg("res_cost_a") = 1.0,
-             py::arg("res_cost_b") = 0.0,
-             py::arg("lse_cost_a") = 1.0,
-             py::arg("lse_cost_b") = 0.0,
-             py::arg("q_bytes_per_edge") = 1,
-             py::arg("res_bytes_per_edge") = 1,
-             py::arg("lse_bytes_per_edge") = 1,
+             py::arg("dynamic_sp_long_request_size")      = 0,
+             py::arg("enable_dynamic_sp_bucket_policy")   = false,
+             py::arg("dynamic_sp_bucket_policy")          = "",
+             py::arg("attention_cost_a")                  = 1.0,
+             py::arg("attention_cost_b")                  = 0.0,
+             py::arg("q_cost_a")                          = 1.0,
+             py::arg("q_cost_b")                          = 0.0,
+             py::arg("res_cost_a")                        = 1.0,
+             py::arg("res_cost_b")                        = 0.0,
+             py::arg("lse_cost_a")                        = 1.0,
+             py::arg("lse_cost_b")                        = 0.0,
+             py::arg("q_bytes_per_edge")                  = 1,
+             py::arg("res_bytes_per_edge")                = 1,
+             py::arg("lse_bytes_per_edge")                = 1,
              py::arg("enable_non_uniform_split"),
              py::arg("sp_master_selector"),
-             py::arg("sp_debug") = false,
+             py::arg("sp_debug")      = false,
              py::arg("fixed_sp_size") = 0)
 
         .def_property_readonly("is_empty", &SPStateManager::is_empty)
 
         .def("can_append", &SPStateManager::can_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def("may_append", &SPStateManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)
+        .def("can_append_on_sp",
+             &SPStateManager::can_append_on_sp,
+             py::arg("seq"),
+             py::arg("sp_idx"),
+             py::arg("num_tokens") = 1)
+        .def("may_append_on_sp",
+             &SPStateManager::may_append_on_sp,
+             py::arg("seq"),
+             py::arg("sp_idx"),
+             py::arg("num_tokens") = 1)
 
         .def("can_allocate",
              &SPStateManager::can_allocate,
@@ -212,7 +235,46 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("num_batched_tokens"))
 
         .def("allocate", &SPStateManager::allocate, py::arg("seq"))
+        .def("allocate_ls_initial", &SPStateManager::allocate_ls_initial, py::arg("seq"))
         .def("deallocate", &SPStateManager::deallocate, py::arg("seq"), py::arg("slot"))
+        .def("set_decode_master", &SPStateManager::set_decode_master, py::arg("seq"), py::arg("master_sp_idx"))
+        .def("estimate_pending_append_capacity",
+             &SPStateManager::estimate_pending_append_capacity,
+             py::arg("rank"),
+             py::arg("requests"),
+             py::arg("group_sequences"))
+        .def("plan_iteration_masters_source_greedy",
+             &SPStateManager::plan_iteration_masters_source_greedy,
+             py::arg("requests"),
+             py::arg("allocation"),
+             py::arg("extra_ranks"),
+             py::arg("batch_per_master"),
+             py::arg("enable_memory_scale_up") = true)
+        .def(
+            "validate_iteration_master_plan",
+            [](const SPStateManager&                         manager,
+               const std::vector<std::shared_ptr<Sequence>>& requests,
+               const SPStateManager::LSDecodeMasterPlan&     plan) {
+                std::string error;
+                bool        valid = manager.validate_iteration_master_plan(requests, plan, &error);
+                return py::make_tuple(valid, error);
+            },
+            py::arg("requests"),
+            py::arg("plan"))
+        .def("reassign_pending_append",
+             &SPStateManager::reassign_pending_append,
+             py::arg("seq"),
+             py::arg("target_sp_idx"))
+        .def("commit_iteration_master_plan",
+             &SPStateManager::commit_iteration_master_plan,
+             py::arg("requests"),
+             py::arg("plan"))
+        .def("group_used_kv_tokens", &SPStateManager::group_used_kv_tokens, py::arg("seqs"))
+        .def("group_used_kv_blocks", &SPStateManager::group_used_kv_blocks, py::arg("seqs"))
+        .def("get_active_master_count", &SPStateManager::get_active_master_count, py::arg("seqs"))
+        .def("get_kv_participant_count", &SPStateManager::get_kv_participant_count, py::arg("seqs"))
+        .def("rebuild_decode_role_counters", &SPStateManager::rebuild_decode_role_counters)
+        .def("add_running_tokens", &SPStateManager::add_running_tokens, py::arg("sp_idx"), py::arg("count"))
 
         .def_readwrite("block_manager", &SPStateManager::block_manager)
         .def_readwrite("running", &SPStateManager::running)

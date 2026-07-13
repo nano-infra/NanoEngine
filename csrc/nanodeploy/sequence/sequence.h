@@ -39,6 +39,14 @@ struct BlockContext {
     int         attention_sp_  = 1;
     int         attention_dp_  = 1;
 
+    // Decode frontier. NanoDeploy keeps the next input token in
+    // num_dispatched_tokens so the existing decode metadata sees the current
+    // token after its KV write. The token is not committed history until the
+    // next forward completes, so scheduler-side KV accounting must subtract it
+    // from pending_token_target_sp_.
+    bool pending_token_present_   = false;
+    int  pending_token_target_sp_ = -1;
+
     // Wrapper container types.
     //
     // Motivation: pybind11 converts STL containers to Python list/dict copies by
@@ -73,6 +81,8 @@ struct BlockContext {
                int,
                int,
                int,
+               bool,
+               int,
                std::vector<std::pair<int, int>>,
                std::vector<std::vector<int>>,
                std::vector<int>>
@@ -82,6 +92,8 @@ struct BlockContext {
                                                   int,
                                                   int,
                                                   int,
+                                                  int,
+                                                  bool,
                                                   int,
                                                   std::vector<std::pair<int, int>>,
                                                   std::vector<std::vector<int>>,
@@ -137,6 +149,11 @@ public:
     void append_token(int                token_id,
                       BlockContextSlot   slot   = BlockContextSlot::ACTIVE,
                       std::optional<int> sp_idx = std::nullopt);
+
+    void mark_last_token_pending(BlockContextSlot   slot   = BlockContextSlot::ACTIVE,
+                                 std::optional<int> sp_idx = std::nullopt);
+
+    int committed_context_len(BlockContextSlot slot, int sp_idx) const;
 
     // Block related methods
     int num_blocks(BlockContextSlot slot, int sp_idx);

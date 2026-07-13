@@ -38,6 +38,9 @@ _META_FIELDS = (
     "res_slice_fill_to_buffer_input",
     "res_to_buffer_input_mask",
     "q_offsets",
+    "q_native_offsets",
+    "q_native_slice_fill",
+    "q_native_gather_indices",
 )
 
 
@@ -178,6 +181,11 @@ def test_decode_optimize_roundtrip_trims_only_target_rank_heavy_fields():
         assert restored_ctx.master_sp_idx == original_ctx.master_sp_idx
         assert restored_ctx.attention_sp == original_ctx.attention_sp
         assert restored_ctx.attention_dp == original_ctx.attention_dp
+        assert restored_ctx.pending_token_present == original_ctx.pending_token_present
+        assert (
+            restored_ctx.pending_token_target_sp
+            == original_ctx.pending_token_target_sp
+        )
         assert restored_ctx.num_dispatched_tokens == original_ctx.num_dispatched_tokens
 
         assert list(restored_ctx.sp_block_table[_SP_RANK]) == list(
@@ -208,3 +216,26 @@ def test_decode_non_optimized_roundtrip_keeps_full_block_context():
             assert list(restored_ctx.sp_block_table[sp_idx]) == list(
                 original_ctx.sp_block_table[sp_idx]
             )
+
+
+def test_decode_roundtrip_preserves_pending_frontier():
+    seq = _make_seq(
+        seq_id=21,
+        master_sp_idx=1,
+        num_dispatched_tokens=[8, 1],
+        sp_block_tables={0: [101], 1: [201]},
+        block_location=[(0, 101), (1, 201)],
+    )
+    ctx = seq.block_ctx(BlockContextSlot.ACTIVE)
+    ctx.pending_token_present = True
+    ctx.pending_token_target_sp = 1
+
+    restored = _serialize_roundtrip(
+        [seq], is_prefill=False, sp_rank=1, sp_size=2
+    )[0]
+    restored_ctx = restored.block_ctx(BlockContextSlot.ACTIVE)
+
+    assert restored_ctx.pending_token_present is True
+    assert restored_ctx.pending_token_target_sp == 1
+    assert restored.committed_context_len(BlockContextSlot.ACTIVE, 0) == 8
+    assert restored.committed_context_len(BlockContextSlot.ACTIVE, 1) == 0

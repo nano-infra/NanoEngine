@@ -129,9 +129,12 @@ void bind_sequence(py::module_& m)
         .def_readwrite("master_sp_idx", &BlockContext::master_sp_idx_)
         .def_readwrite("attention_sp", &BlockContext::attention_sp_)
         .def_readwrite("attention_dp", &BlockContext::attention_dp_)
-        .def_property("num_dispatched_tokens",
-                      [](const BlockContext& self) { return self.num_dispatched_tokens; },
-                      [](BlockContext& self, const std::vector<int>& value) { self.num_dispatched_tokens = value; })
+        .def_readwrite("pending_token_present", &BlockContext::pending_token_present_)
+        .def_readwrite("pending_token_target_sp", &BlockContext::pending_token_target_sp_)
+        .def_property(
+            "num_dispatched_tokens",
+            [](const BlockContext& self) { return self.num_dispatched_tokens; },
+            [](BlockContext& self, const std::vector<int>& value) { self.num_dispatched_tokens = value; })
         .def_property(
             "block_location",
             [](BlockContext& self) -> BlockContext::BlockLocationList& { return self.block_location; },
@@ -148,6 +151,8 @@ void bind_sequence(py::module_& m)
                                             int,
                                             int,
                                             int,
+                                            int,
+                                            bool,
                                             int,
                                             std::vector<std::pair<int, int>>,
                                             std::vector<std::vector<int>>,
@@ -167,6 +172,11 @@ void bind_sequence(py::module_& m)
              py::arg("token_id"),
              py::arg("slot"),
              py::arg("sp_idx") = std::nullopt)
+        .def("mark_last_token_pending",
+             &Sequence::mark_last_token_pending,
+             py::arg("slot")   = BlockContextSlot::ACTIVE,
+             py::arg("sp_idx") = std::nullopt)
+        .def("committed_context_len", &Sequence::committed_context_len, py::arg("slot"), py::arg("sp_idx"))
         .def("block_ctx",
              static_cast<BlockContext& (Sequence::*)(BlockContextSlot)>(&Sequence::block_ctx),
              py::arg("slot") = BlockContextSlot::ACTIVE,

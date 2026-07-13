@@ -26,6 +26,10 @@ def _get_sp_comm_bs(sp_context, context) -> int:
     return sp_context.max_num_seqs
 
 
+def _uses_native_q_offsets(q_buffer) -> bool:
+    return bool(getattr(q_buffer, "supports_native_q_offsets", False))
+
+
 def _narrow_sp_matrix_for_comm(tensor: torch.Tensor, comm_bs: int) -> torch.Tensor:
     if tensor.size(1) == comm_bs:
         return tensor
@@ -102,6 +106,17 @@ class FlashAttentionImpl:
                     else context.q_mask
                 )
                 q_buffer = sp_context.q_buffer
+                native_q_offsets = _uses_native_q_offsets(q_buffer)
+                q_slice_fill = (
+                    context.q_native_slice_fill
+                    if native_q_offsets
+                    else context.q_slice_fill
+                )
+                q_offsets = (
+                    context.q_native_offsets
+                    if native_q_offsets
+                    else context.q_offsets
+                )
 
                 # Q copy
                 local_q_buffer_3d = q_buffer.local_buffer.view(sp_context.dtype)[
@@ -113,7 +128,7 @@ class FlashAttentionImpl:
                     q,
                     local_q_buffer_3d,
                     context.q_slice_get,
-                    context.q_slice_fill,
+                    q_slice_fill,
                     context.q_copy_mask,
                 )
 
@@ -125,10 +140,18 @@ class FlashAttentionImpl:
                 q = q_buffer.all_to_all_ll(
                     q.view([bs, -1]),
                     mask=q_mask,
-                    offsets=context.q_offsets,
+                    offsets=q_offsets,
                 ).view([sp_size * comm_bs, num_head, head_dim])
 
-                q = q[: context.attention_compute_bs]
+                if native_q_offsets:
+                    q = q.index_select(
+                        0,
+                        context.q_native_gather_indices[
+                            : context.attention_compute_bs
+                        ],
+                    )
+                else:
+                    q = q[: context.attention_compute_bs]
                 context_lens = context.context_lens_for_attn[
                     : context.attention_compute_bs
                 ]
@@ -327,6 +350,17 @@ class FlashMLAImpl:
                     else context.q_mask
                 )
                 q_buffer = sp_context.q_buffer
+                native_q_offsets = _uses_native_q_offsets(q_buffer)
+                q_slice_fill = (
+                    context.q_native_slice_fill
+                    if native_q_offsets
+                    else context.q_slice_fill
+                )
+                q_offsets = (
+                    context.q_native_offsets
+                    if native_q_offsets
+                    else context.q_offsets
+                )
 
                 local_q_buffer_3d = q_buffer.local_buffer.view(sp_context.dtype)[
                     : sp_size * comm_bs * num_head * head_dim
@@ -337,17 +371,25 @@ class FlashMLAImpl:
                     q.view(bs, num_head, head_dim),
                     local_q_buffer_3d,
                     context.q_slice_get,
-                    context.q_slice_fill,
+                    q_slice_fill,
                     context.q_copy_mask,
                 )
 
                 q = q_buffer.all_to_all_ll(
                     q.view([bs, -1]),
                     mask=q_mask,
-                    offsets=context.q_offsets,
+                    offsets=q_offsets,
                 ).view([sp_size * comm_bs, num_head, head_dim])
 
-                q = q[: context.attention_compute_bs]
+                if native_q_offsets:
+                    q = q.index_select(
+                        0,
+                        context.q_native_gather_indices[
+                            : context.attention_compute_bs
+                        ],
+                    )
+                else:
+                    q = q[: context.attention_compute_bs]
                 context_lens = context.context_lens_for_attn[
                     : context.attention_compute_bs
                 ]

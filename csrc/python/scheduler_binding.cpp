@@ -26,7 +26,7 @@ void bind_scheduler_utils(py::module_& m)
           py::arg("update_metrics"),
           py::arg("step_duration_ms"),
           py::arg("loop_count"),
-          py::arg("thread_pool")    = nullptr,
+          py::arg("thread_pool") = nullptr,
           py::call_guard<py::gil_scoped_release>());
 
     // Bind the SPStateManagerList type
@@ -108,7 +108,34 @@ void bind_scheduler_utils(py::module_& m)
         .def_readonly("sp_q_matrix", &ScheduleResult::sp_q_matrix)
         .def_readonly("sp_res_matrix", &ScheduleResult::sp_res_matrix)
         .def_readonly("waiting_head_blocks", &ScheduleResult::waiting_head_blocks)
-        .def_readonly("waiting_total_blocks", &ScheduleResult::waiting_total_blocks);    // Bind the Scheduler class
+        .def_readonly("waiting_total_blocks", &ScheduleResult::waiting_total_blocks)
+        .def_readonly("ls_initial_batch_ids", &ScheduleResult::ls_initial_batch_ids)
+        .def_readonly("ls_initial_group_ids", &ScheduleResult::ls_initial_group_ids)
+        .def_readonly("ls_initial_kv_dops", &ScheduleResult::ls_initial_kv_dops)
+        .def_readonly("ls_initial_kv_ranks", &ScheduleResult::ls_initial_kv_ranks)
+        .def_readonly("ls_initial_sequence_ids", &ScheduleResult::ls_initial_sequence_ids)
+        .def_readonly("ls_initial_prompt_kv_tokens", &ScheduleResult::ls_initial_prompt_kv_tokens)
+        .def_readonly("ls_initial_provisional_pending_targets", &ScheduleResult::ls_initial_provisional_pending_targets)
+        .def_readonly("ls_group_ids", &ScheduleResult::ls_group_ids)
+        .def_readonly("ls_group_dp_indices", &ScheduleResult::ls_group_dp_indices)
+        .def_readonly("ls_real_batch_sizes", &ScheduleResult::ls_real_batch_sizes)
+        .def_readonly("ls_master_dops", &ScheduleResult::ls_master_dops)
+        .def_readonly("ls_kv_dops", &ScheduleResult::ls_kv_dops)
+        .def_readonly("ls_master_ranks", &ScheduleResult::ls_master_ranks)
+        .def_readonly("ls_master_batch_sizes", &ScheduleResult::ls_master_batch_sizes)
+        .def_readonly("ls_group_rank_allocations", &ScheduleResult::ls_group_rank_allocations)
+        .def_readonly("ls_group_used_kv_tokens", &ScheduleResult::ls_group_used_kv_tokens)
+        .def_readonly("ls_group_used_kv_blocks", &ScheduleResult::ls_group_used_kv_blocks)
+        .def_readonly("ls_iteration_sequence_ids", &ScheduleResult::ls_iteration_sequence_ids)
+        .def_readonly("ls_iteration_master_assignments", &ScheduleResult::ls_iteration_master_assignments)
+        .def_readonly("ls_pending_append_blocks_per_master", &ScheduleResult::ls_pending_append_blocks_per_master)
+        .def_readonly("ls_new_master_ranks", &ScheduleResult::ls_new_master_ranks)
+        .def_readonly("ls_reused_passive_master_ranks", &ScheduleResult::ls_reused_passive_master_ranks)
+        .def_readonly("ls_scale_reasons", &ScheduleResult::ls_scale_reasons)
+        .def_readonly("ls_historical_kv_migration_bytes", &ScheduleResult::ls_historical_kv_migration_bytes)
+        .def_readonly("ls_preempted_sequence_ids", &ScheduleResult::ls_preempted_sequence_ids)
+        .def_readonly("ls_preemption_reasons", &ScheduleResult::ls_preemption_reasons)
+        .def_readonly("ls_planning_latency_ms", &ScheduleResult::ls_planning_latency_ms);  // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
         .def(py::init([](const std::string& engine_id,
                          int                loop_count,
@@ -141,11 +168,15 @@ void bind_scheduler_utils(py::module_& m)
                          int                q_bytes_per_edge,
                          int                res_bytes_per_edge,
                          int                lse_bytes_per_edge,
-                          bool               enable_non_uniform_split,
-                          const std::string& sp_master_selector,
-                          bool               sp_debug,
-                          int                fixed_sp_size,
-                          const std::string& scheduler_mode) {
+                         bool               enable_non_uniform_split,
+                         const std::string& sp_master_selector,
+                         bool               sp_debug,
+                         int                fixed_sp_size,
+                         bool               enable_ls_decode_core_scheduler,
+                         int                ls_decode_initial_kv_dop,
+                         int                ls_decode_batch_per_master,
+                         bool               ls_decode_enable_memory_scale_up,
+                         const std::string& scheduler_mode) {
                  return std::make_shared<Scheduler>(engine_id,
                                                     loop_count,
                                                     max_num_seqs,
@@ -177,12 +208,16 @@ void bind_scheduler_utils(py::module_& m)
                                                     q_bytes_per_edge,
                                                     res_bytes_per_edge,
                                                     lse_bytes_per_edge,
-                                                     enable_non_uniform_split,
-                                                     sp_master_selector,
-                                                     sp_debug,
-                                                     fixed_sp_size,
-                                                     scheduler_mode);
-              }),
+                                                    enable_non_uniform_split,
+                                                    sp_master_selector,
+                                                    sp_debug,
+                                                    fixed_sp_size,
+                                                    enable_ls_decode_core_scheduler,
+                                                    ls_decode_initial_kv_dop,
+                                                    ls_decode_batch_per_master,
+                                                    ls_decode_enable_memory_scale_up,
+                                                    scheduler_mode);
+             }),
              py::arg("engine_id"),
              py::arg("loop_count"),
              py::arg("max_num_seqs"),
@@ -198,27 +233,31 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("segment_size") = 65536,
              py::arg("enable_dynamic_sp_size"),
              py::arg("use_new_decode_dynamic_sp_scheduler") = false,
-             py::arg("dynamic_sp_size_strategy") = "legacy",
-             py::arg("dynamic_sp_long_request_threshold") = 100000,
-             py::arg("dynamic_sp_long_request_size") = 0,
-             py::arg("enable_dynamic_sp_bucket_policy") = false,
-             py::arg("dynamic_sp_bucket_policy") = "",
-             py::arg("attention_cost_a") = 1.0,
-             py::arg("attention_cost_b") = 0.0,
-             py::arg("q_cost_a") = 1.0,
-             py::arg("q_cost_b") = 0.0,
-             py::arg("res_cost_a") = 1.0,
-             py::arg("res_cost_b") = 0.0,
-             py::arg("lse_cost_a") = 1.0,
-             py::arg("lse_cost_b") = 0.0,
-             py::arg("q_bytes_per_edge") = 1,
-             py::arg("res_bytes_per_edge") = 1,
-             py::arg("lse_bytes_per_edge") = 1,
-              py::arg("enable_non_uniform_split"),
-              py::arg("sp_master_selector"),
-              py::arg("sp_debug") = false,
-              py::arg("fixed_sp_size") = 0,
-              py::arg("scheduler_mode") = "centralized")
+             py::arg("dynamic_sp_size_strategy")            = "legacy",
+             py::arg("dynamic_sp_long_request_threshold")   = 100000,
+             py::arg("dynamic_sp_long_request_size")        = 0,
+             py::arg("enable_dynamic_sp_bucket_policy")     = false,
+             py::arg("dynamic_sp_bucket_policy")            = "",
+             py::arg("attention_cost_a")                    = 1.0,
+             py::arg("attention_cost_b")                    = 0.0,
+             py::arg("q_cost_a")                            = 1.0,
+             py::arg("q_cost_b")                            = 0.0,
+             py::arg("res_cost_a")                          = 1.0,
+             py::arg("res_cost_b")                          = 0.0,
+             py::arg("lse_cost_a")                          = 1.0,
+             py::arg("lse_cost_b")                          = 0.0,
+             py::arg("q_bytes_per_edge")                    = 1,
+             py::arg("res_bytes_per_edge")                  = 1,
+             py::arg("lse_bytes_per_edge")                  = 1,
+             py::arg("enable_non_uniform_split"),
+             py::arg("sp_master_selector"),
+             py::arg("sp_debug")                         = false,
+             py::arg("fixed_sp_size")                    = 0,
+             py::arg("enable_ls_decode_core_scheduler")  = false,
+             py::arg("ls_decode_initial_kv_dop")         = 0,
+             py::arg("ls_decode_batch_per_master")       = 64,
+             py::arg("ls_decode_enable_memory_scale_up") = true,
+             py::arg("scheduler_mode")                   = "centralized")
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))
