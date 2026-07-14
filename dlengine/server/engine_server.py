@@ -282,7 +282,13 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                         traceback.print_exc()
             _lp_drain_ms += (time.perf_counter() - _t_drain) * 1000
 
-            if engine.scheduler.is_finished():
+            # `to_be_migrated` requests intentionally retain their KV blocks
+            # until the decode engine sends /pd/free, so is_finished() remains
+            # false during that interval. They are not runnable, however: an
+            # empty follow-up forward can violate strict kernel batch-shape
+            # contracts (notably DeepGEMM's DSA indexer). Keep draining control
+            # packets without scheduling another model step.
+            if not engine.scheduler.has_runnable_work():
                 time.sleep(0.001)
                 continue
 
