@@ -20,11 +20,11 @@ if KV cache usage < threshold:
 
 低 KV 使用率只能作为候选过滤条件，不能独立决定迁移。正确的执行条件应当同时满足：
 
-1. 当前 KV placement 可以在考虑 block fragmentation、pending token 和 append headroom 后，完整压缩到更少 ranks；
+1. 当前 KV placement 可以在考虑 block fragmentation、pending token、append headroom 和迁移 scratch 后，通过逐 source-rank evacuation 压缩到更少 ranks；
 2. 压缩后至少能彻底清空一个 rank，而不只是把 KV 分布变得更均匀；
 3. 目标 rank 数能够覆盖当前及短期内的 Decode master demand，避免下一轮马上重新扩到 8；
 4. 迁移造成的暂停和传输成本能在 group 的剩余 Decode 生命周期内摊销，或者释放 rank 能立即解除 admission/resource pressure；
-5. 数据面真实复制 KV，metadata 与物理 block 所有权以事务方式一起切换。
+5. 数据面真实复制 KV，source 在 commit 前始终是权威副本，metadata 与物理 block 所有权在无失败 commit 中一起切换。
 
 推荐将该能力命名为：
 
@@ -33,6 +33,8 @@ LS-Decode KV Consolidation
 ```
 
 它是现有 `LS-Decode-Core` 的扩展，不应声称等同于完整 LoongServe。
+
+这里的“可落地”指架构上可实现，不是当前代码已经具备或只改配置即可开启。现有项目没有 live Decode KV relayout、maintenance action、intra-DP KV P2P RPC 和 no-fail metadata commit；这些都是新增实现。落地顺序必须先经过 CPU transaction 和手动 GPU correctness，再接 pressure policy，不能直接从 usage threshold 跳到生产 execute。
 
 ### 1.1 能解决什么
 
@@ -126,7 +128,8 @@ end-to-end ITL
 - 每个 sequence 在每个 owner rank 上都可能有一个 partial tail block；
 - 每条 running sequence 有一个尚未进入 committed history 的 pending input token；
 - planner 还会为下一 sampled token 和 `reserved_blocks_per_req` 留出空间；
-- destination rank 可能需要满足 `max_num_seqs`、`max_num_recv_seqs` 和 CUDA Graph metadata capacity。
+- destination rank 可能需要满足 `max_num_seqs`、`max_num_recv_seqs` 和 CUDA Graph metadata capacity；
+- evacuation 期间还要预留固定 migration scratch 和不能直接复用的 destination blocks。
 
 所以必须运行 exact feasibility planner，而不能用：
 
@@ -185,7 +188,7 @@ D_target >= D_compute
 
 - 哪个 group 的 KV 分布在多少 ranks；
 - 哪些 ranks 可以完整 evacuation；
-- destination 是否有足够 staging/append capacity；
+- destination 是否有足够 tail/新 block/append capacity；
 - 释放 rank 后是否会被其他 group 使用；
 - 需要迁移多少 bytes。
 
@@ -218,22 +221,25 @@ U_group = sum(K_blocks[g][rank])
 
 ### 4.2 Target DoP
 
-先计算：
+先计算长期目标：
 
 ```text
-D_mem = exact relocation planner 找到的最小可行 rank 数
+D_mem = exact relocation planner 找到的最小稳态 rank 数
 D_compute = 当前及短期 master demand 需要的 rank 数
 D_target = max(D_mem, D_compute)
 ```
 
+随后为当前 maintenance event 选择一个 source rank，并验证从当前 placement 到“清空该 rank”这一跳真实可行。不能只证明最终 `D_target` 可行；逐 rank 执行可能在中间态遇到 destination capacity 瓶颈。
+
 Exact planner 必须包含：
 
 - committed KV blocks；
-- destination tail repacking 或 staging block 开销；
+- destination 现有 block 的 committed tail、尚未提交的 tail 区间和新 block 开销；
 - 当前 pending input token 的重新指派；
 - 下一 sampled token reservation；
 - `reserved_blocks_per_req`；
 - per-rank block、sequence、receiver 和 graph capacity；
+- 固定 migration scratch（在 KV block sizing 前已经扣除）；
 - consolidation 后的安全 high watermark。
 
 第一版建议只在：
@@ -242,9 +248,9 @@ Exact planner 必须包含：
 D_target < D_kv
 ```
 
-时产生 candidate，并一次最多释放一个 rank。逐 rank evacuation 更容易控制 pause 时间、回滚和抖动。
+时产生 candidate。MVP 的一次 maintenance event 必须完整清空一个 source rank，且最多释放一个 rank；chunk 只限制 scratch 和单次 send/recv 大小，不能把一个 source 的半迁移 placement 暴露给普通 Decode。
 
-### 4.3 稳定性条件
+### 4.3 Pressure-first 与 opportunistic 两类触发
 
 推荐维护 group-level 状态：
 
@@ -256,7 +262,14 @@ last_consolidation_step
 consolidation_inflight
 ```
 
-只有同一个 `D_target` 连续保持若干 Decode iterations，且最近没有 scale-up，才允许执行。
+其中 stable/cooldown 状态只约束 opportunistic path；`consolidation_inflight` 对两条路径都是硬约束。
+
+策略应明确分为两条路径：
+
+1. **Admission pressure**：存在 pending batch，当前 allocation 无法 admission，而 exact simulation 证明清空该 source 后可立即 admission。该路径在 GPU correctness 完成后优先落地，可以绕过 opportunistic stable window 和普通 cooldown，但仍受 transaction-inflight、单 source、最大 source blocks/bytes、最大 pause 和 destination high watermark 限制；
+2. **Opportunistic**：没有资源压力，只为降低 steady ITL 而迁移。只有同一个 `D_target` 连续保持若干 iterations、最近没有 scale-up 且真实 profiling 模型预测能够回本时才执行。
+
+LoongServe 的开源实现用“新 Prefill 收益 vs Decode KV migration cost”决定是否清空 Decode instance；NanoDeploy 没有真实 Prefill，最接近这一语义的是 admission-pressure path，而不是单独观察 group KV usage。
 
 建议配置先以 shadow mode 收集数据，不直接给生产默认值：
 
@@ -267,7 +280,9 @@ ls_kv_consolidation_target_high_watermark = 0.80
 ls_kv_consolidation_stable_steps = 32
 ls_kv_consolidation_cooldown_steps = 64
 ls_kv_consolidation_max_released_ranks_per_event = 1
-ls_kv_consolidation_max_blocks_per_event = 0  # 0 表示仅由 cost policy 控制
+ls_kv_consolidation_max_source_blocks_per_event = 0
+ls_kv_consolidation_max_pause_ms = 0.0
+ls_kv_consolidation_migration_chunk_tokens = 128
 ```
 
 这些数值只能作为 shadow bring-up 起点，正式值必须来自 4-DP × 8-SP / EP32 trace 和 migration bandwidth profiling。
@@ -277,7 +292,7 @@ ls_kv_consolidation_max_blocks_per_event = 0  # 0 表示仅由 cost policy 控�
 对 candidate plan 估算：
 
 ```text
-MigrationCostMs = bytes_to_copy / measured_effective_bandwidth
+MigrationCostMs = bytes_to_copy / measured_pack_send_scatter_bandwidth
                   + fixed_rpc_and_sync_cost
                   + metadata_commit_cost
 
@@ -299,7 +314,7 @@ PaybackSteps < ExpectedRemainingDecodeSteps * safety_factor
 - 当前 group 中 requests 的剩余长度分布；
 - capped prediction horizon，避免过度依赖不准确的 output length 预测。
 
-当有 pending batch 且没有 unallocated rank 时，可以引入 resource-pressure override：如果释放一个 rank 能避免 admission delay、group merge 或 preemption，可以允许 group 自身 ITL 略有回退，但仍必须限制迁移 bytes 和目标 rank high watermark。
+当有 pending batch 且没有 unallocated rank 时，只有 exact admission simulation 明确证明“本次释放的 rank 会被该 batch 使用”，才允许 pressure override。不能因为全局 queue 非空就迁移；否则可能付出 pause 后仍无法 admission。
 
 ### 4.5 推荐的触发时机
 
@@ -332,7 +347,7 @@ Placement A 中每条 request 通常仍有 remote KV edge。Placement B 可以�
 
 因此 planner 的优化顺序建议为：
 
-1. 最小化可释放 ranks 数量；
+1. 最大化可释放 ranks 数量（等价于在约束内最小化目标 `kv_dop`）；
 2. 在目标 ranks 内优先 whole-sequence packing；
 3. 将 sequence 的 owner 与预计 master 对齐；
 4. 单条 sequence 无法放入单 rank 时，才对该 sequence 做多 rank striping；
@@ -364,15 +379,15 @@ KV 被集中到 ranks {0,1}
 
 ```text
 snapshot committed state
-  -> tentative source-style master plan
-  -> consolidation target placement
+  -> 只计算 tentative source-style master demand，不 commit
+  -> source-only evacuation target placement
   -> validate future append/master capacity
   -> execute KV copy
-  -> atomic metadata commit
-  -> install next iteration master/pending-token plan
+  -> no-fail metadata commit
+  -> 下一 engine step 基于新 placement 重新生成 master/pending-token plan
 ```
 
-第一版也可以更保守：只 evacuation 当前 passive、非 pending-target 的 rank，并要求 retained ranks 已包含下一轮全部 masters。
+MVP 只 evacuation 当前 passive、非 pending-target 的 rank，并要求 retained ranks 能覆盖下一轮全部 masters。不能先调用现有 `commit_iteration_master_plan()` 再做迁移，因为当前 scheduler 在返回 `ScheduleResult` 前已经修改 pending/master state，无法为 maintenance failure 保留稳定快照。
 
 ## 6. 数据迁移与事务设计
 
@@ -414,15 +429,18 @@ KVConsolidationPlan
   state_generation
   dp_idx
   group_id
-  source_ranks
+  source_rank
   retained_ranks
   old_kv_dop
   target_kv_dop
   moves
   reserved_destination_blocks
+  source_blocks_to_release
+  prebuilt_affected_sequence_contexts
   new_num_dispatched_tokens
   new_sp_block_tables
   new_pending_targets
+  migration_chunk_tokens
   predicted_before_itl_ms
   predicted_after_itl_ms
   estimated_migration_bytes
@@ -436,76 +454,104 @@ KVConsolidationPlan
 PLAN
   读取 ACTIVE placement
   只统计 committed KV，不把 pending token 当成历史 KV
-  选择 source/retained ranks
-  生成目标 block tables 和 copy ranges
+  选择一个 passive、非 pending-target source rank
+  只为 source 上的 committed ranges 生成 destination 和 copy ranges
+  预构造受影响 sequences 的目标 metadata
 
 RESERVE
-  在 destination BlockManagers 预留 staging block IDs
+  在 destination BlockManagers 预留 tail 以外所需的新 block IDs
+  预留 commit/abort 所需的 metadata 和容器容量
   不修改 ACTIVE block tables
   不释放 source blocks
 
 EXECUTE
-  在 Decode iteration boundary 暂停该 transaction 涉及的执行
+  作为独占 maintenance step 在 Decode iteration boundary 执行
   对所有 KV components、layers 和 token ranges 执行 GPU copy
-  等待所有 copy 完成
+  source block 保持原样，等待所有 workers 报告成功
 
 COMMIT
   校验 state_generation
-  原子替换 num_dispatched_tokens、sp_block_table、block_location
-  重新安装 pending token target 和 append reservation
-  释放旧 source/staging 不再引用的 blocks
+  以预构造对象替换 num_dispatched_tokens、sp_block_table、block_location
+  保持或重新安装 pending token target 和 append reservation
+  释放 source_blocks_to_release
   从 group.allocated_attention_ranks 删除已清空 ranks
   rebuild_decode_role_counters()
 
 ABORT
   ACTIVE metadata 保持不变
-  释放 destination staging blocks
+  释放 transaction-reserved destination blocks
   source blocks 保持有效
 ```
 
 不能采用“先改 block table，再异步 copy”的顺序；任何 copy/RPC 失败都会让下一轮 Attention 读取未完成的数据。
 
-### 6.4 第一版建议使用完整 staging placement
+`COMMIT` 不能再调用可能因为容量、分配或容器扩容而失败的普通 planning API。当前 `BlockManager` 的 `std::list`/`std::unordered_set` 更新和部分 context vector 更新仍可能分配内存；Phase 1 必须将所需对象全部预构造，并把 free-ID/ownership 更新改成预留容量后无分配的操作（更稳妥的是固定容量 vector stack 或 intrusive free list）。所有可预见失败必须发生在 `COMMIT` 前。
 
-最省流量的 evacuation 需要处理 destination partial tail：填充旧 tail、搬 full blocks、再搬 source tail，事务复杂。
+### 6.4 MVP 采用 LoongServe 式 source-only evacuation
 
-考虑到 proposed trigger 本来就针对长期低 usage，第一版建议使用更保守的完整 staging placement：
+MVP 不为整个 retained placement 建第二份副本，而是：
 
-1. 为受影响 sequences 在 retained ranks 上建立 compact 新 block tables；
-2. 在旧 ACTIVE blocks 仍有效时，把 committed KV 复制到新 blocks；
-3. copy 全部成功后一次性切换；
-4. 再释放旧 blocks。
+1. 每次选择一个 source rank；
+2. 对 source 上每条 sequence 的 committed KV，优先追加到该 sequence 的下一轮 master/已有 owner；
+3. 一个 destination 放不下时才拆分到多个 retained ranks；
+4. 不复制 retained rank 之间已经正确的 KV；
+5. source 全部复制成功后一次 commit 并释放该 rank。
 
-优点：
+这与 LoongServe 开源实现的基本形状一致：manager 选择 KV 使用量最小的 Decode instance，把该 instance 的请求 KV 分配到其他 instances，worker 按 `max_mig_len` 分片，完成后才把空 source 从 scale-down batch 中移除。NanoDeploy 应复用这个“清空 source”的方向，而不是复用它的非事务式 metadata 更新顺序。
 
-- 事务和 rollback 简单；
-- 不存在 in-place overwrite dependency；
-- block tables 天然紧凑；
-- 容易做 synthetic byte-for-byte correctness test。
+完整 placement staging 不适合作为生产 MVP：它会重复复制 retained KV，迁移字节更多，且逐 rank 压缩时中间态可能出现“稳态目标放得下，但当前 placement + 完整目标副本放不下”的死角。source-only 只需要为 source 数据找空间，正好与“一次释放一个 rank”的目标一致。
 
-代价：
+### 6.5 Block tail 与 pending frontier 的 NanoDeploy 适配
 
-- transaction 期间需要额外 staging capacity；
-- retained ranks 的 KV 也可能被重新复制；
-- migration bytes 高于最优 source-only evacuation。
+LoongServe 使用 token-level allocator；NanoDeploy 使用 64-token block，并把 pending input token 计入 `num_dispatched_tokens`。因此 destination 写入位置必须按：
 
-因此第一版 exact planner 必须把 temporary double-buffer capacity 作为硬约束。无法 staging 的 candidate 直接跳过，不退化为非事务式搬运。后续再实现增量 tail repack。
+```text
+dst_logical_start = committed_context_len(ACTIVE, dst_sp_rank)
+```
 
-### 6.5 GPU copy backend
+而不是现有的 `num_dispatched_tokens[dst_sp_rank]`。后者可能包含尚未计算 KV 的 pending token。
 
-目标拓扑中每个 8-SP allocation domain 共置于同一节点。可选实现有：
+具体规则：
 
-1. 在 `attention_sp_group` 上使用确定顺序的 NCCL P2P/batched send-recv；
-2. 为同 engine KV Cache 注册 DLSLIME/RDMA endpoints，扩展现有 assignment copy；
-3. 如果 peer access 条件稳定，增加同节点 CUDA peer copy path。
+- destination 已有 committed prefix 不原地覆盖；
+- 可以从 committed tail 开始写，覆盖 pending reservation 对应但尚无有效 KV 的物理槽；
+- RESERVE 必须按“原 committed + moved committed + pending + 下一 sampled token/headroom”准备 block table；
+- commit 后 pending token 仍位于新的 committed frontier；
+- abort 时 tail 中可能留下不可达字节，但 ACTIVE committed 长度未增加，下一次 pending/append 会覆盖它们；
+- source KV 和 source block table 在 commit 前保持完整，因此 copy error 不会破坏旧逻辑 placement。
 
-第一版更重视正确性和可控 ordering，不应先追求 overlap。无论选择哪种 backend，都必须：
+这要求 planner 能生成 block 内 token-range scatter，而不能只做 block-id 对 block-id 的 zip copy。
+
+### 6.6 GPU copy backend：明确选择 per-DP NCCL P2P
+
+目标拓扑中每个 8-SP allocation domain 共置于同一节点。MVP 直接选择：
+
+```text
+startup 创建专用 per-DP migration NCCL communicator
+source gather -> fixed scratch -> NCCL send/recv -> destination scratch -> scatter
+```
+
+不在第一版扩展 DLSLIME/RDMA，也不把 CUDA peer access 作为必需条件。专用 communicator 将迁移 ordering 与现有 Attention/EP communicator 隔离；但 engine 仍必须让全部 32 workers 进入同一个 maintenance action，只有受影响 DP 执行 P2P，其余 workers 等待，保证任何 rank 都不会提前进入下一轮 EP32 collective。
+
+scratch buffer 在 engine 初始化时固定分配，并在计算 KV cache block 数之前从可用显存扣除。`migration_chunk_tokens` 只控制 gather/send/scatter 的峰值内存；一个 source 仍必须在一个 maintenance event 中完成。source blocks 或预计 pause 超过上限时跳过 candidate，不能留下长期半迁移状态。
+
+backend 必须：
 
 - 对 `kv_count × num_hidden_layers` 的所有 slices 复制；
 - 支持 block 内 token range，而不只支持整 block；
-- 所有 workers 以一致的 transaction ordering 进入和退出迁移；
+- 用固定 transaction、sequence、layer、component、chunk 顺序收发，避免 NCCL P2P 配对不一致；
 - 不与 EP32 collective 并发交错；
-- 记录实际 bytes 和 wall-clock migration latency。
+- 记录 gather、send/recv、scatter、sync 的实际 bytes 和 wall-clock latency。
+
+### 6.7 可恢复失败与 engine-fatal 失败
+
+事务不能承诺任意 GPU/RPC 故障后继续 Decode：
+
+- PLAN、RESERVE、preflight 失败，以及所有 actors/process groups 仍健康时 worker 明确返回的 copy error，可以 ABORT；旧 metadata/source KV 有效，可以继续 Decode；
+- actor 退出、CUDA context 错误、NCCL hang/communicator poisoned 无法仅靠 metadata rollback 恢复，MVP 必须按 engine-fatal 处理；
+- COMMIT 开始后不允许返回业务失败。若 source block 的 post-commit 回收异常，应 retry、暂时记为 leak 或使 engine fail-stop，不能声称回到旧 placement。
+
+如果以后需要 actor-failure recovery，必须另做 checkpoint/restart 或 communicator rebuild，不能把它隐含在本事务设计中。
 
 ## 7. Scheduler 接入方案
 
@@ -550,7 +596,7 @@ Retained/destination ranks 应综合：
 
 ```text
 下一轮是否为 master
-staging free capacity
+tail + free block capacity
 当前 group KV ownership
 预计 Attention critical-path load
 NUMA/NVLink locality（当前 8 ranks 同节点时作为次级 key）
@@ -560,24 +606,25 @@ NUMA/NVLink locality（当前 8 ranks 同节点时作为次级 key）
 
 ### 7.3 Engine step 语义
 
-推荐将 consolidation 作为内部 maintenance transaction，而不是伪装成 Prefill 或普通 Decode：
+MVP 将 consolidation 作为独占的内部 maintenance action，不与同一个 engine step 的普通 Decode 拼接。建议将当前隐含的 Prefill/Decode 二选一扩展为显式 action：
 
 ```text
-schedule maintenance candidate
-  -> executor.consolidate_kv(plan)
-  -> scheduler.commit/abort
-  -> 继续生成本轮正常 Decode plan
+ScheduleResult.action = DECODE | ADMISSION | KV_CONSOLIDATION
 ```
 
-第一版可以 stop-the-world，并把 migration latency 计入当前 request latency。不能把 maintenance 时间从 benchmark ITL 中扣除，否则会高估收益。
-
-如果 engine 当前一步只能执行一个 action，也可以先引入显式：
+`KV_CONSOLIDATION` step 的顺序为：
 
 ```text
-ScheduleResult.maintenance_kind = KV_CONSOLIDATION
+scheduler PLAN + RESERVE（不 commit iteration master plan）
+  -> LLMEngine/Executor 向全部 workers 下发 maintenance RPC
+  -> scheduler COMMIT 或 ABORT
+  -> 本 step 不生成 token
+  -> 下一 step 从新 ACTIVE placement 重新 schedule Decode/admission
 ```
 
-该 step 不生成 token，完成后下一 step 再 Decode。无论采用哪种接口，client-visible E2E/ITL 必须包含这段暂停。
+当前 `_schedule_ls_decode()` 在返回前会调用 `commit_iteration_master_plan()`，因此 consolidation branch 必须在该 commit 之前返回，不能复用“先生成正常 Decode plan，再中途插 maintenance”的路径。
+
+第一版 stop-the-world。client 看到的相邻 token 时间天然包含 maintenance pause；内部指标应单独记录 `kv_consolidation_stall_ms`，并关联到下一个 Decode iteration，不能把这段时间从 benchmark ITL/E2E 中扣除。
 
 ## 8. 与 LoongServe 的差异
 
@@ -588,19 +635,41 @@ LoongServe 的 scale-down 有两个主要时机：
 
 NanoDeploy 当前场景跳过真实 Prefill，所以无法获得第一个零额外通信的 proactive retention 机会。我们只能在 Decode 运行期间做 reactive consolidation，成本更高。
 
+其开源 Decode scale-down 数据路径值得采用：
+
+- router 从 Decode batch 中选择 KV 使用量最低的 source instance；
+- 比较新 Prefill 的预计收益与迁移 source KV 的成本；
+- 把 source 上请求的 KV 分配给其他 instances，source 清空后缩小 batch；
+- worker 以 `max_mig_len` 为上限分片；model 将各层 KV gather 到连续 send buffer，经 NCCL P2P 传输后由 receiver scatter。
+
+但它的故障语义不能直接照搬：router 会在等待 worker migration 完成前修改 request/instance metadata，worker 也会在发送完成前修改请求长度和 source allocator 状态，代码没有完整 rollback。NanoDeploy 必须保留 source 和 ACTIVE metadata 直到所有 copy 成功，再走 no-fail commit。
+
 此外：
 
 - LoongServe 开源实现是 dense Llama ESP/TP；
 - NanoDeploy 目标是 DeepSeek-V3，Attention `4DP × 8SP` 与 FFN `EP32` 复用相同 32 workers；
 - LoongServe 的 logical peer shrink 不能直接解决 NanoDeploy 的 EP32 fixed collective。
 
-因此 NanoDeploy 的 policy 必须比 LoongServe 更保守，并以真实 EP32 ITL 收益而不是只以释放 instance 数量作为验收。
+因此最终选择是：
+
+| 问题 | LoongServe 做法 | NanoDeploy 选择 |
+|---|---|---|
+| 搬运粒度 | 清空低使用 source instance | 清空一个 passive SP rank，source-only |
+| copy 分片 | `max_mig_len` token chunk | 固定 scratch + token chunk |
+| transport | NCCL P2P send/recv | 专用 per-DP NCCL P2P communicator |
+| metadata 顺序 | 迁移前已有局部更新 | copy 全成功后 no-fail commit |
+| scale-down 触发 | 新 Prefill 收益驱动 | 先 admission pressure，后 calibrated ITL/payback |
+| 物理 topology | elastic instances | EP32/SP mesh 保持固定 |
+
+NanoDeploy 的 opportunistic policy 必须以真实 EP32 ITL 收益而不是只以释放 instance 数量作为验收；pressure path 则以是否真正解除 admission 阻塞为验收。
 
 调研依据：
 
 - LoongServe 论文机制：`/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/paper-tex-src/sections/design.tex` 中的 Elastic Scale-down、Elastic Instance Allocation 和 Elastic Scaling Plan Generation；
 - LoongServe 开源调度：`/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py::_minimize_decoding_occupied_instances()`；
 - source rank 清空后的 group shrink：同文件 `_scale_down_batch()`；
+- LoongServe worker chunk 和请求状态更新：`/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/model_infer/model_rpc.py::exposed_migrate_batch()`；
+- LoongServe gather/send/recv/scatter：`/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/models/llama/longserve_model.py::decoding_stage_migration()`；
 - NanoDeploy 当前固定 cadence：`csrc/nanodeploy/scheduler/scheduler.cpp::_schedule_ls_decode()`；
 - NanoDeploy 当前跨 engine KV copy：`nanodeploy/worker/cache.py::CacheContext.migrate()`。
 
@@ -614,12 +683,13 @@ NanoDeploy 当前场景跳过真实 Prefill，所以无法获得第一个零额�
 
 - group/sequence owner distribution；
 - exact `D_mem` 和 `D_target`；
-- candidate source/retained ranks；
-- staging capacity 是否可行；
+- 每一步 candidate source/retained ranks；
+- destination tail/new-block capacity 是否可行；
 - estimated migration blocks/bytes/time；
 - predicted before/after ITL；
 - payback steps；
 - candidate stable steps；
+- 清空 rank 后 pending batch 是否能立即 admission；
 - candidate 被拒绝的原因。
 
 建议拒绝原因枚举：
@@ -627,9 +697,10 @@ NanoDeploy 当前场景跳过真实 Prefill，所以无法获得第一个零额�
 ```text
 no_releasable_rank
 compute_dop_too_high
-insufficient_staging_capacity
+insufficient_destination_capacity
 pending_target_conflict
 receiver_capacity
+source_event_limit
 predicted_itl_regression
 payback_too_long
 cooldown
@@ -645,14 +716,15 @@ Phase 0 的 go/no-go 数据：
 - 有 pending admission pressure 时 candidate 命中率；
 - consolidation 后可让整个 DP `use_sp_a2a=False` 的比例。
 
-如果绝大多数 candidate 的 predicted saving 小于 full-mesh 固定成本，或 payback 超过 requests 剩余长度，应停止 execute 实现，只保留 admission-time placement 优化。
+如果绝大多数 candidate 的 predicted saving 小于 full-mesh 固定成本，或 payback 超过 requests 剩余长度，应停止 opportunistic execute；但仍可继续评估能否通过 pressure-driven evacuation 降低 admission wait/preemption。
 
 ### Phase 1：CPU Planner 与 Block Transaction
 
 - 增加 `KVConsolidationPlan` 和 transaction generation；
-- 实现 exact target placement；
-- 实现 staging block reserve/abort/commit；
-- 实现 pending token 的事务式重新指派；
+- 实现逐 source-rank exact target placement；
+- 实现 destination tail/new block reserve、abort 和 no-fail commit；
+- 预构造 metadata，并改造 commit 路径中的动态分配点；
+- 实现 pending frontier 的事务式保持/重新指派；
 - 增加 group allocation shrink；
 - 使用 synthetic cache/block tables 做 CPU transaction tests；
 - feature 默认 `shadow` 或 `off`。
@@ -660,29 +732,38 @@ Phase 0 的 go/no-go 数据：
 ### Phase 2：真实 Intra-DP GPU Copy
 
 - 增加 executor/worker consolidation RPC；
+- 启动时创建 per-DP migration communicator 和固定 scratch；
 - 搬运全部 layers 和 KV components；
 - stop-the-world 同步；
-- copy failure 注入和 rollback；
+- 先提供手动触发，不接自动 policy；
+- 验证可恢复 copy error 的 abort，以及 fatal error 的 fail-stop；
 - 1-DP × 8-SP / EP8 GPU preflight；
 - 比较迁移前后 synthetic KV 内容；
 - 验证无 block leak、hang、stale block table。
 
 即使 Dummy Prefill 的 prompt KV 数值不具有语言语义，性能实验也必须真实复制对应 bytes，不能只修改 metadata。metadata-only relayout 可以作为 planner test mode，但不能作为 KV Consolidation 性能结果。
 
-### Phase 3：Policy Execute 与 4-DP / EP32 验证
+### Phase 3：Pressure-driven Execute 与 4-DP / EP32 验证
 
-- 启用 stable/cooldown/cost policy；
+- 只在 pending batch no-fit 且 exact simulation 证明释放后可 admission 时执行；
 - 一次最多释放一个 rank；
+- 启用 source blocks/bytes、pause、destination high watermark 硬限制；
 - 记录 migration pause 到真实 ITL/E2E；
 - 运行持续请求到达、batch 上升再下降的 long-run；
 - 验证 `master_dop`、`kv_dop`、remote edges 和 allocation 都按预期变化；
 - 对比 `off`、`shadow`、`execute`。
 
-### Phase 4：可选扩展
+### Phase 4：Opportunistic Execute
 
-- 增量 source-only evacuation 和 tail repack；
+- 基于实测 gather/send/scatter 带宽校准 migration cost；
+- 基于 4-DP / EP32 trace 校准 before/after ITL predictor；
+- 启用 stable window、cooldown、payback 和 scale-up hysteresis；
+- 只有含 pause 的 E2E/ITL 获益后才考虑默认开放。
+
+### Phase 5：可选扩展
+
 - admission-pressure 驱动的跨 group merge + consolidation；
-- migration budget/分片，多轮渐进清空一个 rank；
+- 支持可恢复的多轮渐进 evacuation transaction；
 - selective SP peer communication，减少 full-mesh 固定成本；
 - KV import 时直接使用 compact target placement，减少后续 migration；
 - real Prefill/P-D 场景下的 proactive KV placement。
@@ -693,15 +774,18 @@ Phase 0 的 go/no-go 数据：
 
 ```python
 ls_kv_consolidation_mode: Literal["off", "shadow", "execute"] = "off"
+ls_kv_consolidation_execute_policy: Literal["pressure_only", "pressure_and_opportunistic"] = "pressure_only"
 ls_kv_consolidation_candidate_util: float = 0.50
 ls_kv_consolidation_target_high_watermark: float = 0.80
 ls_kv_consolidation_stable_steps: int = 32
 ls_kv_consolidation_cooldown_steps: int = 64
 ls_kv_consolidation_check_interval_steps: int = 8
 ls_kv_consolidation_max_released_ranks_per_event: int = 1
-ls_kv_consolidation_max_blocks_per_event: int = 0
+ls_kv_consolidation_max_source_blocks_per_event: int = 0
+ls_kv_consolidation_max_migration_bytes_per_event: int = 0
+ls_kv_consolidation_max_pause_ms: float = 0.0
+ls_kv_consolidation_migration_chunk_tokens: int = 128
 ls_kv_consolidation_payback_safety_factor: float = 0.5
-ls_kv_consolidation_allow_admission_pressure_override: bool = False
 ```
 
 配置约束：
@@ -709,6 +793,9 @@ ls_kv_consolidation_allow_admission_pressure_override: bool = False
 - 只允许与 `enable_ls_decode_core_scheduler=True` 一起使用；
 - 第一版仍要求 Decode-only、Dummy Prefill、centralized、`loop_count=1`；
 - execute mode 只对白名单拓扑开放；
+- `max_source_blocks_per_event`、`max_migration_bytes_per_event` 和 `max_pause_ms` 在 execute mode 必须由 profiling 给出正值；`0` 表示尚未校准、禁止自动执行；
+- `candidate_util` 只做快速过滤，不能绕过 exact feasibility/admission simulation；
+- `pressure_and_opportunistic` 只有 Phase 4 的 ITL predictor 校准并验收后才能开放；
 - shadow mode 不得修改 block、group、master 或 pending state；
 - mode 为 `off` 时保持 Core 行为完全不变。
 
@@ -717,18 +804,21 @@ ls_kv_consolidation_allow_admission_pressure_override: bool = False
 1. Consolidation 只移动 committed KV；pending input token 不得被当成已计算 KV 复制。
 2. 对每条 sequence，迁移前后 committed token 总数完全一致。
 3. 对每条 sequence、每层、每个 KV component，目标 cache 内容与源逻辑 KV 内容一致。
-4. ACTIVE block tables 在 EXECUTE 成功前不变化。
-5. EXECUTE 或 COMMIT 失败后，旧 ACTIVE placement 仍可继续 Decode。
-6. destination staging blocks 在 abort 后全部释放。
-7. source blocks 只在 metadata commit 成功后释放。
-8. 一个 transaction 期间 group 不得 finish、merge、preempt 或被另一个 transaction 修改。
-9. commit 必须校验 group/state generation。
-10. consolidation 后每个 pending token 有且只有一个合法 target 和 reservation。
-11. 下一轮 masters 必须属于最终 allocation，并有 append capacity。
-12. 被释放 rank 对该 group 的 committed KV、pending token 和 block table 全部为零。
-13. 同一 DP 内未合并 groups 的 allocations 继续两两不交。
-14. migration latency 和 bytes 必须进入日志和端到端性能统计。
-15. fixed EP collective ordering 不因 maintenance transaction 发生分叉或死锁。
+4. 只复制 source rank 上的 committed ranges；retained ranks 已有 committed KV 不因 consolidation 被重写。
+5. 所有 workers 报告 EXECUTE 成功前，ACTIVE metadata 和 source blocks 不变化；destination 未提交 tail 中的字节不可被 Attention 读取。
+6. PLAN、RESERVE、preflight 或健康 communicator 上的可报告 copy error 发生后，旧 ACTIVE placement 仍可继续 Decode。
+7. actor/CUDA/NCCL fatal failure 必须 fail-stop，不得声称已 rollback 并继续服务。
+8. abort 后所有 transaction-reserved blocks 都被回收；未提交 tail 字节保持逻辑不可达。
+9. source blocks 只在 metadata commit 成功后释放。
+10. 一个 transaction 期间 group 不得 finish、merge、preempt、admit 或被另一个 transaction 修改。
+11. commit 前必须校验 group/state generation；commit 路径不得分配内存、调用可失败 capacity API 或返回业务失败。
+12. consolidation 后每个 pending token 有且只有一个合法 target 和 reservation，且 pending 不被计作已迁移 KV。
+13. 下一轮 masters 必须属于最终 allocation，并有 append capacity。
+14. 被释放 rank 对该 group 的 committed KV、pending token 和 block table 全部为零。
+15. 同一 DP 内未合并 groups 的 allocations 继续两两不交。
+16. 一个 maintenance event 要么完整清空一个 source rank，要么不改变 ACTIVE placement。
+17. migration latency 和 bytes 必须进入日志和端到端性能统计。
+18. fixed EP collective ordering 不因 maintenance transaction 发生分叉或死锁。
 
 ## 12. 测试与验收
 
@@ -737,11 +827,18 @@ ls_kv_consolidation_allow_admission_pressure_override: bool = False
 - 低平均 usage 但因 block tails 无法释放 rank 时拒绝；
 - `D_mem=2`、`D_compute=4` 时选择 `D_target=4`；
 - target high watermark 不满足时拒绝；
-- stable steps 和 cooldown 正确；
+- opportunistic stable steps/cooldown 正确，真实 pressure path 可绕过它们但不能绕过硬限制；
 - source 优先选择 passive、低使用 rank；
 - pending target conflict 正确规避或重指派；
-- staging reserve 部分失败完整 rollback；
+- destination 已有 partial tail 和 pending reservation 时，从 committed frontier 规划写入并把 pending frontier 正确后移；
+- source-only 可行但完整 placement staging 不可行时仍能产生 plan；
+- 最终 `D_target` 可行但当前 source evacuation 这一步不可行时拒绝；
+- 只改 source 涉及的 sequence/rank，retained committed tables 保持不变；
+- destination reserve 部分失败完整 abort；
+- abort 后 ACTIVE metadata 不变，未提交 tail 不可达且后续 append 可覆盖；
 - state generation 变化时拒绝 stale commit；
+- commit 之前完成全部 allocation，commit 路径不触发动态分配/容量失败；
+- pressure candidate 只有在释放后 pending batch 能实际 admission 时通过；
 - group allocation 只在 source 真正清空后缩小；
 - shadow mode 状态零变化；
 - feature 关闭时现有 LS tests 完全不变。
@@ -750,10 +847,14 @@ ls_kv_consolidation_allow_admission_pressure_override: bool = False
 
 - 用确定性 pattern 填充每层 KV block；
 - 迁移 full block、partial head/tail 和多个 sequences；
+- 覆盖 migration bytes 超过 scratch、需要多个 chunks 的 source；
+- 覆盖 destination 带 pending token 的 tail overwrite/shift；
 - 检查目标 token ranges byte-for-byte 或 dtype 精确一致；
 - copy 完成后执行至少一个真实 Decode iteration；
 - 验证无 invalid page、CUDA illegal access、block leak 和 collective hang；
-- 注入 source/destination RPC failure，验证旧 placement 仍可继续运行。
+- 注入 communicator 仍健康的 preflight/worker-reported error，验证 abort 后旧 placement 可继续运行；
+- 注入 actor exit、CUDA fatal 或 NCCL timeout，验证 engine fail-stop，不错误恢复 Decode；
+- 验证未受影响 workers 等待 maintenance 完成后再以一致顺序进入 EP32。
 
 ### 12.3 1-DP × 8-SP / EP8 preflight
 
@@ -784,7 +885,7 @@ use_sp_a2a: True -> False
 - scale-down 后再次 scale-up 的频率；
 - payback prediction 与实际 payback 的误差。
 
-功能通过但正式 workload 的含迁移 ITL/E2E 没有改善时，execute mode 不应默认开启。
+opportunistic 路径只有在正式 workload 的含迁移 ITL/E2E 改善后才能开放。pressure 路径则必须证明 admission wait/preemption/throughput 的收益大于 pause 代价，两者不能混成一个验收结论。
 
 ## 13. 主要风险
 
@@ -804,9 +905,9 @@ num_hidden_layers
 
 长 context 的单 rank evacuation 可能需要复制数 GB。不能因为 utilization 低就忽略绝对迁移体积。
 
-### 13.3 Temporary staging capacity
+### 13.3 Destination capacity 与固定 scratch
 
-完整 staging placement 需要额外显存。第一版宁可跳过 candidate，也不能在显存不足时做不可回滚的 in-place rewrite。
+source-only evacuation 不需要复制整个 retained placement，但 destination 仍需容纳 source committed tokens、pending/append headroom 和 fixed scratch。scratch 必须在 KV block sizing 前扣除；本次 source 放不下时跳过 candidate，不能退回到先释放 source 或暴露半迁移 metadata 的做法。
 
 ### 13.4 Metadata 与物理 cache 不一致
 
@@ -816,6 +917,10 @@ num_hidden_layers
 
 迁移 RPC 不能与某些 ranks 的 Decode/EP collective 交错。第一版应全局同步并牺牲 overlap，先保证 ordering。
 
+### 13.6 故障边界比普通 metadata transaction 更窄
+
+NCCL/CUDA fatal failure 可能同时破坏 communicator 或进程，保留旧 source 并不等于 engine 可继续。实现和测试必须区分可恢复 abort 与 engine-fatal，避免形成“任意 RPC 失败都可回滚”的错误运维预期。
+
 ## 14. 最终建议
 
 建议实施，但按以下顺序推进：
@@ -823,17 +928,19 @@ num_hidden_layers
 ```text
 先做 telemetry + shadow exact planner
     ↓
-确认经常存在可释放 ranks，且实际 payback 合理
+实现 source-only CPU reservation / abort / no-fail commit
     ↓
-实现 group-local、一次一 rank、完整 staging 的事务式 GPU copy
+实现固定 scratch + per-DP NCCL P2P，先手动触发
     ↓
 在 1DP/EP8 做 correctness preflight
     ↓
-在 4DP/EP32 以含 migration pause 的 ITL/E2E 决定是否启用
+先在 4DP/EP32 启用 exact admission-pressure path
+    ↓
+校准 ITL/payback 后再决定是否启用 opportunistic path
 ```
 
 不建议直接实现“usage 低于 X% 就迁移”。推荐把用户提出的长期低使用率改写为：
 
-> 当同一个 group 的 exact target KV DoP 连续多个 Decode iterations 低于当前 `kv_dop`，目标 placement 能满足短期 master/append capacity，并且预测收益可以覆盖真实 KV migration 成本时，逐 rank 做 KV evacuation；有 admission pressure 时允许受限 override。
+> 每次只清空一个 passive、非 pending-target source rank，并只复制该 source 的 committed KV；当 pending batch 因 rank 不足无法 admission、且 exact simulation 证明本次 evacuation 能解除阻塞时优先执行。没有 admission pressure 时，只有 target placement 持续稳定、满足短期 master/append capacity，且校准后的收益能覆盖真实 pack/send/scatter pause，才做 opportunistic evacuation。
 
-这一定义既保留了“长期低 usage”想解决的问题，又避免了 capacity、compute demand、full-mesh 固定成本和反复扩缩容带来的错误决策。
+这一定义保留了“长期低 usage”想解决的问题，同时与 LoongServe 的 source evacuation 数据路径一致，并避开完整 staging、中间态 capacity、过强 rollback 承诺、compute demand、fixed EP32 成本和反复扩缩容带来的错误设计。
