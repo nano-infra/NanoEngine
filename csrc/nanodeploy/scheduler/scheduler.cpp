@@ -1202,7 +1202,7 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_ls_deco
         }
     }
 
-    // Every DP must enter the fixed EP32/SP collective cadence, including a
+    // Every DP must enter the fixed EP/SP collective cadence, including a
     // DP with no live Decode group. Fill missing master ranks uniformly here
     // so no early-exit or failure path can return an empty worker batch.
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {

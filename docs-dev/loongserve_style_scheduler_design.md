@@ -10,7 +10,7 @@ dummy_prefill=True
 loop_count=1
 ```
 
-目标模型和固定并行拓扑为：
+目标模型和正式实验拓扑为：
 
 ```text
 model family = DeepSeek-V3
@@ -21,6 +21,19 @@ ffn_ep       = 32
 ffn_dp       = 1
 ffn_tp       = 1
 ```
+
+在进入上述 `4 DP x 8 SP / EP32` 实验前，额外支持以下单机功能预检拓扑：
+
+```text
+attention_dp = 1
+attention_sp = 8
+attention_tp = 1
+ffn_ep       = 8
+ffn_dp       = 1
+ffn_tp       = 1
+```
+
+单机 8 卡预检用于验证一个完整 8-SP allocation domain 内的 admission、multi-master scale-up/down、pending-token 重指派、DLSLIME 通信和 collective cadence。它不覆盖跨 DP 行为，EP8 的 MoE 性能也不能替代 EP32 正式实验结论。
 
 请求携带已有 prompt tokens。NanoDeploy 为这些 tokens 建立逻辑 KV Cache placement，但不执行真实 Prefill model computation，也不从 Prefill engine 搬运真实 KV。
 
@@ -58,6 +71,8 @@ LoongServe 参考：
 
 > 在 Decode-only workload 和固定 `4 DP x 8 SP x EP32` 拓扑下，能否把 LoongServe 的 multi-master、compute/memory scale-up 和 no-history-migration 思想移植到 NanoDeploy，并通过每迭代重算 masters 改善 DeepSeek-V3 Decode 性能？
 
+`1 DP x 8 SP x EP8` 只作为该问题的单机 bring-up/preflight，不改变上面的论文问题定义。
+
 按本文实现的系统在论文中应称为：
 
 ```text
@@ -80,9 +95,9 @@ NanoDeploy 的 DeepSeek-V3 执行语义不同：
 
 - attention master rank 持有该 token 的 hidden state；
 - master 执行该 token 的 attention-side master computation、MoE gate，以及 EP collective 的 source-side dispatch；
-- expert tokens 进入固定 EP32 域，由对应 expert ranks 执行 expert computation；
+- expert tokens 进入固定 EP 域（正式实验 EP32、单机预检 EP8），由对应 expert ranks 执行 expert computation；
 - expert outputs 返回 token source rank，由 master 完成 combine 和后续 token-side computation；
-- passive attention participants 只处理其持有的历史 KV 所对应的 partial attention，但仍需按 NanoDeploy 固定 EP32 collective ordering 参与执行。
+- passive attention participants 只处理其持有的历史 KV 所对应的 partial attention，但仍需按 NanoDeploy 固定 EP collective ordering 参与执行。
 
 单个 token 在一轮内只有一个 source/master；该 token 的 dispatch 和 combine 不拆到多个 source ranks。multi-master 只是在 batch 维度把不同 tokens 分配给不同 source ranks。
 
@@ -92,23 +107,23 @@ NanoDeploy 的 DeepSeek-V3 执行语义不同：
 本轮承载 real Decode tokens，并作为 MoE dispatch/combine source 的 SP rank 数量
 ```
 
-它不表示 EP world size，也不表示实际启用的 GPU 数量。EP32 始终不变。增加 masters 的潜在收益来自：
+它不表示 EP world size，也不表示实际启用的 GPU 数量。同一次运行中的 EP world size 始终不变。增加 masters 的潜在收益来自：
 
 - 分散 master-side attention/QKV/output 工作；
 - 分散 MoE gate、dispatch 和 combine 的 source-side 工作；
 - 避免单一 source rank 承载过大的 Decode batch。
 
-是否存在有效的 multi-master crossover 必须通过目标模型、硬件、dtype、CUDA Graph 和 EP32 backend 上的 profiling 证明，不能直接从 LoongServe 的 Llama/TP 配置外推。
+是否存在有效的 multi-master crossover 必须通过目标模型、硬件、dtype、CUDA Graph 和正式 EP32 backend 上的 profiling 证明，不能从 LoongServe 的 Llama/TP 配置或单机 EP8 预检外推。
 
 ### 1.3 固定通信拓扑
 
-- 32 个 workers、模型权重、DP/SP/EP device mesh 和 DLSLIME full mesh 在启动时创建；
+- 8（单机预检）或 32（正式实验）个 workers、模型权重、DP/SP/EP device mesh 和 DLSLIME full mesh 在启动时创建；
 - 每个 DP 的 8 个 SP ranks 共置于同一物理机，形成独立的 attention allocation domain；
 - running group 固定属于一个 DP，不跨 DP 使用 SP participant；
 - 多个 Decode groups 可以共享一个 DP iteration，但其 committed rank allocations 不重叠；
-- EP=32 的 collective ordering 对所有 workers 保持一致；
+- 固定 EP world 的 collective ordering 对所有 workers 保持一致；
 - Scheduler 继续为没有 real master work 的 SP rank 补 dummy sequence，`LLMEngine` 将每个 DP batch 展开到全部 SP/TP workers；
-- 32 个 workers 在相同 `loop_count` 和 layer ordering 下进入固定 EP32 collective；LS-Decode-Core 只改变 real sequence-to-master assignment，不改变 collective cadence；
+- 所有 workers 在相同 `loop_count` 和 layer ordering 下进入固定 EP collective；LS-Decode-Core 只改变 real sequence-to-master assignment，不改变 collective cadence；
 - 不创建动态 NCCL/process group。
 
 ## 2. Dummy Prefill 生命周期
@@ -633,17 +648,15 @@ Dummy Prefill 只用于 Decode 性能和 shape/kernel execution。本文不要�
 
 ## 11. 支持边界与配置
 
-第一版只支持：
+第一版的通用约束为：
 
 ```text
 mode == "decode"
 dummy_prefill == true
 scheduler_mode == "centralized"
 DeepSeek-V3 model family
-attention_dp == 4
 attention_sp == 8
 attention_tp == 1
-ffn_ep == 32
 ffn_dp == 1
 ffn_tp == 1
 loop_count == 1                 # 唯一支持值
@@ -652,6 +665,15 @@ fixed_sp_size == 0
 dynamic_sp_size_strategy == "legacy"
 use_new_decode_dynamic_sp_scheduler == false
 ```
+
+并行拓扑只白名单支持：
+
+```text
+单机功能预检：attention_dp == 1, ffn_ep == 8
+正式目标实验：attention_dp == 4, ffn_ep == 32
+```
+
+两种拓扑均满足 attention world size 与 FFN world size 相等。其他 DP/EP 组合仍直接拒绝，避免把单机预检误扩展成未经验证的部署能力。
 
 建议新增配置：
 
@@ -808,6 +830,7 @@ Admission 和 Decode 指标必须分开。论文中 `master_dop` 不得表述成
 
 ### 15.2 集成测试
 
+- 先在 `1 DP x 8 SP x EP8` 上完成单机 smoke，至少触发一次 zero-history new master 和一次 DLSLIME SP all-to-all；
 - batch 从 32 增长到 160，再下降到 16；
 - batch 在 threshold 两侧反复变化，masters 每轮按 source-style greedy chunks 直接变化；
 - admission 后所有方法对每个 batch 使用完全相同的 `D_init`、`initial_kv_ranks` 和 uniform prompt placement；
@@ -815,7 +838,7 @@ Admission 和 Decode 指标必须分开。论文中 `master_dop` 不得表述成
 - 多 group 竞争 8 ranks，验证 allocation 扩大和 deterministic merge；
 - new master 无任何历史 KV 时，DLSLIME remote attention 正常执行；
 - 多轮 master 变化后无 block leak、负计数或 stale mask；
-- EP32 collective ordering 不因某 DP/master batch 为空而死锁；
+- 固定 EP collective ordering 不因某 DP/master batch 为空而死锁；正式实验还需覆盖某个 DP 完全无 real batch 的 EP32 情形；
 - historical KV migration bytes 始终为 0；
 - feature flag 关闭时性能与行为保持原基线。
 
@@ -839,7 +862,7 @@ profiling，并满足：
 - 不增加 KV capacity preemption；
 - 至少报告 threshold 的 ±25% 和 ±50% sensitivity。
 
-如果 profiling 证明固定 EP32 下增加 masters 没有收益，则停止 compute-triggered scale-up，只保留 memory-triggered multi-master，不能为了匹配 LoongServe 机制而强行启用。
+单机 EP8 结果只用于发现 correctness、hang、shape 和容量问题，不用于设定正式 threshold 或报告最终 speedup。如果 profiling 证明固定 EP32 下增加 masters 没有收益，则停止 compute-triggered scale-up，只保留 memory-triggered multi-master，不能为了匹配 LoongServe 机制而强行启用。
 
 ## 16. 实施步骤
 
@@ -872,7 +895,7 @@ Core 实现到 Phase 3 结束。历史 KV rebalance、rank-releasing scale-down 
 ## 17. 实现前确认项
 
 1. Baseline 名称为 `LS-Decode-Core` 或 `LoongServe-style decode-only scheduler`，不称完整 LoongServe。
-2. 目标模型为 DeepSeek-V3，EP32 始终固定。
+2. 目标模型为 DeepSeek-V3；正式实验固定 EP32，单机预检固定 EP8，二者结果边界必须明确区分。
 3. master 是 real token 的 attention master 和 MoE dispatch/combine source，不是独立完整模型 replica。
 4. `loop_count=1` 是硬性支持边界；masters 在每个 token iteration 重算。
 5. `D_init` 是 batch-level initial KV DoP；所有 requests 在相同 initial ranks 上均匀切分 prompt KV。

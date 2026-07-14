@@ -232,17 +232,25 @@ class Config:
                 unsupported.append("scheduler_mode must be 'centralized'")
             if self.loop_count != 1:
                 unsupported.append("loop_count must be 1")
-            if (
+            ls_parallel_topology = (
                 self.attention_dp,
                 self.attention_sp,
                 self.attention_tp,
                 self.ffn_ep,
                 self.ffn_dp,
                 self.ffn_tp,
-            ) != (4, 8, 1, 32, 1, 1):
+            )
+            supported_ls_parallel_topologies = {
+                (1, 8, 1, 8, 1, 1),   # single-node functional preflight
+                (4, 8, 1, 32, 1, 1),  # target 4-DP experiment
+            }
+            if ls_parallel_topology not in supported_ls_parallel_topologies:
                 unsupported.append(
-                    "parallel topology must be attention_dp=4, attention_sp=8, "
-                    "attention_tp=1, ffn_ep=32, ffn_dp=1, ffn_tp=1"
+                    "parallel topology must be either the single-node preflight "
+                    "(attention_dp=1, attention_sp=8, attention_tp=1, "
+                    "ffn_ep=8, ffn_dp=1, ffn_tp=1) or the target experiment "
+                    "(attention_dp=4, attention_sp=8, attention_tp=1, "
+                    "ffn_ep=32, ffn_dp=1, ffn_tp=1)"
                 )
             if not self.use_dlslime_rpc:
                 unsupported.append("use_dlslime_rpc must be True")

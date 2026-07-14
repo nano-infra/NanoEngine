@@ -65,6 +65,16 @@ def test_ls_decode_core_supported_configuration(tmp_path):
     assert config.ls_decode_enable_memory_scale_up is False
 
 
+def test_ls_decode_core_supports_single_node_8gpu_preflight(tmp_path):
+    kwargs = _ls_kwargs()
+    kwargs.update(attention_dp=1, ffn_ep=8)
+
+    config = Config(model=str(tmp_path), **kwargs)
+
+    assert config.attn_world_size == 8
+    assert config.ffn_world_size == 8
+
+
 @pytest.mark.parametrize(
     ("override", "message"),
     [
