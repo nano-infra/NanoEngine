@@ -21,6 +21,11 @@ from dlengine.context_v2.distributed import get_dist_context
 from dlengine.context_v2.peer import PeerAgentContext
 from dlengine.disagg.p2p.cache_layout import P2PCacheLayout
 from dlengine.logging import get_logger
+from dlengine.models.pp_utils import (
+    pp_global_rank,
+    pp_layer_partition,
+    pp_stage_of_layer,
+)
 
 logger = get_logger("dlengine")
 
@@ -69,6 +74,12 @@ def initialize_migration_state(context) -> None:
     context.num_remote_kvcache_blocks = {}
     context.remote_max_num_seqs = {}
     context.remote_attention_tp = {}
+    context.remote_attention_dp = {}
+    context.remote_pp = {}
+    context.remote_num_hidden_layers = {}
+    context.remote_pp_layer_ranges = {}
+    context.remote_pp_cache_layer_indices = {}
+    context.remote_pp_dsv4_ratio_layer_indices = {}
     context.remote_gdn_num_slots = {}
     context.remote_compressed_pool_pages = {}
     context.remote_dsv4_max_slots = {}
@@ -315,6 +326,12 @@ class P2PCacheTransfer:
         self.num_remote_kvcache_blocks.pop(remote_engine_id, None)
         self.remote_max_num_seqs.pop(remote_engine_id, None)
         self.remote_attention_tp.pop(remote_engine_id, None)
+        self.remote_attention_dp.pop(remote_engine_id, None)
+        self.remote_pp.pop(remote_engine_id, None)
+        self.remote_num_hidden_layers.pop(remote_engine_id, None)
+        self.remote_pp_layer_ranges.pop(remote_engine_id, None)
+        self.remote_pp_cache_layer_indices.pop(remote_engine_id, None)
+        self.remote_pp_dsv4_ratio_layer_indices.pop(remote_engine_id, None)
         self.remote_gdn_num_slots.pop(remote_engine_id, None)
         self.remote_compressed_pool_pages.pop(remote_engine_id, None)
         self.remote_dsv4_max_slots.pop(remote_engine_id, None)
@@ -444,6 +461,7 @@ class P2PCacheTransfer:
     def _remote_global_rank(
         self,
         dp_idx: int,
+        dp_size: int,
         sp_idx: int,
         sp_size: int,
         tp_idx: int,
@@ -456,7 +474,15 @@ class P2PCacheTransfer:
         For attention_tp == 1 this reduces to ``dp_idx * sp_size + sp_idx``,
         preserving the previous (TP=1 / MLA) behavior.
         """
-        return (dp_idx * sp_size + sp_idx) * tp_size + tp_idx
+        return pp_global_rank(
+            0,
+            dp_idx,
+            sp_idx,
+            tp_idx,
+            dp_size=dp_size,
+            sp_size=sp_size,
+            tp_size=tp_size,
+        )
 
     def _ensure_peer_connections(
         self, connection_requests: list[tuple[str, str, int, int, int]]
@@ -503,51 +529,78 @@ class P2PCacheTransfer:
 
         Args:
             assigns: engine_id -> peer_alias -> list of
-                     (peer_alias, kv_idx, layer_idx, remote_block_idx, source_block_idx)
+                     (peer_alias, kv_idx, local_layer_idx, remote_layer_idx,
+                      remote_num_layers, remote_block_idx, source_block_idx)
+                     where local_layer_idx indexes the local kv_cache tensor,
+                     remote_layer_idx indexes the remote (possibly PP-stage
+                     sharded) kv_cache tensor and remote_num_layers is that
+                     remote tensor's layer count (for stride math)
             gdn_assigns: engine_id -> peer_alias -> list of
-                         (layer_idx, remote_state_slot, local_state_slot)
+                         (local_layer_idx, remote_layer_idx,
+                          remote_state_slot, local_state_slot)
             indexer_assigns: engine_id -> peer_alias -> list of
-                             (layer_idx, remote_block_idx, source_block_idx)
+                             (local_layer_idx, remote_layer_idx,
+                              remote_block_idx, source_block_idx)
             compressed_assigns: engine_id -> peer_alias -> list of
-                                (ratio, ratio_layer_idx, remote_page_idx, local_page_idx)
+                                (ratio, local_ratio_layer_idx,
+                                 remote_ratio_layer_idx, remote_page_idx,
+                                 local_page_idx)
             compressor_state_assigns: engine_id -> peer_alias -> list of
-                                (ratio, ratio_layer_idx, remote_state_slot, local_state_slot)
+                                (ratio, local_ratio_layer_idx,
+                                 remote_ratio_layer_idx, remote_state_slot,
+                                 local_state_slot)
         """
         peer_context = self.get_peer_agent_context()
         peer_agent = peer_context.agent
-        for engine_id, peer_assigns in assigns.items():
-            for peer_alias, assign_batch in peer_assigns.items():
+        assignment_maps = (
+            assigns,
+            gdn_assigns,
+            indexer_assigns or {},
+            compressed_assigns or {},
+            compressor_state_assigns or {},
+        )
+        engine_ids = {engine_id for mapping in assignment_maps for engine_id in mapping}
+        for engine_id in engine_ids:
+            peer_aliases = {
+                peer_alias
+                for mapping in assignment_maps
+                for peer_alias in mapping.get(engine_id, {})
+            }
+            for peer_alias in peer_aliases:
+                assign_batch = assigns.get(engine_id, {}).get(peer_alias, [])
                 if not peer_context.is_connected(peer_alias):
-                    logger.error(f"Peer {peer_alias} not connected, skipping")
-                    continue
+                    raise RuntimeError(f"Peer {peer_alias} not connected")
 
                 conn = peer_agent.query_connection(peer_alias)
                 if conn is None or conn.endpoint is None:
-                    logger.error(f"Failed to get endpoint for {peer_alias}")
-                    continue
+                    raise RuntimeError(f"Failed to get endpoint for {peer_alias}")
                 endpoint = conn.endpoint
 
-                remote_mr_info = peer_agent.get_mr_info(peer_alias, _KV_CACHE_BUFFER_ID)
-                if remote_mr_info is None:
-                    logger.error(f"Failed to get MR info for {peer_alias}")
-                    continue
-
-                remote_mr_handler = peer_agent.get_handle(
-                    _KV_CACHE_BUFFER_ID, peer_alias=peer_alias
-                )
-                logger.debug(
-                    f"Remote MR for {peer_alias}: handler={remote_mr_handler}, "
-                    f"local_handler={self._local_mr_handler}"
-                )
-
-                if self._local_mr_handler is None:
-                    logger.error(
-                        f"Local MR handler not available for {_KV_CACHE_BUFFER_ID}"
-                    )
-                    continue
+                remote_mr_handler = None
                 local_mr_handler = self._local_mr_handler
+                if assign_batch:
+                    remote_mr_info = peer_agent.get_mr_info(
+                        peer_alias, _KV_CACHE_BUFFER_ID
+                    )
+                    if remote_mr_info is None:
+                        raise RuntimeError(
+                            f"Failed to get {_KV_CACHE_BUFFER_ID} MR info for "
+                            f"{peer_alias}"
+                        )
+                    remote_mr_handler = peer_agent.get_handle(
+                        _KV_CACHE_BUFFER_ID, peer_alias=peer_alias
+                    )
+                    if local_mr_handler is None:
+                        raise RuntimeError(
+                            f"Local MR handler not available for "
+                            f"{_KV_CACHE_BUFFER_ID}"
+                        )
+                    logger.debug(
+                        f"Remote MR for {peer_alias}: handler={remote_mr_handler}, "
+                        f"local_handler={local_mr_handler}"
+                    )
                 use_hisparse_cold = self._local_hisparse_cold_mr_handler is not None
-                if use_hisparse_cold:
+                if assign_batch and use_hisparse_cold:
                     local_mr_handler = self._local_hisparse_cold_mr_handler
 
                 # Build KV cache RDMA ops
@@ -555,7 +608,9 @@ class P2PCacheTransfer:
                 for op_idx, (
                     _peer_alias,
                     kv_idx,
-                    layer_idx,
+                    local_layer_idx,
+                    remote_layer_idx,
+                    remote_num_layers,
                     remote_block_idx,
                     source_block_idx,
                 ) in enumerate(assign_batch):
@@ -563,15 +618,19 @@ class P2PCacheTransfer:
                         cold = self.host_kv_cache
                         local_off = (
                             kv_idx * cold.stride(0)
-                            + layer_idx * cold.stride(1)
+                            + local_layer_idx * cold.stride(1)
                             + source_block_idx * cold.stride(2)
                         ) * cold.element_size()
                     else:
                         local_off = self.layout.local_kv_stride(
-                            kv_idx, layer_idx, source_block_idx
+                            kv_idx, local_layer_idx, source_block_idx
                         )
                     remote_off = self.layout.remote_kv_stride(
-                        kv_idx, layer_idx, remote_block_idx, engine_id
+                        kv_idx,
+                        remote_layer_idx,
+                        remote_block_idx,
+                        engine_id,
+                        remote_num_layers,
                     )
                     length = self.layout.block_stride(1)
 
@@ -611,21 +670,30 @@ class P2PCacheTransfer:
                             "gdn_conv", peer_alias=peer_alias
                         )
                         local_conv_mr = self._local_gdn_conv_mr_handler
+                        if local_conv_mr is None:
+                            raise RuntimeError("Local gdn_conv MR is not registered")
                         conv_len = self.layout.gdn_conv_slot_num_bytes()
-                        for layer_idx, remote_slot, local_slot in gdn_batch:
+                        for (
+                            local_layer_idx,
+                            remote_layer_idx,
+                            remote_slot,
+                            local_slot,
+                        ) in gdn_batch:
                             rdma_ops.append(
                                 (
                                     local_conv_mr,
                                     remote_conv_mr,
                                     self.layout.remote_gdn_conv_stride(
-                                        layer_idx, remote_slot, engine_id
+                                        remote_layer_idx, remote_slot, engine_id
                                     ),
-                                    self.layout.gdn_conv_stride(layer_idx, local_slot),
+                                    self.layout.gdn_conv_stride(
+                                        local_layer_idx, local_slot
+                                    ),
                                     conv_len,
                                 )
                             )
                     else:
-                        logger.warning(
+                        raise RuntimeError(
                             f"Failed to get gdn_conv MR info for {peer_alias}"
                         )
 
@@ -638,23 +706,32 @@ class P2PCacheTransfer:
                             "gdn_recurrent", peer_alias=peer_alias
                         )
                         local_rec_mr = self._local_gdn_recurrent_mr_handler
+                        if local_rec_mr is None:
+                            raise RuntimeError(
+                                "Local gdn_recurrent MR is not registered"
+                            )
                         rec_len = self.layout.gdn_recurrent_slot_num_bytes()
-                        for layer_idx, remote_slot, local_slot in gdn_batch:
+                        for (
+                            local_layer_idx,
+                            remote_layer_idx,
+                            remote_slot,
+                            local_slot,
+                        ) in gdn_batch:
                             rdma_ops.append(
                                 (
                                     local_rec_mr,
                                     remote_rec_mr,
                                     self.layout.remote_gdn_recurrent_stride(
-                                        layer_idx, remote_slot, engine_id
+                                        remote_layer_idx, remote_slot, engine_id
                                     ),
                                     self.layout.gdn_recurrent_stride(
-                                        layer_idx, local_slot
+                                        local_layer_idx, local_slot
                                     ),
                                     rec_len,
                                 )
                             )
                     else:
-                        logger.warning(
+                        raise RuntimeError(
                             f"Failed to get gdn_recurrent MR info for {peer_alias}"
                         )
 
@@ -665,19 +742,23 @@ class P2PCacheTransfer:
                 if comp_batch:
                     # Group by ratio to register the right MR per ratio.
                     by_ratio: dict[int, list[tuple]] = {}
-                    for r, rli, rpage, lpage in comp_batch:
-                        by_ratio.setdefault(r, []).append((rli, rpage, lpage))
+                    for r, local_rli, remote_rli, rpage, lpage in comp_batch:
+                        by_ratio.setdefault(r, []).append(
+                            (local_rli, remote_rli, rpage, lpage)
+                        )
                     for ratio, ops in by_ratio.items():
                         local_handler = self._local_dsv4_compressed_mr_handlers.get(
                             ratio
                         )
                         if local_handler is None:
-                            continue
+                            raise RuntimeError(
+                                f"Local DSv4 compressed ratio={ratio} MR is not registered"
+                            )
                         remote_info = peer_agent.get_mr_info(
                             peer_alias, f"dsv4_compressed_r{ratio}"
                         )
                         if not remote_info:
-                            logger.warning(
+                            raise RuntimeError(
                                 f"Failed to get DSv4 compressed MR info for {peer_alias}, ratio={ratio}"
                             )
                             continue
@@ -685,16 +766,16 @@ class P2PCacheTransfer:
                             f"dsv4_compressed_r{ratio}", peer_alias=peer_alias
                         )
                         page_bytes = self.layout.compressed_page_bytes(ratio)
-                        for rli, rpage, lpage in ops:
+                        for local_rli, remote_rli, rpage, lpage in ops:
                             rdma_ops.append(
                                 (
                                     local_handler,
                                     remote_handler,
                                     self.layout.remote_compressed_stride(
-                                        ratio, rli, rpage, engine_id
+                                        ratio, remote_rli, rpage, engine_id
                                     ),
                                     self.layout.local_compressed_stride(
-                                        ratio, rli, lpage
+                                        ratio, local_rli, lpage
                                     ),
                                     page_bytes,
                                 )
@@ -707,8 +788,10 @@ class P2PCacheTransfer:
                 )
                 if cstate_batch:
                     by_ratio_s: dict[int, list[tuple]] = {}
-                    for r, rli, rslot, lslot in cstate_batch:
-                        by_ratio_s.setdefault(r, []).append((rli, rslot, lslot))
+                    for r, local_rli, remote_rli, rslot, lslot in cstate_batch:
+                        by_ratio_s.setdefault(r, []).append(
+                            (local_rli, remote_rli, rslot, lslot)
+                        )
                     for ratio, ops in by_ratio_s.items():
                         for kind, local_map in (
                             ("kv", self._local_dsv4_compressor_kv_mr_handlers),
@@ -717,11 +800,14 @@ class P2PCacheTransfer:
                         ):
                             local_handler = local_map.get(ratio)
                             if local_handler is None:
-                                continue
+                                raise RuntimeError(
+                                    f"Local {kind} compressor ratio={ratio} MR "
+                                    "is not registered"
+                                )
                             mr_name = f"dsv4_compressor_{kind}_r{ratio}"
                             remote_info = peer_agent.get_mr_info(peer_alias, mr_name)
                             if not remote_info:
-                                logger.warning(
+                                raise RuntimeError(
                                     f"Failed to get {mr_name} MR info for {peer_alias}"
                                 )
                                 continue
@@ -731,16 +817,20 @@ class P2PCacheTransfer:
                             row_bytes = self.layout.compressor_state_row_bytes(
                                 ratio, kind
                             )
-                            for rli, rslot, lslot in ops:
+                            for local_rli, remote_rli, rslot, lslot in ops:
                                 rdma_ops.append(
                                     (
                                         local_handler,
                                         remote_handler,
                                         self.layout.remote_compressor_state_stride(
-                                            ratio, rli, rslot, kind, engine_id
+                                            ratio,
+                                            remote_rli,
+                                            rslot,
+                                            kind,
+                                            engine_id,
                                         ),
                                         self.layout.local_compressor_state_stride(
-                                            ratio, rli, lslot, kind
+                                            ratio, local_rli, lslot, kind
                                         ),
                                         row_bytes,
                                     )
@@ -760,28 +850,32 @@ class P2PCacheTransfer:
                         )
                         local_indexer_mr = self._local_indexer_mr_handler
                         page_bytes = self.layout.indexer_page_num_bytes()
-                        for layer_idx, remote_block, local_block in indexer_batch:
+                        for (
+                            local_layer_idx,
+                            remote_layer_idx,
+                            remote_block,
+                            local_block,
+                        ) in indexer_batch:
                             rdma_ops.append(
                                 (
                                     local_indexer_mr,
                                     remote_indexer_mr,
                                     self.layout.remote_indexer_stride(
-                                        layer_idx, remote_block, engine_id
+                                        remote_layer_idx, remote_block, engine_id
                                     ),
                                     self.layout.local_indexer_stride(
-                                        layer_idx, local_block
+                                        local_layer_idx, local_block
                                     ),
                                     page_bytes,
                                 )
                             )
                     else:
-                        logger.warning(
+                        raise RuntimeError(
                             f"Failed to get indexer_cache MR info for {peer_alias}"
                         )
 
                 if not rdma_ops:
-                    logger.error(f"No valid RDMA ops for {peer_alias}, skipping")
-                    continue
+                    raise RuntimeError(f"No valid RDMA ops for {peer_alias}")
 
                 try:
                     slot = endpoint.read(rdma_ops, None)
@@ -826,7 +920,7 @@ class P2PCacheTransfer:
         engine_info_map = self._fetch_engine_info_from_ctrl(target_engine_ids)
 
         # Ensure connections
-        connection_requests: list[tuple[str, str, int, int]] = []
+        connection_requests: list[tuple[str, str, int, int, int]] = []
         for v in views:
             engine_id = v.migrate_engine_id
             engine_info = engine_info_map.get(engine_id, {})
@@ -858,6 +952,111 @@ class P2PCacheTransfer:
             self.remote_attention_tp[engine_id] = int(
                 engine_info.get("attention_tp", 1)
             )
+            self.remote_attention_dp[engine_id] = int(
+                engine_info.get("attention_dp", 1)
+            )
+            # PP prefill → pp=1 decode: the prefill engine's KV cache is
+            # sharded per pipeline stage, so the decode side must route each
+            # global layer to the stage that owns it. Validate the supported
+            # shape here so failures are loud and early.
+            remote_pp = int(engine_info.get("pp", 1))
+            self.remote_pp[engine_id] = remote_pp
+            remote_layers_total = int(engine_info.get("num_hidden_layers", 0))
+            effective_remote_layers = remote_layers_total or self.num_hidden_layers
+            self.remote_num_hidden_layers[engine_id] = remote_layers_total
+            published_ranges = engine_info.get("pp_layer_ranges") or []
+            if published_ranges:
+                stage_ranges = [(int(s), int(e)) for s, e in published_ranges]
+            else:
+                # Older prefill engines don't publish pp_layer_ranges;
+                # recompute with the shared even-split policy.
+                stage_ranges = pp_layer_partition(effective_remote_layers, remote_pp)
+            if (
+                len(stage_ranges) != remote_pp
+                or not stage_ranges
+                or stage_ranges[0][0] != 0
+                or stage_ranges[-1][1] != effective_remote_layers
+                or any(
+                    start >= end or end != stage_ranges[idx + 1][0]
+                    for idx, (start, end) in enumerate(stage_ranges[:-1])
+                )
+                or stage_ranges[-1][0] >= stage_ranges[-1][1]
+            ):
+                raise RuntimeError(
+                    f"Invalid PP layer ranges for {engine_id}: pp={remote_pp}, "
+                    f"num_layers={effective_remote_layers}, ranges={stage_ranges}"
+                )
+            self.remote_pp_layer_ranges[engine_id] = stage_ranges
+            published_cache_layers = engine_info.get("pp_cache_layer_indices") or []
+            if published_cache_layers:
+                cache_layers_by_stage = [
+                    [int(layer) for layer in stage_layers]
+                    for stage_layers in published_cache_layers
+                ]
+            else:
+                cache_layers_by_stage = [
+                    list(range(start, end)) for start, end in stage_ranges
+                ]
+            self.remote_pp_cache_layer_indices[engine_id] = cache_layers_by_stage
+            published_ratio_layers = (
+                engine_info.get("pp_dsv4_ratio_layer_indices") or {}
+            )
+            self.remote_pp_dsv4_ratio_layer_indices[engine_id] = {
+                int(ratio): [
+                    [int(layer) for layer in stage_layers]
+                    for stage_layers in layers_by_stage
+                ]
+                for ratio, layers_by_stage in published_ratio_layers.items()
+            }
+            if remote_pp > 1:
+                if remote_layers_total <= 0:
+                    raise RuntimeError(
+                        f"PP prefill engine {engine_id} did not publish "
+                        "num_hidden_layers"
+                    )
+                if get_dist_context().pp_world_size > 1:
+                    raise RuntimeError(
+                        "PD migration between two PP engines is not supported "
+                        "(PP prefill requires a pp=1 decode engine)"
+                    )
+                if len(cache_layers_by_stage) != remote_pp:
+                    raise RuntimeError(
+                        f"PP cache-layer metadata mismatch for {engine_id}: "
+                        f"pp={remote_pp}, layers={cache_layers_by_stage}"
+                    )
+                if len(stage_ranges) != remote_pp:
+                    raise RuntimeError(
+                        f"PP layer-range metadata mismatch for {engine_id}: "
+                        f"pp={remote_pp}, pp_layer_ranges={stage_ranges}"
+                    )
+                flattened_cache_layers = [
+                    layer
+                    for stage_layers in cache_layers_by_stage
+                    for layer in stage_layers
+                ]
+                if len(flattened_cache_layers) != self.num_hidden_layers:
+                    raise RuntimeError(
+                        f"PP cache-layer count mismatch for {engine_id}: remote "
+                        f"has {len(flattened_cache_layers)} slots, decode has "
+                        f"{self.num_hidden_layers}"
+                    )
+                if len(set(flattened_cache_layers)) != len(flattened_cache_layers):
+                    raise RuntimeError(
+                        f"PP cache-layer metadata contains duplicates for "
+                        f"{engine_id}: {cache_layers_by_stage}"
+                    )
+                if flattened_cache_layers != sorted(flattened_cache_layers):
+                    raise RuntimeError(
+                        f"PP cache layers are not in global slot order for "
+                        f"{engine_id}: {cache_layers_by_stage}"
+                    )
+                for stage, layers in enumerate(cache_layers_by_stage):
+                    start, end = stage_ranges[stage]
+                    if any(layer < start or layer >= end for layer in layers):
+                        raise RuntimeError(
+                            f"PP cache layer outside stage {stage} range "
+                            f"[{start}, {end}) for {engine_id}: {layers}"
+                        )
             # The RDMA block-copy migrates whole (layer, block) regions whose
             # byte size depends on num_local_kv_heads. That only lines up when
             # prefill and decode shard KV heads identically; otherwise a decode
@@ -916,17 +1115,58 @@ class P2PCacheTransfer:
             engine_info = engine_info_map.get(engine_id, {})
             peer_addrs = engine_info.get("peer_addrs", [])
             if not peer_addrs:
-                logger.warning(
+                raise RuntimeError(
                     f"Sequence {v.seq_id} has no peer_addrs for engine {engine_id}"
                 )
-                continue
+
+            # PP prefill layout: the remote per-stage layer ownership routes
+            # each global layer's RDMA read to the prefill stage (and thus the
+            # peer rank / byte offset) that holds it. For remote_pp == 1 this
+            # degenerates to a single stage covering all layers, preserving
+            # the previous behavior exactly.
+            remote_pp = self.remote_pp.get(engine_id, 1)
+            if remote_pp > 1:
+                remote_stage_ranges = self.remote_pp_layer_ranges[engine_id]
+                remote_cache_layers_by_stage = self.remote_pp_cache_layer_indices[
+                    engine_id
+                ]
+            else:
+                # Single stage covering the local KV layer count. Do NOT use
+                # the published model-layer ranges here: hybrid-attention
+                # models have fewer KV layers than decoder layers, and the
+                # remote cache tensor is sized by KV layers.
+                remote_stage_ranges = [(0, self.num_hidden_layers)]
+                remote_cache_layers_by_stage = [list(range(self.num_hidden_layers))]
+            # Workers within one prefill stage: attention_dp * sp * tp.
+            remote_inner_world_size = (
+                self.remote_attention_dp.get(engine_id, 1)
+                * v.migrate_group_size
+                * self.remote_attention_tp.get(engine_id, 1)
+            )
+            remote_dp = self.remote_attention_dp.get(engine_id, 1)
+            remote_tp = self.remote_attention_tp.get(engine_id, 1)
+            if not 0 <= v.migrate_dp_idx < remote_dp:
+                raise RuntimeError(
+                    f"remote DP index {v.migrate_dp_idx} outside [0, "
+                    f"{remote_dp}) for {engine_id}"
+                )
+            if not 0 <= tp_idx < remote_tp:
+                raise RuntimeError(
+                    f"decode TP index {tp_idx} outside remote TP size "
+                    f"{remote_tp} for {engine_id}"
+                )
+            if remote_pp > 1 and remote_pp * remote_inner_world_size != len(peer_addrs):
+                raise RuntimeError(
+                    f"PP peer layout mismatch for {engine_id}: pp={remote_pp} * "
+                    f"inner={remote_inner_world_size} != "
+                    f"len(peer_addrs)={len(peer_addrs)}"
+                )
 
             if len(v.migrate_block_location) > len(v.active_block_location):
-                logger.error(
+                raise RuntimeError(
                     f"Sequence {v.seq_id}: migrate has MORE blocks than active! "
                     f"migrate={len(v.migrate_block_location)}, active={len(v.active_block_location)}"
                 )
-                continue
             if len(v.migrate_block_location) < len(v.active_block_location):
                 # Expected when prompt_tokens % block_size == 0: prefill serializes N blocks
                 # for prompt KV, but decode allocates N+1 blocks for (prompt+1) total tokens.
@@ -948,56 +1188,91 @@ class P2PCacheTransfer:
                     source_block_idx < 0
                     or source_block_idx >= self.num_local_kvcache_blocks
                 ):
-                    logger.error(
+                    raise RuntimeError(
                         f"Sequence {v.seq_id}: source_block_idx {source_block_idx} "
                         f"out of range [0, {self.num_local_kvcache_blocks})"
                     )
-                    continue
                 remote_max = self.num_remote_kvcache_blocks.get(engine_id, 0)
                 if remote_block_idx < 0 or (
                     remote_max > 0 and remote_block_idx >= remote_max
                 ):
-                    logger.error(
+                    raise RuntimeError(
                         f"Sequence {v.seq_id}: remote_block_idx {remote_block_idx} "
                         f"out of range [0, {remote_max})"
                     )
-                    continue
 
                 if source_sp_idx != sp_idx:
                     continue
 
-                remote_rank = self._remote_global_rank(
+                # Rank of the matching (dp, sp, tp) cell within one prefill
+                # stage; the stage offset is added per layer below.
+                remote_inner_rank = self._remote_global_rank(
                     v.migrate_dp_idx,
+                    remote_dp,
                     remote_sp_idx,
                     v.migrate_group_size,
                     tp_idx,
                     self.remote_attention_tp.get(engine_id, 1),
                 )
 
-                if remote_rank >= len(peer_addrs):
-                    logger.error(
-                        f"remote_rank {remote_rank} >= len(peer_addrs) {len(peer_addrs)}"
+                max_remote_rank = (
+                    len(remote_stage_ranges) - 1
+                ) * remote_inner_world_size + remote_inner_rank
+                if max_remote_rank >= len(peer_addrs):
+                    raise RuntimeError(
+                        f"remote_rank {max_remote_rank} >= len(peer_addrs) "
+                        f"{len(peer_addrs)}"
                     )
-                    continue
-                peer_alias = peer_addrs[remote_rank]
 
-                for kv_idx in range(self.kv_cache.size(0)):
-                    for layer_idx in range(self.num_hidden_layers):
+                cache_planes = 1 if self.mode in ("mla", "dsv4") else 2
+                local_cache_layers = [
+                    layer
+                    for stage_layers in remote_cache_layers_by_stage
+                    for layer in stage_layers
+                ]
+                remote_cache_locations = {
+                    layer: (stage, remote_layer_idx)
+                    for stage, stage_layers in enumerate(remote_cache_layers_by_stage)
+                    for remote_layer_idx, layer in enumerate(stage_layers)
+                }
+                for kv_idx in range(cache_planes):
+                    for local_layer_idx, global_layer_idx in enumerate(
+                        local_cache_layers
+                    ):
+                        stage, remote_layer_idx = remote_cache_locations[
+                            global_layer_idx
+                        ]
+                        peer_alias = peer_addrs[
+                            stage * remote_inner_world_size + remote_inner_rank
+                        ]
                         assigns[engine_id][peer_alias].append(
                             (
                                 peer_alias,
                                 kv_idx,
-                                layer_idx,
+                                local_layer_idx,
+                                remote_layer_idx,
+                                len(remote_cache_layers_by_stage[stage]),
                                 remote_block_idx,
                                 source_block_idx,
                             )
                         )
 
-                # Indexer cache assignments (V3.2 sparse attention)
+                # Indexer cache has one slot per decoder layer. Route each
+                # global layer to its PP stage and stage-local layer index.
                 if self.indexer_cache is not None:
                     for layer_idx in range(self.num_hidden_layers):
-                        indexer_assigns[engine_id][peer_alias].append(
-                            (layer_idx, remote_block_idx, source_block_idx)
+                        stage = pp_stage_of_layer(layer_idx, remote_stage_ranges)
+                        stage_start, _ = remote_stage_ranges[stage]
+                        indexer_peer_alias = peer_addrs[
+                            stage * remote_inner_world_size + remote_inner_rank
+                        ]
+                        indexer_assigns[engine_id][indexer_peer_alias].append(
+                            (
+                                layer_idx,
+                                layer_idx - stage_start,
+                                remote_block_idx,
+                                source_block_idx,
+                            )
                         )
 
             # DSv4 (S2.6): per-ratio compressed cache + compressor state migration.
@@ -1008,31 +1283,62 @@ class P2PCacheTransfer:
                 getattr(self, "dsv4_compressed_caches_flat", None)
                 and v.migrate_compressed_block_tables
             ):
-                remote_rank = self._remote_global_rank(
+                remote_inner_rank = self._remote_global_rank(
                     v.migrate_dp_idx,
+                    remote_dp,
                     v.migrate_group_size - 1,
                     v.migrate_group_size,
                     tp_idx,
                     self.remote_attention_tp.get(engine_id, 1),
                 )
-                if 0 <= remote_rank < len(peer_addrs):
-                    peer_alias = peer_addrs[remote_rank]
-                    for (
-                        ratio,
-                        remote_pages,
-                    ) in v.migrate_compressed_block_tables.items():
-                        if ratio not in self.dsv4_compressed_caches_flat:
-                            continue  # decode engine doesn't have this ratio (mismatch)
-                        local_pages = v.active_compressed_block_tables.get(ratio, [])
+                for ratio, remote_pages in v.migrate_compressed_block_tables.items():
+                    if ratio not in self.dsv4_compressed_caches_flat:
+                        continue  # decode engine doesn't have this ratio (mismatch)
+                    local_pages = v.active_compressed_block_tables.get(ratio, [])
+                    if remote_pp > 1:
+                        layers_by_stage = self.remote_pp_dsv4_ratio_layer_indices[
+                            engine_id
+                        ].get(ratio, [])
+                        if len(layers_by_stage) != remote_pp:
+                            raise RuntimeError(
+                                f"Missing DSv4 ratio={ratio} PP layer metadata "
+                                f"for {engine_id}: {layers_by_stage}"
+                            )
+                    else:
                         n_layers = len(self.dsv4_layers_per_ratio.get(ratio, []))
-                        # Pair-wise remote→local page mapping; for each (rli) layer, the
-                        # SAME (remote_page, local_page) pairs apply (the table is per-seq,
-                        # not per-layer).
-                        for ratio_layer_idx in range(n_layers):
-                            for rpage, lpage in zip(remote_pages, local_pages):
-                                compressed_assigns[engine_id][peer_alias].append(
-                                    (ratio, ratio_layer_idx, rpage, lpage)
+                        layers_by_stage = [list(range(n_layers))]
+                    local_ratio_layers = [
+                        layer
+                        for stage_layers in layers_by_stage
+                        for layer in stage_layers
+                    ]
+                    local_ratio_count = self.dsv4_compressed_caches_flat[ratio].shape[0]
+                    if len(local_ratio_layers) != local_ratio_count:
+                        raise RuntimeError(
+                            f"DSv4 ratio={ratio} layer-count mismatch for "
+                            f"{engine_id}: remote={len(local_ratio_layers)}, "
+                            f"local={local_ratio_count}"
+                        )
+                    remote_ratio_locations = {
+                        layer: (stage, remote_rli)
+                        for stage, stage_layers in enumerate(layers_by_stage)
+                        for remote_rli, layer in enumerate(stage_layers)
+                    }
+                    for local_rli, global_layer_idx in enumerate(local_ratio_layers):
+                        stage, remote_rli = remote_ratio_locations[global_layer_idx]
+                        peer_alias = peer_addrs[
+                            stage * remote_inner_world_size + remote_inner_rank
+                        ]
+                        for rpage, lpage in zip(remote_pages, local_pages):
+                            compressed_assigns[engine_id][peer_alias].append(
+                                (
+                                    ratio,
+                                    local_rli,
+                                    remote_rli,
+                                    rpage,
+                                    lpage,
                                 )
+                            )
 
             # DSv4 (S2.6): per-ratio compressor scratch state migration.
             if (
@@ -1040,26 +1346,54 @@ class P2PCacheTransfer:
                 and v.migrate_state_slot >= 0
                 and v.active_state_slot >= 0
             ):
-                remote_rank = self._remote_global_rank(
+                remote_inner_rank = self._remote_global_rank(
                     v.migrate_dp_idx,
+                    remote_dp,
                     v.migrate_group_size - 1,
                     v.migrate_group_size,
                     tp_idx,
                     self.remote_attention_tp.get(engine_id, 1),
                 )
-                if 0 <= remote_rank < len(peer_addrs):
-                    peer_alias = peer_addrs[remote_rank]
-                    for ratio in self.dsv4_compressor_kv_flat.keys():
+                for ratio in self.dsv4_compressor_kv_flat.keys():
+                    if remote_pp > 1:
+                        layers_by_stage = self.remote_pp_dsv4_ratio_layer_indices[
+                            engine_id
+                        ].get(ratio, [])
+                    else:
                         n_layers = len(self.dsv4_layers_per_ratio.get(ratio, []))
-                        for ratio_layer_idx in range(n_layers):
-                            compressor_state_assigns[engine_id][peer_alias].append(
-                                (
-                                    ratio,
-                                    ratio_layer_idx,
-                                    v.migrate_state_slot,
-                                    v.active_state_slot,
-                                )
+                        layers_by_stage = [list(range(n_layers))]
+                    local_ratio_layers = [
+                        layer
+                        for stage_layers in layers_by_stage
+                        for layer in stage_layers
+                    ]
+                    local_ratio_count = self.dsv4_compressor_kv_flat[ratio].shape[0]
+                    if len(local_ratio_layers) != local_ratio_count:
+                        raise RuntimeError(
+                            f"DSv4 compressor ratio={ratio} layer-count "
+                            f"mismatch for {engine_id}: "
+                            f"remote={len(local_ratio_layers)}, "
+                            f"local={local_ratio_count}"
+                        )
+                    remote_ratio_locations = {
+                        layer: (stage, remote_rli)
+                        for stage, stage_layers in enumerate(layers_by_stage)
+                        for remote_rli, layer in enumerate(stage_layers)
+                    }
+                    for local_rli, global_layer_idx in enumerate(local_ratio_layers):
+                        stage, remote_rli = remote_ratio_locations[global_layer_idx]
+                        peer_alias = peer_addrs[
+                            stage * remote_inner_world_size + remote_inner_rank
+                        ]
+                        compressor_state_assigns[engine_id][peer_alias].append(
+                            (
+                                ratio,
+                                local_rli,
+                                remote_rli,
+                                v.migrate_state_slot,
+                                v.active_state_slot,
                             )
+                        )
 
             # GDN assignments
             if (
@@ -1070,24 +1404,34 @@ class P2PCacheTransfer:
                 local_state_slot = v.active_state_slot
 
                 if remote_state_slot >= 0 and local_state_slot >= 0:
-                    remote_rank = self._remote_global_rank(
+                    remote_inner_rank = self._remote_global_rank(
                         v.migrate_dp_idx,
+                        remote_dp,
                         v.migrate_group_size - 1,
                         v.migrate_group_size,
                         tp_idx,
                         self.remote_attention_tp.get(engine_id, 1),
                     )
-                    if remote_rank < len(peer_addrs):
-                        peer_alias = peer_addrs[remote_rank]
-                        num_gdn_layers = self.gdn_recurrent_states.shape[0]
-                        for layer_idx in range(num_gdn_layers):
-                            gdn_assigns[engine_id][peer_alias].append(
-                                (
-                                    layer_idx,
-                                    remote_state_slot,
-                                    local_state_slot,
-                                )
+                    num_gdn_layers = self.gdn_recurrent_states.shape[0]
+                    for layer_idx in range(num_gdn_layers):
+                        if remote_pp > 1:
+                            stage = pp_stage_of_layer(layer_idx, remote_stage_ranges)
+                            stage_start, _ = remote_stage_ranges[stage]
+                            remote_layer_idx = layer_idx - stage_start
+                        else:
+                            stage = 0
+                            remote_layer_idx = layer_idx
+                        peer_alias = peer_addrs[
+                            stage * remote_inner_world_size + remote_inner_rank
+                        ]
+                        gdn_assigns[engine_id][peer_alias].append(
+                            (
+                                layer_idx,
+                                remote_layer_idx,
+                                remote_state_slot,
+                                local_state_slot,
                             )
+                        )
 
         self._execute_rdma_reads(
             assigns,

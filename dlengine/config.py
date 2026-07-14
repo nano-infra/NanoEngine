@@ -569,15 +569,24 @@ class Config(BaseModel):
                 raise ValueError(
                     "pp > 1 does not support MTP (num_speculative_tokens must be 0)"
                 )
-            if self.enable_hisparse:
-                raise ValueError("pp > 1 does not support enable_hisparse")
+            if self.enable_hisparse and arch not in (
+                "Gemma4ForCausalLM",
+                "Gemma4ForConditionalGeneration",
+            ):
+                raise ValueError(
+                    "pp > 1 only supports enable_hisparse for Gemma4; " f"got {arch!r}"
+                )
             # A hybrid DLSLime executor still needs ctrl_address for RPC agent
             # discovery; ctrl_address alone does not imply PD disaggregation.
             # The prefill/decode roles are what make an engine disaggregated.
-            if self.mode != "hybrid":
+            # PD disaggregation supports a PP prefill engine paired with pp=1
+            # decode engines: the decode side maps each global layer to the
+            # prefill stage owning it during KV migration. A PP decode engine
+            # is not supported yet.
+            if self.mode == "decode":
                 raise ValueError(
-                    "pp > 1 currently supports mode='hybrid' only "
-                    "(no PD disaggregation)"
+                    "pp > 1 is not supported for mode='decode' "
+                    "(use PP prefill + pp=1 decode)"
                 )
             # Stage boundaries send/recv hidden states eagerly; CUDA graph
             # capture across a P2P boundary is not wired yet.

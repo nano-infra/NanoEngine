@@ -20,36 +20,39 @@ from torch import nn
 from dlengine.context_v2.distributed import get_dist_context
 
 
-def get_pp_layer_range(
-    num_layers: int, final_stage_start: int | None = None
-) -> Tuple[int, int]:
-    """Return the ``[start, end)`` decoder-layer range owned by this stage.
+def pp_layer_partition(
+    num_layers: int, pp_size: int, final_stage_start: int | None = None
+) -> list[Tuple[int, int]]:
+    """Return the ``[start, end)`` layer range for every pipeline stage.
+
+    This is the single source of truth for the split policy. It is used both
+    when a worker builds its local model and when a decode engine needs a
+    remote prefill engine's per-stage layer ownership for KV migration.
 
     Layers are split as evenly as possible; when ``num_layers`` is not a
-    multiple of the pipeline size, the first ``num_layers % pp`` stages get one
-    extra layer each.
+    multiple of ``pp_size``, the earlier stages get one extra layer each.
+
+    ``final_stage_start`` handles architectures with cross-layer dependencies
+    that must stay on one stage (e.g. Gemma4 shared-KV layers consume K/V from
+    the last non-sharing layer of each attention type): the suffix
+    ``[final_stage_start, num_layers)`` is reserved for the last stage and the
+    independent prefix is balanced over the remaining stages.
     """
-    ctx = get_dist_context()
-    pp_size = ctx.pp_world_size
-    pp_rank = ctx.pp_rank
-    if pp_size <= 1:
-        return 0, num_layers
-    # Some architectures have cross-layer dependencies which must remain on
-    # one stage.  Gemma4 shared-KV layers, for example, consume K/V produced by
-    # the last non-sharing layer of each attention type.  Reserve that suffix
-    # for the final stage and balance the independent prefix over the others.
-    if final_stage_start is not None and pp_size > 1:
+    pp_size = max(1, pp_size)
+    if pp_size == 1:
+        return [(0, num_layers)]
+
+    if final_stage_start is not None:
         if not 0 < final_stage_start < num_layers:
             raise ValueError(
-                f"invalid final_stage_start={final_stage_start} for {num_layers} layers"
+                f"invalid final_stage_start={final_stage_start} for "
+                f"{num_layers} layers"
             )
         if final_stage_start < pp_size - 1:
             raise ValueError(
                 "not enough independent prefix layers for pipeline stages: "
                 f"prefix={final_stage_start}, pp={pp_size}"
             )
-        if pp_rank == pp_size - 1:
-            return final_stage_start, num_layers
         split_size = pp_size - 1
         base = final_stage_start // split_size
         remainder = final_stage_start % split_size
@@ -58,13 +61,104 @@ def get_pp_layer_range(
         base = num_layers // split_size
         remainder = num_layers % split_size
 
-    start = pp_rank * base + min(pp_rank, remainder)
-    count = base + (1 if pp_rank < remainder else 0)
-    return start, start + count
+    ranges: list[Tuple[int, int]] = []
+    start = 0
+    for stage in range(split_size):
+        count = base + (1 if stage < remainder else 0)
+        ranges.append((start, start + count))
+        start += count
+    if final_stage_start is not None:
+        ranges.append((final_stage_start, num_layers))
+    return ranges
+
+
+def pp_stage_of_layer(layer_idx: int, stage_ranges: list[Tuple[int, int]]) -> int:
+    """Return the pipeline stage index that owns ``layer_idx``."""
+    for stage, (start, end) in enumerate(stage_ranges):
+        if start <= layer_idx < end:
+            return stage
+    raise ValueError(
+        f"layer {layer_idx} outside any pipeline stage range {stage_ranges}"
+    )
+
+
+def cache_layer_indices(
+    config, *, gemma_hisparse_only_full_attention: bool = False
+) -> list[int]:
+    """Global decoder-layer indices represented in the primary KV tensor.
+
+    Most architectures cache every decoder layer. Hybrid linear-attention
+    models cache only full-attention layers, while Gemma4 shared-KV layers
+    reuse the source layer's cache and therefore have no independent slot.
+    """
+    num_layers = int(config.num_hidden_layers)
+    arch = (getattr(config, "architectures", None) or [""])[0]
+    layer_types = list(getattr(config, "layer_types", None) or [])
+    if arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
+        first_shared = num_layers - int(getattr(config, "num_kv_shared_layers", 0) or 0)
+        if gemma_hisparse_only_full_attention:
+            return [
+                idx
+                for idx, layer_type in enumerate(layer_types[:first_shared])
+                if layer_type == "full_attention"
+            ]
+        return list(range(max(0, first_shared)))
+    if layer_types and "linear_attention" in layer_types:
+        return [
+            idx
+            for idx, layer_type in enumerate(layer_types)
+            if layer_type == "full_attention"
+        ]
+    return list(range(num_layers))
+
+
+def partition_layer_indices(
+    layer_indices: list[int], stage_ranges: list[Tuple[int, int]]
+) -> list[list[int]]:
+    """Partition global layer indices using decoder-layer stage ownership."""
+    result = [[] for _ in stage_ranges]
+    for layer_idx in layer_indices:
+        result[pp_stage_of_layer(layer_idx, stage_ranges)].append(layer_idx)
+    return result
+
+
+def pp_global_rank(
+    pp_idx: int,
+    dp_idx: int,
+    sp_idx: int,
+    tp_idx: int,
+    *,
+    dp_size: int,
+    sp_size: int,
+    tp_size: int,
+) -> int:
+    """Map a ``(pp, dp, sp, tp)`` mesh coordinate to flat global rank."""
+    coordinates = (pp_idx, dp_idx, sp_idx, tp_idx)
+    sizes = (None, dp_size, sp_size, tp_size)
+    if pp_idx < 0 or any(
+        coordinate < 0 or coordinate >= size
+        for coordinate, size in zip(coordinates[1:], sizes[1:], strict=True)
+    ):
+        raise ValueError(
+            f"invalid PP mesh coordinate {coordinates} for "
+            f"inner shape ({dp_size}, {sp_size}, {tp_size})"
+        )
+    inner_world_size = dp_size * sp_size * tp_size
+    inner_rank = (dp_idx * sp_size + sp_idx) * tp_size + tp_idx
+    return pp_idx * inner_world_size + inner_rank
+
+
+def get_pp_layer_range(
+    num_layers: int, final_stage_start: int | None = None
+) -> Tuple[int, int]:
+    """Return the ``[start, end)`` decoder-layer range owned by this stage."""
+    ctx = get_dist_context()
+    partition = pp_layer_partition(num_layers, ctx.pp_world_size, final_stage_start)
+    return partition[ctx.pp_rank]
 
 
 def get_gemma4_shared_kv_source_start(config) -> int | None:
-    """Return the earliest KV source that must accompany Gemma4's shared tail."""
+    """Earliest KV source that must accompany Gemma4's shared tail."""
     num_layers = config.num_hidden_layers
     num_shared = int(getattr(config, "num_kv_shared_layers", 0) or 0)
     if num_shared <= 0:

@@ -61,6 +61,7 @@ def test_pp_weight_ownership(monkeypatch, is_first, is_last, weight_name, expect
 
 def _gemma_config():
     return SimpleNamespace(
+        architectures=["Gemma4ForCausalLM"],
         num_hidden_layers=12,
         num_kv_shared_layers=4,
         layer_types=["sliding_attention", "full_attention"] * 6,
@@ -93,3 +94,47 @@ def test_gemma4_without_shared_kv_uses_balanced_split(monkeypatch):
     )
 
     assert pp_utils.get_gemma4_pp_layer_range(config) == (6, 9)
+
+
+def test_cache_layer_indices_for_qwen35_hybrid_attention():
+    config = SimpleNamespace(
+        architectures=["Qwen3_5ForConditionalGeneration"],
+        num_hidden_layers=6,
+        layer_types=[
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+        ],
+    )
+
+    assert pp_utils.cache_layer_indices(config) == [2, 4]
+    assert pp_utils.partition_layer_indices([2, 4], [(0, 2), (2, 4), (4, 6)]) == [
+        [],
+        [2],
+        [4],
+    ]
+
+
+def test_cache_layer_indices_exclude_gemma_shared_kv_tail():
+    config = _gemma_config()
+    ranges = pp_utils.pp_layer_partition(12, 4, final_stage_start=6)
+
+    assert pp_utils.cache_layer_indices(config) == list(range(8))
+    assert pp_utils.partition_layer_indices(
+        pp_utils.cache_layer_indices(config), ranges
+    ) == [[0, 1], [2, 3], [4, 5], [6, 7]]
+
+
+def test_gemma_hisparse_cache_contains_only_nonshared_full_attention():
+    config = _gemma_config()
+
+    assert pp_utils.cache_layer_indices(
+        config, gemma_hisparse_only_full_attention=True
+    ) == [1, 3, 5, 7]
+
+
+def test_pp_dp_sp_tp_global_rank_is_pp_major():
+    assert pp_utils.pp_global_rank(2, 1, 0, 1, dp_size=2, sp_size=2, tp_size=2) == 21

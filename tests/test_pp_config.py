@@ -60,20 +60,38 @@ def test_pp_allows_hybrid_dlslime_ctrl_address(monkeypatch):
     assert config.enforce_eager is True
 
 
-def test_pp_still_rejects_pd_role_with_ctrl_address(monkeypatch):
+def test_pp_allows_prefill_pd_role_with_ctrl_address(monkeypatch):
     monkeypatch.setattr(
         config_module.AutoConfig,
         "from_pretrained",
         lambda *args, **kwargs: _qwen35_config(),
     )
 
-    with pytest.raises(ValueError, match="mode='hybrid' only"):
+    config = Config(
+        model="unused",
+        pp=2,
+        mode="prefill",
+        executor_backend="dlslime",
+        ctrl_address="127.0.0.1:4479",
+        num_speculative_tokens=0,
+    )
+
+    assert config.mode == "prefill"
+    assert config.world_size == 2
+
+
+def test_pp_still_rejects_decode_pd_role(monkeypatch):
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: _qwen35_config(),
+    )
+
+    with pytest.raises(ValueError, match="PP prefill.*pp=1 decode"):
         Config(
             model="unused",
             pp=2,
-            mode="prefill",
-            executor_backend="dlslime",
-            ctrl_address="127.0.0.1:4479",
+            mode="decode",
             num_speculative_tokens=0,
         )
 
@@ -145,3 +163,22 @@ def test_pp4_allows_gemma4_with_shared_kv(monkeypatch, architecture):
 
     assert config.world_size == 4
     assert config.enforce_eager is True
+
+
+def test_pp4_allows_gemma4_hisparse_cache_layout(monkeypatch):
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: _gemma4_config(),
+    )
+
+    config = Config(
+        model="unused",
+        pp=4,
+        mode="prefill",
+        enable_hisparse=True,
+        num_speculative_tokens=0,
+    )
+
+    assert config.enable_hisparse is True
+    assert config.world_size == 4
