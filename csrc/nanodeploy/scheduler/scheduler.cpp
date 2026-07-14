@@ -398,6 +398,112 @@ std::vector<std::pair<uint64_t, uint64_t>> Scheduler::get_ls_active_batch_owners
     return result;
 }
 
+std::vector<int> Scheduler::get_ls_group_allocated_ranks(uint64_t group_id) const
+{
+    auto group = ls_groups_.find(group_id);
+    if (group == ls_groups_.end()) {
+        throw std::runtime_error("unknown LS Decode group");
+    }
+    return group->second.allocated_attention_ranks;
+}
+
+std::shared_ptr<SPStateManager::LSKVConsolidationPlan> Scheduler::plan_ls_kv_scale_down(uint64_t group_id,
+                                                                                        int      source_rank)
+{
+    auto rejected = [&](const std::string& reason) {
+        auto plan            = std::make_shared<SPStateManager::LSKVConsolidationPlan>();
+        plan->transaction_id = next_ls_kv_transaction_id_++;
+        plan->group_id       = group_id;
+        plan->source_rank    = source_rank;
+        plan->failure_reason = reason;
+        return plan;
+    };
+    if (!enable_ls_decode_core_scheduler_) {
+        return rejected("LS Decode core scheduler is disabled");
+    }
+    if (active_ls_kv_transaction_) {
+        return rejected("another LS KV scale-down transaction is already reserved");
+    }
+    auto group_it = ls_groups_.find(group_id);
+    if (group_it == ls_groups_.end()) {
+        return rejected("unknown LS Decode group");
+    }
+
+    auto& group = group_it->second;
+    if (std::find(group.allocated_attention_ranks.begin(), group.allocated_attention_ranks.end(), source_rank)
+        == group.allocated_attention_ranks.end()) {
+        return rejected("source rank is not allocated to the LS Decode group");
+    }
+    std::vector<int> retained;
+    for (int rank : group.allocated_attention_ranks) {
+        if (rank != source_rank) {
+            retained.push_back(rank);
+        }
+    }
+
+    auto plan = worker_state.at(group.dp_idx)
+                    ->plan_kv_consolidation(
+                        next_ls_kv_transaction_id_++, group_id, group.dp_idx, group.sequences, source_rank, retained);
+    if (plan->success) {
+        active_ls_kv_transaction_ = plan;
+    }
+    return plan;
+}
+
+bool Scheduler::commit_ls_kv_scale_down(const std::shared_ptr<SPStateManager::LSKVConsolidationPlan>& plan)
+{
+    if (!plan || !active_ls_kv_transaction_ || active_ls_kv_transaction_.get() != plan.get()) {
+        return false;
+    }
+    auto group_it = ls_groups_.find(plan->group_id);
+    if (group_it == ls_groups_.end() || group_it->second.dp_idx != plan->dp_idx) {
+        return false;
+    }
+    auto& group = group_it->second;
+
+    std::vector<uint64_t> current_sequence_ids;
+    current_sequence_ids.reserve(group.sequences.size());
+    for (const auto& sequence : group.sequences) {
+        if (sequence) {
+            current_sequence_ids.push_back(sequence->seq_id);
+        }
+    }
+    auto planned_sequence_ids = plan->group_sequence_ids;
+    std::sort(current_sequence_ids.begin(), current_sequence_ids.end());
+    std::sort(planned_sequence_ids.begin(), planned_sequence_ids.end());
+    if (current_sequence_ids != planned_sequence_ids) {
+        return false;
+    }
+
+    std::vector<int> expected_allocation = plan->retained_ranks;
+    expected_allocation.push_back(plan->source_rank);
+    auto current_allocation = group.allocated_attention_ranks;
+    std::sort(expected_allocation.begin(), expected_allocation.end());
+    std::sort(current_allocation.begin(), current_allocation.end());
+    if (expected_allocation != current_allocation) {
+        return false;
+    }
+    if (!worker_state.at(plan->dp_idx)->commit_kv_consolidation(plan)) {
+        return false;
+    }
+
+    group.allocated_attention_ranks = plan->retained_ranks;
+    group.last_iteration_masters.erase(
+        std::remove(group.last_iteration_masters.begin(), group.last_iteration_masters.end(), plan->source_rank),
+        group.last_iteration_masters.end());
+    active_ls_kv_transaction_.reset();
+    return true;
+}
+
+void Scheduler::abort_ls_kv_scale_down(const std::shared_ptr<SPStateManager::LSKVConsolidationPlan>& plan)
+{
+    if (!plan || !active_ls_kv_transaction_ || active_ls_kv_transaction_.get() != plan.get()) {
+        return;
+    }
+    worker_state.at(plan->dp_idx)->abort_kv_consolidation(plan);
+    active_ls_kv_transaction_.reset();
+}
+
 void Scheduler::set_ls_admission_failure_after_allocations_for_test(int value)
 {
     ls_admission_failure_after_allocations_for_test_ = value;
@@ -498,6 +604,9 @@ int Scheduler::select_dp_worker_for_routing(Sequence& seq)
 
 ScheduleResult Scheduler::schedule()
 {
+    if (active_ls_kv_transaction_) {
+        throw std::runtime_error("cannot schedule Decode while an LS KV scale-down transaction is reserved");
+    }
     if (enable_ls_decode_core_scheduler_) {
         ls_schedule_step_++;
     }

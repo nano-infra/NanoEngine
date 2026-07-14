@@ -34,9 +34,9 @@ LS-Decode KV Consolidation
 
 它是现有 `LS-Decode-Core` 的扩展，不应声称等同于完整 LoongServe。
 
-这里的“可落地”指架构上可实现，不是当前代码已经具备或只改配置即可开启。现有项目没有 live Decode KV relayout、maintenance action、intra-DP KV P2P RPC 和 no-fail metadata commit；这些都是新增实现。落地顺序必须先经过 CPU transaction 和手动 GPU correctness，再接 pressure policy，不能直接从 usage threshold 跳到生产 execute。
+这里的“可落地”指架构上可实现，不是只改配置即可开启。原始项目没有 live Decode KV relayout、maintenance action、intra-DP KV P2P RPC 和 no-fail metadata commit；当前分支已经补上手动 source-only transaction 和 P2P 数据面，但自动 scheduler action、触发 policy、生产级 no-fail commit 和 4-DP/EP32 验收仍未完成。落地顺序仍必须先经过手动 correctness，再接 pressure policy，不能直接从 usage threshold 跳到生产 execute。
 
-当前已落地的第一小步仅是物理通信层：`KVCacheP2PMove`、固定 scratch、复用 `attn_sp_group` 的 `dist.isend/irecv`、worker/executor 集体 RPC，以及 CPU mock、双进程 Gloo 和双 GPU NCCL correctness preflight。该接口不修改 block table、不释放 source，也没有接 scheduler action/policy，因此还不能称为可用的 scale-down transaction。
+当前已落地一条可手动调用的 stop-the-world scale-down correctness 链路：`Scheduler::plan_ls_kv_scale_down()` 为 passive source 生成 token ranges、预留 destination blocks 并预构造 metadata；`execute_ls_kv_scale_down()` 向所有 workers 下发 `dist.isend/irecv` copy；全部 workers 成功后才交换 ACTIVE context、释放 source blocks 并缩小 group allocation，失败则释放预留并保留旧 placement。CPU 自动化集成测试、双进程 Gloo、双 GPU NCCL，以及 1-DP × 8-SP 的真实 NCCL 8→7 preflight 均已通过。该入口仍是 iteration boundary 上的手动 API，没有接 `LLMEngine.step()` action/policy，也不能作为生产 execute 开关。
 
 ### 1.1 能解决什么
 
@@ -489,6 +489,10 @@ ABORT
 
 `COMMIT` 不能再调用可能因为容量、分配或容器扩容而失败的普通 planning API。当前 `BlockManager` 的 `std::list`/`std::unordered_set` 更新和部分 context vector 更新仍可能分配内存；Phase 1 必须将所需对象全部预构造，并把 free-ID/ownership 更新改成预留容量后无分配的操作（更稳妥的是固定容量 vector stack 或 intrusive free list）。所有可预见失败必须发生在 `COMMIT` 前。
 
+当前手动事务已经遵循上述可见性顺序：PLAN/RESERVE 不修改 ACTIVE metadata，copy 时 source 仍有效；commit 前按 group sequence IDs、allocation 和完整 ACTIVE context snapshot 拒绝 stale plan；commit 使用预构造 `BlockContext` swap，随后才回收 source。worker completion error 的自动化测试还刻意在目标物理 range 已写入后抛错，验证 abort 后旧 metadata、source KV 和 free-block accounting 均可继续 Decode。
+
+但当前实现还不等于严格的 no-fail commit：它使用 snapshot comparison 代替显式 `state_generation`，source 回收仍经过 `std::list`/`unordered_set`，极端 host allocation failure 只能按 engine-fatal 处理；同时 pending target 必须已在 retained rank，尚不支持事务内重指派。这些限制必须在自动 pressure execute 之前补齐或明确接受为 fail-stop 边界。
+
 ### 6.4 MVP 采用 LoongServe 式 source-only evacuation
 
 MVP 不为整个 retained placement 建第二份副本，而是：
@@ -724,27 +728,25 @@ Phase 0 的 go/no-go 数据：
 
 ### Phase 1：CPU Planner 与 Block Transaction
 
-- 增加 `KVConsolidationPlan` 和 transaction generation；
-- 实现逐 source-rank exact target placement；
-- 实现 destination tail/new block reserve、abort 和 no-fail commit；
-- 预构造 metadata，并改造 commit 路径中的动态分配点；
-- 实现 pending frontier 的事务式保持/重新指派；
-- 增加 group allocation shrink；
-- 使用 synthetic cache/block tables 做 CPU transaction tests；
-- feature 默认 `shadow` 或 `off`。
+- 已增加 `LSKVConsolidationPlan`、逐 source-rank target placement 和 physical range generation；
+- 已实现 destination tail/new-block reserve、copy error abort、预构造 metadata swap、source release 和 group allocation shrink；
+- 已保持 retained-rank pending frontier，并拒绝 active/pending source；事务内 pending 重指派仍待实现；
+- 已增加 synthetic cache/block table 的完整 transaction 测试，并在 commit 后继续生成下一轮 Decode；
+- 显式 `state_generation`、完全无 host allocation 的 no-fail commit 和 shadow/execute policy 仍待实现。
 
 ### Phase 2：真实 Intra-DP GPU Copy
 
 - 增加 executor/worker physical range-copy RPC；（第一版已完成）
 - 复用 `attn_sp_group`，在 KV block sizing 前预留固定 scratch；（第一版已完成）
-- 使用 `dist.isend/irecv` 做确定序 chunk copy；（CPU mock、双进程 Gloo 和双 GPU NCCL preflight 已完成，1-DP × 8-SP preflight 待做）
+- 使用 `dist.isend/irecv` 做确定序 chunk copy；（CPU mock、双进程 Gloo、双 GPU NCCL 和 1-DP × 8-SP NCCL 8→7 preflight 已完成）
 - 搬运全部 layers 和 KV components；（第一版 physical range copy 已完成）
-- stop-the-world 同步；
-- 先提供手动触发，不接自动 policy；
-- 验证可恢复 copy error 的 abort，以及 fatal error 的 fail-stop；
-- 1-DP × 8-SP / EP8 GPU preflight；
-- 比较迁移前后 synthetic KV 内容；
-- 验证无 block leak、hang、stale block table。
+- stop-the-world 手动 transaction；（已完成，scheduler 在 reservation 存续期间拒绝普通 schedule）
+- 先提供手动触发，不接自动 policy；（已完成）
+- 验证健康 communicator 上 worker completion error 的 abort；（已完成）
+- actor/CUDA/NCCL fatal error 的 fail-stop 注入；（待完成）
+- 1-DP × 8-SP / EP8 GPU preflight；（8→7 correctness/ordering 已完成，连续 8→4→1 待完成）
+- 比较迁移前后 synthetic KV 内容并验证 source 不变；（已完成）
+- 验证无 block leak、hang、stale block table；（CPU transaction 和 8→7 preflight 已完成，long-run 待完成）
 
 即使 Dummy Prefill 的 prompt KV 数值不具有语言语义，性能实验也必须真实复制对应 bytes，不能只修改 metadata。metadata-only relayout 可以作为 planner test mode，但不能作为 KV Consolidation 性能结果。
 
@@ -851,6 +853,8 @@ ls_kv_consolidation_payback_safety_factor: float = 0.5
 
 ### 12.2 GPU 正确性测试
 
+当前 `tests/test_ls_kv_scale_down.py` 已覆盖：scheduler 生成真实 plan、RESERVE 期间 ACTIVE/source 不变、同一个 `KVCacheP2PTransport` 执行分 chunk copy、成功后 metadata/source-block/group allocation commit、下一轮 Decode 不再给 source 分配真实任务，以及“物理 copy 已完成但 worker completion 报错”时的 abort。另已通过双 GPU NCCL 完整 transaction 和 1-DP × 8-SP NCCL 8→7 preflight；后者可用 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python tests/ls_kv_scale_down_nccl_preflight.py --sp-size 8` 复现。以下未勾选场景仍是进入自动 execute 前的完整验收集合。
+
 - 用确定性 pattern 填充每层 KV block；
 - 迁移 full block、partial head/tail 和多个 sequences；
 - 覆盖 migration bytes 超过 scratch、需要多个 chunks 的 source；
@@ -874,6 +878,8 @@ use_sp_a2a: True -> False
 ```
 
 注意：EP8 只验证 correctness、ordering 和 transaction，不用于得出正式收益。
+
+当前已完成单次 `kv_dop: 8 -> 7`，并确认 1 个 source、1 个 destination 和 6 个 idle workers 都能完成同一 maintenance step 后继续调度。连续 `8 -> 7 -> 4 -> 1`、master_dop 变化和真实 model forward 仍待补测。
 
 ### 12.4 4-DP × 8-SP / EP32 性能验收
 
@@ -938,7 +944,7 @@ NCCL/CUDA fatal failure 可能同时破坏 communicator 或进程，保留旧 so
     ↓
 复用 attn_sp_group，实现固定 scratch + dist.isend/irecv，先手动触发
     ↓
-在 1DP/EP8 做 correctness preflight
+扩展 1DP/EP8 correctness preflight 到连续 8→4→1 和真实 Decode forward
     ↓
 先在 4DP/EP32 启用 exact admission-pressure path
     ↓

@@ -26,6 +26,29 @@ void bind_sp_state_manager(py::module_& m)
         .def_readonly("group_used_kv_tokens", &SPStateManager::LSDecodeMasterPlan::group_used_kv_tokens)
         .def_readonly("group_used_kv_blocks", &SPStateManager::LSDecodeMasterPlan::group_used_kv_blocks);
 
+    py::class_<SPStateManager::KVTokenRangeMove>(m, "KVTokenRangeMove")
+        .def_readonly("seq_id", &SPStateManager::KVTokenRangeMove::seq_id)
+        .def_readonly("dp_idx", &SPStateManager::KVTokenRangeMove::dp_idx)
+        .def_readonly("src_sp_rank", &SPStateManager::KVTokenRangeMove::src_sp_rank)
+        .def_readonly("dst_sp_rank", &SPStateManager::KVTokenRangeMove::dst_sp_rank)
+        .def_readonly("src_block_id", &SPStateManager::KVTokenRangeMove::src_block_id)
+        .def_readonly("src_token_offset", &SPStateManager::KVTokenRangeMove::src_token_offset)
+        .def_readonly("dst_block_id", &SPStateManager::KVTokenRangeMove::dst_block_id)
+        .def_readonly("dst_token_offset", &SPStateManager::KVTokenRangeMove::dst_token_offset)
+        .def_readonly("num_tokens", &SPStateManager::KVTokenRangeMove::num_tokens);
+
+    py::class_<SPStateManager::LSKVConsolidationPlan, std::shared_ptr<SPStateManager::LSKVConsolidationPlan>>(
+        m, "LSKVConsolidationPlan")
+        .def_readonly("success", &SPStateManager::LSKVConsolidationPlan::success)
+        .def_readonly("failure_reason", &SPStateManager::LSKVConsolidationPlan::failure_reason)
+        .def_readonly("transaction_id", &SPStateManager::LSKVConsolidationPlan::transaction_id)
+        .def_readonly("group_id", &SPStateManager::LSKVConsolidationPlan::group_id)
+        .def_readonly("dp_idx", &SPStateManager::LSKVConsolidationPlan::dp_idx)
+        .def_readonly("source_rank", &SPStateManager::LSKVConsolidationPlan::source_rank)
+        .def_readonly("retained_ranks", &SPStateManager::LSKVConsolidationPlan::retained_ranks)
+        .def_readonly("moves", &SPStateManager::LSKVConsolidationPlan::moves)
+        .def_readonly("num_tokens", &SPStateManager::LSKVConsolidationPlan::num_tokens);
+
     // Bind RoutingStrategy
     py::enum_<RoutingStrategy>(m, "RoutingStrategy")
         .value("RoundRobin", RoutingStrategy::RoundRobin)

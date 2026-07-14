@@ -4,7 +4,7 @@ NanoDeploy C++ Backend
 from __future__ import annotations
 import collections.abc
 import typing
-__all__: list[str] = ['ACTIVE', 'Block', 'BlockContext', 'BlockContextSlot', 'BlockIdList', 'BlockLocationList', 'BlockManager', 'BlockManagerMap', 'DecodeMetadata', 'DefaultIntDict', 'DefaultListDict', 'FINISHED', 'LSDecodeMasterPlan', 'LeastBatch', 'LeastCache', 'MIGRATE', 'MigrationMap', 'PrefillMetadata', 'RUNNING', 'RoundRobin', 'RoutingStrategy', 'SPStateManager', 'SPStateManagerList', 'SWAP', 'ScheduleResult', 'Scheduler', 'Sequence', 'SequenceDeque', 'SequenceMetric', 'SequenceStatus', 'ServerMetric', 'TO_BE_MIGRATED', 'WAITING', 'deserialize', 'postprocess_sequences', 'prepare_decode_cpp', 'prepare_prefill_cpp', 'serialize', 'update_seqs_inner_loop']
+__all__: list[str] = ['ACTIVE', 'Block', 'BlockContext', 'BlockContextSlot', 'BlockIdList', 'BlockLocationList', 'BlockManager', 'BlockManagerMap', 'DecodeMetadata', 'DefaultIntDict', 'DefaultListDict', 'FINISHED', 'KVTokenRangeMove', 'LSDecodeMasterPlan', 'LSKVConsolidationPlan', 'LeastBatch', 'LeastCache', 'MIGRATE', 'MigrationMap', 'PrefillMetadata', 'RUNNING', 'RoundRobin', 'RoutingStrategy', 'SPStateManager', 'SPStateManagerList', 'SWAP', 'ScheduleResult', 'Scheduler', 'Sequence', 'SequenceDeque', 'SequenceMetric', 'SequenceStatus', 'ServerMetric', 'TO_BE_MIGRATED', 'WAITING', 'deserialize', 'postprocess_sequences', 'prepare_decode_cpp', 'prepare_prefill_cpp', 'serialize', 'update_seqs_inner_loop']
 class Block:
     def __init__(self, arg0: typing.SupportsInt) -> None:
         ...
@@ -583,6 +583,26 @@ class LSDecodeMasterPlan:
     success: bool
     def __init__(self) -> None:
         ...
+class KVTokenRangeMove:
+    dp_idx: int
+    dst_block_id: int
+    dst_sp_rank: int
+    dst_token_offset: int
+    num_tokens: int
+    seq_id: int
+    src_block_id: int
+    src_sp_rank: int
+    src_token_offset: int
+class LSKVConsolidationPlan:
+    dp_idx: int
+    failure_reason: str
+    group_id: int
+    moves: list[KVTokenRangeMove]
+    num_tokens: int
+    retained_ranks: list[int]
+    source_rank: int
+    success: bool
+    transaction_id: int
 class SPStateManager:
     block_manager: BlockManagerMap
     routing_strategy: RoutingStrategy
@@ -722,6 +742,10 @@ class Scheduler:
         ...
     def block_manager(self, dp_idx: typing.SupportsInt) -> dict[int, BlockManager]:
         ...
+    def abort_ls_kv_scale_down(self, plan: LSKVConsolidationPlan) -> None:
+        ...
+    def commit_ls_kv_scale_down(self, plan: LSKVConsolidationPlan) -> bool:
+        ...
     @typing.overload
     def free_to_be_migrated(self, seq: typing.Sequence) -> None:
         ...
@@ -729,6 +753,10 @@ class Scheduler:
     def free_to_be_migrated(self, seqs: collections.abc.Sequence[typing.Sequence]) -> None:
         ...
     def is_finished(self) -> bool:
+        ...
+    def get_ls_group_allocated_ranks(self, group_id: typing.SupportsInt) -> list[int]:
+        ...
+    def plan_ls_kv_scale_down(self, group_id: typing.SupportsInt, source_rank: typing.SupportsInt) -> LSKVConsolidationPlan:
         ...
     def postprocess(self, dp_seqs: collections.abc.Sequence[collections.abc.Sequence[typing.Sequence]], dp_token_ids: collections.abc.Sequence[collections.abc.Sequence[collections.abc.Sequence[typing.SupportsInt]]], update_metrics: bool = True) -> None:
         ...

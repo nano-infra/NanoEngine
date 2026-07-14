@@ -304,6 +304,10 @@ void bind_scheduler_utils(py::module_& m)
         .def("get_ls_group_initial_admission_orders", &Scheduler::get_ls_group_initial_admission_orders)
         .def("get_ls_group_initial_sequence_ids", &Scheduler::get_ls_group_initial_sequence_ids)
         .def("get_ls_active_batch_owners", &Scheduler::get_ls_active_batch_owners)
+        .def("get_ls_group_allocated_ranks", &Scheduler::get_ls_group_allocated_ranks, py::arg("group_id"))
+        .def("plan_ls_kv_scale_down", &Scheduler::plan_ls_kv_scale_down, py::arg("group_id"), py::arg("source_rank"))
+        .def("commit_ls_kv_scale_down", &Scheduler::commit_ls_kv_scale_down, py::arg("plan"))
+        .def("abort_ls_kv_scale_down", &Scheduler::abort_ls_kv_scale_down, py::arg("plan"))
         .def("set_ls_admission_failure_after_allocations_for_test",
              &Scheduler::set_ls_admission_failure_after_allocations_for_test,
              py::arg("value"))

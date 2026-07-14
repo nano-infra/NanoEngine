@@ -213,6 +213,48 @@ void BlockManager::trim_blocks_to_token_count(Sequence& seq, BlockContextSlot sl
     }
 }
 
+std::vector<int> BlockManager::reserve_blocks(int count)
+{
+    if (count < 0) {
+        throw std::runtime_error("reserved block count must be non-negative");
+    }
+    if (static_cast<int>(free_block_ids_.size()) < count) {
+        throw std::runtime_error("No free blocks available for KV consolidation");
+    }
+
+    std::vector<int> reserved;
+    reserved.reserve(count);
+    try {
+        for (int idx = 0; idx < count; ++idx) {
+            int block_id = free_block_ids_.front();
+            allocate_block(block_id);
+            reserved.push_back(block_id);
+        }
+    }
+    catch (...) {
+        release_blocks(reserved);
+        throw;
+    }
+    return reserved;
+}
+
+void BlockManager::release_blocks(const std::vector<int>& block_ids)
+{
+    for (int block_id : block_ids) {
+        if (block_id < 0 || block_id >= static_cast<int>(blocks_.size()) || !used_block_ids_.count(block_id)) {
+            throw std::runtime_error("attempted to release an unowned KV cache block");
+        }
+        Block& block = blocks_[block_id];
+        if (block.ref_count <= 0) {
+            throw std::runtime_error("KV cache block has an invalid reference count");
+        }
+        block.ref_count--;
+        if (block.ref_count == 0) {
+            deallocate_block(block_id);
+        }
+    }
+}
+
 bool BlockManager::can_append(Sequence& seq, int num_tokens) const
 {
     int num_dispatched             = seq.block_ctx(BlockContextSlot::ACTIVE).num_dispatched_tokens[sp_idx_];

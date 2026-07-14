@@ -31,6 +31,11 @@ public:
     void allocate_uncached(Sequence& seq);
     void deallocate(Sequence& seq, BlockContextSlot slot);
     void trim_blocks_to_token_count(Sequence& seq, BlockContextSlot slot, int token_count);
+    // Reserve physical blocks without publishing them in a sequence block
+    // table. KV consolidation uses this to keep ACTIVE metadata unchanged
+    // until the device-to-device copy has completed successfully.
+    std::vector<int> reserve_blocks(int count);
+    void             release_blocks(const std::vector<int>& block_ids);
 
     // Append related
     bool can_append(Sequence& seq, int num_tokens = 1) const;

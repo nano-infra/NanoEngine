@@ -789,6 +789,314 @@ bool SPStateManager::commit_iteration_master_plan(const std::vector<std::shared_
     return true;
 }
 
+std::shared_ptr<SPStateManager::LSKVConsolidationPlan>
+SPStateManager::plan_kv_consolidation(uint64_t                                      transaction_id,
+                                      uint64_t                                      group_id,
+                                      int                                           dp_idx,
+                                      const std::vector<std::shared_ptr<Sequence>>& sequences,
+                                      int                                           source_rank,
+                                      const std::vector<int>&                       retained_ranks)
+{
+    auto plan            = std::make_shared<LSKVConsolidationPlan>();
+    plan->transaction_id = transaction_id;
+    plan->group_id       = group_id;
+    plan->dp_idx         = dp_idx;
+    plan->source_rank    = source_rank;
+    plan->retained_ranks = retained_ranks;
+
+    auto reject = [&](const std::string& reason) {
+        plan->success        = false;
+        plan->failure_reason = reason;
+        plan->state          = LSKVConsolidationPlan::State::REJECTED;
+        return plan;
+    };
+
+    if (dp_idx != dp_idx_) {
+        return reject("KV consolidation DP does not match the state manager");
+    }
+    if (source_rank < 0 || source_rank >= attention_sp_) {
+        return reject("KV consolidation source rank is out of range");
+    }
+    if (retained_ranks.empty()) {
+        return reject("KV consolidation cannot release the last allocated rank");
+    }
+
+    std::unordered_set<int> unique_retained;
+    for (int rank : retained_ranks) {
+        if (rank < 0 || rank >= attention_sp_ || rank == source_rank) {
+            return reject("KV consolidation retained rank is invalid");
+        }
+        if (!unique_retained.insert(rank).second) {
+            return reject("KV consolidation retained ranks contain a duplicate");
+        }
+    }
+
+    struct Assignment {
+        int dst_rank          = -1;
+        int num_tokens        = 0;
+        int dst_logical_start = 0;
+    };
+    struct Draft {
+        LSKVConsolidationPlan::SequenceStage stage;
+        std::vector<Assignment>              assignments;
+        std::vector<int>                     additional_blocks;
+        int                                  source_tokens = 0;
+    };
+
+    std::vector<int> free_blocks(attention_sp_, 0);
+    for (int rank : retained_ranks) {
+        free_blocks[rank] = block_manager.at(rank)->num_free_blocks();
+    }
+
+    std::vector<Draft>                  drafts;
+    std::unordered_set<const Sequence*> unique_sequences;
+    bool                                found_source_kv = false;
+    for (const auto& sequence : sequences) {
+        if (!sequence || !unique_sequences.insert(sequence.get()).second) {
+            return reject("KV consolidation sequence list is null or contains a duplicate");
+        }
+        if (sequence->status != SequenceStatus::RUNNING) {
+            return reject("KV consolidation only supports RUNNING sequences");
+        }
+        plan->group_sequence_ids.push_back(sequence->seq_id);
+
+        const auto& ctx = sequence->block_ctx(BlockContextSlot::ACTIVE);
+        if (ctx.dp_idx_ != dp_idx || static_cast<int>(ctx.sp_block_table.size()) != attention_sp_
+            || static_cast<int>(ctx.num_dispatched_tokens.size()) != attention_sp_) {
+            return reject("KV consolidation sequence placement is inconsistent with the target DP");
+        }
+        plan->sequence_snapshots.push_back({sequence, ctx, sequence->status});
+        if (ctx.master_sp_idx_ == source_rank
+            || (ctx.pending_token_present_ && ctx.pending_token_target_sp_ == source_rank)) {
+            return reject("KV consolidation source rank is an active or pending Decode master");
+        }
+
+        int source_tokens = sequence->committed_context_len(BlockContextSlot::ACTIVE, source_rank);
+        if (source_tokens == 0) {
+            if (!ctx.sp_block_table[source_rank].empty()) {
+                return reject("KV consolidation source owns blocks without committed KV");
+            }
+            continue;
+        }
+        found_source_kv = true;
+        if (static_cast<int>(ctx.sp_block_table[source_rank].size())
+            < (source_tokens + kvcache_block_size_ - 1) / kvcache_block_size_) {
+            return reject("KV consolidation source block table is shorter than committed KV");
+        }
+
+        Draft draft;
+        draft.stage.sequence       = sequence;
+        draft.stage.old_context    = ctx;
+        draft.stage.staged_context = ctx;
+        draft.stage.source_blocks.assign(ctx.sp_block_table[source_rank].begin(),
+                                         ctx.sp_block_table[source_rank].end());
+        draft.additional_blocks.assign(attention_sp_, 0);
+        draft.source_tokens = source_tokens;
+
+        std::vector<int> candidates = retained_ranks;
+        std::sort(candidates.begin(), candidates.end(), [&](int lhs, int rhs) {
+            bool lhs_master = lhs == ctx.master_sp_idx_;
+            bool rhs_master = rhs == ctx.master_sp_idx_;
+            if (lhs_master != rhs_master) {
+                return lhs_master;
+            }
+            int lhs_tokens = sequence->committed_context_len(BlockContextSlot::ACTIVE, lhs);
+            int rhs_tokens = sequence->committed_context_len(BlockContextSlot::ACTIVE, rhs);
+            if (lhs_tokens != rhs_tokens) {
+                return lhs_tokens > rhs_tokens;
+            }
+            return lhs < rhs;
+        });
+
+        auto movable_capacity = [&](int rank) {
+            int committed = sequence->committed_context_len(BlockContextSlot::ACTIVE, rank);
+            int frontier  = ctx.pending_token_present_ && ctx.pending_token_target_sp_ == rank ? 2 : 0;
+            int blocks    = static_cast<int>(ctx.sp_block_table[rank].size()) + free_blocks[rank];
+            return std::max(0, blocks * kvcache_block_size_ - committed - frontier);
+        };
+
+        int whole_destination = -1;
+        for (int rank : candidates) {
+            if (movable_capacity(rank) >= source_tokens) {
+                whole_destination = rank;
+                break;
+            }
+        }
+
+        int remaining = source_tokens;
+        for (int rank : candidates) {
+            if (whole_destination >= 0 && rank != whole_destination) {
+                continue;
+            }
+            int capacity = movable_capacity(rank);
+            int moved    = std::min(remaining, capacity);
+            if (moved <= 0) {
+                continue;
+            }
+
+            int committed       = sequence->committed_context_len(BlockContextSlot::ACTIVE, rank);
+            int frontier        = ctx.pending_token_present_ && ctx.pending_token_target_sp_ == rank ? 2 : 0;
+            int required_blocks = (committed + moved + frontier + kvcache_block_size_ - 1) / kvcache_block_size_;
+            int existing_blocks = static_cast<int>(ctx.sp_block_table[rank].size());
+            int additional      = std::max(0, required_blocks - existing_blocks);
+            if (additional > free_blocks[rank]) {
+                return reject("KV consolidation capacity simulation diverged");
+            }
+
+            draft.assignments.push_back({rank, moved, committed});
+            draft.additional_blocks[rank] = additional;
+            draft.stage.staged_context.num_dispatched_tokens[rank] += moved;
+            free_blocks[rank] -= additional;
+            remaining -= moved;
+            if (remaining == 0) {
+                break;
+            }
+        }
+        if (remaining != 0) {
+            return reject("insufficient destination capacity for KV consolidation");
+        }
+
+        draft.stage.staged_context.num_dispatched_tokens[source_rank] = 0;
+        draft.stage.staged_context.sp_block_table[source_rank].clear();
+        drafts.push_back(std::move(draft));
+    }
+
+    if (!found_source_kv) {
+        return reject("KV consolidation source rank has no committed KV");
+    }
+
+    size_t reserve_request_count = 0;
+    for (const auto& draft : drafts) {
+        reserve_request_count += static_cast<size_t>(std::count_if(
+            draft.additional_blocks.begin(), draft.additional_blocks.end(), [](int count) { return count > 0; }));
+    }
+    std::vector<std::pair<int, std::vector<int>>> reserved_for_cleanup;
+    reserved_for_cleanup.reserve(reserve_request_count);
+    plan->sequence_stages.reserve(drafts.size());
+
+    try {
+        for (auto& draft : drafts) {
+            for (int rank : retained_ranks) {
+                int count = draft.additional_blocks[rank];
+                if (count == 0) {
+                    continue;
+                }
+                auto reserved = block_manager.at(rank)->reserve_blocks(count);
+                reserved_for_cleanup.emplace_back(rank, std::move(reserved));
+                const auto& tracked = reserved_for_cleanup.back().second;
+                auto&       table   = draft.stage.staged_context.sp_block_table[rank];
+                table.insert(table.end(), tracked.begin(), tracked.end());
+                draft.stage.reserved_blocks.emplace_back(rank, tracked);
+            }
+
+            auto& locations = draft.stage.staged_context.block_location;
+            locations.clear();
+            size_t location_count = 0;
+            for (const auto& table : draft.stage.staged_context.sp_block_table) {
+                location_count += table.size();
+            }
+            locations.reserve(location_count);
+            for (int rank = 0; rank < attention_sp_; ++rank) {
+                for (int block_id : draft.stage.staged_context.sp_block_table[rank]) {
+                    locations.emplace_back(rank, block_id);
+                }
+            }
+
+            int source_cursor = 0;
+            for (const auto& assignment : draft.assignments) {
+                int destination_cursor = assignment.dst_logical_start;
+                int assignment_left    = assignment.num_tokens;
+                while (assignment_left > 0) {
+                    int source_block_index = source_cursor / kvcache_block_size_;
+                    int source_offset      = source_cursor % kvcache_block_size_;
+                    int dest_block_index   = destination_cursor / kvcache_block_size_;
+                    int dest_offset        = destination_cursor % kvcache_block_size_;
+                    int length             = std::min(
+                        {assignment_left, kvcache_block_size_ - source_offset, kvcache_block_size_ - dest_offset});
+                    plan->moves.push_back(
+                        {draft.stage.sequence->seq_id,
+                         dp_idx,
+                         source_rank,
+                         assignment.dst_rank,
+                         draft.stage.old_context.sp_block_table[source_rank][source_block_index],
+                         source_offset,
+                         draft.stage.staged_context.sp_block_table[assignment.dst_rank][dest_block_index],
+                         dest_offset,
+                         length});
+                    source_cursor += length;
+                    destination_cursor += length;
+                    assignment_left -= length;
+                }
+            }
+            if (source_cursor != draft.source_tokens) {
+                throw std::runtime_error("KV consolidation move generation lost source tokens");
+            }
+            plan->num_tokens += draft.source_tokens;
+            plan->sequence_stages.push_back(std::move(draft.stage));
+        }
+        reserved_for_cleanup.clear();
+    }
+    catch (...) {
+        for (const auto& [rank, block_ids] : reserved_for_cleanup) {
+            block_manager.at(rank)->release_blocks(block_ids);
+        }
+        throw;
+    }
+
+    plan->success = true;
+    plan->state   = LSKVConsolidationPlan::State::RESERVED;
+    return plan;
+}
+
+bool SPStateManager::commit_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan)
+{
+    if (!plan || !plan->success || plan->state != LSKVConsolidationPlan::State::RESERVED) {
+        return false;
+    }
+
+    auto contexts_equal = [](const BlockContext& lhs, const BlockContext& rhs) {
+        return lhs.engine_id_ == rhs.engine_id_ && lhs.dp_idx_ == rhs.dp_idx_
+               && lhs.master_sp_idx_ == rhs.master_sp_idx_ && lhs.attention_sp_ == rhs.attention_sp_
+               && lhs.attention_dp_ == rhs.attention_dp_ && lhs.pending_token_present_ == rhs.pending_token_present_
+               && lhs.pending_token_target_sp_ == rhs.pending_token_target_sp_
+               && lhs.block_location == rhs.block_location && lhs.sp_block_table == rhs.sp_block_table
+               && lhs.num_dispatched_tokens == rhs.num_dispatched_tokens;
+    };
+    for (const auto& snapshot : plan->sequence_snapshots) {
+        if (!snapshot.sequence || snapshot.sequence->status != snapshot.status
+            || !contexts_equal(snapshot.sequence->block_ctx(BlockContextSlot::ACTIVE), snapshot.context)) {
+            return false;
+        }
+    }
+
+    for (auto& stage : plan->sequence_stages) {
+        std::swap(stage.sequence->block_ctx(BlockContextSlot::ACTIVE), stage.staged_context);
+    }
+    // From this point onward the transaction is committed. A source-block
+    // reclamation failure is engine-fatal and must never trigger ABORT, since
+    // the reserved destination blocks are now reachable from ACTIVE metadata.
+    plan->state = LSKVConsolidationPlan::State::COMMITTED;
+    for (const auto& stage : plan->sequence_stages) {
+        block_manager.at(plan->source_rank)->release_blocks(stage.source_blocks);
+    }
+    rebuild_decode_role_counters();
+    return true;
+}
+
+void SPStateManager::abort_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan)
+{
+    if (!plan || plan->state != LSKVConsolidationPlan::State::RESERVED) {
+        return;
+    }
+    for (auto& stage : plan->sequence_stages) {
+        for (const auto& [rank, block_ids] : stage.reserved_blocks) {
+            block_manager.at(rank)->release_blocks(block_ids);
+        }
+        stage.reserved_blocks.clear();
+    }
+    plan->state = LSKVConsolidationPlan::State::ABORTED;
+}
+
 int SPStateManager::get_active_master_count(const std::vector<std::shared_ptr<Sequence>>& seqs) const
 {
     std::set<int> masters;

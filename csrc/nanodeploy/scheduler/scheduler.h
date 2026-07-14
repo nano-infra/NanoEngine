@@ -243,6 +243,14 @@ public:
     std::vector<std::vector<uint64_t>>              get_ls_group_initial_admission_orders() const;
     std::vector<std::vector<std::vector<uint64_t>>> get_ls_group_initial_sequence_ids() const;
     std::vector<std::pair<uint64_t, uint64_t>>      get_ls_active_batch_owners() const;
+    std::vector<int>                                get_ls_group_allocated_ranks(uint64_t group_id) const;
+
+    // Manual, stop-the-world LS KV scale-down transaction. Planning reserves
+    // destination blocks but leaves ACTIVE metadata untouched. The caller must
+    // run the returned physical moves on every worker before commit.
+    std::shared_ptr<SPStateManager::LSKVConsolidationPlan> plan_ls_kv_scale_down(uint64_t group_id, int source_rank);
+    bool commit_ls_kv_scale_down(const std::shared_ptr<SPStateManager::LSKVConsolidationPlan>& plan);
+    void abort_ls_kv_scale_down(const std::shared_ptr<SPStateManager::LSKVConsolidationPlan>& plan);
 
     // Test-only failure injection. A non-negative value throws after that
     // many complete sequence allocations inside the next LS admission.
@@ -360,6 +368,8 @@ private:
     int                                                     ls_admission_failure_after_allocations_for_test_  = -1;
     int                                                     ls_admission_failure_after_publications_for_test_ = -1;
     double                                                  ls_step_planning_latency_ms_                      = 0.0;
+    uint64_t                                                next_ls_kv_transaction_id_                        = 1;
+    std::shared_ptr<SPStateManager::LSKVConsolidationPlan>  active_ls_kv_transaction_;
 };
 
 }  // namespace nanodeploy

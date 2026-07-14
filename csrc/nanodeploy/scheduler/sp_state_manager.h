@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -102,6 +103,55 @@ public:
         std::vector<int> group_used_kv_blocks;
     };
 
+    struct KVTokenRangeMove {
+        uint64_t seq_id           = 0;
+        int      dp_idx           = -1;
+        int      src_sp_rank      = -1;
+        int      dst_sp_rank      = -1;
+        int      src_block_id     = -1;
+        int      src_token_offset = 0;
+        int      dst_block_id     = -1;
+        int      dst_token_offset = 0;
+        int      num_tokens       = 0;
+    };
+
+    struct LSKVConsolidationPlan {
+        enum class State {
+            REJECTED,
+            RESERVED,
+            COMMITTED,
+            ABORTED
+        };
+
+        struct SequenceStage {
+            std::shared_ptr<Sequence>                     sequence;
+            BlockContext                                  old_context;
+            BlockContext                                  staged_context;
+            std::vector<int>                              source_blocks;
+            std::vector<std::pair<int, std::vector<int>>> reserved_blocks;
+        };
+
+        struct SequenceSnapshot {
+            std::shared_ptr<Sequence> sequence;
+            BlockContext              context;
+            SequenceStatus            status = SequenceStatus::WAITING;
+        };
+
+        bool                          success = false;
+        std::string                   failure_reason;
+        uint64_t                      transaction_id = 0;
+        uint64_t                      group_id       = 0;
+        int                           dp_idx         = -1;
+        int                           source_rank    = -1;
+        std::vector<int>              retained_ranks;
+        std::vector<uint64_t>         group_sequence_ids;
+        std::vector<KVTokenRangeMove> moves;
+        int64_t                       num_tokens = 0;
+        State                         state      = State::REJECTED;
+        std::vector<SequenceSnapshot> sequence_snapshots;
+        std::vector<SequenceStage>    sequence_stages;
+    };
+
     SPStateManager(const std::string& engine_id,
                    int                attention_sp,
                    int                num_kvcache_blocks,
@@ -188,11 +238,20 @@ public:
     bool               reassign_pending_append(Sequence& seq, int target_sp_idx);
     bool               commit_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
                                                     const LSDecodeMasterPlan&                     plan);
-    std::vector<int>   group_used_kv_tokens(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
-    std::vector<int>   group_used_kv_blocks(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
-    int                get_active_master_count(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
-    int                get_kv_participant_count(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
-    void               rebuild_decode_role_counters();
+    std::shared_ptr<LSKVConsolidationPlan>
+                     plan_kv_consolidation(uint64_t                                      transaction_id,
+                                           uint64_t                                      group_id,
+                                           int                                           dp_idx,
+                                           const std::vector<std::shared_ptr<Sequence>>& sequences,
+                                           int                                           source_rank,
+                                           const std::vector<int>&                       retained_ranks);
+    bool             commit_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan);
+    void             abort_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan);
+    std::vector<int> group_used_kv_tokens(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
+    std::vector<int> group_used_kv_blocks(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
+    int              get_active_master_count(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
+    int              get_kv_participant_count(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
+    void             rebuild_decode_role_counters();
 
     // Build and reuse immutable running-state snapshots within a single
     // scheduler step. This avoids rescanning all running sequences for each
