@@ -137,6 +137,9 @@ class Config:
     ls_decode_initial_kv_dop: int = 0
     ls_decode_batch_per_master: int = 64
     ls_decode_enable_memory_scale_up: bool = True
+    # 0 keeps the physical KV-consolidation P2P transport disabled.  A positive
+    # value reserves a fixed token-major scratch buffer before sizing KV blocks.
+    ls_kv_consolidation_migration_chunk_tokens: int = 0
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -146,6 +149,10 @@ class Config:
             )
         if self.ls_decode_batch_per_master <= 0:
             raise ValueError("ls_decode_batch_per_master must be > 0")
+        if self.ls_kv_consolidation_migration_chunk_tokens < 0:
+            raise ValueError(
+                "ls_kv_consolidation_migration_chunk_tokens must be >= 0"
+            )
         if self.fixed_sp_size < 0:
             raise ValueError("fixed_sp_size must be >= 0")
         if self.fixed_sp_size > self.attention_sp:

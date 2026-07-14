@@ -13,6 +13,7 @@ from nanodeploy.config import Config
 from nanodeploy.endpoint.rpc_endpoint import RPCServerEndpoint
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
+from nanodeploy.worker.kv_p2p import KVCacheP2PMove, KVCacheP2PResult
 from nanodeploy.worker.model_runner import ModelRunner
 
 
@@ -236,6 +237,21 @@ class RayExecutor:
                 for seqs, worker in zip(dp_seqs, self.workers)
             ],
             timeout=timeout,
+        )
+
+    def copy_kv_ranges_p2p(
+        self,
+        moves: list[KVCacheP2PMove],
+        timeout: float | None = None,
+    ) -> list[KVCacheP2PResult]:
+        """Run one physical KV P2P copy plan on every worker.
+
+        This is a data-plane preflight API.  It does not commit scheduler or
+        block-table metadata and therefore must not be treated as a completed
+        scale-down transaction.
+        """
+        return self.collective_rpc(
+            "copy_kv_ranges_p2p", args=(moves,), timeout=timeout
         )
 
     def run(

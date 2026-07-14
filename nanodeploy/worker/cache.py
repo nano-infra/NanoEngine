@@ -9,6 +9,11 @@ import torch.distributed as dist
 from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.worker.distributed import get_dist_context
+from nanodeploy.worker.kv_p2p import (
+    KVCacheP2PMove,
+    KVCacheP2PResult,
+    KVCacheP2PTransport,
+)
 
 
 def _get_slime_qp_num() -> int:
@@ -32,9 +37,12 @@ class CacheContext:
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     mode: Literal["gqa", "mla"] = "gqa"
+    migration_chunk_tokens: int = 0
     num_local_kvcache_blocks = -1
     num_remote_kvcache_blocks: dict[str, int] = None
     kv_cache: torch.Tensor = None
+    migration_scratch: torch.Tensor = None
+    kv_p2p_transport: KVCacheP2PTransport = None
     selected_nic: str | None = None
     endpoints: dict[str, dict[int, dlslime.RDMAEndpoint]] = None
 
@@ -47,6 +55,9 @@ class CacheContext:
         return self.num_kv_heads // self.attention_tp
 
     def __post_init__(self):
+
+        if self.migration_chunk_tokens < 0:
+            raise ValueError("migration_chunk_tokens must be >= 0")
 
         free, total = torch.cuda.mem_get_info()
         if self.gpu_memory_limit_gb is not None:
@@ -76,8 +87,24 @@ class CacheContext:
         if self.mode == "gqa":
             block_bytes *= 2
 
+        kv_count = 2 if self.mode == "gqa" else 1
+        migration_scratch_bytes = (
+            self.migration_chunk_tokens
+            * kv_count
+            * self.num_hidden_layers
+            * self.num_local_kv_heads
+            * self.head_dim
+            * self.dtype.itemsize
+        )
+
         self.num_local_kvcache_blocks = (
-            int(total * self.gpu_memory_utilization - used - peak + current)
+            int(
+                total * self.gpu_memory_utilization
+                - used
+                - peak
+                + current
+                - migration_scratch_bytes
+            )
             // block_bytes
         )
 
@@ -132,6 +159,17 @@ class CacheContext:
         self.num_local_kvcache_blocks = num_kvcache_blocks
         
         kv_count = 2 if self.mode == "gqa" else 1
+
+        if self.migration_chunk_tokens > 0:
+            self.migration_scratch = torch.empty(
+                self.migration_chunk_tokens,
+                kv_count,
+                self.num_hidden_layers,
+                self.num_local_kv_heads,
+                self.head_dim,
+                dtype=self.dtype,
+                device=self.device,
+            )
         
         self.kv_cache = torch.empty(
             kv_count,
@@ -143,6 +181,14 @@ class CacheContext:
             dtype=self.dtype,
             device=self.device,
         )
+
+        if self.migration_scratch is not None:
+            self.kv_p2p_transport = KVCacheP2PTransport(
+                self.kv_cache,
+                get_dist_context().attn_sp_group,
+                self.migration_chunk_tokens,
+                self.migration_scratch,
+            )
 
     def p2p_init(
         self, remote_engine_name: str, num_kv_blocks: int, remote_world_size: int
@@ -218,6 +264,19 @@ class CacheContext:
 
             [future.wait() for future in futures]
 
+    def copy_kv_ranges_p2p(
+        self, moves: list[KVCacheP2PMove]
+    ) -> KVCacheP2PResult:
+        """Copy physical ranges without changing scheduler/block metadata."""
+        if self.kv_p2p_transport is None:
+            raise RuntimeError(
+                "KV P2P transport is disabled; set "
+                "ls_kv_consolidation_migration_chunk_tokens > 0"
+            )
+        return self.kv_p2p_transport.execute(
+            moves, current_dp_idx=get_dist_context().attn_dp_rank
+        )
+
 
 _CACHE_CONTEXT: CacheContext
 
@@ -239,6 +298,7 @@ def set_cache_context(
     device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     mode: Literal["gqa", "mla"] = "gqa",
+    migration_chunk_tokens: int = 0,
 ):
     global _CACHE_CONTEXT
     _CACHE_CONTEXT = CacheContext(
@@ -254,5 +314,6 @@ def set_cache_context(
         device=device,
         dtype=dtype,
         mode=mode,
+        migration_chunk_tokens=migration_chunk_tokens,
     )
     return _CACHE_CONTEXT

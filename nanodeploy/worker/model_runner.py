@@ -31,6 +31,7 @@ from nanodeploy.worker.distributed import (
     set_dist_context,
 )
 from nanodeploy.worker.loader import load_model
+from nanodeploy.worker.kv_p2p import KVCacheP2PMove, KVCacheP2PResult
 from nanodeploy.worker.runner_config import get_runner_config, set_runner_config
 from nanodeploy.worker.sp_context import set_sp_context
 
@@ -319,6 +320,9 @@ class ModelRunner:
             device=torch.get_default_device(),
             dtype=torch.get_default_dtype(),
             mode=mode,
+            migration_chunk_tokens=(
+                config.ls_kv_consolidation_migration_chunk_tokens
+            ),
         )
         config.num_kvcache_blocks = cache_context.num_local_kvcache_blocks
 
@@ -864,6 +868,11 @@ class ModelRunner:
 
     def migrate(self, seqs: list[Sequence]) -> None:
         get_cache_context().migrate(seqs=seqs)
+
+    def copy_kv_ranges_p2p(
+        self, moves: list[KVCacheP2PMove]
+    ) -> KVCacheP2PResult:
+        return get_cache_context().copy_kv_ranges_p2p(moves)
 
     def run(
         self, dp_seqs: list[Sequence], is_prefill: bool, enable_rpc: bool = False, send_timestamp: float = 0.0

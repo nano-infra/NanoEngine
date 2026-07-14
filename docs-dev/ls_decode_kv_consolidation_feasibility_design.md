@@ -36,6 +36,8 @@ LS-Decode KV Consolidation
 
 这里的“可落地”指架构上可实现，不是当前代码已经具备或只改配置即可开启。现有项目没有 live Decode KV relayout、maintenance action、intra-DP KV P2P RPC 和 no-fail metadata commit；这些都是新增实现。落地顺序必须先经过 CPU transaction 和手动 GPU correctness，再接 pressure policy，不能直接从 usage threshold 跳到生产 execute。
 
+当前已落地的第一小步仅是物理通信层：`KVCacheP2PMove`、固定 scratch、复用 `attn_sp_group` 的 `dist.isend/irecv`、worker/executor 集体 RPC，以及 CPU mock、双进程 Gloo 和双 GPU NCCL correctness preflight。该接口不修改 block table、不释放 source，也没有接 scheduler action/policy，因此还不能称为可用的 scale-down transaction。
+
 ### 1.1 能解决什么
 
 第一版 KV Consolidation 可以做到：
@@ -282,7 +284,7 @@ ls_kv_consolidation_cooldown_steps = 64
 ls_kv_consolidation_max_released_ranks_per_event = 1
 ls_kv_consolidation_max_source_blocks_per_event = 0
 ls_kv_consolidation_max_pause_ms = 0.0
-ls_kv_consolidation_migration_chunk_tokens = 128
+ls_kv_consolidation_migration_chunk_tokens = 0  # 0 关闭；手动 preflight 再显式设为 128 等正值
 ```
 
 这些数值只能作为 shadow bring-up 起点，正式值必须来自 4-DP × 8-SP / EP32 trace 和 migration bandwidth profiling。
@@ -522,16 +524,18 @@ dst_logical_start = committed_context_len(ACTIVE, dst_sp_rank)
 
 这要求 planner 能生成 block 内 token-range scatter，而不能只做 block-id 对 block-id 的 zip copy。
 
-### 6.6 GPU copy backend：明确选择 per-DP NCCL P2P
+### 6.6 GPU copy backend：复用 `attn_sp_group` 的 NCCL P2P
 
 目标拓扑中每个 8-SP allocation domain 共置于同一节点。MVP 直接选择：
 
 ```text
-startup 创建专用 per-DP migration NCCL communicator
-source gather -> fixed scratch -> NCCL send/recv -> destination scratch -> scatter
+已有 per-DP attn_sp_group / ProcessGroupNCCL
+source gather -> fixed scratch -> dist.isend/irecv -> destination scratch -> scatter
 ```
 
-不在第一版扩展 DLSLIME/RDMA，也不把 CUDA peer access 作为必需条件。专用 communicator 将迁移 ordering 与现有 Attention/EP communicator 隔离；但 engine 仍必须让全部 32 workers 进入同一个 maintenance action，只有受影响 DP 执行 P2P，其余 workers 等待，保证任何 rank 都不会提前进入下一轮 EP32 collective。
+不在第一版扩展 DLSLIME/RDMA、复制 LoongServe 的 `rnccl` binding 或新建重复 NCCL communicator。当前 LS Attention payload 使用 DLSlime `hao_basic`，而 `attn_sp_group` 已具有目标 DP 内 8 个 SP ranks 的正确 membership；maintenance-only step 又保证不与普通 Decode 重叠，因此复用它更符合项目实际。engine 仍必须让全部 32 workers 进入同一个 maintenance action，只有受影响 DP 执行 P2P，其余 workers 等待，保证任何 rank 都不会提前进入下一轮 EP32 collective。
+
+第一版实现按 `(src_sp_rank, dst_sp_rank)` 和物理 range 固定排序，每个 peer/chunk 顺序执行 `isend` 或 `irecv` 并等待 `Work` 完成。这样容易验证配对和 scratch 复用；`batch_isend_irecv` 只作为 correctness 稳定后的 launch-overhead 优化，不改变 plan/transaction 语义。
 
 scratch buffer 在 engine 初始化时固定分配，并在计算 KV cache block 数之前从可用显存扣除。`migration_chunk_tokens` 只控制 gather/send/scatter 的峰值内存；一个 source 仍必须在一个 maintenance event 中完成。source blocks 或预计 pause 超过上限时跳过 candidate，不能留下长期半迁移状态。
 
@@ -656,7 +660,7 @@ NanoDeploy 当前场景跳过真实 Prefill，所以无法获得第一个零额�
 |---|---|---|
 | 搬运粒度 | 清空低使用 source instance | 清空一个 passive SP rank，source-only |
 | copy 分片 | `max_mig_len` token chunk | 固定 scratch + token chunk |
-| transport | NCCL P2P send/recv | 专用 per-DP NCCL P2P communicator |
+| transport | 自定义 `rnccl` 直接调用 NCCL P2P | 复用 `attn_sp_group`，PyTorch `dist.isend/irecv` |
 | metadata 顺序 | 迁移前已有局部更新 | copy 全成功后 no-fail commit |
 | scale-down 触发 | 新 Prefill 收益驱动 | 先 admission pressure，后 calibrated ITL/payback |
 | 物理 topology | elastic instances | EP32/SP mesh 保持固定 |
@@ -731,9 +735,10 @@ Phase 0 的 go/no-go 数据：
 
 ### Phase 2：真实 Intra-DP GPU Copy
 
-- 增加 executor/worker consolidation RPC；
-- 启动时创建 per-DP migration communicator 和固定 scratch；
-- 搬运全部 layers 和 KV components；
+- 增加 executor/worker physical range-copy RPC；（第一版已完成）
+- 复用 `attn_sp_group`，在 KV block sizing 前预留固定 scratch；（第一版已完成）
+- 使用 `dist.isend/irecv` 做确定序 chunk copy；（CPU mock、双进程 Gloo 和双 GPU NCCL preflight 已完成，1-DP × 8-SP preflight 待做）
+- 搬运全部 layers 和 KV components；（第一版 physical range copy 已完成）
 - stop-the-world 同步；
 - 先提供手动触发，不接自动 policy；
 - 验证可恢复 copy error 的 abort，以及 fatal error 的 fail-stop；
@@ -784,7 +789,7 @@ ls_kv_consolidation_max_released_ranks_per_event: int = 1
 ls_kv_consolidation_max_source_blocks_per_event: int = 0
 ls_kv_consolidation_max_migration_bytes_per_event: int = 0
 ls_kv_consolidation_max_pause_ms: float = 0.0
-ls_kv_consolidation_migration_chunk_tokens: int = 128
+ls_kv_consolidation_migration_chunk_tokens: int = 0  # 0 不预留 scratch/关闭 physical P2P API
 ls_kv_consolidation_payback_safety_factor: float = 0.5
 ```
 
@@ -794,6 +799,7 @@ ls_kv_consolidation_payback_safety_factor: float = 0.5
 - 第一版仍要求 Decode-only、Dummy Prefill、centralized、`loop_count=1`；
 - execute mode 只对白名单拓扑开放；
 - `max_source_blocks_per_event`、`max_migration_bytes_per_event` 和 `max_pause_ms` 在 execute mode 必须由 profiling 给出正值；`0` 表示尚未校准、禁止自动执行；
+- `migration_chunk_tokens=0` 不分配 scratch，physical P2P API 会明确拒绝执行；设为正值后必须在 KV block sizing 前扣除对应显存；
 - `candidate_util` 只做快速过滤，不能绕过 exact feasibility/admission simulation；
 - `pressure_and_opportunistic` 只有 Phase 4 的 ITL predictor 校准并验收后才能开放；
 - shadow mode 不得修改 block、group、master 或 pending state；
@@ -930,7 +936,7 @@ NCCL/CUDA fatal failure 可能同时破坏 communicator 或进程，保留旧 so
     ↓
 实现 source-only CPU reservation / abort / no-fail commit
     ↓
-实现固定 scratch + per-DP NCCL P2P，先手动触发
+复用 attn_sp_group，实现固定 scratch + dist.isend/irecv，先手动触发
     ↓
 在 1DP/EP8 做 correctness preflight
     ↓

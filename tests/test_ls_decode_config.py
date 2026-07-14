@@ -65,6 +65,25 @@ def test_ls_decode_core_supported_configuration(tmp_path):
     assert config.ls_decode_enable_memory_scale_up is False
 
 
+def test_kv_consolidation_p2p_scratch_is_opt_in(tmp_path):
+    config = Config(model=str(tmp_path), **_ls_kwargs())
+    assert config.ls_kv_consolidation_migration_chunk_tokens == 0
+
+    enabled = Config(
+        model=str(tmp_path),
+        **_ls_kwargs(),
+        ls_kv_consolidation_migration_chunk_tokens=128,
+    )
+    assert enabled.ls_kv_consolidation_migration_chunk_tokens == 128
+
+    with pytest.raises(ValueError, match="must be >= 0"):
+        Config(
+            model=str(tmp_path),
+            **_ls_kwargs(),
+            ls_kv_consolidation_migration_chunk_tokens=-1,
+        )
+
+
 def test_ls_decode_core_supports_single_node_8gpu_preflight(tmp_path):
     kwargs = _ls_kwargs()
     kwargs.update(attention_dp=1, ffn_ep=8)
