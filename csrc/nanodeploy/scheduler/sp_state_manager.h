@@ -171,6 +171,8 @@ public:
     void apply_planned_placement(Sequence& seq, const PlannedPlacement& placement);
 
     void               allocate_ls_initial(Sequence& seq);
+    void               allocate_ls_initial_batch(const std::vector<std::shared_ptr<Sequence>>& batch,
+                                                 int failure_after_allocations_for_test = -1);
     void               set_decode_master(Sequence& seq, int master_sp_idx);
     int                estimate_pending_append_capacity(int                                           rank,
                                                         const std::vector<std::shared_ptr<Sequence>>& requests,
@@ -229,6 +231,11 @@ public:
     int num_recv_seqs_per_sp(int sp_idx) const
     {
         return num_recv_seqs_per_sp_[sp_idx];
+    }
+
+    int master_seq_count(int sp_idx) const
+    {
+        return master_seq_counts_[sp_idx];
     }
 
     // WARNING: This method modifies shared state without thread safety protection.

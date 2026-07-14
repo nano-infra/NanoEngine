@@ -1330,7 +1330,9 @@ void SPStateManager::apply_planned_placement(Sequence& seq, const PlannedPlaceme
     block_ctx.master_sp_idx_        = placement.master_sp_idx;
     block_ctx.num_dispatched_tokens = placement.num_dispatched_tokens;
     block_ctx.block_location.clear();
-    block_ctx.sp_block_table.assign(attention_sp_, {});
+    for (auto& table : block_ctx.sp_block_table) {
+        table.clear();
+    }
 
     if (master_selector_ == SPMasterSelector::RoundRobin) {
         sp_rr_counter_ = (placement.master_sp_idx + 1) % attention_sp_;
@@ -1841,32 +1843,126 @@ void SPStateManager::allocate_ls_initial(Sequence& seq)
     num_running_tokens_ += seq.num_tokens;
 }
 
+void SPStateManager::allocate_ls_initial_batch(const std::vector<std::shared_ptr<Sequence>>& batch,
+                                               int failure_after_allocations_for_test)
+{
+    if (batch.empty()) {
+        throw std::runtime_error("LS initial batch must not be empty");
+    }
+
+    std::unordered_set<uint64_t> sequence_ids;
+    std::vector<int>             needed_blocks(attention_sp_, 0);
+    std::vector<int>             master_delta(attention_sp_, 0);
+    std::vector<int>             recv_delta(attention_sp_, 0);
+    int                          running_token_delta = 0;
+
+    // Validate the entire transaction and aggregate its capacity demand before
+    // mutating any block manager or role counter.
+    for (const auto& seq : batch) {
+        if (!seq || !sequence_ids.insert(seq->seq_id).second) {
+            throw std::runtime_error("LS initial batch contains a null or duplicate sequence");
+        }
+        const auto& ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
+        if (ctx.master_sp_idx_ < 0 || ctx.master_sp_idx_ >= attention_sp_) {
+            throw std::runtime_error("LS initial master is out of range");
+        }
+        if (static_cast<int>(ctx.num_dispatched_tokens.size()) != attention_sp_
+            || static_cast<int>(ctx.sp_block_table.size()) != attention_sp_ || !ctx.block_location.empty()) {
+            throw std::runtime_error("LS initial sequence has an invalid active block context");
+        }
+
+        int dispatched = 0;
+        for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+            int tokens = ctx.num_dispatched_tokens[sp_idx];
+            if (tokens < 0 || !ctx.sp_block_table[sp_idx].empty()) {
+                throw std::runtime_error("LS initial sequence has a dirty or negative placement");
+            }
+            dispatched += tokens;
+            needed_blocks[sp_idx] += (tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
+            if (tokens > 0 && sp_idx != ctx.master_sp_idx_) {
+                recv_delta[sp_idx]++;
+            }
+        }
+        if (dispatched != seq->num_tokens) {
+            throw std::runtime_error("LS initial placement does not cover the complete sequence");
+        }
+        master_delta[ctx.master_sp_idx_]++;
+        running_token_delta += seq->num_tokens;
+    }
+    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        if (block_manager.at(sp_idx)->num_free_blocks() < needed_blocks[sp_idx]) {
+            throw std::runtime_error("LS initial batch lost its prevalidated block capacity");
+        }
+    }
+
+    int allocated_sequences = 0;
+    try {
+        if (failure_after_allocations_for_test == 0) {
+            throw std::runtime_error("injected LS initial batch allocation failure");
+        }
+        for (const auto& seq : batch) {
+            for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                block_manager.at(sp_idx)->allocate_uncached(*seq);
+            }
+            allocated_sequences++;
+            if (failure_after_allocations_for_test >= 0 && allocated_sequences == failure_after_allocations_for_test) {
+                throw std::runtime_error("injected LS initial batch allocation failure");
+            }
+        }
+    }
+    catch (...) {
+        // Scan every table, including the currently failing rank. This also
+        // covers an exception thrown after a BlockManager partially mutated a
+        // table but before the sequence-level allocation completed.
+        for (const auto& seq : batch) {
+            if (!seq) {
+                continue;
+            }
+            auto& ctx = seq->block_ctx(BlockContextSlot::ACTIVE);
+            for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+                if (!ctx.sp_block_table[sp_idx].empty()) {
+                    block_manager.at(sp_idx)->deallocate(*seq, BlockContextSlot::ACTIVE);
+                }
+            }
+            ctx.block_location.clear();
+        }
+        throw;
+    }
+
+    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        master_seq_counts_[sp_idx] += master_delta[sp_idx];
+        num_recv_seqs_per_sp_[sp_idx] += recv_delta[sp_idx];
+    }
+    num_running_seqs_ += static_cast<int>(batch.size());
+    num_running_tokens_ += running_token_delta;
+    cached_running_state_.reset();
+}
+
 void SPStateManager::deallocate(Sequence& seq, BlockContextSlot slot)
 {
     cached_running_state_.reset();
     auto& block_ctx     = seq.block_ctx(slot);
     int   master_sp_idx = block_ctx.master_sp_idx_;
 
-    if (master_sp_idx >= 0 && master_sp_idx < attention_sp_) {
-        if (master_seq_counts_[master_sp_idx] > 0) {
-            master_seq_counts_[master_sp_idx]--;
-        }
-    }
-
-    // [修改] 在清理 block_ctx 之前，先减少 Recv 计数
-    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-        if (block_ctx.num_dispatched_tokens[sp_idx] > 0) {
-            if (sp_idx != master_sp_idx) {
-                num_recv_seqs_per_sp_[sp_idx]--;
-            }
-        }
-    }
-
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
         block_manager[sp_idx]->deallocate(seq, slot);
     }
 
-    block_ctx.sp_block_table.assign(attention_sp_, {});
+    // Commit counters only after every rank released successfully. Together
+    // with BlockManager's retry-safe table updates, an exceptional deallocate
+    // never applies the logical counter delta twice.
+    if (master_sp_idx >= 0 && master_sp_idx < attention_sp_ && master_seq_counts_[master_sp_idx] > 0) {
+        master_seq_counts_[master_sp_idx]--;
+    }
+    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        if (block_ctx.num_dispatched_tokens[sp_idx] > 0 && sp_idx != master_sp_idx) {
+            num_recv_seqs_per_sp_[sp_idx]--;
+        }
+    }
+
+    for (auto& table : block_ctx.sp_block_table) {
+        table.clear();
+    }
     block_ctx.block_location.clear();
     std::fill(block_ctx.num_dispatched_tokens.begin(), block_ctx.num_dispatched_tokens.end(), 0);
     block_ctx.pending_token_present_   = false;

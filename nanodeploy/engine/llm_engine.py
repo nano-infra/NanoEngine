@@ -107,6 +107,12 @@ class LLMEngine:
             # This is just for logging, so we skip it in decentralized mode
             if hasattr(self.scheduler, 'waiting_migration') and self.scheduler.waiting_migration:
                 logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
+            elif self.config.enable_ls_decode_core_scheduler:
+                pending = self.scheduler.get_ls_pending_batch_sequence_ids()
+                if pending:
+                    logger.info(
+                        "oldest LS pending logical batch sequence_ids=%s", pending[0]
+                    )
 
         dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
 
@@ -198,6 +204,14 @@ class LLMEngine:
             post_sch_end = time.perf_counter()
 
         if self.config.enable_ls_decode_core_scheduler:
+            if sch_res.ls_sealed_batch_ids:
+                logger.info(
+                    {
+                        "mode": "ls_decode_batch_seal",
+                        "batch_ids": sch_res.ls_sealed_batch_ids,
+                        "sequence_ids": sch_res.ls_sealed_batch_sequence_ids,
+                    }
+                )
             if is_prefill and sch_res.ls_initial_batch_ids:
                 logger.info(
                     {
@@ -211,6 +225,13 @@ class LLMEngine:
                         "provisional_pending_targets": (
                             sch_res.ls_initial_provisional_pending_targets
                         ),
+                        "admission_orders": sch_res.ls_initial_admission_orders,
+                        "admission_attempts": sch_res.ls_initial_admission_attempts,
+                        "is_recovery_batch": (
+                            sch_res.ls_initial_is_recovery_batch
+                        ),
+                        "parent_batch_ids": sch_res.ls_initial_parent_batch_ids,
+                        "admission_kinds": sch_res.ls_initial_admission_kinds,
                         "placement_strategy": "batch_uniform",
                         "block_size": self.config.kvcache_block_size,
                     }
@@ -254,6 +275,33 @@ class LLMEngine:
                         "planning_latency_ms": sch_res.ls_planning_latency_ms,
                         "model_runner_duration_ms": model_runner_duration_ms,
                         "step_itl_ms": step_duration_ms,
+                    }
+                )
+            if (
+                sch_res.ls_pending_batch_count
+                or sch_res.ls_atomic_admission_no_fit_count
+                or sch_res.ls_atomic_admission_rollback_count
+            ):
+                logger.info(
+                    {
+                        "mode": "ls_decode_pending_batches",
+                        "pending_batch_count": sch_res.ls_pending_batch_count,
+                        "pending_request_count": sch_res.ls_pending_request_count,
+                        "oldest_pending_batch_age_steps": (
+                            sch_res.ls_oldest_pending_batch_age_steps
+                        ),
+                        "max_pending_batch_attempts": (
+                            sch_res.ls_max_pending_batch_attempts
+                        ),
+                        "atomic_admission_no_fit_count": (
+                            sch_res.ls_atomic_admission_no_fit_count
+                        ),
+                        "atomic_admission_merge_count": (
+                            sch_res.ls_atomic_admission_merge_count
+                        ),
+                        "atomic_admission_rollback_count": (
+                            sch_res.ls_atomic_admission_rollback_count
+                        ),
                     }
                 )
         outputs = []

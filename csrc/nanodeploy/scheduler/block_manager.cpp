@@ -43,6 +43,10 @@ Block& BlockManager::allocate_block(int block_id)
     if (block.ref_count != 0) {
         throw std::runtime_error("Block ref_count is not 0");
     }
+    // unordered_set insertion is the only potentially allocating operation in
+    // this path. Perform it before removing the block from the free list so an
+    // allocation exception cannot strand the block in neither collection.
+    used_block_ids_.insert(block_id);
     block.reset();
 
     auto it = block_id_to_free_list_it_[block_id];
@@ -50,8 +54,6 @@ Block& BlockManager::allocate_block(int block_id)
         free_block_ids_.erase(it);
         block_id_to_free_list_it_[block_id] = free_block_ids_.end();
     }
-
-    used_block_ids_.insert(block_id);
     return blocks_[block_id];
 }
 
@@ -60,8 +62,10 @@ void BlockManager::deallocate_block(int block_id)
     if (blocks_[block_id].ref_count != 0) {
         throw std::runtime_error("Block ref_count is not 0");
     }
-    used_block_ids_.erase(block_id);
+    // Allocate the free-list node before erasing ownership. If allocation
+    // fails, the block remains discoverable as used and the caller can retry.
     free_block_ids_.push_back(block_id);
+    used_block_ids_.erase(block_id);
     block_id_to_free_list_it_[block_id] = std::prev(free_block_ids_.end());
 }
 
@@ -143,6 +147,11 @@ void BlockManager::allocate_uncached(Sequence& seq)
     if (static_cast<int>(free_block_ids_.size()) < num_blocks) {
         throw std::runtime_error("No free blocks available");
     }
+    // Reserve both destination vectors before touching the free list. The
+    // subsequent push operations then cannot throw due to vector growth.
+    table.reserve(num_blocks);
+    seq.block_ctx(BlockContextSlot::ACTIVE)
+        .block_location.reserve(seq.block_ctx(BlockContextSlot::ACTIVE).block_location.size() + num_blocks);
     for (int i = 0; i < num_blocks; ++i) {
         int block_id = free_block_ids_.front();
         allocate_block(block_id);
@@ -154,17 +163,25 @@ void BlockManager::allocate_uncached(Sequence& seq)
 void BlockManager::deallocate(Sequence& seq, BlockContextSlot slot)
 {
     auto& table = seq.block_table(slot, sp_idx_);
-    // Iterate in reverse
-    for (auto it = table.rbegin(); it != table.rend(); ++it) {
-        int    block_id = *it;
+    // Remove each successfully released ID immediately. If free-list growth
+    // throws, the remaining table is an exact retry set and never contains an
+    // already-free block.
+    while (!table.empty()) {
+        int    block_id = table.back();
         Block& block    = blocks_[block_id];
         block.ref_count--;
         if (block.ref_count == 0) {
-            deallocate_block(block_id);
+            try {
+                deallocate_block(block_id);
+            }
+            catch (...) {
+                block.ref_count++;
+                throw;
+            }
         }
+        table.pop_back();
     }
     seq.num_cached_tokens = 0;
-    table.clear();
 }
 
 void BlockManager::trim_blocks_to_token_count(Sequence& seq, BlockContextSlot slot, int token_count)

@@ -1,9 +1,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
+#include <tuple>
 #include <unordered_set>
 
 #include "nanodeploy/metrics/sequence_metric.h"
@@ -143,6 +146,11 @@ Scheduler::Scheduler(const std::string& engine_id,
         sp_manager->set_dp_idx(dp_idx);
         worker_state.push_back(sp_manager);
     }
+    ls_empty_system_free_blocks_per_rank_.resize(attention_sp_);
+    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        ls_empty_system_free_blocks_per_rank_[sp_idx] =
+            worker_state.front()->block_manager.at(sp_idx)->num_free_blocks();
+    }
     // Set scheduler mode
     if (scheduler_mode == "decentralized") {
         scheduler_mode_ = SchedulerMode::DECENTRALIZED;
@@ -213,6 +221,12 @@ bool Scheduler::is_finished() const
         const auto& wait_queue = (mode_ != "decode") ? waiting : waiting_migration;
         if (!wait_queue.empty())
             return false;
+        if (enable_ls_decode_core_scheduler_ && !ls_pending_decode_batches_.empty()) {
+            return false;
+        }
+        if (enable_ls_decode_core_scheduler_ && !to_be_migrated.empty()) {
+            return false;
+        }
 
         for (const auto& ws : worker_state) {
             if (!ws->is_empty())
@@ -246,8 +260,152 @@ int Scheduler::get_total_waiting_migration_size() const
         return total;
     }
     else {
-        return static_cast<int>(waiting_migration.size());
+        int total = static_cast<int>(waiting_migration.size());
+        if (enable_ls_decode_core_scheduler_) {
+            for (const auto& batch : ls_pending_decode_batches_) {
+                total += static_cast<int>(batch.sequences.size());
+            }
+        }
+        return total;
     }
+}
+
+std::vector<uint64_t> Scheduler::get_ls_pending_batch_ids() const
+{
+    std::vector<uint64_t> result;
+    result.reserve(ls_pending_decode_batches_.size());
+    for (const auto& batch : ls_pending_decode_batches_) {
+        result.push_back(batch.batch_id);
+    }
+    return result;
+}
+
+std::vector<std::vector<uint64_t>> Scheduler::get_ls_pending_batch_sequence_ids() const
+{
+    std::vector<std::vector<uint64_t>> result;
+    result.reserve(ls_pending_decode_batches_.size());
+    for (const auto& batch : ls_pending_decode_batches_) {
+        std::vector<uint64_t> sequence_ids;
+        sequence_ids.reserve(batch.sequences.size());
+        for (const auto& seq : batch.sequences) {
+            sequence_ids.push_back(seq->seq_id);
+        }
+        result.push_back(std::move(sequence_ids));
+    }
+    return result;
+}
+
+std::vector<uint32_t> Scheduler::get_ls_pending_batch_attempts() const
+{
+    std::vector<uint32_t> result;
+    result.reserve(ls_pending_decode_batches_.size());
+    for (const auto& batch : ls_pending_decode_batches_) {
+        result.push_back(batch.admission_attempts);
+    }
+    return result;
+}
+
+std::vector<bool> Scheduler::get_ls_pending_batch_is_recovery() const
+{
+    std::vector<bool> result;
+    result.reserve(ls_pending_decode_batches_.size());
+    for (const auto& batch : ls_pending_decode_batches_) {
+        result.push_back(batch.is_recovery_batch);
+    }
+    return result;
+}
+
+std::vector<std::optional<uint64_t>> Scheduler::get_ls_pending_batch_parent_batch_ids() const
+{
+    std::vector<std::optional<uint64_t>> result;
+    result.reserve(ls_pending_decode_batches_.size());
+    for (const auto& batch : ls_pending_decode_batches_) {
+        result.push_back(batch.parent_batch_id);
+    }
+    return result;
+}
+
+std::vector<uint64_t> Scheduler::get_ls_group_ids() const
+{
+    std::vector<uint64_t> result;
+    result.reserve(ls_groups_.size());
+    for (const auto& [group_id, group] : ls_groups_) {
+        (void)group;
+        result.push_back(group_id);
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+std::vector<std::vector<uint64_t>> Scheduler::get_ls_group_sequence_ids() const
+{
+    std::vector<std::vector<uint64_t>> result;
+    for (uint64_t group_id : get_ls_group_ids()) {
+        std::vector<uint64_t> sequence_ids;
+        for (const auto& seq : ls_groups_.at(group_id).sequences) {
+            if (seq && seq->status == SequenceStatus::RUNNING) {
+                sequence_ids.push_back(seq->seq_id);
+            }
+        }
+        result.push_back(std::move(sequence_ids));
+    }
+    return result;
+}
+
+std::vector<std::vector<uint64_t>> Scheduler::get_ls_group_initial_batch_ids() const
+{
+    std::vector<std::vector<uint64_t>> result;
+    for (uint64_t group_id : get_ls_group_ids()) {
+        std::vector<uint64_t> batch_ids;
+        for (const auto& record : ls_groups_.at(group_id).initial_batch_placements) {
+            batch_ids.push_back(record.batch_id);
+        }
+        result.push_back(std::move(batch_ids));
+    }
+    return result;
+}
+
+std::vector<std::vector<uint64_t>> Scheduler::get_ls_group_initial_admission_orders() const
+{
+    std::vector<std::vector<uint64_t>> result;
+    for (uint64_t group_id : get_ls_group_ids()) {
+        std::vector<uint64_t> admission_orders;
+        for (const auto& record : ls_groups_.at(group_id).initial_batch_placements) {
+            admission_orders.push_back(record.admission_order);
+        }
+        result.push_back(std::move(admission_orders));
+    }
+    return result;
+}
+
+std::vector<std::vector<std::vector<uint64_t>>> Scheduler::get_ls_group_initial_sequence_ids() const
+{
+    std::vector<std::vector<std::vector<uint64_t>>> result;
+    for (uint64_t group_id : get_ls_group_ids()) {
+        std::vector<std::vector<uint64_t>> records;
+        for (const auto& record : ls_groups_.at(group_id).initial_batch_placements) {
+            records.push_back(record.sequence_ids);
+        }
+        result.push_back(std::move(records));
+    }
+    return result;
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> Scheduler::get_ls_active_batch_owners() const
+{
+    std::vector<std::pair<uint64_t, uint64_t>> result(ls_seq_to_batch_.begin(), ls_seq_to_batch_.end());
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+void Scheduler::set_ls_admission_failure_after_allocations_for_test(int value)
+{
+    ls_admission_failure_after_allocations_for_test_ = value;
+}
+
+void Scheduler::set_ls_admission_failure_after_publications_for_test(int value)
+{
+    ls_admission_failure_after_publications_for_test_ = value;
 }
 
 std::deque<std::shared_ptr<Sequence>>& Scheduler::running(int dp_idx)
@@ -340,13 +498,20 @@ int Scheduler::select_dp_worker_for_routing(Sequence& seq)
 
 ScheduleResult Scheduler::schedule()
 {
+    if (enable_ls_decode_core_scheduler_) {
+        ls_schedule_step_++;
+    }
     ls_step_initial_records_.clear();
+    ls_step_sealed_batches_.clear();
     ls_step_group_plans_.clear();
     ls_step_group_plan_ids_.clear();
     ls_step_reused_passive_masters_.clear();
     ls_step_preempted_sequence_ids_.clear();
     ls_step_preemption_reasons_.clear();
-    ls_step_planning_latency_ms_ = 0.0;
+    ls_step_atomic_no_fit_count_   = 0;
+    ls_step_atomic_merge_count_    = 0;
+    ls_step_atomic_rollback_count_ = 0;
+    ls_step_planning_latency_ms_   = 0.0;
     std::vector<std::vector<std::shared_ptr<Sequence>>> dp_seqs;
     bool                                                has_prefill = false;
 
@@ -516,6 +681,17 @@ ScheduleResult Scheduler::schedule()
     for (const auto& seq : wait_queue) {
         total_blocks += (seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
     }
+    if (enable_ls_decode_core_scheduler_) {
+        if (!ls_pending_decode_batches_.empty() && !ls_pending_decode_batches_.front().sequences.empty()) {
+            auto head_seq = ls_pending_decode_batches_.front().sequences.front();
+            head_blocks   = (head_seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+        }
+        for (const auto& batch : ls_pending_decode_batches_) {
+            for (const auto& seq : batch.sequences) {
+                total_blocks += (seq->num_tokens + Sequence::block_size - 1) / Sequence::block_size;
+            }
+        }
+    }
 
     // Replicate to all DP workers (centralized has shared global queue)
     result.waiting_head_blocks.resize(attention_dp_, head_blocks);
@@ -530,6 +706,15 @@ ScheduleResult Scheduler::schedule()
             result.ls_initial_sequence_ids.push_back(record.sequence_ids);
             result.ls_initial_prompt_kv_tokens.push_back(record.prompt_kv_tokens);
             result.ls_initial_provisional_pending_targets.push_back(record.provisional_pending_targets);
+            result.ls_initial_admission_orders.push_back(record.admission_order);
+            result.ls_initial_admission_attempts.push_back(record.admission_attempts);
+            result.ls_initial_is_recovery_batch.push_back(record.is_recovery_batch);
+            result.ls_initial_parent_batch_ids.push_back(record.parent_batch_id);
+            result.ls_initial_admission_kinds.push_back(record.admission_kind);
+        }
+        for (const auto& [batch_id, sequence_ids] : ls_step_sealed_batches_) {
+            result.ls_sealed_batch_ids.push_back(batch_id);
+            result.ls_sealed_batch_sequence_ids.push_back(sequence_ids);
         }
         for (size_t idx = 0; idx < ls_step_group_plans_.size(); ++idx) {
             uint64_t group_id = ls_step_group_plan_ids_[idx];
@@ -576,6 +761,17 @@ ScheduleResult Scheduler::schedule()
         result.ls_preempted_sequence_ids = ls_step_preempted_sequence_ids_;
         result.ls_preemption_reasons     = ls_step_preemption_reasons_;
         result.ls_planning_latency_ms    = ls_step_planning_latency_ms_;
+        result.ls_pending_batch_count    = static_cast<int>(ls_pending_decode_batches_.size());
+        for (const auto& batch : ls_pending_decode_batches_) {
+            result.ls_pending_request_count += static_cast<int>(batch.sequences.size());
+            result.ls_oldest_pending_batch_age_steps =
+                std::max(result.ls_oldest_pending_batch_age_steps, ls_schedule_step_ - batch.enqueue_step);
+            result.ls_max_pending_batch_attempts =
+                std::max(result.ls_max_pending_batch_attempts, batch.admission_attempts);
+        }
+        result.ls_atomic_admission_no_fit_count   = ls_step_atomic_no_fit_count_;
+        result.ls_atomic_admission_merge_count    = ls_step_atomic_merge_count_;
+        result.ls_atomic_admission_rollback_count = ls_step_atomic_rollback_count_;
     }
 
     return result;
@@ -819,6 +1015,148 @@ Scheduler::_plan_ls_initial_placement(int                                       
     return std::nullopt;
 }
 
+bool Scheduler::_ls_batch_fits_empty_system(const std::vector<std::shared_ptr<Sequence>>& batch) const
+{
+    if (batch.empty() || static_cast<int>(batch.size()) > max_num_seqs_) {
+        return false;
+    }
+
+    int first_d = ls_decode_initial_kv_dop_ == 0 ? 1 : ls_decode_initial_kv_dop_;
+    int last_d  = ls_decode_initial_kv_dop_ == 0 ? attention_sp_ : ls_decode_initial_kv_dop_;
+    for (int d = first_d; d <= last_d; ++d) {
+        if (d <= 0 || d > attention_sp_) {
+            continue;
+        }
+        std::vector<std::vector<int>> placements(batch.size(), std::vector<int>(attention_sp_, 0));
+        std::vector<int>              needed_blocks(attention_sp_, 0);
+        for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
+            int prompt_tokens = batch[seq_idx]->num_tokens;
+            int base          = prompt_tokens / d;
+            int remainder     = prompt_tokens % d;
+            for (int rank = 0; rank < d; ++rank) {
+                int tokens                = base + (rank < remainder ? 1 : 0);
+                placements[seq_idx][rank] = tokens;
+                needed_blocks[rank] += (tokens + Sequence::block_size - 1) / Sequence::block_size;
+            }
+            if (placements[seq_idx][0] % Sequence::block_size == 0) {
+                needed_blocks[0]++;
+            }
+        }
+
+        std::vector<int> receiver_load(attention_sp_, 0);
+        std::vector<int> master_load(attention_sp_, 0);
+        for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
+            int master = static_cast<int>(seq_idx % attention_sp_);
+            master_load[master]++;
+            for (int owner = 0; owner < attention_sp_; ++owner) {
+                if (owner != master && placements[seq_idx][owner] > 0) {
+                    receiver_load[owner]++;
+                }
+            }
+        }
+
+        bool feasible = std::all_of(
+            receiver_load.begin(), receiver_load.end(), [&](int count) { return count <= max_num_recv_seqs_; });
+        feasible = feasible && std::all_of(master_load.begin(), master_load.end(), [&](int count) {
+                       return count <= std::min(max_num_seqs_, max_num_batched_tokens_);
+                   });
+        for (int rank = 0; feasible && rank < attention_sp_; ++rank) {
+            int headroom = static_cast<int>(std::ceil(master_load[rank] * reserved_blocks_per_req_));
+            feasible     = needed_blocks[rank] + headroom <= ls_empty_system_free_blocks_per_rank_[rank];
+        }
+        if (feasible) {
+            return true;
+        }
+        if (ls_decode_initial_kv_dop_ != 0) {
+            break;
+        }
+    }
+    return false;
+}
+
+void Scheduler::_seal_ls_decode_arrivals()
+{
+    if (waiting_migration.empty()) {
+        return;
+    }
+
+    const size_t seal_limit  = static_cast<size_t>(attention_dp_) * static_cast<size_t>(max_num_seqs_);
+    const size_t n           = std::min(waiting_migration.size(), seal_limit);
+    const size_t num_batches = std::min(static_cast<size_t>(attention_dp_), n);
+    const size_t base        = n / num_batches;
+    const size_t remainder   = n % num_batches;
+
+    for (size_t batch_idx = 0; batch_idx < num_batches && !waiting_migration.empty(); ++batch_idx) {
+        size_t candidate_size = std::min(base + (batch_idx < remainder ? 1U : 0U), waiting_migration.size());
+        std::vector<std::shared_ptr<Sequence>> candidate;
+        while (candidate_size > 0) {
+            candidate.assign(waiting_migration.begin(), waiting_migration.begin() + candidate_size);
+            if (_ls_batch_fits_empty_system(candidate)) {
+                break;
+            }
+            candidate_size--;
+        }
+        if (candidate_size == 0) {
+            throw std::runtime_error("LS Decode request cannot fit an otherwise empty DP; refusing to seal a "
+                                     "permanently blocked logical batch");
+        }
+
+        std::unordered_set<uint64_t> candidate_sequence_ids;
+        for (const auto& seq : candidate) {
+            if (!seq || !candidate_sequence_ids.insert(seq->seq_id).second || ls_seq_to_batch_.count(seq->seq_id)) {
+                throw std::runtime_error("LS Decode seal found duplicate live sequence ownership");
+            }
+        }
+
+        PendingDecodeBatch batch;
+        batch.batch_id      = next_ls_batch_id_;
+        batch.sequences     = candidate;
+        batch.enqueue_order = next_ls_enqueue_order_;
+        batch.enqueue_step  = ls_schedule_step_;
+        std::vector<uint64_t> sequence_ids;
+        sequence_ids.reserve(batch.sequences.size());
+        for (const auto& seq : batch.sequences) {
+            sequence_ids.push_back(seq->seq_id);
+        }
+
+        std::vector<uint64_t> inserted_sequence_ids;
+        inserted_sequence_ids.reserve(sequence_ids.size());
+        bool sealed_event_published  = false;
+        bool pending_batch_published = false;
+        try {
+            ls_step_sealed_batches_.push_back({batch.batch_id, sequence_ids});
+            sealed_event_published = true;
+            ls_pending_decode_batches_.push_back(batch);
+            pending_batch_published = true;
+            for (uint64_t seq_id : sequence_ids) {
+                auto [it, inserted] = ls_seq_to_batch_.emplace(seq_id, batch.batch_id);
+                (void)it;
+                if (!inserted) {
+                    throw std::runtime_error("LS Decode seal found duplicate live sequence ownership");
+                }
+                inserted_sequence_ids.push_back(seq_id);
+            }
+        }
+        catch (...) {
+            for (uint64_t seq_id : inserted_sequence_ids) {
+                ls_seq_to_batch_.erase(seq_id);
+            }
+            if (pending_batch_published) {
+                ls_pending_decode_batches_.pop_back();
+            }
+            if (sealed_event_published) {
+                ls_step_sealed_batches_.pop_back();
+            }
+            throw;
+        }
+        for (size_t idx = 0; idx < candidate_size; ++idx) {
+            waiting_migration.pop_front();
+        }
+        next_ls_batch_id_++;
+        next_ls_enqueue_order_++;
+    }
+}
+
 void Scheduler::_merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id)
 {
     if (lhs_group_id == rhs_group_id) {
@@ -838,34 +1176,47 @@ void Scheduler::_merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id)
     }
 
     std::unordered_map<uint64_t, std::shared_ptr<Sequence>> sequences_by_id;
+    std::vector<std::shared_ptr<Sequence>>                  prior_sequence_order;
     for (const auto& seq : survivor.sequences) {
         sequences_by_id.emplace(seq->seq_id, seq);
+        prior_sequence_order.push_back(seq);
     }
     for (const auto& seq : removed.sequences) {
         sequences_by_id.emplace(seq->seq_id, seq);
+        prior_sequence_order.push_back(seq);
     }
-    survivor.initial_batch_placements.insert(survivor.initial_batch_placements.end(),
-                                             removed.initial_batch_placements.begin(),
-                                             removed.initial_batch_placements.end());
-    std::stable_sort(survivor.initial_batch_placements.begin(),
-                     survivor.initial_batch_placements.end(),
-                     [](const auto& lhs, const auto& rhs) { return lhs.batch_id < rhs.batch_id; });
-    survivor.sequences.clear();
-    std::unordered_set<uint64_t> emitted_sequence_ids;
-    for (const auto& record : survivor.initial_batch_placements) {
+    auto merged_records = survivor.initial_batch_placements;
+    merged_records.insert(
+        merged_records.end(), removed.initial_batch_placements.begin(), removed.initial_batch_placements.end());
+    std::stable_sort(merged_records.begin(), merged_records.end(), [](const auto& lhs, const auto& rhs) {
+        return std::tie(lhs.admission_order, lhs.batch_id) < std::tie(rhs.admission_order, rhs.batch_id);
+    });
+    std::vector<std::shared_ptr<Sequence>> merged_sequences;
+    std::unordered_set<uint64_t>           emitted_sequence_ids;
+    for (const auto& record : merged_records) {
         for (uint64_t seq_id : record.sequence_ids) {
-            auto seq = sequences_by_id.find(seq_id);
-            if (seq != sequences_by_id.end() && emitted_sequence_ids.insert(seq_id).second) {
-                survivor.sequences.push_back(seq->second);
+            auto seq          = sequences_by_id.find(seq_id);
+            auto active_batch = ls_seq_to_batch_.find(seq_id);
+            if (seq != sequences_by_id.end() && active_batch != ls_seq_to_batch_.end()
+                && active_batch->second == record.batch_id && emitted_sequence_ids.insert(seq_id).second) {
+                merged_sequences.push_back(seq->second);
             }
         }
     }
-    for (int rank : removed.allocated_attention_ranks) {
-        if (std::find(survivor.allocated_attention_ranks.begin(), survivor.allocated_attention_ranks.end(), rank)
-            == survivor.allocated_attention_ranks.end()) {
-            survivor.allocated_attention_ranks.push_back(rank);
+    for (const auto& seq : prior_sequence_order) {
+        if (seq && seq->status == SequenceStatus::RUNNING && emitted_sequence_ids.insert(seq->seq_id).second) {
+            throw std::runtime_error("live LS sequence has no active initial-batch placement record");
         }
     }
+    auto merged_allocation = survivor.allocated_attention_ranks;
+    for (int rank : removed.allocated_attention_ranks) {
+        if (std::find(merged_allocation.begin(), merged_allocation.end(), rank) == merged_allocation.end()) {
+            merged_allocation.push_back(rank);
+        }
+    }
+    survivor.initial_batch_placements  = std::move(merged_records);
+    survivor.sequences                 = std::move(merged_sequences);
+    survivor.allocated_attention_ranks = std::move(merged_allocation);
     for (const auto& seq : removed.sequences) {
         ls_seq_to_group_[seq->seq_id] = survivor_id;
     }
@@ -874,9 +1225,23 @@ void Scheduler::_merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id)
     group_ids.erase(std::remove(group_ids.begin(), group_ids.end(), removed_id), group_ids.end());
     std::sort(group_ids.begin(), group_ids.end());
     ls_groups_.erase(removed_it);
+
+    std::unordered_map<uint64_t, uint64_t> active_batch_group;
+    for (const auto& [group_id, group] : ls_groups_) {
+        for (const auto& seq : group.sequences) {
+            auto owner = ls_seq_to_batch_.find(seq->seq_id);
+            if (owner == ls_seq_to_batch_.end()) {
+                throw std::runtime_error("running LS sequence has no active batch owner");
+            }
+            auto [it, inserted] = active_batch_group.emplace(owner->second, group_id);
+            if (!inserted && it->second != group_id) {
+                throw std::runtime_error("active LS logical batch is split across Decode groups");
+            }
+        }
+    }
 }
 
-void Scheduler::_remove_seq_from_ls_group(uint64_t seq_id)
+void Scheduler::_remove_seq_from_ls_group(uint64_t seq_id, bool clear_batch_owner)
 {
     auto owner = ls_seq_to_group_.find(seq_id);
     if (owner == ls_seq_to_group_.end()) {
@@ -884,6 +1249,9 @@ void Scheduler::_remove_seq_from_ls_group(uint64_t seq_id)
     }
     uint64_t group_id = owner->second;
     ls_seq_to_group_.erase(owner);
+    if (clear_batch_owner) {
+        ls_seq_to_batch_.erase(seq_id);
+    }
     auto group_it = ls_groups_.find(group_id);
     if (group_it == ls_groups_.end()) {
         return;
@@ -925,49 +1293,175 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_ls_deco
 {
     std::vector<std::vector<std::shared_ptr<Sequence>>> scheduled(attention_dp_);
     _reconcile_ls_groups();
-    if (waiting_migration.empty()) {
+    _seal_ls_decode_arrivals();
+    if (ls_pending_decode_batches_.empty()) {
         return scheduled;
     }
 
-    for (int dp_idx = 0; dp_idx < attention_dp_ && !waiting_migration.empty(); ++dp_idx) {
-        int  remaining_dps  = attention_dp_ - dp_idx;
-        int  balanced_batch = (static_cast<int>(waiting_migration.size()) + remaining_dps - 1) / remaining_dps;
-        int  max_batch      = std::min(max_num_seqs_, balanced_batch);
-        bool admitted       = false;
-        for (int batch_size = max_batch; batch_size >= 1 && !admitted; --batch_size) {
-            std::vector<std::shared_ptr<Sequence>> batch;
-            batch.reserve(batch_size);
-            for (int idx = 0; idx < batch_size; ++idx) {
-                batch.push_back(waiting_migration[idx]);
-            }
+    struct AdmissionCandidate {
+        int                           dp_idx = -1;
+        std::optional<uint64_t>       merge_target;
+        std::vector<int>              ranks;
+        std::vector<std::vector<int>> placements;
+        int                           projected_live_sequences = 0;
+        int                           new_allocation_ranks     = 0;
+    };
 
-            std::optional<uint64_t> merge_target;
-            std::vector<int>        rank_pool    = _ls_unallocated_ranks(dp_idx);
-            auto                    initial_plan = _plan_ls_initial_placement(dp_idx, batch, rank_pool);
-            if (!initial_plan.has_value() && !ls_group_ids_by_dp_[dp_idx].empty()) {
-                merge_target =
-                    *std::min_element(ls_group_ids_by_dp_[dp_idx].begin(), ls_group_ids_by_dp_[dp_idx].end());
-                rank_pool        = ls_groups_.at(*merge_target).allocated_attention_ranks;
-                auto unallocated = _ls_unallocated_ranks(dp_idx);
-                for (int rank : unallocated) {
-                    if (std::find(rank_pool.begin(), rank_pool.end(), rank) == rank_pool.end()) {
-                        rank_pool.push_back(rank);
-                    }
-                }
-                const auto& merge_group = ls_groups_.at(*merge_target);
-                initial_plan            = _plan_ls_initial_placement(
-                    dp_idx, batch, rank_pool, merge_group.sequences, merge_group.allocated_attention_ranks);
-            }
-            if (!initial_plan.has_value()) {
+    std::vector<bool>     dp_admitted(attention_dp_, false);
+    std::vector<uint64_t> pending_ids;
+    pending_ids.reserve(ls_pending_decode_batches_.size());
+    for (const auto& batch : ls_pending_decode_batches_) {
+        pending_ids.push_back(batch.batch_id);
+    }
+
+    for (uint64_t pending_id : pending_ids) {
+        if (std::all_of(dp_admitted.begin(), dp_admitted.end(), [](bool used) { return used; })) {
+            break;
+        }
+        auto pending_it = std::find_if(ls_pending_decode_batches_.begin(),
+                                       ls_pending_decode_batches_.end(),
+                                       [&](const auto& batch) { return batch.batch_id == pending_id; });
+        if (pending_it == ls_pending_decode_batches_.end()) {
+            continue;
+        }
+        auto& batch = *pending_it;
+        if (batch.state != PendingDecodeBatchState::QUEUED) {
+            throw std::runtime_error("LS pending batch is not queued at planning time");
+        }
+        batch.admission_attempts++;
+
+        std::optional<AdmissionCandidate> selected;
+        for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+            if (dp_admitted[dp_idx]) {
                 continue;
             }
-
-            uint64_t group_id;
-            if (merge_target.has_value()) {
-                group_id = *merge_target;
+            auto rank_pool = _ls_unallocated_ranks(dp_idx);
+            auto plan      = _plan_ls_initial_placement(dp_idx, batch.sequences, rank_pool);
+            if (!plan.has_value()) {
+                continue;
             }
-            else {
-                group_id = next_ls_group_id_++;
+            AdmissionCandidate candidate;
+            candidate.dp_idx     = dp_idx;
+            candidate.ranks      = std::move(plan->first);
+            candidate.placements = std::move(plan->second);
+            candidate.projected_live_sequences =
+                worker_state[dp_idx]->num_running_seqs() + static_cast<int>(batch.sequences.size());
+            candidate.new_allocation_ranks = static_cast<int>(candidate.ranks.size());
+            if (!selected.has_value()
+                || std::tie(candidate.projected_live_sequences, candidate.new_allocation_ranks, candidate.dp_idx)
+                       < std::tie(
+                           selected->projected_live_sequences, selected->new_allocation_ranks, selected->dp_idx)) {
+                selected = std::move(candidate);
+            }
+        }
+
+        if (!selected.has_value()) {
+            for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+                if (dp_admitted[dp_idx]) {
+                    continue;
+                }
+                std::vector<uint64_t> group_ids = ls_group_ids_by_dp_[dp_idx];
+                std::sort(group_ids.begin(), group_ids.end());
+                for (uint64_t group_id : group_ids) {
+                    const auto&      group     = ls_groups_.at(group_id);
+                    std::vector<int> rank_pool = group.allocated_attention_ranks;
+                    for (int rank : _ls_unallocated_ranks(dp_idx)) {
+                        if (std::find(rank_pool.begin(), rank_pool.end(), rank) == rank_pool.end()) {
+                            rank_pool.push_back(rank);
+                        }
+                    }
+                    auto plan = _plan_ls_initial_placement(
+                        dp_idx, batch.sequences, rank_pool, group.sequences, group.allocated_attention_ranks);
+                    if (!plan.has_value()) {
+                        continue;
+                    }
+                    AdmissionCandidate candidate;
+                    candidate.dp_idx       = dp_idx;
+                    candidate.merge_target = group_id;
+                    candidate.ranks        = std::move(plan->first);
+                    candidate.placements   = std::move(plan->second);
+                    candidate.projected_live_sequences =
+                        static_cast<int>(group.sequences.size()) + static_cast<int>(batch.sequences.size());
+                    candidate.new_allocation_ranks =
+                        static_cast<int>(std::count_if(candidate.ranks.begin(), candidate.ranks.end(), [&](int rank) {
+                            return std::find(group.allocated_attention_ranks.begin(),
+                                             group.allocated_attention_ranks.end(),
+                                             rank)
+                                   == group.allocated_attention_ranks.end();
+                        }));
+                    if (!selected.has_value()
+                        || std::tie(candidate.new_allocation_ranks,
+                                    candidate.projected_live_sequences,
+                                    group_id,
+                                    candidate.dp_idx)
+                               < std::tie(selected->new_allocation_ranks,
+                                          selected->projected_live_sequences,
+                                          *selected->merge_target,
+                                          selected->dp_idx)) {
+                        selected = std::move(candidate);
+                    }
+                }
+            }
+        }
+
+        if (!selected.has_value()) {
+            ls_step_atomic_no_fit_count_++;
+            continue;
+        }
+
+        for (const auto& seq : batch.sequences) {
+            if (!seq) {
+                throw std::runtime_error("LS pending batch contains a null sequence");
+            }
+            auto active_batch = ls_seq_to_batch_.find(seq->seq_id);
+            if (seq->status != SequenceStatus::WAITING || active_batch == ls_seq_to_batch_.end()
+                || active_batch->second != batch.batch_id || ls_seq_to_group_.count(seq->seq_id)) {
+                throw std::runtime_error("LS pending batch changed after placement planning");
+            }
+        }
+        if (selected->placements.size() != batch.sequences.size() || selected->ranks.empty()) {
+            throw std::runtime_error("LS whole-batch plan has incomplete placement output");
+        }
+
+        const int                       dp_idx   = selected->dp_idx;
+        const bool                      is_merge = selected->merge_target.has_value();
+        const uint64_t                  group_id = is_merge ? *selected->merge_target : next_ls_group_id_;
+        std::optional<DecodeGroupState> original_group;
+        if (is_merge) {
+            original_group = ls_groups_.at(group_id);
+        }
+        std::vector<BlockContext> original_contexts;
+        original_contexts.reserve(batch.sequences.size());
+        for (const auto& seq : batch.sequences) {
+            original_contexts.push_back(seq->block_ctx(BlockContextSlot::ACTIVE));
+        }
+
+        bool physical_allocation_committed = false;
+        try {
+            batch.state = PendingDecodeBatchState::COMMITTING;
+            for (size_t seq_idx = 0; seq_idx < batch.sequences.size(); ++seq_idx) {
+                auto& ctx                    = batch.sequences[seq_idx]->block_ctx(BlockContextSlot::ACTIVE);
+                ctx.dp_idx_                  = dp_idx;
+                ctx.master_sp_idx_           = selected->ranks.front();
+                ctx.pending_token_present_   = false;
+                ctx.pending_token_target_sp_ = -1;
+                ctx.num_dispatched_tokens    = selected->placements[seq_idx];
+                ctx.block_location.clear();
+                ctx.sp_block_table.assign(attention_sp_, {});
+            }
+
+            int failure_after                                = ls_admission_failure_after_allocations_for_test_;
+            ls_admission_failure_after_allocations_for_test_ = -1;
+            worker_state[dp_idx]->allocate_ls_initial_batch(batch.sequences, failure_after);
+            physical_allocation_committed = true;
+
+            int failure_after_publications                    = ls_admission_failure_after_publications_for_test_;
+            ls_admission_failure_after_publications_for_test_ = -1;
+            if (failure_after_publications == 0) {
+                throw std::runtime_error("injected LS admission publication failure");
+            }
+
+            if (!is_merge) {
                 DecodeGroupState group;
                 group.group_id = group_id;
                 group.dp_idx   = dp_idx;
@@ -975,50 +1469,96 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_ls_deco
                 ls_group_ids_by_dp_[dp_idx].push_back(group_id);
                 std::sort(ls_group_ids_by_dp_[dp_idx].begin(), ls_group_ids_by_dp_[dp_idx].end());
             }
+            auto& group = ls_groups_.at(group_id);
 
-            auto&                 group      = ls_groups_.at(group_id);
-            const auto&           ranks      = initial_plan->first;
-            const auto&           placements = initial_plan->second;
             InitialBatchPlacement record;
-            record.batch_id         = next_ls_batch_id_++;
+            record.batch_id         = batch.batch_id;
             record.group_id         = group_id;
-            record.initial_kv_dop   = static_cast<int>(ranks.size());
-            record.initial_kv_ranks = ranks;
-            record.prompt_kv_tokens = placements;
-            record.provisional_pending_targets.assign(batch.size(), ranks.front());
+            record.initial_kv_dop   = static_cast<int>(selected->ranks.size());
+            record.initial_kv_ranks = selected->ranks;
+            record.prompt_kv_tokens = selected->placements;
+            record.provisional_pending_targets.assign(batch.sequences.size(), selected->ranks.front());
+            record.admission_order    = next_ls_admission_order_;
+            record.admission_attempts = batch.admission_attempts;
+            record.is_recovery_batch  = batch.is_recovery_batch;
+            record.parent_batch_id    = batch.parent_batch_id;
+            record.admission_kind     = batch.is_recovery_batch ? "recovery" : (is_merge ? "merge" : "standalone");
 
-            for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
-                auto& seq                    = batch[seq_idx];
-                auto& ctx                    = seq->block_ctx(BlockContextSlot::ACTIVE);
-                ctx.dp_idx_                  = dp_idx;
-                ctx.master_sp_idx_           = ranks.front();
-                ctx.pending_token_present_   = false;
-                ctx.pending_token_target_sp_ = -1;
-                ctx.num_dispatched_tokens    = placements[seq_idx];
-                ctx.block_location.clear();
-                ctx.sp_block_table.assign(attention_sp_, {});
-                worker_state[dp_idx]->allocate_ls_initial(*seq);
+            int published_sequences = 0;
+            for (const auto& seq : batch.sequences) {
                 seq->status = SequenceStatus::RUNNING;
                 worker_state[dp_idx]->running.push_back(seq);
                 group.sequences.push_back(seq);
                 ls_seq_to_group_[seq->seq_id] = group_id;
                 record.sequence_ids.push_back(seq->seq_id);
-                scheduled[dp_idx].push_back(seq);
-                waiting_migration.pop_front();
-                if (seq->metric) {
-                    seq->metric->record_first_scheduled();
-                    seq->metric->record_decode_scheduled();
+                published_sequences++;
+                if (failure_after_publications >= 0 && published_sequences == failure_after_publications) {
+                    throw std::runtime_error("injected LS admission publication failure");
                 }
             }
-            for (int rank : ranks) {
+            for (int rank : selected->ranks) {
                 if (std::find(group.allocated_attention_ranks.begin(), group.allocated_attention_ranks.end(), rank)
                     == group.allocated_attention_ranks.end()) {
                     group.allocated_attention_ranks.push_back(rank);
                 }
             }
             group.initial_batch_placements.push_back(record);
-            ls_step_initial_records_.push_back(std::move(record));
-            admitted = true;
+            ls_step_initial_records_.push_back(record);
+
+            batch.state         = PendingDecodeBatchState::ADMITTED;
+            scheduled[dp_idx]   = batch.sequences;
+            dp_admitted[dp_idx] = true;
+            next_ls_admission_order_++;
+            if (!is_merge) {
+                next_ls_group_id_++;
+            }
+            else {
+                ls_step_atomic_merge_count_++;
+            }
+            for (const auto& seq : batch.sequences) {
+                if (seq->metric) {
+                    seq->metric->record_first_scheduled();
+                    seq->metric->record_decode_scheduled();
+                }
+            }
+            ls_pending_decode_batches_.erase(pending_it);
+        }
+        catch (const std::exception& error) {
+            bool injected_failure = std::string_view(error.what()).find("injected LS") != std::string_view::npos;
+            if (physical_allocation_committed) {
+                for (const auto& seq : batch.sequences) {
+                    worker_state[dp_idx]->deallocate(*seq, BlockContextSlot::ACTIVE);
+                }
+            }
+            auto& running_queue = worker_state[dp_idx]->running;
+            for (size_t seq_idx = 0; seq_idx < batch.sequences.size(); ++seq_idx) {
+                const auto& seq = batch.sequences[seq_idx];
+                running_queue.erase(std::remove(running_queue.begin(), running_queue.end(), seq), running_queue.end());
+                ls_seq_to_group_.erase(seq->seq_id);
+                seq->block_ctx(BlockContextSlot::ACTIVE) = std::move(original_contexts[seq_idx]);
+                seq->status                              = SequenceStatus::WAITING;
+            }
+            if (is_merge) {
+                ls_groups_[group_id] = std::move(*original_group);
+            }
+            else {
+                ls_groups_.erase(group_id);
+                auto& group_ids = ls_group_ids_by_dp_[dp_idx];
+                group_ids.erase(std::remove(group_ids.begin(), group_ids.end(), group_id), group_ids.end());
+            }
+            ls_step_initial_records_.erase(
+                std::remove_if(ls_step_initial_records_.begin(),
+                               ls_step_initial_records_.end(),
+                               [&](const auto& record) { return record.batch_id == batch.batch_id; }),
+                ls_step_initial_records_.end());
+            scheduled[dp_idx].clear();
+            batch.state = PendingDecodeBatchState::QUEUED;
+            ls_step_atomic_rollback_count_++;
+            std::cerr << "LS atomic admission rolled back batch=" << batch.batch_id << ": " << error.what()
+                      << std::endl;
+            if (!injected_failure) {
+                throw;
+            }
         }
     }
     return scheduled;
@@ -1451,9 +1991,76 @@ void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
     std::cerr << "Preemption happens for seq_id=" << seq->seq_id << std::endl;
 
     if (enable_ls_decode_core_scheduler_) {
-        _remove_seq_from_ls_group(seq->seq_id);
+        auto group_owner = ls_seq_to_group_.find(seq->seq_id);
+        if (group_owner == ls_seq_to_group_.end()) {
+            throw std::runtime_error("cannot preempt an LS sequence that is not owned by a running group");
+        }
+        auto group = ls_groups_.find(group_owner->second);
+        if (group == ls_groups_.end()) {
+            throw std::runtime_error("cannot preempt an LS sequence whose running group is missing");
+        }
+        if (group->second.dp_idx != dp_idx) {
+            throw std::runtime_error("cannot preempt an LS sequence from a DP that does not own its running group");
+        }
+        auto batch_owner = ls_seq_to_batch_.find(seq->seq_id);
+        if (batch_owner == ls_seq_to_batch_.end()) {
+            throw std::runtime_error("cannot preempt an LS sequence without an active batch owner");
+        }
+
         auto& running_queue = worker_state[dp_idx]->running;
+        if (std::find(running_queue.begin(), running_queue.end(), seq) == running_queue.end()) {
+            throw std::runtime_error("cannot preempt an LS sequence that is absent from its DP running queue");
+        }
+
+        // Prepare every allocation that recovery publication needs before
+        // mutating sequence, group, or block-manager state. Keep the existing
+        // batch-owner map node alive so publishing the replacement owner below
+        // cannot allocate.
+        const uint64_t     recovery_batch_id      = next_ls_batch_id_;
+        const uint64_t     recovery_enqueue_order = next_ls_enqueue_order_;
+        PendingDecodeBatch recovery;
+        recovery.batch_id          = recovery_batch_id;
+        recovery.sequences         = {seq};
+        recovery.enqueue_order     = recovery_enqueue_order;
+        recovery.enqueue_step      = ls_schedule_step_;
+        recovery.is_recovery_batch = true;
+        recovery.parent_batch_id   = batch_owner->second;
+        BlockContext fresh_context(engine_id_, attention_sp_, attention_dp_);
+
+        ls_pending_decode_batches_.push_front(std::move(recovery));
+        try {
+            // Deallocate before resetting num_tokens so running-token
+            // accounting uses the actual preempted length.
+            worker_state[dp_idx]->deallocate(*seq);
+        }
+        catch (...) {
+            if (ls_pending_decode_batches_.empty()
+                || ls_pending_decode_batches_.front().batch_id != recovery_batch_id) {
+                std::terminate();
+            }
+            ls_pending_decode_batches_.pop_front();
+            throw;
+        }
+
+        _remove_seq_from_ls_group(seq->seq_id, false);
         running_queue.erase(std::remove(running_queue.begin(), running_queue.end(), seq), running_queue.end());
+
+        int prompt_len = seq->num_prompt_tokens;
+        seq->status    = SequenceStatus::WAITING;
+        seq->token_ids.resize(prompt_len);
+        seq->num_tokens                          = prompt_len;
+        seq->num_checkpointed_tokens             = prompt_len;
+        seq->last_token                          = seq->token_ids.empty() ? 0 : seq->token_ids.back();
+        seq->block_ctx(BlockContextSlot::ACTIVE) = std::move(fresh_context);
+
+        batch_owner->second = recovery_batch_id;
+        ++next_ls_batch_id_;
+        ++next_ls_enqueue_order_;
+
+        if (seq->metric) {
+            seq->metric->on_preemption();
+        }
+        return;
     }
 
     // Reset metrics for fresh start

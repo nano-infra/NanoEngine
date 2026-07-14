@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-本文是待 review 的实施设计，不包含代码修改。
+本文已进入实施状态。CPU 侧 scheduler、SP state transaction、Python 只读观测和单元测试已经按本文语义落地；1-DP × 8-SP GPU 短时 preflight 已通过，4-DP × 8-SP long-run 仍待执行。
 
 目标是修复 LS-Decode-Core 当前 admission 在容量或 receiver metadata 受限时逐步减小候选 `batch_size`、只接纳可行前缀的行为，使 scheduler 已经形成的 logical Decode batch 具有稳定 identity，并以 all-or-nothing 方式进入一个 Decode group。
 
@@ -18,7 +18,7 @@ loop_count=1
 
 本文中的 admission step 只是 Decode-only 请求进入 running state 前的控制步骤。虽然当前 `ScheduleResult.is_prefill` 和部分函数名仍使用 `prefill`，本文不设计真实 Prefill 计算、Prefill batching、P/D 迁移或 Prefill/Decode 资源竞争。
 
-review 后才进入实现阶段。
+实现中的关键差异和验证状态见第 19 节。
 
 ## 2. 核心结论
 
@@ -32,6 +32,7 @@ review 后才进入实现阶段。
 6. 当前所有 DP 都无法接纳该 batch 时，batch 保持完整并继续等待，不回退到更小 `batch_size`。
 7. running group 之间的 merge 继续以完整 group 为单位，不拆 initial batch records。
 8. 单 request preemption/readmission 作为 recovery batch 处理，不回溯并暂停其原 admission batch 中仍在运行的其他 requests。
+9. seal 在分配 `batch_id` 前执行空系统静态可行性检查；候选若静态不可行可继续缩小，但已经获得 `batch_id` 的 batch 永不拆分。
 
 该语义把“外部请求聚合”“scheduler logical batching”和“runtime group merge”分成三个层次：
 
@@ -203,7 +204,7 @@ num_batches = min(attention_dp, n)
 
 若 `n == 0`，不产生新 batch。
 
-将前 `n` 个 requests 按稳定 FIFO 顺序均衡切成 `num_batches` 份：
+将前 `n` 个 requests 按稳定 FIFO 顺序均衡生成 `num_batches` 个候选：
 
 ```text
 base = floor(n / num_batches)
@@ -219,7 +220,9 @@ size(B_i) = base + 1, i < remainder
 1 <= size(B_i) <= max_num_seqs
 ```
 
-这里的切分是 logical batch 的创建动作，不是对一个已经存在的 batch 进行拆分。`batch_id` 只在切分完成后分配。
+这里的切分是 logical batch 的创建动作，不是对一个已经存在的 batch 进行拆分。每个候选在分配 `batch_id` 前还要验证它能否在“没有真实 running requests、只保留 scheduler-owned dummy sequence 常驻 block”的 DP 上完成 initial placement。实现会在 scheduler 初始化后记录每个 rank 的真实 baseline free blocks，不能直接使用配置的 block 总数，否则会高估每 rank 一个永久不可用的 dummy block。若候选静态不可行，则缩小尚未封存的 FIFO 候选，直到静态可行；尾部 requests 仍是 unsealed arrivals。若连 singleton 都静态不可行，scheduler 立即抛出明确错误，不创建一个永远无法完成的 pending batch。
+
+该检查只读取配置上限、prompt 长度、receiver/master metadata 上限和 reservation，不读取实时 free blocks，因此 transient pressure 不会改变 batch 边界。它与旧 admission prefix fallback 的区别是：缩小发生在 batch identity 创建前；一旦 `batch_id` 分配，后续 no-fit 只等待，不再缩小。
 
 ### 6.3 稳定性
 
@@ -316,7 +319,7 @@ planning 时必须把 target group 的全部 running sequences 作为 `existing_
 
 ### 7.4 No-fit 行为
 
-如果一个 pending batch 在所有未占用 DP admission slots 上都没有可行 candidate：
+如果一个已经通过空系统静态可行性检查的 pending batch 因当前资源压力，在所有未占用 DP admission slots 上都没有可行 candidate：
 
 - `admission_attempts += 1`；
 - batch 保留在 pending queue；
@@ -367,6 +370,8 @@ no-fit 不应阻止 scheduler 在本 step 尝试后面的 pending batches。第�
 8. commit guard 标记成功。
 
 pending batch 不能在 block allocation 完成前从队列删除。
+
+本事务边界截止于 scheduler/SP state 的 initial KV allocation 和状态发布。`LLMEngine.step()` 中随后进行的 dummy pending-token append 不属于该 C++ transaction；initial planner 会为它预留容量，若该容量在单线程 scheduler 返回后仍丢失，engine 将作为 invariant violation 抛错，而不是尝试跨 Python/C++ 回滚 admission。
 
 ### 8.3 Rollback
 
@@ -551,6 +556,7 @@ ls_oldest_pending_batch_age_steps
 ls_max_pending_batch_attempts
 ls_atomic_admission_no_fit_count
 ls_atomic_admission_merge_count
+ls_atomic_admission_rollback_count
 ```
 
 每个成功 admission log 至少包含：
@@ -627,7 +633,7 @@ ls_atomic_admission_merge_count
 
 ### 13.6 Failure injection
 
-为 block allocation commit 增加测试专用 failure injection：在 batch 中第 `k` 个 sequence 分配后抛异常，验证所有 `k` 个已分配 sequences 被回滚，batch 整体仍 pending。
+failure injection 分为两层：在 SP batch allocation 的第 `k` 个 sequence 后抛异常，用于验证物理 block rollback；在 scheduler 发布第 `k` 个 sequence 后抛异常，用于验证 counters、running queue、group、record、ownership 和 context 的外层 rollback。两者都要求 batch 整体仍 pending。
 
 至少覆盖：
 
@@ -657,7 +663,7 @@ ls_atomic_admission_merge_count
 
 ## 14. 实施文件与阶段
 
-### Phase 1：状态模型与只读观测
+### Phase 1：状态模型与只读观测（已完成）
 
 预计修改：
 
@@ -676,7 +682,7 @@ ls_atomic_admission_merge_count
 
 Phase 1 不改变 admission policy，但需要保证新状态可以被单测独立验证。
 
-### Phase 2：Whole-batch planner 与 atomic commit
+### Phase 2：Whole-batch planner 与 atomic commit（已完成）
 
 预计修改：
 
@@ -686,7 +692,7 @@ Phase 1 不改变 admission policy，但需要保证新状态可以被单测独�
 - `InitialBatchPlacement.batch_id` 继承 pending batch ID；
 - 保证每 DP 每 step 最多一个新 batch admission。
 
-### Phase 3：preemption、metrics 和 tests
+### Phase 3：preemption、metrics 和 tests（已完成 CPU 核心覆盖）
 
 - preemption 创建 singleton recovery batch；
 - 增加 pending/atomic admission metrics；
@@ -694,7 +700,7 @@ Phase 1 不改变 admission policy，但需要保证新状态可以被单测独�
 - 增加 merge、bypass、rollback、lineage 测试；
 - 更新设计主文档中的 admission 章节。
 
-### Phase 4：CPU 与 GPU 验证
+### Phase 4：CPU 与 GPU 验证（CPU 和 1-DP preflight 已完成，4-DP long-run 待执行）
 
 1. 编辑 C++ 后执行：
 
@@ -742,7 +748,7 @@ prefix admission 会让部分 requests 尽早开始；atomic admission 可能让
 - 动态 NCCL/process group；
 - GPU/Ray worker 启停；
 - runtime mini-batch identity；
-- 自动拆分永久 no-fit batch；
+- 已封存 pending batch 的自动拆分；
 - 新的全局最优 batching/placement DP。
 
 ## 17. 验收标准
@@ -777,3 +783,18 @@ prefix admission 会让部分 requests 尽早开始；atomic admission 可能让
 7. **配置**：不增加 atomicity 开关，LS-Decode-Core 开启时直接采用新语义。
 8. **事务要求**：必须实现 admission rollback，不接受“planner 理论上不会失败”作为省略 rollback 的理由。
 9. **Merge 范围**：第一版 admission transaction 只并入一个已有 group，不同时合并多个已有 groups；若单 group + unallocated ranks 仍不可行，则保持整批等待。
+
+## 19. 实施状态与最小文件范围
+
+截至当前实现：
+
+- `scheduler.h/.cpp`：sealed pending queue、active batch ownership、静态 seal 可行性、全候选搜索、bounded bypass、recovery lineage、稳定 merge ordering、等待指标与只读 snapshot 已实现。
+- `sp_state_manager.h/.cpp`：整批 initial allocation 使用聚合预检、物理分配和统一 counters commit；异常时扫描并释放本 transaction 的全部 tables。
+- `block_manager.cpp`：uncached allocation 在修改 free list 前预留容器，并把可能分配内存的 used-set 插入提前，降低中途异常造成 block 丢失的风险。
+- `scheduler_binding.cpp`、`sp_state_manager_binding.cpp`：pending/group/active ownership snapshot、ScheduleResult 指标、counter 观测和两层 failure injection 已绑定。
+- `llm_engine.py`：seal、admission lineage 和 pending/no-fit 指标日志已接入。
+- `tests/test_ls_decode_scheduler.py`：覆盖 seal/FIFO、稳定 no-fit、容量释放、bounded bypass、搜索非最老 group、standalone/merge rollback、recovery lineage、抢占 DP 所有权和 feature-flag-off。
+
+验证结果：LS scheduler/planner/metadata/config 相关 CPU 回归共 58 项全部通过。1-DP × 8-SP GPU 短时 preflight 使用 3 个 warmup requests 和 9 个正式 requests，全部完成并 drain；正式阶段包含 5 次 admission step、8 次 Decode step，未出现 preemption、hang、重复 sequence 或未完成请求。4-DP × 8-SP long-run 及修改前后吞吐/ITL 对比不在本次最小实现提交内，仍需单独执行。
+
+从“只改必要内容”的角度，`examples/bench_serving.py` 不参与核心语义，也没有改变逐 request `add_request()` 的方式。本次核心实施不修改它；若用该脚本跑 LS 性能实验，只需另行增加现有 LS flag 与 `max_num_recv_seqs` 的 CLI 透传。正式 GPU 验证优先使用专用 LS long-run 脚本，并在运行前按仓库规则申请 GPU 提权。

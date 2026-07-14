@@ -214,6 +214,10 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("fixed_sp_size") = 0)
 
         .def_property_readonly("is_empty", &SPStateManager::is_empty)
+        .def_property_readonly("num_running_seqs", &SPStateManager::num_running_seqs)
+        .def_property_readonly("num_running_tokens", &SPStateManager::num_running_tokens)
+        .def("num_recv_seqs_per_sp", &SPStateManager::num_recv_seqs_per_sp, py::arg("sp_idx"))
+        .def("master_seq_count", &SPStateManager::master_seq_count, py::arg("sp_idx"))
 
         .def("can_append", &SPStateManager::can_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def("may_append", &SPStateManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)
@@ -236,6 +240,10 @@ void bind_sp_state_manager(py::module_& m)
 
         .def("allocate", &SPStateManager::allocate, py::arg("seq"))
         .def("allocate_ls_initial", &SPStateManager::allocate_ls_initial, py::arg("seq"))
+        .def("allocate_ls_initial_batch",
+             &SPStateManager::allocate_ls_initial_batch,
+             py::arg("batch"),
+             py::arg("failure_after_allocations_for_test") = -1)
         .def("deallocate", &SPStateManager::deallocate, py::arg("seq"), py::arg("slot"))
         .def("set_decode_master", &SPStateManager::set_decode_master, py::arg("seq"), py::arg("master_sp_idx"))
         .def("estimate_pending_append_capacity",

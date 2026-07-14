@@ -87,6 +87,22 @@ struct ScheduleResult {
     std::vector<std::vector<uint64_t>>         ls_initial_sequence_ids;
     std::vector<std::vector<std::vector<int>>> ls_initial_prompt_kv_tokens;
     std::vector<std::vector<int>>              ls_initial_provisional_pending_targets;
+    std::vector<uint64_t>                      ls_initial_admission_orders;
+    std::vector<uint32_t>                      ls_initial_admission_attempts;
+    std::vector<bool>                          ls_initial_is_recovery_batch;
+    std::vector<std::optional<uint64_t>>       ls_initial_parent_batch_ids;
+    std::vector<std::string>                   ls_initial_admission_kinds;
+
+    // LS-Decode-Core sealed/pending logical batch observations.
+    std::vector<uint64_t>              ls_sealed_batch_ids;
+    std::vector<std::vector<uint64_t>> ls_sealed_batch_sequence_ids;
+    int                                ls_pending_batch_count             = 0;
+    int                                ls_pending_request_count           = 0;
+    uint64_t                           ls_oldest_pending_batch_age_steps  = 0;
+    uint32_t                           ls_max_pending_batch_attempts      = 0;
+    uint64_t                           ls_atomic_admission_no_fit_count   = 0;
+    uint64_t                           ls_atomic_admission_merge_count    = 0;
+    uint64_t                           ls_atomic_admission_rollback_count = 0;
 
     // LS-Decode-Core per-iteration group records.
     std::vector<uint64_t>              ls_group_ids;
@@ -119,6 +135,28 @@ struct InitialBatchPlacement {
     std::vector<int>              initial_kv_ranks;
     std::vector<std::vector<int>> prompt_kv_tokens;
     std::vector<int>              provisional_pending_targets;
+    uint64_t                      admission_order    = 0;
+    uint32_t                      admission_attempts = 0;
+    bool                          is_recovery_batch  = false;
+    std::optional<uint64_t>       parent_batch_id;
+    std::string                   admission_kind = "standalone";
+};
+
+enum class PendingDecodeBatchState {
+    QUEUED,
+    COMMITTING,
+    ADMITTED
+};
+
+struct PendingDecodeBatch {
+    uint64_t                               batch_id = 0;
+    std::vector<std::shared_ptr<Sequence>> sequences;
+    uint64_t                               enqueue_order      = 0;
+    uint64_t                               enqueue_step       = 0;
+    uint32_t                               admission_attempts = 0;
+    bool                                   is_recovery_batch  = false;
+    std::optional<uint64_t>                parent_batch_id;
+    PendingDecodeBatchState                state = PendingDecodeBatchState::QUEUED;
 };
 
 struct DecodeGroupState {
@@ -193,6 +231,24 @@ public:
     int get_total_waiting_size() const;
     int get_total_waiting_migration_size() const;
 
+    // Read-only LS logical-batch snapshots for tests and diagnostics.
+    std::vector<uint64_t>                           get_ls_pending_batch_ids() const;
+    std::vector<std::vector<uint64_t>>              get_ls_pending_batch_sequence_ids() const;
+    std::vector<uint32_t>                           get_ls_pending_batch_attempts() const;
+    std::vector<bool>                               get_ls_pending_batch_is_recovery() const;
+    std::vector<std::optional<uint64_t>>            get_ls_pending_batch_parent_batch_ids() const;
+    std::vector<uint64_t>                           get_ls_group_ids() const;
+    std::vector<std::vector<uint64_t>>              get_ls_group_sequence_ids() const;
+    std::vector<std::vector<uint64_t>>              get_ls_group_initial_batch_ids() const;
+    std::vector<std::vector<uint64_t>>              get_ls_group_initial_admission_orders() const;
+    std::vector<std::vector<std::vector<uint64_t>>> get_ls_group_initial_sequence_ids() const;
+    std::vector<std::pair<uint64_t, uint64_t>>      get_ls_active_batch_owners() const;
+
+    // Test-only failure injection. A non-negative value throws after that
+    // many complete sequence allocations inside the next LS admission.
+    void set_ls_admission_failure_after_allocations_for_test(int value);
+    void set_ls_admission_failure_after_publications_for_test(int value);
+
     // Preemption
     void preempt(int dp_idx, std::shared_ptr<Sequence> seq);
 
@@ -232,8 +288,10 @@ private:
                                                 const std::vector<int>&                       base_allocation = {}) const;
     std::vector<int> _ls_unallocated_ranks(int dp_idx, std::optional<uint64_t> excluding_group = std::nullopt) const;
     void             _merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id);
-    void             _remove_seq_from_ls_group(uint64_t seq_id);
+    void             _remove_seq_from_ls_group(uint64_t seq_id, bool clear_batch_owner = true);
     void             _reconcile_ls_groups();
+    void             _seal_ls_decode_arrivals();
+    bool             _ls_batch_fits_empty_system(const std::vector<std::shared_ptr<Sequence>>& batch) const;
 
     // Decentralized scheduling logic
     ScheduleResult                         _schedule_decentralized();
@@ -247,28 +305,29 @@ private:
     int next_dp_idx();
 
     // Configuration
-    std::string engine_id_;
-    int         loop_count_;
-    int         max_num_seqs_;
-    int         max_num_batched_tokens_;
-    int         max_num_recv_seqs_;
-    int         eos_;
-    int         attention_dp_;
-    int         attention_sp_;
-    std::string mode_;
-    double      reserved_blocks_per_req_;
-    int         segment_size_;
-    bool        enable_dynamic_sp_size_;
-    bool        use_new_decode_dynamic_sp_scheduler_;
-    std::string dynamic_sp_size_strategy_;
-    int         dynamic_sp_long_request_threshold_;
-    int         dynamic_sp_long_request_size_;
-    bool        enable_non_uniform_split_;
-    bool        sp_debug_;
-    bool        enable_ls_decode_core_scheduler_;
-    int         ls_decode_initial_kv_dop_;
-    int         ls_decode_batch_per_master_;
-    bool        ls_decode_enable_memory_scale_up_;
+    std::string      engine_id_;
+    int              loop_count_;
+    int              max_num_seqs_;
+    int              max_num_batched_tokens_;
+    int              max_num_recv_seqs_;
+    int              eos_;
+    int              attention_dp_;
+    int              attention_sp_;
+    std::string      mode_;
+    double           reserved_blocks_per_req_;
+    int              segment_size_;
+    bool             enable_dynamic_sp_size_;
+    bool             use_new_decode_dynamic_sp_scheduler_;
+    std::string      dynamic_sp_size_strategy_;
+    int              dynamic_sp_long_request_threshold_;
+    int              dynamic_sp_long_request_size_;
+    bool             enable_non_uniform_split_;
+    bool             sp_debug_;
+    bool             enable_ls_decode_core_scheduler_;
+    int              ls_decode_initial_kv_dop_;
+    int              ls_decode_batch_per_master_;
+    bool             ls_decode_enable_memory_scale_up_;
+    std::vector<int> ls_empty_system_free_blocks_per_rank_;
 
     std::string sp_master_selector_;
 
@@ -278,18 +337,29 @@ private:
 
     std::unique_ptr<ThreadPool> thread_pool_;
 
-    uint64_t                                        next_ls_group_id_ = 0;
-    uint64_t                                        next_ls_batch_id_ = 0;
-    std::unordered_map<uint64_t, DecodeGroupState>  ls_groups_;
-    std::vector<std::vector<uint64_t>>              ls_group_ids_by_dp_;
-    std::unordered_map<uint64_t, uint64_t>          ls_seq_to_group_;
-    std::vector<InitialBatchPlacement>              ls_step_initial_records_;
-    std::vector<SPStateManager::LSDecodeMasterPlan> ls_step_group_plans_;
-    std::vector<uint64_t>                           ls_step_group_plan_ids_;
-    std::vector<std::vector<int>>                   ls_step_reused_passive_masters_;
-    std::vector<uint64_t>                           ls_step_preempted_sequence_ids_;
-    std::vector<std::string>                        ls_step_preemption_reasons_;
-    double                                          ls_step_planning_latency_ms_ = 0.0;
+    uint64_t                                                next_ls_group_id_        = 0;
+    uint64_t                                                next_ls_batch_id_        = 0;
+    uint64_t                                                next_ls_admission_order_ = 0;
+    uint64_t                                                next_ls_enqueue_order_   = 0;
+    uint64_t                                                ls_schedule_step_        = 0;
+    std::unordered_map<uint64_t, DecodeGroupState>          ls_groups_;
+    std::vector<std::vector<uint64_t>>                      ls_group_ids_by_dp_;
+    std::unordered_map<uint64_t, uint64_t>                  ls_seq_to_group_;
+    std::unordered_map<uint64_t, uint64_t>                  ls_seq_to_batch_;
+    std::deque<PendingDecodeBatch>                          ls_pending_decode_batches_;
+    std::vector<InitialBatchPlacement>                      ls_step_initial_records_;
+    std::vector<std::pair<uint64_t, std::vector<uint64_t>>> ls_step_sealed_batches_;
+    std::vector<SPStateManager::LSDecodeMasterPlan>         ls_step_group_plans_;
+    std::vector<uint64_t>                                   ls_step_group_plan_ids_;
+    std::vector<std::vector<int>>                           ls_step_reused_passive_masters_;
+    std::vector<uint64_t>                                   ls_step_preempted_sequence_ids_;
+    std::vector<std::string>                                ls_step_preemption_reasons_;
+    uint64_t                                                ls_step_atomic_no_fit_count_                      = 0;
+    uint64_t                                                ls_step_atomic_merge_count_                       = 0;
+    uint64_t                                                ls_step_atomic_rollback_count_                    = 0;
+    int                                                     ls_admission_failure_after_allocations_for_test_  = -1;
+    int                                                     ls_admission_failure_after_publications_for_test_ = -1;
+    double                                                  ls_step_planning_latency_ms_                      = 0.0;
 };
 
 }  // namespace nanodeploy
