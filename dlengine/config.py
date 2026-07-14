@@ -530,7 +530,12 @@ class Config(BaseModel):
             raise ValueError("pp must be >= 1")
         if self.pp > 1:
             arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
-            supported_pp_archs = ("Qwen3ForCausalLM", "Qwen3MoeForCausalLM")
+            supported_pp_archs = (
+                "Qwen3ForCausalLM",
+                "Qwen3MoeForCausalLM",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
             if arch not in supported_pp_archs:
                 raise ValueError(
                     "pp > 1 is currently only supported for "

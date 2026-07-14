@@ -1033,6 +1033,12 @@ class ModelRunner:
         # attention layers, so they each need a cache slice.
         layer_types = getattr(hf_config, "layer_types", None)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        from dlengine.models.pp_utils import get_pp_layer_range
+
+        pp_start, pp_end = get_pp_layer_range(hf_config.num_hidden_layers)
+        local_layer_types = (
+            layer_types[pp_start:pp_end] if layer_types is not None else None
+        )
         if (
             arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration")
             and layer_types is not None
@@ -1051,18 +1057,15 @@ class ModelRunner:
                 num_kv_layers = sum(
                     1 for i, _lt in enumerate(layer_types) if i < first_shared
                 )
-        elif layer_types is not None and any(
-            lt == "linear_attention" for lt in layer_types
+        elif local_layer_types is not None and any(
+            lt == "linear_attention" for lt in local_layer_types
         ):
-            num_kv_layers = sum(1 for lt in layer_types if lt == "full_attention")
+            num_kv_layers = sum(1 for lt in local_layer_types if lt == "full_attention")
         else:
             # With pipeline parallelism each stage owns only a contiguous slice
             # of the decoder layers, so it allocates KV cache for just those
             # local layers. get_pp_layer_range returns (0, num_hidden_layers)
             # when pp == 1, preserving the original behaviour.
-            from dlengine.models.pp_utils import get_pp_layer_range
-
-            pp_start, pp_end = get_pp_layer_range(hf_config.num_hidden_layers)
             num_kv_layers = pp_end - pp_start
 
         # If ctrl_address is provided, fetch engine_id from NanoCtrl
@@ -1113,10 +1116,10 @@ class ModelRunner:
         # utilization target on hybrid models.
         reserved_state_bytes = 0
         gdn_cache_slots = max(0, getattr(config, "gdn_state_cache_slots", 0))
-        if cache_plan.has_gdn() and layer_types is not None:
+        if cache_plan.has_gdn() and local_layer_types is not None:
             reserved_state_bytes = CacheContext.estimate_gdn_state_bytes(
                 hf_config,
-                layer_types,
+                local_layer_types,
                 config.max_num_seqs,
                 need_backup=config.num_speculative_tokens > 0,
                 cache_slots=gdn_cache_slots,
@@ -1162,10 +1165,10 @@ class ModelRunner:
         )
 
         # Allocate GDN state buffers for linear_attention layers
-        if cache_plan.has_gdn() and layer_types is not None:
+        if cache_plan.has_gdn() and local_layer_types is not None:
             cache_context.allocate_gdn_states(
                 hf_config,
-                layer_types,
+                local_layer_types,
                 config.max_num_seqs,
                 need_backup=config.num_speculative_tokens > 0,
                 cache_slots=gdn_cache_slots,
