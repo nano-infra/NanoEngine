@@ -75,7 +75,7 @@ pub(crate) fn runner_in_prefill(
         cu_k.push(total_k);
         max_len_q = max_len_q.max(q_len_usize);
         max_len_k = max_len_k.max(pos_end.max(0) as usize);
-        if len > 0 {
+        if len > 0 && batch.sample_mask.get(idx).copied().unwrap_or(true) {
             sampling_token_indices.push((total_q - 1) as i64);
             sampling_seq_indices.push(idx as i64);
         }

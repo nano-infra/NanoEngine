@@ -80,6 +80,42 @@ def test_pp_allows_prefill_pd_role_with_ctrl_address(monkeypatch):
     assert config.world_size == 2
 
 
+def test_pp_allows_static_prefill_microbatch_pipeline(monkeypatch):
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: _qwen35_config(),
+    )
+
+    config = Config(
+        model="unused",
+        pp=2,
+        mode="prefill",
+        pp_prefill_microbatch_tokens=1024,
+        pp_prefill_pipeline_depth=2,
+        num_speculative_tokens=0,
+    )
+
+    assert config.pp_prefill_microbatch_tokens == 1024
+    assert config.pp_prefill_pipeline_depth == 2
+
+
+def test_static_prefill_microbatch_pipeline_requires_pp(monkeypatch):
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: _qwen35_config(),
+    )
+
+    with pytest.raises(ValueError, match="requires pp > 1"):
+        Config(
+            model="unused",
+            pp=1,
+            pp_prefill_microbatch_tokens=1024,
+            num_speculative_tokens=0,
+        )
+
+
 def test_pp_still_rejects_decode_pd_role(monkeypatch):
     monkeypatch.setattr(
         config_module.AutoConfig,

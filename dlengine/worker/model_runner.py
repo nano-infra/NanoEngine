@@ -1496,6 +1496,21 @@ class ModelRunner:
         want_lp = bool(getattr(aux, "any_return_completion_logprobs", False))
         logprobs = None
         if tp_rank == 0:
+            context = get_batch_context()
+            if (
+                is_prefill
+                and context.sampling_seq_indices is not None
+                and context.sampling_seq_indices.numel() == 0
+            ):
+                # Intermediate static PP microbatches update cache/state only.
+                # Avoid invoking the sampler (and its compiled kernels) with a
+                # zero-row logits tensor; the driver discards this placeholder.
+                input_ids = input_ids.new_zeros(num_seqs)
+                if want_lp:
+                    logprobs = torch.zeros(
+                        num_seqs, dtype=torch.float32, device=input_ids.device
+                    )
+                return input_ids, logprobs
             greedy_only = not want_lp and all(
                 float(t) < 1e-5 for t in getattr(aux, "temperatures", ())
             )
@@ -1505,7 +1520,6 @@ class ModelRunner:
                 return logits.argmax(dim=-1), None
 
             temperatures = prepare_sample_from_aux(aux)
-            context = get_batch_context()
             if is_prefill and context.sampling_seq_indices is not None:
                 temps_filtered = temperatures[context.sampling_seq_indices]
                 if want_lp:
