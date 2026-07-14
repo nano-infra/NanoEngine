@@ -32,6 +32,7 @@ from dlengine.layers.parallelism_transition import (
 )
 from dlengine.layers.rotary_embedding import get_rope
 from dlengine.logging import get_logger
+from dlengine.models.pp_utils import make_pp_layers, pp_recv_hidden, pp_send_hidden
 from dlengine.worker.runner_config import get_runner_config
 from ..quant_config import QuantizationConfig
 
@@ -461,17 +462,30 @@ class DeepseekV2Model(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
-        )
-        self.layers = nn.ModuleList(
-            [
-                DeepseekV2DecoderLayer(config, quantization_config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+        ctx = get_dist_context()
+        self.is_first_pp_stage = ctx.is_first_pp_stage
+        self.is_last_pp_stage = ctx.is_last_pp_stage
+        self.hidden_size = config.hidden_size
+        self.hidden_dtype = getattr(config, "dtype", None) or torch.get_default_dtype()
+
+        if self.is_first_pp_stage:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = None
+
+        self.start_layer, self.end_layer, self.layers = make_pp_layers(
+            config.num_hidden_layers,
+            lambda layer_idx: DeepseekV2DecoderLayer(
+                config, quantization_config, layer_idx
+            ),
         )
 
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        if self.is_last_pp_stage:
+            self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        else:
+            self.norm = None
 
     def forward(
         self,
@@ -488,10 +502,10 @@ class DeepseekV2Model(nn.Module):
             # launching the metadata kernel once per layer.
             indexer = next(
                 (
-                    layer.self_attn.indexer
-                    for layer in self.layers
-                    if layer.self_attn.indexer is not None
-                    and layer.self_attn.indexer.indexer_cache is not None
+                    self.layers[idx].self_attn.indexer
+                    for idx in range(self.start_layer, self.end_layer)
+                    if self.layers[idx].self_attn.indexer is not None
+                    and self.layers[idx].self_attn.indexer.indexer_cache is not None
                 ),
                 None,
             )
@@ -502,10 +516,26 @@ class DeepseekV2Model(nn.Module):
                     context.context_lens[0, :batch_size]
                 )
 
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
-        for idx, decoder_layer in enumerate(self.layers):
-            hidden_states, residual = decoder_layer(hidden_states, positions, residual)
+        if self.is_first_pp_stage:
+            hidden_states = self.embed_tokens(input_ids)
+            residual = None
+        else:
+            hidden_states = pp_recv_hidden(
+                positions.size(0), self.hidden_size, self.hidden_dtype
+            )
+            residual = None
+
+        for idx in range(self.start_layer, self.end_layer):
+            hidden_states, residual = self.layers[idx](
+                hidden_states, positions, residual
+            )
+
+        if not self.is_last_pp_stage:
+            if residual is not None:
+                hidden_states = hidden_states + residual
+            pp_send_hidden(hidden_states)
+            return hidden_states
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -520,7 +550,15 @@ class DeepseekV2ForCausalLM(nn.Module):
             **getattr(config, "quantization_config", dict())
         )
         self.model = DeepseekV2Model(config, self.quantization_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        if get_dist_context().is_last_pp_stage:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+            if (
+                getattr(config, "tie_word_embeddings", False)
+                and self.model.embed_tokens is not None
+            ):
+                self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        else:
+            self.lm_head = None
 
     def forward(
         self,

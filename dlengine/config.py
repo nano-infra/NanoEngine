@@ -324,6 +324,7 @@ class Config(BaseModel):
             setattr(self.hf_config, attr, getattr(self, attr, None))
 
         if self.hf_config.architectures[0] in (
+            "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
@@ -495,6 +496,7 @@ class Config(BaseModel):
             # iteration — MTP produces its extra tokens within that one step.
 
         if self.hf_config.architectures[0] in (
+            "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
@@ -535,6 +537,8 @@ class Config(BaseModel):
                 "Qwen3MoeForCausalLM",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
+                "DeepseekV2ForCausalLM",
+                "DeepseekV3ForCausalLM",
             )
             if arch not in supported_pp_archs:
                 raise ValueError(
