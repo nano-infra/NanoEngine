@@ -541,6 +541,9 @@ class Config(BaseModel):
                 "DeepseekV3ForCausalLM",
                 "DeepseekV32ForCausalLM",
                 "GlmMoeDsaForCausalLM",
+                "Gemma4ForCausalLM",
+                "Gemma4ForConditionalGeneration",
+                "DeepseekV4ForCausalLM",
             )
             if arch not in supported_pp_archs:
                 raise ValueError(
@@ -552,6 +555,16 @@ class Config(BaseModel):
                 raise ValueError(
                     f"pp cannot exceed num_hidden_layers ({num_hidden_layers})"
                 )
+            if arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
+                from dlengine.models.pp_utils import get_gemma4_shared_kv_source_start
+
+                source_start = get_gemma4_shared_kv_source_start(self.hf_config)
+                if source_start is not None and source_start < self.pp - 1:
+                    raise ValueError(
+                        "Gemma4 PP cannot split its shared-KV source suffix and "
+                        f"needs at least {self.pp - 1} independent prefix layers; "
+                        f"got {source_start}"
+                    )
             if self.num_speculative_tokens > 0:
                 raise ValueError(
                     "pp > 1 does not support MTP (num_speculative_tokens must be 0)"

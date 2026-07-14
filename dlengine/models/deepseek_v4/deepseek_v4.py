@@ -22,6 +22,7 @@ from dlengine.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from dlengine.layers.layernorm import RMSNorm
 from dlengine.layers.rotary_embedding import get_rope
 from dlengine.models.deepseek_v2.deepseek_v2 import DeepseekV2MLP
+from dlengine.models.pp_utils import make_pp_layers, pp_recv_hidden, pp_send_hidden
 from dlengine.models.quant_config import QuantizationConfig
 
 
@@ -2798,27 +2799,52 @@ class DeepseekV4Model(nn.Module):
     def __init__(self, config, quantization_config: QuantizationConfig):
         super().__init__()
         self.config = config
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
+        ctx = get_dist_context()
+        self.is_first_pp_stage = ctx.is_first_pp_stage
+        self.is_last_pp_stage = ctx.is_last_pp_stage
+        self.hidden_size = config.hidden_size
+        self.hidden_dtype = getattr(config, "dtype", None) or torch.get_default_dtype()
+
+        if self.is_first_pp_stage:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = None
+        self.start_layer, self.end_layer, self.layers = make_pp_layers(
+            config.num_hidden_layers,
+            lambda layer_idx: DeepseekV4DecoderLayer(
+                config, quantization_config, layer_idx
+            ),
         )
-        self.layers = nn.ModuleList(
-            [
-                DeepseekV4DecoderLayer(config, quantization_config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hc_head = DeepseekV4HCHead(
-            config.hidden_size, config.hc_mult, config.hc_eps
-        )
+        if self.is_last_pp_stage:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.hc_head = DeepseekV4HCHead(
+                config.hidden_size, config.hc_mult, config.hc_eps
+            )
+        else:
+            self.norm = None
+            self.hc_head = None
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor):
-        hidden_states = self.embed_tokens(input_ids)
-        _debug_dump("embed", hidden_states)
-        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
-        _debug_dump("hc_expand", hidden_states)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, positions, input_ids)
+        if self.is_first_pp_stage:
+            hidden_states = self.embed_tokens(input_ids)
+            _debug_dump("embed", hidden_states)
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
+            _debug_dump("hc_expand", hidden_states)
+        else:
+            hidden_states = pp_recv_hidden(
+                positions.size(0),
+                self.config.hc_mult * self.hidden_size,
+                self.hidden_dtype,
+            ).view(-1, self.config.hc_mult, self.hidden_size)
+
+        for idx in range(self.start_layer, self.end_layer):
+            hidden_states = self.layers[idx](hidden_states, positions, input_ids)
+
+        if not self.is_last_pp_stage:
+            pp_send_hidden(hidden_states)
+            return hidden_states
         hidden_states = self.hc_head(hidden_states)
         _debug_dump("hc_head", hidden_states)
         hidden_states = self.norm(hidden_states)
@@ -2834,7 +2860,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             **getattr(self.config, "quantization_config", {})
         )
         self.model = DeepseekV4Model(self.config, self.quantization_config)
-        self.lm_head = ParallelLMHead(self.config.vocab_size, self.config.hidden_size)
+        if get_dist_context().is_last_pp_stage:
+            self.lm_head = ParallelLMHead(
+                self.config.vocab_size, self.config.hidden_size
+            )
+        else:
+            self.lm_head = None
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return self.model(input_ids, positions)

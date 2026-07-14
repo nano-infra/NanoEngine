@@ -25,6 +25,20 @@ def _deepseek_config(architecture):
     )
 
 
+def _gemma4_config():
+    return SimpleNamespace(
+        architectures=["Gemma4ForCausalLM"],
+        dtype="bfloat16",
+        max_position_embeddings=32768,
+        num_hidden_layers=12,
+        num_key_value_heads=1,
+        head_dim=128,
+        global_head_dim=128,
+        layer_types=["sliding_attention", "full_attention"] * 6,
+        num_kv_shared_layers=4,
+    )
+
+
 def test_pp_allows_hybrid_dlslime_ctrl_address(monkeypatch):
     monkeypatch.setattr(
         config_module.AutoConfig,
@@ -89,4 +103,45 @@ def test_pp16_allows_supported_deepseek_architectures(monkeypatch, architecture)
 
     assert config.world_size == 16
     assert config.kvcache_block_size == 64
+    assert config.enforce_eager is True
+
+
+def test_pp16_allows_deepseek_v4(monkeypatch):
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: _deepseek_config("DeepseekV4ForCausalLM"),
+    )
+
+    config = Config(
+        model="unused",
+        pp=16,
+        mode="hybrid",
+        num_speculative_tokens=0,
+    )
+
+    assert config.world_size == 16
+    assert config.enforce_eager is True
+
+
+@pytest.mark.parametrize(
+    "architecture", ["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"]
+)
+def test_pp4_allows_gemma4_with_shared_kv(monkeypatch, architecture):
+    hf_config = _gemma4_config()
+    hf_config.architectures = [architecture]
+    monkeypatch.setattr(
+        config_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: hf_config,
+    )
+
+    config = Config(
+        model="unused",
+        pp=4,
+        mode="hybrid",
+        num_speculative_tokens=0,
+    )
+
+    assert config.world_size == 4
     assert config.enforce_eager is True

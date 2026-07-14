@@ -8,6 +8,7 @@ from torch import nn
 
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.logging import get_logger
+from dlengine.models.pp_utils import pp_weight_belongs_to_stage
 from dlengine.worker.loader import (
     default_weight_loader,
     EXPERT_RE,
@@ -185,6 +186,10 @@ def load_weights(
     not_found_names: list[str] = []
     pending_fp4_experts: dict[str, torch.Tensor] = {}
     pending_wo_a: dict[str, dict[str, torch.Tensor]] = {}
+    dist_ctx = get_dist_context()
+    pp_size = dist_ctx.pp_world_size
+    start_layer = getattr(model.model, "start_layer", 0)
+    end_layer = getattr(model.model, "end_layer", None)
 
     def load_one(weight_name: str, tensor: torch.Tensor) -> bool:
         nonlocal loaded_count, skipped_count
@@ -229,6 +234,13 @@ def load_weights(
 
     for weight_name, raw_weight_name, tensor in weights:
         weight_name = _remap_name(weight_name)
+
+        if (
+            pp_size > 1
+            and end_layer is not None
+            and not pp_weight_belongs_to_stage(weight_name, start_layer, end_layer)
+        ):
+            continue
 
         if ".indexer." in weight_name:
             skipped_count += 1

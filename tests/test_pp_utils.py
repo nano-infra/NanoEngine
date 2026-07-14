@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
+import dlengine.models.pp_utils as pp_utils
 import pytest
-from dlengine.models import pp_utils
 from torch import nn
 
 
@@ -57,3 +57,39 @@ def test_pp_weight_ownership(monkeypatch, is_first, is_last, weight_name, expect
     monkeypatch.setattr(pp_utils, "get_dist_context", lambda: context)
 
     assert pp_utils.pp_weight_belongs_to_stage(weight_name, 4, 7) is expected
+
+
+def _gemma_config():
+    return SimpleNamespace(
+        num_hidden_layers=12,
+        num_kv_shared_layers=4,
+        layer_types=["sliding_attention", "full_attention"] * 6,
+    )
+
+
+def test_gemma4_pp_keeps_shared_kv_sources_on_last_stage(monkeypatch):
+    config = _gemma_config()
+    assert pp_utils.get_gemma4_shared_kv_source_start(config) == 6
+
+    ranges = []
+    for rank in range(4):
+        monkeypatch.setattr(
+            pp_utils,
+            "get_dist_context",
+            lambda rank=rank: SimpleNamespace(pp_world_size=4, pp_rank=rank),
+        )
+        ranges.append(pp_utils.get_gemma4_pp_layer_range(config))
+
+    assert ranges == [(0, 2), (2, 4), (4, 6), (6, 12)]
+
+
+def test_gemma4_without_shared_kv_uses_balanced_split(monkeypatch):
+    config = _gemma_config()
+    config.num_kv_shared_layers = 0
+    monkeypatch.setattr(
+        pp_utils,
+        "get_dist_context",
+        lambda: SimpleNamespace(pp_world_size=4, pp_rank=2),
+    )
+
+    assert pp_utils.get_gemma4_pp_layer_range(config) == (6, 9)

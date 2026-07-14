@@ -20,7 +20,9 @@ from torch import nn
 from dlengine.context_v2.distributed import get_dist_context
 
 
-def get_pp_layer_range(num_layers: int) -> Tuple[int, int]:
+def get_pp_layer_range(
+    num_layers: int, final_stage_start: int | None = None
+) -> Tuple[int, int]:
     """Return the ``[start, end)`` decoder-layer range owned by this stage.
 
     Layers are split as evenly as possible; when ``num_layers`` is not a
@@ -32,11 +34,65 @@ def get_pp_layer_range(num_layers: int) -> Tuple[int, int]:
     pp_rank = ctx.pp_rank
     if pp_size <= 1:
         return 0, num_layers
-    base = num_layers // pp_size
-    remainder = num_layers % pp_size
+    # Some architectures have cross-layer dependencies which must remain on
+    # one stage.  Gemma4 shared-KV layers, for example, consume K/V produced by
+    # the last non-sharing layer of each attention type.  Reserve that suffix
+    # for the final stage and balance the independent prefix over the others.
+    if final_stage_start is not None and pp_size > 1:
+        if not 0 < final_stage_start < num_layers:
+            raise ValueError(
+                f"invalid final_stage_start={final_stage_start} for {num_layers} layers"
+            )
+        if final_stage_start < pp_size - 1:
+            raise ValueError(
+                "not enough independent prefix layers for pipeline stages: "
+                f"prefix={final_stage_start}, pp={pp_size}"
+            )
+        if pp_rank == pp_size - 1:
+            return final_stage_start, num_layers
+        split_size = pp_size - 1
+        base = final_stage_start // split_size
+        remainder = final_stage_start % split_size
+    else:
+        split_size = pp_size
+        base = num_layers // split_size
+        remainder = num_layers % split_size
+
     start = pp_rank * base + min(pp_rank, remainder)
     count = base + (1 if pp_rank < remainder else 0)
     return start, start + count
+
+
+def get_gemma4_shared_kv_source_start(config) -> int | None:
+    """Return the earliest KV source that must accompany Gemma4's shared tail."""
+    num_layers = config.num_hidden_layers
+    num_shared = int(getattr(config, "num_kv_shared_layers", 0) or 0)
+    if num_shared <= 0:
+        return None
+    first_shared = num_layers - num_shared
+    layer_types = list(config.layer_types)
+    shared_types = set(layer_types[first_shared:])
+    source_indices = []
+    for layer_type in shared_types:
+        candidates = [
+            idx
+            for idx, candidate_type in enumerate(layer_types[:first_shared])
+            if candidate_type == layer_type
+        ]
+        if not candidates:
+            raise ValueError(
+                "Gemma4 shared-KV layer has no preceding source for "
+                f"layer_type={layer_type!r}"
+            )
+        source_indices.append(candidates[-1])
+    return min(source_indices)
+
+
+def get_gemma4_pp_layer_range(config) -> Tuple[int, int]:
+    return get_pp_layer_range(
+        config.num_hidden_layers,
+        final_stage_start=get_gemma4_shared_kv_source_start(config),
+    )
 
 
 class PPMissingLayer(nn.Module):
@@ -57,7 +113,9 @@ class PPMissingLayer(nn.Module):
 
 
 def make_pp_layers(
-    num_layers: int, builder: Callable[[int], nn.Module]
+    num_layers: int,
+    builder: Callable[[int], nn.Module],
+    layer_range: Tuple[int, int] | None = None,
 ) -> Tuple[int, int, nn.ModuleList]:
     """Build a full-length ``ModuleList`` with only this stage's layers real.
 
@@ -71,7 +129,7 @@ def make_pp_layers(
         module for ``start_layer <= i < end_layer`` and a
         :class:`PPMissingLayer` otherwise.
     """
-    start, end = get_pp_layer_range(num_layers)
+    start, end = layer_range or get_pp_layer_range(num_layers)
     modules = []
     for idx in range(num_layers):
         if start <= idx < end:
@@ -121,6 +179,8 @@ def pp_weight_belongs_to_stage(
     if "embed_tokens" in weight_name:
         return ctx.is_first_pp_stage
     if weight_name.startswith("model.norm."):
+        return ctx.is_last_pp_stage
+    if weight_name.startswith("model.hc_head."):
         return ctx.is_last_pp_stage
     if "lm_head" in weight_name:
         return ctx.is_last_pp_stage

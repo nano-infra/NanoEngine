@@ -1033,9 +1033,15 @@ class ModelRunner:
         # attention layers, so they each need a cache slice.
         layer_types = getattr(hf_config, "layer_types", None)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
-        from dlengine.models.pp_utils import get_pp_layer_range
+        from dlengine.models.pp_utils import (
+            get_gemma4_pp_layer_range,
+            get_pp_layer_range,
+        )
 
-        pp_start, pp_end = get_pp_layer_range(hf_config.num_hidden_layers)
+        if arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
+            pp_start, pp_end = get_gemma4_pp_layer_range(hf_config)
+        else:
+            pp_start, pp_end = get_pp_layer_range(hf_config.num_hidden_layers)
         local_layer_types = (
             layer_types[pp_start:pp_end] if layer_types is not None else None
         )
@@ -1050,12 +1056,16 @@ class ModelRunner:
             if cache_plan.has_hisparse() and cache_plan.has_gqa():
                 num_kv_layers = sum(
                     1
-                    for i, lt in enumerate(layer_types)
+                    for i, lt in enumerate(layer_types[pp_start:pp_end], start=pp_start)
                     if i < first_shared and lt == "full_attention"
                 )
             else:
                 num_kv_layers = sum(
-                    1 for i, _lt in enumerate(layer_types) if i < first_shared
+                    1
+                    for i, _lt in enumerate(
+                        layer_types[pp_start:pp_end], start=pp_start
+                    )
+                    if i < first_shared
                 )
         elif local_layer_types is not None and any(
             lt == "linear_attention" for lt in local_layer_types
