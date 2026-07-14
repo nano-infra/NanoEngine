@@ -552,7 +552,10 @@ class Config(BaseModel):
                 )
             if self.enable_hisparse:
                 raise ValueError("pp > 1 does not support enable_hisparse")
-            if self.ctrl_address or self.mode != "hybrid":
+            # A hybrid DLSLime executor still needs ctrl_address for RPC agent
+            # discovery; ctrl_address alone does not imply PD disaggregation.
+            # The prefill/decode roles are what make an engine disaggregated.
+            if self.mode != "hybrid":
                 raise ValueError(
                     "pp > 1 currently supports mode='hybrid' only "
                     "(no PD disaggregation)"
