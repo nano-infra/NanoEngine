@@ -539,6 +539,8 @@ class Config(BaseModel):
                 "Qwen3_5MoeForConditionalGeneration",
                 "DeepseekV2ForCausalLM",
                 "DeepseekV3ForCausalLM",
+                "DeepseekV32ForCausalLM",
+                "GlmMoeDsaForCausalLM",
             )
             if arch not in supported_pp_archs:
                 raise ValueError(

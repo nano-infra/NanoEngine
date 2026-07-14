@@ -32,7 +32,12 @@ from dlengine.layers.parallelism_transition import (
 )
 from dlengine.layers.rotary_embedding import get_rope
 from dlengine.logging import get_logger
-from dlengine.models.pp_utils import make_pp_layers, pp_recv_hidden, pp_send_hidden
+from dlengine.models.pp_utils import (
+    get_pp_layer_range,
+    make_pp_layers,
+    pp_recv_hidden,
+    pp_send_hidden,
+)
 from dlengine.worker.runner_config import get_runner_config
 from ..quant_config import QuantizationConfig
 
@@ -384,12 +389,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: DeepseekV3Config,
         quantization_config: QuantizationConfig,
         layer_idx: int,
+        cache_layer_idx: int | None = None,
     ):
         super().__init__()
 
         self.layer_idx = layer_idx
         self.self_attn = DeepseekV2Attention(
-            config, quantization_config, layer_idx=layer_idx
+            config,
+            quantization_config,
+            layer_idx=layer_idx,
+            cache_layer_idx=cache_layer_idx,
         )
 
         if (
@@ -475,10 +484,14 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = None
 
+        pp_start, _ = get_pp_layer_range(config.num_hidden_layers)
         self.start_layer, self.end_layer, self.layers = make_pp_layers(
             config.num_hidden_layers,
             lambda layer_idx: DeepseekV2DecoderLayer(
-                config, quantization_config, layer_idx
+                config,
+                quantization_config,
+                layer_idx,
+                cache_layer_idx=layer_idx - pp_start,
             ),
         )
 
@@ -611,6 +624,7 @@ class DeepseekV2Attention(nn.Module):
         config: DeepseekV3Config,
         quantization_config: QuantizationConfig | None = None,
         layer_idx: int = 0,
+        cache_layer_idx: int | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -741,7 +755,7 @@ class DeepseekV2Attention(nn.Module):
                 max_position_embeddings=config.max_position_embeddings,
                 rope_theta=float(rope_theta),
                 rope_scaling=rope_params,
-                layer_id=layer_idx,
+                layer_id=(layer_idx if cache_layer_idx is None else cache_layer_idx),
             )
         else:
             self.indexer = None

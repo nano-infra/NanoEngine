@@ -66,7 +66,12 @@ def test_pp_still_rejects_pd_role_with_ctrl_address(monkeypatch):
 
 @pytest.mark.parametrize(
     "architecture",
-    ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"],
+    [
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+    ],
 )
 def test_pp16_allows_supported_deepseek_architectures(monkeypatch, architecture):
     monkeypatch.setattr(
@@ -85,19 +90,3 @@ def test_pp16_allows_supported_deepseek_architectures(monkeypatch, architecture)
     assert config.world_size == 16
     assert config.kvcache_block_size == 64
     assert config.enforce_eager is True
-
-
-def test_pp_rejects_deepseek_v32_until_indexer_cache_is_stage_local(monkeypatch):
-    monkeypatch.setattr(
-        config_module.AutoConfig,
-        "from_pretrained",
-        lambda *args, **kwargs: _deepseek_config("DeepseekV32ForCausalLM"),
-    )
-
-    with pytest.raises(ValueError, match="currently only supported"):
-        Config(
-            model="unused",
-            pp=16,
-            mode="hybrid",
-            num_speculative_tokens=0,
-        )
