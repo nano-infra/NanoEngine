@@ -252,7 +252,7 @@ class ModelRunner:
 
             set_compile_disabled(True)
             logger.info("torch.compile disabled (config.disable_compile=True)")
-        self.world_size = config.attn_world_size
+        self.world_size = config.world_size
         self.rank = rank
         self._dist_initialized = False
         self._dlslime_agent = None
@@ -337,13 +337,14 @@ class ModelRunner:
 
         set_dist_context(
             rank=rank,
-            world_size=config.attn_world_size,
+            world_size=config.world_size,
             attention_dp=config.attention_dp,
             attention_sp=config.attention_sp,
             attention_tp=config.attention_tp,
             ffn_dp=config.ffn_dp,
             ffn_ep=config.ffn_ep,
             ffn_tp=config.ffn_tp,
+            pp=config.pp,
         )
 
         self.default_dtype = torch.get_default_dtype()
@@ -1055,7 +1056,14 @@ class ModelRunner:
         ):
             num_kv_layers = sum(1 for lt in layer_types if lt == "full_attention")
         else:
-            num_kv_layers = hf_config.num_hidden_layers
+            # With pipeline parallelism each stage owns only a contiguous slice
+            # of the decoder layers, so it allocates KV cache for just those
+            # local layers. get_pp_layer_range returns (0, num_hidden_layers)
+            # when pp == 1, preserving the original behaviour.
+            from dlengine.models.pp_utils import get_pp_layer_range
+
+            pp_start, pp_end = get_pp_layer_range(hf_config.num_hidden_layers)
+            num_kv_layers = pp_end - pp_start
 
         # If ctrl_address is provided, fetch engine_id from NanoCtrl
         engine_id = config.engine_id
@@ -1253,6 +1261,10 @@ class ModelRunner:
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
+        # Pipeline parallelism: non-final stages run their local decoder layers
+        # and send the residual stream to the next stage inside model.forward.
+        # They produce no logits, so short-circuit before compute_logits.
+        is_last_pp_stage = get_dist_context().is_last_pp_stage
         flashinfer_decode_eager = (
             not is_prefill
             and os.environ.get("DLENGINE_FLASHINFER_EAGER_DECODE", "0") == "1"
@@ -1285,9 +1297,13 @@ class ModelRunner:
                 hidden = self.model(input_ids, positions)
             if is_prefill:
                 ExpertContext.get_instance().transition_to_low_latency()
+            self._mark_fwd("model")
+            # Non-final pipeline stages already forwarded the residual stream to
+            # the next stage; there is nothing to sample here.
+            if not is_last_pp_stage:
+                return None
             if not is_prefill and self.mtp_runner is not None:
                 self.mtp_runner.last_hidden = hidden
-            self._mark_fwd("model")
             logits = self.model.compute_logits(hidden)
             self._mark_fwd("logits")
             return logits
@@ -1691,6 +1707,16 @@ class ModelRunner:
             _timer.mark("forward")
         if is_prefill and self.vision_manager.has_embeds:
             self.vision_manager.clear()
+
+        # Non-final pipeline stages produce no logits/tokens; they only need to
+        # have run their local layers (and pushed hidden states downstream). The
+        # engine reads tokens from the last stage only, so return a benign
+        # placeholder here.
+        if logits is None:
+            reset_runtime_contexts()
+            self.run_count += 1
+            self._fwd_timer = None
+            return [[0] for _ in range(num_seqs)]
 
         # --- Sampling ---
         num_accepted = None

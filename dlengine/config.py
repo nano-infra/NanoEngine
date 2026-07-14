@@ -62,6 +62,12 @@ class Config(BaseModel):
     ffn_ep: int = 1
     ffn_tp: int = 1
     ffn_dp: int = 1
+    # Pipeline parallelism. Splits the decoder layers into ``pp`` contiguous
+    # stages. Each stage owns one full attn/ffn parallel group
+    # (dp*sp*tp / dp*ep*tp), so the total number of GPU workers is
+    # ``pp * attn_world_size``. Stages exchange hidden states with
+    # point-to-point send/recv along the pipeline dimension.
+    pp: int = 1
 
     # runner config
     enforce_eager: bool = False
@@ -519,6 +525,42 @@ class Config(BaseModel):
                 )
                 self.l3_enable = False
 
+        # Pipeline parallelism validation and constraints.
+        if self.pp < 1:
+            raise ValueError("pp must be >= 1")
+        if self.pp > 1:
+            arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
+            supported_pp_archs = ("Qwen3ForCausalLM", "Qwen3MoeForCausalLM")
+            if arch not in supported_pp_archs:
+                raise ValueError(
+                    "pp > 1 is currently only supported for "
+                    f"{supported_pp_archs}; got {arch!r}"
+                )
+            num_hidden_layers = getattr(self.hf_config, "num_hidden_layers", None)
+            if num_hidden_layers is None or num_hidden_layers < self.pp:
+                raise ValueError(
+                    f"pp cannot exceed num_hidden_layers ({num_hidden_layers})"
+                )
+            if self.num_speculative_tokens > 0:
+                raise ValueError(
+                    "pp > 1 does not support MTP (num_speculative_tokens must be 0)"
+                )
+            if self.enable_hisparse:
+                raise ValueError("pp > 1 does not support enable_hisparse")
+            if self.ctrl_address or self.mode != "hybrid":
+                raise ValueError(
+                    "pp > 1 currently supports mode='hybrid' only "
+                    "(no PD disaggregation)"
+                )
+            # Stage boundaries send/recv hidden states eagerly; CUDA graph
+            # capture across a P2P boundary is not wired yet.
+            if not self.enforce_eager:
+                logger.info(
+                    "pp > 1: forcing enforce_eager=True (CUDA graph capture "
+                    "across pipeline stages is not supported)"
+                )
+                self.enforce_eager = True
+
         # Convert dynamic trust_remote_code config class (from transformers_modules.*)
         # to a standard PretrainedConfig so Ray can serialize it across workers.
         if self.trust_remote_code and self.hf_config.__class__.__module__.startswith(
@@ -540,3 +582,8 @@ class Config(BaseModel):
     @property
     def ffn_world_size(self):
         return self.ffn_dp * self.ffn_ep * self.ffn_tp
+
+    @property
+    def world_size(self):
+        """Total number of GPU workers across all pipeline stages."""
+        return self.pp * self.attn_world_size

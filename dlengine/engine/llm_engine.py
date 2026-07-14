@@ -142,6 +142,7 @@ class LLMEngine:
 
     def _run_scheduled_step(self, schedule_result):
         tp_size = self.config.attention_tp
+        pp_size = self.config.pp
         runner_outs = None
         self._run_host_swap_outs(schedule_result, tp_size)
         self._run_host_swap_ins(schedule_result, tp_size)
@@ -150,10 +151,20 @@ class LLMEngine:
             batch_bytes = self.scheduler.serialize_run_batches_for_result(
                 schedule_result, tp_size
             )
+            # Every pipeline stage runs the same batch (each stage forwards its
+            # own layers); replicate the per-inner-rank bytes across stages so
+            # the flat worker list [stage0 ranks..., stage1 ranks..., ...] lines
+            # up with the batch list.
+            inner = len(batch_bytes)
+            batch_bytes = self._replicate_for_pp(batch_bytes, pp_size)
             handle = self.executor.run_batch_bytes_async(
                 batch_bytes, schedule_result.is_prefill
             )
-            runner_outs = self.executor.run_wait_runner_outs(handle)[::tp_size]
+            all_outs = self.executor.run_wait_runner_outs(handle)
+            # Tokens are produced only by the last pipeline stage; its workers
+            # occupy the final ``inner`` slots of the worker list.
+            last_stage_outs = all_outs[(pp_size - 1) * inner :]
+            runner_outs = last_stage_outs[::tp_size]
             self.scheduler.postprocess_schedule_runner_outs(
                 schedule_result,
                 runner_outs,
@@ -164,9 +175,22 @@ class LLMEngine:
             batch_bytes = self.scheduler.serialize_migrate_batches_for_result(
                 schedule_result, tp_size
             )
+            batch_bytes = self._replicate_for_pp(batch_bytes, pp_size)
             self.executor.migrate_batch_bytes(batch_bytes)
 
         return runner_outs
+
+    @staticmethod
+    def _replicate_for_pp(items, pp_size: int):
+        """Replicate a per-inner-rank list across pipeline stages.
+
+        Workers are ordered pp-major (all of stage 0's inner ranks, then stage
+        1's, ...), so repeating the inner list ``pp_size`` times aligns each
+        stage's workers with the same batch/task payloads.
+        """
+        if pp_size <= 1:
+            return items
+        return list(items) * pp_size
 
     def _run_host_swap_outs(self, schedule_result, tp_size: int) -> None:
         tasks = getattr(schedule_result, "swap_out_tasks", None) or []
@@ -183,6 +207,9 @@ class LLMEngine:
         for group_tasks in tasks:
             for _ in range(max(1, tp_size)):
                 per_worker_tasks.append(group_tasks)
+        # Each pipeline stage holds its own KV shard for the same block ids, so
+        # every stage must perform the swap.
+        per_worker_tasks = self._replicate_for_pp(per_worker_tasks, self.config.pp)
         self.executor.swap_out_blocks_to_host(per_worker_tasks)
         self.scheduler.complete_host_swap_outs(tasks)
         logger.info("host swap-out done: seqs=%d blocks=%d", num_seqs, num_blocks)
@@ -202,6 +229,7 @@ class LLMEngine:
         for group_tasks in tasks:
             for _ in range(max(1, tp_size)):
                 per_worker_tasks.append(group_tasks)
+        per_worker_tasks = self._replicate_for_pp(per_worker_tasks, self.config.pp)
         self.executor.swap_in_blocks_from_host(per_worker_tasks)
         self.scheduler.complete_host_swap_ins(tasks)
         logger.info("host swap-in done: seqs=%d blocks=%d", num_seqs, num_blocks)
