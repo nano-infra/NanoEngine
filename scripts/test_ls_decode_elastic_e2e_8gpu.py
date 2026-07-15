@@ -48,6 +48,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--burst-size", type=int, default=64)
     parser.add_argument("--low-load-decode-steps", type=int, default=4)
     parser.add_argument("--max-total-steps", type=int, default=160)
+    parser.add_argument(
+        "--require-decode-between-consolidations",
+        action="store_true",
+        help=(
+            "Require a real Decode at each intermediate allocation DoP before "
+            "the next KV-consolidation maintenance step. Use cooldown >= 2."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--ls-batch-per-master", type=int, default=8)
@@ -90,6 +98,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("KV consolidation execute requires a positive block budget")
     if args.ls_kv_consolidation_migration_chunk_tokens <= 0:
         parser.error("KV consolidation execute requires positive scratch tokens")
+    if (
+        args.require_decode_between_consolidations
+        and args.ls_kv_consolidation_cooldown_steps < 2
+    ):
+        parser.error(
+            "--require-decode-between-consolidations requires "
+            "--ls-kv-consolidation-cooldown-steps >= 2"
+        )
     return args
 
 
@@ -192,6 +208,72 @@ def find_iteration(
         ):
             return item
     return None
+
+
+def validate_interleaved_scale_down(
+    trace: list[dict[str, Any]],
+    *,
+    initial_dop: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Validate maintenance(D-1) -> Decode@(D-1) for every released rank."""
+
+    cursor = 0
+    verified: list[dict[str, Any]] = []
+    for target_dop in range(initial_dop - 1, 0, -1):
+        maintenance_idx: int | None = None
+        while cursor < len(trace):
+            event = trace[cursor]
+            if event["event"] == "maintenance":
+                if event["retained_dop"] != target_dop:
+                    return False, {
+                        "reason": "unexpected_maintenance_target",
+                        "expected_target_dop": target_dop,
+                        "event": event,
+                        "trace": trace,
+                    }
+                maintenance_idx = cursor
+                cursor += 1
+                break
+            cursor += 1
+        if maintenance_idx is None:
+            return False, {
+                "reason": "missing_maintenance",
+                "expected_target_dop": target_dop,
+                "trace": trace,
+            }
+
+        matching_decode: dict[str, Any] | None = None
+        while cursor < len(trace):
+            event = trace[cursor]
+            if event["event"] == "maintenance":
+                break
+            cursor += 1
+            if (
+                event["event"] == "decode"
+                and event["real_batch_size"] == 1
+                and event["master_dop"] == 1
+                and event["kv_dop"] == target_dop
+                and event["allocation_dop"] == target_dop
+            ):
+                matching_decode = event
+                break
+        if matching_decode is None:
+            return False, {
+                "reason": "missing_decode_before_next_maintenance",
+                "target_dop": target_dop,
+                "maintenance": trace[maintenance_idx],
+                "next_event": trace[cursor] if cursor < len(trace) else None,
+                "trace": trace,
+            }
+        verified.append(
+            {
+                "target_dop": target_dop,
+                "maintenance": trace[maintenance_idx],
+                "decode": matching_decode,
+            }
+        )
+
+    return True, {"verified_transitions": verified, "trace": trace}
 
 
 def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -383,8 +465,36 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             [r for r in collector.records if r.get("mode") == "ls_kv_consolidation"]
         )
         low_iteration: dict[str, Any] | None = None
+        scale_down_trace: list[dict[str, Any]] = []
         while low_iteration is None:
-            step("arrival_idle_scale_down")
+            records = step("arrival_idle_scale_down")
+            for record in records:
+                if (
+                    record.get("mode") == "ls_kv_consolidation"
+                    and int(record["group_id"]) == first_group_id
+                ):
+                    scale_down_trace.append(
+                        {
+                            "event": "maintenance",
+                            "transaction_id": record["transaction_id"],
+                            "source_rank": record["source_rank"],
+                            "retained_dop": len(record["retained_ranks"]),
+                            "num_tokens": record["num_tokens"],
+                            "num_moves": record["num_moves"],
+                        }
+                    )
+            for item in flatten_iterations(records):
+                if item["group_id"] == first_group_id:
+                    scale_down_trace.append(
+                        {
+                            "event": "decode",
+                            "real_batch_size": item["real_batch_size"],
+                            "master_dop": item["master_dop"],
+                            "kv_dop": item["kv_dop"],
+                            "allocation_dop": len(item["rank_allocation"]),
+                            "master_ranks": item["master_ranks"],
+                        }
+                    )
             low_iteration = find_iteration(
                 collector.records,
                 group_id=first_group_id,
@@ -406,6 +516,16 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             retained_sizes,
         )
         require("low_load_reached_1_1_1", low_iteration is not None, low_iteration)
+        if args.require_decode_between_consolidations:
+            interleaved_ok, interleaved_detail = validate_interleaved_scale_down(
+                scale_down_trace,
+                initial_dop=8,
+            )
+            require(
+                "decode_between_every_consolidation",
+                interleaved_ok,
+                interleaved_detail,
+            )
 
         low_decode_seen = 0
         while low_decode_seen < args.low_load_decode_steps:
@@ -503,6 +623,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 for step_record in result["steps"]
             ),
             "first_scale_down_retained_sizes": retained_sizes[:7],
+            "first_scale_down_trace": scale_down_trace,
             "first_group_id": first_group_id,
             "first_high": first_high,
             "low_load": low_iteration,
