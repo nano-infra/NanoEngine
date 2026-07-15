@@ -65,6 +65,9 @@ class ModelRunner:
         self.log_decode_a2a_masks = _env_flag_enabled(
             "NANODEPLOY_LOG_DECODE_A2A_MASKS", default=False
         )
+        self.log_model_forward_timing = _env_flag_enabled(
+            "NANODEPLOY_LOG_MODEL_FORWARD_TIMING", default=False
+        )
 
         logger.debug(f"init ModelRunner, {rank=}, {get_local_ip()=}")
 
@@ -96,6 +99,23 @@ class ModelRunner:
         self.default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
+
+        self.model_forward_timing_events = None
+        if self.log_model_forward_timing:
+            # Reuse events across steps so timing does not allocate CUDA events
+            # on the serving path. Prefill uses only the first pair.
+            self.model_forward_timing_events = [
+                (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                for _ in range(max(1, self.config.loop_count))
+            ]
+            logger.info(
+                "Rank %s: model forward CUDA-event timing enabled via "
+                "NANODEPLOY_LOG_MODEL_FORWARD_TIMING",
+                self.rank,
+            )
 
         sp_size = get_dist_context().attn_sp_world_size
         ep_size = get_dist_context().ffn_ep_world_size
@@ -958,7 +978,13 @@ class ModelRunner:
                 if self.log_decode_a2a_masks:
                     self._log_decode_a2a_masks(loop_idx=i, is_dummy=is_dummy)
 
-            logits = self.run_model(input_ids, positions, is_prefill)
+            if self.model_forward_timing_events is not None:
+                forward_start, forward_end = self.model_forward_timing_events[i]
+                forward_start.record()
+                logits = self.run_model(input_ids, positions, is_prefill)
+                forward_end.record()
+            else:
+                logits = self.run_model(input_ids, positions, is_prefill)
 
             tp_rank = get_dist_context().attn_tp_rank
             if tp_rank == 0:
@@ -1076,8 +1102,19 @@ class ModelRunner:
 
         loop_count_token_ids = torch.cat(get_context().token_ids, dim=0).T.tolist()
         reset_context()
+
+        forward_gpu_ms = None
+        if self.model_forward_timing_events is not None:
+            # The tolist() above already waits for the sampled token tensors, so
+            # these events are complete without adding another CUDA synchronize.
+            forward_gpu_ms = [
+                start.elapsed_time(end)
+                for start, end in self.model_forward_timing_events[:loop_count]
+            ]
         worker_end_time = time.time()
 
+        if forward_gpu_ms is not None:
+            return loop_count_token_ids, worker_end_time, forward_gpu_ms
         return loop_count_token_ids, worker_end_time
 
     @torch.inference_mode()

@@ -11,6 +11,9 @@ from ray.util.placement_group import placement_group, remove_placement_group
 from nanodeploy.config import Config
 
 from nanodeploy.endpoint.rpc_endpoint import RPCServerEndpoint
+from nanodeploy.engine.model_forward_timing import (
+    summarize_model_forward_gpu_timings,
+)
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.worker.kv_p2p import KVCacheP2PMove, KVCacheP2PResult
@@ -127,7 +130,10 @@ class RayExecutor:
         self.placement_groups = []
         assert config.attn_world_size == config.ffn_world_size
         worker_env_vars = {}
-        for env_name in ("SLIME_QP_NUM",):
+        for env_name in (
+            "SLIME_QP_NUM",
+            "NANODEPLOY_LOG_MODEL_FORWARD_TIMING",
+        ):
             if env_name in os.environ:
                 worker_env_vars[env_name] = os.environ[env_name]
         worker_runtime_env = (
@@ -289,17 +295,56 @@ class RayExecutor:
 
         token_ids_list = []
         worker_end_times = []
+        model_forward_gpu_timings = []
         for res in results:
-            if isinstance(res, tuple) and len(res) == 2:
+            if isinstance(res, tuple) and len(res) in (2, 3):
                 token_ids_list.append(res[0])
                 worker_end_times.append(res[1])
+                if len(res) == 3:
+                    model_forward_gpu_timings.append(list(res[2]))
             else:
                 token_ids_list.append(res)
-        
+
+        model_forward_summary = None
+        if model_forward_gpu_timings:
+            if len(model_forward_gpu_timings) != len(results):
+                logger.warning(
+                    "Ignoring incomplete model forward GPU timings: got %s of %s ranks",
+                    len(model_forward_gpu_timings),
+                    len(results),
+                )
+            else:
+                model_forward_summary = summarize_model_forward_gpu_timings(
+                    model_forward_gpu_timings
+                )
+                if model_forward_summary is None:
+                    logger.warning(
+                        "Ignoring model forward GPU timings with inconsistent loop counts"
+                    )
+
         if worker_end_times:
             # Output Transfer Latency = Driver Recv Time - Max Worker Finish Time
             output_transfer_latency = (recv_timestamp - max(worker_end_times)) * 1000
-            logger.info(f"[METRIC] Output Transfer Latency: {output_transfer_latency:.4f} ms")
+            metric = (
+                f"[METRIC] Output Transfer Latency: "
+                f"{output_transfer_latency:.4f} ms"
+            )
+            if model_forward_summary is not None:
+                metric += (
+                    f", model_forward_gpu_ms: "
+                    f"{model_forward_summary['critical_path_ms']:.4f}, "
+                    f"model_forward_gpu_per_loop_ms: "
+                    f"{model_forward_summary['per_loop_ms']:.4f}, "
+                    f"model_forward_gpu_rank_mean_ms: "
+                    f"{model_forward_summary['rank_mean_total_ms']:.4f}, "
+                    f"model_forward_gpu_rank_min_ms: "
+                    f"{model_forward_summary['rank_min_total_ms']:.4f}, "
+                    f"model_forward_gpu_rank_max_ms: "
+                    f"{model_forward_summary['rank_max_total_ms']:.4f}, "
+                    f"model_forward_gpu_loop_count: "
+                    f"{model_forward_summary['loop_count']}"
+                )
+            logger.info(metric)
 
         return token_ids_list
 
