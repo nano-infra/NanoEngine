@@ -151,6 +151,37 @@ def _weighted_relu_mqa_scores(
     return scores
 
 
+def _expand_decode_context_lens(
+    context_lens: torch.Tensor, next_n: int
+) -> torch.Tensor:
+    """Return DeepGEMM's ``[batch, next_n]`` context-length layout.
+
+    ``context_lens`` contains the length after the last query token.  For
+    multi-token decode (MTP, or an inactive DP rank's dummy batch), each query
+    needs its own causal length.  DeepGEMM specializes both its metadata and
+    logits kernel on ``next_n``, so passing ``[batch, 1]`` metadata with a
+    ``[batch, next_n, ...]`` query is invalid.
+    """
+    if context_lens.dim() == 1:
+        context_lens = context_lens[:, None]
+    if context_lens.dim() != 2 or context_lens.shape[1] not in (1, next_n):
+        raise ValueError(
+            "Indexer context_lens must have shape [batch], [batch, 1], or "
+            f"[batch, next_n]; got {tuple(context_lens.shape)} for next_n={next_n}"
+        )
+    if context_lens.shape[1] == next_n:
+        return context_lens.to(torch.int32)
+
+    offsets = torch.arange(
+        next_n - 1,
+        -1,
+        -1,
+        dtype=context_lens.dtype,
+        device=context_lens.device,
+    )
+    return (context_lens - offsets).clamp_min(1).to(torch.int32)
+
+
 class IndexerCache:
     """Per-layer FP8 cache for indexer keys.
 
@@ -892,9 +923,9 @@ class Indexer(nn.Module):
         # (block_tables.shape[-1] * page_size is constant per captured graph).
         max_context_len = block_tables.shape[-1] * page_size
         context_lens_i32 = context_lens.to(torch.int32)
-        context_lens_for_gemm = context_lens_i32
-        if context_lens_for_gemm.dim() == 1:
-            context_lens_for_gemm = context_lens_for_gemm[:, None]
+        context_lens_for_gemm = _expand_decode_context_lens(
+            context_lens_i32, ntps
+        )
 
         # All layers share this schedule. The model builds it once per forward;
         # retain the fallback for standalone Indexer calls and tests.
@@ -925,11 +956,7 @@ class Indexer(nn.Module):
                 raise ValueError("topk_page_size is required when translate_topk=True")
             from dlengine.kernel.jit.sgl.deepseek_v4 import topk_transform
 
-            seq_lens = (
-                context_lens_i32
-                if ntps == 1
-                else context_lens_i32.repeat_interleave(ntps)
-            )
+            seq_lens = context_lens_for_gemm.reshape(-1)
             page_tables = (
                 block_tables
                 if ntps == 1
@@ -954,7 +981,7 @@ class Indexer(nn.Module):
 
         # Portable fallback: explicitly clean the logits because DeepGEMM cannot
         # enable clean_logits for 2D context_lens.
-        ctx_expanded = context_lens_i32.repeat_interleave(ntps).unsqueeze(1)
+        ctx_expanded = context_lens_for_gemm.reshape(-1, 1)
         logit_positions = torch.arange(max_context_len, device=logits.device).unsqueeze(
             0
         )

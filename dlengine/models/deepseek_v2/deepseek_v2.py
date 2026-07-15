@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -36,6 +37,103 @@ from dlengine.worker.runner_config import get_runner_config
 from ..quant_config import QuantizationConfig
 
 logger = get_logger()
+
+
+def _get_indexer_mode(config, layer_idx: int) -> str:
+    """Return ``full``, ``shared`` or ``none`` for an attention layer.
+
+    GLM-5.2 checkpoints carry an explicit per-backbone-layer
+    ``indexer_types`` schedule.  Older DSA checkpoints instead describe the
+    same schedule with ``index_topk_pattern`` or
+    ``index_topk_freq``/``index_skip_topk_offset``.  MTP layers are always
+    constructed with a full indexer; runtime sharing between MTP iterations is
+    a separate concern.
+    """
+    if not hasattr(config, "index_topk"):
+        return "none"
+
+    num_hidden_layers = int(getattr(config, "num_hidden_layers", 0))
+    if layer_idx >= num_hidden_layers:
+        return "full"
+
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        if len(indexer_types) != num_hidden_layers:
+            raise ValueError(
+                "indexer_types must contain one entry per backbone layer: "
+                f"got {len(indexer_types)} entries for {num_hidden_layers} layers"
+            )
+        mode = str(indexer_types[layer_idx]).lower()
+        if mode not in ("full", "shared"):
+            raise ValueError(
+                f"Unsupported indexer_types[{layer_idx}]={indexer_types[layer_idx]!r}"
+            )
+        return mode
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None and layer_idx < len(pattern):
+        marker = pattern[layer_idx]
+        if isinstance(marker, str):
+            marker = marker.upper()
+            if marker in ("S", "SHARED"):
+                return "shared"
+            if marker in ("F", "FULL"):
+                return "full"
+        raise ValueError(f"Unsupported index_topk_pattern[{layer_idx}]={marker!r}")
+
+    freq = max(int(getattr(config, "index_topk_freq", 1) or 1), 1)
+    offset = int(getattr(config, "index_skip_topk_offset", 2) or 0)
+    skip_topk = max(layer_idx - offset + 1, 0) % freq != 0
+    return "shared" if skip_topk else "full"
+
+
+@dataclass
+class _IndexerTopKState:
+    """TopK selection shared by consecutive GLM-5.2 attention layers."""
+
+    logical_indices: torch.Tensor | None = None
+    physical_indices: torch.Tensor | None = None
+    source_layer: int | None = None
+
+    def publish(
+        self,
+        layer_idx: int,
+        logical_indices: torch.Tensor,
+        physical_indices: torch.Tensor | None = None,
+    ) -> None:
+        self.logical_indices = logical_indices
+        self.physical_indices = physical_indices
+        self.source_layer = layer_idx
+
+    def require(
+        self,
+        layer_idx: int,
+        num_tokens: int,
+        topk: int,
+        *,
+        require_physical: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        logical = self.logical_indices
+        if logical is None or self.source_layer is None:
+            raise RuntimeError(
+                f"Shared indexer layer {layer_idx} has no TopK from a preceding full layer"
+            )
+        expected = (num_tokens, topk)
+        if tuple(logical.shape) != expected:
+            raise RuntimeError(
+                f"Shared indexer layer {layer_idx} received stale TopK shape "
+                f"{tuple(logical.shape)} from layer {self.source_layer}; expected {expected}"
+            )
+        physical = self.physical_indices
+        if require_physical and (
+            physical is None or tuple(physical.shape) != expected
+        ):
+            shape = None if physical is None else tuple(physical.shape)
+            raise RuntimeError(
+                f"Shared indexer layer {layer_idx} received invalid physical TopK "
+                f"shape {shape} from layer {self.source_layer}; expected {expected}"
+            )
+        return logical, physical
 
 # Varlen attention func for non-absorbed MLA prefill, resolved once.
 # FA3 (``flash_attn_interface``) supports arbitrary head dims (incl. 256/256)
@@ -428,6 +526,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        indexer_state: _IndexerTopKState | None = None,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         if residual is None:
             residual = hidden_states
@@ -436,7 +535,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         # Self Attention
 
-        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = self.self_attn(
+            positions, hidden_states, indexer_state=indexer_state
+        )
 
         # Fully Connected
 
@@ -496,16 +597,34 @@ class DeepseekV2Model(nn.Module):
                 None,
             )
             if indexer is not None:
-                ntps = context.num_tokens_per_seq
-                batch_size = input_ids.numel() // ntps
+                from dlengine.layers.indexer import _expand_decode_context_lens
+
+                sp_rank = get_dist_context().attn_sp_rank
+                nominal_bs = input_ids.numel() // context.num_tokens_per_seq
+                context_lens = context.context_lens[sp_rank, :nominal_bs]
+                if context_lens.numel() == 0 or (
+                    input_ids.numel() % context_lens.numel()
+                ):
+                    raise RuntimeError(
+                        "Indexer decode batch shape mismatch: "
+                        f"tokens={input_ids.numel()}, "
+                        f"context_lens={tuple(context_lens.shape)}"
+                    )
+                effective_ntps = input_ids.numel() // context_lens.numel()
                 context.indexer_schedule_meta = indexer.build_schedule_metadata(
-                    context.context_lens[0, :batch_size]
+                    _expand_decode_context_lens(context_lens, effective_ntps)
                 )
 
         hidden_states = self.embed_tokens(input_ids)
         residual = None
+        indexer_state = _IndexerTopKState()
         for idx, decoder_layer in enumerate(self.layers):
-            hidden_states, residual = decoder_layer(hidden_states, positions, residual)
+            hidden_states, residual = decoder_layer(
+                hidden_states,
+                positions,
+                residual,
+                indexer_state=indexer_state,
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -569,6 +688,7 @@ class DeepseekV2Attention(nn.Module):
     """Deepseekv2 attention."""
 
     _cache_aware_prefill_logged = False
+    _shared_indexer_logged = False
 
     def __init__(
         self,
@@ -587,12 +707,15 @@ class DeepseekV2Attention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.index_topk = int(getattr(config, "index_topk", 0) or 0)
         self.enable_mla_reference_fallback = getattr(
             config, "enable_mla_reference_fallback", False
         )
         # For MLA, effective num_kv_heads is 1 (single compressed KV representation)
         num_key_value_heads = 1
         self.is_v32 = hasattr(config, "index_topk")
+        self.indexer_mode = _get_indexer_mode(config, layer_idx)
+        self.skip_topk = self.indexer_mode == "shared"
 
         if self.q_lora_rank is None:
             self.q_proj: (
@@ -692,7 +815,7 @@ class DeepseekV2Attention(nn.Module):
         )
 
         # NSA Indexer (V3.2 only)
-        if self.is_v32:
+        if self.is_v32 and not self.skip_topk:
             from dlengine.layers.indexer import Indexer
 
             self.indexer = Indexer(
@@ -931,6 +1054,7 @@ class DeepseekV2Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        indexer_state: _IndexerTopKState | None = None,
     ):
         """Forward with separate prefill (non-absorbed) and decode (absorbed) paths."""
         num_heads = self.num_heads
@@ -1011,10 +1135,14 @@ class DeepseekV2Attention(nn.Module):
             # prefill scores cached-prefix indexer keys plus causal fresh keys,
             # and sparse MLA consumes the same cached+fresh ragged K layout.
             # Prefill is eager, so reading ``total_cached`` on the host is safe.
+            has_full_indexer = (
+                self.indexer is not None and self.indexer.indexer_cache is not None
+            )
+            has_shared_indexer = self.skip_topk and indexer_state is not None
             nsa_prefill = (
                 _NSA_SPARSE_PREFILL
-                and self.indexer is not None
-                and self.indexer.indexer_cache is not None
+                and self.is_v32
+                and (has_full_indexer or has_shared_indexer)
                 and context.cu_seqlens_q is not None
             )
             total_cached = 0
@@ -1038,16 +1166,15 @@ class DeepseekV2Attention(nn.Module):
                 can_sparse_chunk = total_cached == 0 or has_cache_metadata
                 if (
                     can_sparse_chunk
-                    and max_sparse_len > self.indexer.index_topk
+                    and max_sparse_len > self.index_topk
                     and _sparse_prefill_supported(
                         num_heads,
-                        self.indexer.index_topk,
+                        self.index_topk,
                         self.kv_lora_rank + self.qk_rope_head_dim,
                     )
                 ):
-                    if self.q_lora_rank is None:
-                        q_lora = None
-                    else:
+                    q_lora = None
+                    if has_full_indexer and self.q_lora_rank is not None:
                         q_lora = self.q_a_layernorm(self.q_a_proj(hidden_states))
                     # Absorbed query: q_nope @ W_UK -> (q_len, H, 512), + RoPE'd q_pe.
                     query_states = hidden_states.new_empty(
@@ -1057,14 +1184,7 @@ class DeepseekV2Attention(nn.Module):
                     query_states[..., self.kv_lora_rank :] = q_pe
 
                     key_states_for_sparse = key_states_3d
-                    if total_cached == 0:
-                        topk_indices = self.indexer.compute_prefill_topk(
-                            q_lora,
-                            hidden_states,
-                            positions,
-                            context.cu_seqlens_q,
-                        )
-                    else:
+                    if total_cached > 0:
                         sp_rank = get_dist_context().attn_sp_rank
                         num_seqs = context.cu_seqlens_k.shape[0] - 1
                         block_table = context.block_tables[sp_rank, :num_seqs, :]
@@ -1101,23 +1221,53 @@ class DeepseekV2Attention(nn.Module):
                                 context.cu_seqlens_k,
                             )
 
-                        topk_indices = self.indexer.compute_prefill_topk_cache_aware(
-                            q_lora,
-                            hidden_states,
-                            positions,
-                            context.cu_seqlens_q,
-                            context.cu_seqlens_k,
-                            block_table,
+                    if self.skip_topk:
+                        topk_indices, _ = indexer_state.require(
+                            self.layer_idx,
+                            q_len,
+                            self.index_topk,
+                            require_physical=False,
                         )
-                        if not type(self)._cache_aware_prefill_logged:
+                        if not type(self)._shared_indexer_logged:
                             logger.info(
-                                "Using cache-aware NSA sparse chunk prefill: "
-                                "cached_tokens=%d, fresh_tokens=%d, topk=%d",
-                                total_cached,
+                                "Reusing shared NSA TopK: layer=%d, "
+                                "source_layer=%d, tokens=%d, topk=%d",
+                                self.layer_idx,
+                                indexer_state.source_layer,
                                 q_len,
-                                self.indexer.index_topk,
+                                self.index_topk,
                             )
-                            type(self)._cache_aware_prefill_logged = True
+                            type(self)._shared_indexer_logged = True
+                    else:
+                        if total_cached == 0:
+                            topk_indices = self.indexer.compute_prefill_topk(
+                                q_lora,
+                                hidden_states,
+                                positions,
+                                context.cu_seqlens_q,
+                            )
+                        else:
+                            topk_indices = (
+                                self.indexer.compute_prefill_topk_cache_aware(
+                                    q_lora,
+                                    hidden_states,
+                                    positions,
+                                    context.cu_seqlens_q,
+                                    context.cu_seqlens_k,
+                                    block_table,
+                                )
+                            )
+                            if not type(self)._cache_aware_prefill_logged:
+                                logger.info(
+                                    "Using cache-aware NSA sparse chunk prefill: "
+                                    "cached_tokens=%d, fresh_tokens=%d, topk=%d",
+                                    total_cached,
+                                    q_len,
+                                    self.index_topk,
+                                )
+                                type(self)._cache_aware_prefill_logged = True
+                        if indexer_state is not None:
+                            indexer_state.publish(self.layer_idx, topk_indices)
 
                     out, _, _ = sparse_fwd(
                         query_states,  # (s_q, H, 576)
@@ -1297,47 +1447,85 @@ class DeepseekV2Attention(nn.Module):
 
             # Run NSA Indexer (V3.2 only) — compute topk block indices
             sparse_indices = None
+            has_full_indexer = (
+                self.indexer is not None and self.indexer.indexer_cache is not None
+            )
+            has_shared_indexer = self.skip_topk and indexer_state is not None
+            has_decode_pages = (
+                context.block_tables is not None
+                and context.block_tables.dim() == 3
+                and context.block_tables.shape[1] > 0
+                and context.block_tables.shape[2] > 0
+            )
             if (
-                self.indexer is not None
-                and self.indexer.indexer_cache is not None
-                and self.attn_fwd.k_cache.dtype == torch.float8_e4m3fn
+                self.attn_fwd.k_cache.dtype == torch.float8_e4m3fn
+                and (has_full_indexer or has_shared_indexer)
+                and has_decode_pages
             ):
                 from dlengine.layers.hopper.attention import topk_indices_to_physical
 
                 sp_rank = get_dist_context().attn_sp_rank
-                ntps = context.num_tokens_per_seq
+                nominal_ntps = context.num_tokens_per_seq
                 total_tokens = hidden_states.size(0)
-                bs = total_tokens // ntps
-                ctx_lens = context.context_lens[0, :bs]
+                requested_bs = total_tokens // nominal_ntps
+                ctx_lens = context.context_lens[sp_rank, :requested_bs]
+                # Inactive attention-DP ranks run a multi-token dummy batch,
+                # while context_lens still has one dummy sequence row.  The
+                # DeepGEMM query then uses next_n > 1 for that single row; its
+                # block table must have the same effective batch dimension.
+                bs = ctx_lens.shape[0]
+                ntps = total_tokens // bs
                 bt = context.block_tables[sp_rank, :bs]
                 k_cache = self.attn_fwd.k_cache
                 block_size = k_cache.shape[1]
-                use_fused_topk = fused_kernels_enabled() and (
-                    self.indexer.index_topk in (512, 2048)
-                )
-                topk_result = self.indexer(
-                    hidden_states,
-                    q_lora,
-                    positions,
-                    ctx_lens,
-                    bt,
-                    context.slot_mapping,
-                    translate_topk=use_fused_topk,
-                    topk_page_size=block_size,
-                )
-                if use_fused_topk:
-                    topk_indices, sparse_indices = topk_result
-                else:
-                    topk_indices = topk_result
-                    # Convert logical token indices → physical paged indices.
-                    # For ntps>1 (lazy verify), repeat bt per token.
-                    if ntps > 1:
-                        bt_expanded = bt.repeat_interleave(ntps, dim=0)
-                    else:
-                        bt_expanded = bt
-                    sparse_indices = topk_indices_to_physical(
-                        topk_indices, bt_expanded, block_size
+                if self.skip_topk:
+                    topk_indices, sparse_indices = indexer_state.require(
+                        self.layer_idx,
+                        total_tokens,
+                        self.index_topk,
+                        require_physical=True,
                     )
+                    if not type(self)._shared_indexer_logged:
+                        logger.info(
+                            "Reusing shared NSA TopK: layer=%d, "
+                            "source_layer=%d, tokens=%d, topk=%d",
+                            self.layer_idx,
+                            indexer_state.source_layer,
+                            total_tokens,
+                            self.index_topk,
+                        )
+                        type(self)._shared_indexer_logged = True
+                else:
+                    use_fused_topk = fused_kernels_enabled() and (
+                        self.index_topk in (512, 2048)
+                    )
+                    topk_result = self.indexer(
+                        hidden_states,
+                        q_lora,
+                        positions,
+                        ctx_lens,
+                        bt,
+                        context.slot_mapping,
+                        translate_topk=use_fused_topk,
+                        topk_page_size=block_size,
+                    )
+                    if use_fused_topk:
+                        topk_indices, sparse_indices = topk_result
+                    else:
+                        topk_indices = topk_result
+                        # Convert logical token indices → physical paged indices.
+                        # For ntps>1 (lazy verify), repeat bt per token.
+                        if ntps > 1:
+                            bt_expanded = bt.repeat_interleave(ntps, dim=0)
+                        else:
+                            bt_expanded = bt
+                        sparse_indices = topk_indices_to_physical(
+                            topk_indices, bt_expanded, block_size
+                        )
+                    if indexer_state is not None:
+                        indexer_state.publish(
+                            self.layer_idx, topk_indices, sparse_indices
+                        )
                 if getattr(self.config, "enable_hisparse", False):
                     from dlengine.context_v2.cache.hisparse import (
                         get_hisparse_context,
