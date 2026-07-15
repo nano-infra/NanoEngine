@@ -67,6 +67,13 @@ def test_ls_decode_core_supported_configuration(tmp_path):
 
 def test_kv_consolidation_p2p_scratch_is_opt_in(tmp_path):
     config = Config(model=str(tmp_path), **_ls_kwargs())
+    assert config.ls_kv_consolidation_mode == "off"
+    assert config.ls_kv_consolidation_candidate_util == 0.50
+    assert config.ls_kv_consolidation_target_high_watermark == 0.80
+    assert config.ls_kv_consolidation_stable_steps == 32
+    assert config.ls_kv_consolidation_cooldown_steps == 64
+    assert config.ls_kv_consolidation_check_interval_steps == 8
+    assert config.ls_kv_consolidation_max_source_blocks_per_event == 0
     assert config.ls_kv_consolidation_migration_chunk_tokens == 0
 
     enabled = Config(
@@ -81,6 +88,66 @@ def test_kv_consolidation_p2p_scratch_is_opt_in(tmp_path):
             model=str(tmp_path),
             **_ls_kwargs(),
             ls_kv_consolidation_migration_chunk_tokens=-1,
+        )
+
+
+def test_kv_consolidation_shadow_and_execute_validation(tmp_path):
+    shadow = Config(
+        model=str(tmp_path),
+        **_ls_kwargs(),
+        ls_kv_consolidation_mode="shadow",
+    )
+    assert shadow.ls_kv_consolidation_mode == "shadow"
+
+    with pytest.raises(ValueError, match="migration_chunk_tokens > 0"):
+        Config(
+            model=str(tmp_path),
+            **_ls_kwargs(),
+            ls_kv_consolidation_mode="execute",
+        )
+
+    with pytest.raises(ValueError, match="max_source_blocks_per_event > 0"):
+        Config(
+            model=str(tmp_path),
+            **_ls_kwargs(),
+            ls_kv_consolidation_mode="execute",
+            ls_kv_consolidation_migration_chunk_tokens=128,
+        )
+
+    execute = Config(
+        model=str(tmp_path),
+        **_ls_kwargs(),
+        ls_kv_consolidation_mode="execute",
+        ls_kv_consolidation_migration_chunk_tokens=128,
+        ls_kv_consolidation_max_source_blocks_per_event=16,
+    )
+    assert execute.ls_kv_consolidation_mode == "execute"
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"ls_kv_consolidation_candidate_util": 0.0}, r"must be in \(0, 1\]"),
+        ({"ls_kv_consolidation_candidate_util": 1.1}, r"must be in \(0, 1\]"),
+        ({"ls_kv_consolidation_target_high_watermark": 0.0}, r"must be in \(0, 1\]"),
+        ({"ls_kv_consolidation_target_high_watermark": 1.1}, r"must be in \(0, 1\]"),
+        ({"ls_kv_consolidation_stable_steps": 0}, "must be > 0"),
+        ({"ls_kv_consolidation_cooldown_steps": -1}, "must be >= 0"),
+        ({"ls_kv_consolidation_check_interval_steps": 0}, "must be > 0"),
+        ({"ls_kv_consolidation_max_source_blocks_per_event": -1}, "must be >= 0"),
+    ],
+)
+def test_kv_consolidation_threshold_validation(tmp_path, override, message):
+    with pytest.raises(ValueError, match=message):
+        Config(model=str(tmp_path), kvcache_block_size=64, **override)
+
+
+def test_kv_consolidation_non_off_mode_requires_ls_scheduler(tmp_path):
+    with pytest.raises(ValueError, match="requires enable_ls_decode_core_scheduler"):
+        Config(
+            model=str(tmp_path),
+            kvcache_block_size=64,
+            ls_kv_consolidation_mode="shadow",
         )
 
 

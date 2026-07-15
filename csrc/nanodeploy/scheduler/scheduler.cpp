@@ -83,7 +83,14 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                ls_decode_initial_kv_dop,
                      int                ls_decode_batch_per_master,
                      bool               ls_decode_enable_memory_scale_up,
-                     const std::string& scheduler_mode):
+                     const std::string& scheduler_mode,
+                     const std::string& ls_kv_consolidation_mode,
+                     double             ls_kv_consolidation_candidate_util,
+                     double             ls_kv_consolidation_target_high_watermark,
+                     int                ls_kv_consolidation_stable_steps,
+                     int                ls_kv_consolidation_cooldown_steps,
+                     int                ls_kv_consolidation_check_interval_steps,
+                     int                ls_kv_consolidation_max_source_blocks_per_event):
     engine_id_(engine_id),
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
@@ -106,8 +113,35 @@ Scheduler::Scheduler(const std::string& engine_id,
     ls_decode_initial_kv_dop_(ls_decode_initial_kv_dop),
     ls_decode_batch_per_master_(ls_decode_batch_per_master),
     ls_decode_enable_memory_scale_up_(ls_decode_enable_memory_scale_up),
+    ls_kv_consolidation_mode_(ls_kv_consolidation_mode),
+    ls_kv_consolidation_candidate_util_(ls_kv_consolidation_candidate_util),
+    ls_kv_consolidation_target_high_watermark_(ls_kv_consolidation_target_high_watermark),
+    ls_kv_consolidation_stable_steps_(ls_kv_consolidation_stable_steps),
+    ls_kv_consolidation_cooldown_steps_(ls_kv_consolidation_cooldown_steps),
+    ls_kv_consolidation_check_interval_steps_(ls_kv_consolidation_check_interval_steps),
+    ls_kv_consolidation_max_source_blocks_per_event_(ls_kv_consolidation_max_source_blocks_per_event),
     sp_master_selector_(sp_master_selector)
 {
+    if (ls_kv_consolidation_mode_ != "off" && ls_kv_consolidation_mode_ != "shadow"
+        && ls_kv_consolidation_mode_ != "execute") {
+        throw std::invalid_argument("ls_kv_consolidation_mode must be one of: off, shadow, execute");
+    }
+    if (ls_kv_consolidation_mode_ != "off" && !enable_ls_decode_core_scheduler_) {
+        throw std::invalid_argument("automatic KV consolidation requires the LS Decode core scheduler");
+    }
+    if (!(ls_kv_consolidation_candidate_util_ > 0.0 && ls_kv_consolidation_candidate_util_ <= 1.0)) {
+        throw std::invalid_argument("ls_kv_consolidation_candidate_util must be in (0, 1]");
+    }
+    if (!(ls_kv_consolidation_target_high_watermark_ > 0.0 && ls_kv_consolidation_target_high_watermark_ <= 1.0)) {
+        throw std::invalid_argument("ls_kv_consolidation_target_high_watermark must be in (0, 1]");
+    }
+    if (ls_kv_consolidation_stable_steps_ <= 0 || ls_kv_consolidation_cooldown_steps_ < 0
+        || ls_kv_consolidation_check_interval_steps_ <= 0 || ls_kv_consolidation_max_source_blocks_per_event_ < 0) {
+        throw std::invalid_argument("invalid automatic KV consolidation step threshold");
+    }
+    if (ls_kv_consolidation_mode_ == "execute" && ls_kv_consolidation_max_source_blocks_per_event_ == 0) {
+        throw std::invalid_argument("automatic KV consolidation execute requires a positive source-block budget");
+    }
     Sequence::block_size = kvcache_block_size;
     // Initialize worker states
     worker_state.reserve(attention_dp_);
@@ -171,6 +205,9 @@ Scheduler::Scheduler(const std::string& engine_id,
 
 void Scheduler::add(std::shared_ptr<Sequence> seq)
 {
+    if (active_ls_kv_transaction_) {
+        throw std::runtime_error("cannot add a sequence while an LS KV scale-down transaction is reserved");
+    }
     seq->active(engine_id_, attention_sp_, attention_dp_);
 
     if (seq->metric) {
@@ -491,6 +528,9 @@ bool Scheduler::commit_ls_kv_scale_down(const std::shared_ptr<SPStateManager::LS
     group.last_iteration_masters.erase(
         std::remove(group.last_iteration_masters.begin(), group.last_iteration_masters.end(), plan->source_rank),
         group.last_iteration_masters.end());
+    group.kv_candidate_target_dop   = -1;
+    group.kv_candidate_stable_steps = 0;
+    group.last_consolidation_step   = ls_schedule_step_;
     active_ls_kv_transaction_.reset();
     return true;
 }
@@ -502,6 +542,195 @@ void Scheduler::abort_ls_kv_scale_down(const std::shared_ptr<SPStateManager::LSK
     }
     worker_state.at(plan->dp_idx)->abort_kv_consolidation(plan);
     active_ls_kv_transaction_.reset();
+}
+
+bool Scheduler::_ls_kv_consolidation_watermark_ok(
+    const std::shared_ptr<SPStateManager::LSKVConsolidationPlan>& plan) const
+{
+    if (!plan || !plan->success || plan->dp_idx < 0 || plan->dp_idx >= attention_dp_) {
+        return false;
+    }
+    for (int rank : plan->retained_ranks) {
+        const auto& manager = worker_state.at(plan->dp_idx)->block_manager.at(rank);
+        int         total   = static_cast<int>(manager->blocks().size());
+        if (total <= 0) {
+            return false;
+        }
+        double utilization = static_cast<double>(total - manager->num_free_blocks()) / static_cast<double>(total);
+        if (utilization > ls_kv_consolidation_target_high_watermark_) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void Scheduler::_populate_ls_kv_consolidation_telemetry(ScheduleResult& result) const
+{
+    result.ls_kv_consolidation_candidate       = ls_step_kv_candidate_;
+    result.ls_kv_consolidation_group_id        = ls_step_kv_group_id_;
+    result.ls_kv_consolidation_source_rank     = ls_step_kv_source_rank_;
+    result.ls_kv_consolidation_target_dop      = ls_step_kv_target_dop_;
+    result.ls_kv_consolidation_stable_steps    = ls_step_kv_stable_steps_;
+    result.ls_kv_consolidation_group_util      = ls_step_kv_group_util_;
+    result.ls_kv_consolidation_decision_reason = ls_step_kv_decision_reason_;
+}
+
+std::shared_ptr<SPStateManager::LSKVConsolidationPlan> Scheduler::_maybe_plan_ls_kv_consolidation()
+{
+    if (ls_kv_consolidation_mode_ == "off") {
+        ls_step_kv_decision_reason_ = "off";
+        return nullptr;
+    }
+    if (!ls_pending_decode_batches_.empty()) {
+        for (auto& [group_id, group] : ls_groups_) {
+            (void)group_id;
+            group.kv_candidate_target_dop   = -1;
+            group.kv_candidate_stable_steps = 0;
+        }
+        ls_step_kv_decision_reason_ = "pending_admission_not_proven";
+        return nullptr;
+    }
+
+    _reconcile_ls_groups();
+
+    struct Candidate {
+        uint64_t         group_id     = 0;
+        int              dp_idx       = -1;
+        int              target_dop   = -1;
+        double           utilization  = 0.0;
+        uint64_t         stable_steps = 0;
+        std::vector<int> source_ranks;
+    };
+    std::vector<Candidate> candidates;
+
+    auto group_ids = get_ls_group_ids();
+    for (uint64_t group_id : group_ids) {
+        auto& group       = ls_groups_.at(group_id);
+        auto  used_blocks = worker_state.at(group.dp_idx)->group_used_kv_blocks(group.sequences);
+        auto  used_tokens = worker_state.at(group.dp_idx)->group_used_kv_tokens(group.sequences);
+
+        std::vector<int> participants;
+        int64_t          used_block_sum   = 0;
+        int64_t          usable_block_sum = 0;
+        for (int rank : group.allocated_attention_ranks) {
+            if (rank >= 0 && rank < attention_sp_ && used_blocks.at(rank) > 0) {
+                participants.push_back(rank);
+                used_block_sum += used_blocks[rank];
+                usable_block_sum += ls_empty_system_free_blocks_per_rank_.at(rank);
+            }
+        }
+
+        int real_batch =
+            static_cast<int>(std::count_if(group.sequences.begin(), group.sequences.end(), [](const auto& sequence) {
+                return sequence && sequence->status == SequenceStatus::RUNNING;
+            }));
+        int    target_dop  = std::max(1, (real_batch + ls_decode_batch_per_master_ - 1) / ls_decode_batch_per_master_);
+        double utilization = usable_block_sum > 0 ? static_cast<double>(used_block_sum) / usable_block_sum : 1.0;
+
+        bool has_unreclaimed_empty_rank = participants.size() != group.allocated_attention_ranks.size();
+        bool below_candidate_threshold  = utilization < ls_kv_consolidation_candidate_util_;
+        bool dop_can_shrink             = static_cast<int>(participants.size()) > target_dop;
+        if (real_batch == 0 || has_unreclaimed_empty_rank || !below_candidate_threshold || !dop_can_shrink) {
+            group.kv_candidate_target_dop   = -1;
+            group.kv_candidate_stable_steps = 0;
+            continue;
+        }
+
+        std::vector<int> sources;
+        for (int rank : participants) {
+            bool active_or_pending_master = std::any_of(
+                group.sequences.begin(), group.sequences.end(), [&](const std::shared_ptr<Sequence>& sequence) {
+                    if (!sequence || sequence->status != SequenceStatus::RUNNING) {
+                        return false;
+                    }
+                    const auto& context = sequence->block_ctx(BlockContextSlot::ACTIVE);
+                    return context.master_sp_idx_ == rank
+                           || (context.pending_token_present_ && context.pending_token_target_sp_ == rank);
+                });
+            if (!active_or_pending_master) {
+                sources.push_back(rank);
+            }
+        }
+        std::sort(sources.begin(), sources.end(), [&](int lhs, int rhs) {
+            return std::tie(used_blocks[lhs], used_tokens[lhs], lhs)
+                   < std::tie(used_blocks[rhs], used_tokens[rhs], rhs);
+        });
+        if (sources.empty()) {
+            group.kv_candidate_target_dop   = -1;
+            group.kv_candidate_stable_steps = 0;
+            continue;
+        }
+        if (group.kv_candidate_target_dop == target_dop) {
+            group.kv_candidate_stable_steps++;
+        }
+        else {
+            group.kv_candidate_target_dop   = target_dop;
+            group.kv_candidate_stable_steps = 1;
+        }
+        candidates.push_back(
+            {group_id, group.dp_idx, target_dop, utilization, group.kv_candidate_stable_steps, std::move(sources)});
+    }
+
+    if (candidates.empty()) {
+        ls_step_kv_decision_reason_ = "no_candidate";
+        return nullptr;
+    }
+
+    bool check_due = ls_schedule_step_ % static_cast<uint64_t>(ls_kv_consolidation_check_interval_steps_) == 0;
+    for (const auto& candidate : candidates) {
+        const auto& group        = ls_groups_.at(candidate.group_id);
+        ls_step_kv_candidate_    = true;
+        ls_step_kv_group_id_     = static_cast<int64_t>(candidate.group_id);
+        ls_step_kv_source_rank_  = candidate.source_ranks.front();
+        ls_step_kv_target_dop_   = candidate.target_dop;
+        ls_step_kv_stable_steps_ = candidate.stable_steps;
+        ls_step_kv_group_util_   = candidate.utilization;
+
+        if (candidate.stable_steps < static_cast<uint64_t>(ls_kv_consolidation_stable_steps_)) {
+            ls_step_kv_decision_reason_ = "stable_window";
+            continue;
+        }
+        uint64_t cooldown = static_cast<uint64_t>(ls_kv_consolidation_cooldown_steps_);
+        if (ls_schedule_step_ < group.last_scale_up_step + cooldown
+            || ls_schedule_step_ < group.last_consolidation_step + cooldown) {
+            ls_step_kv_decision_reason_ = "cooldown";
+            continue;
+        }
+        if (!check_due) {
+            ls_step_kv_decision_reason_ = "check_interval";
+            continue;
+        }
+        if (ls_kv_consolidation_mode_ == "shadow") {
+            ls_step_kv_decision_reason_ = "shadow_candidate";
+            return nullptr;
+        }
+
+        for (int source_rank : candidate.source_ranks) {
+            auto plan = plan_ls_kv_scale_down(candidate.group_id, source_rank);
+            if (!plan->success) {
+                ls_step_kv_decision_reason_ = plan->failure_reason;
+                continue;
+            }
+            int source_blocks = 0;
+            for (const auto& stage : plan->sequence_stages) {
+                source_blocks += static_cast<int>(stage.source_blocks.size());
+            }
+            if (source_blocks > ls_kv_consolidation_max_source_blocks_per_event_) {
+                abort_ls_kv_scale_down(plan);
+                ls_step_kv_decision_reason_ = "source_block_budget";
+                continue;
+            }
+            if (!_ls_kv_consolidation_watermark_ok(plan)) {
+                abort_ls_kv_scale_down(plan);
+                ls_step_kv_decision_reason_ = "target_high_watermark";
+                continue;
+            }
+            ls_step_kv_source_rank_     = source_rank;
+            ls_step_kv_decision_reason_ = "execute";
+            return plan;
+        }
+    }
+    return nullptr;
 }
 
 void Scheduler::set_ls_admission_failure_after_allocations_for_test(int value)
@@ -621,6 +850,13 @@ ScheduleResult Scheduler::schedule()
     ls_step_atomic_merge_count_    = 0;
     ls_step_atomic_rollback_count_ = 0;
     ls_step_planning_latency_ms_   = 0.0;
+    ls_step_kv_candidate_          = false;
+    ls_step_kv_group_id_           = -1;
+    ls_step_kv_source_rank_        = -1;
+    ls_step_kv_target_dop_         = -1;
+    ls_step_kv_stable_steps_       = 0;
+    ls_step_kv_group_util_         = 0.0;
+    ls_step_kv_decision_reason_    = ls_kv_consolidation_mode_ == "off" ? "off" : "no_candidate";
     std::vector<std::vector<std::shared_ptr<Sequence>>> dp_seqs;
     bool                                                has_prefill = false;
 
@@ -640,6 +876,18 @@ ScheduleResult Scheduler::schedule()
             }
         }
 
+        if (!has_prefill && enable_ls_decode_core_scheduler_) {
+            auto consolidation_plan = _maybe_plan_ls_kv_consolidation();
+            if (consolidation_plan) {
+                ScheduleResult maintenance;
+                maintenance.action                = ScheduleAction::KV_CONSOLIDATION;
+                maintenance.is_prefill            = false;
+                maintenance.kv_consolidation_plan = std::move(consolidation_plan);
+                _populate_ls_kv_consolidation_telemetry(maintenance);
+                return maintenance;
+            }
+        }
+
         if (!has_prefill) {
             // No prefill sequences, schedule decode
             dp_seqs = enable_ls_decode_core_scheduler_ ? _schedule_ls_decode() : _schedule_decode();
@@ -649,6 +897,7 @@ ScheduleResult Scheduler::schedule()
     ScheduleResult result;
     result.dp_seqs    = dp_seqs;
     result.is_prefill = has_prefill;
+    result.action     = has_prefill ? ScheduleAction::ADMISSION : ScheduleAction::DECODE;
 
     // Prepare dp_sp_seqs and filtered_dp_sp_seqs
     result.dp_sp_seqs.reserve(attention_dp_ * attention_sp_);
@@ -882,6 +1131,8 @@ ScheduleResult Scheduler::schedule()
         result.ls_atomic_admission_merge_count    = ls_step_atomic_merge_count_;
         result.ls_atomic_admission_rollback_count = ls_step_atomic_rollback_count_;
     }
+
+    _populate_ls_kv_consolidation_telemetry(result);
 
     return result;
 }
@@ -1326,6 +1577,9 @@ void Scheduler::_merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id)
     survivor.initial_batch_placements  = std::move(merged_records);
     survivor.sequences                 = std::move(merged_sequences);
     survivor.allocated_attention_ranks = std::move(merged_allocation);
+    survivor.last_scale_up_step        = ls_schedule_step_;
+    survivor.kv_candidate_target_dop   = -1;
+    survivor.kv_candidate_stable_steps = 0;
     for (const auto& seq : removed.sequences) {
         ls_seq_to_group_[seq->seq_id] = survivor_id;
     }
@@ -1369,6 +1623,8 @@ void Scheduler::_remove_seq_from_ls_group(uint64_t seq_id, bool clear_batch_owne
     seqs.erase(std::remove_if(seqs.begin(), seqs.end(), [&](const auto& seq) { return !seq || seq->seq_id == seq_id; }),
                seqs.end());
     if (!seqs.empty()) {
+        group_it->second.kv_candidate_target_dop   = -1;
+        group_it->second.kv_candidate_stable_steps = 0;
         return;
     }
     int   dp_idx    = group_it->second.dp_idx;
@@ -1611,6 +1867,11 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_ls_deco
                     group.allocated_attention_ranks.push_back(rank);
                 }
             }
+            if (!is_merge || selected->new_allocation_ranks > 0) {
+                group.last_scale_up_step = ls_schedule_step_;
+            }
+            group.kv_candidate_target_dop   = -1;
+            group.kv_candidate_stable_steps = 0;
             group.initial_batch_placements.push_back(record);
             ls_step_initial_records_.push_back(record);
 
@@ -1836,8 +2097,14 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_ls_deco
                     scheduled[dp_idx].push_back(pending.requests[seq_idx]);
                     master_load[master]++;
                 }
+                bool allocation_grew = pending.plan.allocation.size() > group.allocated_attention_ranks.size();
                 group.allocated_attention_ranks = pending.plan.allocation;
                 group.last_iteration_masters    = pending.plan.master_ranks;
+                if (allocation_grew) {
+                    group.last_scale_up_step        = ls_schedule_step_;
+                    group.kv_candidate_target_dop   = -1;
+                    group.kv_candidate_stable_steps = 0;
+                }
                 ls_step_group_plan_ids_.push_back(pending.group_id);
                 ls_step_group_plans_.push_back(pending.plan);
                 ls_step_reused_passive_masters_.push_back(pending.reused_passive);
@@ -2097,6 +2364,9 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_decode(
 
 void Scheduler::preempt(int dp_idx, std::shared_ptr<Sequence> seq)
 {
+    if (active_ls_kv_transaction_) {
+        throw std::runtime_error("cannot preempt while an LS KV scale-down transaction is reserved");
+    }
     std::cerr << "Preemption happens for seq_id=" << seq->seq_id << std::endl;
 
     if (enable_ls_decode_core_scheduler_) {
@@ -2216,6 +2486,9 @@ void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequen
                             double                                                     accumulated_step_time_ms,
                             int                                                        loop_count)
 {
+    if (active_ls_kv_transaction_) {
+        throw std::runtime_error("cannot postprocess while an LS KV scale-down transaction is reserved");
+    }
     // Call the C++ postprocess_sequences utility directly with shared_ptrs
     auto migrations = postprocess_sequences(worker_state,
                                             dp_sp_seqs,
@@ -2238,6 +2511,9 @@ void Scheduler::postprocess(const std::vector<std::vector<std::shared_ptr<Sequen
 
 void Scheduler::free_to_be_migrated(std::shared_ptr<Sequence> seq)
 {
+    if (active_ls_kv_transaction_) {
+        throw std::runtime_error("cannot free migration KV while an LS KV scale-down transaction is reserved");
+    }
     auto it = to_be_migrated.find(seq->seq_id);
     if (it == to_be_migrated.end()) {
         throw std::runtime_error("Sequence " + std::to_string(seq->seq_id) + " not found in to_be_migrated");
@@ -2279,6 +2555,7 @@ ScheduleResult Scheduler::_schedule_decentralized()
     ScheduleResult result;
     result.dp_seqs    = scheduled_seqs;
     result.is_prefill = has_prefill;
+    result.action     = has_prefill ? ScheduleAction::ADMISSION : ScheduleAction::DECODE;
 
     // Prepare dp_sp_seqs and filtered_dp_sp_seqs (same as centralized mode)
     result.dp_sp_seqs.reserve(attention_dp_ * attention_sp_);

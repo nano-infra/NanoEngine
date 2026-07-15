@@ -4,7 +4,7 @@ NanoDeploy C++ Backend
 from __future__ import annotations
 import collections.abc
 import typing
-__all__: list[str] = ['ACTIVE', 'Block', 'BlockContext', 'BlockContextSlot', 'BlockIdList', 'BlockLocationList', 'BlockManager', 'BlockManagerMap', 'DecodeMetadata', 'DefaultIntDict', 'DefaultListDict', 'FINISHED', 'KVTokenRangeMove', 'LSDecodeMasterPlan', 'LSKVConsolidationPlan', 'LeastBatch', 'LeastCache', 'MIGRATE', 'MigrationMap', 'PrefillMetadata', 'RUNNING', 'RoundRobin', 'RoutingStrategy', 'SPStateManager', 'SPStateManagerList', 'SWAP', 'ScheduleResult', 'Scheduler', 'Sequence', 'SequenceDeque', 'SequenceMetric', 'SequenceStatus', 'ServerMetric', 'TO_BE_MIGRATED', 'WAITING', 'deserialize', 'postprocess_sequences', 'prepare_decode_cpp', 'prepare_prefill_cpp', 'serialize', 'update_seqs_inner_loop']
+__all__: list[str] = ['ACTIVE', 'ADMISSION', 'Block', 'BlockContext', 'BlockContextSlot', 'BlockIdList', 'BlockLocationList', 'BlockManager', 'BlockManagerMap', 'DECODE', 'DecodeMetadata', 'DefaultIntDict', 'DefaultListDict', 'FINISHED', 'KV_CONSOLIDATION', 'KVTokenRangeMove', 'LSDecodeMasterPlan', 'LSKVConsolidationPlan', 'LeastBatch', 'LeastCache', 'MIGRATE', 'MigrationMap', 'PrefillMetadata', 'RUNNING', 'RoundRobin', 'RoutingStrategy', 'SPStateManager', 'SPStateManagerList', 'SWAP', 'ScheduleAction', 'ScheduleResult', 'Scheduler', 'Sequence', 'SequenceDeque', 'SequenceMetric', 'SequenceStatus', 'ServerMetric', 'TO_BE_MIGRATED', 'WAITING', 'deserialize', 'postprocess_sequences', 'prepare_decode_cpp', 'prepare_prefill_cpp', 'serialize', 'update_seqs_inner_loop']
 class Block:
     def __init__(self, arg0: typing.SupportsInt) -> None:
         ...
@@ -570,6 +570,40 @@ class RoutingStrategy:
     @property
     def value(self) -> int:
         ...
+class ScheduleAction:
+    """
+    Members:
+
+      ADMISSION
+
+      DECODE
+
+      KV_CONSOLIDATION
+    """
+    ADMISSION: typing.ClassVar[ScheduleAction]  # value = <ScheduleAction.ADMISSION: 0>
+    DECODE: typing.ClassVar[ScheduleAction]  # value = <ScheduleAction.DECODE: 1>
+    KV_CONSOLIDATION: typing.ClassVar[ScheduleAction]  # value = <ScheduleAction.KV_CONSOLIDATION: 2>
+    __members__: typing.ClassVar[dict[str, ScheduleAction]]
+    def __eq__(self, other: typing.Any) -> bool:
+        ...
+    def __hash__(self) -> int:
+        ...
+    def __init__(self, value: typing.SupportsInt) -> None:
+        ...
+    def __int__(self) -> int:
+        ...
+    def __ne__(self, other: typing.Any) -> bool:
+        ...
+    def __repr__(self) -> str:
+        ...
+    def __str__(self) -> str:
+        ...
+    @property
+    def name(self) -> str:
+        ...
+    @property
+    def value(self) -> int:
+        ...
 class LSDecodeMasterPlan:
     allocation: list[int]
     failure_reason: str
@@ -670,7 +704,9 @@ class SPStateManagerList:
     def __setitem__(self, arg0: typing.SupportsInt, arg1: SPStateManager) -> None:
         ...
 class ScheduleResult:
+    action: ScheduleAction
     is_prefill: bool
+    kv_consolidation_plan: LSKVConsolidationPlan | None
     ls_group_dp_indices: list[int]
     ls_group_ids: list[int]
     ls_group_rank_allocations: list[list[int]]
@@ -687,6 +723,13 @@ class ScheduleResult:
     ls_iteration_master_assignments: list[list[int]]
     ls_iteration_sequence_ids: list[list[int]]
     ls_kv_dops: list[int]
+    ls_kv_consolidation_candidate: bool
+    ls_kv_consolidation_decision_reason: str
+    ls_kv_consolidation_group_id: int
+    ls_kv_consolidation_group_util: float
+    ls_kv_consolidation_source_rank: int
+    ls_kv_consolidation_stable_steps: int
+    ls_kv_consolidation_target_dop: int
     ls_master_batch_sizes: list[list[int]]
     ls_master_dops: list[int]
     ls_master_ranks: list[list[int]]

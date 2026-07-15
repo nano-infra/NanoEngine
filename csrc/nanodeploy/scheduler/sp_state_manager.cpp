@@ -7,6 +7,7 @@
 #include <random>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "nanodeploy/sequence/sequence.h"
@@ -963,6 +964,35 @@ SPStateManager::plan_kv_consolidation(uint64_t                                  
 
     if (!found_source_kv) {
         return reject("KV consolidation source rank has no committed KV");
+    }
+
+    std::unordered_map<const Sequence*, const BlockContext*> staged_contexts;
+    staged_contexts.reserve(drafts.size());
+    for (const auto& draft : drafts) {
+        staged_contexts.emplace(draft.stage.sequence.get(), &draft.stage.staged_context);
+    }
+    std::vector<int> staged_remote_recv(attention_sp_, 0);
+    for (const auto& sequence : running) {
+        if (!sequence || sequence->status != SequenceStatus::RUNNING) {
+            continue;
+        }
+        const auto  staged = staged_contexts.find(sequence.get());
+        const auto& ctx =
+            staged == staged_contexts.end() ? sequence->block_ctx(BlockContextSlot::ACTIVE) : *staged->second;
+        for (int rank = 0; rank < attention_sp_; ++rank) {
+            int committed = ctx.num_dispatched_tokens[rank];
+            if (ctx.pending_token_present_ && ctx.pending_token_target_sp_ == rank) {
+                committed--;
+            }
+            if (rank != ctx.master_sp_idx_ && committed > 0) {
+                staged_remote_recv[rank]++;
+            }
+        }
+    }
+    if (std::any_of(staged_remote_recv.begin(), staged_remote_recv.end(), [&](int count) {
+            return count > max_num_recv_seqs_;
+        })) {
+        return reject("KV consolidation would exceed remote attention capacity");
     }
 
     size_t reserve_request_count = 0;

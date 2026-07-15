@@ -70,6 +70,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ls-initial-kv-dop", type=int, default=0)
     parser.add_argument("--ls-batch-per-master", type=int, default=8)
     parser.add_argument(
+        "--ls-kv-consolidation-mode",
+        choices=["off", "shadow", "execute"],
+        default="off",
+    )
+    parser.add_argument("--ls-kv-consolidation-candidate-util", type=float, default=0.50)
+    parser.add_argument(
+        "--ls-kv-consolidation-target-high-watermark", type=float, default=0.80
+    )
+    parser.add_argument("--ls-kv-consolidation-stable-steps", type=int, default=32)
+    parser.add_argument("--ls-kv-consolidation-cooldown-steps", type=int, default=64)
+    parser.add_argument(
+        "--ls-kv-consolidation-check-interval-steps", type=int, default=8
+    )
+    parser.add_argument(
+        "--ls-kv-consolidation-max-source-blocks-per-event", type=int, default=0
+    )
+    parser.add_argument(
+        "--ls-kv-consolidation-migration-chunk-tokens", type=int, default=0
+    )
+    parser.add_argument(
         "--disable-ls-memory-scale-up",
         action="store_true",
         help="Disable LS decode memory scale-up.",
@@ -123,6 +143,22 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-num-recv-seqs must be > 0")
     if args.ls_batch_per_master <= 0:
         parser.error("--ls-batch-per-master must be > 0")
+    if (
+        args.ls_kv_consolidation_mode == "execute"
+        and args.ls_kv_consolidation_migration_chunk_tokens <= 0
+    ):
+        parser.error(
+            "--ls-kv-consolidation-mode execute requires "
+            "--ls-kv-consolidation-migration-chunk-tokens > 0"
+        )
+    if (
+        args.ls_kv_consolidation_mode == "execute"
+        and args.ls_kv_consolidation_max_source_blocks_per_event <= 0
+    ):
+        parser.error(
+            "--ls-kv-consolidation-mode execute requires "
+            "--ls-kv-consolidation-max-source-blocks-per-event > 0"
+        )
     if args.warmup_requests < 0:
         parser.error("--warmup-requests must be >= 0")
     return args
@@ -277,6 +313,26 @@ def build_engine(args: argparse.Namespace) -> LLM:
         ls_decode_initial_kv_dop=args.ls_initial_kv_dop,
         ls_decode_batch_per_master=args.ls_batch_per_master,
         ls_decode_enable_memory_scale_up=not args.disable_ls_memory_scale_up,
+        ls_kv_consolidation_mode=args.ls_kv_consolidation_mode,
+        ls_kv_consolidation_candidate_util=(
+            args.ls_kv_consolidation_candidate_util
+        ),
+        ls_kv_consolidation_target_high_watermark=(
+            args.ls_kv_consolidation_target_high_watermark
+        ),
+        ls_kv_consolidation_stable_steps=args.ls_kv_consolidation_stable_steps,
+        ls_kv_consolidation_cooldown_steps=(
+            args.ls_kv_consolidation_cooldown_steps
+        ),
+        ls_kv_consolidation_check_interval_steps=(
+            args.ls_kv_consolidation_check_interval_steps
+        ),
+        ls_kv_consolidation_max_source_blocks_per_event=(
+            args.ls_kv_consolidation_max_source_blocks_per_event
+        ),
+        ls_kv_consolidation_migration_chunk_tokens=(
+            args.ls_kv_consolidation_migration_chunk_tokens
+        ),
     )
 
 
@@ -314,6 +370,28 @@ def config_dict(args: argparse.Namespace, output_json: Path, completion_jsonl: P
         "ls_decode_initial_kv_dop": args.ls_initial_kv_dop,
         "ls_decode_batch_per_master": args.ls_batch_per_master,
         "ls_decode_enable_memory_scale_up": not args.disable_ls_memory_scale_up,
+        "ls_kv_consolidation_mode": args.ls_kv_consolidation_mode,
+        "ls_kv_consolidation_candidate_util": (
+            args.ls_kv_consolidation_candidate_util
+        ),
+        "ls_kv_consolidation_target_high_watermark": (
+            args.ls_kv_consolidation_target_high_watermark
+        ),
+        "ls_kv_consolidation_stable_steps": (
+            args.ls_kv_consolidation_stable_steps
+        ),
+        "ls_kv_consolidation_cooldown_steps": (
+            args.ls_kv_consolidation_cooldown_steps
+        ),
+        "ls_kv_consolidation_check_interval_steps": (
+            args.ls_kv_consolidation_check_interval_steps
+        ),
+        "ls_kv_consolidation_max_source_blocks_per_event": (
+            args.ls_kv_consolidation_max_source_blocks_per_event
+        ),
+        "ls_kv_consolidation_migration_chunk_tokens": (
+            args.ls_kv_consolidation_migration_chunk_tokens
+        ),
         "loop_count": 1,
         "max_num_seqs": args.max_num_seqs,
         "max_num_recv_seqs": args.max_num_recv_seqs,
@@ -387,6 +465,7 @@ def run_warmup(engine: LLM, args: argparse.Namespace, rng: np.random.Generator) 
     completed = 0
     decode_steps = 0
     prefill_steps = 0
+    maintenance_steps = 0
     start = time.perf_counter()
     print(
         "WARMUP_START "
@@ -406,6 +485,8 @@ def run_warmup(engine: LLM, args: argparse.Namespace, rng: np.random.Generator) 
         completed += len(outputs)
         if num_tokens < 0:
             decode_steps += 1
+        elif num_tokens == 0:
+            maintenance_steps += 1
         else:
             prefill_steps += 1
     duration = time.perf_counter() - start
@@ -415,6 +496,7 @@ def run_warmup(engine: LLM, args: argparse.Namespace, rng: np.random.Generator) 
         "steps": steps,
         "prefill_steps": prefill_steps,
         "decode_steps": decode_steps,
+        "maintenance_steps": maintenance_steps,
         "duration_sec": duration,
     }
     print("WARMUP_SUMMARY " + json.dumps(summary), flush=True)
@@ -460,6 +542,7 @@ def run_longrun(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     step_records: list[dict[str, Any]] = []
     decode_itls: list[float] = []
     steady_decode_itls: list[float] = []
+    pending_maintenance_ms = 0.0
 
     requests_sent = 0
     requests_dropped_backpressure = 0
@@ -529,7 +612,13 @@ def run_longrun(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 )
                 step_duration_ms = (time.perf_counter() - step_start) * 1000.0
                 elapsed_after_step_s = time.perf_counter() - start
-                phase = "decode" if num_tokens < 0 else "prefill"
+                phase = (
+                    "decode"
+                    if num_tokens < 0
+                    else "maintenance"
+                    if num_tokens == 0
+                    else "prefill"
+                )
                 step_record: dict[str, Any] = {
                     "step_idx": step_idx,
                     "elapsed_s": elapsed_after_step_s,
@@ -543,11 +632,15 @@ def run_longrun(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     "post_scheduler_latency_ms": post_sch_latency_ms,
                 }
                 if phase == "decode":
-                    itl_ms = step_duration_ms
+                    itl_ms = pending_maintenance_ms + step_duration_ms
                     step_record["itl_ms"] = itl_ms
+                    step_record["preceding_maintenance_ms"] = pending_maintenance_ms
+                    pending_maintenance_ms = 0.0
                     decode_itls.append(itl_ms)
                     if elapsed_after_step_s >= args.steady_start_sec:
                         steady_decode_itls.append(itl_ms)
+                elif phase == "maintenance":
+                    pending_maintenance_ms += step_duration_ms
                 step_records.append(step_record)
                 step_idx += 1
 
@@ -628,6 +721,9 @@ def run_longrun(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "step_count": step_idx,
             "prefill_steps": sum(1 for step in step_records if step["phase"] == "prefill"),
             "decode_steps": len(decode_itls),
+            "maintenance_steps": sum(
+                1 for step in step_records if step["phase"] == "maintenance"
+            ),
             "total_input_tokens": total_input_tokens,
             "total_output_tokens": total_output_tokens,
             "request_throughput_per_sec": (

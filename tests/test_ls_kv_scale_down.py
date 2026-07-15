@@ -6,12 +6,14 @@ import torch
 import nanodeploy.worker.kv_p2p as kv_p2p
 from nanodeploy._cpp import (
     BlockContextSlot,
+    ScheduleAction,
     Scheduler,
     Sequence,
     prepare_decode_cpp,
 )
 from nanodeploy.engine.kv_consolidation import (
     KVScaleDownRejected,
+    execute_planned_ls_kv_scale_down,
     execute_ls_kv_scale_down,
 )
 from nanodeploy.worker.kv_p2p import KVCacheP2PMove, KVCacheP2PTransport
@@ -23,7 +25,16 @@ _NUM_BLOCKS = 16
 _MAX_NUM_SEQS = 16
 
 
-def _make_scheduler() -> Scheduler:
+def _make_scheduler(
+    *,
+    consolidation_mode: str = "off",
+    candidate_util: float = 0.50,
+    target_high_watermark: float = 0.80,
+    stable_steps: int = 32,
+    cooldown_steps: int = 64,
+    check_interval_steps: int = 8,
+    max_source_blocks_per_event: int = 16,
+) -> Scheduler:
     return Scheduler(
         "scale-down-test",
         1,
@@ -65,6 +76,13 @@ def _make_scheduler() -> Scheduler:
         64,
         True,
         "centralized",
+        consolidation_mode,
+        candidate_util,
+        target_high_watermark,
+        stable_steps,
+        cooldown_steps,
+        check_interval_steps,
+        max_source_blocks_per_event,
     )
 
 
@@ -76,6 +94,7 @@ def _admit_striped_sequence(scheduler: Scheduler):
     scheduler.add(sequence)
     admission = scheduler.schedule()
     assert admission.is_prefill is True
+    assert admission.action == ScheduleAction.ADMISSION
     assert admission.ls_initial_kv_dops == [2]
 
     worker = scheduler.worker_state[0]
@@ -270,6 +289,158 @@ def test_scale_down_runs_p2p_then_commits_and_schedules_without_source(
     assert _context_snapshot(sequence) != source_context_before
 
 
+def test_automatic_scale_down_waits_for_stability_and_executes_reserved_plan(
+    monkeypatch,
+):
+    scheduler = _make_scheduler(
+        consolidation_mode="execute",
+        stable_steps=2,
+        cooldown_steps=0,
+        check_interval_steps=3,
+    )
+    sequence, group_id = _admit_striped_sequence(scheduler)
+
+    stable = scheduler.schedule()
+    assert stable.action == ScheduleAction.DECODE
+    assert stable.ls_kv_consolidation_candidate is True
+    assert stable.ls_kv_consolidation_stable_steps == 1
+    assert stable.ls_kv_consolidation_decision_reason == "stable_window"
+
+    maintenance = scheduler.schedule()
+    assert maintenance.action == ScheduleAction.KV_CONSOLIDATION
+    assert maintenance.dp_seqs == []
+    assert maintenance.kv_consolidation_plan.success is True
+    assert maintenance.ls_kv_consolidation_stable_steps == 2
+    assert maintenance.ls_kv_consolidation_decision_reason == "execute"
+    with pytest.raises(RuntimeError, match="transaction is reserved"):
+        scheduler.schedule()
+
+    executor = _InProcessP2PExecutor(monkeypatch, _make_caches())
+    result = execute_planned_ls_kv_scale_down(
+        scheduler,
+        executor,
+        maintenance.kv_consolidation_plan,
+    )
+    assert result.group_id == group_id
+    assert result.source_rank == 1
+    assert scheduler.get_ls_group_allocated_ranks(group_id) == [0]
+
+
+def test_automatic_candidate_util_threshold_is_strict():
+    scheduler = _make_scheduler(
+        consolidation_mode="execute",
+        candidate_util=2 / (_SP_SIZE * (_NUM_BLOCKS - 1)),
+        stable_steps=1,
+        cooldown_steps=0,
+        check_interval_steps=1,
+    )
+    _, group_id = _admit_striped_sequence(scheduler)
+
+    result = scheduler.schedule()
+    assert result.action == ScheduleAction.DECODE
+    assert result.ls_kv_consolidation_candidate is False
+    assert result.ls_kv_consolidation_decision_reason == "no_candidate"
+    assert scheduler.get_ls_group_allocated_ranks(group_id) == [0, 1]
+
+
+def test_automatic_scale_down_honors_scale_up_cooldown():
+    scheduler = _make_scheduler(
+        consolidation_mode="execute",
+        stable_steps=1,
+        cooldown_steps=64,
+        check_interval_steps=1,
+    )
+    _admit_striped_sequence(scheduler)
+
+    result = scheduler.schedule()
+    assert result.action == ScheduleAction.DECODE
+    assert result.ls_kv_consolidation_candidate is True
+    assert result.ls_kv_consolidation_decision_reason == "cooldown"
+
+
+def test_automatic_high_watermark_rejection_releases_reservations():
+    control = _make_scheduler()
+    _admit_striped_sequence(control)
+    control.schedule()
+    expected_free_blocks = _free_blocks(control)
+
+    scheduler = _make_scheduler(
+        consolidation_mode="execute",
+        target_high_watermark=0.05,
+        stable_steps=1,
+        cooldown_steps=0,
+        check_interval_steps=1,
+    )
+    _, group_id = _admit_striped_sequence(scheduler)
+    result = scheduler.schedule()
+    assert result.action == ScheduleAction.DECODE
+    assert result.ls_kv_consolidation_candidate is True
+    assert result.ls_kv_consolidation_decision_reason == "target_high_watermark"
+    assert _free_blocks(scheduler) == expected_free_blocks
+    assert scheduler.get_ls_group_allocated_ranks(group_id) == [0, 1]
+
+
+def test_automatic_source_block_budget_releases_reservations():
+    control = _make_scheduler()
+    control_sequence = Sequence(list(range(13)), 1.0, 32, True)
+    control.add(control_sequence)
+    control.schedule()
+    control_worker = control.worker_state[0]
+    assert control_worker.may_append(control_sequence, 1)
+    control_sequence.append_token(99, BlockContextSlot.ACTIVE)
+    control_sequence.mark_last_token_pending(BlockContextSlot.ACTIVE)
+    control_worker.add_running_tokens(control_sequence.block_ctx().master_sp_idx, 1)
+    control.schedule()
+    expected_free_blocks = _free_blocks(control)
+
+    scheduler = _make_scheduler(
+        consolidation_mode="execute",
+        stable_steps=1,
+        cooldown_steps=0,
+        check_interval_steps=1,
+        max_source_blocks_per_event=1,
+    )
+    sequence = Sequence(list(range(13)), 1.0, 32, True)
+    scheduler.add(sequence)
+    admission = scheduler.schedule()
+    assert admission.action == ScheduleAction.ADMISSION
+    assert len(sequence.block_table(BlockContextSlot.ACTIVE, 1)) == 2
+
+    worker = scheduler.worker_state[0]
+    assert worker.may_append(sequence, 1)
+    sequence.append_token(99, BlockContextSlot.ACTIVE)
+    sequence.mark_last_token_pending(BlockContextSlot.ACTIVE)
+    worker.add_running_tokens(sequence.block_ctx().master_sp_idx, 1)
+
+    result = scheduler.schedule()
+    assert result.action == ScheduleAction.DECODE
+    assert result.ls_kv_consolidation_candidate is True
+    assert result.ls_kv_consolidation_decision_reason == "source_block_budget"
+    assert _free_blocks(scheduler) == expected_free_blocks
+
+
+def test_shadow_candidate_does_not_reserve_or_change_group_allocation():
+    control = _make_scheduler()
+    _admit_striped_sequence(control)
+    control.schedule()
+    expected_free_blocks = _free_blocks(control)
+
+    scheduler = _make_scheduler(
+        consolidation_mode="shadow",
+        stable_steps=1,
+        cooldown_steps=0,
+        check_interval_steps=1,
+    )
+    _, group_id = _admit_striped_sequence(scheduler)
+    result = scheduler.schedule()
+    assert result.action == ScheduleAction.DECODE
+    assert result.ls_kv_consolidation_candidate is True
+    assert result.ls_kv_consolidation_decision_reason == "shadow_candidate"
+    assert result.kv_consolidation_plan is None
+    assert _free_blocks(scheduler) == expected_free_blocks
+    assert scheduler.get_ls_group_allocated_ranks(group_id) == [0, 1]
+
+
 def test_scale_down_worker_failure_aborts_metadata_and_block_reservations(
     monkeypatch,
 ):
@@ -299,6 +470,26 @@ def test_scale_down_worker_failure_aborts_metadata_and_block_reservations(
     decode = scheduler.schedule()
     assert decode.is_prefill is False
     assert decode.ls_group_rank_allocations == [[0, 1]]
+
+
+def test_automatic_copy_failure_keeps_reservation_fail_closed(monkeypatch):
+    scheduler = _make_scheduler()
+    _, group_id = _admit_striped_sequence(scheduler)
+    plan = scheduler.plan_ls_kv_scale_down(group_id, 1)
+    assert plan.success
+    physical_executor = _InProcessP2PExecutor(monkeypatch, _make_caches())
+
+    with pytest.raises(RuntimeError, match="injected worker completion failure"):
+        execute_planned_ls_kv_scale_down(
+            scheduler,
+            _FailAfterPhysicalCopyExecutor(physical_executor),
+            plan,
+            abort_on_copy_error=False,
+        )
+
+    with pytest.raises(RuntimeError, match="transaction is reserved"):
+        scheduler.schedule()
+    scheduler.abort_ls_kv_scale_down(plan)
 
 
 def test_scale_down_rejects_current_decode_master_without_calling_executor():
@@ -331,6 +522,14 @@ def test_reserved_scale_down_blocks_normal_decode_until_abort():
     assert _free_blocks(scheduler)[0] < free_before[0]
     with pytest.raises(RuntimeError, match="transaction is reserved"):
         scheduler.schedule()
+    with pytest.raises(RuntimeError, match="transaction is reserved"):
+        scheduler.add(Sequence([7], 1.0, 4, True))
+    with pytest.raises(RuntimeError, match="transaction is reserved"):
+        scheduler.preempt(0, sequence)
+    with pytest.raises(RuntimeError, match="transaction is reserved"):
+        scheduler.postprocess([], [], False, 0.0, 1)
+    with pytest.raises(RuntimeError, match="transaction is reserved"):
+        scheduler.free_to_be_migrated(sequence)
 
     scheduler.abort_ls_kv_scale_down(plan)
     assert _context_snapshot(sequence) == context_before

@@ -34,11 +34,11 @@ LS-Decode KV Consolidation
 
 它是现有 `LS-Decode-Core` 的扩展，不应声称等同于完整 LoongServe。
 
-这里的“可落地”指架构上可实现，不是只改配置即可开启。原始项目没有 live Decode KV relayout、maintenance action、intra-DP KV P2P RPC 和 no-fail metadata commit；当前分支已经补上手动 source-only transaction 和 P2P 数据面，但自动 scheduler action、触发 policy、生产级 no-fail commit 和 4-DP/EP32 验收仍未完成。落地顺序仍必须先经过手动 correctness，再接 pressure policy，不能直接从 usage threshold 跳到生产 execute。
+这里的“可落地”指架构上可实现，不是只改配置即可无条件开启。原始项目没有 live Decode KV relayout、maintenance action、intra-DP KV P2P RPC 和 no-fail metadata commit；当前分支已经补上手动 source-only transaction、P2P 数据面，以及实验性的 `off|shadow|execute` opportunistic policy。生产级 no-fail commit、精确 pressure beneficiary simulation、完整 pause/bytes/payback 预算和 4-DP/EP32 验收仍未完成。
 
-当前已落地一条可手动调用的 stop-the-world scale-down correctness 链路：`Scheduler::plan_ls_kv_scale_down()` 为 passive source 生成 token ranges、预留 destination blocks 并预构造 metadata；`execute_ls_kv_scale_down()` 向所有 workers 下发 `dist.isend/irecv` copy；全部 workers 成功后才交换 ACTIVE context、释放 source blocks 并缩小 group allocation，失败则释放预留并保留旧 placement。CPU 自动化集成测试、双进程 Gloo、双 GPU NCCL，以及 1-DP × 8-SP 的真实 NCCL 8→7 preflight 均已通过。该入口仍是 iteration boundary 上的手动 API，没有接 `LLMEngine.step()` action/policy，也不能作为生产 execute 开关。
+当前已落地 stop-the-world scale-down correctness 链路：`Scheduler::plan_ls_kv_scale_down()` 为 passive source 生成 token ranges、预留 destination blocks 并预构造 metadata；`execute_ls_kv_scale_down()` 向所有 workers 下发 `dist.isend/irecv` copy；全部 workers 成功后才交换 ACTIVE context、释放 source blocks 并缩小 group allocation。自动路径通过互斥的 `ScheduleAction::KV_CONSOLIDATION` 返回同一个已 RESERVED plan，`LLMEngine.step()` 在普通 forward/postprocess 前消费它；COPY completion 未知时 engine 进入 fatal 状态且不释放 reservation。CPU 自动化集成测试、双进程 Gloo、双 GPU NCCL，以及 1-DP × 8-SP 的真实 NCCL 8→7 preflight 均已通过。自动 `execute` 默认关闭，并受正值 scratch 和 source-block event budget 约束，仍只应视为受控实验开关。
 
-本文后续定义的 `ScheduleAction`、`EngineStepResult`、pressure intent、engine-fatal 分类和真实 forward/4-DP 验收是下一阶段的确定实现目标，不是对当前代码状态的描述。
+本文后续定义的 pressure intent、完整预算、生产级异常分类和真实 forward/4-DP 验收仍是下一阶段目标；`ScheduleAction` 和基本 engine-fatal 隔离已经接入当前代码。
 
 ### 1.1 能解决什么
 
@@ -621,7 +621,7 @@ COPY:      发 P2P、scatter，并在返回前完成本 rank CUDA stream synchro
 RESULT:    driver 等到全部 actors 的结构化结果后再决定 COMMIT/ABORT
 ```
 
-当前 `execute_ls_kv_scale_down()` 对 `copy_kv_ranges_p2p()` 的任意异常都会调用 `abort_ls_kv_scale_down()`；这对 CPU fake 和“全部 futures 已知完成”的测试成立，但对 Ray timeout/actor death/NCCL unknown-completion 不够安全。接自动 execute 前必须把异常分类和 engine fatal state 补齐；在此之前不能给 RPC 设置超时后声称可继续服务。
+手动 `execute_ls_kv_scale_down()` 默认会在 copy 异常时 ABORT，这只适用于 CPU fake 和“全部 futures 已知完成”的测试。自动路径调用同一 planned coordinator 时显式禁用 copy-error ABORT；Ray timeout、actor death 或 NCCL unknown-completion 会保留 reservation、将 `LLMEngine` 标记为 fatal，并拒绝后续业务调用。更细的结构化异常分类和 actor 重建仍未实现，不能在超时后声称可继续服务。
 
 第一版明确选择更窄但可实现的恢复边界：只有 PLAN、RESERVE、generation recheck 和 no-NCCL PREFLIGHT 失败是 recoverable；首个 P2P 发出后出现的任意异常都停止 engine、终止/重建 actors，不再尝试发下一轮 collective。COPY 全成功且同步完成后的 metadata stale 在正常隔离下不应发生；若发生，按 scheduler invariant violation 和 engine-fatal 处理，而不是静默 ABORT 后继续。
 
@@ -888,7 +888,7 @@ Phase 0 的 go/no-go 数据：
 - 已实现 destination tail/new-block reserve、copy error abort、预构造 metadata swap、source release 和 group allocation shrink；
 - 已保持 retained-rank pending frontier，并拒绝 active/pending source；事务内 pending 重指派仍待实现；
 - 已增加 synthetic cache/block table 的完整 transaction 测试，并在 commit 后继续生成下一轮 Decode；
-- 显式 `state_generation`、完全无 host allocation 的 no-fail commit 和 shadow/execute policy 仍待实现。
+- 已接入 `off | shadow | execute` 的 opportunistic threshold policy：`candidate_util=0.50`、`target_high_watermark=0.80`、`stable_steps=32`、`cooldown_steps=64`、`check_interval_steps=8`；显式 `state_generation` 和完全无 host allocation 的 no-fail commit 仍待实现。
 
 ### Phase 2：真实 Intra-DP GPU Copy
 
@@ -897,7 +897,7 @@ Phase 0 的 go/no-go 数据：
 - 使用 `dist.isend/irecv` 做确定序 chunk copy；（CPU mock、双进程 Gloo、双 GPU NCCL 和 1-DP × 8-SP NCCL 8→7 preflight 已完成）
 - 搬运全部 layers 和 KV components；（第一版 physical range copy 已完成）
 - stop-the-world 手动 transaction；（已完成，scheduler 在 reservation 存续期间拒绝普通 schedule）
-- 先提供手动触发，不接自动 policy；（已完成）
+- 保留手动触发，并由 scheduler 通过独占 `KV_CONSOLIDATION` action 自动消费同一类 RESERVED plan；（已完成，默认 `off`，execute 需显式开启）
 - 验证 CPU fake 中“全部 workers 已知结束后 completion error”的 abort；（已完成；不能外推到 Ray timeout/NCCL failure）
 - 拆分 no-NCCL preflight、copy 和 structured result，并加入 recoverable/fatal 分类；（待完成）
 - actor/CUDA/NCCL fatal error 的 fail-stop 注入；（待完成）
@@ -909,7 +909,7 @@ Phase 0 的 go/no-go 数据：
 
 ### Phase 3：Pressure-driven Execute 与 4-DP / EP32 验证
 
-- 增加 `ScheduleAction`、planned coordinator、`EngineStepResult` 和 engine-fatal state；
+- 增加 `ScheduleAction`、planned coordinator 和 maintenance failure 后的 engine-fatal fail-fast；（已完成）`EngineStepResult` 仍待完成；
 - 只在 pending batch 原子 admission 明确 no-fit，且 exact simulation 证明单 hop 或完整有限 chain 后可 admission 时执行；
 - 一次 event 最多释放一个 rank，多 hop 由 intent 跨 maintenance steps 编排；
 - 启用 source blocks/bytes、pause、destination high watermark 硬限制；
@@ -924,7 +924,7 @@ Phase 0 的 go/no-go 数据：
 
 - 基于实测 gather/send/scatter 带宽校准 migration cost；
 - 基于 4-DP / EP32 trace 校准 before/after ITL predictor；
-- 启用 stable window、cooldown、payback 和 scale-up hysteresis；
+- 启用 stable window、cooldown 和 scale-up hysteresis；（threshold 版本已完成）payback 仍待带宽/ITL profiling 后接入；
 - 只有含 pause 的 E2E/ITL 获益后才考虑默认开放。
 
 ### Phase 5：可选扩展
@@ -966,10 +966,11 @@ ls_kv_consolidation_payback_safety_factor: float = 0.5
 - 第一版仍要求 Decode-only、Dummy Prefill、centralized、`loop_count=1`；
 - execute mode 只对白名单拓扑开放；
 - `max_released_ranks_per_event` 第一版必须等于 1；intent 可以包含多 hop，但每 hop 都是独立原子 transaction；
-- `max_source_blocks_per_event`、event/intent migration bytes、event/intent pause 和 `max_consecutive_maintenance_steps` 在 execute mode 必须由 profiling 给出正值；`0` 表示尚未校准、禁止自动执行；
+- 当前代码已强制 `max_source_blocks_per_event > 0`；event/intent migration bytes、pause、payback 和 `max_consecutive_maintenance_steps` 仍需在生产 execute 前由 profiling 校准并加入硬门禁；
 - `migration_chunk_tokens=0` 不分配 scratch，physical P2P API 会明确拒绝执行；设为正值后必须在 KV block sizing 前扣除对应显存；
 - `rpc_timeout_s` 只负责把 hang 转为 engine-fatal 告警/重启流程；timeout 后绝不能走普通 ABORT 并继续 Decode；
 - `candidate_util` 只做快速过滤，不能绕过 exact feasibility/admission simulation；
+- 当前 opportunistic policy 使用严格边界 `U_group < candidate_util`；等于 `0.50` 时不产生 candidate；
 - `pressure_and_opportunistic` 只有 Phase 4 的 ITL predictor 校准并验收后才能开放；
 - shadow mode 不得修改 block、group、master 或 pending state；
 - mode 为 `off` 时保持 Core 行为完全不变。
@@ -1030,7 +1031,7 @@ ls_kv_consolidation_payback_safety_factor: float = 0.5
 
 ### 12.2 GPU 正确性测试
 
-当前 `tests/test_ls_kv_scale_down.py` 已覆盖：scheduler 生成真实 plan、RESERVE 期间 ACTIVE/source 不变、同一个 `KVCacheP2PTransport` 执行分 chunk copy、成功后 metadata/source-block/group allocation commit、下一轮 Decode 不再给 source 分配真实任务，以及 CPU fake 中“物理 copy 已完成且所有 worker 调用已知结束，但 completion 报错”时的 abort。另已通过双 GPU NCCL 完整 transaction 和 1-DP × 8-SP NCCL 8→7 preflight；后者可用 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python tests/ls_kv_scale_down_nccl_preflight.py --sp-size 8` 复现。以下未勾选场景仍是进入自动 execute 前的完整验收集合。
+当前 `tests/test_ls_kv_scale_down.py` 已覆盖：scheduler 生成真实 plan、RESERVE 期间 ACTIVE/source 不变、同一个 `KVCacheP2PTransport` 执行分 chunk copy、成功后 metadata/source-block/group allocation commit、下一轮 Decode 不再给 source 分配真实任务，以及 CPU fake 中“物理 copy 已完成且所有 worker 调用已知结束，但 completion 报错”时的 abort。另已通过双 GPU NCCL 完整 transaction 和 1-DP × 8-SP NCCL 8→7 preflight；后者可用 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python tests/ls_kv_scale_down_nccl_preflight.py --sp-size 8` 复现。以下未勾选场景仍是进入生产 execute/4-DP 验收前的完整测试集合。
 
 - 用确定性 pattern 填充每层 KV block；
 - 迁移 full block、partial head/tail 和多个 sequences；

@@ -10,8 +10,9 @@ import numpy as np
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-from nanodeploy._cpp import BlockContextSlot
+from nanodeploy._cpp import BlockContextSlot, ScheduleAction
 from nanodeploy.config import Config
+from nanodeploy.engine.kv_consolidation import execute_planned_ls_kv_scale_down
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
@@ -40,6 +41,8 @@ class LLMEngine:
         self.config.engine_id = self.engine_id
         self.ps = []
         self.events = []
+        self.pending_maintenance_stall_ms = 0.0
+        self.fatal_error: BaseException | None = None
         self.log_decode_step_detail = _env_flag_enabled(
             "NANODEPLOY_LOG_DECODE_STEP_DETAIL", default=False
         )
@@ -70,6 +73,7 @@ class LLMEngine:
         self.executor.init_rpc_endpoint()
 
     def add_request(self, seqs: Sequence | list[Sequence]):
+        self._raise_if_fatal()
         if isinstance(seqs, Sequence):
             seqs = [seqs]
         for seq in seqs:
@@ -79,15 +83,67 @@ class LLMEngine:
             self.scheduler.add(seq)
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
+        self._raise_if_fatal()
         self.scheduler.free_to_be_migrated(seqs)
 
+    def _raise_if_fatal(self):
+        if self.fatal_error is not None:
+            raise RuntimeError(
+                "LLMEngine is fatal after a failed KV consolidation; restart required"
+            ) from self.fatal_error
+
     def step(self):
+        self._raise_if_fatal()
         step_start = time.perf_counter()
         dp_size = self.config.attention_dp
         sp_size = self.config.attention_sp
         tp_size = self.config.attention_tp
         sch_begin = time.perf_counter()
         sch_res = self.scheduler.schedule()
+        sch_end = time.perf_counter()
+        if sch_res.action == ScheduleAction.KV_CONSOLIDATION:
+            maintenance_begin = time.perf_counter()
+            try:
+                result = execute_planned_ls_kv_scale_down(
+                    self.scheduler,
+                    self.executor,
+                    sch_res.kv_consolidation_plan,
+                    abort_on_copy_error=False,
+                )
+            except BaseException as error:
+                self.fatal_error = error
+                logger.exception(
+                    "KV consolidation failed; engine is fatal and must be restarted"
+                )
+                raise
+            maintenance_ms = (time.perf_counter() - maintenance_begin) * 1000.0
+            maintenance_stall_ms = (time.perf_counter() - step_start) * 1000.0
+            self.pending_maintenance_stall_ms += maintenance_stall_ms
+            logger.info(
+                {
+                    "mode": "ls_kv_consolidation",
+                    "transaction_id": result.transaction_id,
+                    "group_id": result.group_id,
+                    "dp_idx": result.dp_idx,
+                    "source_rank": result.source_rank,
+                    "retained_ranks": result.retained_ranks,
+                    "num_tokens": result.num_tokens,
+                    "num_moves": result.num_moves,
+                    "group_util": sch_res.ls_kv_consolidation_group_util,
+                    "target_dop": sch_res.ls_kv_consolidation_target_dop,
+                    "stable_steps": sch_res.ls_kv_consolidation_stable_steps,
+                    "maintenance_ms": maintenance_ms,
+                    "maintenance_stall_ms": maintenance_stall_ms,
+                }
+            )
+            return (
+                [],
+                0,
+                0,
+                (sch_end - sch_begin) * 1000.0,
+                0.0,
+            )
+
         dp_seqs = sch_res.dp_seqs
         is_prefill = sch_res.is_prefill
         dp_sp_seqs = sch_res.dp_sp_seqs
@@ -196,11 +252,15 @@ class LLMEngine:
             token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
             model_runner_duration_ms = (time.perf_counter() - model_runner_start) * 1000.0
             step_duration_ms = (time.perf_counter() - step_start) * 1000.0
+            if not is_prefill:
+                step_duration_ms += self.pending_maintenance_stall_ms
             post_sch_begin = time.perf_counter()
             self.scheduler.postprocess(
                 filtered_dp_sp_seqs, token_ids, self.metrics_manager,
                 step_duration_ms, self.config.loop_count
             )
+            if not is_prefill:
+                self.pending_maintenance_stall_ms = 0.0
             post_sch_end = time.perf_counter()
 
         if self.config.enable_ls_decode_core_scheduler:
@@ -269,6 +329,27 @@ class LLMEngine:
                         ),
                         "historical_kv_migration_bytes": (
                             sch_res.ls_historical_kv_migration_bytes
+                        ),
+                        "kv_consolidation_candidate": (
+                            sch_res.ls_kv_consolidation_candidate
+                        ),
+                        "kv_consolidation_group_id": (
+                            sch_res.ls_kv_consolidation_group_id
+                        ),
+                        "kv_consolidation_source_rank": (
+                            sch_res.ls_kv_consolidation_source_rank
+                        ),
+                        "kv_consolidation_target_dop": (
+                            sch_res.ls_kv_consolidation_target_dop
+                        ),
+                        "kv_consolidation_stable_steps": (
+                            sch_res.ls_kv_consolidation_stable_steps
+                        ),
+                        "kv_consolidation_group_util": (
+                            sch_res.ls_kv_consolidation_group_util
+                        ),
+                        "kv_consolidation_decision_reason": (
+                            sch_res.ls_kv_consolidation_decision_reason
                         ),
                         "preempted_sequence_ids": sch_res.ls_preempted_sequence_ids,
                         "preemption_reasons": sch_res.ls_preemption_reasons,
@@ -414,11 +495,13 @@ class LLMEngine:
         )
 
     def is_finished(self):
+        self._raise_if_fatal()
         return self.scheduler.is_finished()
 
     def p2p_init(
         self, remote_engine_name: str, num_kv_blocks: int, remote_world_size: int
     ):
+        self._raise_if_fatal()
         return self.executor.p2p_init(
             remote_engine_name, num_kv_blocks, remote_world_size
         )
@@ -426,6 +509,7 @@ class LLMEngine:
     def p2p_connect(
         self, remote_engine_name: str, remote_endpoints_info: list[list[dict]]
     ):
+        self._raise_if_fatal()
         return self.executor.p2p_connect(remote_engine_name, remote_endpoints_info)
 
     def generate(
@@ -439,23 +523,37 @@ class LLMEngine:
 
         outputs = {}
         prefill_throughput = decode_throughput = 0.0
+        pending_maintenance_sec = 0.0
         step_count = 0
 
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens, bs, sch_latency, post_sch_latency = self.step()
+            step_duration_sec = perf_counter() - t
             if use_tqdm:
                 if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
+                    prefill_throughput = num_tokens / step_duration_sec
                     self.metrics_manager.server_metric.record_prefill_throughput(
-                        num_tokens, (perf_counter() - t)
+                        num_tokens, step_duration_sec
+                    )
+                elif num_tokens < 0:
+                    decode_duration_sec = (
+                        pending_maintenance_sec + step_duration_sec
+                    )
+                    pending_maintenance_sec = 0.0
+                    decode_throughput = -num_tokens / decode_duration_sec
+                    self.metrics_manager.server_metric.record_decode_throughput(
+                        -num_tokens, decode_duration_sec
                     )
                 else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                    self.metrics_manager.server_metric.record_decode_throughput(
-                        -num_tokens, (perf_counter() - t)
+                    # An exclusive maintenance step moves no user token and
+                    # must not be recorded as a zero-throughput Decode sample.
+                    pending_maintenance_sec += step_duration_sec
+                    continue
+                itl_duration_sec = (
+                    decode_duration_sec if num_tokens < 0 else step_duration_sec
                     )
-                itl = (perf_counter() - t) * 1000 / self.config.loop_count
+                itl = itl_duration_sec * 1000 / self.config.loop_count
                 pbar.set_postfix(
                     {
                         "bs": f"{bs}",

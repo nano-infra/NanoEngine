@@ -24,11 +24,19 @@ enum class SchedulerMode {
     DECENTRALIZED
 };
 
+enum class ScheduleAction {
+    ADMISSION,
+    DECODE,
+    KV_CONSOLIDATION
+};
+
 // Result of a single scheduling step.
 // This struct is returned by `schedule()` and summarizes which sequences
 // should be executed on each data-parallel (DP) worker (and, if applicable,
 // on each sequence-parallel (SP) shard) for the current iteration.
 struct ScheduleResult {
+    ScheduleAction action = ScheduleAction::DECODE;
+
     // Sequences scheduled per DP worker for this step.
     // Outer index: DP worker index.
     // Inner vector: sequences assigned to that DP worker.
@@ -49,7 +57,11 @@ struct ScheduleResult {
     // Indicates whether this scheduling step is a prefill step (true) or a
     // decode step (false). Callers can use this to select the appropriate
     // execution path.
-    bool is_prefill;
+    bool is_prefill = false;
+
+    // Set only for an exclusive KV_CONSOLIDATION maintenance step. The plan
+    // is already RESERVED and must be executed directly by the engine.
+    std::shared_ptr<SPStateManager::LSKVConsolidationPlan> kv_consolidation_plan;
 
     // SP counts
     std::vector<std::vector<int>> sp_send_counts;
@@ -125,6 +137,16 @@ struct ScheduleResult {
     std::vector<uint64_t>              ls_preempted_sequence_ids;
     std::vector<std::string>           ls_preemption_reasons;
     double                             ls_planning_latency_ms = 0.0;
+
+    // Automatic KV-consolidation decision telemetry. Shadow mode populates
+    // these fields without reserving blocks or changing placement.
+    bool        ls_kv_consolidation_candidate       = false;
+    int64_t     ls_kv_consolidation_group_id        = -1;
+    int         ls_kv_consolidation_source_rank     = -1;
+    int         ls_kv_consolidation_target_dop      = -1;
+    uint64_t    ls_kv_consolidation_stable_steps    = 0;
+    double      ls_kv_consolidation_group_util      = 0.0;
+    std::string ls_kv_consolidation_decision_reason = "off";
 };
 
 struct InitialBatchPlacement {
@@ -166,6 +188,10 @@ struct DecodeGroupState {
     std::vector<InitialBatchPlacement>     initial_batch_placements;
     std::vector<int>                       allocated_attention_ranks;
     std::vector<int>                       last_iteration_masters;
+    int                                    kv_candidate_target_dop   = -1;
+    uint64_t                               kv_candidate_stable_steps = 0;
+    uint64_t                               last_scale_up_step        = 0;
+    uint64_t                               last_consolidation_step   = 0;
 };
 
 class Scheduler {
@@ -205,11 +231,18 @@ public:
               const std::string& sp_master_selector,
               bool               sp_debug,
               int                fixed_sp_size,
-              bool               enable_ls_decode_core_scheduler  = false,
-              int                ls_decode_initial_kv_dop         = 0,
-              int                ls_decode_batch_per_master       = 64,
-              bool               ls_decode_enable_memory_scale_up = true,
-              const std::string& scheduler_mode                   = "centralized");
+              bool               enable_ls_decode_core_scheduler                 = false,
+              int                ls_decode_initial_kv_dop                        = 0,
+              int                ls_decode_batch_per_master                      = 64,
+              bool               ls_decode_enable_memory_scale_up                = true,
+              const std::string& scheduler_mode                                  = "centralized",
+              const std::string& ls_kv_consolidation_mode                        = "off",
+              double             ls_kv_consolidation_candidate_util              = 0.50,
+              double             ls_kv_consolidation_target_high_watermark       = 0.80,
+              int                ls_kv_consolidation_stable_steps                = 32,
+              int                ls_kv_consolidation_cooldown_steps              = 64,
+              int                ls_kv_consolidation_check_interval_steps        = 8,
+              int                ls_kv_consolidation_max_source_blocks_per_event = 0);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -300,6 +333,9 @@ private:
     void             _reconcile_ls_groups();
     void             _seal_ls_decode_arrivals();
     bool             _ls_batch_fits_empty_system(const std::vector<std::shared_ptr<Sequence>>& batch) const;
+    std::shared_ptr<SPStateManager::LSKVConsolidationPlan> _maybe_plan_ls_kv_consolidation();
+    bool _ls_kv_consolidation_watermark_ok(const std::shared_ptr<SPStateManager::LSKVConsolidationPlan>& plan) const;
+    void _populate_ls_kv_consolidation_telemetry(ScheduleResult& result) const;
 
     // Decentralized scheduling logic
     ScheduleResult                         _schedule_decentralized();
@@ -335,6 +371,13 @@ private:
     int              ls_decode_initial_kv_dop_;
     int              ls_decode_batch_per_master_;
     bool             ls_decode_enable_memory_scale_up_;
+    std::string      ls_kv_consolidation_mode_;
+    double           ls_kv_consolidation_candidate_util_;
+    double           ls_kv_consolidation_target_high_watermark_;
+    int              ls_kv_consolidation_stable_steps_;
+    int              ls_kv_consolidation_cooldown_steps_;
+    int              ls_kv_consolidation_check_interval_steps_;
+    int              ls_kv_consolidation_max_source_blocks_per_event_;
     std::vector<int> ls_empty_system_free_blocks_per_rank_;
 
     std::string sp_master_selector_;
@@ -370,6 +413,13 @@ private:
     double                                                  ls_step_planning_latency_ms_                      = 0.0;
     uint64_t                                                next_ls_kv_transaction_id_                        = 1;
     std::shared_ptr<SPStateManager::LSKVConsolidationPlan>  active_ls_kv_transaction_;
+    bool                                                    ls_step_kv_candidate_       = false;
+    int64_t                                                 ls_step_kv_group_id_        = -1;
+    int                                                     ls_step_kv_source_rank_     = -1;
+    int                                                     ls_step_kv_target_dop_      = -1;
+    uint64_t                                                ls_step_kv_stable_steps_    = 0;
+    double                                                  ls_step_kv_group_util_      = 0.0;
+    std::string                                             ls_step_kv_decision_reason_ = "off";
 };
 
 }  // namespace nanodeploy

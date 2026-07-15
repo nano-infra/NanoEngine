@@ -63,7 +63,14 @@ class Scheduler(_CppScheduler):
             config.ls_decode_initial_kv_dop,
             config.ls_decode_batch_per_master,
             config.ls_decode_enable_memory_scale_up,
-            config.scheduler_mode
+            config.scheduler_mode,
+            config.ls_kv_consolidation_mode,
+            config.ls_kv_consolidation_candidate_util,
+            config.ls_kv_consolidation_target_high_watermark,
+            config.ls_kv_consolidation_stable_steps,
+            config.ls_kv_consolidation_cooldown_steps,
+            config.ls_kv_consolidation_check_interval_steps,
+            config.ls_kv_consolidation_max_source_blocks_per_event,
         )
         # Store config for compatibility
         self.engine_id = config.engine_id

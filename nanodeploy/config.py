@@ -137,6 +137,16 @@ class Config:
     ls_decode_initial_kv_dop: int = 0
     ls_decode_batch_per_master: int = 64
     ls_decode_enable_memory_scale_up: bool = True
+    # Automatic KV consolidation is opt-in. Shadow mode evaluates the
+    # utilization/stability gates without reserving blocks or moving KV.
+    ls_kv_consolidation_mode: Literal["off", "shadow", "execute"] = "off"
+    ls_kv_consolidation_candidate_util: float = 0.50
+    ls_kv_consolidation_target_high_watermark: float = 0.80
+    ls_kv_consolidation_stable_steps: int = 32
+    ls_kv_consolidation_cooldown_steps: int = 64
+    ls_kv_consolidation_check_interval_steps: int = 8
+    # Hard execution budget. 0 means uncalibrated and forbids automatic execute.
+    ls_kv_consolidation_max_source_blocks_per_event: int = 0
     # 0 keeps the physical KV-consolidation P2P transport disabled.  A positive
     # value reserves a fixed token-major scratch buffer before sizing KV blocks.
     ls_kv_consolidation_migration_chunk_tokens: int = 0
@@ -149,9 +159,57 @@ class Config:
             )
         if self.ls_decode_batch_per_master <= 0:
             raise ValueError("ls_decode_batch_per_master must be > 0")
+        if self.ls_kv_consolidation_mode not in {"off", "shadow", "execute"}:
+            raise ValueError(
+                "ls_kv_consolidation_mode must be one of: off, shadow, execute"
+            )
+        if not 0.0 < self.ls_kv_consolidation_candidate_util <= 1.0:
+            raise ValueError(
+                "ls_kv_consolidation_candidate_util must be in (0, 1]"
+            )
+        if not 0.0 < self.ls_kv_consolidation_target_high_watermark <= 1.0:
+            raise ValueError(
+                "ls_kv_consolidation_target_high_watermark must be in (0, 1]"
+            )
+        if self.ls_kv_consolidation_stable_steps <= 0:
+            raise ValueError("ls_kv_consolidation_stable_steps must be > 0")
+        if self.ls_kv_consolidation_cooldown_steps < 0:
+            raise ValueError("ls_kv_consolidation_cooldown_steps must be >= 0")
+        if self.ls_kv_consolidation_check_interval_steps <= 0:
+            raise ValueError(
+                "ls_kv_consolidation_check_interval_steps must be > 0"
+            )
+        if self.ls_kv_consolidation_max_source_blocks_per_event < 0:
+            raise ValueError(
+                "ls_kv_consolidation_max_source_blocks_per_event must be >= 0"
+            )
         if self.ls_kv_consolidation_migration_chunk_tokens < 0:
             raise ValueError(
                 "ls_kv_consolidation_migration_chunk_tokens must be >= 0"
+            )
+        if (
+            self.ls_kv_consolidation_mode != "off"
+            and not self.enable_ls_decode_core_scheduler
+        ):
+            raise ValueError(
+                "ls_kv_consolidation_mode requires "
+                "enable_ls_decode_core_scheduler=True"
+            )
+        if (
+            self.ls_kv_consolidation_mode == "execute"
+            and self.ls_kv_consolidation_migration_chunk_tokens == 0
+        ):
+            raise ValueError(
+                "ls_kv_consolidation_mode='execute' requires "
+                "ls_kv_consolidation_migration_chunk_tokens > 0"
+            )
+        if (
+            self.ls_kv_consolidation_mode == "execute"
+            and self.ls_kv_consolidation_max_source_blocks_per_event == 0
+        ):
+            raise ValueError(
+                "ls_kv_consolidation_mode='execute' requires "
+                "ls_kv_consolidation_max_source_blocks_per_event > 0"
             )
         if self.fixed_sp_size < 0:
             raise ValueError("fixed_sp_size must be >= 0")

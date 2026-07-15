@@ -15,6 +15,12 @@ PYBIND11_MAKE_OPAQUE(std::unordered_map<std::string, std::pair<std::shared_ptr<S
 
 void bind_scheduler_utils(py::module_& m)
 {
+    py::enum_<ScheduleAction>(m, "ScheduleAction")
+        .value("ADMISSION", ScheduleAction::ADMISSION)
+        .value("DECODE", ScheduleAction::DECODE)
+        .value("KV_CONSOLIDATION", ScheduleAction::KV_CONSOLIDATION)
+        .export_values();
+
     // Bind the postprocess_sequences utility function
     m.def("postprocess_sequences",
           &postprocess_sequences,
@@ -97,10 +103,12 @@ void bind_scheduler_utils(py::module_& m)
 
     // Bind the ScheduleResult struct
     py::class_<ScheduleResult>(m, "ScheduleResult")
+        .def_readonly("action", &ScheduleResult::action)
         .def_readwrite("dp_seqs", &ScheduleResult::dp_seqs)
         .def_readwrite("dp_sp_seqs", &ScheduleResult::dp_sp_seqs)
         .def_readwrite("filtered_dp_sp_seqs", &ScheduleResult::filtered_dp_sp_seqs)
         .def_readwrite("is_prefill", &ScheduleResult::is_prefill)
+        .def_readonly("kv_consolidation_plan", &ScheduleResult::kv_consolidation_plan)
         .def_readonly("sp_send_counts", &ScheduleResult::sp_send_counts)
         .def_readonly("sp_recv_counts", &ScheduleResult::sp_recv_counts)
         .def_readonly("sp_size_hist_per_dp", &ScheduleResult::sp_size_hist_per_dp)
@@ -149,7 +157,15 @@ void bind_scheduler_utils(py::module_& m)
         .def_readonly("ls_historical_kv_migration_bytes", &ScheduleResult::ls_historical_kv_migration_bytes)
         .def_readonly("ls_preempted_sequence_ids", &ScheduleResult::ls_preempted_sequence_ids)
         .def_readonly("ls_preemption_reasons", &ScheduleResult::ls_preemption_reasons)
-        .def_readonly("ls_planning_latency_ms", &ScheduleResult::ls_planning_latency_ms);  // Bind the Scheduler class
+        .def_readonly("ls_planning_latency_ms", &ScheduleResult::ls_planning_latency_ms)
+        .def_readonly("ls_kv_consolidation_candidate", &ScheduleResult::ls_kv_consolidation_candidate)
+        .def_readonly("ls_kv_consolidation_group_id", &ScheduleResult::ls_kv_consolidation_group_id)
+        .def_readonly("ls_kv_consolidation_source_rank", &ScheduleResult::ls_kv_consolidation_source_rank)
+        .def_readonly("ls_kv_consolidation_target_dop", &ScheduleResult::ls_kv_consolidation_target_dop)
+        .def_readonly("ls_kv_consolidation_stable_steps", &ScheduleResult::ls_kv_consolidation_stable_steps)
+        .def_readonly("ls_kv_consolidation_group_util", &ScheduleResult::ls_kv_consolidation_group_util)
+        .def_readonly("ls_kv_consolidation_decision_reason",
+                      &ScheduleResult::ls_kv_consolidation_decision_reason);  // Bind the Scheduler class
     py::class_<Scheduler, std::shared_ptr<Scheduler>>(m, "Scheduler")
         .def(py::init([](const std::string& engine_id,
                          int                loop_count,
@@ -190,7 +206,14 @@ void bind_scheduler_utils(py::module_& m)
                          int                ls_decode_initial_kv_dop,
                          int                ls_decode_batch_per_master,
                          bool               ls_decode_enable_memory_scale_up,
-                         const std::string& scheduler_mode) {
+                         const std::string& scheduler_mode,
+                         const std::string& ls_kv_consolidation_mode,
+                         double             ls_kv_consolidation_candidate_util,
+                         double             ls_kv_consolidation_target_high_watermark,
+                         int                ls_kv_consolidation_stable_steps,
+                         int                ls_kv_consolidation_cooldown_steps,
+                         int                ls_kv_consolidation_check_interval_steps,
+                         int                ls_kv_consolidation_max_source_blocks_per_event) {
                  return std::make_shared<Scheduler>(engine_id,
                                                     loop_count,
                                                     max_num_seqs,
@@ -230,7 +253,14 @@ void bind_scheduler_utils(py::module_& m)
                                                     ls_decode_initial_kv_dop,
                                                     ls_decode_batch_per_master,
                                                     ls_decode_enable_memory_scale_up,
-                                                    scheduler_mode);
+                                                    scheduler_mode,
+                                                    ls_kv_consolidation_mode,
+                                                    ls_kv_consolidation_candidate_util,
+                                                    ls_kv_consolidation_target_high_watermark,
+                                                    ls_kv_consolidation_stable_steps,
+                                                    ls_kv_consolidation_cooldown_steps,
+                                                    ls_kv_consolidation_check_interval_steps,
+                                                    ls_kv_consolidation_max_source_blocks_per_event);
              }),
              py::arg("engine_id"),
              py::arg("loop_count"),
@@ -265,13 +295,20 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("lse_bytes_per_edge")                  = 1,
              py::arg("enable_non_uniform_split"),
              py::arg("sp_master_selector"),
-             py::arg("sp_debug")                         = false,
-             py::arg("fixed_sp_size")                    = 0,
-             py::arg("enable_ls_decode_core_scheduler")  = false,
-             py::arg("ls_decode_initial_kv_dop")         = 0,
-             py::arg("ls_decode_batch_per_master")       = 64,
-             py::arg("ls_decode_enable_memory_scale_up") = true,
-             py::arg("scheduler_mode")                   = "centralized")
+             py::arg("sp_debug")                                        = false,
+             py::arg("fixed_sp_size")                                   = 0,
+             py::arg("enable_ls_decode_core_scheduler")                 = false,
+             py::arg("ls_decode_initial_kv_dop")                        = 0,
+             py::arg("ls_decode_batch_per_master")                      = 64,
+             py::arg("ls_decode_enable_memory_scale_up")                = true,
+             py::arg("scheduler_mode")                                  = "centralized",
+             py::arg("ls_kv_consolidation_mode")                        = "off",
+             py::arg("ls_kv_consolidation_candidate_util")              = 0.50,
+             py::arg("ls_kv_consolidation_target_high_watermark")       = 0.80,
+             py::arg("ls_kv_consolidation_stable_steps")                = 32,
+             py::arg("ls_kv_consolidation_cooldown_steps")              = 64,
+             py::arg("ls_kv_consolidation_check_interval_steps")        = 8,
+             py::arg("ls_kv_consolidation_max_source_blocks_per_event") = 0)
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))

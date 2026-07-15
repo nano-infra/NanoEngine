@@ -46,6 +46,32 @@ def execute_ls_kv_scale_down(
     """
 
     plan = scheduler.plan_ls_kv_scale_down(group_id, source_rank)
+    return execute_planned_ls_kv_scale_down(
+        scheduler,
+        executor,
+        plan,
+        timeout=timeout,
+    )
+
+
+def execute_planned_ls_kv_scale_down(
+    scheduler: Any,
+    executor: Any,
+    plan: Any,
+    *,
+    timeout: float | None = None,
+    abort_on_copy_error: bool = True,
+) -> KVScaleDownResult:
+    """Execute one scheduler-owned, already-reserved scale-down plan.
+
+    Automatic scheduling must call this coordinator directly. Re-planning by
+    group/source would leak the original reservation and could select a plan
+    that no longer matches the scheduler decision returned for this step.
+    Automatic Ray/NCCL execution sets ``abort_on_copy_error=False`` because
+    worker completion may be unknown; retaining the reservation makes any
+    attempted continuation fail closed on the scheduler transaction guard.
+    """
+
     if not plan.success:
         raise KVScaleDownRejected(plan.failure_reason)
 
@@ -66,7 +92,8 @@ def execute_ls_kv_scale_down(
     try:
         worker_results = executor.copy_kv_ranges_p2p(moves, timeout=timeout)
     except BaseException:
-        scheduler.abort_ls_kv_scale_down(plan)
+        if abort_on_copy_error:
+            scheduler.abort_ls_kv_scale_down(plan)
         raise
 
     try:
