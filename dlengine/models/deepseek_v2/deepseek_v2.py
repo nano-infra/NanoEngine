@@ -568,6 +568,8 @@ class DeepseekV2BMM(nn.Module):
 class DeepseekV2Attention(nn.Module):
     """Deepseekv2 attention."""
 
+    _cache_aware_prefill_logged = False
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -1005,13 +1007,10 @@ class DeepseekV2Attention(nn.Module):
             # later reads). Reproduce the trained sparse pattern with the absorbed
             # MLA form (same as decode) + ``flash_mla_sparse_fwd``.
             #
-            # Handles the no-cached-prefix case (fresh single-chunk prompt):
-            # ``key_states_3d`` already covers the whole sequence, so
-            # ``compute_prefill_topk`` over the fresh keys gives the exact
-            # per-query selection. The cached-prefix / chunked case (total_cached
-            # > 0) is handled by the dense fallback below for now; note this is an
-            # *eager* path (only decode is CUDA-graph captured), so the host sync
-            # to read ``total_cached`` is safe.
+            # A fresh prompt can score its contiguous keys directly. Chunked
+            # prefill scores cached-prefix indexer keys plus causal fresh keys,
+            # and sparse MLA consumes the same cached+fresh ragged K layout.
+            # Prefill is eager, so reading ``total_cached`` on the host is safe.
             nsa_prefill = (
                 _NSA_SPARSE_PREFILL
                 and self.indexer is not None
@@ -1019,26 +1018,32 @@ class DeepseekV2Attention(nn.Module):
                 and context.cu_seqlens_q is not None
             )
             total_cached = 0
-            if (
-                nsa_prefill
-                and context.block_tables is not None
-                and context.cu_seqlens_k is not None
-            ):
+            if nsa_prefill and context.cu_seqlens_k is not None:
                 total_cached = int(
                     (context.cu_seqlens_k[-1] - context.cu_seqlens_q[-1]).item()
                 )
-            sparse_fwd = (
-                _get_flash_mla_sparse_fwd()
-                if (nsa_prefill and total_cached == 0)
-                else None
+            has_cache_metadata = (
+                context.block_tables is not None and context.cu_seqlens_k is not None
             )
+            sparse_fwd = _get_flash_mla_sparse_fwd() if nsa_prefill else None
             if sparse_fwd is not None:
-                seq_lens = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
-                max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() else 0
-                if max_seq_len > self.indexer.index_topk and _sparse_prefill_supported(
-                    num_heads,
-                    self.indexer.index_topk,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
+                sparse_lens = (
+                    context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
+                    if context.cu_seqlens_k is not None
+                    else context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
+                )
+                max_sparse_len = (
+                    int(sparse_lens.max().item()) if sparse_lens.numel() else 0
+                )
+                can_sparse_chunk = total_cached == 0 or has_cache_metadata
+                if (
+                    can_sparse_chunk
+                    and max_sparse_len > self.indexer.index_topk
+                    and _sparse_prefill_supported(
+                        num_heads,
+                        self.indexer.index_topk,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    )
                 ):
                     if self.q_lora_rank is None:
                         q_lora = None
@@ -1051,14 +1056,72 @@ class DeepseekV2Attention(nn.Module):
                     self.kc(q_nope, query_states[..., : self.kv_lora_rank])
                     query_states[..., self.kv_lora_rank :] = q_pe
 
-                    topk_indices = self.indexer.compute_prefill_topk(
-                        q_lora, hidden_states, positions, context.cu_seqlens_q
-                    )  # (q_len, index_topk) int32, absolute key positions
+                    key_states_for_sparse = key_states_3d
+                    if total_cached == 0:
+                        topk_indices = self.indexer.compute_prefill_topk(
+                            q_lora,
+                            hidden_states,
+                            positions,
+                            context.cu_seqlens_q,
+                        )
+                    else:
+                        sp_rank = get_dist_context().attn_sp_rank
+                        num_seqs = context.cu_seqlens_k.shape[0] - 1
+                        block_table = context.block_tables[sp_rank, :num_seqs, :]
+                        block_size = k_cache.shape[1]
+
+                        k_cached_raw, cached_lens, cu_cached = (
+                            _gather_cache_cached_only(
+                                k_cache,
+                                block_table,
+                                context.cu_seqlens_q,
+                                context.cu_seqlens_k,
+                                block_size,
+                            )
+                        )
+                        if k_cached_raw.shape[0] > 0:
+                            k_cached_raw = k_cached_raw.squeeze(1)
+                            if k_cache.dtype == torch.float8_e4m3fn:
+                                dequantize_fn = getattr(self, "_dequantize_fn", None)
+                                if dequantize_fn is None:
+                                    from dlengine.kernel.triton.hopper.fp8_utils import (
+                                        dequantize_and_unpack_mla as dequantize_fn,
+                                    )
+
+                                    self._dequantize_fn = dequantize_fn
+                                k_cached_raw = dequantize_fn(
+                                    k_cached_raw.view(torch.uint8)
+                                )
+                            key_states_for_sparse = _interleave_cached_fresh(
+                                k_cached_raw.unsqueeze(1),
+                                key_states_3d,
+                                cached_lens,
+                                cu_cached,
+                                context.cu_seqlens_q,
+                                context.cu_seqlens_k,
+                            )
+
+                        topk_indices = self.indexer.compute_prefill_topk_cache_aware(
+                            q_lora,
+                            hidden_states,
+                            positions,
+                            context.cu_seqlens_q,
+                            context.cu_seqlens_k,
+                            block_table,
+                        )
+                        if not type(self)._cache_aware_prefill_logged:
+                            logger.info(
+                                "Using cache-aware NSA sparse chunk prefill: "
+                                "cached_tokens=%d, fresh_tokens=%d, topk=%d",
+                                total_cached,
+                                q_len,
+                                self.indexer.index_topk,
+                            )
+                            type(self)._cache_aware_prefill_logged = True
 
                     out, _, _ = sparse_fwd(
                         query_states,  # (s_q, H, 576)
-                        # (s_kv, 1, 576) compressed latent + RoPE'd k_pe
-                        key_states_3d,
+                        key_states_for_sparse,  # (s_kv, 1, 576), cached + fresh
                         topk_indices.unsqueeze(1),  # (s_q, 1, topk)
                         self.softmax_scale,
                         d_v=self.kv_lora_rank,
