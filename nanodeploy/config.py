@@ -307,13 +307,16 @@ class Config:
             )
             supported_ls_parallel_topologies = {
                 (1, 8, 1, 8, 1, 1),   # single-node functional preflight
+                (2, 8, 1, 16, 1, 1),  # two-node scaling validation
                 (4, 8, 1, 32, 1, 1),  # target 4-DP experiment
             }
             if ls_parallel_topology not in supported_ls_parallel_topologies:
                 unsupported.append(
-                    "parallel topology must be either the single-node preflight "
+                    "parallel topology must be the single-node preflight "
                     "(attention_dp=1, attention_sp=8, attention_tp=1, "
-                    "ffn_ep=8, ffn_dp=1, ffn_tp=1) or the target experiment "
+                    "ffn_ep=8, ffn_dp=1, ffn_tp=1), the two-node validation "
+                    "(attention_dp=2, attention_sp=8, attention_tp=1, "
+                    "ffn_ep=16, ffn_dp=1, ffn_tp=1), or the target experiment "
                     "(attention_dp=4, attention_sp=8, attention_tp=1, "
                     "ffn_ep=32, ffn_dp=1, ffn_tp=1)"
                 )

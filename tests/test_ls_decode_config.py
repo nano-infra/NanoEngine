@@ -161,6 +161,16 @@ def test_ls_decode_core_supports_single_node_8gpu_preflight(tmp_path):
     assert config.ffn_world_size == 8
 
 
+def test_ls_decode_core_supports_two_node_16gpu_validation(tmp_path):
+    kwargs = _ls_kwargs()
+    kwargs.update(attention_dp=2, ffn_ep=16)
+
+    config = Config(model=str(tmp_path), **kwargs)
+
+    assert config.attn_world_size == 16
+    assert config.ffn_world_size == 16
+
+
 @pytest.mark.parametrize(
     ("override", "message"),
     [

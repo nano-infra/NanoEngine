@@ -21,8 +21,9 @@ PROXY_ENV_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Long-running 8-GPU LS-Decode-Core serving benchmark. The default "
-            "configuration runs attention DP=1, SP=8, FFN EP=8 for 10 minutes."
+            "Long-running LS-Decode-Core serving benchmark. The default "
+            "configuration runs attention DP=1, SP=8, FFN EP=8 for 10 minutes; "
+            "--attention-dp 2 uses the two-node DP=2, SP=8, FFN EP=16 topology."
         )
     )
     parser.add_argument(
@@ -63,6 +64,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-recv-seqs", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=0)
     parser.add_argument("--max-num-batched-tokens", type=int, default=0)
+    parser.add_argument(
+        "--attention-dp",
+        type=int,
+        choices=[1, 2, 4],
+        default=1,
+        help="Number of independent SP8 attention domains; FFN EP is 8x this value.",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--gpu-memory-limit-gb", type=float, default=None)
     parser.add_argument("--kvcache-block-size", type=int, default=64)
@@ -259,7 +267,8 @@ def make_sequence(
 
 def default_output_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = f"ls_decode_longrun_8gpu_{int(args.duration_sec)}s_{timestamp}"
+    num_gpus = args.attention_dp * 8
+    stem = f"ls_decode_longrun_{num_gpus}gpu_{int(args.duration_sec)}s_{timestamp}"
     return Path("docs-dev") / f"{stem}.json", Path("docs-dev") / f"{stem}.jsonl"
 
 
@@ -290,11 +299,11 @@ def build_engine(args: argparse.Namespace) -> LLM:
         dummy_prefill=True,
         dummy_weight=args.dummy_weight,
         perfect_eplb=True,
-        attention_dp=1,
+        attention_dp=args.attention_dp,
         attention_sp=8,
         attention_tp=1,
         ffn_dp=1,
-        ffn_ep=8,
+        ffn_ep=args.attention_dp * 8,
         ffn_tp=1,
         max_num_seqs=args.max_num_seqs,
         max_num_recv_seqs=args.max_num_recv_seqs,
@@ -358,10 +367,10 @@ def config_dict(args: argparse.Namespace, output_json: Path, completion_jsonl: P
         "max_tokens": args.max_tokens,
         "max_generated_requests": args.max_generated_requests,
         "max_inflight_requests": args.max_inflight_requests,
-        "attention_dp": 1,
+        "attention_dp": args.attention_dp,
         "attention_sp": 8,
         "attention_tp": 1,
-        "ffn_ep": 8,
+        "ffn_ep": args.attention_dp * 8,
         "ffn_dp": 1,
         "ffn_tp": 1,
         "fixed_sp_size": 0,
