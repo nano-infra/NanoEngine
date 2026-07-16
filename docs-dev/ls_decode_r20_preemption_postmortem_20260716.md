@@ -6,6 +6,8 @@
 
 两节点 `DP2 × SP8 / EP16`、Issue 1%、`rate=20` 运行中出现的早期频繁抢占，主要是 NanoDeploy 当前 LS-Decode-Core 调度实现中的 receiver 约束、贪心 master 分配和立即恢复机制共同造成的调度抖动；它不是开始阶段全局 KV cache 用满，也不是 LoongServe multi-master 思想的固有限制。
 
+随后进行的 600-request 定向诊断复跑已经确认：首次失败由 `max_num_recv_seqs=128` 的 receiver capacity 触发；当时集群真实 KV block 利用率只有 4.59%，并且存在 receiver 最大值仅 121 的均衡合法 assignment。当前 source-greedy 没有找到该 assignment，随后进入每轮 9 次抢占和立即恢复的活锁。
+
 同时，`rate=20` 对这份数据集提供的长期负载很高。随着等待队列持续增长，后期仍可能出现真实的计算或 KV 容量压力。因此需要区分：
 
 - 开始约 20 秒出现的重复抢占：NanoDeploy 调度/恢复问题；
@@ -79,7 +81,7 @@ append capacity cannot cover remaining requests
 
 代码位置：`csrc/nanodeploy/scheduler/sp_state_manager.cpp:487-537`。
 
-因此旧日志中的错误文本不能证明物理 KV blocks 不足。结合首次故障时极低的 block 占用，receiver metadata 上限是更可能的直接触发条件。
+因此旧日志中的错误文本不能证明物理 KV blocks 不足。第 9 节的诊断复跑通过逐 rank blocks/receiver 快照进一步确认，这次故障的直接触发条件是 receiver capacity。
 
 ### 4.2 source-greedy 可能拒绝实际可行的分配
 
@@ -94,7 +96,7 @@ append capacity cannot cover remaining requests
 
 例如一个 owner 持有约 200 条请求的 prompt KV，若 8 个 master 近似平均分配，该 owner 需要接收约 175 条 remote request，超过 `max_num_recv_seqs=128`。实际可以让 owner 自己承担至少 72 条请求，把 remote receiver 数降到 128；但一次性平均切块的贪心不一定找到这个分配。
 
-缺少故障瞬间的 per-sequence owner snapshot，所以还不能形式化证明某一次失败一定存在合法 matching；这是与容量数据、代码路径和重复 victim 现象最吻合的高置信解释，需要诊断复跑最终确认。
+旧日志缺少故障瞬间的 per-sequence owner snapshot，单靠旧日志无法形式化证明存在合法 matching。第 9 节通过重放 admission 和逐轮 master assignment 重建了精确 owner 集合，并找到了满足所有约束的均衡 assignment，已经确认本次 source-greedy 存在 false negative。
 
 ### 4.3 victim 选择没有针对瓶颈
 
@@ -152,7 +154,7 @@ NanoDeploy 当前 initial admission 主要预算 prompt、pending token 和固�
 
 本轮 consolidation 使用 `execute` 和非常积极的 `2/2/1` 阈值，理论上可能把 KV 压到少数 owner rank，放大 receiver 热点或 scale-down/scale-up 抖动。
 
-但旧运行关闭了详细 NanoDeploy 日志，缺少 consolidation action、迁移前后 rank blocks 和 receiver counts，不能确认首次失败前是否实际执行过有效迁移。因此当前将其定为潜在放大器，而不是已证实的首要根因。
+但旧运行关闭了详细 NanoDeploy 日志，缺少 consolidation action、迁移前后 rank blocks 和 receiver counts，不能确认首次失败前是否实际执行过有效迁移。新的诊断复跑记录到零次 consolidation action，已排除 consolidation 是该次复现的首因；它在其他运行中是否会成为放大器，仍需单独 A/B。
 
 ## 8. 诊断复跑方案
 
@@ -183,7 +185,104 @@ export NANODEPLOY_LOG_MODEL_FORWARD_TIMING=1
 
 重点判据：若首次失败前后所有相关 rank 仍有大量 free blocks，同时某 owner 的 receiver count 接近 128，并出现同一 recovery request 反复 admission/preempt，则可以直接确认 receiver/recovery thrashing；若 receiver 未接近上限，则需要用该次 placement snapshot 进一步检查 planner false-negative 或 reservation 计算。
 
-## 9. 修复优先级
+## 9. 诊断复跑结果
+
+诊断日志：`docs-dev/ls_style_issue001_2node_dp2sp8_r20_diag30s_verbose_forward_20260716.log`。
+
+测试使用原配置和相同 seed 的前 600 个请求，最后一个采样到达为 28.17699 秒。正式 workload 于 08:08:27 开始，首次失败于 08:08:50 出现，即约 23 秒。发送窗口结束且活锁证据已完整采集后，在 08:09:16 主动停止 drain；因此该运行没有最终 JSONL，也不作为性能结果。
+
+### 9.1 Receiver 是直接触发条件
+
+首次失败前最后一个成功 decode step 中，两个 group 分别为 173 和 168 个请求，均已使用 8 个 ranks。逐 rank 状态为：
+
+```text
+DP0 free_blocks    = [13844, 13909, 13850, 13859,  8745, 12010, 13854, 13858]
+DP0 recv_counts    = [  128,    65,    68,   104,    47,    70,    87,   111]
+
+DP1 free_blocks    = [13812, 13714, 13921, 13810, 13668, 13811, 13810, 13926]
+DP1 recv_counts    = [  116,    49,    62,    79,   108,    88,   126,    54]
+```
+
+由此得到：
+
+- DP0 KV block 利用率 7.50%；
+- DP1 KV block 利用率 1.67%；
+- 集群整体 KV block 利用率 4.59%；
+- 最紧张的单 rank 仍有 `8,745 / 14,044 = 62.27%` blocks 空闲；
+- receiver 已分别达到 128 和 126。
+
+失败调度中，group 3 在合入 48 个 pending requests 后共有 216 个请求。对应 DP 的任意 rank 至少仍有 13,668 个 free blocks；即使保守地给 216 个请求各计一个 pending append block 和一个 reservation block，也只需要不超过 432 blocks。因此 `estimate_pending_append_capacity(...)` 对候选 rank 不可能为零，联合候选谓词中只剩 `receiver_prefix_capacity(...)` 可以导致失败。
+
+这确认了 generic `append capacity cannot cover remaining requests` 实际由 receiver cap 触发，而不是 KV blocks 用尽。
+
+### 9.2 存在合法均衡 assignment，确认 planner false negative
+
+诊断日志记录了每个 batch 的 initial KV ranks 和每轮 sequence-to-master assignment。由于本轮没有 consolidation action，可按时间顺序取这些 ranks 的并集，精确重建每条 active sequence 的 KV owners。重建出的上一轮 receiver counts 与日志矩阵完全一致：
+
+```text
+reconstructed = [116, 49, 62, 79, 108, 88, 126, 54]
+logged        = [116, 49, 62, 79, 108, 88, 126, 54]
+```
+
+216 个候选请求在 8 个 ranks 上的 owner counts 为：
+
+```text
+[140, 70, 91, 101, 129, 111, 147, 109]
+```
+
+将每条请求分配给它已有 KV 的一个 owner，并在满足 receiver lower bound 后平衡 master load，可以得到：
+
+```text
+master_load   = [26, 26, 26, 26, 26, 26, 26, 34]
+receiver_load = [114, 44, 65, 75, 103, 85, 121, 75]
+```
+
+所有 master batch 均不小于 `batch_per_master=8`，最大只有 34；所有 receiver 均不超过 128，最大为 121；append blocks 也有充足余量。这是一个满足当前物理和 metadata 约束的合法计划。
+
+因此此次失败不是请求集合本身不可调度，而是当前连续 prefix/chunk、无回溯的 source-greedy 没有找到已存在的合法 assignment，造成资源未充分利用。
+
+### 9.3 立即恢复形成确定的活锁
+
+主动停止前共记录：
+
+- 113 个包含失败的调度 iteration；
+- 每个 iteration 达到 `attention_sp + 1 = 9` 次重试/抢占；
+- 合计 1,017 次 preemption，但只有 12 个 unique victims；
+- `seq_id=430..435` 各被抢占 113 次，`427..429` 各 112 次，`436..438` 各 1 次；
+- 1,012 次 recovery admission；
+- pending batch 峰值 172，pending request 峰值 221；
+- oldest pending batch age 达到 1,203 steps，最大 admission attempts 达到 1,204。
+
+日志直接显示 recovery request 被 `push_front` 后，在同一 group 和几乎相同资源状态下再次 admission。该数据确认了 `preempt -> recovery push_front -> immediate re-admission -> same failure` 的 liveness bug。
+
+### 9.4 Consolidation 在该复现中没有执行
+
+333 个 decode iterations 中：
+
+- `kv_consolidation_decision_reason=no_candidate`：149 次；
+- `pending_admission_not_proven`：184 次；
+- consolidation action：0 次。
+
+所以虽然配置为 aggressive `execute(2/2/1)`，本次早期 receiver failure 与 recovery thrashing 并不是 consolidation migration 造成的。
+
+### 9.5 Actual forward 已成功采集
+
+`NANODEPLOY_LOG_MODEL_FORWARD_TIMING=1` 共得到 326 个正式 workload CUDA-event 样本。该时间覆盖每个 worker 的实际 `run_model`，包括模型内 collective，不包括调度、RPC prepare 和 sampling；distributed critical path 取每轮 16 ranks 中的最慢 rank。
+
+```text
+                              首次失败前        首次失败后
+critical-path forward mean      93.2 ms           111.4 ms
+critical-path forward p50       94.3 ms           113.4 ms
+rank-mean forward mean          82.7 ms           100.6 ms
+rank-min forward mean           45.1 ms            54.7 ms
+planner latency mean             1.05 ms            6.14 ms
+driver scheduler overhead mean   3.30 ms           25.05 ms
+step ITL mean                   103.9 ms           141.0 ms
+```
+
+详细日志会扰动 driver wall time，因此 scheduler overhead 和 step ITL 只用于故障诊断；CUDA-event actual forward 仍可用于区分模型执行与调度/恢复开销。数据表明抢占循环不仅没有释放真实 KV 瓶颈，还把平均调度开销提高约 7.6 倍，并使 step ITL 明显恶化。
+
+## 10. 修复优先级
 
 1. 将 block append、receiver overflow、metadata batch limit 等失败原因拆开，并在失败时保存逐 rank 快照；
 2. recovery 增加 capacity/receiver epoch 或 backoff，禁止无状态变化的立即重入；
