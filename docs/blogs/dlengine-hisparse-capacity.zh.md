@@ -269,6 +269,6 @@ $N_{bs,max}=1/2/4$ 的可行上界约为 $512/303.3/142.4$。
 | --- | --- |
 | sparse kernel 可运行 | $N_{T,Buffer}\ge N_{Topk}$ |
 | 一个 model-length 的 worker aggregate capacity | 令 $C_{worker}\ge L_{max,model}$，并确认 crossing 小于 $R^{Topk}_{Host,max}$ |
-| 高并发 | 使用 worker-wide Buffer pool，并验证 $B^{T,GPU}_{Buffer}\ge N_{bs,max}N_{Topk}$ |
+| 高并发 | 使用 worker-wide Buffer pool；总 hot-slot 数需覆盖所有并发请求的 Top-k 下界 |
 | 更高容量 | 增大 $R_{Host}$，但注意 Indexer ceiling 与 host RAM |
 | Indexer 已主导 HBM | 优先增大 $R_{Share}$ 或压缩 Indexer，而不是继续推高 $R_{Host}$ |
