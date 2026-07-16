@@ -92,7 +92,8 @@ public:
     struct LSDecodeMasterPlan {
         bool             success = false;
         std::string      failure_reason;
-        std::string      scale_reason = "none";
+        std::string      scale_reason        = "none";
+        std::string      assignment_strategy = "source_greedy";
         std::vector<int> allocation;
         std::vector<int> master_ranks;
         std::vector<int> master_batch_sizes;

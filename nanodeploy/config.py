@@ -153,6 +153,8 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
+        if self.reserved_blocks_per_req < 0:
+            raise ValueError("reserved_blocks_per_req must be >= 0")
         if not 0 <= self.ls_decode_initial_kv_dop <= self.attention_sp:
             raise ValueError(
                 "ls_decode_initial_kv_dop must be in [0, attention_sp]"

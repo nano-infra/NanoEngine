@@ -1,9 +1,11 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <queue>
 #include <random>
 #include <set>
 #include <sstream>
@@ -17,6 +19,91 @@
 namespace nanodeploy {
 
 namespace {
+
+class SmallDinic {
+public:
+    struct Edge {
+        int to       = 0;
+        int reverse  = 0;
+        int capacity = 0;
+    };
+
+    explicit SmallDinic(int nodes): graph_(nodes), level_(nodes), next_edge_(nodes) {}
+
+    void add_edge(int from, int to, int capacity)
+    {
+        int forward_reverse = static_cast<int>(graph_[to].size());
+        int reverse_reverse = static_cast<int>(graph_[from].size());
+        graph_[from].push_back({to, forward_reverse, capacity});
+        graph_[to].push_back({from, reverse_reverse, 0});
+    }
+
+    int max_flow(int source, int sink, int limit)
+    {
+        int flow = 0;
+        while (flow < limit && build_levels(source, sink)) {
+            std::fill(next_edge_.begin(), next_edge_.end(), 0);
+            while (flow < limit) {
+                int pushed = send_flow(source, sink, limit - flow);
+                if (pushed == 0) {
+                    break;
+                }
+                flow += pushed;
+            }
+        }
+        return flow;
+    }
+
+    const std::vector<Edge>& edges(int node) const
+    {
+        return graph_[node];
+    }
+
+private:
+    bool build_levels(int source, int sink)
+    {
+        std::fill(level_.begin(), level_.end(), -1);
+        std::queue<int> queue;
+        level_[source] = 0;
+        queue.push(source);
+        while (!queue.empty()) {
+            int node = queue.front();
+            queue.pop();
+            for (const auto& edge : graph_[node]) {
+                if (edge.capacity > 0 && level_[edge.to] < 0) {
+                    level_[edge.to] = level_[node] + 1;
+                    queue.push(edge.to);
+                }
+            }
+        }
+        return level_[sink] >= 0;
+    }
+
+    int send_flow(int node, int sink, int available)
+    {
+        if (node == sink) {
+            return available;
+        }
+        for (int& edge_idx = next_edge_[node]; edge_idx < static_cast<int>(graph_[node].size()); ++edge_idx) {
+            auto& edge = graph_[node][edge_idx];
+            if (edge.capacity <= 0 || level_[edge.to] != level_[node] + 1) {
+                continue;
+            }
+            int pushed = send_flow(edge.to, sink, std::min(available, edge.capacity));
+            if (pushed == 0) {
+                continue;
+            }
+            edge.capacity -= pushed;
+            graph_[edge.to][edge.reverse].capacity += pushed;
+            return pushed;
+        }
+        return 0;
+    }
+
+    std::vector<std::vector<Edge>> graph_;
+    std::vector<int>               level_;
+    std::vector<int>               next_edge_;
+};
 
 std::string trim_copy(const std::string& input)
 {
@@ -447,9 +534,43 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
         return lhs < rhs;
     });
 
-    bool      compute_scaled = false;
-    bool      memory_scaled  = false;
-    const int max_restarts   = attention_sp_ + 1;
+    bool      compute_scaled  = false;
+    bool      memory_scaled   = false;
+    bool      receiver_scaled = false;
+    const int max_restarts    = attention_sp_ + 1;
+
+    auto set_scale_reason = [&](LSDecodeMasterPlan& plan) {
+        plan.scale_reason.clear();
+        auto append_reason = [&](const std::string& reason) {
+            if (!plan.scale_reason.empty()) {
+                plan.scale_reason += "+";
+            }
+            plan.scale_reason += reason;
+        };
+        if (compute_scaled) {
+            append_reason("compute");
+        }
+        if (memory_scaled) {
+            append_reason("memory");
+        }
+        if (receiver_scaled) {
+            append_reason("receiver");
+        }
+        if (plan.scale_reason.empty()) {
+            plan.scale_reason = "none";
+        }
+    };
+
+    struct SourceGreedyAttempt {
+        bool             success       = false;
+        bool             request_scale = false;
+        bool             memory_scale  = false;
+        std::string      failure_reason;
+        std::vector<int> master_ranks;
+        std::vector<int> master_batch_sizes;
+        std::vector<int> sequence_master_ranks;
+    };
+
     for (int restart = 0; restart < max_restarts; ++restart) {
         auto             candidates = current_allocation;
         std::vector<int> recv_counts(attention_sp_, 0);
@@ -474,133 +595,721 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
             return lhs < rhs;
         });
 
-        std::vector<int> masters;
-        std::vector<int> chunks;
-        std::vector<int> assignments(requests.size(), -1);
-        std::vector<int> planned_remote_recv(attention_sp_, 0);
-        size_t           remaining_begin = 0;
-        size_t           candidate_begin = 0;
-        bool             need_restart    = false;
-        bool             failed          = false;
-        std::string      failure;
+        auto run_source_greedy = [&](const std::vector<size_t>& planning_order) {
+            SourceGreedyAttempt attempt;
+            attempt.sequence_master_ranks.assign(requests.size(), -1);
+            std::vector<int> planned_remote_recv(attention_sp_, 0);
+            size_t           remaining_begin = 0;
+            size_t           candidate_begin = 0;
 
-        auto receiver_prefix_capacity = [&](int rank, size_t begin) {
-            std::vector<int> simulated = planned_remote_recv;
-            int              accepted  = 0;
-            for (size_t request_idx = begin; request_idx < requests.size(); ++request_idx) {
-                bool feasible = true;
-                for (int owner = 0; owner < attention_sp_; ++owner) {
-                    if (owner != rank
-                        && requests[request_idx]->committed_context_len(BlockContextSlot::ACTIVE, owner) > 0
-                        && simulated[owner] + 1 > max_num_recv_seqs_) {
-                        feasible = false;
+            auto ordered_suffix = [&](size_t begin) {
+                std::vector<std::shared_ptr<Sequence>> suffix;
+                suffix.reserve(planning_order.size() - begin);
+                for (size_t order_idx = begin; order_idx < planning_order.size(); ++order_idx) {
+                    suffix.push_back(requests[planning_order[order_idx]]);
+                }
+                return suffix;
+            };
+
+            auto receiver_prefix_capacity = [&](int rank, size_t begin) {
+                std::vector<int> simulated = planned_remote_recv;
+                int              accepted  = 0;
+                for (size_t order_idx = begin; order_idx < planning_order.size(); ++order_idx) {
+                    size_t request_idx = planning_order[order_idx];
+                    bool   feasible    = true;
+                    for (int owner = 0; owner < attention_sp_; ++owner) {
+                        if (owner != rank
+                            && requests[request_idx]->committed_context_len(BlockContextSlot::ACTIVE, owner) > 0
+                            && simulated[owner] + 1 > max_num_recv_seqs_) {
+                            feasible = false;
+                            break;
+                        }
+                    }
+                    if (!feasible) {
                         break;
                     }
+                    for (int owner = 0; owner < attention_sp_; ++owner) {
+                        if (owner != rank
+                            && requests[request_idx]->committed_context_len(BlockContextSlot::ACTIVE, owner) > 0) {
+                            simulated[owner]++;
+                        }
+                    }
+                    accepted++;
                 }
-                if (!feasible) {
-                    break;
-                }
-                for (int owner = 0; owner < attention_sp_; ++owner) {
-                    if (owner != rank
-                        && requests[request_idx]->committed_context_len(BlockContextSlot::ACTIVE, owner) > 0) {
-                        simulated[owner]++;
+                return accepted;
+            };
+
+            while (remaining_begin < planning_order.size()) {
+                auto                suffix = ordered_suffix(remaining_begin);
+                std::vector<size_t> append_capable;
+                int                 compute_capable = 0;
+                for (size_t idx = candidate_begin; idx < candidates.size(); ++idx) {
+                    int rank = candidates[idx];
+                    if (estimate_pending_append_capacity(rank, suffix, requests) <= 0) {
+                        continue;
+                    }
+                    compute_capable++;
+                    if (receiver_prefix_capacity(rank, remaining_begin) > 0) {
+                        append_capable.push_back(idx);
                     }
                 }
-                accepted++;
+
+                if (append_capable.empty()) {
+                    if (enable_memory_scale_up && !extras.empty()) {
+                        attempt.request_scale = true;
+                        attempt.memory_scale  = true;
+                    }
+                    else {
+                        attempt.failure_reason = "source-greedy append/receiver prefix exhausted";
+                    }
+                    return attempt;
+                }
+
+                int n_left    = static_cast<int>(append_capable.size());
+                int remaining = static_cast<int>(planning_order.size() - remaining_begin);
+                if (remaining / compute_capable > batch_per_master && !extras.empty()) {
+                    attempt.request_scale = true;
+                    return attempt;
+                }
+
+                size_t rank_pos  = append_capable.front();
+                int    rank      = candidates[rank_pos];
+                int    capacity  = estimate_pending_append_capacity(rank, suffix, requests);
+                capacity         = std::min(capacity, receiver_prefix_capacity(rank, remaining_begin));
+                int target_chunk = std::max(remaining / n_left, batch_per_master);
+                int chunk        = std::min({remaining, target_chunk, capacity});
+                candidate_begin  = rank_pos + 1;
+                if (chunk <= 0) {
+                    continue;
+                }
+                attempt.master_ranks.push_back(rank);
+                attempt.master_batch_sizes.push_back(chunk);
+                for (int i = 0; i < chunk; ++i) {
+                    size_t request_idx                         = planning_order[remaining_begin + i];
+                    attempt.sequence_master_ranks[request_idx] = rank;
+                    for (int owner = 0; owner < attention_sp_; ++owner) {
+                        if (owner != rank
+                            && requests[request_idx]->committed_context_len(BlockContextSlot::ACTIVE, owner) > 0) {
+                            planned_remote_recv[owner]++;
+                        }
+                    }
+                }
+                remaining_begin += chunk;
             }
-            return accepted;
+            attempt.success = true;
+            return attempt;
         };
 
-        while (remaining_begin < requests.size()) {
-            std::vector<size_t> append_capable;
-            for (size_t idx = candidate_begin; idx < candidates.size(); ++idx) {
-                std::vector<std::shared_ptr<Sequence>> suffix(
-                    requests.begin() + static_cast<std::ptrdiff_t>(remaining_begin), requests.end());
-                int rank = candidates[idx];
-                if (estimate_pending_append_capacity(rank, suffix, requests) > 0
-                    && receiver_prefix_capacity(rank, remaining_begin) > 0) {
-                    append_capable.push_back(idx);
+        std::vector<size_t> identity_order(requests.size());
+        std::iota(identity_order.begin(), identity_order.end(), 0);
+        auto attempt = run_source_greedy(identity_order);
+        if (attempt.request_scale && !attempt.memory_scale) {
+            int rank = extras.front();
+            extras.erase(extras.begin());
+            current_allocation.push_back(rank);
+            result.new_allocation_ranks.push_back(rank);
+            compute_scaled = true;
+            continue;
+        }
+
+        auto return_attempt = [&](SourceGreedyAttempt&& successful, const std::string& strategy) {
+            result.success               = true;
+            result.assignment_strategy   = strategy;
+            result.allocation            = current_allocation;
+            result.master_ranks          = std::move(successful.master_ranks);
+            result.master_batch_sizes    = std::move(successful.master_batch_sizes);
+            result.sequence_master_ranks = std::move(successful.sequence_master_ranks);
+            set_scale_reason(result);
+        };
+
+        if (attempt.success) {
+            return_attempt(std::move(attempt), "source_greedy");
+            return result;
+        }
+
+        // The source-greedy fast path consumes a contiguous request prefix per
+        // candidate. That ordering is not a correctness constraint and can
+        // reject a feasible owner-local assignment. Retry once with stable
+        // current-master buckets while preserving candidate and chunk policy.
+        std::vector<std::vector<size_t>> owner_buckets(candidates.size());
+        for (size_t request_idx = 0; request_idx < requests.size(); ++request_idx) {
+            int    previous_master = requests[request_idx]->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+            size_t bucket          = candidates.size();
+            for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx) {
+                if (candidates[candidate_idx] == previous_master) {
+                    bucket = candidate_idx;
+                    break;
                 }
             }
-
-            if (append_capable.empty()) {
-                if (enable_memory_scale_up && !extras.empty()) {
-                    int rank = extras.front();
-                    extras.erase(extras.begin());
-                    current_allocation.push_back(rank);
-                    result.new_allocation_ranks.push_back(rank);
-                    memory_scaled = true;
-                    need_restart  = true;
+            if (bucket == candidates.size() && !candidates.empty()) {
+                bucket          = 0;
+                int best_tokens = -1;
+                for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx) {
+                    int tokens = requests[request_idx]->committed_context_len(BlockContextSlot::ACTIVE,
+                                                                              candidates[candidate_idx]);
+                    if (tokens > best_tokens) {
+                        best_tokens = tokens;
+                        bucket      = candidate_idx;
+                    }
                 }
-                else {
-                    failed  = true;
-                    failure = "append capacity cannot cover remaining requests";
-                }
-                break;
             }
-
-            int n_left    = static_cast<int>(append_capable.size());
-            int remaining = static_cast<int>(requests.size() - remaining_begin);
-            if (remaining / n_left > batch_per_master && !extras.empty()) {
+            if (bucket < owner_buckets.size()) {
+                owner_buckets[bucket].push_back(request_idx);
+            }
+        }
+        std::vector<size_t> owner_order;
+        owner_order.reserve(requests.size());
+        for (const auto& bucket : owner_buckets) {
+            owner_order.insert(owner_order.end(), bucket.begin(), bucket.end());
+        }
+        if (owner_order.size() == requests.size() && owner_order != identity_order) {
+            auto owner_attempt = run_source_greedy(owner_order);
+            if (owner_attempt.request_scale && !owner_attempt.memory_scale) {
                 int rank = extras.front();
                 extras.erase(extras.begin());
                 current_allocation.push_back(rank);
                 result.new_allocation_ranks.push_back(rank);
                 compute_scaled = true;
-                need_restart   = true;
-                break;
-            }
-
-            size_t                                 rank_pos = append_capable.front();
-            int                                    rank     = candidates[rank_pos];
-            std::vector<std::shared_ptr<Sequence>> suffix(
-                requests.begin() + static_cast<std::ptrdiff_t>(remaining_begin), requests.end());
-            int capacity     = estimate_pending_append_capacity(rank, suffix, requests);
-            capacity         = std::min(capacity, receiver_prefix_capacity(rank, remaining_begin));
-            int target_chunk = std::max(remaining / n_left, batch_per_master);
-            int chunk        = std::min({remaining, target_chunk, capacity});
-            candidate_begin  = rank_pos + 1;
-            if (chunk <= 0) {
                 continue;
             }
-            masters.push_back(rank);
-            chunks.push_back(chunk);
-            for (int i = 0; i < chunk; ++i) {
-                size_t request_idx       = remaining_begin + i;
-                assignments[request_idx] = rank;
-                for (int owner = 0; owner < attention_sp_; ++owner) {
-                    if (owner != rank
-                        && requests[request_idx]->committed_context_len(BlockContextSlot::ACTIVE, owner) > 0) {
-                        planned_remote_recv[owner]++;
-                    }
-                }
+            if (owner_attempt.success) {
+                return_attempt(std::move(owner_attempt), "owner_bucket_repair");
+                return result;
             }
-            remaining_begin += chunk;
         }
 
-        if (need_restart) {
+        // Merging two previously legal groups should not make their existing
+        // master placement illegal merely because request order changed. Keep
+        // the sticky placement when the authoritative validator accepts it.
+        LSDecodeMasterPlan sticky = result;
+        sticky.success            = true;
+        sticky.failure_reason.clear();
+        sticky.assignment_strategy = "sticky_repair";
+        sticky.allocation          = current_allocation;
+        sticky.master_ranks.clear();
+        sticky.master_batch_sizes.clear();
+        sticky.sequence_master_ranks.assign(requests.size(), -1);
+        std::vector<int> sticky_load(attention_sp_, 0);
+        bool             sticky_complete = true;
+        for (size_t request_idx = 0; request_idx < requests.size(); ++request_idx) {
+            int master = requests[request_idx]->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+            if (std::find(current_allocation.begin(), current_allocation.end(), master) == current_allocation.end()) {
+                sticky_complete = false;
+                break;
+            }
+            sticky.sequence_master_ranks[request_idx] = master;
+            sticky_load[master]++;
+        }
+        if (sticky_complete) {
+            for (int rank : candidates) {
+                if (sticky_load[rank] > 0) {
+                    sticky.master_ranks.push_back(rank);
+                    sticky.master_batch_sizes.push_back(sticky_load[rank]);
+                }
+            }
+            set_scale_reason(sticky);
+            if (validate_iteration_master_plan(requests, sticky)) {
+                return sticky;
+            }
+        }
+
+        // Exact receiver feasibility fallback. Receiver load on rank r is
+        // owner_count[r] minus requests assigned locally to r, so rank r needs
+        // at least max(0, owner_count[r] - max_num_recv_seqs_) local-owner
+        // assignments. A capacitated bipartite matching over these quota slots
+        // is complete for receiver and per-master count constraints.
+        const int        batch_size   = static_cast<int>(requests.size());
+        const int        metadata_cap = std::min(max_num_seqs_, max_num_batched_tokens_);
+        std::vector<int> owner_count(attention_sp_, 0);
+        for (const auto& seq : requests) {
+            for (int rank = 0; rank < attention_sp_; ++rank) {
+                if (seq->committed_context_len(BlockContextSlot::ACTIVE, rank) > 0) {
+                    owner_count[rank]++;
+                }
+            }
+        }
+
+        std::vector<int> candidate_pos(attention_sp_, -1);
+        for (size_t idx = 0; idx < candidates.size(); ++idx) {
+            candidate_pos[candidates[idx]] = static_cast<int>(idx);
+        }
+        std::vector<int> lower(candidates.size(), 0);
+        bool             receiver_rank_missing = false;
+        bool             receiver_restart      = false;
+        int              total_lower           = 0;
+        for (int rank = 0; rank < attention_sp_; ++rank) {
+            int required = std::max(0, owner_count[rank] - max_num_recv_seqs_);
+            if (required == 0) {
+                continue;
+            }
+            if (candidate_pos[rank] < 0) {
+                auto extra = std::find(extras.begin(), extras.end(), rank);
+                if (extra != extras.end()) {
+                    extras.erase(extra);
+                    current_allocation.push_back(rank);
+                    result.new_allocation_ranks.push_back(rank);
+                    receiver_scaled  = true;
+                    receiver_restart = true;
+                }
+                else {
+                    receiver_rank_missing = true;
+                }
+                break;
+            }
+            lower[candidate_pos[rank]] = required;
+            total_lower += required;
+        }
+        if (receiver_restart) {
             continue;
         }
-        if (failed) {
-            result.failure_reason = failure;
+        if (receiver_rank_missing || total_lower > batch_size) {
+            result.failure_reason = "receiver capacity proven infeasible: owner-local quota exceeds request supply";
+            return result;
+        }
+        if (std::any_of(lower.begin(), lower.end(), [&](int required) { return required > metadata_cap; })) {
+            result.failure_reason = "decode metadata capacity cannot cover receiver-feasible assignment";
+            return result;
+        }
+        if (static_cast<int>(candidates.size()) * metadata_cap < batch_size) {
+            if (!extras.empty()) {
+                int rank = extras.front();
+                extras.erase(extras.begin());
+                current_allocation.push_back(rank);
+                result.new_allocation_ranks.push_back(rank);
+                compute_scaled = true;
+                continue;
+            }
+            result.failure_reason = "decode metadata capacity cannot cover receiver-feasible assignment";
             return result;
         }
 
-        result.success               = true;
-        result.allocation            = current_allocation;
-        result.master_ranks          = std::move(masters);
-        result.master_batch_sizes    = std::move(chunks);
-        result.sequence_master_ranks = std::move(assignments);
-        if (compute_scaled && memory_scaled) {
-            result.scale_reason = "compute+memory";
+        auto append_cost = [&](size_t request_idx, int rank) {
+            int committed = requests[request_idx]->committed_context_len(BlockContextSlot::ACTIVE, rank);
+            int before    = (committed + kvcache_block_size_ - 1) / kvcache_block_size_;
+            int after     = (committed + 2 + kvcache_block_size_ - 1) / kvcache_block_size_;
+            return after - before;
+        };
+
+        auto reclaimable_free_blocks = [&](int rank) {
+            auto manager = block_manager.find(rank);
+            if (manager == block_manager.end()) {
+                return 0;
+            }
+            int free_blocks = manager->second->num_free_blocks();
+            for (const auto& seq : requests) {
+                int committed        = seq->committed_context_len(BlockContextSlot::ACTIVE, rank);
+                int committed_blocks = (committed + kvcache_block_size_ - 1) / kvcache_block_size_;
+                int table_blocks     = static_cast<int>(seq->block_table(BlockContextSlot::ACTIVE, rank).size());
+                free_blocks += std::max(0, table_blocks - committed_blocks);
+            }
+            return free_blocks;
+        };
+
+        // With the current +2-token reservation and block_size >= 2, per-request
+        // append cost is binary. Cost-0 requests are necessarily local owners,
+        // so append and receiver quotas are nested and can be solved exactly by
+        // one capacity-flow assignment below. Compute an existence upper bound
+        // using the cheapest possible subset, not the old worst-prefix bound.
+        std::vector<int> upper(candidates.size(), 0);
+        std::vector<int> free_blocks(candidates.size(), 0);
+        std::vector<int> cheap_supply(candidates.size(), 0);
+        for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx) {
+            int rank                   = candidates[candidate_idx];
+            free_blocks[candidate_idx] = reclaimable_free_blocks(rank);
+            int cheap_count            = 0;
+            for (size_t request_idx = 0; request_idx < requests.size(); ++request_idx) {
+                if (append_cost(request_idx, rank) == 0) {
+                    cheap_count++;
+                }
+            }
+            cheap_supply[candidate_idx] = cheap_count;
+            if (kvcache_block_size_ < 2) {
+                std::vector<size_t> worst_indices(requests.size());
+                std::iota(worst_indices.begin(), worst_indices.end(), 0);
+                std::stable_sort(worst_indices.begin(), worst_indices.end(), [&](size_t lhs, size_t rhs) {
+                    return append_cost(lhs, rank) > append_cost(rhs, rank);
+                });
+                std::vector<std::shared_ptr<Sequence>> worst_requests;
+                worst_requests.reserve(requests.size());
+                for (size_t request_idx : worst_indices) {
+                    worst_requests.push_back(requests[request_idx]);
+                }
+                upper[candidate_idx] =
+                    std::min(metadata_cap, estimate_pending_append_capacity(rank, worst_requests, requests));
+                continue;
+            }
+            for (int load = 0; load <= metadata_cap; ++load) {
+                int minimum_append_blocks = std::max(0, load - cheap_count);
+                int reserve_headroom      = static_cast<int>(std::ceil(load * reserved_blocks_per_req_));
+                if (minimum_append_blocks + reserve_headroom <= free_blocks[candidate_idx]) {
+                    upper[candidate_idx] = load;
+                }
+            }
         }
-        else if (compute_scaled) {
-            result.scale_reason = "compute";
+        for (size_t idx = 0; idx < candidates.size(); ++idx) {
+            if (lower[idx] > upper[idx]) {
+                result.failure_reason = "append capacity cannot satisfy required receiver-local quota";
+                return result;
+            }
         }
-        else if (memory_scaled) {
-            result.scale_reason = "memory";
+        if (std::accumulate(upper.begin(), upper.end(), 0) < batch_size) {
+            if (enable_memory_scale_up && !extras.empty()) {
+                int rank = extras.front();
+                extras.erase(extras.begin());
+                current_allocation.push_back(rank);
+                result.new_allocation_ranks.push_back(rank);
+                memory_scaled = true;
+                continue;
+            }
+            result.failure_reason = "append capacity cannot cover receiver-feasible assignment";
+            return result;
         }
-        return result;
+
+        std::vector<int> nominal(candidates.size(), 0);
+        int              nominal_remaining = batch_size;
+        for (size_t idx = 0; idx < candidates.size() && nominal_remaining > 0; ++idx) {
+            int ranks_left = static_cast<int>(candidates.size() - idx);
+            int chunk      = std::min(nominal_remaining, std::max(nominal_remaining / ranks_left, batch_per_master));
+            nominal[idx]   = chunk;
+            nominal_remaining -= chunk;
+        }
+
+        std::vector<int> target_load    = lower;
+        int              load_remaining = batch_size - total_lower;
+        for (size_t idx = 0; idx < candidates.size() && load_remaining > 0; ++idx) {
+            int desired = std::max(0, std::min(nominal[idx], upper[idx]) - target_load[idx]);
+            int add     = std::min(load_remaining, desired);
+            target_load[idx] += add;
+            load_remaining -= add;
+        }
+        for (size_t idx = 0; idx < candidates.size() && load_remaining > 0; ++idx) {
+            int add = std::min(load_remaining, upper[idx] - target_load[idx]);
+            target_load[idx] += add;
+            load_remaining -= add;
+        }
+        if (load_remaining != 0) {
+            if (enable_memory_scale_up && !extras.empty()) {
+                int rank = extras.front();
+                extras.erase(extras.begin());
+                current_allocation.push_back(rank);
+                result.new_allocation_ranks.push_back(rank);
+                memory_scaled = true;
+                continue;
+            }
+            result.failure_reason = "append capacity cannot realize receiver-feasible master loads";
+            return result;
+        }
+
+        const int  flow_source       = 0;
+        const int  flow_request_base = 1;
+        const int  flow_rank_base    = flow_request_base + batch_size;
+        const int  flow_sink         = flow_rank_base + static_cast<int>(candidates.size());
+        SmallDinic quota_flow(flow_sink + 1);
+        for (int request_idx = 0; request_idx < batch_size; ++request_idx) {
+            quota_flow.add_edge(flow_source, flow_request_base + request_idx, 1);
+            for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx) {
+                int rank = candidates[candidate_idx];
+                if (lower[candidate_idx] > 0
+                    && requests[request_idx]->committed_context_len(BlockContextSlot::ACTIVE, rank) > 0) {
+                    quota_flow.add_edge(
+                        flow_request_base + request_idx, flow_rank_base + static_cast<int>(candidate_idx), 1);
+                }
+            }
+        }
+        for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx) {
+            quota_flow.add_edge(flow_rank_base + static_cast<int>(candidate_idx), flow_sink, lower[candidate_idx]);
+        }
+        int matched_lower = quota_flow.max_flow(flow_source, flow_sink, total_lower);
+        if (matched_lower != total_lower) {
+            result.failure_reason = "receiver capacity proven infeasible: owner-local quota matching failed";
+            return result;
+        }
+
+        struct JointAssignmentAttempt {
+            bool             success = false;
+            std::vector<int> sequence_master_ranks;
+        };
+        constexpr int categories_per_rank = 3;
+        auto solve_category_assignment = [&](const std::vector<std::array<int, categories_per_rank>>& category_capacity,
+                                             int mandatory_category_count) {
+            JointAssignmentAttempt assignment;
+            const int              assignment_source        = 0;
+            const int              assignment_request_base  = 1;
+            const int              assignment_category_base = assignment_request_base + batch_size;
+            const int              assignment_sink =
+                assignment_category_base + categories_per_rank * static_cast<int>(candidates.size());
+            SmallDinic assignment_flow(assignment_sink + 1);
+            for (int request_idx = 0; request_idx < batch_size; ++request_idx) {
+                assignment_flow.add_edge(assignment_source, assignment_request_base + request_idx, 1);
+            }
+
+            auto add_category_range = [&](int category_begin, int category_end) {
+                int added_capacity = 0;
+                for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx) {
+                    for (int category = category_begin; category < category_end; ++category) {
+                        int capacity = category_capacity[candidate_idx][category];
+                        if (capacity <= 0) {
+                            continue;
+                        }
+                        int node =
+                            assignment_category_base + categories_per_rank * static_cast<int>(candidate_idx) + category;
+                        assignment_flow.add_edge(node, assignment_sink, capacity);
+                        added_capacity += capacity;
+                    }
+                }
+
+                for (int request_idx = 0; request_idx < batch_size; ++request_idx) {
+                    int                 request_node = assignment_request_base + request_idx;
+                    std::vector<size_t> candidate_order;
+                    int previous = requests[request_idx]->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_;
+                    if (previous >= 0 && previous < attention_sp_ && candidate_pos[previous] >= 0) {
+                        candidate_order.push_back(static_cast<size_t>(candidate_pos[previous]));
+                    }
+                    for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx) {
+                        if (candidate_order.empty() || candidate_order.front() != candidate_idx) {
+                            candidate_order.push_back(candidate_idx);
+                        }
+                    }
+                    for (size_t candidate_idx : candidate_order) {
+                        int rank = candidates[candidate_idx];
+                        int node_base =
+                            assignment_category_base + categories_per_rank * static_cast<int>(candidate_idx);
+                        for (int category = category_begin; category < category_end; ++category) {
+                            if (category_capacity[candidate_idx][category] <= 0) {
+                                continue;
+                            }
+                            bool eligible =
+                                category == 2 || (category == 0 && append_cost(request_idx, rank) == 0)
+                                || (category == 1
+                                    && requests[request_idx]->committed_context_len(BlockContextSlot::ACTIVE, rank)
+                                           > 0);
+                            if (eligible) {
+                                assignment_flow.add_edge(request_node, node_base + category, 1);
+                            }
+                        }
+                    }
+                }
+                return added_capacity;
+            };
+
+            int mandatory_capacity = add_category_range(0, mandatory_category_count);
+            if (mandatory_capacity > batch_size
+                || assignment_flow.max_flow(assignment_source, assignment_sink, mandatory_capacity)
+                       != mandatory_capacity) {
+                return assignment;
+            }
+            int optional_capacity = add_category_range(mandatory_category_count, categories_per_rank);
+            int remaining         = batch_size - mandatory_capacity;
+            if (optional_capacity < remaining
+                || assignment_flow.max_flow(assignment_source, assignment_sink, remaining) != remaining) {
+                return assignment;
+            }
+
+            assignment.sequence_master_ranks.assign(requests.size(), -1);
+            for (int request_idx = 0; request_idx < batch_size; ++request_idx) {
+                for (const auto& edge : assignment_flow.edges(assignment_request_base + request_idx)) {
+                    if (edge.to < assignment_category_base || edge.to >= assignment_sink || edge.capacity != 0) {
+                        continue;
+                    }
+                    int candidate_idx = (edge.to - assignment_category_base) / categories_per_rank;
+                    assignment.sequence_master_ranks[request_idx] = candidates[candidate_idx];
+                    break;
+                }
+                if (assignment.sequence_master_ranks[request_idx] < 0) {
+                    assignment.sequence_master_ranks.clear();
+                    return assignment;
+                }
+            }
+            assignment.success = true;
+            return assignment;
+        };
+
+        auto try_target_load = [&](const std::vector<int>& load_vector) {
+            std::vector<std::array<int, categories_per_rank>> category_capacity(candidates.size());
+            for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx) {
+                int load           = load_vector[candidate_idx];
+                int required_cheap = 0;
+                if (kvcache_block_size_ >= 2) {
+                    int reserve_headroom = static_cast<int>(std::ceil(load * reserved_blocks_per_req_));
+                    int cost_one_budget  = std::max(0, free_blocks[candidate_idx] - reserve_headroom);
+                    required_cheap       = std::max(0, load - cost_one_budget);
+                }
+                int required_owner = std::max(0, lower[candidate_idx] - required_cheap);
+                int general        = load - std::max(lower[candidate_idx], required_cheap);
+                if (required_cheap > load || general < 0) {
+                    return JointAssignmentAttempt{};
+                }
+                category_capacity[candidate_idx] = {required_cheap, required_owner, general};
+            }
+            return solve_category_assignment(category_capacity, categories_per_rank);
+        };
+
+        auto exact_assignment     = try_target_load(target_load);
+        bool target_load_repaired = false;
+        int  load_search_states   = 0;
+        if (!exact_assignment.success) {
+            // The source-style target load is a preference, not a feasibility
+            // constraint. Search variable load bounds exactly. For any relaxed
+            // assignment that exceeds rank r's append budget, every legal
+            // solution either has a smaller load on r or supplies at least the
+            // newly derived number of cheap (cost-0) requests there. Those two
+            // branches are exhaustive and each strictly tightens one bound.
+            struct LoadSearchNode {
+                std::vector<int> upper_load;
+                std::vector<int> cheap_lower;
+            };
+            std::vector<LoadSearchNode> load_stack;
+            std::set<std::vector<int>>  visited_bounds;
+            load_stack.push_back({upper, std::vector<int>(candidates.size(), 0)});
+
+            auto bounds_key = [](const LoadSearchNode& node) {
+                std::vector<int> key = node.upper_load;
+                key.insert(key.end(), node.cheap_lower.begin(), node.cheap_lower.end());
+                return key;
+            };
+            visited_bounds.insert(bounds_key(load_stack.back()));
+
+            while (!load_stack.empty() && !exact_assignment.success) {
+                auto node = std::move(load_stack.back());
+                load_stack.pop_back();
+                load_search_states++;
+
+                int                                               minimum_total = 0;
+                int                                               maximum_total = 0;
+                bool                                              bounds_valid  = true;
+                std::vector<std::array<int, categories_per_rank>> category_capacity(candidates.size());
+                for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx) {
+                    int mandatory_cheap = node.cheap_lower[candidate_idx];
+                    int mandatory_owner = std::max(0, lower[candidate_idx] - mandatory_cheap);
+                    int minimum_load    = std::max(lower[candidate_idx], mandatory_cheap);
+                    int maximum_load    = node.upper_load[candidate_idx];
+                    if (mandatory_cheap > cheap_supply[candidate_idx] || minimum_load > maximum_load) {
+                        bounds_valid = false;
+                        break;
+                    }
+                    category_capacity[candidate_idx] = {mandatory_cheap, mandatory_owner, maximum_load - minimum_load};
+                    minimum_total += minimum_load;
+                    maximum_total += maximum_load;
+                }
+                if (!bounds_valid || minimum_total > batch_size || maximum_total < batch_size) {
+                    continue;
+                }
+
+                auto relaxed_assignment = solve_category_assignment(category_capacity, 2);
+                if (!relaxed_assignment.success) {
+                    continue;
+                }
+
+                std::vector<int> actual_load(candidates.size(), 0);
+                std::vector<int> actual_cheap(candidates.size(), 0);
+                std::vector<int> actual_append_blocks(candidates.size(), 0);
+                for (int request_idx = 0; request_idx < batch_size; ++request_idx) {
+                    int rank          = relaxed_assignment.sequence_master_ranks[request_idx];
+                    int candidate_idx = candidate_pos[rank];
+                    actual_load[candidate_idx]++;
+                    int cost = append_cost(request_idx, rank);
+                    actual_append_blocks[candidate_idx] += cost;
+                    if (cost == 0) {
+                        actual_cheap[candidate_idx]++;
+                    }
+                }
+
+                int violating_candidate = -1;
+                int largest_deficit     = 0;
+                for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx) {
+                    int reserve_headroom =
+                        static_cast<int>(std::ceil(actual_load[candidate_idx] * reserved_blocks_per_req_));
+                    int deficit = actual_append_blocks[candidate_idx] + reserve_headroom - free_blocks[candidate_idx];
+                    if (deficit > largest_deficit) {
+                        largest_deficit     = deficit;
+                        violating_candidate = static_cast<int>(candidate_idx);
+                    }
+                }
+                if (violating_candidate < 0) {
+                    exact_assignment     = std::move(relaxed_assignment);
+                    target_load_repaired = true;
+                    break;
+                }
+
+                int candidate_idx = violating_candidate;
+                int load          = actual_load[candidate_idx];
+                if (load > 0) {
+                    LoadSearchNode smaller_load            = node;
+                    smaller_load.upper_load[candidate_idx] = std::min(smaller_load.upper_load[candidate_idx], load - 1);
+                    auto key                               = bounds_key(smaller_load);
+                    if (visited_bounds.insert(key).second) {
+                        load_stack.push_back(std::move(smaller_load));
+                    }
+                }
+
+                if (kvcache_block_size_ >= 2) {
+                    int reserve_headroom = static_cast<int>(std::ceil(load * reserved_blocks_per_req_));
+                    int needed_cheap     = std::max(0, load + reserve_headroom - free_blocks[candidate_idx]);
+                    if (needed_cheap > node.cheap_lower[candidate_idx] && needed_cheap <= cheap_supply[candidate_idx]) {
+                        LoadSearchNode more_cheap             = node;
+                        more_cheap.cheap_lower[candidate_idx] = needed_cheap;
+                        auto key                              = bounds_key(more_cheap);
+                        if (visited_bounds.insert(key).second) {
+                            // LIFO ordering explores the cheap-preserving
+                            // branch before reducing the preferred load.
+                            load_stack.push_back(std::move(more_cheap));
+                        }
+                    }
+                }
+                else if (actual_cheap[candidate_idx] != 0) {
+                    // With block size 1 append cost is constant, so the
+                    // precomputed upper bound alone is exact.
+                    throw std::runtime_error("unexpected cheap append with block size 1");
+                }
+            }
+        }
+        if (!exact_assignment.success) {
+            if (enable_memory_scale_up && !extras.empty()) {
+                int rank = extras.front();
+                extras.erase(extras.begin());
+                current_allocation.push_back(rank);
+                result.new_allocation_ranks.push_back(rank);
+                memory_scaled = true;
+                continue;
+            }
+            result.failure_reason = "append/receiver joint capacity proven infeasible after "
+                                    + std::to_string(load_search_states) + " variable-load states";
+            return result;
+        }
+
+        LSDecodeMasterPlan exact = result;
+        exact.success            = true;
+        exact.failure_reason.clear();
+        exact.assignment_strategy = target_load_repaired ? "receiver_append_flow_load_repair" : "receiver_append_flow";
+        exact.allocation          = current_allocation;
+        exact.master_ranks.clear();
+        exact.master_batch_sizes.clear();
+        exact.sequence_master_ranks = std::move(exact_assignment.sequence_master_ranks);
+        std::vector<int> exact_load(attention_sp_, 0);
+        for (int request_idx = 0; request_idx < batch_size; ++request_idx) {
+            exact_load[exact.sequence_master_ranks[request_idx]]++;
+        }
+        for (int rank : candidates) {
+            if (exact_load[rank] > 0) {
+                exact.master_ranks.push_back(rank);
+                exact.master_batch_sizes.push_back(exact_load[rank]);
+            }
+        }
+        set_scale_reason(exact);
+        std::string exact_error;
+        if (!validate_iteration_master_plan(requests, exact, &exact_error)) {
+            if (enable_memory_scale_up && !extras.empty() && exact_error.find("append capacity") != std::string::npos) {
+                int rank = extras.front();
+                extras.erase(extras.begin());
+                current_allocation.push_back(rank);
+                result.new_allocation_ranks.push_back(rank);
+                memory_scaled = true;
+                continue;
+            }
+            result.failure_reason = "receiver quota matching failed validation: " + exact_error;
+            return result;
+        }
+        return exact;
     }
 
     result.failure_reason = "master planning exceeded restart bound";
@@ -622,6 +1331,28 @@ bool SPStateManager::validate_iteration_master_plan(const std::vector<std::share
     }
     if (plan.sequence_master_ranks.size() != requests.size()) {
         return fail("sequence assignment count mismatch");
+    }
+    if (plan.master_ranks.size() != plan.master_batch_sizes.size()) {
+        return fail("master rank/count telemetry size mismatch");
+    }
+
+    std::vector<int> declared_master_load(attention_sp_, 0);
+    int              declared_total = 0;
+    for (size_t idx = 0; idx < plan.master_ranks.size(); ++idx) {
+        int rank  = plan.master_ranks[idx];
+        int count = plan.master_batch_sizes[idx];
+        if (rank < 0 || rank >= attention_sp_
+            || std::find(plan.allocation.begin(), plan.allocation.end(), rank) == plan.allocation.end()) {
+            return fail("declared master is outside group allocation");
+        }
+        if (count <= 0 || declared_master_load[rank] != 0) {
+            return fail("declared master ranks must be unique with positive counts");
+        }
+        declared_master_load[rank] = count;
+        declared_total += count;
+    }
+    if (declared_total != static_cast<int>(requests.size())) {
+        return fail("declared master batch sizes do not cover request list");
     }
 
     std::unordered_set<const Sequence*> unique_requests;
@@ -659,6 +1390,9 @@ bool SPStateManager::validate_iteration_master_plan(const std::vector<std::share
         }
     }
     for (int rank = 0; rank < attention_sp_; ++rank) {
+        if (static_cast<int>(assigned[rank].size()) != declared_master_load[rank]) {
+            return fail("declared master batch sizes disagree with sequence assignments");
+        }
         if (!assigned[rank].empty()
             && estimate_pending_append_capacity(rank, assigned[rank], requests)
                    < static_cast<int>(assigned[rank].size())) {

@@ -235,6 +235,15 @@ def test_ls_decode_batch_per_master_must_be_positive(tmp_path):
         )
 
 
+def test_reserved_blocks_per_request_must_be_non_negative(tmp_path):
+    with pytest.raises(ValueError, match="reserved_blocks_per_req must be >= 0"):
+        Config(
+            model=str(tmp_path),
+            kvcache_block_size=64,
+            reserved_blocks_per_req=-0.1,
+        )
+
+
 def test_ls_decode_feature_flag_defaults_off(tmp_path):
     config = Config(model=str(tmp_path), kvcache_block_size=64)
 
