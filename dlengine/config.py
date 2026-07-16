@@ -138,7 +138,6 @@ class Config(BaseModel):
     # Number of hot token slots reserved for each active sequence. Total
     # HiSparse device capacity is this value multiplied by max_num_seqs.
     hisparse_device_buffer_size: int = 4096
-    hisparse_host_to_device_ratio: int = 2
     hisparse_swap_in_block_size: int = 960
 
     # Correctness-only fallback for MLA shapes that current FlashMLA wheels do
@@ -312,7 +311,6 @@ class Config(BaseModel):
         for attr in (
             "enable_hisparse",
             "hisparse_device_buffer_size",
-            "hisparse_host_to_device_ratio",
             "hisparse_swap_in_block_size",
         ):
             setattr(self.hf_config, attr, getattr(self, attr, None))
@@ -400,8 +398,6 @@ class Config(BaseModel):
                 raise ValueError("enable_hisparse does not support MTP")
             if self.hisparse_device_buffer_size <= 0:
                 raise ValueError("hisparse_device_buffer_size must be positive")
-            if self.hisparse_host_to_device_ratio < 1:
-                raise ValueError("hisparse_host_to_device_ratio must be >= 1")
             if self.hisparse_swap_in_block_size <= 0:
                 raise ValueError("hisparse_swap_in_block_size must be positive")
             if arch in ("DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"):

@@ -44,6 +44,115 @@ from dlengine.logging import get_logger
 logger = get_logger("dlengine")
 
 
+@dataclasses.dataclass(frozen=True)
+class MLAHiSparseCapacity:
+    """Byte-accurate capacity plan for the MLA HiSparse cache hierarchy."""
+
+    block_size: int
+    gpu_cache_budget_bytes: int
+    host_cache_budget_bytes: int
+    kv_block_bytes: int
+    indexer_block_bytes: int
+    hot_blocks: int
+    hot_tier_bytes: int
+    indexer_budget_bytes: int
+    indexer_blocks: int
+    host_blocks: int
+    logical_blocks: int
+
+    @property
+    def hot_tokens(self) -> int:
+        return self.hot_blocks * self.block_size
+
+    @property
+    def indexer_tokens(self) -> int:
+        return self.indexer_blocks * self.block_size
+
+    @property
+    def host_tokens(self) -> int:
+        return self.host_blocks * self.block_size
+
+    @property
+    def logical_tokens(self) -> int:
+        return self.logical_blocks * self.block_size
+
+    @property
+    def buffer_hbm_shortfall_bytes(self) -> int:
+        return max(0, self.hot_tier_bytes - self.gpu_cache_budget_bytes)
+
+    @property
+    def allocated_indexer_bytes(self) -> int:
+        return self.logical_blocks * self.indexer_block_bytes
+
+    @property
+    def unused_indexer_budget_bytes(self) -> int:
+        return self.indexer_budget_bytes - self.allocated_indexer_bytes
+
+    @property
+    def allocated_host_bytes(self) -> int:
+        return self.logical_blocks * self.kv_block_bytes
+
+    @property
+    def unused_host_budget_bytes(self) -> int:
+        return self.host_cache_budget_bytes - self.allocated_host_bytes
+
+    @property
+    def limiting_tier(self) -> str:
+        if self.indexer_blocks < self.host_blocks:
+            return "gpu_indexer"
+        if self.host_blocks < self.indexer_blocks:
+            return "host_mla"
+        return "both"
+
+
+def plan_mla_hisparse_capacity(
+    *,
+    gpu_cache_budget: int,
+    host_cache_budget: int,
+    max_num_seqs: int,
+    device_buffer_size: int,
+    block_size: int,
+    kv_block_bytes: int,
+    indexer_block_bytes: int,
+) -> MLAHiSparseCapacity:
+    """Reserve the hot Buffer first, then size the logical cold tier.
+
+    The Indexer must cover every logical cold token and is resident on the GPU,
+    while the MLA KV for those tokens is resident in host memory. Consequently,
+    the usable logical capacity is the smaller of the Indexer-backed capacity
+    and the host-backed capacity.
+    """
+    if min(block_size, kv_block_bytes, indexer_block_bytes) <= 0:
+        raise ValueError("HiSparse cache block sizes must be positive")
+    if max_num_seqs <= 0 or device_buffer_size <= 0:
+        raise ValueError("HiSparse sequence count and device buffer must be positive")
+
+    # One extra block per sequence is reserved for the newly generated token.
+    hot_blocks_per_seq = (
+        device_buffer_size + block_size + block_size - 1
+    ) // block_size
+    hot_blocks = max_num_seqs * hot_blocks_per_seq
+    hot_tier_bytes = hot_blocks * kv_block_bytes
+
+    indexer_budget_bytes = max(0, gpu_cache_budget - hot_tier_bytes)
+    indexer_blocks = indexer_budget_bytes // indexer_block_bytes
+    host_blocks = max(0, host_cache_budget) // kv_block_bytes
+
+    return MLAHiSparseCapacity(
+        block_size=block_size,
+        gpu_cache_budget_bytes=max(0, gpu_cache_budget),
+        host_cache_budget_bytes=max(0, host_cache_budget),
+        kv_block_bytes=kv_block_bytes,
+        indexer_block_bytes=indexer_block_bytes,
+        hot_blocks=hot_blocks,
+        hot_tier_bytes=hot_tier_bytes,
+        indexer_budget_bytes=indexer_budget_bytes,
+        indexer_blocks=indexer_blocks,
+        host_blocks=host_blocks,
+        logical_blocks=min(indexer_blocks, host_blocks),
+    )
+
+
 @dataclasses.dataclass
 class CacheContext(KVCacheAllocatorMixin):
     num_kv_heads: int
@@ -255,37 +364,56 @@ class CacheContext(KVCacheAllocatorMixin):
             and bool(self.ctrl_address)
         )
         if is_mla_hisparse:
-            hot_blocks_per_seq = max(
-                1,
-                (
-                    self.hisparse_device_buffer_size
-                    + self.block_size
-                    + self.block_size
-                    - 1
-                )
-                // self.block_size,
+            host_budget_bytes = int(
+                max(0.0, float(self.host_utilization_per_device or 0.0))
+                * 1024**3
             )
-            hot_blocks = max(1, self.max_num_seqs) * hot_blocks_per_seq
-            hot_tier_bytes = hot_blocks * kv_block_bytes
-            indexer_budget = max(0, gpu_cache_budget - hot_tier_bytes)
-            gpu_indexer_blocks = indexer_budget // indexer_block_bytes
-            host_blocks, host_budget_bytes = self._compute_host_kvcache_blocks(
-                kv_block_bytes
+            capacity = plan_mla_hisparse_capacity(
+                gpu_cache_budget=gpu_cache_budget,
+                host_cache_budget=host_budget_bytes,
+                max_num_seqs=self.max_num_seqs,
+                device_buffer_size=self.hisparse_device_buffer_size,
+                block_size=self.block_size,
+                kv_block_bytes=kv_block_bytes,
+                indexer_block_bytes=indexer_block_bytes,
             )
-            self.num_local_kvcache_blocks = min(host_blocks, gpu_indexer_blocks)
+            self.num_local_kvcache_blocks = capacity.logical_blocks
             # Do not allocate cold pages which cannot be indexed. Logical,
             # host-cold, and Indexer page counts deliberately stay identical.
             self.num_host_kvcache_blocks = self.num_local_kvcache_blocks
             logger.info(
-                "Rank%s MLA HiSparse capacity: logical=%s blocks, host=%s, "
-                "gpu_indexer=%s, hot=%s blocks (%.2f GiB)",
+                "Rank%s MLA HiSparse HBM plan: cache_budget=%.2f GiB, "
+                "hot_buffer=%s tokens/%.2f GiB, remaining_for_indexer=%.2f GiB",
                 dist.get_rank(),
-                self.num_local_kvcache_blocks,
-                host_blocks,
-                gpu_indexer_blocks,
-                hot_blocks,
-                hot_tier_bytes / 1024**3,
+                capacity.gpu_cache_budget_bytes / 1024**3,
+                capacity.hot_tokens,
+                capacity.hot_tier_bytes / 1024**3,
+                capacity.indexer_budget_bytes / 1024**3,
             )
+            logger.info(
+                "Rank%s MLA HiSparse capacity ceilings: gpu_indexer=%s tokens, "
+                "host_mla=%s tokens/%.2f GiB; selected=%s tokens, limiter=%s",
+                dist.get_rank(),
+                capacity.indexer_tokens,
+                capacity.host_tokens,
+                capacity.host_cache_budget_bytes / 1024**3,
+                capacity.logical_tokens,
+                capacity.limiting_tier,
+            )
+            logger.info(
+                "Rank%s MLA HiSparse unused capacity after min(): "
+                "gpu_indexer_hbm=%.2f GiB, host_mla=%.2f GiB",
+                dist.get_rank(),
+                capacity.unused_indexer_budget_bytes / 1024**3,
+                capacity.unused_host_budget_bytes / 1024**3,
+            )
+            if capacity.buffer_hbm_shortfall_bytes > 0:
+                logger.error(
+                    "Rank%s MLA HiSparse Buffer exceeds the GPU cache budget "
+                    "by %.2f GiB; no HBM remains for the Indexer",
+                    dist.get_rank(),
+                    capacity.buffer_hbm_shortfall_bytes / 1024**3,
+                )
         else:
             block_bytes = kv_block_bytes + indexer_block_bytes
             self.num_local_kvcache_blocks = gpu_cache_budget // block_bytes
