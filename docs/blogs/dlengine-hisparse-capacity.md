@@ -19,7 +19,40 @@ $$
 C = R_{Host} \cdot B^{T}_{Buffer}
 $$
 
-where $`B^{T}_{Buffer}`$ is the total device-buffer token count of the whole decode batch. With a per-sequence device hot buffer of $`N_{T,Buffer}`$ and a maximum batch concurrency of $`N_{bs,max}`$:
+where $`B^{T}_{Buffer}`$ is the total device-buffer token count of the whole decode batch.
+
+The definition can be expanded directly from the HBM budget. One device hot slot pays $`N_{layer}B_{T,MLA}`$ bytes for MLA KV across all model layers. It represents $`R_{Host}`$ logical tokens whose Indexer entries are fully resident on the GPU; after Indexer layer sharing, that contribution is $`N_{layer}R_{Host}B_{T,Indexer}/R_{Share}`$. The effective HBM cost of one hot slot is therefore:
+
+$$
+m_{slot}=N_{layer}
+\left(
+B_{T,MLA}+\frac{R_{Host}B_{T,Indexer}}{R_{Share}}
+\right)
+$$
+
+When the worker-wide Buffer pool fully uses $`M_{cache}`$, its total number of device hot slots is:
+
+$$
+B^T_{Buffer}
+=\frac{M_{cache}}
+{N_{layer}\left(
+B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
+\right)}
+$$
+
+Each hot slot covers $`R_{Host}`$ logical tokens, hence:
+
+$$
+C=C_{worker}
+=\frac{M_{cache}R_{Host}}
+{N_{layer}\left(
+B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
+\right)}
+$$
+
+This is exactly $`C=R_{Host}B^T_{Buffer}`$ with the HBM-constrained Buffer size substituted. If the Buffer pool does not consume all of $`M_{cache}`$, the last two equalities become upper bounds; the figures in this post plot the saturated-HBM ceiling.
+
+An equal per-sequence split is only one way to partition this worker-wide pool. Under that split:
 
 $$
 B^{T}_{Buffer} = N_{bs,max} \cdot N_{T,Buffer}
@@ -33,7 +66,7 @@ C = C_{worker}
   = N_{bs,max} \cdot C_{host,seq}
 $$
 
-$`C_{host,seq}`$ is the capacity of one equal-sized partition under a static per-sequence split, while $`C=C_{worker}`$ is the aggregate logical capacity of the worker. This post uses the model context length as a **worker-level capacity target**:
+$`C_{host,seq}`$ is the capacity of one equal-sized partition under a static per-sequence split, while $`C=C_{worker}`$ is the aggregate logical capacity of the worker. $`N_{bs,max}`$ only determines how the fixed total Buffer is partitioned; it does not change $`B^T_{Buffer}`$ or $`C_{worker}`$, both of which are fixed by $`M_{cache}`$ at a given $`R_{Host}`$. This post uses the model context length as a **worker-level capacity target**:
 
 $$
 C_{worker}\ge L_{max,model}
