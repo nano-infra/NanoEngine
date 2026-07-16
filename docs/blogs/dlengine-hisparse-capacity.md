@@ -387,10 +387,10 @@ This section instantiates the model for two concrete NSA models on two H100 depl
 | GLM5.1 | $78$ | per-layer Indexer cache | $1$ | $262{,}144$ (256K) |
 | GLM5.2 | $78$ | Indexer shared across layers ($78/21$) | $3.714$ | $1{,}048{,}576$ (1M) |
 
-| Config | $M_{Available}$ | $F$ | $M_{weights}$ | $M_{cache}=M_{Available}F-M_{weights}$ |
+| Config | `M_Available` | `F` | `M_weights` | `M_cache = M_Available * F - M_weights` |
 | --- | ---: | ---: | ---: | ---: |
-| H100 DP16EP16 | $77.47\ \mathrm{GB}$ | $0.88$ | $64.52\ \mathrm{GB}$ | $3.6536\ \mathrm{GB}$ |
-| H100 DP32EP32 | $77.47\ \mathrm{GB}$ | $0.82$ | $43.42\ \mathrm{GB}$ | $20.1054\ \mathrm{GB}$ |
+| H100 DP16EP16 | 77.47 GB | 0.88 | 64.52 GB | 3.6536 GB |
+| H100 DP32EP32 | 77.47 GB | 0.82 | 43.42 GB | 20.1054 GB |
 
 #### 5.1 How to read the figures
 
