@@ -69,7 +69,7 @@ Mapping to the SGLang / DLEngine allocator: the device pool has size `size_devic
 
 Three families of constraints bound the **sparse kernel**, the **GPU hot tier**, and the **host logical namespace** respectively.
 
-#### 3.1 Sparse hard floor ($N_{Topk}$)
+#### 3.1 Sparse hard floor
 
 $$
 N_{T,Buffer}\ge N_{Topk}
@@ -139,11 +139,8 @@ $$
 Therefore:
 
 $$
-C_{worker}
-\le
-C^{Host}_{worker,max}
-=
-\frac{M_{Host,Available}}
+C_{worker}\le C^{Host}_{worker,max}
+=\frac{M_{Host,Available}}
 {N_{layer}B_{T,MLA}}
 $$
 
@@ -221,8 +218,7 @@ without adding $B_{T,Indexer}$ on the host side. If a future implementation also
 The Indexer-to-Buffer memory ratio is:
 
 $$
-\frac{M_{Indexer}}{M_{Buffer}}
-=
+\frac{M_{Indexer}}{M_{Buffer}}=
 \frac{R_{Host}B_{T,Indexer}}
 {R_{Share}B_{T,MLA}}
 $$
@@ -230,9 +226,7 @@ $$
 so the Indexer's share of the HiSparse cache is:
 
 $$
-P_{Indexer}
-=
-\frac{R_{Host}B_{T,Indexer}}
+P_{Indexer}=\frac{R_{Host}B_{T,Indexer}}
 {R_{Share}B_{T,MLA}+R_{Host}B_{T,Indexer}}
 $$
 
@@ -241,9 +235,7 @@ This share is independent of $N_{T,Buffer}$, $N_{bs,max}$, $N_{layer}$, and $M_{
 The break-even point where $M_{Indexer}=M_{Buffer}$ — beyond which the Indexer becomes the dominant memory cost — is:
 
 $$
-R^{50\%}_{Host}
-=
-\frac{R_{Share}B_{T,MLA}}{B_{T,Indexer}}
+R^{50\%}_{Host}=\frac{R_{Share}B_{T,MLA}}{B_{T,Indexer}}
 \approx 4.97\,R_{Share}
 $$
 
@@ -271,9 +263,7 @@ $$
 If instead the memory budget $M_{cache}$ is fixed and the buffer uses its full allowance, then:
 
 $$
-N^{GPU}_{T,Buffer}
-=
-\frac{M_{cache}}
+N^{GPU}_{T,Buffer}=\frac{M_{cache}}
 {N_{layer}N_{bs,max}
 \left(
 B_{T,MLA}
@@ -292,8 +282,7 @@ but the batch-wide hot-slot ceiling:
 $$
 B^{T,GPU}_{Buffer}
 =N_{bs,max}N^{GPU}_{T,Buffer}
-=
-\frac{M_{cache}}
+=\frac{M_{cache}}
 {N_{layer}
 \left(
 B_{T,MLA}
@@ -303,14 +292,12 @@ $$
 
 is independent of $N_{bs,max}$. In a memory-saturated deployment, raising concurrency does not create more hot slots — it only splits a fixed hot-slot budget across more sequences.
 
-#### 4.4 $R_{Host}$'s payoff has an Indexer ceiling
+#### 4.4 Host ratio payoff has an Indexer ceiling
 
 Substituting $N^{GPU}_{T,Buffer}$ into $C_{worker}=N_{bs,max}R_{Host}N_{T,Buffer}$:
 
 $$
-C^{GPU}_{worker}(R_{Host})
-=
-\frac{M_{cache}R_{Host}}
+C^{GPU}_{worker}(R_{Host})=\frac{M_{cache}R_{Host}}
 {N_{layer}
 \left(
 B_{T,MLA}
@@ -324,8 +311,7 @@ As $R_{Host}\rightarrow\infty$:
 
 $$
 \lim_{R_{Host}\to\infty}C^{GPU}_{worker}
-=
-\frac{M_{cache}R_{Share}}
+=\frac{M_{cache}R_{Share}}
 {N_{layer}B_{T,Indexer}}
 $$
 
@@ -360,9 +346,7 @@ $$
 Equivalently, fixing $N_{bs,max}$ gives the top-k-imposed ratio ceiling:
 
 $$
-R^{Topk}_{Host,max}
-=
-\frac{R_{Share}}{B_{T,Indexer}}
+R^{Topk}_{Host,max}=\frac{R_{Share}}{B_{T,Indexer}}
 \left(
 \frac{M_{cache}}
 {N_{layer}N_{bs,max}N_{Topk}}
@@ -422,9 +406,7 @@ Each config gets one two-panel figure. The left panel plots the worker-wide logi
 The top-k upper bound is:
 
 $$
-R^{Topk}_{Host,max}
-=
-\frac{R_{Share}}{B_{T,Indexer}}
+R^{Topk}_{Host,max}=\frac{R_{Share}}{B_{T,Indexer}}
 \left(
 \frac{M_{cache}}
 {N_{layer}N_{bs,max}N_{Topk}}
