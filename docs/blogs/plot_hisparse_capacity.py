@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Plot HiSparse capacity bounds and the feasible region.
+"""Plot the SGLang HiSparse ratio-driven capacity model.
 
-The formulas and defaults come from ``dlengine-hisparse-capacity.md``.  The
-x-axis is the host/device logical ratio (R_host).  Each subplot fixes one
-max_num_seqs value.  Each run evaluates one model, so pass that model's
+The formulas and defaults come from ``dlengine-hisparse-capacity.md``. The
+configured ``R_host`` scales the logical pool from the device Buffer, and the
+plot solves their joint Buffer-plus-Indexer HBM budget. The x-axis is the
+host/device logical ratio. Each run evaluates one model, so pass that model's
 Indexer layer-sharing factor (``--shared-ratios``) and context length
-(``--max-model-len``).  Each curve is the maximum worker-wide host logical
+(``--max-model-len``). The capacity curve is the maximum worker-wide logical
 capacity allowed by the GPU inequality:
 
     C_Batch_gpu = N_bs_max * R_host * M_cache
             / (((R_host * B_indexer / R_share) + B_mla)
                * N_layer * N_bs_max)
 
-The shaded region contains capacities satisfying all three inequalities:
+Feasibility additionally requires:
 
     N_buffer >= N_topk
     N_buffer <= GPU upper bound

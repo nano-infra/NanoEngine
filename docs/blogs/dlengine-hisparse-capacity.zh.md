@@ -1,8 +1,8 @@
-## DLEngine - HiSparse 容量模型
+## SGLang HiSparse 容量模型
 
-HiSparse 将 KV / Indexer cache 分为 logical 命名空间、GPU device hot Buffer 与 CPU host cold tier。本文建立统一的容量模型，用来判断固定 HBM 预算下的 worker 容量、可达并发、Buffer / Indexer 显存构成以及 host 内存需求。
+SGLang HiSparse 将 KV / Indexer cache 分为 logical 命名空间、GPU device hot Buffer 与 CPU host cold tier。本文针对 SGLang 的 **ratio-driven 分配策略**建立容量模型，用来判断固定 HBM 预算下的 worker 容量、可达并发、Buffer / Indexer 显存构成以及 host 内存需求。
 
-实现细节见 [HiSparse 设计文档](../hisparse-design.zh.md)。
+NSA / FP8 KV / Indexer 的字节布局见 [DLEngine - NSA](dlengine-nsa.md)。DLEngine 当前采用 buffer-first 分配策略，不属于本文模型。
 
 ### 1. 背景与理论假设
 
@@ -17,9 +17,9 @@ HiSparse 将 KV / Indexer cache 分为 logical 命名空间、GPU device hot Buf
 | --- | --- | --- |
 | $`N_{T,Buffer}`$ | 静态均分时每条请求的 device hot slots | $`6144`$ |
 | $`B^T_{Buffer}`$ | worker / batch 的总 device hot slots | $`N_{bs,max}N_{T,Buffer}`$ |
-| $`C=C_{Batch}`$ | 一个 decode batch 能服务的 aggregate logical tokens | 由引理 1 推导 |
+| $`R_{Host}`$ | SGLang logical-capacity expansion factor：每个 GPU MLA hot slot 对应的 logical Indexer token 数，即 $`C_{Batch}/B^T_{Buffer}`$ | `hisparse_host_to_device_ratio`，且 $`R_{Host}\ge1`$ |
+| $`C=C_{Batch}`$ | 一个 decode batch 能服务的 aggregate logical tokens | 由 $`R_{Host}`$ 定义并在引理 1 中推导其 HBM 上界 |
 | $`N_{Topk}`$ | sparse kernel 的 per-request Buffer 下界 | $`2048`$ |
-| $`R_{Host}`$ | host logical pool / device hot pool | 配置项 |
 | $`R_{Share}`$ | Indexer 层共享系数 | GLM5.1: $`1`$；GLM5.2: $`3.714`$ |
 | $`B_{T,Indexer}`$ | 每 logical token 每 Indexer 层字节数 | $`132\ \mathrm{B}`$ |
 | $`B_{T,MLA}`$ | 每 hot token 每层 MLA KV 字节数 | $`656\ \mathrm{B}`$ |
@@ -30,26 +30,74 @@ HiSparse 将 KV / Indexer cache 分为 logical 命名空间、GPU device hot Buf
 
 ### 3. Capacity 推导
 
-#### 3.1 单个 hot slot 的 HBM 成本
+#### 3.1 定义 host/device 缩放系数
 
-一个 device hot slot 在全部模型层上的 MLA KV 成本为 $`N_{layer}B_{T,MLA}`$。该 slot 对应 $`R_{Host}`$ 个 logical token；这些 token 的 Indexer 全量常驻 GPU，并按 $`R_{Share}`$ 做层共享。因此，一个 hot slot 的有效 HBM 成本为：
+SGLang 将 $`R_{Host}`$ 定义为 full logical Indexer namespace 相对于 GPU MLA hot Buffer 的 **logical-capacity expansion factor**：
+
+$$
+\boxed{
+\begin{aligned}
+R_{Host}
+&:=\frac{C_{Batch}}{B^T_{Buffer}}
+=\frac{\mathtt{size\_full}}{\mathtt{size\_device}},
+\qquad R_{Host}\ge1, \\
+C=C_{Batch}&=R_{Host}B^T_{Buffer}.
+\end{aligned}
+}
+\tag{3.1}
+$$
+
+这是 token-slot 数量之比，不是 Host RAM 与 HBM 的字节数之比；它是 SGLang allocator 的输入参数，而不是分配完成后测得的派生量。对应到 SGLang allocator，即 $`\mathtt{size\_full}=\mathtt{size\_device}\cdot R_{Host}`$。因此，式 (3.1) 是 logical 命名空间的定义，不是完成显存分配后才得到的派生关系。后续推导要解决的是：在 HBM 预算约束下，$`B^T_{Buffer}`$ 最大能有多大，以及由式 (3.1) 决定的 $`C_{Batch}`$ 最大能有多大。
+
+#### 3.2 拆分 HBM 预算
+
+MLA device Buffer 只保存 hot token slots，而全量常驻 GPU 的 Indexer 需要覆盖全部 $`C_{Batch}`$ 个 logical tokens。两部分 HBM 占用分别为：
+
+$$
+\begin{aligned}
+M_{Buffer}
+&=N_{layer}B^T_{Buffer}B_{T,MLA}, \\
+M_{Indexer}
+&=N_{layer}\frac{C_{Batch}B_{T,Indexer}}{R_{Share}}.
+\end{aligned}
+\tag{3.2}
+$$
+
+因此，SGLang 最基础的 HBM 预算式为：
+
+$$
+\boxed{
+M_{cache}
+\ge
+N_{layer}B^T_{Buffer}B_{T,MLA}
++N_{layer}\frac{C_{Batch}B_{T,Indexer}}{R_{Share}}
+}
+\tag{3.3}
+$$
+
+将式 (3.1) 的缩放定义代入：
+
+$$
+M_{cache}
+\ge
+B^T_{Buffer}N_{layer}
+\left(
+B_{T,MLA}+\frac{R_{Host}B_{T,Indexer}}{R_{Share}}
+\right).
+\tag{3.4}
+$$
+
+由此也可以得到一个 hot slot 的等效 HBM 成本：
 
 $$
 m_{slot}=N_{layer}
 \left(
 B_{T,MLA}+\frac{R_{Host}B_{T,Indexer}}{R_{Share}}
 \right)
-\tag{3.1}
+\tag{3.5}
 $$
 
-#### 3.2 HBM 预算支持的总 Buffer
-
-当 worker-wide Buffer 与对应的 Indexer 共同占用 $`M_{cache}`$ 时，HBM 预算满足：
-
-$$
-B^T_{Buffer}m_{slot}\le M_{cache}
-\tag{3.2}
-$$
+#### 3.3 反解 worker-wide 总 Buffer
 
 因此，充分使用 HBM 时，worker-wide 总 Buffer 为：
 
@@ -60,12 +108,12 @@ B^T_{Buffer}
 {N_{layer}\left(
 B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
 \right)}
-\tag{3.3}
+\tag{3.6}
 $$
 
-未充分使用 HBM 时，式 (3.3) 的等号相应变为小于号。本文图片采用充分使用 HBM 的容量上界。
+未充分使用 HBM 时，式 (3.6) 的等号相应变为小于号。本文图片采用充分使用 HBM 的容量上界。
 
-#### 3.3 Batch Capacity
+#### 3.4 Batch Capacity
 
 > **引理 1（HiSparse Batch Capacity）.** 在前述理论假设和充分使用 HBM 的条件下，一个 Decode batch 能服务的 aggregate logical token 数为：
 
@@ -73,38 +121,38 @@ $$
 \boxed{
 \begin{aligned}
 C=C_{Batch}
+&=R_{Host}B^T_{Buffer} \\
 &=\frac{M_{cache}R_{Host}}
 {N_{layer}\left(
 B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
 \right)} \\
-&=\frac{M_{cache}R_{Host}}{m_{slot}} \\
-&=R_{Host}B^T_{Buffer}
+&=\frac{M_{cache}R_{Host}}{m_{slot}}
 \end{aligned}}
-\tag{3.4}
+\tag{3.7}
 $$
 
-**证明。** 将式 (3.1) 的单 slot 成本代入 HBM 预算，得到式 (3.3) 的 worker-wide Buffer 数量。Capacity 等于每个 slot 覆盖的 $`R_{Host}`$ 个 logical token 乘以总 slot 数，因此最终得到 $`C=C_{Batch}=R_{Host}B^T_{Buffer}`$。
+**证明。** 式 (3.1) 首先定义 worker-wide Buffer 所代表的 logical capacity。将该定义代入式 (3.3) 的两项 HBM 预算，得到式 (3.4)；令 HBM 预算充分使用后得到式 (3.6) 的 Buffer 上界；最后将该上界代回式 (3.1)，即可得到式 (3.7)。
 
-式 (3.4) 是本文图片中 Capacity 曲线使用的核心公式。
+式 (3.7) 是本文图片中 Capacity 曲线使用的核心公式。
 
-#### 3.4 与 batch size 的关系
+#### 3.5 与 batch size 的关系
 
 静态均分只是 worker-wide Buffer pool 的一种切分方式：
 
 $$
 B^T_{Buffer}=N_{bs,max}N_{T,Buffer}
-\tag{3.5}
+\tag{3.8}
 $$
 
-代入引理 1 的最后一行：
+将该关系代入式 (3.1) 的缩放定义：
 
 $$
 C_{Batch}=N_{bs,max}R_{Host}N_{T,Buffer}
 =N_{bs,max}C_{host,seq}
-\tag{3.6}
+\tag{3.9}
 $$
 
-其中 $`C_{host,seq}=R_{Host}N_{T,Buffer}`$。式 (3.5)–(3.6) 只描述总 Buffer 如何静态切分；固定 $`M_{cache}`$ 和 $`R_{Host}`$ 时，引理 1 中的 worker-wide Capacity 不随 $`N_{bs,max}`$ 改变。
+其中 $`C_{host,seq}=R_{Host}N_{T,Buffer}`$。式 (3.8)–(3.9) 只描述总 Buffer 如何静态切分；固定 $`M_{cache}`$ 和 $`R_{Host}`$ 时，引理 1 中的 worker-wide Capacity 不随 $`N_{bs,max}`$ 改变。
 
 ### 4. Capacity 约束
 
@@ -183,25 +231,7 @@ $$
 
 #### 5.1 Buffer 与 Indexer 构成
 
-$$
-M_{Buffer}=N_{layer}B^T_{Buffer}B_{T,MLA}
-\tag{5.1}
-$$
-
-$$
-M_{Indexer}=N_{layer}\frac{C_{Batch}B_{T,Indexer}}{R_{Share}}
-\tag{5.2}
-$$
-
-因此：
-
-$$
-M_{HiSparse}
-=N_{layer}B^T_{Buffer}
-\left(B_{T,MLA}+\frac{R_{Host}B_{T,Indexer}}{R_{Share}}\right)
-\le M_{cache}
-\tag{5.3}
-$$
+Buffer / Indexer 的两项显存构成已由式 (3.2) 定义，并由式 (3.3) 合并到同一个 HBM 预算中：MLA Buffer 只覆盖 $`B^T_{Buffer}`$ 个 GPU hot slots，而 Indexer 覆盖完整的 $`C_{Batch}`$ logical namespace。图片中的 Memory Composition 正是对这两项的可视化，不是另一套容量模型。
 
 在“Indexer 全量常驻 GPU”的假设下，host cold tier 只保存 MLA KV，不重复保存 Indexer。
 
@@ -210,7 +240,7 @@ $$
 $$
 \frac{M_{Indexer}}{M_{Buffer}}=
 \frac{R_{Host}B_{T,Indexer}}{R_{Share}B_{T,MLA}}
-\tag{5.4}
+\tag{5.1}
 $$
 
 Indexer HBM 占比为：
@@ -219,14 +249,14 @@ $$
 f_{Indexer}
 =\frac{R_{Host}B_{T,Indexer}}
 {R_{Share}B_{T,MLA}+R_{Host}B_{T,Indexer}}
-\tag{5.5}
+\tag{5.2}
 $$
 
 Buffer 与 Indexer 各占 50% 时：
 
 $$
 R^{\mathrm{50pct}}_{Host}=\frac{R_{Share}B_{T,MLA}}{B_{T,Indexer}}
-\tag{5.6}
+\tag{5.3}
 $$
 
 GLM5.1 的分界点约为 $`4.97`$，GLM5.2 约为 $`18.46`$。
@@ -237,7 +267,7 @@ GLM5.1 的分界点约为 $`4.97`$，GLM5.2 约为 $`18.46`$。
 
 $$
 N^{GPU}_{T,Buffer}\propto\frac{1}{N_{bs,max}}
-\tag{5.7}
+\tag{5.4}
 $$
 
 但 $`B^{T,GPU}_{Buffer}=N_{bs,max}N^{GPU}_{T,Buffer}`$ 保持不变。更高并发不会创造更多 hot slots，只会把同一个 pool 切得更细。
@@ -247,7 +277,7 @@ $$
 $$
 C^{GPU}_{Batch}(R_{Host})=\frac{M_{cache}R_{Host}}
 {N_{layer}\left(B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}\right)}
-\tag{5.8}
+\tag{5.5}
 $$
 
 当 $`R_{Host}\to\infty`$：
@@ -255,7 +285,7 @@ $$
 $$
 \lim C^{GPU}_{Batch}
 =\frac{M_{cache}R_{Share}}{N_{layer}B_{T,Indexer}}
-\tag{5.9}
+\tag{5.6}
 $$
 
 #### 5.5 最大 batch size 限制 ratio 可达性
@@ -267,7 +297,7 @@ N_{bs,max}\le
 \frac{M_{cache}}
 {N_{layer}N_{Topk}
 \left(B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}\right)}
-\tag{5.10}
+\tag{5.7}
 $$
 
 固定 $`N_{bs,max}`$ 后得到：
@@ -278,7 +308,7 @@ R^{Topk}_{Host,max}
 \left(
 \frac{M_{cache}}{N_{layer}N_{bs,max}N_{Topk}}-B_{T,MLA}
 \right)
-\tag{5.11}
+\tag{5.8}
 $$
 
 长度均为 $`L_{req}`$ 时，可接纳请求数满足：
@@ -290,7 +320,7 @@ N_{bs,max},
 \left\lfloor\frac{C^{GPU}_{Batch}}{L_{req}}\right\rfloor,
 \left\lfloor\frac{B^{T,GPU}_{Buffer}}{N_{Topk}}\right\rfloor
 \right)
-\tag{5.12}
+\tag{5.9}
 $$
 
 固定 per-sequence Buffer 为 $`B`$ 时，图中的连续请求数上界是 $`B^{T,GPU}_{Buffer}/B`$。因此随着 $`R_{Host}`$ 增大，aggregate capacity 上升，但固定 Buffer 下的最大请求数下降。

@@ -1,12 +1,12 @@
-## DLEngine - HiSparse Capacity Model
+## SGLang HiSparse Capacity Model
 
-HiSparse splits the KV / Indexer cache into three tiers: **logical** (scheduling semantics), **device hot buffer** (a small swap-in window on the GPU), and **host cold tier** (the full KV in CPU pinned memory). This post builds a quantitative capacity model on top of that architecture: what "capacity" means, which inequalities bound it, where the GPU memory actually goes, and what configurations are feasible for two concrete models (GLM5.1 and GLM5.2) on two H100 deployments.
+SGLang HiSparse splits the KV / Indexer cache into three tiers: **logical** (scheduling semantics), **device hot buffer** (a small swap-in window on the GPU), and **host cold tier** (the full KV in CPU pinned memory). This post builds a quantitative capacity model for SGLang's **ratio-driven allocation policy**: what "capacity" means, which inequalities bound it, where the GPU memory actually goes, and what configurations are feasible for two concrete models (GLM5.1 and GLM5.2) on two H100 deployments.
 
-Implementation details are covered in [hisparse-design.md](../hisparse-design.md); the NSA / FP8 KV / Indexer byte layouts are covered in [DLEngine - NSA](dlengine-nsa.md).
+The NSA / FP8 KV / Indexer byte layouts are covered in [DLEngine - NSA](dlengine-nsa.md). DLEngine's buffer-first allocator is a different policy and is not modeled here.
 
 ### 1. Background and Assumptions
 
-Deploying HiSparse boils down to choosing three knobs — the per-sequence device buffer size (`hisparse_device_buffer_size`), the host/device logical ratio (`hisparse_host_to_device_ratio`), and the maximum concurrency (`max_num_seqs`) — under a fixed GPU memory budget. The capacity model in this post is built on two assumptions:
+Deploying SGLang HiSparse boils down to choosing three knobs — the per-sequence device buffer size (`hisparse_device_buffer_size`), the host/device logical ratio (`hisparse_host_to_device_ratio`), and the maximum concurrency (`max_num_seqs`) — under a fixed GPU memory budget. The capacity model in this post is built on two assumptions:
 
 1. **The Indexer cache is fully resident in GPU memory.** HiSparse only splits the MLA KV between the host cold tier and the device hot buffer; the Indexer cache is provisioned on the GPU for the complete logical token space. Some models amortize this cost by sharing one Indexer cache across multiple model layers, captured by the layer-sharing factor $`R_{Share} = N_{layer} / N_{layer,indexer}`$ (GLM5.1 keeps a per-layer Indexer cache, so $`R_{Share}=1`$; GLM5.2 shares the Indexer across layers at $`78/21 \approx 3.714`$). The Indexer cost per hot token slot in the GPU memory model is therefore $`R_{Host} \cdot B_{T,Indexer} / R_{Share}`$.
 2. **No prefix cache.** The capacity calculation assumes every logical token independently occupies KV / Indexer space, with no deduplication or reuse of shared prefixes. With prefix caching enabled, the effective serviceable capacity additionally depends on workload prefix overlap and hit rate, which is out of scope here (see the TODO in Section 8).
@@ -17,7 +17,7 @@ Deploying HiSparse boils down to choosing three knobs — the per-sequence devic
 | --- | --- | --- |
 | $`N_{T,Buffer}`$ | Device hot capacity (per-seq): token slots resident on the GPU hot tier per sequence; the swap-in window of sparse decode. Short sequences take the fast path when $`L_{seq}\le N_{T,Buffer}`$. | $`6144`$ — `hisparse_device_buffer_size`; validated by the ESS paper (arXiv) and the SGLang HiSparse default |
 | $`B^T_{Buffer}`$ | Device hot capacity (per-batch): total GPU hot token slots of a decode batch | $`N_{bs,max}N_{T,Buffer}`$ |
-| $`R_{Host}`$ | Host/device logical ratio: how much larger the host logical pool is than the device hot pool | `hisparse_host_to_device_ratio`; $`2`$ for short contexts, $`5\sim10`$ and beyond for long contexts |
+| $`R_{Host}`$ | SGLang logical-capacity expansion factor: the number of logical Indexer tokens provisioned per GPU MLA hot slot, equivalently $`C_{Batch}/B^T_{Buffer}`$ | `hisparse_host_to_device_ratio`; $`R_{Host}\ge1`$ |
 | $`C_{host,seq}`$ | Host logical capacity (per-seq): logical tokens one sequence can cover in the host namespace | $`R_{Host}N_{T,Buffer}`$; e.g. $`2\times6144=12{,}288`$ tokens |
 | $`C=C_{Batch}`$ | Decode-batch logical capacity: maximum aggregate tokens one batch can serve | Derived in Lemma 1 |
 | $`N_{Topk}`$ | Sparse hard floor: top-k entries one sparse attention step must hold; $`N_{T,Buffer}`$ may not go below it | $`2048`$ — `index_topk` |
@@ -33,35 +33,80 @@ Deploying HiSparse boils down to choosing three knobs — the per-sequence devic
 | $`M_{cache}`$ | HBM available to the HiSparse Buffer and Indexer | $`M_{Available}F-M_{weights}`$ |
 | $`M_{Host,Available}`$ | Host memory available to the worker's cold MLA KV | Deployment parameter |
 
-> Note: the [HiSparse design doc](../hisparse-design.md) still lists `hisparse_device_buffer_size = 4096` as the initial default; $`6144`$ is the value validated by the ESS paper and adopted as the SGLang HiSparse default, and is what this post standardizes on.
-
-Mapping to the SGLang / DLEngine allocator: the device pool has size `size_device`, and the logical pool satisfies $`\mathtt{size\_full}=\mathtt{size\_device}\cdot R_{Host}`$. Dividing evenly across concurrent sequences, each sequence's logical limit is exactly $`C_{host,seq}`$.
+> Note: $`6144`$ is the value validated by the ESS paper and adopted as the SGLang HiSparse default, and is what this post standardizes on.
 
 ### 3. Capacity Derivation
 
-#### 3.1 HBM cost of one hot slot
+#### 3.1 Define the host/device scaling factor
 
-One device hot slot pays $`N_{layer}B_{T,MLA}`$ bytes for MLA KV across all model layers. It represents $`R_{Host}`$ logical tokens whose Indexer entries are fully resident on the GPU and amortized by $`R_{Share}`$-way layer sharing. Its effective HBM cost is therefore:
+SGLang defines $`R_{Host}`$ as the configured **logical-capacity expansion factor** between the full logical Indexer namespace and the GPU MLA hot Buffer:
+
+$$
+\boxed{
+\begin{aligned}
+R_{Host}
+&:=\frac{C_{Batch}}{B^T_{Buffer}}
+=\frac{\mathtt{size\_full}}{\mathtt{size\_device}},
+\qquad R_{Host}\ge1, \\
+C=C_{Batch}&=R_{Host}B^T_{Buffer}.
+\end{aligned}
+}
+\tag{3.1}
+$$
+
+This is a ratio of **token-slot counts**, not a byte ratio between host RAM and HBM. It is an input to the SGLang allocator rather than a quantity measured after allocation. Equivalently, SGLang uses $`\mathtt{size\_full}=\mathtt{size\_device}\cdot R_{Host}`$. Equation (3.1) defines the logical namespace; it is not a result inferred after memory allocation. The remaining derivation asks how large $`B^T_{Buffer}`$ can be under the HBM budget and, through Equation (3.1), how large $`C_{Batch}`$ can be.
+
+#### 3.2 Decompose the HBM budget
+
+The MLA device Buffer stores only the hot token slots, whereas the fully resident Indexer covers all $`C_{Batch}`$ logical tokens. Their HBM costs are:
+
+$$
+\begin{aligned}
+M_{Buffer}
+&=N_{layer}B^T_{Buffer}B_{T,MLA}, \\
+M_{Indexer}
+&=N_{layer}\frac{C_{Batch}B_{T,Indexer}}{R_{Share}}.
+\end{aligned}
+\tag{3.2}
+$$
+
+Therefore the fundamental SGLang HBM budget is:
+
+$$
+\boxed{
+M_{cache}
+\ge
+N_{layer}B^T_{Buffer}B_{T,MLA}
++N_{layer}\frac{C_{Batch}B_{T,Indexer}}{R_{Share}}
+}
+\tag{3.3}
+$$
+
+Substituting the scaling definition in Equation (3.1) gives:
+
+$$
+M_{cache}
+\ge
+B^T_{Buffer}N_{layer}
+\left(
+B_{T,MLA}+\frac{R_{Host}B_{T,Indexer}}{R_{Share}}
+\right).
+\tag{3.4}
+$$
+
+This form also explains the effective HBM cost of one hot slot:
 
 $$
 m_{slot}=N_{layer}
 \left(
 B_{T,MLA}+\frac{R_{Host}B_{T,Indexer}}{R_{Share}}
 \right)
-\tag{3.1}
+\tag{3.5}
 $$
 
-#### 3.2 Worker-wide Buffer supported by HBM
-
-When the worker-wide Buffer and its corresponding Indexer share $`M_{cache}`$, the HBM budget satisfies:
-
-$$
-B^T_{Buffer}m_{slot}\le M_{cache}
-\tag{3.2}
-$$
+#### 3.3 Solve for the worker-wide Buffer
 
 With saturated HBM, the worker-wide Buffer is:
-
 
 $$
 B^T_{Buffer}
@@ -70,12 +115,12 @@ B^T_{Buffer}
 {N_{layer}\left(
 B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
 \right)}
-\tag{3.3}
+\tag{3.6}
 $$
 
-For an undersubscribed pool, the equalities in Equation (3.3) become upper bounds. The figures use the saturated-HBM ceiling.
+For an undersubscribed pool, the equalities in Equation (3.6) become upper bounds. The figures use the saturated-HBM ceiling.
 
-#### 3.3 Batch Capacity
+#### 3.4 Batch Capacity
 
 > **Lemma 1 (HiSparse Batch Capacity).** Under the assumptions above and with saturated HBM, the aggregate logical token capacity of one decode batch is:
 
@@ -83,38 +128,38 @@ $$
 \boxed{
 \begin{aligned}
 C=C_{Batch}
+&=R_{Host}B^T_{Buffer} \\
 &=\frac{M_{cache}R_{Host}}
 {N_{layer}\left(
 B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
 \right)} \\
-&=\frac{M_{cache}R_{Host}}{m_{slot}} \\
-&=R_{Host}B^T_{Buffer}
+&=\frac{M_{cache}R_{Host}}{m_{slot}}
 \end{aligned}}
-\tag{3.4}
+\tag{3.7}
 $$
 
-**Proof.** Substituting the per-slot cost in Equation (3.1) into the HBM budget gives the worker-wide Buffer size in Equation (3.3). Multiplying the total slot count by the $`R_{Host}`$ logical tokens represented by each slot yields the final identity $`C=C_{Batch}=R_{Host}B^T_{Buffer}`$.
+**Proof.** Equation (3.1) first defines the logical capacity represented by a worker-wide Buffer. Substituting that definition into the explicit two-term HBM budget in Equation (3.3) gives Equation (3.4), and saturating the budget gives the Buffer ceiling in Equation (3.6). Substituting this ceiling into Equation (3.1) yields Equation (3.7).
 
-Equation (3.4) is the central Capacity formula plotted in this post.
+Equation (3.7) is the central Capacity formula plotted in this post.
 
-#### 3.4 Relationship to batch size
+#### 3.5 Relationship to batch size
 
 An equal split is only one way to partition the worker-wide Buffer pool:
 
 $$
 B^T_{Buffer}=N_{bs,max}N_{T,Buffer}
-\tag{3.5}
+\tag{3.8}
 $$
 
-Substituting this relation into the final line of Lemma 1 gives:
+Substituting this relation into the scaling definition in Equation (3.1) gives:
 
 $$
 C_{Batch}=N_{bs,max}R_{Host}N_{T,Buffer}
 =N_{bs,max}C_{host,seq}
-\tag{3.6}
+\tag{3.9}
 $$
 
-Here $`C_{host,seq}=R_{Host}N_{T,Buffer}`$. Equations (3.5)–(3.6) describe only a static partition of the total Buffer. At fixed $`M_{cache}`$ and $`R_{Host}`$, the worker-wide Capacity in Lemma 1 is independent of $`N_{bs,max}`$.
+Here $`C_{host,seq}=R_{Host}N_{T,Buffer}`$. Equations (3.8)–(3.9) describe only a static partition of the total Buffer. At fixed $`M_{cache}`$ and $`R_{Host}`$, the worker-wide Capacity in Lemma 1 is independent of $`N_{bs,max}`$.
 
 ### 4. Capacity Constraints
 
@@ -214,55 +259,11 @@ This is a hard physical-capacity bound, unlike the no-waste bound above. The fig
 
 ### 5. Where the GPU Memory Actually Goes
 
-The constraints above are phrased in logical token counts. This section splits the same capacity model into its MLA device-buffer and Indexer components, to see what the GPU memory is ultimately spent on, and what raising $`R_{Host}`$, $`R_{Share}`$, or $`N_{bs,max}`$ each actually buys.
-
-Let the memory available to the HiSparse cache be:
-
-$$
-M_{cache}=M_{Available}F-M_{weights}
-\tag{5.1}
-$$
+The constraints above are phrased in logical token counts. This section interprets the Buffer / Indexer decomposition already established by Equations (3.2)–(3.3), to see what the GPU memory is ultimately spent on and what raising $`R_{Host}`$, $`R_{Share}`$, or $`N_{bs,max}`$ each actually buys.
 
 #### 5.1 Buffer vs. Indexer composition
 
-The MLA device buffer only covers GPU hot token slots:
-
-$$
-\begin{aligned}
-M_{Buffer}
-&=N_{layer}B^T_{Buffer}B_{T,MLA} \\
-&=N_{layer}N_{bs,max}N_{T,Buffer}B_{T,MLA}
-\end{aligned}
-\tag{5.2}
-$$
-
-The Indexer cache covers the complete logical token space:
-
-$$
-\begin{aligned}
-M_{Indexer}
-&=N_{layer}\frac{C_{Batch}B_{T,Indexer}}{R_{Share}} \\
-&=N_{layer}N_{bs,max}N_{T,Buffer}
-  \frac{R_{Host}B_{T,Indexer}}{R_{Share}}
-\end{aligned}
-\tag{5.3}
-$$
-
-So the total HiSparse cache budget constraint is:
-
-$$
-\begin{aligned}
-M_{HiSparse}
-&=M_{Buffer}+M_{Indexer} \\
-&=N_{layer}N_{bs,max}N_{T,Buffer}
-\left(
-B_{T,MLA}
-+\frac{R_{Host}B_{T,Indexer}}{R_{Share}}
-\right) \\
-&\le M_{cache}
-\end{aligned}
-\tag{5.4}
-$$
+Equation (3.2) already gives both components: the MLA Buffer covers only $`B^T_{Buffer}`$ GPU hot slots, while the Indexer covers the complete $`C_{Batch}`$ logical namespace. Equation (3.3) then adds them under the same HBM budget. This is exactly the decomposition shown in the figures; it is not a second capacity model.
 
 Because this post assumes the Indexer cache is fully GPU-resident, the host cold tier only stores the complete logical MLA KV. The host memory for one full-length sequence should therefore be estimated as:
 
@@ -270,7 +271,7 @@ $$
 M_{host,seq}
 \approx
 L_{max,model}N_{layer}B_{T,MLA}
-\tag{5.5}
+\tag{5.1}
 $$
 
 without adding $`B_{T,Indexer}`$ on the host side. If a future implementation also keeps an Indexer replica on the host, add $`L_{max,model}N_{layer}B_{T,Indexer}`$ on top.
@@ -283,7 +284,7 @@ $$
 \frac{M_{Indexer}}{M_{Buffer}}=
 \frac{R_{Host}B_{T,Indexer}}
 {R_{Share}B_{T,MLA}}
-\tag{5.6}
+\tag{5.2}
 $$
 
 so the Indexer's share of the HiSparse cache is:
@@ -291,7 +292,7 @@ so the Indexer's share of the HiSparse cache is:
 $$
 P_{Indexer}=\frac{R_{Host}B_{T,Indexer}}
 {R_{Share}B_{T,MLA}+R_{Host}B_{T,Indexer}}
-\tag{5.7}
+\tag{5.3}
 $$
 
 This share is independent of $`N_{T,Buffer}`$, $`N_{bs,max}`$, $`N_{layer}`$, and $`M_{cache}`$: scaling concurrency or the buffer inflates both components proportionally without changing their mix.
@@ -301,7 +302,7 @@ The break-even point where $`M_{Indexer}=M_{Buffer}`$ — beyond which the Index
 $$
 R^{\mathrm{50pct}}_{Host}=\frac{R_{Share}B_{T,MLA}}{B_{T,Indexer}}
 \approx 4.97\,R_{Share}
-\tag{5.8}
+\tag{5.4}
 $$
 
 using $`B_{T,MLA}=656\ \mathrm{B}`$ and $`B_{T,Indexer}=132\ \mathrm{B}`$. Instantiated for the two models:
@@ -323,7 +324,7 @@ If the configured $`N_{T,Buffer}`$ is fixed, both Buffer and Indexer memory grow
 
 $$
 M_{HiSparse}\propto N_{bs,max}
-\tag{5.9}
+\tag{5.5}
 $$
 
 If instead the memory budget $`M_{cache}`$ is fixed and the buffer uses its full allowance, then:
@@ -335,14 +336,14 @@ N^{GPU}_{T,Buffer}=\frac{M_{cache}}
 B_{T,MLA}
 +\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
 \right)}
-\tag{5.10}
+\tag{5.6}
 $$
 
 so the per-sequence buffer is inversely proportional to concurrency:
 
 $$
 N^{GPU}_{T,Buffer}\propto\frac{1}{N_{bs,max}}
-\tag{5.11}
+\tag{5.7}
 $$
 
 but the batch-wide hot-slot ceiling:
@@ -356,7 +357,7 @@ B^{T,GPU}_{Buffer}
 B_{T,MLA}
 +\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
 \right)}
-\tag{5.12}
+\tag{5.8}
 $$
 
 is independent of $`N_{bs,max}`$. In a memory-saturated deployment, raising concurrency does not create more hot slots — it only splits a fixed hot-slot budget across more sequences.
@@ -372,7 +373,7 @@ C^{GPU}_{Batch}(R_{Host})=\frac{M_{cache}R_{Host}}
 B_{T,MLA}
 +\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
 \right)}
-\tag{5.13}
+\tag{5.9}
 $$
 
 This expression contains no $`N_{bs,max}`$: in the idealized continuous-allocation model, adding concurrency only changes how capacity is divided among sequences, never the worker's total logical capacity.
@@ -383,7 +384,7 @@ $$
 \lim_{R_{Host}\to\infty}C^{GPU}_{Batch}
 =\frac{M_{cache}R_{Share}}
 {N_{layer}B_{T,Indexer}}
-\tag{5.14}
+\tag{5.10}
 $$
 
 This is the capacity ceiling imposed by the GPU-resident Indexer. Raising $`R_{Host}`$ drives the MLA device-buffer cost down, but the per-logical-token Indexer cost never goes away. For a fixed target capacity $`C_{Batch}`$, the two components can equivalently be written as:
@@ -395,7 +396,7 @@ M_{Buffer}
 M_{Indexer}
 &=N_{layer}C_{Batch}\frac{B_{T,Indexer}}{R_{Share}}.
 \end{aligned}
-\tag{5.15}
+\tag{5.11}
 $$
 
 Raising $`R_{Host}`$ shrinks the Buffer cost as $`1/R_{Host}`$ but cannot reduce the Indexer cost of a given logical capacity. Moreover, at $`R_{Host}=R^{\mathrm{50pct}}_{Host}`$ the capacity reaches exactly half of the theoretical ceiling; beyond that point the marginal return of raising $`R_{Host}`$ falls off quickly.
@@ -413,7 +414,7 @@ N_{bs,max}
 B_{T,MLA}
 +\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
 \right)}
-\tag{5.16}
+\tag{5.12}
 $$
 
 Equivalently, fixing $`N_{bs,max}`$ gives the top-k-imposed ratio ceiling:
@@ -425,7 +426,7 @@ R^{Topk}_{Host,max}=\frac{R_{Share}}{B_{T,Indexer}}
 {N_{layer}N_{bs,max}N_{Topk}}
 -B_{T,MLA}
 \right)
-\tag{5.17}
+\tag{5.13}
 $$
 
 This is why the capacity curve is shared by every batch size while each $`N_{bs,max}`$ has a different colored vertical boundary in the figures. A feasible operating point under this post's default criterion must satisfy both $`C^{GPU}_{Batch}\ge L_{max,model}`$ and $`R_{Host}\le R^{Topk}_{Host,max}`$.
@@ -440,7 +441,7 @@ N_{bs,max},
 \left\lfloor\frac{C^{GPU}_{Batch}(R_{Host})}{L_{req}}\right\rfloor,
 \left\lfloor\frac{B^{T,GPU}_{Buffer}(R_{Host})}{N_{Topk}}\right\rfloor
 \right)
-\tag{5.18}
+\tag{5.14}
 $$
 
 With a fixed $`6144`$-token Buffer per sequence, $`C_{host,seq}=6144R_{Host}`$ makes the single-request coverage immediately visible. The number of requests still cannot be inferred from $`R_{Host}`$ alone: it also depends on the worker-wide Buffer pool, request lengths, and the top-k floor.
@@ -558,8 +559,8 @@ Both models tell the same story: $`N_{bs,max}`$ does not change the worker-capac
 
 Take $`M_{cache}=77.47\times0.88-64.52\approx3.6536\ \mathrm{GB}`$, $`N_{layer}=78`$, $`N_{bs,max}=8`$, $`R_{Host}=2`$, $`R_{Share}=3.714`$, $`N_{Topk}=2048`$, and the default $`N_{T,Buffer}=6144`$, then walk the three constraints in order.
 
-1. **Sparse floor (3.1):** $`N_{T,Buffer}=6144\ge N_{Topk}=2048`$ — satisfied with $`3\times`$ headroom.
-2. **GPU ceiling (3.2):** the per-slot cost is $`B_{T,MLA}+R_{Host}B_{T,Indexer}/R_{Share} = 656+2\times132/3.714\approx727\ \mathrm{B}`$, so the ceiling is $`3.6536\times10^9/(727\times78\times8)\approx8053\ge6144`$ — the default buffer fits. Without Indexer layer sharing ($`R_{Share}=1`$, the GLM5.1 layout) the per-slot cost rises to $`920\ \mathrm{B}`$ and the ceiling drops to $`\approx6364`$: the default buffer would only *barely* fit.
+1. **Sparse floor (4.1):** $`N_{T,Buffer}=6144\ge N_{Topk}=2048`$ — satisfied with $`3\times`$ headroom.
+2. **GPU ceiling (4.2):** the per-slot cost is $`B_{T,MLA}+R_{Host}B_{T,Indexer}/R_{Share} = 656+2\times132/3.714\approx727\ \mathrm{B}`$, so the ceiling is $`3.6536\times10^9/(727\times78\times8)\approx8053\ge6144`$ — the default buffer fits. Without Indexer layer sharing ($`R_{Share}=1`$, the GLM5.1 layout) the per-slot cost rises to $`920\ \mathrm{B}`$ and the ceiling drops to $`\approx6364`$: the default buffer would only *barely* fit.
 3. **Batch capacity (Lemma 1):** $`C_{host,seq}=2\times6144=12{,}288`$ tokens and $`C_{Batch}=8\times12{,}288=98{,}304`$ tokens, below the 1M aggregate target. The capacity curve reaches 1M at $`R_{Host}\approx71.85`$, but the $`N_{bs,max}=8`$ top-k ceiling is only about $`62`$, so no ratio satisfies both constraints. Reducing $`N_{bs,max}`$ to $`4`$ opens the interval $`[71.85,142.4]`$; alternatively, a larger $`M_{cache}`$ such as DP32EP32 moves the top-k ceiling right.
 
 Conclusion: this configuration runs sparse decode comfortably at $`R_{Host}=2`$, but its worker capacity is only $`98{,}304`$ tokens. Reaching the 1M aggregate target requires simultaneously lowering concurrency (or enlarging $`M_{cache}`$), raising $`R_{Host}`$, and provisioning the host RAM to back the resulting logical capacity.
