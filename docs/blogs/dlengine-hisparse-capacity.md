@@ -495,7 +495,7 @@ Conclusion: this configuration runs sparse decode comfortably at $R_{Host}=2$, b
 | Run the sparse kernel at all | $N_{T,Buffer}\ge N_{Topk}$ |
 | Short-sequence fast path | $N_{T,Buffer}$ slightly above $N_{Topk}$ |
 | One model-length of aggregate worker capacity | Raise $R_{Host}$ until $C_{worker}\ge L_{max,model}$; verify that the crossing remains below $R^{Topk}_{Host,max}$ |
-| High concurrency | Use the worker-wide Buffer pool efficiently and verify $B^{T,GPU}_{Buffer}\ge N_{bs,max}N_{Topk}$ |
+| High concurrency | Use the worker-wide Buffer pool; its total hot-slot count must cover the top-k floor of every concurrent request |
 | Host machine RAM | $\approx1\ \mathrm{TB}$ supports $R_{Host}\approx5$; $\approx2\ \mathrm{TB}$ supports $R_{Host}\approx10$ |
 
 Trade-offs: enlarging $N_{T,Buffer}$ reduces swap-in misses but squeezes the concurrency the GPU can sustain; enlarging $R_{Host}$ grows $C_{host,seq}$ but inflates the Indexer term in the GPU inequality; a larger $R_{Share}$ (more Indexer layer sharing, a model-architecture property) relieves GPU Indexer pressure and raises the capacity ceiling linearly.
