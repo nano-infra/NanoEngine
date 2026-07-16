@@ -153,7 +153,7 @@ $$
 Buffer 与 Indexer 各占 50% 时：
 
 $$
-R^{50\%}_{Host}=\frac{R_{Share}B_{T,MLA}}{B_{T,Indexer}}
+R^{\mathrm{50pct}}_{Host}=\frac{R_{Share}B_{T,MLA}}{B_{T,Indexer}}
 $$
 
 GLM5.1 的分界点约为 $4.97$，GLM5.2 约为 $18.46$。
