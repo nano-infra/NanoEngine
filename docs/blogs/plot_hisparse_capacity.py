@@ -8,7 +8,7 @@ Indexer layer-sharing factor (``--shared-ratios``) and context length
 (``--max-model-len``).  Each curve is the maximum worker-wide host logical
 capacity allowed by the GPU inequality:
 
-    C_worker_gpu = N_bs_max * R_host * M_cache
+    C_Batch_gpu = N_bs_max * R_host * M_cache
             / (((R_host * B_indexer / R_share) + B_mla)
                * N_layer * N_bs_max)
 
@@ -16,8 +16,8 @@ The shaded region contains capacities satisfying all three inequalities:
 
     N_buffer >= N_topk
     N_buffer <= GPU upper bound
-    L_max_model <= C_worker
-    C_worker = N_bs_max * R_host * N_buffer
+    L_max_model <= C_Batch
+    C_Batch = N_bs_max * R_host * N_buffer
 
 Examples (GLM5.1: per-layer Indexer, R_share=1, 256K context;
 GLM5.2: Indexer shared across layers 78/21, R_share=3.714, 1M context):
@@ -226,8 +226,8 @@ def feasible_ratio_interval(
     if asymptotic_capacity <= config.max_model_len:
         return None
 
-    # Solve C_worker_gpu(R_host) = L_max_model for the lower endpoint.  Since
-    # C_worker_gpu = N_bs * C_host_seq_gpu, the per-sequence target here is
+    # Solve C_Batch_gpu(R_host) = L_max_model for the lower endpoint.  Since
+    # C_Batch_gpu = N_bs * C_host_seq_gpu, the per-sequence target here is
     # L_max_model / N_bs rather than L_max_model.
     per_sequence_target = config.max_model_len / config.max_num_seqs
     lower_denominator = available - (
@@ -328,7 +328,7 @@ def plot_capacity(
     )
     capacity_legend_entries[r"$L_{max,model}$"] = model_handle
 
-    # C_worker_gpu is independent of N_bs because the N_bs factor in worker
+    # C_Batch_gpu is independent of N_bs because the N_bs factor in worker
     # capacity cancels the N_bs factor in the GPU buffer denominator.
     gpu_capacity = host_capacity_upper(
         ratios, shared_ratio, reference_config
@@ -341,9 +341,9 @@ def plot_capacity(
         markevery=boundary_indices,
         markersize=12,
         linewidth=3.2,
-        label=r"$C^{GPU}_{worker}$",
+        label=r"$C^{GPU}_{Batch}$",
     )[0]
-    capacity_legend_entries[r"$C^{GPU}_{worker}$"] = gpu_handle
+    capacity_legend_entries[r"$C^{GPU}_{Batch}$"] = gpu_handle
 
     ax.set_xlabel(r"$R_{host}$")
     ax.set_ylabel("#tokens", labelpad=20)
@@ -505,10 +505,10 @@ def plot_capacity(
             interval = feasible_ratio_interval(shared_ratio, curve_config)
             prefix = f"R_Share={shared_ratio:g}, max_num_seqs={max_num_seqs}"
             if interval is None:
-                print(f"{prefix}: C_worker >= L_max R_host interval = empty")
+                print(f"{prefix}: C_Batch >= L_max R_host interval = empty")
             else:
                 print(
-                    f"{prefix}: C_worker >= L_max R_host interval = "
+                    f"{prefix}: C_Batch >= L_max R_host interval = "
                     f"[{interval[0]:.6g}, {interval[1]:.6g}]"
                 )
 
