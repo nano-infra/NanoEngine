@@ -77,9 +77,7 @@ $$
 worker-wide 总 Buffer 上界为：
 
 $$
-B^{T,GPU}_{Buffer}
-=
-\frac{M_{cache}}
+B^{T,GPU}_{Buffer}=\frac{M_{cache}}
 {N_{layer}
 \left(B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}\right)}
 $$
@@ -109,8 +107,9 @@ $$
 因此：
 
 $$
-C_{worker}\le
-\frac{M_{Host,Available}}{N_{layer}B_{T,MLA}}
+C_{worker}
+\le C^{Host}_{worker,max}
+=\frac{M_{Host,Available}}{N_{layer}B_{T,MLA}}
 $$
 
 ### 4. HBM 到底花在哪里
@@ -139,8 +138,8 @@ $$
 #### 4.2 Indexer 占比
 
 $$
-\frac{M_{Indexer}}{M_{Buffer}}
-=\frac{R_{Host}B_{T,Indexer}}{R_{Share}B_{T,MLA}}
+\frac{M_{Indexer}}{M_{Buffer}}=
+\frac{R_{Host}B_{T,Indexer}}{R_{Share}B_{T,MLA}}
 $$
 
 Indexer HBM 占比为：
@@ -169,12 +168,10 @@ $$
 
 但 $B^{T,GPU}_{Buffer}=N_{bs,max}N^{GPU}_{T,Buffer}$ 保持不变。更高并发不会创造更多 hot slots，只会把同一个 pool 切得更细。
 
-#### 4.4 $R_{Host}$ 的 Indexer 天花板
+#### 4.4 Host ratio 的 Indexer 天花板
 
 $$
-C^{GPU}_{worker}(R_{Host})
-=
-\frac{M_{cache}R_{Host}}
+C^{GPU}_{worker}(R_{Host})=\frac{M_{cache}R_{Host}}
 {N_{layer}\left(B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}\right)}
 $$
 
@@ -275,4 +272,3 @@ $N_{bs,max}=1/2/4$ 的可行上界约为 $512/303.3/142.4$。
 | 高并发 | 使用 worker-wide Buffer pool，并验证 $B^{T,GPU}_{Buffer}\ge N_{bs,max}N_{Topk}$ |
 | 更高容量 | 增大 $R_{Host}$，但注意 Indexer ceiling 与 host RAM |
 | Indexer 已主导 HBM | 优先增大 $R_{Share}$ 或压缩 Indexer，而不是继续推高 $R_{Host}$ |
-
