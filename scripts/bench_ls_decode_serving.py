@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ray-address", default="10.102.243.60:8776")
     parser.add_argument("--master-address", default="10.102.243.60:29906")
     parser.add_argument("--duration-sec", type=float, default=360.0)
-    parser.add_argument("--request-rate", type=float, default=30.0)
+    parser.add_argument("--request-rate", type=float, default=20.0)
     parser.add_argument("--num-requests", type=int, default=0)
     parser.add_argument("--burstiness", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
