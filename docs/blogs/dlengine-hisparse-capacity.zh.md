@@ -43,7 +43,7 @@ C_{worker}\ge N_{bs,max}L_{max,model}
 $$
 
 | 符号 | 含义 | 典型值 |
-| --- | --- | ---: |
+| --- | --- | --- |
 | $`N_{T,Buffer}`$ | 静态均分时每条请求的 device hot slots | $`6144`$ |
 | $`B^T_{Buffer}`$ | worker / batch 的总 device hot slots | $`N_{bs,max}N_{T,Buffer}`$ |
 | $`N_{Topk}`$ | sparse kernel 的 per-request Buffer 下界 | $`2048`$ |
