@@ -118,3 +118,84 @@ rate 20 下请求仍有完成进展，但完成速率明显低于到达速率，
 - `max_num_recv_seqs=128`：为多-rank KV placement 和 receiver metadata 留出容量。
 
 脚本已将它们设为默认值。
+
+## NanoDeploy original setting 对照组
+
+若要在相同的两节点、Issue 1%、rate 20、6 分钟 workload 上运行用户给出的 sh 所使用的 NanoDeploy 策略，直接调用原始 CSV serving driver：
+
+```bash
+cd /mnt/nvme1n1/ml_research/linbinbin1/NanoDeploy-July
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
+export NANODEPLOY_LOG_DECODE_A2A_MASKS=0
+export NANODEPLOY_LOG_DECODE_STEP_DETAIL=0
+export NANODEPLOY_LOG_MODEL_FORWARD_TIMING=0
+export RAY_DEDUP_LOGS=1
+export PYTHONUNBUFFERED=1
+
+set -o pipefail
+python scripts/issue003/bench_serving_overhead.py \
+  --dataset csv \
+  --csv-path /mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/sharegpt-4o-mixlong-0326/sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv \
+  --num-requests 7200 \
+  --request-rate 20 \
+  --dp 2 \
+  --sp 8 \
+  --tp 1 \
+  --ep 16 \
+  --max-num-seqs 256 \
+  --gpu-memory-limit-gb 141 \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 1000000 \
+  --max-input-len 1000000 \
+  --dummy-prefill \
+  --ray-address 10.102.243.60:8776 \
+  --master-address 10.102.243.60:29906 \
+  --loop-count 16 \
+  --model-path /mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3 \
+  --routing-strategy LeastBatch \
+  --scheduler-mode centralized \
+  --segment-size 65536 \
+  --sp-backend hao_basic \
+  --cuda-graph-mode full \
+  --fixed-sp-size 0 \
+  --enable-dynamic-sp-size \
+  --dynamic-sp-size-strategy long_short_sp8 \
+  --long-request-sp-threshold 100000 \
+  --long-request-sp-size 8 \
+  --itl-log-path docs-dev/nanodeploy_original_issue001_2node_dp2sp8_r20_6min.jsonl \
+  2>&1 | tee docs-dev/nanodeploy_original_issue001_2node_dp2sp8_r20_6min.log
+```
+
+这条命令对应参考 sh 的 original setting：
+
+- `batch_size/max_num_seqs=256`；
+- `segment_size=65536`；
+- `scheduler_mode=centralized`；
+- `gpu_memory_limit_gb=141`、`gpu_memory_utilization=0.9`；
+- `max_model_len=max_input_len=1000000`；
+- `loop_count=16`；
+- `fixed_sp_size=0`；
+- `sp_backend=hao_basic`；
+- full CUDA Graph，不启用 eager；
+- legacy Decode dynamic-SP path；
+- `long_short_sp8`，长请求阈值 100,000，长请求使用 SP8；
+- `LeastBatch` routing；
+- 默认启用 non-uniform KV split。
+
+它不会传入任何 LS scheduler 或 KV consolidation 参数，因此运行的是 NanoDeploy original 策略。
+
+参考 sh 中模型默认路径是 `/mnt/nvme1n1/ml_research/models/deepseek-v3`；当前两节点集群使用的是等价且已验证存在的 `/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3`。
+
+原始 driver 没有 `--duration-sec` 参数。这里用 `7200 = 20 req/s × 360 s` 表达 6 分钟 offered load；最后一个 Poisson 到达会在 360 秒附近，随后继续 drain。该 driver 使用参考 sh 原有的 256-request warmup。
+
+该命令同样会使用 16 块 GPU；通过 Codex 启动前必须单独申请 GPU 提权。建议不要直接调用参考 sh 的 sweep wrapper，因为它按 600 秒硬编码请求数，会把 rate 20 转成 12,000 请求，而不是本次需要的 7,200 请求。
+
+实时监测：
+
+```bash
+tail -f docs-dev/nanodeploy_original_issue001_2node_dp2sp8_r20_6min.log
+```
+
+正常完成时应在日志末尾看到 `Benchmark Results`，并生成对应 JSONL。中途终止的运行仍不能用于性能对比。
