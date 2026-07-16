@@ -19,7 +19,38 @@ $$
 C=C_{worker}=R_{Host}B^T_{Buffer}
 $$
 
-静态均分时：
+这个定义可以直接从 HBM 预算展开。一个 device hot slot 在全部模型层上的 MLA KV 成本为 $`N_{layer}B_{T,MLA}`$。该 slot 对应 $`R_{Host}`$ 个 logical token，而这些 logical token 的 Indexer 全量常驻 GPU；考虑 $`R_{Share}`$ 的层共享后，其 Indexer 成本为 $`N_{layer}R_{Host}B_{T,Indexer}/R_{Share}`$。因此，一个 hot slot 的有效 HBM 成本为：
+
+$$
+m_{slot}=N_{layer}
+\left(
+B_{T,MLA}+\frac{R_{Host}B_{T,Indexer}}{R_{Share}}
+\right)
+$$
+
+当 $`M_{cache}`$ 被 worker-wide Buffer pool 充分使用时，总 device hot slots 为：
+
+$$
+B^T_{Buffer}
+=\frac{M_{cache}}
+{N_{layer}\left(
+B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
+\right)}
+$$
+
+每个 hot slot 可覆盖 $`R_{Host}`$ 个 logical token，所以：
+
+$$
+C=C_{worker}
+=\frac{M_{cache}R_{Host}}
+{N_{layer}\left(
+B_{T,MLA}+\dfrac{R_{Host}B_{T,Indexer}}{R_{Share}}
+\right)}
+$$
+
+这就是 $`C=R_{Host}B^T_{Buffer}`$ 在 HBM 预算下的展开形式。若 Buffer pool 没有占满 $`M_{cache}`$，以上两个等号应理解为上界；本文图片画的是充分使用 HBM 时的容量上界。
+
+静态均分只是这个 worker-wide pool 的一种切分方式。此时：
 
 $$
 B^T_{Buffer}=N_{bs,max}N_{T,Buffer}
@@ -30,7 +61,7 @@ C_{worker}=N_{bs,max}R_{Host}N_{T,Buffer}
 =N_{bs,max}C_{host,seq}
 $$
 
-其中 $`C_{host,seq}=R_{Host}N_{T,Buffer}`$ 只是静态均分下的一份 per-sequence 容量。本文图片采用的默认模型上下文目标是 worker 级下界：
+其中 $`C_{host,seq}=R_{Host}N_{T,Buffer}`$ 只是静态均分下的一份 per-sequence 容量。$`N_{bs,max}`$ 只决定总 Buffer 如何切分，并不改变由 $`M_{cache}`$ 决定的 $`B^T_{Buffer}`$ 和 $`C_{worker}`$。本文图片采用的默认模型上下文目标是 worker 级下界：
 
 $$
 C_{worker}\ge L_{max,model}
