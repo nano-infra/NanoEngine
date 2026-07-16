@@ -235,18 +235,18 @@ This share is independent of $N_{T,Buffer}$, $N_{bs,max}$, $N_{layer}$, and $M_{
 The break-even point where $M_{Indexer}=M_{Buffer}$ — beyond which the Indexer becomes the dominant memory cost — is:
 
 $$
-R^{50\%}_{Host}=\frac{R_{Share}B_{T,MLA}}{B_{T,Indexer}}
+R^{\mathrm{50pct}}_{Host}=\frac{R_{Share}B_{T,MLA}}{B_{T,Indexer}}
 \approx 4.97\,R_{Share}
 $$
 
 using $B_{T,MLA}=656\ \mathrm{B}$ and $B_{T,Indexer}=132\ \mathrm{B}$. Instantiated for the two models:
 
-| $R_{Host}$ | $P_{Indexer}$, GLM5.1 ($R_{Share}=1$) | $P_{Indexer}$, GLM5.2 ($R_{Share}=3.714$) |
+| `R_Host` | `P_Indexer`, GLM5.1 (`R_Share=1`) | `P_Indexer`, GLM5.2 (`R_Share=3.714`) |
 | ---: | ---: | ---: |
-| $5$ | $50.2\%$ | $21.3\%$ |
-| $10$ | $66.8\%$ | $35.1\%$ |
-| $20$ | $80.1\%$ | $52.0\%$ |
-| $40$ | $88.9\%$ | $68.4\%$ |
+| 5 | 50.2% | 21.3% |
+| 10 | 66.8% | 35.1% |
+| 20 | 80.1% | 52.0% |
+| 40 | 88.9% | 68.4% |
 
 For GLM5.1 the Indexer already overtakes the Buffer at $R_{Host}\approx5$; GLM5.2's layer sharing pushes that break-even out to $R_{Host}\approx18.5$. In long-context configurations, the dominant memory problem quickly shifts from the MLA hot buffer to the full-resident Indexer cache.
 
@@ -326,7 +326,7 @@ M_{Indexer}
 \end{aligned}
 $$
 
-Raising $R_{Host}$ shrinks the Buffer cost as $1/R_{Host}$ but cannot reduce the Indexer cost of a given logical capacity. Moreover, at $R_{Host}=R^{50\%}_{Host}$ the capacity reaches exactly half of the theoretical ceiling; beyond that point the marginal return of raising $R_{Host}$ falls off quickly.
+Raising $R_{Host}$ shrinks the Buffer cost as $1/R_{Host}$ but cannot reduce the Indexer cost of a given logical capacity. Moreover, at $R_{Host}=R^{\mathrm{50pct}}_{Host}$ the capacity reaches exactly half of the theoretical ceiling; beyond that point the marginal return of raising $R_{Host}$ falls off quickly.
 
 #### 4.5 Maximum batch size limits ratio reachability
 
