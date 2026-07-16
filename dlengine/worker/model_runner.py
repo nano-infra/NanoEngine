@@ -218,7 +218,6 @@ class ModelRunner:
         for attr in (
             "enable_hisparse",
             "hisparse_device_buffer_size",
-            "hisparse_host_to_device_ratio",
             "hisparse_swap_in_block_size",
         ):
             setattr(hf_config, attr, getattr(config, attr, None))
@@ -1220,7 +1219,6 @@ class ModelRunner:
             hisparse = cache_plan.hisparse
             hisparse.max_num_seqs = self.config.max_num_seqs
             hisparse.device_buffer_size = self.config.hisparse_device_buffer_size
-            hisparse.host_to_device_ratio = self.config.hisparse_host_to_device_ratio
             if cache_plan.has_gqa():
                 hisparse.swap_in_block_size = int(
                     getattr(self.config.hf_config, "sliding_window", 0)

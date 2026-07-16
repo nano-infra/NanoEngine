@@ -74,7 +74,6 @@ spec!(IndexerCacheSpec {
 spec!(HiSparseCacheSpec {
     max_num_seqs,
     device_buffer_size,
-    host_to_device_ratio,
     swap_in_block_size,
     dummy_slot,
 });
