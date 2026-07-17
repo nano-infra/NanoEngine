@@ -4,7 +4,16 @@
 
 ## 最新进展
 
-当前最新报告是 2026-07-16 的 [LS-Decode owner-aware 两机复跑与容量鲁棒性复盘](2026-07-16/ls_decode_owneraware_2node_capacity_postmortem_20260716.md)。结论是 owner-aware planner 修复有效，但两机验收仍受 KV consolidation 运行期分配失败和 admission capacity cliff 阻塞。
+当前最新报告是 2026-07-17 的 [LS Decode future-KV 两机 rate=20 六分钟验收](2026-07-17/ls_decode_future_kv_2node_r20_141gb_result_20260717.md)。141 GiB 配置首次自然完成全部 7,200 个请求，pending 峰值从旧基线的 71 batches / 185 requests 降到 7 / 16，全程没有 planner failure、preemption 或 NCCL/CUDA fatal；下一步需要验证 140 GiB，并解决原子 batch 连带排队和每 step 重试。
+
+## 2026-07-17
+
+以下按进展时间从新到旧排列：
+
+1. [LS Decode future-KV 两机 rate=20 六分钟验收](2026-07-17/ls_decode_future_kv_2node_r20_141gb_result_20260717.md)
+2. [LS Decode future-KV admission implementation](2026-07-17/ls_decode_future_kv_admission_implementation.md)
+
+同目录保留本轮两机测试的原始日志和 7,200 条 JSONL 指标。
 
 ## 2026-07-16
 
