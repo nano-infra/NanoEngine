@@ -4,17 +4,18 @@
 
 ## 最新进展
 
-当前最新报告是 2026-07-17 的 [Original NanoDeploy 同配置复跑与 LS future-KV 性能对比](2026-07-17/nanodeploy_original_rerun_vs_ls_futurekv_2node_r20_20260717.md)。昨日失败配置本次完成 7,200 / 7,200；360 秒完成数比 LS future-KV 高 21.0%，但命令之外还存在 RPC metadata buffer、loop count、SP policy 等独立变量。昨日故障点前没有排队且 KV 未接近耗尽，单次成功不能排除异步 GPU/RDMA/NCCL 问题。
+当前最新报告是 2026-07-17 的 [Original NanoDeploy loop_count=1 两机复跑失败与三组局部对照](2026-07-17/nanodeploy_original_loop1_2node_failure_and_partial_comparison_20260717.md)。在 Original loop16 成功配置上只把 loop count 改为 1 后，两次运行分别在 107 秒 / 1,295 请求和 173 秒 / 2,647 请求时由 head global rank 0 首报 CUDA illegal memory。两次故障前都没有 waiting，且 KV 未耗尽，因此没有形成可用于完整吞吐和延迟对比的第三组数据；60 秒和 120 秒 partial 轨迹只能用于局部交叉校验。
 
 ## 2026-07-17
 
 以下按进展时间从新到旧排列：
 
-1. [Original NanoDeploy 同配置复跑与 LS future-KV 性能对比](2026-07-17/nanodeploy_original_rerun_vs_ls_futurekv_2node_r20_20260717.md)
-2. [LS Decode future-KV 两机 rate=20 六分钟验收](2026-07-17/ls_decode_future_kv_2node_r20_141gb_result_20260717.md)
-3. [LS Decode future-KV admission implementation](2026-07-17/ls_decode_future_kv_admission_implementation.md)
+1. [Original NanoDeploy loop_count=1 两机复跑失败与三组局部对照](2026-07-17/nanodeploy_original_loop1_2node_failure_and_partial_comparison_20260717.md)
+2. [Original NanoDeploy 同配置复跑与 LS future-KV 性能对比](2026-07-17/nanodeploy_original_rerun_vs_ls_futurekv_2node_r20_20260717.md)
+3. [LS Decode future-KV 两机 rate=20 六分钟验收](2026-07-17/ls_decode_future_kv_2node_r20_141gb_result_20260717.md)
+4. [LS Decode future-KV admission implementation](2026-07-17/ls_decode_future_kv_admission_implementation.md)
 
-同目录保留本轮两机测试的原始日志和 7,200 条 JSONL 指标。
+同目录保留两次 Original loop1 失败运行的原始日志、结构化失败摘要，以及已完成两机运行的 7,200 条 JSONL 指标。
 
 ## 2026-07-16
 

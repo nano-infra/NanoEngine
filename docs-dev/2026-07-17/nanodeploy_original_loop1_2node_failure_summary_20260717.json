@@ -1,0 +1,104 @@
+{
+  "date": "2026-07-17",
+  "status": "failed_after_two_attempts",
+  "valid_full_benchmark": false,
+  "code_revision": "3272c30",
+  "worktree_runtime_note": "RPCServerEndpoint server buffer is 32*32000000 bytes in the existing worktree",
+  "config": {
+    "dataset": "sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv",
+    "seed": 0,
+    "num_requests": 7200,
+    "request_rate": 20,
+    "attention_dp": 2,
+    "attention_sp": 8,
+    "attention_tp": 1,
+    "ffn_ep": 16,
+    "max_num_seqs": 256,
+    "max_num_recv_seqs": 32,
+    "gpu_memory_limit_gb": 141,
+    "num_kvcache_blocks_per_rank": 14045,
+    "loop_count": 1,
+    "scheduler_mode": "centralized",
+    "routing_strategy": "LeastBatch",
+    "cuda_graph_mode": "full",
+    "dynamic_sp_size_strategy": "long_short_sp8",
+    "enable_ls_decode_core_scheduler": false,
+    "ls_kv_consolidation_mode": "off"
+  },
+  "attempts": [
+    {
+      "name": "attempt_1",
+      "log": "nanodeploy_original_loop1_issue001_2node_dp2sp8_r20_6min_20260717.log",
+      "exit_code": 1,
+      "warmup_seconds": 26.89,
+      "completed_at_60_seconds": 409,
+      "last_elapsed_seconds": 107,
+      "last_completed": 1295,
+      "fatal_global_rank": 0,
+      "fatal_node": "10.102.243.60",
+      "fatal_error": "CUDA error: an illegal memory access was encountered",
+      "peak_total_batch_size": 905,
+      "peak_kv_util_pct": 57.0,
+      "min_free_blocks": 6040,
+      "max_waiting_requests": 0,
+      "max_rpc_metadata_bytes_per_step": 3655640,
+      "last_complete_step": {
+        "itl_ms": 69.57,
+        "total_batch_size": 891,
+        "min_free_blocks": 6249,
+        "max_kv_util_pct": 55.51,
+        "waiting_requests": 0
+      },
+      "request_jsonl_generated": false
+    },
+    {
+      "name": "attempt_2",
+      "log": "nanodeploy_original_loop1_issue001_2node_dp2sp8_r20_6min_rerun_20260717.log",
+      "exit_code": 1,
+      "warmup_seconds": 25.78,
+      "completed_at_60_seconds": 402,
+      "completed_at_120_seconds": 1499,
+      "last_elapsed_seconds": 173,
+      "last_completed": 2647,
+      "fatal_global_rank": 0,
+      "fatal_node": "10.102.243.60",
+      "fatal_error": "CUDA error: an illegal memory access was encountered",
+      "peak_total_batch_size": 954,
+      "peak_kv_util_pct": 76.57,
+      "min_free_blocks": 3291,
+      "max_waiting_requests": 0,
+      "max_rpc_metadata_bytes_per_step": 3844740,
+      "last_complete_step": {
+        "itl_ms": 61.34,
+        "total_batch_size": 814,
+        "min_free_blocks": 10621,
+        "max_kv_util_pct": 24.38,
+        "waiting_requests": 0
+      },
+      "request_jsonl_generated": false
+    }
+  ],
+  "comparators": {
+    "original_loop16": {
+      "completed_at_60_seconds": 661,
+      "completed_at_120_seconds": 1865,
+      "completed_at_180_seconds": 3018,
+      "completed_at_360_seconds": 6495,
+      "final_completed": 7200,
+      "full_drain_seconds": 411.06
+    },
+    "ls_future_kv_loop1": {
+      "completed_at_60_seconds": 130,
+      "completed_at_120_seconds": 882,
+      "completed_at_180_seconds": 1891,
+      "completed_at_360_seconds": 5366,
+      "final_completed": 7200,
+      "full_drain_seconds": 566.04
+    }
+  },
+  "post_exit_cluster_state": {
+    "active_nodes": 2,
+    "ray_gpu_usage": "0/16",
+    "head_gpu_memory_used_mib": [0, 0, 0, 0, 0, 0, 0, 0]
+  }
+}
