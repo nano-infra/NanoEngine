@@ -104,9 +104,9 @@ pytest -q \
 
 产物：
 
-- `docs-dev/ls_decode_owner_repair_8gpu_scaled_r8_60s_20260716.log`
-- `docs-dev/ls_decode_owner_repair_8gpu_scaled_r8_60s_20260716.json`
-- `docs-dev/ls_decode_owner_repair_8gpu_scaled_r8_60s_20260716.jsonl`
+- `docs-dev/2026-07-16/ls_decode_owner_repair_8gpu_scaled_r8_60s_20260716.log`
+- `docs-dev/2026-07-16/ls_decode_owner_repair_8gpu_scaled_r8_60s_20260716.json`
+- `docs-dev/2026-07-16/ls_decode_owner_repair_8gpu_scaled_r8_60s_20260716.jsonl`
 
 该 workload 把 256 个请求分布到 8 个单-owner group，因此验证了高并发和最终二进制稳定性，但没有重放两机日志中的 443-request group merge；该假阴性由确定性 planner regression 直接覆盖。
 
@@ -121,9 +121,9 @@ pytest -q \
 
 产物：
 
-- `docs-dev/ls_decode_owner_repair_branch_flow_final_8gpu_smoke_20260716.log`
-- `docs-dev/ls_decode_owner_repair_branch_flow_final_8gpu_smoke_20260716.json`
-- `docs-dev/ls_decode_owner_repair_branch_flow_final_8gpu_smoke_20260716.jsonl`
+- `docs-dev/2026-07-16/ls_decode_owner_repair_branch_flow_final_8gpu_smoke_20260716.log`
+- `docs-dev/2026-07-16/ls_decode_owner_repair_branch_flow_final_8gpu_smoke_20260716.json`
+- `docs-dev/2026-07-16/ls_decode_owner_repair_branch_flow_final_8gpu_smoke_20260716.jsonl`
 
 ## 两机验收重点
 

@@ -89,7 +89,7 @@ LS-Decode KV Consolidation
 - `csrc/nanodeploy/scheduler/scheduler.cpp::_schedule_ls_decode()`；
 - `csrc/nanodeploy/scheduler/sp_state_manager.cpp::plan_iteration_masters_source_greedy()`；
 - `csrc/nanodeploy/scheduler/sp_state_manager.cpp::commit_iteration_master_plan()`；
-- `docs-dev/loongserve_style_scheduler_design.md` 第 3、7、16 节。
+- `docs-dev/2026-07-13/loongserve_style_scheduler_design.md` 第 3、7、16 节。
 
 这意味着：
 

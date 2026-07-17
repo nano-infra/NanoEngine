@@ -62,8 +62,8 @@ python scripts/bench_ls_decode_serving.py \
   --ls-kv-consolidation-max-source-blocks-per-event 128 \
   --ls-kv-consolidation-migration-chunk-tokens 64 \
   --verbose-nanodeploy-logs \
-  --output-jsonl docs-dev/ls_style_issue001_2node_dp2sp8_r20_t128_6min_20260716.jsonl \
-  2>&1 | tee docs-dev/ls_style_issue001_2node_dp2sp8_r20_t128_6min_20260716.log'
+  --output-jsonl docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_t128_6min_20260716.jsonl \
+  2>&1 | tee docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_t128_6min_20260716.log'
 ```
 
 ## 3. 运行结果
@@ -187,6 +187,6 @@ T=128 的 clean-start 路径确实显著优于 T=8：它减少早期 master 数�
 
 ## 8. 产物
 
-- 原始日志：`docs-dev/ls_style_issue001_2node_dp2sp8_r20_t128_6min_20260716.log`；
-- 前一轮复盘：`docs-dev/ls_decode_r20_preemption_postmortem_20260716.md`；
+- 原始日志：`docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_t128_6min_20260716.log`；
+- 前一轮复盘：`docs-dev/2026-07-16/ls_decode_r20_preemption_postmortem_20260716.md`；
 - 本轮未生成 JSONL，原因是 drain 活锁后主动停止。

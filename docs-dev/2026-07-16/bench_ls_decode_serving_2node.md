@@ -48,8 +48,8 @@ python scripts/bench_ls_decode_serving.py \
   --request-rate 20 \
   --duration-sec 360 \
   --num-requests 7200 \
-  --output-jsonl docs-dev/ls_style_issue001_2node_dp2sp8_r20_6min.jsonl \
-  2>&1 | tee docs-dev/ls_style_issue001_2node_dp2sp8_r20_6min.log
+  --output-jsonl docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_6min.jsonl \
+  2>&1 | tee docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_6min.log
 ```
 
 该命令会使用 GPU。通过 Codex 启动时，必须在执行这条命令前单独申请 GPU 提权。
@@ -74,20 +74,20 @@ python scripts/bench_ls_decode_serving.py \
 实时查看日志：
 
 ```bash
-tail -f docs-dev/ls_style_issue001_2node_dp2sp8_r20_6min.log
+tail -f docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_6min.log
 ```
 
 筛选关键阶段和错误：
 
 ```bash
-tr '\r' '\n' < docs-dev/ls_style_issue001_2node_dp2sp8_r20_6min.log | \
+tr '\r' '\n' < docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_6min.log | \
   rg 'LS_WARMUP_SUMMARY|LS_BENCH_ARRIVALS|Processing Requests:|Benchmark Results|Traceback|RuntimeError|CUDA error|out of memory'
 ```
 
 正常完成时，日志末尾应包含 `Benchmark Results`，并生成：
 
-- `docs-dev/ls_style_issue001_2node_dp2sp8_r20_6min.log`
-- `docs-dev/ls_style_issue001_2node_dp2sp8_r20_6min.jsonl`
+- `docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_6min.log`
+- `docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_6min.jsonl`
 
 JSONL 在全部请求完成后统一写入；中途终止时可能不存在，不能将其当作有效结果。
 
@@ -164,8 +164,8 @@ python scripts/issue003/bench_serving_overhead.py \
   --dynamic-sp-size-strategy long_short_sp8 \
   --long-request-sp-threshold 100000 \
   --long-request-sp-size 8 \
-  --itl-log-path docs-dev/nanodeploy_original_issue001_2node_dp2sp8_r20_6min.jsonl \
-  2>&1 | tee docs-dev/nanodeploy_original_issue001_2node_dp2sp8_r20_6min.log
+  --itl-log-path docs-dev/2026-07-16/nanodeploy_original_issue001_2node_dp2sp8_r20_6min.jsonl \
+  2>&1 | tee docs-dev/2026-07-16/nanodeploy_original_issue001_2node_dp2sp8_r20_6min.log
 ```
 
 这条命令对应参考 sh 的 original setting：
@@ -195,7 +195,7 @@ python scripts/issue003/bench_serving_overhead.py \
 实时监测：
 
 ```bash
-tail -f docs-dev/nanodeploy_original_issue001_2node_dp2sp8_r20_6min.log
+tail -f docs-dev/2026-07-16/nanodeploy_original_issue001_2node_dp2sp8_r20_6min.log
 ```
 
 正常完成时应在日志末尾看到 `Benchmark Results`，并生成对应 JSONL。中途终止的运行仍不能用于性能对比。

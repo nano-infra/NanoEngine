@@ -38,8 +38,8 @@
 
 日志：
 
-- `docs-dev/ls_style_issue001_2node_dp2sp8_r20_t128_owneraware_6min_20260716.log`
-- `docs-dev/ls_style_issue001_2node_dp2sp8_r20_t128_owneraware_mem140_retry_20260716.log`
+- `docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_t128_owneraware_6min_20260716.log`
+- `docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_t128_owneraware_mem140_retry_20260716.log`
 
 ## 3. 两次运行的定量结果
 
@@ -72,7 +72,7 @@ owner-aware planner 修复经过了真实两机压力：
 - 没有 recovery admission；
 - 141 GiB 的 planner p99 仍为 7.475 ms，没有出现 fallback 搜索失控。
 
-因此旧的“存在合法 owner-aware assignment，但 source-greedy 误报不可行，随后反复抢占”的问题可以认为已修复。修复内容和单机验证见 `docs-dev/ls_decode_owner_aware_planner_fix_20260716.md`。
+因此旧的“存在合法 owner-aware assignment，但 source-greedy 误报不可行，随后反复抢占”的问题可以认为已修复。修复内容和单机验证见 `docs-dev/2026-07-16/ls_decode_owner_aware_planner_fix_20260716.md`。
 
 但这只修复了 decode master assignment 的假阴性，并不等于 admission、KV consolidation、物理显存生命周期和 overload control 都已修复。本轮恰好暴露了这些后续层的问题。
 

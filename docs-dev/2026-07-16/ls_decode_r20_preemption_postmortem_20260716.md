@@ -14,7 +14,7 @@
 - 持续注入后的排队和后期容量压力：工作负载过载叠加 admission 缺少未来 KV 保护；
 - consolidation：可能放大 owner/receiver 热点，但当前日志不足以证明它是首次故障的直接原因。
 
-本报告分析的日志为 `docs-dev/ls_style_issue001_2node_dp2sp8_r20_6min.log`。该运行在正式 workload 约 187 秒时中止，没有最终 JSONL 或 `Benchmark Results`，不能作为完整性能结果。
+本报告分析的日志为 `docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_6min.log`。该运行在正式 workload 约 187 秒时中止，没有最终 JSONL 或 `Benchmark Results`，不能作为完整性能结果。
 
 ## 2. 测试配置
 
@@ -127,7 +127,7 @@ plan failed -> preempt small newest request -> recovery push_front
 
 每个 running group 固定属于一个 DP，不能跨 DP 使用空闲 SP participant。`LeastBatch` 平衡请求数量，而不是 prompt tokens、KV blocks 或 receiver edges，因此可能出现一个 DP/owner 已达到 receiver 上限，另一 DP 或其他 ranks 仍有大量空闲 blocks。
 
-设计约束见 `docs-dev/loongserve_style_scheduler_design.md:118-127`。
+设计约束见 `docs-dev/2026-07-13/loongserve_style_scheduler_design.md:118-127`。
 
 ## 5. 与原版 LoongServe 的区别
 
@@ -187,7 +187,7 @@ export NANODEPLOY_LOG_MODEL_FORWARD_TIMING=1
 
 ## 9. 诊断复跑结果
 
-诊断日志：`docs-dev/ls_style_issue001_2node_dp2sp8_r20_diag30s_verbose_forward_20260716.log`。
+诊断日志：`docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_diag30s_verbose_forward_20260716.log`。
 
 测试使用原配置和相同 seed 的前 600 个请求，最后一个采样到达为 28.17699 秒。正式 workload 于 08:08:27 开始，首次失败于 08:08:50 出现，即约 23 秒。发送窗口结束且活锁证据已完整采集后，在 08:09:16 主动停止 drain；因此该运行没有最终 JSONL，也不作为性能结果。
 

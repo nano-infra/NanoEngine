@@ -24,7 +24,7 @@
 - KV consolidation `execute`，参数为 `candidate_util=0.50`、`high_watermark=0.80`、`stable/cooldown/check=2/2/1`；
 - CUDA Graph full；开启 `NANODEPLOY_LOG_MODEL_FORWARD_TIMING=1` 和 verbose LS telemetry。
 
-日志：`docs-dev/ls_style_issue001_2node_dp2sp8_r20_t128_6min_20260716.log`。
+日志：`docs-dev/2026-07-16/ls_style_issue001_2node_dp2sp8_r20_t128_6min_20260716.log`。
 
 运行时间线：
 

@@ -39,7 +39,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python -u scripts/test_ls_decode_elastic_e2e_8gpu.py \
   --ray-address 10.102.243.60:8776 \
   --master-address 10.102.243.60:29776 \
-  --output-json docs-dev/ls_decode_elastic_e2e_8gpu.json
+  --output-json docs-dev/2026-07-15/ls_decode_elastic_e2e_8gpu.json
 ```
 
 ## 结果
@@ -58,7 +58,7 @@ python -u scripts/test_ls_decode_elastic_e2e_8gpu.py \
 7. 总共 40 个 engine steps、127 个请求全部完成，输出长度均符合请求配置；
 8. 8 个 Ray ModelRunner workers 测试结束后全部正常退出。
 
-详细结果见 `docs-dev/ls_decode_elastic_e2e_8gpu.json`。Ray driver 输出过一次 metrics
+详细结果见 `docs-dev/2026-07-15/ls_decode_elastic_e2e_8gpu.json`。Ray driver 输出过一次 metrics
 exporter agent 连接告警，但不影响 worker、CUDA Graph、NCCL、KV transaction 或请求完成。
 
 ## 边界
