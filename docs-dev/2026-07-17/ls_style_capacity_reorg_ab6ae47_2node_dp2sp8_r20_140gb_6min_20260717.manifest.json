@@ -1,0 +1,121 @@
+{
+  "experiment_id": "ls_style_capacity_reorg_ab6ae47_2node_dp2sp8_r20_140gb_6min_20260717",
+  "status": "running",
+  "created_utc": "2026-07-17T10:05:31Z",
+  "runtime": {
+    "formal_workload_start_utc": "2026-07-17T10:11:06Z",
+    "engine_id": "561d4fce-e2e9-4f4a-acba-d68f134df4eb",
+    "num_kvcache_blocks_per_rank": 14030,
+    "warmup_summary": {
+      "requests": 32,
+      "completed": 32,
+      "steps": 8,
+      "duration_sec": 2.4176301429979503
+    },
+    "sampled_last_arrival_sec": 354.6171997611252
+  },
+  "git": {
+    "commit": "ab6ae471d1a8f949be807a22909999e295715dc8",
+    "short_commit": "ab6ae47",
+    "subject": "feat(scheduler): align LS capacity reorganization",
+    "commit_time_utc": "2026-07-17T09:53:07+00:00",
+    "worktree_clean": false,
+    "tracked_dirty_overrides": [
+      {
+        "path": "nanodeploy/engine/ray_executor.py",
+        "semantic_change": "RPCServerEndpoint buffer expression is 32*32_000_000 instead of committed 8*32_000_000"
+      },
+      {
+        "path": "nanodeploy/engine/llm_engine.py",
+        "semantic_change": "none; line-ending-only working-tree difference"
+      }
+    ],
+    "semantic_dirty_diff_sha256": "c02d6ddd976df6f71f19e426e3e085dd38f596d35442e2588966e337bba849fe"
+  },
+  "compiled_artifacts": {
+    "build/lib/_nanodeploy_cpp.cpython-312-x86_64-linux-gnu.so.sha256": "5c7c227bfa2e17f66a4ce152c12a339e2909c59e27bb54fffdefa432406937f4",
+    "build/lib/lib_nanodeploy_scheduler.so.sha256": "ebbf20131d7e2f3db1b702abc48b888de336a23579d47320aeb9a0d49461ccb9"
+  },
+  "cluster": {
+    "ray_address": "10.102.243.60:8776",
+    "master_address": "10.102.243.60:29906",
+    "nodes": [
+      "10.102.243.60",
+      "10.102.206.14"
+    ],
+    "gpu_type": "H200",
+    "total_gpus": 16,
+    "ray_resources_before_start": "0/16 GPU used"
+  },
+  "features": {
+    "loongserve_style_core_scheduler": true,
+    "capacity_driven_group_reorganization": "enabled by commit ab6ae47; compiled-in when LS core scheduler is enabled",
+    "capacity_donor_selection": true,
+    "idle_rank_memory_scale_up": true,
+    "future_kv_admission": true,
+    "pending_no_fit_consolidation_proof": true,
+    "kv_consolidation_mode": "execute"
+  },
+  "topology": {
+    "attention_dp": 2,
+    "attention_sp": 8,
+    "attention_tp": 1,
+    "ffn_dp": 1,
+    "ffn_ep": 16,
+    "ffn_tp": 1
+  },
+  "workload": {
+    "model_path": "/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3",
+    "dummy_prefill": true,
+    "dummy_weight": true,
+    "csv_path": "/mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/sharegpt-4o-mixlong-0326/sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv",
+    "request_rate": 20.0,
+    "duration_sec": 360.0,
+    "num_requests": 7200,
+    "burstiness": 1.0,
+    "seed": 0,
+    "warmup_requests": 32,
+    "warmup_prompt_len": 512,
+    "warmup_max_tokens": 8
+  },
+  "engine_config": {
+    "max_num_seqs": 256,
+    "max_num_recv_seqs": 128,
+    "max_model_len": 1000000,
+    "max_input_len": 1000000,
+    "max_num_batched_tokens": 1024000,
+    "gpu_memory_limit_gb": 140.0,
+    "gpu_memory_utilization": 0.9,
+    "kvcache_block_size": 64,
+    "segment_size": 65536,
+    "routing_strategy": "LeastBatch",
+    "cuda_graph_mode": "full",
+    "enforce_eager": false,
+    "ls_initial_kv_dop": 0,
+    "ls_batch_per_master": 128,
+    "ls_kv_consolidation_candidate_util": 0.5,
+    "ls_kv_consolidation_target_high_watermark": 0.8,
+    "ls_kv_consolidation_stable_steps": 2,
+    "ls_kv_consolidation_cooldown_steps": 2,
+    "ls_kv_consolidation_check_interval_steps": 1,
+    "ls_kv_consolidation_max_source_blocks_per_event": 128,
+    "ls_kv_consolidation_migration_chunk_tokens": 64
+  },
+  "environment": {
+    "http_proxy": "unset",
+    "https_proxy": "unset",
+    "HTTP_PROXY": "unset",
+    "HTTPS_PROXY": "unset",
+    "NANODEPLOY_LOG_DECODE_A2A_MASKS": "0",
+    "NANODEPLOY_LOG_DECODE_STEP_DETAIL": "0",
+    "NANODEPLOY_LOG_MODEL_FORWARD_TIMING": "1",
+    "RAY_DEDUP_LOGS": "1",
+    "PYTHONUNBUFFERED": "1"
+  },
+  "artifacts": {
+    "log": "docs-dev/2026-07-17/ls_style_capacity_reorg_ab6ae47_2node_dp2sp8_r20_140gb_6min_20260717.log",
+    "output_jsonl": "docs-dev/2026-07-17/ls_style_capacity_reorg_ab6ae47_2node_dp2sp8_r20_140gb_6min_20260717.jsonl",
+    "manifest": "docs-dev/2026-07-17/ls_style_capacity_reorg_ab6ae47_2node_dp2sp8_r20_140gb_6min_20260717.manifest.json"
+  },
+  "command": "env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY NANODEPLOY_LOG_DECODE_A2A_MASKS=0 NANODEPLOY_LOG_DECODE_STEP_DETAIL=0 NANODEPLOY_LOG_MODEL_FORWARD_TIMING=1 RAY_DEDUP_LOGS=1 PYTHONUNBUFFERED=1 bash -o pipefail -c 'python scripts/bench_ls_decode_serving.py --attention-dp 2 --attention-sp 8 --ray-address 10.102.243.60:8776 --master-address 10.102.243.60:29906 --model-path /mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3 --csv-path /mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/sharegpt-4o-mixlong-0326/sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv --request-rate 20 --duration-sec 360 --num-requests 7200 --burstiness 1 --seed 0 --warmup-requests 32 --warmup-prompt-len 512 --warmup-max-tokens 8 --max-num-seqs 256 --max-num-recv-seqs 128 --max-model-len 1000000 --max-input-len 1000000 --max-num-batched-tokens 1024000 --gpu-memory-limit-gb 140 --gpu-memory-utilization 0.90 --segment-size 65536 --routing-strategy LeastBatch --cuda-graph-mode full --ls-initial-kv-dop 0 --ls-batch-per-master 128 --ls-kv-consolidation-mode execute --ls-kv-consolidation-candidate-util 0.50 --ls-kv-consolidation-target-high-watermark 0.80 --ls-kv-consolidation-stable-steps 2 --ls-kv-consolidation-cooldown-steps 2 --ls-kv-consolidation-check-interval-steps 1 --ls-kv-consolidation-max-source-blocks-per-event 128 --ls-kv-consolidation-migration-chunk-tokens 64 --verbose-nanodeploy-logs --output-jsonl docs-dev/2026-07-17/ls_style_capacity_reorg_ab6ae47_2node_dp2sp8_r20_140gb_6min_20260717.jsonl 2>&1 | tee docs-dev/2026-07-17/ls_style_capacity_reorg_ab6ae47_2node_dp2sp8_r20_140gb_6min_20260717.log'"
+}
