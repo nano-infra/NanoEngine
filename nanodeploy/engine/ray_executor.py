@@ -132,6 +132,7 @@ class RayExecutor:
         worker_env_vars = {}
         for env_name in (
             "SLIME_QP_NUM",
+            "CUDA_LAUNCH_BLOCKING",
             "NANODEPLOY_LOG_MODEL_FORWARD_TIMING",
         ):
             if env_name in os.environ:
