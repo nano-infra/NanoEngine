@@ -566,6 +566,67 @@ bool Scheduler::_ls_kv_consolidation_watermark_ok(
     return true;
 }
 
+bool Scheduler::_ls_consolidation_enables_pending_batch(
+    const std::shared_ptr<SPStateManager::LSKVConsolidationPlan>& plan, const PendingDecodeBatch& pending_batch) const
+{
+    if (!plan || !plan->success || plan->dp_idx < 0 || plan->dp_idx >= attention_dp_
+        || pending_batch.state != PendingDecodeBatchState::QUEUED || pending_batch.sequences.empty()) {
+        return false;
+    }
+
+    // plan_kv_consolidation has already reserved destination blocks, so the
+    // live free counters match the post-commit destination state. Shadow only
+    // the source blocks that commit will release and the staged KV placement.
+    std::vector<int>        free_block_adjustments(attention_sp_, 0);
+    LSBlockContextOverrides context_overrides;
+    for (const auto& stage : plan->sequence_stages) {
+        if (!stage.sequence) {
+            return false;
+        }
+        free_block_adjustments[plan->source_rank] += static_cast<int>(stage.source_blocks.size());
+        context_overrides.emplace(stage.sequence.get(), &stage.staged_context);
+    }
+
+    auto post_unallocated = _ls_unallocated_ranks(plan->dp_idx);
+    if (std::find(post_unallocated.begin(), post_unallocated.end(), plan->source_rank) == post_unallocated.end()) {
+        post_unallocated.push_back(plan->source_rank);
+    }
+
+    auto standalone = _plan_ls_initial_placement(
+        plan->dp_idx, pending_batch.sequences, post_unallocated, {}, {}, free_block_adjustments, context_overrides);
+    if (standalone.has_value()) {
+        return true;
+    }
+
+    // Match normal admission semantics: if a standalone placement is still
+    // impossible, prove that merging the complete logical batch into one
+    // existing group becomes feasible after this exact evacuation.
+    std::vector<uint64_t> group_ids = ls_group_ids_by_dp_.at(plan->dp_idx);
+    std::sort(group_ids.begin(), group_ids.end());
+    for (uint64_t group_id : group_ids) {
+        const auto&      group = ls_groups_.at(group_id);
+        std::vector<int> post_allocation =
+            group.group_id == plan->group_id ? plan->retained_ranks : group.allocated_attention_ranks;
+        std::vector<int> rank_pool = post_allocation;
+        for (int rank : post_unallocated) {
+            if (std::find(rank_pool.begin(), rank_pool.end(), rank) == rank_pool.end()) {
+                rank_pool.push_back(rank);
+            }
+        }
+        auto merged = _plan_ls_initial_placement(plan->dp_idx,
+                                                 pending_batch.sequences,
+                                                 rank_pool,
+                                                 group.sequences,
+                                                 post_allocation,
+                                                 free_block_adjustments,
+                                                 context_overrides);
+        if (merged.has_value()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Scheduler::_populate_ls_kv_consolidation_telemetry(ScheduleResult& result) const
 {
     result.ls_kv_consolidation_candidate       = ls_step_kv_candidate_;
@@ -583,17 +644,24 @@ std::shared_ptr<SPStateManager::LSKVConsolidationPlan> Scheduler::_maybe_plan_ls
         ls_step_kv_decision_reason_ = "off";
         return nullptr;
     }
-    if (!ls_pending_decode_batches_.empty()) {
-        for (auto& [group_id, group] : ls_groups_) {
-            (void)group_id;
-            group.kv_candidate_target_dop   = -1;
-            group.kv_candidate_stable_steps = 0;
-        }
-        ls_step_kv_decision_reason_ = "pending_admission_not_proven";
-        return nullptr;
-    }
-
     _reconcile_ls_groups();
+
+    const PendingDecodeBatch* pressure_batch = nullptr;
+    if (!ls_pending_decode_batches_.empty()) {
+        if (!ls_step_oldest_no_fit_batch_id_.has_value()) {
+            ls_step_kv_decision_reason_ = "pending_without_no_fit_proof";
+            return nullptr;
+        }
+        auto pending =
+            std::find_if(ls_pending_decode_batches_.begin(), ls_pending_decode_batches_.end(), [&](const auto& batch) {
+                return batch.batch_id == *ls_step_oldest_no_fit_batch_id_;
+            });
+        if (pending == ls_pending_decode_batches_.end()) {
+            ls_step_kv_decision_reason_ = "pending_no_fit_batch_disappeared";
+            return nullptr;
+        }
+        pressure_batch = &*pending;
+    }
 
     struct Candidate {
         uint64_t         group_id     = 0;
@@ -632,7 +700,9 @@ std::shared_ptr<SPStateManager::LSKVConsolidationPlan> Scheduler::_maybe_plan_ls
         bool has_unreclaimed_empty_rank = participants.size() != group.allocated_attention_ranks.size();
         bool below_candidate_threshold  = utilization < ls_kv_consolidation_candidate_util_;
         bool dop_can_shrink             = static_cast<int>(participants.size()) > target_dop;
-        if (real_batch == 0 || has_unreclaimed_empty_rank || !below_candidate_threshold || !dop_can_shrink) {
+        bool pressure_eligible          = pressure_batch != nullptr;
+        if (real_batch == 0 || has_unreclaimed_empty_rank || !dop_can_shrink
+            || (!pressure_eligible && !below_candidate_threshold)) {
             group.kv_candidate_target_dop   = -1;
             group.kv_candidate_stable_steps = 0;
             continue;
@@ -662,19 +732,23 @@ std::shared_ptr<SPStateManager::LSKVConsolidationPlan> Scheduler::_maybe_plan_ls
             group.kv_candidate_stable_steps = 0;
             continue;
         }
-        if (group.kv_candidate_target_dop == target_dop) {
+        if (below_candidate_threshold && group.kv_candidate_target_dop == target_dop) {
             group.kv_candidate_stable_steps++;
         }
-        else {
+        else if (below_candidate_threshold) {
             group.kv_candidate_target_dop   = target_dop;
             group.kv_candidate_stable_steps = 1;
+        }
+        else {
+            group.kv_candidate_target_dop   = -1;
+            group.kv_candidate_stable_steps = 0;
         }
         candidates.push_back(
             {group_id, group.dp_idx, target_dop, utilization, group.kv_candidate_stable_steps, std::move(sources)});
     }
 
     if (candidates.empty()) {
-        ls_step_kv_decision_reason_ = "no_candidate";
+        ls_step_kv_decision_reason_ = pressure_batch ? "pending_no_beneficial_consolidation" : "no_candidate";
         return nullptr;
     }
 
@@ -688,23 +762,25 @@ std::shared_ptr<SPStateManager::LSKVConsolidationPlan> Scheduler::_maybe_plan_ls
         ls_step_kv_stable_steps_ = candidate.stable_steps;
         ls_step_kv_group_util_   = candidate.utilization;
 
-        if (candidate.stable_steps < static_cast<uint64_t>(ls_kv_consolidation_stable_steps_)) {
-            ls_step_kv_decision_reason_ = "stable_window";
-            continue;
-        }
-        uint64_t cooldown = static_cast<uint64_t>(ls_kv_consolidation_cooldown_steps_);
-        if (ls_schedule_step_ < group.last_scale_up_step + cooldown
-            || ls_schedule_step_ < group.last_consolidation_step + cooldown) {
-            ls_step_kv_decision_reason_ = "cooldown";
-            continue;
-        }
-        if (!check_due) {
-            ls_step_kv_decision_reason_ = "check_interval";
-            continue;
-        }
-        if (ls_kv_consolidation_mode_ == "shadow") {
-            ls_step_kv_decision_reason_ = "shadow_candidate";
-            return nullptr;
+        if (!pressure_batch) {
+            if (candidate.stable_steps < static_cast<uint64_t>(ls_kv_consolidation_stable_steps_)) {
+                ls_step_kv_decision_reason_ = "stable_window";
+                continue;
+            }
+            uint64_t cooldown = static_cast<uint64_t>(ls_kv_consolidation_cooldown_steps_);
+            if (ls_schedule_step_ < group.last_scale_up_step + cooldown
+                || ls_schedule_step_ < group.last_consolidation_step + cooldown) {
+                ls_step_kv_decision_reason_ = "cooldown";
+                continue;
+            }
+            if (!check_due) {
+                ls_step_kv_decision_reason_ = "check_interval";
+                continue;
+            }
+            if (ls_kv_consolidation_mode_ == "shadow") {
+                ls_step_kv_decision_reason_ = "shadow_candidate";
+                return nullptr;
+            }
         }
 
         for (int source_rank : candidate.source_ranks) {
@@ -717,7 +793,8 @@ std::shared_ptr<SPStateManager::LSKVConsolidationPlan> Scheduler::_maybe_plan_ls
             for (const auto& stage : plan->sequence_stages) {
                 source_blocks += static_cast<int>(stage.source_blocks.size());
             }
-            if (source_blocks > ls_kv_consolidation_max_source_blocks_per_event_) {
+            if (ls_kv_consolidation_mode_ == "execute"
+                && source_blocks > ls_kv_consolidation_max_source_blocks_per_event_) {
                 abort_ls_kv_scale_down(plan);
                 ls_step_kv_decision_reason_ = "source_block_budget";
                 continue;
@@ -727,8 +804,19 @@ std::shared_ptr<SPStateManager::LSKVConsolidationPlan> Scheduler::_maybe_plan_ls
                 ls_step_kv_decision_reason_ = "target_high_watermark";
                 continue;
             }
+            if (pressure_batch && !_ls_consolidation_enables_pending_batch(plan, *pressure_batch)) {
+                abort_ls_kv_scale_down(plan);
+                ls_step_kv_decision_reason_ = "pending_no_benefit";
+                continue;
+            }
+            if (ls_kv_consolidation_mode_ == "shadow") {
+                abort_ls_kv_scale_down(plan);
+                ls_step_kv_source_rank_     = source_rank;
+                ls_step_kv_decision_reason_ = pressure_batch ? "shadow_pressure_candidate" : "shadow_candidate";
+                return nullptr;
+            }
             ls_step_kv_source_rank_     = source_rank;
-            ls_step_kv_decision_reason_ = "execute";
+            ls_step_kv_decision_reason_ = pressure_batch ? "execute_pressure" : "execute";
             return plan;
         }
     }
@@ -851,14 +939,15 @@ ScheduleResult Scheduler::schedule()
     ls_step_atomic_no_fit_count_   = 0;
     ls_step_atomic_merge_count_    = 0;
     ls_step_atomic_rollback_count_ = 0;
-    ls_step_planning_latency_ms_   = 0.0;
-    ls_step_kv_candidate_          = false;
-    ls_step_kv_group_id_           = -1;
-    ls_step_kv_source_rank_        = -1;
-    ls_step_kv_target_dop_         = -1;
-    ls_step_kv_stable_steps_       = 0;
-    ls_step_kv_group_util_         = 0.0;
-    ls_step_kv_decision_reason_    = ls_kv_consolidation_mode_ == "off" ? "off" : "no_candidate";
+    ls_step_oldest_no_fit_batch_id_.reset();
+    ls_step_planning_latency_ms_ = 0.0;
+    ls_step_kv_candidate_        = false;
+    ls_step_kv_group_id_         = -1;
+    ls_step_kv_source_rank_      = -1;
+    ls_step_kv_target_dop_       = -1;
+    ls_step_kv_stable_steps_     = 0;
+    ls_step_kv_group_util_       = 0.0;
+    ls_step_kv_decision_reason_  = ls_kv_consolidation_mode_ == "off" ? "off" : "no_candidate";
     std::vector<std::vector<std::shared_ptr<Sequence>>> dp_seqs;
     bool                                                has_prefill = false;
 
@@ -1315,7 +1404,9 @@ Scheduler::_ls_future_kv_peak_tokens(const std::vector<std::shared_ptr<Sequence>
 bool Scheduler::_ls_future_kv_fits(int                                           dp_idx,
                                    const std::vector<std::shared_ptr<Sequence>>& batch,
                                    const std::vector<std::shared_ptr<Sequence>>& existing_sequences,
-                                   const std::vector<int>&                       future_rank_pool) const
+                                   const std::vector<int>&                       future_rank_pool,
+                                   const std::vector<int>&                       free_block_adjustments,
+                                   const LSBlockContextOverrides&                context_overrides) const
 {
     if (!ls_decode_enable_future_kv_admission_) {
         return true;
@@ -1347,12 +1438,16 @@ bool Scheduler::_ls_future_kv_fits(int                                          
         if (manager == worker_state[dp_idx]->block_manager.end()) {
             return false;
         }
-        accessible_blocks += manager->second->num_free_blocks();
+        int free_adjustment = rank < static_cast<int>(free_block_adjustments.size()) ? free_block_adjustments[rank] : 0;
+        accessible_blocks += manager->second->num_free_blocks() + free_adjustment;
         for (const auto& seq : existing_sequences) {
             if (!seq || seq->status == SequenceStatus::FINISHED) {
                 continue;
             }
-            const auto& tables = seq->block_ctx(BlockContextSlot::ACTIVE).sp_block_table;
+            auto        context = context_overrides.find(seq.get());
+            const auto& tables  = context == context_overrides.end() ?
+                                      seq->block_ctx(BlockContextSlot::ACTIVE).sp_block_table :
+                                      context->second->sp_block_table;
             if (rank >= static_cast<int>(tables.size())) {
                 return false;
             }
@@ -1394,15 +1489,21 @@ Scheduler::_plan_ls_initial_placement(int                                       
                                       const std::vector<std::shared_ptr<Sequence>>& batch,
                                       const std::vector<int>&                       rank_pool,
                                       const std::vector<std::shared_ptr<Sequence>>& existing_sequences,
-                                      const std::vector<int>&                       base_allocation) const
+                                      const std::vector<int>&                       base_allocation,
+                                      const std::vector<int>&                       free_block_adjustments,
+                                      const LSBlockContextOverrides&                context_overrides) const
 {
     if (batch.empty() || static_cast<int>(batch.size()) > max_num_seqs_) {
         return std::nullopt;
     }
-    std::vector<int> ordered_pool = rank_pool;
+    std::vector<int> ordered_pool         = rank_pool;
+    auto             adjusted_free_blocks = [&](int rank) {
+        int adjustment = rank < static_cast<int>(free_block_adjustments.size()) ? free_block_adjustments[rank] : 0;
+        return worker_state[dp_idx]->block_manager.at(rank)->num_free_blocks() + adjustment;
+    };
     std::sort(ordered_pool.begin(), ordered_pool.end(), [&](int lhs, int rhs) {
-        int lhs_free = worker_state[dp_idx]->block_manager.at(lhs)->num_free_blocks();
-        int rhs_free = worker_state[dp_idx]->block_manager.at(rhs)->num_free_blocks();
+        int lhs_free = adjusted_free_blocks(lhs);
+        int rhs_free = adjusted_free_blocks(rhs);
         return lhs_free != rhs_free ? lhs_free > rhs_free : lhs < rhs;
     });
     ordered_pool.erase(std::unique(ordered_pool.begin(), ordered_pool.end()), ordered_pool.end());
@@ -1427,7 +1528,8 @@ Scheduler::_plan_ls_initial_placement(int                                       
                 }
             }
         }
-        if (!_ls_future_kv_fits(dp_idx, batch, existing_sequences, future_rank_pool)) {
+        if (!_ls_future_kv_fits(
+                dp_idx, batch, existing_sequences, future_rank_pool, free_block_adjustments, context_overrides)) {
             continue;
         }
         std::vector<std::vector<int>> placements(batch.size(), std::vector<int>(attention_sp_, 0));
@@ -1453,7 +1555,7 @@ Scheduler::_plan_ls_initial_placement(int                                       
 
         bool feasible = true;
         for (int rank : ranks) {
-            int free_blocks = worker_state[dp_idx]->block_manager.at(rank)->num_free_blocks();
+            int free_blocks = adjusted_free_blocks(rank);
             if (free_blocks < needed_blocks[rank]) {
                 feasible = false;
                 break;
@@ -1481,10 +1583,17 @@ Scheduler::_plan_ls_initial_placement(int                                       
                 if (!seq || seq->status != SequenceStatus::RUNNING) {
                     continue;
                 }
-                int master = planning_ranks[master_cursor++ % planning_ranks.size()];
+                int         master  = planning_ranks[master_cursor++ % planning_ranks.size()];
+                auto        context = context_overrides.find(seq.get());
+                const auto& ctx =
+                    context == context_overrides.end() ? seq->block_ctx(BlockContextSlot::ACTIVE) : *context->second;
                 master_load[master]++;
                 for (int owner = 0; owner < attention_sp_; ++owner) {
-                    if (owner != master && seq->committed_context_len(BlockContextSlot::ACTIVE, owner) > 0) {
+                    int committed = ctx.num_dispatched_tokens[owner];
+                    if (ctx.pending_token_present_ && ctx.pending_token_target_sp_ == owner) {
+                        committed--;
+                    }
+                    if (owner != master && committed > 0) {
                         receiver_load[owner]++;
                     }
                 }
@@ -1506,7 +1615,7 @@ Scheduler::_plan_ls_initial_placement(int                                       
                           });
             if (feasible) {
                 for (int rank : planning_ranks) {
-                    int free_blocks = worker_state[dp_idx]->block_manager.at(rank)->num_free_blocks();
+                    int free_blocks = adjusted_free_blocks(rank);
                     int headroom    = static_cast<int>(std::ceil(master_load[rank] * reserved_blocks_per_req_));
                     if (free_blocks < needed_blocks[rank] + headroom) {
                         feasible = false;
@@ -1763,6 +1872,142 @@ void Scheduler::_merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id)
     }
 }
 
+std::optional<int64_t> Scheduler::_ls_group_append_slack(const DecodeGroupState& group) const
+{
+    if (group.dp_idx < 0 || group.dp_idx >= attention_dp_ || group.allocated_attention_ranks.empty()) {
+        return std::nullopt;
+    }
+
+    int64_t available_blocks = 0;
+    for (int rank : group.allocated_attention_ranks) {
+        auto manager = worker_state[group.dp_idx]->block_manager.find(rank);
+        if (rank < 0 || rank >= attention_sp_ || manager == worker_state[group.dp_idx]->block_manager.end()) {
+            return std::nullopt;
+        }
+        available_blocks += manager->second->num_free_blocks();
+        for (const auto& sequence : group.sequences) {
+            if (!sequence || sequence->status != SequenceStatus::RUNNING) {
+                continue;
+            }
+            int committed        = sequence->committed_context_len(BlockContextSlot::ACTIVE, rank);
+            int committed_blocks = (committed + Sequence::block_size - 1) / Sequence::block_size;
+            int table_blocks     = static_cast<int>(sequence->block_table(BlockContextSlot::ACTIVE, rank).size());
+            available_blocks += std::max(0, table_blocks - committed_blocks);
+        }
+    }
+
+    int64_t minimum_append_blocks = 0;
+    int64_t running_requests      = 0;
+    for (const auto& sequence : group.sequences) {
+        if (!sequence || sequence->status != SequenceStatus::RUNNING) {
+            continue;
+        }
+        running_requests++;
+        int best_cost = std::numeric_limits<int>::max();
+        for (int rank : group.allocated_attention_ranks) {
+            int committed = sequence->committed_context_len(BlockContextSlot::ACTIVE, rank);
+            int before    = (committed + Sequence::block_size - 1) / Sequence::block_size;
+            int after     = (committed + 2 + Sequence::block_size - 1) / Sequence::block_size;
+            best_cost     = std::min(best_cost, after - before);
+        }
+        if (best_cost == std::numeric_limits<int>::max()) {
+            return std::nullopt;
+        }
+        minimum_append_blocks += best_cost;
+    }
+    minimum_append_blocks += static_cast<int64_t>(std::ceil(running_requests * reserved_blocks_per_req_));
+    return available_blocks - minimum_append_blocks;
+}
+
+std::optional<uint64_t> Scheduler::_select_ls_capacity_merge_target(int dp_idx, uint64_t constrained_group_id) const
+{
+    auto constrained_it = ls_groups_.find(constrained_group_id);
+    if (constrained_it == ls_groups_.end() || constrained_it->second.dp_idx != dp_idx) {
+        return std::nullopt;
+    }
+
+    auto running_sequences = [](const DecodeGroupState& group) {
+        std::vector<std::shared_ptr<Sequence>> requests;
+        for (const auto& sequence : group.sequences) {
+            if (sequence && sequence->status == SequenceStatus::RUNNING) {
+                requests.push_back(sequence);
+            }
+        }
+        return requests;
+    };
+
+    const auto constrained_requests = running_sequences(constrained_it->second);
+    struct Candidate {
+        uint64_t group_id          = 0;
+        bool     resolves_pressure = false;
+        int64_t  append_slack      = std::numeric_limits<int64_t>::min();
+        int64_t  free_blocks       = 0;
+    };
+    std::optional<Candidate> selected;
+
+    std::vector<uint64_t> group_ids = ls_group_ids_by_dp_.at(dp_idx);
+    std::sort(group_ids.begin(), group_ids.end());
+    for (uint64_t group_id : group_ids) {
+        if (group_id == constrained_group_id) {
+            continue;
+        }
+        const auto& donor          = ls_groups_.at(group_id);
+        auto        donor_requests = running_sequences(donor);
+        if (donor_requests.empty()) {
+            continue;
+        }
+
+        // Match LoongServe's preference for a batch that can already Decode
+        // and has the largest remaining capacity. A donor that is itself
+        // blocked must not be used to hide two independent deficits.
+        auto donor_slack = _ls_group_append_slack(donor);
+        if (!donor_slack.has_value() || *donor_slack < 0) {
+            continue;
+        }
+
+        int64_t free_blocks = 0;
+        for (int rank : donor.allocated_attention_ranks) {
+            free_blocks += worker_state[dp_idx]->block_manager.at(rank)->num_free_blocks();
+        }
+
+        std::vector<std::shared_ptr<Sequence>> combined_requests = constrained_requests;
+        combined_requests.insert(combined_requests.end(), donor_requests.begin(), donor_requests.end());
+        std::vector<int> combined_allocation = constrained_it->second.allocated_attention_ranks;
+        for (int rank : donor.allocated_attention_ranks) {
+            if (std::find(combined_allocation.begin(), combined_allocation.end(), rank) == combined_allocation.end()) {
+                combined_allocation.push_back(rank);
+            }
+        }
+        auto combined_plan = worker_state[dp_idx]->plan_iteration_masters_source_greedy(
+            combined_requests, combined_allocation, {}, ls_decode_batch_per_master_, false);
+
+        Candidate candidate;
+        candidate.group_id          = group_id;
+        candidate.resolves_pressure = combined_plan.success;
+        candidate.append_slack      = *donor_slack;
+        candidate.free_blocks       = free_blocks;
+        bool better                 = !selected.has_value();
+        if (selected.has_value()) {
+            if (candidate.resolves_pressure != selected->resolves_pressure) {
+                better = candidate.resolves_pressure;
+            }
+            else if (candidate.append_slack != selected->append_slack) {
+                better = candidate.append_slack > selected->append_slack;
+            }
+            else if (candidate.free_blocks != selected->free_blocks) {
+                better = candidate.free_blocks > selected->free_blocks;
+            }
+            else {
+                better = candidate.group_id < selected->group_id;
+            }
+        }
+        if (better) {
+            selected = candidate;
+        }
+    }
+    return selected.has_value() ? std::optional<uint64_t>(selected->group_id) : std::nullopt;
+}
+
 void Scheduler::_remove_seq_from_ls_group(uint64_t seq_id, bool clear_batch_owner)
 {
     auto owner = ls_seq_to_group_.find(seq_id);
@@ -1930,6 +2175,9 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_ls_deco
 
         if (!selected.has_value()) {
             ls_step_atomic_no_fit_count_++;
+            if (!ls_step_oldest_no_fit_batch_id_.has_value()) {
+                ls_step_oldest_no_fit_batch_id_ = batch.batch_id;
+            }
             continue;
         }
 
@@ -2130,6 +2378,28 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_ls_deco
                     group.allocated_attention_ranks.end());
             }
 
+            // LoongServe first tries to satisfy a Decode batch by combining it
+            // with another independently-decodable batch that has spare KV
+            // capacity. Probe each group without globally idle ranks so that a
+            // capacity-bearing donor is preferred over consuming a new rank.
+            bool merged_for_capacity = false;
+            for (uint64_t group_id : group_ids) {
+                const auto& group     = ls_groups_.at(group_id);
+                auto        own_slack = _ls_group_append_slack(group);
+                if (!own_slack.has_value() || *own_slack >= 0) {
+                    continue;
+                }
+                auto merge_target = _select_ls_capacity_merge_target(dp_idx, group_id);
+                if (merge_target.has_value()) {
+                    _merge_ls_groups(group_id, *merge_target);
+                    merged_for_capacity = true;
+                    break;
+                }
+            }
+            if (merged_for_capacity) {
+                continue;
+            }
+
             // If ranks assigned to other groups are the only reason a group
             // cannot reach its threshold-sized compute demand, merge with the
             // oldest compatible group before generating any iteration plan.
@@ -2146,7 +2416,9 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_ls_deco
                 int directly_available =
                     static_cast<int>(group.allocated_attention_ranks.size()) + globally_unallocated;
                 if (desired > directly_available && group_ids.size() > 1) {
-                    uint64_t merge_with = group_ids.front() == group_id ? group_ids[1] : group_ids.front();
+                    auto     capacity_target = _select_ls_capacity_merge_target(dp_idx, group_id);
+                    uint64_t merge_with =
+                        capacity_target.value_or(group_ids.front() == group_id ? group_ids[1] : group_ids.front());
                     _merge_ls_groups(group_id, merge_with);
                     merged_for_compute = true;
                     break;
@@ -2225,7 +2497,9 @@ std::vector<std::vector<std::shared_ptr<Sequence>>> Scheduler::_schedule_ls_deco
 
             if (failed_group.has_value()) {
                 if (group_ids.size() > 1) {
-                    uint64_t merge_with = group_ids.front() == *failed_group ? group_ids[1] : group_ids.front();
+                    auto     capacity_target = _select_ls_capacity_merge_target(dp_idx, *failed_group);
+                    uint64_t merge_with =
+                        capacity_target.value_or(group_ids.front() == *failed_group ? group_ids[1] : group_ids.front());
                     _merge_ls_groups(*failed_group, merge_with);
                     continue;
                 }

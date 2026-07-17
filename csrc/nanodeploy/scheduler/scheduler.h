@@ -316,31 +316,47 @@ public:
     RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;
 
 private:
+    using LSBlockContextOverrides = std::unordered_map<const Sequence*, const BlockContext*>;
+
     // Internal scheduling logic
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_ls_decode_admission();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_ls_decode();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode_prefill_latency_aware();
+
     std::optional<std::pair<std::vector<int>, std::vector<std::vector<int>>>>
                      _plan_ls_initial_placement(int                                           dp_idx,
                                                 const std::vector<std::shared_ptr<Sequence>>& batch,
                                                 const std::vector<int>&                       rank_pool,
                                                 const std::vector<std::shared_ptr<Sequence>>& existing_sequences = {},
-                                                const std::vector<int>&                       base_allocation = {}) const;
+                                                const std::vector<int>&                       base_allocation    = {},
+                                                const std::vector<int>&                       free_block_adjustments = {},
+                                                const LSBlockContextOverrides&                context_overrides = {}) const;
     std::vector<int> _ls_unallocated_ranks(int dp_idx, std::optional<uint64_t> excluding_group = std::nullopt) const;
     std::optional<int64_t> _ls_future_kv_peak_tokens(const std::vector<std::shared_ptr<Sequence>>& sequences) const;
-    bool                   _ls_future_kv_fits(int                                           dp_idx,
-                                              const std::vector<std::shared_ptr<Sequence>>& batch,
-                                              const std::vector<std::shared_ptr<Sequence>>& existing_sequences,
-                                              const std::vector<int>&                       future_rank_pool) const;
-    bool                   _ls_future_kv_fits_empty_system(const std::vector<std::shared_ptr<Sequence>>& batch,
-                                                           const std::vector<int>&                       future_rank_pool) const;
-    void                   _merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id);
-    void                   _remove_seq_from_ls_group(uint64_t seq_id, bool clear_batch_owner = true);
-    void                   _reconcile_ls_groups();
-    void                   _seal_ls_decode_arrivals();
-    bool                   _ls_batch_fits_empty_system(const std::vector<std::shared_ptr<Sequence>>& batch) const;
+
+    bool _ls_future_kv_fits(int                                           dp_idx,
+                            const std::vector<std::shared_ptr<Sequence>>& batch,
+                            const std::vector<std::shared_ptr<Sequence>>& existing_sequences,
+                            const std::vector<int>&                       future_rank_pool,
+                            const std::vector<int>&                       free_block_adjustments = {},
+                            const LSBlockContextOverrides&                context_overrides      = {}) const;
+
+    bool _ls_future_kv_fits_empty_system(const std::vector<std::shared_ptr<Sequence>>& batch,
+                                         const std::vector<int>&                       future_rank_pool) const;
+    void _merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id);
+
+    std::optional<int64_t> _ls_group_append_slack(const DecodeGroupState& group) const;
+
+    std::optional<uint64_t> _select_ls_capacity_merge_target(int dp_idx, uint64_t constrained_group_id) const;
+    bool _ls_consolidation_enables_pending_batch(const std::shared_ptr<SPStateManager::LSKVConsolidationPlan>& plan,
+                                                 const PendingDecodeBatch& pending_batch) const;
+
+    void _remove_seq_from_ls_group(uint64_t seq_id, bool clear_batch_owner = true);
+    void _reconcile_ls_groups();
+    void _seal_ls_decode_arrivals();
+    bool _ls_batch_fits_empty_system(const std::vector<std::shared_ptr<Sequence>>& batch) const;
     std::shared_ptr<SPStateManager::LSKVConsolidationPlan> _maybe_plan_ls_kv_consolidation();
     bool _ls_kv_consolidation_watermark_ok(const std::shared_ptr<SPStateManager::LSKVConsolidationPlan>& plan) const;
     void _populate_ls_kv_consolidation_telemetry(ScheduleResult& result) const;
@@ -422,6 +438,7 @@ private:
     double                                                  ls_step_planning_latency_ms_                      = 0.0;
     uint64_t                                                next_ls_kv_transaction_id_                        = 1;
     std::shared_ptr<SPStateManager::LSKVConsolidationPlan>  active_ls_kv_transaction_;
+    std::optional<uint64_t>                                 ls_step_oldest_no_fit_batch_id_;
     bool                                                    ls_step_kv_candidate_       = false;
     int64_t                                                 ls_step_kv_group_id_        = -1;
     int                                                     ls_step_kv_source_rank_     = -1;

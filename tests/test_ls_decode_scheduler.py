@@ -865,6 +865,44 @@ def test_multi_group_compute_pressure_merges_into_oldest_group():
     ]
 
 
+def test_kv_pressure_merges_with_highest_capacity_donor_instead_of_oldest():
+    scheduler = _make_scheduler(
+        attention_sp=3,
+        block_size=4,
+        num_blocks=3,
+        max_num_seqs=2,
+        max_num_recv_seqs=1,
+        initial_dop=1,
+        threshold=64,
+        future_kv_admission=False,
+    )
+    first, first_admission = _admit_and_append_dummy(scheduler, [7])
+    second, second_admission = _admit_and_append_dummy(scheduler, [3])
+    third, third_admission = _admit_and_append_dummy(scheduler, [1])
+
+    assert first_admission.ls_initial_group_ids == [0]
+    assert second_admission.ls_initial_group_ids == [1]
+    assert third_admission.ls_initial_group_ids == [2]
+    assert scheduler.get_ls_group_sequence_ids() == [
+        [first[0].seq_id],
+        [second[0].seq_id],
+        [third[0].seq_id],
+    ]
+
+    result = scheduler.schedule()
+
+    # Group 0 is append-constrained. Group 2 has more usable append slack than
+    # the older group 1, so the LoongServe-style capacity pass consumes rank 2
+    # and leaves group 1 independent.
+    assert result.ls_group_ids == [0, 1]
+    assert result.ls_group_rank_allocations == [[0, 2], [1]]
+    assert result.ls_iteration_sequence_ids == [
+        [first[0].seq_id, third[0].seq_id],
+        [second[0].seq_id],
+    ]
+    assert result.ls_preempted_sequence_ids == []
+
+
 def test_preempt_readmit_then_merge_keeps_each_live_sequence_once():
     scheduler = _make_scheduler(
         attention_sp=2,

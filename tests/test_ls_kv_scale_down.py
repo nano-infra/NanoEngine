@@ -27,6 +27,13 @@ _MAX_NUM_SEQS = 16
 
 def _make_scheduler(
     *,
+    sp_size: int = _SP_SIZE,
+    block_size: int = _BLOCK_SIZE,
+    num_blocks: int = _NUM_BLOCKS,
+    max_num_seqs: int = _MAX_NUM_SEQS,
+    max_num_recv_seqs: int = _MAX_NUM_SEQS,
+    initial_dop: int = 2,
+    future_kv_admission: bool = True,
     consolidation_mode: str = "off",
     candidate_util: float = 0.50,
     target_high_watermark: float = 0.80,
@@ -38,17 +45,17 @@ def _make_scheduler(
     return Scheduler(
         "scale-down-test",
         1,
-        _MAX_NUM_SEQS,
+        max_num_seqs,
         4096,
-        _MAX_NUM_SEQS,
+        max_num_recv_seqs,
         -1,
         1,
-        _SP_SIZE,
-        _NUM_BLOCKS,
-        _BLOCK_SIZE,
+        sp_size,
+        num_blocks,
+        block_size,
         "decode",
         0.0,
-        _BLOCK_SIZE,
+        block_size,
         False,
         False,
         "legacy",
@@ -72,7 +79,7 @@ def _make_scheduler(
         False,
         0,
         True,
-        2,
+        initial_dop,
         64,
         True,
         "centralized",
@@ -83,6 +90,7 @@ def _make_scheduler(
         cooldown_steps,
         check_interval_steps,
         max_source_blocks_per_event,
+        future_kv_admission,
     )
 
 
@@ -324,6 +332,136 @@ def test_automatic_scale_down_waits_for_stability_and_executes_reserved_plan(
     assert result.group_id == group_id
     assert result.source_rank == 1
     assert scheduler.get_ls_group_allocated_ranks(group_id) == [0]
+
+
+def test_pending_no_fit_executes_only_consolidation_that_proves_next_admission():
+    scheduler = _make_scheduler(
+        sp_size=3,
+        block_size=4,
+        num_blocks=3,
+        max_num_seqs=1,
+        max_num_recv_seqs=1,
+        initial_dop=3,
+        future_kv_admission=True,
+        consolidation_mode="execute",
+        target_high_watermark=1.0,
+        # Admission pressure deliberately bypasses the opportunistic windows.
+        stable_steps=32,
+        cooldown_steps=64,
+        check_interval_steps=8,
+    )
+    running = Sequence(list(range(14)), 1.0, 2, True)
+    scheduler.add(running)
+    admission = scheduler.schedule()
+    assert admission.action == ScheduleAction.ADMISSION
+
+    worker = scheduler.worker_state[0]
+    assert worker.may_append(running, 1)
+    running.append_token(99, BlockContextSlot.ACTIVE)
+    running.mark_last_token_pending(BlockContextSlot.ACTIVE)
+    worker.add_running_tokens(running.block_ctx().master_sp_idx, 1)
+    assert scheduler.schedule().action == ScheduleAction.DECODE
+
+    waiting = Sequence([7], 1.0, 2, True)
+    scheduler.add(waiting)
+    maintenance = scheduler.schedule()
+
+    assert maintenance.action == ScheduleAction.KV_CONSOLIDATION
+    assert maintenance.ls_kv_consolidation_decision_reason == "execute_pressure"
+    assert maintenance.kv_consolidation_plan.success is True
+    assert scheduler.get_ls_pending_batch_sequence_ids() == [[waiting.seq_id]]
+
+    # Metadata-only commit is sufficient for this scheduler unit test; the
+    # physical P2P transaction is covered by the executor tests above.
+    assert scheduler.commit_ls_kv_scale_down(maintenance.kv_consolidation_plan)
+    readmission = scheduler.schedule()
+    assert readmission.action == ScheduleAction.ADMISSION
+    assert readmission.ls_initial_sequence_ids == [[waiting.seq_id]]
+    assert readmission.ls_initial_admission_kinds == ["merge"]
+    assert scheduler.get_ls_pending_batch_ids() == []
+
+
+def test_pending_no_fit_rejects_consolidation_without_admission_benefit():
+    scheduler = _make_scheduler(
+        sp_size=3,
+        block_size=4,
+        num_blocks=3,
+        max_num_seqs=1,
+        max_num_recv_seqs=1,
+        initial_dop=3,
+        future_kv_admission=False,
+        consolidation_mode="execute",
+        target_high_watermark=1.0,
+        stable_steps=32,
+        cooldown_steps=64,
+        check_interval_steps=8,
+    )
+    running = Sequence(list(range(14)), 1.0, 32, True)
+    scheduler.add(running)
+    assert scheduler.schedule().action == ScheduleAction.ADMISSION
+
+    worker = scheduler.worker_state[0]
+    assert worker.may_append(running, 1)
+    running.append_token(99, BlockContextSlot.ACTIVE)
+    running.mark_last_token_pending(BlockContextSlot.ACTIVE)
+    worker.add_running_tokens(running.block_ctx().master_sp_idx, 1)
+    assert scheduler.schedule().action == ScheduleAction.DECODE
+
+    # This prompt fits an empty three-rank DP, but not the capacity left by the
+    # running request. Evacuating one rank only moves KV and cannot create the
+    # additional blocks needed by this admission.
+    waiting = Sequence(list(range(20)), 1.0, 32, True)
+    scheduler.add(waiting)
+    free_before = _free_blocks(scheduler)
+    result = scheduler.schedule()
+
+    assert result.action == ScheduleAction.DECODE
+    assert result.kv_consolidation_plan is None
+    assert result.ls_kv_consolidation_decision_reason == "pending_no_benefit"
+    assert scheduler.get_ls_pending_batch_sequence_ids() == [[waiting.seq_id]]
+    assert _free_blocks(scheduler) == free_before
+
+
+def test_pending_pressure_shadow_mode_proves_candidate_without_reserving_blocks():
+    scheduler = _make_scheduler(
+        sp_size=3,
+        block_size=4,
+        num_blocks=3,
+        max_num_seqs=1,
+        max_num_recv_seqs=1,
+        initial_dop=3,
+        future_kv_admission=False,
+        consolidation_mode="shadow",
+        target_high_watermark=1.0,
+        stable_steps=32,
+        cooldown_steps=64,
+        check_interval_steps=8,
+        # A shadow proof observes the actual move but does not execute it, so
+        # the execute-only transfer budget must not hide this telemetry.
+        max_source_blocks_per_event=0,
+    )
+    running = Sequence(list(range(14)), 1.0, 32, True)
+    scheduler.add(running)
+    assert scheduler.schedule().action == ScheduleAction.ADMISSION
+
+    worker = scheduler.worker_state[0]
+    assert worker.may_append(running, 1)
+    running.append_token(99, BlockContextSlot.ACTIVE)
+    running.mark_last_token_pending(BlockContextSlot.ACTIVE)
+    worker.add_running_tokens(running.block_ctx().master_sp_idx, 1)
+    assert scheduler.schedule().action == ScheduleAction.DECODE
+
+    waiting = Sequence([7], 1.0, 32, True)
+    scheduler.add(waiting)
+    free_before = _free_blocks(scheduler)
+    result = scheduler.schedule()
+
+    assert result.action == ScheduleAction.DECODE
+    assert result.kv_consolidation_plan is None
+    assert result.ls_kv_consolidation_candidate is True
+    assert result.ls_kv_consolidation_decision_reason == "shadow_pressure_candidate"
+    assert scheduler.get_ls_pending_batch_sequence_ids() == [[waiting.seq_id]]
+    assert _free_blocks(scheduler) == free_before
 
 
 def test_automatic_candidate_util_threshold_is_strict():
