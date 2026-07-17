@@ -213,7 +213,8 @@ void bind_scheduler_utils(py::module_& m)
                          int                ls_kv_consolidation_stable_steps,
                          int                ls_kv_consolidation_cooldown_steps,
                          int                ls_kv_consolidation_check_interval_steps,
-                         int                ls_kv_consolidation_max_source_blocks_per_event) {
+                         int                ls_kv_consolidation_max_source_blocks_per_event,
+                         bool               ls_decode_enable_future_kv_admission) {
                  return std::make_shared<Scheduler>(engine_id,
                                                     loop_count,
                                                     max_num_seqs,
@@ -260,7 +261,8 @@ void bind_scheduler_utils(py::module_& m)
                                                     ls_kv_consolidation_stable_steps,
                                                     ls_kv_consolidation_cooldown_steps,
                                                     ls_kv_consolidation_check_interval_steps,
-                                                    ls_kv_consolidation_max_source_blocks_per_event);
+                                                    ls_kv_consolidation_max_source_blocks_per_event,
+                                                    ls_decode_enable_future_kv_admission);
              }),
              py::arg("engine_id"),
              py::arg("loop_count"),
@@ -308,7 +310,8 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("ls_kv_consolidation_stable_steps")                = 32,
              py::arg("ls_kv_consolidation_cooldown_steps")              = 64,
              py::arg("ls_kv_consolidation_check_interval_steps")        = 8,
-             py::arg("ls_kv_consolidation_max_source_blocks_per_event") = 0)
+             py::arg("ls_kv_consolidation_max_source_blocks_per_event") = 0,
+             py::arg("ls_decode_enable_future_kv_admission")            = true)
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))

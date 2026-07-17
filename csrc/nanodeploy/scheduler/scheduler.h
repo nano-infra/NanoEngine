@@ -242,7 +242,8 @@ public:
               int                ls_kv_consolidation_stable_steps                = 32,
               int                ls_kv_consolidation_cooldown_steps              = 64,
               int                ls_kv_consolidation_check_interval_steps        = 8,
-              int                ls_kv_consolidation_max_source_blocks_per_event = 0);
+              int                ls_kv_consolidation_max_source_blocks_per_event = 0,
+              bool               ls_decode_enable_future_kv_admission            = true);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
@@ -328,11 +329,18 @@ private:
                                                 const std::vector<std::shared_ptr<Sequence>>& existing_sequences = {},
                                                 const std::vector<int>&                       base_allocation = {}) const;
     std::vector<int> _ls_unallocated_ranks(int dp_idx, std::optional<uint64_t> excluding_group = std::nullopt) const;
-    void             _merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id);
-    void             _remove_seq_from_ls_group(uint64_t seq_id, bool clear_batch_owner = true);
-    void             _reconcile_ls_groups();
-    void             _seal_ls_decode_arrivals();
-    bool             _ls_batch_fits_empty_system(const std::vector<std::shared_ptr<Sequence>>& batch) const;
+    std::optional<int64_t> _ls_future_kv_peak_tokens(const std::vector<std::shared_ptr<Sequence>>& sequences) const;
+    bool                   _ls_future_kv_fits(int                                           dp_idx,
+                                              const std::vector<std::shared_ptr<Sequence>>& batch,
+                                              const std::vector<std::shared_ptr<Sequence>>& existing_sequences,
+                                              const std::vector<int>&                       future_rank_pool) const;
+    bool                   _ls_future_kv_fits_empty_system(const std::vector<std::shared_ptr<Sequence>>& batch,
+                                                           const std::vector<int>&                       future_rank_pool) const;
+    void                   _merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id);
+    void                   _remove_seq_from_ls_group(uint64_t seq_id, bool clear_batch_owner = true);
+    void                   _reconcile_ls_groups();
+    void                   _seal_ls_decode_arrivals();
+    bool                   _ls_batch_fits_empty_system(const std::vector<std::shared_ptr<Sequence>>& batch) const;
     std::shared_ptr<SPStateManager::LSKVConsolidationPlan> _maybe_plan_ls_kv_consolidation();
     bool _ls_kv_consolidation_watermark_ok(const std::shared_ptr<SPStateManager::LSKVConsolidationPlan>& plan) const;
     void _populate_ls_kv_consolidation_telemetry(ScheduleResult& result) const;
@@ -371,6 +379,7 @@ private:
     int              ls_decode_initial_kv_dop_;
     int              ls_decode_batch_per_master_;
     bool             ls_decode_enable_memory_scale_up_;
+    bool             ls_decode_enable_future_kv_admission_;
     std::string      ls_kv_consolidation_mode_;
     double           ls_kv_consolidation_candidate_util_;
     double           ls_kv_consolidation_target_high_watermark_;

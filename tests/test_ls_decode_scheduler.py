@@ -25,6 +25,7 @@ def _make_scheduler(
     threshold: int = 2,
     memory_scale_up: bool = True,
     enable_ls: bool = True,
+    future_kv_admission: bool = True,
 ) -> Scheduler:
     return Scheduler(
         "",
@@ -67,6 +68,14 @@ def _make_scheduler(
         threshold,
         memory_scale_up,
         "centralized",
+        "off",
+        0.50,
+        0.80,
+        32,
+        64,
+        8,
+        0,
+        future_kv_admission,
     )
 
 
@@ -178,6 +187,7 @@ def test_auto_initial_dop_selects_first_feasible_and_forced_value_does_not_chang
         block_size=4,
         num_blocks=6,
         initial_dop=0,
+        future_kv_admission=False,
     )
     _, result = _admit_and_append_dummy(automatic, [20])
     assert result.ls_initial_kv_dops == [2]
@@ -187,6 +197,7 @@ def test_auto_initial_dop_selects_first_feasible_and_forced_value_does_not_chang
         block_size=4,
         num_blocks=6,
         initial_dop=1,
+        future_kv_admission=False,
     )
     seqs = [Sequence(list(range(20)), 1.0, 32, True)]
     for seq in seqs:
@@ -220,12 +231,87 @@ def test_initial_reservation_headroom_follows_shadow_master_load():
         reserved_blocks_per_req=1.0,
         initial_dop=0,
         threshold=1,
+        future_kv_admission=False,
     )
     _, admission = _admit_and_append_dummy(scheduler, [1, 1])
 
     assert admission.ls_initial_kv_dops == [1]
     decode = scheduler.schedule()
     assert decode.ls_master_batch_sizes == [[1, 1]]
+
+
+def test_future_kv_peak_keeps_merge_pending_before_prompt_capacity_is_exhausted():
+    scheduler = _make_scheduler(
+        attention_sp=1,
+        block_size=4,
+        num_blocks=10,
+        initial_dop=1,
+    )
+    running = Sequence(list(range(4)), 1.0, 20, True)
+    scheduler.add(running)
+    first = scheduler.schedule()
+    _append_dummy_for_admission(scheduler, first)
+
+    waiting = Sequence(list(range(4)), 1.0, 20, True)
+    scheduler.add(waiting)
+    before_blocks = _free_block_counts(scheduler)
+
+    blocked = scheduler.schedule()
+
+    # Both prompts fit in the ten-block pool, but the LoongServe high-water
+    # estimate is (5 + 5) + 2 * 18 = 46 tokens > 40-token capacity.
+    assert blocked.ls_initial_batch_ids == []
+    assert blocked.ls_atomic_admission_no_fit_count == 1
+    assert scheduler.get_ls_pending_batch_sequence_ids() == [[waiting.seq_id]]
+    assert waiting.status == SequenceStatus.WAITING
+    assert _free_block_counts(scheduler) == before_blocks
+
+    _finish_and_free(scheduler, 0, running)
+    admitted = scheduler.schedule()
+    assert admitted.ls_initial_sequence_ids == [[waiting.seq_id]]
+    assert waiting.status == SequenceStatus.RUNNING
+
+
+def test_future_kv_peak_uses_completion_overlap_instead_of_summing_all_maxima():
+    scheduler = _make_scheduler(
+        attention_sp=1,
+        block_size=4,
+        num_blocks=30,
+        initial_dop=1,
+    )
+    short_output = Sequence(list(range(100)), 1.0, 4, True)
+    long_output = Sequence(list(range(4)), 1.0, 100, True)
+    scheduler.add(short_output)
+    scheduler.add(long_output)
+
+    admitted = scheduler.schedule()
+
+    # Naively summing both terminal KV sizes gives 206 tokens. LoongServe's
+    # completion-boundary envelope is max(5 + 98, 5 + 101 + 2 * 2) = 110,
+    # so the pair safely fits in the 120-token pool.
+    assert admitted.ls_initial_sequence_ids == [[short_output.seq_id, long_output.seq_id]]
+    assert all(seq.status == SequenceStatus.RUNNING for seq in (short_output, long_output))
+
+
+def test_future_kv_peak_shrinks_only_the_unsealed_candidate():
+    scheduler = _make_scheduler(
+        attention_sp=1,
+        block_size=4,
+        num_blocks=10,
+        initial_dop=1,
+    )
+    seqs = [Sequence(list(range(4)), 1.0, 20, True) for _ in range(2)]
+    for seq in seqs:
+        scheduler.add(seq)
+
+    admitted = scheduler.schedule()
+
+    assert admitted.ls_sealed_batch_sequence_ids == [[seqs[0].seq_id]]
+    assert admitted.ls_initial_sequence_ids == [[seqs[0].seq_id]]
+    assert scheduler.get_ls_pending_batch_ids() == []
+    assert [seq.seq_id for seq in scheduler.waiting_migration] == [seqs[1].seq_id]
+    assert seqs[0].status == SequenceStatus.RUNNING
+    assert seqs[1].status == SequenceStatus.WAITING
 
 
 def test_iteration_planner_uses_source_style_chunks_and_preserves_history():
@@ -340,6 +426,7 @@ def test_seal_balances_fifo_batches_and_keeps_no_fit_membership_stable():
         max_num_seqs=4,
         num_blocks=4,
         initial_dop=1,
+        future_kv_admission=False,
     )
     _, occupied = _admit_and_append_dummy(scheduler, [8, 8, 8, 8])
     assert len(occupied.ls_initial_batch_ids) == 4
@@ -406,6 +493,7 @@ def test_seal_limit_leaves_tail_unsealed_without_reforming_old_batches():
         max_num_seqs=2,
         num_blocks=4,
         initial_dop=1,
+        future_kv_admission=False,
     )
     _admit_and_append_dummy(scheduler, [8, 8])
     seqs = [Sequence([idx], 1.0, 16, True) for idx in range(6)]
@@ -442,6 +530,7 @@ def test_no_fit_batch_admits_whole_after_capacity_is_released():
         attention_sp=1,
         num_blocks=5,
         initial_dop=1,
+        future_kv_admission=False,
     )
     occupied, _ = _admit_and_append_dummy(scheduler, [8])
     waiting = Sequence(list(range(8)), 1.0, 32, True)
@@ -509,6 +598,7 @@ def test_bounded_bypass_admits_a_later_complete_batch():
         attention_sp=1,
         num_blocks=8,
         initial_dop=1,
+        future_kv_admission=False,
     )
     occupied, occupied_admission = _admit_and_append_dummy(scheduler, [8])
 
@@ -557,6 +647,7 @@ def test_standalone_atomic_commit_failure_rolls_back_every_sequence():
         attention_sp=1,
         num_blocks=8,
         initial_dop=1,
+        future_kv_admission=False,
     )
     seqs = [Sequence(list(range(4)), 1.0, 16, True) for _ in range(2)]
     for seq in seqs:
@@ -599,6 +690,7 @@ def test_merge_atomic_commit_failure_restores_existing_group():
         attention_sp=1,
         num_blocks=8,
         initial_dop=1,
+        future_kv_admission=False,
     )
     running, initial = _admit_and_append_dummy(scheduler, [4])
     original_group_ids = scheduler.get_ls_group_ids()
@@ -664,6 +756,7 @@ def test_admission_searches_all_groups_instead_of_only_the_oldest():
         max_num_seqs=2,
         num_blocks=6,
         initial_dop=1,
+        future_kv_admission=False,
     )
     _, first = _admit_and_append_dummy(scheduler, [12])
     _, second = _admit_and_append_dummy(scheduler, [4])
@@ -688,6 +781,7 @@ def test_kv_capacity_preemption_is_structured_and_frontier_safe():
         num_blocks=2,
         initial_dop=1,
         threshold=64,
+        future_kv_admission=False,
     )
     seqs, _ = _admit_and_append_dummy(scheduler, [3])
 

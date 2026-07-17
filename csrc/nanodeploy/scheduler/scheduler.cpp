@@ -90,7 +90,8 @@ Scheduler::Scheduler(const std::string& engine_id,
                      int                ls_kv_consolidation_stable_steps,
                      int                ls_kv_consolidation_cooldown_steps,
                      int                ls_kv_consolidation_check_interval_steps,
-                     int                ls_kv_consolidation_max_source_blocks_per_event):
+                     int                ls_kv_consolidation_max_source_blocks_per_event,
+                     bool               ls_decode_enable_future_kv_admission):
     engine_id_(engine_id),
     loop_count_(loop_count),
     max_num_seqs_(max_num_seqs),
@@ -113,6 +114,7 @@ Scheduler::Scheduler(const std::string& engine_id,
     ls_decode_initial_kv_dop_(ls_decode_initial_kv_dop),
     ls_decode_batch_per_master_(ls_decode_batch_per_master),
     ls_decode_enable_memory_scale_up_(ls_decode_enable_memory_scale_up),
+    ls_decode_enable_future_kv_admission_(ls_decode_enable_future_kv_admission),
     ls_kv_consolidation_mode_(ls_kv_consolidation_mode),
     ls_kv_consolidation_candidate_util_(ls_kv_consolidation_candidate_util),
     ls_kv_consolidation_target_high_watermark_(ls_kv_consolidation_target_high_watermark),
@@ -1254,6 +1256,139 @@ std::vector<int> Scheduler::_ls_unallocated_ranks(int dp_idx, std::optional<uint
     return result;
 }
 
+std::optional<int64_t>
+Scheduler::_ls_future_kv_peak_tokens(const std::vector<std::shared_ptr<Sequence>>& sequences) const
+{
+    // Source-equivalent to LoongServe ReqQueue::_can_add_new_req(): represent
+    // every live request as (KV held now, remaining Decode iterations), sort by
+    // remaining iterations, and evaluate the aggregate KV high-water mark at
+    // every request-completion boundary. NanoDeploy's LS workload uses
+    // ignore_eos=True, and LoongServe's default/busy path also uses the full
+    // user-provided maximum output length, so max_tokens is deliberately not
+    // shortened using an average-output heuristic here.
+    std::vector<std::pair<int64_t, int64_t>> lengths;
+    lengths.reserve(sequences.size());
+    for (const auto& seq : sequences) {
+        if (!seq) {
+            return std::nullopt;
+        }
+        if (seq->status == SequenceStatus::FINISHED) {
+            continue;
+        }
+
+        const int64_t generated  = std::max(0, seq->num_completed_tokens());
+        const int64_t max_output = std::max(0, seq->max_tokens);
+        int64_t       held_tokens;
+        int64_t       remaining_iterations;
+        if (seq->status == SequenceStatus::RUNNING) {
+            held_tokens          = static_cast<int64_t>(seq->num_prompt_tokens) + generated;
+            remaining_iterations = std::max<int64_t>(0, max_output - generated - 1);
+        }
+        else if (seq->status == SequenceStatus::WAITING) {
+            // LoongServe charges the first sampled token at admission and then
+            // excludes the final token, whose KV is never needed after finish.
+            held_tokens          = static_cast<int64_t>(seq->num_prompt_tokens) + 1;
+            remaining_iterations = std::max<int64_t>(0, max_output - 2);
+        }
+        else {
+            return std::nullopt;
+        }
+        lengths.emplace_back(held_tokens, remaining_iterations);
+    }
+
+    if (lengths.empty()) {
+        return int64_t{0};
+    }
+    std::stable_sort(
+        lengths.begin(), lengths.end(), [](const auto& lhs, const auto& rhs) { return lhs.second > rhs.second; });
+
+    int64_t prefix_held = 0;
+    int64_t peak_tokens = 0;
+    for (size_t idx = 0; idx < lengths.size(); ++idx) {
+        prefix_held += lengths[idx].first;
+        const int64_t active_requests = static_cast<int64_t>(idx) + 1;
+        peak_tokens                   = std::max(peak_tokens, prefix_held + active_requests * lengths[idx].second);
+    }
+    return peak_tokens;
+}
+
+bool Scheduler::_ls_future_kv_fits(int                                           dp_idx,
+                                   const std::vector<std::shared_ptr<Sequence>>& batch,
+                                   const std::vector<std::shared_ptr<Sequence>>& existing_sequences,
+                                   const std::vector<int>&                       future_rank_pool) const
+{
+    if (!ls_decode_enable_future_kv_admission_) {
+        return true;
+    }
+    if (dp_idx < 0 || dp_idx >= attention_dp_ || future_rank_pool.empty()) {
+        return false;
+    }
+
+    std::vector<std::shared_ptr<Sequence>> projected_sequences = existing_sequences;
+    projected_sequences.insert(projected_sequences.end(), batch.begin(), batch.end());
+    auto peak_tokens = _ls_future_kv_peak_tokens(projected_sequences);
+    if (!peak_tokens.has_value()) {
+        return false;
+    }
+
+    // Only capacity already owned by this prospective group plus currently
+    // free blocks is admissible. This prevents the aggregate test from
+    // borrowing blocks held by another LS group on the same DP domain.
+    std::unordered_set<int> unique_ranks;
+    int64_t                 accessible_blocks = 0;
+    for (int rank : future_rank_pool) {
+        if (rank < 0 || rank >= attention_sp_ || !unique_ranks.insert(rank).second) {
+            if (rank < 0 || rank >= attention_sp_) {
+                return false;
+            }
+            continue;
+        }
+        auto manager = worker_state[dp_idx]->block_manager.find(rank);
+        if (manager == worker_state[dp_idx]->block_manager.end()) {
+            return false;
+        }
+        accessible_blocks += manager->second->num_free_blocks();
+        for (const auto& seq : existing_sequences) {
+            if (!seq || seq->status == SequenceStatus::FINISHED) {
+                continue;
+            }
+            const auto& tables = seq->block_ctx(BlockContextSlot::ACTIVE).sp_block_table;
+            if (rank >= static_cast<int>(tables.size())) {
+                return false;
+            }
+            accessible_blocks += static_cast<int64_t>(tables[rank].size());
+        }
+    }
+    const int64_t accessible_tokens = accessible_blocks * static_cast<int64_t>(Sequence::block_size);
+    return *peak_tokens <= accessible_tokens;
+}
+
+bool Scheduler::_ls_future_kv_fits_empty_system(const std::vector<std::shared_ptr<Sequence>>& batch,
+                                                const std::vector<int>&                       future_rank_pool) const
+{
+    if (!ls_decode_enable_future_kv_admission_) {
+        return true;
+    }
+    auto peak_tokens = _ls_future_kv_peak_tokens(batch);
+    if (!peak_tokens.has_value() || future_rank_pool.empty()) {
+        return false;
+    }
+
+    std::unordered_set<int> unique_ranks;
+    int64_t                 capacity_blocks = 0;
+    for (int rank : future_rank_pool) {
+        if (rank < 0 || rank >= attention_sp_ || !unique_ranks.insert(rank).second) {
+            if (rank < 0 || rank >= attention_sp_) {
+                return false;
+            }
+            continue;
+        }
+        capacity_blocks += ls_empty_system_free_blocks_per_rank_[rank];
+    }
+    const int64_t capacity_tokens = capacity_blocks * static_cast<int64_t>(Sequence::block_size);
+    return *peak_tokens <= capacity_tokens;
+}
+
 std::optional<std::pair<std::vector<int>, std::vector<std::vector<int>>>>
 Scheduler::_plan_ls_initial_placement(int                                           dp_idx,
                                       const std::vector<std::shared_ptr<Sequence>>& batch,
@@ -1279,7 +1414,22 @@ Scheduler::_plan_ls_initial_placement(int                                       
         if (d <= 0 || d > static_cast<int>(ordered_pool.size())) {
             continue;
         }
-        std::vector<int>              ranks(ordered_pool.begin(), ordered_pool.begin() + d);
+        std::vector<int> ranks(ordered_pool.begin(), ordered_pool.begin() + d);
+        std::vector<int> future_rank_pool;
+        if (ls_decode_enable_memory_scale_up_) {
+            future_rank_pool = ordered_pool;
+        }
+        else {
+            future_rank_pool = base_allocation;
+            for (int rank : ranks) {
+                if (std::find(future_rank_pool.begin(), future_rank_pool.end(), rank) == future_rank_pool.end()) {
+                    future_rank_pool.push_back(rank);
+                }
+            }
+        }
+        if (!_ls_future_kv_fits(dp_idx, batch, existing_sequences, future_rank_pool)) {
+            continue;
+        }
         std::vector<std::vector<int>> placements(batch.size(), std::vector<int>(attention_sp_, 0));
         std::vector<int>              needed_blocks(attention_sp_, 0);
         for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
@@ -1385,6 +1535,15 @@ bool Scheduler::_ls_batch_fits_empty_system(const std::vector<std::shared_ptr<Se
     int last_d  = ls_decode_initial_kv_dop_ == 0 ? attention_sp_ : ls_decode_initial_kv_dop_;
     for (int d = first_d; d <= last_d; ++d) {
         if (d <= 0 || d > attention_sp_) {
+            continue;
+        }
+        std::vector<int> future_rank_pool;
+        int              future_dop = ls_decode_enable_memory_scale_up_ ? attention_sp_ : d;
+        future_rank_pool.reserve(future_dop);
+        for (int rank = 0; rank < future_dop; ++rank) {
+            future_rank_pool.push_back(rank);
+        }
+        if (!_ls_future_kv_fits_empty_system(batch, future_rank_pool)) {
             continue;
         }
         std::vector<std::vector<int>> placements(batch.size(), std::vector<int>(attention_sp_, 0));

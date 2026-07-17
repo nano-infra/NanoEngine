@@ -57,12 +57,14 @@ def test_ls_decode_core_supported_configuration(tmp_path):
         ls_decode_initial_kv_dop=8,
         ls_decode_batch_per_master=128,
         ls_decode_enable_memory_scale_up=False,
+        ls_decode_enable_future_kv_admission=False,
     )
 
     assert config.enable_ls_decode_core_scheduler is True
     assert config.ls_decode_initial_kv_dop == 8
     assert config.ls_decode_batch_per_master == 128
     assert config.ls_decode_enable_memory_scale_up is False
+    assert config.ls_decode_enable_future_kv_admission is False
 
 
 def test_kv_consolidation_p2p_scratch_is_opt_in(tmp_path):
@@ -251,3 +253,4 @@ def test_ls_decode_feature_flag_defaults_off(tmp_path):
     assert config.ls_decode_initial_kv_dop == 0
     assert config.ls_decode_batch_per_master == 64
     assert config.ls_decode_enable_memory_scale_up is True
+    assert config.ls_decode_enable_future_kv_admission is True

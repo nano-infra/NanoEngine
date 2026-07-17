@@ -137,6 +137,9 @@ class Config:
     ls_decode_initial_kv_dop: int = 0
     ls_decode_batch_per_master: int = 64
     ls_decode_enable_memory_scale_up: bool = True
+    # LoongServe-style admission guard. Estimate the aggregate future KV
+    # high-water mark from each request's current progress and max_tokens.
+    ls_decode_enable_future_kv_admission: bool = True
     # Automatic KV consolidation is opt-in. Shadow mode evaluates the
     # utilization/stability gates without reserving blocks or moving KV.
     ls_kv_consolidation_mode: Literal["off", "shadow", "execute"] = "off"
