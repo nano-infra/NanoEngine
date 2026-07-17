@@ -4,17 +4,18 @@
 
 ## 最新进展
 
-当前最新报告是 2026-07-17 的 [Original NanoDeploy loop1 CUDA_LAUNCH_BLOCKING 两机诊断](2026-07-17/nanodeploy_original_loop1_cuda_launch_blocking_diagnosis_20260717.md)。在显式把 `CUDA_LAUNCH_BLOCKING=1` 传播到全部 16 个 Ray ModelRunner 后，运行在 154 秒 / 2,157 请求时由 head global rank 6 同步失败于 `torch.cuda.CUDAGraph.replay()`，将 illegal memory 的故障范围从异步 `.tolist()` / NCCL watchdog 收敛到了 full CUDA Graph 内部。
+当前最新报告是 2026-07-17 的 [Original NanoDeploy loop1 enforce eager 两机 A/B](2026-07-17/nanodeploy_original_loop1_enforce_eager_cuda_launch_blocking_20260717.md)。在相同 worker-level `CUDA_LAUNCH_BLOCKING=1` 配置上启用 `--enforce-eager` 后，运行稳定推进到用户手动中止的 616 秒 / 5,224 请求，期间 KV 一度达到 100% 并发生正常 preemption，但未出现 CUDA illegal。对照 full graph 在 154 秒 / 2,157 请求同步失败于 `graph.replay()`，结果高置信指向 CUDA Graph 路径。
 
 ## 2026-07-17
 
 以下按进展时间从新到旧排列：
 
-1. [Original NanoDeploy loop1 CUDA_LAUNCH_BLOCKING 两机诊断](2026-07-17/nanodeploy_original_loop1_cuda_launch_blocking_diagnosis_20260717.md)
-2. [Original NanoDeploy loop_count=1 两机复跑失败与三组局部对照](2026-07-17/nanodeploy_original_loop1_2node_failure_and_partial_comparison_20260717.md)
-3. [Original NanoDeploy 同配置复跑与 LS future-KV 性能对比](2026-07-17/nanodeploy_original_rerun_vs_ls_futurekv_2node_r20_20260717.md)
-4. [LS Decode future-KV 两机 rate=20 六分钟验收](2026-07-17/ls_decode_future_kv_2node_r20_141gb_result_20260717.md)
-5. [LS Decode future-KV admission implementation](2026-07-17/ls_decode_future_kv_admission_implementation.md)
+1. [Original NanoDeploy loop1 enforce eager 两机 A/B](2026-07-17/nanodeploy_original_loop1_enforce_eager_cuda_launch_blocking_20260717.md)
+2. [Original NanoDeploy loop1 CUDA_LAUNCH_BLOCKING 两机诊断](2026-07-17/nanodeploy_original_loop1_cuda_launch_blocking_diagnosis_20260717.md)
+3. [Original NanoDeploy loop_count=1 两机复跑失败与三组局部对照](2026-07-17/nanodeploy_original_loop1_2node_failure_and_partial_comparison_20260717.md)
+4. [Original NanoDeploy 同配置复跑与 LS future-KV 性能对比](2026-07-17/nanodeploy_original_rerun_vs_ls_futurekv_2node_r20_20260717.md)
+5. [LS Decode future-KV 两机 rate=20 六分钟验收](2026-07-17/ls_decode_future_kv_2node_r20_141gb_result_20260717.md)
+6. [LS Decode future-KV admission implementation](2026-07-17/ls_decode_future_kv_admission_implementation.md)
 
 同目录保留 Original loop1 失败运行、CUDA_LAUNCH_BLOCKING 诊断的原始日志、结构化失败摘要，以及已完成两机运行的 7,200 条 JSONL 指标。
 
