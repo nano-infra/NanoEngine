@@ -146,11 +146,14 @@ def test_forced_initial_dop_uses_batch_uniform_prompt_placement():
 
     assert result.ls_initial_kv_dops == [3]
     assert result.ls_initial_kv_ranks == [[0, 1, 2]]
+    assert result.ls_initial_sequence_ids == [
+        [seqs[2].seq_id, seqs[1].seq_id, seqs[0].seq_id]
+    ]
     assert result.ls_initial_prompt_kv_tokens == [
         [
-            [3, 3, 2, 0],
-            [3, 3, 3, 0],
             [4, 3, 3, 0],
+            [3, 3, 3, 0],
+            [3, 3, 2, 0],
         ]
     ]
     assert result.ls_initial_provisional_pending_targets == [[0, 0, 0]]
@@ -417,6 +420,66 @@ def test_receiver_limit_shrinks_only_the_unsealed_candidate():
     assert second.ls_initial_sequence_ids == [[seqs[2].seq_id, seqs[3].seq_id]]
     assert second.ls_initial_batch_ids == second.ls_sealed_batch_ids
     assert second.ls_initial_batch_ids != admission.ls_initial_batch_ids
+
+
+def test_seal_sorts_only_fifo_window_before_balanced_contiguous_split():
+    scheduler = _make_scheduler(
+        attention_dp=2,
+        attention_sp=1,
+        max_num_seqs=2,
+        num_blocks=64,
+        initial_dop=1,
+        future_kv_admission=False,
+    )
+    prompt_lengths = [2, 6, 4, 6, 100, 3]
+    seqs = [
+        Sequence(list(range(length)), 1.0, 16, True)
+        for length in prompt_lengths
+    ]
+    for seq in seqs:
+        scheduler.add(seq)
+
+    result = scheduler.schedule()
+
+    # Only the first DP * max_num_seqs arrivals are eligible. Within that FIFO
+    # window, prompt lengths are stably sorted before the existing 2/2 split.
+    expected = [
+        [seqs[1].seq_id, seqs[3].seq_id],
+        [seqs[2].seq_id, seqs[0].seq_id],
+    ]
+    assert result.ls_sealed_batch_sequence_ids == expected
+    assert result.ls_initial_sequence_ids == expected
+    assert [seq.seq_id for seq in scheduler.waiting_migration] == [
+        seqs[4].seq_id,
+        seqs[5].seq_id,
+    ]
+
+
+def test_sorted_seal_shrink_removes_members_and_preserves_fifo_remainder():
+    scheduler = _make_scheduler(
+        initial_dop=1,
+        threshold=1,
+        max_num_recv_seqs=1,
+    )
+    prompt_lengths = [4, 8, 6, 2]
+    seqs = [
+        Sequence(list(range(length)), 1.0, 32, True)
+        for length in prompt_lengths
+    ]
+    for seq in seqs:
+        scheduler.add(seq)
+
+    result = scheduler.schedule()
+
+    # The receiver limit shrinks the sorted [8, 6, 4, 2] candidate to [8, 6].
+    # Removing those actual members must not pop the original FIFO prefix [4, 8].
+    expected = [[seqs[1].seq_id, seqs[2].seq_id]]
+    assert result.ls_sealed_batch_sequence_ids == expected
+    assert result.ls_initial_sequence_ids == expected
+    assert [seq.seq_id for seq in scheduler.waiting_migration] == [
+        seqs[0].seq_id,
+        seqs[3].seq_id,
+    ]
 
 
 def test_seal_balances_fifo_batches_and_keeps_no_fit_membership_stable():

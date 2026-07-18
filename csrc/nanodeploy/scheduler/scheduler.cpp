@@ -1714,11 +1714,27 @@ void Scheduler::_seal_ls_decode_arrivals()
     const size_t base        = n / num_batches;
     const size_t remainder   = n % num_batches;
 
-    for (size_t batch_idx = 0; batch_idx < num_batches && !waiting_migration.empty(); ++batch_idx) {
-        size_t candidate_size = std::min(base + (batch_idx < remainder ? 1U : 0U), waiting_migration.size());
+    // LoongServe first determines which waiting requests are eligible, then
+    // orders that selected set by descending prefill length before partitioning
+    // it into contiguous batches. Dummy Prefill has no latency profiler, so keep
+    // NanoDeploy's existing balanced-cardinality partition while matching that
+    // ordering shape inside a bounded FIFO window.
+    std::vector<std::shared_ptr<Sequence>> ordered_window(waiting_migration.begin(), waiting_migration.begin() + n);
+    if (std::any_of(ordered_window.begin(), ordered_window.end(), [](const auto& seq) { return !seq; })) {
+        throw std::runtime_error("LS Decode seal found a null sequence in the FIFO window");
+    }
+    std::stable_sort(ordered_window.begin(), ordered_window.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs->num_prompt_tokens > rhs->num_prompt_tokens;
+    });
+
+    size_t ordered_offset = 0;
+    for (size_t batch_idx = 0; batch_idx < num_batches && ordered_offset < ordered_window.size(); ++batch_idx) {
+        size_t candidate_size =
+            std::min(base + (batch_idx < remainder ? 1U : 0U), ordered_window.size() - ordered_offset);
         std::vector<std::shared_ptr<Sequence>> candidate;
         while (candidate_size > 0) {
-            candidate.assign(waiting_migration.begin(), waiting_migration.begin() + candidate_size);
+            candidate.assign(ordered_window.begin() + ordered_offset,
+                             ordered_window.begin() + ordered_offset + candidate_size);
             if (_ls_batch_fits_empty_system(candidate)) {
                 break;
             }
@@ -1777,9 +1793,17 @@ void Scheduler::_seal_ls_decode_arrivals()
             }
             throw;
         }
-        for (size_t idx = 0; idx < candidate_size; ++idx) {
-            waiting_migration.pop_front();
+        // Sorting changes batch membership relative to the queue prefix. Remove
+        // the actual sealed members, rather than blindly popping candidate_size
+        // requests, and leave every unsealed request in its original FIFO order.
+        for (const auto& seq : candidate) {
+            auto waiting_it = std::find(waiting_migration.begin(), waiting_migration.end(), seq);
+            if (waiting_it == waiting_migration.end()) {
+                throw std::runtime_error("LS Decode sealed sequence disappeared from the waiting queue");
+            }
+            waiting_migration.erase(waiting_it);
         }
+        ordered_offset += candidate_size;
         next_ls_batch_id_++;
         next_ls_enqueue_order_++;
     }
