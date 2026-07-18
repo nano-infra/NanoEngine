@@ -22,22 +22,24 @@ LoongServe-style Decode-only scheduler on NanoDeploy
 
 它对齐 LoongServe 中与当前实验直接相关的设计：
 
-1. waiting queue 的 FIFO 顺序和有限越序；
-2. request-level current/future KV admission；
-3. 选中后按 prompt length 降序；
-4. 连续 request range 形成 batch；
-5. instance 按已用 token 排序；
-6. capacity-aware initial DoP 和 KV placement；
-7. 运行中 Decode 的 memory-deficit merge；
-8. 运行中 Decode 的 compute-bound scale-up；
-9. pause/readmission 保留生成进度。
+1. request round-robin 分配到独立 DP pool；
+2. 每个 pool 内 waiting queue 的 FIFO 顺序和有限越序；
+3. request-level current/future KV admission；
+4. 选中后按 prompt length 降序；
+5. 连续 request range 形成 batch；
+6. instance 按已用 token 排序；
+7. capacity-aware initial DoP 和 KV placement；
+8. 运行中 Decode 的 memory-deficit merge；
+9. 运行中 Decode 的 compute-bound scale-up；
+10. pause/readmission 保留生成进度。
 
 第一版不迁移 LoongServe 原二维 DP 的 cost 部分。当前环境没有与原目标函数对应的运行时 cost，强行加载一组无关参数反而会让 baseline 难以解释。第一版采用：
 
 ```text
-FIFO 有限越序选择
+request round-robin 固定到 DP pool
+        -> pool-local FIFO 有限越序选择
         -> prompt length 稳定降序
-        -> 连续等数量初始切分
+        -> 每 pool 一个连续候选 batch
         -> exact capacity 检查并缩短
         -> 现有 placement/admission transaction
         -> source-shaped Decode merge/scale-up
@@ -52,7 +54,7 @@ FIFO 有限越序选择
 Fresh request 的稳定状态只有：
 
 ```text
-WAITING_REQUEST
+WAITING_REQUEST(assigned_dp)
     -> RUNNING_DECODE_REQUEST
     -> FINISHED
 ```
@@ -69,8 +71,9 @@ AdmissionTransaction
 
 - `DispatchCandidate` 没有 batch ID；
 - `DecodeBatchPlan` 没有持久 ownership；
+- request 进入 waiting 前已经取得不可变的 `assigned_dp`；
 - 只有 admission transaction commit 后才创建 batch/group ownership；
-- planning 或 allocation 失败时，request 仍留在 waiting queue。
+- planning 或 allocation 失败时，request 仍留在所属 pool 的 waiting queue。
 
 ### 1.2 对齐范围
 
@@ -118,13 +121,14 @@ LoongServe source-identical
 
 | 环节 | Nano 当前实现 | Decode-only baseline 目标 | 处理方式 |
 |---|---|---|---|
+| DP assignment | admission 时按当前负载选择可行 DP | request 到达时 round-robin 固定 DP | 修改 |
 | Admission opportunity | 每次 `schedule()` 都先尝试 admission，成功则不 Decode | 每个 scheduler step 都可 scan，但成功 admission 不抑制已有请求 Decode | 修改返回结果 |
-| Queue scan | 固定截取 queue prefix | FIFO scan + bounded OOE + current/future KV | 修改 |
+| Queue scan | 一个全局 queue，固定截取 prefix | 每个 pool 独立 FIFO + bounded OOE + current/future KV | 修改 |
 | Fresh batch identity | current-fit 前创建长期 `PendingDecodeBatch` | exact plan 成功前保持 request-level waiting | 修改 |
 | Request ordering | 选中窗口内已按长度降序 | 保留 | 已完成 |
-| Batch partition | 按请求数均分，no-fit 时缩短 | 第一版保留连续均分形状，但在 ephemeral plan 内完成 | 移动时机 |
-| Batch count/DoP | batch 数绑定 `attention_dp`，DoP 取第一个可行值 | 第一版作为明确近似；二维 DP 单列扩展 | 记录偏差 |
-| Future-KV | candidate + 单个 target group | DP-domain 全局 running + tentative envelope | 修改 |
+| Batch partition | 全局窗口按 `attention_dp` 均分，no-fit 时缩短 | 每个 pool 每轮一个 ephemeral continuous batch | 修改 |
+| Batch count/DoP | batch 数绑定 `attention_dp`，DoP 取第一个可行值 | 每 pool 每轮最多一个 batch；DoP 取本 pool 第一个可行值 | 明确近似 |
+| Future-KV | candidate + 单个 target group | 所属 SP8 pool 全部 running + tentative envelope | 修改 |
 | Prompt KV placement | request 在 ranks 上均匀 striping | 最终目标为 packed intervals | 分阶段修改 |
 | Admission/Decode | admission 成功会让已有请求少跑一次 Decode | bootstrap 不应吞掉已有请求的 Decode iteration | 修改 |
 | Scale-down | Nano utilization/stability/cooldown consolidation | base path 关闭 | 修改配置/入口 |
@@ -177,15 +181,39 @@ FIFO:   [276, 199, 923230, 229, 197, 213, 227]
 
 ## 4. Request dispatch
 
-### 4.1 每个 scheduler step 都允许 admission
+### 4.1 Arrival 时固定所属 pool
+
+Fresh request 到达 scheduler 时立即 round-robin 分配：
+
+```text
+assigned_dp = next_dp_rr
+next_dp_rr = (next_dp_rr + 1) % attention_dp
+waiting_by_dp[assigned_dp].push_back(request)
+```
+
+以 `4DP×8SP` 为例，请求分配顺序为：
+
+```text
+R0 -> DP0
+R1 -> DP1
+R2 -> DP2
+R3 -> DP3
+R4 -> DP0
+...
+```
+
+assignment 完成后，request 不因其他 pool 更空闲而重新路由。pause/readmission 也回到原 `assigned_dp`。这对应 LoongServe artifact 使用外部 round-robin proxy 将请求固定到独立 worker，而不是 Nano 自定义的 admission-time load balancing。
+
+### 4.2 每个 scheduler step 都允许 admission
 
 Decode-only baseline 不使用固定 step 间隔限制 waiting scan。
 
 规则是：
 
 ```text
-if waiting 非空:
-    本 scheduler step 执行 request-level admission scan
+for dp in [0, attention_dp):
+    if waiting_by_dp[dp] 非空:
+        本 scheduler step 执行该 pool 的 request-level admission scan
 
 if admission 成功且已有 running requests:
     commit 新 requests
@@ -200,16 +228,16 @@ dummy bootstrap 只有 scheduler/KV 状态更新，没有需要用固定间隔�
 
 第一版直接每 step scan，先保证语义简单。若 telemetry 证明 scan 开销仍高，可以增加 correctness-preserving event cache：只有 new arrival，或者 request finish、pause/readmission、rank ownership 等可能让可行性改善的资源事件发生时，才重新执行 expensive exact planning。该优化不能延迟一个本来已经可 admission 的 request。
 
-### 4.2 FIFO scan 和 bounded OOE
+### 4.3 Pool-local FIFO scan 和 bounded OOE
 
 第一版扫描：
 
 ```text
-for request in waiting FIFO order:
+for request in waiting_by_dp[dp] FIFO order:
     检查 running request 数量
     检查本轮 admission token 上限
     检查 current KV capacity
-    检查 domain-level future-KV
+    检查 pool-wide future-KV
 
     if feasible:
         selected.push(request)
@@ -228,7 +256,7 @@ num_ooe
 max_num_ooe
 ```
 
-`num_ooe` 表示连续多少个 admission round 真正让后项越过了前项，不是单轮跳过 request 的数量。
+每个 pool 独立维护 `num_ooe[dp]`。它表示该 pool 连续多少个 admission round 真正让后项越过了前项，不是单轮跳过 request 的数量。
 
 规则：
 
@@ -238,9 +266,9 @@ max_num_ooe
 4. no-fit 且没有 request 被接纳时，不伪造 reset；
 5. aborted request 从 queue 安全移除，不计 OOE。
 
-LoongServe API 默认 `max_num_ooe=10`，artifact 会按 dataset 使用其他值。Nano 正式 workload 必须在 manifest 记录 resolved value。
+LoongServe API 默认 `max_num_ooe=10`，artifact 会按 dataset 使用其他值。Nano 正式 workload 必须在 manifest 记录每个 pool 共用的 resolved limit，以及各 pool 的实时 counter。
 
-### 4.3 第一版不保留 cost-driven undecided list
+### 4.4 第一版不保留 cost-driven undecided list
 
 LoongServe queue scan 中还有一段由运行时间比较控制的 undecided-prefix 逻辑。当前实验不使用对应 cost，第一版不照搬该分支，也不伪造替代参数。
 
@@ -253,19 +281,20 @@ capacity infeasible -> bounded defer 或停止
 
 这是一项 intentional adaptation，必须出现在 baseline manifest 和论文方法说明中。
 
-### 4.4 Candidate window 上限
+### 4.5 Pool-local candidate window 上限
 
 仍保留有限 planning window，避免单次 scheduler 扫描无界增长：
 
 ```text
-max_selected_requests = attention_dp * max_num_seqs
-max_selected_tokens   = ls_admission_max_tokens
+max_selected_requests_per_pool = max_num_seqs
+max_selected_tokens_per_pool   = ls_admission_max_tokens_per_pool
 ```
 
 建议：
 
 ```text
-ls_admission_max_tokens = max(max_req_total_len, total_domain_kv_tokens / 6)
+ls_admission_max_tokens_per_pool =
+    max(max_req_total_len, total_pool_kv_tokens / 6)
 ```
 
 window 只限制本轮候选，不创建长期 batch membership。
@@ -299,20 +328,33 @@ PAUSED_KVKEEP:      held = prompt + generated
 peak = max_i(prefix_held(i) + i * remaining_i)
 ```
 
-### 5.2 检查域必须是 DP-domain 全局
+### 5.2 检查域是所属 SP8 pool 全局
 
-每个 DP domain 的 envelope 包含：
+每个 Nano DP domain 映射成一个固定 SP8 elastic pool。该 pool 的 envelope 包含：
 
 ```text
-该 domain 全部 running requests
-+ paused-and-KVKEEP requests
-+ 本轮已 tentative 分配到该 domain 的 requests
+该 pool 全部 running requests
++ 该 pool 的 paused-and-KVKEEP requests
++ 本轮该 pool 已 selected/tentative requests
 + 当前检查的 request
 ```
 
-容量为该 domain 全部可用于该 workload 的 KV token slots，扣除固定占用和不可迁移 reservation。
+容量为该 pool 的 8 个 SP ranks 可用于该 workload 的 KV token slots，扣除固定占用和不可迁移 reservation。
+
+以 `4DP×8SP` 为例，独立计算四份 envelope：
+
+```text
+DP0 pool = {DP0-SP0 ... DP0-SP7}
+DP1 pool = {DP1-SP0 ... DP1-SP7}
+DP2 pool = {DP2-SP0 ... DP2-SP7}
+DP3 pool = {DP3-SP0 ... DP3-SP7}
+```
+
+DP0 request 只进入 DP0 envelope。即使 DP1 有大量空闲 KV，DP0 request 也不会在 admission 或 scale-up 时使用 DP1 capacity。
 
 当前 `candidate + one target group` 的局部检查会让多个 group 重复承诺同一批未来 rank capacity，必须替换。
+
+这里的“pool 全局”是指同一 SP8 pool 内所有 groups 联合计算，不是把 4 个 DP pool 合成一个 SP32 pool。
 
 ### 5.3 Nano exact safety gate
 
@@ -341,26 +383,25 @@ or reject and replan
 必须先决定 selected membership，再排序：
 
 ```text
-waiting FIFO scan
+pool-local waiting FIFO scan
     -> selected request IDs
     -> stable sort by num_prompt_tokens descending
 ```
 
-不能先对整个 waiting queue 排序，否则会破坏全局公平性。
+不能先对某个 pool 的整个 waiting queue 排序，否则会破坏该 pool 的 FIFO 公平性。跨 pool 的服务顺序由 arrival-time round-robin assignment 隔离，不再做全局重排。
 
 等长 requests 保持原 FIFO 次序。
 
 ### 6.2 第一版切分算法
 
-第一版保留最小改动的连续切分：
+第一版每个 pool 在一次 admission round 最多生成一个 ephemeral batch：
 
 ```text
-n = selected.size
-num_batches = min(attention_dp, n)
-target sizes = quotient/remainder balanced split
+n = selected_by_dp[dp].size
+candidate = sorted_selected_by_dp[dp][0:n]
 ```
 
-对排序后的每个连续 target range：
+对该连续 range：
 
 1. 调用 `_ls_batch_fits_empty_system(candidate)`；
 2. no-fit 时从 range 尾部逐个缩短；
@@ -371,7 +412,9 @@ target sizes = quotient/remainder balanced split
 
 这里“缩短 range”只发生在本次 ephemeral plan 中，不能生成一个长期等待的缩小 batch。
 
-### 6.3 为什么第一版仍使用等数量切分
+四个 pools 可以在同一 scheduler step 各提交一个 batch，因此 `4DP×8SP` 每轮最多提交四个相互独立的 admission batches。batch 不跨 pool，成员也不会在 pools 之间重新平衡。
+
+### 6.3 为什么第一版每 pool 只生成一个 batch
 
 原因是当前没有可解释的 LoongServe batching cost。下面几种做法都不是源码逻辑：
 
@@ -381,9 +424,9 @@ target sizes = quotient/remainder balanced split
 - age boost；
 - 人工最小化方差。
 
-在没有 cost 的情况下，保留现有 deterministic partition 比引入新的 length heuristic 更适合作为 baseline。
+在没有 cost 的情况下，每 pool 一个 deterministic continuous range 比引入新的 length heuristic 更适合作为 baseline。它也对应当前 `attention_dp` 个 batch 最终分别落到 `attention_dp` 个 domains 的执行形状，只是把 domain assignment 前移到了 request arrival。
 
-它的局限也要明确：长度排序加等数量切分不能保证超长 request 一定单独成 batch。因此第一版名称只能是 LoongServe-style Decode-only。
+它的局限也要明确：一个 pool 的超长 request 仍可能与该 pool 的短 request 处于同一 batch。因此第一版名称只能是 LoongServe-style Decode-only。
 
 ### 6.4 二维 DP 的处理
 
@@ -467,31 +510,38 @@ initial_dop_policy = min_exact_feasible
 
 packed placement 会减少短 request 的 KV owner 数、receiver 数和 block rounding，是 Decode 路径中值得保留的 LoongServe 设计。
 
-### 7.4 DP-domain topology adaptation
+### 7.4 `4DP×8SP` 映射为四个独立 elastic pools
 
-LoongServe 是一个统一 elastic instance pool；Nano 当前是：
+LoongServe 的一个 RouterManager 管理一个固定 `sp_world_size` pool；batch scale-up 扩大的是 `occupied_instances`，不会扩大该 pool 的 `sp_world_size`。LoongServe artifact 使用 DP 时，会启动多个独立 API workers，由外部 proxy round-robin 分流。
+
+Nano 当前拓扑为：
 
 ```text
 Attention DP{1,2,4} x SP8
 ```
 
-group 不能跨 DP domain 合并。建议：
+baseline 固定映射：
 
-1. 只有一个全局 FIFO waiting queue；
-2. dispatcher 为 candidate 计算 feasible domains；
-3. 按以下 stable score 选择 domain：
+```text
+Nano DP0 -> Loong worker/pool 0 -> SP0...SP7
+Nano DP1 -> Loong worker/pool 1 -> SP0...SP7
+Nano DP2 -> Loong worker/pool 2 -> SP0...SP7
+Nano DP3 -> Loong worker/pool 3 -> SP0...SP7
+```
 
-   ```text
-   projected_future_kv_utilization
-   -> current_used_kv_tokens
-   -> running_request_count
-   -> dp_idx
-   ```
+规则：
 
-4. 每个 domain 内独立执行 batching、placement 和 Decode elasticity；
-5. OOE counter 仍由全局 queue 维护。
+1. request arrival 时 round-robin 固定 `assigned_dp`；
+2. 每个 pool 有独立 waiting queue、OOE counter 和 future-KV envelope；
+3. 每个 pool 独立执行 batching、placement、merge 和 scale-up；
+4. group 可以在本 pool 内从 DoP=1 扩到 DoP=8；
+5. group 不能跨 DP merge，不能扩到 DoP=9...32；
+6. pause/readmission 回原 pool；
+7. baseline 禁止 admission-time load-aware rerouting 和跨 pool work stealing。
 
-这是必要 topology adapter，不能宣传成 LoongServe 原统一实例池。
+这意味着某个 pool 可能因长 request 阻塞，而另一个 pool 同时存在 idle ranks。基础组保留这一结果；若增加跨 pool rerouting，必须命名为单独的 Nano load-balancing enhancement。
+
+如果未来要复现一个统一 32-instance pool，应使用 `DP1×SP32`，或者修改 Nano collective、KV ownership 和 group merge 以支持跨现有 DP domains。该工作不属于当前 baseline。
 
 ## 8. Admission transaction
 
@@ -500,7 +550,7 @@ group 不能跨 DP domain 合并。建议：
 batch/group ID 只在以下条件全部满足后创建：
 
 1. ephemeral continuous range 已确定；
-2. domain 和 initial ranks 已确定；
+2. 已在 `assigned_dp` pool 内确定 initial ranks；
 3. exact placement validation 成功；
 4. physical allocation 成功；
 5. scheduler 准备发布 ownership。
@@ -645,7 +695,7 @@ PAUSED_OFFLOAD:
     readmission tokens = prompt + generated
 ```
 
-paused request 回到全局 request-level waiting queue，接受同一套 FIFO/OOE/future-KV scan。
+paused request 回到原 `assigned_dp` 的 request-level waiting queue，接受该 pool 的 FIFO/OOE/future-KV scan。
 
 不再创建优先级高于普通 request 的长期 singleton recovery batch。
 
@@ -656,18 +706,22 @@ paused request 回到全局 request-level waiting queue，接受同一套 FIFO/O
 ```text
 ls_max_num_ooe = 10
 ls_running_max_req_size = 1000
-ls_admission_max_tokens = auto
+ls_admission_max_tokens_per_pool = auto
 ls_min_comp_bound_decoding_batch_size = 128
 ls_disable_scale_up = false
 ls_decode_enable_future_kv_admission = true
 ls_decode_initial_kv_dop = 0
 ls_nano_background_consolidation = false
+ls_dp_assignment_policy = round_robin
+ls_cross_dp_scale_up = false
 ```
 
 其中：
 
 - `ls_decode_initial_kv_dop=0` 表示最小 exact feasible；正式 baseline 禁止强制值；
 - `ls_nano_background_consolidation=false` 只关闭 Nano 自定义后台策略；
+- `ls_dp_assignment_policy=round_robin` 在 request arrival 时固定 pool；
+- `ls_cross_dp_scale_up=false` 是当前执行拓扑硬约束，正式 baseline 禁止覆盖；
 - source-shaped memory/compute elasticity 不受旧 consolidation mode 控制；
 - 所有 resolved values 写入运行 manifest。
 
@@ -686,13 +740,14 @@ ls_nano_background_consolidation = false
 ### 12.1 `scheduler.h/.cpp`
 
 - 删除 fresh request 的 persistent seal/pending ownership；
-- 每个 scheduler step 执行 request-level admission scan，并维护 OOE counter；
+- arrival-time round-robin assignment 和 `waiting_by_dp`；
+- 每个 scheduler step 扫描各 pool，并维护 pool-local OOE counters；
 - request-level current/future scan；
 - selected 后 stable length sort；
 - ephemeral continuous partition；
 - current no-fit 时保持 waiting；
 - commit 时才创建 batch/group ID；
-- DP-domain global future envelope；
+- SP8 pool-wide future envelope；
 - admission result 可携带已有 running Decode plan；
 - Decode memory/compute scale-up 收敛到 source-shaped 规则；
 - pause 保留 generated progress。
@@ -737,7 +792,7 @@ ls_nano_background_consolidation = false
 
 - 固定 LoongServe commit；
 - 固定 Nano code snapshot；
-- waiting/running/capacity synthetic snapshots；
+- per-pool waiting/running/capacity synthetic snapshots；
 - Issue 1% 六个长短混合窗口；
 - resolved config manifest schema。
 
@@ -746,19 +801,20 @@ ls_nano_background_consolidation = false
 改动：
 
 - 删除 fresh persistent pending batch；
-- FIFO/OOE scan；
+- arrival-time round-robin assignment；
+- pool-local FIFO/OOE scan；
 - stable length sort；
-- ephemeral balanced continuous ranges；
+- 每 pool 每轮一个 ephemeral continuous range；
 - empty-system 检查和 current-system exact commit；
 - rollback 后恢复 waiting order。
 
 该阶段不改 placement 表示和 Decode planner。
 
-### Phase 2：Global future-KV 和 admission continuity
+### Phase 2：Pool-wide future-KV 和 admission continuity
 
 改动：
 
-- DP-domain global future envelope；
+- 每个 SP8 pool 独立的 future envelope；
 - 消除跨 group future capacity 重复承诺；
 - admission 不吞掉已有 Decode iteration；
 - 完整 telemetry。
@@ -795,25 +851,35 @@ ls_nano_background_consolidation = false
 
 ## 14. 不变量
 
-1. selected membership 由 FIFO/OOE 决定，长度排序不能改变本轮服务资格。
-2. request 只有 admission commit 成功后才能从 waiting 移除。
-3. planning no-fit 不创建 batch/group ID。
-4. 同一 request 只能处于 waiting、planned、running、paused、finished 之一。
-5. OOE 只能由 source-shaped counter 允许，不能由 pending bypass 隐式产生。
-6. future envelope 包含 domain 全部 running 和 tentative requests。
-7. Nano exact gate 只能 reject/replan，不能静默改 DoP。
-8. physical allocation 失败必须完整 rollback。
-9. admission side effect 不减少已有 requests 的 Decode iteration 数。
-10. memory merge 只由 capacity deficit 触发。
-11. compute scale-up 只消费 idle ranks。
-12. pause/readmission 保留 generated tokens 和采样进度。
-13. baseline 不执行 gap、age、utilization 或 arbitrary merge heuristic。
-14. 非 LS scheduler 行为不变。
+1. request arrival 时 round-robin 固定 `assigned_dp`，之后不做 load-aware rerouting。
+2. 每个 pool 的 selected membership 由本地 FIFO/OOE 决定，长度排序不能改变本轮服务资格。
+3. request 只有 admission commit 成功后才能从所属 waiting queue 移除。
+4. planning no-fit 不创建 batch/group ID。
+5. 同一 request 只能处于 waiting、planned、running、paused、finished 之一。
+6. OOE 只能由所属 pool 的 counter 允许，不能由 pending bypass 隐式产生。
+7. future envelope 包含所属 pool 全部 running 和 tentative requests。
+8. group DoP 不得超过 8，不能跨 DP pool merge/scale-up。
+9. Nano exact gate 只能 reject/replan，不能静默改 DoP。
+10. physical allocation 失败必须完整 rollback。
+11. admission side effect 不减少已有 requests 的 Decode iteration 数。
+12. memory merge 只由 capacity deficit 触发。
+13. compute scale-up 只消费所属 pool 的 idle ranks。
+14. pause/readmission 保留 generated tokens、采样进度和 `assigned_dp`。
+15. baseline 不执行 gap、age、utilization 或 arbitrary merge heuristic。
+16. 非 LS scheduler 行为不变。
 
 ## 15. Telemetry
 
+### `ls_decode_dp_assignment`
+
+- request ID；
+- arrival order；
+- assigned DP/pool；
+- round-robin counter before/after。
+
 ### `ls_decode_dispatch_scan`
 
+- DP/pool ID；
 - FIFO snapshot IDs；
 - scanned/selected/deferred/frontier IDs；
 - per-request reject reason；
@@ -833,7 +899,7 @@ ls_nano_background_consolidation = false
 
 ### `ls_decode_future_kv`
 
-- domain ID；
+- DP/pool ID；
 - running/tentative request IDs；
 - peak tokens；
 - token capacity；
@@ -856,24 +922,28 @@ ls_nano_background_consolidation = false
 
 ### 16.1 CPU tests
 
-1. FIFO selection：可运行请求保持 queue 顺序。
-2. Bounded OOE：blocker 最多被越过配置轮数。
-3. OOE reset：frontier 成功运行后 counter 清零。
-4. Every-step opportunity：new arrival 在下一个 scheduler step 即进入 scan，不存在固定 Decode-step 延迟。
-5. Membership-before-sort：排序不改变 selected IDs。
-6. Stable length order：等长 request 保持 FIFO。
-7. Continuous split：每个 batch 都是排序数组连续 range。
-8. Shrink-on-no-fit：只缩短 ephemeral range，剩余 request 返回 waiting。
-9. No persistent identity：current no-fit 后不存在 batch ID/ownership。
-10. Global future-KV：两个 group 单独可行、合计不可行时拒绝第二份承诺。
-11. Exact adapter：block/metadata reject 后 replan，不改 heuristic。
-12. Atomic rollback：任意注入点失败后 queue/blocks/ownership 完全恢复。
-13. Admission continuity：已有 requests 不因新 admission 少一次 Decode。
-14. Memory deficit merge：donor 顺序和新增 rank 数符合 source-shaped 规则。
-15. Compute scale-up：只使用 idle ranks，不 merge healthy group。
-16. Scale-up off：memory/compute 两条路径都不能绕过开关。
-17. Pause progress：readmission 后保留 prompt+generated。
-18. Feature-off：非 LS scheduler 不受影响。
+1. Round-robin assignment：连续 requests 映射为 DP0、DP1、DP2、DP3、DP0。
+2. Assignment stability：no-fit、pause/readmission 不改变 `assigned_dp`。
+3. Pool-local FIFO：可运行请求保持所属 queue 顺序。
+4. Pool-local OOE：一个 pool 的 blocker/counter 不影响其他 pool。
+5. OOE reset：本 pool frontier 成功运行后 counter 清零。
+6. Every-step opportunity：new arrival 在下一个 scheduler step 即进入所属 pool scan。
+7. Membership-before-sort：排序不改变 selected IDs。
+8. Stable length order：等长 request 保持本 pool FIFO。
+9. One batch per pool：一个 scheduler step 每 pool 最多提交一个 fresh batch。
+10. Continuous range：每个 batch 都是本 pool 排序数组的连续 range。
+11. Shrink-on-no-fit：只缩短 ephemeral range，剩余 request 返回所属 waiting。
+12. No persistent identity：current no-fit 后不存在 batch ID/ownership。
+13. Pool-wide future-KV：同 pool 两个 groups 单独可行、合计不可行时拒绝第二份承诺。
+14. Pool isolation：DP0 full 不会借用 DP1 capacity，group DoP 最大为 8。
+15. Exact adapter：block/metadata reject 后 replan，不改 heuristic。
+16. Atomic rollback：任意注入点失败后本 pool queue/blocks/ownership 完全恢复。
+17. Admission continuity：已有 requests 不因新 admission 少一次 Decode。
+18. Memory deficit merge：只选择本 pool donor，新增 rank 数符合 source-shaped 规则。
+19. Compute scale-up：只使用本 pool idle ranks，不 merge healthy group。
+20. Scale-up off：memory/compute 两条路径都不能绕过开关。
+21. Pause progress：readmission 后保留 prompt+generated 和 `assigned_dp`。
+22. Feature-off：非 LS scheduler 不受影响。
 
 ### 16.2 Issue 1% fixtures
 
@@ -888,13 +958,17 @@ ls_nano_background_consolidation = false
 [205, 130, 214, 198, 840341, 201]
 ```
 
+这些 length 列表必须与原始 `arrival_index/request_id` 一起保存。测试先按全局 arrival order 执行 round-robin assignment，再分别构造四个 pool-local FIFO snapshots；不能直接把整段 length window 当成单个 pool 的 queue。
+
 断言：
 
+- arrival order 按 DP0、DP1、DP2、DP3 round-robin 分配；
 - long current no-fit 时保持 request-level waiting；
-- short request 只有在 OOE 允许时越过；
+- short request 只有在所属 pool 的 OOE 允许时越过；
 - short request 不因历史 batch identity 陪等；
+- request 不因其他 pool 空闲而改变 `assigned_dp`；
 - 没有 request 丢失、重复或跨状态 ownership；
-- `num_ooe` 达到上限后 FIFO blocker 成为 frontier。
+- 某 pool 的 `num_ooe` 达到上限后，本 pool FIFO blocker 成为 frontier。
 
 ### 16.3 GPU 验收
 
@@ -913,6 +987,14 @@ ls_nano_background_consolidation = false
 - Nano background consolidation 关闭；
 - source-default 和 artifact-derived threshold 分组运行。
 
+32 GPU（正式使用 `4DP×8SP` 时）：
+
+- 验证四个独立 SP8 pools；
+- request assignment 严格 round-robin；
+- 每个 group 的 KV/master DoP 均不超过 8；
+- DP0 capacity pressure 不触发跨 DP migration/merge/scale-up；
+- 四个 pool 的 queue、OOE 和 future-KV telemetry 可独立核对。
+
 GPU 测试必须按仓库规定申请提权。
 
 ## 17. Baseline 完成标准
@@ -920,19 +1002,21 @@ GPU 测试必须按仓库规定申请提权。
 以下全部满足后，才能称为 LoongServe-style Decode-only baseline：
 
 1. 运行中不存在 fresh persistent pending batch。
-2. FIFO/bounded OOE/every-step admission 行为通过 CPU fixtures。
-3. request membership 在长度排序之前确定。
-4. batch 是排序数组的连续 ranges。
-5. no-fit 时 request 保持 waiting，没有 batch ownership。
-6. future-KV 使用 DP-domain global envelope。
-7. admission commit 保持 exact allocation/rollback。
-8. 已有 requests 不因 admission 丢失 Decode iteration。
-9. packed placement 阶段完成并通过 block/metadata correctness。
-10. memory-deficit merge 与 compute idle-rank scale-up通过 differential fixtures。
-11. Nano background consolidation 和 arbitrary merge 不在 base path。
-12. pause/readmission 保留生成进度。
-13. resolved config 和 intentional adaptations 写入 manifest。
-14. 8/16 GPU correctness 完成。
+2. request arrival 按 round-robin 固定 `assigned_dp`。
+3. 四个 pools 的 FIFO/OOE/every-step admission 状态相互独立。
+4. request membership 在本 pool 长度排序之前确定。
+5. 每 pool 每轮最多一个 batch，且是排序数组的连续 range。
+6. no-fit 时 request 保持在所属 waiting queue，没有 batch ownership。
+7. future-KV 使用所属 SP8 pool-wide envelope。
+8. group 只能在本 pool 内 scale-up，DoP 不超过 8。
+9. admission commit 保持 exact allocation/rollback。
+10. 已有 requests 不因 admission 丢失 Decode iteration。
+11. packed placement 阶段完成并通过 block/metadata correctness。
+12. memory-deficit merge 与 compute idle-rank scale-up通过 differential fixtures。
+13. Nano background consolidation 和 arbitrary merge 不在 base path。
+14. pause/readmission 保留生成进度和 `assigned_dp`。
+15. resolved config 和 intentional adaptations 写入 manifest。
+16. 对应实验规模的 8/16/32 GPU correctness 完成。
 
 性能改善不能替代调度一致性检查。正式实验必须同时保存 dispatch、batch、future-KV 和 Decode elasticity telemetry。
 
@@ -942,15 +1026,17 @@ GPU 测试必须按仓库规定申请提权。
 |---|---|---|
 | Baseline 名称 | LoongServe / LoongServe-style Decode-only | 后者 |
 | Persistent fresh batch | 保留 / 删除 | 删除 |
-| Batching v1 | 连续等数量 + capacity shrink / 新 length heuristic | 前者 |
+| Batching v1 | 每 pool 一个连续 batch + capacity shrink / 新 length heuristic | 前者 |
 | 二维 DP | 进入第一版 / Decode-cost 独立 variant | 独立 variant |
 | Placement | 第一阶段就改 packed / 第二阶段改 | 第二阶段，先隔离 queue 变化 |
 | Admission continuity | 保留 admission-only / 同 step 保持已有 Decode | 保持已有 Decode |
-| Future-KV | group-local / DP-domain global | DP-domain global |
+| Future-KV | group-local / SP8 pool-wide | SP8 pool-wide |
 | Decode threshold | 100 / 128 | Issue 1% 主实验建议 128，100 做 source-default sensitivity |
 | Custom consolidation | 进入 base / 关闭 | 关闭 |
 | Pause | restart / preserve progress | preserve progress |
-| DP topology | 声称统一 pool / 显式 domain adapter | 显式 adapter |
+| DP topology | 统一 SP32 / 4 个独立 SP8 pools | 已决定：4 个独立 pools |
+| DP assignment | admission-time load-aware / arrival-time round-robin | 建议 artifact-style round-robin；load-aware 只能作为增强项 |
+| Cross-DP scale-up | 允许 / 禁止 | 已决定：禁止，单 group DoP≤8 |
 
 ## 19. 推荐会议决议
 
@@ -958,14 +1044,15 @@ GPU 测试必须按仓库规定申请提权。
 
 1. baseline 范围严格限定为 Decode-only；
 2. 旧 persistent fresh-batch 设计不再约束实现；
-3. Phase 1 只改 request-level selection、排序和 ephemeral continuous batching；
+3. Phase 1 增加 arrival-time round-robin、pool-local selection、排序和 ephemeral continuous batching；
 4. placement/admission transaction 第一阶段保持不变；
-5. Phase 2 修复 global future-KV 和 admission continuity；
+5. Phase 2 修复 SP8 pool-wide future-KV 和 admission continuity；
 6. Phase 3 再切 packed placement；
 7. Phase 4 对齐 Decode memory/compute elasticity；
 8. 二维 DP 不进入第一版，单列 Decode-cost variant；
-9. 所有 Nano topology adapter 和 source deviation 写入 manifest；
-10. 正式实验统一命名为 `LoongServe-style Decode-only`。
+9. `4DP×8SP` 固定为四个独立 pools，禁止 load-aware rerouting 和 cross-DP scale-up；
+10. 所有 Nano topology adapter 和 source deviation 写入 manifest；
+11. 正式实验统一命名为 `LoongServe-style Decode-only`。
 
 这样可以避免把当前实验不执行的内容带入设计，同时保留 LoongServe 对 Decode 资源管理最关键的思想，也能控制每个阶段的改动面和验证成本。
 
@@ -975,11 +1062,14 @@ LoongServe：
 
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/req_queue.py:46`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/req_queue.py:135`
+- `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:40`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:686`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:764`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:844`
+- `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:975`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/longserve_c_scheduler/src/main.cpp:33`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/paper-tex-src/sections/design.tex:68`
+- `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/test/longserve/5-start-api-server.py:261`
 
 NanoDeploy：
 
@@ -987,6 +1077,7 @@ NanoDeploy：
 - `csrc/nanodeploy/scheduler/scheduler.cpp:1348`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:1488`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:1705`
+- `csrc/nanodeploy/scheduler/scheduler.cpp:1826`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:2085`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:2368`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:2822`
