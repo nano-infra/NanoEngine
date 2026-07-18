@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, model_validator
 from transformers import AutoConfig, PretrainedConfig
 
 from dlengine.logging import get_logger
+from dlengine.models.trait import apply_hf_config_compatibility_fixes
 
 logger = get_logger("dlengine")
 
@@ -276,6 +277,19 @@ class Config(BaseModel):
                 )
 
                 self.hf_config = DeepseekV4Config(**config_dict)
+
+        # Read the unmodified JSON as well as the instantiated HF config. Some
+        # Transformers config classes apply attribute aliases while loading and
+        # can lose a model-specific value when both alias names are present.
+        config_path = Path(self.model) / "config.json"
+        if config_path.exists():
+            with config_path.open() as f:
+                raw_config = json.load(f)
+        else:
+            raw_config, _ = PretrainedConfig.get_config_dict(
+                self.model, trust_remote_code=self.trust_remote_code
+            )
+        apply_hf_config_compatibility_fixes(self.hf_config, raw_config)
 
         # For VLM models with nested text_config (e.g. Qwen3.5-MoE),
         # flatten text_config attributes into hf_config for uniform access.

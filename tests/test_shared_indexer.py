@@ -8,6 +8,7 @@ from dlengine.models.deepseek_v2.deepseek_v2 import (
     _get_indexer_mode,
 )
 from dlengine.layers.indexer import _expand_decode_context_lens
+from dlengine.models.trait import apply_hf_config_compatibility_fixes
 
 
 GLM52_INDEXER_TYPES = [
@@ -142,3 +143,22 @@ def test_dummy_decode_context_lens_do_not_underflow():
 
     assert expanded.shape == (1, 8)
     assert torch.equal(expanded, torch.ones_like(expanded))
+
+
+def test_glm52_repairs_transformers_rope_head_dim_alias():
+    config = SimpleNamespace(
+        qk_rope_head_dim=192,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+    )
+    raw_config = {
+        "model_type": "glm_moe_dsa",
+        "head_dim": 192,
+        "qk_rope_head_dim": 64,
+    }
+
+    apply_hf_config_compatibility_fixes(config, raw_config)
+
+    assert config.qk_rope_head_dim == 64
+    assert config.qk_head_dim == 256
+    assert config.kv_lora_rank + config.qk_rope_head_dim == 576
