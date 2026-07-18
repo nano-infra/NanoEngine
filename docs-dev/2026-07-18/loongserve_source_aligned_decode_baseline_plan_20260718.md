@@ -78,7 +78,6 @@ AdmissionTransaction
 
 - request future-capacity check：`req_queue.py:46-76`；
 - waiting queue scan 与有限越序：`req_queue.py:80-227`；
-- admission cadence：`manager.py:351-373`；
 - request/instance 排序与连续 batch range：`manager.py:686-750`；
 - 二维 DP 的状态和回溯形状：`longserve_c_scheduler/src/main.cpp:33-84`；
 - packed token interval placement：`manager.py:764-800`；
@@ -119,7 +118,7 @@ LoongServe source-identical
 
 | 环节 | Nano 当前实现 | Decode-only baseline 目标 | 处理方式 |
 |---|---|---|---|
-| Admission cadence | 每次 `schedule()` 都先尝试 admission | idle 时立即；busy 时按 Decode step 周期检查 | 修改 |
+| Admission opportunity | 每次 `schedule()` 都先尝试 admission，成功则不 Decode | 每个 scheduler step 都可 scan，但成功 admission 不抑制已有请求 Decode | 修改返回结果 |
 | Queue scan | 固定截取 queue prefix | FIFO scan + bounded OOE + current/future KV | 修改 |
 | Fresh batch identity | current-fit 前创建长期 `PendingDecodeBatch` | exact plan 成功前保持 request-level waiting | 修改 |
 | Request ordering | 选中窗口内已按长度降序 | 保留 | 已完成 |
@@ -178,28 +177,28 @@ FIFO:   [276, 199, 923230, 229, 197, 213, 227]
 
 ## 4. Request dispatch
 
-### 4.1 Admission opportunity
+### 4.1 每个 scheduler step 都允许 admission
 
-新增：
+Decode-only baseline 不使用固定 step 间隔限制 waiting scan。
 
-```text
-decode_steps_since_last_admission
-```
-
-只有以下情况执行 waiting scan：
+规则是：
 
 ```text
-running 为空
-or decode_steps_since_last_admission >= ls_max_wait_tokens
+if waiting 非空:
+    本 scheduler step 执行 request-level admission scan
+
+if admission 成功且已有 running requests:
+    commit 新 requests
+    同时返回已有 requests 的本轮 Decode plan
+
+if admission 成功且系统原本 idle:
+    commit 新 requests
+    下一 scheduler step 开始 Decode
 ```
 
-建议 source-default：
+dummy bootstrap 只有 scheduler/KV 状态更新，没有需要用固定间隔摊销的 GPU 工作。照搬 10-step gate 会人为增加 queueing latency，并改变 arrival rate 实验的负载形状。
 
-```text
-ls_max_wait_tokens = 10
-```
-
-counter 只在成功完成真实 Decode iteration 后递增；成功 admission 后清零。idle 系统不等待 counter。
+第一版直接每 step scan，先保证语义简单。若 telemetry 证明 scan 开销仍高，可以增加 correctness-preserving event cache：只有 new arrival，或者 request finish、pause/readmission、rank ownership 等可能让可行性改善的资源事件发生时，才重新执行 expensive exact planning。该优化不能延迟一个本来已经可 admission 的 request。
 
 ### 4.2 FIFO scan 和 bounded OOE
 
@@ -655,7 +654,6 @@ paused request 回到全局 request-level waiting queue，接受同一套 FIFO/O
 建议 source-shaped 参数：
 
 ```text
-ls_max_wait_tokens = 10
 ls_max_num_ooe = 10
 ls_running_max_req_size = 1000
 ls_admission_max_tokens = auto
@@ -688,7 +686,7 @@ ls_nano_background_consolidation = false
 ### 12.1 `scheduler.h/.cpp`
 
 - 删除 fresh request 的 persistent seal/pending ownership；
-- 新增 admission cadence 和 OOE counter；
+- 每个 scheduler step 执行 request-level admission scan，并维护 OOE counter；
 - request-level current/future scan；
 - selected 后 stable length sort；
 - ephemeral continuous partition；
@@ -748,7 +746,7 @@ ls_nano_background_consolidation = false
 改动：
 
 - 删除 fresh persistent pending batch；
-- FIFO cadence/OOE scan；
+- FIFO/OOE scan；
 - stable length sort；
 - ephemeral balanced continuous ranges；
 - empty-system 检查和 current-system exact commit；
@@ -821,7 +819,7 @@ ls_nano_background_consolidation = false
 - per-request reject reason；
 - OOE before/after；
 - selected prompt token sum；
-- cadence counter。
+- scan trigger 和是否命中 event cache。
 
 ### `ls_decode_batch_plan`
 
@@ -861,7 +859,7 @@ ls_nano_background_consolidation = false
 1. FIFO selection：可运行请求保持 queue 顺序。
 2. Bounded OOE：blocker 最多被越过配置轮数。
 3. OOE reset：frontier 成功运行后 counter 清零。
-4. Cadence：idle 立即；busy 按成功 Decode iteration 计数。
+4. Every-step opportunity：new arrival 在下一个 scheduler step 即进入 scan，不存在固定 Decode-step 延迟。
 5. Membership-before-sort：排序不改变 selected IDs。
 6. Stable length order：等长 request 保持 FIFO。
 7. Continuous split：每个 batch 都是排序数组连续 range。
@@ -922,7 +920,7 @@ GPU 测试必须按仓库规定申请提权。
 以下全部满足后，才能称为 LoongServe-style Decode-only baseline：
 
 1. 运行中不存在 fresh persistent pending batch。
-2. FIFO/bounded OOE/cadence 行为通过 CPU fixtures。
+2. FIFO/bounded OOE/every-step admission 行为通过 CPU fixtures。
 3. request membership 在长度排序之前确定。
 4. batch 是排序数组的连续 ranges。
 5. no-fit 时 request 保持 waiting，没有 batch ownership。
@@ -977,7 +975,6 @@ LoongServe：
 
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/req_queue.py:46`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/req_queue.py:135`
-- `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:351`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:686`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:764`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:844`
