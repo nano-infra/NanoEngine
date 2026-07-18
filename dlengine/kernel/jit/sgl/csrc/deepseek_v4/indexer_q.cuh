@@ -146,8 +146,10 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
         Float4 reordered;
 #pragma unroll
         for (int i = 0; i < kVecSize; ++i) {
-            const uint32_t dst      = lane_id * kVecSize + i;
-            const uint32_t src      = dst < kRopeDim ? dst * 2 : (dst - kRopeDim) * 2 + 1;
+            const uint32_t dst = lane_id * kVecSize + i;
+            const uint32_t src = dst < kRopeDim / 2
+                                     ? dst * 2
+                                     : dst < kRopeDim ? (dst - kRopeDim / 2) * 2 + 1 : dst;
             const uint32_t src_lane = src / kVecSize;
             const uint32_t src_item = src % kVecSize;
             const float    v0       = __shfl_sync(0xFFFFFFFFu, data[0], src_lane, kWarpThreads);
