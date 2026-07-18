@@ -100,6 +100,88 @@ def _interleaved_to_half(x: torch.Tensor) -> torch.Tensor:
     return x.unflatten(-1, (-1, 2)).transpose(-1, -2).contiguous().flatten(-2)
 
 
+def _weighted_relu_mqa_scores(
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    key: torch.Tensor,
+    head_chunk: int = 4,
+) -> torch.Tensor:
+    """Compute exact Lightning-Indexer scores in bounded workspace.
+
+    DeepGEMM defines the MQA score for query ``i`` and key ``j`` as::
+
+        sum_h weights[i, h] * relu(dot(query[i, h], key[j]))
+
+    ReLU is applied before the weighted head reduction, so gate weights cannot
+    be folded into one query vector. Chunking the head dimension limits the
+    largest temporary to ``[num_queries, head_chunk, num_keys]``.
+    """
+    if query.ndim != 3:
+        raise RuntimeError(f"query must be [Q, H, D], got {query.shape}")
+    if weights.shape != query.shape[:2]:
+        raise RuntimeError(
+            f"weights/query shape mismatch: {weights.shape} vs {query.shape[:2]}"
+        )
+    if key.ndim != 2 or key.shape[1] != query.shape[2]:
+        raise RuntimeError(
+            f"key/query shape mismatch: key={key.shape}, query={query.shape}"
+        )
+    if head_chunk <= 0:
+        raise ValueError(f"head_chunk must be positive, got {head_chunk}")
+
+    num_queries, num_heads, _ = query.shape
+    num_keys = key.shape[0]
+    if num_keys == 0:
+        return torch.empty(
+            num_queries, 0, dtype=torch.float32, device=query.device
+        )
+
+    query_f = query.float()
+    weights_f = weights.float()
+    key_t = key.float().T
+    scores = torch.zeros(
+        num_queries, num_keys, dtype=torch.float32, device=query.device
+    )
+    for h_start in range(0, num_heads, head_chunk):
+        h_end = min(h_start + head_chunk, num_heads)
+        head_scores = torch.matmul(query_f[:, h_start:h_end], key_t)
+        head_scores.relu_()
+        head_scores.mul_(weights_f[:, h_start:h_end, None])
+        scores.add_(head_scores.sum(dim=1))
+    return scores
+
+
+def _expand_decode_context_lens(
+    context_lens: torch.Tensor, next_n: int
+) -> torch.Tensor:
+    """Return DeepGEMM's ``[batch, next_n]`` context-length layout.
+
+    ``context_lens`` contains the length after the last query token.  For
+    multi-token decode (MTP, or an inactive DP rank's dummy batch), each query
+    needs its own causal length.  DeepGEMM specializes both its metadata and
+    logits kernel on ``next_n``, so passing ``[batch, 1]`` metadata with a
+    ``[batch, next_n, ...]`` query is invalid.
+    """
+    if context_lens.dim() == 1:
+        context_lens = context_lens[:, None]
+    if context_lens.dim() != 2 or context_lens.shape[1] not in (1, next_n):
+        raise ValueError(
+            "Indexer context_lens must have shape [batch], [batch, 1], or "
+            f"[batch, next_n]; got {tuple(context_lens.shape)} for next_n={next_n}"
+        )
+    if context_lens.shape[1] == next_n:
+        return context_lens.to(torch.int32)
+
+    offsets = torch.arange(
+        next_n - 1,
+        -1,
+        -1,
+        dtype=context_lens.dtype,
+        device=context_lens.device,
+    )
+    return (context_lens - offsets).clamp_min(1).to(torch.int32)
+
+
 class IndexerCache:
     """Per-layer FP8 cache for indexer keys.
 
@@ -441,7 +523,7 @@ class Indexer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        query_chunk: int = 2048,
+        query_chunk: int = 256,
     ) -> torch.Tensor:
         """Per-query top-k selection for the non-prefix (single-chunk) prefill.
 
@@ -452,9 +534,12 @@ class Indexer(nn.Module):
         which is decode-shaped.
 
         The indexer is MQA (a single key head shared by all ``n_heads`` query
-        heads), so the per-head gate weights fold into the query:
-            score[i, j] = sum_d (sum_h w[i, h] * q[i, h, d]) * k[j, d]
-        which keeps the score matrix at ``[L, L]`` instead of ``[L, H, L]``.
+        heads), but weighted-ReLU must preserve the head dimension until after
+        activation::
+
+            score[i, j] = sum_h w[i, h] * relu(dot(q[i, h], k[j]))
+
+        Query and head chunking avoid materializing ``[L, H, L]``.
 
         Args:
             q_lora:        (num_tokens, q_lora_rank) — main-attn Q LoRA.
@@ -469,13 +554,14 @@ class Indexer(nn.Module):
         query, key = self._compute_q_k(q_lora, hidden_states, positions)
         # query: (N, n_heads, head_dim), key: (N, head_dim)
         weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
-        # Fold gates into the query (MQA): qw[i, d] = sum_h w[i, h] * q[i, h, d]
-        qw = torch.einsum("nhd,nh->nd", query.float(), weights)  # (N, head_dim)
         key_f = key.float()
 
-        num_tokens = qw.shape[0]
+        num_tokens = query.shape[0]
         indices = torch.full(
-            (num_tokens, self.index_topk), -1, dtype=torch.int32, device=qw.device
+            (num_tokens, self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=query.device,
         )
         num_seqs = cu_seqlens.shape[0] - 1
         neg_inf = float("-inf")
@@ -489,16 +575,227 @@ class Indexer(nn.Module):
             k = min(self.index_topk, seq_len)
             for a in range(0, seq_len, query_chunk):
                 b = min(a + query_chunk, seq_len)
-                seq_q = qw[start + a : start + b]  # (C, D)
-                score = seq_q @ seq_key.T  # (C, L)
+                seq_q = query[start + a : start + b]
+                seq_weights = weights[start + a : start + b]
+                score = _weighted_relu_mqa_scores(seq_q, seq_weights, seq_key)
                 # Causal mask: query at local row (a + r) attends keys j <= a + r.
-                rows = torch.arange(a, b, device=qw.device).unsqueeze(1)  # (C, 1)
-                cols = torch.arange(seq_len, device=qw.device).unsqueeze(0)  # (1, L)
+                rows = torch.arange(a, b, device=query.device).unsqueeze(1)
+                cols = torch.arange(seq_len, device=query.device).unsqueeze(0)
                 score.masked_fill_(cols > rows, neg_inf)
                 top_val, top_idx = score.topk(k, dim=-1)
                 top_idx = (top_idx + start).to(torch.int32)
                 top_idx[top_val == neg_inf] = -1
                 indices[start + a : start + b, :k] = top_idx
+        return indices
+
+    def _gather_cached_prefix_keys(
+        self,
+        block_table: torch.Tensor,
+        cached_lens: torch.Tensor,
+        cu_cached: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Gather and dequantize cached indexer keys for chunked prefill.
+
+        This readable reference path materializes only previously cached prefix
+        keys. A production implementation will replace it with paged-FP8
+        score+TopK without a full-prefix dequantized tensor.
+        """
+        assert self.indexer_cache is not None, "IndexerCache not initialized"
+
+        if block_table.shape[0] != cached_lens.numel():
+            raise RuntimeError(
+                "block_table/cached_lens batch mismatch: "
+                f"{block_table.shape[0]} vs {cached_lens.numel()}"
+            )
+
+        total_cached = int(cu_cached[-1].item())
+        if total_cached == 0:
+            return torch.empty(
+                0, self.head_dim, dtype=dtype, device=block_table.device
+            )
+
+        from dlengine.kernel.triton.generic.paged_gather import (
+            build_paged_gather_indices,
+        )
+
+        cache = self.indexer_cache
+        page_size = cache.page_size
+        head_dim = cache.head_dim
+        if head_dim != self.head_dim:
+            raise RuntimeError(
+                f"Indexer cache head_dim mismatch: cache={head_dim}, "
+                f"indexer={self.head_dim}"
+            )
+        if head_dim != INDEXER_QUANT_BLOCK_SIZE:
+            raise NotImplementedError(
+                "Reference cache-aware prefill TopK currently assumes "
+                f"indexer head_dim={INDEXER_QUANT_BLOCK_SIZE}, got {head_dim}"
+            )
+
+        physical_slots = build_paged_gather_indices(
+            block_table,
+            cu_cached,
+            page_size,
+            total_k=total_cached,
+        )
+        page_idx = physical_slots // page_size
+        offset_in_page = physical_slots % page_size
+
+        row_stride = page_size * cache.bytes_per_token
+        flat_base = page_idx.long() * row_stride
+        buf_flat = cache.get_buffer(self.layer_id).view(-1)
+
+        byte_range = torch.arange(head_dim, device=block_table.device)
+        fp8_byte_offset = offset_in_page.long() * head_dim
+        fp8_indices = (
+            flat_base.unsqueeze(1) + fp8_byte_offset.unsqueeze(1) + byte_range
+        )
+        key_fp8_bytes = buf_flat[fp8_indices.reshape(-1)].view(total_cached, head_dim)
+        key_fp8 = key_fp8_bytes.contiguous().view(torch.float8_e4m3fn)
+
+        scale_range = torch.arange(4, device=block_table.device)
+        scale_byte_offset = page_size * head_dim + offset_in_page.long() * 4
+        scale_indices = (
+            flat_base.unsqueeze(1) + scale_byte_offset.unsqueeze(1) + scale_range
+        )
+        scale_bytes = buf_flat[scale_indices.reshape(-1)].view(total_cached, 4)
+        scale = scale_bytes.contiguous().view(torch.float32).view(total_cached, 1)
+
+        return (key_fp8.float() * scale).to(dtype)
+
+    def compute_prefill_topk_cache_aware(
+        self,
+        q_lora: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        block_table: torch.Tensor,
+        query_chunk: int = 256,
+    ) -> torch.Tensor:
+        """Compute exact TopK over cached prefix plus causal fresh keys.
+
+        For a query at local row ``r`` with cached length ``C``, the visible
+        key set is ``[0, C)`` plus fresh keys ``[C, C + r]``. Prefix and fresh
+        candidates are selected separately and then merged; keeping up to K
+        from each half is exactly equivalent to selecting K from their union.
+
+        Returned indices address the concatenated ragged K layout described by
+        ``cu_seqlens_k`` and use ``-1`` for invalid/padded candidates.
+        """
+        assert self.indexer_cache is not None, "IndexerCache not initialized"
+        if cu_seqlens_q.shape != cu_seqlens_k.shape:
+            raise RuntimeError(
+                "cu_seqlens_q/cu_seqlens_k shape mismatch: "
+                f"{cu_seqlens_q.shape} vs {cu_seqlens_k.shape}"
+            )
+
+        query, fresh_key = self._compute_q_k(q_lora, hidden_states, positions)
+        weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
+        fresh_key_f = fresh_key.float()
+
+        q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).long()
+        k_lens = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).long()
+        cached_lens = k_lens - q_lens
+        if torch.any(cached_lens < 0):
+            raise RuntimeError(
+                "Invalid chunked-prefill lengths: cu_seqlens_k must be >= "
+                "cu_seqlens_q for every sequence"
+            )
+
+        cu_cached = torch.zeros_like(cu_seqlens_k)
+        cu_cached[1:] = cached_lens.cumsum(0).to(cu_cached.dtype)
+        cached_key_f = self._gather_cached_prefix_keys(
+            block_table,
+            cached_lens,
+            cu_cached,
+            dtype=torch.float32,
+        )
+
+        num_tokens = query.shape[0]
+        indices = torch.full(
+            (num_tokens, self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=query.device,
+        )
+
+        num_seqs = cu_seqlens_q.shape[0] - 1
+        neg_inf = float("-inf")
+        for seq_id in range(num_seqs):
+            q_start = int(cu_seqlens_q[seq_id].item())
+            q_end = int(cu_seqlens_q[seq_id + 1].item())
+            k_start = int(cu_seqlens_k[seq_id].item())
+            seq_q_len = q_end - q_start
+            if seq_q_len <= 0:
+                continue
+
+            cached_start = int(cu_cached[seq_id].item())
+            cached_end = int(cu_cached[seq_id + 1].item())
+            cached_len = cached_end - cached_start
+
+            seq_prefix_key = cached_key_f[cached_start:cached_end]
+            seq_fresh_key = fresh_key_f[q_start:q_end]
+            prefix_k = min(self.index_topk, cached_len)
+            fresh_k = min(self.index_topk, seq_q_len)
+
+            for a in range(0, seq_q_len, query_chunk):
+                b = min(a + query_chunk, seq_q_len)
+                seq_q = query[q_start + a : q_start + b]
+                seq_weights = weights[q_start + a : q_start + b]
+
+                candidate_values: list[torch.Tensor] = []
+                candidate_indices: list[torch.Tensor] = []
+                if prefix_k > 0:
+                    prefix_scores = _weighted_relu_mqa_scores(
+                        seq_q, seq_weights, seq_prefix_key
+                    )
+                    prefix_values, prefix_indices = prefix_scores.topk(
+                        prefix_k, dim=-1
+                    )
+                    candidate_values.append(prefix_values)
+                    candidate_indices.append(prefix_indices.to(torch.int64))
+
+                if fresh_k > 0:
+                    fresh_scores = _weighted_relu_mqa_scores(
+                        seq_q, seq_weights, seq_fresh_key
+                    )
+                    rows = torch.arange(a, b, device=query.device).unsqueeze(1)
+                    cols = torch.arange(seq_q_len, device=query.device).unsqueeze(0)
+                    fresh_scores.masked_fill_(cols > rows, neg_inf)
+
+                    fresh_values, fresh_indices = fresh_scores.topk(
+                        fresh_k, dim=-1
+                    )
+                    fresh_indices = fresh_indices.to(torch.int64) + cached_len
+                    fresh_indices = torch.where(
+                        fresh_values == neg_inf,
+                        torch.full_like(fresh_indices, -1),
+                        fresh_indices,
+                    )
+                    candidate_values.append(fresh_values)
+                    candidate_indices.append(fresh_indices)
+
+                if not candidate_values:
+                    continue
+
+                merged_values = torch.cat(candidate_values, dim=-1)
+                merged_indices = torch.cat(candidate_indices, dim=-1)
+                final_k = min(self.index_topk, merged_values.shape[-1])
+                final_values, final_positions = merged_values.topk(final_k, dim=-1)
+                final_indices = torch.gather(
+                    merged_indices, dim=-1, index=final_positions
+                )
+                final_indices = torch.where(
+                    final_values == neg_inf,
+                    torch.full_like(final_indices, -1),
+                    final_indices + k_start,
+                )
+                indices[q_start + a : q_start + b, :final_k] = final_indices.to(
+                    torch.int32
+                )
+
         return indices
 
     def _compute_gate_weights(
@@ -626,9 +923,9 @@ class Indexer(nn.Module):
         # (block_tables.shape[-1] * page_size is constant per captured graph).
         max_context_len = block_tables.shape[-1] * page_size
         context_lens_i32 = context_lens.to(torch.int32)
-        context_lens_for_gemm = context_lens_i32
-        if context_lens_for_gemm.dim() == 1:
-            context_lens_for_gemm = context_lens_for_gemm[:, None]
+        context_lens_for_gemm = _expand_decode_context_lens(
+            context_lens_i32, ntps
+        )
 
         # All layers share this schedule. The model builds it once per forward;
         # retain the fallback for standalone Indexer calls and tests.
@@ -659,11 +956,7 @@ class Indexer(nn.Module):
                 raise ValueError("topk_page_size is required when translate_topk=True")
             from dlengine.kernel.jit.sgl.deepseek_v4 import topk_transform
 
-            seq_lens = (
-                context_lens_i32
-                if ntps == 1
-                else context_lens_i32.repeat_interleave(ntps)
-            )
+            seq_lens = context_lens_for_gemm.reshape(-1)
             page_tables = (
                 block_tables
                 if ntps == 1
@@ -688,7 +981,7 @@ class Indexer(nn.Module):
 
         # Portable fallback: explicitly clean the logits because DeepGEMM cannot
         # enable clean_logits for 2D context_lens.
-        ctx_expanded = context_lens_i32.repeat_interleave(ntps).unsqueeze(1)
+        ctx_expanded = context_lens_for_gemm.reshape(-1, 1)
         logit_positions = torch.arange(max_context_len, device=logits.device).unsqueeze(
             0
         )
