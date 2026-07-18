@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, model_validator
 from transformers import AutoConfig, PretrainedConfig
 
 from dlengine.logging import get_logger
+from dlengine.models.trait import apply_hf_config_compatibility_fixes
 
 logger = get_logger("dlengine")
 
@@ -153,7 +154,6 @@ class Config(BaseModel):
     # Number of hot token slots reserved for each active sequence. Total
     # HiSparse device capacity is this value multiplied by max_num_seqs.
     hisparse_device_buffer_size: int = 4096
-    hisparse_host_to_device_ratio: int = 2
     hisparse_swap_in_block_size: int = 960
 
     # Correctness-only fallback for MLA shapes that current FlashMLA wheels do
@@ -293,6 +293,19 @@ class Config(BaseModel):
 
                 self.hf_config = DeepseekV4Config(**config_dict)
 
+        # Read the unmodified JSON as well as the instantiated HF config. Some
+        # Transformers config classes apply attribute aliases while loading and
+        # can lose a model-specific value when both alias names are present.
+        config_path = Path(self.model) / "config.json"
+        if config_path.exists():
+            with config_path.open() as f:
+                raw_config = json.load(f)
+        else:
+            raw_config, _ = PretrainedConfig.get_config_dict(
+                self.model, trust_remote_code=self.trust_remote_code
+            )
+        apply_hf_config_compatibility_fixes(self.hf_config, raw_config)
+
         # For VLM models with nested text_config (e.g. Qwen3.5-MoE),
         # flatten text_config attributes into hf_config for uniform access.
         if hasattr(self.hf_config, "text_config"):
@@ -327,7 +340,6 @@ class Config(BaseModel):
         for attr in (
             "enable_hisparse",
             "hisparse_device_buffer_size",
-            "hisparse_host_to_device_ratio",
             "hisparse_swap_in_block_size",
         ):
             setattr(self.hf_config, attr, getattr(self, attr, None))
@@ -416,8 +428,6 @@ class Config(BaseModel):
                 raise ValueError("enable_hisparse does not support MTP")
             if self.hisparse_device_buffer_size <= 0:
                 raise ValueError("hisparse_device_buffer_size must be positive")
-            if self.hisparse_host_to_device_ratio < 1:
-                raise ValueError("hisparse_host_to_device_ratio must be >= 1")
             if self.hisparse_swap_in_block_size <= 0:
                 raise ValueError("hisparse_swap_in_block_size must be positive")
             if arch in ("DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"):

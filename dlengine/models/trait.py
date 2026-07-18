@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from dlengine.logging import get_logger
+
+logger = get_logger("dlengine")
+
 
 def has_gdn_component(hf_config: Any) -> bool:
     """Whether a config or nested sub-config declares a GDN layer."""
@@ -45,6 +49,34 @@ def has_layer_type(hf_config: Any, layer_type: str) -> bool:
     return visit(hf_config)
 
 
+def apply_hf_config_compatibility_fixes(hf_config: Any, raw_config: dict) -> None:
+    """Repair model dimensions clobbered by Hugging Face config aliases."""
+    if raw_config.get("model_type") != "glm_moe_dsa":
+        return
+
+    raw_rope_dim = raw_config.get("qk_rope_head_dim")
+    if raw_rope_dim is None:
+        return
+
+    # Transformers 5.12 maps generic ``head_dim`` to ``qk_rope_head_dim``.
+    # GLM-5.2 carries both (192 and 64), so the alias overwrites the latter and
+    # constructs a 512+192=704 projection for a 512+64=576 checkpoint weight.
+    raw_rope_dim = int(raw_rope_dim)
+    parsed_rope_dim = int(getattr(hf_config, "qk_rope_head_dim", raw_rope_dim))
+    if parsed_rope_dim != raw_rope_dim:
+        logger.warning(
+            "Restoring GLM DSA qk_rope_head_dim=%s from config.json "
+            "(Transformers parsed %s via the head_dim alias)",
+            raw_rope_dim,
+            parsed_rope_dim,
+        )
+    hf_config.qk_rope_head_dim = raw_rope_dim
+
+    qk_nope_dim = getattr(hf_config, "qk_nope_head_dim", None)
+    if qk_nope_dim is not None:
+        hf_config.qk_head_dim = int(qk_nope_dim) + raw_rope_dim
+
+
 def resolve_eos_token_ids(model: str, tokenizer: Any) -> list[int]:
     """Resolve all EOS token ids declared by tokenizer and generation config."""
     eos_ids: set[int] = set()
@@ -78,6 +110,7 @@ def load_tokenizer_and_eos(model: str) -> tuple[Any, list[int]]:
 
 
 __all__ = [
+    "apply_hf_config_compatibility_fixes",
     "has_gdn_component",
     "has_hca_csa_cache",
     "has_layer_type",

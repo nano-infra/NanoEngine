@@ -282,7 +282,6 @@ Add these config fields:
 - `enable_hisparse: bool = False`
 - `hisparse_device_buffer_size: int = 4096` (hot token slots per sequence;
   total device capacity is `max_num_seqs * hisparse_device_buffer_size`)
-- `hisparse_host_to_device_ratio: int = 2`
 - `hisparse_swap_in_block_size: int = 960`
 
 Enable validation:
