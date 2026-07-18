@@ -1,0 +1,220 @@
+{
+  "experiment_id": "ls_style_capacity_reorg_908933a_2node_dp2sp8_r20_140gb_mem085_6min_20260718",
+  "status": "success",
+  "created_utc": "2026-07-18T10:24:11Z",
+  "completed_utc": "2026-07-18T10:40:10Z",
+  "runtime": {
+    "formal_workload_start_utc": "2026-07-18T10:29:08Z",
+    "engine_id": "a2537cc4-13aa-49a6-bfa5-1978d9026f89",
+    "num_kvcache_blocks_per_rank": 12359,
+    "warmup_summary": {
+      "requests": 32,
+      "completed": 32,
+      "steps": 8,
+      "duration_sec": 2.369585547596216
+    },
+    "sampled_last_arrival_sec": 354.6171997611252,
+    "exit_code": 0,
+    "benchmark_results_emitted": true,
+    "output_jsonl_rows": 7200
+  },
+  "git": {
+    "commit": "908933a5c0b8d5a54f86bfa589a372b14e9f19ca",
+    "short_commit": "908933a",
+    "subject": "feat(scheduler): sort LS admission window by prompt length",
+    "commit_time_utc": "2026-07-18T10:07:08+00:00",
+    "worktree_clean": false,
+    "tracked_dirty_overrides": [
+      {
+        "path": "nanodeploy/engine/ray_executor.py",
+        "worktree_sha256": "911fd170c0d8d147325984bc5c9a4f91917cec700299e786d5a69437ae52348e",
+        "semantic_change": "RPCServerEndpoint buffer expression is 32*32_000_000 instead of committed 8*32_000_000; line endings also differ"
+      },
+      {
+        "path": "nanodeploy/engine/llm_engine.py",
+        "worktree_sha256": "4df393f4918a671f1f74ddd3ee1546632744fe3277375107e8a547a4d38a1955",
+        "semantic_change": "none; line-ending-only working-tree difference"
+      }
+    ]
+  },
+  "build": {
+    "editable_install": "pip install -v -e . succeeded before the run; ninja reported no work to do",
+    "compiled_artifacts": {
+      "build/lib/_nanodeploy_cpp.cpython-312-x86_64-linux-gnu.so.sha256": "5c7c227bfa2e17f66a4ce152c12a339e2909c59e27bb54fffdefa432406937f4",
+      "build/lib/lib_nanodeploy_scheduler.so.sha256": "544f3ef6b13863a406c09a5e7d9a2a70a863242002a2bde447905fae43409974"
+    }
+  },
+  "cluster": {
+    "ray_address": "10.102.243.60:8776",
+    "master_address": "10.102.243.60:29906",
+    "nodes": [
+      "10.102.243.60",
+      "10.102.252.174"
+    ],
+    "gpu_type": "H200",
+    "total_gpus": 16,
+    "total_cpus": 384,
+    "ray_resources_before_start": "0/16 GPU used"
+  },
+  "features": {
+    "loongserve_style_core_scheduler": true,
+    "prompt_length_sorted_admission_window": true,
+    "capacity_driven_group_reorganization": true,
+    "capacity_donor_selection": true,
+    "idle_rank_memory_scale_up": true,
+    "future_kv_admission": true,
+    "pending_no_fit_consolidation_proof": true,
+    "kv_consolidation_mode": "execute"
+  },
+  "topology": {
+    "attention_dp": 2,
+    "attention_sp": 8,
+    "attention_tp": 1,
+    "ffn_dp": 1,
+    "ffn_ep": 16,
+    "ffn_tp": 1
+  },
+  "workload": {
+    "model_path": "/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3",
+    "dummy_prefill": true,
+    "dummy_weight": true,
+    "csv_path": "/mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/sharegpt-4o-mixlong-0326/sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv",
+    "request_rate": 20.0,
+    "duration_sec": 360.0,
+    "num_requests": 7200,
+    "burstiness": 1.0,
+    "seed": 0,
+    "warmup_requests": 32,
+    "warmup_prompt_len": 512,
+    "warmup_max_tokens": 8
+  },
+  "engine_config": {
+    "max_num_seqs": 256,
+    "max_num_recv_seqs": 128,
+    "max_model_len": 1000000,
+    "max_input_len": 1000000,
+    "max_num_batched_tokens": 1024000,
+    "gpu_memory_limit_gb": 140.0,
+    "gpu_memory_utilization": 0.85,
+    "kvcache_block_size": 64,
+    "segment_size": 65536,
+    "routing_strategy": "LeastBatch",
+    "cuda_graph_mode": "full",
+    "enforce_eager": false,
+    "ls_initial_kv_dop": 0,
+    "ls_batch_per_master": 128,
+    "ls_kv_consolidation_candidate_util": 0.5,
+    "ls_kv_consolidation_target_high_watermark": 0.8,
+    "ls_kv_consolidation_stable_steps": 2,
+    "ls_kv_consolidation_cooldown_steps": 2,
+    "ls_kv_consolidation_check_interval_steps": 1,
+    "ls_kv_consolidation_max_source_blocks_per_event": 128,
+    "ls_kv_consolidation_migration_chunk_tokens": 64
+  },
+  "progress": [
+    {"elapsed_sec": 60, "completed_requests": 190, "partial_average_latency_sec": 38.79},
+    {"elapsed_sec": 120, "completed_requests": 1095, "partial_average_latency_sec": 54.57},
+    {"elapsed_sec": 180, "completed_requests": 2097, "partial_average_latency_sec": 63.11},
+    {"elapsed_sec": 240, "completed_requests": 3217, "partial_average_latency_sec": 69.32},
+    {"elapsed_sec": 300, "completed_requests": 4259, "partial_average_latency_sec": 74.51},
+    {"elapsed_sec": 360, "completed_requests": 5111, "partial_average_latency_sec": 77.90}
+  ],
+  "observed_result": {
+    "successful": true,
+    "requests_sent": 7200,
+    "requests_completed": 7200,
+    "completed_at_360_sec": 5111,
+    "completion_ratio_at_360_sec": 0.7098611111111112,
+    "completed_rate_at_360_sec": 14.197222222222223,
+    "total_time_sec": 660.44,
+    "full_run_request_throughput": 10.901823027072861,
+    "total_input_tokens": 41285449,
+    "total_output_tokens": 4312075,
+    "output_token_throughput": 6529.09,
+    "latency": {
+      "average_ttft_ms": 6132.74,
+      "average_e2e_sec": 103.95,
+      "tpot_without_queue_ms": {"avg": 155.00, "p50": 135.71, "p90": 274.67, "p95": 311.30, "p99": 367.96},
+      "itl_with_decode_queue_ms": {"avg": 166.15, "p50": 142.89, "p90": 249.48, "p95": 281.01, "p99": 457.86},
+      "queueing_time_ms": {"avg": 6132.07, "p50": 1.12, "p90": 2.03, "p95": 34.40, "p99": 140843.35}
+    },
+    "goodput": {
+      "slo": "TPOT with queueing < 100ms",
+      "successful_requests": 580,
+      "total_requests": 7200,
+      "ratio_pct": 8.06
+    },
+    "scheduler": {
+      "decode_iterations": 4445,
+      "max_total_batch_size": 1978,
+      "max_sp_batch_size": 159,
+      "peak_kv_util_pct": 99.6,
+      "min_free_blocks": 50,
+      "max_pending_batches": 106,
+      "max_pending_requests": 300,
+      "max_oldest_pending_age_steps": 4255,
+      "max_pending_attempts": 4256,
+      "preemptions": 0,
+      "planner_failures": 0,
+      "memory_scale_up_events": 0,
+      "scheduler_overhead_ms": {"mean": 16.087, "p50": 4.95, "p95": 115.384, "p99": 176.7044, "max": 195.6},
+      "planner_latency_ms": {"mean": 1.85184, "p50": 1.721171, "p95": 6.6819132, "p99": 7.40909, "max": 12.108048},
+      "model_forward_gpu_critical_path_ms": {"mean": 116.598, "p50": 117.4105, "p95": 168.0933, "p99": 182.1123, "max": 240.8537}
+    },
+    "consolidation": {
+      "successful_events": 13,
+      "failed_events": 0,
+      "migrated_tokens": 16003,
+      "physical_moves": 561,
+      "maintenance_ms_sum": 1007.145,
+      "maintenance_stall_ms_sum": 1015.659,
+      "first_transaction_id": 4253,
+      "last_transaction_id": 5971,
+      "decision_reason_counts": {
+        "pending_no_beneficial_consolidation": 2417,
+        "no_candidate": 981,
+        "source_block_budget": 764,
+        "insufficient destination capacity for KV consolidation": 233,
+        "stable_window": 48,
+        "KV consolidation would exceed remote attention capacity": 2
+      }
+    },
+    "fatal_errors": []
+  },
+  "post_run": {
+    "ray_gpu_usage": "0/16 GPU used",
+    "ray_cpu_usage": "0/384 CPU used",
+    "pending_demands": "none",
+    "resources_released": true
+  },
+  "environment": {
+    "http_proxy": "unset",
+    "https_proxy": "unset",
+    "HTTP_PROXY": "unset",
+    "HTTPS_PROXY": "unset",
+    "NANODEPLOY_LOG_DECODE_A2A_MASKS": "0",
+    "NANODEPLOY_LOG_DECODE_STEP_DETAIL": "0",
+    "NANODEPLOY_LOG_MODEL_FORWARD_TIMING": "1",
+    "RAY_DEDUP_LOGS": "1",
+    "PYTHONUNBUFFERED": "1"
+  },
+  "artifacts": {
+    "log": {
+      "path": "docs-dev/2026-07-18/ls_style_capacity_reorg_908933a_2node_dp2sp8_r20_140gb_mem085_6min_20260718.log",
+      "size_bytes": 60081428,
+      "sha256": "2afcbb0ddc37918f51043779f72688c76e862c58c7f4aff64d34fb65d9587bde",
+      "git_status": "ignored by *.log; retained locally"
+    },
+    "output_jsonl": {
+      "path": "docs-dev/2026-07-18/ls_style_capacity_reorg_908933a_2node_dp2sp8_r20_140gb_mem085_6min_20260718.jsonl",
+      "size_bytes": 65005352,
+      "rows": 7200,
+      "sha256": "4822554f5447fe431b5c22a5715e4ab019017599dc8541e5a4ce5bffb214ca19",
+      "git_status": "untracked; retained locally and deliberately not committed due size"
+    },
+    "manifest": "docs-dev/2026-07-18/ls_style_capacity_reorg_908933a_2node_dp2sp8_r20_140gb_mem085_6min_20260718.manifest.json",
+    "result_report": "docs-dev/2026-07-18/ls_style_capacity_reorg_mem085_2node_result_20260718.md"
+  },
+  "comparison_note": "The previous 140 GiB / 0.90 run used commit ab6ae47, while this run used 908933a with prompt-length admission sorting. This is not a strict memory-fraction-only A/B.",
+  "command": "env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY NANODEPLOY_LOG_DECODE_A2A_MASKS=0 NANODEPLOY_LOG_DECODE_STEP_DETAIL=0 NANODEPLOY_LOG_MODEL_FORWARD_TIMING=1 RAY_DEDUP_LOGS=1 PYTHONUNBUFFERED=1 bash -o pipefail -c 'python scripts/bench_ls_decode_serving.py --attention-dp 2 --attention-sp 8 --ray-address 10.102.243.60:8776 --master-address 10.102.243.60:29906 --model-path /mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3 --csv-path /mnt/nvme1n1/ml_research/linbinbin1/paper-nanolmdeploy/dataset/sharegpt-4o-mixlong-0326/sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv --request-rate 20 --duration-sec 360 --num-requests 7200 --burstiness 1 --seed 0 --warmup-requests 32 --warmup-prompt-len 512 --warmup-max-tokens 8 --max-num-seqs 256 --max-num-recv-seqs 128 --max-model-len 1000000 --max-input-len 1000000 --max-num-batched-tokens 1024000 --gpu-memory-limit-gb 140 --gpu-memory-utilization 0.85 --segment-size 65536 --routing-strategy LeastBatch --cuda-graph-mode full --ls-initial-kv-dop 0 --ls-batch-per-master 128 --ls-kv-consolidation-mode execute --ls-kv-consolidation-candidate-util 0.50 --ls-kv-consolidation-target-high-watermark 0.80 --ls-kv-consolidation-stable-steps 2 --ls-kv-consolidation-cooldown-steps 2 --ls-kv-consolidation-check-interval-steps 1 --ls-kv-consolidation-max-source-blocks-per-event 128 --ls-kv-consolidation-migration-chunk-tokens 64 --verbose-nanodeploy-logs --output-jsonl docs-dev/2026-07-18/ls_style_capacity_reorg_908933a_2node_dp2sp8_r20_140gb_mem085_6min_20260718.jsonl 2>&1 | tee docs-dev/2026-07-18/ls_style_capacity_reorg_908933a_2node_dp2sp8_r20_140gb_mem085_6min_20260718.log'"
+}
