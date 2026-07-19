@@ -47,6 +47,8 @@ Epic
 
 See the complete [GitHub Issue and Pull Request Workflow](./docs/github-workflow.zh.md) for Issue templates, branch conventions, review requirements, labels, and weekly triage rules.
 
+Release maintainers should use the guarded [DLEngine release workflow](./docs/releasing.md) to synchronize versions and create tags.
+
 ______________________________________________________________________
 
 ## 📄 License
