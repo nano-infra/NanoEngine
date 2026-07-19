@@ -23,6 +23,9 @@ class Config(BaseModel):
     model: str = Field(..., description="Path to the model")
 
     # scheduler config
+    # Maximum tokens processed by one model forward. With pipeline parallel
+    # prefill, the scheduler admits up to ``max_num_batched_tokens * pp``
+    # tokens and splits that window into microbatches of this size.
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 16
     max_num_recv_seqs: int = 32
@@ -69,12 +72,9 @@ class Config(BaseModel):
     # ``pp * attn_world_size``. Stages exchange hidden states with
     # point-to-point send/recv along the pipeline dimension.
     pp: int = 1
-    # Static forward-only prefill pipeline. A positive value splits each
-    # scheduled request into ordered microbatches of at most this many tokens;
-    # different requests always occupy different microbatches. Multiple
-    # microbatches are queued per PP worker so adjacent stages can overlap.
-    # Zero preserves the original fill-drain execution.
-    pp_prefill_microbatch_tokens: int = 0
+    # Static forward-only prefill pipeline. ``max_num_batched_tokens`` is the
+    # per-stage microbatch size; the scheduler admits up to ``pp`` such
+    # microbatches per step so adjacent stages can overlap.
     # Maximum queued microbatch RPCs per worker. Zero defaults to min(pp, 16),
     # matching DLSLime's default RPC slot count while filling a PP16 pipeline.
     pp_prefill_pipeline_depth: int = 0
@@ -549,12 +549,8 @@ class Config(BaseModel):
         # Pipeline parallelism validation and constraints.
         if self.pp < 1:
             raise ValueError("pp must be >= 1")
-        if self.pp_prefill_microbatch_tokens < 0:
-            raise ValueError("pp_prefill_microbatch_tokens must be >= 0")
         if self.pp_prefill_pipeline_depth < 0:
             raise ValueError("pp_prefill_pipeline_depth must be >= 0")
-        if self.pp_prefill_microbatch_tokens > 0 and self.pp <= 1:
-            raise ValueError("pp_prefill_microbatch_tokens requires pp > 1")
         if self.pp > 1:
             arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
             supported_pp_archs = (

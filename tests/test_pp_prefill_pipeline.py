@@ -2,6 +2,13 @@ from types import SimpleNamespace
 
 import dlengine._rust.proto as proto
 from dlengine.engine.llm_engine import LLMEngine
+from dlengine.engine.scheduler import scheduler_token_budget
+
+
+def test_scheduler_budget_scales_with_pipeline_size():
+    config = SimpleNamespace(max_num_batched_tokens=16384, pp=16)
+
+    assert scheduler_token_budget(config) == 16384 * 16
 
 
 class _FakeRunnerOut:
@@ -69,7 +76,7 @@ def test_static_pp_prefill_pipelines_long_and_independent_requests(monkeypatch):
     engine = LLMEngine.__new__(LLMEngine)
     engine.engine_id = "engine"
     engine.config = SimpleNamespace(
-        pp_prefill_microbatch_tokens=4,
+        max_num_batched_tokens=4,
         pp_prefill_pipeline_depth=3,
         num_kvcache_blocks=16,
         executor_backend="ray",
@@ -109,7 +116,7 @@ def test_static_pp_prefill_pads_shorter_dp_cells_with_dummy(monkeypatch):
     engine = LLMEngine.__new__(LLMEngine)
     engine.engine_id = "engine"
     engine.config = SimpleNamespace(
-        pp_prefill_microbatch_tokens=4,
+        max_num_batched_tokens=4,
         pp_prefill_pipeline_depth=2,
         num_kvcache_blocks=16,
     )

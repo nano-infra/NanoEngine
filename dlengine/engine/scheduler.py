@@ -22,15 +22,23 @@ def init_scheduler(config: Config) -> RustScheduler:
     return RustScheduler(scheduler_config)
 
 
+def scheduler_token_budget(config: Config) -> int:
+    """Return the scheduler window for one pipeline-parallel engine step."""
+    return config.max_num_batched_tokens * max(1, config.pp)
+
+
 def build_scheduler_config(
     config: Config, cache_plan: CachePlan | None = None
 ) -> SchedulerConfig:
     cache_plan = cache_plan or ensure_cache_plan(config)
+    # ``max_num_batched_tokens`` is the per-forward/per-stage microbatch size.
+    # Admit one microbatch per PP stage so a scheduler step can fill the pipe.
+    token_budget = scheduler_token_budget(config)
     return SchedulerConfig(
         engine_id=config.engine_id or "",
         num_speculative_tokens=config.num_speculative_tokens,
         max_num_seqs=config.max_num_seqs,
-        max_num_batched_tokens=config.max_num_batched_tokens,
+        max_num_batched_tokens=token_budget,
         max_model_len=config.max_model_len,
         eos_ids=config.eos,
         attention_dp=config.attention_dp,

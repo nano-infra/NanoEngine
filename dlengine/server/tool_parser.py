@@ -87,7 +87,12 @@ def _extract_reasoning(text: str) -> tuple[Optional[str], str]:
     """
     close = text.find("</think>")
     if close == -1:
-        return None, text
+        unfinished = text.strip()
+        if not unfinished.startswith("<think>"):
+            return None, text
+        while unfinished.startswith("<think>"):
+            unfinished = unfinished[len("<think>") :].lstrip()
+        return (unfinished or None), ""
     open_idx = text.find("<think>")
     if 0 <= open_idx < close:
         reasoning = text[open_idx + len("<think>") : close]
@@ -95,7 +100,10 @@ def _extract_reasoning(text: str) -> tuple[Optional[str], str]:
     else:
         reasoning = text[:close]
         rest = text[close + len("</think>") :]
-    return (reasoning.strip() or None), rest
+    reasoning = reasoning.strip()
+    while reasoning.startswith("<think>"):
+        reasoning = reasoning[len("<think>") :].lstrip()
+    return (reasoning or None), rest
 
 
 def _coerce_value(raw: str):

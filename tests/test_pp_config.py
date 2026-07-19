@@ -3,6 +3,16 @@ from types import SimpleNamespace
 import dlengine.config as config_module
 import pytest
 from dlengine.config import Config
+from dlengine.engine.scheduler import scheduler_token_budget
+
+
+@pytest.fixture(autouse=True)
+def _mock_raw_config(monkeypatch):
+    monkeypatch.setattr(
+        config_module.PretrainedConfig,
+        "get_config_dict",
+        lambda *args, **kwargs: ({}, {}),
+    )
 
 
 def _qwen35_config():
@@ -80,7 +90,7 @@ def test_pp_allows_prefill_pd_role_with_ctrl_address(monkeypatch):
     assert config.world_size == 2
 
 
-def test_pp_allows_static_prefill_microbatch_pipeline(monkeypatch):
+def test_pp_uses_max_batched_tokens_as_prefill_microbatch_size(monkeypatch):
     monkeypatch.setattr(
         config_module.AutoConfig,
         "from_pretrained",
@@ -91,29 +101,14 @@ def test_pp_allows_static_prefill_microbatch_pipeline(monkeypatch):
         model="unused",
         pp=2,
         mode="prefill",
-        pp_prefill_microbatch_tokens=1024,
+        max_num_batched_tokens=1024,
         pp_prefill_pipeline_depth=2,
         num_speculative_tokens=0,
     )
 
-    assert config.pp_prefill_microbatch_tokens == 1024
+    assert config.max_num_batched_tokens == 1024
+    assert scheduler_token_budget(config) == 2048
     assert config.pp_prefill_pipeline_depth == 2
-
-
-def test_static_prefill_microbatch_pipeline_requires_pp(monkeypatch):
-    monkeypatch.setattr(
-        config_module.AutoConfig,
-        "from_pretrained",
-        lambda *args, **kwargs: _qwen35_config(),
-    )
-
-    with pytest.raises(ValueError, match="requires pp > 1"):
-        Config(
-            model="unused",
-            pp=1,
-            pp_prefill_microbatch_tokens=1024,
-            num_speculative_tokens=0,
-        )
 
 
 def test_pp_still_rejects_decode_pd_role(monkeypatch):
@@ -156,6 +151,7 @@ def test_pp16_allows_supported_deepseek_architectures(monkeypatch, architecture)
     )
 
     assert config.world_size == 16
+    assert scheduler_token_budget(config) == 16384 * 16
     assert config.kvcache_block_size == 64
     assert config.enforce_eager is True
 

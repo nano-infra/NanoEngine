@@ -433,8 +433,10 @@ class EngineServer:
         logger.info(
             f"KV Cache:        {self.config.num_kvcache_blocks} blocks x {self.config.kvcache_block_size} tokens"
         )
+        scheduler_tokens = self.config.max_num_batched_tokens * max(1, self.config.pp)
         logger.info(
-            f"Max Tokens:      {self.config.max_num_batched_tokens} batched, {self.config.max_model_len} model length"
+            f"Max Tokens:      {self.config.max_num_batched_tokens} per forward, "
+            f"{scheduler_tokens} scheduled, {self.config.max_model_len} model length"
         )
         logger.info(f"NanoCtrl:        {self.config.ctrl_address or 'Not configured'}")
         logger.info(f"Ray Address:     {self.config.ray_address}")

@@ -156,11 +156,7 @@ class LLMEngine:
             # the flat worker list [stage0 ranks..., stage1 ranks..., ...] lines
             # up with the batch list.
             inner = len(batch_bytes)
-            if (
-                schedule_result.is_prefill
-                and pp_size > 1
-                and self.config.pp_prefill_microbatch_tokens > 0
-            ):
+            if schedule_result.is_prefill and pp_size > 1:
                 runner_outs = self._run_static_pp_prefill_pipeline(
                     batch_bytes,
                     schedule_result,
@@ -210,7 +206,7 @@ class LLMEngine:
         """
         from dlengine._rust.proto import RunnerIn, RunnerOut
 
-        microbatch_tokens = self.config.pp_prefill_microbatch_tokens
+        microbatch_tokens = self.config.max_num_batched_tokens
         cell_fragments = [
             RunnerIn.from_bytes(payload).prefill_microbatches(microbatch_tokens)
             for payload in batch_bytes
