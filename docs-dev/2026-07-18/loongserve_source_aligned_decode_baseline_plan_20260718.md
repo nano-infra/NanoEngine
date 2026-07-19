@@ -55,7 +55,8 @@ LoongServe-style Decode-only scheduler on NanoDeploy
 7. capacity-aware initial DoP 和 KV placement；
 8. 运行中 Decode 的 memory-deficit merge；
 9. 运行中 Decode 的 compute-bound idle-rank scale-up；
-10. `PAUSED_OFFLOAD`/readmission 保留生成进度。
+10. 低 KV 利用率时把最空 rank 的 KV 压紧到 retained ranks 并 scale-down；
+11. `PAUSED_OFFLOAD`/readmission 保留生成进度。
 
 第一版不迁移 LoongServe 原二维 DP 的 cost 部分。当前环境没有与原目标函数对应的运行时 cost，强行加载一组无关参数反而会让 baseline 难以解释。第一版采用：
 
@@ -68,24 +69,26 @@ request round-robin 固定到 DP pool
         -> 每 pool 一个连续候选 batch
         -> LoongServe-style packed interval placement
         -> Nano block/metadata exact adapter + allocation/rollback transaction
-        -> source-shaped Decode merge/idle-rank scale-up/OFFLOAD
+        -> source-shaped Decode merge/idle-rank scale-up
+        -> low-KV exact consolidation/OFFLOAD
 ```
 
 这比当前实现更贴近 LoongServe，同时将改动限制在 Decode scheduler。若会议要求二维 DP，再增加一个明确命名的 Decode-cost 版本，不能把它静默混入基础组。
 
 ### 0.1 最小偏离原则
 
-基础组只允许四类 unavoidable adaptation：
+基础组只允许五类 unavoidable adaptation：
 
 1. LoongServe artifact 的多个独立 worker 映射为 Nano 的多个固定 SP8 attention pools；
 2. 原 Prefill cost DP 删除后，每 pool 每轮只形成一个 batch，并选择最小 exact-feasible DoP；
 3. dummy bootstrap 是 CPU/KV side effect，因此每个非 OFFLOAD step 都可 scan、且 admission 不抑制本轮已有 requests 的 Decode；admission token 数超过剩余 truly-idle rank 总容量时，才按 LoongServe 原 capacity 顺序 append/merge existing groups；
-4. LoongServe token interval 通过 Nano 的 block/metadata transaction 落地。
+4. LoongServe token interval 通过 Nano 的 block/metadata transaction 落地；
+5. LoongServe 的 scale-down 原本由真实 Prefill pressure/收益触发；本实验没有真实 Prefill cost，因此只用 low-KV utilization 触发同 group 内 exact rank evacuation，补齐 scale-up 后可回落的闭环。
 
 以下内容不进入 baseline：
 
-- 周期性 low-KV-util consolidation；
 - Prefill gain/cost 驱动的 admission-time reclaim，以及 unordered/ad-hoc admission merge；
+- waiting/pending benefit、gap、age 或 planner failure 绕过 low-KV threshold 的 consolidation；
 - `PAUSED_KVKEEP`；
 - block-rounded future predictor；
 - event-driven planning cache；
@@ -162,7 +165,7 @@ FIFO membership 由 pool-local queue 决定；membership 确定后的稳定降�
 - request/instance 排序与连续 batch range：`manager.py:686-750`；
 - 二维 DP 的状态和回溯形状：`longserve_c_scheduler/src/main.cpp:33-84`；
 - packed token interval placement：`manager.py:764-800`；
-- 新 Prefill 到达时的可选 scale-down（仅作为为何不移植的边界证据）：`manager.py:516-680`；
+- 新 Prefill 到达时按低占用 source 压紧 instances 的 scale-down 方向：`manager.py:516-680`；
 - Decode memory/compute elasticity：`manager.py:844-970`；
 - request 状态、admission token 和 future tuple：`io_struct.py:14-24,110-147`；
 - `max_new_tokens>=1`、`ignore_eos` 字段与 length/EOS finish：`sampling_params.py:9-56`、`io_struct.py:188-200`；
@@ -180,7 +183,7 @@ FIFO membership 由 pool-local queue 决定；membership 确定后的稳定降�
 - 两条计算 lane 的联合调度；
 - 与当前 Nano topology 无关的全局通信重构；
 - Nano 自定义 gap、age 或 planner-failure group merge heuristic；
-- 周期性 low-utilization KV consolidation；
+- fresh waiting/pending benefit、gap、age 或 planner failure 触发的 consolidation；
 - KVKEEP 及其 paused-KV reservation accounting；
 - 为 dummy prefill 伪造 Prefill gain、migration-payback 或 profiler cost。
 
@@ -219,7 +222,7 @@ LoongServe source-identical
 | Prompt KV placement | request 在 ranks 上均匀 striping | packed intervals，再转换为 Nano blocks/metadata | 与 batching 同步修改 |
 | Admission target | standalone no-fit 后按 Nano planner failure 选择 existing group | idle token capacity 足够时只建 standalone；不足时按 LoongServe capacity 顺序 append/merge | 收窄 Nano fallback |
 | Admission/Decode | admission 成功会让已有请求少跑一次 Decode | bootstrap 不应吞掉已有请求的 Decode iteration | 修改 |
-| Proactive scale-down | utilization 或 pending benefit 可触发 consolidation | baseline 固定关闭 | 移到 Nano enhancement |
+| Proactive scale-down | utilization 或 pending benefit 可触发 consolidation | 只由 low-KV utilization 产生 candidate；stable/cooldown 只防抖 | 收窄触发并保留 scale-down |
 | Memory scale-up | 多种 planner failure 都可能触发 merge | 只按 Decode token deficit merge/加 rank | 修改 |
 | Compute scale-up | threshold 与 arbitrary group merge 混合 | 只消费 idle ranks，不强并健康 group | 修改 |
 | Preemption | 丢弃 generated tokens 后重启 | 只做 preserve-progress OFFLOAD/readmission | 修改 |
@@ -304,7 +307,7 @@ assignment 完成后，request 不因其他 pool 更空闲而重新路由。无�
 
 ### 4.2 每个非 OFFLOAD scheduler step 都允许 admission
 
-Decode-only baseline 不使用固定 step 间隔限制 waiting scan；第 10 节 mandatory OFFLOAD commit 后立即返回，是唯一 source-shaped early-return exception。
+Decode-only baseline 不使用固定 step 间隔限制 waiting scan；第 10 节 mandatory OFFLOAD 是唯一在 scan 前立即返回的 source-shaped exception。第 9.3 节 low-KV candidate 只在各 pool 已完成本轮 scan、且全局没有可提交 admission plan时检查，命中后才以独占 `KV_CONSOLIDATION` 取代本轮 Decode。
 
 语义规则是：
 
@@ -316,6 +319,10 @@ else:
     for dp in [0, attention_dp):
         if waiting_by_dp[dp] 非空:
             本 scheduler step 执行该 pool 的 request-level admission scan
+
+if 全局没有 valid admission plan，且所有 tentative pool transaction 已结束:
+    检查 low-KV candidate
+    exact plan 成功则 KV_CONSOLIDATION return，不执行本轮 Decode
 
 if step 入口存在 running requests 且可形成本轮 Decode plan:
     先为入口 snapshot 保留本轮 Decode 所需 ranks
@@ -330,7 +337,7 @@ if admission 成功且系统原本 idle:
 
 dummy bootstrap 只有 scheduler/KV 状态更新，没有需要用固定间隔摊销的 GPU 工作。照搬 10-step gate 会人为增加 queueing latency，并改变 arrival rate 实验的负载形状。
 
-第一版固定 every-non-OFFLOAD-step scan，不叠加 event cache。LoongServe 源码只在 idle 或累计到 `max_wait_tokens` 时扫描；这里删除 cadence gate 是因为 dummy bootstrap 没有 Prefill GPU cost，是一项显式 cadence adaptation。若后续 telemetry 证明 scan 开销成为瓶颈，event cache 只能作为独立性能 variant，不能静默进入基础组。
+第一版固定 every-non-OFFLOAD-step scan，不叠加 event cache。LoongServe 源码只在 idle 或累计到 `max_wait_tokens` 时扫描；这里删除 cadence gate 是因为 dummy bootstrap 没有 Prefill GPU cost，是一项显式 cadence adaptation。KV consolidation 发生在 scan 后，因此不取消本轮 admission opportunity；只有没有可提交 admission 时才延后一轮 Decode。若后续 telemetry 证明 scan 开销成为瓶颈，event cache 只能作为独立性能 variant，不能静默进入基础组。
 
 ### 4.3 Pool-local FIFO scan 和 bounded OOE
 
@@ -648,7 +655,7 @@ admission_token_sum = sum(admission_need_tokens of selected membership)
 
 所有 group-list 算法都从 canonical `ls_group_ids_by_dp_[dp]` 的当前稳定顺序取输入，不遍历 unordered map。与 LoongServe 一样，按单一数值 key 做 stable ascending sort 后从尾部 `pop_back()`；equal-key 时因此选择原 pool order 中更靠后的 group，不再增加 group-ID tie heuristic。
 
-canonical pool order 的 mutation 也冻结：standalone/new admission survivor append tail；capacity append 将 actually merged donors 按原顺序 stable erase 后，把 new survivor append tail；memory planning commit 后直接采用第 9.1 节最终 can-list 的 survivor 顺序；finish/OFFLOAD/whole-group delete 只 stable erase；idle-rank scale-up 与 zero-live rank cleanup 不重排。任何路径都不得按 unordered-map iteration 或 group ID 重新排序。
+canonical pool order 的 mutation 也冻结：standalone/new admission survivor append tail；capacity append 将 actually merged donors 按原顺序 stable erase 后，把 new survivor append tail；memory planning commit 后直接采用第 9.1 节最终 can-list 的 survivor 顺序；finish/OFFLOAD/whole-group delete 只 stable erase；idle-rank scale-up、zero-live cleanup和同 group low-KV consolidation都不重排 group。任何路径都不得按 unordered-map iteration 或 group ID 重新排序。
 
 group 内 Sequence 顺序同样不得由 unordered container 重建：admission capacity survivor 先放 surviving new requests 的既定 stable admission order，再按 planned-donor selection order追加每个 actually overlapped donor 的原 Sequence order；memory survivor 先保留 constrained group 原顺序，再按 can-list pop/union order追加 donors；finish/abort 只 stable erase。这一顺序直接决定后续 continuous master ranges。
 
@@ -665,7 +672,7 @@ capacity append 只能弥补源码定义的 idle aggregate token deficit，不�
 
 同 key 时保持原 rank-pool 顺序。Nano 当前没有本设计需要单独引入的 `node_id` key，使用现有 `sp_rank` 即可确定性复现。
 
-ownership 只在 standalone admission、capacity append/merge、memory-deficit merge、idle-rank scale-up、zero-live-KV cleanup 或整个 group 删除时改变。单个 request finish/OFFLOAD 后，对 group 的每个 rank 重新计算 live KV、pending token、iteration master 和 step-local reservation；四者都为 0/空的 rank 立即从 canonical allocation 删除并令 owner 变为 NONE，即使 group 仍非空。该操作不移动任何历史 KV，等价于 LoongServe finish cleanup，不是 low-util consolidation。
+ownership 只在 standalone admission、capacity append/merge、memory-deficit merge、idle-rank scale-up、zero-live-KV cleanup、成功 low-KV consolidation 或整个 group 删除时改变。单个 request finish/OFFLOAD 后，对 group 的每个 rank 重新计算 live KV、pending token、iteration master 和 step-local reservation；四者都为 0/空的 rank 立即从 canonical allocation 删除并令 owner 变为 NONE，即使 group 仍非空。该 zero-live 操作不移动历史 KV；low-KV consolidation 则必须走第 9.3 节独占 exact P2P transaction。
 
 ### 7.2 Initial DoP
 
@@ -777,7 +784,7 @@ ls_seq_to_batch_
 - dummy token append、pending flag/target 和 running-token accounting；
 - `SequenceStatus`、group/batch maps 和 canonical `allocated_attention_ranks`；派生 owner 索引只在 publication 后重建并校验；
 - pool-local OOE；
-- fresh admission 的 first-scheduled、decode-scheduled、first-token/generated metric state；OFFLOAD readmission 只保留这些既有时间点并增加 generated。
+- fresh admission 的 first-scheduled、decode-scheduled、first-token/last-token/generated metric state；OFFLOAD readmission 保留 first/queue时间点并prepared更新 last-token、ITL和generated。
 
 dummy append 后统一检查 output limit。fresh 或 OFFLOAD readmission 若由该 token 完成，则在同一 transaction 内标记 FINISHED、释放刚恢复的 KV 和该 request 的 group membership，并按 zero-live-KV cleanup 释放不再承载任何 live/pending/master/reservation 的 ranks；group 变空时删除其全部剩余状态。admission record 标记 `bootstrap_finished=true`，该 request 不会进入下一轮 Decode。
 
@@ -789,7 +796,7 @@ post-bootstrap filtering 发生在 persistent group publication 之前，并复�
 
 只要存在 surviving new request，admission transaction 预留的 **new group ID** 就是最终 survivor ID；所有实际 overlap 的 donor group IDs 被删除并重映射到该 new group。这与 LoongServe 将 overlapped Decode batches merge 到 new batch 的方向一致，也消除了 tie-break 歧义。若全部 bootstrap-finished，则该预留 group ID 只留下允许的 gap，不发布。
 
-metric 规则同样固定：fresh bootstrap commit 同时幂等记录 first-scheduled、decode-scheduled 和 first-token timestamp，并把 generated count 增加 1；OFFLOAD readmission 保留这些既有 timestamp/queue history，只把 generated count 增加 1。任何 staging/validation 失败都必须恢复增量前的 metric snapshot。
+metric 规则同样固定：transaction prepare捕获一个 bootstrap commit timestamp。fresh bootstrap commit幂等记录 first-scheduled、decode-scheduled和first-token，将last-token设为该timestamp、generated加1且不产生首token ITL；OFFLOAD readmission保留first/queue timestamps，把 `(commit_timestamp - previous_last_token) * 1000` 作为一条ITL sample，更新last-token并generated加1。prepare必须预留ITL vector容量，commit不得调用可能分配的`record_token()`；任何staging/validation失败都恢复完整metric snapshot。
 
 因此 dummy bootstrap 从 Python `llm_engine.py` 移入 C++ admission transaction。Python 不再执行 admission 后的 `may_append()`、`append_token(0)`、pending mark 或 running-token counter 更新，只消费 committed admission records 和记录外部 telemetry。这样 allocation 成功但 bootstrap 失败时仍能在同一 transaction 内回滚。
 
@@ -849,16 +856,19 @@ LS path 的 action 语义固定为：
 |---|---|---|---|
 | `DECODE` | admissions 可有，OFFLOAD record 必为空 | eligible snapshot real requests + required dummies | 只执行一轮 Decode |
 | `ADMISSION` | 至少一条 committed admission，或恰一条 OFFLOAD record；二者不同时出现 | 空 | scheduler-only，不调用 model |
+| `KV_CONSOLIDATION` | 恰一份 RESERVED low-KV exact evacuation plan；admission/OFFLOAD records 均为空 | 空 | 独占执行 P2P、提交 scale-down，不调用 model |
 
-为复用现有 ABI，本文的 OFFLOAD record 就是同 index 的 `ls_preempted_sequence_ids` 与 `ls_preemption_reasons`，reason 固定含 `OFFLOAD`；不再新增第三种 maintenance action。
+为复用现有 ABI，本文的 OFFLOAD record 就是同 index 的 `ls_preempted_sequence_ids` 与 `ls_preemption_reasons`，reason 固定含 `OFFLOAD`；OFFLOAD 继续复用 `ADMISSION`，不为它再新增第四种 action。
 
-formal baseline 固定 `ls_kv_consolidation_mode=off`，因此绝不返回 `KV_CONSOLIDATION`，其现有 `LSKVConsolidationPlan`/engine coordinator 只服务独立 Nano enhancement。capacity group merge 是 scheduler metadata union；OFFLOAD 是第 10 节 scheduler-local commit，二者都不能伪装成该 action。
+formal baseline 固定 `ls_kv_consolidation_mode=execute`。`KV_CONSOLIDATION` 只服务第 9.3 节同一 group 内“迁走一个低占用 source rank 并释放该 rank”的 exact P2P scale-down；capacity/admission group merge 是 scheduler metadata union，OFFLOAD 是第 10 节 scheduler-local commit，二者都不能伪装成该 action。一次 `schedule()` 全局最多返回一份 consolidation plan。
 
-LS path 不再用 `is_prefill` 选择 dummy bootstrap 分支；`is_prefill` 固定为 `false`，engine 必须按 `action` 决定是否执行 model。无 real Decode、无 committed admission/OFFLOAD 却仍有 waiting 的情况违反 ingress empty-pool-fit invariant，scheduler 抛第 8.6 节 typed fatal error，不能用无进展的空 `ADMISSION` 忙等。
+field matrix 必须严格：`DECODE/ADMISSION` 的 `kv_consolidation_plan == null`；`KV_CONSOLIDATION` 恰有一个 `RESERVED` plan，且 admission records、OFFLOAD records、real/running IDs 及全部 Decode-shaped arrays 都为空。
 
-engine 在读取 Decode-shaped arrays 前先消费 `ls_admission_records`：对 `bootstrap_finished=true` 的 sequence 恰好调用一次 `metrics_manager.complete_sequence()` 并把 `(seq_id, completion_token_ids)` 加入本 step outputs；其 ID 必须与 Decode real set 不相交。其余 records 只记 telemetry。随后先用 `ls_running_ids_by_dp_after_commit` 更新 running gauge，并刷新 waiting/paused gauges；`action=ADMISSION` 才直接返回 `(outputs, num_tokens=0, real_batch_size=0, ...)`，只跳过 Decode-shaped stats、executor 与 throughput，不得访问/flatten 空 Decode arrays。`action=DECODE` 才 forward，并从 Decode results 追加普通 finished outputs；用 step-local finished-ID set 断言没有重复 completion。
+LS path 不再用 `is_prefill` 选择 dummy bootstrap 分支；`is_prefill` 固定为 `false`，engine 必须按 `action` 决定是否执行 model。无 real Decode、无 committed admission/OFFLOAD、也无有效 RESERVED consolidation plan却仍有 waiting 的情况违反 ingress empty-pool-fit invariant，scheduler 抛第 8.6 节 typed fatal error，不能用无进展的空 `ADMISSION` 忙等。
 
-`LLMEngine.generate()` 必须先把本 step `outputs` 合并进最终结果并更新 completed progress，再处理 `num_tokens == 0` 的 throughput 分支；零 GPU token 只能跳过吞吐率采样，不能 `continue` 掉 admission-only completion。running gauge 使用 `ls_running_ids_by_dp_after_commit`，batch size、Decode token usage、throughput 和普通 completion 只使用 `ls_real_decode_ids_by_dp` 过滤后的 real requests，collective dummies 永不进入用户指标。
+engine 在读取 Decode-shaped arrays 前先按 action 分流。`KV_CONSOLIDATION` 必须断言 admission/OFFLOAD/Decode fields 为空，调用冻结 plan 自带的 P2P coordinator，成功后刷新 group/maintenance telemetry并直接返回 zero-token result；不得调用 model。其余 action 才先消费 `ls_admission_records`：对 `bootstrap_finished=true` 的 sequence 恰好调用一次 `metrics_manager.complete_sequence()` 并把 `(seq_id, completion_token_ids)` 加入本 step outputs；其 ID 必须与 Decode real set 不相交。其余 records 只记 telemetry。随后先用 `ls_running_ids_by_dp_after_commit` 更新 running gauge，并刷新 waiting/paused gauges；`action=ADMISSION` 才直接返回 `(outputs, num_tokens=0, real_batch_size=0, ...)`，只跳过 Decode-shaped stats、executor 与 throughput，不得访问/flatten 空 Decode arrays。`action=DECODE` 才 forward，并从 Decode results 追加普通 finished outputs；用 step-local finished-ID set 断言没有重复 completion。
+
+`LLMEngine.generate()` 必须先把本 step `outputs` 合并进最终结果并更新 completed progress，再处理 `num_tokens == 0` 的 throughput 分支；零 GPU token 只能跳过当步吞吐率采样，不能 `continue` 掉 admission-only completion。KV consolidation stall 单独累计并归入下一次 Decode wall time，同时单独报告 maintenance latency。running gauge 使用 `ls_running_ids_by_dp_after_commit`，batch size、Decode token usage、throughput 和普通 completion 只使用 `ls_real_decode_ids_by_dp` 过滤后的 real requests，collective dummies 永不进入用户指标。
 
 ### 8.4 单步顺序和资源优先级
 
@@ -874,28 +884,34 @@ engine 在读取 Decode-shaped arrays 前先消费 `ls_admission_records`：对 
 3. pool-local FIFO/OOE admission prepare
    idle aggregate token deficit -> ordered capacity append/merge prepare
    同时建立 transaction-owned admission rank/block reservations
-4. optional compute scale-up 只规划 admission reservation 剩余的 idle ranks
-5. 以 admission 后的 prospective group graph 为输入，为 eligible entry IDs 构造并 validate `LSDecodePlanTransaction`
-6. admission/optional prepare 或 combined validate 失败 -> abort tentative mutations，OOE 不变，重新构造 stable graph 的 decode-only plan
+4. 若全局没有 valid admission plan，先确保所有 tentative pool transaction 已 abort/结束，再按
+   `(dp_idx asc, canonical group order)` 检查成熟 low-KV candidate；选择
+   `(used_blocks, used_tokens, sp_rank) asc` 的非 master source，exact plan成功则发布全局恰一份
+   RESERVED plan并立即返回 KV_CONSOLIDATION；plan reject/abort保持稳定 graph并继续
+5. optional compute scale-up 只规划 admission reservation 剩余的 idle ranks
+6. 以 admission 后的 prospective group graph 为输入，为 eligible entry IDs 构造并 validate `LSDecodePlanTransaction`
+7. admission/optional prepare 或 combined validate 失败 -> abort tentative mutations，OOE 不变，重新构造 stable graph 的 decode-only plan
    decode-only capacity NO_FIT -> 按步骤 2 commit 恰好一个 OFFLOAD并返回；decode-only internal prepare/validate error -> typed fatal
-7. 将同一 pool 的 admission 与 Decode plan 组成 `LSPoolStepTransaction`；全部 required Decode components validate 后，按 dp_idx no-throw publication
-8. 有 eligible real snapshot -> DECODE；否则有 committed admission/OFFLOAD -> ADMISSION；否则按第 8.6 节处理
+8. 将同一 pool 的 admission 与 Decode plan 组成 `LSPoolStepTransaction`；全部 required Decode components validate 后，按 dp_idx no-throw publication
+9. 有 eligible real snapshot -> DECODE；否则有 committed admission/OFFLOAD -> ADMISSION；否则按第 8.6 节处理
 ```
 
 执行效果：
 
-1. 纯 admission 不会让 step-entry running requests 少一次 Decode；mandatory OFFLOAD 与 LoongServe 一致，是一次独占 scheduler-only step，整个 snapshot 本轮不 forward；
+1. 纯 admission 不会让 step-entry running requests 少一次 Decode；mandatory OFFLOAD 和 KV consolidation 是两种独占 maintenance，整个 snapshot 本轮不 forward；
 2. 新 admitted 且未完成的 requests 已完成 dummy bootstrap，但不出现在本轮 Decode snapshot，从下一轮开始 Decode；`bootstrap_finished` readmission 直接完成；
 3. 系统原本 idle 时，本轮只做 admission，下一轮开始 Decode；
 4. waiting admission 的 rank reservation 先于 optional compute scale-up，compute 只能消费剩余 idle ranks，不能饿死 waiting；
 5. ordinary admission no-fit、prepare rollback 或 optional scale-up failure 只丢弃 tentative work，不能让稳定 running requests 少一次 Decode；
-6. baseline 中不存在主动或 mandatory `KV_CONSOLIDATION` step。
+6. 成熟 low-KV candidate 只在没有 valid admission 时让 Decode 延后一轮；一次只释放一个 rank，且 stable/cooldown/check-interval 限制其频率。它不能与 admission、OFFLOAD 或 pool transaction 共存，也不能饿死可提交 admission。
 
 这里没有第二条 GPU 计算 lane，只是把 CPU/KV admission side effect 与已有 Decode plan 放在同一个 scheduler result 中。
 
 ### 8.5 DecodePlan transaction
 
 `LSDecodePlanTransaction` 只包含 mandatory memory-deficit group merge、空 rank scale-up 和 iteration-master/pending-token reservation，不迁移历史 KV、不执行 P2P。admission capacity append/merge 属于同 pool 的 admission plan；两者共同生成一份 prospective group graph。prepare 保存 canonical group allocations、Sequence ACTIVE contexts、blocks/running counters，并完成所有可能分配内存的容器准备；validate 在该 prospective graph 上做 exact master/headroom 和 real-membership 检查。
+
+`LSKVConsolidationPlan` 是独立的 stop-the-world transaction，不嵌入 `LSPoolStepTransaction`。只有全局没有 valid admission、所有 tentative admission/其他 pool transaction 都已 abort/结束且没有 active prepared/committing state 时才能创建它；RESERVED 期间 scheduler 的 add/schedule/preempt/postprocess/free 全部 fail closed，直到 coordinator commit 或明确可安全 abort。
 
 `LSPoolStepTransaction` 是原子性 wrapper，不是新的调度 policy。它只把已由第 7、9 节决定的 admission/Decode mutations 按依赖顺序发布：staged prompt/readmission KV 与 dummy 结果 → post-bootstrap filter/zero-live cleanup → surviving-overlap group union/idle-rank ownership → iteration master/pending reservation → queue/maps/OOE/derived-owner publication。所有可能失败的 allocator/container 操作必须在 prepare 阶段完成。admission/optional component prepare 或 combined validate 失败时，abort 后必须在未改变的稳定 graph 上重建 decode-only transaction；只有 decode-only 本身发生 fatal safety/internal error 时才不 forward。通过 validate 后的 commit 必须 no-throw，因此不存在“admission 已发布但 Decode layout 仍引用旧 group”的中间状态。
 
@@ -942,6 +958,7 @@ enum class LSFatalCode {
     UNRECOVERABLE_CAPACITY,
     DECODE_PREPARE_OR_VALIDATE_FAILED,
     METRIC_COMMIT_FAILED,
+    KV_CONSOLIDATION_FAILED,
     POST_PUBLICATION_INVARIANT,
 };
 
@@ -957,9 +974,9 @@ private:
 void Scheduler::latch_ls_fatal(LSFatalCode code) noexcept;
 ```
 
-ingress 的 `UnschedulableRequestError` 是 request-local 非 fatal 错误；以上 fatal codes 则令 scheduler 设置永久 `ls_fatal_` latch。LS `LLMEngine.step()` 必须包住 `scheduler.schedule()` 和 admission-record publication：捕获 `LSSchedulerFatalError` 或任何 publication-boundary unexpected exception 后，先通过 binding 调用 `latch_ls_fatal(code)`，再设置现有 Python `fatal_error`、记录 code/step/state hashes并重新抛出。`LLMEngine.add_request()` 同样包住 `Scheduler::add()` 与 metric ticket commit：scheduler ingress prepare 异常发生在任何 seen/RR/assignment mutation 前，因此 abort ticket 后可原样抛出；accepted enqueue 后的异常调用 `latch_ls_fatal(METRIC_COMMIT_FAILED)` 并 latch engine。之后 `add_request()/step()/generate()` 都经 `_raise_if_fatal()` 拒绝继续。benchmark 将它记录为 run failure，不能重试同一 engine 掩盖重复 no-progress。
+ingress 的 `UnschedulableRequestError` 是 request-local 非 fatal 错误；以上 fatal codes 则令 scheduler 设置永久 `ls_fatal_` latch。LS `LLMEngine.step()` 必须包住 `scheduler.schedule()`、consolidation coordinator/P2P/commit和admission-record publication：捕获 `LSSchedulerFatalError` 或任何 publication-boundary unexpected exception 后，先通过 binding 调用 `latch_ls_fatal(code)`，再设置现有 Python `fatal_error`、记录 code/step/state hashes并重新抛出。consolidation在确认尚未dispatch任何worker RPC时失败，才允许`abort_noexcept()` destination reservation、记录rejected maintenance并返回zero-token；从首次dispatch开始，任何completion ambiguity或commit stale/failure都必须latch `KV_CONSOLIDATION_FAILED`。`LLMEngine.add_request()` 同样包住 `Scheduler::add()` 与 metric ticket commit：scheduler ingress prepare 异常发生在任何 seen/RR/assignment mutation 前，因此 abort ticket 后可原样抛出；accepted enqueue 后的异常调用 `latch_ls_fatal(METRIC_COMMIT_FAILED)` 并 latch engine。之后 `add_request()/step()/generate()` 都经 `_raise_if_fatal()` 拒绝继续。benchmark 将它记录为 run failure，不能重试同一 engine 掩盖重复 no-progress。
 
-fatal code 映射不得由调用点自由选择：typed `LSSchedulerFatalError` 使用其 `fatal_code()`；required Decode prepare/validate 的 unexpected exception，在确认稳定状态未改变后映射为 `DECODE_PREPARE_OR_VALIDATE_FAILED`；commit 返回后的 post-check failure 或其他 publication-boundary unexpected exception 映射为 `POST_PUBLICATION_INVARIANT`；accepted add 后的 metric attach/commit failure 映射为 `METRIC_COMMIT_FAILED`。`NO_PROGRESS_INVARIANT` 与 `UNRECOVERABLE_CAPACITY` 只由对应显式 scheduler invariant path 产生。
+fatal code 映射不得由调用点自由选择：typed `LSSchedulerFatalError` 使用其 `fatal_code()`；required Decode prepare/validate 的 unexpected exception，在确认稳定状态未改变后映射为 `DECODE_PREPARE_OR_VALIDATE_FAILED`；KV P2P 已 dispatch 后的 worker completion ambiguity、copy/commit failure映射为 `KV_CONSOLIDATION_FAILED`，保留 RESERVED guard且不继续运行；其他 commit 返回后的 post-check failure 或 publication-boundary unexpected exception映射为 `POST_PUBLICATION_INVARIANT`；accepted add 后的 metric attach/commit failure映射为 `METRIC_COMMIT_FAILED`。`NO_PROGRESS_INVARIANT` 与 `UNRECOVERABLE_CAPACITY` 只由对应显式 scheduler invariant path 产生。
 
 ## 9. 运行中 Decode elasticity
 
@@ -1001,27 +1018,47 @@ while remaining_requests // remaining_instances
 
 LoongServe API default 为 100，artifact launcher 使用 128。两者都有 source provenance。
 
-正式 Issue 1% baseline 建议冻结一个值，不在运行中自适应。当前正式实验已使用 128，可以继续作为 artifact-derived profile；64 和 8 作为独立 sensitivity，不混入 base。
+正式 Issue 1% baseline 固定为 128，不在运行中自适应；100只用于 source-default sensitivity，64和8只作为独立 sensitivity，不混入base。
 
-### 9.3 只做 zero-live-KV cleanup，不做主动 consolidation
+### 9.3 Low-KV exact consolidation
 
-LoongServe `manager.py:516-680` 的 scale-down 发生在真实新 Prefill 到来时，并比较 Prefill speedup 与 KV migration cost。dummy prefill 没有对应 GPU Prefill gain，不能用固定 `group_kv_util < 0.50` 伪造收益函数。
+LoongServe `manager.py:516-680` 只在真实新 Prefill 到来时尝试压紧 Decode instances：按 used tokens 选择最低占用 source，把 KV 搬到 retained ranks，source 清空后再 scale-down。普通 Decode path 不做这类迁移；finish path 只释放已经 zero-live 的 rank。因此在没有真实 Prefill cost 的 dummy-prefill/Decode-only 实验里完全关闭 consolidation，会令临时 scale-up 到 SP8 的 group 除非某 rank 自然归零，否则没有回落路径。
 
-因此正式 baseline 固定：
-
-```text
-ls_kv_consolidation_mode = off
-```
-
-每轮 finish/abort cleanup 和 OFFLOAD commit 后，立即释放 `live KV == 0` 且没有 pending token、iteration master 或 transaction reservation 的 rank；这条无迁移 cleanup 与 LoongServe `_handle_finish_req()` 释放 zero-used-token instances 对齐。禁止为了降低 DoP 而搬迁仍存活的 KV，也禁止仅因 utilization 较低释放非空 rank。
-
-capacity/admission merge 将 donor rank ownership 原子改到 survivor，idle-rank scale-up 将 NONE 改为该 group，zero-live-KV cleanup 将 group rank 改回 NONE。现有 low-util consolidation 代码可以保留用于独立实验，但名称必须是：
+formal baseline 保留一个显式的 Decode-only adaptation：**candidate 只能来自持续低 KV 利用率，执行形状继续沿用 LoongServe 的 low-source → retained destination → source release**。
 
 ```text
-LoongServe-style Decode-only + Nano KV consolidation
+group_kv_util = sum(used_kv_blocks on participating ranks)
+              / sum(usable_kv_blocks on participating ranks)
+
+compute_floor = minimum d such that
+                real_running_requests // d
+                <= ls_min_comp_bound_decoding_batch_size
+
+eligible iff:
+    group_kv_util < ls_kv_consolidation_candidate_util
+    and current_kv_dop > 1
+    and current_kv_dop - 1 >= compute_floor
+    and candidate stable/cooldown/check gates pass
 ```
 
-其 utilization threshold、stable/cooldown、destination watermark、source-block budget 和 migration chunk 均不属于本 baseline 配置、telemetry 或验收标准。
+`compute_floor` 复用第 9.2 节同一个 source threshold，不再引入独立的 scale-down target policy；如果撤掉一个 rank 会令下一次 source compute rule 立刻 scale-up，则本轮不 consolidation。candidate 只遍历 real RUNNING group，按 `(dp_idx ascending, ls_group_ids_by_dp_ canonical order)` 选第一个可执行 group。source ranks 排除 active/pending Decode master 和任何 transaction reservation，再按 `(used_blocks, used_tokens, sp_rank)` ascending 逐个 exact 尝试。
+
+防抖计数语义固定：只有“全局无 valid admission、已经进入 maintenance check”的 step才更新。candidate identity 为 `(dp, group_id, ordered member IDs, current allocation, compute_floor)`；identity与上一 eligible check相同且 raw utilization仍低于 threshold时 `stable_steps++`，新 identity从1开始，utilization回升、`DoP <= compute_floor`、membership/allocation改变时清零。execute还要求 global schedule step命中 check interval，且距 `last_scale_up_step` 和 `last_consolidation_step` 都至少 cooldown steps。exact plan reject保留 stable count但不更新 cooldown/epoch；成功 commit才清零并写 `last_consolidation_step`。
+
+每个 source plan 固定：
+
+1. 一次只 evacuation 一个 source rank，全局每个 `schedule()` 最多一份 plan，group 至少保留一个 rank且不跨 SP8 pool；
+2. retained destination 按 `(available exact capacity descending, used KV ascending, sp_rank ascending)`，sequences 按 canonical group sequence order填充；
+3. shadow placement 必须通过 block capacity、destination high-watermark、receiver metadata、pending/master headroom和下一轮 Decode exact validation；
+4. source-block budget 和 migration chunk 只限制一次 transport，不得改变 candidate group/source 顺序；超限或 exact no-fit 时 abort reservation，保持 canonical allocation并继续本轮正常 admission/Decode；
+5. plan 成功后返回独占 `KV_CONSOLIDATION`：先 P2P copy prepared ranges，全部 worker确认后再 no-throw swap ACTIVE metadata、释放 source blocks、从 canonical allocation 删除 source rank并重建 derived owner；
+6. commit 后 source 才成为 truly idle，`pool_resource_epoch[dp]` 增加一次；下一 scheduler call 才 admission/Decode或继续释放另一个 rank。
+
+RESERVED plan publication 前的确定性 planner rejection可以 `abort_noexcept()` 并继续；P2P 已 dispatch 后若 worker completion 不确定、copy 或 metadata/source-release commit 失败，则以 `KV_CONSOLIDATION_FAILED` 永久 latch，保留 transaction guard，不能假设 source/destination 哪一侧可回滚。
+
+candidate 唯一 policy trigger 是 low-KV threshold。`stable_steps/cooldown/check_interval` 只是防止 scale-up/scale-down 抖动和连续 maintenance，destination watermark/source-block budget/migration chunk只是 exact transport safety；fresh waiting/pending benefit、gap、age、planner failure、跨 group或 multi-source event都不能产生或加速 candidate，也不能绕过 threshold/gates。
+
+zero-live cleanup 仍先于本节执行：finish/abort/OFFLOAD 后立即释放 `live KV == 0` 且没有 pending/master/reservation 的 rank，不做 P2P。capacity/admission merge 将 donor ownership 改到 survivor，idle-rank scale-up 将 NONE 改为 group，zero-live cleanup和成功 low-KV consolidation才将 rank改回 NONE。
 
 ### 9.4 Scale-up 固定开启
 
@@ -1082,13 +1119,13 @@ OFFLOAD 使用 prepare/no-throw-commit，而不是承诺释放 block 后还能�
 5. 删除 victim membership 后执行统一 zero-live-KV cleanup：已无 live KV/pending/master/reservation 的 rank 变为 NONE；group 为空时删除其全部剩余状态，非空 group 只保留仍承载状态的 ranks；
 6. commit 前失败可撤销 prepare；commit 后若违反 no-throw invariant，engine fail closed，不尝试伪造已释放 KV 的 rollback。
 
-readmission 从下一次 `schedule()` 起接受同一 pool 的 FIFO/OOE/future-KV scan和普通 ephemeral batch transaction，重新放置 `prompt+generated` tokens，再恰好追加一个固定 ID 0 的 dummy pending token；该固定 token 不调用 sampler。它不推进 RR、不重置 first-token/queueing metrics，generated metric 只按该 token 增加 1，也不调用现有会清零进度的 `SequenceMetric::on_preemption()`。
+readmission 从下一次 `schedule()` 起接受同一 pool 的 FIFO/OOE/future-KV scan和普通 ephemeral batch transaction，重新放置 `prompt+generated` tokens，再恰好追加一个固定 ID 0 的 dummy pending token；该固定 token 不调用 sampler。它不推进 RR、不重置 first-token/queueing metrics，也不调用现有会清零进度的 `SequenceMetric::on_preemption()`；它按第8.2节 prepared metric mutation增加generated、更新last-token并把pause/readmission间隔保留为ITL sample。
 
 不再创建优先级高于普通 request 的长期 singleton recovery batch。
 
 ## 11. 冻结配置
 
-正式 baseline 只把 LoongServe 本身已有的阈值暴露为 tunables：
+正式 baseline 把 LoongServe 本身已有的阈值与一份冻结的 low-KV execution-adapter profile 分开记录：
 
 ```text
 ls_max_num_ooe = 10
@@ -1103,7 +1140,14 @@ ls_min_comp_bound_decoding_batch_size = 128
 ls_decode_enable_future_kv_admission = true
 ls_decode_initial_kv_dop = 0
 ls_disable_scale_up = false
-ls_kv_consolidation_mode = off
+ls_kv_consolidation_mode = execute
+ls_kv_consolidation_candidate_util = 0.50
+ls_kv_consolidation_target_high_watermark = 0.80
+ls_kv_consolidation_stable_steps = 2
+ls_kv_consolidation_cooldown_steps = 2
+ls_kv_consolidation_check_interval_steps = 1
+ls_kv_consolidation_max_source_blocks_per_event = 128
+ls_kv_consolidation_migration_chunk_tokens = 64
 pause_mode = offload
 dp_assignment = arrival_round_robin
 cross_dp_scale_up = false
@@ -1112,22 +1156,24 @@ cross_dp_scale_up = false
 其中：
 
 - `ls_decode_initial_kv_dop=0` 表示最小 exact feasible；正式 baseline 禁止强制值；
-- future-KV、OFFLOAD-only、arrival RR、min-exact DoP、consolidation off 和 cross-DP off 均由 baseline mode 固定，不增加六个新的 runtime policy flags；
+- future-KV、OFFLOAD-only、arrival RR、min-exact DoP、low-KV consolidation execute 和 cross-DP off 均由 baseline mode 固定；`off/shadow` 只用于开发验证，不能作为 formal baseline；
+- consolidation candidate 只由 `group_kv_util < 0.50` 产生；formal profile固定使用已跑过压力实验的防抖/限频值`2/2/1`，它们不是LoongServe source parameter；
+- `0.80/128/64` 分别是 destination safety watermark、单 event source-block budget和预留 transport chunk；它们只允许 reject/限频，不能改变 group/source选择顺序；
 - global `routing_strategy` 在 LS path 不参与 DP 选择，正式脚本仍固定为 `RoundRobin` 以避免 manifest 歧义；
 - `ls_admission_max_tokens_per_pool=auto` 在启动时一次解析为 `max(max_model_len, total_pool_kv_tokens / 6)`，运行中不自适应；
 - 所有 resolved values、固定运行条件、topology 和 `max_tokens>=1` ingress contract 写入运行 manifest。
 
-建议固定三个配置 profile：
+配置只允许以下三个显式 profile：
 
 | Profile | `max_num_ooe` | Decode threshold | 用途 |
 |---|---:|---:|---|
 | `loong_decode_source_default` | 10 | 100 | API default conformance |
-| `loong_decode_artifact_derived` | workload-specific | 128 | 对齐 artifact 参数形状 |
-| `loong_decode_issue001` | 实验 manifest 冻结 | 128 | Nano 正式 Issue 1% 实验 |
+| `loong_decode_artifact_derived` | 必须由 workload manifest 显式给值 | 128 | 对齐 artifact 参数形状 |
+| `loong_decode_issue001` | 必须由正式 manifest 显式给值 | 128 | Nano 正式 Issue 1% 实验 |
 
 参数 profile 变化不代表算法变化，但一次运行不能隐式混用 config、benchmark 和 CLI 三套默认值。
 
-初始化只发生在 engine construction：`next_dp_rr=0`、`next_arrival_order=0`，每个 pool 的 `num_ooe=0`、`pool_resource_epoch=0`，所有 waiting/group/arrival/seen registries为空，`ls_fatal_` 未设置。drain 到空、profile 切换或 benchmark phase 切换都不得隐式重置；需要新序列时必须新建 engine并生成新 manifest。
+初始化只发生在 engine construction：`next_dp_rr=0`、`next_arrival_order=0`，每个 pool 的 `num_ooe=0`、`pool_resource_epoch=0`，所有 waiting/group/arrival/seen registries为空，consolidation stable/cooldown state与 active plan为空，`ls_fatal_` 未设置。drain 到空、profile 切换或 benchmark phase 切换都不得隐式重置；需要新序列时必须新建 engine并生成新 manifest。
 
 ## 12. 代码改造范围
 
@@ -1149,9 +1195,10 @@ cross_dp_scale_up = false
 - typed `LSAddResult`/`LSAdmissionRecord` 与 eligible Decode plan 正交返回；
 - `LSPoolStepTransaction`/`LSDecodePlanTransaction` prepare/validate、decode-only fallback、no-throw commit/abort；
 - Decode memory/compute scale-up 收敛到 source-shaped 规则；
+- low-KV-only candidate、stable/cooldown/check gates、canonical group/least-KV source顺序和全局单 plan publication；删除 pending/no-fit pressure及 admission-benefit bypass；
 - 只实现每 step 至多一次的 OFFLOAD pause/readmission，并保留 generated progress；
 - typed `LSSchedulerFatalError` 与 permanent scheduler fatal latch；
-- baseline 永不生成 proactive low-util consolidation candidate。
+- `KV_CONSOLIDATION` 与 admission/OFFLOAD/pool transaction互斥，RESERVED期间所有 mutation API fail closed。
 
 ### 12.2 `block_manager.*` 与 `sp_state_manager.*`
 
@@ -1161,6 +1208,7 @@ cross_dp_scale_up = false
 - pending-token headroom 和 pinned rank-range validation；
 - prospective group-union/empty-rank/master plan validation；capacity merge 不迁移历史 KV；
 - `prepare_ls_initial_batch()`/`prepare_iteration_master_plan()` 构造 shadow contexts 和 prepared block mutations；formal LS commit 不调用现有 mutating allocator API；
+- `LSKVConsolidationPlan` 的 exact destination reservation、canonical sequence/rank move ranges、P2P 后 no-throw ACTIVE metadata/source-release publication及安全 abort；
 - 增加 adapter rejection reason；
 - 支持 admission side effect 与已有 Decode plan 共存。
 
@@ -1173,9 +1221,10 @@ cross_dp_scale_up = false
 
 ### 12.4 Python/config
 
-- `nanodeploy/config.py`：固定 Decode-only topology/adapter 参数和 profile；
+- `nanodeploy/config.py`：固定 Decode-only topology、low-KV execute adapter参数和 profile；
 - `nanodeploy/engine/scheduler.py`：构造参数；
-- `nanodeploy/engine/llm_engine.py`：删除 Python dummy append；按 metric ticket → `Scheduler::add()` → commit/abort 顺序 ingress；在 Decode arrays 前处理 admission records/ADMISSION early return；在 zero-token throughput 分支前消费 outputs；捕获并 latch LS fatal；
+- `nanodeploy/engine/llm_engine.py`：删除 Python dummy append；按 metric ticket → `Scheduler::add()` → commit/abort 顺序 ingress；在 Decode arrays 前处理 `KV_CONSOLIDATION` coordinator与 admission records/ADMISSION early return；在 zero-token throughput 分支前消费 outputs；捕获并 latch LS fatal；
+- `nanodeploy/engine/kv_consolidation.py`、`ray_executor.py` 和 worker P2P：只执行 scheduler 返回的冻结 plan，不按 group/source二次 planning；copy completion不确定时 fail closed；
 - request ingress：校验 `ignore_eos=true`、`max_tokens>=1` 和 singleton empty-pool fit；
 - benchmark script：输出完整 resolved manifest。
 
@@ -1237,9 +1286,11 @@ Phase 1 完成前不启用任何 LS 新路径，也不保留“新 batching + �
 - memory-deficit donor merge；
 - exact idle-rank scale-up；
 - integer-floor compute threshold；
+- low-KV-only exact consolidation、单 source-rank P2P transaction和防抖/transport safety gates；
+- 删除 pending/no-fit pressure、admission-benefit proof及其对 threshold/stable/cooldown的 bypass；
 - 删除 baseline 中额外 merge；
 - OFFLOAD-only preserve-progress pause/readmission；
-- 将 Phase 1 transaction core 的 mutation set 扩展到 memory merge/idle scale-up/OFFLOAD，并加入 recoverable-victim precheck。
+- 将 Phase 1 transaction core 的 mutation set 扩展到 memory merge/idle scale-up/OFFLOAD，并加入 recoverable-victim precheck；consolidation保持独立 stop-the-world transaction。
 
 ### Phase 3：验收和清理
 
@@ -1264,12 +1315,12 @@ Phase 1 完成前不启用任何 LS 新路径，也不保留“新 batching + �
 9. group DoP 不得超过 8，不能跨 DP pool merge/scale-up。
 10. Nano exact gate 只能 reject/replan，不能静默改变 selected membership；membership shrink 只能按 FIFO selection order。
 11. admission/optional mutation 在 publication 前失败必须 `abort_noexcept()` 并恢复 queue、blocks、ownership、OOE 和 metric；monotonic ID 不要求无 gap，validated publication 不再设置 fault point。
-12. 纯 admission 不减少 eligible step-entry real requests 的 Decode iteration 数；new admitted 当步不参加 Decode，collective dummies 仍完整。OFFLOAD 是显式独占 scheduler-only step，不能与本不变量混淆。
+12. 纯 admission 不减少 eligible step-entry real requests 的 Decode iteration 数；new admitted 当步不参加 Decode，collective dummies 仍完整。OFFLOAD 和 low-KV consolidation 是显式独占 maintenance，不能与本不变量混淆。
 13. memory merge 只由 capacity deficit 触发。
 14. compute scale-up 使用整数 floor threshold，只消费 admission logical reservation 后剩余的 truly-idle ranks。
 15. OFFLOAD/readmission 保留 generated tokens、sampling params、metric progress、arrival order 和 canonical `assigned_dp`；只有通过 empty-pool exact recoverability precheck 才能清 ACTIVE KV；每次 schedule 最多一个 victim且同调用不 readmit。
-16. formal baseline 的 proactive consolidation 固定关闭，不产生 low-util/pending/gap/age candidate。
-17. formal baseline 的 `ScheduleAction` 只返回 `ADMISSION` 或 `DECODE`，绝不返回 `KV_CONSOLIDATION`。
+16. consolidation candidate 只能由持续 low-KV utilization 产生；pending/no-fit pressure、admission benefit、gap、age、planner failure和跨 group状态都不能产生或加速 candidate。每个 action最多释放一个 source rank且不能低于 source compute floor。
+17. formal baseline 的 `ScheduleAction` 可返回 `ADMISSION`、`DECODE` 或独占 `KV_CONSOLIDATION`；三者 field matrix互斥，consolidation全局每 step最多一份 RESERVED plan。
 18. user metrics 只使用 typed real/running IDs；collective dummies 永不计入 running、batch、token、throughput 或 completion。
 19. 任一 fatal code 永久 latch scheduler/engine；不得在同一进程继续 schedule。
 20. 非 LS scheduler 行为不变。
@@ -1293,7 +1344,7 @@ Phase 1 完成前不启用任何 LS 新路径，也不保留“新 batching + �
 - OOE before/tentative/final committed after；
 - first blocker 和 final bypass IDs；
 - selected admission token sum；
-- scan trigger（baseline 为 `every_non_offload_step`；OFFLOAD early-return 明确记录，无 event-cache 字段）。
+- scan trigger（baseline 为 `every_non_offload_step`；OFFLOAD scan-before-return 和 scan 后 consolidation decision明确记录，无 event-cache 字段）。
 
 ### `ls_decode_batch_plan`
 
@@ -1346,6 +1397,16 @@ Phase 1 完成前不启用任何 LS 新路径，也不保留“新 batching + �
 - validate/commit/rollback stage 与 failure reason；
 - group/context/block/running-counter state hashes before/after。
 
+### `ls_decode_consolidation`
+
+- candidate DP/group、canonical order index、group utilization/threshold和 compute floor；
+- stable/cooldown/check state及唯一 decision reason；
+- source candidates 的 `(used_blocks, used_tokens, sp_rank)`、排除原因和最终 source；
+- retained/destination ranks、per-rank exact capacity/high-watermark和 canonical sequence order；
+- reserved destination blocks、P2P token ranges、source-block count和 migration chunk；
+- transaction/resource epoch、plan state、exact reject/abort/commit/fatal reason；
+- P2P/maintenance wall time、最终 canonical allocation和释放的 truly-idle rank。
+
 ### `ls_decode_schedule_result`
 
 - step-entry running IDs；
@@ -1353,6 +1414,7 @@ Phase 1 完成前不启用任何 LS 新路径，也不保留“新 batching + �
 - eligible real Decode IDs 和 collective dummy IDs；
 - `ls_running_ids_by_dp_after_commit`；
 - paired `ls_preempted_sequence_ids/ls_preemption_reasons` OFFLOAD records；
+- nullable consolidation plan ID/state；仅 `KV_CONSOLIDATION` 时为恰一 RESERVED plan；
 - `ScheduleAction`；
 - bootstrap-finished output IDs。
 
@@ -1365,6 +1427,7 @@ Phase 1 完成前不启用任何 LS 新路径，也不保留“新 batching + �
 - capacity-deficit groups；
 - donor groups；
 - added idle ranks；
+- low-KV candidate/source、released rank和 consolidation stall；
 - compute threshold decisions；
 - pause victim/readmission IDs；
 - per-victim empty-pool recoverability check；
@@ -1372,7 +1435,7 @@ Phase 1 完成前不启用任何 LS 新路径，也不保留“新 batching + �
 
 每步另记录 scheduler wall time、exact-plan count、oldest waiting age 和 waiting request count，用于第 16.4 节非功能验收。
 
-`pool_resource_epoch[dp]` 只在 committed block ownership、canonical group allocation、pending/master、admission/finish/OFFLOAD status mutation 后增加一次；planner attempt、NO_FIT、rollback、monotonic ID reserve 和纯 telemetry 不递增。单次调用内 exact-attempt identity 冻结为：
+`pool_resource_epoch[dp]` 只在 committed block ownership、canonical group allocation、pending/master、admission/finish/OFFLOAD status mutation或成功 consolidation publication 后增加一次；consolidation reservation、planner attempt、NO_FIT、rollback、monotonic ID reserve 和纯 telemetry 不递增。单次调用内 exact-attempt identity 冻结为：
 
 ```text
 LSExactPlanKey = (
@@ -1408,7 +1471,7 @@ LSExactPlanKey = (
 15. No persistent identity：current no-fit 后无 batch/group ownership、map entry或 committed telemetry；预留 ID 可留无语义 gap。
 16. Future identity/capacity：running/tentative/candidate 同 ID 只计一次，未选中 OFFLOAD 只占 request slot；pool-wide peak 使用实际 blocks×64且不重复扣 fixed/headroom。
 17. Pool isolation：DP0 full 不借 DP1 capacity，group KV/master DoP 最大为 8。
-18. Canonical owner/cleanup：standalone、capacity/memory merge、scale-up、zero-live cleanup、whole-group delete 后 canonical allocation与派生 owner一致；finish/OFFLOAD 释放 zero-live且无 pending/master/reservation的 ranks，不迁移 live KV。
+18. Canonical owner/cleanup：standalone、capacity/memory merge、scale-up、zero-live cleanup、low-KV consolidation、whole-group delete 后 canonical allocation与派生 owner一致；finish/OFFLOAD 释放 zero-live且无 pending/master/reservation的 ranks，不迁移 live KV；consolidation stable-erase source且不重排 group。
 19. Admission target：idle raw capacity 足够时只 standalone，exact no-fit 走 FIFO shrink；仅 raw deficit 时按 canonical pool order stable-sort slack ascending再 pop-back到首次覆盖 deficit的 donor sequence，并在固定 donor set做 min-exact search；exact failure不追加 donor。
 20. Admission survivor/order：有 surviving new request 时 new group ID 恒为 survivor；new survivors 在前、actual donors 按 selection order及各自原 order追加。全部 `bootstrap_finished` 时 standalone/capacity都不留group/merge，部分完成时 finished record owner为 null、survivors共享 new group。
 21. Packed intervals/exact adapter：rank/packing stable，token 守恒，interval无重叠缺口；block/metadata/headroom reject只触发 FIFO shrink/replan。
@@ -1417,18 +1480,21 @@ LSExactPlanKey = (
 24. Cross-pool admission：各 pool先 prepare required Decode；某 pool admission rollback不撤销其他 valid admission，且失败 pool仍 Decode；global IDs唯一可有 gap，任一 required Decode internal failure发生在全局 publication前。
 25. Simultaneous ABI：`admitted={B}`、real `decode={A}`，collective dummies完整但 B 不是 real Decode member；`ls_running_ids_by_dp_after_commit` 同时包含 A/B，B下一 step才 Decode。
 26. Real/dummy metrics：ADMISSION early return前用 after-commit IDs更新 running gauge并刷新 waiting/paused gauges；batch size、token usage、throughput、普通 completion只用 real Decode IDs，所有 collective dummies计数为0。
-27. Idle/no-progress action：empty engine直接 `step()` 在 scheduler前返回 non-fatal API misuse error；idle且有 admission返回有 record 的 `ADMISSION`；有 outstanding work却无 real Decode、无 admission/OFFLOAD时抛 `NO_PROGRESS_INVARIANT`，不产生空 action/busy loop。
+27. Idle/no-progress action：empty engine直接 `step()` 在 scheduler前返回 non-fatal API misuse error；idle且有 admission返回有 record 的 `ADMISSION`；有 outstanding work却无 real Decode、admission/OFFLOAD或有效 consolidation plan时抛 `NO_PROGRESS_INVARIANT`，不产生空 action/busy loop。
 28. Memory safety source order：cannot/can lists按 pool order stable-sort idle ascending；donor从 can尾部 pop，feasible union append tail且不 re-sort，constrained ID/原 sequence order在前、donors按 pop/union order追加；不足时按 deficit ceiling取 `sp_rank asc` idle ranks。
 29. Decode transaction failure classes：admission/optional component fault可 abort并 decode-only；required decode prepare/validate fault typed-fatal且全局无 publication；validated commit无可恢复 fault point。
 30. Compute scale-up：groups按 prospective can-list顺序争用 idle ranks，每组使用 eligible step-entry real count做 floor threshold，排除 new admissions，并按 `sp_rank desc` 取 rank；admission reservations优先。
-31. No proactive consolidation：low-util、pending、gap、age 都不触发 maintenance，formal baseline绝不返回 `KV_CONSOLIDATION`。
-32. OFFLOAD recoverability：candidate domain为 deficit pool全部 RUNNING，按 `(arrival_order desc, seq_id desc)` 跳过 MIGRATE/SWAP 或 full-SP8 future/current exact不可恢复者；无 candidate抛 `UNRECOVERABLE_CAPACITY`且状态不变。
-33. OFFLOAD commit/action：一次 schedule 全局最多一个 victim；多 pool deficit时选最小 dp_idx。prepared ACTIVE release只执行一次、做zero-live cleanup、队首 splice，立即以含 OFFLOAD record 的 `ADMISSION` 返回；同调用不 readmit也不 Decode。
-34. OFFLOAD progress/readmission：保留 output/generated/sampling params/metrics/arrival order/assigned DP；下一 schedule 按普通 FIFO/OOE放置 prompt+generated并追加恰好一个 dummy token，达到上限走 `bootstrap_finished`。
-35. Fatal latch：typed exception、required Decode unexpected、post-publication unexpected和accepted metric failure分别映射到冻结 code；全部 scheduler fatal codes 都记录 code/state hash、令后续 add/step/generate拒绝；ingress `UnschedulableRequestError` 不 latch。
-36. Exact-key/epoch：epoch只在冻结的 committed resource mutations递增；attempt/reject/rollback/ID reserve不递增；fingerprint只含规范化内容，同一 schedule 相同 `LSExactPlanKey`只求解一次。
-37. ScheduleAction：`DECODE` 可同时携带 admissions但 OFFLOAD 必为空；`ADMISSION` 至少有 admissions或恰一 OFFLOAD、二者不同时出现且不 forward；formal baseline不产生 `KV_CONSOLIDATION`。
-38. Feature-off：非 LS scheduler 的 action、state、seq-id mutability、metrics 和结果不受影响。
+31. Low-KV trigger/gates：只有 RUNNING group的 utilization严格低于冻结 threshold且连续满足 stable/cooldown/check gates才成为 candidate；pending/no-fit/admission benefit、gap、age和planner failure不能产生或加速 candidate，formal manifest固定 execute参数。
+32. Consolidation order/floor：按 `dp asc`、canonical group order选 group，按 `(used blocks, used tokens, rank)`选非 master/reserved source，destination按 exact available capacity优先；每次只释放一个 rank、group至少留一个rank，且不得低于第9.2节 compute floor。
+33. Consolidation priority/action：任一 pool有 valid admission时不 consolidation；无 valid admission且exact plan成功时全局只返回一个独占 `KV_CONSOLIDATION`。field matrix中只有一个 RESERVED plan，其余 admission/OFFLOAD/real/running/Decode fields全空；plan reject/超budget保持状态并正常 Decode。
+34. Consolidation transaction/fatal：prepared destination blocks和move ranges在P2P前不改ACTIVE metadata；全部copy成功后no-throw publication、stable-erase source、epoch恰加1，下一Decode不再使用source。pre-dispatch abort完整恢复；dispatch后completion ambiguity/copy/commit failure永久 latch `KV_CONSOLIDATION_FAILED`且RESERVED guard禁止继续。maintenance返回zero token/output/completion，stall计入下一Decode wall time并单独记latency。
+35. OFFLOAD recoverability：candidate domain为 deficit pool全部 RUNNING，按 `(arrival_order desc, seq_id desc)` 跳过 MIGRATE/SWAP 或 full-SP8 future/current exact不可恢复者；无 candidate抛 `UNRECOVERABLE_CAPACITY`且状态不变。
+36. OFFLOAD commit/action：一次 schedule 全局最多一个 victim；多 pool deficit时选最小 dp_idx。prepared ACTIVE release只执行一次、做zero-live cleanup、队首 splice，立即以含 OFFLOAD record 的 `ADMISSION` 返回；同调用不 readmit也不 Decode。
+37. OFFLOAD progress/readmission：保留 output/generated/sampling params/first/queue metrics/arrival order/assigned DP；下一 schedule 按普通 FIFO/OOE放置 prompt+generated并追加恰好一个 dummy token，prepared更新generated/last-token并追加pause间隔ITL，达到上限走 `bootstrap_finished`。
+38. Fatal latch：typed exception、required Decode unexpected、consolidation failure、post-publication unexpected和accepted metric failure分别映射到冻结 code；全部 scheduler fatal codes都记录code/state hash、令后续add/step/generate拒绝；ingress `UnschedulableRequestError`不latch。
+39. Exact-key/epoch：epoch只在冻结的 committed resource mutations（含 consolidation publication）递增；attempt/reservation/reject/rollback/ID reserve不递增；fingerprint只含规范化内容，同一 schedule相同 `LSExactPlanKey`只求解一次。
+40. ScheduleAction：`DECODE`可同时携带admissions但OFFLOAD/plan必为空；`ADMISSION`至少有admissions或恰一OFFLOAD、二者不同时出现且plan为空；`KV_CONSOLIDATION`严格符合独占field matrix且不forward。
+41. Feature-off：非 LS scheduler 的 action、state、seq-id mutability、metrics 和结果不受影响。
 
 ### 16.2 Issue 1% fixtures
 
@@ -1461,7 +1527,8 @@ LSExactPlanKey = (
 
 - DP1×SP8；
 - mixed 200/4K/100K/900K prompt；
-- placement、append、memory/compute scale-up correctness；
+- placement、append、memory/compute scale-up correctness；强制 group 到 SP8 后降低 live KV/batch，至少成功 consolidation 一个 source rank并在后续 admission复用；
+- P2P token/bytes守恒，publication后下一轮 Decode不再引用 released rank；
 - 输出长度正确，无 planner failure loop。
 
 16 GPU：
@@ -1469,8 +1536,8 @@ LSExactPlanKey = (
 - DP2×SP8 / EP16；
 - Issue 1%，rate 20，seed 0，7,200 requests；
 - 141 GiB 和 140 GiB；
-- `ls_kv_consolidation_mode=off`，确认没有 proactive maintenance action；
-- 保存 admission transaction、combined result、capacity merge/scale/OFFLOAD telemetry；
+- `ls_kv_consolidation_mode=execute`，committed consolidation plan数必须大于0；
+- 保存 admission transaction、combined result、capacity merge/scale/consolidation/OFFLOAD telemetry，结束时无 RESERVED plan或fatal；
 - source-default 和 artifact-derived threshold 分组运行。
 
 32 GPU（正式使用 `4DP×8SP` 时）：
@@ -1479,6 +1546,7 @@ LSExactPlanKey = (
 - request assignment 严格 round-robin；
 - 每个 group 的 KV/master DoP 均不超过 8；
 - DP0 capacity pressure 不触发跨 DP migration/merge/scale-up；
+- consolidation P2P source/destination严格留在 candidate所属SP8 pool，四pool fixture至少各成功一次scale-down；
 - 四个 pool 的 queue、OOE 和 future-KV telemetry 可独立核对。
 
 GPU 测试必须按仓库规定申请提权。
@@ -1492,7 +1560,8 @@ GPU 测试必须按仓库规定申请提权。
 - accepted requests 最终全部完成，只有 ingress 明确拒绝的 requests 可以不完成；
 - lost、duplicate、cross-state owner、cross-pool owner 和 allocator invariant violation 均为 0；
 - 输出 token 数与 trace 要求一致；`max_tokens=1` 只产生 bootstrap output，`max_tokens=2` 只执行一次 Decode；
-- 7,200-request drain run 无 planner-failure loop、永久 frontier 或未释放 transaction。
+- 7,200-request drain run 无 planner-failure loop、永久 frontier、未释放 admission/consolidation transaction或fatal；
+- controlled elasticity fixture 从 SP8 scale-up后在低KV/低batch状态至少释放一个非空source rank，迁移token守恒，最终DoP低于8且released rank可复用。
 
 实施效率 gate：
 
@@ -1519,15 +1588,15 @@ GPU 测试必须按仓库规定申请提权。
 8. canonical group allocation、pool group order与派生 rank owner一致；admission按 raw idle-token deficit二选一 standalone 或 source-list capacity append，不使用额外 target heuristic。
 9. group 只能在本 pool 内 scale-up，DoP 不超过 8。
 10. block/list/map prepared mutations、admission allocation、dummy bootstrap、Decode reservation 和 OOE 在同一 pool transaction no-throw commit/abort。
-11. 已有 requests 不因纯 admission 丢失 Decode iteration，新 admitted 下一 step 才 Decode；OFFLOAD 明确为每 step 至多一个的独占 scheduler-only action。
+11. 已有 requests 不因纯 admission 丢失 Decode iteration，新 admitted 下一 step 才 Decode；OFFLOAD和low-KV consolidation都是全局每 step至多一个的独占maintenance。
 12. packed placement 与 batching 同步启用，并通过 interval/block/metadata correctness。
 13. memory-deficit source-list merge、integer-threshold compute和固定 rank/group遍历顺序通过 differential fixtures。
-14. proactive low-KV/pending/gap/age consolidation 在 formal base 固定关闭。
+14. low-KV-only exact consolidation在formal base固定execute，并能让scale-up后的group回落；pending/no-fit benefit、gap、age、planner failure、cross-group和multi-source trigger全部禁止。
 15. OFFLOAD/readmission 保留生成、采样、metric/arrival进度及 `assigned_dp`，prepared KV release 后回队首且同调用不 readmit。
 16. ingress 永久不适配 request 明确返回错误，不占 waiting frontier 或 OOE。
 17. resolved config、逻辑/物理 topology 差异和 intentional adaptations 写入 manifest。
-18. typed real/running membership、ADMISSION-only output 和 dummy-excluded metrics 通过 engine tests。
-19. fatal ABI/latch、resource epoch/exact key 和对应故障注入通过。
+18. typed real/running membership、ADMISSION-only output、`KV_CONSOLIDATION` field matrix/zero-token maintenance和dummy-excluded metrics通过engine tests。
+19. admission/consolidation transaction、fatal ABI/latch、resource epoch/exact key和对应故障注入通过。
 20. 对应实验规模的 8/16/32 GPU correctness 与第 16.4 节 A/B gates 完成。
 
 性能改善不能替代调度一致性检查。正式实验必须同时保存 dispatch、batch、future-KV 和 Decode elasticity telemetry。
@@ -1542,10 +1611,10 @@ GPU 测试必须按仓库规定申请提权。
 | 二维 DP | 不进入 base | Decode-cost 独立 variant |
 | Placement | packed + Nano exact adapter | 不保留均匀 striping 过渡 baseline |
 | Admission target | raw idle capacity 足够则 standalone；不足则 ordered capacity append/merge | 只保留 LoongServe capacity 触发和顺序，不按 exact failure/age/gap 选 target |
-| Admission continuity | 纯 admission 同 step保持 step-entry Decode；OFFLOAD 独占 | 不新增组合 action；复用 scheduler-only `ADMISSION` |
+| Admission continuity | 纯 admission 同 step保持 step-entry Decode；OFFLOAD/consolidation独占 | OFFLOAD复用`ADMISSION`；consolidation复用现有独占action，不新增组合action |
 | Future-KV | SP8 pool-wide token policy | 不新增 future-block predictor |
 | Decode threshold | Issue 1% 为 128 | 100 做 source-default sensitivity |
-| Proactive consolidation | formal base 关闭 | Nano consolidation 独立 variant |
+| Proactive consolidation | formal base固定low-KV-only execute | 补齐scale-down闭环；stable/cooldown仅防抖，禁止pending/gap/age等旁路trigger |
 | Pause | 每 step 至多一个 OFFLOAD、preserve progress、同调用不 readmit | KVKEEP 不进入 base |
 | Transaction adapter | prepared block/list/map mutation + pool-step atomic publication | 是 Nano allocator 适配，不是新 policy |
 | DP topology | 4 个逻辑 SP8 pools | 物理 FFN EP32 仍同步 |
@@ -1561,8 +1630,8 @@ GPU 测试必须按仓库规定申请提权。
 3. Phase 1 一次完成 arrival-time round-robin、pool-local FIFO/OOE、admission-token stable sort、ephemeral batching、pool-wide future-KV、raw-idle-capacity 驱动的 standalone/capacity-append initial DoP 和 packed placement；
 4. packed intervals 与 dummy bootstrap 通过 Nano block/metadata transaction 原子落地；
 5. Phase 1 同时返回 committed admissions 和 step-entry Decode snapshot，不新增第二 GPU lane或组合 action；
-6. Phase 2 只对齐 Decode memory-deficit merge、idle-rank compute scale-up 和 OFFLOAD；
-7. low-util consolidation、KVKEEP、event cache、Prefill gain/cost reclaim、unordered admission merge 和二维 DP 均移到单独 variant；
+6. Phase 2 完成 Decode memory-deficit merge、idle-rank compute scale-up、low-KV-only exact consolidation和OFFLOAD，形成scale-up/scale-down闭环；
+7. 移到单独variant的仅是pending/no-fit benefit、gap/age/planner-failure/cross-group/multi-source consolidation、KVKEEP、event cache、Prefill gain/cost reclaim、unordered admission merge和二维DP；
 8. `4DP×8SP` 固定为四个逻辑 attention/KV pools，禁止 load-aware rerouting 和 cross-DP scale-up，同时承认 FFN EP32 的物理同步；
 9. 所有 Nano allocator/topology adapter 和 source deviation 写入 manifest；
 10. 正式实验统一命名为 `LoongServe-style Decode-only`。
@@ -1591,6 +1660,9 @@ LoongServe：
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:587`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:591`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:613`
+- `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:617`
+- `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:637`
+- `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:678`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:844`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:975`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:1138`
@@ -1599,6 +1671,8 @@ LoongServe：
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/longserve_c_scheduler/src/main.cpp:33`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/paper-tex-src/sections/design.tex:14`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/paper-tex-src/sections/design.tex:107`
+- `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/paper-tex-src/sections/design.tex:110`
+- `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/paper-tex-src/sections/design.tex:149`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/test/longserve/5-start-api-server.py:209`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/test/longserve/5-start-api-server.py:242`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/test/longserve/5-start-api-server.py:274`
@@ -1611,11 +1685,15 @@ NanoDeploy：
 - `csrc/nanodeploy/scheduler/scheduler.cpp:1488`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:1705`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:641`
+- `csrc/nanodeploy/scheduler/scheduler.cpp:449`
+- `csrc/nanodeploy/scheduler/scheduler.cpp:971`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:1826`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:2085`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:2368`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:2822`
 - `csrc/nanodeploy/scheduler/sp_state_manager.cpp:488`
+- `csrc/nanodeploy/scheduler/sp_state_manager.cpp:1527`
+- `csrc/nanodeploy/scheduler/sp_state_manager.cpp:1815`
 - `csrc/nanodeploy/sequence/sequence.h:18`
 - `csrc/nanodeploy/sequence/sequence.cpp:20`
 - `csrc/nanodeploy/sequence/serialization.cpp:168`
@@ -1624,9 +1702,13 @@ NanoDeploy：
 - `nanodeploy/config.py:295`
 - `nanodeploy/engine/llm_engine.py:214`
 - `nanodeploy/engine/llm_engine.py:548`
+- `nanodeploy/engine/llm_engine.py:104`
+- `nanodeploy/engine/kv_consolidation.py:57`
+- `nanodeploy/engine/ray_executor.py:258`
 
 实验记录：
 
 - `docs-dev/2026-07-17/ls_decode_future_kv_2node_r20_141gb_result_20260717.md`
 - `docs-dev/2026-07-17/ls_decode_loongserve_capacity_alignment_20260717.md`
 - `docs-dev/2026-07-18/ls_style_capacity_reorg_mem085_2node_result_20260718.md`
+- `docs-dev/2026-07-18/ls_style_capacity_reorg_908933a_2node_dp2sp8_r20_140gb_mem085_6min_20260718.manifest.json`
