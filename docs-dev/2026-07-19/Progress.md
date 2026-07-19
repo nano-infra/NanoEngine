@@ -1,6 +1,6 @@
 # 任务进度罗盘
 
-更新时间：2026-07-19 13:38 UTC
+更新时间：2026-07-19 13:58 UTC
 
 目标：实现
 `docs-dev/2026-07-18/loongserve_source_aligned_decode_baseline_plan_20260718.md`
@@ -11,7 +11,15 @@
 `loongserve_source_aligned_decode_baseline_progress_20260719.md`。压缩恢复后必须先读
 这两个文件，再查看 `git status`/`git diff`，不得重做已完成工作。
 
-最新检查点：13:38 UTC 学术 demo 范围的实现与单机 CPU 验收已完成，主实现已提交为
+最新检查点：13:58 UTC 已按用户要求提权运行单机 8-GPU 测试。机器为 8×NVIDIA H200，测试前
+均空闲。新增 `ls_kv_scale_down_nccl_preflight.py --transport-only` 后，8进程 NCCL 2.27.3
+rank7→rank0 KV range copy及逐元素校验通过、exit 0。另用8进程分别完成 MLA SP
+`hao_basic` vs `nccl` 的 eager和CUDA Graph correctness，Q/Res/Lse全部逐项一致、exit 0。
+原完整 KV scheduler+consolidation preflight 在创建NCCL进程前被旧fixture断言拦截：单个8-token
+request在当前packed placement下只实际使用rank0，不能断言立即占满SP8；该项未虚报为GPU失败或
+通过，后续需重构admission fixture后再验完整metadata commit链。此次GPU测试没有使用Ray。
+
+13:38 UTC 学术 demo 范围的实现与单机 CPU 验收已完成，主实现已提交为
 `b8e0b7d feat: align decode scheduler with LoongServe baseline`。工作树只保留用户原有的
 `AGENTS.md`、`nanodeploy/engine/ray_executor.py` 修改，以及历史未跟踪实验产物；均未进入提交。
 原计划中的 combined exact fingerprint/attempt/dedupe、waiting age/fatal hash、stable fault hooks

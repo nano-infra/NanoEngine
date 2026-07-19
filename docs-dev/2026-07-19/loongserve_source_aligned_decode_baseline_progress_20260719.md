@@ -1,6 +1,6 @@
 # LoongServe source-aligned Decode baseline 任务罗盘
 
-更新时间：2026-07-19 13:38:18 UTC
+更新时间：2026-07-19 13:58:27 UTC
 
 ## 任务目标
 
@@ -77,6 +77,14 @@
 - 最新 Python validator/feature-off targeted subset：`6 passed`；Python `py_compile`通过。
 
 ## 当前正在进行
+
+- 13:58 UTC 单机 GPU检查点：经提权确认本机8×H200空闲，已实际运行三项8-GPU测试。
+  `tests/ls_kv_scale_down_nccl_preflight.py --sp-size 8 --transport-only` 使用8进程NCCL 2.27.3，
+  rank7→rank0 KV range copy与逐元素内容校验通过、exit 0；`test_mla_sp_backend_correctness.py`
+  在world_size=8/max_num_seqs=8/num_requests=8下分别跑eager和CUDA Graph，`hao_basic`与`nccl`
+  的Q/Res/Lse全部一致、两次均exit 0。完整scheduler+consolidation preflight仍有fixture gap：旧脚本
+  用单个8-token request却断言packed admission立即占满SP8，因此在spawn NCCL前失败；当前结果只
+  声明transport与SP backend GPU正确性，不虚称完成完整metadata transaction E2E。GPU测试未使用Ray。
 
 - 13:38 UTC 最终提交检查点：主实现、tests、fixtures与当日罗盘已提交为
   `b8e0b7d feat: align decode scheduler with LoongServe baseline`。提交后工作树仅有明确排除的用户

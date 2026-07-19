@@ -4,6 +4,8 @@ Examples:
     CUDA_VISIBLE_DEVICES=0,1 python tests/ls_kv_scale_down_nccl_preflight.py --sp-size 2
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
         python tests/ls_kv_scale_down_nccl_preflight.py --sp-size 8
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+        python tests/ls_kv_scale_down_nccl_preflight.py --sp-size 8 --transport-only
 """
 
 from __future__ import annotations
@@ -137,6 +139,28 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def transport_only(sp_size: int) -> None:
+    source_rank = sp_size - 1
+    moves = [
+        KVCacheP2PMove(
+            dp_idx=0,
+            src_sp_rank=source_rank,
+            dst_sp_rank=0,
+            src_block_id=0,
+            src_token_offset=0,
+            dst_block_id=1,
+            dst_token_offset=0,
+            num_tokens=_BLOCK_SIZE,
+        )
+    ]
+    mp.spawn(
+        _worker,
+        args=(sp_size, source_rank, f"tcp://127.0.0.1:{_free_port()}", moves),
+        nprocs=sp_size,
+        join=True,
+    )
+
+
 def main(sp_size: int) -> None:
     source_rank = sp_size - 1
     scheduler = _make_scheduler(sp_size)
@@ -204,4 +228,9 @@ def main(sp_size: int) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sp-size", type=int, choices=(2, 8), default=2)
-    main(parser.parse_args().sp_size)
+    parser.add_argument("--transport-only", action="store_true")
+    args = parser.parse_args()
+    if args.transport_only:
+        transport_only(args.sp_size)
+    else:
+        main(args.sp_size)
