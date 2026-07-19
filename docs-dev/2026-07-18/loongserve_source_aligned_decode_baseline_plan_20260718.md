@@ -2,6 +2,8 @@
 
 日期：2026-07-18
 
+最近修订：2026-07-19
+
 状态：Proposal，已按 Decode-only 实验范围收敛
 
 NanoDeploy 代码基线：`64a199154b375aba8cd469ca75542f4103ccbf64`
@@ -11,6 +13,16 @@ LoongServe 源码基线：`fb87896d87b170afd4afe591e29da1aa5f6d4e16`
 ## 0. 结论先行
 
 本实验只研究 Decode。新请求进入系统时，scheduler 直接建立 prompt KV placement，并通过 dummy bootstrap 补齐进入 Decode 所需的状态；之后所有 GPU iteration 都是 Decode。
+
+固定运行条件：
+
+```text
+mode = decode
+dummy_prefill = true
+loop_count = 1
+```
+
+`dummy_prefill` 只负责初始化 prompt KV、追加 pending token 和记录首 token 状态，不参与 batching cost，也不引入固定 admission 延迟。
 
 因此，本方案不设计任何其他执行阶段，不引入与其他阶段有关的 cost model、资源竞争、并发执行接口或阶段切换逻辑。
 
@@ -38,9 +50,10 @@ LoongServe-style Decode-only scheduler on NanoDeploy
 ```text
 request round-robin 固定到 DP pool
         -> pool-local FIFO 有限越序选择
-        -> prompt length 稳定降序
+        -> current/future KV 检查
+        -> prompt length 稳定降序后做 Nano exact planning
+        -> no-fit 时按 FIFO selection order 回退并重新 planning
         -> 每 pool 一个连续候选 batch
-        -> exact capacity 检查并缩短
         -> 现有 placement/admission transaction
         -> source-shaped Decode merge/scale-up
 ```
@@ -374,88 +387,71 @@ accept
 or reject and replan
 ```
 
-不能在 reject 后静默换成另一种 batch/DoP heuristic。
+如果需要缩小 membership，只能撤销 FIFO scan 中最后加入的 request，再重新排序和 exact planning；不能删除长度排序后的尾部 request。这样 Nano block/metadata 约束不会把“短 request 优先被移除”变成新的 batching policy。
 
 ## 6. Candidate 排序与连续 batching
 
-### 6.1 顺序
+### 6.1 LoongServe 原逻辑
 
-必须先决定 selected membership，再排序：
+一个独立 SP pool 内，LoongServe：
 
-```text
-pool-local waiting FIFO scan
-    -> selected request IDs
-    -> stable sort by num_prompt_tokens descending
-```
+1. 按 waiting FIFO、容量和 bounded OOE 确定 selected membership；
+2. selected requests 按长度稳定降序；
+3. available instances 按已用 token 数升序；
+4. 二维 DP 同时枚举最后一个 batch 的连续 request 数量和 instance 数量；
+5. 用 aggregate free-token capacity 判断 transition 是否可行；
+6. 回溯得到一个或多个 batches，以及每个 batch 的 DoP。
 
-不能先对某个 pool 的整个 waiting queue 排序，否则会破坏该 pool 的 FIFO 公平性。跨 pool 的服务顺序由 arrival-time round-robin assignment 隔离，不再做全局重排。
+所以 LoongServe 不会按 DP 数量平均切 requests，也不会从长度排序后的尾部逐个删除 request。最终 selected set 由 DP plan 完整覆盖。
 
-等长 requests 保持原 FIFO 次序。
+### 6.2 Nano 当前代码
 
-### 6.2 第一版切分算法
+当前 `_seal_ls_decode_arrivals()`：
 
-第一版每个 pool 在一次 admission round 最多生成一个 ephemeral batch：
+1. 从全局 `waiting_migration` 固定截取 `attention_dp * max_num_seqs` 个 requests；
+2. 按 prompt length 稳定降序；
+3. 固定切成最多 `attention_dp` 个等数量 ranges；
+4. 某个 range no-fit 时，从排序后的 range 尾部缩短；
+5. empty-system fit 后立即创建长期 `PendingDecodeBatch`；
+6. 后续 admission 再选择 DP 和第一个 exact feasible DoP。
 
-```text
-n = selected_by_dp[dp].size
-candidate = sorted_selected_by_dp[dp][0:n]
-```
+这里有两个主要问题：batch 数和 DP 数绑定；排序后的短 requests 可能因为 shrink 被移出本轮 membership。后者意味着长度排序反过来改变了 FIFO 服务资格。
 
-对该连续 range：
+### 6.3 第一版改法
 
-1. 调用 `_ls_batch_fits_empty_system(candidate)`；
-2. no-fit 时从 range 尾部逐个缩短；
-3. 获得 empty-system-feasible prefix 后，进入 current-system exact planning；
-4. current no-fit 时不 seal，不创建 batch ID；
-5. 未提交成员全部回到原 waiting order；
-6. 后续 request 能否越过由 bounded OOE 决定。
+对每个独立 SP8 pool：
 
-这里“缩短 range”只发生在本次 ephemeral plan 中，不能生成一个长期等待的缩小 batch。
+1. pool-local FIFO/OOE scan 产生 `selected_fifo`；
+2. scan 过程中检查 current/future KV，避免选择明显不可运行的 request；
+3. 对 `selected_fifo` 的拷贝做 prompt length 稳定降序；
+4. 调用 empty-system 和 current-system Nano exact planning；
+5. exact no-fit 时撤销 `selected_fifo` 中最后加入的 request，然后重新排序、重新 planning；
+6. exact fit 后，排序结果整体形成一个 ephemeral batch；
+7. placement/allocation 成功后才创建 batch/group ID 并修改 waiting ownership。
 
-四个 pools 可以在同一 scheduler step 各提交一个 batch，因此 `4DP×8SP` 每轮最多提交四个相互独立的 admission batches。batch 不跨 pool，成员也不会在 pools 之间重新平衡。
-
-### 6.3 为什么第一版每 pool 只生成一个 batch
-
-原因是当前没有可解释的 LoongServe batching cost。下面几种做法都不是源码逻辑：
-
-- 最大长度 gap；
-- 固定 long/short threshold；
-- batch 内长度比例阈值；
-- age boost；
-- 人工最小化方差。
-
-在没有 cost 的情况下，每 pool 一个 deterministic continuous range 比引入新的 length heuristic 更适合作为 baseline。它也对应当前 `attention_dp` 个 batch 最终分别落到 `attention_dp` 个 domains 的执行形状，只是把 domain assignment 前移到了 request arrival。
-
-它的局限也要明确：一个 pool 的超长 request 仍可能与该 pool 的短 request 处于同一 batch。因此第一版名称只能是 LoongServe-style Decode-only。
-
-### 6.4 二维 DP 的处理
-
-LoongServe 原 DP 的结构仍作为 source-conformance reference：
+伪代码：
 
 ```text
-f[i][k] = 前 i 个排序后 requests 使用前 k 个排序后 instances 的最优值
+selected_fifo = pool_local_fifo_ooe_scan(dp)
+
+while not selected_fifo.empty():
+    candidate = stable_sort_copy(selected_fifo, prompt_length_desc)
+
+    if empty_system_fit(candidate)
+       and current_system_exact_plan(candidate):
+        commit(candidate)
+        break
+
+    selected_fifo.pop_back()  # 按 scan order 回退，不是 candidate.pop_back()
 ```
 
-转移仍是：
+未提交 requests 始终保持所属 pool 的原 waiting order，不创建长期 pending batch。`4DP×8SP` 同一 scheduler step 最多由四个 pools 各提交一个相互独立的 batch。
 
-```text
-最后一个 batch 使用 b 个连续 requests
-最后一个 batch 使用 d 个连续 instances
-```
+### 6.4 第一版与 LoongServe 的已知差异
 
-容量仍是：
+第一版每 pool 每轮只有一个 fresh batch，initial DoP 仍取 Nano 的第一个 exact feasible 值；LoongServe 可以通过二维 DP 在一个 pool 内生成多个 batches，并联合选择 batch boundaries 和 DoPs。
 
-```text
-sum(request tokens) <= sum(instance free tokens)
-```
-
-但第一版不实现 cost 和回溯选择。若会议要求增加 DP，只允许新增显式 variant：
-
-```text
-LoongServe-style Decode-only + Decode-cost DP
-```
-
-该 variant 的 cost 必须来自真实 Decode 数据，并单独做消融；不能覆盖基础组的结果。
+第一版不使用 gap、固定长度阈值、方差或其他替代 heuristic，也不声称复现完整 batching DP。若后续需要这部分，完整 DP 作为独立 variant 实现和消融，不在本节展开。
 
 ## 7. Instance ordering、initial DoP 和 placement
 
@@ -803,7 +799,9 @@ ls_cross_dp_scale_up = false
 - 删除 fresh persistent pending batch；
 - arrival-time round-robin assignment；
 - pool-local FIFO/OOE scan；
+- current/future KV 先筛选 selected membership；
 - stable length sort；
+- exact no-fit 时按 FIFO scan 顺序回退 membership 并重新 planning；
 - 每 pool 每轮一个 ephemeral continuous range；
 - empty-system 检查和 current-system exact commit；
 - rollback 后恢复 waiting order。
@@ -889,9 +887,9 @@ ls_cross_dp_scale_up = false
 
 ### `ls_decode_batch_plan`
 
-- sorted request IDs/lengths；
-- target ranges；
-- shrunk ranges；
+- FIFO-selected request IDs；
+- membership rollback request IDs 及顺序；
+- 最终 sorted request IDs/lengths；
 - empty-system fit result；
 - current-system fit result；
 - committed members；
@@ -932,7 +930,7 @@ ls_cross_dp_scale_up = false
 8. Stable length order：等长 request 保持本 pool FIFO。
 9. One batch per pool：一个 scheduler step 每 pool 最多提交一个 fresh batch。
 10. Continuous range：每个 batch 都是本 pool 排序数组的连续 range。
-11. Shrink-on-no-fit：只缩短 ephemeral range，剩余 request 返回所属 waiting。
+11. FIFO-order rollback：exact no-fit 时撤销 FIFO scan 中最后加入的 request，而不是删除长度排序后的尾部 request；未提交 request 保持所属 waiting 原顺序。
 12. No persistent identity：current no-fit 后不存在 batch ID/ownership。
 13. Pool-wide future-KV：同 pool 两个 groups 单独可行、合计不可行时拒绝第二份承诺。
 14. Pool isolation：DP0 full 不会借用 DP1 capacity，group DoP 最大为 8。
@@ -1026,7 +1024,7 @@ GPU 测试必须按仓库规定申请提权。
 |---|---|---|
 | Baseline 名称 | LoongServe / LoongServe-style Decode-only | 后者 |
 | Persistent fresh batch | 保留 / 删除 | 删除 |
-| Batching v1 | 每 pool 一个连续 batch + capacity shrink / 新 length heuristic | 前者 |
+| Batching v1 | FIFO membership 回退 + stable sort + 每 pool 一个 batch / 新 length heuristic | 前者 |
 | 二维 DP | 进入第一版 / Decode-cost 独立 variant | 独立 variant |
 | Placement | 第一阶段就改 packed / 第二阶段改 | 第二阶段，先隔离 queue 变化 |
 | Admission continuity | 保留 admission-only / 同 step 保持已有 Decode | 保持已有 Decode |
@@ -1044,7 +1042,7 @@ GPU 测试必须按仓库规定申请提权。
 
 1. baseline 范围严格限定为 Decode-only；
 2. 旧 persistent fresh-batch 设计不再约束实现；
-3. Phase 1 增加 arrival-time round-robin、pool-local selection、排序和 ephemeral continuous batching；
+3. Phase 1 增加 arrival-time round-robin、pool-local selection、按 FIFO selection order 回退、stable sort 和每 pool 一个 ephemeral batch；
 4. placement/admission transaction 第一阶段保持不变；
 5. Phase 2 修复 SP8 pool-wide future-KV 和 admission continuity；
 6. Phase 3 再切 packed placement；
