@@ -1,6 +1,6 @@
 # LoongServe source-aligned Decode baseline 任务罗盘
 
-更新时间：2026-07-19 13:32:43 UTC
+更新时间：2026-07-19 13:38:18 UTC
 
 ## 任务目标
 
@@ -77,6 +77,12 @@
 - 最新 Python validator/feature-off targeted subset：`6 passed`；Python `py_compile`通过。
 
 ## 当前正在进行
+
+- 13:38 UTC 最终提交检查点：主实现、tests、fixtures与当日罗盘已提交为
+  `b8e0b7d feat: align decode scheduler with LoongServe baseline`。提交后工作树仅有明确排除的用户
+  `AGENTS.md`、`nanodeploy/engine/ray_executor.py` 与历史实验产物。学术 demo 单机 CPU目标已经完成；
+  原计划的production-grade exact fingerprint/attempt/dedupe、waiting age/fatal hash、stable required
+  Decode fault hooks按用户范围决定不实现，不应再恢复到热路径。未运行 GPU。
 
 - 13:32 UTC 单机 CPU 验收完成检查点：按仓库规则设置代理、显式禁用 GPU并提权执行 editable
   reinstall，C++全量重编译/链接成功。安装后 task-scope 联合套件在 `PYTHONMALLOC=debug` 下
@@ -186,9 +192,9 @@
 
 ## 下一步顺序
 
-1. 运行最终 `git diff --check`/staged diff审查；显式分组暂存并及时提交。不要暂存用户
-   `AGENTS.md`、`ray_executor.py`、历史 JSON/JSONL、profile 脚本或其他无关修改。
-2. 单机目标已稳定；GPU/真实 Ray-NCCL 端到端不属于本次学术 demo CPU完成线。若后续运行，任何
+1. 单机学术 demo 目标已完成并提交。保留用户 `AGENTS.md`、`ray_executor.py`、历史 JSON/JSONL、
+   profile 脚本，不纳入本任务提交。
+2. GPU/真实 Ray-NCCL 端到端不属于本次学术 demo CPU完成线。若后续运行，任何
    GPU操作必须单独提权，Ray操作需清除代理。
 
 ## 工作树注意事项

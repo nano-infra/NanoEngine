@@ -1,6 +1,6 @@
 # 任务进度罗盘
 
-更新时间：2026-07-19 13:32 UTC
+更新时间：2026-07-19 13:38 UTC
 
 目标：实现
 `docs-dev/2026-07-18/loongserve_source_aligned_decode_baseline_plan_20260718.md`
@@ -11,7 +11,13 @@
 `loongserve_source_aligned_decode_baseline_progress_20260719.md`。压缩恢复后必须先读
 这两个文件，再查看 `git status`/`git diff`，不得重做已完成工作。
 
-最新检查点：13:32 UTC 学术 demo 范围的实现与单机 CPU 验收已完成，正在做显式分组暂存/提交；
+最新检查点：13:38 UTC 学术 demo 范围的实现与单机 CPU 验收已完成，主实现已提交为
+`b8e0b7d feat: align decode scheduler with LoongServe baseline`。工作树只保留用户原有的
+`AGENTS.md`、`nanodeploy/engine/ray_executor.py` 修改，以及历史未跟踪实验产物；均未进入提交。
+原计划中的 combined exact fingerprint/attempt/dedupe、waiting age/fatal hash、stable fault hooks
+等生产级观测与故障注入，已根据用户“学术 demo”范围明确不作为本轮完成条件，也没有残留运行时代码。
+
+13:32 UTC 学术 demo 范围的实现与单机 CPU 验收已完成，正在做显式分组暂存/提交；
 未运行 GPU。两次按规则提权的非 GPU `pip install -v -e .` 均完成 C++ 全量重编译。最终安装后
 联合套件在 `CUDA_VISIBLE_DEVICES='' PYTHONMALLOC=debug` 下为 `221 passed in 34.49s`，独立
 Sequence proxy 通过，新增 KV plan 跨 Scheduler 生命周期回归普通模式 `4 passed`、ASan/UBSan
