@@ -1,6 +1,5 @@
 site_name: DLEngine
 site_description: Distributed inference for state-of-the-art large models
-site_url: https://jimyma.github.io/NanoDeploy/
 docs_dir: site
 site_dir: generated
 
@@ -38,11 +37,7 @@ theme:
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - pymdownx.superfences:
-      custom_fences:
-        - name: mermaid
-          class: mermaid
-          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.superfences
   - pymdownx.highlight:
       anchor_linenums: true
       line_spans: __span
@@ -72,9 +67,6 @@ nav:
 
 extra:
   generator: false
-  version:
-    provider: mike
-    default: latest
   social:
     - icon: fontawesome/brands/github
       link: https://github.com/JimyMa/NanoDeploy
