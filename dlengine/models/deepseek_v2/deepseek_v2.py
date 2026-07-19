@@ -33,10 +33,28 @@ from dlengine.layers.parallelism_transition import (
 )
 from dlengine.layers.rotary_embedding import get_rope
 from dlengine.logging import get_logger
+from dlengine.models.pp_utils import (
+    get_pp_layer_range,
+    make_pp_layers,
+    pp_recv_hidden,
+    pp_send_hidden,
+)
 from dlengine.worker.runner_config import get_runner_config
 from ..quant_config import QuantizationConfig
 
 logger = get_logger()
+
+
+# The current fused radix selector stores at most 8192 candidates from its
+# threshold bucket. It is exact only while the whole context fits that bound.
+_FUSED_INDEXER_TOPK_MAX_CONTEXT = 8192
+
+
+def _can_use_fused_indexer_topk(index_topk: int, max_context_len: int) -> bool:
+    return (
+        index_topk in (512, 2048)
+        and max_context_len <= _FUSED_INDEXER_TOPK_MAX_CONTEXT
+    )
 
 
 def _get_indexer_mode(config, layer_idx: int) -> str:
@@ -134,6 +152,54 @@ class _IndexerTopKState:
                 f"shape {shape} from layer {self.source_layer}; expected {expected}"
             )
         return logical, physical
+
+
+def _pp_send_indexer_state(
+    state: _IndexerTopKState, device: torch.device
+) -> None:
+    """Send prefill TopK state after the residual stream at a PP boundary."""
+    ctx = get_dist_context()
+    logical = state.logical_indices
+    source_layer = -1 if logical is None else state.source_layer
+    physical = state.physical_indices
+    header = torch.tensor(
+        [-1 if source_layer is None else source_layer, int(physical is not None)],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.send(header, dst=ctx.pp_next_global_rank)
+    if logical is not None:
+        dist.send(logical.contiguous(), dst=ctx.pp_next_global_rank)
+    if physical is not None:
+        dist.send(physical.contiguous(), dst=ctx.pp_next_global_rank)
+
+
+def _pp_recv_indexer_state(
+    num_tokens: int, index_topk: int, device: torch.device
+) -> _IndexerTopKState:
+    """Receive prefill TopK state sent after the residual stream."""
+    ctx = get_dist_context()
+    state = _IndexerTopKState()
+    header = torch.empty(2, dtype=torch.int64, device=device)
+    dist.recv(header, src=ctx.pp_prev_global_rank)
+    source_layer, has_physical = (int(value) for value in header.tolist())
+    if source_layer < 0:
+        return state
+    if index_topk <= 0:
+        raise RuntimeError(
+            "Received Indexer TopK state for a model without index_topk"
+        )
+    logical = torch.empty(
+        (num_tokens, index_topk), dtype=torch.int32, device=device
+    )
+    dist.recv(logical, src=ctx.pp_prev_global_rank)
+    physical = None
+    if has_physical:
+        physical = torch.empty_like(logical)
+        dist.recv(physical, src=ctx.pp_prev_global_rank)
+    state.publish(source_layer, logical, physical)
+    return state
+
 
 # Varlen attention func for non-absorbed MLA prefill, resolved once.
 # FA3 (``flash_attn_interface``) supports arbitrary head dims (incl. 256/256)
@@ -481,12 +547,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: DeepseekV3Config,
         quantization_config: QuantizationConfig,
         layer_idx: int,
+        cache_layer_idx: int | None = None,
     ):
         super().__init__()
 
         self.layer_idx = layer_idx
         self.self_attn = DeepseekV2Attention(
-            config, quantization_config, layer_idx=layer_idx
+            config,
+            quantization_config,
+            layer_idx=layer_idx,
+            cache_layer_idx=cache_layer_idx,
         )
 
         if (
@@ -562,17 +632,34 @@ class DeepseekV2Model(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
-        )
-        self.layers = nn.ModuleList(
-            [
-                DeepseekV2DecoderLayer(config, quantization_config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+        ctx = get_dist_context()
+        self.is_first_pp_stage = ctx.is_first_pp_stage
+        self.is_last_pp_stage = ctx.is_last_pp_stage
+        self.hidden_size = config.hidden_size
+        self.hidden_dtype = getattr(config, "dtype", None) or torch.get_default_dtype()
+
+        if self.is_first_pp_stage:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = None
+
+        pp_start, _ = get_pp_layer_range(config.num_hidden_layers)
+        self.start_layer, self.end_layer, self.layers = make_pp_layers(
+            config.num_hidden_layers,
+            lambda layer_idx: DeepseekV2DecoderLayer(
+                config,
+                quantization_config,
+                layer_idx,
+                cache_layer_idx=layer_idx - pp_start,
+            ),
         )
 
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        if self.is_last_pp_stage:
+            self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        else:
+            self.norm = None
 
     def forward(
         self,
@@ -589,10 +676,10 @@ class DeepseekV2Model(nn.Module):
             # launching the metadata kernel once per layer.
             indexer = next(
                 (
-                    layer.self_attn.indexer
-                    for layer in self.layers
-                    if layer.self_attn.indexer is not None
-                    and layer.self_attn.indexer.indexer_cache is not None
+                    self.layers[idx].self_attn.indexer
+                    for idx in range(self.start_layer, self.end_layer)
+                    if self.layers[idx].self_attn.indexer is not None
+                    and self.layers[idx].self_attn.indexer.indexer_cache is not None
                 ),
                 None,
             )
@@ -615,16 +702,35 @@ class DeepseekV2Model(nn.Module):
                     _expand_decode_context_lens(context_lens, effective_ntps)
                 )
 
-        hidden_states = self.embed_tokens(input_ids)
+        if self.is_first_pp_stage:
+            hidden_states = self.embed_tokens(input_ids)
+            indexer_state = _IndexerTopKState()
+        else:
+            hidden_states = pp_recv_hidden(
+                positions.size(0), self.hidden_size, self.hidden_dtype
+            )
+            indexer_state = _pp_recv_indexer_state(
+                positions.size(0),
+                int(getattr(self.config, "index_topk", 0) or 0),
+                hidden_states.device,
+            )
         residual = None
-        indexer_state = _IndexerTopKState()
-        for idx, decoder_layer in enumerate(self.layers):
-            hidden_states, residual = decoder_layer(
+
+        for idx in range(self.start_layer, self.end_layer):
+            hidden_states, residual = self.layers[idx](
                 hidden_states,
                 positions,
                 residual,
                 indexer_state=indexer_state,
             )
+
+        if not self.is_last_pp_stage:
+            if residual is not None:
+                hidden_states = hidden_states + residual
+            pp_send_hidden(hidden_states)
+            _pp_send_indexer_state(indexer_state, hidden_states.device)
+            return hidden_states
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -639,7 +745,15 @@ class DeepseekV2ForCausalLM(nn.Module):
             **getattr(config, "quantization_config", dict())
         )
         self.model = DeepseekV2Model(config, self.quantization_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        if get_dist_context().is_last_pp_stage:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+            if (
+                getattr(config, "tie_word_embeddings", False)
+                and self.model.embed_tokens is not None
+            ):
+                self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        else:
+            self.lm_head = None
 
     def forward(
         self,
@@ -695,6 +809,7 @@ class DeepseekV2Attention(nn.Module):
         config: DeepseekV3Config,
         quantization_config: QuantizationConfig | None = None,
         layer_idx: int = 0,
+        cache_layer_idx: int | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -828,7 +943,13 @@ class DeepseekV2Attention(nn.Module):
                 max_position_embeddings=config.max_position_embeddings,
                 rope_theta=float(rope_theta),
                 rope_scaling=rope_params,
-                layer_id=layer_idx,
+                layer_id=(layer_idx if cache_layer_idx is None else cache_layer_idx),
+                indexer_norm_eps=float(
+                    getattr(config, "indexer_norm_eps", 1e-6)
+                ),
+                indexer_rope_interleave=bool(
+                    getattr(config, "indexer_rope_interleave", False)
+                ),
             )
         else:
             self.indexer = None
@@ -1496,8 +1617,12 @@ class DeepseekV2Attention(nn.Module):
                         )
                         type(self)._shared_indexer_logged = True
                 else:
-                    use_fused_topk = fused_kernels_enabled() and (
-                        self.index_topk in (512, 2048)
+                    max_topk_context = bt.shape[-1] * block_size
+                    use_fused_topk = (
+                        fused_kernels_enabled()
+                        and _can_use_fused_indexer_topk(
+                            self.index_topk, max_topk_context
+                        )
                     )
                     topk_result = self.indexer(
                         hidden_states,

@@ -320,6 +320,10 @@ impl Scheduler {
         self.is_finished_api()
     }
 
+    fn has_runnable_work(&self) -> bool {
+        self.has_runnable_work_api()
+    }
+
     fn num_waiting(&self) -> i32 {
         self.num_waiting_api()
     }

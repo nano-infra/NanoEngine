@@ -13,6 +13,12 @@ from dlengine.layers import get_backend
 from dlengine.layers.base_backend import ColumnParallelLinearBase, RowParallelLinearBase
 from dlengine.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from dlengine.layers.layernorm import RMSNorm
+from dlengine.models.pp_utils import (
+    get_gemma4_pp_layer_range,
+    make_pp_layers,
+    pp_recv_hidden,
+    pp_send_hidden,
+)
 
 
 def _gelu_pytorch_tanh(x: torch.Tensor) -> torch.Tensor:
@@ -327,13 +333,33 @@ class Gemma4Model(nn.Module):
     def __init__(self, config: Gemma4TextConfig) -> None:
         super().__init__()
         self.config = config
-        self.embed_tokens = ScaledVocabEmbedding(
-            config.vocab_size, config.hidden_size, math.sqrt(config.hidden_size)
+        ctx = get_dist_context()
+        self.is_first_pp_stage = ctx.is_first_pp_stage
+        self.is_last_pp_stage = ctx.is_last_pp_stage
+        self.hidden_size = config.hidden_size
+        self.hidden_dtype = getattr(config, "dtype", None) or torch.get_default_dtype()
+
+        # The last stage also owns a copy when embeddings are tied, because a
+        # parameter cannot be shared by reference across pipeline processes.
+        if self.is_first_pp_stage or (
+            self.is_last_pp_stage and config.tie_word_embeddings
+        ):
+            self.embed_tokens = ScaledVocabEmbedding(
+                config.vocab_size, config.hidden_size, math.sqrt(config.hidden_size)
+            )
+        else:
+            self.embed_tokens = None
+
+        layer_range = get_gemma4_pp_layer_range(config)
+        self.start_layer, self.end_layer, self.layers = make_pp_layers(
+            config.num_hidden_layers,
+            lambda idx: Gemma4DecoderLayer(config, idx),
+            layer_range=layer_range,
         )
-        self.layers = nn.ModuleList(
-            [Gemma4DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.is_last_pp_stage:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = None
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
             self.embed_tokens_per_layer = CpuScaledVocabEmbedding(
@@ -355,11 +381,13 @@ class Gemma4Model(nn.Module):
 
     def wire_shared_kv_caches(self) -> None:
         source_by_type: dict[str, Gemma4Attention] = {}
-        for layer in self.layers:
+        for idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[idx]
             attn = layer.self_attn
             if attn.store_full_length_kv:
                 source_by_type[attn.layer_type] = attn
-        for layer in self.layers:
+        for idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[idx]
             attn = layer.self_attn
             if not attn.is_kv_shared_layer:
                 continue
@@ -412,14 +440,23 @@ class Gemma4Model(nn.Module):
         positions: torch.Tensor,
         per_layer_token_part: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if self.is_first_pp_stage:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = pp_recv_hidden(
+                positions.size(0), self.hidden_size, self.hidden_dtype
+            )
         per_layer_inputs = self._per_layer_inputs(
             input_ids, hidden_states, per_layer_token_part
         )
         shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = UserDict()
-        for i, layer in enumerate(self.layers):
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
             pli = per_layer_inputs[:, i, :] if per_layer_inputs is not None else None
             hidden_states = layer(positions, hidden_states, pli, shared_kv_states)
+        if not self.is_last_pp_stage:
+            pp_send_hidden(hidden_states)
+            return hidden_states
         return self.norm(hidden_states)
 
 
@@ -428,7 +465,9 @@ class Gemma4ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.model = Gemma4Model(config)
-        if config.tie_word_embeddings:
+        if not get_dist_context().is_last_pp_stage:
+            self.lm_head = None
+        elif config.tie_word_embeddings:
             self.lm_head = TiedParallelLMHead(self.model.embed_tokens)
         else:
             self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)

@@ -65,6 +65,7 @@ architecture_loaders = {
     "Qwen3ForCausalLM": _qwen3_cls,
     "Qwen3MoeForCausalLM": _qwen3_moe_cls,
     "Qwen3_5ForConditionalGeneration": _qwen3_5_cls,
+    "DeepseekV2ForCausalLM": _deepseek_v2_cls,
     "DeepseekV3ForCausalLM": _deepseek_v2_cls,
     "DeepseekV32ForCausalLM": _deepseek_v2_cls,
     "DeepseekV4ForCausalLM": _deepseek_v4_cls,

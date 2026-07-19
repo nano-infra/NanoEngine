@@ -152,12 +152,12 @@ class RayExecutor:
             pg_id_hex: Placement group ID in hex format
         """
         logger.info(
-            f"Scheduling {self.config.attn_world_size} workers using Ray job's placement group"
+            f"Scheduling {self.config.world_size} workers using Ray job's placement group"
         )
 
         # Create every worker first with distributed initialization deferred;
         # rank 0's actual placement determines the rendezvous address.
-        for rank in range(self.config.attn_world_size):
+        for rank in range(self.config.world_size):
             worker = ModelRunner.remote(
                 self.config,
                 rank,
@@ -181,8 +181,9 @@ class RayExecutor:
         # A configured master is a legacy node-placement override. With the
         # default None, PGs carry no node hint and Ray chooses available nodes.
         node_ids = None
+        world_size = self.config.world_size
         if self.config.master_address is not None:
-            required_on_master = min(self.config.attn_world_size, workers_per_node)
+            required_on_master = min(world_size, workers_per_node)
             nodes = get_available_nodes_with_master_first(
                 self.config.master_address, required_gpus=required_on_master
             )
@@ -190,19 +191,14 @@ class RayExecutor:
 
         # When world size exceeds a single node, it must be a multiple of
         # workers_per_node so each node is fully packed.
-        if (
-            self.config.attn_world_size > workers_per_node
-            and self.config.attn_world_size % workers_per_node != 0
-        ):
+        if world_size > workers_per_node and world_size % workers_per_node != 0:
             raise ValueError(
-                f"attn_world_size ({self.config.attn_world_size}) must be a "
+                f"world_size ({world_size}) must be a "
                 f"multiple of {workers_per_node} when larger than {workers_per_node}"
             )
 
         # 4. 计算需要多少个节点
-        num_nodes_needed = (
-            self.config.attn_world_size + workers_per_node - 1
-        ) // workers_per_node
+        num_nodes_needed = (world_size + workers_per_node - 1) // workers_per_node
         if node_ids is not None and num_nodes_needed > len(node_ids):
             raise ValueError(
                 f"insufficient resources, {num_nodes_needed} on demand，but only find {len(node_ids)} nodes"
@@ -214,7 +210,7 @@ class RayExecutor:
             logger.info("--- scheduling worker group %s ---", node_idx)
 
             start_rank = node_idx * workers_per_node
-            end_rank = min(start_rank + workers_per_node, self.config.attn_world_size)
+            end_rank = min(start_rank + workers_per_node, world_size)
             num_workers_on_node = end_rank - start_rank
 
             # PG names must be globally unique. Include the engine id so several

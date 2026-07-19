@@ -76,17 +76,45 @@ except ImportError:
     can_use_ragged_to_padded_triton = None
     ragged_to_padded_triton = None
 
-# Try to import flashinfer GDN kernels (preferred, SM90 native)
+# Try to import flashinfer GDN kernels (preferred, SM90 native). Some
+# FlashInfer builds expose the Python API while omitting one of the optional
+# compiled decode backends, so probe the actual backend callables separately.
 try:
     from flashinfer import chunk_gated_delta_rule
-    from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 
-    _HAS_FLASHINFER_GDN = True
+    _HAS_FLASHINFER_GDN_PREFILL = callable(chunk_gated_delta_rule)
 except ImportError:
-    _HAS_FLASHINFER_GDN = False
+    chunk_gated_delta_rule = None
+    _HAS_FLASHINFER_GDN_PREFILL = False
     logger.warning(
         "flashinfer GDN kernels not available. GatedDeltaNet will use naive fallback."
     )
+
+try:
+    from flashinfer.gdn_decode import (
+        gated_delta_rule_decode_pretranspose,
+        run_pretranspose_decode as _run_pretranspose_decode,
+    )
+
+    _HAS_FLASHINFER_GDN_PRETRANSPOSE = callable(
+        gated_delta_rule_decode_pretranspose
+    ) and callable(_run_pretranspose_decode)
+except ImportError:
+    gated_delta_rule_decode_pretranspose = None
+    _HAS_FLASHINFER_GDN_PRETRANSPOSE = False
+
+try:
+    from flashinfer.gdn_decode import (
+        gated_delta_rule_decode,
+        run_nontranspose_decode as _run_nontranspose_decode,
+    )
+
+    _HAS_FLASHINFER_GDN_NONTRANSPOSE = callable(gated_delta_rule_decode) and callable(
+        _run_nontranspose_decode
+    )
+except ImportError:
+    gated_delta_rule_decode = None
+    _HAS_FLASHINFER_GDN_NONTRANSPOSE = False
 
 # Try to import flash-linear-attention GDN kernels (preferred for non-Hopper).
 try:
@@ -143,9 +171,9 @@ class RMSNormGated(nn.Module):
 class GenericGatedDeltaNet(GatedDeltaNetBase):
     """GatedDeltaNet linear attention.
 
-    Uses flashinfer SM90 kernels:
+    Uses FlashInfer SM90 kernels when their compiled backends are available:
     - Prefill: chunk_gated_delta_rule
-    - Decode: gated_delta_rule_decode_pretranspose (fused gate computation)
+    - Decode: pretranspose fused kernel, with nontranspose/FLA/naive fallbacks
 
     State layout is K-last: [N, H, V, K].
     """
@@ -219,8 +247,16 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
 
         # Kernel availability
         is_hopper_gpu = is_hopper()
-        self._has_flashinfer = _HAS_FLASHINFER_GDN and is_hopper_gpu
-        self._has_fla = (not is_hopper_gpu) and _HAS_FLA_GDN
+        self._has_flashinfer_prefill = _HAS_FLASHINFER_GDN_PREFILL and is_hopper_gpu
+        self._has_flashinfer_pretranspose = (
+            _HAS_FLASHINFER_GDN_PRETRANSPOSE and is_hopper_gpu
+        )
+        self._has_flashinfer_nontranspose = (
+            _HAS_FLASHINFER_GDN_NONTRANSPOSE and is_hopper_gpu
+        )
+        # FLA is also a valid fallback on Hopper when a FlashInfer build omits
+        # its optional decode kernels.
+        self._has_fla = _HAS_FLA_GDN
         self._conv1d_prefill_padded_ws: torch.Tensor | None = None
 
     def _get_conv1d_prefill_padded_workspace(
@@ -721,7 +757,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                     num_seqs, self.num_v_heads, self.head_v_dim, self.head_k_dim
                 )
 
-        if self._has_flashinfer:
+        if self._has_flashinfer_prefill:
             q_normed = self._l2norm(q.float(), dim=-1).to(q.dtype)
             k_normed = self._l2norm(k.float(), dim=-1).to(k.dtype)
             o, final_state = chunk_gated_delta_rule(
@@ -768,10 +804,11 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         return o
 
     def _gdn_decode(self, q, k, v, a, b, scale, context) -> torch.Tensor:
-        """Decode: flashinfer fused kernel with pool+indices.
+        """Decode with FlashInfer, FLA, or a naive recurrent fallback.
 
-        flashinfer takes raw A_log, a, dt_bias, b and computes gates internally,
-        and supports direct pool indexing to avoid gather/scatter overhead.
+        The preferred FlashInfer pretranspose kernel takes raw A_log, a,
+        dt_bias, b and supports direct pool indexing. Builds without that
+        optional backend use the nontranspose kernel with gather/scatter.
         State layout is K-last [pool_size, H, V, K].
         """
         bs = q.shape[0]
@@ -779,7 +816,7 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
         gdn_recurrent_states = getattr(context, "gdn_recurrent_states", None)
         gdn_state_slots = getattr(context, "gdn_state_slots", None)
 
-        if self._has_flashinfer and gdn_recurrent_states is not None:
+        if self._has_flashinfer_pretranspose and gdn_recurrent_states is not None:
             state_pool = gdn_recurrent_states[self.layer_idx]
             if gdn_state_slots is not None:
                 indices = gdn_state_slots[:bs].to(torch.int64)
@@ -801,6 +838,36 @@ class GenericGatedDeltaNet(GatedDeltaNetBase):
                 initial_state_indices=indices,
             )
             o = o.squeeze(1)
+        elif self._has_flashinfer_nontranspose and gdn_recurrent_states is not None:
+            if gdn_state_slots is not None:
+                slots = gdn_state_slots[:bs]
+                initial_state = gdn_recurrent_states[self.layer_idx, slots]
+            else:
+                slots = None
+                initial_state = gdn_recurrent_states[self.layer_idx, :bs]
+
+            # The shared state pool is V-major/K-last. FlashInfer's alternate
+            # decode backend expects K-major/V-last, so gather a contiguous
+            # batch view, transpose it for the call, then scatter it back.
+            nontranspose_state = initial_state.transpose(-1, -2).contiguous()
+            o, updated_state = gated_delta_rule_decode(
+                q=q.unsqueeze(1),
+                k=k.unsqueeze(1),
+                v=v.unsqueeze(1),
+                state=nontranspose_state,
+                A_log=self.A_log.detach().float(),
+                a=a.unsqueeze(1),
+                dt_bias=self.dt_bias.detach(),
+                b=b.unsqueeze(1),
+                scale=scale,
+                use_qk_l2norm=True,
+            )
+            o = o.squeeze(1)
+            updated_state = updated_state.transpose(-1, -2)
+            if slots is not None:
+                gdn_recurrent_states[self.layer_idx, slots] = updated_state
+            else:
+                gdn_recurrent_states[self.layer_idx, :bs] = updated_state
         elif self._has_fla and gdn_recurrent_states is not None:
             if gdn_state_slots is not None:
                 initial_state = gdn_recurrent_states[

@@ -17,6 +17,17 @@ impl Scheduler {
             && self.prefilling.iter().all(|seqs| seqs.is_empty())
     }
 
+    pub(super) fn has_runnable_work_api(&self) -> bool {
+        // A prefill request remains in `to_be_migrated` until the decode
+        // engine acknowledges migration and sends /pd/free. It still owns KV
+        // blocks, but it must not trigger another model forward while waiting
+        // for that control-plane acknowledgement.
+        !self.waiting.is_empty()
+            || !self.waiting_migration.is_empty()
+            || self.running.iter().any(|seqs| !seqs.is_empty())
+            || self.prefilling.iter().any(|seqs| !seqs.is_empty())
+    }
+
     pub(super) fn num_waiting_api(&self) -> i32 {
         self.waiting.len() as i32
     }

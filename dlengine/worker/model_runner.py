@@ -251,7 +251,7 @@ class ModelRunner:
 
             set_compile_disabled(True)
             logger.info("torch.compile disabled (config.disable_compile=True)")
-        self.world_size = config.attn_world_size
+        self.world_size = config.world_size
         self.rank = rank
         self._dist_initialized = False
         self._dlslime_agent = None
@@ -336,13 +336,14 @@ class ModelRunner:
 
         set_dist_context(
             rank=rank,
-            world_size=config.attn_world_size,
+            world_size=config.world_size,
             attention_dp=config.attention_dp,
             attention_sp=config.attention_sp,
             attention_tp=config.attention_tp,
             ffn_dp=config.ffn_dp,
             ffn_ep=config.ffn_ep,
             ffn_tp=config.ffn_tp,
+            pp=config.pp,
         )
 
         self.default_dtype = torch.get_default_dtype()
@@ -1031,6 +1032,18 @@ class ModelRunner:
         # attention layers, so they each need a cache slice.
         layer_types = getattr(hf_config, "layer_types", None)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        from dlengine.models.pp_utils import (
+            get_gemma4_pp_layer_range,
+            get_pp_layer_range,
+        )
+
+        if arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
+            pp_start, pp_end = get_gemma4_pp_layer_range(hf_config)
+        else:
+            pp_start, pp_end = get_pp_layer_range(hf_config.num_hidden_layers)
+        local_layer_types = (
+            layer_types[pp_start:pp_end] if layer_types is not None else None
+        )
         if (
             arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration")
             and layer_types is not None
@@ -1042,19 +1055,27 @@ class ModelRunner:
             if cache_plan.has_hisparse() and cache_plan.has_gqa():
                 num_kv_layers = sum(
                     1
-                    for i, lt in enumerate(layer_types)
+                    for i, lt in enumerate(layer_types[pp_start:pp_end], start=pp_start)
                     if i < first_shared and lt == "full_attention"
                 )
             else:
                 num_kv_layers = sum(
-                    1 for i, _lt in enumerate(layer_types) if i < first_shared
+                    1
+                    for i, _lt in enumerate(
+                        layer_types[pp_start:pp_end], start=pp_start
+                    )
+                    if i < first_shared
                 )
-        elif layer_types is not None and any(
-            lt == "linear_attention" for lt in layer_types
+        elif local_layer_types is not None and any(
+            lt == "linear_attention" for lt in local_layer_types
         ):
-            num_kv_layers = sum(1 for lt in layer_types if lt == "full_attention")
+            num_kv_layers = sum(1 for lt in local_layer_types if lt == "full_attention")
         else:
-            num_kv_layers = hf_config.num_hidden_layers
+            # With pipeline parallelism each stage owns only a contiguous slice
+            # of the decoder layers, so it allocates KV cache for just those
+            # local layers. get_pp_layer_range returns (0, num_hidden_layers)
+            # when pp == 1, preserving the original behaviour.
+            num_kv_layers = pp_end - pp_start
 
         # If ctrl_address is provided, fetch engine_id from NanoCtrl
         engine_id = config.engine_id
@@ -1104,10 +1125,10 @@ class ModelRunner:
         # utilization target on hybrid models.
         reserved_state_bytes = 0
         gdn_cache_slots = max(0, getattr(config, "gdn_state_cache_slots", 0))
-        if cache_plan.has_gdn() and layer_types is not None:
+        if cache_plan.has_gdn() and local_layer_types is not None:
             reserved_state_bytes = CacheContext.estimate_gdn_state_bytes(
                 hf_config,
-                layer_types,
+                local_layer_types,
                 config.max_num_seqs,
                 need_backup=config.num_speculative_tokens > 0,
                 cache_slots=gdn_cache_slots,
@@ -1153,10 +1174,10 @@ class ModelRunner:
         )
 
         # Allocate GDN state buffers for linear_attention layers
-        if cache_plan.has_gdn() and layer_types is not None:
+        if cache_plan.has_gdn() and local_layer_types is not None:
             cache_context.allocate_gdn_states(
                 hf_config,
-                layer_types,
+                local_layer_types,
                 config.max_num_seqs,
                 need_backup=config.num_speculative_tokens > 0,
                 cache_slots=gdn_cache_slots,
@@ -1251,6 +1272,10 @@ class ModelRunner:
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
+        # Pipeline parallelism: non-final stages run their local decoder layers
+        # and send the residual stream to the next stage inside model.forward.
+        # They produce no logits, so short-circuit before compute_logits.
+        is_last_pp_stage = get_dist_context().is_last_pp_stage
         flashinfer_decode_eager = (
             not is_prefill
             and os.environ.get("DLENGINE_FLASHINFER_EAGER_DECODE", "0") == "1"
@@ -1283,9 +1308,13 @@ class ModelRunner:
                 hidden = self.model(input_ids, positions)
             if is_prefill:
                 ExpertContext.get_instance().transition_to_low_latency()
+            self._mark_fwd("model")
+            # Non-final pipeline stages already forwarded the residual stream to
+            # the next stage; there is nothing to sample here.
+            if not is_last_pp_stage:
+                return None
             if not is_prefill and self.mtp_runner is not None:
                 self.mtp_runner.last_hidden = hidden
-            self._mark_fwd("model")
             logits = self.model.compute_logits(hidden)
             self._mark_fwd("logits")
             return logits
@@ -1465,6 +1494,21 @@ class ModelRunner:
         want_lp = bool(getattr(aux, "any_return_completion_logprobs", False))
         logprobs = None
         if tp_rank == 0:
+            context = get_batch_context()
+            if (
+                is_prefill
+                and context.sampling_seq_indices is not None
+                and context.sampling_seq_indices.numel() == 0
+            ):
+                # Intermediate static PP microbatches update cache/state only.
+                # Avoid invoking the sampler (and its compiled kernels) with a
+                # zero-row logits tensor; the driver discards this placeholder.
+                input_ids = input_ids.new_zeros(num_seqs)
+                if want_lp:
+                    logprobs = torch.zeros(
+                        num_seqs, dtype=torch.float32, device=input_ids.device
+                    )
+                return input_ids, logprobs
             greedy_only = not want_lp and all(
                 float(t) < 1e-5 for t in getattr(aux, "temperatures", ())
             )
@@ -1474,7 +1518,6 @@ class ModelRunner:
                 return logits.argmax(dim=-1), None
 
             temperatures = prepare_sample_from_aux(aux)
-            context = get_batch_context()
             if is_prefill and context.sampling_seq_indices is not None:
                 temps_filtered = temperatures[context.sampling_seq_indices]
                 if want_lp:
@@ -1689,6 +1732,16 @@ class ModelRunner:
             _timer.mark("forward")
         if is_prefill and self.vision_manager.has_embeds:
             self.vision_manager.clear()
+
+        # Non-final pipeline stages produce no logits/tokens; they only need to
+        # have run their local layers (and pushed hidden states downstream). The
+        # engine reads tokens from the last stage only, so return a benign
+        # placeholder here.
+        if logits is None:
+            reset_runtime_contexts()
+            self.run_count += 1
+            self._fwd_timer = None
+            return [[0] for _ in range(num_seqs)]
 
         # --- Sampling ---
         num_accepted = None

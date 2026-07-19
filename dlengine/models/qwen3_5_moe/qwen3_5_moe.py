@@ -39,6 +39,12 @@ from dlengine.layers.parallelism_transition import (
 )
 from dlengine.layers.rotary_embedding import get_rope
 from dlengine.logging import get_logger
+from dlengine.models.pp_utils import (
+    get_pp_layer_range,
+    make_pp_layers,
+    pp_recv_hidden,
+    pp_send_hidden,
+)
 from dlengine.worker.runner_config import get_runner_config
 from ..quant_config import QuantizationConfig
 
@@ -341,6 +347,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         config,
         quantization_config: QuantizationConfig,
         layer_idx: int = -1,
+        state_layer_idx: int | None = None,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -360,7 +367,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
             )
         else:  # linear_attention
             self.linear_attn = get_backend().get_gated_delta_net(
-                layer_idx=layer_idx,
+                layer_idx=layer_idx if state_layer_idx is None else state_layer_idx,
                 config=config,
                 quantization_config=quantization_config,
             )
@@ -421,18 +428,36 @@ class Qwen3_5MoeModel(nn.Module):
 
     def __init__(self, config, quantization_config: QuantizationConfig) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
+        ctx = get_dist_context()
+        self.is_first_pp_stage = ctx.is_first_pp_stage
+        self.is_last_pp_stage = ctx.is_last_pp_stage
+        self.hidden_size = config.hidden_size
+        self.hidden_dtype = getattr(config, "dtype", None) or torch.get_default_dtype()
+
+        if self.is_first_pp_stage:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = None
+
+        pp_start, _ = get_pp_layer_range(config.num_hidden_layers)
+        self.start_layer, self.end_layer, self.layers = make_pp_layers(
+            config.num_hidden_layers,
+            lambda layer_idx: Qwen3_5MoeDecoderLayer(
+                config,
+                quantization_config,
+                layer_idx,
+                state_layer_idx=layer_idx - pp_start,
+            ),
         )
-        self.layers = nn.ModuleList(
-            [
-                Qwen3_5MoeDecoderLayer(config, quantization_config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
-        self.norm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=True
-        )
+
+        if self.is_last_pp_stage:
+            self.norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=True
+            )
+        else:
+            self.norm = None
 
     def forward(
         self,
@@ -440,14 +465,28 @@ class Qwen3_5MoeModel(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+        if self.is_first_pp_stage:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_tokens(input_ids)
+            residual = None
         else:
-            hidden_states = self.embed_tokens(input_ids)
+            hidden_states = pp_recv_hidden(
+                positions.size(0), self.hidden_size, self.hidden_dtype
+            )
+            residual = None
 
-        residual = None
-        for i, layer in enumerate(self.layers):
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        for idx in range(self.start_layer, self.end_layer):
+            hidden_states, residual = self.layers[idx](
+                positions, hidden_states, residual
+            )
+
+        if not self.is_last_pp_stage:
+            if residual is not None:
+                hidden_states = hidden_states + residual
+            pp_send_hidden(hidden_states)
+            return hidden_states
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
@@ -476,10 +515,15 @@ class Qwen3_5MoeForConditionalGeneration(nn.Module):
         self.quantization_config = quantization_config
 
         self.model = Qwen3_5MoeModel(config, quantization_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-
-        if getattr(config, "tie_word_embeddings", False):
-            self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        if get_dist_context().is_last_pp_stage:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+            if (
+                getattr(config, "tie_word_embeddings", False)
+                and self.model.embed_tokens is not None
+            ):
+                self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        else:
+            self.lm_head = None
 
     def forward(
         self,

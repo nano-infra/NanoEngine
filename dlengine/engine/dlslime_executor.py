@@ -102,6 +102,13 @@ class DLSLimeExecutor(RayExecutor):
             imm_cnt += getattr(session, "imm_recv_count", 0)
         return wwi_ns, wwi_cnt, imm_ns, imm_cnt
 
+    def max_inflight_requests(self) -> int:
+        """Smallest RPC mailbox capacity across worker proxies."""
+        return min(
+            (int(proxy._ch.slot_count) for proxy in self._proxies),
+            default=1,
+        )
+
     def _probe_per_proxy(self) -> tuple[list[int], list[int]]:
         """Per-proxy cumulative (write_with_imm_ns, imm_recv_ns) snapshots.
 

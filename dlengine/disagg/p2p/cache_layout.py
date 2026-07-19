@@ -108,6 +108,7 @@ class CacheTensorLayout:
         gdn_num_slots: int = 0,
         compressed_pool_pages: dict[int, int] | None = None,
         dsv4_max_slots: int = 0,
+        num_hidden_layers: int = 0,
     ) -> "CacheTensorLayout":
         compressor_slots_plus_dummy_by_ratio = {}
         for ratio, local_slots in (
@@ -122,7 +123,10 @@ class CacheTensorLayout:
             num_local_kv_heads=local_layout.num_local_kv_heads,
             head_dim=local_layout.head_dim,
             dtype_itemsize=local_layout.dtype_itemsize,
-            num_hidden_layers=local_layout.num_hidden_layers,
+            # A PP prefill stage's kv_cache tensor holds only that stage's
+            # layers, so its stride math must use the stage-local layer count
+            # rather than the (full) local one.
+            num_hidden_layers=(num_hidden_layers or local_layout.num_hidden_layers),
             mode=local_layout.mode,
             is_fp8_kvcache=local_layout.is_fp8_kvcache,
             fp8_head_dim=local_layout.fp8_head_dim,
@@ -148,6 +152,8 @@ class CacheTensorLayout:
         )
 
     def block_stride(self, block_idx: int) -> int:
+        if self.mode == "dsv4":
+            return block_idx * self.block_size * DSV4_BYTES_PER_TOKEN
         if self.is_fp8_kvcache and self.mode == "mla":
             return block_idx * (self.block_size + 1) * self.fp8_head_dim
         return (
@@ -159,11 +165,17 @@ class CacheTensorLayout:
         )
 
     def layer_stride(self, layer_idx: int, block_idx: int) -> int:
-        return self.block_stride(self.num_blocks) * layer_idx + self.block_stride(
+        # DSv4 HCA allocates one extra dummy page per layer.
+        layer_blocks = self.num_blocks + 1 if self.mode == "dsv4" else self.num_blocks
+        return self.block_stride(layer_blocks) * layer_idx + self.block_stride(
             block_idx
         )
 
     def kv_stride(self, kv_idx: int, layer_idx: int, block_idx: int) -> int:
+        if self.mode == "dsv4":
+            if kv_idx != 0:
+                raise ValueError("DSv4 HCA cache has a single cache plane")
+            return self.layer_stride(layer_idx, block_idx)
         return self.layer_stride(
             self.num_hidden_layers, 0
         ) * kv_idx + self.layer_stride(layer_idx, block_idx)
@@ -224,7 +236,15 @@ class P2PCacheLayout:
     def local(self) -> CacheTensorLayout:
         return CacheTensorLayout.from_cache_context(self.transfer.cache_context)
 
-    def remote(self, remote_engine_id: str) -> CacheTensorLayout:
+    def remote(
+        self, remote_engine_id: str, num_hidden_layers: int = 0
+    ) -> CacheTensorLayout:
+        """Layout snapshot of a remote engine's cache tensors.
+
+        ``num_hidden_layers`` overrides the remote layer count for PP prefill
+        engines, whose per-stage kv_cache tensors hold only the stage's own
+        layers (0 = same as local, i.e. a non-PP peer).
+        """
         local_layout = self.local()
         return CacheTensorLayout.from_peer_metadata(
             local_layout=local_layout,
@@ -234,6 +254,7 @@ class P2PCacheLayout:
                 remote_engine_id, {}
             ),
             dsv4_max_slots=self.transfer.remote_dsv4_max_slots.get(remote_engine_id, 0),
+            num_hidden_layers=num_hidden_layers,
         )
 
     def block_stride(self, block_idx: int) -> int:
@@ -243,9 +264,16 @@ class P2PCacheLayout:
         return self.local().kv_stride(kv_idx, layer_idx, block_idx)
 
     def remote_kv_stride(
-        self, kv_idx: int, layer_idx: int, block_idx: int, remote_engine_id: str
+        self,
+        kv_idx: int,
+        layer_idx: int,
+        block_idx: int,
+        remote_engine_id: str,
+        remote_num_layers: int = 0,
     ) -> int:
-        return self.remote(remote_engine_id).kv_stride(kv_idx, layer_idx, block_idx)
+        return self.remote(remote_engine_id, remote_num_layers).kv_stride(
+            kv_idx, layer_idx, block_idx
+        )
 
     def gdn_conv_stride(self, layer_idx: int, slot_idx: int) -> int:
         return self.local().gdn_conv_stride(layer_idx, slot_idx)

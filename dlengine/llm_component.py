@@ -69,6 +69,63 @@ class LLMComponent(LLM):
 
         atexit.register(self.shutdown)
 
+    def _pp_layer_ranges(self) -> list[list[int]]:
+        """Authoritative ``[start, end)`` decoder-layer range per pipeline stage.
+
+        Published in engine metadata so a pp=1 decode engine can route each
+        global layer's KV read to the prefill stage that owns it, without
+        having to replicate architecture-specific split policies (e.g.
+        Gemma4 reserves its shared-KV suffix for the last stage).
+        """
+        from dlengine.models.pp_utils import (
+            get_gemma4_shared_kv_source_start,
+            pp_layer_partition,
+        )
+
+        num_layers = getattr(self.config.hf_config, "num_hidden_layers", 0)
+        arch = (getattr(self.config.hf_config, "architectures", None) or [""])[0]
+        final_stage_start = None
+        if self.config.pp > 1 and arch in (
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+        ):
+            final_stage_start = get_gemma4_shared_kv_source_start(self.config.hf_config)
+        return [
+            [start, end]
+            for start, end in pp_layer_partition(
+                num_layers, self.config.pp, final_stage_start
+            )
+        ]
+
+    def _pp_cache_layer_indices(self) -> list[list[int]]:
+        """Global primary-cache layer indices owned by each PP stage."""
+        from dlengine.models.pp_utils import (
+            cache_layer_indices,
+            partition_layer_indices,
+        )
+
+        ranges = [tuple(value) for value in self._pp_layer_ranges()]
+        return partition_layer_indices(
+            cache_layer_indices(
+                self.config.hf_config,
+                gemma_hisparse_only_full_attention=bool(self.config.enable_hisparse),
+            ),
+            ranges,
+        )
+
+    def _pp_dsv4_ratio_layer_indices(self) -> dict[int, list[list[int]]]:
+        """Global DSv4 compressed-layer indices by ratio and PP stage."""
+        from dlengine.models.pp_utils import partition_layer_indices
+
+        ranges = [tuple(value) for value in self._pp_layer_ranges()]
+        ratios = list(getattr(self.config.hf_config, "compress_ratios", None) or [])
+        return {
+            int(ratio): partition_layer_indices(
+                [idx for idx, value in enumerate(ratios) if value == ratio], ranges
+            )
+            for ratio in sorted({value for value in ratios if value > 0})
+        }
+
     def get_engine_info(self, status: str = "ready") -> str:
         """Get engine info as JSON string."""
         # Get peer_agent addresses from all workers
@@ -86,7 +143,7 @@ class LLMComponent(LLM):
             "id": self.engine_id,
             "role": self.config.mode,
             "rank": 0,
-            "world_size": self.config.attn_world_size,
+            "world_size": self.config.world_size,
             "num_blocks": self.config.num_kvcache_blocks,
             "host": zmq_host,
             "port": self.config.port,
@@ -96,12 +153,18 @@ class LLMComponent(LLM):
             "p2p_port": self.p2p_port if self.p2p_port else 0,
             "max_num_seqs": self.config.max_num_seqs,
             # Attention parallel layout. Consumers (decode engines) need these
-            # to map a (dp_idx, sp_idx, tp_idx) cell to the right global rank
-            # in ``peer_addrs`` during PD KV migration. peer_addrs is ordered by
-            # global rank = dp_idx*(sp*tp) + sp_idx*tp + tp_idx.
+            # to map a (pp_idx, dp_idx, sp_idx, tp_idx) cell to the right
+            # global rank in ``peer_addrs`` during PD KV migration. peer_addrs
+            # is ordered by global rank =
+            # pp_idx*(dp*sp*tp) + dp_idx*(sp*tp) + sp_idx*tp + tp_idx.
             "attention_dp": self.config.attention_dp,
             "attention_sp": self.config.attention_sp,
             "attention_tp": self.config.attention_tp,
+            "pp": self.config.pp,
+            "num_hidden_layers": getattr(self.config.hf_config, "num_hidden_layers", 0),
+            "pp_layer_ranges": self._pp_layer_ranges(),
+            "pp_cache_layer_indices": self._pp_cache_layer_indices(),
+            "pp_dsv4_ratio_layer_indices": self._pp_dsv4_ratio_layer_indices(),
             # Per-rank KV-head shard size. The RDMA block-copy migration requires
             # the prefill and decode engines to share the same per-rank KV-head
             # layout (i.e. equal attention_tp for GQA), so the decode side can
@@ -397,7 +460,10 @@ class LLMComponent(LLM):
         )
         metadata = {
             "role": self.config.mode,
-            "world_size": self.config.attn_world_size,
+            # Total worker count (all pipeline stages). ``peer_addrs`` has one
+            # entry per worker, ordered by global rank:
+            # pp_idx * (dp*sp*tp) + dp_idx*(sp*tp) + sp_idx*tp + tp_idx.
+            "world_size": self.config.world_size,
             "num_blocks": self.config.num_kvcache_blocks,
             "host": zmq_host,
             "port": self.config.port,
@@ -415,6 +481,16 @@ class LLMComponent(LLM):
             "attention_sp": self.config.attention_sp,
             "attention_tp": self.config.attention_tp,
             "ffn_ep": self.config.ffn_ep,
+            # Pipeline layout. A pp=1 decode engine uses these to map each
+            # global layer to the prefill stage that owns it during PD KV
+            # migration. pp_layer_ranges is the authoritative [start, end)
+            # decoder-layer range per stage (uneven splits included, e.g.
+            # Gemma4's reserved final-stage suffix).
+            "pp": self.config.pp,
+            "num_hidden_layers": getattr(self.config.hf_config, "num_hidden_layers", 0),
+            "pp_layer_ranges": self._pp_layer_ranges(),
+            "pp_cache_layer_indices": self._pp_cache_layer_indices(),
+            "pp_dsv4_ratio_layer_indices": self._pp_dsv4_ratio_layer_indices(),
             "num_local_kv_heads": (
                 getattr(self.config.hf_config, "num_key_value_heads", 1)
                 // self.config.attention_tp

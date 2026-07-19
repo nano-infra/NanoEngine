@@ -128,6 +128,20 @@ def _partial_stop_holdback(text: str, stops: list[str]) -> int:
     return max_hold
 
 
+def _skip_redundant_think_openers(text: str, start: int) -> tuple[int, bool]:
+    """Skip generated ``<think>`` tags when the prompt already opened thinking.
+
+    Returns the next unread offset and whether more text is needed to decide if
+    the remaining suffix is another (possibly partial) opening tag.
+    """
+    marker = "<think>"
+    pos = start
+    while text.startswith(marker, pos):
+        pos += len(marker)
+    suffix = text[pos:]
+    return pos, not suffix or marker.startswith(suffix)
+
+
 class OpenAIServer:
     """Holds the engine worker, tokenizer and serving metadata."""
 
@@ -540,6 +554,7 @@ class OpenAIServer:
         # text to a reasoning channel (gen.in_reasoning) instead of content.
         reasoning_active = reasoning_open
         think_close = "</think>"
+        drop_redundant_think_openers = reasoning_open
         while True:
             item = await req.aqueue.get()
             if item is None:
@@ -554,6 +569,13 @@ class OpenAIServer:
                 continue
             text += delta
             if reasoning_active:
+                if drop_redundant_think_openers:
+                    emitted, need_more = _skip_redundant_think_openers(
+                        text, emitted
+                    )
+                    if need_more:
+                        continue
+                    drop_redundant_think_openers = False
                 close = text.find(think_close, emitted)
                 if close == -1:
                     # No closing tag yet: stream reasoning, but hold back a

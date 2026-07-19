@@ -54,44 +54,50 @@ class DistContext(ContextManagerMixin, BaseContext):
 
     def reset_context(self) -> None:
         self.clear_context()
+        pp = max(1, self.pp)
         self.cpu_world_mesh = init_device_mesh(
             "cpu", (self.world_size,), mesh_dim_names=("world",)
         )
         self.cuda_world_mesh = init_device_mesh(
             "cuda", (self.world_size,), mesh_dim_names=("world",)
         )
+        # The pipeline dimension is the outermost mesh axis, so global rank
+        # layout is pp-major: rank = pp_idx * inner + inner_rank. This keeps the
+        # attn/ffn (dp/sp/tp/ep) sub-groups confined to a single pipeline stage
+        # while ``get_group("pp")`` spans stages for point-to-point transfer.
         self.attn_cpu_device_mesh = init_device_mesh(
             "cpu",
-            (self.attention_dp, self.attention_sp, self.attention_tp),
-            mesh_dim_names=("attn_dp", "attn_sp", "attn_tp"),
+            (pp, self.attention_dp, self.attention_sp, self.attention_tp),
+            mesh_dim_names=("pp", "attn_dp", "attn_sp", "attn_tp"),
         )
         self.ffn_cpu_device_mesh = init_device_mesh(
             "cpu",
-            (self.ffn_dp, self.ffn_ep, self.ffn_tp),
-            mesh_dim_names=("ffn_dp", "ffn_ep", "ffn_tp"),
+            (pp, self.ffn_dp, self.ffn_ep, self.ffn_tp),
+            mesh_dim_names=("pp", "ffn_dp", "ffn_ep", "ffn_tp"),
         )
         self.attn_device_mesh = init_device_mesh(
             "cuda",
-            (self.attention_dp, self.attention_sp, self.attention_tp),
-            mesh_dim_names=("attn_dp", "attn_sp", "attn_tp"),
+            (pp, self.attention_dp, self.attention_sp, self.attention_tp),
+            mesh_dim_names=("pp", "attn_dp", "attn_sp", "attn_tp"),
         )
         self.ffn_device_mesh = init_device_mesh(
             "cuda",
-            (self.ffn_dp, self.ffn_ep, self.ffn_tp),
-            mesh_dim_names=("ffn_dp", "ffn_ep", "ffn_tp"),
+            (pp, self.ffn_dp, self.ffn_ep, self.ffn_tp),
+            mesh_dim_names=("pp", "ffn_dp", "ffn_ep", "ffn_tp"),
         )
 
     def _validate_parallelism(self) -> None:
-        attn_world_size = self.attention_dp * self.attention_sp * self.attention_tp
-        ffn_world_size = self.ffn_dp * self.ffn_ep * self.ffn_tp
+        pp = max(1, self.pp)
+        attn_world_size = pp * self.attention_dp * self.attention_sp * self.attention_tp
+        ffn_world_size = pp * self.ffn_dp * self.ffn_ep * self.ffn_tp
         if attn_world_size != self.world_size:
             raise ValueError(
-                "attention parallelism must match world_size: "
+                "attention parallelism (incl. pp) must match world_size: "
                 f"{attn_world_size} != {self.world_size}"
             )
         if ffn_world_size != self.world_size:
             raise ValueError(
-                "ffn parallelism must match world_size: "
+                "ffn parallelism (incl. pp) must match world_size: "
                 f"{ffn_world_size} != {self.world_size}"
             )
 
@@ -268,6 +274,45 @@ class DistContext(ContextManagerMixin, BaseContext):
     @property
     def cuda_world_group(self):
         return self.cuda_world_mesh.get_group("world")
+
+    # ------------------------------------------------------------------ #
+    # Pipeline parallelism helpers                                         #
+    # ------------------------------------------------------------------ #
+    @property
+    def pp_world_size(self) -> int:
+        return max(1, self.pp)
+
+    @property
+    def pp_inner_world_size(self) -> int:
+        """Number of ranks within a single pipeline stage."""
+        return self.world_size // self.pp_world_size
+
+    @property
+    def pp_rank(self) -> int:
+        """Index of this rank's pipeline stage (pp-major global layout)."""
+        return self.rank // self.pp_inner_world_size
+
+    @property
+    def is_first_pp_stage(self) -> bool:
+        return self.pp_rank == 0
+
+    @property
+    def is_last_pp_stage(self) -> bool:
+        return self.pp_rank == self.pp_world_size - 1
+
+    @property
+    def pp_prev_global_rank(self) -> int:
+        """Global rank of the same inner position in the previous stage."""
+        return self.rank - self.pp_inner_world_size
+
+    @property
+    def pp_next_global_rank(self) -> int:
+        """Global rank of the same inner position in the next stage."""
+        return self.rank + self.pp_inner_world_size
+
+    @property
+    def pp_group(self):
+        return self.attn_device_mesh.get_group("pp")
 
 
 DistributedContext = DistContext

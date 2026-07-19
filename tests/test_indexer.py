@@ -81,6 +81,8 @@ def indexer(indexer_cache):
         rope_theta=ROPE_THETA,
         rope_scaling=None,
         layer_id=0,
+        indexer_norm_eps=1e-6,
+        indexer_rope_interleave=False,
     )
     torch.set_default_device(prev_device)
     torch.set_default_dtype(prev_dtype)

@@ -26,6 +26,7 @@ from dlengine.layers.parallelism_transition import (
 )
 from dlengine.layers.rotary_embedding import get_rope
 from dlengine.logging import get_logger
+from dlengine.models.pp_utils import make_pp_layers, pp_recv_hidden, pp_send_hidden
 from dlengine.worker.runner_config import get_runner_config
 from ..quant_config import QuantizationConfig
 
@@ -437,27 +438,60 @@ class Qwen3MoeModel(nn.Module):
         self, config: Qwen3MoeConfig, quantization_config: QuantizationConfig
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
+        ctx = get_dist_context()
+        self.is_first_pp_stage = ctx.is_first_pp_stage
+        self.is_last_pp_stage = ctx.is_last_pp_stage
+        self.hidden_size = config.hidden_size
+        self.hidden_dtype = getattr(config, "dtype", None) or torch.get_default_dtype()
+
+        if self.is_first_pp_stage:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = None
+
+        self.start_layer, self.end_layer, self.layers = make_pp_layers(
+            config.num_hidden_layers,
+            lambda layer_idx: Qwen3MoeDecoderLayer(
+                config, quantization_config, layer_idx
+            ),
         )
-        self.layers = nn.ModuleList(
-            [
-                Qwen3MoeDecoderLayer(config, quantization_config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        if self.is_last_pp_stage:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if self.is_first_pp_stage:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_tokens(input_ids)
+            residual = None
+        else:
+            hidden_states = pp_recv_hidden(
+                positions.size(0), self.hidden_size, self.hidden_dtype
+            )
+            residual = None
 
-        residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        for idx in range(self.start_layer, self.end_layer):
+            hidden_states, residual = self.layers[idx](
+                positions, hidden_states, residual
+            )
+
+        if not self.is_last_pp_stage:
+            if residual is not None:
+                hidden_states = hidden_states + residual
+            pp_send_hidden(hidden_states)
+            return hidden_states
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -471,16 +505,20 @@ class Qwen3MoeForCausalLM(nn.Module):
             **getattr(config, "quantization_config", dict())
         )
         self.model = Qwen3MoeModel(config, quantization_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        if get_dist_context().is_last_pp_stage:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+            if config.tie_word_embeddings and self.model.embed_tokens is not None:
+                self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        else:
+            self.lm_head = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions)
+        hidden_states = self.model(input_ids, positions, inputs_embeds=inputs_embeds)
         return hidden_states
 
     def compute_logits(

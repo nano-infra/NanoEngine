@@ -282,7 +282,13 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                         traceback.print_exc()
             _lp_drain_ms += (time.perf_counter() - _t_drain) * 1000
 
-            if engine.scheduler.is_finished():
+            # `to_be_migrated` requests intentionally retain their KV blocks
+            # until the decode engine sends /pd/free, so is_finished() remains
+            # false during that interval. They are not runnable, however: an
+            # empty follow-up forward can violate strict kernel batch-shape
+            # contracts (notably DeepGEMM's DSA indexer). Keep draining control
+            # packets without scheduling another model step.
+            if not engine.scheduler.has_runnable_work():
                 time.sleep(0.001)
                 continue
 
@@ -427,8 +433,10 @@ class EngineServer:
         logger.info(
             f"KV Cache:        {self.config.num_kvcache_blocks} blocks x {self.config.kvcache_block_size} tokens"
         )
+        scheduler_tokens = self.config.max_num_batched_tokens * max(1, self.config.pp)
         logger.info(
-            f"Max Tokens:      {self.config.max_num_batched_tokens} batched, {self.config.max_model_len} model length"
+            f"Max Tokens:      {self.config.max_num_batched_tokens} per forward, "
+            f"{scheduler_tokens} scheduled, {self.config.max_model_len} model length"
         )
         logger.info(f"NanoCtrl:        {self.config.ctrl_address or 'Not configured'}")
         logger.info(f"Ray Address:     {self.config.ray_address}")

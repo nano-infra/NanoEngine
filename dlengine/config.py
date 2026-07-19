@@ -23,6 +23,9 @@ class Config(BaseModel):
     model: str = Field(..., description="Path to the model")
 
     # scheduler config
+    # Maximum tokens processed by one model forward. With pipeline parallel
+    # prefill, the scheduler admits up to ``max_num_batched_tokens * pp``
+    # tokens and splits that window into microbatches of this size.
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 16
     max_num_recv_seqs: int = 32
@@ -63,6 +66,18 @@ class Config(BaseModel):
     ffn_ep: int = 1
     ffn_tp: int = 1
     ffn_dp: int = 1
+    # Pipeline parallelism. Splits the decoder layers into ``pp`` contiguous
+    # stages. Each stage owns one full attn/ffn parallel group
+    # (dp*sp*tp / dp*ep*tp), so the total number of GPU workers is
+    # ``pp * attn_world_size``. Stages exchange hidden states with
+    # point-to-point send/recv along the pipeline dimension.
+    pp: int = 1
+    # Static forward-only prefill pipeline. ``max_num_batched_tokens`` is the
+    # per-stage microbatch size; the scheduler admits up to ``pp`` such
+    # microbatches per step so adjacent stages can overlap.
+    # Maximum queued microbatch RPCs per worker. Zero defaults to min(pp, 16),
+    # matching DLSLime's default RPC slot count while filling a PP16 pipeline.
+    pp_prefill_pipeline_depth: int = 0
 
     # runner config
     enforce_eager: bool = False
@@ -330,6 +345,7 @@ class Config(BaseModel):
             setattr(self.hf_config, attr, getattr(self, attr, None))
 
         if self.hf_config.architectures[0] in (
+            "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
@@ -499,6 +515,7 @@ class Config(BaseModel):
             # iteration — MTP produces its extra tokens within that one step.
 
         if self.hf_config.architectures[0] in (
+            "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
@@ -529,6 +546,78 @@ class Config(BaseModel):
                 )
                 self.l3_enable = False
 
+        # Pipeline parallelism validation and constraints.
+        if self.pp < 1:
+            raise ValueError("pp must be >= 1")
+        if self.pp_prefill_pipeline_depth < 0:
+            raise ValueError("pp_prefill_pipeline_depth must be >= 0")
+        if self.pp > 1:
+            arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
+            supported_pp_archs = (
+                "Qwen3ForCausalLM",
+                "Qwen3MoeForCausalLM",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+                "DeepseekV2ForCausalLM",
+                "DeepseekV3ForCausalLM",
+                "DeepseekV32ForCausalLM",
+                "GlmMoeDsaForCausalLM",
+                "Gemma4ForCausalLM",
+                "Gemma4ForConditionalGeneration",
+                "DeepseekV4ForCausalLM",
+            )
+            if arch not in supported_pp_archs:
+                raise ValueError(
+                    "pp > 1 is currently only supported for "
+                    f"{supported_pp_archs}; got {arch!r}"
+                )
+            num_hidden_layers = getattr(self.hf_config, "num_hidden_layers", None)
+            if num_hidden_layers is None or num_hidden_layers < self.pp:
+                raise ValueError(
+                    f"pp cannot exceed num_hidden_layers ({num_hidden_layers})"
+                )
+            if arch in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
+                from dlengine.models.pp_utils import get_gemma4_shared_kv_source_start
+
+                source_start = get_gemma4_shared_kv_source_start(self.hf_config)
+                if source_start is not None and source_start < self.pp - 1:
+                    raise ValueError(
+                        "Gemma4 PP cannot split its shared-KV source suffix and "
+                        f"needs at least {self.pp - 1} independent prefix layers; "
+                        f"got {source_start}"
+                    )
+            if self.num_speculative_tokens > 0:
+                raise ValueError(
+                    "pp > 1 does not support MTP (num_speculative_tokens must be 0)"
+                )
+            if self.enable_hisparse and arch not in (
+                "Gemma4ForCausalLM",
+                "Gemma4ForConditionalGeneration",
+            ):
+                raise ValueError(
+                    "pp > 1 only supports enable_hisparse for Gemma4; " f"got {arch!r}"
+                )
+            # A hybrid DLSLime executor still needs ctrl_address for RPC agent
+            # discovery; ctrl_address alone does not imply PD disaggregation.
+            # The prefill/decode roles are what make an engine disaggregated.
+            # PD disaggregation supports a PP prefill engine paired with pp=1
+            # decode engines: the decode side maps each global layer to the
+            # prefill stage owning it during KV migration. A PP decode engine
+            # is not supported yet.
+            if self.mode == "decode":
+                raise ValueError(
+                    "pp > 1 is not supported for mode='decode' "
+                    "(use PP prefill + pp=1 decode)"
+                )
+            # Stage boundaries send/recv hidden states eagerly; CUDA graph
+            # capture across a P2P boundary is not wired yet.
+            if not self.enforce_eager:
+                logger.info(
+                    "pp > 1: forcing enforce_eager=True (CUDA graph capture "
+                    "across pipeline stages is not supported)"
+                )
+                self.enforce_eager = True
+
         # Convert dynamic trust_remote_code config class (from transformers_modules.*)
         # to a standard PretrainedConfig so Ray can serialize it across workers.
         if self.trust_remote_code and self.hf_config.__class__.__module__.startswith(
@@ -550,3 +639,8 @@ class Config(BaseModel):
     @property
     def ffn_world_size(self):
         return self.ffn_dp * self.ffn_ep * self.ffn_tp
+
+    @property
+    def world_size(self):
+        """Total number of GPU workers across all pipeline stages."""
+        return self.pp * self.attn_world_size

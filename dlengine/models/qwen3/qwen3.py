@@ -15,6 +15,7 @@ from dlengine.layers.base_backend import (
 from dlengine.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from dlengine.layers.layernorm import RMSNorm
 from dlengine.layers.rotary_embedding import get_rope
+from dlengine.models.pp_utils import make_pp_layers, pp_recv_hidden, pp_send_hidden
 
 
 class Qwen3Attention(nn.Module):
@@ -172,23 +173,62 @@ class Qwen3Model(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
+        ctx = get_dist_context()
+        self.is_first_pp_stage = ctx.is_first_pp_stage
+        self.is_last_pp_stage = ctx.is_last_pp_stage
+        self.hidden_size = config.hidden_size
+        self.hidden_dtype = getattr(config, "dtype", None) or torch.get_default_dtype()
+
+        if self.is_first_pp_stage:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = None
+
+        self.start_layer, self.end_layer, self.layers = make_pp_layers(
+            config.num_hidden_layers, lambda _idx: Qwen3DecoderLayer(config)
         )
-        self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        if self.is_last_pp_stage:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        if self.is_first_pp_stage:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_tokens(input_ids)
+            residual = None
+        else:
+            # Receive the folded residual stream from the previous stage and
+            # treat it as a fresh input (residual == None), which is exactly
+            # equivalent to threading hidden_states + residual through the
+            # boundary layernorm.
+            hidden_states = pp_recv_hidden(
+                positions.size(0), self.hidden_size, self.hidden_dtype
+            )
+            residual = None
+
+        for idx in range(self.start_layer, self.end_layer):
+            hidden_states, residual = self.layers[idx](
+                positions, hidden_states, residual
+            )
+
+        if not self.is_last_pp_stage:
+            # Fold the residual into a single tensor and hand it downstream.
+            if residual is not None:
+                hidden_states = hidden_states + residual
+            pp_send_hidden(hidden_states)
+            return hidden_states
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -199,16 +239,24 @@ class Qwen3ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.model = Qwen3Model(config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        # lm_head lives on the last pipeline stage only.
+        if get_dist_context().is_last_pp_stage:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+            # Tied embeddings can only be shared by reference within a single
+            # stage (pp == 1). With pp > 1 the last stage loads its own copy of
+            # the embedding weight into lm_head (handled by the weight loader).
+            if config.tie_word_embeddings and self.model.embed_tokens is not None:
+                self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        else:
+            self.lm_head = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(
         self,

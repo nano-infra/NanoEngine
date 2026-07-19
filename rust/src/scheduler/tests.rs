@@ -146,6 +146,25 @@ fn run_prefill_until_ready(py: Python<'_>, scheduler: &mut Scheduler) -> PyResul
 }
 
 #[test]
+fn pending_migration_is_retained_but_not_runnable() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let mut scheduler = make_scheduler();
+        add_tokens(py, &mut scheduler, 42, vec![1, 2, 3]).unwrap();
+        assert!(scheduler.has_runnable_work_api());
+
+        scheduler.waiting.clear();
+        scheduler.to_be_migrated.insert(42, 0);
+
+        assert!(!scheduler.is_finished_api());
+        assert!(!scheduler.has_runnable_work_api());
+
+        scheduler.free_to_be_migrated_ids_impl(py, vec![42]);
+        assert!(scheduler.is_finished_api());
+    });
+}
+
+#[test]
 fn preempted_sequence_restores_from_host_without_prefill() {
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
