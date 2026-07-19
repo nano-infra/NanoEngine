@@ -1,308 +1,250 @@
-# DLEngine: LLM Inference with Prefill-Decode Disaggregation and Wide Expert Parallelism
+# DLEngine: Distributed Inference for State-of-the-Art Large Models
 
-## 📦 Components
+DLEngine is a distributed inference system built primarily for serving state-of-the-art large models. It combines cluster-wide GPU resource management, prefill/decode disaggregation, wide expert parallelism, sparse attention, and long-context inference behind OpenAI- and Anthropic-compatible APIs.
 
-| Component                            | Language   | Description          | Key Features                                                                                    |
-| ------------------------------------ | ---------- | -------------------- | ----------------------------------------------------------------------------------------------- |
-| [dlengine](./dlengine)               | Python/C++ | LLM inference engine | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
-| [dlengine-router](./rust/src/router) | Rust       | HTTP load balancer   | OpenAI-compatible API, routing strategies, engine discovery                                     |
+Start with the focused documentation:
 
-## 🧠 Supported Models
+- [Installation](./docs/installation.md) — image-based and local development setup.
+- [Feature matrix](./docs/features.md) — distributed inference, serving, attention, cache, and model-execution capabilities.
+- [Supported models](./docs/supported-models.md) — model families, architectures, and current constraints.
+- [Offline inference](./docs/offline-inference.md) — Python examples for local validation and development.
 
-| Model         | Component   | Architecture          |
-| ------------- | ----------- | --------------------- |
-| DeepSeek-V3   | dlengine    | MLA + MoE             |
-| DeepSeek-V3.2 | dlengine    | MLA + MoE + NSA       |
-| DeepSeek-V4   | dlengine    | MLA + MoE + DSA + SWA |
-| GLM-5         | dlengine    | MLA + MoE + NSA       |
-| Kimi-K2       | dlengine    | MLA + MoE             |
-| Qwen3         | dlengine    | GQA (Dense)           |
-| Qwen3-MoE     | dlengine    | GQA + MoE             |
-| Qwen3.5-MoE   | dlengine    | GQA + GDN + MoE       |
-| Qwen3-VL      | dlengine.vl | GQA + MoE + ViT       |
+## Components
 
-## ✨ Key Features
+| Component                            | Language   | Description          | Key Features                                                                                      |
+| ------------------------------------ | ---------- | -------------------- | ------------------------------------------------------------------------------------------------- |
+| [dlengine](./dlengine)               | Python/C++ | LLM inference engine | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers   |
+| [dlengine-router](./rust/src/router) | Rust       | HTTP API gateway     | OpenAI and Anthropic APIs, PD routing, dynamic engine discovery, streaming                         |
 
-| Feature                                            | Description                                                                                 |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| ✅ **Chunked Prefill**                             | Split long prompts into chunks to overlap with decode batches.                              |
-| ✅ **Continuous Batching**                         | Dynamic request scheduling with paged KV cache.                                             |
-| ✅ **CUDA Graph**                                  | Captured decode kernels for low-latency token generation.                                   |
-| ✅ **Encoder-Prefill-Decode (EPD) Disaggregation** | Separate encoder, prefill and decode across GPU nodes with GPUDirect RDMA KV migration.     |
-| ✅ **FP8 KV Cache**                                | Float8 (E4M3) paged KV cache, ~50% memory reduction.                                        |
-| ✅ **Gated Delta Net (GDN)**                       | Linear attention for Qwen3.5-MoE hybrid full/linear layers.                                 |
-| ✅ **Multi-head Latent Attention (MLA)**           | Compressed KV cache with low-rank projection for DeepSeek-V3 family.                        |
-| ✅ **Multi-Token Prediction (MTP)**                | Speculative decoding with model-native MTP heads.                                           |
-| ✅ **Native Sparse Attention (NSA)**               | FP8 sparse decode with block-level indexing for DeepSeek-V3.2.                              |
-| ✅ **Node Discovery**                              | Automatic engine registration and heartbeat via the DLSlime control plane (`dlslime-ctrl`). |
-| ✅ **Prefix Caching**                              | Reuse KV cache of shared prompt prefixes across requests.                                   |
-| ✅ **Tensor Parallelism (TP)**                     | Split weight matrices across GPUs for large model inference.                                |
-| ✅ **Wide Expert Parallelism**                     | MoE EP across all GPUs with attention data-parallel (`attention_dp × ffn_ep`).              |
+## Installation
 
-## 🏗️ Architecture
+Use the prebuilt CUDA development image for the recommended setup. DeepSeek-family kernels require SM90+ NVIDIA Hopper GPUs. See the [installation guide](./docs/installation.md) for image-based setup, local editable installs, component extras, and developer builds.
 
-```mermaid
-graph TB
-    Client[Client Layer<br/>HTTP Requests / OpenAI SDK]
-    Route[dlengine-router<br/>Rust/HTTP<br/>Load Balancer]
-    VL[dlengine.vl<br/>Vision Encoder]
-    Prefill[Prefill Engine<br/>Python/C++]
-    Decode[Decode Engine<br/>Python/C++]
-    Ctrl[dlslime-ctrl<br/>Redis<br/>Service Registry<br/>from DLSlime]
+## Quick Start: Ray + DLEngine PD + Router
 
-    Client -->|HTTP| Route
-    Route -->|ZMQ| VL
-    Route -->|ZMQ| Prefill
-    Route -->|ZMQ| Decode
-    VL -->|RDMA<br/>Embeddings| Prefill
-    Prefill -->|RDMA<br/>KV Migration| Decode
-    VL -->|Register/Heartbeat| Ctrl
-    Prefill -->|Register/Heartbeat| Ctrl
-    Decode -->|Register/Heartbeat| Ctrl
-    Route -->|Engine Discovery| Ctrl
+This example shows the production serving path for GLM-5.2-FP8: a PP16 prefill engine, an attention-DP32/EP32 HiSparse decode engine, and `dlengine-router` serving both OpenAI and Anthropic APIs.
+
+### What each component does
+
+| Component | Responsibility |
+| --- | --- |
+| **Ray cluster** | Manages cluster GPU resources, places DLEngine workers, and provides the distributed execution backend. Ray does not route client requests. |
+| **dlslime-ctrl + Redis** | Provides node/service discovery and the control plane: registration, heartbeat/liveness, scope isolation, and coordination metadata such as RDMA peers. It does not execute inference. |
+| **dlengine serve** | Runs the inference data plane. Prefill consumes prompts and produces KV state; decode pulls that state and generates tokens. |
+| **dlengine-router** | Exposes the public OpenAI/Anthropic HTTP API, discovers healthy engines through dlslime-ctrl, and orchestrates the prefill-to-decode request flow. |
+
+In short, **Ray answers “where do the GPU workers run?”**, while **dlslime-ctrl answers “which service nodes are alive and how do they find each other?”**. DLEngine performs the model computation, and the router connects clients to that compute data plane.
+
+### Request flow
+
+```text
+OpenAI / Anthropic / Claude Code client
+                  │
+                  ▼
+        dlengine-router :3001
+          │             │
+          │ prompt      │ decode + stream
+          ▼             ▼
+  prefill engine ──RDMA KV──► decode engine
+          │                     │
+          └── register/heartbeat┴──► dlslime-ctrl :4479 ──► Redis :16379
+                  GPU workers are allocated and placed by Ray :7078
 ```
 
-## 🚀 Installation
-
-### Docker Development Image
-
-A prebuilt CUDA 12.8 development image bundles all build dependencies (PyTorch,
-DeepEP/DeepGEMM/FlashMLA/FlashInfer, flash-attn, DLSlime, Rust toolchain), plus an
-optional variant with **3FS USRBIO** support. See **[`docker/README.md`](./docker/README.md)**
-for the pinned dependency versions, build/run commands, and the 3FS image.
-
-The DeepSeek kernels require SM90+ (NVIDIA Hopper) GPUs. To install the key dependencies
-manually instead of using the image:
-
-```bash
-cd DeepEP && pip install .
-cd DeepGEMM && pip install .
-cd FlashMLA && pip install .
-pip install flashinfer-python==0.6.9
-pip install dlslime==0.1.16
-```
-
-### One-liner: install everything
-
-```bash
-pip install ".[all]"
-```
-
-### Install individual components
-
-```bash
-pip install ".[dlengine]"   # DLEngine inference engine only
-pip install ".[dlenginevl]" # DLEngine + vision-language extras (dlengine.vl subpackage)
-```
-
-> The control-plane server (`dlslime-ctrl`) and its Python client (`dlslime.ctrl.NanoCtrlClient`)
-> now live in the [DLSlime](https://github.com/DeepLink-org/DLSlime) repo. Install them via:
->
-> ```bash
-> pip install dlslime           # PeerAgent + NanoCtrlClient (data-plane wheel)
-> pip install dlslime-ctrl      # Rust control-plane server binary
-> # or, from a DLSlime checkout: pip install -e ./dlslime ./dlslime-ctrl
-> ```
-
-### For developers
-
-```bash
-# Build DLEngine C++ extensions in-place (GPU kernels ship in dlengine.kernel)
-pip install -e .
-
-# Build Rust extension and dlengine-router
-cargo build --release
-
-# Build dlslime-ctrl (Rust) from the DLSlime checkout
-cd /path/to/DLSlime/dlslime-ctrl && cargo build --release && cd -
-```
-
-## Quick Start: LLM Inference
-
-Prefill-Decode disaggregation splits prompt processing (prefill) and token generation (decode) across separate GPU nodes connected via RDMA.
+The concrete topology below requires 16 GPUs for prefill and 32 GPUs for decode. Adjust `pp`, `attention_dp`, and `ffn_ep` together for a smaller cluster.
 
 ### Prerequisites
 
-- 2 nodes with NVIDIA GPUs (SM90+ for FP8), RDMA-capable NICs
-- Redis, Ray cluster, Rust toolchain
+- NVIDIA Hopper-class GPUs and RDMA connectivity for the FP8/RDMA path.
+- The same DLEngine build, model checkpoint, and dependency versions on every Ray node.
+- Ray, Redis, `dlslime-ctrl`, and `dlengine-router` installed.
+- TCP connectivity for Ray (`7078` in this example), Redis (`16379`), dlslime-ctrl (`4479`), engine HTTP endpoints (`8101/8102`), and the router (`3001`).
 
-#### 1. Start Ray
+### 1. Define deployment values
+
+Run these exports in every shell that launches a DLEngine or router process:
 
 ```bash
-# Node 0 (head)
-ray start --head --port=7078 --dashboard-host=0.0.0.0
+export HEAD_IP=<ray-head-ip>
+export PREFILL_IP=<prefill-coordinator-ip>
+export DECODE_IP=<decode-coordinator-ip>
+export MODEL_PATH=/mnt/mnt/public/GLM-5.2-FP8
+export SERVED_MODEL=GLM-5.2-FP8
 
-# Node 1 (multi-node only)
-ray start --address <node0-ip>:7078
+export RAY_ADDRESS="${HEAD_IP}:7078"
+export CTRL_ADDRESS="http://${HEAD_IP}:4479"
 ```
 
-### Offline mode
+`SERVED_MODEL` must match on both engines and in every client request. The prefill and decode coordinators may be the same host if the cluster has enough GPUs.
 
-Batch generation without HTTP serving.
+### 2. Start the Ray resource cluster
 
-#### Single node (no dlslime-ctrl needed)
+On the head node:
 
 ```bash
-python examples/non_disagg.py \
-    --model /models/Qwen3-235B-A22B \
-    --ray_address auto \
-    --attention_dp 8 --ffn_ep 8 \
-    --kvcache_block_size 256 \
-    --prompt "1+1=?" --max_tokens 128
+ray start --head \
+  --node-ip-address "${HEAD_IP}" \
+  --port 7078 \
+  --dashboard-host 0.0.0.0
 ```
 
-#### PD disaggregated (2 nodes)
-
-##### 2. Start Redis + dlslime-ctrl
+On every worker node:
 
 ```bash
-redis-server --bind 0.0.0.0 --port 6379
-dlslime-ctrl server --redis-url redis://127.0.0.1:6379
+ray start --address "${HEAD_IP}:7078"
 ```
 
-##### 3. Launch engines
+Verify that all nodes and GPUs joined the same resource pool:
 
 ```bash
-python examples/disagg.py \
-    --model /models/Qwen3-235B-A22B \
-    --ray_address <node0-ip>:7078 \
-    --ctrl_address <node0-ip>:4479 \
-    --attention_dp 8 --ffn_ep 8
+ray status --address "${RAY_ADDRESS}"
 ```
 
-### Single-node serving (`dlengine serve`)
+When either `dlengine serve` process starts, it connects to this address and asks Ray to place the requested PP/DP/EP workers across the available GPUs.
 
-For single-node hybrid deployment (prefill + decode in one process), use the
-`dlengine serve` command. It runs the engine in-process and exposes an
-OpenAI-compatible HTTP API directly, in the spirit of `vllm serve` — no
-dlengine-router and no ZMQ engine servers required:
+### 3. Start the discovery and control plane
+
+Run the ordinary host deployment on the control-plane node:
 
 ```bash
-# Same Config flags as engine_server.py (--host/--port bind HTTP for serve)
-dlengine serve /path/to/model \
-  --host 0.0.0.0 --port 8100 \
-  --served-model-name Qwen3-4B
+redis-server \
+  --daemonize yes \
+  --port 16379 \
+  --bind 0.0.0.0 \
+  --protected-mode no
+
+export REDIS_PUBLIC_ADDRESS="${HEAD_IP}:16379"
+dlslime-ctrl start --redis-url redis://127.0.0.1:16379
 ```
 
-Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/completions`,
-`POST /v1/chat/completions` (streaming and non-streaming).
+Verify both processes:
 
 ```bash
-curl http://127.0.0.1:8100/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-4B", "messages": [{"role": "user", "content": "Hello"}]}'
+redis-cli -h 127.0.0.1 -p 16379 ping
+dlslime-ctrl status
+curl -sS http://127.0.0.1:4479/
 ```
 
-To make the node discoverable by a router (e.g. DLRouter) via dlslime-ctrl,
-point it at a running control plane; the server then registers its HTTP
-endpoint (entity kind `dlengine`) and keeps a heartbeat:
+DLEngine nodes register their HTTP endpoint, model name, `prefill`/`decode` role, and heartbeat with dlslime-ctrl. The router watches this registry instead of relying on a static engine list. Redis stores the control-plane state; model tensors and KV cache do not pass through Redis. `REDIS_PUBLIC_ADDRESS` tells remote DLSlime PeerAgents which reachable Redis endpoint to use, while dlslime-ctrl itself connects over loopback.
+
+`--protected-mode no` exposes Redis to the network; use it only on a trusted/private deployment network and restrict port `16379` at the firewall. For container deployment, advertised Redis addresses, and external-Redis configuration, follow the official [DLSlime Docker deployment guide](https://github.com/DeepLink-org/DLSlime/blob/main/docker/README.md).
+
+### 4. Launch the DLEngine inference data plane
+
+Both services connect to the same Ray cluster and control plane. `dlengine serve` starts the engine, asks Ray to place its workers, binds an HTTP endpoint, registers its role with dlslime-ctrl, and maintains a heartbeat.
+
+On the prefill coordinator:
 
 ```bash
-# Control plane (Redis + dlslime-ctrl)
-redis-server --bind 0.0.0.0 --port 6379 &
-dlslime-ctrl server --redis-url redis://127.0.0.1:6379 &
-
-dlengine serve /path/to/model \
-  --host 0.0.0.0 --port 8100 \
-  --served-model-name Qwen3-4B \
-  --ctrl-address 127.0.0.1:4479
-```
-
-#### PD disaggregation with `dlengine serve` + DLRouter
-
-`dlengine serve` also supports Prefill-Decode disaggregation over HTTP.
-Launch one engine with `--mode prefill` and another with `--mode decode`
-(both pointed at the same dlslime-ctrl). They register their role with the
-control plane and connect their PeerAgents for KV migration. A PD-aware
-gateway such as [DLRouter](https://github.com/DeepLink-org/DLRouter) then
-orchestrates the two-stage handoff: it asks the prefill node to process the
-prompt and return an opaque KV migration payload (via `kv_transfer_params`),
-hands that payload to the decode node, which RDMA-pulls the KV cache and
-streams the completion, and finally releases the prefill-side KV blocks
-(`POST /pd/free`).
-
-```bash
-# Control plane (Redis + dlslime-ctrl)
-redis-server --bind 0.0.0.0 --port 6379 &
-dlslime-ctrl server --redis-url redis://127.0.0.1:6379 &
-
-# Prefill node
-dlengine serve /path/to/model \
-  --host 0.0.0.0 --port 8101 \
-  --served-model-name Qwen3-4B \
+dlengine serve "${MODEL_PATH}" \
+  --served-model-name "${SERVED_MODEL}" \
+  --host 0.0.0.0 \
+  --port 8101 \
   --mode prefill \
-  --ctrl-address 127.0.0.1:4479 \
-  --ray_address 127.0.0.1:7078
+  --ray_address "${RAY_ADDRESS}" \
+  --ctrl_address "${CTRL_ADDRESS}" \
+  --executor_backend dlslime \
+  --pp 16 \
+  --attention_dp 1 \
+  --ffn_ep 1 \
+  --max_model_len 1048576 \
+  --max_num_batched_tokens 16384 \
+  --gpu_memory_utilization 0.75 \
+  2>&1 | tee prefill_log.log
+```
 
-# Decode node
-dlengine serve /path/to/model \
-  --host 0.0.0.0 --port 8102 \
-  --served-model-name Qwen3-4B \
+Here `max_num_batched_tokens=16384` is the per-stage prefill microbatch size. With `pp=16`, the scheduler may admit up to `16384 × 16` prompt tokens into one PP pipeline step.
+
+On the decode coordinator:
+
+```bash
+dlengine serve "${MODEL_PATH}" \
+  --served-model-name "${SERVED_MODEL}" \
+  --host 0.0.0.0 \
+  --port 8102 \
   --mode decode \
-  --ctrl-address 127.0.0.1:4479 \
-  --ray_address 127.0.0.1:7078
+  --ray_address "${RAY_ADDRESS}" \
+  --ctrl_address "${CTRL_ADDRESS}" \
+  --executor_backend dlslime \
+  --attention_dp 32 \
+  --ffn_ep 32 \
+  --max_model_len 1048576 \
+  --max_num_batched_tokens 2048 \
+  --enable_hisparse true \
+  --host_utilization_per_device 64 \
+  --hisparse_device_buffer_size 4096 \
+  --gpu_memory_utilization 0.7 \
+  --enforce_eager false \
+  2>&1 | tee decode_log.log
 ```
 
-DLRouter discovers both nodes (entity kind `dlengine`) via dlslime-ctrl,
-maps their roles to `PREFILL`/`DECODE`, and serves an OpenAI-compatible API.
-Point clients at DLRouter; requests transparently flow prefill → KV
-migration → decode. When the prefill node fully answers a request on its own
-(e.g. the first sampled token is EOS), the completion is returned directly
-without a decode handoff. Prefill and decode engines may co-locate on the
-same node when GPU resources allow.
-
-### Online mode
-
-ZMQ engine servers with OpenAI-compatible HTTP API via dlengine-router.
-
-##### 2. Start Redis + dlslime-ctrl
+Check the direct engine endpoints and their service-registry entries:
 
 ```bash
-redis-server --bind 0.0.0.0 --port 6379
-dlslime-ctrl server --redis-url redis://127.0.0.1:6379
-```
+curl -sS "http://${PREFILL_IP}:8101/health"
+curl -sS "http://${DECODE_IP}:8102/health"
 
-##### 3. Start dlengine-router
-
-```bash
-dlengine-router --ctrl-address http://<node0-ip>:4479
-```
-
-##### 4. Launch engines
-
-```bash
-# Terminal 1 — Decode engine
-python dlengine/server/engine_server.py \
-    --model /models/Qwen3-235B-A22B \
-    --mode decode \
-    --ray_address <node0-ip>:7078 \
-    --ctrl_address <node0-ip>:4479 \
-    --ctrl_scope nanoctrl-0 \
-    --host <node0-ip> --port 6001 \
-    --attention_dp 8 --ffn_ep 8 \
-    --kvcache_block_size 64 \
-    --max_num_batched_tokens 16384 --max_model_len 16384
-
-# Terminal 2 — Prefill engine
-python dlengine/server/engine_server.py \
-    --model /models/Qwen3-235B-A22B \
-    --mode prefill \
-    --ray_address <node0-ip>:7078 \
-    --ctrl_address <node0-ip>:4479 \
-    --ctrl_scope nanoctrl-0 \
-    --host <node0-ip> --port 6002 \
-    --attention_dp 8 --ffn_ep 8 \
-    --kvcache_block_size 64 \
-    --max_num_batched_tokens 16384 --max_model_len 16384
-```
-
-##### 5. Send requests
-
-```bash
-curl http://<node0-ip>:8080/v1/chat/completions \
+curl -sS "${CTRL_ADDRESS}/list_entities" \
   -H "Content-Type: application/json" \
-  -d '{"model": "/models/Qwen3-235B-A22B", "messages": [{"role": "user", "content": "Hello"}]}'
+  -d '{"entity_type":"service","kind":"dlengine"}'
 ```
+
+The registry response should contain one `prefill` and one `decode` endpoint for `GLM-5.2-FP8`.
+
+### 5. Start the public API gateway
+
+The router watches dlslime-ctrl for engine registration and heartbeat changes. It may start before or after the engines; discovery is refreshed dynamically.
+
+```bash
+RUST_LOG=info dlengine-router \
+  --port 3001 \
+  --ctrl-address "${CTRL_ADDRESS}"
+```
+
+Verify the public gateway:
+
+```bash
+curl -sS http://127.0.0.1:3001/health
+```
+
+### 6. Send an OpenAI-compatible request
+
+```bash
+curl http://127.0.0.1:3001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "GLM-5.2-FP8",
+    "messages": [{"role": "user", "content": "Explain pipeline parallelism."}],
+    "temperature": 0,
+    "max_tokens": 256,
+    "stream": false
+  }'
+```
+
+The router selects the model pool, sends the prompt to prefill, passes the returned migration metadata to decode, streams or returns the decode result, and releases the prefill-side KV allocation.
+
+### 7. Use Claude Code through the Anthropic API
+
+`dlengine-router` exposes `POST /v1/messages` and `POST /v1/messages/count_tokens`, so Claude Code can use the same PD deployment without an extra protocol adapter:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:3001 \
+ANTHROPIC_API_KEY=dummy \
+ANTHROPIC_MODEL=GLM-5.2-FP8 \
+ANTHROPIC_SMALL_FAST_MODEL=GLM-5.2-FP8 \
+claude --model GLM-5.2-FP8
+```
+
+Run the command from the project directory that Claude Code should work on. `ANTHROPIC_API_KEY=dummy` is a placeholder for this local gateway; add real authentication at the network or gateway layer before exposing the endpoint outside a trusted environment.
+
+### Operational checks
+
+- **Ray has insufficient GPUs:** run `ray status --address "${RAY_ADDRESS}"` and confirm the total resources match the requested PP/DP/EP topology.
+- **Router reports model not found:** verify that both engines use exactly the same `--served-model-name`, `--ctrl_address`, and optional `--ctrl_scope`.
+- **Router has only one PD role:** query `/list_entities` and inspect the registered `metadata.role` and heartbeat.
+- **Engine is healthy but unreachable through the router:** ensure the advertised coordinator IP and ports `8101/8102` are reachable from the router host.
+- **KV migration fails:** verify RDMA/NIC configuration and that prefill and decode use the same dlslime-ctrl/Redis service.
+- **Multiple jobs share one control plane:** give both engines the same `--ctrl_scope <job-name>` and start the router with `--ctrl-scope <job-name>`.
 
 ______________________________________________________________________
 
