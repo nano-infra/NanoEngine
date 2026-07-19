@@ -2,8 +2,6 @@
 
 DLEngine is a distributed inference system built primarily for serving state-of-the-art large models. It combines cluster-wide GPU resource management, prefill/decode disaggregation, wide expert parallelism, sparse attention, and long-context inference behind OpenAI- and Anthropic-compatible APIs.
 
-Read the versioned [DLEngine documentation](https://jimyma.github.io/NanoDeploy/) or browse the focused guides below.
-
 Start with the focused documentation:
 
 - [Installation](./docs/site/installation.md) — image-based and local development setup.
@@ -12,10 +10,10 @@ Start with the focused documentation:
 
 ## Components
 
-| Component                            | Language   | Description          | Key Features                                                                                      |
-| ------------------------------------ | ---------- | -------------------- | ------------------------------------------------------------------------------------------------- |
-| [dlengine](./dlengine)               | Python/C++ | LLM inference engine | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers   |
-| [dlengine-router](./rust/src/router) | Rust       | HTTP API gateway     | OpenAI and Anthropic APIs, PD routing, dynamic engine discovery, streaming                         |
+| Component                            | Language   | Description          | Key Features                                                                                    |
+| ------------------------------------ | ---------- | -------------------- | ----------------------------------------------------------------------------------------------- |
+| [dlengine](./dlengine)               | Python/C++ | LLM inference engine | Prefill/decode engines, KV cache management, continuous batching, Ray-based distributed workers |
+| [dlengine-router](./rust/src/router) | Rust       | HTTP API gateway     | OpenAI and Anthropic APIs, PD routing, dynamic engine discovery, streaming                      |
 
 ## Installation
 

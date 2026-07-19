@@ -26,10 +26,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: docs-pages-${{ github.ref }}
+  group: docs-build-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -55,33 +55,10 @@ jobs:
       - name: Build documentation
         run: make -C docs build
 
-      - name: Configure git identity
-        if: github.event_name == 'push'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Fetch existing Pages branch
-        if: github.event_name == 'push'
-        run: git fetch origin gh-pages:refs/remotes/origin/gh-pages || true
-
-      - name: Deploy development documentation
-        if: github.event_name == 'push' && github.ref_type == 'branch'
-        working-directory: docs
-        run: |
-          mike deploy --update-aliases dev latest
-          mike set-default latest
-          git push origin gh-pages
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Deploy release documentation
-        if: github.event_name == 'push' && github.ref_type == 'tag'
-        working-directory: docs
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          mike deploy --update-aliases "${VERSION}" latest
-          mike set-default latest
-          git push origin gh-pages
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload private documentation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dlengine-docs-${{ github.sha }}
+          path: docs/generated
+          if-no-files-found: error
+          retention-days: 14
