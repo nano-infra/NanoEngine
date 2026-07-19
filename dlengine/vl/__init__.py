@@ -5,7 +5,7 @@ a standalone EncoderEngine runs the vision encoder and delivers
 embeddings to the LLM workers via RDMA.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from dlengine.vl.config import VLConfig
 from dlengine.vl.encoder.encoder_config import EncoderConfig
