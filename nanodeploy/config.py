@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
@@ -13,6 +13,12 @@ DEEPSEEK_V3_BUCKET_POLICY = (
     "7:194561-436224;"
     "8:436225-1048576"
 )
+
+LS_DECODE_PROFILES = {
+    "loong_decode_source_default",
+    "loong_decode_artifact_derived",
+    "loong_decode_issue001",
+}
 
 
 @dataclass
@@ -133,89 +139,154 @@ class Config:
 
     # LoongServe-style Decode-only multi-master scheduler.
     enable_ls_decode_core_scheduler: bool = False
+    ls_decode_profile: Literal[
+        "loong_decode_source_default",
+        "loong_decode_artifact_derived",
+        "loong_decode_issue001",
+    ] = "loong_decode_source_default"
+    # The source-default profile resolves this to 10.  Artifact-derived and
+    # Issue001 runs must provide the workload-manifest value explicitly.
+    ls_max_num_ooe: int | None = None
+    ls_running_max_req_size: int = 1000
+    ls_admission_max_tokens_per_pool: int | Literal["auto"] = "auto"
+    ls_resolved_admission_max_tokens_per_pool: int | None = field(
+        init=False, default=None
+    )
+    # Resolved from the profile: 100 for source-default, 128 otherwise.
+    ls_min_comp_bound_decoding_batch_size: int | None = None
     # 0 selects the smallest feasible admission-time KV DoP automatically.
     ls_decode_initial_kv_dop: int = 0
     ls_decode_batch_per_master: int = 64
     ls_decode_enable_memory_scale_up: bool = True
+    ls_disable_scale_up: bool = False
     # LoongServe-style admission guard. Estimate the aggregate future KV
     # high-water mark from each request's current progress and max_tokens.
     ls_decode_enable_future_kv_admission: bool = True
-    # Automatic KV consolidation is opt-in. Shadow mode evaluates the
-    # utilization/stability gates without reserving blocks or moving KV.
-    ls_kv_consolidation_mode: Literal["off", "shadow", "execute"] = "off"
-    ls_kv_consolidation_candidate_util: float = 0.50
-    ls_kv_consolidation_target_high_watermark: float = 0.80
-    ls_kv_consolidation_stable_steps: int = 32
-    ls_kv_consolidation_cooldown_steps: int = 64
-    ls_kv_consolidation_check_interval_steps: int = 8
-    # Hard execution budget. 0 means uncalibrated and forbids automatic execute.
-    ls_kv_consolidation_max_source_blocks_per_event: int = 0
-    # 0 keeps the physical KV-consolidation P2P transport disabled.  A positive
-    # value reserves a fixed token-major scratch buffer before sizing KV blocks.
-    ls_kv_consolidation_migration_chunk_tokens: int = 0
+    # None preserves feature-off defaults, but resolves to the frozen formal
+    # profile whenever the LS Decode-only scheduler is enabled.
+    ls_kv_consolidation_mode: Literal["off", "shadow", "execute"] | None = None
+    ls_kv_consolidation_candidate_util: float | None = None
+    ls_kv_consolidation_target_high_watermark: float | None = None
+    ls_kv_consolidation_stable_steps: int | None = None
+    ls_kv_consolidation_cooldown_steps: int | None = None
+    ls_kv_consolidation_check_interval_steps: int | None = None
+    ls_kv_consolidation_max_source_blocks_per_event: int | None = None
+    ls_kv_consolidation_migration_chunk_tokens: int | None = None
+    dummy_bootstrap_token_id: int = 0
+    pause_mode: Literal["offload"] = "offload"
+    dp_assignment: Literal["arrival_round_robin"] = "arrival_round_robin"
+    cross_dp_scale_up: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
         if self.reserved_blocks_per_req < 0:
             raise ValueError("reserved_blocks_per_req must be >= 0")
+        if self.ls_decode_profile not in LS_DECODE_PROFILES:
+            raise ValueError(
+                "ls_decode_profile must be one of: "
+                + ", ".join(sorted(LS_DECODE_PROFILES))
+            )
+        if self.ls_max_num_ooe is not None and self.ls_max_num_ooe < 0:
+            raise ValueError("ls_max_num_ooe must be >= 0")
+        if self.ls_running_max_req_size <= 0:
+            raise ValueError("ls_running_max_req_size must be > 0")
+        if (
+            self.ls_admission_max_tokens_per_pool != "auto"
+            and (
+                not isinstance(self.ls_admission_max_tokens_per_pool, int)
+                or isinstance(self.ls_admission_max_tokens_per_pool, bool)
+                or self.ls_admission_max_tokens_per_pool <= 0
+            )
+        ):
+            raise ValueError(
+                "ls_admission_max_tokens_per_pool must be 'auto' or a positive integer"
+            )
+        if (
+            self.ls_min_comp_bound_decoding_batch_size is not None
+            and self.ls_min_comp_bound_decoding_batch_size <= 0
+        ):
+            raise ValueError(
+                "ls_min_comp_bound_decoding_batch_size must be > 0"
+            )
         if not 0 <= self.ls_decode_initial_kv_dop <= self.attention_sp:
             raise ValueError(
                 "ls_decode_initial_kv_dop must be in [0, attention_sp]"
             )
         if self.ls_decode_batch_per_master <= 0:
             raise ValueError("ls_decode_batch_per_master must be > 0")
-        if self.ls_kv_consolidation_mode not in {"off", "shadow", "execute"}:
+        if self.ls_kv_consolidation_mode not in {None, "off", "shadow", "execute"}:
             raise ValueError(
                 "ls_kv_consolidation_mode must be one of: off, shadow, execute"
             )
-        if not 0.0 < self.ls_kv_consolidation_candidate_util <= 1.0:
+        if (
+            self.ls_kv_consolidation_candidate_util is not None
+            and not 0.0 < self.ls_kv_consolidation_candidate_util <= 1.0
+        ):
             raise ValueError(
                 "ls_kv_consolidation_candidate_util must be in (0, 1]"
             )
-        if not 0.0 < self.ls_kv_consolidation_target_high_watermark <= 1.0:
+        if (
+            self.ls_kv_consolidation_target_high_watermark is not None
+            and not 0.0 < self.ls_kv_consolidation_target_high_watermark <= 1.0
+        ):
             raise ValueError(
                 "ls_kv_consolidation_target_high_watermark must be in (0, 1]"
             )
-        if self.ls_kv_consolidation_stable_steps <= 0:
+        if (
+            self.ls_kv_consolidation_stable_steps is not None
+            and self.ls_kv_consolidation_stable_steps <= 0
+        ):
             raise ValueError("ls_kv_consolidation_stable_steps must be > 0")
-        if self.ls_kv_consolidation_cooldown_steps < 0:
+        if (
+            self.ls_kv_consolidation_cooldown_steps is not None
+            and self.ls_kv_consolidation_cooldown_steps < 0
+        ):
             raise ValueError("ls_kv_consolidation_cooldown_steps must be >= 0")
-        if self.ls_kv_consolidation_check_interval_steps <= 0:
+        if (
+            self.ls_kv_consolidation_check_interval_steps is not None
+            and self.ls_kv_consolidation_check_interval_steps <= 0
+        ):
             raise ValueError(
                 "ls_kv_consolidation_check_interval_steps must be > 0"
             )
-        if self.ls_kv_consolidation_max_source_blocks_per_event < 0:
+        if (
+            self.ls_kv_consolidation_max_source_blocks_per_event is not None
+            and self.ls_kv_consolidation_max_source_blocks_per_event < 0
+        ):
             raise ValueError(
                 "ls_kv_consolidation_max_source_blocks_per_event must be >= 0"
             )
-        if self.ls_kv_consolidation_migration_chunk_tokens < 0:
+        if (
+            self.ls_kv_consolidation_migration_chunk_tokens is not None
+            and self.ls_kv_consolidation_migration_chunk_tokens < 0
+        ):
             raise ValueError(
                 "ls_kv_consolidation_migration_chunk_tokens must be >= 0"
             )
-        if (
-            self.ls_kv_consolidation_mode != "off"
-            and not self.enable_ls_decode_core_scheduler
-        ):
-            raise ValueError(
-                "ls_kv_consolidation_mode requires "
-                "enable_ls_decode_core_scheduler=True"
-            )
-        if (
-            self.ls_kv_consolidation_mode == "execute"
-            and self.ls_kv_consolidation_migration_chunk_tokens == 0
-        ):
-            raise ValueError(
-                "ls_kv_consolidation_mode='execute' requires "
-                "ls_kv_consolidation_migration_chunk_tokens > 0"
-            )
-        if (
-            self.ls_kv_consolidation_mode == "execute"
-            and self.ls_kv_consolidation_max_source_blocks_per_event == 0
-        ):
-            raise ValueError(
-                "ls_kv_consolidation_mode='execute' requires "
-                "ls_kv_consolidation_max_source_blocks_per_event > 0"
-            )
+        if not self.enable_ls_decode_core_scheduler:
+            # Preserve the historical feature-off defaults and validation.
+            if self.ls_max_num_ooe is None:
+                self.ls_max_num_ooe = 10
+            if self.ls_min_comp_bound_decoding_batch_size is None:
+                self.ls_min_comp_bound_decoding_batch_size = 128
+            feature_off_defaults = {
+                "ls_kv_consolidation_mode": "off",
+                "ls_kv_consolidation_candidate_util": 0.50,
+                "ls_kv_consolidation_target_high_watermark": 0.80,
+                "ls_kv_consolidation_stable_steps": 32,
+                "ls_kv_consolidation_cooldown_steps": 64,
+                "ls_kv_consolidation_check_interval_steps": 8,
+                "ls_kv_consolidation_max_source_blocks_per_event": 0,
+                "ls_kv_consolidation_migration_chunk_tokens": 0,
+            }
+            for name, default in feature_off_defaults.items():
+                if getattr(self, name) is None:
+                    setattr(self, name, default)
+            if self.ls_kv_consolidation_mode != "off":
+                raise ValueError(
+                    "ls_kv_consolidation_mode requires "
+                    "enable_ls_decode_core_scheduler=True"
+                )
         if self.fixed_sp_size < 0:
             raise ValueError("fixed_sp_size must be >= 0")
         if self.fixed_sp_size > self.attention_sp:
@@ -294,6 +365,50 @@ class Config:
             )
         if self.enable_ls_decode_core_scheduler:
             unsupported = []
+            profile_threshold = (
+                100
+                if self.ls_decode_profile == "loong_decode_source_default"
+                else 128
+            )
+            if self.ls_decode_profile == "loong_decode_source_default":
+                if self.ls_max_num_ooe is None:
+                    self.ls_max_num_ooe = 10
+                elif self.ls_max_num_ooe != 10:
+                    unsupported.append(
+                        "loong_decode_source_default requires ls_max_num_ooe=10"
+                    )
+            elif self.ls_max_num_ooe is None:
+                unsupported.append(
+                    f"{self.ls_decode_profile} requires an explicit "
+                    "ls_max_num_ooe from the workload manifest"
+                )
+
+            if self.ls_min_comp_bound_decoding_batch_size is None:
+                self.ls_min_comp_bound_decoding_batch_size = profile_threshold
+            elif self.ls_min_comp_bound_decoding_batch_size != profile_threshold:
+                unsupported.append(
+                    f"{self.ls_decode_profile} requires "
+                    "ls_min_comp_bound_decoding_batch_size="
+                    f"{profile_threshold}"
+                )
+
+            formal_values = {
+                "ls_kv_consolidation_mode": "execute",
+                "ls_kv_consolidation_candidate_util": 0.50,
+                "ls_kv_consolidation_target_high_watermark": 0.80,
+                "ls_kv_consolidation_stable_steps": 2,
+                "ls_kv_consolidation_cooldown_steps": 2,
+                "ls_kv_consolidation_check_interval_steps": 1,
+                "ls_kv_consolidation_max_source_blocks_per_event": 128,
+                "ls_kv_consolidation_migration_chunk_tokens": 64,
+            }
+            for name, expected in formal_values.items():
+                value = getattr(self, name)
+                if value is None:
+                    setattr(self, name, expected)
+                elif value != expected:
+                    unsupported.append(f"{name} must be {expected!r}")
+
             if self.mode != "decode":
                 unsupported.append("mode must be 'decode'")
             if self.dummy_prefill is not True:
@@ -302,6 +417,34 @@ class Config:
                 unsupported.append("scheduler_mode must be 'centralized'")
             if self.loop_count != 1:
                 unsupported.append("loop_count must be 1")
+            if self.routing_strategy != "RoundRobin":
+                unsupported.append("routing_strategy must be 'RoundRobin'")
+            if self.kvcache_block_size != 64:
+                unsupported.append("kvcache_block_size must be 64")
+            if self.ls_decode_initial_kv_dop != 0:
+                unsupported.append("ls_decode_initial_kv_dop must be 0")
+            if not self.ls_decode_enable_future_kv_admission:
+                unsupported.append(
+                    "ls_decode_enable_future_kv_admission must be True"
+                )
+            if not self.ls_decode_enable_memory_scale_up:
+                unsupported.append("ls_decode_enable_memory_scale_up must be True")
+            if self.ls_disable_scale_up:
+                unsupported.append("ls_disable_scale_up must be False")
+            if self.ls_running_max_req_size != 1000:
+                unsupported.append("ls_running_max_req_size must be 1000")
+            if self.ls_admission_max_tokens_per_pool != "auto":
+                unsupported.append(
+                    "ls_admission_max_tokens_per_pool must be 'auto'"
+                )
+            if self.dummy_bootstrap_token_id != 0:
+                unsupported.append("dummy_bootstrap_token_id must be 0")
+            if self.pause_mode != "offload":
+                unsupported.append("pause_mode must be 'offload'")
+            if self.dp_assignment != "arrival_round_robin":
+                unsupported.append("dp_assignment must be 'arrival_round_robin'")
+            if self.cross_dp_scale_up:
+                unsupported.append("cross_dp_scale_up must be False")
             ls_parallel_topology = (
                 self.attention_dp,
                 self.attention_sp,
@@ -460,3 +603,89 @@ class Config:
     @property
     def ffn_world_size(self):
         return self.ffn_dp * self.ffn_ep * self.ffn_tp
+
+    def resolve_ls_admission_max_tokens(self, total_pool_kv_tokens: int) -> int:
+        """Resolve the profile's per-pool admission token budget once at startup."""
+        if total_pool_kv_tokens <= 0:
+            raise ValueError("total_pool_kv_tokens must be > 0")
+        if self.ls_admission_max_tokens_per_pool == "auto":
+            return max(self.max_model_len, total_pool_kv_tokens // 6)
+        return self.ls_admission_max_tokens_per_pool
+
+    def ls_decode_manifest(self) -> dict[str, Any]:
+        """Return the fully resolved formal-baseline manifest fragment."""
+        if not self.enable_ls_decode_core_scheduler:
+            raise RuntimeError("LS Decode-only manifest requires the LS scheduler")
+        if self.ls_resolved_admission_max_tokens_per_pool is None:
+            raise RuntimeError(
+                "LS admission token limit is unresolved; construct Scheduler first"
+            )
+        return {
+            "baseline_name": "LoongServe-style Decode-only",
+            "profile": self.ls_decode_profile,
+            "mode": self.mode,
+            "dummy_prefill": self.dummy_prefill,
+            "dummy_bootstrap_token_id": self.dummy_bootstrap_token_id,
+            "max_tokens_min": 1,
+            "ignore_eos_required": True,
+            "loop_count": self.loop_count,
+            "scheduler_mode": self.scheduler_mode,
+            "routing_strategy": self.routing_strategy,
+            "dp_assignment": self.dp_assignment,
+            "pause_mode": self.pause_mode,
+            "cross_dp_scale_up": self.cross_dp_scale_up,
+            "attention_dp": self.attention_dp,
+            "attention_sp": self.attention_sp,
+            "attention_tp": self.attention_tp,
+            "ffn_ep": self.ffn_ep,
+            "ffn_dp": self.ffn_dp,
+            "ffn_tp": self.ffn_tp,
+            "sp_backend": self.sp_backend,
+            "use_dlslime_rpc": self.use_dlslime_rpc,
+            "kvcache_block_size": self.kvcache_block_size,
+            "fixed_sp_size": self.fixed_sp_size,
+            "enable_dynamic_sp_size": self.enable_dynamic_sp_size,
+            "ls_max_num_ooe": self.ls_max_num_ooe,
+            "ls_running_max_req_size": self.ls_running_max_req_size,
+            "ls_admission_max_tokens_per_pool": (
+                self.ls_resolved_admission_max_tokens_per_pool
+            ),
+            "ls_admission_max_tokens_per_pool_configured": (
+                self.ls_admission_max_tokens_per_pool
+            ),
+            "ls_min_comp_bound_decoding_batch_size": (
+                self.ls_min_comp_bound_decoding_batch_size
+            ),
+            "ls_decode_enable_future_kv_admission": (
+                self.ls_decode_enable_future_kv_admission
+            ),
+            "ls_decode_initial_kv_dop": self.ls_decode_initial_kv_dop,
+            "initial_dop_policy": "min_exact_feasible",
+            "ls_disable_scale_up": self.ls_disable_scale_up,
+            "ls_kv_consolidation_mode": self.ls_kv_consolidation_mode,
+            "ls_kv_consolidation_candidate_util": (
+                self.ls_kv_consolidation_candidate_util
+            ),
+            "ls_kv_consolidation_target_high_watermark": (
+                self.ls_kv_consolidation_target_high_watermark
+            ),
+            "ls_kv_consolidation_stable_steps": (
+                self.ls_kv_consolidation_stable_steps
+            ),
+            "ls_kv_consolidation_cooldown_steps": (
+                self.ls_kv_consolidation_cooldown_steps
+            ),
+            "ls_kv_consolidation_check_interval_steps": (
+                self.ls_kv_consolidation_check_interval_steps
+            ),
+            "ls_kv_consolidation_max_source_blocks_per_event": (
+                self.ls_kv_consolidation_max_source_blocks_per_event
+            ),
+            "ls_kv_consolidation_migration_chunk_tokens": (
+                self.ls_kv_consolidation_migration_chunk_tokens
+            ),
+            "topology_adaptation": (
+                "independent fixed SP8 attention/KV pools with globally "
+                "synchronized FFN cadence"
+            ),
+        }

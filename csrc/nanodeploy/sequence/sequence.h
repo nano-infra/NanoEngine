@@ -15,14 +15,28 @@ namespace nanodeploy {
 // Forward declaration
 class SequenceMetric;
 
-enum class SequenceStatus {
-    WAITING,
-    RUNNING,
-    FINISHED,
-    TO_BE_MIGRATED,
+enum class SequenceStatus: int {
+    WAITING          = 0,
+    RUNNING          = 1,
+    FINISHED         = 2,
+    TO_BE_MIGRATED   = 3,
+    PAUSED_OFFLOAD   = 4,
 
-    _COUNT
+    _COUNT = 5
 };
+
+static_assert(static_cast<int>(SequenceStatus::WAITING) == 0);
+static_assert(static_cast<int>(SequenceStatus::RUNNING) == 1);
+static_assert(static_cast<int>(SequenceStatus::FINISHED) == 2);
+static_assert(static_cast<int>(SequenceStatus::TO_BE_MIGRATED) == 3);
+static_assert(static_cast<int>(SequenceStatus::PAUSED_OFFLOAD) == 4);
+
+constexpr bool is_valid_sequence_status(SequenceStatus status) noexcept
+{
+    const int ordinal = static_cast<int>(status);
+    return ordinal >= static_cast<int>(SequenceStatus::WAITING)
+           && ordinal < static_cast<int>(SequenceStatus::_COUNT);
+}
 
 enum class BlockContextSlot : int {
     ACTIVE,
@@ -121,10 +135,21 @@ public:
              int                     max_tokens  = 256,
              bool                    ignore_eos  = false);
 
+    // Restore a serialized identity and atomically advance the process-local
+    // allocator beyond it. The high-watermark update never moves backwards.
+    void restore_seq_id(uint64_t restored_seq_id);
+
     // Jumping
     int32_t active(const std::string& engine_id, int attention_sp, int attention_dp)
     {
-        slots_[(size_t)BlockContextSlot::ACTIVE].reset(engine_id, attention_sp, attention_dp);
+        auto& active_ctx = slots_[(size_t)BlockContextSlot::ACTIVE];
+        active_ctx.reset(engine_id, attention_sp, attention_dp);
+        // assigned_dp is the canonical LS pool assignment. Keep the legacy
+        // reset-to-DP0 behavior for non-LS sequences, whose assignment remains
+        // -1 for their whole lifetime.
+        if (assigned_dp != -1) {
+            active_ctx.dp_idx_ = assigned_dp;
+        }
         return 0;
     }
 
@@ -215,6 +240,7 @@ public:
     // Public members
     uint64_t         seq_id;
     SequenceStatus   status = SequenceStatus::WAITING;
+    int              assigned_dp = -1;
     std::vector<int> token_ids;
     int              last_token;
     int              num_tokens;

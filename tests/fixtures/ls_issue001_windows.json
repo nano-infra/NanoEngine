@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "source": {
+    "csv_name": "sharegpt4o-random_geminiissue_r0.01_n60000_60k.csv",
+    "csv_sha256": "6e319608aaaca20656e838812b1188f966e77524c7f56da5feb20661bfdc216b",
+    "arrival_index": "zero-based CSV data-row index, excluding the header",
+    "request_id": "equal to arrival_index for this fixture"
+  },
+  "assignment": {
+    "attention_dp": 4,
+    "initial_dp": 0,
+    "policy": "assigned_dp = arrival_index % attention_dp"
+  },
+  "windows": [
+    {
+      "name": "arrival_1482_1488",
+      "requests": [
+        {"arrival_index": 1482, "request_id": 1482, "prompt_len": 276, "output_len": 510, "type": "short"},
+        {"arrival_index": 1483, "request_id": 1483, "prompt_len": 199, "output_len": 640, "type": "short"},
+        {"arrival_index": 1484, "request_id": 1484, "prompt_len": 923230, "output_len": 628, "type": "long"},
+        {"arrival_index": 1485, "request_id": 1485, "prompt_len": 229, "output_len": 512, "type": "short"},
+        {"arrival_index": 1486, "request_id": 1486, "prompt_len": 197, "output_len": 639, "type": "short"},
+        {"arrival_index": 1487, "request_id": 1487, "prompt_len": 213, "output_len": 494, "type": "short"},
+        {"arrival_index": 1488, "request_id": 1488, "prompt_len": 227, "output_len": 633, "type": "short"}
+      ],
+      "expected_dp4_pool_snapshots": [
+        {"dp_idx": 0, "request_ids": [1484, 1488], "prompt_lengths": [923230, 227]},
+        {"dp_idx": 1, "request_ids": [1485], "prompt_lengths": [229]},
+        {"dp_idx": 2, "request_ids": [1482, 1486], "prompt_lengths": [276, 197]},
+        {"dp_idx": 3, "request_ids": [1483, 1487], "prompt_lengths": [199, 213]}
+      ]
+    },
+    {
+      "name": "arrival_5234_5236",
+      "requests": [
+        {"arrival_index": 5234, "request_id": 5234, "prompt_len": 170, "output_len": 490, "type": "short"},
+        {"arrival_index": 5235, "request_id": 5235, "prompt_len": 960909, "output_len": 571, "type": "long"},
+        {"arrival_index": 5236, "request_id": 5236, "prompt_len": 199, "output_len": 669, "type": "short"}
+      ],
+      "expected_dp4_pool_snapshots": [
+        {"dp_idx": 0, "request_ids": [5236], "prompt_lengths": [199]},
+        {"dp_idx": 1, "request_ids": [], "prompt_lengths": []},
+        {"dp_idx": 2, "request_ids": [5234], "prompt_lengths": [170]},
+        {"dp_idx": 3, "request_ids": [5235], "prompt_lengths": [960909]}
+      ]
+    },
+    {
+      "name": "arrival_5372_5375",
+      "requests": [
+        {"arrival_index": 5372, "request_id": 5372, "prompt_len": 971548, "output_len": 107, "type": "long"},
+        {"arrival_index": 5373, "request_id": 5373, "prompt_len": 198, "output_len": 707, "type": "short"},
+        {"arrival_index": 5374, "request_id": 5374, "prompt_len": 215, "output_len": 593, "type": "short"},
+        {"arrival_index": 5375, "request_id": 5375, "prompt_len": 277, "output_len": 399, "type": "short"}
+      ],
+      "expected_dp4_pool_snapshots": [
+        {"dp_idx": 0, "request_ids": [5372], "prompt_lengths": [971548]},
+        {"dp_idx": 1, "request_ids": [5373], "prompt_lengths": [198]},
+        {"dp_idx": 2, "request_ids": [5374], "prompt_lengths": [215]},
+        {"dp_idx": 3, "request_ids": [5375], "prompt_lengths": [277]}
+      ]
+    },
+    {
+      "name": "arrival_5722_5725",
+      "requests": [
+        {"arrival_index": 5722, "request_id": 5722, "prompt_len": 228, "output_len": 848, "type": "short"},
+        {"arrival_index": 5723, "request_id": 5723, "prompt_len": 921913, "output_len": 285, "type": "long"},
+        {"arrival_index": 5724, "request_id": 5724, "prompt_len": 217, "output_len": 496, "type": "short"},
+        {"arrival_index": 5725, "request_id": 5725, "prompt_len": 286, "output_len": 558, "type": "short"}
+      ],
+      "expected_dp4_pool_snapshots": [
+        {"dp_idx": 0, "request_ids": [5724], "prompt_lengths": [217]},
+        {"dp_idx": 1, "request_ids": [5725], "prompt_lengths": [286]},
+        {"dp_idx": 2, "request_ids": [5722], "prompt_lengths": [228]},
+        {"dp_idx": 3, "request_ids": [5723], "prompt_lengths": [921913]}
+      ]
+    },
+    {
+      "name": "arrival_6407_6410",
+      "requests": [
+        {"arrival_index": 6407, "request_id": 6407, "prompt_len": 941787, "output_len": 588, "type": "long"},
+        {"arrival_index": 6408, "request_id": 6408, "prompt_len": 199, "output_len": 488, "type": "short"},
+        {"arrival_index": 6409, "request_id": 6409, "prompt_len": 198, "output_len": 671, "type": "short"},
+        {"arrival_index": 6410, "request_id": 6410, "prompt_len": 214, "output_len": 733, "type": "short"}
+      ],
+      "expected_dp4_pool_snapshots": [
+        {"dp_idx": 0, "request_ids": [6408], "prompt_lengths": [199]},
+        {"dp_idx": 1, "request_ids": [6409], "prompt_lengths": [198]},
+        {"dp_idx": 2, "request_ids": [6410], "prompt_lengths": [214]},
+        {"dp_idx": 3, "request_ids": [6407], "prompt_lengths": [941787]}
+      ]
+    },
+    {
+      "name": "arrival_6915_6920",
+      "requests": [
+        {"arrival_index": 6915, "request_id": 6915, "prompt_len": 205, "output_len": 508, "type": "short"},
+        {"arrival_index": 6916, "request_id": 6916, "prompt_len": 130, "output_len": 430, "type": "short"},
+        {"arrival_index": 6917, "request_id": 6917, "prompt_len": 214, "output_len": 638, "type": "short"},
+        {"arrival_index": 6918, "request_id": 6918, "prompt_len": 198, "output_len": 579, "type": "short"},
+        {"arrival_index": 6919, "request_id": 6919, "prompt_len": 840341, "output_len": 627, "type": "long"},
+        {"arrival_index": 6920, "request_id": 6920, "prompt_len": 201, "output_len": 745, "type": "short"}
+      ],
+      "expected_dp4_pool_snapshots": [
+        {"dp_idx": 0, "request_ids": [6916, 6920], "prompt_lengths": [130, 201]},
+        {"dp_idx": 1, "request_ids": [6917], "prompt_lengths": [214]},
+        {"dp_idx": 2, "request_ids": [6918], "prompt_lengths": [198]},
+        {"dp_idx": 3, "request_ids": [6915, 6919], "prompt_lengths": [205, 840341]}
+      ]
+    }
+  ]
+}

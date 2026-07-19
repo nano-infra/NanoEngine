@@ -16,6 +16,27 @@ using namespace nanodeploy;
 
 namespace {
 
+inline constexpr uint64_t kSequencePickleMagic   = 0x4E44534551504B4CULL;  // "NDSEQPKL"
+inline constexpr uint32_t kSequencePickleVersion = 1;
+
+using SequencePickleState =
+    std::tuple<uint64_t,
+               uint32_t,
+               uint64_t,
+               SequenceStatus,
+               int,
+               std::vector<int>,
+               int,
+               int,
+               int,
+               int,
+               int,
+               std::array<BlockContext, (size_t)BlockContextSlot::_COUNT>,
+               std::shared_ptr<SequenceMetric>,
+               double,
+               int,
+               bool>;
+
 BlockContext::BlockIdList block_id_list_from_iterable(const py::iterable& it)
 {
     BlockContext::BlockIdList out;
@@ -23,6 +44,55 @@ BlockContext::BlockIdList block_id_list_from_iterable(const py::iterable& it)
         out.push_back(item.cast<int>());
     }
     return out;
+}
+
+void validate_sequence_pickle_state(const SequencePickleState& state)
+{
+    if (std::get<0>(state) != kSequencePickleMagic || std::get<1>(state) != kSequencePickleVersion) {
+        throw py::value_error("unsupported Sequence pickle schema");
+    }
+    if (!is_valid_sequence_status(std::get<3>(state))) {
+        throw py::value_error("invalid SequenceStatus in pickle state");
+    }
+    if (std::get<4>(state) < -1) {
+        throw py::value_error("invalid assigned_dp in pickle state");
+    }
+
+    const int num_tokens              = std::get<7>(state);
+    const int num_prompt_tokens       = std::get<8>(state);
+    const int num_checkpointed_tokens = std::get<9>(state);
+    const int num_cached_tokens       = std::get<10>(state);
+    if (num_tokens < 0 || num_prompt_tokens < 0 || num_prompt_tokens > num_tokens
+        || num_checkpointed_tokens < 0 || num_checkpointed_tokens > num_tokens || num_cached_tokens < 0
+        || num_cached_tokens > num_tokens || std::get<14>(state) < 0) {
+        throw py::value_error("invalid token counters in Sequence pickle state");
+    }
+    const auto& token_ids = std::get<5>(state);
+    if (token_ids.size() != static_cast<size_t>(num_tokens)) {
+        throw py::value_error("Sequence pickle state does not contain the complete token history");
+    }
+    if (!token_ids.empty() && token_ids.back() != std::get<6>(state)) {
+        throw py::value_error("Sequence pickle last_token does not match the token history");
+    }
+    const auto& metric = std::get<12>(state);
+    if (metric && metric->seq_id != std::get<2>(state)) {
+        throw py::value_error("Sequence metric identity does not match pickle state");
+    }
+    for (const auto& context : std::get<11>(state)) {
+        try {
+            validate_serializable_block_context(context);
+        }
+        catch (const std::exception& error) {
+            throw py::value_error(std::string("invalid BlockContext in Sequence pickle state: ") + error.what());
+        }
+    }
+    try {
+        validate_serializable_sequence_context_ownership(
+            std::get<4>(state), std::get<3>(state), std::get<11>(state)[(size_t)BlockContextSlot::ACTIVE]);
+    }
+    catch (const std::exception& error) {
+        throw py::value_error(std::string("invalid Sequence pickle ownership: ") + error.what());
+    }
 }
 
 }  // namespace
@@ -68,6 +138,7 @@ void bind_sequence(py::module_& m)
         .value("RUNNING", SequenceStatus::RUNNING)
         .value("FINISHED", SequenceStatus::FINISHED)
         .value("TO_BE_MIGRATED", SequenceStatus::TO_BE_MIGRATED)
+        .value("PAUSED_OFFLOAD", SequenceStatus::PAUSED_OFFLOAD)
         .export_values();
 
     py::enum_<BlockContextSlot>(m, "BlockContextSlot")
@@ -146,7 +217,10 @@ void bind_sequence(py::module_& m)
             [](BlockContext& self, const BlockContext::SpBlockTable& value) { self.sp_block_table = value; },
             py::return_value_policy::reference_internal)
         .def("reset", &BlockContext::reset, py::arg("engine_id"), py::arg("attention_sp"), py::arg("attention_dp"))
-        .def(py::pickle([](const BlockContext& p) { return p.getstate(); },
+        .def(py::pickle([](const BlockContext& p) {
+                            validate_serializable_block_context(p);
+                            return p.getstate();
+                        },
                         [](const std::tuple<std::string,
                                             int,
                                             int,
@@ -156,7 +230,11 @@ void bind_sequence(py::module_& m)
                                             int,
                                             std::vector<std::pair<int, int>>,
                                             std::vector<std::vector<int>>,
-                                            std::vector<int>>& t) { return BlockContext::setstate(t); }));
+                                            std::vector<int>>& t) {
+                            auto context = BlockContext::setstate(t);
+                            validate_serializable_block_context(context);
+                            return context;
+                        }));
 
     py::class_<Sequence, std::shared_ptr<Sequence>>(m, "Sequence")
         .def(py::init<const std::vector<int>&, double, int, bool>(),
@@ -192,8 +270,28 @@ void bind_sequence(py::module_& m)
         .def("last_block_num_tokens", &Sequence::last_block_num_tokens, py::arg("slot"), py::arg("sp_idx"))
         .def("block", &Sequence::block, py::arg("i"), py::arg("slot"), py::arg("sp_idx"))
 
-        .def_readwrite("seq_id", &Sequence::seq_id)
+        .def_property(
+            "seq_id",
+            [](const Sequence& self) { return self.seq_id; },
+            [](Sequence& self, uint64_t seq_id) {
+                if (self.assigned_dp != -1) {
+                    throw py::value_error("cannot modify seq_id after assigned_dp is set");
+                }
+                self.seq_id = seq_id;
+            })
         .def_readwrite("status", &Sequence::status)
+        .def_property(
+            "assigned_dp",
+            [](const Sequence& self) { return self.assigned_dp; },
+            [](Sequence& self, int assigned_dp) {
+                if (assigned_dp < -1) {
+                    throw py::value_error("assigned_dp must be -1 or a non-negative DP index");
+                }
+                if (self.assigned_dp != -1 && assigned_dp != self.assigned_dp) {
+                    throw py::value_error("cannot modify assigned_dp after it is set");
+                }
+                self.assigned_dp = assigned_dp;
+            })
         .def_readwrite("token_ids", &Sequence::token_ids)
         .def_readwrite("last_token", &Sequence::last_token)
         .def_readwrite("num_tokens", &Sequence::num_tokens)
@@ -241,63 +339,51 @@ void bind_sequence(py::module_& m)
              })
 
         .def(py::pickle(
-            [](const Sequence& p) {  // __getstate__
-                // (num_tokens, num_checkpointed_tokens, num_cached_tokens, backup_engine_id, active_engine_id,
-                // block_ctx_map, temperature, token_ids/last_token)
-                std::vector<int> last_element;
-                if (p.num_generated_tokens_since_checkpoint() == 0) {
-                    last_element = p.token_ids;
-                }
-                else {
-                    last_element = {p.last_token};
-                }
-
-                return std::make_tuple(p.num_tokens,
-                                       p.num_checkpointed_tokens,
-                                       p.num_cached_tokens,
-                                       p.slots_,
-                                       p.temperature,
-                                       last_element);
+            [](const Sequence& p) -> py::tuple {  // __getstate__
+                SequencePickleState state{kSequencePickleMagic,
+                                          kSequencePickleVersion,
+                                          p.seq_id,
+                                          p.status,
+                                          p.assigned_dp,
+                                          p.token_ids,
+                                          p.last_token,
+                                          p.num_tokens,
+                                          p.num_prompt_tokens,
+                                          p.num_checkpointed_tokens,
+                                          p.num_cached_tokens,
+                                          p.slots_,
+                                          p.metric,
+                                          p.temperature,
+                                          p.max_tokens,
+                                          p.ignore_eos};
+                validate_sequence_pickle_state(state);
+                return py::cast(state).cast<py::tuple>();
             },
-            [](const std::tuple<int,
-                                int,
-                                int,
-                                std::array<BlockContext, (size_t)BlockContextSlot::_COUNT>,
-                                double,
-                                std::vector<int>>& t) {  // __setstate__
-                // We need to reconstruct the object.
-                // Since we don't have a constructor that takes all these, we create a dummy one and fill it.
-                // Or we can use the existing constructor and then overwrite fields.
-                // But the existing constructor requires token_ids.
-
-                // Let's extract token_ids from the last element if possible.
-                std::vector<int> last_element = std::get<5>(t);
-                std::vector<int> initial_tokens;
-
-                // If num_generated_tokens_since_checkpoint == 0, last_element is token_ids.
-                // We can check num_tokens vs num_checkpointed_tokens.
-                int num_tokens              = std::get<0>(t);
-                int num_checkpointed_tokens = std::get<1>(t);
-
-                if (num_tokens - num_checkpointed_tokens == 0) {
-                    initial_tokens = last_element;
+            [](py::tuple raw_state) {  // __setstate__
+                if (raw_state.size() != std::tuple_size_v<SequencePickleState>) {
+                    throw py::value_error("unsupported Sequence pickle schema");
                 }
-
-                auto seq                     = std::make_shared<Sequence>(initial_tokens);
-                seq->num_tokens              = std::get<0>(t);
-                seq->num_checkpointed_tokens = std::get<1>(t);
-                seq->num_cached_tokens       = std::get<2>(t);
-
-                seq->slots_ = std::move(std::get<3>(t));
-
-                seq->temperature = std::get<4>(t);
-
-                if (num_tokens - num_checkpointed_tokens != 0) {
-                    if (!last_element.empty()) {
-                        seq->last_token = last_element[0];
-                    }
+                SequencePickleState state;
+                try {
+                    state = raw_state.cast<SequencePickleState>();
                 }
+                catch (const py::cast_error&) {
+                    throw py::value_error("invalid field types in Sequence pickle schema");
+                }
+                validate_sequence_pickle_state(state);
 
+                auto seq = std::make_shared<Sequence>(
+                    std::get<5>(state), std::get<13>(state), std::get<14>(state), std::get<15>(state));
+                seq->restore_seq_id(std::get<2>(state));
+                seq->status                  = std::get<3>(state);
+                seq->assigned_dp             = std::get<4>(state);
+                seq->last_token              = std::get<6>(state);
+                seq->num_tokens              = std::get<7>(state);
+                seq->num_prompt_tokens       = std::get<8>(state);
+                seq->num_checkpointed_tokens = std::get<9>(state);
+                seq->num_cached_tokens       = std::get<10>(state);
+                seq->slots_                  = std::get<11>(state);
+                seq->metric                  = std::get<12>(state);
                 return seq;
             }))
 

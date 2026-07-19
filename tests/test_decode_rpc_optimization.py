@@ -90,7 +90,9 @@ def _build_regression_case() -> list[Sequence]:
             master_sp_idx=0,
             num_dispatched_tokens=[1, 0],
             sp_block_tables={0: [100]},
-            block_location=[(0, 100), (1, 999)],
+            # Keep the fixture at the allocator's canonical ABI boundary:
+            # block_location is the flattened form of sp_block_table.
+            block_location=[(0, 100)],
         ),
         _make_seq(
             seq_id=11,

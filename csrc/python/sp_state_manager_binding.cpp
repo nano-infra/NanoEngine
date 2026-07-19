@@ -38,6 +38,13 @@ void bind_sp_state_manager(py::module_& m)
         .def_readonly("dst_token_offset", &SPStateManager::KVTokenRangeMove::dst_token_offset)
         .def_readonly("num_tokens", &SPStateManager::KVTokenRangeMove::num_tokens);
 
+    py::enum_<SPStateManager::LSKVConsolidationPlan::State>(m, "LSKVConsolidationState")
+        .value("REJECTED", SPStateManager::LSKVConsolidationPlan::State::REJECTED)
+        .value("RESERVED", SPStateManager::LSKVConsolidationPlan::State::RESERVED)
+        .value("DISPATCHED", SPStateManager::LSKVConsolidationPlan::State::DISPATCHED)
+        .value("COMMITTED", SPStateManager::LSKVConsolidationPlan::State::COMMITTED)
+        .value("ABORTED", SPStateManager::LSKVConsolidationPlan::State::ABORTED);
+
     py::class_<SPStateManager::LSKVConsolidationPlan, std::shared_ptr<SPStateManager::LSKVConsolidationPlan>>(
         m, "LSKVConsolidationPlan")
         .def_readonly("success", &SPStateManager::LSKVConsolidationPlan::success)
@@ -48,7 +55,8 @@ void bind_sp_state_manager(py::module_& m)
         .def_readonly("source_rank", &SPStateManager::LSKVConsolidationPlan::source_rank)
         .def_readonly("retained_ranks", &SPStateManager::LSKVConsolidationPlan::retained_ranks)
         .def_readonly("moves", &SPStateManager::LSKVConsolidationPlan::moves)
-        .def_readonly("num_tokens", &SPStateManager::LSKVConsolidationPlan::num_tokens);
+        .def_readonly("num_tokens", &SPStateManager::LSKVConsolidationPlan::num_tokens)
+        .def_readonly("state", &SPStateManager::LSKVConsolidationPlan::state);
 
     // Bind RoutingStrategy
     py::enum_<RoutingStrategy>(m, "RoutingStrategy")

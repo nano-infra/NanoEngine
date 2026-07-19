@@ -8,6 +8,27 @@
 namespace py = pybind11;
 using namespace nanodeploy;
 
+namespace {
+PyObject* ls_scheduler_fatal_exception_type = nullptr;
+
+void translate_ls_scheduler_fatal(std::exception_ptr exception)
+{
+    if (!exception || !ls_scheduler_fatal_exception_type) {
+        return;
+    }
+    try {
+        std::rethrow_exception(exception);
+    }
+    catch (const LSSchedulerFatalError& error) {
+        py::object exception_type =
+            py::reinterpret_borrow<py::object>(ls_scheduler_fatal_exception_type);
+        py::object instance = exception_type(py::str(error.what()));
+        instance.attr("fatal_code") = py::cast(error.fatal_code());
+        PyErr_SetObject(ls_scheduler_fatal_exception_type, instance.ptr());
+    }
+}
+}  // namespace
+
 // Make opaque types for Scheduler's containers
 PYBIND11_MAKE_OPAQUE(std::deque<std::shared_ptr<Sequence>>);
 PYBIND11_MAKE_OPAQUE(std::vector<std::shared_ptr<SPStateManager>>);
@@ -20,6 +41,53 @@ void bind_scheduler_utils(py::module_& m)
         .value("DECODE", ScheduleAction::DECODE)
         .value("KV_CONSOLIDATION", ScheduleAction::KV_CONSOLIDATION)
         .export_values();
+
+    py::enum_<LSAddError>(m, "LSAddError")
+        .value("NONE", LSAddError::NONE)
+        .value("ALREADY_ADDED_OR_ASSIGNED", LSAddError::ALREADY_ADDED_OR_ASSIGNED)
+        .value("IGNORE_EOS_REQUIRED", LSAddError::IGNORE_EOS_REQUIRED)
+        .value("INVALID_MAX_TOKENS", LSAddError::INVALID_MAX_TOKENS)
+        .value("FUTURE_TOKEN_NO_FIT", LSAddError::FUTURE_TOKEN_NO_FIT)
+        .value("CURRENT_EXACT_NO_FIT", LSAddError::CURRENT_EXACT_NO_FIT)
+        .export_values();
+    py::class_<LSAddResult>(m, "LSAddResult")
+        .def_readonly("accepted", &LSAddResult::accepted)
+        .def_readonly("assigned_dp", &LSAddResult::assigned_dp)
+        .def_readonly("error", &LSAddResult::error)
+        .def_readonly("reason", &LSAddResult::reason);
+
+    py::enum_<LSAdmissionKind>(m, "LSAdmissionKind")
+        .value("FRESH", LSAdmissionKind::FRESH)
+        .value("OFFLOAD_READMIT", LSAdmissionKind::OFFLOAD_READMIT)
+        .export_values();
+    py::enum_<LSAdmissionTargetKind>(m, "LSAdmissionTargetKind")
+        .value("STANDALONE", LSAdmissionTargetKind::STANDALONE)
+        .value("CAPACITY_APPEND", LSAdmissionTargetKind::CAPACITY_APPEND)
+        .export_values();
+    py::class_<LSAdmissionRecord>(m, "LSAdmissionRecord")
+        .def_readonly("sequence", &LSAdmissionRecord::sequence)
+        .def_readonly("dp_idx", &LSAdmissionRecord::dp_idx)
+        .def_readonly("batch_id", &LSAdmissionRecord::batch_id)
+        .def_readonly("group_id_after_commit", &LSAdmissionRecord::group_id_after_commit)
+        .def_readonly("admission_kind", &LSAdmissionRecord::admission_kind)
+        .def_readonly("target_kind", &LSAdmissionRecord::target_kind)
+        .def_readonly("planned_kv_dop", &LSAdmissionRecord::planned_kv_dop)
+        .def_readonly("planned_kv_ranks", &LSAdmissionRecord::planned_kv_ranks)
+        .def_readonly("bootstrap_finished", &LSAdmissionRecord::bootstrap_finished)
+        .def_readonly("bootstrap_token_id", &LSAdmissionRecord::bootstrap_token_id);
+
+    py::enum_<LSFatalCode>(m, "LSFatalCode")
+        .value("NO_PROGRESS_INVARIANT", LSFatalCode::NO_PROGRESS_INVARIANT)
+        .value("UNRECOVERABLE_CAPACITY", LSFatalCode::UNRECOVERABLE_CAPACITY)
+        .value("DECODE_PREPARE_OR_VALIDATE_FAILED", LSFatalCode::DECODE_PREPARE_OR_VALIDATE_FAILED)
+        .value("METRIC_COMMIT_FAILED", LSFatalCode::METRIC_COMMIT_FAILED)
+        .value("KV_CONSOLIDATION_FAILED", LSFatalCode::KV_CONSOLIDATION_FAILED)
+        .value("POST_PUBLICATION_INVARIANT", LSFatalCode::POST_PUBLICATION_INVARIANT)
+        .export_values();
+    auto& fatal_exception =
+        py::register_exception<LSSchedulerFatalError>(m, "LSSchedulerFatalError", PyExc_RuntimeError);
+    ls_scheduler_fatal_exception_type = fatal_exception.ptr();
+    py::register_local_exception_translator(&translate_ls_scheduler_fatal);
 
     // Bind the postprocess_sequences utility function
     m.def("postprocess_sequences",
@@ -109,6 +177,11 @@ void bind_scheduler_utils(py::module_& m)
         .def_readwrite("filtered_dp_sp_seqs", &ScheduleResult::filtered_dp_sp_seqs)
         .def_readwrite("is_prefill", &ScheduleResult::is_prefill)
         .def_readonly("kv_consolidation_plan", &ScheduleResult::kv_consolidation_plan)
+        .def_readonly("ls_admission_records", &ScheduleResult::ls_admission_records)
+        .def_readonly("ls_real_decode_ids_by_dp", &ScheduleResult::ls_real_decode_ids_by_dp)
+        .def_readonly("ls_running_ids_by_dp_after_commit", &ScheduleResult::ls_running_ids_by_dp_after_commit)
+        .def_readonly("ls_pool_resource_epoch_before", &ScheduleResult::ls_pool_resource_epoch_before)
+        .def_readonly("ls_pool_resource_epoch_after", &ScheduleResult::ls_pool_resource_epoch_after)
         .def_readonly("sp_send_counts", &ScheduleResult::sp_send_counts)
         .def_readonly("sp_recv_counts", &ScheduleResult::sp_recv_counts)
         .def_readonly("sp_size_hist_per_dp", &ScheduleResult::sp_size_hist_per_dp)
@@ -117,18 +190,6 @@ void bind_scheduler_utils(py::module_& m)
         .def_readonly("sp_res_matrix", &ScheduleResult::sp_res_matrix)
         .def_readonly("waiting_head_blocks", &ScheduleResult::waiting_head_blocks)
         .def_readonly("waiting_total_blocks", &ScheduleResult::waiting_total_blocks)
-        .def_readonly("ls_initial_batch_ids", &ScheduleResult::ls_initial_batch_ids)
-        .def_readonly("ls_initial_group_ids", &ScheduleResult::ls_initial_group_ids)
-        .def_readonly("ls_initial_kv_dops", &ScheduleResult::ls_initial_kv_dops)
-        .def_readonly("ls_initial_kv_ranks", &ScheduleResult::ls_initial_kv_ranks)
-        .def_readonly("ls_initial_sequence_ids", &ScheduleResult::ls_initial_sequence_ids)
-        .def_readonly("ls_initial_prompt_kv_tokens", &ScheduleResult::ls_initial_prompt_kv_tokens)
-        .def_readonly("ls_initial_provisional_pending_targets", &ScheduleResult::ls_initial_provisional_pending_targets)
-        .def_readonly("ls_initial_admission_orders", &ScheduleResult::ls_initial_admission_orders)
-        .def_readonly("ls_initial_admission_attempts", &ScheduleResult::ls_initial_admission_attempts)
-        .def_readonly("ls_initial_is_recovery_batch", &ScheduleResult::ls_initial_is_recovery_batch)
-        .def_readonly("ls_initial_parent_batch_ids", &ScheduleResult::ls_initial_parent_batch_ids)
-        .def_readonly("ls_initial_admission_kinds", &ScheduleResult::ls_initial_admission_kinds)
         .def_readonly("ls_sealed_batch_ids", &ScheduleResult::ls_sealed_batch_ids)
         .def_readonly("ls_sealed_batch_sequence_ids", &ScheduleResult::ls_sealed_batch_sequence_ids)
         .def_readonly("ls_pending_batch_count", &ScheduleResult::ls_pending_batch_count)
@@ -214,7 +275,11 @@ void bind_scheduler_utils(py::module_& m)
                          int                ls_kv_consolidation_cooldown_steps,
                          int                ls_kv_consolidation_check_interval_steps,
                          int                ls_kv_consolidation_max_source_blocks_per_event,
-                         bool               ls_decode_enable_future_kv_admission) {
+                         bool               ls_decode_enable_future_kv_admission,
+                         int                ls_max_num_ooe,
+                         int                ls_running_max_req_size,
+                         int                ls_admission_max_tokens_per_pool,
+                         int                ls_min_comp_bound_decoding_batch_size) {
                  return std::make_shared<Scheduler>(engine_id,
                                                     loop_count,
                                                     max_num_seqs,
@@ -262,7 +327,11 @@ void bind_scheduler_utils(py::module_& m)
                                                     ls_kv_consolidation_cooldown_steps,
                                                     ls_kv_consolidation_check_interval_steps,
                                                     ls_kv_consolidation_max_source_blocks_per_event,
-                                                    ls_decode_enable_future_kv_admission);
+                                                    ls_decode_enable_future_kv_admission,
+                                                    ls_max_num_ooe,
+                                                    ls_running_max_req_size,
+                                                    ls_admission_max_tokens_per_pool,
+                                                    ls_min_comp_bound_decoding_batch_size);
              }),
              py::arg("engine_id"),
              py::arg("loop_count"),
@@ -311,10 +380,24 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("ls_kv_consolidation_cooldown_steps")              = 64,
              py::arg("ls_kv_consolidation_check_interval_steps")        = 8,
              py::arg("ls_kv_consolidation_max_source_blocks_per_event") = 0,
-             py::arg("ls_decode_enable_future_kv_admission")            = true)
+             py::arg("ls_decode_enable_future_kv_admission")            = true,
+             py::arg("ls_max_num_ooe")                                   = 10,
+             py::arg("ls_running_max_req_size")                          = 1000,
+             py::arg("ls_admission_max_tokens_per_pool")                 = 0,
+             py::arg("ls_min_comp_bound_decoding_batch_size")            = 128)
 
         // Queue management
-        .def("add", &Scheduler::add, py::arg("seq"))
+        .def(
+            "add",
+            [](Scheduler& scheduler, const std::shared_ptr<Sequence>& sequence) -> py::object {
+                auto result = scheduler.add(sequence);
+                if (!scheduler.ls_decode_core_enabled()) {
+                    return py::none();
+                }
+                return py::cast(std::move(result));
+            },
+            py::arg("seq"))
+        .def("precheck_add_identity", &Scheduler::precheck_add_identity, py::arg("seq"))
 
         // Scheduling
         .def("schedule", &Scheduler::schedule, py::call_guard<py::gil_scoped_release>())
@@ -345,7 +428,16 @@ void bind_scheduler_utils(py::module_& m)
         .def("get_ls_group_initial_sequence_ids", &Scheduler::get_ls_group_initial_sequence_ids)
         .def("get_ls_active_batch_owners", &Scheduler::get_ls_active_batch_owners)
         .def("get_ls_group_allocated_ranks", &Scheduler::get_ls_group_allocated_ranks, py::arg("group_id"))
+        .def("get_ls_waiting_sequence_ids_by_dp", &Scheduler::get_ls_waiting_sequence_ids_by_dp)
+        .def("get_ls_num_ooe", &Scheduler::get_ls_num_ooe)
+        .def("get_ls_pool_resource_epochs", &Scheduler::get_ls_pool_resource_epochs)
+        .def("get_ls_arrival_order", &Scheduler::get_ls_arrival_order, py::arg("seq_id"))
+        .def("latch_ls_fatal", &Scheduler::latch_ls_fatal, py::arg("code"))
+        .def("ls_fatal_code", &Scheduler::ls_fatal_code)
         .def("plan_ls_kv_scale_down", &Scheduler::plan_ls_kv_scale_down, py::arg("group_id"), py::arg("source_rank"))
+        .def("mark_ls_kv_scale_down_dispatched",
+             &Scheduler::mark_ls_kv_scale_down_dispatched,
+             py::arg("plan"))
         .def("commit_ls_kv_scale_down", &Scheduler::commit_ls_kv_scale_down, py::arg("plan"))
         .def("abort_ls_kv_scale_down", &Scheduler::abort_ls_kv_scale_down, py::arg("plan"))
         .def("set_ls_admission_failure_after_allocations_for_test",
@@ -353,6 +445,9 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("value"))
         .def("set_ls_admission_failure_after_publications_for_test",
              &Scheduler::set_ls_admission_failure_after_publications_for_test,
+             py::arg("value"))
+        .def("set_ls_post_admission_component_failure_for_test",
+             &Scheduler::set_ls_post_admission_component_failure_for_test,
              py::arg("value"))
 
         // Preemption

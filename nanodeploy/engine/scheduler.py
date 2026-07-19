@@ -1,4 +1,4 @@
-from typing import Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from nanodeploy.config import Config
 from nanodeploy.engine.sequence import Sequence
@@ -19,10 +19,29 @@ logger = get_logger()
 SPStateManager = _CppSPStateManager
 RoutingStrategy = _CppRoutingStrategy
 
+
+class UnschedulableRequestError(ValueError):
+    """Typed request-local LS ingress rejection."""
+
+    def __init__(self, error, assigned_dp: int, reason: str):
+        self.error = error
+        self.assigned_dp = assigned_dp
+        self.reason = reason
+        super().__init__(reason)
+
+
 # Adapter class for C++ Scheduler to work with Config object
 class Scheduler(_CppScheduler):
     def __init__(self, config: Config):
         # C++ Scheduler expects individual parameters, not Config object
+        ls_admission_max_tokens_per_pool = config.resolve_ls_admission_max_tokens(
+            config.attention_sp
+            * config.num_kvcache_blocks
+            * config.kvcache_block_size
+        )
+        config.ls_resolved_admission_max_tokens_per_pool = (
+            ls_admission_max_tokens_per_pool
+        )
         super().__init__(
             config.engine_id or "",
             config.loop_count,
@@ -72,6 +91,10 @@ class Scheduler(_CppScheduler):
             config.ls_kv_consolidation_check_interval_steps,
             config.ls_kv_consolidation_max_source_blocks_per_event,
             config.ls_decode_enable_future_kv_admission,
+            config.ls_max_num_ooe,
+            config.ls_running_max_req_size,
+            ls_admission_max_tokens_per_pool,
+            config.ls_min_comp_bound_decoding_batch_size,
         )
         # Store config for compatibility
         self.engine_id = config.engine_id
@@ -83,6 +106,9 @@ class Scheduler(_CppScheduler):
         self.attention_sp = config.attention_sp
         self.mode = config.mode
         self.routing_strategy = RoutingStrategy[config.routing_strategy]
+        self.ls_admission_max_tokens_per_pool = (
+            ls_admission_max_tokens_per_pool
+        )
 
     def postprocess(
         self,

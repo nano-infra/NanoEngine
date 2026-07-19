@@ -50,25 +50,46 @@ def _ls_kwargs() -> dict:
     }
 
 
-def test_ls_decode_core_supported_configuration(tmp_path):
-    config = Config(
-        model=str(tmp_path),
-        **_ls_kwargs(),
-        ls_decode_initial_kv_dop=8,
-        ls_decode_batch_per_master=128,
-        ls_decode_enable_memory_scale_up=False,
-        ls_decode_enable_future_kv_admission=False,
-    )
+def test_ls_decode_source_default_resolves_formal_profile(tmp_path):
+    config = Config(model=str(tmp_path), **_ls_kwargs())
 
     assert config.enable_ls_decode_core_scheduler is True
-    assert config.ls_decode_initial_kv_dop == 8
-    assert config.ls_decode_batch_per_master == 128
-    assert config.ls_decode_enable_memory_scale_up is False
-    assert config.ls_decode_enable_future_kv_admission is False
+    assert config.ls_decode_profile == "loong_decode_source_default"
+    assert config.ls_max_num_ooe == 10
+    assert config.ls_running_max_req_size == 1000
+    assert config.ls_admission_max_tokens_per_pool == "auto"
+    assert config.ls_min_comp_bound_decoding_batch_size == 100
+    assert config.ls_decode_initial_kv_dop == 0
+    assert config.ls_decode_enable_memory_scale_up is True
+    assert config.ls_disable_scale_up is False
+    assert config.ls_decode_enable_future_kv_admission is True
+    assert config.ls_kv_consolidation_mode == "execute"
+    assert config.ls_kv_consolidation_candidate_util == 0.50
+    assert config.ls_kv_consolidation_target_high_watermark == 0.80
+    assert config.ls_kv_consolidation_stable_steps == 2
+    assert config.ls_kv_consolidation_cooldown_steps == 2
+    assert config.ls_kv_consolidation_check_interval_steps == 1
+    assert config.ls_kv_consolidation_max_source_blocks_per_event == 128
+    assert config.ls_kv_consolidation_migration_chunk_tokens == 64
+    assert config.dummy_bootstrap_token_id == 0
+    assert config.pause_mode == "offload"
+    assert config.dp_assignment == "arrival_round_robin"
+    assert config.cross_dp_scale_up is False
+    assert config.resolve_ls_admission_max_tokens(600_000) == 100_000
+    assert config.resolve_ls_admission_max_tokens(60_000) == config.max_model_len
+
+    config.ls_resolved_admission_max_tokens_per_pool = 100_000
+    manifest = config.ls_decode_manifest()
+    assert manifest["baseline_name"] == "LoongServe-style Decode-only"
+    assert manifest["profile"] == "loong_decode_source_default"
+    assert manifest["ls_admission_max_tokens_per_pool"] == 100_000
+    assert manifest["initial_dop_policy"] == "min_exact_feasible"
+    assert manifest["max_tokens_min"] == 1
+    assert manifest["ignore_eos_required"] is True
 
 
-def test_kv_consolidation_p2p_scratch_is_opt_in(tmp_path):
-    config = Config(model=str(tmp_path), **_ls_kwargs())
+def test_kv_consolidation_feature_off_defaults_are_preserved(tmp_path):
+    config = Config(model=str(tmp_path), kvcache_block_size=64)
     assert config.ls_kv_consolidation_mode == "off"
     assert config.ls_kv_consolidation_candidate_util == 0.50
     assert config.ls_kv_consolidation_target_high_watermark == 0.80
@@ -80,7 +101,7 @@ def test_kv_consolidation_p2p_scratch_is_opt_in(tmp_path):
 
     enabled = Config(
         model=str(tmp_path),
-        **_ls_kwargs(),
+        kvcache_block_size=64,
         ls_kv_consolidation_migration_chunk_tokens=128,
     )
     assert enabled.ls_kv_consolidation_migration_chunk_tokens == 128
@@ -88,42 +109,75 @@ def test_kv_consolidation_p2p_scratch_is_opt_in(tmp_path):
     with pytest.raises(ValueError, match="must be >= 0"):
         Config(
             model=str(tmp_path),
-            **_ls_kwargs(),
+            kvcache_block_size=64,
             ls_kv_consolidation_migration_chunk_tokens=-1,
         )
 
 
-def test_kv_consolidation_shadow_and_execute_validation(tmp_path):
-    shadow = Config(
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"ls_decode_initial_kv_dop": 8}, "ls_decode_initial_kv_dop must be 0"),
+        (
+            {"ls_decode_enable_memory_scale_up": False},
+            "ls_decode_enable_memory_scale_up must be True",
+        ),
+        (
+            {"ls_decode_enable_future_kv_admission": False},
+            "ls_decode_enable_future_kv_admission must be True",
+        ),
+        ({"ls_kv_consolidation_mode": "off"}, "must be 'execute'"),
+        ({"ls_kv_consolidation_mode": "shadow"}, "must be 'execute'"),
+        ({"ls_kv_consolidation_stable_steps": 32}, "must be 2"),
+        ({"ls_kv_consolidation_cooldown_steps": 64}, "must be 2"),
+        ({"ls_kv_consolidation_check_interval_steps": 8}, "must be 1"),
+        (
+            {"ls_kv_consolidation_max_source_blocks_per_event": 16},
+            "must be 128",
+        ),
+        ({"ls_kv_consolidation_migration_chunk_tokens": 128}, "must be 64"),
+        ({"routing_strategy": "LeastBatch"}, "routing_strategy must be 'RoundRobin'"),
+        ({"dummy_bootstrap_token_id": 1}, "dummy_bootstrap_token_id must be 0"),
+        ({"ls_disable_scale_up": True}, "ls_disable_scale_up must be False"),
+        ({"pause_mode": "kvkeep"}, "pause_mode must be 'offload'"),
+        (
+            {"dp_assignment": "load_aware"},
+            "dp_assignment must be 'arrival_round_robin'",
+        ),
+        ({"cross_dp_scale_up": True}, "cross_dp_scale_up must be False"),
+    ],
+)
+def test_ls_decode_formal_profile_rejects_policy_overrides(
+    tmp_path, override, message
+):
+    kwargs = _ls_kwargs()
+    kwargs.update(override)
+    with pytest.raises(ValueError, match=message):
+        Config(model=str(tmp_path), **kwargs)
+
+
+@pytest.mark.parametrize(
+    "profile", ["loong_decode_artifact_derived", "loong_decode_issue001"]
+)
+def test_workload_profiles_require_explicit_ooe_and_resolve_threshold(
+    tmp_path, profile
+):
+    with pytest.raises(ValueError, match="requires an explicit ls_max_num_ooe"):
+        Config(model=str(tmp_path), **_ls_kwargs(), ls_decode_profile=profile)
+
+    config = Config(
         model=str(tmp_path),
         **_ls_kwargs(),
-        ls_kv_consolidation_mode="shadow",
+        ls_decode_profile=profile,
+        ls_max_num_ooe=7,
     )
-    assert shadow.ls_kv_consolidation_mode == "shadow"
+    assert config.ls_max_num_ooe == 7
+    assert config.ls_min_comp_bound_decoding_batch_size == 128
 
-    with pytest.raises(ValueError, match="migration_chunk_tokens > 0"):
-        Config(
-            model=str(tmp_path),
-            **_ls_kwargs(),
-            ls_kv_consolidation_mode="execute",
-        )
 
-    with pytest.raises(ValueError, match="max_source_blocks_per_event > 0"):
-        Config(
-            model=str(tmp_path),
-            **_ls_kwargs(),
-            ls_kv_consolidation_mode="execute",
-            ls_kv_consolidation_migration_chunk_tokens=128,
-        )
-
-    execute = Config(
-        model=str(tmp_path),
-        **_ls_kwargs(),
-        ls_kv_consolidation_mode="execute",
-        ls_kv_consolidation_migration_chunk_tokens=128,
-        ls_kv_consolidation_max_source_blocks_per_event=16,
-    )
-    assert execute.ls_kv_consolidation_mode == "execute"
+def test_source_default_rejects_non_source_ooe(tmp_path):
+    with pytest.raises(ValueError, match="requires ls_max_num_ooe=10"):
+        Config(model=str(tmp_path), **_ls_kwargs(), ls_max_num_ooe=7)
 
 
 @pytest.mark.parametrize(

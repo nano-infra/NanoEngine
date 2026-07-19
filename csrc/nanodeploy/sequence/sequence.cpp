@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 
@@ -114,6 +115,21 @@ Sequence::Sequence(const std::vector<int>& token_ids, double temperature, int ma
     num_prompt_tokens       = num_tokens;
     num_checkpointed_tokens = num_tokens;
     num_cached_tokens       = 0;
+}
+
+void Sequence::restore_seq_id(uint64_t restored_seq_id)
+{
+    if (restored_seq_id == std::numeric_limits<uint64_t>::max()) {
+        throw std::invalid_argument("serialized sequence ID cannot be UINT64_MAX");
+    }
+
+    const uint64_t next_id = restored_seq_id + 1;
+    uint64_t       current = next_seq_id_.load(std::memory_order_relaxed);
+    while (current < next_id
+           && !next_seq_id_.compare_exchange_weak(
+               current, next_id, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+    seq_id = restored_seq_id;
 }
 
 BlockContext& Sequence::block_ctx(BlockContextSlot slot)

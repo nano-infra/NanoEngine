@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "nanodeploy/sequence/sequence.h"
@@ -41,6 +42,113 @@ struct SPBucketInterval {
 
 class SPStateManager {
 public:
+    class PreparedLSInitialBatch {
+    public:
+        enum class State {
+            PREPARED,
+            COMMITTED,
+            ABORTED
+        };
+
+        PreparedLSInitialBatch(const PreparedLSInitialBatch&)            = delete;
+        PreparedLSInitialBatch& operator=(const PreparedLSInitialBatch&) = delete;
+        PreparedLSInitialBatch(PreparedLSInitialBatch&& other) noexcept;
+        PreparedLSInitialBatch& operator=(PreparedLSInitialBatch&& other) noexcept;
+        ~PreparedLSInitialBatch() noexcept;
+
+        State state() const noexcept
+        {
+            return state_;
+        }
+
+        // The caller must validate immediately before entering its no-throw
+        // publication region. A false result means stable Sequence/counter
+        // state changed since prepare and the mutation must be aborted.
+        bool validate_precommit_noexcept() const noexcept;
+
+        // Idempotent, allocation-free publication/rollback primitives.
+        void commit_noexcept() noexcept;
+        void abort_noexcept() noexcept;
+
+    private:
+        friend class SPStateManager;
+        struct Impl;
+
+        explicit PreparedLSInitialBatch(std::unique_ptr<Impl> impl) noexcept;
+        void     take_from(PreparedLSInitialBatch&& other) noexcept;
+
+        std::unique_ptr<Impl> impl_;
+        State                 state_ = State::ABORTED;
+    };
+
+    class PreparedLSRelease {
+    public:
+        enum class State {
+            PREPARED,
+            COMMITTED,
+            ABORTED
+        };
+
+        PreparedLSRelease(const PreparedLSRelease&)            = delete;
+        PreparedLSRelease& operator=(const PreparedLSRelease&) = delete;
+        PreparedLSRelease(PreparedLSRelease&& other) noexcept;
+        PreparedLSRelease& operator=(PreparedLSRelease&& other) noexcept;
+        ~PreparedLSRelease() noexcept;
+
+        State state() const noexcept
+        {
+            return state_;
+        }
+
+        bool validate_precommit_noexcept() const noexcept;
+        void commit_noexcept() noexcept;
+        void abort_noexcept() noexcept;
+
+    private:
+        friend class SPStateManager;
+        struct Impl;
+
+        explicit PreparedLSRelease(std::unique_ptr<Impl> impl) noexcept;
+        void     take_from(PreparedLSRelease&& other) noexcept;
+
+        std::unique_ptr<Impl> impl_;
+        State                 state_ = State::ABORTED;
+    };
+
+    class PreparedLSIterationMasterPlan {
+    public:
+        enum class State {
+            PREPARED,
+            COMMITTED,
+            ABORTED
+        };
+
+        PreparedLSIterationMasterPlan(const PreparedLSIterationMasterPlan&)            = delete;
+        PreparedLSIterationMasterPlan& operator=(const PreparedLSIterationMasterPlan&) = delete;
+        PreparedLSIterationMasterPlan(PreparedLSIterationMasterPlan&& other) noexcept;
+        PreparedLSIterationMasterPlan& operator=(PreparedLSIterationMasterPlan&& other) noexcept;
+        ~PreparedLSIterationMasterPlan() noexcept;
+
+        State state() const noexcept
+        {
+            return state_;
+        }
+
+        bool validate_precommit_noexcept() const noexcept;
+        void commit_noexcept() noexcept;
+        void abort_noexcept() noexcept;
+
+    private:
+        friend class SPStateManager;
+        struct Impl;
+
+        explicit PreparedLSIterationMasterPlan(std::unique_ptr<Impl> impl) noexcept;
+        void     take_from(PreparedLSIterationMasterPlan&& other) noexcept;
+
+        std::unique_ptr<Impl> impl_;
+        State                 state_ = State::ABORTED;
+    };
+
     struct StageModel {
         double a = 1.0;
         double b = 0.0;
@@ -120,16 +228,33 @@ public:
         enum class State {
             REJECTED,
             RESERVED,
+            DISPATCHED,
             COMMITTED,
             ABORTED
         };
 
+        struct PreparedBlockStage {
+            int                                 rank = -1;
+            BlockManager::PreparedBlockMutation mutation;
+
+            PreparedBlockStage(int rank, BlockManager::PreparedBlockMutation&& mutation) noexcept:
+                rank(rank), mutation(std::move(mutation))
+            {
+            }
+
+            PreparedBlockStage(const PreparedBlockStage&)            = delete;
+            PreparedBlockStage& operator=(const PreparedBlockStage&) = delete;
+            PreparedBlockStage(PreparedBlockStage&&) noexcept         = default;
+            PreparedBlockStage& operator=(PreparedBlockStage&&) noexcept = default;
+        };
+
         struct SequenceStage {
-            std::shared_ptr<Sequence>                     sequence;
-            BlockContext                                  old_context;
-            BlockContext                                  staged_context;
-            std::vector<int>                              source_blocks;
-            std::vector<std::pair<int, std::vector<int>>> reserved_blocks;
+            std::shared_ptr<Sequence>                sequence;
+            BlockContext                             old_context;
+            BlockContext                             staged_context;
+            std::vector<int>                         source_blocks;
+            std::vector<PreparedBlockStage>          destination_allocations;
+            std::optional<BlockManager::PreparedBlockMutation> source_release;
         };
 
         struct SequenceSnapshot {
@@ -150,7 +275,24 @@ public:
         int64_t                       num_tokens = 0;
         State                         state      = State::REJECTED;
         std::vector<SequenceSnapshot> sequence_snapshots;
+        // Prepared mutations keep raw BlockManager pointers. A plan can be
+        // retained by Python after Scheduler teardown, so keep every manager
+        // alive until sequence_stages (declared after this guard) is destroyed.
+        std::vector<std::shared_ptr<BlockManager>> block_manager_lifetime_guards;
         std::vector<SequenceStage>    sequence_stages;
+        std::vector<int>              master_seq_counts_before;
+        std::vector<int>              master_seq_counts_after;
+        std::vector<int>              recv_seq_counts_before;
+        std::vector<int>              recv_seq_counts_after;
+        int                           running_seqs_before   = 0;
+        int                           running_tokens_before = 0;
+
+        // Scheduler publication shadows are populated while the transaction
+        // is still RESERVED. The post-copy commit only swaps these vectors and
+        // scalar metadata; it performs no allocation.
+        std::vector<int> scheduler_allocation_before;
+        std::vector<int> scheduler_allocation_after;
+        std::vector<int> scheduler_last_iteration_masters_after;
     };
 
     SPStateManager(const std::string& engine_id,
@@ -222,6 +364,28 @@ public:
     void apply_planned_placement(Sequence& seq, const PlannedPlacement& placement);
 
     void               allocate_ls_initial(Sequence& seq);
+    // Formal LS path. placement_contexts contain the complete logical prompt
+    // placement but no physical block IDs. prepare reserves exact physical
+    // blocks, including one fixed dummy-bootstrap token of headroom on each
+    // sequence's master, and builds complete shadow ACTIVE contexts without
+    // changing stable Sequence state. commit_noexcept() swaps those contexts
+    // and publishes counters including that future dummy token
+    // (baseline + sum(prompt_tokens + 1)); the caller must append/mark the
+    // already-reserved dummy without calling add_running_tokens(). It never
+    // calls legacy allocate or may_append APIs.
+    PreparedLSInitialBatch
+    prepare_ls_initial_batch(const std::vector<std::shared_ptr<Sequence>>& batch,
+                             const std::vector<BlockContext>&              placement_contexts);
+    // Convenience overload for callers that already installed placement-only
+    // ACTIVE contexts. New formal callers should use the explicit-shadow
+    // overload above so prepare leaves stable contexts untouched.
+    PreparedLSInitialBatch prepare_ls_initial_batch(const std::vector<std::shared_ptr<Sequence>>& batch);
+
+    // Prepare an exact, allocation-free-at-commit ACTIVE release for OFFLOAD
+    // and bootstrap-finished cleanup. Other slots remain on the legacy path.
+    PreparedLSRelease prepare_ls_release(const std::shared_ptr<Sequence>& sequence,
+                                         BlockContextSlot slot = BlockContextSlot::ACTIVE);
+
     void               allocate_ls_initial_batch(const std::vector<std::shared_ptr<Sequence>>& batch,
                                                  int failure_after_allocations_for_test = -1);
     void               set_decode_master(Sequence& seq, int master_sp_idx);
@@ -236,9 +400,23 @@ public:
     bool               validate_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
                                                       const LSDecodeMasterPlan&                     plan,
                                                       std::string*                                  error = nullptr) const;
-    bool               reassign_pending_append(Sequence& seq, int target_sp_idx);
-    bool               commit_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
-                                                    const LSDecodeMasterPlan&                     plan);
+    // Formal LS Decode publication adapter. It builds complete shadow ACTIVE
+    // contexts and rank-local prepared rebalances from a validated plan. The
+    // current pending frontier and its output headroom can be transferred on a
+    // completely full rank; prepare never changes Sequence/counter state and
+    // commit/abort are idempotent, allocation-free and noexcept.
+    PreparedLSIterationMasterPlan prepare_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
+                                                                const LSDecodeMasterPlan&                     plan);
+    // Validate the final manager counters for one atomic pool step that may
+    // publish a survivor admission before applying the existing Decode
+    // iteration's role deltas. Both transactions must still be PREPARED and
+    // individually fresh. The check is allocation-free and noexcept so the
+    // scheduler can repeat it immediately before entering publication.
+    bool validate_ls_pool_step_composition_noexcept(const PreparedLSInitialBatch*        initial,
+                                                    const PreparedLSIterationMasterPlan* iteration) const noexcept;
+    bool reassign_pending_append(Sequence& seq, int target_sp_idx);
+    bool commit_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
+                                      const LSDecodeMasterPlan&                     plan);
     std::shared_ptr<LSKVConsolidationPlan>
                      plan_kv_consolidation(uint64_t                                      transaction_id,
                                            uint64_t                                      group_id,
@@ -246,8 +424,8 @@ public:
                                            const std::vector<std::shared_ptr<Sequence>>& sequences,
                                            int                                           source_rank,
                                            const std::vector<int>&                       retained_ranks);
-    bool             commit_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan);
-    void             abort_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan);
+    bool             commit_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan) noexcept;
+    void             abort_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan) noexcept;
     std::vector<int> group_used_kv_tokens(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
     std::vector<int> group_used_kv_blocks(const std::vector<std::shared_ptr<Sequence>>& seqs) const;
     int              get_active_master_count(const std::vector<std::shared_ptr<Sequence>>& seqs) const;

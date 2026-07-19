@@ -9,7 +9,9 @@ import logging
 import random
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -19,7 +21,20 @@ ISSUE003_DIR = SCRIPT_DIR / "issue003"
 if str(ISSUE003_DIR) not in sys.path:
     sys.path.insert(0, str(ISSUE003_DIR))
 
-import bench_serving_overhead as serving  # noqa: E402
+try:
+    from ls_decode_issue001_profile import (
+        add_formal_profile_arguments,
+        clear_ray_proxy_env,
+        formal_engine_kwargs,
+        resolved_manifest,
+    )
+except ModuleNotFoundError:  # pragma: no cover - module-style invocation
+    from scripts.ls_decode_issue001_profile import (
+        add_formal_profile_arguments,
+        clear_ray_proxy_env,
+        formal_engine_kwargs,
+        resolved_manifest,
+    )
 
 
 DEFAULT_DATASET = Path(
@@ -49,9 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--burstiness", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-jsonl", type=Path, required=True)
-    parser.add_argument("--warmup-requests", type=int, default=32)
-    parser.add_argument("--warmup-prompt-len", type=int, default=512)
-    parser.add_argument("--warmup-max-tokens", type=int, default=8)
+    parser.add_argument(
+        "--manifest-json",
+        type=Path,
+        default=None,
+        help="Defaults to <output-jsonl stem>.manifest.json.",
+    )
     parser.add_argument("--verbose-nanodeploy-logs", action="store_true")
 
     parser.add_argument("--attention-dp", type=int, default=2, choices=[1, 2, 4])
@@ -64,29 +82,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-limit-gb", type=float, default=141.0)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--segment-size", type=int, default=65_536)
-    parser.add_argument("--routing-strategy", default="LeastBatch")
     parser.add_argument("--cuda-graph-mode", choices=["full", "piecewise"], default="full")
     parser.add_argument("--enforce-eager", action="store_true")
 
-    parser.add_argument("--ls-initial-kv-dop", type=int, default=0)
-    parser.add_argument("--ls-batch-per-master", type=int, default=8)
+    add_formal_profile_arguments(parser)
     parser.add_argument(
-        "--ls-kv-consolidation-mode",
-        choices=["off", "shadow", "execute"],
-        default="execute",
-    )
-    parser.add_argument("--ls-kv-consolidation-candidate-util", type=float, default=0.50)
-    parser.add_argument(
-        "--ls-kv-consolidation-target-high-watermark", type=float, default=0.80
-    )
-    parser.add_argument("--ls-kv-consolidation-stable-steps", type=int, default=2)
-    parser.add_argument("--ls-kv-consolidation-cooldown-steps", type=int, default=2)
-    parser.add_argument("--ls-kv-consolidation-check-interval-steps", type=int, default=1)
-    parser.add_argument(
-        "--ls-kv-consolidation-max-source-blocks-per-event", type=int, default=128
-    )
-    parser.add_argument(
-        "--ls-kv-consolidation-migration-chunk-tokens", type=int, default=64
+        "--ls-batch-per-master",
+        type=int,
+        default=64,
+        help="Legacy constructor ABI value; recorded in the resolved manifest.",
     )
     args = parser.parse_args()
 
@@ -94,8 +98,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("duration-sec, request-rate, and burstiness must be positive")
     if args.num_requests < 0:
         parser.error("num-requests must be non-negative")
-    if args.warmup_requests < 0:
-        parser.error("warmup-requests must be non-negative")
+    if args.ls_batch_per_master <= 0:
+        parser.error("--ls-batch-per-master must be > 0")
     if not args.csv_path.is_file():
         parser.error(f"CSV file not found: {args.csv_path}")
     if args.attention_sp != 8:
@@ -105,49 +109,11 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def run_warmup(engine, args: argparse.Namespace) -> None:
-    if args.warmup_requests == 0:
-        return
-
-    sampling_params = serving.SamplingParams(
-        temperature=0.6,
-        ignore_eos=True,
-        max_tokens=args.warmup_max_tokens,
+def build_engine(args: argparse.Namespace, serving):
+    ls_kwargs = formal_engine_kwargs(
+        args.ls_max_num_ooe,
+        ls_decode_batch_per_master=args.ls_batch_per_master,
     )
-    sequences = [
-        serving.Sequence(
-            token_ids=np.random.randint(
-                0, 10_000, size=args.warmup_prompt_len
-            ).tolist(),
-            sampling_params=sampling_params,
-        )
-        for _ in range(args.warmup_requests)
-    ]
-    for sequence in sequences:
-        engine.add_request(sequence)
-
-    completed = 0
-    steps = 0
-    started = time.perf_counter()
-    while not engine.is_finished():
-        outputs, _, _, _, _ = engine.step()
-        completed += len(outputs)
-        steps += 1
-    print(
-        "LS_WARMUP_SUMMARY "
-        + json.dumps(
-            {
-                "requests": args.warmup_requests,
-                "completed": completed,
-                "steps": steps,
-                "duration_sec": time.perf_counter() - started,
-            }
-        ),
-        flush=True,
-    )
-
-
-def build_engine(args: argparse.Namespace):
     return serving.LLM(
         args.model_path,
         enforce_eager=args.enforce_eager,
@@ -171,7 +137,6 @@ def build_engine(args: argparse.Namespace):
         max_num_recv_seqs=args.max_num_recv_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         loop_count=1,
-        routing_strategy=args.routing_strategy,
         scheduler_mode="centralized",
         segment_size=args.segment_size,
         kvcache_block_size=64,
@@ -183,27 +148,95 @@ def build_engine(args: argparse.Namespace):
         enable_dynamic_sp_size=False,
         use_new_decode_dynamic_sp_scheduler=False,
         dynamic_sp_size_strategy="legacy",
-        enable_ls_decode_core_scheduler=True,
-        ls_decode_initial_kv_dop=args.ls_initial_kv_dop,
-        ls_decode_batch_per_master=args.ls_batch_per_master,
-        ls_decode_enable_memory_scale_up=True,
-        ls_kv_consolidation_mode=args.ls_kv_consolidation_mode,
-        ls_kv_consolidation_candidate_util=args.ls_kv_consolidation_candidate_util,
-        ls_kv_consolidation_target_high_watermark=(
-            args.ls_kv_consolidation_target_high_watermark
-        ),
-        ls_kv_consolidation_stable_steps=args.ls_kv_consolidation_stable_steps,
-        ls_kv_consolidation_cooldown_steps=args.ls_kv_consolidation_cooldown_steps,
-        ls_kv_consolidation_check_interval_steps=(
-            args.ls_kv_consolidation_check_interval_steps
-        ),
-        ls_kv_consolidation_max_source_blocks_per_event=(
-            args.ls_kv_consolidation_max_source_blocks_per_event
-        ),
-        ls_kv_consolidation_migration_chunk_tokens=(
-            args.ls_kv_consolidation_migration_chunk_tokens
-        ),
+        **ls_kwargs,
     )
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _manifest_path(args: argparse.Namespace) -> Path:
+    if args.manifest_json is not None:
+        return args.manifest_json
+    return args.output_jsonl.with_suffix(".manifest.json")
+
+
+def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _build_manifest(
+    engine,
+    args: argparse.Namespace,
+    manifest_path: Path,
+    cleared_proxy_keys: list[str],
+) -> dict[str, Any]:
+    resolved = resolved_manifest(engine.config, args.ls_max_num_ooe)
+    num_blocks = int(engine.config.num_kvcache_blocks)
+    pool_kv_tokens = (
+        engine.config.attention_sp
+        * num_blocks
+        * engine.config.kvcache_block_size
+    )
+    return {
+        "schema_version": 1,
+        "status": "initialized",
+        "created_utc": _utc_now(),
+        "baseline": resolved,
+        "initialization": {
+            "engine_id": engine.engine_id,
+            "scheduler_state_initialized_once": True,
+            "warmup_policy": "disabled_for_formal_issue001",
+            "warmup_requests": 0,
+            "engine_reused_after_request_warmup": False,
+            "cleared_http_proxy_env_keys": cleared_proxy_keys,
+        },
+        "topology_capacity": {
+            "num_kvcache_blocks_per_rank": num_blocks,
+            "pool_total_kv_tokens": pool_kv_tokens,
+            "resolved_admission_max_tokens_per_pool": resolved[
+                "ls_admission_max_tokens_per_pool"
+            ],
+        },
+        "workload": {
+            "kind": "issue001_csv",
+            "csv_path": str(args.csv_path),
+            "duration_sec": args.duration_sec,
+            "request_rate": args.request_rate,
+            "num_requests": args.num_requests,
+            "burstiness": args.burstiness,
+            "seed": args.seed,
+            "max_input_len": args.max_input_len,
+            "max_model_len": args.max_model_len,
+            "max_tokens_contract": ">=1",
+            "ignore_eos_required": True,
+            "dp_assignment": "arrival_round_robin",
+        },
+        "engine_runtime": {
+            "model_path": args.model_path,
+            "ray_address": args.ray_address,
+            "master_address": args.master_address,
+            "max_num_seqs": args.max_num_seqs,
+            "max_num_recv_seqs": args.max_num_recv_seqs,
+            "max_num_batched_tokens": args.max_num_batched_tokens,
+            "gpu_memory_limit_gb": args.gpu_memory_limit_gb,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "segment_size": args.segment_size,
+            "cuda_graph_mode": args.cuda_graph_mode,
+            "enforce_eager": args.enforce_eager,
+        },
+        "artifacts": {
+            "completion_jsonl": str(args.output_jsonl),
+            "manifest_json": str(manifest_path),
+        },
+        "result": None,
+    }
 
 
 def main() -> None:
@@ -211,10 +244,13 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = _manifest_path(args)
+    cleared_proxy_keys = clear_ray_proxy_env()
 
     config = vars(args).copy()
     config["csv_path"] = str(args.csv_path)
     config["output_jsonl"] = str(args.output_jsonl)
+    config["manifest_json"] = str(manifest_path)
     config["ffn_ep"] = args.attention_dp * args.attention_sp
     config["loop_count"] = 1
     print("LS_BENCH_CONFIG " + json.dumps(config, sort_keys=True), flush=True)
@@ -227,9 +263,16 @@ def main() -> None:
         for handler in nanodeploy_logger.handlers:
             handler.setLevel(logging.WARNING)
 
-    engine = build_engine(args)
+    # Importing the legacy dataset/metrics helpers loads GPU model modules, so
+    # keep it after CLI validation and proxy cleanup. In particular, --help and
+    # CPU-only profile tests must not initialize CUDA.
+    import bench_serving_overhead as serving
+
+    engine = build_engine(args, serving)
     serving.print_model_config(engine)
-    run_warmup(engine, args)
+    manifest = _build_manifest(engine, args, manifest_path, cleared_proxy_keys)
+    _write_manifest(manifest_path, manifest)
+    print("LS_BENCH_MANIFEST " + json.dumps(manifest, sort_keys=True), flush=True)
 
     dataset_args = argparse.Namespace(
         dataset="csv",
@@ -253,15 +296,40 @@ def main() -> None:
         ),
         flush=True,
     )
-    total_time, seq_map = serving.run_benchmark(
-        engine, request_generator, arrival_times, args.num_requests
+    try:
+        total_time, seq_map = serving.run_benchmark(
+            engine, request_generator, arrival_times, args.num_requests
+        )
+        serving.calculate_and_print_metrics(
+            total_time,
+            seq_map,
+            args.num_requests,
+            itl_log_path=str(args.output_jsonl),
+        )
+    except BaseException as error:
+        manifest["status"] = "failed"
+        manifest["completed_utc"] = _utc_now()
+        manifest["result"] = {
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+        _write_manifest(manifest_path, manifest)
+        raise
+
+    completed = sum(
+        1
+        for sequence in seq_map.values()
+        if sequence.metric is not None and sequence.metric.completion_time
     )
-    serving.calculate_and_print_metrics(
-        total_time,
-        seq_map,
-        args.num_requests,
-        itl_log_path=str(args.output_jsonl),
-    )
+    manifest["status"] = "success"
+    manifest["completed_utc"] = _utc_now()
+    manifest["result"] = {
+        "total_time_sec": total_time,
+        "requests_sent": args.num_requests,
+        "requests_completed": completed,
+        "sampled_last_arrival_sec": float(arrival_times[-1]),
+    }
+    _write_manifest(manifest_path, manifest)
 
 
 if __name__ == "__main__":

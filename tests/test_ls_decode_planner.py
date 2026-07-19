@@ -93,7 +93,10 @@ def _remote_receiver_counts(
         (_T_COMPUTE, [_T_COMPUTE]),
         (_T_COMPUTE + 1, [_T_COMPUTE, 1]),
         (2 * _T_COMPUTE, [_T_COMPUTE, _T_COMPUTE]),
-        (2 * _T_COMPUTE + 1, [_T_COMPUTE, _T_COMPUTE, 1]),
+        # Source uses floor division for the global compute decision: 9 // 2
+        # equals the threshold, so a third rank must not be added merely because
+        # the final source-greedy chunk contains five requests.
+        (2 * _T_COMPUTE + 1, [_T_COMPUTE, _T_COMPUTE + 1]),
     ],
 )
 def test_source_greedy_threshold_boundaries(
@@ -112,14 +115,20 @@ def test_source_greedy_threshold_boundaries(
 
     assert plan.success, plan.failure_reason
     assert list(plan.master_batch_sizes) == expected_chunks
-    assert list(plan.master_ranks) == list(range(len(expected_chunks)))
+    added = max(0, len(expected_chunks) - 1)
+    expected_master_ranks = (
+        [0, *range(_SP_SIZE - added, _SP_SIZE)] if expected_chunks else []
+    )
+    assert list(plan.master_ranks) == expected_master_ranks
     assert sum(plan.master_batch_sizes) == batch_size
     assert list(plan.sequence_master_ranks) == [
         rank
         for rank, chunk_size in zip(plan.master_ranks, expected_chunks, strict=True)
         for _ in range(chunk_size)
     ]
-    assert list(plan.new_allocation_ranks) == list(range(1, len(expected_chunks)))
+    assert list(plan.new_allocation_ranks) == list(
+        range(_SP_SIZE - 1, _SP_SIZE - 1 - added, -1)
+    )
     assert plan.scale_reason == ("compute" if batch_size > _T_COMPUTE else "none")
 
     valid, error = manager.validate_iteration_master_plan(requests, plan)

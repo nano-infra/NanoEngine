@@ -4,18 +4,29 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, median
 from typing import Any, TextIO
 
 import numpy as np
 
-
-PROXY_ENV_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+try:
+    from ls_decode_issue001_profile import (
+        add_formal_profile_arguments,
+        clear_ray_proxy_env,
+        formal_engine_kwargs,
+        resolved_manifest,
+    )
+except ModuleNotFoundError:  # pragma: no cover - module-style invocation
+    from scripts.ls_decode_issue001_profile import (
+        add_formal_profile_arguments,
+        clear_ray_proxy_env,
+        formal_engine_kwargs,
+        resolved_manifest,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,37 +87,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kvcache-block-size", type=int, default=64)
     parser.add_argument("--segment-size", type=int, default=65536)
     parser.add_argument("--ls-initial-kv-dop", type=int, default=0)
-    parser.add_argument("--ls-batch-per-master", type=int, default=8)
+    parser.add_argument(
+        "--ls-batch-per-master",
+        type=int,
+        default=64,
+        help="Legacy constructor ABI value; recorded in the resolved manifest.",
+    )
     parser.add_argument(
         "--ls-kv-consolidation-mode",
-        choices=["off", "shadow", "execute"],
-        default="off",
+        choices=["execute"],
+        default="execute",
     )
     parser.add_argument("--ls-kv-consolidation-candidate-util", type=float, default=0.50)
     parser.add_argument(
         "--ls-kv-consolidation-target-high-watermark", type=float, default=0.80
     )
-    parser.add_argument("--ls-kv-consolidation-stable-steps", type=int, default=32)
-    parser.add_argument("--ls-kv-consolidation-cooldown-steps", type=int, default=64)
+    parser.add_argument("--ls-kv-consolidation-stable-steps", type=int, default=2)
+    parser.add_argument("--ls-kv-consolidation-cooldown-steps", type=int, default=2)
     parser.add_argument(
-        "--ls-kv-consolidation-check-interval-steps", type=int, default=8
+        "--ls-kv-consolidation-check-interval-steps", type=int, default=1
     )
     parser.add_argument(
-        "--ls-kv-consolidation-max-source-blocks-per-event", type=int, default=0
+        "--ls-kv-consolidation-max-source-blocks-per-event", type=int, default=128
     )
     parser.add_argument(
-        "--ls-kv-consolidation-migration-chunk-tokens", type=int, default=0
+        "--ls-kv-consolidation-migration-chunk-tokens", type=int, default=64
     )
     parser.add_argument(
         "--disable-ls-memory-scale-up",
         action="store_true",
         help="Disable LS decode memory scale-up.",
     )
-    parser.add_argument(
-        "--routing-strategy",
-        choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
-        default="RoundRobin",
-    )
+    add_formal_profile_arguments(parser)
     parser.add_argument(
         "--cuda-graph-mode",
         choices=["full", "piecewise"],
@@ -117,12 +129,10 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(enforce_eager=True)
     parser.add_argument("--real-weight", dest="dummy_weight", action="store_false")
     parser.set_defaults(dummy_weight=True)
-    parser.add_argument("--warmup-requests", type=int, default=16)
-    parser.add_argument("--warmup-prompt-len", type=int, default=512)
-    parser.add_argument("--warmup-max-tokens", type=int, default=8)
     parser.add_argument("--steady-start-sec", type=float, default=60.0)
     parser.add_argument("--progress-interval-sec", type=float, default=30.0)
     parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument("--manifest-json", type=Path, default=None)
     parser.add_argument(
         "--completion-jsonl",
         "--itl-log-path",
@@ -151,34 +161,24 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-num-recv-seqs must be > 0")
     if args.ls_batch_per_master <= 0:
         parser.error("--ls-batch-per-master must be > 0")
-    if (
-        args.ls_kv_consolidation_mode == "execute"
-        and args.ls_kv_consolidation_migration_chunk_tokens <= 0
-    ):
-        parser.error(
-            "--ls-kv-consolidation-mode execute requires "
-            "--ls-kv-consolidation-migration-chunk-tokens > 0"
-        )
-    if (
-        args.ls_kv_consolidation_mode == "execute"
-        and args.ls_kv_consolidation_max_source_blocks_per_event <= 0
-    ):
-        parser.error(
-            "--ls-kv-consolidation-mode execute requires "
-            "--ls-kv-consolidation-max-source-blocks-per-event > 0"
-        )
-    if args.warmup_requests < 0:
-        parser.error("--warmup-requests must be >= 0")
+    frozen_cli_values = {
+        "ls_initial_kv_dop": 0,
+        "ls_kv_consolidation_mode": "execute",
+        "ls_kv_consolidation_candidate_util": 0.50,
+        "ls_kv_consolidation_target_high_watermark": 0.80,
+        "ls_kv_consolidation_stable_steps": 2,
+        "ls_kv_consolidation_cooldown_steps": 2,
+        "ls_kv_consolidation_check_interval_steps": 1,
+        "ls_kv_consolidation_max_source_blocks_per_event": 128,
+        "ls_kv_consolidation_migration_chunk_tokens": 64,
+    }
+    for name, expected in frozen_cli_values.items():
+        if getattr(args, name) != expected:
+            option = "--" + name.replace("_", "-")
+            parser.error(f"{option} is frozen to {expected!r} for formal Issue001")
+    if args.disable_ls_memory_scale_up:
+        parser.error("formal Issue001 requires LS memory scale-up")
     return args
-
-
-def clear_http_proxy_env() -> list[str]:
-    cleared = []
-    for key in PROXY_ENV_KEYS:
-        if key in os.environ:
-            cleared.append(key)
-            os.environ.pop(key, None)
-    return cleared
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -265,11 +265,16 @@ def make_sequence(
     return Sequence(prompt, sampling_params=sampling_params)
 
 
-def default_output_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+def default_output_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     num_gpus = args.attention_dp * 8
     stem = f"ls_decode_longrun_{num_gpus}gpu_{int(args.duration_sec)}s_{timestamp}"
-    return Path("docs-dev") / f"{stem}.json", Path("docs-dev") / f"{stem}.jsonl"
+    root = Path("docs-dev")
+    return (
+        root / f"{stem}.json",
+        root / f"{stem}.jsonl",
+        root / f"{stem}.manifest.json",
+    )
 
 
 def build_engine(args: argparse.Namespace) -> LLM:
@@ -285,6 +290,10 @@ def build_engine(args: argparse.Namespace) -> LLM:
             max_model_len,
             args.max_num_seqs * (args.prompt_len + args.max_tokens) + 1024,
         )
+    ls_kwargs = formal_engine_kwargs(
+        args.ls_max_num_ooe,
+        ls_decode_batch_per_master=args.ls_batch_per_master,
+    )
 
     return LLM(
         args.model_path,
@@ -309,7 +318,6 @@ def build_engine(args: argparse.Namespace) -> LLM:
         max_num_recv_seqs=args.max_num_recv_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         loop_count=1,
-        routing_strategy=args.routing_strategy,
         scheduler_mode="centralized",
         segment_size=args.segment_size,
         kvcache_block_size=args.kvcache_block_size,
@@ -318,34 +326,17 @@ def build_engine(args: argparse.Namespace) -> LLM:
         use_dlslime_rpc=True,
         optimize_decode_block_table=True,
         enable_non_uniform_split=False,
-        enable_ls_decode_core_scheduler=True,
-        ls_decode_initial_kv_dop=args.ls_initial_kv_dop,
-        ls_decode_batch_per_master=args.ls_batch_per_master,
-        ls_decode_enable_memory_scale_up=not args.disable_ls_memory_scale_up,
-        ls_kv_consolidation_mode=args.ls_kv_consolidation_mode,
-        ls_kv_consolidation_candidate_util=(
-            args.ls_kv_consolidation_candidate_util
-        ),
-        ls_kv_consolidation_target_high_watermark=(
-            args.ls_kv_consolidation_target_high_watermark
-        ),
-        ls_kv_consolidation_stable_steps=args.ls_kv_consolidation_stable_steps,
-        ls_kv_consolidation_cooldown_steps=(
-            args.ls_kv_consolidation_cooldown_steps
-        ),
-        ls_kv_consolidation_check_interval_steps=(
-            args.ls_kv_consolidation_check_interval_steps
-        ),
-        ls_kv_consolidation_max_source_blocks_per_event=(
-            args.ls_kv_consolidation_max_source_blocks_per_event
-        ),
-        ls_kv_consolidation_migration_chunk_tokens=(
-            args.ls_kv_consolidation_migration_chunk_tokens
-        ),
+        **ls_kwargs,
     )
 
 
-def config_dict(args: argparse.Namespace, output_json: Path, completion_jsonl: Path) -> dict[str, Any]:
+def config_dict(
+    engine: LLM,
+    args: argparse.Namespace,
+    output_json: Path,
+    completion_jsonl: Path,
+    manifest_json: Path,
+) -> dict[str, Any]:
     max_model_len = args.max_model_len
     if max_model_len <= 0:
         max_model_len = args.prompt_len + args.max_tokens + 16
@@ -355,7 +346,9 @@ def config_dict(args: argparse.Namespace, output_json: Path, completion_jsonl: P
             max_model_len,
             args.max_num_seqs * (args.prompt_len + args.max_tokens) + 1024,
         )
+    baseline = resolved_manifest(engine.config, args.ls_max_num_ooe)
     return {
+        "resolved_ls_decode_manifest": baseline,
         "model_path": args.model_path,
         "ray_address": args.ray_address,
         "master_address": args.master_address,
@@ -376,31 +369,42 @@ def config_dict(args: argparse.Namespace, output_json: Path, completion_jsonl: P
         "fixed_sp_size": 0,
         "sp_backend": "hao_basic",
         "enable_ls_decode_core_scheduler": True,
-        "ls_decode_initial_kv_dop": args.ls_initial_kv_dop,
-        "ls_decode_batch_per_master": args.ls_batch_per_master,
-        "ls_decode_enable_memory_scale_up": not args.disable_ls_memory_scale_up,
-        "ls_kv_consolidation_mode": args.ls_kv_consolidation_mode,
-        "ls_kv_consolidation_candidate_util": (
-            args.ls_kv_consolidation_candidate_util
-        ),
-        "ls_kv_consolidation_target_high_watermark": (
-            args.ls_kv_consolidation_target_high_watermark
-        ),
-        "ls_kv_consolidation_stable_steps": (
-            args.ls_kv_consolidation_stable_steps
-        ),
-        "ls_kv_consolidation_cooldown_steps": (
-            args.ls_kv_consolidation_cooldown_steps
-        ),
-        "ls_kv_consolidation_check_interval_steps": (
-            args.ls_kv_consolidation_check_interval_steps
-        ),
-        "ls_kv_consolidation_max_source_blocks_per_event": (
-            args.ls_kv_consolidation_max_source_blocks_per_event
-        ),
-        "ls_kv_consolidation_migration_chunk_tokens": (
-            args.ls_kv_consolidation_migration_chunk_tokens
-        ),
+        "ls_decode_profile": baseline["profile"],
+        "ls_max_num_ooe": baseline["ls_max_num_ooe"],
+        "ls_running_max_req_size": baseline["ls_running_max_req_size"],
+        "ls_admission_max_tokens_per_pool": baseline[
+            "ls_admission_max_tokens_per_pool"
+        ],
+        "ls_min_comp_bound_decoding_batch_size": baseline[
+            "ls_min_comp_bound_decoding_batch_size"
+        ],
+        "ls_decode_initial_kv_dop": baseline["ls_decode_initial_kv_dop"],
+        "ls_decode_batch_per_master": baseline["ls_decode_batch_per_master"],
+        "ls_decode_enable_memory_scale_up": baseline[
+            "ls_decode_enable_memory_scale_up"
+        ],
+        "ls_kv_consolidation_mode": baseline["ls_kv_consolidation_mode"],
+        "ls_kv_consolidation_candidate_util": baseline[
+            "ls_kv_consolidation_candidate_util"
+        ],
+        "ls_kv_consolidation_target_high_watermark": baseline[
+            "ls_kv_consolidation_target_high_watermark"
+        ],
+        "ls_kv_consolidation_stable_steps": baseline[
+            "ls_kv_consolidation_stable_steps"
+        ],
+        "ls_kv_consolidation_cooldown_steps": baseline[
+            "ls_kv_consolidation_cooldown_steps"
+        ],
+        "ls_kv_consolidation_check_interval_steps": baseline[
+            "ls_kv_consolidation_check_interval_steps"
+        ],
+        "ls_kv_consolidation_max_source_blocks_per_event": baseline[
+            "ls_kv_consolidation_max_source_blocks_per_event"
+        ],
+        "ls_kv_consolidation_migration_chunk_tokens": baseline[
+            "ls_kv_consolidation_migration_chunk_tokens"
+        ],
         "loop_count": 1,
         "max_num_seqs": args.max_num_seqs,
         "max_num_recv_seqs": args.max_num_recv_seqs,
@@ -417,11 +421,11 @@ def config_dict(args: argparse.Namespace, output_json: Path, completion_jsonl: P
         "enforce_eager": args.enforce_eager,
         "cuda_graph_mode": args.cuda_graph_mode,
         "warmup_requests": args.warmup_requests,
-        "warmup_prompt_len": args.warmup_prompt_len,
-        "warmup_max_tokens": args.warmup_max_tokens,
+        "warmup_policy": "disabled_for_formal_issue001",
         "steady_start_sec": args.steady_start_sec,
         "output_json": str(output_json),
         "completion_jsonl": str(completion_jsonl),
+        "manifest_json": str(manifest_json),
     }
 
 
@@ -454,64 +458,6 @@ def completion_record(seq: Sequence, completed_elapsed_s: float) -> dict[str, An
     }
 
 
-def run_warmup(engine: LLM, args: argparse.Namespace, rng: np.random.Generator) -> dict[str, Any]:
-    if args.warmup_requests == 0:
-        return {"requests": 0, "steps": 0, "duration_sec": 0.0}
-
-    warmup_sampling_start = time.perf_counter()
-    warmup_seqs = [
-        make_sequence(
-            rng,
-            args.warmup_prompt_len,
-            args.warmup_max_tokens,
-            args.temperature,
-        )
-        for _ in range(args.warmup_requests)
-    ]
-    engine.add_request(warmup_seqs)
-
-    steps = 0
-    completed = 0
-    decode_steps = 0
-    prefill_steps = 0
-    maintenance_steps = 0
-    start = time.perf_counter()
-    print(
-        "WARMUP_START "
-        + json.dumps(
-            {
-                "requests": args.warmup_requests,
-                "prompt_len": args.warmup_prompt_len,
-                "max_tokens": args.warmup_max_tokens,
-                "sequence_generation_sec": start - warmup_sampling_start,
-            }
-        ),
-        flush=True,
-    )
-    while not engine.is_finished():
-        outputs, num_tokens, _, _, _ = engine.step()
-        steps += 1
-        completed += len(outputs)
-        if num_tokens < 0:
-            decode_steps += 1
-        elif num_tokens == 0:
-            maintenance_steps += 1
-        else:
-            prefill_steps += 1
-    duration = time.perf_counter() - start
-    summary = {
-        "requests": args.warmup_requests,
-        "completed": completed,
-        "steps": steps,
-        "prefill_steps": prefill_steps,
-        "decode_steps": decode_steps,
-        "maintenance_steps": maintenance_steps,
-        "duration_sec": duration,
-    }
-    print("WARMUP_SUMMARY " + json.dumps(summary), flush=True)
-    return summary
-
-
 def write_completion(
     record: dict[str, Any],
     completion_fh: TextIO | None,
@@ -522,8 +468,21 @@ def write_completion(
     completion_fh.flush()
 
 
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
 def run_longrun(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
-    cleared_proxy_keys = clear_http_proxy_env()
+    cleared_proxy_keys = clear_ray_proxy_env()
     if cleared_proxy_keys:
         print(
             "CLEARED_HTTP_PROXY_ENV "
@@ -531,20 +490,64 @@ def run_longrun(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             flush=True,
         )
 
-    output_json, completion_jsonl = default_output_paths(args)
+    output_json, completion_jsonl, manifest_json = default_output_paths(args)
     if args.output_json is not None:
         output_json = args.output_json
     if args.completion_jsonl is not None:
         completion_jsonl = args.completion_jsonl
+    if args.manifest_json is not None:
+        manifest_json = args.manifest_json
     output_json.parent.mkdir(parents=True, exist_ok=True)
     completion_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    manifest_json.parent.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(args.seed)
     engine = build_engine(args)
-    warmup_summary = run_warmup(engine, args, rng)
+    warmup_summary = {
+        "policy": "disabled_for_formal_issue001",
+        "requests": 0,
+        "steps": 0,
+        "duration_sec": 0.0,
+    }
 
-    config = config_dict(args, output_json, completion_jsonl)
+    config = config_dict(
+        engine, args, output_json, completion_jsonl, manifest_json
+    )
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "initialized",
+        "created_utc": utc_now(),
+        "baseline": config["resolved_ls_decode_manifest"],
+        "initialization": {
+            "engine_id": engine.engine_id,
+            "scheduler_state_initialized_once": True,
+            "warmup_policy": "disabled_for_formal_issue001",
+            "warmup_requests": 0,
+            "engine_reused_after_request_warmup": False,
+            "cleared_http_proxy_env_keys": cleared_proxy_keys,
+        },
+        "topology_capacity": {
+            "num_kvcache_blocks_per_rank": int(engine.config.num_kvcache_blocks),
+            "pool_total_kv_tokens": (
+                engine.config.attention_sp
+                * int(engine.config.num_kvcache_blocks)
+                * engine.config.kvcache_block_size
+            ),
+            "resolved_admission_max_tokens_per_pool": config[
+                "ls_admission_max_tokens_per_pool"
+            ],
+        },
+        "config": config,
+        "artifacts": {
+            "summary_json": str(output_json),
+            "completion_jsonl": str(completion_jsonl),
+            "manifest_json": str(manifest_json),
+        },
+        "result": None,
+    }
+    write_manifest(manifest_json, manifest)
     print("RUN_CONFIG " + json.dumps(config, indent=2), flush=True)
+    print("RUN_MANIFEST " + json.dumps(manifest, sort_keys=True), flush=True)
 
     seq_map: dict[str, Sequence] = {}
     completion_records: list[dict[str, Any]] = []
@@ -697,6 +700,18 @@ def run_longrun(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 }
                 print("PROGRESS " + json.dumps(progress), flush=True)
                 last_progress = now
+    except BaseException as error:
+        manifest["status"] = "failed"
+        manifest["completed_utc"] = utc_now()
+        manifest["result"] = {
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "accepted_requests": requests_sent,
+            "completed_requests": len(completion_records),
+            "inflight_requests": len(seq_map),
+        }
+        write_manifest(manifest_json, manifest)
+        raise
     finally:
         if completion_fh is not None:
             completion_fh.close()
@@ -767,6 +782,10 @@ def run_longrun(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "steps": step_records,
     }
     output_json.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    manifest["status"] = "success" if drain_completed else "incomplete"
+    manifest["completed_utc"] = utc_now()
+    manifest["result"] = result["run"]
+    write_manifest(manifest_json, manifest)
 
     print("RESULT_SUMMARY")
     print(
@@ -789,6 +808,7 @@ def run_longrun(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             {
                 "summary_json": str(output_json),
                 "completion_jsonl": str(completion_jsonl),
+                "manifest_json": str(manifest_json),
             }
         ),
         flush=True,

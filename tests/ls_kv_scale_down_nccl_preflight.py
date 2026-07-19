@@ -150,7 +150,14 @@ def main(sp_size: int) -> None:
     sequence.mark_last_token_pending(BlockContextSlot.ACTIVE)
     state.add_running_tokens(sequence.block_ctx().master_sp_idx, 1)
 
-    group_id = admission.ls_initial_group_ids[0]
+    group_ids = {
+        record.group_id_after_commit
+        for record in admission.ls_admission_records
+        if not record.bootstrap_finished
+    }
+    if len(group_ids) != 1 or None in group_ids:
+        raise RuntimeError("preflight admission did not publish one typed survivor group")
+    group_id = group_ids.pop()
     assert scheduler.get_ls_group_allocated_ranks(group_id) == list(range(sp_size))
     plan = scheduler.plan_ls_kv_scale_down(group_id, source_rank)
     assert plan.success, plan.failure_reason
@@ -168,6 +175,7 @@ def main(sp_size: int) -> None:
         for move in plan.moves
     ]
 
+    assert scheduler.mark_ls_kv_scale_down_dispatched(plan)
     mp.spawn(
         _worker,
         args=(

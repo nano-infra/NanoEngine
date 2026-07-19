@@ -10,6 +10,25 @@
 
 namespace nanodeploy {
 
+// Raw Sequence payloads are an internal lockstep ABI. Legacy and mixed-version
+// payloads are rejected rather than guessed or partially decoded.
+inline constexpr uint64_t kSequenceSerializationMagic      = 0x4E44534551524157ULL;  // "NDSEQRAW"
+inline constexpr uint32_t kSequenceSerializationVersion    = 1;
+inline constexpr size_t   kSequenceSerializationHeaderSize =
+    sizeof(kSequenceSerializationMagic) + sizeof(kSequenceSerializationVersion);
+
+// Shared by the raw and pickle schemas so both reject malformed topology,
+// block-table and inactive-context state at the same ABI boundary.
+void validate_serializable_block_context(const BlockContext& context);
+
+// assigned_dp is persistent LS ownership. A detached WAITING request may have
+// an assigned pool while its default ACTIVE context remains uninitialized; once
+// that context is dimensioned or the request enters an active lifecycle state,
+// its DP must agree with the canonical assignment.
+void validate_serializable_sequence_context_ownership(int                 assigned_dp,
+                                                      SequenceStatus      status,
+                                                      const BlockContext& active_context);
+
 /**
  * @brief 序列化一组 Sequence
  * @param data_ptr 目标缓冲区的起始物理/虚拟地址

@@ -2,6 +2,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -9,8 +10,10 @@
 #include <random>
 #include <set>
 #include <sstream>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "nanodeploy/sequence/sequence.h"
 
@@ -168,7 +171,397 @@ const char* dynamic_sp_size_strategy_name(DynamicSPSizeStrategy strategy)
     return "unknown";
 }
 
+bool block_context_equal(const BlockContext& lhs, const BlockContext& rhs) noexcept
+{
+    return lhs.engine_id_ == rhs.engine_id_ && lhs.dp_idx_ == rhs.dp_idx_
+           && lhs.master_sp_idx_ == rhs.master_sp_idx_ && lhs.attention_sp_ == rhs.attention_sp_
+           && lhs.attention_dp_ == rhs.attention_dp_ && lhs.pending_token_present_ == rhs.pending_token_present_
+           && lhs.pending_token_target_sp_ == rhs.pending_token_target_sp_
+           && lhs.block_location == rhs.block_location && lhs.sp_block_table == rhs.sp_block_table
+           && lhs.num_dispatched_tokens == rhs.num_dispatched_tokens;
+}
+
+struct PreparedRankMutation {
+    int                                 rank = -1;
+    BlockManager::PreparedBlockMutation mutation;
+
+    PreparedRankMutation(int rank, BlockManager::PreparedBlockMutation&& mutation) noexcept:
+        rank(rank), mutation(std::move(mutation))
+    {
+    }
+
+    PreparedRankMutation(const PreparedRankMutation&)            = delete;
+    PreparedRankMutation& operator=(const PreparedRankMutation&) = delete;
+    PreparedRankMutation(PreparedRankMutation&&) noexcept         = default;
+    PreparedRankMutation& operator=(PreparedRankMutation&&) noexcept = default;
+};
+
+struct PreparedRankRebalance {
+    int                                  rank = -1;
+    BlockManager::PreparedBlockRebalance rebalance;
+
+    PreparedRankRebalance(int rank, BlockManager::PreparedBlockRebalance&& rebalance) noexcept:
+        rank(rank), rebalance(std::move(rebalance))
+    {
+    }
+
+    PreparedRankRebalance(const PreparedRankRebalance&)            = delete;
+    PreparedRankRebalance& operator=(const PreparedRankRebalance&) = delete;
+    PreparedRankRebalance(PreparedRankRebalance&&) noexcept         = default;
+    PreparedRankRebalance& operator=(PreparedRankRebalance&&) noexcept = default;
+};
+
 }  // namespace
+
+struct SPStateManager::PreparedLSInitialBatch::Impl {
+    SPStateManager*                                manager = nullptr;
+    std::vector<std::shared_ptr<Sequence>>          sequences;
+    std::vector<BlockContext>                       original_contexts;
+    std::vector<BlockContext>                       shadow_contexts;
+    std::vector<int>                                original_num_tokens;
+    std::vector<size_t>                             original_token_sizes;
+    std::vector<SequenceStatus>                     original_statuses;
+    std::vector<PreparedRankMutation>               allocations;
+    std::vector<int>                                master_counts_before;
+    std::vector<int>                                master_counts_after;
+    std::vector<int>                                recv_counts_before;
+    std::vector<int>                                recv_counts_after;
+    int                                             running_seqs_before   = 0;
+    int                                             running_seqs_after    = 0;
+    int                                             running_tokens_before = 0;
+    int                                             running_tokens_after  = 0;
+};
+
+struct SPStateManager::PreparedLSRelease::Impl {
+    SPStateManager*                  manager = nullptr;
+    std::shared_ptr<Sequence>        sequence;
+    BlockContext                    original_context;
+    BlockContext                    shadow_context;
+    int                             original_num_tokens   = 0;
+    size_t                          original_token_size   = 0;
+    int                             original_cached_tokens = 0;
+    SequenceStatus                  original_status       = SequenceStatus::WAITING;
+    std::vector<PreparedRankMutation> releases;
+    std::vector<int>                master_counts_before;
+    std::vector<int>                master_counts_after;
+    std::vector<int>                recv_counts_before;
+    std::vector<int>                recv_counts_after;
+    int                             running_seqs_before   = 0;
+    int                             running_seqs_after    = 0;
+    int                             running_tokens_before = 0;
+    int                             running_tokens_after  = 0;
+};
+
+struct SPStateManager::PreparedLSIterationMasterPlan::Impl {
+    SPStateManager*                       manager = nullptr;
+    std::vector<std::shared_ptr<Sequence>> sequences;
+    std::vector<BlockContext>              original_contexts;
+    std::vector<BlockContext>              shadow_contexts;
+    std::vector<int>                       original_num_tokens;
+    std::vector<size_t>                    original_token_sizes;
+    std::vector<int>                       original_cached_tokens;
+    std::vector<int>                       original_last_tokens;
+    std::vector<SequenceStatus>            original_statuses;
+    std::vector<PreparedRankRebalance>      rebalances;
+    std::vector<int>                       master_counts_before;
+    std::vector<int>                       master_counts_after;
+    std::vector<int>                       recv_counts_before;
+    std::vector<int>                       recv_counts_after;
+    int                                    running_seqs_before   = 0;
+    int                                    running_tokens_before = 0;
+};
+
+static_assert(std::is_nothrow_swappable_v<BlockContext>,
+              "formal LS publication requires BlockContext swap to be noexcept");
+
+SPStateManager::PreparedLSInitialBatch::PreparedLSInitialBatch(std::unique_ptr<Impl> impl) noexcept:
+    impl_(std::move(impl)), state_(State::PREPARED)
+{
+}
+
+SPStateManager::PreparedLSInitialBatch::PreparedLSInitialBatch(PreparedLSInitialBatch&& other) noexcept
+{
+    take_from(std::move(other));
+}
+
+SPStateManager::PreparedLSInitialBatch&
+SPStateManager::PreparedLSInitialBatch::operator=(PreparedLSInitialBatch&& other) noexcept
+{
+    if (this != &other) {
+        abort_noexcept();
+        take_from(std::move(other));
+    }
+    return *this;
+}
+
+SPStateManager::PreparedLSInitialBatch::~PreparedLSInitialBatch() noexcept
+{
+    abort_noexcept();
+}
+
+void SPStateManager::PreparedLSInitialBatch::take_from(PreparedLSInitialBatch&& other) noexcept
+{
+    impl_  = std::move(other.impl_);
+    state_ = std::exchange(other.state_, State::ABORTED);
+}
+
+bool SPStateManager::PreparedLSInitialBatch::validate_precommit_noexcept() const noexcept
+{
+    if (state_ != State::PREPARED || !impl_ || !impl_->manager
+        || impl_->sequences.size() != impl_->original_contexts.size()
+        || impl_->sequences.size() != impl_->original_num_tokens.size()
+        || impl_->sequences.size() != impl_->original_token_sizes.size()
+        || impl_->sequences.size() != impl_->original_statuses.size()) {
+        return false;
+    }
+    const auto& manager = *impl_->manager;
+    if (manager.master_seq_counts_ != impl_->master_counts_before
+        || manager.num_recv_seqs_per_sp_ != impl_->recv_counts_before
+        || manager.num_running_seqs_ != impl_->running_seqs_before
+        || manager.num_running_tokens_ != impl_->running_tokens_before) {
+        return false;
+    }
+    for (size_t idx = 0; idx < impl_->sequences.size(); ++idx) {
+        const auto& sequence = impl_->sequences[idx];
+        if (!sequence || sequence->num_tokens != impl_->original_num_tokens[idx]
+            || sequence->token_ids.size() != impl_->original_token_sizes[idx]
+            || sequence->status != impl_->original_statuses[idx]
+            || !block_context_equal(sequence->block_ctx(BlockContextSlot::ACTIVE),
+                                    impl_->original_contexts[idx])) {
+            return false;
+        }
+    }
+    return std::all_of(impl_->allocations.begin(), impl_->allocations.end(), [](const auto& allocation) {
+        return allocation.mutation.state() == BlockManager::PreparedBlockMutation::State::PREPARED;
+    });
+}
+
+void SPStateManager::PreparedLSInitialBatch::commit_noexcept() noexcept
+{
+    if (state_ != State::PREPARED || !impl_ || !impl_->manager) {
+        return;
+    }
+    auto& manager = *impl_->manager;
+    for (size_t idx = 0; idx < impl_->sequences.size(); ++idx) {
+        using std::swap;
+        swap(impl_->sequences[idx]->block_ctx(BlockContextSlot::ACTIVE), impl_->shadow_contexts[idx]);
+    }
+    for (auto& allocation : impl_->allocations) {
+        allocation.mutation.commit_noexcept();
+    }
+    manager.master_seq_counts_.swap(impl_->master_counts_after);
+    manager.num_recv_seqs_per_sp_.swap(impl_->recv_counts_after);
+    manager.num_running_seqs_   = impl_->running_seqs_after;
+    manager.num_running_tokens_ = impl_->running_tokens_after;
+    manager.cached_running_state_.reset();
+    state_ = State::COMMITTED;
+}
+
+void SPStateManager::PreparedLSInitialBatch::abort_noexcept() noexcept
+{
+    if (state_ != State::PREPARED) {
+        return;
+    }
+    if (impl_) {
+        for (auto& allocation : impl_->allocations) {
+            allocation.mutation.abort_noexcept();
+        }
+    }
+    state_ = State::ABORTED;
+}
+
+SPStateManager::PreparedLSRelease::PreparedLSRelease(std::unique_ptr<Impl> impl) noexcept:
+    impl_(std::move(impl)), state_(State::PREPARED)
+{
+}
+
+SPStateManager::PreparedLSRelease::PreparedLSRelease(PreparedLSRelease&& other) noexcept
+{
+    take_from(std::move(other));
+}
+
+SPStateManager::PreparedLSRelease&
+SPStateManager::PreparedLSRelease::operator=(PreparedLSRelease&& other) noexcept
+{
+    if (this != &other) {
+        abort_noexcept();
+        take_from(std::move(other));
+    }
+    return *this;
+}
+
+SPStateManager::PreparedLSRelease::~PreparedLSRelease() noexcept
+{
+    abort_noexcept();
+}
+
+void SPStateManager::PreparedLSRelease::take_from(PreparedLSRelease&& other) noexcept
+{
+    impl_  = std::move(other.impl_);
+    state_ = std::exchange(other.state_, State::ABORTED);
+}
+
+bool SPStateManager::PreparedLSRelease::validate_precommit_noexcept() const noexcept
+{
+    if (state_ != State::PREPARED || !impl_ || !impl_->manager || !impl_->sequence) {
+        return false;
+    }
+    const auto& manager = *impl_->manager;
+    const auto& sequence = impl_->sequence;
+    if (manager.master_seq_counts_ != impl_->master_counts_before
+        || manager.num_recv_seqs_per_sp_ != impl_->recv_counts_before
+        || manager.num_running_seqs_ != impl_->running_seqs_before
+        || manager.num_running_tokens_ != impl_->running_tokens_before
+        || sequence->num_tokens != impl_->original_num_tokens
+        || sequence->token_ids.size() != impl_->original_token_size
+        || sequence->num_cached_tokens != impl_->original_cached_tokens
+        || sequence->status != impl_->original_status
+        || !block_context_equal(sequence->block_ctx(BlockContextSlot::ACTIVE), impl_->original_context)) {
+        return false;
+    }
+    return std::all_of(impl_->releases.begin(), impl_->releases.end(), [](const auto& release) {
+        return release.mutation.state() == BlockManager::PreparedBlockMutation::State::PREPARED;
+    });
+}
+
+void SPStateManager::PreparedLSRelease::commit_noexcept() noexcept
+{
+    if (state_ != State::PREPARED || !impl_ || !impl_->manager || !impl_->sequence) {
+        return;
+    }
+    auto& manager = *impl_->manager;
+    using std::swap;
+    swap(impl_->sequence->block_ctx(BlockContextSlot::ACTIVE), impl_->shadow_context);
+    for (auto& release : impl_->releases) {
+        release.mutation.commit_noexcept();
+    }
+    manager.master_seq_counts_.swap(impl_->master_counts_after);
+    manager.num_recv_seqs_per_sp_.swap(impl_->recv_counts_after);
+    manager.num_running_seqs_   = impl_->running_seqs_after;
+    manager.num_running_tokens_ = impl_->running_tokens_after;
+    manager.cached_running_state_.reset();
+    impl_->sequence->num_cached_tokens = 0;
+    state_ = State::COMMITTED;
+}
+
+void SPStateManager::PreparedLSRelease::abort_noexcept() noexcept
+{
+    if (state_ != State::PREPARED) {
+        return;
+    }
+    if (impl_) {
+        for (auto& release : impl_->releases) {
+            release.mutation.abort_noexcept();
+        }
+    }
+    state_ = State::ABORTED;
+}
+
+SPStateManager::PreparedLSIterationMasterPlan::PreparedLSIterationMasterPlan(std::unique_ptr<Impl> impl) noexcept:
+    impl_(std::move(impl)), state_(State::PREPARED)
+{
+}
+
+SPStateManager::PreparedLSIterationMasterPlan::PreparedLSIterationMasterPlan(
+    PreparedLSIterationMasterPlan&& other) noexcept
+{
+    take_from(std::move(other));
+}
+
+SPStateManager::PreparedLSIterationMasterPlan&
+SPStateManager::PreparedLSIterationMasterPlan::operator=(PreparedLSIterationMasterPlan&& other) noexcept
+{
+    if (this != &other) {
+        abort_noexcept();
+        take_from(std::move(other));
+    }
+    return *this;
+}
+
+SPStateManager::PreparedLSIterationMasterPlan::~PreparedLSIterationMasterPlan() noexcept
+{
+    abort_noexcept();
+}
+
+void SPStateManager::PreparedLSIterationMasterPlan::take_from(PreparedLSIterationMasterPlan&& other) noexcept
+{
+    impl_  = std::move(other.impl_);
+    state_ = std::exchange(other.state_, State::ABORTED);
+}
+
+bool SPStateManager::PreparedLSIterationMasterPlan::validate_precommit_noexcept() const noexcept
+{
+    if (state_ != State::PREPARED || !impl_ || !impl_->manager
+        || impl_->sequences.size() != impl_->original_contexts.size()
+        || impl_->sequences.size() != impl_->original_num_tokens.size()
+        || impl_->sequences.size() != impl_->original_token_sizes.size()
+        || impl_->sequences.size() != impl_->original_cached_tokens.size()
+        || impl_->sequences.size() != impl_->original_last_tokens.size()
+        || impl_->sequences.size() != impl_->original_statuses.size()) {
+        return false;
+    }
+    const auto& manager = *impl_->manager;
+    if (manager.master_seq_counts_ != impl_->master_counts_before
+        || manager.num_recv_seqs_per_sp_ != impl_->recv_counts_before
+        || manager.num_running_seqs_ != impl_->running_seqs_before
+        || manager.num_running_tokens_ != impl_->running_tokens_before) {
+        return false;
+    }
+    for (size_t idx = 0; idx < impl_->sequences.size(); ++idx) {
+        const auto& sequence = impl_->sequences[idx];
+        if (!sequence || sequence->num_tokens != impl_->original_num_tokens[idx]
+            || sequence->token_ids.size() != impl_->original_token_sizes[idx]
+            || sequence->num_cached_tokens != impl_->original_cached_tokens[idx]
+            || sequence->last_token != impl_->original_last_tokens[idx]
+            || sequence->status != impl_->original_statuses[idx]
+            || !block_context_equal(sequence->block_ctx(BlockContextSlot::ACTIVE),
+                                    impl_->original_contexts[idx])) {
+            return false;
+        }
+    }
+    return std::all_of(impl_->rebalances.begin(), impl_->rebalances.end(), [](const auto& rank) {
+        return rank.rebalance.state() == BlockManager::PreparedBlockRebalance::State::PREPARED;
+    });
+}
+
+void SPStateManager::PreparedLSIterationMasterPlan::commit_noexcept() noexcept
+{
+    if (state_ != State::PREPARED || !impl_ || !impl_->manager) {
+        return;
+    }
+    auto& manager = *impl_->manager;
+    for (size_t idx = 0; idx < impl_->sequences.size(); ++idx) {
+        using std::swap;
+        swap(impl_->sequences[idx]->block_ctx(BlockContextSlot::ACTIVE), impl_->shadow_contexts[idx]);
+    }
+    for (auto& rank : impl_->rebalances) {
+        rank.rebalance.commit_noexcept();
+    }
+    // This transaction may be composed with a prepared initial admission in
+    // the same pool step. The admission is published first and contributes new
+    // absolute role counters; applying the precomputed iteration delta keeps
+    // those contributions instead of overwriting them with the iteration's
+    // stable-state snapshot.
+    for (size_t rank = 0; rank < impl_->master_counts_before.size(); ++rank) {
+        manager.master_seq_counts_[rank] += impl_->master_counts_after[rank] - impl_->master_counts_before[rank];
+        manager.num_recv_seqs_per_sp_[rank] += impl_->recv_counts_after[rank] - impl_->recv_counts_before[rank];
+    }
+    manager.cached_running_state_.reset();
+    state_ = State::COMMITTED;
+}
+
+void SPStateManager::PreparedLSIterationMasterPlan::abort_noexcept() noexcept
+{
+    if (state_ != State::PREPARED) {
+        return;
+    }
+    if (impl_) {
+        for (auto& rank : impl_->rebalances) {
+            rank.rebalance.abort_noexcept();
+        }
+    }
+    state_ = State::ABORTED;
+}
 
 SPStateManager::SPStateManager(const std::string& engine_id,
                                int                attention_sp,
@@ -525,19 +918,27 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
                                            != current_allocation.end();
                                 }),
                  extras.end());
-    std::stable_sort(extras.begin(), extras.end(), [&](int lhs, int rhs) {
-        int lhs_capacity = estimate_pending_append_capacity(lhs, requests, requests);
-        int rhs_capacity = estimate_pending_append_capacity(rhs, requests, requests);
-        if (lhs_capacity != rhs_capacity) {
-            return lhs_capacity > rhs_capacity;
-        }
-        return lhs < rhs;
-    });
+    // LoongServe consumes the idle-instance stack from the end. Nano exposes
+    // deterministic SP ranks, so the Decode-only adapter uses rank descending.
+    std::stable_sort(extras.begin(), extras.end(), std::greater<int>());
 
     bool      compute_scaled  = false;
     bool      memory_scaled   = false;
     bool      receiver_scaled = false;
     const int max_restarts    = attention_sp_ + 1;
+
+    // Source compute-bound expansion is decided once from the complete real
+    // step-entry membership. It uses integer floor division exactly; suffix
+    // chunking below must not request extra ranks after part of the batch has
+    // already been assigned.
+    while (!current_allocation.empty() && !extras.empty()
+           && static_cast<int>(requests.size()) / static_cast<int>(current_allocation.size()) > batch_per_master) {
+        int rank = extras.front();
+        extras.erase(extras.begin());
+        current_allocation.push_back(rank);
+        result.new_allocation_ranks.push_back(rank);
+        compute_scaled = true;
+    }
 
     auto set_scale_reason = [&](LSDecodeMasterPlan& plan) {
         plan.scale_reason.clear();
@@ -667,11 +1068,6 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
 
                 int n_left    = static_cast<int>(append_capable.size());
                 int remaining = static_cast<int>(planning_order.size() - remaining_begin);
-                if (remaining / compute_capable > batch_per_master && !extras.empty()) {
-                    attempt.request_scale = true;
-                    return attempt;
-                }
-
                 size_t rank_pos  = append_capable.front();
                 int    rank      = candidates[rank_pos];
                 int    capacity  = estimate_pending_append_capacity(rank, suffix, requests);
@@ -703,15 +1099,6 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
         std::vector<size_t> identity_order(requests.size());
         std::iota(identity_order.begin(), identity_order.end(), 0);
         auto attempt = run_source_greedy(identity_order);
-        if (attempt.request_scale && !attempt.memory_scale) {
-            int rank = extras.front();
-            extras.erase(extras.begin());
-            current_allocation.push_back(rank);
-            result.new_allocation_ranks.push_back(rank);
-            compute_scaled = true;
-            continue;
-        }
-
         auto return_attempt = [&](SourceGreedyAttempt&& successful, const std::string& strategy) {
             result.success               = true;
             result.assignment_strategy   = strategy;
@@ -764,14 +1151,6 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
         }
         if (owner_order.size() == requests.size() && owner_order != identity_order) {
             auto owner_attempt = run_source_greedy(owner_order);
-            if (owner_attempt.request_scale && !owner_attempt.memory_scale) {
-                int rank = extras.front();
-                extras.erase(extras.begin());
-                current_allocation.push_back(rank);
-                result.new_allocation_ranks.push_back(rank);
-                compute_scaled = true;
-                continue;
-            }
             if (owner_attempt.success) {
                 return_attempt(std::move(owner_attempt), "owner_bucket_repair");
                 return result;
@@ -1405,6 +1784,323 @@ bool SPStateManager::validate_iteration_master_plan(const std::vector<std::share
     return true;
 }
 
+SPStateManager::PreparedLSIterationMasterPlan
+SPStateManager::prepare_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
+                                              const LSDecodeMasterPlan&                     plan)
+{
+    std::unordered_set<int> allocation_ranks;
+    allocation_ranks.reserve(plan.allocation.size());
+    for (int rank : plan.allocation) {
+        if (rank < 0 || rank >= attention_sp_ || !allocation_ranks.insert(rank).second) {
+            throw std::runtime_error("prepared LS iteration plan has an invalid canonical allocation");
+        }
+    }
+
+    // validate_iteration_master_plan assumes dimensionally valid ACTIVE
+    // contexts. Establish those bounds first so malformed stable metadata is a
+    // deterministic rejection rather than an out-of-bounds read.
+    for (const auto& sequence : requests) {
+        if (!sequence) {
+            throw std::runtime_error("prepared LS iteration request is null");
+        }
+        const auto& context = sequence->block_ctx(BlockContextSlot::ACTIVE);
+        if (context.engine_id_ != engine_id_ || context.attention_sp_ != attention_sp_
+            || (dp_idx_ >= 0 && context.dp_idx_ != dp_idx_)
+            || static_cast<int>(context.num_dispatched_tokens.size()) != attention_sp_
+            || static_cast<int>(context.sp_block_table.size()) != attention_sp_) {
+            throw std::runtime_error("prepared LS iteration ACTIVE context has invalid dimensions");
+        }
+    }
+
+    std::string validation_error;
+    if (!validate_iteration_master_plan(requests, plan, &validation_error)) {
+        throw std::runtime_error("prepared LS iteration plan validation failed: " + validation_error);
+    }
+
+    auto impl     = std::make_unique<PreparedLSIterationMasterPlan::Impl>();
+    impl->manager = this;
+    impl->sequences.reserve(requests.size());
+    impl->original_contexts.reserve(requests.size());
+    impl->shadow_contexts.reserve(requests.size());
+    impl->original_num_tokens.reserve(requests.size());
+    impl->original_token_sizes.reserve(requests.size());
+    impl->original_cached_tokens.reserve(requests.size());
+    impl->original_last_tokens.reserve(requests.size());
+    impl->original_statuses.reserve(requests.size());
+    impl->rebalances.reserve(attention_sp_);
+    impl->master_counts_before   = master_seq_counts_;
+    impl->master_counts_after    = master_seq_counts_;
+    impl->recv_counts_before     = num_recv_seqs_per_sp_;
+    impl->recv_counts_after      = num_recv_seqs_per_sp_;
+    impl->running_seqs_before    = num_running_seqs_;
+    impl->running_tokens_before  = num_running_tokens_;
+
+    struct ExtraBlockTarget {
+        size_t sequence_idx = 0;
+        int    rank         = -1;
+    };
+    std::vector<std::vector<int>>              releases(attention_sp_);
+    std::vector<std::vector<ExtraBlockTarget>> extra_targets(attention_sp_);
+    for (int rank = 0; rank < attention_sp_; ++rank) {
+        releases[rank].reserve(requests.size());
+        extra_targets[rank].reserve(requests.size());
+    }
+
+    std::unordered_set<const Sequence*> unique_sequences;
+    std::unordered_set<uint64_t>        unique_sequence_ids;
+    unique_sequences.reserve(requests.size());
+    unique_sequence_ids.reserve(requests.size());
+
+    for (size_t sequence_idx = 0; sequence_idx < requests.size(); ++sequence_idx) {
+        const auto& sequence = requests[sequence_idx];
+        const auto& context  = sequence->block_ctx(BlockContextSlot::ACTIVE);
+        const int   target   = plan.sequence_master_ranks[sequence_idx];
+        if (!unique_sequences.insert(sequence.get()).second
+            || !unique_sequence_ids.insert(sequence->seq_id).second) {
+            throw std::runtime_error("prepared LS iteration request list contains duplicate identity");
+        }
+        if (sequence->status != SequenceStatus::RUNNING || sequence->num_tokens < 0
+            || sequence->token_ids.size() != static_cast<size_t>(sequence->num_tokens)
+            || !context.pending_token_present_ || context.pending_token_target_sp_ < 0
+            || context.pending_token_target_sp_ >= attention_sp_
+            || context.master_sp_idx_ != context.pending_token_target_sp_) {
+            throw std::runtime_error("prepared LS iteration request has an invalid stable frontier");
+        }
+
+        std::vector<std::pair<int, int>> table_locations;
+        table_locations.reserve(context.block_location.size());
+        int64_t total_dispatched = 0;
+        int64_t total_final_blocks = 0;
+
+        BlockContext shadow = context;
+        shadow.master_sp_idx_           = target;
+        shadow.pending_token_present_   = true;
+        shadow.pending_token_target_sp_ = target;
+        shadow.block_location.clear();
+
+        for (int rank = 0; rank < attention_sp_; ++rank) {
+            const int dispatched = context.num_dispatched_tokens[rank];
+            if (dispatched < 0) {
+                throw std::runtime_error("prepared LS iteration has a negative dispatched-token count");
+            }
+            total_dispatched += dispatched;
+            const int committed = dispatched
+                                  - (rank == context.pending_token_target_sp_ ? 1 : 0);
+            if (committed < 0) {
+                throw std::runtime_error("prepared LS iteration pending frontier exceeds dispatched tokens");
+            }
+
+            const int64_t historical_blocks =
+                (static_cast<int64_t>(committed) + kvcache_block_size_ - 1) / kvcache_block_size_;
+            const int64_t old_max_blocks =
+                (static_cast<int64_t>(committed)
+                 + (rank == context.pending_token_target_sp_ ? 2 : 0)
+                 + kvcache_block_size_ - 1)
+                / kvcache_block_size_;
+            const int64_t final_blocks =
+                (static_cast<int64_t>(committed) + (rank == target ? 2 : 0)
+                 + kvcache_block_size_ - 1)
+                / kvcache_block_size_;
+            const auto& old_table = context.sp_block_table[rank];
+            if (historical_blocks > static_cast<int64_t>(old_table.size())
+                || static_cast<int64_t>(old_table.size()) > old_max_blocks
+                || final_blocks < historical_blocks
+                || final_blocks > std::numeric_limits<int>::max()) {
+                throw std::runtime_error("prepared LS iteration block table is not an exact pending reservation");
+            }
+
+            std::unordered_set<int> rank_table_ids;
+            rank_table_ids.reserve(old_table.size());
+            for (int block_id : old_table) {
+                if (block_id < 0
+                    || block_id >= static_cast<int>(block_manager.at(rank)->blocks().size())
+                    || block_manager.at(rank)->blocks()[block_id].ref_count <= 0
+                    || !rank_table_ids.insert(block_id).second) {
+                    throw std::runtime_error("prepared LS iteration block table contains invalid ownership");
+                }
+                table_locations.emplace_back(rank, block_id);
+            }
+
+            auto& shadow_table = shadow.sp_block_table[rank];
+            shadow_table.clear();
+            shadow_table.reserve(static_cast<size_t>(final_blocks));
+            shadow_table.insert(shadow_table.end(),
+                                old_table.begin(),
+                                old_table.begin() + static_cast<std::ptrdiff_t>(historical_blocks));
+            for (size_t block_idx = static_cast<size_t>(historical_blocks);
+                 block_idx < old_table.size();
+                 ++block_idx) {
+                releases[rank].push_back(old_table[block_idx]);
+            }
+            for (int64_t block_idx = historical_blocks; block_idx < final_blocks; ++block_idx) {
+                extra_targets[rank].push_back({sequence_idx, rank});
+            }
+            shadow.num_dispatched_tokens[rank] = committed + (rank == target ? 1 : 0);
+            total_final_blocks += final_blocks;
+        }
+
+        auto published_locations =
+            std::vector<std::pair<int, int>>(context.block_location.begin(), context.block_location.end());
+        std::sort(table_locations.begin(), table_locations.end());
+        std::sort(published_locations.begin(), published_locations.end());
+        if (table_locations != published_locations || total_dispatched != sequence->num_tokens) {
+            throw std::runtime_error("prepared LS iteration ACTIVE block metadata is inconsistent");
+        }
+        shadow.block_location.reserve(static_cast<size_t>(total_final_blocks));
+
+        impl->sequences.push_back(sequence);
+        impl->original_contexts.push_back(context);
+        impl->shadow_contexts.push_back(std::move(shadow));
+        impl->original_num_tokens.push_back(sequence->num_tokens);
+        impl->original_token_sizes.push_back(sequence->token_ids.size());
+        impl->original_cached_tokens.push_back(sequence->num_cached_tokens);
+        impl->original_last_tokens.push_back(sequence->last_token);
+        impl->original_statuses.push_back(sequence->status);
+
+        const int old_master = context.master_sp_idx_;
+        if (impl->master_counts_after[old_master] <= 0) {
+            throw std::runtime_error("prepared LS iteration master counters are inconsistent");
+        }
+        impl->master_counts_after[old_master]--;
+        impl->master_counts_after[target]++;
+        for (int rank = 0; rank < attention_sp_; ++rank) {
+            const int committed = context.num_dispatched_tokens[rank]
+                                  - (rank == context.pending_token_target_sp_ ? 1 : 0);
+            const bool was_receiver = rank != old_master && committed > 0;
+            const bool is_receiver  = rank != target && committed > 0;
+            if (was_receiver && !is_receiver) {
+                if (impl->recv_counts_after[rank] <= 0) {
+                    throw std::runtime_error("prepared LS iteration receiver counters are inconsistent");
+                }
+                impl->recv_counts_after[rank]--;
+            }
+            else if (!was_receiver && is_receiver) {
+                impl->recv_counts_after[rank]++;
+            }
+        }
+    }
+
+    for (int rank = 0; rank < attention_sp_; ++rank) {
+        if (impl->master_counts_after[rank] < 0 || impl->master_counts_after[rank] > max_num_seqs_
+            || impl->recv_counts_after[rank] < 0 || impl->recv_counts_after[rank] > max_num_recv_seqs_) {
+            throw std::runtime_error("prepared LS iteration role metadata capacity is exceeded");
+        }
+    }
+
+    // All shadow/container allocation is complete. Rank-local prepare may now
+    // reserve ownership; if a later rank fails, already-prepared RAII owners in
+    // impl abort exactly while stable ACTIVE contexts and counters stay intact.
+    for (int rank = 0; rank < attention_sp_; ++rank) {
+        if (releases[rank].empty() && extra_targets[rank].empty()) {
+            continue;
+        }
+        auto rebalance = block_manager.at(rank)->prepare_rebalance(
+            releases[rank], static_cast<int>(extra_targets[rank].size()));
+        const auto& allocation_ids = rebalance.allocation_block_ids();
+        if (allocation_ids.size() != extra_targets[rank].size()) {
+            throw std::runtime_error("prepared LS iteration rebalance returned the wrong block count");
+        }
+        for (size_t block_idx = 0; block_idx < allocation_ids.size(); ++block_idx) {
+            const auto& target = extra_targets[rank][block_idx];
+            impl->shadow_contexts[target.sequence_idx].sp_block_table[target.rank].push_back(
+                allocation_ids[block_idx]);
+        }
+        impl->rebalances.emplace_back(rank, std::move(rebalance));
+    }
+
+    // Rebuild a complete deterministic rank-major location table only after
+    // every rank table has its final prepared IDs. Capacity was reserved above.
+    for (auto& shadow : impl->shadow_contexts) {
+        for (int rank = 0; rank < attention_sp_; ++rank) {
+            for (int block_id : shadow.sp_block_table[rank]) {
+                shadow.block_location.emplace_back(rank, block_id);
+            }
+        }
+    }
+
+
+    return PreparedLSIterationMasterPlan(std::move(impl));
+}
+
+bool SPStateManager::validate_ls_pool_step_composition_noexcept(
+    const PreparedLSInitialBatch* initial, const PreparedLSIterationMasterPlan* iteration) const noexcept
+{
+    if (!initial && !iteration) {
+        return true;
+    }
+    if ((initial
+         && (initial->state_ != PreparedLSInitialBatch::State::PREPARED || !initial->impl_
+             || initial->impl_->manager != this || !initial->validate_precommit_noexcept()))
+        || (iteration
+            && (iteration->state_ != PreparedLSIterationMasterPlan::State::PREPARED || !iteration->impl_
+                || iteration->impl_->manager != this || !iteration->validate_precommit_noexcept()))) {
+        return false;
+    }
+
+    const auto& initial_master = initial ? initial->impl_->master_counts_after : master_seq_counts_;
+    const auto& initial_recv   = initial ? initial->impl_->recv_counts_after : num_recv_seqs_per_sp_;
+    if (initial_master.size() != master_seq_counts_.size() || initial_recv.size() != num_recv_seqs_per_sp_.size()) {
+        return false;
+    }
+
+    if (iteration
+        && (iteration->impl_->master_counts_before.size() != master_seq_counts_.size()
+            || iteration->impl_->master_counts_after.size() != master_seq_counts_.size()
+            || iteration->impl_->recv_counts_before.size() != num_recv_seqs_per_sp_.size()
+            || iteration->impl_->recv_counts_after.size() != num_recv_seqs_per_sp_.size())) {
+        return false;
+    }
+
+    for (size_t rank = 0; rank < master_seq_counts_.size(); ++rank) {
+        int64_t final_master = initial_master[rank];
+        int64_t final_recv   = initial_recv[rank];
+        if (iteration) {
+            final_master += static_cast<int64_t>(iteration->impl_->master_counts_after[rank])
+                            - iteration->impl_->master_counts_before[rank];
+            final_recv += static_cast<int64_t>(iteration->impl_->recv_counts_after[rank])
+                          - iteration->impl_->recv_counts_before[rank];
+        }
+        if (final_master < 0 || final_master > max_num_seqs_ || final_recv < 0 || final_recv > max_num_recv_seqs_) {
+            return false;
+        }
+    }
+
+    const int64_t final_running_seqs   = initial ? initial->impl_->running_seqs_after : num_running_seqs_;
+    const int64_t final_running_tokens = initial ? initial->impl_->running_tokens_after : num_running_tokens_;
+    if (final_running_seqs < 0 || final_running_seqs > std::numeric_limits<int>::max() || final_running_tokens < 0
+        || final_running_tokens > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    if (initial && iteration) {
+        // noexcept validation must remain allocation-free. Pool batches are
+        // bounded by max_num_seqs_, so the quadratic identity check is both
+        // deterministic and small.
+        for (size_t lhs = 0; lhs < initial->impl_->sequences.size(); ++lhs) {
+            const auto& sequence = initial->impl_->sequences[lhs];
+            if (!sequence) {
+                return false;
+            }
+            for (size_t rhs = 0; rhs < lhs; ++rhs) {
+                if (initial->impl_->sequences[rhs].get() == sequence.get()) {
+                    return false;
+                }
+            }
+        }
+        for (const auto& sequence : iteration->impl_->sequences) {
+            if (!sequence) {
+                return false;
+            }
+            for (const auto& admitted : initial->impl_->sequences) {
+                if (admitted.get() == sequence.get()) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 void SPStateManager::set_decode_master(Sequence& seq, int master_sp_idx)
 {
     if (master_sp_idx < 0 || master_sp_idx >= attention_sp_) {
@@ -1566,6 +2262,12 @@ SPStateManager::plan_kv_consolidation(uint64_t                                  
         }
     }
 
+    plan->block_manager_lifetime_guards.reserve(retained_ranks.size() + 1);
+    plan->block_manager_lifetime_guards.push_back(block_manager.at(source_rank));
+    for (int rank : retained_ranks) {
+        plan->block_manager_lifetime_guards.push_back(block_manager.at(rank));
+    }
+
     struct Assignment {
         int dst_rank          = -1;
         int num_tokens        = 0;
@@ -1585,7 +2287,6 @@ SPStateManager::plan_kv_consolidation(uint64_t                                  
 
     std::vector<Draft>                  drafts;
     std::unordered_set<const Sequence*> unique_sequences;
-    bool                                found_source_kv = false;
     for (const auto& sequence : sequences) {
         if (!sequence || !unique_sequences.insert(sequence.get()).second) {
             return reject("KV consolidation sequence list is null or contains a duplicate");
@@ -1605,6 +2306,15 @@ SPStateManager::plan_kv_consolidation(uint64_t                                  
             || (ctx.pending_token_present_ && ctx.pending_token_target_sp_ == source_rank)) {
             return reject("KV consolidation source rank is an active or pending Decode master");
         }
+    }
+
+    // The source contract fills sequences in canonical group order. Rank
+    // preference is global exact capacity first, then current group KV, then
+    // rank ID; it must not be biased toward the current Decode master.
+    std::vector<int> destination_used_tokens = group_used_kv_tokens(sequences);
+    bool             found_source_kv         = false;
+    for (const auto& sequence : sequences) {
+        const auto& ctx = sequence->block_ctx(BlockContextSlot::ACTIVE);
 
         int source_tokens = sequence->committed_context_len(BlockContextSlot::ACTIVE, source_rank);
         if (source_tokens == 0) {
@@ -1628,27 +2338,25 @@ SPStateManager::plan_kv_consolidation(uint64_t                                  
         draft.additional_blocks.assign(attention_sp_, 0);
         draft.source_tokens = source_tokens;
 
-        std::vector<int> candidates = retained_ranks;
-        std::sort(candidates.begin(), candidates.end(), [&](int lhs, int rhs) {
-            bool lhs_master = lhs == ctx.master_sp_idx_;
-            bool rhs_master = rhs == ctx.master_sp_idx_;
-            if (lhs_master != rhs_master) {
-                return lhs_master;
-            }
-            int lhs_tokens = sequence->committed_context_len(BlockContextSlot::ACTIVE, lhs);
-            int rhs_tokens = sequence->committed_context_len(BlockContextSlot::ACTIVE, rhs);
-            if (lhs_tokens != rhs_tokens) {
-                return lhs_tokens > rhs_tokens;
-            }
-            return lhs < rhs;
-        });
-
         auto movable_capacity = [&](int rank) {
             int committed = sequence->committed_context_len(BlockContextSlot::ACTIVE, rank);
             int frontier  = ctx.pending_token_present_ && ctx.pending_token_target_sp_ == rank ? 2 : 0;
             int blocks    = static_cast<int>(ctx.sp_block_table[rank].size()) + free_blocks[rank];
             return std::max(0, blocks * kvcache_block_size_ - committed - frontier);
         };
+
+        std::vector<int> candidates = retained_ranks;
+        std::sort(candidates.begin(), candidates.end(), [&](int lhs, int rhs) {
+            int lhs_capacity = movable_capacity(lhs);
+            int rhs_capacity = movable_capacity(rhs);
+            if (lhs_capacity != rhs_capacity) {
+                return lhs_capacity > rhs_capacity;
+            }
+            if (destination_used_tokens[lhs] != destination_used_tokens[rhs]) {
+                return destination_used_tokens[lhs] < destination_used_tokens[rhs];
+            }
+            return lhs < rhs;
+        });
 
         int whole_destination = -1;
         for (int rank : candidates) {
@@ -1682,6 +2390,7 @@ SPStateManager::plan_kv_consolidation(uint64_t                                  
             draft.additional_blocks[rank] = additional;
             draft.stage.staged_context.num_dispatched_tokens[rank] += moved;
             free_blocks[rank] -= additional;
+            destination_used_tokens[rank] += moved;
             remaining -= moved;
             if (remaining == 0) {
                 break;
@@ -1705,6 +2414,7 @@ SPStateManager::plan_kv_consolidation(uint64_t                                  
     for (const auto& draft : drafts) {
         staged_contexts.emplace(draft.stage.sequence.get(), &draft.stage.staged_context);
     }
+    std::vector<int> staged_master_counts(attention_sp_, 0);
     std::vector<int> staged_remote_recv(attention_sp_, 0);
     for (const auto& sequence : running) {
         if (!sequence || sequence->status != SequenceStatus::RUNNING) {
@@ -1713,6 +2423,10 @@ SPStateManager::plan_kv_consolidation(uint64_t                                  
         const auto  staged = staged_contexts.find(sequence.get());
         const auto& ctx =
             staged == staged_contexts.end() ? sequence->block_ctx(BlockContextSlot::ACTIVE) : *staged->second;
+        if (ctx.master_sp_idx_ < 0 || ctx.master_sp_idx_ >= attention_sp_) {
+            return reject("KV consolidation encountered an invalid Decode master");
+        }
+        staged_master_counts[ctx.master_sp_idx_]++;
         for (int rank = 0; rank < attention_sp_; ++rank) {
             int committed = ctx.num_dispatched_tokens[rank];
             if (ctx.pending_token_present_ && ctx.pending_token_target_sp_ == rank) {
@@ -1729,134 +2443,162 @@ SPStateManager::plan_kv_consolidation(uint64_t                                  
         return reject("KV consolidation would exceed remote attention capacity");
     }
 
-    size_t reserve_request_count = 0;
+    size_t move_count = 0;
     for (const auto& draft : drafts) {
-        reserve_request_count += static_cast<size_t>(std::count_if(
+        int source_cursor = 0;
+        for (const auto& assignment : draft.assignments) {
+            int destination_cursor = assignment.dst_logical_start;
+            int assignment_left    = assignment.num_tokens;
+            while (assignment_left > 0) {
+                int length = std::min({assignment_left,
+                                       kvcache_block_size_ - source_cursor % kvcache_block_size_,
+                                       kvcache_block_size_ - destination_cursor % kvcache_block_size_});
+                source_cursor += length;
+                destination_cursor += length;
+                assignment_left -= length;
+                ++move_count;
+            }
+        }
+    }
+    plan->moves.reserve(move_count);
+    std::vector<LSKVConsolidationPlan::SequenceStage> prepared_stages;
+    prepared_stages.reserve(drafts.size());
+
+    for (auto& draft : drafts) {
+        const auto stage_reservation_count = static_cast<size_t>(std::count_if(
             draft.additional_blocks.begin(), draft.additional_blocks.end(), [](int count) { return count > 0; }));
-    }
-    std::vector<std::pair<int, std::vector<int>>> reserved_for_cleanup;
-    reserved_for_cleanup.reserve(reserve_request_count);
-    plan->sequence_stages.reserve(drafts.size());
-
-    try {
-        for (auto& draft : drafts) {
-            for (int rank : retained_ranks) {
-                int count = draft.additional_blocks[rank];
-                if (count == 0) {
-                    continue;
-                }
-                auto reserved = block_manager.at(rank)->reserve_blocks(count);
-                reserved_for_cleanup.emplace_back(rank, std::move(reserved));
-                const auto& tracked = reserved_for_cleanup.back().second;
-                auto&       table   = draft.stage.staged_context.sp_block_table[rank];
-                table.insert(table.end(), tracked.begin(), tracked.end());
-                draft.stage.reserved_blocks.emplace_back(rank, tracked);
+        draft.stage.destination_allocations.reserve(stage_reservation_count);
+        for (int rank : retained_ranks) {
+            int count = draft.additional_blocks[rank];
+            if (count == 0) {
+                continue;
             }
-
-            auto& locations = draft.stage.staged_context.block_location;
-            locations.clear();
-            size_t location_count = 0;
-            for (const auto& table : draft.stage.staged_context.sp_block_table) {
-                location_count += table.size();
-            }
-            locations.reserve(location_count);
-            for (int rank = 0; rank < attention_sp_; ++rank) {
-                for (int block_id : draft.stage.staged_context.sp_block_table[rank]) {
-                    locations.emplace_back(rank, block_id);
-                }
-            }
-
-            int source_cursor = 0;
-            for (const auto& assignment : draft.assignments) {
-                int destination_cursor = assignment.dst_logical_start;
-                int assignment_left    = assignment.num_tokens;
-                while (assignment_left > 0) {
-                    int source_block_index = source_cursor / kvcache_block_size_;
-                    int source_offset      = source_cursor % kvcache_block_size_;
-                    int dest_block_index   = destination_cursor / kvcache_block_size_;
-                    int dest_offset        = destination_cursor % kvcache_block_size_;
-                    int length             = std::min(
-                        {assignment_left, kvcache_block_size_ - source_offset, kvcache_block_size_ - dest_offset});
-                    plan->moves.push_back(
-                        {draft.stage.sequence->seq_id,
-                         dp_idx,
-                         source_rank,
-                         assignment.dst_rank,
-                         draft.stage.old_context.sp_block_table[source_rank][source_block_index],
-                         source_offset,
-                         draft.stage.staged_context.sp_block_table[assignment.dst_rank][dest_block_index],
-                         dest_offset,
-                         length});
-                    source_cursor += length;
-                    destination_cursor += length;
-                    assignment_left -= length;
-                }
-            }
-            if (source_cursor != draft.source_tokens) {
-                throw std::runtime_error("KV consolidation move generation lost source tokens");
-            }
-            plan->num_tokens += draft.source_tokens;
-            plan->sequence_stages.push_back(std::move(draft.stage));
+            auto& table = draft.stage.staged_context.sp_block_table[rank];
+            table.reserve(table.size() + static_cast<size_t>(count));
+            auto allocation = block_manager.at(rank)->prepare_allocate_uncached(count);
+            const auto& block_ids = allocation.block_ids();
+            table.insert(table.end(), block_ids.begin(), block_ids.end());
+            draft.stage.destination_allocations.emplace_back(rank, std::move(allocation));
         }
-        reserved_for_cleanup.clear();
-    }
-    catch (...) {
-        for (const auto& [rank, block_ids] : reserved_for_cleanup) {
-            block_manager.at(rank)->release_blocks(block_ids);
+
+        auto& locations = draft.stage.staged_context.block_location;
+        locations.clear();
+        size_t location_count = 0;
+        for (const auto& table : draft.stage.staged_context.sp_block_table) {
+            location_count += table.size();
         }
-        throw;
+        locations.reserve(location_count);
+        for (int rank = 0; rank < attention_sp_; ++rank) {
+            for (int block_id : draft.stage.staged_context.sp_block_table[rank]) {
+                locations.emplace_back(rank, block_id);
+            }
+        }
+
+        int source_cursor = 0;
+        for (const auto& assignment : draft.assignments) {
+            int destination_cursor = assignment.dst_logical_start;
+            int assignment_left    = assignment.num_tokens;
+            while (assignment_left > 0) {
+                int source_block_index = source_cursor / kvcache_block_size_;
+                int source_offset      = source_cursor % kvcache_block_size_;
+                int dest_block_index   = destination_cursor / kvcache_block_size_;
+                int dest_offset        = destination_cursor % kvcache_block_size_;
+                int length             = std::min(
+                    {assignment_left, kvcache_block_size_ - source_offset, kvcache_block_size_ - dest_offset});
+                plan->moves.push_back(
+                    {draft.stage.sequence->seq_id,
+                     dp_idx,
+                     source_rank,
+                     assignment.dst_rank,
+                     draft.stage.old_context.sp_block_table[source_rank][source_block_index],
+                     source_offset,
+                     draft.stage.staged_context.sp_block_table[assignment.dst_rank][dest_block_index],
+                     dest_offset,
+                     length});
+                source_cursor += length;
+                destination_cursor += length;
+                assignment_left -= length;
+            }
+        }
+        if (source_cursor != draft.source_tokens) {
+            throw std::runtime_error("KV consolidation move generation lost source tokens");
+        }
+        draft.stage.source_release.emplace(
+            block_manager.at(source_rank)->prepare_release(draft.stage.source_blocks));
+        plan->num_tokens += draft.source_tokens;
+        prepared_stages.push_back(std::move(draft.stage));
     }
 
+    plan->sequence_stages      = std::move(prepared_stages);
+    plan->master_seq_counts_before = master_seq_counts_;
+    plan->master_seq_counts_after  = std::move(staged_master_counts);
+    plan->recv_seq_counts_before   = num_recv_seqs_per_sp_;
+    plan->recv_seq_counts_after    = std::move(staged_remote_recv);
+    plan->running_seqs_before      = num_running_seqs_;
+    plan->running_tokens_before    = num_running_tokens_;
     plan->success = true;
     plan->state   = LSKVConsolidationPlan::State::RESERVED;
     return plan;
 }
 
-bool SPStateManager::commit_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan)
+bool SPStateManager::commit_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan) noexcept
 {
-    if (!plan || !plan->success || plan->state != LSKVConsolidationPlan::State::RESERVED) {
+    if (!plan || !plan->success || plan->state != LSKVConsolidationPlan::State::DISPATCHED
+        || master_seq_counts_ != plan->master_seq_counts_before
+        || num_recv_seqs_per_sp_ != plan->recv_seq_counts_before
+        || num_running_seqs_ != plan->running_seqs_before
+        || num_running_tokens_ != plan->running_tokens_before) {
         return false;
     }
 
-    auto contexts_equal = [](const BlockContext& lhs, const BlockContext& rhs) {
-        return lhs.engine_id_ == rhs.engine_id_ && lhs.dp_idx_ == rhs.dp_idx_
-               && lhs.master_sp_idx_ == rhs.master_sp_idx_ && lhs.attention_sp_ == rhs.attention_sp_
-               && lhs.attention_dp_ == rhs.attention_dp_ && lhs.pending_token_present_ == rhs.pending_token_present_
-               && lhs.pending_token_target_sp_ == rhs.pending_token_target_sp_
-               && lhs.block_location == rhs.block_location && lhs.sp_block_table == rhs.sp_block_table
-               && lhs.num_dispatched_tokens == rhs.num_dispatched_tokens;
-    };
     for (const auto& snapshot : plan->sequence_snapshots) {
         if (!snapshot.sequence || snapshot.sequence->status != snapshot.status
-            || !contexts_equal(snapshot.sequence->block_ctx(BlockContextSlot::ACTIVE), snapshot.context)) {
+            || !block_context_equal(snapshot.sequence->block_ctx(BlockContextSlot::ACTIVE), snapshot.context)) {
+            return false;
+        }
+    }
+    for (const auto& stage : plan->sequence_stages) {
+        if (!stage.source_release.has_value()
+            || stage.source_release->state() != BlockManager::PreparedBlockMutation::State::PREPARED
+            || std::any_of(stage.destination_allocations.begin(),
+                           stage.destination_allocations.end(),
+                           [](const auto& allocation) {
+                               return allocation.mutation.state()
+                                      != BlockManager::PreparedBlockMutation::State::PREPARED;
+                           })) {
             return false;
         }
     }
 
     for (auto& stage : plan->sequence_stages) {
-        std::swap(stage.sequence->block_ctx(BlockContextSlot::ACTIVE), stage.staged_context);
+        using std::swap;
+        swap(stage.sequence->block_ctx(BlockContextSlot::ACTIVE), stage.staged_context);
     }
-    // From this point onward the transaction is committed. A source-block
-    // reclamation failure is engine-fatal and must never trigger ABORT, since
-    // the reserved destination blocks are now reachable from ACTIVE metadata.
+    for (auto& stage : plan->sequence_stages) {
+        for (auto& allocation : stage.destination_allocations) {
+            allocation.mutation.commit_noexcept();
+        }
+        stage.source_release->commit_noexcept();
+    }
+    master_seq_counts_.swap(plan->master_seq_counts_after);
+    num_recv_seqs_per_sp_.swap(plan->recv_seq_counts_after);
+    cached_running_state_.reset();
     plan->state = LSKVConsolidationPlan::State::COMMITTED;
-    for (const auto& stage : plan->sequence_stages) {
-        block_manager.at(plan->source_rank)->release_blocks(stage.source_blocks);
-    }
-    rebuild_decode_role_counters();
     return true;
 }
 
-void SPStateManager::abort_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan)
+void SPStateManager::abort_kv_consolidation(const std::shared_ptr<LSKVConsolidationPlan>& plan) noexcept
 {
     if (!plan || plan->state != LSKVConsolidationPlan::State::RESERVED) {
         return;
     }
     for (auto& stage : plan->sequence_stages) {
-        for (const auto& [rank, block_ids] : stage.reserved_blocks) {
-            block_manager.at(rank)->release_blocks(block_ids);
+        for (auto& allocation : stage.destination_allocations) {
+            allocation.mutation.abort_noexcept();
         }
-        stage.reserved_blocks.clear();
+        if (stage.source_release.has_value()) {
+            stage.source_release->abort_noexcept();
+        }
     }
     plan->state = LSKVConsolidationPlan::State::ABORTED;
 }
@@ -2913,6 +3655,269 @@ void SPStateManager::allocate_ls_initial(Sequence& seq)
     }
     num_running_seqs_++;
     num_running_tokens_ += seq.num_tokens;
+}
+
+SPStateManager::PreparedLSInitialBatch
+SPStateManager::prepare_ls_initial_batch(const std::vector<std::shared_ptr<Sequence>>& batch,
+                                         const std::vector<BlockContext>&              placement_contexts)
+{
+    if (batch.empty()) {
+        throw std::runtime_error("prepared LS initial batch must not be empty");
+    }
+    if (batch.size() != placement_contexts.size()) {
+        throw std::runtime_error("prepared LS initial batch placement count mismatch");
+    }
+
+    auto impl     = std::make_unique<PreparedLSInitialBatch::Impl>();
+    impl->manager = this;
+    impl->sequences.reserve(batch.size());
+    impl->original_contexts.reserve(batch.size());
+    impl->shadow_contexts.reserve(batch.size());
+    impl->original_num_tokens.reserve(batch.size());
+    impl->original_token_sizes.reserve(batch.size());
+    impl->original_statuses.reserve(batch.size());
+    impl->allocations.reserve(attention_sp_);
+
+    impl->master_counts_before   = master_seq_counts_;
+    impl->master_counts_after    = master_seq_counts_;
+    impl->recv_counts_before     = num_recv_seqs_per_sp_;
+    impl->recv_counts_after      = num_recv_seqs_per_sp_;
+    impl->running_seqs_before    = num_running_seqs_;
+    impl->running_seqs_after     = num_running_seqs_;
+    impl->running_tokens_before  = num_running_tokens_;
+    impl->running_tokens_after   = num_running_tokens_;
+
+    std::unordered_set<uint64_t> sequence_ids;
+    sequence_ids.reserve(batch.size());
+    std::vector<std::vector<int>> blocks_per_sequence(batch.size(), std::vector<int>(attention_sp_, 0));
+    std::vector<int>              needed_blocks(attention_sp_, 0);
+    int64_t                       running_token_delta = 0;
+
+    // Finish every allocating shadow/container operation before reserving the
+    // first physical block. token_ids capacity is semantically invisible and
+    // makes the caller's fixed dummy append allocation-free after commit.
+    for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
+        const auto& sequence  = batch[seq_idx];
+        const auto& placement = placement_contexts[seq_idx];
+        if (!sequence || !sequence_ids.insert(sequence->seq_id).second) {
+            throw std::runtime_error("prepared LS initial batch contains a null or duplicate sequence");
+        }
+        if (sequence->num_tokens < 0 || sequence->token_ids.size() != static_cast<size_t>(sequence->num_tokens)) {
+            throw std::runtime_error("prepared LS initial sequence token metadata is inconsistent");
+        }
+        if (placement.engine_id_ != engine_id_ || placement.attention_sp_ != attention_sp_
+            || (dp_idx_ >= 0 && placement.dp_idx_ != dp_idx_)
+            || placement.master_sp_idx_ < 0 || placement.master_sp_idx_ >= attention_sp_
+            || static_cast<int>(placement.num_dispatched_tokens.size()) != attention_sp_
+            || static_cast<int>(placement.sp_block_table.size()) != attention_sp_
+            || !placement.block_location.empty() || placement.pending_token_present_
+            || placement.pending_token_target_sp_ != -1) {
+            throw std::runtime_error("prepared LS initial placement context is invalid");
+        }
+        if (std::any_of(placement.sp_block_table.begin(), placement.sp_block_table.end(), [](const auto& table) {
+                return !table.empty();
+            })) {
+            throw std::runtime_error("prepared LS initial placement already contains physical blocks");
+        }
+
+        int64_t dispatched = 0;
+        int64_t location_capacity = 0;
+        for (int rank = 0; rank < attention_sp_; ++rank) {
+            const int tokens = placement.num_dispatched_tokens[rank];
+            if (tokens < 0) {
+                throw std::runtime_error("prepared LS initial placement contains a negative token count");
+            }
+            dispatched += tokens;
+            const int64_t tokens_with_dummy_headroom =
+                static_cast<int64_t>(tokens) + (rank == placement.master_sp_idx_ ? 1 : 0);
+            const int64_t block_count =
+                (tokens_with_dummy_headroom + kvcache_block_size_ - 1) / kvcache_block_size_;
+            if (block_count > std::numeric_limits<int>::max()
+                || needed_blocks[rank] > std::numeric_limits<int>::max() - block_count) {
+                throw std::runtime_error("prepared LS initial block demand overflows integer accounting");
+            }
+            blocks_per_sequence[seq_idx][rank] = static_cast<int>(block_count);
+            needed_blocks[rank] += static_cast<int>(block_count);
+            location_capacity += block_count;
+        }
+        if (dispatched != sequence->num_tokens) {
+            throw std::runtime_error("prepared LS initial placement does not cover the complete prompt");
+        }
+
+        sequence->token_ids.reserve(sequence->token_ids.size() + 1);
+        impl->sequences.push_back(sequence);
+        impl->original_contexts.push_back(sequence->block_ctx(BlockContextSlot::ACTIVE));
+        impl->original_num_tokens.push_back(sequence->num_tokens);
+        impl->original_token_sizes.push_back(sequence->token_ids.size());
+        impl->original_statuses.push_back(sequence->status);
+
+        BlockContext shadow = placement;
+        shadow.block_location.clear();
+        shadow.block_location.reserve(static_cast<size_t>(location_capacity));
+        shadow.sp_block_table.clear();
+        shadow.sp_block_table.resize(attention_sp_);
+        for (int rank = 0; rank < attention_sp_; ++rank) {
+            shadow.sp_block_table[rank].reserve(blocks_per_sequence[seq_idx][rank]);
+        }
+        impl->shadow_contexts.push_back(std::move(shadow));
+
+        impl->master_counts_after[placement.master_sp_idx_]++;
+        for (int rank = 0; rank < attention_sp_; ++rank) {
+            if (placement.num_dispatched_tokens[rank] > 0 && rank != placement.master_sp_idx_) {
+                impl->recv_counts_after[rank]++;
+            }
+        }
+        // The fixed dummy token is already included in the publication target
+        // even though the shadow context remains prompt-only until the caller's
+        // allocation-free append/mark operations.
+        running_token_delta += static_cast<int64_t>(sequence->num_tokens) + 1;
+    }
+
+    if (batch.size() > static_cast<size_t>(std::numeric_limits<int>::max() - impl->running_seqs_after)
+        || running_token_delta > std::numeric_limits<int>::max() - impl->running_tokens_after) {
+        throw std::runtime_error("prepared LS initial running counter overflows integer accounting");
+    }
+    impl->running_seqs_after += static_cast<int>(batch.size());
+    impl->running_tokens_after += static_cast<int>(running_token_delta);
+    for (int rank = 0; rank < attention_sp_; ++rank) {
+        if (impl->master_counts_after[rank] > max_num_seqs_) {
+            throw std::runtime_error("prepared LS initial master metadata capacity is exceeded");
+        }
+        if (impl->recv_counts_after[rank] > max_num_recv_seqs_) {
+            throw std::runtime_error("prepared LS initial receiver metadata capacity is exceeded");
+        }
+        if (block_manager.at(rank)->num_free_blocks() < needed_blocks[rank]) {
+            throw std::runtime_error("prepared LS initial batch lost its exact block capacity");
+        }
+    }
+
+    // Each rank gets one exact transaction-owned ID list. Sequence shadow
+    // tables consume that list in stable batch order; no publication occurs.
+    for (int rank = 0; rank < attention_sp_; ++rank) {
+        if (needed_blocks[rank] == 0) {
+            continue;
+        }
+        auto mutation = block_manager.at(rank)->prepare_allocate_uncached(needed_blocks[rank]);
+        const auto& block_ids = mutation.block_ids();
+        size_t      block_pos = 0;
+        for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
+            auto& shadow = impl->shadow_contexts[seq_idx];
+            for (int block_idx = 0; block_idx < blocks_per_sequence[seq_idx][rank]; ++block_idx) {
+                const int block_id = block_ids[block_pos++];
+                shadow.sp_block_table[rank].push_back(block_id);
+                shadow.block_location.emplace_back(rank, block_id);
+            }
+        }
+        if (block_pos != block_ids.size()) {
+            std::terminate();
+        }
+        impl->allocations.emplace_back(rank, std::move(mutation));
+    }
+
+    return PreparedLSInitialBatch(std::move(impl));
+}
+
+SPStateManager::PreparedLSInitialBatch
+SPStateManager::prepare_ls_initial_batch(const std::vector<std::shared_ptr<Sequence>>& batch)
+{
+    std::vector<BlockContext> placement_contexts;
+    placement_contexts.reserve(batch.size());
+    for (const auto& sequence : batch) {
+        if (!sequence) {
+            throw std::runtime_error("prepared LS initial batch contains a null sequence");
+        }
+        placement_contexts.push_back(sequence->block_ctx(BlockContextSlot::ACTIVE));
+    }
+    return prepare_ls_initial_batch(batch, placement_contexts);
+}
+
+SPStateManager::PreparedLSRelease
+SPStateManager::prepare_ls_release(const std::shared_ptr<Sequence>& sequence, BlockContextSlot slot)
+{
+    if (slot != BlockContextSlot::ACTIVE) {
+        throw std::runtime_error("formal LS prepared release only supports the ACTIVE context");
+    }
+    if (!sequence) {
+        throw std::runtime_error("prepared LS release sequence is null");
+    }
+    const auto& context = sequence->block_ctx(BlockContextSlot::ACTIVE);
+    if (context.engine_id_ != engine_id_ || context.attention_sp_ != attention_sp_
+        || (dp_idx_ >= 0 && context.dp_idx_ != dp_idx_)
+        || context.master_sp_idx_ < 0 || context.master_sp_idx_ >= attention_sp_
+        || static_cast<int>(context.num_dispatched_tokens.size()) != attention_sp_
+        || static_cast<int>(context.sp_block_table.size()) != attention_sp_) {
+        throw std::runtime_error("prepared LS release ACTIVE context is invalid");
+    }
+    if (sequence->num_tokens < 0 || sequence->token_ids.size() != static_cast<size_t>(sequence->num_tokens)) {
+        throw std::runtime_error("prepared LS release token metadata is inconsistent");
+    }
+
+    // Validate that every published table ID has exactly one matching location
+    // entry before any BlockManager is reserved.
+    std::vector<std::pair<int, int>> table_locations;
+    table_locations.reserve(context.block_location.size());
+    for (int rank = 0; rank < attention_sp_; ++rank) {
+        for (int block_id : context.sp_block_table[rank]) {
+            table_locations.emplace_back(rank, block_id);
+        }
+    }
+    auto published_locations = std::vector<std::pair<int, int>>(context.block_location.begin(),
+                                                                 context.block_location.end());
+    std::sort(table_locations.begin(), table_locations.end());
+    std::sort(published_locations.begin(), published_locations.end());
+    if (table_locations != published_locations) {
+        throw std::runtime_error("prepared LS release block tables and locations disagree");
+    }
+
+    auto impl                    = std::make_unique<PreparedLSRelease::Impl>();
+    impl->manager                = this;
+    impl->sequence               = sequence;
+    impl->original_context       = context;
+    impl->original_num_tokens    = sequence->num_tokens;
+    impl->original_token_size    = sequence->token_ids.size();
+    impl->original_cached_tokens = sequence->num_cached_tokens;
+    impl->original_status        = sequence->status;
+    impl->master_counts_before   = master_seq_counts_;
+    impl->master_counts_after    = master_seq_counts_;
+    impl->recv_counts_before     = num_recv_seqs_per_sp_;
+    impl->recv_counts_after      = num_recv_seqs_per_sp_;
+    impl->running_seqs_before    = num_running_seqs_;
+    impl->running_seqs_after     = num_running_seqs_;
+    impl->running_tokens_before  = num_running_tokens_;
+    impl->running_tokens_after   = num_running_tokens_;
+    impl->releases.reserve(attention_sp_);
+
+    impl->shadow_context = BlockContext(engine_id_, attention_sp_, context.attention_dp_);
+    impl->shadow_context.dp_idx_ = sequence->assigned_dp >= 0 ? sequence->assigned_dp : context.dp_idx_;
+    impl->shadow_context.master_sp_idx_ = -1;
+
+    const int master = context.master_sp_idx_;
+    if (impl->master_counts_after[master] <= 0 || impl->running_seqs_after <= 0
+        || impl->running_tokens_after < sequence->num_tokens) {
+        throw std::runtime_error("prepared LS release logical counters are inconsistent");
+    }
+    impl->master_counts_after[master]--;
+    for (int rank = 0; rank < attention_sp_; ++rank) {
+        if (context.num_dispatched_tokens[rank] > 0 && rank != master) {
+            if (impl->recv_counts_after[rank] <= 0) {
+                throw std::runtime_error("prepared LS release receiver counter is inconsistent");
+            }
+            impl->recv_counts_after[rank]--;
+        }
+    }
+    impl->running_seqs_after--;
+    impl->running_tokens_after -= sequence->num_tokens;
+
+    for (int rank = 0; rank < attention_sp_; ++rank) {
+        const auto& block_ids = context.sp_block_table[rank];
+        if (block_ids.empty()) {
+            continue;
+        }
+        auto mutation = block_manager.at(rank)->prepare_release(
+            std::vector<int>(block_ids.begin(), block_ids.end()));
+        impl->releases.emplace_back(rank, std::move(mutation));
+    }
+    return PreparedLSRelease(std::move(impl));
 }
 
 void SPStateManager::allocate_ls_initial_batch(const std::vector<std::shared_ptr<Sequence>>& batch,
