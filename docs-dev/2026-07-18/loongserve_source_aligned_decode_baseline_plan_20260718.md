@@ -41,9 +41,10 @@ LoongServe-style Decode-only scheduler on NanoDeploy
 5. 连续 request range 形成 batch；
 6. instance 按已用 token 排序；
 7. capacity-aware initial DoP 和 KV placement；
-8. 运行中 Decode 的 memory-deficit merge；
-9. 运行中 Decode 的 compute-bound scale-up；
-10. pause/readmission 保留生成进度。
+8. 低 KV 利用率时的 pool-local consolidation；
+9. 运行中 Decode 的 memory-deficit merge；
+10. 运行中 Decode 的 compute-bound scale-up；
+11. pause/readmission 保留生成进度。
 
 第一版不迁移 LoongServe 原二维 DP 的 cost 部分。当前环境没有与原目标函数对应的运行时 cost，强行加载一组无关参数反而会让 baseline 难以解释。第一版采用：
 
@@ -98,6 +99,7 @@ AdmissionTransaction
 - request/instance 排序与连续 batch range：`manager.py:686-750`；
 - 二维 DP 的状态和回溯形状：`longserve_c_scheduler/src/main.cpp:33-84`；
 - packed token interval placement：`manager.py:764-800`；
+- 新请求到达时压紧低占用 instances：`manager.py:516-680`；
 - Decode memory/compute elasticity：`manager.py:844-970`。
 
 ### 1.3 明确不做的内容
@@ -109,7 +111,7 @@ AdmissionTransaction
 - 跨执行阶段的资源比较和抢占；
 - 两条计算 lane 的联合调度；
 - 与当前 Nano topology 无关的全局通信重构；
-- Nano 自定义 gap、age、utilization 或 planner-failure merge heuristic。
+- Nano 自定义 gap、age 或 planner-failure group merge heuristic。
 
 这部分不是“以后补齐 baseline”的隐含任务，而是当前实验定义之外的内容。
 
@@ -145,7 +147,7 @@ LoongServe source-identical
 | Future-KV | candidate + 单个 target group | 所属 SP8 pool 全部 running + tentative envelope | 修改 |
 | Prompt KV placement | request 在 ranks 上均匀 striping | packed intervals，再转换为 Nano blocks/metadata | 与 batching 同步修改 |
 | Admission/Decode | admission 成功会让已有请求少跑一次 Decode | bootstrap 不应吞掉已有请求的 Decode iteration | 修改 |
-| Scale-down | Nano utilization/stability/cooldown consolidation | base path 关闭 | 修改配置/入口 |
+| Scale-down | utilization 或 pending benefit 都可能触发 consolidation | 只由低 KV 利用率产生 candidate，stable/cooldown 仅防抖 | 简化触发条件 |
 | Memory scale-up | 多种 planner failure 都可能触发 merge | 只按 Decode token deficit merge/加 rank | 修改 |
 | Compute scale-up | threshold 与 arbitrary group merge 混合 | 只消费 idle ranks，不强并健康 group | 修改 |
 | Preemption | 丢弃 generated tokens 后重启 | 保留 output progress 再 admission | 修改 |
@@ -638,14 +640,38 @@ LoongServe API default 为 100，artifact launcher 使用 128。两者都有 sou
 
 正式 Issue 1% baseline 建议冻结一个值，不在运行中自适应。当前正式实验已使用 128，可以继续作为 artifact-derived profile；64 和 8 作为独立 sensitivity，不混入 base。
 
-### 9.3 禁止额外 merge heuristic
+### 9.3 低 KV 利用率 consolidation
 
-baseline path 删除或关闭：
+保留一个简单的 pool-local scale-down policy：group 的 KV 利用率低于固定阈值时，尝试把最低占用 rank 上的 KV 搬到该 group 的其他 ranks，释放一个完整 rank。
+
+```text
+group_kv_util = sum(used_kv_blocks on participating ranks)
+              / sum(usable_kv_blocks on participating ranks)
+
+if group_kv_util < ls_kv_consolidation_candidate_util:
+    source_rank = argmin(used_kv_blocks, used_kv_tokens, rank_id)
+    exact-plan migrate(source_rank -> retained_ranks)
+```
+
+约束：
+
+1. group 至少保留一个 participating rank；每次只尝试释放一个 rank，并且不能跨 SP8 pool；
+2. source rank 不能承载无法安全迁移的 pending token/master 状态；
+3. destination 必须通过 block capacity、metadata 和 headroom exact validation；
+4. migration 和 group allocation 更新必须原子 commit/rollback；
+5. exact no-fit 时不 consolidation，不改变 group ownership；
+6. 释放后的 rank 才算 truly idle，之后可被 admission 或 compute scale-up 使用。
+
+这保留了 LoongServe 优先压紧低占用 instances 的方向，但把源码中的收益比较简化成 KV utilization trigger，是本 Decode-only baseline 的显式 adaptation。
+
+baseline 不再使用 fresh persistent pending batch 是否受益、waiting age 或 length gap 产生 consolidation candidate。stable window、cooldown 和 check interval 可以保留为固定的防抖/限频保护，但它们不能绕过低利用率条件，也不参与收益比较。
+
+`ls_kv_consolidation_candidate_util` 在正式实验中固定，建议先沿用 Nano 当前默认值 `0.50`；防抖和 transport safety 参数也全部写入 manifest。
+
+这里的 consolidation 是同一 group 内迁移 KV 并释放 rank，不是合并两个健康 groups。以下 group merge 仍然禁止：
 
 - compute-pressure merge healthy group；
 - planner-failure arbitrary merge；
-- pending batch benefit heuristic；
-- utilization/stability/cooldown consolidation；
 - gap/age-driven group merge。
 
 compute-bound path 只使用真正 idle ranks。所需 rank 被其他健康 group 占用时，不强制合并那个 group。
@@ -712,7 +738,14 @@ ls_min_comp_bound_decoding_batch_size = 128
 ls_disable_scale_up = false
 ls_decode_enable_future_kv_admission = true
 ls_decode_initial_kv_dop = 0
-ls_nano_background_consolidation = false
+ls_kv_consolidation_mode = execute
+ls_kv_consolidation_candidate_util = 0.50
+ls_kv_consolidation_target_high_watermark = 0.80
+ls_kv_consolidation_stable_steps = 2
+ls_kv_consolidation_cooldown_steps = 2
+ls_kv_consolidation_check_interval_steps = 1
+ls_kv_consolidation_max_source_blocks_per_event = 128
+ls_kv_consolidation_migration_chunk_tokens = 64
 ls_dp_assignment_policy = round_robin
 ls_cross_dp_scale_up = false
 ```
@@ -720,10 +753,12 @@ ls_cross_dp_scale_up = false
 其中：
 
 - `ls_decode_initial_kv_dop=0` 表示最小 exact feasible；正式 baseline 禁止强制值；
-- `ls_nano_background_consolidation=false` 只关闭 Nano 自定义后台策略；
+- consolidation candidate 只由 `group_kv_util < 0.50` 产生，不能由 fresh waiting/pending benefit 绕过；
+- `stable_steps/cooldown/check_interval` 只用于防抖和限频，`2/2/1` 是当前已测试的起始 profile，不是 LoongServe source parameter；
+- destination high-watermark、source-block budget 和 migration chunk 属于 transport safety 参数；`0.80/128/64` 是当前已测试的起始 profile，正式实验必须显式冻结；
 - `ls_dp_assignment_policy=round_robin` 在 request arrival 时固定 pool；
 - `ls_cross_dp_scale_up=false` 是当前执行拓扑硬约束，正式 baseline 禁止覆盖；
-- source-shaped memory/compute elasticity 不受旧 consolidation mode 控制；
+- memory/compute scale-up 使用独立开关；`ls_kv_consolidation_mode` 只控制低利用率 scale-down；
 - 所有 resolved values 写入运行 manifest。
 
 建议固定三个配置 profile：
@@ -751,6 +786,7 @@ ls_cross_dp_scale_up = false
 - commit 时才创建 batch/group ID；
 - SP8 pool-wide future envelope；
 - admission result 可携带已有 running Decode plan；
+- low-KV-util consolidation candidate 和 pool-local transaction；
 - Decode memory/compute scale-up 收敛到 source-shaped 规则；
 - pause 保留 generated progress。
 
@@ -759,6 +795,7 @@ ls_cross_dp_scale_up = false
 - 接收 packed token intervals；
 - intervals 到 Nano block counts/receiver metadata 的 exact adapter；
 - pending-token headroom 和 pinned rank-range validation；
+- consolidation KV migration plan、exact destination validation 和 rollback；
 - 复用现有 allocator 与 transaction/rollback；
 - 增加 adapter rejection reason；
 - 支持 admission side effect 与已有 Decode plan 共存。
@@ -822,6 +859,7 @@ Phase 1 完成前不启用正式 baseline，也不保留“新 batching + 旧均
 - memory-deficit donor merge；
 - exact idle-rank scale-up；
 - compute threshold；
+- low-KV-util exact consolidation；
 - 删除 baseline 中额外 merge；
 - preserve-progress pause/readmission；
 - source-shaped disable switch。
@@ -852,7 +890,7 @@ Phase 1 完成前不启用正式 baseline，也不保留“新 batching + 旧均
 12. memory merge 只由 capacity deficit 触发。
 13. compute scale-up 只消费所属 pool 的 idle ranks。
 14. pause/readmission 保留 generated tokens、采样进度和 `assigned_dp`。
-15. baseline 不执行 gap、age、utilization 或 arbitrary merge heuristic。
+15. consolidation candidate 只能由本 pool 的低 KV 利用率产生；fresh pending benefit、gap、age 和 arbitrary planner failure 不能触发 consolidation/group merge。
 16. 非 LS scheduler 行为不变。
 
 ## 15. Telemetry
@@ -903,6 +941,16 @@ Phase 1 完成前不启用正式 baseline，也不保留“新 batching + 旧均
 - receiver/master metadata counts；
 - exact reject reason 或 committed initial DoP。
 
+### `ls_decode_consolidation`
+
+- DP/pool 和 group ID；
+- group KV utilization、threshold 和防抖状态；
+- source/retained ranks 及 per-rank used blocks/tokens；
+- migrated token/block counts；
+- exact reject reason；
+- transaction commit/rollback result；
+- 最终释放的 truly idle rank。
+
 ### `ls_decode_iteration`
 
 - group IDs；
@@ -941,8 +989,12 @@ Phase 1 完成前不启用正式 baseline，也不保留“新 batching + 旧均
 20. Memory deficit merge：只选择本 pool donor，新增 rank 数符合 source-shaped 规则。
 21. Compute scale-up：只使用本 pool idle ranks，不 merge healthy group。
 22. Scale-up off：memory/compute 两条路径都不能绕过开关。
-23. Pause progress：readmission 后保留 prompt+generated 和 `assigned_dp`。
-24. Feature-off：非 LS scheduler 不受影响。
+23. Low-util candidate：只有 `group_kv_util` 低于固定阈值才产生 consolidation candidate，并选择最低占用 source rank。
+24. No pending bypass：高利用率 group 不因 fresh waiting request no-fit 而绕过 utilization threshold。
+25. Consolidation exactness：destination block/metadata/headroom no-fit 时不迁移 KV，不改变 allocation。
+26. Consolidation atomicity：注入 migration/commit failure 后 KV、blocks 和 group ranks 完整恢复。
+27. Pause progress：readmission 后保留 prompt+generated 和 `assigned_dp`。
+28. Feature-off：非 LS scheduler 不受影响。
 
 ### 16.2 Issue 1% fixtures
 
@@ -983,7 +1035,7 @@ Phase 1 完成前不启用正式 baseline，也不保留“新 batching + 旧均
 - DP2×SP8 / EP16；
 - Issue 1%，rate 20，seed 0，7,200 requests；
 - 141 GiB 和 140 GiB；
-- Nano background consolidation 关闭；
+- low-KV-util consolidation 开启，并保存 candidate/commit/rollback telemetry；
 - source-default 和 artifact-derived threshold 分组运行。
 
 32 GPU（正式使用 `4DP×8SP` 时）：
@@ -1012,7 +1064,7 @@ GPU 测试必须按仓库规定申请提权。
 10. 已有 requests 不因 admission 丢失 Decode iteration。
 11. packed placement 与 batching 同步启用，并通过 interval/block/metadata correctness。
 12. memory-deficit merge 与 compute idle-rank scale-up通过 differential fixtures。
-13. Nano background consolidation 和 arbitrary merge 不在 base path。
+13. low-KV-util exact consolidation 在 base path，fresh pending benefit 和 arbitrary merge 不在 base path。
 14. pause/readmission 保留生成进度和 `assigned_dp`。
 15. resolved config 和 intentional adaptations 写入 manifest。
 16. 对应实验规模的 8/16/32 GPU correctness 完成。
@@ -1031,7 +1083,7 @@ GPU 测试必须按仓库规定申请提权。
 | Admission continuity | 保留 admission-only / 同 step 保持已有 Decode | 保持已有 Decode |
 | Future-KV | group-local / SP8 pool-wide | SP8 pool-wide |
 | Decode threshold | 100 / 128 | Issue 1% 主实验建议 128，100 做 source-default sensitivity |
-| Custom consolidation | 进入 base / 关闭 | 关闭 |
+| Consolidation trigger | low KV utilization / fresh pending benefit / 全部关闭 | 已决定：只用 low KV utilization |
 | Pause | restart / preserve progress | preserve progress |
 | DP topology | 统一 SP32 / 4 个独立 SP8 pools | 已决定：4 个独立 pools |
 | DP assignment | admission-time load-aware / arrival-time round-robin | 建议 artifact-style round-robin；load-aware 只能作为增强项 |
@@ -1046,7 +1098,7 @@ GPU 测试必须按仓库规定申请提权。
 3. Phase 1 一次完成 arrival-time round-robin、pool-local selection、FIFO-order membership 回退、stable sort、ephemeral batching、pool-wide future-KV、initial DoP 和 packed placement；
 4. packed intervals 通过 Nano block/metadata adapter 接入现有 allocator transaction，不保留均匀 striping 的过渡 baseline；
 5. Phase 1 同时保证 admission 不吞掉已有 Decode iteration；
-6. Phase 2 对齐 Decode memory/compute elasticity；
+6. Phase 2 对齐 Decode memory/compute elasticity，并保留 low-KV-util exact consolidation；
 7. 二维 DP 不进入第一版，单列 Decode-cost variant；
 8. `4DP×8SP` 固定为四个独立 pools，禁止 load-aware rerouting 和 cross-DP scale-up；
 9. 所有 Nano topology adapter 和 source deviation 写入 manifest；
@@ -1063,6 +1115,8 @@ LoongServe：
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:40`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:686`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:764`
+- `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:516`
+- `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:613`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:844`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/loongserve/longserve_server/router/manager.py:975`
 - `/mnt/nvme1n1/ml_research/linbinbin1/LoongServe/longserve_c_scheduler/src/main.cpp:33`
@@ -1075,6 +1129,7 @@ NanoDeploy：
 - `csrc/nanodeploy/scheduler/scheduler.cpp:1348`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:1488`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:1705`
+- `csrc/nanodeploy/scheduler/scheduler.cpp:641`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:1826`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:2085`
 - `csrc/nanodeploy/scheduler/scheduler.cpp:2368`
