@@ -1,0 +1,85 @@
+site_name: DLEngine
+site_description: Distributed inference for state-of-the-art large models
+site_url: https://jimyma.github.io/NanoDeploy/
+docs_dir: site
+site_dir: generated
+
+repo_name: JimyMa/NanoDeploy
+repo_url: https://github.com/JimyMa/NanoDeploy
+edit_uri: edit/Pure_dp/docs/site/
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.tracking
+    - navigation.top
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Get Started:
+      - Installation: installation.md
+      - Production Serving: online-serving.md
+  - Reference:
+      - Feature Matrix: features.md
+      - Supported Models: supported-models.md
+  - Development:
+      - Offline Inference: offline-inference.md
+
+extra:
+  generator: false
+  version:
+    provider: mike
+    default: latest
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/JimyMa/NanoDeploy
+
+extra_css:
+  - assets/stylesheets/dlengine.css
+
+copyright: © 2026 DLEngine contributors.

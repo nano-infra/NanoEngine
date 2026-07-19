@@ -13,7 +13,7 @@ The recommended way to run DLEngine is the prebuilt CUDA development image. It k
 
 The CUDA 12.8 development image bundles PyTorch, the DLEngine kernels, communication libraries, DLSlime, the Rust toolchain, and an optional 3FS USRBIO variant.
 
-See [the Docker guide](../docker/README.md) for pinned versions, image builds, container startup, mounts, and the 3FS image.
+See [the Docker guide](https://github.com/JimyMa/NanoDeploy/tree/Pure_dp/docker#readme) for pinned versions, image builds, container startup, mounts, and the 3FS image.
 
 ## Local Python installation
 
@@ -59,4 +59,4 @@ pip install dlslime-ctrl
 
 For container deployment and external Redis configuration, use the official [DLSlime Docker deployment guide](https://github.com/DeepLink-org/DLSlime/blob/main/docker/README.md).
 
-After installation, continue with the [Ray + DLEngine PD + Router workflow](../README.md#quick-start-ray--dlengine-pd--router). For local Python-only validation, see [Offline Inference](./offline-inference.md).
+After installation, continue with the [Ray + DLEngine PD + Router workflow](./online-serving.md). For local Python-only validation, see [Offline Inference](./offline-inference.md).

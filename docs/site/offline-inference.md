@@ -1,8 +1,8 @@
 # Offline Inference
 
-This guide covers direct Python inference through the scripts in [`examples/`](../examples). Offline mode is intended for development, debugging, correctness checks, and batch jobs that do not need a public HTTP API.
+This guide covers direct Python inference through the scripts in [`examples/`](https://github.com/JimyMa/NanoDeploy/tree/Pure_dp/examples). Offline mode is intended for development, debugging, correctness checks, and batch jobs that do not need a public HTTP API.
 
-For production HTTP serving with `dlengine serve`, `dlengine-router`, and Claude Code, use the [Ray + DLEngine PD + Router quick start](../README.md#quick-start-ray--dlengine-pd--router).
+For production HTTP serving with `dlengine serve`, `dlengine-router`, and Claude Code, use the [Ray + DLEngine PD + Router quick start](./online-serving.md).
 
 ## Offline versus serving mode
 
@@ -38,7 +38,7 @@ ray status --address "${RAY_ADDRESS}"
 
 ## Non-disaggregated offline inference
 
-[`examples/non_disagg.py`](../examples/non_disagg.py) runs prefill and decode in one logical engine. Ray still owns GPU resource allocation and worker placement, but no service registry or router is involved.
+[`examples/non_disagg.py`](https://github.com/JimyMa/NanoDeploy/blob/Pure_dp/examples/non_disagg.py) runs prefill and decode in one logical engine. Ray still owns GPU resource allocation and worker placement, but no service registry or router is involved.
 
 ```bash
 python examples/non_disagg.py \
@@ -64,7 +64,7 @@ Use `--ignore_eos` when a fixed number of output tokens is required. Models with
 
 ## PD-disaggregated offline inference
 
-[`examples/disagg.py`](../examples/disagg.py) creates separate prefill and decode components but drives both from one Python process. It is useful for validating cache migration without running `dlengine-router`.
+[`examples/disagg.py`](https://github.com/JimyMa/NanoDeploy/blob/Pure_dp/examples/disagg.py) creates separate prefill and decode components but drives both from one Python process. It is useful for validating cache migration without running `dlengine-router`.
 
 PD offline mode needs the same dlslime-ctrl control plane used by serving mode:
 
@@ -136,4 +136,4 @@ Both examples also accept `--config <yaml-file>` for reproducible configurations
 - Use **PD-disaggregated offline** to isolate prefill/decode migration and role-specific configuration.
 - Use **production serving** when clients need OpenAI/Anthropic APIs, dynamic engine discovery, load balancing, streaming, or Claude Code integration.
 
-For multi-node Redis security and containerized dlslime-ctrl deployment, see the [production quick start](../README.md#3-start-the-discovery-and-control-plane) and the official [DLSlime Docker guide](https://github.com/DeepLink-org/DLSlime/blob/main/docker/README.md).
+For multi-node Redis security and containerized dlslime-ctrl deployment, see the [production quick start](./online-serving.md#3-start-the-discovery-and-control-plane) and the official [DLSlime Docker guide](https://github.com/DeepLink-org/DLSlime/blob/main/docker/README.md).

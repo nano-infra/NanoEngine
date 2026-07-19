@@ -1,0 +1,87 @@
+name: Documentation website
+
+on:
+  pull_request:
+    branches:
+      - Pure_dp
+    paths:
+      - "README.md"
+      - "docs/site/**"
+      - "docs/mkdocs.yml"
+      - "docs/requirements.txt"
+      - "docs/Makefile"
+      - ".github/workflows/docs.yml"
+  push:
+    branches:
+      - Pure_dp
+    tags:
+      - "v*"
+    paths:
+      - "README.md"
+      - "docs/site/**"
+      - "docs/mkdocs.yml"
+      - "docs/requirements.txt"
+      - "docs/Makefile"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: docs-pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install documentation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r docs/requirements.txt
+
+      - name: Build documentation
+        run: make -C docs build
+
+      - name: Configure git identity
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch existing Pages branch
+        if: github.event_name == 'push'
+        run: git fetch origin gh-pages:refs/remotes/origin/gh-pages || true
+
+      - name: Deploy development documentation
+        if: github.event_name == 'push' && github.ref_type == 'branch'
+        working-directory: docs
+        run: |
+          mike deploy --update-aliases dev latest
+          mike set-default latest
+          git push origin gh-pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy release documentation
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        working-directory: docs
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mike deploy --update-aliases "${VERSION}" latest
+          mike set-default latest
+          git push origin gh-pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
