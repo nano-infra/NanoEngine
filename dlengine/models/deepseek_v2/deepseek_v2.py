@@ -45,6 +45,18 @@ from ..quant_config import QuantizationConfig
 logger = get_logger()
 
 
+# The current fused radix selector stores at most 8192 candidates from its
+# threshold bucket. It is exact only while the whole context fits that bound.
+_FUSED_INDEXER_TOPK_MAX_CONTEXT = 8192
+
+
+def _can_use_fused_indexer_topk(index_topk: int, max_context_len: int) -> bool:
+    return (
+        index_topk in (512, 2048)
+        and max_context_len <= _FUSED_INDEXER_TOPK_MAX_CONTEXT
+    )
+
+
 def _get_indexer_mode(config, layer_idx: int) -> str:
     """Return ``full``, ``shared`` or ``none`` for an attention layer.
 
@@ -932,6 +944,12 @@ class DeepseekV2Attention(nn.Module):
                 rope_theta=float(rope_theta),
                 rope_scaling=rope_params,
                 layer_id=(layer_idx if cache_layer_idx is None else cache_layer_idx),
+                indexer_norm_eps=float(
+                    getattr(config, "indexer_norm_eps", 1e-6)
+                ),
+                indexer_rope_interleave=bool(
+                    getattr(config, "indexer_rope_interleave", False)
+                ),
             )
         else:
             self.indexer = None
@@ -1599,8 +1617,12 @@ class DeepseekV2Attention(nn.Module):
                         )
                         type(self)._shared_indexer_logged = True
                 else:
-                    use_fused_topk = fused_kernels_enabled() and (
-                        self.index_topk in (512, 2048)
+                    max_topk_context = bt.shape[-1] * block_size
+                    use_fused_topk = (
+                        fused_kernels_enabled()
+                        and _can_use_fused_indexer_topk(
+                            self.index_topk, max_topk_context
+                        )
                     )
                     topk_result = self.indexer(
                         hidden_states,

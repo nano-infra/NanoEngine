@@ -16,6 +16,39 @@ class _FixedWeights(nn.Module):
         return self.value
 
 
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_indexer_key_rope_layout_follows_model_config(monkeypatch, interleaved):
+    import dlengine.layers.indexer as indexer_module
+    from dlengine.layers.indexer import Indexer, _interleaved_to_half
+
+    class CaptureRope(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen_key = None
+
+        def forward(self, positions, query, key):
+            self.seen_key = key.clone()
+            return query, key
+
+    indexer = Indexer.__new__(Indexer)
+    nn.Module.__init__(indexer)
+    indexer.rope_head_dim = 4
+    indexer.indexer_rope_interleave = interleaved
+    indexer.wk = nn.Identity()
+    indexer.k_norm = nn.Identity()
+    indexer.rotary_emb = CaptureRope()
+    monkeypatch.setattr(indexer_module, "_hadamard_rotate", lambda value: value)
+
+    hidden_states = torch.arange(8, dtype=torch.bfloat16).reshape(1, 8)
+    actual = indexer._compute_key(hidden_states, torch.tensor([0]))
+    expected_rope = hidden_states[:, :4].unsqueeze(1)
+    if interleaved:
+        expected_rope = _interleaved_to_half(expected_rope)
+
+    assert torch.equal(indexer.rotary_emb.seen_key, expected_rope)
+    assert torch.equal(actual[:, :4], expected_rope.squeeze(1))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_weighted_relu_mqa_scores_matches_dense_reference():
     from dlengine.layers.indexer import _weighted_relu_mqa_scores

@@ -335,6 +335,8 @@ class Indexer(nn.Module):
         rope_theta: float,
         rope_scaling: dict | None,
         layer_id: int,
+        indexer_norm_eps: float = 1e-6,
+        indexer_rope_interleave: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -345,6 +347,7 @@ class Indexer(nn.Module):
         self.index_topk = index_topk
         self.layer_id = layer_id
         self.softmax_scale = index_head_dim**-0.5
+        self.indexer_rope_interleave = indexer_rope_interleave
 
         # Linear projections
         self.wq_b: ReplicatedLinearBase = get_backend().get_replicated_linear(
@@ -367,7 +370,11 @@ class Indexer(nn.Module):
         )
 
         # k_norm: LayerNorm with bias (FP32 weights in checkpoint)
-        self.k_norm = nn.LayerNorm(index_head_dim, dtype=torch.float32)
+        self.k_norm = nn.LayerNorm(
+            index_head_dim,
+            eps=indexer_norm_eps,
+            dtype=torch.float32,
+        )
 
         # RoPE for indexer (same config as main attention)
         self.rotary_emb = get_rope(
@@ -420,7 +427,11 @@ class Indexer(nn.Module):
 
         # K projection + LayerNorm
         key = self.wk(hidden_states)
-        if key.is_cuda and not defer_key_transform:
+        if (
+            key.is_cuda
+            and self.indexer_rope_interleave
+            and not defer_key_transform
+        ):
             key = indexer_layer_norm_bf16(
                 key.contiguous(),
                 self.k_norm.weight,
@@ -449,9 +460,13 @@ class Indexer(nn.Module):
             q_rope = query[..., : self.rope_head_dim]
             k_rope = key[..., : self.rope_head_dim]
 
-            # Convert from interleaved to half format (consistent with main attention)
-            q_rope = _interleaved_to_half(q_rope)
-            k_rope_3d = _interleaved_to_half(k_rope.unsqueeze(1))
+            k_rope_3d = k_rope.unsqueeze(1)
+            if self.indexer_rope_interleave:
+                # The local RoPE implementation consumes NeoX half layout.
+                # GLM Indexer projections are interleaved, while DeepSeek-V3.2
+                # Indexer projections are already in half layout.
+                q_rope = _interleaved_to_half(q_rope)
+                k_rope_3d = _interleaved_to_half(k_rope_3d)
 
             # Apply RoPE
             q_rope, k_rope_3d = self.rotary_emb(positions, q_rope, k_rope_3d)
@@ -488,7 +503,9 @@ class Indexer(nn.Module):
         key = self.k_norm(key.float()).to(key.dtype)
 
         k_rope = key[..., : self.rope_head_dim]
-        k_rope_3d = _interleaved_to_half(k_rope.unsqueeze(1))
+        k_rope_3d = k_rope.unsqueeze(1)
+        if self.indexer_rope_interleave:
+            k_rope_3d = _interleaved_to_half(k_rope_3d)
 
         # RoPE needs a dummy q; pass k_rope_3d as both q and k, discard q output
         _, k_rope_3d = self.rotary_emb(positions, k_rope_3d, k_rope_3d)
@@ -852,7 +869,9 @@ class Indexer(nn.Module):
         batch_size = context_lens.shape[0]
 
         # Step 1-4: Compute query and key (with RoPE + Hadamard)
-        use_fused_query = fused_kernels_enabled()
+        use_fused_query = (
+            fused_kernels_enabled() and self.indexer_rope_interleave
+        )
         use_fused_key = use_fused_query and hidden_states.is_cuda
         query, key = self._compute_q_k(
             q_lora,

@@ -5,6 +5,7 @@ import torch
 
 from dlengine.models.deepseek_v2.deepseek_v2 import (
     _IndexerTopKState,
+    _can_use_fused_indexer_topk,
     _get_indexer_mode,
 )
 from dlengine.layers.indexer import _expand_decode_context_lens
@@ -143,6 +144,13 @@ def test_dummy_decode_context_lens_do_not_underflow():
 
     assert expanded.shape == (1, 8)
     assert torch.equal(expanded, torch.ones_like(expanded))
+
+
+def test_fused_indexer_topk_is_limited_to_exact_context_range():
+    assert _can_use_fused_indexer_topk(2048, 8192)
+    assert not _can_use_fused_indexer_topk(2048, 8193)
+    assert not _can_use_fused_indexer_topk(2048, 1_048_576)
+    assert not _can_use_fused_indexer_topk(1024, 8192)
 
 
 def test_glm52_repairs_transformers_rope_head_dim_alias():
