@@ -54,7 +54,8 @@ request round-robin 固定到 DP pool
         -> prompt length 稳定降序后做 Nano exact planning
         -> no-fit 时按 FIFO selection order 回退并重新 planning
         -> 每 pool 一个连续候选 batch
-        -> 现有 placement/admission transaction
+        -> LoongServe-style packed interval placement
+        -> Nano block/metadata exact adapter + allocation/rollback transaction
         -> source-shaped Decode merge/scale-up
 ```
 
@@ -142,7 +143,7 @@ LoongServe source-identical
 | Batch partition | 全局窗口按 `attention_dp` 均分，no-fit 时缩短 | 每个 pool 每轮一个 ephemeral continuous batch | 修改 |
 | Batch count/DoP | batch 数绑定 `attention_dp`，DoP 取第一个可行值 | 每 pool 每轮最多一个 batch；DoP 取本 pool 第一个可行值 | 明确近似 |
 | Future-KV | candidate + 单个 target group | 所属 SP8 pool 全部 running + tentative envelope | 修改 |
-| Prompt KV placement | request 在 ranks 上均匀 striping | 最终目标为 packed intervals | 分阶段修改 |
+| Prompt KV placement | request 在 ranks 上均匀 striping | packed intervals，再转换为 Nano blocks/metadata | 与 batching 同步修改 |
 | Admission/Decode | admission 成功会让已有请求少跑一次 Decode | bootstrap 不应吞掉已有请求的 Decode iteration | 修改 |
 | Scale-down | Nano utilization/stability/cooldown consolidation | base path 关闭 | 修改配置/入口 |
 | Memory scale-up | 多种 planner failure 都可能触发 merge | 只按 Decode token deficit merge/加 rank | 修改 |
@@ -475,7 +476,8 @@ while not selected_fifo.empty():
 for d = 1 .. attention_sp:
     取排序后前 d 个 ranks
     检查 future-KV
-    检查 block/metadata/headroom
+    生成 packed token intervals
+    转换并检查 block/metadata/headroom
     第一个 exact feasible d 即为 initial DoP
 ```
 
@@ -487,24 +489,27 @@ initial_dop_policy = min_exact_feasible
 
 禁止通过非零 `ls_decode_initial_kv_dop` 在正式 baseline 中强制固定 DoP。
 
-### 7.3 Placement 分两步
+### 7.3 Placement 一次切换
 
-第一阶段不修改现有 placement 数据面，只改变 batching 发生的时机：
+batching 和 initial placement 在同一个 admission pipeline 中一次切换，不保留“新 batching + 旧均匀 striping”的中间 baseline。
 
-- 继续使用现有 block allocator；
-- 继续生成现有 receiver metadata；
-- 继续保留 pending-token headroom；
-- 继续使用现有 allocation/rollback transaction。
+这里要区分两种排序：
 
-第二阶段再切换为 LoongServe-style packed intervals：
+- **选择 ranks**：available ranks 按 used tokens 升序，initial DoP 取该顺序的前 `d` 个；
+- **在 selected ranks 内写入**：selected ranks 按 used tokens 降序，优先填更满 rank 的剩余空间。
 
-1. selected ranks 按 used tokens 从高到低填充；
-2. request prompt 按排序后的 request 次序写入；
-3. 先填更满 rank 的剩余空间；
-4. 只有跨越容量边界时才把一个 request 分布到多个 ranks；
-5. interval 最终转换成 Nano block counts 和 metadata。
+第二个顺序与 LoongServe `manager.py:764-800` 的 packed interval 逻辑一致。对每个候选 `d`，placement 流程为：
 
-packed placement 会减少短 request 的 KV owner 数、receiver 数和 block rounding，是 Decode 路径中值得保留的 LoongServe 设计。
+1. request prompt 按 batch 中已经确定的 request 次序依次写入；
+2. 先填当前 rank 的全部剩余 token capacity；
+3. 只有 request 跨越 capacity boundary 时，才把它分布到下一个 rank；
+4. 得到每个 `(request, rank)` 的连续 token interval；
+5. 将 intervals 转换为 Nano block counts，计入 block rounding、pending-token headroom、receiver/master metadata；
+6. exact adapter 通过后，使用现有 block allocator 和 allocation/rollback transaction 原子提交。
+
+因此，一次切换修改的是 placement **policy**，不是抛弃 Nano 的 allocation 数据面。现有 allocator、metadata 结构和 rollback transaction 继续作为 LoongServe-style intervals 的执行适配层。任一 `d` 的 adapter 校验失败就尝试下一个 `d`；全部失败时按第 6 节的 FIFO selection order 回退 request membership 并完整重算。
+
+packed placement 会减少短 request 的 KV owner 数、receiver 数和 block rounding，是 Decode 路径中应与 batching 同时落地的 LoongServe 设计。
 
 ### 7.4 `4DP×8SP` 映射为四个独立 elastic pools
 
@@ -741,6 +746,7 @@ ls_cross_dp_scale_up = false
 - request-level current/future scan；
 - selected 后 stable length sort；
 - ephemeral continuous partition；
+- available-rank ordering、initial DoP search 和 packed token interval planning；
 - current no-fit 时保持 waiting；
 - commit 时才创建 batch/group ID；
 - SP8 pool-wide future envelope；
@@ -750,18 +756,12 @@ ls_cross_dp_scale_up = false
 
 ### 12.2 `sp_state_manager.*`
 
-第一阶段：
-
-- 复用现有 exact placement；
-- 复用 transaction/rollback；
+- 接收 packed token intervals；
+- intervals 到 Nano block counts/receiver metadata 的 exact adapter；
+- pending-token headroom 和 pinned rank-range validation；
+- 复用现有 allocator 与 transaction/rollback；
 - 增加 adapter rejection reason；
 - 支持 admission side effect 与已有 Decode plan 共存。
-
-第二阶段：
-
-- packed token intervals；
-- interval 到 blocks/metadata 的转换；
-- pinned rank-range validation。
 
 ### 12.3 Python/config
 
@@ -792,7 +792,7 @@ ls_cross_dp_scale_up = false
 - Issue 1% 六个长短混合窗口；
 - resolved config manifest schema。
 
-### Phase 1：Request-level batching
+### Phase 1：Fresh-request admission pipeline 一次切换
 
 改动：
 
@@ -803,30 +803,19 @@ ls_cross_dp_scale_up = false
 - stable length sort；
 - exact no-fit 时按 FIFO scan 顺序回退 membership 并重新 planning；
 - 每 pool 每轮一个 ephemeral continuous range；
-- empty-system 检查和 current-system exact commit；
-- rollback 后恢复 waiting order。
-
-该阶段不改 placement 表示和 Decode planner。
-
-### Phase 2：Pool-wide future-KV 和 admission continuity
-
-改动：
-
 - 每个 SP8 pool 独立的 future envelope；
+- available-rank ordering 和 initial DoP search；
+- packed token intervals；
+- interval 到 blocks/metadata/headroom 的 exact adapter；
+- 使用现有 allocator transaction 原子 commit/rollback；
+- rollback 后恢复 waiting order；
 - 消除跨 group future capacity 重复承诺；
 - admission 不吞掉已有 Decode iteration；
 - 完整 telemetry。
 
-### Phase 3：Packed placement
+Phase 1 完成前不启用正式 baseline，也不保留“新 batching + 旧均匀 striping”的实验配置。实现过程可以拆成可回溯的小提交，但语义上只做一次切换。
 
-改动：
-
-- instance ordering；
-- packed intervals；
-- block/metadata adapter；
-- exact rejection/replan。
-
-### Phase 4：Decode elasticity
+### Phase 2：Decode elasticity
 
 改动：
 
@@ -837,7 +826,7 @@ ls_cross_dp_scale_up = false
 - preserve-progress pause/readmission；
 - source-shaped disable switch。
 
-### Phase 5：验收和清理
+### Phase 3：验收和清理
 
 - 删除临时双 policy；
 - 旧 persistent-batch 文档标记 historical；
@@ -845,7 +834,7 @@ ls_cross_dp_scale_up = false
 - 完成 source-shaped CPU differential tests；
 - 正式 Issue 1% A/B。
 
-每个 Phase 单独提交，避免一次改动同时重写 queue、placement 和 Decode group ownership。
+每个逻辑单元及时提交，方便回溯；只有 Phase 1 的完整 admission pipeline 通过 CPU fixtures 后，才整体启用 baseline path。
 
 ## 14. 不变量
 
@@ -904,6 +893,16 @@ ls_cross_dp_scale_up = false
 - exact block requirement；
 - adapter reject reason。
 
+### `ls_decode_initial_placement`
+
+- available ranks 及 used-token 升序；
+- 每个候选 `d` 的 selected ranks；
+- selected ranks 的 used-token 降序 packing order；
+- per-request token intervals；
+- converted block counts 和 pending-token headroom；
+- receiver/master metadata counts；
+- exact reject reason 或 committed initial DoP。
+
 ### `ls_decode_iteration`
 
 - group IDs；
@@ -934,14 +933,16 @@ ls_cross_dp_scale_up = false
 12. No persistent identity：current no-fit 后不存在 batch ID/ownership。
 13. Pool-wide future-KV：同 pool 两个 groups 单独可行、合计不可行时拒绝第二份承诺。
 14. Pool isolation：DP0 full 不会借用 DP1 capacity，group DoP 最大为 8。
-15. Exact adapter：block/metadata reject 后 replan，不改 heuristic。
-16. Atomic rollback：任意注入点失败后本 pool queue/blocks/ownership 完全恢复。
-17. Admission continuity：已有 requests 不因新 admission 少一次 Decode。
-18. Memory deficit merge：只选择本 pool donor，新增 rank 数符合 source-shaped 规则。
-19. Compute scale-up：只使用本 pool idle ranks，不 merge healthy group。
-20. Scale-up off：memory/compute 两条路径都不能绕过开关。
-21. Pause progress：readmission 后保留 prompt+generated 和 `assigned_dp`。
-22. Feature-off：非 LS scheduler 不受影响。
+15. Packed ordering：rank selection 按 used tokens 升序；selected ranks 内 packing 按 used tokens 降序。
+16. Packed intervals：request 只在 capacity boundary 上跨 rank，interval 无重叠、无缺口且总 token 数守恒。
+17. Exact adapter：interval 转换后的 block/metadata/headroom reject 会触发 replan，不改 heuristic。
+18. Atomic rollback：任意注入点失败后本 pool queue/blocks/ownership 完全恢复。
+19. Admission continuity：已有 requests 不因新 admission 少一次 Decode。
+20. Memory deficit merge：只选择本 pool donor，新增 rank 数符合 source-shaped 规则。
+21. Compute scale-up：只使用本 pool idle ranks，不 merge healthy group。
+22. Scale-up off：memory/compute 两条路径都不能绕过开关。
+23. Pause progress：readmission 后保留 prompt+generated 和 `assigned_dp`。
+24. Feature-off：非 LS scheduler 不受影响。
 
 ### 16.2 Issue 1% fixtures
 
@@ -1009,7 +1010,7 @@ GPU 测试必须按仓库规定申请提权。
 8. group 只能在本 pool 内 scale-up，DoP 不超过 8。
 9. admission commit 保持 exact allocation/rollback。
 10. 已有 requests 不因 admission 丢失 Decode iteration。
-11. packed placement 阶段完成并通过 block/metadata correctness。
+11. packed placement 与 batching 同步启用，并通过 interval/block/metadata correctness。
 12. memory-deficit merge 与 compute idle-rank scale-up通过 differential fixtures。
 13. Nano background consolidation 和 arbitrary merge 不在 base path。
 14. pause/readmission 保留生成进度和 `assigned_dp`。
@@ -1026,7 +1027,7 @@ GPU 测试必须按仓库规定申请提权。
 | Persistent fresh batch | 保留 / 删除 | 删除 |
 | Batching v1 | FIFO membership 回退 + stable sort + 每 pool 一个 batch / 新 length heuristic | 前者 |
 | 二维 DP | 进入第一版 / Decode-cost 独立 variant | 独立 variant |
-| Placement | 第一阶段就改 packed / 第二阶段改 | 第二阶段，先隔离 queue 变化 |
+| Placement | 与 batching 同步切 packed / 保留均匀 striping 过渡阶段 | 已决定：同步切 packed，不保留过渡 baseline |
 | Admission continuity | 保留 admission-only / 同 step 保持已有 Decode | 保持已有 Decode |
 | Future-KV | group-local / SP8 pool-wide | SP8 pool-wide |
 | Decode threshold | 100 / 128 | Issue 1% 主实验建议 128，100 做 source-default sensitivity |
@@ -1042,15 +1043,14 @@ GPU 测试必须按仓库规定申请提权。
 
 1. baseline 范围严格限定为 Decode-only；
 2. 旧 persistent fresh-batch 设计不再约束实现；
-3. Phase 1 增加 arrival-time round-robin、pool-local selection、按 FIFO selection order 回退、stable sort 和每 pool 一个 ephemeral batch；
-4. placement/admission transaction 第一阶段保持不变；
-5. Phase 2 修复 SP8 pool-wide future-KV 和 admission continuity；
-6. Phase 3 再切 packed placement；
-7. Phase 4 对齐 Decode memory/compute elasticity；
-8. 二维 DP 不进入第一版，单列 Decode-cost variant；
-9. `4DP×8SP` 固定为四个独立 pools，禁止 load-aware rerouting 和 cross-DP scale-up；
-10. 所有 Nano topology adapter 和 source deviation 写入 manifest；
-11. 正式实验统一命名为 `LoongServe-style Decode-only`。
+3. Phase 1 一次完成 arrival-time round-robin、pool-local selection、FIFO-order membership 回退、stable sort、ephemeral batching、pool-wide future-KV、initial DoP 和 packed placement；
+4. packed intervals 通过 Nano block/metadata adapter 接入现有 allocator transaction，不保留均匀 striping 的过渡 baseline；
+5. Phase 1 同时保证 admission 不吞掉已有 Decode iteration；
+6. Phase 2 对齐 Decode memory/compute elasticity；
+7. 二维 DP 不进入第一版，单列 Decode-cost variant；
+8. `4DP×8SP` 固定为四个独立 pools，禁止 load-aware rerouting 和 cross-DP scale-up；
+9. 所有 Nano topology adapter 和 source deviation 写入 manifest；
+10. 正式实验统一命名为 `LoongServe-style Decode-only`。
 
 这样可以避免把当前实验不执行的内容带入设计，同时保留 LoongServe 对 Decode 资源管理最关键的思想，也能控制每个阶段的改动面和验证成本。
 
