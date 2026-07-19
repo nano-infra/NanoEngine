@@ -1,0 +1,55 @@
+:root {
+  --md-primary-fg-color: #172554;
+  --md-primary-fg-color--light: #2563eb;
+  --md-primary-fg-color--dark: #0f172a;
+  --md-accent-fg-color: #06b6d4;
+}
+
+.md-typeset .hero {
+  max-width: 68rem;
+  margin: 1.5rem 0 2.25rem;
+}
+
+.md-typeset .hero .eyebrow {
+  color: var(--md-accent-fg-color);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin-bottom: 0.5rem;
+  text-transform: uppercase;
+}
+
+.md-typeset .hero h1 {
+  font-size: clamp(2rem, 5vw, 3.4rem);
+  line-height: 1.08;
+  margin: 0 0 0.8rem;
+  max-width: 58rem;
+}
+
+.md-typeset .hero p:last-child {
+  font-size: 1.05rem;
+  max-width: 58rem;
+}
+
+.md-typeset .feature-grid {
+  display: grid;
+  gap: 0.85rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin: 1rem 0 1.75rem;
+}
+
+.md-typeset .feature-grid > a {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 10px;
+  color: var(--md-default-fg-color);
+  display: block;
+  padding: 1rem;
+  transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+}
+
+.md-typeset .feature-grid > a:hover {
+  border-color: var(--md-accent-fg-color);
+  box-shadow: 0 6px 22px rgb(0 0 0 / 10%);
+  text-decoration: none;
+  transform: translateY(-2px);
+}
