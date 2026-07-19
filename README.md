@@ -306,6 +306,28 @@ curl http://<node0-ip>:8080/v1/chat/completions \
 
 ______________________________________________________________________
 
+## 🤝 Contribution Workflow
+
+We use GitHub Issues, formal Sub-issues, and pull requests as one hierarchy:
+
+```text
+Epic
+└── Workstream
+    └── Task / Bug
+        └── Pull Request
+```
+
+- Search for and reuse an existing Issue before creating a new one.
+- Track project outcomes as Epics, implementation areas as Workstreams, and concrete deliverables as Task/Bug Sub-issues.
+- Keep one primary review objective per PR; split correctness, performance, and large refactors when they can be reviewed or reverted independently.
+- Use `Refs #N` for Epics, Workstreams, and partially addressed Issues. Use `Closes #N` only when merging fully satisfies a leaf Issue's acceptance criteria.
+- Target the `Pure_dp` integration branch unless the PR documents an explicit exception.
+- Create and link follow-up Issues before merging; a note left only in a PR is not considered scheduled work.
+
+See the complete [GitHub Issue and Pull Request Workflow](./docs/github-workflow.zh.md) for Issue templates, branch conventions, review requirements, labels, and weekly triage rules.
+
+______________________________________________________________________
+
 ## 📄 License
 
 See individual component [license](./LICENSE).
