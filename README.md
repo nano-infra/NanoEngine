@@ -314,3 +314,4 @@ See individual component [license](./LICENSE).
 
 - **Issues**: [GitHub Issues](https://github.com/JimyMa/NanoDeploy/issues)
 - **Documentation**: Check component READMEs
+- **Contribution workflow**: [GitHub Issue and Pull Request Workflow](./docs/github-workflow.zh.md)
