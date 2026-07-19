@@ -798,6 +798,151 @@ class Indexer(nn.Module):
 
         return indices
 
+    def compute_prefill_topk_paged(
+        self,
+        q_lora: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        block_table: torch.Tensor,
+        query_chunk: int = 64,
+    ) -> torch.Tensor:
+        """Compute chunked-prefill TopK against the paged FP8 cache.
+
+        Fresh keys must already have been stored by store_prefill_keys. This
+        avoids gathering/dequantizing the full prefix and scores cached and
+        fresh candidates with the same production kernel used by decode.
+        """
+        assert self.indexer_cache is not None, "IndexerCache not initialized"
+        if query_chunk <= 0:
+            raise ValueError(f"query_chunk must be positive, got {query_chunk}")
+        if cu_seqlens_q.shape != cu_seqlens_k.shape:
+            raise RuntimeError(
+                "cu_seqlens_q/cu_seqlens_k shape mismatch: "
+                f"{cu_seqlens_q.shape} vs {cu_seqlens_k.shape}"
+            )
+
+        use_fused_query = fused_kernels_enabled()
+        query, _ = self._compute_q_k(
+            q_lora,
+            hidden_states,
+            positions,
+            defer_query_transform=use_fused_query,
+        )
+        if use_fused_query:
+            gate_weight = self.weights_proj(hidden_states)
+            q_fp8, weights = indexer_q_rope_hadamard_quant(
+                query,
+                gate_weight,
+                (self.n_heads**-0.5) * self.softmax_scale,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+            )
+            weights = weights.squeeze(-1)
+        else:
+            q_flat = query.reshape(-1, self.head_dim)
+            q_fp8, q_scale = quant_fp8(
+                q_flat.contiguous(),
+                self.head_dim,
+                round_ue8m0=True,
+                min_absmax=1e-4,
+            )
+            q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
+            weights = self._compute_gate_weights(
+                hidden_states, q_scale.view(-1, self.n_heads, 1)
+            )
+
+        indices = torch.full(
+            (q_fp8.shape[0], self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=q_fp8.device,
+        )
+        cache = self.indexer_cache
+        page_size = cache.page_size
+        kv_cache = cache.get_buffer(self.layer_id).view(
+            cache.num_pages, page_size, 1, cache.bytes_per_token
+        )
+
+        for seq_id in range(cu_seqlens_q.shape[0] - 1):
+            q_start = int(cu_seqlens_q[seq_id].item())
+            q_end = int(cu_seqlens_q[seq_id + 1].item())
+            k_start = int(cu_seqlens_k[seq_id].item())
+            context_len = int(cu_seqlens_k[seq_id + 1].item()) - k_start
+            q_len = q_end - q_start
+            cached_len = context_len - q_len
+            if q_len <= 0:
+                continue
+            if cached_len < 0:
+                raise RuntimeError(
+                    f"Invalid chunk lengths: context={context_len}, query={q_len}"
+                )
+
+            used_pages = max(1, math.ceil(context_len / page_size))
+            if used_pages > block_table.shape[1]:
+                raise RuntimeError(
+                    f"Indexer needs {used_pages} pages, got {block_table.shape[1]}"
+                )
+            seq_pages = block_table[seq_id : seq_id + 1, :used_pages]
+            max_context_len = used_pages * page_size
+
+            for a in range(0, q_len, query_chunk):
+                b = min(a + query_chunk, q_len)
+                rows = b - a
+                tiled_q = q_fp8[q_start + a : q_start + b].unsqueeze(1)
+                tiled_weights = weights[q_start + a : q_start + b]
+                context_lens = (
+                    cached_len
+                    + torch.arange(
+                        a + 1,
+                        b + 1,
+                        dtype=torch.int32,
+                        device=q_fp8.device,
+                    )
+                ).unsqueeze(1)
+                page_tables = seq_pages.repeat(rows, 1).to(torch.int32)
+                schedule_meta = self.build_schedule_metadata(context_lens)
+                logits = deep_gemm.fp8_paged_mqa_logits(
+                    tiled_q,
+                    kv_cache,
+                    tiled_weights,
+                    context_lens,
+                    page_tables,
+                    schedule_meta,
+                    max_context_len,
+                    clean_logits=False,
+                )
+
+                # The original fused radix TopK silently clips a threshold
+                # bucket to 8192 candidates. Its correctness therefore depends
+                # on the score distribution, not just sequence length. The v2
+                # cluster kernel fixes this for Top-512, but Indexer uses
+                # Top-2048. Keep production paged-FP8 scoring and select the
+                # exact TopK here until a Top-2048 cluster kernel is available.
+                actual_topk = min(self.index_topk, context_len)
+                cols = torch.arange(
+                    max_context_len, device=q_fp8.device
+                ).unsqueeze(0)
+                logits.masked_fill_(cols >= context_lens, float("-inf"))
+                top_values, logical = logits.topk(actual_topk, dim=-1)
+                logical = logical.to(torch.int32).masked_fill_(
+                    ~torch.isfinite(top_values), -1
+                )
+                if actual_topk < self.index_topk:
+                    logical = torch.nn.functional.pad(
+                        logical,
+                        (0, self.index_topk - actual_topk),
+                        value=-1,
+                    )
+
+                logical = torch.where(
+                    logical >= 0, logical + k_start, logical
+                )
+                indices[q_start + a : q_start + b] = logical
+
+        return indices
+
     def _compute_gate_weights(
         self,
         hidden_states: torch.Tensor,

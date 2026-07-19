@@ -1163,10 +1163,10 @@ class DeepseekV2Attention(nn.Module):
                 max_sparse_len = (
                     int(sparse_lens.max().item()) if sparse_lens.numel() else 0
                 )
-                can_sparse_chunk = total_cached == 0 or has_cache_metadata
+                can_sparse_chunk = has_cache_metadata
                 if (
                     can_sparse_chunk
-                    and max_sparse_len > self.index_topk
+                    and max_sparse_len > 0
                     and _sparse_prefill_supported(
                         num_heads,
                         self.index_topk,
@@ -1183,13 +1183,13 @@ class DeepseekV2Attention(nn.Module):
                     self.kc(q_nope, query_states[..., : self.kv_lora_rank])
                     query_states[..., self.kv_lora_rank :] = q_pe
 
+                    sp_rank = get_dist_context().attn_sp_rank
+                    num_seqs = context.cu_seqlens_k.shape[0] - 1
+                    block_table = context.block_tables[sp_rank, :num_seqs, :]
+                    block_size = k_cache.shape[1]
+
                     key_states_for_sparse = key_states_3d
                     if total_cached > 0:
-                        sp_rank = get_dist_context().attn_sp_rank
-                        num_seqs = context.cu_seqlens_k.shape[0] - 1
-                        block_table = context.block_tables[sp_rank, :num_seqs, :]
-                        block_size = k_cache.shape[1]
-
                         k_cached_raw, cached_lens, cu_cached = (
                             _gather_cache_cached_only(
                                 k_cache,
@@ -1202,7 +1202,9 @@ class DeepseekV2Attention(nn.Module):
                         if k_cached_raw.shape[0] > 0:
                             k_cached_raw = k_cached_raw.squeeze(1)
                             if k_cache.dtype == torch.float8_e4m3fn:
-                                dequantize_fn = getattr(self, "_dequantize_fn", None)
+                                dequantize_fn = getattr(
+                                    self, "_dequantize_fn", None
+                                )
                                 if dequantize_fn is None:
                                     from dlengine.kernel.triton.hopper.fp8_utils import (
                                         dequantize_and_unpack_mla as dequantize_fn,
@@ -1239,33 +1241,23 @@ class DeepseekV2Attention(nn.Module):
                             )
                             type(self)._shared_indexer_logged = True
                     else:
-                        if total_cached == 0:
-                            topk_indices = self.indexer.compute_prefill_topk(
-                                q_lora,
-                                hidden_states,
-                                positions,
-                                context.cu_seqlens_q,
+                        topk_indices = self.indexer.compute_prefill_topk_paged(
+                            q_lora,
+                            hidden_states,
+                            positions,
+                            context.cu_seqlens_q,
+                            context.cu_seqlens_k,
+                            block_table,
+                        )
+                        if not type(self)._cache_aware_prefill_logged:
+                            logger.info(
+                                "Using paged-FP8 NSA sparse prefill: "
+                                "cached_tokens=%d, fresh_tokens=%d, topk=%d",
+                                total_cached,
+                                q_len,
+                                self.index_topk,
                             )
-                        else:
-                            topk_indices = (
-                                self.indexer.compute_prefill_topk_cache_aware(
-                                    q_lora,
-                                    hidden_states,
-                                    positions,
-                                    context.cu_seqlens_q,
-                                    context.cu_seqlens_k,
-                                    block_table,
-                                )
-                            )
-                            if not type(self)._cache_aware_prefill_logged:
-                                logger.info(
-                                    "Using cache-aware NSA sparse chunk prefill: "
-                                    "cached_tokens=%d, fresh_tokens=%d, topk=%d",
-                                    total_cached,
-                                    q_len,
-                                    self.index_topk,
-                                )
-                                type(self)._cache_aware_prefill_logged = True
+                            type(self)._cache_aware_prefill_logged = True
                         if indexer_state is not None:
                             indexer_state.publish(self.layer_idx, topk_indices)
 

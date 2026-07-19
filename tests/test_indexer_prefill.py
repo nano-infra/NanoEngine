@@ -133,3 +133,148 @@ def test_cache_aware_prefill_topk_matches_ragged_dense_reference():
         cached_offset += cached_len
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_paged_prefill_topk_uses_per_query_causal_context(monkeypatch):
+    import dlengine.layers.indexer as indexer_module
+    from dlengine.layers.indexer import Indexer, IndexerCache
+
+    device = torch.device("cuda")
+    indexer = Indexer.__new__(Indexer)
+    nn.Module.__init__(indexer)
+    indexer.n_heads = 2
+    indexer.head_dim = 128
+    indexer.index_topk = 3
+    indexer.layer_id = 0
+    indexer.softmax_scale = 1.0
+    indexer.indexer_cache = IndexerCache(
+        num_layers=1, num_pages=6, page_size=4, head_dim=128, device="cuda"
+    )
+
+    query = torch.ones(5, 2, 128, dtype=torch.bfloat16, device=device)
+
+    def fake_compute_q_k(self, q_lora, hidden_states, positions, **kwargs):
+        return query, torch.empty(0, device=device)
+
+    indexer._compute_q_k = types.MethodType(fake_compute_q_k, indexer)
+    indexer._compute_gate_weights = types.MethodType(
+        lambda self, hidden_states, q_scale: torch.ones(
+            hidden_states.shape[0], self.n_heads, device=device
+        ),
+        indexer,
+    )
+    indexer.build_schedule_metadata = types.MethodType(
+        lambda self, context_lens: torch.empty(0, device=device),
+        indexer,
+    )
+
+    monkeypatch.setattr(indexer_module, "fused_kernels_enabled", lambda: False)
+    monkeypatch.setattr(
+        indexer_module,
+        "quant_fp8",
+        lambda value, *args, **kwargs: (
+            value, torch.ones(value.shape[0], 1, device=device)
+        ),
+    )
+    seen_context_lens = []
+
+    def fake_paged_logits(
+        tiled_q, kv_cache, weights, context_lens, page_tables, schedule,
+        max_context_len, **kwargs
+    ):
+        seen_context_lens.append(context_lens.flatten().tolist())
+        return torch.arange(
+            max_context_len, dtype=torch.float32, device=device
+        ).expand(tiled_q.shape[0], -1).clone()
+
+    monkeypatch.setattr(
+        indexer_module.deep_gemm, "fp8_paged_mqa_logits", fake_paged_logits
+    )
+
+    cu_q = torch.tensor([0, 2, 5], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, 5, 10], dtype=torch.int32, device=device)
+    block_table = torch.tensor([[3, 1], [4, 0]], dtype=torch.int32, device=device)
+    dummy = torch.empty(5, 1, dtype=torch.bfloat16, device=device)
+    actual = indexer.compute_prefill_topk_paged(
+        dummy, dummy, torch.arange(5, device=device), cu_q, cu_k, block_table,
+        query_chunk=2,
+    )
+
+    expected = torch.tensor(
+        [[3, 2, 1], [4, 3, 2], [7, 6, 5], [8, 7, 6], [9, 8, 7]],
+        dtype=torch.int32, device=device,
+    )
+    assert torch.equal(actual, expected)
+    assert seen_context_lens == [[4, 5], [3, 4], [5]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_paged_prefill_long_context_preserves_exact_topk(monkeypatch):
+    """Paged scoring must preserve exact causal TopK beyond 64K."""
+    import dlengine.layers.indexer as indexer_module
+    from dlengine.layers.indexer import Indexer, IndexerCache
+
+    device = torch.device("cuda")
+    indexer = Indexer.__new__(Indexer)
+    nn.Module.__init__(indexer)
+    indexer.n_heads = 2
+    indexer.head_dim = 128
+    indexer.index_topk = 512
+    indexer.layer_id = 0
+    indexer.softmax_scale = 1.0
+    indexer.indexer_cache = IndexerCache(
+        num_layers=1, num_pages=1, page_size=64, head_dim=128, device="cuda"
+    )
+
+    query = torch.ones(2, 2, 128, dtype=torch.bfloat16, device=device)
+    indexer._compute_q_k = types.MethodType(
+        lambda self, *args, **kwargs: (query, torch.empty(0, device=device)),
+        indexer,
+    )
+    indexer._compute_gate_weights = types.MethodType(
+        lambda self, hidden_states, q_scale: torch.ones(
+            hidden_states.shape[0], self.n_heads, device=device
+        ),
+        indexer,
+    )
+    indexer.build_schedule_metadata = types.MethodType(
+        lambda self, context_lens: torch.empty(0, device=device), indexer
+    )
+    monkeypatch.setattr(indexer_module, "fused_kernels_enabled", lambda: False)
+    monkeypatch.setattr(
+        indexer_module,
+        "quant_fp8",
+        lambda value, *args, **kwargs: (
+            value,
+            torch.ones(value.shape[0], 1, device=device),
+        ),
+    )
+    monkeypatch.setattr(
+        indexer_module.deep_gemm,
+        "fp8_paged_mqa_logits",
+        lambda tiled_q, kv_cache, weights, context_lens, page_tables,
+        schedule, max_context_len, **kwargs: torch.arange(
+            max_context_len, dtype=torch.float32, device=device
+        ).expand(tiled_q.shape[0], -1).clone(),
+    )
+
+    cu_q = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, 65538], dtype=torch.int32, device=device)
+    block_table = torch.zeros((1, 1025), dtype=torch.int32, device=device)
+    dummy = torch.empty(2, 1, dtype=torch.bfloat16, device=device)
+    actual = indexer.compute_prefill_topk_paged(
+        dummy,
+        dummy,
+        torch.arange(2, device=device),
+        cu_q,
+        cu_k,
+        block_table,
+        query_chunk=2,
+    )
+
+    assert actual.shape == (2, 512)
+    assert actual[0].max().item() == 65536
+    assert actual[0].min().item() == 65536 - 511
+    assert actual[1].max().item() == 65537
+    assert actual[1].min().item() == 65537 - 511
