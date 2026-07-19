@@ -61,4 +61,4 @@ DLEngine focuses on distributed inference for state-of-the-art large models. Thi
 
 Feature availability is configuration-specific. Model architecture, GPU generation, attention layout, cache mode, and parallel topology may rule out combinations that are individually supported. DLEngine validates many incompatible combinations during configuration, but production deployments should still validate accuracy, memory capacity, and throughput with their exact checkpoint and topology.
 
-See [Supported Models](./supported-models.md) for model-specific coverage and [the production workflow](../README.md#quick-start-ray--dlengine-pd--router) for a complete deployment example.
+See [Supported Models](./supported-models.md) for model-specific coverage and [the production workflow](./online-serving.md) for a complete deployment example.

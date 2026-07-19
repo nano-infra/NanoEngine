@@ -222,3 +222,5 @@ scripts/.bin/
 
 # 3FS USRBIO wheel copied into the docker build context (see docker/README.md)
 docker/*.whl
+
+docs/generated/

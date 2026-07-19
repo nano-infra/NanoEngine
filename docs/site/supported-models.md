@@ -1,6 +1,6 @@
 # Supported Models
 
-DLEngine is designed primarily for large-model inference on multi-GPU and multi-node clusters. The canonical support boundary is the lazy architecture registry in [`dlengine/models/registry.py`](../dlengine/models/registry.py); model names are less reliable than the `architectures` value in the checkpoint configuration.
+DLEngine is designed primarily for large-model inference on multi-GPU and multi-node clusters. The canonical support boundary is the lazy architecture registry in [`dlengine/models/registry.py`](https://github.com/JimyMa/NanoDeploy/blob/Pure_dp/dlengine/models/registry.py); model names are less reliable than the `architectures` value in the checkpoint configuration.
 
 ## Text model families
 
@@ -56,7 +56,7 @@ python -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("archite
   /path/to/model/config.json
 ```
 
-Then compare the architecture with [`dlengine/models/registry.py`](../dlengine/models/registry.py). DLEngine also validates unsupported parallel, cache, HiSparse, and MTP combinations during `Config` construction and should fail before worker execution.
+Then compare the architecture with [`dlengine/models/registry.py`](https://github.com/JimyMa/NanoDeploy/blob/Pure_dp/dlengine/models/registry.py). DLEngine also validates unsupported parallel, cache, HiSparse, and MTP combinations during `Config` construction and should fail before worker execution.
 
 ## Documentation maintenance
 
