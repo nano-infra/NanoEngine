@@ -98,3 +98,69 @@ manifest 为 `success`，原来触发异常的全局 rank 8 路径已通过。
 真实 GPU smoke 使用 811259-token prompt，`1/1` 请求完成、17 tokens 输出、
 manifest `success`、exit 0。退出后 Ray 为 `0.0/16.0 GPU` 且本机无残留进程。
 详细记录见 `loongserve_cross_rank_admission_fix_20260720.md`。
+
+---
+
+更新时间：2026-07-20 12:49 UTC
+
+任务目标：持续监控修复后的 DP2×SP8、`.85`、`loop_count=16`、20 req/s
+正式 workload，解释运行速度异常缓慢的原因；本阶段只做只读诊断，未停止任务或
+修改代码。
+
+最新阶段性状态：正式日志为
+`ls_style_loop16_2node_dp2sp8_.85_r20_6min_20260720.log`。截至 12:47:57 UTC，
+进度停在 `676/7200`、平均延迟约 57.45 秒，日志 mtime 为 12:44:43.748，已超过
+3 分钟没有新增内容，且没有 traceback。Ray 仍完整占用 16/16 GPU、无 pending
+demand；当前节点 8 张 GPU 连续采样均为 0% utilization、约 133–135 GiB 显存占用，
+说明 worker/模型仍驻留，但长时间没有收到执行任务。
+
+负载证据：按 seed=0 的开放环到达序列，125 秒约到达 2427 个请求、220 秒约到达
+4364 个、308 秒约到达 6224 个，而 308 秒时只完成 676 个，积压已约 5548 个；
+360 秒后 7200 个请求都会到达，脚本还需继续排空队列，所以配置中的“6 分钟”只是
+注入持续时间，不是整体运行完成时间。
+
+当前根因判断：主要瓶颈在 host 端 LoongServe admission/scheduling，而非 GPU kernel。
+组合调度路径会在每一步遍历不断增长的 waiting 队列；每个候选又调用 future-KV
+容量检查和完整 admission placement 规划，其中包含 running envelope 重建、排序、
+donor/placement 扫描。`ls_max_num_ooe=8` 当前只决定是否允许 OOE，却没有把一次扫描
+限制为跳过 8 个候选，因此在数千请求积压后出现近似 waiting×planning 的超线性开销。
+日志已出现约 72 秒、约 90 秒的无 worker metric 间隔，随后演变为超过 3 分钟的
+调度空窗，与 GPU 0% 利用率吻合。下一步继续采样确认是否恢复或已实质卡在单轮调度。
+
+---
+
+更新时间：2026-07-20 13:02 UTC
+
+最终日志分析：用户于 12:53 UTC 手动关闭任务；manifest 随后记录
+`status=failed`、`BrokenPipeError`。这是关闭 stdout/任务后的结果，不是原始性能故障。
+正式运行没有出现新的 `IndexError`、`UnschedulableRequestError` 或 scheduler traceback，
+最后完成 `680/7200`。
+
+时间轴：full CUDA graph 初始化从 12:35:51 到 12:39:14，engine 到 12:39:28
+才开始正式 workload，这部分约 3 分 49 秒是一次性启动成本。正式处理最初完成吞吐
+约 4.6--4.9 req/s：100/200/300/400/500/600 个请求分别在 37/51/67/85/102/124
+秒完成。随后进度从 664 开始塌缩，ModelRunner metric 的相邻间隔从稳定的 5--6 秒
+变成 72、91、249 秒；249 秒空窗后仅从 676 推进到 680，下一轮又持续无下发直至
+手动关闭。空窗期间 8 张本机 GPU 实测均为 0% utilization、模型显存仍驻留。
+
+开放环积压：复现 seed=0 的 arrival sequence 后，145/220/308/356 秒累计到达
+2812/4364/6224/7200 个请求，对应只完成 664/674/676/约 676；最后 559 秒时完成
+680，有 6520 个 outstanding。DP2 且每池 running cap=1000，因此此时 waiting 至少
+4520。所谓 6 分钟只是请求注入窗口，脚本会在注入结束后继续排空全部 7200 个请求。
+
+代码根因：组合 admission 路径逐项遍历整个 `step->waiting[dp_idx]`；每个仍有机会的
+候选会重复执行 future-KV 和 exact placement，其中 `_ls_pool_future_kv_fits` 每次又
+重新收集 running、遍历完整 canonical waiting 统计 paused、分配哈希集合并排序 future
+envelope。future 检查在外层、`make_admission_plan`、`_plan_ls_initial_placement` 内最多
+重复三次。候选还会逐次复制 `selected_fifo`，每轮 admission 又复制完整 scheduler
+shadow。`max_num_ooe=8` 的布尔语义与 LoongServe 上游一致，表示允许连续 8 轮 OOE，
+不是“最多检查 8 个候选”，所以允许 OOE 时仍可全队列扫描；但 NanoDeploy 缺少上游在
+running 已满时的立即返回，并且把上游单次 future policy 检查扩展成多次 exact planner，
+使几千 waiting 时形成严重的超线性 host 开销。driver 在一次 `engine.step()` 中同步阻塞，
+返回后 benchmark 又突发补交阻塞期间累计的 arrivals，形成正反馈。
+
+归因结论：`loop_count=16` 和本日两项正确性修复不是此次分钟级停顿的直接原因；两项
+修复没有改 admission queue loop，后者由 2026-07-19 的 `b8e0b7d3` 引入。K=16 反而
+减少 scheduler 调用次数。下一步应先优化/缓存 admission fast policy、补 running-full
+fast path、避免 per-candidate 完整 planner 和队列扫描，再按同一 workload 复跑；仅降
+request rate 可绕开积压但不能验证正式 r20 场景。
