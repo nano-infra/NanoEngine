@@ -237,23 +237,23 @@ def _validator_engine(llm_engine_type, *, attention_dp=1, attention_sp=1):
     return engine, latched
 
 
-def _make_actual_ls_scheduler():
+def _make_actual_ls_scheduler(*, loop_count=1, block_size=4, num_blocks=64):
     from nanodeploy._cpp import Scheduler
 
     return Scheduler(
         "",
-        1,
+        loop_count,
         16,
-        64,
+        4096,
         16,
         -1,
         1,
         1,
-        64,
-        4,
+        num_blocks,
+        block_size,
         "decode",
         0.0,
-        4,
+        block_size,
         False,
         False,
         "legacy",
@@ -291,7 +291,7 @@ def _make_actual_ls_scheduler():
         True,
         10,
         1000,
-        64,
+        4096,
         100,
     )
 
@@ -323,7 +323,9 @@ class _ActualSchedulerAdapter:
         )
 
 
-def _make_engine_around_actual_scheduler(llm_engine_type, scheduler):
+def _make_engine_around_actual_scheduler(
+    llm_engine_type, scheduler, *, loop_count=1, block_size=4, num_blocks=64
+):
     from nanodeploy.metrics import MetricsManager
 
     engine = object.__new__(llm_engine_type)
@@ -333,11 +335,11 @@ def _make_engine_around_actual_scheduler(llm_engine_type, scheduler):
         attention_tp=1,
         enable_ls_decode_core_scheduler=True,
         dummy_bootstrap_token_id=0,
-        loop_count=1,
+        loop_count=loop_count,
         mode="decode",
         dummy_prefill=True,
-        kvcache_block_size=4,
-        num_kvcache_blocks=64,
+        kvcache_block_size=block_size,
+        num_kvcache_blocks=num_blocks,
     )
     engine.scheduler = _ActualSchedulerAdapter(scheduler)
     engine.metrics_manager = MetricsManager()
@@ -345,6 +347,7 @@ def _make_engine_around_actual_scheduler(llm_engine_type, scheduler):
     engine.fatal_code = None
     engine.pending_maintenance_stall_ms = 0.0
     engine.last_schedule_action = None
+    engine.last_execution_loop_count = 1
     engine.log_decode_step_detail = False
     return engine
 
@@ -1081,7 +1084,7 @@ def test_actual_scheduler_max_tokens_two_decodes_exactly_once(monkeypatch):
     engine = _make_engine_around_actual_scheduler(llm_engine_type, scheduler)
     sequence = Sequence([1, 2, 3, 4], 1.0, 2, True)
     engine.executor = SimpleNamespace(
-        run=lambda dp_sp_tp_seqs, _is_prefill: [
+        run=lambda dp_sp_tp_seqs, _is_prefill, **_kwargs: [
             [[7] for _sequence in sequences]
             for sequences in dp_sp_tp_seqs
         ]
@@ -1097,6 +1100,52 @@ def test_actual_scheduler_max_tokens_two_decodes_exactly_once(monkeypatch):
     assert decode[1:3] == (-1, 1)
     assert scheduler.is_finished()
     assert engine.metrics_manager.server_metric.num_completed_requests == 1
+
+
+def test_actual_engine_chunked_16_executes_full_chunk_then_one_token_tail(
+    monkeypatch,
+):
+    llm_engine_type = _load_llm_engine_without_model_runner(monkeypatch)
+    from nanodeploy._cpp import Sequence
+
+    scheduler = _make_actual_ls_scheduler(
+        loop_count=16, block_size=64, num_blocks=16
+    )
+    engine = _make_engine_around_actual_scheduler(
+        llm_engine_type,
+        scheduler,
+        loop_count=16,
+        block_size=64,
+        num_blocks=16,
+    )
+    observed_loop_counts = []
+
+    def run(dp_sp_tp_seqs, _is_prefill, *, execution_loop_count):
+        observed_loop_counts.append(execution_loop_count)
+        return [
+            [
+                [7 + index for index in range(execution_loop_count)]
+                for _sequence in sequences
+            ]
+            for sequences in dp_sp_tp_seqs
+        ]
+
+    engine.executor = SimpleNamespace(run=run)
+    sequence = Sequence(list(range(63)), 1.0, 18, True)
+
+    engine.add_request([sequence])
+    admission = engine.step()
+    first_decode = engine.step()
+    final_decode = engine.step()
+
+    assert admission[1:3] == (0, 0)
+    assert first_decode[0] == []
+    assert first_decode[1:3] == (-16, 1)
+    assert final_decode[0][0][0] == sequence.seq_id
+    assert len(final_decode[0][0][1]) == 18
+    assert final_decode[1:3] == (-1, 1)
+    assert observed_loop_counts == [16, 1]
+    assert scheduler.is_finished()
 
 
 def test_admission_action_rejects_consolidation_plan(monkeypatch):
@@ -1174,7 +1223,7 @@ def test_ls_executor_run_exception_latches_postpublication(monkeypatch):
         update_sp_stats = staticmethod(lambda *_args: None)
         update_waiting_blocks = staticmethod(lambda *_args: None)
 
-    def fail_run(*_args):
+    def fail_run(*_args, **_kwargs):
         raise RuntimeError("injected LS executor.run failure")
 
     engine = object.__new__(llm_engine_type)
@@ -1331,7 +1380,9 @@ def test_decode_metrics_exclude_collective_dummies_and_new_admissions(monkeypatc
         num_kvcache_blocks=10,
     )
     engine.scheduler = FakeScheduler()
-    engine.executor = SimpleNamespace(run=lambda *_args: [[[4], [5]]])
+    engine.executor = SimpleNamespace(
+        run=lambda *_args, **_kwargs: [[[4], [5]]]
+    )
     engine.metrics_manager = manager
     engine.fatal_error = None
     engine.fatal_code = None

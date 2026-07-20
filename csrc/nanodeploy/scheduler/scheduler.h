@@ -101,6 +101,11 @@ private:
 struct ScheduleResult {
     ScheduleAction action = ScheduleAction::DECODE;
 
+    // Actual number of model-forward loops for this Decode action. LoongServe
+    // treats Config::loop_count as a maximum and may shorten the final chunk so
+    // every scheduled request produces exactly its remaining output tokens.
+    int execution_loop_count = 1;
+
     // Sequences scheduled per DP worker for this step.
     // Outer index: DP worker index.
     // Inner vector: sequences assigned to that DP worker.
@@ -532,6 +537,7 @@ private:
     std::unordered_set<uint64_t>                      seen_ls_seq_ids_;
     std::vector<LSAdmissionRecord>                    ls_step_admission_records_;
     std::vector<std::vector<uint64_t>>                ls_step_real_decode_ids_by_dp_;
+    int                                               ls_step_execution_loop_count_ = 1;
     std::vector<uint64_t>                             ls_pool_resource_epoch_;
     std::vector<uint64_t>                             ls_step_pool_resource_epoch_before_;
     std::vector<bool>                                 ls_step_pool_resource_mutated_;

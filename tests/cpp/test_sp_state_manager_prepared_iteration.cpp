@@ -98,12 +98,12 @@ void expect_throw(Fn&& fn, const std::string& message)
     throw std::runtime_error(message);
 }
 
-std::unique_ptr<SPStateManager> make_manager(int blocks_per_rank)
+std::unique_ptr<SPStateManager> make_manager_with_block_size(int blocks_per_rank, int block_size)
 {
     auto manager = std::make_unique<SPStateManager>("prepared-iteration-cpu",
                                                     2,
                                                     blocks_per_rank,
-                                                    2,
+                                                    block_size,
                                                     16,
                                                     1024,
                                                     16,
@@ -132,6 +132,11 @@ std::unique_ptr<SPStateManager> make_manager(int blocks_per_rank)
                                                     0);
     manager->set_dp_idx(0);
     return manager;
+}
+
+std::unique_ptr<SPStateManager> make_manager(int blocks_per_rank)
+{
+    return make_manager_with_block_size(blocks_per_rank, 2);
 }
 
 std::shared_ptr<Sequence> make_sequence(int token_seed)
@@ -409,6 +414,49 @@ void test_initial_iteration_composition_is_allocation_free_and_preserves_counter
           "composed publication installed incorrect ACTIVE masters");
 }
 
+void test_chunked_16_reserves_cross_block_frontier()
+{
+    constexpr int block_size = 64;
+    auto          manager    = make_manager_with_block_size(5, block_size);
+    std::vector<int> prompt(63);
+    for (int idx = 0; idx < static_cast<int>(prompt.size()); ++idx) {
+        prompt[idx] = 900 + idx;
+    }
+    auto sequence         = std::make_shared<Sequence>(prompt, 1.0, 128, true);
+    sequence->assigned_dp = 0;
+    sequence->active("prepared-iteration-cpu", 2, 1);
+    admit_with_pending_dummy(*manager, sequence, 0);
+
+    const auto before = sequence->block_ctx(BlockContextSlot::ACTIVE);
+    check(before.sp_block_table[0].size() == 1,
+          "chunked setup did not begin immediately before a KV block boundary");
+
+    auto transaction = manager->prepare_iteration_master_plan({sequence}, make_plan({0}), 16);
+    check(transaction.validate_precommit_noexcept(), "chunked-16 reservation was not fresh");
+    check(sequence->block_ctx(BlockContextSlot::ACTIVE).sp_block_table[0].size() == 1,
+          "chunked-16 prepare changed the stable block table");
+    transaction.commit_noexcept();
+
+    auto& committed = sequence->block_ctx(BlockContextSlot::ACTIVE);
+    check(committed.sp_block_table[0].size() == 2,
+          "chunked-16 publication did not reserve the crossed KV block");
+    check(committed.num_dispatched_tokens[0] == 64 && committed.pending_token_present_
+              && committed.pending_token_target_sp_ == 0,
+          "chunked-16 publication changed the pending frontier metadata");
+
+    for (int token = 0; token < 16; ++token) {
+        sequence->append_token(1000 + token, BlockContextSlot::ACTIVE, 0);
+        (void)sequence->last_block_page_id(BlockContextSlot::ACTIVE, 0);
+    }
+    check(sequence->committed_context_len(BlockContextSlot::ACTIVE, 0) == 79,
+          "chunked-16 postprocess simulation produced the wrong committed frontier");
+
+    auto final_iteration = manager->prepare_iteration_master_plan({sequence}, make_plan({0}), 1);
+    check(final_iteration.validate_precommit_noexcept(),
+          "one-token tail did not accept the chunked-16 committed frontier");
+    final_iteration.abort_noexcept();
+}
+
 struct TestCase {
     const char*           name;
     std::function<void()> run;
@@ -422,6 +470,7 @@ const std::vector<TestCase> test_cases = {
     {"stale_validation_move_and_destructor_abort", test_stale_validation_move_and_destructor_abort},
     {"initial_iteration_composition_is_allocation_free_and_preserves_counters",
      test_initial_iteration_composition_is_allocation_free_and_preserves_counters},
+    {"chunked_16_reserves_cross_block_frontier", test_chunked_16_reserves_cross_block_frontier},
 };
 
 }  // namespace

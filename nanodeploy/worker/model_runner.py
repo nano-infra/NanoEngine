@@ -895,7 +895,12 @@ class ModelRunner:
         return get_cache_context().copy_kv_ranges_p2p(moves)
 
     def run(
-        self, dp_seqs: list[Sequence], is_prefill: bool, enable_rpc: bool = False, send_timestamp: float = 0.0
+        self,
+        dp_seqs: list[Sequence],
+        is_prefill: bool,
+        enable_rpc: bool = False,
+        send_timestamp: float = 0.0,
+        execution_loop_count: int | None = None,
     ) -> list[list[int]]:
 
         if enable_rpc:
@@ -926,7 +931,15 @@ class ModelRunner:
             if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
         ]
 
-        loop_count = self.config.loop_count if not is_prefill else 1
+        loop_count = (
+            self.config.loop_count
+            if execution_loop_count is None
+            else execution_loop_count
+        )
+        if is_prefill:
+            loop_count = 1
+        if not 1 <= loop_count <= self.config.loop_count:
+            raise ValueError("invalid execution_loop_count received by model runner")
         for i in range(loop_count):
             current_time = time.time()
             

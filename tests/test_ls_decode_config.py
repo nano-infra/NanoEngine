@@ -217,6 +217,15 @@ def test_ls_decode_core_supports_single_node_8gpu_preflight(tmp_path):
     assert config.ffn_world_size == 8
 
 
+def test_ls_decode_core_supports_chunked_loop_count_16(tmp_path):
+    kwargs = _ls_kwargs()
+    kwargs.update(loop_count=16, attention_dp=1, ffn_ep=8)
+
+    config = Config(model=str(tmp_path), **kwargs)
+
+    assert config.loop_count == 16
+
+
 def test_ls_decode_core_supports_two_node_16gpu_validation(tmp_path):
     kwargs = _ls_kwargs()
     kwargs.update(attention_dp=2, ffn_ep=16)
@@ -233,7 +242,8 @@ def test_ls_decode_core_supports_two_node_16gpu_validation(tmp_path):
         ({"mode": "hybrid"}, "mode must be 'decode'"),
         ({"dummy_prefill": False}, "dummy_prefill must be True"),
         ({"scheduler_mode": "decentralized"}, "scheduler_mode must be 'centralized'"),
-        ({"loop_count": 2}, "loop_count must be 1"),
+        ({"loop_count": 0}, r"loop_count must be in \[1, 16\]"),
+        ({"loop_count": 17}, r"loop_count must be in \[1, 16\]"),
         ({"attention_dp": 1}, "parallel topology must be"),
         ({"use_dlslime_rpc": False}, "use_dlslime_rpc must be True"),
         ({"sp_backend": "legacy_ll"}, "sp_backend must be 'hao_basic'"),

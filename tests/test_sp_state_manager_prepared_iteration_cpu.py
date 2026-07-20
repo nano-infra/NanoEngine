@@ -16,6 +16,7 @@ TEST_CASES = [
     "combined_disjoint_groups_publish_once",
     "stale_validation_move_and_destructor_abort",
     "initial_iteration_composition_is_allocation_free_and_preserves_counters",
+    "chunked_16_reserves_cross_block_frontier",
 ]
 
 

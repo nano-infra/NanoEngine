@@ -46,6 +46,7 @@ class LLMEngine:
         self.events = []
         self.pending_maintenance_stall_ms = 0.0
         self.last_schedule_action = None
+        self.last_execution_loop_count = 1
         self.fatal_error: BaseException | None = None
         self.fatal_code = None
         self.log_decode_step_detail = _env_flag_enabled(
@@ -342,6 +343,20 @@ class LLMEngine:
                         error, LSFatalCode.POST_PUBLICATION_INVARIANT
                     )
                 raise
+        scheduled_loop_count = getattr(sch_res, "execution_loop_count", None)
+        configured_loop_count = getattr(self.config, "loop_count", 1)
+        if not isinstance(scheduled_loop_count, int):
+            scheduled_loop_count = configured_loop_count
+        execution_loop_count = (
+            scheduled_loop_count
+            if sch_res.action == ScheduleAction.DECODE and not sch_res.is_prefill
+            else 1
+        )
+        if not 1 <= execution_loop_count <= configured_loop_count:
+            raise RuntimeError(
+                "scheduler returned execution_loop_count outside the configured range"
+            )
+        self.last_execution_loop_count = execution_loop_count
         if sch_res.action == ScheduleAction.KV_CONSOLIDATION:
             maintenance_begin = time.perf_counter()
             try:
@@ -571,7 +586,11 @@ class LLMEngine:
                             seq.metric.num_generated_tokens = 1
         else:
             model_runner_start = time.perf_counter()
-            token_ids = self.executor.run(dp_sp_tp_seqs, is_prefill)[::tp_size]
+            token_ids = self.executor.run(
+                dp_sp_tp_seqs,
+                is_prefill,
+                execution_loop_count=execution_loop_count,
+            )[::tp_size]
             model_runner_duration_ms = (time.perf_counter() - model_runner_start) * 1000.0
             step_duration_ms = (time.perf_counter() - step_start) * 1000.0
             if not is_prefill:
@@ -583,7 +602,7 @@ class LLMEngine:
                     token_ids,
                     self.metrics_manager,
                     step_duration_ms,
-                    self.config.loop_count,
+                    execution_loop_count,
                 )
             except BaseException as error:
                 if self.config.enable_ls_decode_core_scheduler:
@@ -667,7 +686,8 @@ class LLMEngine:
                             sch_res.ls_pool_resource_epoch_after
                         ),
                         "model_runner_duration_ms": model_runner_duration_ms,
-                        "step_itl_ms": step_duration_ms,
+                        "step_itl_ms": step_duration_ms / execution_loop_count,
+                        "execution_loop_count": execution_loop_count,
                     }
                 )
             if (
@@ -712,7 +732,7 @@ class LLMEngine:
             num_tokens += (
                 sum(len(seq) for seq in real_seqs)
                 if is_prefill
-                else -len(real_seqs) * self.config.loop_count
+                else -len(real_seqs) * execution_loop_count
             )
             for seq in real_seqs:
                 if seq.is_finished:
@@ -739,7 +759,7 @@ class LLMEngine:
 
         # Calculate and log ITL for this step
         if not is_prefill:
-            itl = step_duration_ms / self.config.loop_count
+            itl = step_duration_ms / execution_loop_count
             free_blocks = [
                 [
                     len(worker_state.block_manager[i].free_block_ids)
@@ -893,7 +913,9 @@ class LLMEngine:
                 itl_duration_sec = (
                     decode_duration_sec if num_tokens < 0 else step_duration_sec
                 )
-                itl = itl_duration_sec * 1000 / self.config.loop_count
+                itl = itl_duration_sec * 1000 / getattr(
+                    self, "last_execution_loop_count", self.config.loop_count
+                )
                 pbar.set_postfix(
                     {
                         "bs": f"{bs}",

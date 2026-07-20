@@ -827,17 +827,19 @@ std::vector<int> SPStateManager::group_used_kv_blocks(const std::vector<std::sha
 int SPStateManager::estimate_pending_append_capacity(
     int                                           rank,
     const std::vector<std::shared_ptr<Sequence>>& requests,
-    const std::vector<std::shared_ptr<Sequence>>& group_sequences) const
+    const std::vector<std::shared_ptr<Sequence>>& group_sequences,
+    int                                           num_output_tokens) const
 {
     auto manager = block_manager.find(rank);
-    if (rank < 0 || rank >= attention_sp_ || manager == block_manager.end()) {
+    if (rank < 0 || rank >= attention_sp_ || manager == block_manager.end()
+        || num_output_tokens <= 0 || num_output_tokens >= kvcache_block_size_) {
         return 0;
     }
 
     int free_blocks = manager->second->num_free_blocks();
-    // Reservations for the still-pending token (and the next sampled token)
-    // can be discarded before an iteration plan is committed. Add them back
-    // to the read-only simulation, then charge the selected target afresh.
+    // Reservations for the still-pending token can be discarded before an
+    // iteration plan is committed. Add them back to the read-only simulation,
+    // then charge the selected target for that input and this chunk's outputs.
     for (const auto& seq : group_sequences) {
         if (!seq || seq->status == SequenceStatus::FINISHED) {
             continue;
@@ -860,9 +862,10 @@ int SPStateManager::estimate_pending_append_capacity(
 
         int committed     = seq->committed_context_len(BlockContextSlot::ACTIVE, rank);
         int before_blocks = (committed + kvcache_block_size_ - 1) / kvcache_block_size_;
-        // One slot is for the current pending input. NanoDeploy also reserves
-        // the slot for the sampled token that becomes pending at postprocess.
-        int after_blocks  = (committed + 2 + kvcache_block_size_ - 1) / kvcache_block_size_;
+        // One slot is for the current pending input. Every output in the chunk
+        // needs KV space; after postprocess the final output remains pending.
+        int after_blocks  = (committed + 1 + num_output_tokens + kvcache_block_size_ - 1)
+                           / kvcache_block_size_;
         int needed_blocks = after_blocks - before_blocks;
         if (free_blocks < needed_blocks) {
             break;
@@ -883,7 +886,8 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
                                                      const std::vector<int>&                       allocation,
                                                      const std::vector<int>&                       extra_ranks,
                                                      int                                           batch_per_master,
-                                                     bool enable_memory_scale_up) const
+                                                     bool enable_memory_scale_up,
+                                                     int  num_output_tokens) const
 {
     LSDecodeMasterPlan result;
     result.group_used_kv_tokens = group_used_kv_tokens(requests);
@@ -895,6 +899,10 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
     }
     if (batch_per_master <= 0) {
         result.failure_reason = "batch_per_master must be positive";
+        return result;
+    }
+    if (num_output_tokens <= 0 || num_output_tokens >= kvcache_block_size_) {
+        result.failure_reason = "Decode chunk size must be positive and smaller than the KV block size";
         return result;
     }
 
@@ -1046,7 +1054,7 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
                 int                 compute_capable = 0;
                 for (size_t idx = candidate_begin; idx < candidates.size(); ++idx) {
                     int rank = candidates[idx];
-                    if (estimate_pending_append_capacity(rank, suffix, requests) <= 0) {
+                    if (estimate_pending_append_capacity(rank, suffix, requests, num_output_tokens) <= 0) {
                         continue;
                     }
                     compute_capable++;
@@ -1070,7 +1078,7 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
                 int remaining = static_cast<int>(planning_order.size() - remaining_begin);
                 size_t rank_pos  = append_capable.front();
                 int    rank      = candidates[rank_pos];
-                int    capacity  = estimate_pending_append_capacity(rank, suffix, requests);
+                int    capacity  = estimate_pending_append_capacity(rank, suffix, requests, num_output_tokens);
                 capacity         = std::min(capacity, receiver_prefix_capacity(rank, remaining_begin));
                 int target_chunk = std::max(remaining / n_left, batch_per_master);
                 int chunk        = std::min({remaining, target_chunk, capacity});
@@ -1187,7 +1195,7 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
                 }
             }
             set_scale_reason(sticky);
-            if (validate_iteration_master_plan(requests, sticky)) {
+            if (validate_iteration_master_plan(requests, sticky, nullptr, num_output_tokens)) {
                 return sticky;
             }
         }
@@ -1265,7 +1273,8 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
         auto append_cost = [&](size_t request_idx, int rank) {
             int committed = requests[request_idx]->committed_context_len(BlockContextSlot::ACTIVE, rank);
             int before    = (committed + kvcache_block_size_ - 1) / kvcache_block_size_;
-            int after     = (committed + 2 + kvcache_block_size_ - 1) / kvcache_block_size_;
+            int after     = (committed + 1 + num_output_tokens + kvcache_block_size_ - 1)
+                            / kvcache_block_size_;
             return after - before;
         };
 
@@ -1284,11 +1293,12 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
             return free_blocks;
         };
 
-        // With the current +2-token reservation and block_size >= 2, per-request
-        // append cost is binary. Cost-0 requests are necessarily local owners,
-        // so append and receiver quotas are nested and can be solved exactly by
-        // one capacity-flow assignment below. Compute an existence upper bound
-        // using the cheapest possible subset, not the old worst-prefix bound.
+        // The supported chunk is smaller than one KV block, so per-request
+        // append cost remains binary. Cost-0 requests are necessarily local
+        // owners, so append and receiver quotas are nested and can be solved
+        // exactly by one capacity-flow assignment below. Compute an existence
+        // upper bound using the cheapest possible subset, not the old
+        // worst-prefix bound.
         std::vector<int> upper(candidates.size(), 0);
         std::vector<int> free_blocks(candidates.size(), 0);
         std::vector<int> cheap_supply(candidates.size(), 0);
@@ -1314,7 +1324,9 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
                     worst_requests.push_back(requests[request_idx]);
                 }
                 upper[candidate_idx] =
-                    std::min(metadata_cap, estimate_pending_append_capacity(rank, worst_requests, requests));
+                    std::min(metadata_cap,
+                             estimate_pending_append_capacity(
+                                 rank, worst_requests, requests, num_output_tokens));
                 continue;
             }
             for (int load = 0; load <= metadata_cap; ++load) {
@@ -1676,7 +1688,7 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
         }
         set_scale_reason(exact);
         std::string exact_error;
-        if (!validate_iteration_master_plan(requests, exact, &exact_error)) {
+        if (!validate_iteration_master_plan(requests, exact, &exact_error, num_output_tokens)) {
             if (enable_memory_scale_up && !extras.empty() && exact_error.find("append capacity") != std::string::npos) {
                 int rank = extras.front();
                 extras.erase(extras.begin());
@@ -1697,7 +1709,8 @@ SPStateManager::plan_iteration_masters_source_greedy(const std::vector<std::shar
 
 bool SPStateManager::validate_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
                                                     const LSDecodeMasterPlan&                     plan,
-                                                    std::string*                                  error) const
+                                                    std::string*                                  error,
+                                                    int                                           num_output_tokens) const
 {
     auto fail = [&](const std::string& message) {
         if (error) {
@@ -1707,6 +1720,9 @@ bool SPStateManager::validate_iteration_master_plan(const std::vector<std::share
     };
     if (!plan.success) {
         return fail(plan.failure_reason.empty() ? "planner returned failure" : plan.failure_reason);
+    }
+    if (num_output_tokens <= 0 || num_output_tokens >= kvcache_block_size_) {
+        return fail("Decode chunk size must be positive and smaller than the KV block size");
     }
     if (plan.sequence_master_ranks.size() != requests.size()) {
         return fail("sequence assignment count mismatch");
@@ -1773,7 +1789,7 @@ bool SPStateManager::validate_iteration_master_plan(const std::vector<std::share
             return fail("declared master batch sizes disagree with sequence assignments");
         }
         if (!assigned[rank].empty()
-            && estimate_pending_append_capacity(rank, assigned[rank], requests)
+            && estimate_pending_append_capacity(rank, assigned[rank], requests, num_output_tokens)
                    < static_cast<int>(assigned[rank].size())) {
             return fail("master append capacity changed during validation");
         }
@@ -1786,8 +1802,13 @@ bool SPStateManager::validate_iteration_master_plan(const std::vector<std::share
 
 SPStateManager::PreparedLSIterationMasterPlan
 SPStateManager::prepare_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
-                                              const LSDecodeMasterPlan&                     plan)
+                                              const LSDecodeMasterPlan&                     plan,
+                                              int                                           num_output_tokens)
 {
+    if (num_output_tokens <= 0 || num_output_tokens >= kvcache_block_size_) {
+        throw std::invalid_argument(
+            "prepared LS iteration chunk size must be positive and smaller than the KV block size");
+    }
     std::unordered_set<int> allocation_ranks;
     allocation_ranks.reserve(plan.allocation.size());
     for (int rank : plan.allocation) {
@@ -1813,7 +1834,7 @@ SPStateManager::prepare_iteration_master_plan(const std::vector<std::shared_ptr<
     }
 
     std::string validation_error;
-    if (!validate_iteration_master_plan(requests, plan, &validation_error)) {
+    if (!validate_iteration_master_plan(requests, plan, &validation_error, num_output_tokens)) {
         throw std::runtime_error("prepared LS iteration plan validation failed: " + validation_error);
     }
 
@@ -1898,7 +1919,8 @@ SPStateManager::prepare_iteration_master_plan(const std::vector<std::shared_ptr<
                  + kvcache_block_size_ - 1)
                 / kvcache_block_size_;
             const int64_t final_blocks =
-                (static_cast<int64_t>(committed) + (rank == target ? 2 : 0)
+                (static_cast<int64_t>(committed)
+                 + (rank == target ? static_cast<int64_t>(1 + num_output_tokens) : 0)
                  + kvcache_block_size_ - 1)
                 / kvcache_block_size_;
             const auto& old_table = context.sp_block_table[rank];
@@ -2119,9 +2141,10 @@ void SPStateManager::set_decode_master(Sequence& seq, int master_sp_idx)
     cached_running_state_.reset();
 }
 
-bool SPStateManager::reassign_pending_append(Sequence& seq, int target_sp_idx)
+bool SPStateManager::reassign_pending_append(Sequence& seq, int target_sp_idx, int num_output_tokens)
 {
-    if (target_sp_idx < 0 || target_sp_idx >= attention_sp_) {
+    if (target_sp_idx < 0 || target_sp_idx >= attention_sp_ || num_output_tokens <= 0
+        || num_output_tokens >= kvcache_block_size_) {
         return false;
     }
     auto& ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
@@ -2136,7 +2159,7 @@ bool SPStateManager::reassign_pending_append(Sequence& seq, int target_sp_idx)
     // frontier. With the single-threaded state manager, the following trim and
     // reservation operations are then deterministic and cannot fail for an
     // expected capacity condition.
-    if (estimate_pending_append_capacity(target_sp_idx, request_view, request_view) < 1) {
+    if (estimate_pending_append_capacity(target_sp_idx, request_view, request_view, num_output_tokens) < 1) {
         return false;
     }
 
@@ -2160,20 +2183,21 @@ bool SPStateManager::reassign_pending_append(Sequence& seq, int target_sp_idx)
     ctx.pending_token_target_sp_ = target_sp_idx;
     set_decode_master(seq, target_sp_idx);
 
-    // Reserve the sampled token that postprocess will append as the pending
-    // input for the next iteration. This preserves the existing NanoDeploy
-    // block-table contract while historical ownership remains untouched.
-    if (!can_append_on_sp(seq, target_sp_idx, 1) || !may_append_on_sp(seq, target_sp_idx, 1)) {
-        throw std::runtime_error("pending append preflight diverged while reserving sampled token");
+    // Reserve every sampled token in the chunk. The final one becomes the
+    // pending input for the next scheduler-visible iteration.
+    if (!can_append_on_sp(seq, target_sp_idx, num_output_tokens)
+        || !may_append_on_sp(seq, target_sp_idx, num_output_tokens)) {
+        throw std::runtime_error("pending append preflight diverged while reserving Decode chunk outputs");
     }
     return true;
 }
 
 bool SPStateManager::commit_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
-                                                  const LSDecodeMasterPlan&                     plan)
+                                                  const LSDecodeMasterPlan&                     plan,
+                                                  int                                           num_output_tokens)
 {
     std::string error;
-    if (!validate_iteration_master_plan(requests, plan, &error)) {
+    if (!validate_iteration_master_plan(requests, plan, &error, num_output_tokens)) {
         return false;
     }
 
@@ -2212,8 +2236,9 @@ bool SPStateManager::commit_iteration_master_plan(const std::vector<std::shared_
         ctx.pending_token_present_   = true;
         ctx.pending_token_target_sp_ = target;
         set_decode_master(seq, target);
-        if (!can_append_on_sp(seq, target, 1) || !may_append_on_sp(seq, target, 1)) {
-            throw std::runtime_error("validated LS plan diverged while reserving sampled token");
+        if (!can_append_on_sp(seq, target, num_output_tokens)
+            || !may_append_on_sp(seq, target, num_output_tokens)) {
+            throw std::runtime_error("validated LS plan diverged while reserving Decode chunk outputs");
         }
     }
     rebuild_decode_role_counters();

@@ -282,33 +282,40 @@ void bind_sp_state_manager(py::module_& m)
              &SPStateManager::estimate_pending_append_capacity,
              py::arg("rank"),
              py::arg("requests"),
-             py::arg("group_sequences"))
+             py::arg("group_sequences"),
+             py::arg("num_output_tokens") = 1)
         .def("plan_iteration_masters_source_greedy",
              &SPStateManager::plan_iteration_masters_source_greedy,
              py::arg("requests"),
              py::arg("allocation"),
              py::arg("extra_ranks"),
              py::arg("batch_per_master"),
-             py::arg("enable_memory_scale_up") = true)
+             py::arg("enable_memory_scale_up") = true,
+             py::arg("num_output_tokens")      = 1)
         .def(
             "validate_iteration_master_plan",
             [](const SPStateManager&                         manager,
                const std::vector<std::shared_ptr<Sequence>>& requests,
-               const SPStateManager::LSDecodeMasterPlan&     plan) {
+               const SPStateManager::LSDecodeMasterPlan&     plan,
+               int                                            num_output_tokens) {
                 std::string error;
-                bool        valid = manager.validate_iteration_master_plan(requests, plan, &error);
+                bool        valid =
+                    manager.validate_iteration_master_plan(requests, plan, &error, num_output_tokens);
                 return py::make_tuple(valid, error);
             },
             py::arg("requests"),
-            py::arg("plan"))
+            py::arg("plan"),
+            py::arg("num_output_tokens") = 1)
         .def("reassign_pending_append",
              &SPStateManager::reassign_pending_append,
              py::arg("seq"),
-             py::arg("target_sp_idx"))
+             py::arg("target_sp_idx"),
+             py::arg("num_output_tokens") = 1)
         .def("commit_iteration_master_plan",
              &SPStateManager::commit_iteration_master_plan,
              py::arg("requests"),
-             py::arg("plan"))
+             py::arg("plan"),
+             py::arg("num_output_tokens") = 1)
         .def("group_used_kv_tokens", &SPStateManager::group_used_kv_tokens, py::arg("seqs"))
         .def("group_used_kv_blocks", &SPStateManager::group_used_kv_blocks, py::arg("seqs"))
         .def("get_active_master_count", &SPStateManager::get_active_master_count, py::arg("seqs"))

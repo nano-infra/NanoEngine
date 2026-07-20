@@ -34,10 +34,11 @@ def _make_scheduler(
     max_num_ooe: int = 10,
     running_max_req_size: int = 1000,
     admission_max_tokens_per_pool: int = 4096,
+    loop_count: int = 1,
 ) -> Scheduler:
     return Scheduler(
         "",
-        1,
+        loop_count,
         max_num_seqs,
         max_num_batched_tokens,
         max_num_recv_seqs,
@@ -121,7 +122,10 @@ def _postprocess_decode(
     token_id: int = 17,
 ) -> None:
     token_ids = [
-        [[token_id] for _ in sequences]
+        [
+            [token_id + loop_idx for loop_idx in range(result.execution_loop_count)]
+            for _ in sequences
+        ]
         for sequences in result.filtered_dp_sp_seqs
     ]
     scheduler.postprocess(
@@ -129,7 +133,7 @@ def _postprocess_decode(
         token_ids,
         False,
         1.0,
-        1,
+        result.execution_loop_count,
     )
 
 
@@ -308,6 +312,37 @@ def test_max_tokens_two_runs_exactly_one_real_decode_after_bootstrap():
     assert sequence.num_completed_tokens == 2
     assert sequence.status == SequenceStatus.FINISHED
     assert list(sequence.token_ids)[-2:] == [0, 17]
+    assert scheduler.is_finished() is True
+
+
+def test_chunked_16_reserves_kv_and_shortens_the_final_decode_step():
+    scheduler = _make_scheduler(
+        attention_sp=2,
+        block_size=64,
+        num_blocks=16,
+        loop_count=16,
+    )
+    sequence = _sequence(63, max_tokens=18)
+    _add(scheduler, sequence, 0)
+
+    admission = scheduler.schedule()
+    assert admission.action == ScheduleAction.ADMISSION
+    assert sequence.num_completed_tokens == 1
+
+    first_decode = scheduler.schedule()
+    assert first_decode.action == ScheduleAction.DECODE
+    assert first_decode.execution_loop_count == 16
+
+    _postprocess_decode(scheduler, first_decode)
+    assert sequence.num_completed_tokens == 17
+    assert sequence.status == SequenceStatus.RUNNING
+
+    final_decode = scheduler.schedule()
+    assert final_decode.execution_loop_count == 1
+    _postprocess_decode(scheduler, final_decode, token_id=99)
+
+    assert sequence.num_completed_tokens == 18
+    assert sequence.status == SequenceStatus.FINISHED
     assert scheduler.is_finished() is True
 
 

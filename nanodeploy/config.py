@@ -415,8 +415,8 @@ class Config:
                 unsupported.append("dummy_prefill must be True")
             if self.scheduler_mode != "centralized":
                 unsupported.append("scheduler_mode must be 'centralized'")
-            if self.loop_count != 1:
-                unsupported.append("loop_count must be 1")
+            if not 1 <= self.loop_count <= 16:
+                unsupported.append("loop_count must be in [1, 16]")
             if self.routing_strategy != "RoundRobin":
                 unsupported.append("routing_strategy must be 'RoundRobin'")
             if self.kvcache_block_size != 64:

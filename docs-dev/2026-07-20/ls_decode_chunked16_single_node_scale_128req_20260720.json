@@ -1,0 +1,97 @@
+{
+  "config": {
+    "case": "ls",
+    "model_path": "/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3",
+    "ray_address": "10.102.252.174:6380",
+    "master_address": "10.102.252.174:29909",
+    "num_requests": 128,
+    "prompt_len": 512,
+    "max_tokens": 34,
+    "total_prompt_tokens": 65536,
+    "attention_dp": 1,
+    "attention_sp": 8,
+    "ffn_ep": 8,
+    "fixed_sp_size": 0,
+    "sp_backend": "hao_basic",
+    "loop_count": 16,
+    "discard_decode_steps": 0,
+    "max_num_seqs": 128,
+    "max_num_recv_seqs": 256,
+    "ls_batch_per_master": 8,
+    "gpu_memory_utilization": 0.9
+  },
+  "total_duration_ms": 14605.855515925214,
+  "num_steps": 4,
+  "decode_steps": 3,
+  "all_decode_itl": {
+    "count": 3,
+    "mean_ms": 401.5264329694522,
+    "median_ms": 311.40489084646106,
+    "p90_ms": 567.892267217394,
+    "min_ms": 261.1602967517683,
+    "max_ms": 632.0141113101272
+  },
+  "steady_decode_itl": {
+    "count": 3,
+    "mean_ms": 401.5264329694522,
+    "median_ms": 311.40489084646106,
+    "p90_ms": 567.892267217394,
+    "min_ms": 261.1602967517683,
+    "max_ms": 632.0141113101272
+  },
+  "steps": [
+    {
+      "step_idx": 0,
+      "phase": "prefill",
+      "duration_ms": 3.546822816133499,
+      "num_tokens_returned": 0,
+      "batch_size_returned": 0,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 2.3087668232619762,
+      "post_scheduler_latency_ms": 0.0
+    },
+    {
+      "step_idx": 1,
+      "phase": "decode",
+      "duration_ms": 10112.225780962035,
+      "num_tokens_returned": -2048,
+      "batch_size_returned": 128,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 1.0615838691592216,
+      "post_scheduler_latency_ms": 0.6805760785937309,
+      "decode_step_idx": 0,
+      "execution_loop_count": 16,
+      "itl_ms": 632.0141113101272
+    },
+    {
+      "step_idx": 2,
+      "phase": "decode",
+      "duration_ms": 4178.564748028293,
+      "num_tokens_returned": -2048,
+      "batch_size_returned": 128,
+      "outputs": 0,
+      "finished_requests": 0,
+      "scheduler_latency_ms": 1.2367761228233576,
+      "post_scheduler_latency_ms": 0.5509969778358936,
+      "decode_step_idx": 1,
+      "execution_loop_count": 16,
+      "itl_ms": 261.1602967517683
+    },
+    {
+      "step_idx": 3,
+      "phase": "decode",
+      "duration_ms": 311.40489084646106,
+      "num_tokens_returned": -128,
+      "batch_size_returned": 128,
+      "outputs": 128,
+      "finished_requests": 128,
+      "scheduler_latency_ms": 1.1410070583224297,
+      "post_scheduler_latency_ms": 0.6733669433742762,
+      "decode_step_idx": 2,
+      "execution_loop_count": 1,
+      "itl_ms": 311.40489084646106
+    }
+  ]
+}

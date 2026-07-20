@@ -266,13 +266,24 @@ class RayExecutor:
         dp_seqs: List[List[Sequence]],
         is_prefill: bool,
         timeout: float | None = None,
+        execution_loop_count: int | None = None,
     ) -> list[list[list[int]]]:
+        if execution_loop_count is None:
+            execution_loop_count = 1 if is_prefill else self.config.loop_count
+        if is_prefill:
+            execution_loop_count = 1
+        if not 1 <= execution_loop_count <= self.config.loop_count:
+            raise ValueError(
+                "execution_loop_count must be in [1, config.loop_count]"
+            )
         # start = time.perf_counter()
         send_timestamp = time.time()
         if self.config.use_dlslime_rpc:
             # When using dlslime RPC, sequences are delivered via the endpoint.
             ray_futures = [
-                getattr(worker, "run").remote([], is_prefill, True, send_timestamp)
+                getattr(worker, "run").remote(
+                    [], is_prefill, True, send_timestamp, execution_loop_count
+                )
                 for _, worker in zip(dp_seqs, self.workers)
             ]
             self.endpoint.send_seqs(dp_seqs, is_prefill)
@@ -280,7 +291,9 @@ class RayExecutor:
         else:
             # When not using dlslime RPC, pass sequences directly to workers.
             ray_futures = [
-                getattr(worker, "run").remote(seqs, is_prefill, False, send_timestamp)
+                getattr(worker, "run").remote(
+                    seqs, is_prefill, False, send_timestamp, execution_loop_count
+                )
                 for seqs, worker in zip(dp_seqs, self.workers)
             ]
             # trans_type = "Ray"

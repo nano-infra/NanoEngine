@@ -86,8 +86,8 @@ def summarize(values: list[float]) -> dict[str, float | int]:
 def build_engine(args: argparse.Namespace) -> LLM:
     is_ls = args.case == "ls"
     is_forced_sp8 = args.case == "sp8_ep"
-    if is_ls and args.loop_count != 1:
-        raise ValueError("LS-Decode-Core requires --loop-count 1")
+    if is_ls and not 1 <= args.loop_count <= 16:
+        raise ValueError("LS-Decode-Core requires --loop-count in [1, 16]")
 
     max_model_len = args.max_model_len
     if max_model_len <= 0:
@@ -183,8 +183,10 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
             "post_scheduler_latency_ms": post_sch_latency_ms,
         }
         if is_decode:
+            execution_loop_count = engine.last_execution_loop_count
             entry["decode_step_idx"] = decode_step_idx
-            entry["itl_ms"] = duration_ms / args.loop_count
+            entry["execution_loop_count"] = execution_loop_count
+            entry["itl_ms"] = duration_ms / execution_loop_count
             decode_step_idx += 1
         steps.append(entry)
 

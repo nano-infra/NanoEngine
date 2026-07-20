@@ -139,6 +139,10 @@ Scheduler::Scheduler(const std::string& engine_id,
         || ls_min_comp_bound_decoding_batch_size_ <= 0) {
         throw std::invalid_argument("invalid LoongServe-style Decode-only admission configuration");
     }
+    if (enable_ls_decode_core_scheduler_ && (loop_count_ <= 0 || loop_count_ >= kvcache_block_size)) {
+        throw std::invalid_argument(
+            "LoongServe-style Decode loop_count must be positive and smaller than kvcache_block_size");
+    }
     if (ls_kv_consolidation_mode_ != "off" && ls_kv_consolidation_mode_ != "shadow"
         && ls_kv_consolidation_mode_ != "execute") {
         throw std::invalid_argument("ls_kv_consolidation_mode must be one of: off, shadow, execute");
@@ -1107,6 +1111,7 @@ try
     ls_step_kv_decision_reason_  = ls_kv_consolidation_mode_ == "off" ? "off" : "no_candidate";
     ls_step_admission_records_.clear();
     ls_step_real_decode_ids_by_dp_.assign(attention_dp_, {});
+    ls_step_execution_loop_count_ = 1;
     ls_step_offload_committed_ = false;
     std::vector<std::vector<std::shared_ptr<Sequence>>> dp_seqs;
     bool                                                has_prefill = false;
@@ -1118,11 +1123,23 @@ try
     else {
         if (enable_ls_decode_core_scheduler_) {
             std::unordered_set<uint64_t> step_entry_ids;
+            int                          effective_loop_count = loop_count_;
             for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
                 for (const auto& sequence : _ls_running_sequences_in_pool(dp_idx)) {
+                    const int remaining_tokens = sequence->max_tokens - sequence->num_completed_tokens();
+                    if (remaining_tokens <= 0) {
+                        latch_ls_fatal(LSFatalCode::POST_PUBLICATION_INVARIANT);
+                        throw LSSchedulerFatalError(
+                            LSFatalCode::POST_PUBLICATION_INVARIANT,
+                            "LoongServe-style RUNNING sequence has no remaining output tokens");
+                    }
+                    effective_loop_count = std::min(effective_loop_count, remaining_tokens);
                     step_entry_ids.insert(sequence->seq_id);
                     has_step_entry_decode = true;
                 }
+            }
+            if (has_step_entry_decode) {
+                ls_step_execution_loop_count_ = effective_loop_count;
             }
 
             std::shared_ptr<SPStateManager::LSKVConsolidationPlan> consolidation_plan;
@@ -1186,6 +1203,8 @@ try
     ScheduleResult result;
     result.dp_seqs    = dp_seqs;
     result.is_prefill = has_prefill;
+    result.execution_loop_count = enable_ls_decode_core_scheduler_ ? ls_step_execution_loop_count_ :
+                                                                    (has_prefill ? 1 : loop_count_);
     result.action = enable_ls_decode_core_scheduler_
                         ? (has_step_entry_decode && !ls_step_offload_committed_ ? ScheduleAction::DECODE
                                                                                : ScheduleAction::ADMISSION)
@@ -3194,7 +3213,8 @@ try
                 group.allocated_attention_ranks,
                 extras,
                 ls_min_comp_bound_decoding_batch_size_,
-                ls_decode_enable_memory_scale_up_);
+                ls_decode_enable_memory_scale_up_,
+                ls_step_execution_loop_count_);
             if (!plan.success) {
                 const std::string reason = plan.failure_reason.empty() ? "planner returned failure" : plan.failure_reason;
                 if (!is_capacity_no_fit(reason)) {
@@ -3217,7 +3237,8 @@ try
             }
 
             std::string validation_error;
-            if (!worker_state[dp_idx]->validate_iteration_master_plan(requests, plan, &validation_error)) {
+            if (!worker_state[dp_idx]->validate_iteration_master_plan(
+                    requests, plan, &validation_error, ls_step_execution_loop_count_)) {
                 fail_required_decode("LS required Decode plan validation failed: " + validation_error);
             }
             for (int rank : plan.allocation) {
@@ -3291,7 +3312,10 @@ try
             worker_state[dp_idx]->group_used_kv_blocks(pending_dp.combined_requests);
         std::string combined_validation_error;
         if (!worker_state[dp_idx]->validate_iteration_master_plan(
-                pending_dp.combined_requests, combined, &combined_validation_error)) {
+                pending_dp.combined_requests,
+                combined,
+                &combined_validation_error,
+                ls_step_execution_loop_count_)) {
             fail_required_decode("LS combined pool Decode validation failed: " + combined_validation_error);
         }
     }
@@ -3358,7 +3382,7 @@ try
         auto& pending_dp = pending_by_dp[dp_idx];
         if (!pending_dp.combined_requests.empty()) {
             pending_dp.prepared.emplace(worker_state[dp_idx]->prepare_iteration_master_plan(
-                pending_dp.combined_requests, pending_dp.combined_plan));
+                pending_dp.combined_requests, pending_dp.combined_plan, ls_step_execution_loop_count_));
         }
     }
     for (const auto& pending_dp : pending_by_dp) {
@@ -4374,7 +4398,8 @@ try {
                         group.allocated_attention_ranks,
                         extras,
                         ls_min_comp_bound_decoding_batch_size_,
-                        ls_decode_enable_memory_scale_up_);
+                        ls_decode_enable_memory_scale_up_,
+                        ls_step_execution_loop_count_);
                     if (!plan.success) {
                         const std::string reason =
                             plan.failure_reason.empty() ? "planner returned failure" : plan.failure_reason;
@@ -4387,7 +4412,8 @@ try {
                                            reason};
                     }
                     std::string validation_error;
-                    if (!worker_state[dp_idx]->validate_iteration_master_plan(requests, plan, &validation_error)) {
+                    if (!worker_state[dp_idx]->validate_iteration_master_plan(
+                            requests, plan, &validation_error, ls_step_execution_loop_count_)) {
                         throw AttemptError{tentative_component ? AttemptFailureKind::TENTATIVE :
                                                                AttemptFailureKind::INTERNAL,
                                            dp_idx,
@@ -4469,7 +4495,10 @@ try {
                     worker_state[dp_idx]->group_used_kv_blocks(pending_dp.combined_requests);
                 std::string combined_error;
                 if (!worker_state[dp_idx]->validate_iteration_master_plan(
-                        pending_dp.combined_requests, combined, &combined_error)) {
+                        pending_dp.combined_requests,
+                        combined,
+                        &combined_error,
+                        ls_step_execution_loop_count_)) {
                     throw AttemptError{tentative_component ? AttemptFailureKind::TENTATIVE :
                                                             AttemptFailureKind::INTERNAL,
                                        dp_idx,
@@ -4482,7 +4511,9 @@ try {
                 if (!pending_dp.combined_requests.empty()) {
                     try {
                         pending_dp.prepared.emplace(worker_state[dp_idx]->prepare_iteration_master_plan(
-                            pending_dp.combined_requests, pending_dp.combined_plan));
+                            pending_dp.combined_requests,
+                            pending_dp.combined_plan,
+                            ls_step_execution_loop_count_));
                     }
                     catch (const std::exception& error) {
                         throw AttemptError{tentative_component ? AttemptFailureKind::TENTATIVE :

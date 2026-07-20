@@ -391,22 +391,26 @@ public:
     void               set_decode_master(Sequence& seq, int master_sp_idx);
     int                estimate_pending_append_capacity(int                                           rank,
                                                         const std::vector<std::shared_ptr<Sequence>>& requests,
-                                                        const std::vector<std::shared_ptr<Sequence>>& group_sequences) const;
+                                                        const std::vector<std::shared_ptr<Sequence>>& group_sequences,
+                                                        int num_output_tokens = 1) const;
     LSDecodeMasterPlan plan_iteration_masters_source_greedy(const std::vector<std::shared_ptr<Sequence>>& requests,
                                                             const std::vector<int>&                       allocation,
                                                             const std::vector<int>&                       extra_ranks,
                                                             int  batch_per_master,
-                                                            bool enable_memory_scale_up) const;
+                                                            bool enable_memory_scale_up,
+                                                            int  num_output_tokens = 1) const;
     bool               validate_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
                                                       const LSDecodeMasterPlan&                     plan,
-                                                      std::string*                                  error = nullptr) const;
+                                                      std::string*                                  error = nullptr,
+                                                      int num_output_tokens = 1) const;
     // Formal LS Decode publication adapter. It builds complete shadow ACTIVE
     // contexts and rank-local prepared rebalances from a validated plan. The
     // current pending frontier and its output headroom can be transferred on a
     // completely full rank; prepare never changes Sequence/counter state and
     // commit/abort are idempotent, allocation-free and noexcept.
     PreparedLSIterationMasterPlan prepare_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
-                                                                const LSDecodeMasterPlan&                     plan);
+                                                                const LSDecodeMasterPlan&                     plan,
+                                                                int num_output_tokens = 1);
     // Validate the final manager counters for one atomic pool step that may
     // publish a survivor admission before applying the existing Decode
     // iteration's role deltas. Both transactions must still be PREPARED and
@@ -414,9 +418,10 @@ public:
     // scheduler can repeat it immediately before entering publication.
     bool validate_ls_pool_step_composition_noexcept(const PreparedLSInitialBatch*        initial,
                                                     const PreparedLSIterationMasterPlan* iteration) const noexcept;
-    bool reassign_pending_append(Sequence& seq, int target_sp_idx);
+    bool reassign_pending_append(Sequence& seq, int target_sp_idx, int num_output_tokens = 1);
     bool commit_iteration_master_plan(const std::vector<std::shared_ptr<Sequence>>& requests,
-                                      const LSDecodeMasterPlan&                     plan);
+                                      const LSDecodeMasterPlan&                     plan,
+                                      int num_output_tokens = 1);
     std::shared_ptr<LSKVConsolidationPlan>
                      plan_kv_consolidation(uint64_t                                      transaction_id,
                                            uint64_t                                      group_id,

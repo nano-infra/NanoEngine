@@ -172,6 +172,7 @@ void bind_scheduler_utils(py::module_& m)
     // Bind the ScheduleResult struct
     py::class_<ScheduleResult>(m, "ScheduleResult")
         .def_readonly("action", &ScheduleResult::action)
+        .def_readonly("execution_loop_count", &ScheduleResult::execution_loop_count)
         .def_readwrite("dp_seqs", &ScheduleResult::dp_seqs)
         .def_readwrite("dp_sp_seqs", &ScheduleResult::dp_sp_seqs)
         .def_readwrite("filtered_dp_sp_seqs", &ScheduleResult::filtered_dp_sp_seqs)
