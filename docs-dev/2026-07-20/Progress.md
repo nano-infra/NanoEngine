@@ -48,3 +48,29 @@ compute scale-up，首轮 master DoP=2、KV DoP=1，后续 KV DoP=2。由于请�
 K=16 跨 KV block 边界预留。详细报告见
 `loongserve_loop_count16_single_node_validation_20260720.md`。提交范围已核对：
 只包含本任务修改，用户原有 ray executor buffer override 与其他工作树改动未纳入。
+
+---
+
+更新时间：2026-07-20 07:50 UTC
+
+任务目标：修复 LoongServe-style `loop_count=16` 在双节点 DP2×SP8
+稀疏启动时首轮 Decode 报 `IndexError: Block index out of range` 的问题。
+
+根因：首个请求只被分配到 DP0。组合调度器仅在某个 DP 自己存在真实 Decode
+group 时才为该 DP 的空闲 SP rank 添加持久化 dummy，导致 DP1 的 8 个 rank
+收到空 `dp_seqs`。worker 随后临时构造了没有 KV block table 的 dummy，读取
+`last_block_page_id` 时越界。
+
+修复：只要本轮任意 DP 存在真实 Decode，就为所有没有真实负载的 DP/SP rank
+补充调度器拥有、已分配 KV block 的持久化 dummy，以保持全局同步的 FFN cadence；
+纯 admission 步骤不额外创建 dummy。新增 DP2×SP8、K=16 的空闲 DP 回归测试，
+验证 DP1 获得 8 个 KV-backed dummy。
+
+验证：修改 C++ 后已执行 `pip install -v -e .`；相关 CPU 回归两组分别
+100、101 项通过，共 201 项。Ray `10.102.243.60:8776` 上完成 DP2×SP8、
+loop_count=16 的双机真实 GPU 稀疏启动 smoke：1/1 请求完成、进程 exit 0、
+manifest 为 `success`，原来触发异常的全局 rank 8 路径已通过。
+
+资源与文档状态：smoke 退出后 Ray 为 `0.0/16.0 GPU`、无 pending demand，
+本机没有残留 CUDA 计算进程；详细记录见
+`loongserve_loop16_idle_dp_fix_20260720.md`。本轮修复将随对应代码提交落盘。

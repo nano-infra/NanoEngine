@@ -346,6 +346,37 @@ def test_chunked_16_reserves_kv_and_shortens_the_final_decode_step():
     assert scheduler.is_finished() is True
 
 
+def test_chunked_16_fills_an_idle_dp_with_kv_backed_rank_dummies():
+    scheduler = _make_scheduler(
+        attention_dp=2,
+        attention_sp=8,
+        block_size=64,
+        num_blocks=64,
+        loop_count=16,
+        threshold=128,
+    )
+    sequence = _sequence(221, max_tokens=698)
+    _add(scheduler, sequence, 0)
+
+    admission = scheduler.schedule()
+    assert admission.action == ScheduleAction.ADMISSION
+
+    decode = scheduler.schedule()
+    assert decode.action == ScheduleAction.DECODE
+    assert decode.execution_loop_count == 16
+    assert decode.ls_real_decode_ids_by_dp == [[sequence.seq_id], []]
+    assert [len(sequences) for sequences in decode.dp_seqs] == [8, 8]
+
+    idle_dp = decode.dp_seqs[1]
+    assert sorted(
+        dummy.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
+        for dummy in idle_dp
+    ) == list(range(8))
+    for dummy in idle_dp:
+        master = dummy.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx
+        assert dummy.last_block_page_id(BlockContextSlot.ACTIVE, master) >= 0
+
+
 def test_pool_local_fifo_membership_then_stable_need_sort_one_batch_per_pool():
     scheduler = _make_scheduler(
         attention_dp=2,

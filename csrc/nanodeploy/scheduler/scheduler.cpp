@@ -4569,6 +4569,10 @@ try {
             step->group_plan_ids.reserve(total_group_plans);
             step->group_plan_sequence_ids.reserve(total_group_plans);
             step->reused_passive_masters.reserve(total_group_plans);
+            const bool has_global_decode = std::any_of(
+                step->decode_by_dp.begin(), step->decode_by_dp.end(), [](const auto& pending_dp) {
+                    return !pending_dp.groups.empty();
+                });
             for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
                 std::vector<int> master_load(attention_sp_, 0);
                 for (const auto& pending : step->decode_by_dp[dp_idx].groups) {
@@ -4605,7 +4609,11 @@ try {
                     step->reused_passive_masters.push_back(pending.reused_passive);
                 }
                 for (int rank = 0; rank < attention_sp_; ++rank) {
-                    if (master_load[rank] == 0 && !step->decode_by_dp[dp_idx].groups.empty()) {
+                    // Every DP pool participates in the globally synchronized
+                    // FFN cadence. An idle pool must therefore receive the
+                    // scheduler-owned, KV-backed rank dummy instead of leaving
+                    // ModelRunner to fabricate an unallocated local Sequence.
+                    if (master_load[rank] == 0 && has_global_decode) {
                         step->scheduled[dp_idx].push_back(worker_state[dp_idx]->dummy_seqs[rank]);
                     }
                 }
