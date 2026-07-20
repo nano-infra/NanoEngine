@@ -92,12 +92,15 @@ def test_formal_entrypoints_resolve_shared_cli_contract(tmp_path, monkeypatch):
             str(output_jsonl),
             "--ls-max-num-ooe",
             "6",
+            "--loop-count",
+            "16",
         ],
     )
     serving_args = serving_script.parse_args()
     assert serving_args.ls_max_num_ooe == 6
     assert serving_args.routing_strategy == "RoundRobin"
     assert serving_args.warmup_requests == 0
+    assert serving_args.loop_count == 16
 
     monkeypatch.setattr(
         "sys.argv",
@@ -147,9 +150,18 @@ def test_resolved_manifest_uses_scheduler_resolved_values(tmp_path):
     assert manifest["ls_decode_enable_memory_scale_up"] is True
     assert manifest["ls_decode_batch_per_master"] == 64
 
+    config.loop_count = 16
+    chunked_manifest = resolved_manifest(config, 7, expected_loop_count=16)
+    assert chunked_manifest["loop_count"] == 16
+    with pytest.raises(RuntimeError, match="loop_count"):
+        resolved_manifest(config, 7)
+
     config.routing_strategy = "LeastBatch"
     with pytest.raises(RuntimeError, match="routing_strategy"):
-        resolved_manifest(config, 7)
+        resolved_manifest(config, 7, expected_loop_count=16)
+
+    with pytest.raises(ValueError, match="expected_loop_count"):
+        resolved_manifest(config, 7, expected_loop_count=17)
 
 
 def test_clear_ray_proxy_env(monkeypatch):

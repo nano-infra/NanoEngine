@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-sp", type=int, default=8)
     parser.add_argument("--max-num-seqs", type=int, default=256)
     parser.add_argument("--max-num-recv-seqs", type=int, default=128)
+    parser.add_argument("--loop-count", type=int, choices=range(1, 17), default=1)
     parser.add_argument("--max-model-len", type=int, default=1_000_000)
     parser.add_argument("--max-input-len", type=int, default=1_000_000)
     parser.add_argument("--max-num-batched-tokens", type=int, default=1_024_000)
@@ -136,7 +137,7 @@ def build_engine(args: argparse.Namespace, serving):
         max_num_seqs=args.max_num_seqs,
         max_num_recv_seqs=args.max_num_recv_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
-        loop_count=1,
+        loop_count=args.loop_count,
         scheduler_mode="centralized",
         segment_size=args.segment_size,
         kvcache_block_size=64,
@@ -177,7 +178,11 @@ def _build_manifest(
     manifest_path: Path,
     cleared_proxy_keys: list[str],
 ) -> dict[str, Any]:
-    resolved = resolved_manifest(engine.config, args.ls_max_num_ooe)
+    resolved = resolved_manifest(
+        engine.config,
+        args.ls_max_num_ooe,
+        expected_loop_count=args.loop_count,
+    )
     num_blocks = int(engine.config.num_kvcache_blocks)
     pool_kv_tokens = (
         engine.config.attention_sp
@@ -224,6 +229,7 @@ def _build_manifest(
             "master_address": args.master_address,
             "max_num_seqs": args.max_num_seqs,
             "max_num_recv_seqs": args.max_num_recv_seqs,
+            "loop_count": args.loop_count,
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "gpu_memory_limit_gb": args.gpu_memory_limit_gb,
             "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -252,7 +258,7 @@ def main() -> None:
     config["output_jsonl"] = str(args.output_jsonl)
     config["manifest_json"] = str(manifest_path)
     config["ffn_ep"] = args.attention_dp * args.attention_sp
-    config["loop_count"] = 1
+    config["loop_count"] = args.loop_count
     print("LS_BENCH_CONFIG " + json.dumps(config, sort_keys=True), flush=True)
 
     if not args.verbose_nanodeploy_logs:
