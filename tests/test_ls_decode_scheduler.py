@@ -251,6 +251,35 @@ def test_typed_add_current_exact_rejection_is_detached_but_consumes_rr():
     _assert_no_persistent_admission_batch(scheduler)
 
 
+def test_cross_rank_initial_placement_reserves_master_headroom_before_packing():
+    scheduler = _make_scheduler(
+        attention_dp=2,
+        attention_sp=2,
+        block_size=64,
+        num_blocks=4,
+        reserved_blocks_per_req=1.0,
+        loop_count=16,
+        threshold=128,
+    )
+    sequence = _sequence(270, max_tokens=2)
+
+    _add(scheduler, sequence, 0)
+    admission = scheduler.schedule()
+
+    assert admission.action == ScheduleAction.ADMISSION
+    assert len(admission.ls_admission_records) == 1
+    record = admission.ls_admission_records[0]
+    assert record.sequence is sequence
+    assert record.planned_kv_dop == 2
+    assert list(record.planned_kv_ranks) == [0, 1]
+
+    context = sequence.block_ctx(BlockContextSlot.ACTIVE)
+    assert context.master_sp_idx == 0
+    assert list(context.num_dispatched_tokens) == [128, 143]
+    assert len(context.sp_block_table[0]) == 2
+    assert len(context.sp_block_table[1]) == 3
+
+
 def test_max_tokens_one_finishes_inside_cpp_bootstrap_without_decode_arrays():
     scheduler = _make_scheduler()
     sequence = _sequence(3, max_tokens=1)

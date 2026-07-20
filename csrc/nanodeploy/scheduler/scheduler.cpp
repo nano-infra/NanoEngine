@@ -1937,13 +1937,46 @@ Scheduler::_plan_ls_initial_placement(int                                       
         std::stable_sort(packing_ranks.begin(), packing_ranks.end(), [&](int lhs, int rhs) {
             return used_tokens[lhs] != used_tokens[rhs] ? used_tokens[lhs] > used_tokens[rhs] : lhs < rhs;
         });
-        std::vector<int64_t> free_tokens(attention_sp_, 0);
-        for (int rank : packing_ranks) {
-            free_tokens[rank] = static_cast<int64_t>(adjusted_free_blocks(rank)) * Sequence::block_size;
+        std::vector<int> existing_master_load(attention_sp_, 0);
+        std::vector<int> new_master_load(attention_sp_, 0);
+        for (const auto& seq : existing_sequences) {
+            if (seq && seq->status == SequenceStatus::RUNNING) {
+                existing_master_load[seq->block_ctx(BlockContextSlot::ACTIVE).master_sp_idx_]++;
+            }
+        }
+        for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
+            new_master_load[ranks[seq_idx % ranks.size()]]++;
+        }
+        std::vector<int> master_load = existing_master_load;
+        for (int rank = 0; rank < attention_sp_; ++rank) {
+            master_load[rank] += new_master_load[rank];
         }
 
-        bool feasible = true;
+        std::vector<int64_t> free_tokens(attention_sp_, 0);
+        bool                 feasible = true;
+        for (int rank : packing_ranks) {
+            const int free_blocks = adjusted_free_blocks(rank);
+            const int reserved_blocks =
+                static_cast<int>(std::ceil(master_load[rank] * reserved_blocks_per_req_));
+            const int usable_blocks = free_blocks - reserved_blocks;
+            const int bootstrap_tokens = new_master_load[rank];
+            if (usable_blocks < 0
+                || static_cast<int64_t>(usable_blocks) * Sequence::block_size < bootstrap_tokens) {
+                feasible = false;
+                break;
+            }
+            // Initial placement publishes one fixed bootstrap token per new
+            // master and must preserve reserved Decode headroom. Remove both
+            // from the packing capacity up front so a long prompt cannot fill
+            // a rank and make the otherwise feasible cross-rank plan fail its
+            // exact block check afterwards.
+            free_tokens[rank] = static_cast<int64_t>(usable_blocks) * Sequence::block_size - bootstrap_tokens;
+        }
+
         for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
+            if (!feasible) {
+                break;
+            }
             int64_t remaining = _ls_admission_need_tokens(*batch[seq_idx]);
             for (int rank : packing_ranks) {
                 int64_t placed = std::min(remaining, free_tokens[rank]);
@@ -1991,7 +2024,6 @@ Scheduler::_plan_ls_initial_placement(int                                       
                 }
             }
             std::vector<int> receiver_load(attention_sp_, 0);
-            std::vector<int> master_load(attention_sp_, 0);
             for (const auto& seq : existing_sequences) {
                 if (!seq || seq->status != SequenceStatus::RUNNING) {
                     continue;
@@ -2000,7 +2032,6 @@ Scheduler::_plan_ls_initial_placement(int                                       
                 auto        context = context_overrides.find(seq.get());
                 const auto& ctx =
                     context == context_overrides.end() ? seq->block_ctx(BlockContextSlot::ACTIVE) : *context->second;
-                master_load[master]++;
                 for (int owner = 0; owner < attention_sp_; ++owner) {
                     int committed = ctx.num_dispatched_tokens[owner];
                     if (ctx.pending_token_present_ && ctx.pending_token_target_sp_ == owner) {
@@ -2013,7 +2044,6 @@ Scheduler::_plan_ls_initial_placement(int                                       
             }
             for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
                 int master = ranks[seq_idx % ranks.size()];
-                master_load[master]++;
                 for (int owner = 0; owner < attention_sp_; ++owner) {
                     if (owner != master && placements[seq_idx][owner] > 0) {
                         receiver_load[owner]++;
@@ -2071,13 +2101,29 @@ bool Scheduler::_ls_batch_fits_empty_system(
             continue;
         }
         std::vector<std::vector<int>> placements(batch.size(), std::vector<int>(attention_sp_, 0));
-        std::vector<int64_t>          free_tokens(attention_sp_, 0);
-        for (int rank = 0; rank < d; ++rank) {
-            free_tokens[rank] = static_cast<int64_t>(ls_empty_system_free_blocks_per_rank_[dp_idx][rank])
-                                * Sequence::block_size;
-        }
-        bool placement_feasible = true;
+        std::vector<int>              master_load(attention_sp_, 0);
         for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
+            master_load[seq_idx % d]++;
+        }
+        std::vector<int64_t>          free_tokens(attention_sp_, 0);
+        bool                          placement_feasible = true;
+        for (int rank = 0; rank < d; ++rank) {
+            const int free_blocks = ls_empty_system_free_blocks_per_rank_[dp_idx][rank];
+            const int reserved_blocks =
+                static_cast<int>(std::ceil(master_load[rank] * reserved_blocks_per_req_));
+            const int usable_blocks = free_blocks - reserved_blocks;
+            const int bootstrap_tokens = master_load[rank];
+            if (usable_blocks < 0
+                || static_cast<int64_t>(usable_blocks) * Sequence::block_size < bootstrap_tokens) {
+                placement_feasible = false;
+                break;
+            }
+            free_tokens[rank] = static_cast<int64_t>(usable_blocks) * Sequence::block_size - bootstrap_tokens;
+        }
+        for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
+            if (!placement_feasible) {
+                break;
+            }
             int64_t remaining = _ls_admission_need_tokens(*batch[seq_idx]);
             for (int rank = 0; rank < d && remaining > 0; ++rank) {
                 int64_t placed = std::min(remaining, free_tokens[rank]);
@@ -2096,10 +2142,8 @@ bool Scheduler::_ls_batch_fits_empty_system(
 
         std::vector<int> needed_blocks(attention_sp_, 0);
         std::vector<int> receiver_load(attention_sp_, 0);
-        std::vector<int> master_load(attention_sp_, 0);
         for (size_t seq_idx = 0; seq_idx < batch.size(); ++seq_idx) {
             int master = static_cast<int>(seq_idx % d);
-            master_load[master]++;
             for (int owner = 0; owner < attention_sp_; ++owner) {
                 const int tokens_with_bootstrap = placements[seq_idx][owner] + (owner == master ? 1 : 0);
                 needed_blocks[owner] +=

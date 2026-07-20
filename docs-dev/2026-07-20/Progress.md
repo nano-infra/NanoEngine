@@ -74,3 +74,27 @@ manifest 为 `success`，原来触发异常的全局 rank 8 路径已通过。
 资源与文档状态：smoke 退出后 Ray 为 `0.0/16.0 GPU`、无 pending demand，
 本机没有残留 CUDA 计算进程；详细记录见
 `loongserve_loop16_idle_dp_fix_20260720.md`。本轮修复将随对应代码提交落盘。
+
+---
+
+更新时间：2026-07-20 11:54 UTC
+
+任务目标：修复双节点 DP2×SP8、`.85`、K=16 正式 workload 在约 21 秒后报
+`request cannot fit the full empty SP pool exactly` 的新问题。
+
+根因：原始 811259-token 长请求必须跨 rank。入口预检和正式 placement 都先按
+原始 free-token 容量填满 master rank，之后才计算 bootstrap token 和
+`reserved_blocks_per_req=1`，导致 master 精确 block 数超限；每个候选 DoP 都
+重复填满第一个 rank，因此把总 pool 容量足够的请求错误判为永久不可调度。
+
+修复：每个候选 DoP 在 prompt 打包前先扣除所有 master 的 reserved blocks 和
+新增 master 的 bootstrap tokens，之后继续执行原有逐请求 block rounding 与
+精确容量校验。入口 `_ls_batch_fits_empty_system` 和实际
+`_plan_ls_initial_placement` 同步修改。
+
+验证：新增 DP2×SP2、K=16 的纯 CPU 跨-rank回归，旧实现稳定失败、新实现通过；
+失败 workload 的精确 811259/754 样本和首 7200 条最大 prompt 971548 均在 CPU
+上成功选择 KV DoP=2。相关回归共 `201 passed`。双节点 DP2×SP8、`.85`、K=16
+真实 GPU smoke 使用 811259-token prompt，`1/1` 请求完成、17 tokens 输出、
+manifest `success`、exit 0。退出后 Ray 为 `0.0/16.0 GPU` 且本机无残留进程。
+详细记录见 `loongserve_cross_rank_admission_fix_20260720.md`。
