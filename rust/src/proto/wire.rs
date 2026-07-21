@@ -15,6 +15,9 @@ pub(super) struct WireBatch {
     pub(super) seq_lens: Vec<i32>,
     pub(super) block_tables: Vec<Vec<i32>>,
     pub(super) temperatures: Vec<f32>,
+    pub(super) json_schemas: Vec<Option<String>>,
+    pub(super) structural_tags: Vec<Option<String>>,
+    pub(super) remaining_tokens: Vec<i32>,
     pub(super) state_slots: Vec<i64>,
     pub(super) compressed_block_tables: std::collections::HashMap<i32, Vec<Vec<i32>>>,
     pub(super) hisparse_slots: Vec<i64>,
@@ -29,6 +32,8 @@ pub(crate) struct WireSamplingParams {
     pub(crate) max_tokens: i32,
     pub(crate) ignore_eos: bool,
     pub(crate) return_completion_logprobs: bool,
+    pub(crate) json_schema: Option<String>,
+    pub(crate) structural_tag: Option<String>,
 }
 
 impl From<&SamplingParams> for WireSamplingParams {
@@ -38,6 +43,8 @@ impl From<&SamplingParams> for WireSamplingParams {
             max_tokens: value.max_tokens,
             ignore_eos: value.ignore_eos,
             return_completion_logprobs: value.return_completion_logprobs,
+            json_schema: value.json_schema.clone(),
+            structural_tag: value.structural_tag.clone(),
         }
     }
 }
@@ -49,6 +56,8 @@ impl WireSamplingParams {
             self.max_tokens,
             self.ignore_eos,
             self.return_completion_logprobs,
+            self.json_schema.clone(),
+            self.structural_tag.clone(),
         )
     }
 }
@@ -161,6 +170,9 @@ impl WireBatch {
             seq_lens: Vec::new(),
             block_tables: Vec::new(),
             temperatures: Vec::new(),
+            json_schemas: Vec::new(),
+            structural_tags: Vec::new(),
+            remaining_tokens: Vec::new(),
             state_slots: Vec::new(),
             compressed_block_tables: std::collections::HashMap::new(),
             hisparse_slots: Vec::new(),
@@ -178,6 +190,9 @@ impl WireBatch {
             seq_lens: vec![1],
             block_tables: vec![Vec::new()],
             temperatures: vec![0.0],
+            json_schemas: vec![None],
+            structural_tags: vec![None],
+            remaining_tokens: vec![1],
             state_slots: vec![-1],
             compressed_block_tables: std::collections::HashMap::new(),
             hisparse_slots: vec![-1],
@@ -232,6 +247,17 @@ impl WireBatch {
                             .cloned()
                             .unwrap_or_default()],
                         temperatures: vec![self.temperatures.get(seq_idx).copied().unwrap_or(0.0)],
+                        json_schemas: vec![self.json_schemas.get(seq_idx).cloned().unwrap_or(None)],
+                        structural_tags: vec![self
+                            .structural_tags
+                            .get(seq_idx)
+                            .cloned()
+                            .unwrap_or(None)],
+                        remaining_tokens: vec![self
+                            .remaining_tokens
+                            .get(seq_idx)
+                            .copied()
+                            .unwrap_or(1)],
                         state_slots: vec![self.state_slots.get(seq_idx).copied().unwrap_or(-1)],
                         compressed_block_tables,
                         hisparse_slots: vec![self
@@ -283,6 +309,9 @@ pub(crate) fn sequence_refs_runner_in_bytes(
     let mut seq_lens = Vec::new();
     let mut block_tables = Vec::new();
     let mut temperatures = Vec::new();
+    let mut json_schemas = Vec::new();
+    let mut structural_tags = Vec::new();
+    let mut remaining_tokens = Vec::new();
     let mut state_slots = Vec::new();
     let mut compressed_block_tables: HashMap<i32, Vec<Vec<i32>>> = HashMap::new();
     let mut hisparse_slots = Vec::new();
@@ -295,6 +324,10 @@ pub(crate) fn sequence_refs_runner_in_bytes(
         let block_table = item.active_block_table.clone();
         let compressed_tables = item.active_compressed_block_tables.clone();
         let temperature = item.sampling_params.temperature as f32;
+        let json_schema = item.sampling_params.json_schema.clone();
+        let structural_tag = item.sampling_params.structural_tag.clone();
+        let generated = item.num_tokens.saturating_sub(item.num_prompt_tokens);
+        let remaining = item.sampling_params.max_tokens.saturating_sub(generated);
 
         let should_sample;
         if is_prefill {
@@ -317,6 +350,9 @@ pub(crate) fn sequence_refs_runner_in_bytes(
         }
         block_tables.push(block_table);
         temperatures.push(temperature);
+        json_schemas.push(json_schema);
+        structural_tags.push(structural_tag);
+        remaining_tokens.push(remaining);
         state_slots.push(i64::from(item.active_state_slot));
         hisparse_slots.push(i64::from(item.active_hisparse_slot));
         seq_ids.push(item.seq_id);
@@ -343,6 +379,9 @@ pub(crate) fn sequence_refs_runner_in_bytes(
             seq_lens,
             block_tables,
             temperatures,
+            json_schemas,
+            structural_tags,
+            remaining_tokens,
             state_slots,
             compressed_block_tables,
             hisparse_slots,
@@ -510,6 +549,9 @@ mod tests {
             seq_lens: vec![5, 3],
             block_tables: vec![vec![1, 2], vec![3]],
             temperatures: vec![0.1, 0.2],
+            json_schemas: vec![None, None],
+            structural_tags: vec![None, None],
+            remaining_tokens: vec![16, 16],
             state_slots: vec![7, 8],
             compressed_block_tables: compressed,
             hisparse_slots: vec![9, 10],

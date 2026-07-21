@@ -72,7 +72,7 @@ impl Sequence {
             prefill_start_offset: 0,
             affinity_key: 0,
             sampling_params: sampling_params
-                .unwrap_or_else(|| SamplingParams::new(1.0, 256, false, false)),
+                .unwrap_or_else(|| SamplingParams::new(1.0, 256, false, false, None, None)),
             completion_logprobs: Vec::new(),
             vision_slots: Vec::new(),
             active_block_table: Vec::new(),

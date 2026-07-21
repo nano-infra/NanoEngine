@@ -423,7 +423,7 @@ mod tests {
         set_sequence_block_size(BS);
         Sequence::new(
             tokens.clone(),
-            Some(SamplingParams::new(1.0, 16, false, false)),
+            Some(SamplingParams::new(1.0, 16, false, false, None, None)),
         )
     }
 

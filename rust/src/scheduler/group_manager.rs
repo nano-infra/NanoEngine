@@ -49,7 +49,7 @@ impl Scheduler {
         let seq_id = u64::MAX - (dp_idx * self.group() + group_id) as u64;
         let mut seq = Sequence::new(
             vec![0i32],
-            Some(SamplingParams::new(1.0, 256, false, false)),
+            Some(SamplingParams::new(1.0, 256, false, false, None, None)),
         );
         seq.seq_id = seq_id;
         seq.status = 1;

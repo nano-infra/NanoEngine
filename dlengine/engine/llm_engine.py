@@ -127,7 +127,10 @@ class LLMEngine:
     def free_to_be_migrated_ids(self, seq_ids: int | list[int]):
         if isinstance(seq_ids, int):
             seq_ids = [seq_ids]
-        self.scheduler.free_to_be_migrated_ids([int(seq_id) for seq_id in seq_ids])
+        seq_ids = [int(seq_id) for seq_id in seq_ids]
+        self.scheduler.free_to_be_migrated_ids(seq_ids)
+        if seq_ids:
+            self.executor.collective_rpc("free_structured_output", (seq_ids,))
 
     def abort(self, seq_ids: int | list[int]) -> list[int]:
         """Stop generating for the given sequences and free their KV blocks.
@@ -138,7 +141,10 @@ class LLMEngine:
         """
         if isinstance(seq_ids, int):
             seq_ids = [seq_ids]
-        return self.scheduler.abort_many([int(seq_id) for seq_id in seq_ids])
+        aborted = self.scheduler.abort_many([int(seq_id) for seq_id in seq_ids])
+        if aborted:
+            self.executor.collective_rpc("free_structured_output", (aborted,))
+        return aborted
 
     def _run_scheduled_step(self, schedule_result):
         tp_size = self.config.attention_tp

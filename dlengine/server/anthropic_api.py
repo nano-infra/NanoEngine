@@ -370,7 +370,10 @@ async def event_stream(
             stop=stop,
             hold_markers=hold_markers,
             reasoning_open=reasoning_open,
+            preserve_special_tokens=use_tools,
         ):
+            if not delta:
+                continue
             # Drop reasoning ("thinking") deltas; only stream the visible answer.
             if gen.in_reasoning:
                 continue
@@ -400,7 +403,9 @@ async def event_stream(
 
         tool_calls = []
         if use_tools and gen is not None:
-            full_text = server.tokenizer.decode(gen.token_ids, skip_special_tokens=True)
+            full_text = server._decode_generated(
+                gen.token_ids, preserve_special_tokens=True
+            )
             tool_calls = server.tool_parser.parse_full(full_text).tool_calls
 
         # Anthropic messages must carry at least one content block.
@@ -494,6 +499,16 @@ async def handle_messages(server: Any, request: Any, body: dict):  # noqa: ANN20
     prompt_ids, reasoning_open = server._encode_chat(
         messages, tools=tools if use_tools else None, tool_choice=tool_choice
     )
+    if use_tools:
+        try:
+            server._attach_tool_constraint(
+                sampling_params,
+                tools,
+                tool_choice,
+                reasoning_open=reasoning_open,
+            )
+        except (TypeError, ValueError) as e:
+            return AnthropicError(400, str(e)).to_response()
     affinity_key = server.session_affinity_key(request, body)
     input_tokens = len(prompt_ids)
     kv_transfer = body.get("kv_transfer_params") or {}
@@ -574,7 +589,10 @@ async def handle_messages(server: Any, request: Any, body: dict):  # noqa: ANN20
     monitor = server._spawn_disconnect_monitor(request, req)
     try:
         async for delta, gen in server.stream_text(
-            req, sampling_params.max_tokens, stop=stop
+            req,
+            sampling_params.max_tokens,
+            stop=stop,
+            preserve_special_tokens=use_tools,
         ):
             text += delta
     except RuntimeError as e:
