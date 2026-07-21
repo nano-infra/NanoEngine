@@ -230,9 +230,13 @@ class StructuredOutputManager:
             ):
                 raise RuntimeError(f"missing grammar matcher for seq_id={seq_id}")
             if not state.matcher.accept_token(token_id):
-                raise RuntimeError(
-                    f"XGrammar rejected sampled token {token_id} for seq_id={seq_id}"
+                from dlengine.logging import get_logger
+                get_logger("DLENGINE").error(
+                    "XGrammar rejected sampled token %d for seq_id=%s. Discarding matcher.",
+                    token_id, seq_id
                 )
+                self._matchers.pop(int(seq_id), None)
+                continue
             if state.matcher.is_terminated():
                 self._matchers.pop(int(seq_id), None)
 
