@@ -1123,7 +1123,6 @@ try
     else {
         if (enable_ls_decode_core_scheduler_) {
             std::unordered_set<uint64_t> step_entry_ids;
-            int                          effective_loop_count = loop_count_;
             for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
                 for (const auto& sequence : _ls_running_sequences_in_pool(dp_idx)) {
                     const int remaining_tokens = sequence->max_tokens - sequence->num_completed_tokens();
@@ -1133,13 +1132,17 @@ try
                             LSFatalCode::POST_PUBLICATION_INVARIANT,
                             "LoongServe-style RUNNING sequence has no remaining output tokens");
                     }
-                    effective_loop_count = std::min(effective_loop_count, remaining_tokens);
                     step_entry_ids.insert(sequence->seq_id);
                     has_step_entry_decode = true;
                 }
             }
             if (has_step_entry_decode) {
-                ls_step_execution_loop_count_ = effective_loop_count;
+                // Match NanoDeploy's original chunked Decode semantics: every
+                // Decode dispatch executes the configured loop count. Requests
+                // that reach max_tokens or EOS inside the chunk are finalized by
+                // postprocess(), which discards the unused tail tokens instead of
+                // shrinking the whole batch to the shortest remaining request.
+                ls_step_execution_loop_count_ = loop_count_;
             }
 
             std::shared_ptr<SPStateManager::LSKVConsolidationPlan> consolidation_plan;

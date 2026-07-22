@@ -1102,7 +1102,7 @@ def test_actual_scheduler_max_tokens_two_decodes_exactly_once(monkeypatch):
     assert engine.metrics_manager.server_metric.num_completed_requests == 1
 
 
-def test_actual_engine_chunked_16_executes_full_chunk_then_one_token_tail(
+def test_actual_engine_chunked_16_keeps_fixed_loop_for_one_token_tail(
     monkeypatch,
 ):
     llm_engine_type = _load_llm_engine_without_model_runner(monkeypatch)
@@ -1143,8 +1143,8 @@ def test_actual_engine_chunked_16_executes_full_chunk_then_one_token_tail(
     assert first_decode[1:3] == (-16, 1)
     assert final_decode[0][0][0] == sequence.seq_id
     assert len(final_decode[0][0][1]) == 18
-    assert final_decode[1:3] == (-1, 1)
-    assert observed_loop_counts == [16, 1]
+    assert final_decode[1:3] == (-16, 1)
+    assert observed_loop_counts == [16, 16]
     assert scheduler.is_finished()
 
 

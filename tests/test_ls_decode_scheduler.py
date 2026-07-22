@@ -344,7 +344,7 @@ def test_max_tokens_two_runs_exactly_one_real_decode_after_bootstrap():
     assert scheduler.is_finished() is True
 
 
-def test_chunked_16_reserves_kv_and_shortens_the_final_decode_step():
+def test_chunked_16_reserves_kv_and_keeps_fixed_final_decode_step():
     scheduler = _make_scheduler(
         attention_sp=2,
         block_size=64,
@@ -367,10 +367,11 @@ def test_chunked_16_reserves_kv_and_shortens_the_final_decode_step():
     assert sequence.status == SequenceStatus.RUNNING
 
     final_decode = scheduler.schedule()
-    assert final_decode.execution_loop_count == 1
+    assert final_decode.execution_loop_count == 16
     _postprocess_decode(scheduler, final_decode, token_id=99)
 
     assert sequence.num_completed_tokens == 18
+    assert list(sequence.token_ids)[-1] == 99
     assert sequence.status == SequenceStatus.FINISHED
     assert scheduler.is_finished() is True
 
