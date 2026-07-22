@@ -343,6 +343,19 @@ class LLMEngine:
                         error, LSFatalCode.POST_PUBLICATION_INVARIANT
                     )
                 raise
+            if getattr(sch_res, "ls_scheduler_phase_timing_enabled", False):
+                # The formal serving benchmark suppresses INFO by default. This
+                # warning-level diagnostic is still opt-in because the C++ flag
+                # is false unless the timing environment variable is enabled.
+                logger.warning(
+                    {
+                        "mode": "ls_scheduler_phase_timing",
+                        "action": str(sch_res.action),
+                        "planning_latency_ms": sch_res.ls_planning_latency_ms,
+                        "phase_ms": dict(sch_res.ls_scheduler_phase_timing_ms),
+                        "counts": dict(sch_res.ls_scheduler_phase_timing_counts),
+                    }
+                )
         scheduled_loop_count = getattr(sch_res, "execution_loop_count", None)
         configured_loop_count = getattr(self.config, "loop_count", 1)
         if not isinstance(scheduled_loop_count, int):

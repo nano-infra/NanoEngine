@@ -171,6 +171,64 @@ def _assert_no_persistent_admission_batch(scheduler: Scheduler) -> None:
     assert scheduler.get_ls_active_batch_owners() == []
 
 
+def test_ls_scheduler_phase_timing_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("NANODEPLOY_LS_SCHEDULER_PHASE_TIMING", raising=False)
+    scheduler = _make_scheduler()
+    _add(scheduler, _sequence(3, max_tokens=2), 0)
+
+    result = scheduler.schedule()
+
+    assert result.ls_scheduler_phase_timing_enabled is False
+    assert dict(result.ls_scheduler_phase_timing_ms) == {}
+    assert dict(result.ls_scheduler_phase_timing_counts) == {}
+
+
+def test_ls_scheduler_phase_timing_reports_top_level_and_nested_work(monkeypatch):
+    monkeypatch.setenv("NANODEPLOY_LS_SCHEDULER_PHASE_TIMING", "1")
+    scheduler = _make_scheduler(block_size=64, loop_count=16, threshold=128)
+    sequence = _sequence(3, max_tokens=32)
+    _add(scheduler, sequence, 0)
+
+    admission = scheduler.schedule()
+
+    assert admission.action == ScheduleAction.ADMISSION
+    assert admission.ls_scheduler_phase_timing_enabled is True
+    phase_ms = dict(admission.ls_scheduler_phase_timing_ms)
+    counts = dict(admission.ls_scheduler_phase_timing_counts)
+    assert phase_ms["total"] == admission.ls_planning_latency_ms
+    assert all(value >= 0.0 for value in phase_ms.values())
+    assert {
+        "snapshot_copy",
+        "mandatory_safety",
+        "admission",
+        "kv_consolidation",
+        "decode_plan_prepare",
+        "publication",
+        "unattributed",
+        "nested.rollback_shadow_copy",
+        "nested.admission_scan",
+        "nested.future_kv_pool",
+        "nested.empty_system_fit",
+        "nested.initial_placement",
+        "nested.admission_plan",
+    } <= phase_ms.keys()
+    assert counts["prepare_attempts"] >= 1
+    assert counts["snapshot_copies"] >= 1
+    assert counts["rollback_shadow_copies"] >= 1
+    assert counts["admission_pool_attempts"] == 1
+    assert counts["waiting_candidates_scanned"] >= 1
+    assert counts["future_kv_pool_calls"] >= 1
+    assert counts["empty_system_fit_calls"] >= 1
+    assert counts["initial_placement_calls"] >= 1
+    assert counts["admission_plan_calls"] >= 1
+
+    decode = scheduler.schedule()
+
+    assert decode.action == ScheduleAction.DECODE
+    assert decode.ls_scheduler_phase_timing_enabled is True
+    assert decode.ls_scheduler_phase_timing_counts["decode_pool_plan_attempts"] >= 1
+
+
 def test_typed_add_consumes_rr_only_for_structurally_new_attempts():
     scheduler = _make_scheduler(attention_dp=4, attention_sp=1)
 

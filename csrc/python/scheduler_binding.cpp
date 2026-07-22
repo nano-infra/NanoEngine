@@ -20,9 +20,8 @@ void translate_ls_scheduler_fatal(std::exception_ptr exception)
         std::rethrow_exception(exception);
     }
     catch (const LSSchedulerFatalError& error) {
-        py::object exception_type =
-            py::reinterpret_borrow<py::object>(ls_scheduler_fatal_exception_type);
-        py::object instance = exception_type(py::str(error.what()));
+        py::object exception_type   = py::reinterpret_borrow<py::object>(ls_scheduler_fatal_exception_type);
+        py::object instance         = exception_type(py::str(error.what()));
         instance.attr("fatal_code") = py::cast(error.fatal_code());
         PyErr_SetObject(ls_scheduler_fatal_exception_type, instance.ptr());
     }
@@ -220,6 +219,9 @@ void bind_scheduler_utils(py::module_& m)
         .def_readonly("ls_preempted_sequence_ids", &ScheduleResult::ls_preempted_sequence_ids)
         .def_readonly("ls_preemption_reasons", &ScheduleResult::ls_preemption_reasons)
         .def_readonly("ls_planning_latency_ms", &ScheduleResult::ls_planning_latency_ms)
+        .def_readonly("ls_scheduler_phase_timing_enabled", &ScheduleResult::ls_scheduler_phase_timing_enabled)
+        .def_readonly("ls_scheduler_phase_timing_ms", &ScheduleResult::ls_scheduler_phase_timing_ms)
+        .def_readonly("ls_scheduler_phase_timing_counts", &ScheduleResult::ls_scheduler_phase_timing_counts)
         .def_readonly("ls_kv_consolidation_candidate", &ScheduleResult::ls_kv_consolidation_candidate)
         .def_readonly("ls_kv_consolidation_group_id", &ScheduleResult::ls_kv_consolidation_group_id)
         .def_readonly("ls_kv_consolidation_source_rank", &ScheduleResult::ls_kv_consolidation_source_rank)
@@ -382,10 +384,10 @@ void bind_scheduler_utils(py::module_& m)
              py::arg("ls_kv_consolidation_check_interval_steps")        = 8,
              py::arg("ls_kv_consolidation_max_source_blocks_per_event") = 0,
              py::arg("ls_decode_enable_future_kv_admission")            = true,
-             py::arg("ls_max_num_ooe")                                   = 10,
-             py::arg("ls_running_max_req_size")                          = 1000,
-             py::arg("ls_admission_max_tokens_per_pool")                 = 0,
-             py::arg("ls_min_comp_bound_decoding_batch_size")            = 128)
+             py::arg("ls_max_num_ooe")                                  = 10,
+             py::arg("ls_running_max_req_size")                         = 1000,
+             py::arg("ls_admission_max_tokens_per_pool")                = 0,
+             py::arg("ls_min_comp_bound_decoding_batch_size")           = 128)
 
         // Queue management
         .def(
@@ -436,9 +438,7 @@ void bind_scheduler_utils(py::module_& m)
         .def("latch_ls_fatal", &Scheduler::latch_ls_fatal, py::arg("code"))
         .def("ls_fatal_code", &Scheduler::ls_fatal_code)
         .def("plan_ls_kv_scale_down", &Scheduler::plan_ls_kv_scale_down, py::arg("group_id"), py::arg("source_rank"))
-        .def("mark_ls_kv_scale_down_dispatched",
-             &Scheduler::mark_ls_kv_scale_down_dispatched,
-             py::arg("plan"))
+        .def("mark_ls_kv_scale_down_dispatched", &Scheduler::mark_ls_kv_scale_down_dispatched, py::arg("plan"))
         .def("commit_ls_kv_scale_down", &Scheduler::commit_ls_kv_scale_down, py::arg("plan"))
         .def("abort_ls_kv_scale_down", &Scheduler::abort_ls_kv_scale_down, py::arg("plan"))
         .def("set_ls_admission_failure_after_allocations_for_test",

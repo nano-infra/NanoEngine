@@ -101,9 +101,8 @@ private:
 struct ScheduleResult {
     ScheduleAction action = ScheduleAction::DECODE;
 
-    // Actual number of model-forward loops for this Decode action. LoongServe
-    // treats Config::loop_count as a maximum and may shorten the final chunk so
-    // every scheduled request produces exactly its remaining output tokens.
+    // Actual number of model-forward loops for this action. Decode uses the
+    // configured fixed loop count; scheduler-only actions use one.
     int execution_loop_count = 1;
 
     // Sequences scheduled per DP worker for this step.
@@ -135,13 +134,13 @@ struct ScheduleResult {
     // Typed LoongServe-style Decode-only ABI. Admissions are scheduler/KV
     // side effects and may accompany a Decode action for the step-entry
     // running snapshot. Newly admitted requests start Decode on the next step.
-    std::vector<LSAdmissionRecord>              ls_admission_records;
-    std::vector<std::vector<uint64_t>>          ls_real_decode_ids_by_dp;
-    std::vector<std::vector<uint64_t>>          ls_running_ids_by_dp_after_commit;
+    std::vector<LSAdmissionRecord>     ls_admission_records;
+    std::vector<std::vector<uint64_t>> ls_real_decode_ids_by_dp;
+    std::vector<std::vector<uint64_t>> ls_running_ids_by_dp_after_commit;
     // Resource-version telemetry. Epochs are engine-lifetime monotonic pool
     // versions; reservation/rollback/NO_FIT never increments them.
-    std::vector<uint64_t>                       ls_pool_resource_epoch_before;
-    std::vector<uint64_t>                       ls_pool_resource_epoch_after;
+    std::vector<uint64_t> ls_pool_resource_epoch_before;
+    std::vector<uint64_t> ls_pool_resource_epoch_after;
 
     // SP counts
     std::vector<std::vector<int>> sp_send_counts;
@@ -202,6 +201,12 @@ struct ScheduleResult {
     std::vector<uint64_t>              ls_preempted_sequence_ids;
     std::vector<std::string>           ls_preemption_reasons;
     double                             ls_planning_latency_ms = 0.0;
+    // Optional NANODEPLOY_LS_SCHEDULER_PHASE_TIMING diagnostics. Top-level
+    // phase values are mutually exclusive; nested hotspot values are inclusive
+    // and therefore must not be added to the top-level values as percentages.
+    bool                                      ls_scheduler_phase_timing_enabled = false;
+    std::unordered_map<std::string, double>   ls_scheduler_phase_timing_ms;
+    std::unordered_map<std::string, uint64_t> ls_scheduler_phase_timing_counts;
 
     // Automatic KV-consolidation decision telemetry. Shadow mode populates
     // these fields without reserving blocks or changing placement.
@@ -240,8 +245,8 @@ struct DecodeGroupState {
     uint64_t                               kv_candidate_stable_steps = 0;
     std::vector<uint64_t>                  kv_candidate_member_ids;
     std::vector<int>                       kv_candidate_allocation;
-    uint64_t                               last_scale_up_step        = 0;
-    uint64_t                               last_consolidation_step   = 0;
+    uint64_t                               last_scale_up_step      = 0;
+    uint64_t                               last_consolidation_step = 0;
 };
 
 class Scheduler {
@@ -294,10 +299,10 @@ public:
               int                ls_kv_consolidation_check_interval_steps        = 8,
               int                ls_kv_consolidation_max_source_blocks_per_event = 0,
               bool               ls_decode_enable_future_kv_admission            = true,
-              int                ls_max_num_ooe                                   = 10,
-              int                ls_running_max_req_size                          = 1000,
-              int                ls_admission_max_tokens_per_pool                 = 0,
-              int                ls_min_comp_bound_decoding_batch_size            = 128);
+              int                ls_max_num_ooe                                  = 10,
+              int                ls_running_max_req_size                         = 1000,
+              int                ls_admission_max_tokens_per_pool                = 0,
+              int                ls_min_comp_bound_decoding_batch_size           = 128);
 
     // Queue management
     LSAddResult add(std::shared_ptr<Sequence> seq);
@@ -338,9 +343,9 @@ public:
     std::vector<uint64_t>                           get_ls_pool_resource_epochs() const;
     std::optional<uint64_t>                         get_ls_arrival_order(uint64_t seq_id) const;
 
-    void                    latch_ls_fatal(LSFatalCode code) noexcept;
+    void                       latch_ls_fatal(LSFatalCode code) noexcept;
     std::optional<LSFatalCode> ls_fatal_code() const noexcept;
-    bool ls_decode_core_enabled() const noexcept
+    bool                       ls_decode_core_enabled() const noexcept
     {
         return enable_ls_decode_core_scheduler_;
     }
@@ -421,25 +426,25 @@ private:
                                          const std::vector<int>&                       future_rank_pool) const;
     void _merge_ls_groups(uint64_t lhs_group_id, uint64_t rhs_group_id);
 
-    void _remove_seq_from_ls_group(uint64_t seq_id);
-    void _reconcile_ls_groups();
-    bool _ls_batch_fits_empty_system(int dp_idx, const std::vector<std::shared_ptr<Sequence>>& batch) const;
-    bool _ls_current_admission_fits(int dp_idx, const std::vector<std::shared_ptr<Sequence>>& batch) const;
+    void    _remove_seq_from_ls_group(uint64_t seq_id);
+    void    _reconcile_ls_groups();
+    bool    _ls_batch_fits_empty_system(int dp_idx, const std::vector<std::shared_ptr<Sequence>>& batch) const;
+    bool    _ls_current_admission_fits(int dp_idx, const std::vector<std::shared_ptr<Sequence>>& batch) const;
     int64_t _ls_admission_need_tokens(const Sequence& sequence) const;
     int64_t _ls_pool_token_capacity(int dp_idx) const;
-    bool _ls_pool_future_kv_fits(int                                           dp_idx,
-                                 const std::vector<std::shared_ptr<Sequence>>& tentative) const;
-    bool _ls_rank_is_truly_idle(int dp_idx, int sp_idx) const;
+    bool    _ls_pool_future_kv_fits(int dp_idx, const std::vector<std::shared_ptr<Sequence>>& tentative) const;
+    bool    _ls_rank_is_truly_idle(int dp_idx, int sp_idx) const;
     // `force_new_boundary` is for public publications that happen after
     // schedule() returned (manual consolidation commit / explicit preempt).
     // In-step publications keep the default de-duplication semantics.
     void _mark_ls_pool_resource_mutated(int dp_idx, bool force_new_boundary = false) noexcept;
     std::vector<std::shared_ptr<Sequence>> _ls_running_sequences_in_pool(int dp_idx) const;
-    bool _ensure_ls_decode_memory_safety();
-    bool _ls_offload_one_victim(int dp_idx, const std::string& reason);
+    bool                                   _ensure_ls_decode_memory_safety();
+    bool                                   _ls_offload_one_victim(int dp_idx, const std::string& reason);
     std::shared_ptr<SPStateManager::LSKVConsolidationPlan> _maybe_plan_ls_kv_consolidation();
     bool _ls_kv_consolidation_watermark_ok(const std::shared_ptr<SPStateManager::LSKVConsolidationPlan>& plan) const;
     void _populate_ls_kv_consolidation_telemetry(ScheduleResult& result) const;
+    void _populate_ls_scheduler_phase_timing(ScheduleResult& result) const;
 
     // Decentralized scheduling logic
     ScheduleResult                         _schedule_decentralized();
@@ -453,40 +458,41 @@ private:
     int next_dp_idx();
 
     // Configuration
-    std::string      engine_id_;
-    int              loop_count_;
-    int              max_num_seqs_;
-    int              max_num_batched_tokens_;
-    int              max_num_recv_seqs_;
-    int              eos_;
-    int              attention_dp_;
-    int              attention_sp_;
-    std::string      mode_;
-    double           reserved_blocks_per_req_;
-    int              segment_size_;
-    bool             enable_dynamic_sp_size_;
-    bool             use_new_decode_dynamic_sp_scheduler_;
-    std::string      dynamic_sp_size_strategy_;
-    int              dynamic_sp_long_request_threshold_;
-    int              dynamic_sp_long_request_size_;
-    bool             enable_non_uniform_split_;
-    bool             sp_debug_;
-    bool             enable_ls_decode_core_scheduler_;
-    int              ls_decode_initial_kv_dop_;
-    int              ls_decode_batch_per_master_;
-    bool             ls_decode_enable_memory_scale_up_;
-    bool             ls_decode_enable_future_kv_admission_;
-    int              ls_max_num_ooe_;
-    int              ls_running_max_req_size_;
-    int              ls_admission_max_tokens_per_pool_;
-    int              ls_min_comp_bound_decoding_batch_size_;
-    std::string      ls_kv_consolidation_mode_;
-    double           ls_kv_consolidation_candidate_util_;
-    double           ls_kv_consolidation_target_high_watermark_;
-    int              ls_kv_consolidation_stable_steps_;
-    int              ls_kv_consolidation_cooldown_steps_;
-    int              ls_kv_consolidation_check_interval_steps_;
-    int              ls_kv_consolidation_max_source_blocks_per_event_;
+    std::string                   engine_id_;
+    int                           loop_count_;
+    int                           max_num_seqs_;
+    int                           max_num_batched_tokens_;
+    int                           max_num_recv_seqs_;
+    int                           eos_;
+    int                           attention_dp_;
+    int                           attention_sp_;
+    std::string                   mode_;
+    double                        reserved_blocks_per_req_;
+    int                           segment_size_;
+    bool                          enable_dynamic_sp_size_;
+    bool                          use_new_decode_dynamic_sp_scheduler_;
+    std::string                   dynamic_sp_size_strategy_;
+    int                           dynamic_sp_long_request_threshold_;
+    int                           dynamic_sp_long_request_size_;
+    bool                          enable_non_uniform_split_;
+    bool                          sp_debug_;
+    bool                          enable_ls_decode_core_scheduler_;
+    bool                          ls_scheduler_phase_timing_enabled_;
+    int                           ls_decode_initial_kv_dop_;
+    int                           ls_decode_batch_per_master_;
+    bool                          ls_decode_enable_memory_scale_up_;
+    bool                          ls_decode_enable_future_kv_admission_;
+    int                           ls_max_num_ooe_;
+    int                           ls_running_max_req_size_;
+    int                           ls_admission_max_tokens_per_pool_;
+    int                           ls_min_comp_bound_decoding_batch_size_;
+    std::string                   ls_kv_consolidation_mode_;
+    double                        ls_kv_consolidation_candidate_util_;
+    double                        ls_kv_consolidation_target_high_watermark_;
+    int                           ls_kv_consolidation_stable_steps_;
+    int                           ls_kv_consolidation_cooldown_steps_;
+    int                           ls_kv_consolidation_check_interval_steps_;
+    int                           ls_kv_consolidation_max_source_blocks_per_event_;
     std::vector<std::vector<int>> ls_empty_system_free_blocks_per_rank_;
 
     std::string sp_master_selector_;
@@ -497,36 +503,65 @@ private:
 
     std::unique_ptr<ThreadPool> thread_pool_;
 
-    uint64_t                                                next_ls_group_id_        = 0;
-    uint64_t                                                next_ls_batch_id_        = 0;
-    uint64_t                                                next_ls_admission_order_ = 0;
-    uint64_t                                                ls_schedule_step_        = 0;
-    std::unordered_map<uint64_t, DecodeGroupState>          ls_groups_;
-    std::vector<std::vector<uint64_t>>                      ls_group_ids_by_dp_;
-    std::unordered_map<uint64_t, uint64_t>                  ls_seq_to_group_;
-    std::vector<InitialBatchPlacement>                      ls_step_initial_records_;
-    std::vector<SPStateManager::LSDecodeMasterPlan>         ls_step_group_plans_;
-    std::vector<uint64_t>                                   ls_step_group_plan_ids_;
-    std::vector<std::vector<uint64_t>>                      ls_step_group_plan_sequence_ids_;
-    std::vector<std::vector<int>>                           ls_step_reused_passive_masters_;
-    std::vector<uint64_t>                                   ls_step_preempted_sequence_ids_;
-    std::vector<std::string>                                ls_step_preemption_reasons_;
-    uint64_t                                                ls_step_atomic_no_fit_count_                      = 0;
-    uint64_t                                                ls_step_atomic_merge_count_                       = 0;
-    uint64_t                                                ls_step_atomic_rollback_count_                    = 0;
-    int                                                     ls_admission_failure_after_allocations_for_test_  = -1;
-    int                                                     ls_admission_failure_after_publications_for_test_ = -1;
-    int                                                     ls_post_admission_component_failure_for_test_    = -1;
-    double                                                  ls_step_planning_latency_ms_                      = 0.0;
-    uint64_t                                                next_ls_kv_transaction_id_                        = 1;
-    std::shared_ptr<SPStateManager::LSKVConsolidationPlan>  active_ls_kv_transaction_;
-    bool                                                    ls_step_kv_candidate_       = false;
-    int64_t                                                 ls_step_kv_group_id_        = -1;
-    int                                                     ls_step_kv_source_rank_     = -1;
-    int                                                     ls_step_kv_target_dop_      = -1;
-    uint64_t                                                ls_step_kv_stable_steps_    = 0;
-    double                                                  ls_step_kv_group_util_      = 0.0;
-    std::string                                             ls_step_kv_decision_reason_ = "off";
+    uint64_t                                        next_ls_group_id_        = 0;
+    uint64_t                                        next_ls_batch_id_        = 0;
+    uint64_t                                        next_ls_admission_order_ = 0;
+    uint64_t                                        ls_schedule_step_        = 0;
+    std::unordered_map<uint64_t, DecodeGroupState>  ls_groups_;
+    std::vector<std::vector<uint64_t>>              ls_group_ids_by_dp_;
+    std::unordered_map<uint64_t, uint64_t>          ls_seq_to_group_;
+    std::vector<InitialBatchPlacement>              ls_step_initial_records_;
+    std::vector<SPStateManager::LSDecodeMasterPlan> ls_step_group_plans_;
+    std::vector<uint64_t>                           ls_step_group_plan_ids_;
+    std::vector<std::vector<uint64_t>>              ls_step_group_plan_sequence_ids_;
+    std::vector<std::vector<int>>                   ls_step_reused_passive_masters_;
+    std::vector<uint64_t>                           ls_step_preempted_sequence_ids_;
+    std::vector<std::string>                        ls_step_preemption_reasons_;
+    uint64_t                                        ls_step_atomic_no_fit_count_                      = 0;
+    uint64_t                                        ls_step_atomic_merge_count_                       = 0;
+    uint64_t                                        ls_step_atomic_rollback_count_                    = 0;
+    int                                             ls_admission_failure_after_allocations_for_test_  = -1;
+    int                                             ls_admission_failure_after_publications_for_test_ = -1;
+    int                                             ls_post_admission_component_failure_for_test_     = -1;
+    double                                          ls_step_planning_latency_ms_                      = 0.0;
+    struct LSSchedulerPhaseTimingState {
+        double   total_ms                     = 0.0;
+        double   snapshot_copy_ms             = 0.0;
+        double   mandatory_safety_ms          = 0.0;
+        double   admission_ms                 = 0.0;
+        double   kv_consolidation_ms          = 0.0;
+        double   decode_plan_prepare_ms       = 0.0;
+        double   publication_ms               = 0.0;
+        double   unattributed_ms              = 0.0;
+        double   rollback_shadow_copy_ms      = 0.0;
+        double   admission_scan_ms            = 0.0;
+        double   future_kv_pool_ms            = 0.0;
+        double   future_kv_empty_system_ms    = 0.0;
+        double   empty_system_fit_ms          = 0.0;
+        double   initial_placement_ms         = 0.0;
+        double   admission_plan_ms            = 0.0;
+        uint64_t prepare_attempts             = 0;
+        uint64_t snapshot_copies              = 0;
+        uint64_t rollback_shadow_copies       = 0;
+        uint64_t admission_pool_attempts      = 0;
+        uint64_t waiting_candidates_scanned   = 0;
+        uint64_t future_kv_pool_calls         = 0;
+        uint64_t future_kv_empty_system_calls = 0;
+        uint64_t empty_system_fit_calls       = 0;
+        uint64_t initial_placement_calls      = 0;
+        uint64_t admission_plan_calls         = 0;
+        uint64_t decode_pool_plan_attempts    = 0;
+    };
+    mutable LSSchedulerPhaseTimingState                    ls_step_phase_timing_;
+    uint64_t                                               next_ls_kv_transaction_id_ = 1;
+    std::shared_ptr<SPStateManager::LSKVConsolidationPlan> active_ls_kv_transaction_;
+    bool                                                   ls_step_kv_candidate_       = false;
+    int64_t                                                ls_step_kv_group_id_        = -1;
+    int                                                    ls_step_kv_source_rank_     = -1;
+    int                                                    ls_step_kv_target_dop_      = -1;
+    uint64_t                                               ls_step_kv_stable_steps_    = 0;
+    double                                                 ls_step_kv_group_util_      = 0.0;
+    std::string                                            ls_step_kv_decision_reason_ = "off";
 
     // Canonical request-level dispatch state for the Decode-only baseline.
     std::vector<std::list<std::shared_ptr<Sequence>>> ls_waiting_by_dp_;
@@ -547,8 +582,8 @@ private:
     // unexpected exception (including ScheduleResult/telemetry allocation) to
     // POST_PUBLICATION_INVARIANT instead of misclassifying it as a recoverable
     // Decode prepare failure.
-    bool                                              ls_step_publication_started_ = false;
-    std::optional<LSFatalCode>                        ls_fatal_;
+    bool                       ls_step_publication_started_ = false;
+    std::optional<LSFatalCode> ls_fatal_;
 };
 
 }  // namespace nanodeploy

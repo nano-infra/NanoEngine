@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <iterator>
@@ -22,6 +24,43 @@
 namespace nanodeploy {
 
 namespace {
+
+bool environment_flag_enabled(const char* name)
+{
+    const char* raw = std::getenv(name);
+    if (!raw) {
+        return false;
+    }
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
+class ScopedAccumulatedTimer {
+public:
+    explicit ScopedAccumulatedTimer(double* accumulator):
+        accumulator_(accumulator), start_(accumulator ? std::chrono::steady_clock::now() : TimePoint{})
+    {
+    }
+
+    ScopedAccumulatedTimer(const ScopedAccumulatedTimer&)            = delete;
+    ScopedAccumulatedTimer& operator=(const ScopedAccumulatedTimer&) = delete;
+
+    ~ScopedAccumulatedTimer()
+    {
+        if (accumulator_) {
+            *accumulator_ +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_).count();
+        }
+    }
+
+private:
+    using TimePoint        = std::chrono::steady_clock::time_point;
+    double*   accumulator_ = nullptr;
+    TimePoint start_;
+};
 
 bool has_remote_committed_kv(const Sequence& seq, int attention_sp)
 {
@@ -118,6 +157,7 @@ Scheduler::Scheduler(const std::string& engine_id,
     enable_non_uniform_split_(enable_non_uniform_split),
     sp_debug_(sp_debug),
     enable_ls_decode_core_scheduler_(enable_ls_decode_core_scheduler),
+    ls_scheduler_phase_timing_enabled_(environment_flag_enabled("NANODEPLOY_LS_SCHEDULER_PHASE_TIMING")),
     ls_decode_initial_kv_dop_(ls_decode_initial_kv_dop),
     ls_decode_batch_per_master_(ls_decode_batch_per_master),
     ls_decode_enable_memory_scale_up_(ls_decode_enable_memory_scale_up),
@@ -791,6 +831,46 @@ void Scheduler::_populate_ls_kv_consolidation_telemetry(ScheduleResult& result) 
     result.ls_kv_consolidation_decision_reason = ls_step_kv_decision_reason_;
 }
 
+void Scheduler::_populate_ls_scheduler_phase_timing(ScheduleResult& result) const
+{
+    result.ls_scheduler_phase_timing_enabled = ls_scheduler_phase_timing_enabled_;
+    if (!ls_scheduler_phase_timing_enabled_) {
+        return;
+    }
+
+    const auto& timing                  = ls_step_phase_timing_;
+    result.ls_scheduler_phase_timing_ms = {
+        {"total", timing.total_ms},
+        {"snapshot_copy", timing.snapshot_copy_ms},
+        {"mandatory_safety", timing.mandatory_safety_ms},
+        {"admission", timing.admission_ms},
+        {"kv_consolidation", timing.kv_consolidation_ms},
+        {"decode_plan_prepare", timing.decode_plan_prepare_ms},
+        {"publication", timing.publication_ms},
+        {"unattributed", timing.unattributed_ms},
+        {"nested.rollback_shadow_copy", timing.rollback_shadow_copy_ms},
+        {"nested.admission_scan", timing.admission_scan_ms},
+        {"nested.future_kv_pool", timing.future_kv_pool_ms},
+        {"nested.future_kv_empty_system", timing.future_kv_empty_system_ms},
+        {"nested.empty_system_fit", timing.empty_system_fit_ms},
+        {"nested.initial_placement", timing.initial_placement_ms},
+        {"nested.admission_plan", timing.admission_plan_ms},
+    };
+    result.ls_scheduler_phase_timing_counts = {
+        {"prepare_attempts", timing.prepare_attempts},
+        {"snapshot_copies", timing.snapshot_copies},
+        {"rollback_shadow_copies", timing.rollback_shadow_copies},
+        {"admission_pool_attempts", timing.admission_pool_attempts},
+        {"waiting_candidates_scanned", timing.waiting_candidates_scanned},
+        {"future_kv_pool_calls", timing.future_kv_pool_calls},
+        {"future_kv_empty_system_calls", timing.future_kv_empty_system_calls},
+        {"empty_system_fit_calls", timing.empty_system_fit_calls},
+        {"initial_placement_calls", timing.initial_placement_calls},
+        {"admission_plan_calls", timing.admission_plan_calls},
+        {"decode_pool_plan_attempts", timing.decode_pool_plan_attempts},
+    };
+}
+
 std::shared_ptr<SPStateManager::LSKVConsolidationPlan> Scheduler::_maybe_plan_ls_kv_consolidation()
 {
     if (ls_kv_consolidation_mode_ == "off") {
@@ -1101,11 +1181,12 @@ try
     ls_step_atomic_no_fit_count_   = 0;
     ls_step_atomic_merge_count_    = 0;
     ls_step_atomic_rollback_count_ = 0;
-    ls_step_planning_latency_ms_ = 0.0;
-    ls_step_kv_candidate_        = false;
-    ls_step_kv_group_id_         = -1;
-    ls_step_kv_source_rank_      = -1;
-    ls_step_kv_target_dop_       = -1;
+    ls_step_planning_latency_ms_   = 0.0;
+    ls_step_phase_timing_          = {};
+    ls_step_kv_candidate_          = false;
+    ls_step_kv_group_id_           = -1;
+    ls_step_kv_source_rank_        = -1;
+    ls_step_kv_target_dop_         = -1;
     ls_step_kv_stable_steps_     = 0;
     ls_step_kv_group_util_       = 0.0;
     ls_step_kv_decision_reason_  = ls_kv_consolidation_mode_ == "off" ? "off" : "no_candidate";
@@ -1150,12 +1231,14 @@ try
             if (consolidation_plan) {
                 try {
                     ScheduleResult maintenance;
-                    maintenance.action                = ScheduleAction::KV_CONSOLIDATION;
-                    maintenance.is_prefill            = false;
-                    maintenance.kv_consolidation_plan = consolidation_plan;
+                    maintenance.action                        = ScheduleAction::KV_CONSOLIDATION;
+                    maintenance.is_prefill                    = false;
+                    maintenance.kv_consolidation_plan         = consolidation_plan;
                     maintenance.ls_pool_resource_epoch_before = ls_step_pool_resource_epoch_before_;
                     maintenance.ls_pool_resource_epoch_after  = ls_pool_resource_epoch_;
+                    maintenance.ls_planning_latency_ms        = ls_step_planning_latency_ms_;
                     _populate_ls_kv_consolidation_telemetry(maintenance);
+                    _populate_ls_scheduler_phase_timing(maintenance);
                     return maintenance;
                 }
                 catch (...) {
@@ -1438,13 +1521,14 @@ try
         result.ls_preempted_sequence_ids = ls_step_preempted_sequence_ids_;
         result.ls_preemption_reasons     = ls_step_preemption_reasons_;
         result.ls_planning_latency_ms    = ls_step_planning_latency_ms_;
-        result.ls_pending_batch_count = 0;
+        result.ls_pending_batch_count    = 0;
         for (const auto& queue : ls_waiting_by_dp_) {
             result.ls_pending_request_count += static_cast<int>(queue.size());
         }
         result.ls_atomic_admission_no_fit_count   = ls_step_atomic_no_fit_count_;
         result.ls_atomic_admission_merge_count    = ls_step_atomic_merge_count_;
         result.ls_atomic_admission_rollback_count = ls_step_atomic_rollback_count_;
+        _populate_ls_scheduler_phase_timing(result);
     }
 
     _populate_ls_kv_consolidation_telemetry(result);
@@ -1646,9 +1730,13 @@ std::vector<std::shared_ptr<Sequence>> Scheduler::_ls_running_sequences_in_pool(
     return result;
 }
 
-bool Scheduler::_ls_pool_future_kv_fits(int                                           dp_idx,
-                                        const std::vector<std::shared_ptr<Sequence>>& tentative) const
+bool Scheduler::_ls_pool_future_kv_fits(int dp_idx, const std::vector<std::shared_ptr<Sequence>>& tentative) const
 {
+    ScopedAccumulatedTimer timer(ls_scheduler_phase_timing_enabled_ ? &ls_step_phase_timing_.future_kv_pool_ms :
+                                                                      nullptr);
+    if (ls_scheduler_phase_timing_enabled_) {
+        ++ls_step_phase_timing_.future_kv_pool_calls;
+    }
     if (!ls_decode_enable_future_kv_admission_) {
         return true;
     }
@@ -1863,6 +1951,11 @@ bool Scheduler::_ls_future_kv_fits_empty_system(int                             
                                                 const std::vector<std::shared_ptr<Sequence>>& batch,
                                                 const std::vector<int>&                       future_rank_pool) const
 {
+    ScopedAccumulatedTimer timer(ls_scheduler_phase_timing_enabled_ ? &ls_step_phase_timing_.future_kv_empty_system_ms :
+                                                                      nullptr);
+    if (ls_scheduler_phase_timing_enabled_) {
+        ++ls_step_phase_timing_.future_kv_empty_system_calls;
+    }
     if (!ls_decode_enable_future_kv_admission_) {
         return true;
     }
@@ -1901,6 +1994,11 @@ Scheduler::_plan_ls_initial_placement(int                                       
                                       const std::vector<int>&                       free_block_adjustments,
                                       const LSBlockContextOverrides&                context_overrides) const
 {
+    ScopedAccumulatedTimer timer(ls_scheduler_phase_timing_enabled_ ? &ls_step_phase_timing_.initial_placement_ms :
+                                                                      nullptr);
+    if (ls_scheduler_phase_timing_enabled_) {
+        ++ls_step_phase_timing_.initial_placement_calls;
+    }
     if (batch.empty() || static_cast<int>(batch.size()) > max_num_seqs_) {
         return std::nullopt;
     }
@@ -2080,11 +2178,14 @@ Scheduler::_plan_ls_initial_placement(int                                       
     return std::nullopt;
 }
 
-bool Scheduler::_ls_batch_fits_empty_system(
-    int dp_idx, const std::vector<std::shared_ptr<Sequence>>& batch) const
+bool Scheduler::_ls_batch_fits_empty_system(int dp_idx, const std::vector<std::shared_ptr<Sequence>>& batch) const
 {
-    if (dp_idx < 0 || dp_idx >= attention_dp_ || batch.empty()
-        || static_cast<int>(batch.size()) > max_num_seqs_) {
+    ScopedAccumulatedTimer timer(ls_scheduler_phase_timing_enabled_ ? &ls_step_phase_timing_.empty_system_fit_ms :
+                                                                      nullptr);
+    if (ls_scheduler_phase_timing_enabled_) {
+        ++ls_step_phase_timing_.empty_system_fit_calls;
+    }
+    if (dp_idx < 0 || dp_idx >= attention_dp_ || batch.empty() || static_cast<int>(batch.size()) > max_num_seqs_) {
         return false;
     }
 
@@ -3517,7 +3618,24 @@ try {
         throw std::invalid_argument("LS combined pool step requires a consolidation-plan output");
     }
     kv_consolidation_plan->reset();
-    const auto planning_start = std::chrono::steady_clock::now();
+    const auto planning_start    = std::chrono::steady_clock::now();
+    auto       phase_accumulator = [&](double& accumulator) -> double* {
+        return ls_scheduler_phase_timing_enabled_ ? &accumulator : nullptr;
+    };
+    auto finish_planning_timing = [&]() {
+        const double total_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - planning_start).count();
+        ls_step_planning_latency_ms_ = total_ms;
+        if (!ls_scheduler_phase_timing_enabled_) {
+            return;
+        }
+        auto& timing               = ls_step_phase_timing_;
+        timing.total_ms            = total_ms;
+        const double attributed_ms = timing.snapshot_copy_ms + timing.mandatory_safety_ms + timing.admission_ms
+                                     + timing.kv_consolidation_ms + timing.decode_plan_prepare_ms
+                                     + timing.publication_ms;
+        timing.unattributed_ms = std::max(0.0, total_ms - attributed_ms);
+    };
 
     enum class AttemptFailureKind {
         NONE,
@@ -3618,31 +3736,44 @@ try {
                || reason.starts_with("append/receiver joint capacity proven infeasible after");
     };
 
-    int                                                injected_allocation_failure  = -2;
-    int                                                injected_publication_failure = -2;
-    bool                                               injection_captured           = false;
-    auto prepare_attempt = [&](bool include_admission) -> AttemptResult {
+    int  injected_allocation_failure  = -2;
+    int  injected_publication_failure = -2;
+    bool injection_captured           = false;
+    auto prepare_attempt              = [&](bool include_admission) -> AttemptResult {
+        if (ls_scheduler_phase_timing_enabled_) {
+            ++ls_step_phase_timing_.prepare_attempts;
+        }
         AttemptResult result;
-        auto          step      = std::make_unique<PreparedStep>();
-        step->groups            = ls_groups_;
-        step->group_ids_by_dp   = ls_group_ids_by_dp_;
-        step->seq_to_group      = ls_seq_to_group_;
-        step->arrival_orders    = ls_arrival_order_by_seq_id_;
-        step->waiting           = ls_waiting_by_dp_;
-        step->ooe               = ls_num_ooe_;
-        step->admission_records = ls_step_admission_records_;
-        step->initial_records   = ls_step_initial_records_;
-        step->admissions.resize(attention_dp_);
-        step->decode_by_dp.resize(attention_dp_);
-        step->scheduled.resize(attention_dp_);
-        step->real_decode_ids.resize(attention_dp_);
-        step->pool_resource_changed.assign(attention_dp_, false);
-        step->running.reserve(attention_dp_);
-        for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-            step->running.push_back(worker_state[dp_idx]->running);
+        auto          step = std::make_unique<PreparedStep>();
+        {
+            ScopedAccumulatedTimer timer(phase_accumulator(ls_step_phase_timing_.snapshot_copy_ms));
+            if (ls_scheduler_phase_timing_enabled_) {
+                ++ls_step_phase_timing_.snapshot_copies;
+            }
+            step->groups            = ls_groups_;
+            step->group_ids_by_dp   = ls_group_ids_by_dp_;
+            step->seq_to_group      = ls_seq_to_group_;
+            step->arrival_orders    = ls_arrival_order_by_seq_id_;
+            step->waiting           = ls_waiting_by_dp_;
+            step->ooe               = ls_num_ooe_;
+            step->admission_records = ls_step_admission_records_;
+            step->initial_records   = ls_step_initial_records_;
+            step->admissions.resize(attention_dp_);
+            step->decode_by_dp.resize(attention_dp_);
+            step->scheduled.resize(attention_dp_);
+            step->real_decode_ids.resize(attention_dp_);
+            step->pool_resource_changed.assign(attention_dp_, false);
+            step->running.reserve(attention_dp_);
+            for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+                step->running.push_back(worker_state[dp_idx]->running);
+            }
         }
 
         auto capture_admission_scheduler_shadow = [&]() {
+            ScopedAccumulatedTimer timer(phase_accumulator(ls_step_phase_timing_.rollback_shadow_copy_ms));
+            if (ls_scheduler_phase_timing_enabled_) {
+                ++ls_step_phase_timing_.rollback_shadow_copies;
+            }
             auto shadow                     = std::make_unique<AdmissionSchedulerShadow>();
             shadow->groups                  = step->groups;
             shadow->group_ids_by_dp         = step->group_ids_by_dp;
@@ -3783,94 +3914,102 @@ try {
 
             // Mandatory safety is prospective only. No group/owner publication
             // occurs until every required Decode component below validates.
-            for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
-                auto group_ids = step->group_ids_by_dp[dp_idx];
-                for (uint64_t group_id : group_ids) {
-                    auto&        group  = step->groups.at(group_id);
-                    auto         used   = worker_state[dp_idx]->group_used_kv_tokens(group.sequences);
-                    const size_t before = group.allocated_attention_ranks.size();
-                    group.allocated_attention_ranks.erase(
-                        std::remove_if(
-                            group.allocated_attention_ranks.begin(),
-                            group.allocated_attention_ranks.end(),
-                            [&](int rank) {
-                                bool protected_role = std::any_of(
-                                    group.sequences.begin(), group.sequences.end(), [&](const auto& sequence) {
-                                        if (!sequence || sequence->status != SequenceStatus::RUNNING) {
-                                            return false;
-                                        }
-                                        const auto& context = sequence->block_ctx(BlockContextSlot::ACTIVE);
-                                        return context.master_sp_idx_ == rank
-                                               || (context.pending_token_present_
-                                                   && context.pending_token_target_sp_ == rank);
-                                    });
-                                return used.at(rank) == 0 && !protected_role;
-                            }),
-                        group.allocated_attention_ranks.end());
-                    if (group.allocated_attention_ranks.size() != before) {
+            {
+                ScopedAccumulatedTimer timer(phase_accumulator(ls_step_phase_timing_.mandatory_safety_ms));
+                for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
+                    auto group_ids = step->group_ids_by_dp[dp_idx];
+                    for (uint64_t group_id : group_ids) {
+                        auto&        group  = step->groups.at(group_id);
+                        auto         used   = worker_state[dp_idx]->group_used_kv_tokens(group.sequences);
+                        const size_t before = group.allocated_attention_ranks.size();
+                        group.allocated_attention_ranks.erase(
+                            std::remove_if(
+                                group.allocated_attention_ranks.begin(),
+                                group.allocated_attention_ranks.end(),
+                                [&](int rank) {
+                                    bool protected_role = std::any_of(
+                                        group.sequences.begin(), group.sequences.end(), [&](const auto& sequence) {
+                                            if (!sequence || sequence->status != SequenceStatus::RUNNING) {
+                                                return false;
+                                            }
+                                            const auto& context = sequence->block_ctx(BlockContextSlot::ACTIVE);
+                                            return context.master_sp_idx_ == rank
+                                                   || (context.pending_token_present_
+                                                       && context.pending_token_target_sp_ == rank);
+                                        });
+                                    return used.at(rank) == 0 && !protected_role;
+                                }),
+                            group.allocated_attention_ranks.end());
+                        if (group.allocated_attention_ranks.size() != before) {
+                            step->mandatory_graph_changed       = true;
+                            step->pool_resource_changed[dp_idx] = true;
+                        }
+                    }
+
+                    std::vector<uint64_t> can_decode;
+                    std::vector<uint64_t> cannot_decode;
+                    for (uint64_t group_id : group_ids) {
+                        (decode_idle_tokens(dp_idx, group_id) >= 0 ? can_decode : cannot_decode).push_back(group_id);
+                    }
+                    auto slack_less = [&](uint64_t lhs, uint64_t rhs) {
+                        return decode_idle_tokens(dp_idx, lhs) < decode_idle_tokens(dp_idx, rhs);
+                    };
+                    std::stable_sort(can_decode.begin(), can_decode.end(), slack_less);
+                    std::stable_sort(cannot_decode.begin(), cannot_decode.end(), slack_less);
+                    for (uint64_t constrained_id : cannot_decode) {
+                        int64_t slack = decode_idle_tokens(dp_idx, constrained_id);
+                        while (slack < 0 && !can_decode.empty()) {
+                            uint64_t donor_id = can_decode.back();
+                            can_decode.pop_back();
+                            if (donor_id == constrained_id || !step->groups.count(donor_id)) {
+                                continue;
+                            }
+                            merge_shadow_groups(constrained_id, donor_id);
+                            slack = decode_idle_tokens(dp_idx, constrained_id);
+                        }
+                        if (slack < 0) {
+                            auto& constrained = step->groups.at(constrained_id);
+                            for (int rank : unallocated_ranks(dp_idx)) {
+                                constrained.allocated_attention_ranks.push_back(rank);
+                                constrained.last_scale_up_step        = ls_schedule_step_;
+                                constrained.kv_candidate_target_dop   = -1;
+                                constrained.kv_candidate_stable_steps = 0;
+                                constrained.kv_candidate_member_ids.clear();
+                                constrained.kv_candidate_allocation.clear();
+                                step->mandatory_graph_changed       = true;
+                                step->pool_resource_changed[dp_idx] = true;
+                                slack +=
+                                    static_cast<int64_t>(worker_state[dp_idx]->block_manager.at(rank)->blocks().size())
+                                    * Sequence::block_size;
+                                if (slack >= 0) {
+                                    break;
+                                }
+                            }
+                        }
+                        if (slack < 0) {
+                            throw AttemptError{include_admission ? AttemptFailureKind::TENTATIVE :
+                                                                                AttemptFailureKind::CAPACITY_NO_FIT,
+                                               dp_idx,
+                                               "capacity no-fit for mandatory Decode memory safety"};
+                        }
+                        can_decode.push_back(constrained_id);
+                    }
+                    if (step->group_ids_by_dp[dp_idx] != can_decode) {
                         step->mandatory_graph_changed       = true;
                         step->pool_resource_changed[dp_idx] = true;
                     }
+                    step->group_ids_by_dp[dp_idx] = std::move(can_decode);
                 }
-
-                std::vector<uint64_t> can_decode;
-                std::vector<uint64_t> cannot_decode;
-                for (uint64_t group_id : group_ids) {
-                    (decode_idle_tokens(dp_idx, group_id) >= 0 ? can_decode : cannot_decode).push_back(group_id);
-                }
-                auto slack_less = [&](uint64_t lhs, uint64_t rhs) {
-                    return decode_idle_tokens(dp_idx, lhs) < decode_idle_tokens(dp_idx, rhs);
-                };
-                std::stable_sort(can_decode.begin(), can_decode.end(), slack_less);
-                std::stable_sort(cannot_decode.begin(), cannot_decode.end(), slack_less);
-                for (uint64_t constrained_id : cannot_decode) {
-                    int64_t slack = decode_idle_tokens(dp_idx, constrained_id);
-                    while (slack < 0 && !can_decode.empty()) {
-                        uint64_t donor_id = can_decode.back();
-                        can_decode.pop_back();
-                        if (donor_id == constrained_id || !step->groups.count(donor_id)) {
-                            continue;
-                        }
-                        merge_shadow_groups(constrained_id, donor_id);
-                        slack = decode_idle_tokens(dp_idx, constrained_id);
-                    }
-                    if (slack < 0) {
-                        auto& constrained = step->groups.at(constrained_id);
-                        for (int rank : unallocated_ranks(dp_idx)) {
-                            constrained.allocated_attention_ranks.push_back(rank);
-                            constrained.last_scale_up_step        = ls_schedule_step_;
-                            constrained.kv_candidate_target_dop   = -1;
-                            constrained.kv_candidate_stable_steps = 0;
-                            constrained.kv_candidate_member_ids.clear();
-                            constrained.kv_candidate_allocation.clear();
-                            step->mandatory_graph_changed       = true;
-                            step->pool_resource_changed[dp_idx] = true;
-                            slack += static_cast<int64_t>(worker_state[dp_idx]->block_manager.at(rank)->blocks().size())
-                                     * Sequence::block_size;
-                            if (slack >= 0) {
-                                break;
-                            }
-                        }
-                    }
-                    if (slack < 0) {
-                        throw AttemptError{include_admission ? AttemptFailureKind::TENTATIVE :
-                                                               AttemptFailureKind::CAPACITY_NO_FIT,
-                                           dp_idx,
-                                           "capacity no-fit for mandatory Decode memory safety"};
-                    }
-                    can_decode.push_back(constrained_id);
-                }
-                if (step->group_ids_by_dp[dp_idx] != can_decode) {
-                    step->mandatory_graph_changed       = true;
-                    step->pool_resource_changed[dp_idx] = true;
-                }
-                step->group_ids_by_dp[dp_idx] = std::move(can_decode);
             }
 
             if (include_admission) {
+                ScopedAccumulatedTimer admission_timer(phase_accumulator(ls_step_phase_timing_.admission_ms));
                 for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
                     if (step->waiting[dp_idx].empty()) {
                         continue;
+                    }
+                    if (ls_scheduler_phase_timing_enabled_) {
+                        ++ls_step_phase_timing_.admission_pool_attempts;
                     }
 
                     // Admission is optional per pool. Keep a post-mandatory
@@ -3882,6 +4021,10 @@ try {
 
                         auto make_admission_plan =
                             [&](const std::vector<std::shared_ptr<Sequence>>& ordered) -> std::optional<AdmissionPlan> {
+                            ScopedAccumulatedTimer timer(phase_accumulator(ls_step_phase_timing_.admission_plan_ms));
+                            if (ls_scheduler_phase_timing_enabled_) {
+                                ++ls_step_phase_timing_.admission_plan_calls;
+                            }
                             if (ordered.empty() || !_ls_batch_fits_empty_system(dp_idx, ordered)
                                 || !_ls_pool_future_kv_fits(dp_idx, ordered)) {
                                 return std::nullopt;
@@ -3968,34 +4111,41 @@ try {
                         int64_t                                selected_tokens = 0;
                         const bool                             allow_ooe       = step->ooe[dp_idx] < ls_max_num_ooe_;
                         const int running_count = static_cast<int>(_ls_running_sequences_in_pool(dp_idx).size());
-                        for (const auto& sequence : step->waiting[dp_idx]) {
-                            if (!sequence || sequence->assigned_dp != dp_idx
-                                || (sequence->status != SequenceStatus::WAITING
-                                    && sequence->status != SequenceStatus::PAUSED_OFFLOAD)) {
-                                throw std::runtime_error("invalid sequence in an LS pool-local waiting queue");
-                            }
-                            const int64_t need      = _ls_admission_need_tokens(*sequence);
-                            auto          tentative = selected_fifo;
-                            tentative.push_back(sequence);
-                            bool feasible =
-                                static_cast<int>(tentative.size()) <= max_num_seqs_
-                                && running_count + static_cast<int>(tentative.size()) <= ls_running_max_req_size_
-                                && selected_tokens + need <= ls_admission_max_tokens_per_pool_
-                                && _ls_pool_future_kv_fits(dp_idx, tentative)
-                                && make_admission_plan({sequence}).has_value();
-                            if (feasible) {
-                                selected_fifo.push_back(sequence);
-                                selected_tokens += need;
-                                if (first_blocker) {
-                                    selected_after_blocker.insert(sequence->seq_id);
+                        {
+                            ScopedAccumulatedTimer scan_timer(
+                                phase_accumulator(ls_step_phase_timing_.admission_scan_ms));
+                            for (const auto& sequence : step->waiting[dp_idx]) {
+                                if (ls_scheduler_phase_timing_enabled_) {
+                                    ++ls_step_phase_timing_.waiting_candidates_scanned;
                                 }
-                                continue;
-                            }
-                            if (!first_blocker) {
-                                first_blocker = sequence->seq_id;
-                            }
-                            if (!allow_ooe) {
-                                break;
+                                if (!sequence || sequence->assigned_dp != dp_idx
+                                    || (sequence->status != SequenceStatus::WAITING
+                                        && sequence->status != SequenceStatus::PAUSED_OFFLOAD)) {
+                                    throw std::runtime_error("invalid sequence in an LS pool-local waiting queue");
+                                }
+                                const int64_t need      = _ls_admission_need_tokens(*sequence);
+                                auto          tentative = selected_fifo;
+                                tentative.push_back(sequence);
+                                bool feasible =
+                                    static_cast<int>(tentative.size()) <= max_num_seqs_
+                                    && running_count + static_cast<int>(tentative.size()) <= ls_running_max_req_size_
+                                    && selected_tokens + need <= ls_admission_max_tokens_per_pool_
+                                    && _ls_pool_future_kv_fits(dp_idx, tentative)
+                                    && make_admission_plan({sequence}).has_value();
+                                if (feasible) {
+                                    selected_fifo.push_back(sequence);
+                                    selected_tokens += need;
+                                    if (first_blocker) {
+                                        selected_after_blocker.insert(sequence->seq_id);
+                                    }
+                                    continue;
+                                }
+                                if (!first_blocker) {
+                                    first_blocker = sequence->seq_id;
+                                }
+                                if (!allow_ooe) {
+                                    break;
+                                }
                             }
                         }
 
@@ -4271,7 +4421,8 @@ try {
             // tentative admission owners have ended and no mandatory shadow
             // mutation exists. A rejected candidate is followed by Decode.
             if (include_admission && !step->has_admission && !step->mandatory_graph_changed) {
-                auto consolidation = _maybe_plan_ls_kv_consolidation();
+                ScopedAccumulatedTimer timer(phase_accumulator(ls_step_phase_timing_.kv_consolidation_ms));
+                auto                   consolidation = _maybe_plan_ls_kv_consolidation();
                 if (consolidation) {
                     result.failure       = AttemptFailureKind::KV_CONSOLIDATION;
                     result.consolidation = std::move(consolidation);
@@ -4284,7 +4435,8 @@ try {
                 step->seq_to_group    = ls_seq_to_group_;
             }
 
-            auto make_pool_admission_rollback_shadow = [&](int dp_idx) {
+            ScopedAccumulatedTimer decode_timer(phase_accumulator(ls_step_phase_timing_.decode_plan_prepare_ms));
+            auto                   make_pool_admission_rollback_shadow = [&](int dp_idx) {
                 if (dp_idx < 0 || dp_idx >= attention_dp_ || !step->admissions[dp_idx]
                     || !step->admissions[dp_idx]->rollback_base) {
                     throw std::runtime_error("missing LS pool-local admission rollback shadow");
@@ -4294,7 +4446,7 @@ try {
                 auto        rollback  = capture_admission_scheduler_shadow();
 
                 std::unordered_set<uint64_t> pool_sequence_ids;
-                auto collect_group_sequences = [&](const auto& groups, const auto& group_ids) {
+                auto                         collect_group_sequences = [&](const auto& groups, const auto& group_ids) {
                     for (uint64_t group_id : group_ids) {
                         auto group = groups.find(group_id);
                         if (group == groups.end() || group->second.dp_idx != dp_idx) {
@@ -4401,13 +4553,15 @@ try {
                        && eligible_sequence_ids.count(sequence->seq_id) != 0;
             };
             auto plan_decode_component = [&](int dp_idx, bool tentative_component) {
+                if (ls_scheduler_phase_timing_enabled_) {
+                    ++ls_step_phase_timing_.decode_pool_plan_attempts;
+                }
                 auto& pending_dp = step->decode_by_dp[dp_idx];
                 pending_dp       = PendingDPPlan{};
                 if (tentative_component && injected_publication_failure == 0) {
                     injected_publication_failure = -1;
-                    throw AttemptError{AttemptFailureKind::TENTATIVE,
-                                       dp_idx,
-                                       "injected LS post-admission Decode-component failure"};
+                    throw AttemptError{
+                        AttemptFailureKind::TENTATIVE, dp_idx, "injected LS post-admission Decode-component failure"};
                 }
                 if (tentative_component && injected_publication_failure > 0) {
                     --injected_publication_failure;
@@ -4695,8 +4849,7 @@ try {
     AttemptResult attempt = prepare_attempt(true);
     if (attempt.failure == AttemptFailureKind::KV_CONSOLIDATION) {
         *kv_consolidation_plan = std::move(attempt.consolidation);
-        ls_step_planning_latency_ms_ =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - planning_start).count();
+        finish_planning_timing();
         return std::vector<std::vector<std::shared_ptr<Sequence>>>(attention_dp_);
     }
     if (attempt.failure == AttemptFailureKind::TENTATIVE) {
@@ -4720,8 +4873,7 @@ try {
                 throw LSSchedulerFatalError(LSFatalCode::UNRECOVERABLE_CAPACITY,
                                             "no recoverable OFFLOAD victim for decode-only capacity no-fit");
             }
-            ls_step_planning_latency_ms_ =
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - planning_start).count();
+            finish_planning_timing();
             return std::vector<std::vector<std::shared_ptr<Sequence>>>(attention_dp_);
         }
         latch_ls_fatal(LSFatalCode::DECODE_PREPARE_OR_VALIDATE_FAILED);
@@ -4729,7 +4881,9 @@ try {
                                     "stable decode-only prepare/validate failed: " + reason);
     }
 
-    auto& step = *attempt.step;
+    auto&      step = *attempt.step;
+    const auto publication_start =
+        ls_scheduler_phase_timing_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (int dp_idx = 0; dp_idx < attention_dp_; ++dp_idx) {
         auto* initial   = step.admissions[dp_idx] && step.admissions[dp_idx]->prepared_survivors ?
                               &*step.admissions[dp_idx]->prepared_survivors :
@@ -4821,9 +4975,12 @@ try {
         ls_step_reused_passive_masters_.swap(step.reused_passive_masters);
         ls_step_atomic_merge_count_ = step.atomic_merge_count;
     }
+    if (ls_scheduler_phase_timing_enabled_) {
+        ls_step_phase_timing_.publication_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - publication_start).count();
+    }
 
-    ls_step_planning_latency_ms_ =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - planning_start).count();
+    finish_planning_timing();
     return std::move(step.scheduled);
 }
 catch (const LSSchedulerFatalError&) {
