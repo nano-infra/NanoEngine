@@ -2,8 +2,6 @@
 
 SGLang HiSparse 将 KV / Indexer cache 分为 logical 命名空间、GPU device hot Buffer 与 CPU host cold tier。本文针对 SGLang 的 **ratio-driven 分配策略**建立容量模型，用来判断固定 HBM 预算下的 worker 容量、可达并发、Buffer / Indexer 显存构成以及 host 内存需求。
 
-NSA / FP8 KV / Indexer 的字节布局见 [DLEngine - NSA](dlengine-nsa.md)。DLEngine 当前采用 buffer-first 分配策略，不属于本文模型。
-
 ### 1. 背景与理论假设
 
 本文采用两个基础假设：
@@ -331,8 +329,11 @@ $$
 | --- | --- | --- | --- | --- |
 | H100 DP16EP16 | $`77.47\ \mathrm{GB}`$ | $`0.88`$ | $`64.52\ \mathrm{GB}`$ | $`3.6536\ \mathrm{GB}`$ |
 | H100 DP32EP32 | $`77.47\ \mathrm{GB}`$ | $`0.82`$ | $`43.42\ \mathrm{GB}`$ | $`20.1054\ \mathrm{GB}`$ |
+| H200 DP8EP8 | $`137.97\ \mathrm{GB}`$ | $`0.86`$ | $`106.72\ \mathrm{GB}`$ | $`11.9342\ \mathrm{GB}`$ |
+| H200 DP16EP16 | $`137.97\ \mathrm{GB}`$ | $`0.85`$ | $`64.52\ \mathrm{GB}`$ | $`52.7545\ \mathrm{GB}`$ |
+| H200 DP32EP32 | $`137.97\ \mathrm{GB}`$ | $`0.85`$ | $`43.42\ \mathrm{GB}`$ | $`73.8545\ \mathrm{GB}`$ |
 
-每张图现在包含两个子图：左图为 $`C^{GPU}_{Batch}`$ 与固定 Buffer 为 $`2048/4096/6144`$ 时的最大请求数；右图为 Buffer / Indexer HBM 的绝对 GB 构成及对应 HostMemory。横轴均从 $`2^{-1}`$ 开始使用 base-2 对数刻度。
+每张图现在包含两个子图：左图为 $`C^{GPU}_{Batch}`$ 与固定 Buffer 为 $`2048/4096/6144`$ 时的最大请求数，其中 Capacity 的 `#tokens` 使用 base-10 对数刻度，并在每个 decade 标出 $`1/2/5\times10^n`$；`#requests` 使用 base-2 对数刻度，刻度标签以十进制整数显示为 $`1/2/4/8/16/32/\ldots`$。右图为 Buffer / Indexer HBM 的绝对 GB 构成及对应 HostMemory。横轴均从 $`2^{-1}`$ 开始使用 base-2 对数刻度。
 
 图中的 marker 放在各 $`N_{bs}`$ 理论 top-k ratio 边界上，而不是任意采样点。由于 $`2048=N_{Topk}`$，Buffer=2048 曲线上的 marker 会精确落在对应的 $`N_{bs}`$ 值；Buffer=4096/6144 则分别落在 $`N_{bs}/2`$ 与 $`N_{bs}/3`$。
 
@@ -350,6 +351,18 @@ DP16EP16 的 256K lower crossing 为 $`R_{Host}\approx14.05`$。$`N_{bs,max}=1/2
 
 DP32EP32 的 256K lower crossing 为 $`R_{Host}\approx0.77`$；$`N_{bs,max}=1/2/4/8`$ 的上界约为 $`128/256/233.4/114.2`$。
 
+![GLM5.1 H200 DP8EP8 worker capacity](../imgs/glm51_h200_dp8_ep_8.png)
+
+> **H200 DP8EP8：** 取 $`F=0.86`$、$`M_{weights}=106.72\ \mathrm{GB}`$，则 $`M_{cache}=137.97\times0.86-106.72=11.9342\ \mathrm{GB}`$。256K lower crossing 为 $`R_{Host}\approx1.452`$；$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`128/256/136.5/65.78`$。
+
+![GLM5.1 H200 DP16EP16 worker capacity](../imgs/glm51_h200_dp16_ep_16.png)
+
+> **H200 DP16EP16：** $`M_{cache}=137.97\times0.85-64.52=52.7545\ \mathrm{GB}`$。256K lower crossing 为 $`R_{Host}\approx0.268`$，低于图片横轴起点 $`2^{-1}=0.5`$；因此图中的整个可见区间均已达到 256K。$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`128/256/512/307.8`$。
+
+![GLM5.1 H200 DP32EP32 worker capacity](../imgs/glm51_h200_dp32_ep_32.png)
+
+> **H200 DP32EP32：** $`M_{cache}=137.97\times0.85-43.42=73.8545\ \mathrm{GB}`$。256K lower crossing 进一步降至 $`R_{Host}\approx0.189`$，同样位于图片范围左侧；$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`128/256/512/432.8`$。
+
 #### 6.2 GLM5.2（1M）
 
 ![GLM5.2 H100 DP16EP16 worker capacity](../imgs/glm52_h100_dp16_ep_16.png)
@@ -363,6 +376,18 @@ $`N_{bs,max}=1/2/4`$ 的可行上界约为 $`512/303.3/142.4`$。
 > **图结论：** DP32EP32 将 1M crossing 降到 $`R_{Host}\approx3.12`$，并使 $`N_{bs,max}=1/2/4/8`$ 均可达。
 
 对应上界约为 $`512/1024/866.9/424.2`$。
+
+![GLM5.2 H200 DP8EP8 worker capacity](../imgs/glm52_h200_dp8_ep_8.png)
+
+> **H200 DP8EP8：** 取 $`F=0.86`$、$`M_{weights}=106.72\ \mathrm{GB}`$，$`M_{cache}=11.9342\ \mathrm{GB}`$。1M lower crossing 为 $`R_{Host}\approx5.943`$；$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`512/1024/507.0/244.3`$。
+
+![GLM5.2 H200 DP16EP16 worker capacity](../imgs/glm52_h200_dp16_ep_16.png)
+
+> **H200 DP16EP16：** 在 $`M_{cache}=52.7545\ \mathrm{GB}`$ 下，1M lower crossing 降至 $`R_{Host}\approx1.076`$；$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`512/1024/2048/1143.0`$。
+
+![GLM5.2 H200 DP32EP32 worker capacity](../imgs/glm52_h200_dp32_ep_32.png)
+
+> **H200 DP32EP32：** 在 $`M_{cache}=73.8545\ \mathrm{GB}`$ 下，1M lower crossing 为 $`R_{Host}\approx0.756`$；$`N_{bs,max}=1/2/4/8`$ 的可行上界分别约为 $`512/1024/2048/1607.6`$。
 
 ### 7. 算例：GLM5.2 + H100 DP16EP16
 

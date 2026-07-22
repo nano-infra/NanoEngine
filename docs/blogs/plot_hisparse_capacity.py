@@ -57,6 +57,7 @@ from matplotlib import font_manager
 from matplotlib.ticker import (
     AutoMinorLocator,
     FuncFormatter,
+    LogFormatterSciNotation,
     LogLocator,
     NullFormatter,
 )
@@ -103,6 +104,13 @@ def power_of_two_formatter(value: float, _position: int) -> str:
     return rf"$2^{{{exponent}}}$"
 
 
+def decimal_power_of_two_formatter(value: float, _position: int) -> str:
+    """Format base-2 log ticks as ordinary decimal integers."""
+    if value < 1:
+        return ""
+    return f"{int(round(value))}"
+
+
 def power_of_two_ticks(
     minimum: float, maximum: float, *, include_zero: bool
 ) -> list[float]:
@@ -131,7 +139,7 @@ def academic_config_title(config_name: str) -> str:
         accelerator = parts[1].upper()
         dp = parts[2].upper()
         ep = "".join(parts[3:]).upper()
-        return rf"{model} $\cdot$ {accelerator} $\cdot$ {dp}/{ep}"
+        return f"{model} · {accelerator} · {dp}/{ep}"
     return config_name.replace("_", " ")
 
 
@@ -362,13 +370,22 @@ def plot_capacity(
     capacity_top = max(float(np.max(gpu_capacity)), config.max_model_len) * 1.8
     ax.set_yscale("log")
     ax.set_ylim(capacity_bottom, capacity_top)
+    ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5)))
+    ax.yaxis.set_major_formatter(
+        LogFormatterSciNotation(
+            base=10,
+            labelOnlyBase=False,
+            minor_thresholds=(np.inf, np.inf),
+        )
+    )
     ax.xaxis.set_minor_locator(
         LogLocator(base=2, subs=(1.25, 1.5, 1.75))
     )
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.yaxis.set_minor_locator(
-        LogLocator(base=10, subs=np.arange(2, 10) * 0.1)
+        LogLocator(base=10, subs=(3, 4, 6, 7, 8, 9))
     )
+    ax.yaxis.set_minor_formatter(NullFormatter())
     ax.set_axisbelow(True)
     ax.grid(True, which="major", alpha=0.28)
     ax.grid(True, which="minor", linestyle=":", alpha=0.14)
@@ -405,13 +422,18 @@ def plot_capacity(
         )
     request_ax.set_yscale("log", base=2)
     request_ax.set_ylim(
-        bottom=2**0,
-        top=2
-        ** (np.ceil(np.log2(float(np.max(max_request_curve)) * 1.15)) + 1),
+        bottom=1,
+        top=2 ** np.ceil(np.log2(float(np.max(max_request_curve)) * 1.1)),
     )
     request_ax.set_ylabel("#requests", labelpad=14)
-    request_ax.yaxis.set_major_locator(LogLocator(base=2))
-    request_ax.yaxis.set_major_formatter(FuncFormatter(power_of_two_formatter))
+    request_ax.yaxis.set_major_locator(LogLocator(base=2, numticks=20))
+    request_ax.yaxis.set_major_formatter(
+        FuncFormatter(decimal_power_of_two_formatter)
+    )
+    request_ax.yaxis.set_minor_locator(
+        LogLocator(base=2, subs=(1.25, 1.5, 1.75))
+    )
+    request_ax.yaxis.set_minor_formatter(NullFormatter())
 
     indexer_cost = ratios * config.indexer_bytes / shared_ratio
     total_cost = config.mla_bytes + indexer_cost
