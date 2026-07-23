@@ -115,3 +115,36 @@
   utilization、warmup 和 recv 配置均不同。下一步最有判别力的是在同一
   节点/同一代码下启用 forward timing，分别跑 KV-local 短 prompt 与当前
   长 prompt workload。
+
+## 2026-07-23 07:39 UTC
+
+- 当前目标：从
+  `docs-dev/2026-07-23/ls_style_loop16_dp2sp8_r20_diag01_3.log`
+  分析现有 LoongServe-style 调度器进行 DoP 扩张和缩小的实际条件。
+- 分析会区分两层 DoP：每轮执行的 master/compute DoP，以及序列历史 KV
+  分布对应的 KV DoP；前者可随 batch 快速变化，后者缩小需要 KV
+  consolidation。
+- 接下来提取本轮全部 `scale_reasons`、master/rank allocation 和
+  consolidation 决策事件，再回查 `scheduler.cpp` 与
+  `sp_state_manager.cpp` 确认阈值和资源约束。
+
+## 2026-07-23 07:48 UTC
+
+- 已完成当前 LoongServe-style DoP 扩缩容分析，详细报告写入
+  `loongserve_style_dop_scaling_analysis_20260723.md`。
+- 需要区分 master/compute DoP 与 KV/allocation DoP。master DoP 每轮重算，
+  可以在已有 allocation 内快速扩缩；KV DoP 的非空 rank 缩小需要
+  consolidation。
+- 本轮 3,818 个 group-step 的 `scale_reasons` 全为 `none`，未发生 Decode
+  planner 的 compute/memory/receiver 物理加 rank。531 个 admission batch
+  中有 513 个 `CAPACITY_APPEND`；其中 226 个新 group 的首次 allocation
+  大于 admission 自身 planned DoP，说明 KV DoP 增长主要来自 donor group
+  merge。
+- 当前实际 compute threshold 是
+  `ls_min_comp_bound_decoding_batch_size=128`；manifest 中的
+  `ls_decode_batch_per_master=64` 未被 core planner 使用。
+- KV consolidation 需要 group utilization `<50%`、相同 candidate 稳定
+  2 steps、scale-up/consolidation cooldown 2 steps、source migration
+  `<=128` blocks，且迁移后 retained ranks utilization `<=80%`。
+- 尾部执行 7 次 consolidation：group 525 `2→1`、group 531 `3→1`、
+  group 532 `5→1`，总 maintenance stall 约 669.69 ms。
