@@ -82,3 +82,36 @@
 - 测试后 Ray `0/8 GPU`，8 张 H200 全部 `0 MiB / 0%`。
 - 详细报告：
   `loongserve_loop16_backlog_r50_5min_20260723.md`。
+
+## 2026-07-23 07:17 UTC
+
+- 当前目标：解释相同 `loop_count=16` 下，LoongServe-style
+  `ls_style_loop16_dp2sp8_r20_diag01_3` 为什么仍明显慢于最近一次
+  NanoDeploy original rate=20 基线。
+- 两轮真实 logical sequence-step 完全相同，均为 `272430`；因此差异不是
+  loop 数量或输出工作量。Original/LS 总耗时分别为 `411.06/510.15 s`。
+- 外层 scheduler 累计从 `0.474 s` 增至 `14.964 s`，增加 `14.490 s`；
+  但 model-runner/executor 路径从推算的 `404.494 s` 增至实测
+  `488.411 s`，增加 `83.918 s`，约解释总差距的 84.7%。7 次
+  consolidation 仅累计 `0.670 s`。所以 loop=16 确实摊薄了 scheduler，
+  但 scheduler 不是主要瓶颈。
+- LS 的实际 KV DoP（按 sequence-step 加权）为：
+  DoP1 `60.77%`、DoP2 `32.11%`、DoP3 `6.35%`、DoP4+ `0.77%`；
+  original 的 DoP1 为 `99.15%`。LS 的 attention sequence-rank work
+  为 `401107`，original 为 `288532`，增加约 39.0%。
+- 忙时 LS/original 的最忙 rank batch 平均约 `129.4/39.0`，
+  `max_rank_batch / mean_rank_batch` 平均约 `2.18/1.11`。当前 LS 的
+  group ownership、master 扩缩容与历史 KV 分片，使请求虽然经常显示
+  master DoP=1，仍要访问多个 KV rank；最慢 rank、SP A2A 和同步路径决定
+  每 token 时间。
+- LS/original 的 hottest-rank KV utilization 分别达到 `100%/56.55%`；
+  LS 每 rank KV block 又因 memory utilization 0.85 而比 original 的
+  0.90 少约 11.9%，加剧容量压力、KV 分片和排队的正反馈。
+- 序列元数据/RPC send 累计从约 `5.585 s` 增至 `12.847 s`，可解释
+  model-runner 差距中的约 `7.26 s`；其余大头仍在 worker 侧
+  prepare/forward/SP communication/synchronization。当前日志未启用
+  CUDA-event forward timing，不能再精确拆出纯 kernel 与通信占比。
+- 这不是严格同机同版本 A/B：两轮 Ray 节点组合、代码版本、KV memory
+  utilization、warmup 和 recv 配置均不同。下一步最有判别力的是在同一
+  节点/同一代码下启用 forward timing，分别跑 KV-local 短 prompt 与当前
+  长 prompt workload。
