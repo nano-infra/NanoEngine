@@ -183,3 +183,46 @@
   或 context 长度决策，combined 阶段只拼接/验证而不做 DP 全局 rebalance；
   master 切换又会保留 historical KV。建议分别做 sticky-local、global
   balance 和二者同时启用的三组 A/B。
+
+## 2026-07-23 08:24 UTC
+
+- 当前目标：实现一个独立的静态 Decode 数据面 harness，直接运行
+  T00/T10/T01/T11 四个反事实布局，用实验区分短请求 CP 扩散与
+  master batch 偏斜的影响；本轮由用户明确要求写代码。
+- 固定代表性 workload：DP2×SP8、每个 DP 520 条请求、context 800、
+  `loop_count=16`。当前 CP 分布为全局
+  DoP1/2/3=`574/347/119`，当前 master batch 为
+  DP0=`[102,75,0,1,120,113,58,51]`、
+  DP1=`[16,138,66,1,36,125,16,122]`；均衡布局为每 rank 65。
+- 实现策略：复用现有 `LLM`、`SPStateManager.allocate_ls_initial_batch`
+  和 worker `ModelRunner.run`，绕过 `engine.step()` 与生产 scheduler；
+  以固定 sequence metadata/KV block table 重复执行 Decode，读取
+  CUDA-event forward timing。布局生成、约束校验与 2×2 effect 计算保持
+  纯 Python，并增加无需 GPU/Ray 的单元测试。
+- CP2/3 默认复现短请求历史 KV 碎片形态：master 保留 16 tokens，
+  dominant owner 持有其余大段，DoP3 再有一个 16-token shard；这样测试
+  的是额外 KV rank-work/通信，不会把 CP 人为变成均匀上下文切分优化。
+- 计划新增 `scripts/bench_ls_decode_static_layout.py` 和对应 CPU 测试；
+  不修改 C++ 或生产 scheduler。完成后运行定向测试和 CLI help，并提交
+  独立 commit。
+
+## 2026-07-23 08:43 UTC
+
+- 静态 2×2 harness 已实现为
+  `scripts/bench_ls_decode_static_layout.py`。它自动清除 Ray 代理、启用
+  worker CUDA-event timing，使用正式 Issue001 engine profile 和 DLSlime
+  metadata 传输，但计时路径不包含 scheduler。
+- T00/T10/T01/T11 使用同一 DP2×SP8、1040 requests、context 800、
+  loop16 workload；CP2/3 分别采用 `[784,16]` 和 `[768,16,16]` 的历史
+  碎片形态。每个 case/round 都做成批量原子 allocation，结束后释放并
+  断言两个 SPStateManager 的 running sequence/token 计数归零。
+- 默认做 3 个随机 case-order rounds，每 case 每轮 1 次 warmup + 10 次
+  measurement；JSON 会逐 case checkpoint，并保存全部 16 rank×16 loop
+  CUDA timings、wall time、master/participant/receiver batch、KV
+  token/block load、总 effect、interaction 和 paired-round effect。
+- `--dry-run` 不导入 Ray 或使用 GPU，可先审查精确布局。CPU 定向测试覆盖
+  四组边际、碎片形态、容量失败、真实 C++ block allocation/cleanup、
+  critical-path 和 2×2 effect；相关回归共 `18 passed`。`black --check`、
+  `py_compile`、CLI help、dry-run 和 `git diff --check` 均通过。
+- 本轮没有修改 C++ 或生产 scheduler，因此不需要 `pip install -v -e .`；
+  尚未申请 GPU，也没有实际启动 16-GPU harness。
