@@ -226,3 +226,22 @@
   `py_compile`、CLI help、dry-run 和 `git diff --check` 均通过。
 - 本轮没有修改 C++ 或生产 scheduler，因此不需要 `pip install -v -e .`；
   尚未申请 GPU，也没有实际启动 16-GPU harness。
+
+## 2026-07-23 09:24 UTC
+
+- 用户首次启动 16-GPU harness；graph capture 和 endpoint 初始化成功，但
+  round0 首个 T11 warmup 在 global rank2（DP0/SP2）进入
+  `prepare_decode_cpp` 时触发 `IndexError: Block index out of range`。
+- 原因已定位：T11 的 DP0/SP2 master batch 精确为 0。正式 scheduler 在
+  发布 batch 时会为 zero-work rank 加入 `SPStateManager.dummy_seqs[2]`，
+  该 dummy 已有合法 KV block；harness 绕过 scheduler 后漏了这一步，
+  于是 `ModelRunner.run` 的兜底 Python dummy 没有 block table。
+- 修复限定在 harness：发送前为每个 zero-master rank 加入 scheduler-owned
+  persistent dummy，统计布局仍只包含 1040 条真实请求，JSON 中原有
+  `effective_model_master_batch_by_sp=max(1, real_count)` 与实际 worker
+  batch 保持一致。增加 CPU 回归，对 T11 的 16 个 DP/SP 逐一执行
+  `prepare_decode_cpp`，直接覆盖本次失败路径。
+- 额外对 DP0/SP2 做了 optimized Decode `serialize→deserialize` 往返，
+  确认接收端 dummy 的 target-rank block table 非空，随后
+  `prepare_decode_cpp` 得到恰好 1 个 dummy input。相关回归仍为
+  `18 passed`，无需修改或重编译 C++。

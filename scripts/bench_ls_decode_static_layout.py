@@ -812,6 +812,46 @@ def _deallocate_case(engine: Any, allocated_by_dp: Sequence[Sequence[Any]]) -> N
         raise RuntimeError("static layout cleanup failed: " + "; ".join(cleanup_errors))
 
 
+def _execution_sequences_by_dp(
+    engine: Any,
+    allocated_by_dp: Sequence[Sequence[Any]],
+) -> list[list[Any]]:
+    """Add the scheduler-owned dummy for every zero-master SP rank.
+
+    The production scheduler does this before publishing ``dp_sp_seqs``.  If a
+    caller invokes ModelRunner directly with no master for the local SP rank,
+    ModelRunner's last-resort Python dummy has no allocated block table and
+    cannot be consumed by ``prepare_decode_cpp``.
+    """
+    from nanodeploy._cpp import BlockContextSlot
+
+    execution_by_dp: list[list[Any]] = []
+    for dp_idx, real_sequences in enumerate(allocated_by_dp):
+        sequences = list(real_sequences)
+        manager = engine.scheduler.worker_state[dp_idx]
+        master_counts = [
+            sum(
+                seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_idx
+                for seq in real_sequences
+            )
+            for sp_idx in range(ATTENTION_SP)
+        ]
+        for sp_idx, master_count in enumerate(master_counts):
+            if master_count:
+                continue
+            dummy = manager.dummy_seqs[sp_idx]
+            dummy_ctx = dummy.block_ctx(BlockContextSlot.ACTIVE)
+            if dummy_ctx.master_sp_idx != sp_idx or not list(
+                dummy.block_table(BlockContextSlot.ACTIVE, sp_idx)
+            ):
+                raise RuntimeError(
+                    f"DP{dp_idx}/SP{sp_idx} scheduler dummy is not allocated"
+                )
+            sequences.append(dummy)
+        execution_by_dp.append(sequences)
+    return execution_by_dp
+
+
 def _run_worker_iteration(
     engine: Any,
     allocated_by_dp: Sequence[Sequence[Any]],
@@ -821,8 +861,9 @@ def _run_worker_iteration(
 ) -> dict[str, Any]:
     import ray
 
+    execution_by_dp = _execution_sequences_by_dp(engine, allocated_by_dp)
     dp_sp_seqs = [
-        list(allocated_by_dp[dp_idx])
+        execution_by_dp[dp_idx]
         for dp_idx in range(ATTENTION_DP)
         for _ in range(ATTENTION_SP)
     ]

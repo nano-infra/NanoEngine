@@ -13,6 +13,7 @@ from scripts.bench_ls_decode_static_layout import (
     OBSERVED_MASTER_COUNTS,
     _allocate_case,
     _deallocate_case,
+    _execution_sequences_by_dp,
     build_case_layout,
     calculate_2x2_effects,
     summarize_case_layout,
@@ -85,7 +86,15 @@ def test_layout_rejects_insufficient_master_or_receiver_capacity() -> None:
 
 
 def test_static_layout_cpu_allocation_and_cleanup_leave_managers_empty() -> None:
-    from nanodeploy._cpp import BlockContextSlot, SPStateManager
+    import torch
+
+    from nanodeploy._cpp import (
+        BlockContextSlot,
+        SPStateManager,
+        deserialize,
+        prepare_decode_cpp,
+        serialize,
+    )
 
     engine_id = "static-layout-cpu-test"
     managers = [
@@ -123,6 +132,52 @@ def test_static_layout_cpu_allocation_and_cleanup_leave_managers_empty() -> None
             == 800
             for seq in sequences
         )
+
+    execution_by_dp = _execution_sequences_by_dp(engine, allocated)
+    assert len(execution_by_dp[0]) == BATCH_PER_DP + 1
+    assert len(execution_by_dp[1]) == BATCH_PER_DP
+    assert managers[0].dummy_seqs[2] in execution_by_dp[0]
+    for dp_sequences in execution_by_dp:
+        for sp_idx in range(ATTENTION_SP):
+            # This is the exact metadata operation that failed on the first GPU
+            # run when DP0/SP2 had no real master and no allocated dummy.
+            meta = prepare_decode_cpp(
+                dp_sequences,
+                sp_idx,
+                ATTENTION_SP,
+                64,
+                256,
+            )
+            assert len(meta.input_ids) >= 1
+
+    buffer = torch.empty(8 << 20, dtype=torch.int8)
+    data_len = serialize(
+        buffer.data_ptr(),
+        buffer.numel(),
+        execution_by_dp[0],
+        False,
+        2,
+        ATTENTION_SP,
+    )
+    dp0_sp2_roundtrip = deserialize(buffer.data_ptr(), data_len)
+    restored_dummy = next(
+        seq
+        for seq in dp0_sp2_roundtrip
+        if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == 2
+    )
+    assert list(restored_dummy.block_table(BlockContextSlot.ACTIVE, 2))
+    assert (
+        len(
+            prepare_decode_cpp(
+                dp0_sp2_roundtrip,
+                2,
+                ATTENTION_SP,
+                64,
+                256,
+            ).input_ids
+        )
+        == 1
+    )
 
     _deallocate_case(engine, allocated)
     for manager in managers:
