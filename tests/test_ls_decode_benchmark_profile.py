@@ -104,7 +104,13 @@ def test_formal_entrypoints_resolve_shared_cli_contract(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "sys.argv",
-        ["bench_ls_decode_longrun_8gpu.py", "--ls-max-num-ooe", "8"],
+        [
+            "bench_ls_decode_longrun_8gpu.py",
+            "--ls-max-num-ooe",
+            "8",
+            "--loop-count",
+            "16",
+        ],
     )
     longrun_args = longrun_script.parse_args()
     assert longrun_args.ls_max_num_ooe == 8
@@ -114,6 +120,7 @@ def test_formal_entrypoints_resolve_shared_cli_contract(tmp_path, monkeypatch):
     assert longrun_args.ls_kv_consolidation_stable_steps == 2
     assert longrun_args.ls_kv_consolidation_cooldown_steps == 2
     assert longrun_args.ls_kv_consolidation_check_interval_steps == 1
+    assert longrun_args.loop_count == 16
 
 
 def test_resolved_manifest_uses_scheduler_resolved_values(tmp_path):

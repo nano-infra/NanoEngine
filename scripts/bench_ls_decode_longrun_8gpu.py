@@ -73,6 +73,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-num-seqs", type=int, default=64)
     parser.add_argument("--max-num-recv-seqs", type=int, default=128)
+    parser.add_argument(
+        "--loop-count",
+        type=int,
+        choices=range(1, 17),
+        default=1,
+        help="Decode forwards per scheduler dispatch.",
+    )
     parser.add_argument("--max-model-len", type=int, default=0)
     parser.add_argument("--max-num-batched-tokens", type=int, default=0)
     parser.add_argument(
@@ -317,7 +324,7 @@ def build_engine(args: argparse.Namespace) -> LLM:
         max_num_seqs=args.max_num_seqs,
         max_num_recv_seqs=args.max_num_recv_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
-        loop_count=1,
+        loop_count=args.loop_count,
         scheduler_mode="centralized",
         segment_size=args.segment_size,
         kvcache_block_size=args.kvcache_block_size,
@@ -346,7 +353,11 @@ def config_dict(
             max_model_len,
             args.max_num_seqs * (args.prompt_len + args.max_tokens) + 1024,
         )
-    baseline = resolved_manifest(engine.config, args.ls_max_num_ooe)
+    baseline = resolved_manifest(
+        engine.config,
+        args.ls_max_num_ooe,
+        expected_loop_count=args.loop_count,
+    )
     return {
         "resolved_ls_decode_manifest": baseline,
         "model_path": args.model_path,
@@ -405,7 +416,7 @@ def config_dict(
         "ls_kv_consolidation_migration_chunk_tokens": baseline[
             "ls_kv_consolidation_migration_chunk_tokens"
         ],
-        "loop_count": 1,
+        "loop_count": args.loop_count,
         "max_num_seqs": args.max_num_seqs,
         "max_num_recv_seqs": args.max_num_recv_seqs,
         "max_model_len": max_model_len,
@@ -644,7 +655,16 @@ def run_longrun(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     "post_scheduler_latency_ms": post_sch_latency_ms,
                 }
                 if phase == "decode":
-                    itl_ms = pending_maintenance_ms + step_duration_ms
+                    execution_loop_count = engine.last_execution_loop_count
+                    if not 1 <= execution_loop_count <= args.loop_count:
+                        raise RuntimeError(
+                            "engine returned execution_loop_count outside the "
+                            "configured range"
+                        )
+                    itl_ms = (
+                        pending_maintenance_ms + step_duration_ms
+                    ) / execution_loop_count
+                    step_record["execution_loop_count"] = execution_loop_count
                     step_record["itl_ms"] = itl_ms
                     step_record["preceding_maintenance_ms"] = pending_maintenance_ms
                     pending_maintenance_ms = 0.0
