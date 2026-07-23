@@ -19,3 +19,26 @@
   `loongserve_loop16_fixed_tail_single_node_validation_20260723.md`。
 - 本任务没有修改代码；保留用户原有 `AGENTS.md`、
   `nanodeploy/engine/ray_executor.py` 和历史实验产物。
+
+## 2026-07-23 03:41 UTC
+
+- 后续目标：把同一固定尾轮场景延长为 5 分钟单机长跑。
+- 原 longrun 入口硬编码 `loop_count=1`；已增加向后兼容的
+  `--loop-count` 参数、resolved manifest 校验、per-step execution K 记录和
+  按实际 K 折算的 step ITL。CPU profile/CLI 回归 `5 passed`，提交为
+  `23db1fd feat: support chunked LS longrun tests`。
+- GPU 配置：单机 DP1×SP8/EP8、8×H200、eager、prompt 63、
+  max_tokens 18、loop_count 16、4 req/s、burstiness 2、inflight cap 64。
+- 结果：注入 300 秒、drain 6.61 秒、总运行 306.90 秒；accepted/completed
+  `1264/1264`、unfinished 0、manifest `success`、进程 exit 0。
+- 90 个 Decode step 的 scheduler `execution_loop_count` 全部为 16；
+  90 条 worker CUDA-event 聚合记录同样全部为 16。1,264 个 completion 的
+  output length 全部精确为 18。
+- 稳定段 Decode ITL：mean 208.36、p99 211.43 ms/token。输出吞吐
+  74.14 token/s，请求吞吐 4.12 req/s。
+- inflight cap 在到达 burst 中丢弃 35 个尚未 admission 的 arrival；这是
+  有界 backpressure，不是 accepted request 失败。
+- 日志没有 inconsistent K、traceback、scheduler fatal、CUDA/NCCL error
+  或 drain timeout。测试后 Ray `0/8 GPU`，8 张卡均 `0 MiB / 0%`。
+- 详细结果见
+  `loongserve_loop16_fixed_tail_longrun_5min_20260723.md`。
