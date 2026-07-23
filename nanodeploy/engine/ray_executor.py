@@ -185,7 +185,7 @@ class RayExecutor:
                 self.workers.append(worker)
 
         self.endpoint = RPCServerEndpoint(
-            8*32_000_000, 
+            32 * 32_000_000,
             self.config.attn_world_size,
             self.config.attention_sp,
             self.config.attention_tp,
