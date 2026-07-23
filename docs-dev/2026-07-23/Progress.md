@@ -148,3 +148,38 @@
   `<=128` blocks，且迁移后 retained ranks utilization `<=80%`。
 - 尾部执行 7 次 consolidation：group 525 `2→1`、group 531 `3→1`、
   group 532 `5→1`，总 maintenance stall 约 669.69 ms。
+
+## 2026-07-23 08:06 UTC
+
+- 当前目标：判定 LoongServe-style 慢主要来自 GPU 负载不均衡，还是短请求
+  被不必要地扩成 CP2+。
+- 已确认日志中的 `sp_size_hist_global` 是逐序列已提交 KV rank 数的精确
+  统计；本轮共有 `272430` logical sequence-step、`401107`
+  attention sequence-rank work。
+- 已重放 admission、decode master 分配与 consolidation：以 admission
+  planned ranks 初始化序列 KV ownership 的重放，在 346 个 Decode step
+  中精确匹配 339 个，累计 sequence-rank work 为 `401104`，与日志精确值
+  只差 3，可用于把 CP2+ 归因到具体 prompt 长度。
+- 下一步：按 prompt 长度统计 CP2+ 和额外 rank-work，构造逐轮 master/KV
+  rank 负载偏斜指标，并在相近 batch/KV 压力下比较 ITL，给出直接瓶颈与
+  根因的区分。
+
+## 2026-07-23 08:13 UTC
+
+- 已完成 LoongServe-style 慢因拆分，详细报告为
+  `loongserve_style_slowdown_cp_vs_imbalance_20260723.md`。
+- 本轮 128,674 个可归因的额外 CP rank-work 中，prompt `<=1K` 请求贡献
+  126,502（98.31%）；这些请求最终 context 最大仅 2,301 tokens。短请求
+  额外 work 中 99.91% 来自 admission 初始 DoP1、后续 master 切换造成的
+  CP 扩散。
+- `batch>=512` 的 249 个忙轮中，最忙 attention GPU 的 master batch 平均
+  是 16 卡均值的 2.16 倍；同批量范围的 original 参考约 1.11 倍。
+- 控制 batch、max KV utilization 和另一个因素后，忙轮 ITL 与平均 CP 的
+  partial correlation 为 0.655，与 master imbalance 为 0.335；二者均有
+  独立信号，但短请求 CP 更强。
+- `batch>=800` 的 2×2 分桶中，低 CP/低偏斜 ITL 90.57 ms，单独一个因素高
+  约 94 ms，而高 CP/高偏斜达到 118.07 ms，说明存在明显交互。
+- 代码根因是逐 group source-greedy fast path 不按单请求 owner locality
+  或 context 长度决策，combined 阶段只拼接/验证而不做 DP 全局 rebalance；
+  master 切换又会保留 historical KV。建议分别做 sticky-local、global
+  balance 和二者同时启用的三组 A/B。
