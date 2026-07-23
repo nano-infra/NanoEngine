@@ -245,3 +245,45 @@
   确认接收端 dummy 的 target-rank block table 非空，随后
   `prepare_decode_cpp` 得到恰好 1 个 dummy input。相关回归仍为
   `18 passed`，无需修改或重编译 C++。
+
+## 2026-07-23 09:54 UTC
+
+- 当前目标：按用户要求做一次精准重放。目标选取原 LS serving 日志
+  `06:26:05` 的代表轮（line 3508）：batch=1040、master max=138、
+  DoP1/2/3=`574/347/119`、max KV util=99.44%、ITL=94.01 ms。
+- 首先尝试仅用现有 admission、iteration master assignment、
+  consolidation 和 benchmark 请求长度重建每条 active sequence 的真实
+  `num_dispatched_tokens[8]`。重建必须同时精确对齐 active sequence IDs、
+  master counts、DoP histogram、每 rank KV token/block 汇总；不满足则
+  不把结果称为精准重放，而改为增加 snapshot dump 后重新跑 serving 捕获。
+- 通过 CPU 一致性检查后，将扩展静态 harness 读取 snapshot，优先运行
+  exact E11，并在容量可行时生成 balance-master、D1-collapse 和 both
+  counterfactual；GPU 操作按仓库要求申请提权。
+
+## 2026-07-23 10:00 UTC
+
+- 已完成 iteration 118 的 metadata-exact replay。新增
+  `bench_ls_decode_snapshot_replay.py`，从 admission、此前每轮 master
+  assignment 和目标 group aggregate 重建 1040 条 sequence 的真实
+  per-rank committed KV placement。
+- CPU 校验 12/12 groups 的 KV tokens、逐 sequence-rounded KV blocks、
+  master batch、KV DoP 和 loop16 pending reservation blocks 全部 exact；
+  全局 D1/D2/D3 为 `574/347/119`。按真实 12372 blocks/rank 的 C++
+  allocation/cleanup 也通过。
+- 两条初始 D2 prompt split 被唯一求出：seq1500 在 rank1/rank6 为
+  `174174/749056`；seq2359 在 rank1/rank7 为 `463895/283904`。
+- 两节点 16-GPU full-graph replay 完成，3 rounds × 5 measurements：
+  wall/loop median `90.1087 ms`，GPU critical median `89.3284 ms`。
+  历史目标轮 model-runner/loop 为 `90.6628 ms`；replay 仅低
+  `0.5541 ms`（`0.9939x`），成功在 0.61% 内复现。
+- 目标 step ITL `94.0128 ms` 中 model runner 占 96.44%；余下
+  `3.3500 ms/loop × 16 = 53.60 ms` 正好是 scheduler overhead。
+- 精准快照含 5,968,143 committed tokens；其 GPU critical 比固定
+  800-token synthetic T11 的 67.0009 ms 高 22.3275 ms（33.32%）。
+  说明之前 synthetic harness 的剩余缺口来自真实长 context/KV shape，
+  不是 scheduler 混入。
+- replay 是 scheduler-visible metadata exact；历史日志没有 sampled token
+  values 和物理 block IDs，因此这两项重新生成，不声称 bitwise exact。
+- 详细报告：
+  `loongserve_iteration118_exact_replay_20260723.md`。运行结束后 Ray
+  `0/16 GPU`。

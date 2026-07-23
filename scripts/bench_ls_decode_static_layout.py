@@ -775,6 +775,16 @@ def _allocate_case(engine: Any, layout: StaticCaseLayout) -> list[list[Any]]:
                 seq.append_token(0, BlockContextSlot.ACTIVE, master)
                 seq.mark_last_token_pending(BlockContextSlot.ACTIVE, master)
                 manager.add_running_tokens(master, 1)
+                # The production LS scheduler reserves the whole Decode chunk
+                # after installing its one pending input token.  This is
+                # normally invisible for the synthetic 800-token layout, but
+                # it is required when this allocator is reused for an exact
+                # snapshot whose master frontier is close to a block boundary.
+                if not manager.may_append_on_sp(seq, master, engine.config.loop_count):
+                    raise RuntimeError(
+                        f"DP{dp_idx} seq={seq.seq_id} cannot reserve "
+                        f"{engine.config.loop_count} Decode output tokens"
+                    )
                 manager.running.append(seq)
         return allocated_by_dp
     except BaseException:
