@@ -1,6 +1,6 @@
 # 任务进度罗盘
 
-更新时间：2026-07-19 13:58 UTC
+更新时间：2026-07-19 14:02 UTC
 
 目标：实现
 `docs-dev/2026-07-18/loongserve_source_aligned_decode_baseline_plan_20260718.md`
@@ -18,6 +18,13 @@ rank7→rank0 KV range copy及逐元素校验通过、exit 0。另用8进程分�
 原完整 KV scheduler+consolidation preflight 在创建NCCL进程前被旧fixture断言拦截：单个8-token
 request在当前packed placement下只实际使用rank0，不能断言立即占满SP8；该项未虚报为GPU失败或
 通过，后续需重构admission fixture后再验完整metadata commit链。此次GPU测试没有使用Ray。
+
+14:02 UTC 压缩恢复后已完整重读两份任务罗盘。当前新增目标是直接运行单机 8 卡 serving
+smoke；不重复 CPU 测试。已完成的 GPU 基线仍为 NCCL rank7→rank0 KV transport、MLA SP eager
+与 CUDA Graph correctness 三项全部通过。下一步只核对本地 Ray 地址、模型与 CSV 路径以及
+single-node 参数，然后清除四个代理变量并申请提权运行
+`scripts/bench_ls_decode_serving.py --attention-dp 1 --attention-sp 8`；结果将写入当日 docs-dev，
+失败时保留首个真实 serving blocker 与完整命令。
 
 13:38 UTC 学术 demo 范围的实现与单机 CPU 验收已完成，主实现已提交为
 `b8e0b7d feat: align decode scheduler with LoongServe baseline`。工作树只保留用户原有的

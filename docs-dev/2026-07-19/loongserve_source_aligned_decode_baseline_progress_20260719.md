@@ -1,6 +1,6 @@
 # LoongServe source-aligned Decode baseline 任务罗盘
 
-更新时间：2026-07-19 13:58:27 UTC
+更新时间：2026-07-19 14:02:13 UTC
 
 ## 任务目标
 
@@ -77,6 +77,13 @@
 - 最新 Python validator/feature-off targeted subset：`6 passed`；Python `py_compile`通过。
 
 ## 当前正在进行
+
+- 14:02 UTC 压缩恢复检查点：已先完整重读本罗盘和 `Progress.md`，当前用户目标切换为运行
+  单机 serving 测试。此前已提权完成的 8-GPU NCCL transport、MLA SP eager、MLA SP CUDA Graph
+  三项均通过；本轮不再重复 CPU suite。精确恢复顺序为：只读确认本地 Ray 状态、模型/CSV路径和
+  profile 参数；以 DP1×SP8 配置、清除 Ray 代理并申请提权执行
+  `scripts/bench_ls_decode_serving.py` 的小规模真实请求 smoke；记录吞吐/延迟或首个真实 blocker。
+  尚未启动本轮 serving 进程。
 
 - 13:58 UTC 单机 GPU检查点：经提权确认本机8×H200空闲，已实际运行三项8-GPU测试。
   `tests/ls_kv_scale_down_nccl_preflight.py --sp-size 8 --transport-only` 使用8进程NCCL 2.27.3，
@@ -200,10 +207,9 @@
 
 ## 下一步顺序
 
-1. 单机学术 demo 目标已完成并提交。保留用户 `AGENTS.md`、`ray_executor.py`、历史 JSON/JSONL、
-   profile 脚本，不纳入本任务提交。
-2. GPU/真实 Ray-NCCL 端到端不属于本次学术 demo CPU完成线。若后续运行，任何
-   GPU操作必须单独提权，Ray操作需清除代理。
+1. 只读确认单机 Ray、DeepSeek-V3 模型和 serving CSV 可用性，确定 DP1×SP8 的本机参数。
+2. 清除 Ray 代理并提权运行单机 8-GPU serving smoke，保存输出并记录结果；不重复 CPU 测试。
+3. 保留用户 `AGENTS.md`、`ray_executor.py`、历史 JSON/JSONL、profile 脚本，不纳入本任务提交。
 
 ## 工作树注意事项
 
