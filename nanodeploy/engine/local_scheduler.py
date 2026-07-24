@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
+from math import ceil
 
 from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.config import Config
@@ -63,6 +65,12 @@ class LocalScheduler:
             engine_id_override=f"{config.engine_id or 'hierarchical'}:dp{self.engine_id}",
         )
         self._state_manager = self._scheduler.worker_state[0]
+        self._capacity_probe: Scheduler | None = None
+        self._capacity_probe_state = None
+        self._capacity_probe_num_blocks = 0
+        self._capacity_validation_cache: dict[
+            tuple[int, int, int], str | None
+        ] = {}
         self._records: dict[int, LocalRequestRecord] = {}
         self._terminal_events: list[FinishEvent] = []
         self._inflight_ids: set[int] = set()
@@ -87,8 +95,53 @@ class LocalScheduler:
             not record.state.is_terminal for record in self._records.values()
         )
 
-    def _validate_service_capacity(
-        self, total_capacity_len: int, padded_completion_len: int
+    def _ensure_capacity_probe(
+        self, *, prompt_len: int, total_capacity_len: int
+    ) -> None:
+        block_size = self.config.kvcache_block_size
+        control_blocks = max(
+            self._state_manager.num_control_dummy_blocks(sp_idx)
+            for sp_idx in self._state_manager.block_manager
+        )
+        reservation_blocks = ceil(self.config.reserved_blocks_per_req)
+        lifetime_blocks = (total_capacity_len + block_size - 1) // block_size
+        admission_blocks = (
+            (prompt_len + block_size - 1) // block_size
+        ) + reservation_blocks
+        required_num_blocks = control_blocks + max(
+            lifetime_blocks, admission_blocks
+        )
+        probe_num_blocks = min(
+            self.config.num_kvcache_blocks, required_num_blocks
+        )
+        if (
+            self._capacity_probe is not None
+            and self._capacity_probe_num_blocks >= probe_num_blocks
+        ):
+            return
+
+        probe_config = copy(self.config)
+        probe_config.num_kvcache_blocks = probe_num_blocks
+        self._capacity_probe_state = None
+        self._capacity_probe = None
+        self._capacity_probe = Scheduler(
+            probe_config,
+            attention_dp_override=1,
+            engine_id_override=(
+                f"{self.config.engine_id or 'hierarchical'}:"
+                f"dp{self.engine_id}:capacity-probe"
+            ),
+        )
+        self._capacity_probe_state = self._capacity_probe.worker_state[0]
+        self._capacity_probe_num_blocks = probe_num_blocks
+
+    def _validate_exclusive_lifetime(
+        self,
+        *,
+        prompt_len: int,
+        max_tokens: int,
+        total_capacity_len: int,
+        padded_completion_len: int,
     ) -> None:
         block_size = self.config.kvcache_block_size
         service_blocks = [
@@ -115,6 +168,63 @@ class LocalScheduler:
             raise ValueError(
                 "request padded lifetime exceeds the LocalEngine KV capacity"
             )
+
+        cache_key = (prompt_len, max_tokens, padded_completion_len)
+        if cache_key in self._capacity_validation_cache:
+            cached_reason = self._capacity_validation_cache[cache_key]
+            if cached_reason is not None:
+                raise ValueError(cached_reason)
+            return
+
+        self._ensure_capacity_probe(
+            prompt_len=prompt_len,
+            total_capacity_len=total_capacity_len,
+        )
+        if self._capacity_probe is None or self._capacity_probe_state is None:
+            raise RuntimeError("exclusive-capacity probe was not initialized")
+
+        probe = Sequence(
+            [0] * prompt_len,
+            sampling_params=SamplingParams(
+                temperature=1.0,
+                max_tokens=max_tokens,
+                ignore_eos=True,
+            ),
+        )
+        if self._capacity_probe.running(0):
+            raise RuntimeError("exclusive-capacity probe retained running state")
+        if self._capacity_probe.waiting_migration:
+            raise RuntimeError("exclusive-capacity probe retained waiting state")
+
+        self._capacity_probe.add(probe)
+        admitted: list[Sequence] = []
+        try:
+            admitted = list(self._capacity_probe.admit()[0])
+            fits = (
+                len(admitted) == 1
+                and admitted[0] is probe
+                and self._capacity_probe_state.can_fit_lifetime(
+                    probe, 1 + padded_completion_len
+                )
+            )
+        finally:
+            if probe in self._capacity_probe_state.running:
+                self._capacity_probe_state.running.remove(probe)
+                self._capacity_probe_state.deallocate(
+                    probe, BlockContextSlot.ACTIVE
+                )
+            if probe in self._capacity_probe.waiting_migration:
+                self._capacity_probe.waiting_migration.remove(probe)
+
+        reason = None
+        if not fits:
+            reason = (
+                "request padded lifetime cannot fit its exclusive "
+                "LocalEngine SP placement"
+            )
+        self._capacity_validation_cache[cache_key] = reason
+        if reason is not None:
+            raise ValueError(reason)
 
     def add(self, command: AddCommand) -> AddResult:
         existing = self._records.get(command.request_id)
@@ -149,9 +259,11 @@ class LocalScheduler:
                 max_model_len=self.config.max_model_len,
                 vocab_size=self.config.hf_config.vocab_size,
             )
-            self._validate_service_capacity(
-                validation.total_capacity_len,
-                validation.padded_completion_len,
+            self._validate_exclusive_lifetime(
+                prompt_len=validation.original_prompt_len,
+                max_tokens=command.max_tokens,
+                total_capacity_len=validation.total_capacity_len,
+                padded_completion_len=validation.padded_completion_len,
             )
         except ValueError as exc:
             return AddResult(
@@ -183,6 +295,12 @@ class LocalScheduler:
             engine_id=self.engine_id,
         )
 
+    def _defer_admission(self, sequence: Sequence) -> None:
+        if sequence not in self._state_manager.running:
+            raise RuntimeError("cannot defer a sequence that is not running")
+        self._state_manager.running.remove(sequence)
+        self._scheduler.preempt(0, sequence)
+
     def admit(self) -> tuple[int, ...]:
         admitted = self._scheduler.admit()[0]
         admitted_ids: list[int] = []
@@ -191,14 +309,11 @@ class LocalScheduler:
             if not self._state_manager.can_fit_lifetime(
                 sequence, 1 + record.padded_completion_len
             ):
-                self._state_manager.running.remove(sequence)
-                self._state_manager.deallocate(
-                    sequence, BlockContextSlot.ACTIVE
-                )
-                raise RuntimeError(
-                    "accepted request failed exact padded lifetime validation: "
-                    f"request_id={sequence.seq_id}"
-                )
+                self._defer_admission(sequence)
+                continue
+            if not self._state_manager.can_append(sequence, 1):
+                self._defer_admission(sequence)
+                continue
             if not self._state_manager.may_append(sequence, 1):
                 raise RuntimeError(
                     "bootstrap allocation failed after successful admission: "

@@ -347,6 +347,90 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert load.all_dummy_rank_forwards == 0
 
 
+def test_local_scheduler_rejects_illegal_exclusive_sp_lifetime_on_add():
+    config = make_hierarchical_config(
+        num_kvcache_blocks=3,
+        reserved_blocks_per_req=0,
+    )
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+
+    rejected = local.add(
+        AddCommand(
+            request_id=43,
+            prompt_token_ids=tuple(range(120)),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+    )
+
+    assert not rejected.accepted
+    assert "exclusive LocalEngine SP placement" in rejected.reason
+    assert local.cpp_scheduler.get_total_waiting_migration_size() == 0
+    assert local.state_manager.num_running_seqs == 0
+    assert local.admit() == ()
+
+
+def test_local_scheduler_accepts_distributed_exclusive_sp_lifetime():
+    config = make_hierarchical_config(
+        num_kvcache_blocks=3,
+        reserved_blocks_per_req=0,
+        segment_size=64,
+    )
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+
+    accepted = local.add(
+        AddCommand(
+            request_id=44,
+            prompt_token_ids=tuple(range(120)),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+    )
+
+    assert accepted.accepted
+    assert local.admit() == (44,)
+    sequence = local.cpp_scheduler.running(0)[0]
+    assert local.state_manager.can_fit_lifetime(
+        sequence, 1 + round_up(sequence.max_tokens)
+    )
+
+
+def test_local_scheduler_defers_admission_without_bootstrap_capacity():
+    config = make_hierarchical_config(
+        attention_dp=8,
+        attention_sp=1,
+        ffn_ep=8,
+        num_kvcache_blocks=4,
+        reserved_blocks_per_req=0,
+    )
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    for request_id, prompt_tokens in (
+        (45, tuple(range(120))),
+        (46, tuple(range(1000, 1064))),
+    ):
+        assert local.add(
+            AddCommand(
+                request_id=request_id,
+                prompt_token_ids=prompt_tokens,
+                max_tokens=16,
+                temperature=0.1,
+                ignore_eos=True,
+                wave_id=1,
+            )
+        ).accepted
+
+    assert local.admit() == (45,)
+    assert [
+        sequence.seq_id for sequence in local.cpp_scheduler.waiting_migration
+    ] == [46]
+    assert local.state_manager.num_running_seqs == 1
+    assert local.state_manager.num_running_tokens == 121
+
+
 def test_local_scheduler_inflight_abort_wins_before_commit():
     config = make_hierarchical_config()
     local = LocalScheduler(config, config.hierarchical_topology.engine(0))
