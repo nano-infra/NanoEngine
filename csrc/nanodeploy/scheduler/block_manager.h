@@ -41,6 +41,10 @@ public:
     {
         return static_cast<int>(free_block_ids_.size());
     }
+    int num_blocks() const
+    {
+        return static_cast<int>(blocks_.size());
+    }
     const std::vector<Block>& blocks() const
     {
         return blocks_;

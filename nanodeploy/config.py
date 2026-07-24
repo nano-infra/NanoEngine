@@ -1,9 +1,20 @@
 import os
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
 from transformers import AutoConfig
+
+from nanodeploy.engine.hierarchical_contract import (
+    CONTROL_DUMMY_SCHEMA_VERSION,
+    HIERARCHICAL_LOOP_COUNT,
+)
+from nanodeploy.engine.topology import (
+    HierarchicalTopology,
+    build_hierarchical_topology,
+)
 
 
 DEEPSEEK_V3_BUCKET_POLICY = (
@@ -28,7 +39,12 @@ class Config:
     gpu_memory_utilization: float = 0.85
     gpu_memory_limit_gb: float | None = None
     routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"] = "RoundRobin"
-    scheduler_mode: Literal["centralized", "decentralized"] = "centralized"
+    scheduler_arch: Literal["legacy_global", "hierarchical"] = "legacy_global"
+    router_policy: Literal["round_robin"] = "round_robin"
+    load_report_interval_ms: int = 100
+    hierarchical_queue_capacity: int = 4096
+    startup_timeout_s: float = 600.0
+    quantum_timeout_s: float = 120.0
 
     # parallel config
     attention_tp: int = 1
@@ -133,6 +149,48 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
+        if self.scheduler_arch not in {"legacy_global", "hierarchical"}:
+            raise ValueError(
+                "scheduler_arch must be one of: legacy_global, hierarchical"
+            )
+        if self.router_policy != "round_robin":
+            raise ValueError(
+                "hierarchical MVP only supports router_policy='round_robin'"
+            )
+        if self.load_report_interval_ms <= 0:
+            raise ValueError("load_report_interval_ms must be positive")
+        if self.hierarchical_queue_capacity <= 0:
+            raise ValueError("hierarchical_queue_capacity must be positive")
+        if self.startup_timeout_s <= 0:
+            raise ValueError("startup_timeout_s must be positive")
+        if self.quantum_timeout_s <= 0:
+            raise ValueError("quantum_timeout_s must be positive")
+        if self.scheduler_arch == "hierarchical":
+            if self.mode != "decode":
+                raise ValueError(
+                    "hierarchical scheduler requires mode='decode'"
+                )
+            if self.dummy_prefill is not True:
+                raise ValueError(
+                    "hierarchical scheduler requires dummy_prefill=True"
+                )
+            if self.loop_count != HIERARCHICAL_LOOP_COUNT:
+                raise ValueError(
+                    "hierarchical scheduler requires loop_count="
+                    f"{HIERARCHICAL_LOOP_COUNT}"
+                )
+            if not self.use_dlslime_rpc:
+                raise ValueError(
+                    "hierarchical scheduler MVP requires use_dlslime_rpc=True"
+                )
+            build_hierarchical_topology(
+                attention_dp=self.attention_dp,
+                attention_sp=self.attention_sp,
+                attention_tp=self.attention_tp,
+                ffn_dp=self.ffn_dp,
+                ffn_ep=self.ffn_ep,
+                ffn_tp=self.ffn_tp,
+            )
         if self.fixed_sp_size < 0:
             raise ValueError("fixed_sp_size must be >= 0")
         if self.fixed_sp_size > self.attention_sp:
@@ -314,3 +372,71 @@ class Config:
     @property
     def ffn_world_size(self):
         return self.ffn_dp * self.ffn_ep * self.ffn_tp
+
+    @property
+    def hierarchical_topology(self) -> HierarchicalTopology:
+        if self.scheduler_arch != "hierarchical":
+            raise ValueError(
+                "hierarchical_topology is only available for "
+                "scheduler_arch='hierarchical'"
+            )
+        return build_hierarchical_topology(
+            attention_dp=self.attention_dp,
+            attention_sp=self.attention_sp,
+            attention_tp=self.attention_tp,
+            ffn_dp=self.ffn_dp,
+            ffn_ep=self.ffn_ep,
+            ffn_tp=self.ffn_tp,
+        )
+
+    def collective_fingerprint(self) -> str:
+        """Hash fields that must agree before hierarchical workers become READY."""
+
+        hf_dtype = getattr(self.hf_config, "dtype", None)
+        if hf_dtype is None:
+            hf_dtype = getattr(self.hf_config, "torch_dtype", None)
+        communication_env_names = (
+            "NCCL_ALGO",
+            "NCCL_PROTO",
+            "NCCL_P2P_DISABLE",
+            "NCCL_IB_DISABLE",
+            "SLIME_QP_NUM",
+        )
+        payload = {
+            "model": os.path.realpath(self.model),
+            "dtype": str(hf_dtype),
+            "attention": [
+                self.attention_dp,
+                self.attention_sp,
+                self.attention_tp,
+            ],
+            "ffn": [self.ffn_dp, self.ffn_ep, self.ffn_tp],
+            "sp_backend": self.sp_backend,
+            "cuda_graph": {
+                "enforce_eager": self.enforce_eager,
+                "mode": self.cuda_graph_mode,
+            },
+            "batch_limits": [
+                self.max_num_seqs,
+                self.max_num_batched_tokens,
+                self.max_num_recv_seqs,
+            ],
+            "kv": [self.kvcache_block_size, self.max_model_len],
+            "eplb": self.perfect_eplb,
+            "dynamic_sp": {
+                "enabled": self.enable_dynamic_sp_size,
+                "new_scheduler": self.use_new_decode_dynamic_sp_scheduler,
+                "strategy": self.dynamic_sp_size_strategy,
+                "bucket": self.dynamic_sp_bucket_policy,
+                "fixed_sp_size": self.fixed_sp_size,
+            },
+            "dummy_schema_version": CONTROL_DUMMY_SCHEMA_VERSION,
+            "loop_count": self.loop_count,
+            "communication_env": {
+                name: os.getenv(name) for name in communication_env_names
+            },
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()

@@ -39,5 +39,6 @@ void bind_block_manager(py::module_& m)
         .def("may_append", &BlockManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def_property_readonly("free_block_ids", &BlockManager::free_block_ids)
         .def_property_readonly("num_free_blocks", &BlockManager::num_free_blocks)
+        .def_property_readonly("num_blocks", &BlockManager::num_blocks)
         .def_property_readonly("blocks", &BlockManager::blocks);
 }

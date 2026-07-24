@@ -188,6 +188,7 @@ void bind_sequence(py::module_& m)
         .def_readwrite("last_token", &Sequence::last_token)
         .def_readwrite("num_tokens", &Sequence::num_tokens)
         .def_readwrite("num_prompt_tokens", &Sequence::num_prompt_tokens)
+        .def_readwrite("num_bootstrap_tokens", &Sequence::num_bootstrap_tokens)
         .def_readwrite("num_checkpointed_tokens", &Sequence::num_checkpointed_tokens)
         .def_readwrite("num_cached_tokens", &Sequence::num_cached_tokens)
         .def_readwrite("metric", &Sequence::metric)
@@ -232,8 +233,9 @@ void bind_sequence(py::module_& m)
 
         .def(py::pickle(
             [](const Sequence& p) {  // __getstate__
-                // (num_tokens, num_checkpointed_tokens, num_cached_tokens, backup_engine_id, active_engine_id,
-                // block_ctx_map, temperature, token_ids/last_token)
+                // (num_tokens, num_checkpointed_tokens, num_cached_tokens,
+                // num_bootstrap_tokens, block_ctx_map, temperature,
+                // token_ids/last_token)
                 std::vector<int> last_element;
                 if (p.num_generated_tokens_since_checkpoint() == 0) {
                     last_element = p.token_ids;
@@ -245,11 +247,13 @@ void bind_sequence(py::module_& m)
                 return std::make_tuple(p.num_tokens,
                                        p.num_checkpointed_tokens,
                                        p.num_cached_tokens,
+                                       p.num_bootstrap_tokens,
                                        p.slots_,
                                        p.temperature,
                                        last_element);
             },
             [](const std::tuple<int,
+                                int,
                                 int,
                                 int,
                                 std::array<BlockContext, (size_t)BlockContextSlot::_COUNT>,
@@ -261,7 +265,7 @@ void bind_sequence(py::module_& m)
                 // But the existing constructor requires token_ids.
 
                 // Let's extract token_ids from the last element if possible.
-                std::vector<int> last_element = std::get<5>(t);
+                std::vector<int> last_element = std::get<6>(t);
                 std::vector<int> initial_tokens;
 
                 // If num_generated_tokens_since_checkpoint == 0, last_element is token_ids.
@@ -277,10 +281,11 @@ void bind_sequence(py::module_& m)
                 seq->num_tokens              = std::get<0>(t);
                 seq->num_checkpointed_tokens = std::get<1>(t);
                 seq->num_cached_tokens       = std::get<2>(t);
+                seq->num_bootstrap_tokens    = std::get<3>(t);
 
-                seq->slots_ = std::move(std::get<3>(t));
+                seq->slots_ = std::move(std::get<4>(t));
 
-                seq->temperature = std::get<4>(t);
+                seq->temperature = std::get<5>(t);
 
                 if (num_tokens - num_checkpointed_tokens != 0) {
                     if (!last_element.empty()) {

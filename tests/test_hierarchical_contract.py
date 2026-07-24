@@ -1,0 +1,412 @@
+from pathlib import Path
+
+import pytest
+
+from nanodeploy._cpp import BlockContextSlot
+from nanodeploy.config import Config
+from nanodeploy.engine.hierarchical_contract import (
+    AddCommand,
+    HIERARCHICAL_LOOP_COUNT,
+    LocalDecodeBatch,
+    WorkerDecodeResult,
+    round_up,
+    validate_add_request,
+)
+from nanodeploy.engine.local_scheduler import LocalScheduler
+from nanodeploy.engine.scheduler import Scheduler
+from nanodeploy.engine.topology import build_hierarchical_topology
+from nanodeploy.engine.sequence import Sequence
+from nanodeploy.sampling_params import SamplingParams
+
+
+DEEPSEEK_MODEL = Path(
+    "/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3"
+)
+
+
+pytestmark = pytest.mark.skipif(
+    not (DEEPSEEK_MODEL / "config.json").is_file(),
+    reason=f"DeepSeek-V3 config not found at {DEEPSEEK_MODEL}",
+)
+
+
+def make_hierarchical_config(**overrides) -> Config:
+    values = {
+        "model": str(DEEPSEEK_MODEL),
+        "scheduler_arch": "hierarchical",
+        "mode": "decode",
+        "dummy_prefill": True,
+        "attention_dp": 2,
+        "attention_sp": 4,
+        "attention_tp": 1,
+        "ffn_dp": 1,
+        "ffn_ep": 8,
+        "ffn_tp": 1,
+        "kvcache_block_size": 64,
+        "num_kvcache_blocks": 32,
+        "max_model_len": 16384,
+        "max_num_batched_tokens": 16384,
+    }
+    values.update(overrides)
+    return Config(**values)
+
+
+def test_dp2_sp4_topology_has_two_disjoint_engines():
+    topology = build_hierarchical_topology(
+        attention_dp=2,
+        attention_sp=4,
+        attention_tp=1,
+        ffn_dp=1,
+        ffn_ep=8,
+        ffn_tp=1,
+    )
+
+    assert len(topology.engines) == 2
+    assert topology.engine(0).global_ranks == (0, 1, 2, 3)
+    assert topology.engine(1).global_ranks == (4, 5, 6, 7)
+    assert topology.engine(1).engine_local_rank(6) == 2
+    assert topology.engine(1).global_rank(sp_idx=3) == 7
+
+
+@pytest.mark.parametrize(
+    ("attention_dp", "attention_sp", "world_size"),
+    [
+        (8, 1, 8),
+        (2, 4, 8),
+        (1, 8, 8),
+        (16, 1, 16),
+        (2, 8, 16),
+        (32, 1, 32),
+        (4, 8, 32),
+    ],
+)
+def test_complete_hierarchical_topology_whitelist(
+    attention_dp, attention_sp, world_size
+):
+    topology = build_hierarchical_topology(
+        attention_dp=attention_dp,
+        attention_sp=attention_sp,
+        attention_tp=1,
+        ffn_dp=1,
+        ffn_ep=world_size,
+        ffn_tp=1,
+    )
+
+    assert topology.world_size == world_size
+    assert len(topology.engines) == attention_dp
+    flattened = tuple(
+        rank for engine in topology.engines for rank in engine.global_ranks
+    )
+    assert flattened == tuple(range(world_size))
+    assert all(engine.world_size == attention_sp for engine in topology.engines)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("loop_count", 8, "loop_count=16"),
+        ("mode", "hybrid", "mode='decode'"),
+        ("dummy_prefill", False, "dummy_prefill=True"),
+        ("ffn_ep", 4, "topology is not supported"),
+    ],
+)
+def test_hierarchical_config_rejects_out_of_contract_values(
+    field, value, message
+):
+    with pytest.raises(ValueError, match=message):
+        make_hierarchical_config(**{field: value})
+
+
+def test_hierarchical_config_uses_deepseek_v3_mla_contract():
+    config = make_hierarchical_config()
+
+    assert config.hf_config.architectures == ["DeepseekV3ForCausalLM"]
+    assert config.hf_config.num_key_value_heads == 1
+    assert config.kvcache_block_size == 64
+    assert len(config.collective_fingerprint()) == 64
+
+
+def test_add_validation_rounds_completion_and_excludes_bootstrap():
+    validation = validate_add_request(
+        request_id=7,
+        prompt_token_ids=[1, 2, 3],
+        max_tokens=17,
+        ignore_eos=True,
+        max_model_len=36,
+        vocab_size=129280,
+    )
+
+    assert round_up(17) == 32
+    assert validation.original_prompt_len == 3
+    assert validation.internal_prompt_len == 4
+    assert validation.padded_completion_len == 32
+    assert validation.total_capacity_len == 36
+
+
+def test_add_validation_rejects_bad_eos_token_and_padded_length():
+    with pytest.raises(ValueError, match="ignore_eos=True"):
+        validate_add_request(
+            request_id=1,
+            prompt_token_ids=[1],
+            max_tokens=1,
+            ignore_eos=False,
+            max_model_len=64,
+            vocab_size=129280,
+        )
+    with pytest.raises(ValueError, match="outside"):
+        validate_add_request(
+            request_id=1,
+            prompt_token_ids=[129280],
+            max_tokens=1,
+            ignore_eos=True,
+            max_model_len=64,
+            vocab_size=129280,
+        )
+    with pytest.raises(ValueError, match="padded model length"):
+        validate_add_request(
+            request_id=1,
+            prompt_token_ids=[1, 2],
+            max_tokens=17,
+            ignore_eos=True,
+            max_model_len=34,
+            vocab_size=129280,
+        )
+
+
+def test_control_dummies_are_deterministic_and_have_reserved_blocks():
+    config = make_hierarchical_config()
+    scheduler = Scheduler(config)
+
+    assert len(scheduler.worker_state) == 2
+    for state in scheduler.worker_state:
+        assert len(state.dummy_seqs) == 4
+        assert state.num_control_dummy_blocks() == 4
+        for sp_idx, dummy in enumerate(state.dummy_seqs):
+            assert state.is_control_dummy(dummy)
+            assert dummy.token_ids == [0, 0]
+            assert dummy.ignore_eos
+            assert dummy.block_ctx().master_sp_idx == sp_idx
+            assert (
+                len(dummy.block_table(BlockContextSlot.ACTIVE, sp_idx)) == 1
+            )
+            assert state.block_manager[sp_idx].num_free_blocks == 31
+
+
+def test_admission_and_decode_are_separate_cpp_calls():
+    config = make_hierarchical_config()
+    scheduler = Scheduler(config)
+    seq = Sequence(
+        [11, 12, 13],
+        sampling_params=SamplingParams(
+            temperature=0.1,
+            max_tokens=17,
+            ignore_eos=True,
+        ),
+    )
+    scheduler.add(seq)
+
+    admitted = scheduler.admit()
+    assert sum(map(len, admitted)) == 1
+    assert scheduler.get_total_waiting_migration_size() == 0
+    dp_idx = seq.block_ctx().dp_idx
+    state = scheduler.worker_state[dp_idx]
+    assert state.can_fit_lifetime(
+        seq, 1 + round_up(seq.max_tokens)
+    )
+
+    decode_batches = scheduler.plan_decode()
+    assert len(decode_batches) == 2
+    assert seq in decode_batches[dp_idx]
+    assert all(
+        any(
+            scheduled.block_ctx().master_sp_idx == sp_idx
+            for scheduled in decode_batches[dp_idx]
+        )
+        for sp_idx in range(config.attention_sp)
+    )
+
+
+def test_local_decode_batch_validates_rank_order_and_forward_count():
+    batch = LocalDecodeBatch(
+        wave_id=3,
+        quantum_id=5,
+        engine_id=1,
+        engine_has_real=True,
+        per_rank_sequences={4: [], 5: []},
+        request_master_global_rank={10: 4},
+        frozen_request_order={4: (10,), 5: ()},
+        control_dummy_ids=frozenset({99}),
+    )
+    valid_results = [
+        WorkerDecodeResult(
+            wave_id=3,
+            quantum_id=5,
+            global_rank=4,
+            forward_count=HIERARCHICAL_LOOP_COUNT,
+            mastered_request_ids=(10,),
+            sampled_token_ids=(tuple(range(HIERARCHICAL_LOOP_COUNT)),),
+        ),
+        WorkerDecodeResult(
+            wave_id=3,
+            quantum_id=5,
+            global_rank=5,
+            forward_count=HIERARCHICAL_LOOP_COUNT,
+            mastered_request_ids=(),
+            sampled_token_ids=(),
+        ),
+    ]
+
+    assert set(batch.validate_worker_results(valid_results)) == {4, 5}
+
+    invalid = valid_results[0]
+    invalid = WorkerDecodeResult(
+        wave_id=invalid.wave_id,
+        quantum_id=invalid.quantum_id,
+        global_rank=invalid.global_rank,
+        forward_count=15,
+        mastered_request_ids=invalid.mastered_request_ids,
+        sampled_token_ids=invalid.sampled_token_ids,
+    )
+    with pytest.raises(ValueError, match="exactly 16"):
+        batch.validate_worker_results([invalid, valid_results[1]])
+
+
+def make_worker_results(
+    batch: LocalDecodeBatch, *, token_base: int = 100
+) -> list[WorkerDecodeResult]:
+    return [
+        WorkerDecodeResult(
+            wave_id=batch.wave_id,
+            quantum_id=batch.quantum_id,
+            global_rank=global_rank,
+            forward_count=HIERARCHICAL_LOOP_COUNT,
+            mastered_request_ids=batch.expected_request_ids(global_rank),
+            sampled_token_ids=tuple(
+                tuple(
+                    token_base + offset
+                    for offset in range(HIERARCHICAL_LOOP_COUNT)
+                )
+                for _ in batch.expected_request_ids(global_rank)
+            ),
+        )
+        for global_rank in batch.per_rank_sequences
+    ]
+
+
+def test_local_scheduler_bootstrap_and_final_overrun_accounting():
+    config = make_hierarchical_config()
+    local = LocalScheduler(config, config.hierarchical_topology.engine(1))
+    result = local.add(
+        AddCommand(
+            request_id=42,
+            prompt_token_ids=(10, 11, 12),
+            max_tokens=17,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+    )
+    assert result.accepted
+    assert local.admit() == (42,)
+
+    sequence = local.cpp_scheduler.running(0)[0]
+    assert sequence.num_prompt_tokens == 3
+    assert sequence.num_bootstrap_tokens == 1
+    assert sequence.num_completed_tokens == 0
+    assert sequence.completion_token_ids == []
+    assert sequence.block_ctx().dp_idx == 1
+    assert local.state_manager.num_running_seqs == 1
+    assert local.state_manager.num_running_tokens == 4
+
+    first = local.plan_decode(wave_id=1, quantum_id=0)
+    assert first.engine_has_real
+    assert first.request_master_global_rank[42] in {4, 5, 6, 7}
+    assert local.postprocess(first, make_worker_results(first)) == ()
+    assert sequence.num_completed_tokens == 16
+
+    assert local.admit() == ()
+    final = local.plan_decode(wave_id=1, quantum_id=1)
+    events = local.postprocess(
+        final, make_worker_results(final, token_base=200)
+    )
+    assert len(events) == 1
+    assert events[0].request_id == 42
+    assert events[0].generated_count == 17
+    assert events[0].status == "FINISHED"
+    assert sequence.num_completed_tokens == 17
+    assert len(sequence.completion_token_ids) == 17
+    assert local.state_manager.num_running_seqs == 0
+    assert local.state_manager.num_running_tokens == 0
+    assert local.is_finished()
+
+
+def test_local_scheduler_inflight_abort_wins_before_commit():
+    config = make_hierarchical_config()
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    assert local.add(
+        AddCommand(
+            request_id=77,
+            prompt_token_ids=(10, 11),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+    ).accepted
+    local.admit()
+    batch = local.plan_decode(wave_id=1, quantum_id=0)
+
+    assert local.abort(77).status == "abort_pending"
+    events = local.postprocess(batch, make_worker_results(batch))
+    assert len(events) == 1
+    assert events[0].status == "ABORTED"
+    assert events[0].generated_count == 0
+    assert local.state_manager.num_running_seqs == 0
+    assert local.state_manager.num_running_tokens == 0
+    assert local.abort(77).status == "already_terminal"
+    assert local.is_finished()
+
+
+def test_local_scheduler_preempts_running_tail_and_readmits_cleanly():
+    config = make_hierarchical_config(
+        attention_dp=8,
+        attention_sp=1,
+        ffn_ep=8,
+        num_kvcache_blocks=3,
+        reserved_blocks_per_req=0,
+    )
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    for request_id in (101, 102):
+        assert local.add(
+            AddCommand(
+                request_id=request_id,
+                prompt_token_ids=tuple(range(60)),
+                max_tokens=16,
+                temperature=0.1,
+                ignore_eos=True,
+                wave_id=1,
+            )
+        ).accepted
+
+    assert local.admit() == (101, 102)
+    assert local.state_manager.num_running_tokens == 122
+
+    batch = local.plan_decode(wave_id=1, quantum_id=0)
+    assert batch.expected_request_ids(0) == (101,)
+    waiting = list(local.cpp_scheduler.waiting_migration)
+    assert [sequence.seq_id for sequence in waiting] == [102]
+    assert waiting[0].num_tokens == 60
+    assert waiting[0].num_bootstrap_tokens == 0
+    assert local.state_manager.num_running_tokens == 61
+
+    events = local.postprocess(batch, make_worker_results(batch))
+    assert [(event.request_id, event.status) for event in events] == [
+        (101, "FINISHED")
+    ]
+    assert local.state_manager.num_running_tokens == 0
+
+    assert local.admit() == (102,)
+    readmitted = local.cpp_scheduler.running(0)[0]
+    assert readmitted.num_tokens == 61
+    assert readmitted.num_bootstrap_tokens == 1
+    assert local.state_manager.num_running_tokens == 61

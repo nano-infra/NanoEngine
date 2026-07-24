@@ -1,29 +1,48 @@
+from pathlib import Path
+
+import pytest
+
 from nanodeploy.config import Config
-from nanodeploy.engine.scheduler import Scheduler, RoutingStrategy
-import os
+from nanodeploy.engine.scheduler import RoutingStrategy, Scheduler
 
-def test_routing_strategy():
-    # Mock a model path
-    model_path = "/models/qwen3-235B-Instruct-2507-FP8"
-    os.makedirs(model_path, exist_ok=True)
-    
-    # Test default
-    config = Config(model=model_path)
-    scheduler = Scheduler(config)
-    print(f"Default strategy: {scheduler.routing_strategy}")
-    assert scheduler.routing_strategy == RoutingStrategy.RoundRobin
-    
-    # Test LeastBatch
-    config = Config(model=model_path, routing_strategy="LeastBatch")
-    scheduler = Scheduler(config)
-    print(f"Set strategy: {scheduler.routing_strategy}")
-    assert scheduler.routing_strategy == RoutingStrategy.LeastBatch
 
-if __name__ == "__main__":
-    try:
-        test_routing_strategy()
-        print("Test passed!")
-    except Exception as e:
-        print(f"Test failed: {e}")
-        import traceback
-        traceback.print_exc()
+DEEPSEEK_MODEL = Path(
+    "/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3"
+)
+
+
+pytestmark = pytest.mark.skipif(
+    not (DEEPSEEK_MODEL / "config.json").is_file(),
+    reason=f"DeepSeek-V3 config not found at {DEEPSEEK_MODEL}",
+)
+
+
+def make_config(**overrides) -> Config:
+    values = {
+        "model": str(DEEPSEEK_MODEL),
+        "kvcache_block_size": 64,
+        "num_kvcache_blocks": 32,
+    }
+    values.update(overrides)
+    return Config(**values)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("RoundRobin", RoutingStrategy.RoundRobin),
+        ("LeastBatch", RoutingStrategy.LeastBatch),
+        ("LeastCache", RoutingStrategy.LeastCache),
+    ],
+)
+def test_legacy_routing_strategy(name, expected):
+    scheduler = Scheduler(make_config(routing_strategy=name))
+    assert scheduler.routing_strategy == expected
+
+
+def test_removed_scheduler_mode_is_not_a_config_field():
+    with pytest.raises(TypeError, match="scheduler_mode"):
+        Config(  # type: ignore[call-arg]
+            model=str(DEEPSEEK_MODEL),
+            scheduler_mode="decentralized",
+        )

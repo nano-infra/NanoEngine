@@ -204,6 +204,18 @@ void bind_sp_state_manager(py::module_& m)
 
         .def("can_append", &SPStateManager::can_append, py::arg("seq"), py::arg("num_tokens") = 1)
         .def("may_append", &SPStateManager::may_append, py::arg("seq"), py::arg("num_tokens") = 1)
+        .def("can_fit_lifetime",
+             &SPStateManager::can_fit_lifetime,
+             py::arg("seq"),
+             py::arg("additional_master_tokens"))
+        .def("is_control_dummy", &SPStateManager::is_control_dummy, py::arg("seq"))
+        .def("num_control_dummy_blocks",
+             &SPStateManager::num_control_dummy_blocks,
+             py::arg("sp_idx") = -1)
+        .def("add_running_tokens",
+             &SPStateManager::add_running_tokens,
+             py::arg("sp_idx"),
+             py::arg("count"))
 
         .def("can_allocate",
              &SPStateManager::can_allocate,
@@ -217,8 +229,9 @@ void bind_sp_state_manager(py::module_& m)
         .def_readwrite("block_manager", &SPStateManager::block_manager)
         .def_readwrite("running", &SPStateManager::running)
         .def_readwrite("dummy_seqs", &SPStateManager::dummy_seqs)
-        .def_readwrite("routing_strategy", &SPStateManager::routing_strategy)
-        // Expose waiting queues for decentralized scheduler mode (per-rank control)
-        .def_readwrite("waiting", &SPStateManager::waiting)
-        .def_readwrite("waiting_migration", &SPStateManager::waiting_migration);
+        .def_property_readonly(
+            "num_running_seqs", &SPStateManager::num_running_seqs)
+        .def_property_readonly(
+            "num_running_tokens", &SPStateManager::num_running_tokens)
+        .def_readwrite("routing_strategy", &SPStateManager::routing_strategy);
 }

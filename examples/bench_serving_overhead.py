@@ -71,9 +71,9 @@ def parse_args():
     parser.add_argument("--routing-strategy", type=str, default="RoundRobin", 
                         choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
                         help="Routing strategy.")
-    parser.add_argument("--scheduler-mode", type=str, default="centralized",
-                        choices=["centralized", "decentralized"],
-                        help="Scheduler mode: centralized or decentralized (default: centralized).")
+    parser.add_argument("--scheduler-arch", type=str, default="legacy_global",
+                        choices=["legacy_global", "hierarchical"],
+                        help="Scheduler architecture (default: legacy_global).")
     
     # Profiler arguments
     parser.add_argument("--enable-profiler", action="store_true", help="Enable profiler.")
@@ -378,7 +378,7 @@ def main():
     print(f"\n--- Benchmark: {args.num_requests} reqs, {args.request_rate} req/s, burst={args.burstiness} ---")
 
     # Initialize Engine
-    print(f"Scheduler mode: {args.scheduler_mode}, Routing strategy: {args.routing_strategy}")
+    print(f"Scheduler architecture: {args.scheduler_arch}, Routing strategy: {args.routing_strategy}")
     engine = LLM(
         args.model_path,
         enforce_eager=args.enforce_eager,
@@ -401,7 +401,7 @@ def main():
         max_num_batched_tokens=1024000,
         loop_count=args.loop_count,
         routing_strategy=args.routing_strategy,
-        scheduler_mode=args.scheduler_mode,
+        scheduler_arch=args.scheduler_arch,
         segment_size=args.segment_size,
         kvcache_block_size=64,
         max_num_recv_seqs=16,

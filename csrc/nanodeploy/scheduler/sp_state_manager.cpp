@@ -4,7 +4,6 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
-#include <random>
 #include <sstream>
 #include <set>
 
@@ -221,27 +220,87 @@ std::optional<int> SPStateManager::select_bucket_sp_size(int seq_len) const
 
 void SPStateManager::initialize_dummy_seqs()
 {
-    // Use a fixed seed for reproducibility or random device
-    std::random_device              rd;
-    std::mt19937                    gen(rd());
-    std::uniform_int_distribution<> dis(0, 7999);
+    constexpr int kControlToken = 0;
+    constexpr int kDecodeQuantum = 16;
 
     for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
-        std::vector<int> token_ids = {dis(gen)};
+        std::vector<int> token_ids = {kControlToken};
 
         auto dummy_seq = std::make_shared<Sequence>(token_ids,
                                                     1.0,   // temperature
-                                                    256,   // max_tokens
-                                                    false  // ignore_eos
+                                                    kDecodeQuantum,
+                                                    true   // ignore_eos
         );
         dummy_seq->active(engine_id_, attention_sp_, 1);
         dummy_seq->block_ctx().master_sp_idx_ = sp_idx;
 
-        dummy_seq->append_token(dis(gen), BlockContextSlot::ACTIVE, sp_idx);
+        // The first dispatched token is the deterministic bootstrap token.
+        // Reserve the complete 16-forward quantum before the object can be
+        // used so every worker receives a structurally valid block table.
+        dummy_seq->append_token(kControlToken, BlockContextSlot::ACTIVE, sp_idx);
+        dummy_seq->num_bootstrap_tokens = 1;
 
         block_manager[sp_idx]->allocate(*dummy_seq);
+        if (!block_manager[sp_idx]->may_append(*dummy_seq, kDecodeQuantum)) {
+            throw std::runtime_error(
+                "Insufficient KV blocks for the permanent control dummy on SP rank "
+                + std::to_string(sp_idx));
+        }
         dummy_seqs.push_back(dummy_seq);
     }
+}
+
+bool SPStateManager::can_fit_lifetime(const Sequence& seq, int additional_master_tokens) const
+{
+    if (additional_master_tokens < 0) {
+        return false;
+    }
+
+    const auto& block_ctx = seq.block_ctx(BlockContextSlot::ACTIVE);
+    const int master_sp_idx = block_ctx.master_sp_idx_;
+    if (master_sp_idx < 0 || master_sp_idx >= attention_sp_
+        || static_cast<int>(block_ctx.num_dispatched_tokens.size()) != attention_sp_) {
+        return false;
+    }
+
+    for (int sp_idx = 0; sp_idx < attention_sp_; ++sp_idx) {
+        const int control_blocks = num_control_dummy_blocks(sp_idx);
+        const int service_blocks = block_manager.at(sp_idx)->num_blocks() - control_blocks;
+        const int extra_tokens = sp_idx == master_sp_idx ? additional_master_tokens : 0;
+        const int required_tokens = block_ctx.num_dispatched_tokens[sp_idx] + extra_tokens;
+        const int required_blocks =
+            (required_tokens + kvcache_block_size_ - 1) / kvcache_block_size_;
+        if (required_blocks > service_blocks) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool SPStateManager::is_control_dummy(const std::shared_ptr<Sequence>& seq) const
+{
+    return std::find(dummy_seqs.begin(), dummy_seqs.end(), seq) != dummy_seqs.end();
+}
+
+int SPStateManager::num_control_dummy_blocks(int sp_idx) const
+{
+    if (sp_idx < -1 || sp_idx >= attention_sp_) {
+        throw std::out_of_range("control dummy SP rank is out of range");
+    }
+
+    int total = 0;
+    for (const auto& dummy_seq : dummy_seqs) {
+        const auto& block_ctx = dummy_seq->block_ctx(BlockContextSlot::ACTIVE);
+        if (sp_idx == -1) {
+            for (const auto& table : block_ctx.sp_block_table) {
+                total += static_cast<int>(table.size());
+            }
+        }
+        else {
+            total += static_cast<int>(block_ctx.sp_block_table[sp_idx].size());
+        }
+    }
+    return total;
 }
 
 int SPStateManager::select_master_rank()

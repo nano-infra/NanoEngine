@@ -18,11 +18,6 @@ namespace nanodeploy {
 // Forward declaration
 class MetricsManager;
 
-enum class SchedulerMode {
-    CENTRALIZED,
-    DECENTRALIZED
-};
-
 // Result of a single scheduling step.
 // This struct is returned by `schedule()` and summarizes which sequences
 // should be executed on each data-parallel (DP) worker (and, if applicable,
@@ -114,14 +109,15 @@ public:
               bool               enable_non_uniform_split,
               const std::string& sp_master_selector,
               bool               sp_debug,
-              int                fixed_sp_size,
-              const std::string& scheduler_mode = "centralized");
+              int                fixed_sp_size);
 
     // Queue management
     void add(std::shared_ptr<Sequence> seq);
 
     // Main scheduling functions
     ScheduleResult schedule();
+    std::vector<std::vector<std::shared_ptr<Sequence>>> admit();
+    std::vector<std::vector<std::shared_ptr<Sequence>>> plan_decode();
 
     // Postprocessing
     void postprocess(const std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_sp_seqs,
@@ -166,14 +162,8 @@ private:
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_prefill();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode();
     std::vector<std::vector<std::shared_ptr<Sequence>>> _schedule_decode_prefill_latency_aware();
-    
-    // Decentralized scheduling logic
-    ScheduleResult _schedule_decentralized();
-    std::vector<std::shared_ptr<Sequence>> _schedule_prefill_for_worker(int dp_idx);
-    std::vector<std::shared_ptr<Sequence>> _schedule_decode_for_worker(int dp_idx);
-    
-    // Routing function for decentralized mode
-    int select_dp_worker_for_routing(Sequence& seq);
+    void append_missing_control_dummies(
+        std::vector<std::vector<std::shared_ptr<Sequence>>>& dp_seqs);
 
     // Round-robin counter for DP
     int next_dp_idx();
@@ -199,8 +189,6 @@ private:
     bool        sp_debug_;
 
     std::string sp_master_selector_;
-    
-    SchedulerMode scheduler_mode_ = SchedulerMode::CENTRALIZED;
 
     int dp_rr_counter_ = 0;
 

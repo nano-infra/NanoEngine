@@ -34,7 +34,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-1000000}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-1000000}"
 LOOP_COUNT="${LOOP_COUNT:-16}"
 FIXED_SP_SEGMENTS="${FIXED_SP_SEGMENTS:-0}"
-SCHEDULER="${SCHEDULER:-centralized}"
+SCHEDULER="${SCHEDULER:-legacy_global}"
 ROUTING="${ROUTING:-LeastBatch}"
 ENABLE_DYNAMIC_SP_SIZE="${ENABLE_DYNAMIC_SP_SIZE:-1}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
@@ -108,8 +108,8 @@ routing_short() {
 
 scheduler_short() {
     case "$1" in
-        centralized) echo "cen" ;;
-        decentralized) echo "dec" ;;
+        legacy_global) echo "legacy" ;;
+        hierarchical) echo "hier" ;;
         *) echo "$1" ;;
     esac
 }
@@ -178,7 +178,7 @@ for rate in "${RATES[@]}"; do
         --routing-strategy "$ROUTING"
         --itl-log-path "$json_file"
         --segment-size "$SEG"
-        --scheduler-mode "$SCHEDULER"
+        --scheduler-arch "$SCHEDULER"
         --fixed-sp-segments "$FIXED_SP_SEGMENTS"
         --dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY"
         --long-request-sp-threshold "$LONG_REQUEST_SP_THRESHOLD"

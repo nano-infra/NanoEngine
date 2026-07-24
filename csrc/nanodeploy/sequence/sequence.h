@@ -164,7 +164,7 @@ public:
     }
     int num_completed_tokens() const
     {
-        return num_tokens - num_prompt_tokens;
+        return num_tokens - num_prompt_tokens - num_bootstrap_tokens;
     }
     int num_generated_tokens_since_checkpoint() const
     {
@@ -202,6 +202,7 @@ public:
     int              last_token;
     int              num_tokens;
     int              num_prompt_tokens;
+    int              num_bootstrap_tokens = 0;
     int              num_checkpointed_tokens;
     int              num_cached_tokens = 0;
 

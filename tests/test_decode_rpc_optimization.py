@@ -55,6 +55,7 @@ def _make_seq(
     seq.last_token = 2000 + seq_id
     seq.num_tokens = 10 + seq_id
     seq.num_prompt_tokens = 7 + seq_id
+    seq.num_bootstrap_tokens = seq_id % 2
     seq.num_checkpointed_tokens = 6 + seq_id
     seq.num_cached_tokens = seq_id
     seq.active("decode-engine", _SP_SIZE, 1)
@@ -170,6 +171,9 @@ def test_decode_optimize_roundtrip_trims_only_target_rank_heavy_fields():
         assert restored.last_token == original.last_token
         assert restored.num_tokens == original.num_tokens
         assert restored.num_prompt_tokens == original.num_prompt_tokens
+        assert (
+            restored.num_bootstrap_tokens == original.num_bootstrap_tokens
+        )
         assert restored.num_checkpointed_tokens == original.num_checkpointed_tokens
         assert restored.num_cached_tokens == original.num_cached_tokens
 

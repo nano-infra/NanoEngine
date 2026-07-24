@@ -30,6 +30,11 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
 
 class LLMEngine:
     def __init__(self, model, **kwargs):
+        if "scheduler_mode" in kwargs:
+            raise TypeError(
+                "scheduler_mode was removed; use "
+                "scheduler_arch='legacy_global' or 'hierarchical'"
+            )
         self.engine_id = str(uuid.uuid4())
 
         config_fields = {field.name for field in fields(Config)}
@@ -102,13 +107,12 @@ class LLMEngine:
             total_waiting_migration
         )
 
-        if self.log_decode_step_detail and total_waiting_migration > 0:
-            # In decentralized mode, we can't directly access waiting_migration[0]
-            # This is just for logging, so we skip it in decentralized mode
-            if hasattr(self.scheduler, 'waiting_migration') and self.scheduler.waiting_migration:
-                logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
-
-        dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
+        if (
+            self.log_decode_step_detail
+            and total_waiting_migration > 0
+            and self.scheduler.waiting_migration
+        ):
+            logger.info(f"{self.scheduler.waiting_migration[0].num_tokens=}")
 
         dp_sp_tp_seqs = [seqs for seqs in dp_sp_seqs for _ in range(tp_size)]
         # dp_batch_sizes = [len(seqs) for seqs in dp_seqs]
@@ -162,6 +166,10 @@ class LLMEngine:
             else:
                 for dp_idx, seqs in enumerate(dp_seqs):
                     for seq in seqs:
+                        if self.scheduler.worker_state[
+                            dp_idx
+                        ].is_control_dummy(seq):
+                            continue
                         if not self.scheduler.worker_state[dp_idx].may_append(seq, 1):
                             logger.error(
                                 "Failed to allocate block for sequence %s during dummy prefill; skipping token append.",

@@ -174,6 +174,7 @@ size_t serialize_sequences(uintptr_t                                     data_pt
         write_raw(data_ptr, off, buffer_size, seq.last_token);
         write_raw(data_ptr, off, buffer_size, seq.num_tokens);
         write_raw(data_ptr, off, buffer_size, seq.num_prompt_tokens);
+        write_raw(data_ptr, off, buffer_size, seq.num_bootstrap_tokens);
         write_raw(data_ptr, off, buffer_size, seq.num_checkpointed_tokens);
         write_raw(data_ptr, off, buffer_size, seq.num_cached_tokens);
 
@@ -220,6 +221,7 @@ std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr,
         int            last   = read_raw<int>(data_ptr, off, data_len);
         int            num    = read_raw<int>(data_ptr, off, data_len);
         int            prompt = read_raw<int>(data_ptr, off, data_len);
+        int            bootstrap = read_raw<int>(data_ptr, off, data_len);
         int            check  = read_raw<int>(data_ptr, off, data_len);
         int            cached = read_raw<int>(data_ptr, off, data_len);
 
@@ -233,6 +235,7 @@ std::vector<std::shared_ptr<Sequence>> deserialize_sequences(uintptr_t data_ptr,
         seq->last_token              = last;
         seq->num_tokens              = num;
         seq->num_prompt_tokens       = prompt;
+        seq->num_bootstrap_tokens    = bootstrap;
         seq->num_checkpointed_tokens = check;
         seq->num_cached_tokens       = cached;
 

@@ -24,7 +24,7 @@ DEFAULT_GPU_UTIL=0.9
 
 # 策略配置
 DEFAULT_ROUTING="LeastBatch"
-DEFAULT_SCHEDULER_MODE="centralized"
+DEFAULT_SCHEDULER_ARCH="legacy_global"
 DEFAULT_LOOP_COUNT=16
 DEFAULT_FIXED_SP_SIZE=0
 DEFAULT_SP_BACKEND="hao_basic"
@@ -57,7 +57,7 @@ GPU_MEM="$DEFAULT_GPU_MEM"
 MAX_MODEL_LEN="$DEFAULT_MAX_MODEL_LEN"
 GPU_UTIL="$DEFAULT_GPU_UTIL"
 ROUTING_STRATEGY="$DEFAULT_ROUTING"
-SCHEDULER_MODE="$DEFAULT_SCHEDULER_MODE"
+SCHEDULER_ARCH="$DEFAULT_SCHEDULER_ARCH"
 LOOP_COUNT="$DEFAULT_LOOP_COUNT"
 FIXED_SP_SIZE="${FIXED_SP_SIZE:-$DEFAULT_FIXED_SP_SIZE}"
 SP_BACKEND="${SP_BACKEND:-$DEFAULT_SP_BACKEND}"
@@ -93,7 +93,7 @@ usage() {
     echo "  --max-model-len <int>     Max Model Len (default: $DEFAULT_MAX_MODEL_LEN)"
     echo "  --gpu-util <float>        GPU Memory Utilization (default: $DEFAULT_GPU_UTIL)"
     echo "  --routing-strategy <str>  Routing Strategy (default: $DEFAULT_ROUTING)"
-    echo "  --scheduler-mode <str>    Scheduler Mode (default: $DEFAULT_SCHEDULER_MODE)"
+    echo "  --scheduler-arch <str>    Scheduler architecture (default: $DEFAULT_SCHEDULER_ARCH)"
     echo "  --loop-count <int>        Loop count (default: $DEFAULT_LOOP_COUNT)"
     echo "  --fixed-sp-size <int>     Fixed SP size baseline (0 = disabled, default: $DEFAULT_FIXED_SP_SIZE)"
     echo "  --sp-backend <str>        legacy_ll | hao_basic | nccl (default: $DEFAULT_SP_BACKEND)"
@@ -129,7 +129,7 @@ while [[ $# -gt 0 ]]; do
         --max-model-len)    MAX_MODEL_LEN="$2"; shift 2 ;;
         --gpu-util)         GPU_UTIL="$2"; shift 2 ;;
         --routing-strategy) ROUTING_STRATEGY="$2"; shift 2 ;;
-        --scheduler-mode)   SCHEDULER_MODE="$2"; shift 2 ;;
+        --scheduler-arch)   SCHEDULER_ARCH="$2"; shift 2 ;;
         --loop-count)       LOOP_COUNT="$2"; shift 2 ;;
         --fixed-sp-size)     FIXED_SP_SIZE="$2"; shift 2 ;;
         --sp-backend)       SP_BACKEND="$2"; shift 2 ;;
@@ -168,9 +168,9 @@ case "$ROUTING_STRATEGY" in
     *) echo "Error: Invalid routing strategy '$ROUTING_STRATEGY'."; exit 1 ;;
 esac
 
-case "$SCHEDULER_MODE" in
-    decentralized|centralized) ;;
-    *) echo "Error: Invalid scheduler mode '$SCHEDULER_MODE'."; exit 1 ;;
+case "$SCHEDULER_ARCH" in
+    legacy_global|hierarchical) ;;
+    *) echo "Error: Invalid scheduler architecture '$SCHEDULER_ARCH'."; exit 1 ;;
 esac
 
 case "$SP_BACKEND" in
@@ -211,7 +211,7 @@ echo "Model Name  : $MODEL_NAME"
 echo "Dataset     : $DATASET_NAME"
 echo "Strategy    : DP=$DP, SP=$SP, EP=$EP, TP=$TP, BK_SZ=$BLOCK_SIZE"
 echo "Routing     : $ROUTING_STRATEGY"
-echo "SchedMod    : $SCHEDULER_MODE"
+echo "SchedArch   : $SCHEDULER_ARCH"
 echo "LBCandRatio : $LEASTBATCH_TOKEN_CANDIDATE_RATIO"
 echo "BatchSz     : $BATCH_SIZE"
 echo "GPU Util    : $GPU_UTIL ($MEM_TAG)"
@@ -233,7 +233,7 @@ echo "================================================"
 
 log_progress "=== NEW BATCH STARTED ==="
 log_progress "Model: $MODEL_NAME | Dataset: $DATASET_NAME"
-log_progress "Parallel: DP=$DP, SP=$SP, EP=$EP, TP=$TP | Scheduler: $SCHEDULER_MODE"
+log_progress "Parallel: DP=$DP, SP=$SP, EP=$EP, TP=$TP | Scheduler: $SCHEDULER_ARCH"
 log_progress "SegSize=$SEG_SIZE | BatchSize=$BATCH_SIZE | MaxLen=$MAX_MODEL_LEN | MaxInput=${MAX_INPUT_LEN:-unlimited} | FixedSPSize=$FIXED_SP_SIZE"
 log_progress "SPBackend=$SP_BACKEND"
 log_progress "CUDAGraphMode=$CUDA_GRAPH_MODE"
@@ -271,10 +271,10 @@ for rate in "${RATES[@]}"; do
     esac
     # 调度缩写
     sc_short=""
-    case "$SCHEDULER_MODE" in
-        centralized)   sc_short="cen" ;;
-        decentralized) sc_short="dec" ;;
-        *)             sc_short="$SCHEDULER_MODE" ;;
+    case "$SCHEDULER_ARCH" in
+        legacy_global) sc_short="legacy" ;;
+        hierarchical) sc_short="hier" ;;
+        *)             sc_short="$SCHEDULER_ARCH" ;;
     esac
     # segment size 缩写 (65536->64k)
     seg_short=$(( SEG_SIZE / 1024 ))k
@@ -337,7 +337,7 @@ for rate in "${RATES[@]}"; do
         --segment-size "$SEG_SIZE"
         --sp-backend "$SP_BACKEND"
         --cuda-graph-mode "$CUDA_GRAPH_MODE"
-        --scheduler-mode "$SCHEDULER_MODE"
+        --scheduler-arch "$SCHEDULER_ARCH"
         --fixed-sp-size "$FIXED_SP_SIZE"
         --dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY"
         --long-request-sp-threshold "$LONG_REQUEST_SP_THRESHOLD"

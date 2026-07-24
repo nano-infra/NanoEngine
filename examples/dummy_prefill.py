@@ -9,20 +9,20 @@ from transformers import AutoTokenizer
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Dummy prefill test with scheduler mode selection")
+    parser = argparse.ArgumentParser(description="Dummy prefill decode test")
     parser.add_argument(
-        "--scheduler-mode",
+        "--scheduler-arch",
         type=str,
-        default="centralized",
-        choices=["centralized", "decentralized"],
-        help="Scheduler mode: centralized or decentralized (default: centralized)"
+        default="legacy_global",
+        choices=["legacy_global", "hierarchical"],
+        help="Scheduler architecture (default: legacy_global)",
     )
     parser.add_argument(
         "--routing-strategy",
         type=str,
         default="RoundRobin",
         choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
-        help="Routing strategy for decentralized scheduler (default: RoundRobin)"
+        help="Legacy scheduler routing strategy (default: RoundRobin)"
     )
     parser.add_argument("--num-seqs", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=2048)
@@ -35,7 +35,7 @@ def main():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="/mnt/nvme1n1/ml_research/chenjiefei/models/deepseek-v3",
+        default="/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3",
     )
     parser.add_argument("--master-address", type=str, default="10.102.252.174:26444")
     parser.add_argument("--ray-address", type=str, default="10.102.252.174:7799")
@@ -85,11 +85,14 @@ def main():
         profiler_start_time=args.profiler_start_time,
         profiling_duration=args.profiling_duration,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        scheduler_mode=args.scheduler_mode,
+        scheduler_arch=args.scheduler_arch,
         routing_strategy=args.routing_strategy,
     )
-    
-    print(f"Starting with scheduler_mode={args.scheduler_mode}, routing_strategy={args.routing_strategy}")
+
+    print(
+        f"Starting with scheduler_arch={args.scheduler_arch}, "
+        f"routing_strategy={args.routing_strategy}"
+    )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=args.max_tokens, ignore_eos=True)
 

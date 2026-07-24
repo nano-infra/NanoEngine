@@ -844,13 +844,13 @@ class ModelRunner:
             for seq in dp_seqs
             if seq.block_ctx(BlockContextSlot.ACTIVE).master_sp_idx == sp_rank
         )
-        is_dummy = False
         if num_sp_seqs == 0:
-            is_dummy = True
-            seq = Sequence([np.random.randint(self.config.hf_config.vocab_size - 1)])
-            seq.block_ctx().reset(self.engine_id, sp_size, 1)
-            seq.block_ctx().master_sp_idx = sp_rank
-            dp_seqs.append(seq)
+            raise RuntimeError(
+                "worker received no canonical Sequence for its SP rank; "
+                "the scheduler must provide a persistent control dummy with "
+                "reserved KV blocks"
+            )
+        is_dummy = False
 
         sp_seqs = [
             seq

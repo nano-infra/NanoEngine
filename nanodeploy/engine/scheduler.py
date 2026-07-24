@@ -21,16 +21,32 @@ RoutingStrategy = _CppRoutingStrategy
 
 # Adapter class for C++ Scheduler to work with Config object
 class Scheduler(_CppScheduler):
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        attention_dp_override: int | None = None,
+        engine_id_override: str | None = None,
+    ):
+        attention_dp = (
+            config.attention_dp
+            if attention_dp_override is None
+            else attention_dp_override
+        )
+        engine_id = (
+            config.engine_id
+            if engine_id_override is None
+            else engine_id_override
+        )
         # C++ Scheduler expects individual parameters, not Config object
         super().__init__(
-            config.engine_id or "",
+            engine_id or "",
             config.loop_count,
             config.max_num_seqs,
             config.max_num_batched_tokens,
             config.max_num_recv_seqs,
             config.eos,
-            config.attention_dp,
+            attention_dp,
             config.attention_sp,
             config.num_kvcache_blocks,
             config.kvcache_block_size,
@@ -59,15 +75,14 @@ class Scheduler(_CppScheduler):
             config.sp_master_selector,
             config.sp_debug,
             config.fixed_sp_size,
-            config.scheduler_mode
         )
         # Store config for compatibility
-        self.engine_id = config.engine_id
+        self.engine_id = engine_id
         self.loop_count = config.loop_count
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        self.attention_dp = config.attention_dp
+        self.attention_dp = attention_dp
         self.attention_sp = config.attention_sp
         self.mode = config.mode
         self.routing_strategy = RoutingStrategy[config.routing_strategy]

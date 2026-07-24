@@ -144,8 +144,7 @@ void bind_scheduler_utils(py::module_& m)
                           bool               enable_non_uniform_split,
                           const std::string& sp_master_selector,
                           bool               sp_debug,
-                          int                fixed_sp_size,
-                          const std::string& scheduler_mode) {
+                          int                fixed_sp_size) {
                  return std::make_shared<Scheduler>(engine_id,
                                                     loop_count,
                                                     max_num_seqs,
@@ -180,8 +179,7 @@ void bind_scheduler_utils(py::module_& m)
                                                      enable_non_uniform_split,
                                                      sp_master_selector,
                                                      sp_debug,
-                                                     fixed_sp_size,
-                                                     scheduler_mode);
+                                                     fixed_sp_size);
               }),
              py::arg("engine_id"),
              py::arg("loop_count"),
@@ -217,14 +215,15 @@ void bind_scheduler_utils(py::module_& m)
               py::arg("enable_non_uniform_split"),
               py::arg("sp_master_selector"),
               py::arg("sp_debug") = false,
-              py::arg("fixed_sp_size") = 0,
-              py::arg("scheduler_mode") = "centralized")
+              py::arg("fixed_sp_size") = 0)
 
         // Queue management
         .def("add", &Scheduler::add, py::arg("seq"))
 
         // Scheduling
         .def("schedule", &Scheduler::schedule, py::call_guard<py::gil_scoped_release>())
+        .def("admit", &Scheduler::admit, py::call_guard<py::gil_scoped_release>())
+        .def("plan_decode", &Scheduler::plan_decode, py::call_guard<py::gil_scoped_release>())
 
         // Postprocessing
         .def("postprocess",

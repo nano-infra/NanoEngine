@@ -7,7 +7,6 @@ Supports:
 - enable_non_uniform_split=True
 - sp_master_selector="LeastBatch"
 - Custom sp_seq_lens input via JSON file
-- Per-rank sequence length control via --per-rank-seq-lens-file (decentralized mode)
 - Profiling on specific loop iterations (default: loops 5-6)
 """
 
@@ -18,7 +17,7 @@ import os
 import numpy as np
 
 from nanodeploy import LLM, SamplingParams
-from nanodeploy.engine.sequence import Sequence, BlockContextSlot
+from nanodeploy.engine.sequence import Sequence
 
 
 # Default sp_seq_lens data (provided by user)
@@ -57,17 +56,6 @@ DEFAULT_SP_SEQ_LENS = [
     [[386118, 12646, 12560, 12645]],
 ]
 
-# Example per-rank sequence lengths for DP32-decentralized mode
-# Key: rank index (0-31), Value: list of sequence lengths for that rank
-DEFAULT_PER_RANK_SEQ_LENS = {
-    0: [748128, 12502, 12249, 12394, 12838, 12268, 12087, 12827, 12068, 12571, 12302],
-    1: [12502, 12249, 12394, 12838, 12268],
-    2: [12087, 12827, 12068, 12571, 12302],
-    # Add more ranks as needed...
-    # Ranks without specified sequences will have empty queues
-}
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Profiling script with DP32/DP4SP8 configurations"
@@ -86,7 +74,7 @@ def parse_args():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="/models/deepseek-v3",
+        default="/mnt/nvme1n1/ml_research/linbinbin1/DeepSeek-V3",
         help="Path to the model"
     )
     parser.add_argument(
@@ -108,15 +96,6 @@ def parse_args():
         type=str,
         default=None,
         help="Path to JSON file containing sp_seq_lens list"
-    )
-    
-    # Per-rank sequence lengths (decentralized mode)
-    parser.add_argument(
-        "--per-rank-seq-lens-file",
-        type=str,
-        default=None,
-        help="Path to JSON file containing per-rank sequence lengths (enables decentralized mode). "
-             "Format: {\"0\": [len1, len2, ...], \"1\": [len1, len2, ...], ...}"
     )
     
     # Profiler settings
@@ -209,28 +188,6 @@ def load_sp_seq_lens(file_path: str | None) -> list:
     return data
 
 
-def load_per_rank_seq_lens(file_path: str | None) -> dict[int, list[int]] | None:
-    """Load per-rank sequence lengths from JSON file.
-    
-    Returns:
-        Dict mapping rank index to list of sequence lengths, or None if not specified.
-    """
-    if file_path is None:
-        return None
-    
-    print(f"Loading per-rank sequence lengths from: {file_path}")
-    with open(file_path, 'r') as f:
-        data = json.load(f)
-    
-    # Convert string keys to int
-    if isinstance(data, dict):
-        if 'per_rank_seq_lens' in data:
-            data = data['per_rank_seq_lens']
-        return {int(k): v for k, v in data.items()}
-    
-    raise ValueError(f"Invalid per-rank seq lens format. Expected dict, got {type(data)}")
-
-
 def create_sequences_from_sp_seq_lens(sp_seq_lens: list, sampling_params: SamplingParams) -> list[Sequence]:
     """
     Create sequences based on sp_seq_lens structure.
@@ -252,81 +209,6 @@ def create_sequences_from_sp_seq_lens(sp_seq_lens: list, sampling_params: Sampli
     return sequences
 
 
-def add_sequences_per_rank(
-    decode_engine,
-    per_rank_seq_lens: dict[int, list[int]],
-    sampling_params: SamplingParams,
-    attention_dp: int,
-) -> int:
-    """
-    Add sequences directly to each rank's worker queue (decentralized mode).
-    
-    This function bypasses the normal routing logic and directly places sequences
-    into each rank's waiting_migration queue, giving precise control over which
-    sequences are processed by which rank.
-    
-    Args:
-        decode_engine: The LLM engine instance
-        per_rank_seq_lens: Dict mapping rank index to list of sequence lengths
-        sampling_params: Sampling parameters for generation
-        attention_dp: Number of DP workers (ranks)
-    
-    Returns:
-        Total number of sequences added
-    """
-    scheduler = decode_engine.scheduler
-    metrics_manager = decode_engine.metrics_manager
-    total_seqs = 0
-    
-    print(f"\n{'='*60}")
-    print(f"Per-Rank Sequence Assignment (Decentralized Mode)")
-    print(f"{'='*60}")
-    
-    for rank_idx in range(attention_dp):
-        seq_lens = per_rank_seq_lens.get(rank_idx, [])
-        if not seq_lens:
-            print(f"  Rank {rank_idx}: 0 sequences (empty)")
-            continue
-        
-        print(f"  Rank {rank_idx}: {len(seq_lens)} sequences, lengths={seq_lens[:3]}{'...' if len(seq_lens) > 3 else ''}")
-        
-        for seq_len in seq_lens:
-            # Create sequence with specified length
-            token_ids = np.random.randint(0, 10001, size=seq_len).tolist()
-            seq = Sequence(token_ids, sampling_params=sampling_params)
-            
-            # Set up metrics
-            seq.metric = metrics_manager.create_sequence_metric(
-                seq.seq_id, seq.num_prompt_tokens
-            )
-            
-            # Activate the sequence for this engine
-            seq.active(scheduler.engine_id, scheduler.attention_sp, scheduler.attention_dp)
-            
-            # Record arrival metrics
-            if seq.metric:
-                seq.metric.record_arrival()
-                seq.metric.record_decode_arrival()
-            
-            # Directly add to the target rank's waiting_migration queue
-            # This bypasses the normal routing and gives us precise control
-            # Note: SequenceDeque uses .append() method (exposed via pybind11)
-            target_queue = scheduler.worker_state[rank_idx].waiting_migration
-            target_queue.append(seq)
-            
-            # Set the dp_idx to indicate target rank
-            # Note: block_ctx() returns BlockContext with BlockContextSlot.ACTIVE by default
-            seq.block_ctx(BlockContextSlot.ACTIVE).dp_idx_ = rank_idx
-            
-            total_seqs += 1
-    
-    print(f"{'='*60}")
-    print(f"Total sequences added: {total_seqs}")
-    print(f"{'='*60}\n")
-    
-    return total_seqs
-
-
 def main():
     args = parse_args()
     
@@ -335,13 +217,6 @@ def main():
     
     # Get parallelism configuration
     config_params = get_config_params(args.config)
-    
-    # Check if per-rank mode is enabled
-    per_rank_seq_lens = load_per_rank_seq_lens(args.per_rank_seq_lens_file)
-    use_per_rank_mode = per_rank_seq_lens is not None
-    
-    # Determine scheduler mode based on per-rank configuration
-    scheduler_mode = "decentralized" if use_per_rank_mode else "centralized"
     
     print(f"\n{'='*60}")
     print(f"Configuration: {args.config}")
@@ -356,9 +231,7 @@ def main():
         selector = "LeastCache"
 
     print(f"  sp_master_selector={selector}")
-    print(f"  scheduler_mode={scheduler_mode}")
-    if use_per_rank_mode:
-        print(f"  per_rank_mode=ENABLED (sequences assigned directly to ranks)")
+    print("  scheduler_arch=legacy_global")
     print(f"{'='*60}\n")
     
     # Initialize the LLM engine
@@ -393,8 +266,7 @@ def main():
         # Non-uniform split and LeastBatch selector
         enable_non_uniform_split=True,
         sp_master_selector=selector,
-        # Scheduler mode: decentralized for per-rank control, centralized otherwise
-        scheduler_mode=scheduler_mode,
+        scheduler_arch="legacy_global",
         routing_strategy=selector,
     )
     
@@ -408,38 +280,26 @@ def main():
         ignore_eos=True
     )
     
-    if use_per_rank_mode:
-        # Per-rank mode: directly assign sequences to specific ranks
-        total_seqs = add_sequences_per_rank(
-            decode,
-            per_rank_seq_lens,
-            sampling_params,
-            config_params['attention_dp'],
-        )
-        print(f"Added {total_seqs} sequences in per-rank mode")
-    else:
-        # Standard mode: use sp_seq_lens and normal routing
-        sp_seq_lens = load_sp_seq_lens(args.sp_seq_lens_file)
-        print(f"Loaded {len(sp_seq_lens)} loop configurations")
-        
-        # Create sequences based on sp_seq_lens
-        total_seqs = 0
-        for loop_data in sp_seq_lens:
-            for dp_group in loop_data:
-                total_seqs += len(dp_group)
-        
-        print(f"Total sequences from sp_seq_lens: {total_seqs}")
-        
-        sequences = []
-        for dp_group in sp_seq_lens:
-            for sp_rank_seqs in dp_group:
-                for seq_len in sp_rank_seqs:
-                    token_ids = np.random.randint(0, 10001, size=seq_len).tolist()
-                    seq = Sequence(token_ids, sampling_params=sampling_params)
-                    sequences.append(seq)
+    sp_seq_lens = load_sp_seq_lens(args.sp_seq_lens_file)
+    print(f"Loaded {len(sp_seq_lens)} loop configurations")
 
-        print(f"Created {len(sequences)} sequences from sp_seq_lens for profiling")
-        decode.add_request(sequences)
+    total_seqs = 0
+    for loop_data in sp_seq_lens:
+        for dp_group in loop_data:
+            total_seqs += len(dp_group)
+
+    print(f"Total sequences from sp_seq_lens: {total_seqs}")
+
+    sequences = []
+    for dp_group in sp_seq_lens:
+        for sp_rank_seqs in dp_group:
+            for seq_len in sp_rank_seqs:
+                token_ids = np.random.randint(0, 10001, size=seq_len).tolist()
+                seq = Sequence(token_ids, sampling_params=sampling_params)
+                sequences.append(seq)
+
+    print(f"Created {len(sequences)} sequences from sp_seq_lens for profiling")
+    decode.add_request(sequences)
     
     decode.generate()
     

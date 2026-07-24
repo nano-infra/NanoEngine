@@ -100,6 +100,7 @@ Sequence::Sequence(const std::vector<int>& token_ids, double temperature, int ma
         last_token = -1;  // Should not happen based on usage
     }
     num_prompt_tokens       = num_tokens;
+    num_bootstrap_tokens    = 0;
     num_checkpointed_tokens = num_tokens;
     num_cached_tokens       = 0;
 }
@@ -198,9 +199,10 @@ std::vector<int> Sequence::prompt_token_ids() const
 
 std::vector<int> Sequence::completion_token_ids() const
 {
-    if (num_prompt_tokens >= static_cast<int>(token_ids.size()))
+    const int completion_start = num_prompt_tokens + num_bootstrap_tokens;
+    if (completion_start >= static_cast<int>(token_ids.size()))
         return {};
-    return std::vector<int>(token_ids.begin() + num_prompt_tokens, token_ids.end());
+    return std::vector<int>(token_ids.begin() + completion_start, token_ids.end());
 }
 
 }  // namespace nanodeploy

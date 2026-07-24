@@ -122,6 +122,9 @@ public:
     void set_dp_idx(int dp_idx)
     {
         dp_idx_ = dp_idx;
+        for (const auto& dummy_seq : dummy_seqs) {
+            dummy_seq->block_ctx(BlockContextSlot::ACTIVE).dp_idx_ = dp_idx;
+        }
     }
 
     int segment_size() const
@@ -138,6 +141,9 @@ public:
     // Block management delegation
     bool can_append(Sequence& seq, int num_tokens = 1);
     bool may_append(Sequence& seq, int num_tokens = 1);
+    bool can_fit_lifetime(const Sequence& seq, int additional_master_tokens) const;
+    bool is_control_dummy(const std::shared_ptr<Sequence>& seq) const;
+    int  num_control_dummy_blocks(int sp_idx = -1) const;
 
     // Allocation logic
     // num_seqs and num_batched_tokens are maps from dp_idx to count/tokens
@@ -207,28 +213,8 @@ public:
     std::unordered_map<int, std::shared_ptr<BlockManager>> block_manager;
     std::deque<std::shared_ptr<Sequence>>                  running;
     std::vector<std::shared_ptr<Sequence>>                 dummy_seqs;
-    
-    // Waiting queues for decentralized scheduler mode
-    std::deque<std::shared_ptr<Sequence>>                  waiting;
-    std::deque<std::shared_ptr<Sequence>>                  waiting_migration;
 
     RoutingStrategy routing_strategy = RoutingStrategy::RoundRobin;
-    
-    // Helper methods for decentralized scheduler
-    bool is_waiting_empty() const
-    {
-        return waiting.empty() && waiting_migration.empty();
-    }
-    
-    int get_waiting_queue_size() const
-    {
-        return static_cast<int>(waiting.size() + waiting_migration.size());
-    }
-    
-    int get_total_load() const
-    {
-        return num_running_seqs_ + get_waiting_queue_size();
-    }
 
 private:
     struct PlanningState {
