@@ -46,10 +46,27 @@ class LocalExecutor:
 
     def initialize_endpoint(self, timeout: float) -> None:
         server_info = self.endpoint.init_server_endpoint()
-        futures = [
-            worker.init_rpc_endpoint.remote(server_info)
-            for worker in self.workers
-        ]
+        # Ray 2.51 can deserialize a nested actor handle with generic
+        # ``(**kwargs)`` method metadata. Named arguments remain valid for
+        # both that handle and the concrete ModelRunner signature.
+        try:
+            futures = [
+                worker.init_rpc_endpoint.remote(server_info=server_info)
+                for worker in self.workers
+            ]
+        except TypeError as exc:
+            signatures = tuple(
+                repr(
+                    getattr(worker, "_ray_method_signatures", {}).get(
+                        "init_rpc_endpoint"
+                    )
+                )
+                for worker in self.workers
+            )
+            raise TypeError(
+                "Ray rejected ModelRunner.init_rpc_endpoint; "
+                f"worker handle signatures={signatures}"
+            ) from exc
         client_info = ray.get(futures, timeout=timeout)
         self.endpoint.connect(client_info)
 
@@ -103,12 +120,14 @@ class LocalExecutor:
                     ),
                 }
             futures.append(
+                # Keep this call keyword-only for the same nested actor-handle
+                # compatibility required by initialize_endpoint().
                 worker.run.remote(
-                    [],
-                    False,
-                    True,
-                    send_timestamp,
-                    trace_context,
+                    dp_seqs=[],
+                    is_prefill=False,
+                    enable_rpc=True,
+                    send_timestamp=send_timestamp,
+                    hierarchical_trace=trace_context,
                 )
             )
 

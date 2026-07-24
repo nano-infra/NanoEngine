@@ -37,6 +37,8 @@ _PROXY_ENV_NAMES = (
     "https_proxy",
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
 )
 _PROXY_ENV_LOCK = threading.RLock()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,8 @@ from nanodeploy.engine.hierarchical_contract import (
     OwnerState,
     validate_execution_trace_set,
 )
+from nanodeploy.engine.local_executor import LocalExecutor
+from nanodeploy.engine.topology import EngineTopology
 from nanodeploy.router.request_router import RequestRouter
 
 
@@ -211,3 +214,93 @@ def test_execution_trace_validation_requires_identical_global_steps():
 
     with pytest.raises(ValueError, match="different wave/quantum"):
         validate_execution_trace_set(traces[:-1], (0, 1))
+
+
+def test_local_executor_uses_keyword_only_nested_actor_calls(monkeypatch):
+    class FakeEndpoint:
+        def __init__(self, *_args, **_kwargs):
+            self.connected = None
+            self.sent = None
+
+        def init_server_endpoint(self):
+            return ("server",)
+
+        def connect(self, client_info):
+            self.connected = client_info
+
+        def send_seqs(self, sequences, *, is_prefill):
+            self.sent = (sequences, is_prefill)
+
+    class RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def remote(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.result
+
+    class FakeWorker:
+        def __init__(self):
+            self.init_rpc_endpoint = RemoteMethod(("client",))
+            self.run = RemoteMethod(([[]], 1.0))
+
+    class FakeSequence:
+        seq_id = -1
+
+        @staticmethod
+        def block_ctx():
+            return SimpleNamespace(master_sp_idx=0)
+
+    class FakeBatch:
+        engine_id = 0
+        wave_id = 1
+        quantum_id = 0
+        engine_has_real = False
+        per_rank_sequences = {0: [FakeSequence()]}
+
+        @staticmethod
+        def is_control_dummy(_sequence):
+            return True
+
+        @staticmethod
+        def expected_request_ids(_global_rank):
+            return ()
+
+    monkeypatch.setattr(
+        "nanodeploy.engine.local_executor.RPCServerEndpoint",
+        FakeEndpoint,
+    )
+    monkeypatch.setattr(
+        "nanodeploy.engine.local_executor.ray.get",
+        lambda refs, timeout: refs,
+    )
+    config = SimpleNamespace(
+        optimize_decode_block_table=True,
+        hierarchical_execution_trace=False,
+    )
+    topology = EngineTopology(
+        engine_id=0,
+        global_dp_idx=0,
+        global_ranks=(0,),
+        attention_sp=1,
+        attention_tp=1,
+    )
+    worker = FakeWorker()
+    executor = LocalExecutor(config, topology, [worker])
+
+    executor.initialize_endpoint(timeout=1.0)
+    executor.run(FakeBatch(), timeout=1.0)
+
+    assert worker.init_rpc_endpoint.calls == [
+        {"server_info": ("server",)}
+    ]
+    assert len(worker.run.calls) == 1
+    run_call = dict(worker.run.calls[0])
+    assert run_call.pop("send_timestamp") > 0
+    assert run_call == {
+        "dp_seqs": [],
+        "is_prefill": False,
+        "enable_rpc": True,
+        "hierarchical_trace": None,
+    }

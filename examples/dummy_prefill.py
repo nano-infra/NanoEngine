@@ -4,6 +4,9 @@ import os
 import numpy as np
 
 from nanodeploy import LLM, SamplingParams
+from nanodeploy.engine.hierarchical_contract import (
+    validate_execution_trace_set,
+)
 from nanodeploy.engine.sequence import Sequence
 from transformers import AutoTokenizer
 
@@ -44,6 +47,11 @@ def main():
     parser.add_argument("--max-num-recv-seqs", type=int, default=130)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument(
+        "--hierarchical-execution-trace",
+        action="store_true",
+        help="Capture and validate every hierarchical 16-forward quantum.",
+    )
+    parser.add_argument(
         "--loop-count",
         type=int,
         default=None,
@@ -62,6 +70,14 @@ def main():
     parser.add_argument("--profiler-start-time", type=float, default=None)
     parser.add_argument("--profiling-duration", type=float, default=None)
     args = parser.parse_args()
+    if (
+        args.hierarchical_execution_trace
+        and args.scheduler_arch != "hierarchical"
+    ):
+        parser.error(
+            "--hierarchical-execution-trace requires "
+            "--scheduler-arch hierarchical"
+        )
     path = os.path.expanduser(args.model_path)
     loop_count = args.loop_count
     if loop_count is None:
@@ -98,6 +114,7 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         scheduler_arch=args.scheduler_arch,
         routing_strategy=args.routing_strategy,
+        hierarchical_execution_trace=args.hierarchical_execution_trace,
     )
 
     print(
@@ -146,6 +163,18 @@ def main():
             )
     else:
         decode.generate()
+    if args.hierarchical_execution_trace:
+        traces = decode.drain_execution_traces()
+        steps = validate_execution_trace_set(
+            traces,
+            range(args.dp * args.sp),
+        )
+        print(
+            "Validated hierarchical execution trace:",
+            f"ranks={args.dp * args.sp}",
+            f"global_steps={len(steps)}",
+            f"records={len(traces)}",
+        )
 
 
 if __name__ == "__main__":
