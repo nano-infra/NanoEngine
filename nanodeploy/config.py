@@ -45,6 +45,7 @@ class Config:
     hierarchical_queue_capacity: int = 4096
     startup_timeout_s: float = 600.0
     quantum_timeout_s: float = 120.0
+    hierarchical_execution_trace: bool = False
 
     # parallel config
     attention_tp: int = 1
@@ -73,6 +74,7 @@ class Config:
     # dist config
     master_address: str = "127.0.0.1:6006"
     ray_address: str = "127.0.0.1:6379"
+    hierarchical_control_address: str | None = None
 
     # profiler
     enable_profiler: bool = False
@@ -421,7 +423,11 @@ class Config:
                 self.max_num_batched_tokens,
                 self.max_num_recv_seqs,
             ],
-            "kv": [self.kvcache_block_size, self.max_model_len],
+            "kv": [
+                self.kvcache_block_size,
+                self.num_kvcache_blocks,
+                self.max_model_len,
+            ],
             "eplb": self.perfect_eplb,
             "dynamic_sp": {
                 "enabled": self.enable_dynamic_sp_size,
@@ -435,6 +441,10 @@ class Config:
             "communication_env": {
                 name: os.getenv(name) for name in communication_env_names
             },
+            "hierarchical_control_address": (
+                self.hierarchical_control_address
+                or f"derived-from:{self.master_address}"
+            ),
         }
         encoded = json.dumps(
             payload, sort_keys=True, separators=(",", ":")

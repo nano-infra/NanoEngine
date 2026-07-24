@@ -67,6 +67,12 @@ class LocalScheduler:
         self._terminal_events: list[FinishEvent] = []
         self._inflight_ids: set[int] = set()
         self._all_dummy_engine_quantums = 0
+        self._useful_decode_tokens = 0
+        self._raw_token_slots = 0
+        self._control_dummy_slots = 0
+        self._total_rank_forwards = 0
+        self._all_dummy_rank_forwards = 0
+        self._preemption_count = 0
 
     @property
     def cpp_scheduler(self) -> Scheduler:
@@ -230,6 +236,8 @@ class LocalScheduler:
                     raise RuntimeError(
                         "preempted request retained a bootstrap token"
                     )
+                if record.state != RequestState.WAITING_ADMISSION:
+                    self._preemption_count += 1
                 record.state = RequestState.WAITING_ADMISSION
             elif request_id in running_ids:
                 record.state = RequestState.RUNNING_DECODE
@@ -245,14 +253,17 @@ class LocalScheduler:
             for sequence in sequences
             if self._state_manager.is_control_dummy(sequence)
         )
+        control_dummy_object_ids = frozenset(
+            id(sequence)
+            for sequence in sequences
+            if self._state_manager.is_control_dummy(sequence)
+        )
         real_sequences = [
             sequence
             for sequence in sequences
-            if sequence.seq_id not in control_dummy_ids
+            if id(sequence) not in control_dummy_object_ids
         ]
         self._inflight_ids = {sequence.seq_id for sequence in real_sequences}
-        if not real_sequences:
-            self._all_dummy_engine_quantums += 1
 
         request_master_global_rank = {
             sequence.seq_id: self.topology.global_rank(
@@ -282,6 +293,7 @@ class LocalScheduler:
             frozen_request_order=frozen_request_order,
             control_dummy_ids=control_dummy_ids,
             _all_sequences=sequences,
+            _control_dummy_object_ids=control_dummy_object_ids,
         )
 
     def _finish_aborted(self, request_id: int) -> None:
@@ -336,11 +348,26 @@ class LocalScheduler:
         if batch.engine_id != self.engine_id:
             raise ValueError("decode batch belongs to a different LocalScheduler")
         results_by_rank = batch.validate_worker_results(worker_results)
+        self._raw_token_slots += (
+            len(batch._all_sequences) * HIERARCHICAL_LOOP_COUNT
+        )
+        self._control_dummy_slots += (
+            len(batch._control_dummy_object_ids) * HIERARCHICAL_LOOP_COUNT
+        )
+        rank_forwards = self.topology.world_size * HIERARCHICAL_LOOP_COUNT
+        self._total_rank_forwards += rank_forwards
+        if not batch.engine_has_real:
+            self._all_dummy_engine_quantums += 1
+            self._all_dummy_rank_forwards += rank_forwards
 
         aborted_ids = {
             request_id
             for request_id in self._inflight_ids
             if self._records[request_id].state == RequestState.ABORT_PENDING
+        }
+        completed_before = {
+            request_id: self._records[request_id].sequence.num_completed_tokens
+            for request_id in self._inflight_ids.difference(aborted_ids)
         }
         for request_id in sorted(aborted_ids):
             self._finish_aborted(request_id)
@@ -365,10 +392,13 @@ class LocalScheduler:
                     != sp_idx
                 ):
                     continue
-                if sequence.seq_id in aborted_ids:
+                if (
+                    sequence.seq_id in aborted_ids
+                    and not batch.is_control_dummy(sequence)
+                ):
                     continue
                 rank_sequences.append(sequence)
-                if sequence.seq_id in batch.control_dummy_ids:
+                if batch.is_control_dummy(sequence):
                     rank_token_ids.append([0] * HIERARCHICAL_LOOP_COUNT)
                 else:
                     rank_token_ids.append(
@@ -382,6 +412,11 @@ class LocalScheduler:
             dp_sp_token_ids,
             metrics_manager=None,
             loop_count=HIERARCHICAL_LOOP_COUNT,
+        )
+        self._useful_decode_tokens += sum(
+            self._records[request_id].sequence.num_completed_tokens
+            - completed_before[request_id]
+            for request_id in completed_before
         )
         for request_id in sorted(self._inflight_ids.difference(aborted_ids)):
             record = self._records[request_id]
@@ -424,4 +459,10 @@ class LocalScheduler:
             useful_real_batch_size=len(self._inflight_ids),
             control_dummy_count=len(self._state_manager.dummy_seqs),
             all_dummy_engine_quantums=self._all_dummy_engine_quantums,
+            useful_decode_tokens=self._useful_decode_tokens,
+            raw_token_slots=self._raw_token_slots,
+            control_dummy_slots=self._control_dummy_slots,
+            total_rank_forwards=self._total_rank_forwards,
+            all_dummy_rank_forwards=self._all_dummy_rank_forwards,
+            preemption_count=self._preemption_count,
         )

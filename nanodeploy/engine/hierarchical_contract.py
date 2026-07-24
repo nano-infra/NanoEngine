@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 HIERARCHICAL_LOOP_COUNT = 16
@@ -139,6 +139,54 @@ class LoadSnapshot:
     useful_real_batch_size: int = 0
     control_dummy_count: int = 0
     all_dummy_engine_quantums: int = 0
+    useful_decode_tokens: int = 0
+    raw_token_slots: int = 0
+    control_dummy_slots: int = 0
+    total_rank_forwards: int = 0
+    all_dummy_rank_forwards: int = 0
+    preemption_count: int = 0
+    command_count: int = 0
+    command_queue_delay_ms_total: float = 0.0
+    decode_quantum_count: int = 0
+    admission_latency_ms_total: float = 0.0
+    schedule_latency_ms_total: float = 0.0
+    coordination_latency_ms_total: float = 0.0
+    execute_latency_ms_total: float = 0.0
+    postprocess_latency_ms_total: float = 0.0
+
+    @property
+    def dummy_rank_forward_ratio(self) -> float:
+        if self.total_rank_forwards == 0:
+            return 0.0
+        return self.all_dummy_rank_forwards / self.total_rank_forwards
+
+    @property
+    def dummy_slot_ratio(self) -> float:
+        if self.raw_token_slots == 0:
+            return 0.0
+        return self.control_dummy_slots / self.raw_token_slots
+
+
+@dataclass(frozen=True, slots=True)
+class EngineReady:
+    engine_id: int
+    global_ranks: tuple[int, ...]
+    config_fingerprint: str
+    node_id: str
+    worker_node_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StartWave:
+    wave_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class CoordinatorStatus:
+    wave_id: int
+    running: bool
+    ready: bool
+    pending_wakeup: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,9 +235,15 @@ class LocalDecodeBatch:
     frozen_request_order: dict[int, tuple[int, ...]]
     control_dummy_ids: frozenset[int]
     _all_sequences: list[Any] = field(repr=False, default_factory=list)
+    _control_dummy_object_ids: frozenset[int] = field(
+        repr=False, default_factory=frozenset
+    )
 
     def expected_request_ids(self, global_rank: int) -> tuple[int, ...]:
         return self.frozen_request_order.get(global_rank, ())
+
+    def is_control_dummy(self, sequence: Any) -> bool:
+        return id(sequence) in self._control_dummy_object_ids
 
     def validate_worker_results(
         self, results: Iterable[WorkerDecodeResult]
@@ -218,3 +272,84 @@ class LocalDecodeBatch:
                 f"extra={sorted(extra)}"
             )
         return by_rank
+
+
+def validate_execution_trace_set(
+    traces: Iterable[Mapping[str, Any]],
+    expected_global_ranks: Iterable[int],
+) -> tuple[tuple[int, int], ...]:
+    """Validate a completed integration trace across all global GPU ranks."""
+
+    expected_ranks = tuple(expected_global_ranks)
+    if not expected_ranks or len(set(expected_ranks)) != len(expected_ranks):
+        raise ValueError("expected_global_ranks must be non-empty and unique")
+    by_rank: dict[int, list[tuple[int, int]]] = {
+        rank: [] for rank in expected_ranks
+    }
+    seen_steps: dict[int, set[tuple[int, int]]] = {
+        rank: set() for rank in expected_ranks
+    }
+
+    for trace in traces:
+        global_rank = trace.get("global_rank")
+        if global_rank not in by_rank:
+            raise ValueError(f"trace contains unknown global rank {global_rank}")
+        wave_id = trace.get("wave_id")
+        quantum_id = trace.get("quantum_id")
+        if (
+            not isinstance(wave_id, int)
+            or wave_id <= 0
+            or not isinstance(quantum_id, int)
+            or quantum_id < 0
+        ):
+            raise ValueError("trace contains an invalid wave/quantum identity")
+        step = (wave_id, quantum_id)
+        if step in seen_steps[global_rank]:
+            raise ValueError(
+                f"trace contains duplicate step {step} for rank {global_rank}"
+            )
+        if trace.get("forward_count") != HIERARCHICAL_LOOP_COUNT:
+            raise ValueError(
+                f"rank {global_rank} step {step} did not execute "
+                f"{HIERARCHICAL_LOOP_COUNT} forwards"
+            )
+        if trace.get("batch_kind") not in {
+            "real_or_mixed",
+            "all_control_dummy",
+        }:
+            raise ValueError("trace contains an invalid batch_kind")
+        if any(
+            not isinstance(trace.get(name), int) or trace[name] < 0
+            for name in ("real_batch_size", "control_dummy_count")
+        ):
+            raise ValueError("trace contains an invalid batch size")
+
+        forwards = tuple(trace.get("forwards", ()))
+        inner_loops = tuple(item.get("inner_loop_idx") for item in forwards)
+        if inner_loops != tuple(range(HIERARCHICAL_LOOP_COUNT)):
+            raise ValueError(
+                f"rank {global_rank} step {step} has invalid inner-loop order"
+            )
+        if any(
+            item.get("forward_begin") is None
+            or item.get("forward_end") is None
+            or item["forward_end"] < item["forward_begin"]
+            for item in forwards
+        ):
+            raise ValueError("trace contains an invalid forward interval")
+
+        seen_steps[global_rank].add(step)
+        by_rank[global_rank].append(step)
+
+    reference = tuple(by_rank[expected_ranks[0]])
+    if not reference:
+        raise ValueError("execution trace set is empty")
+    if reference != tuple(sorted(reference)):
+        raise ValueError("execution trace steps are not monotonic")
+    for rank in expected_ranks[1:]:
+        if tuple(by_rank[rank]) != reference:
+            raise ValueError(
+                "global ranks executed different wave/quantum sequences: "
+                f"rank={rank}, expected={reference}, got={tuple(by_rank[rank])}"
+            )
+    return reference

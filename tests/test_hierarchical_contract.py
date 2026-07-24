@@ -123,6 +123,7 @@ def test_hierarchical_config_uses_deepseek_v3_mla_contract():
     assert config.hf_config.architectures == ["DeepseekV3ForCausalLM"]
     assert config.hf_config.num_key_value_heads == 1
     assert config.kvcache_block_size == 64
+    assert not config.hierarchical_execution_trace
     assert len(config.collective_fingerprint()) == 64
 
 
@@ -338,6 +339,12 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert local.state_manager.num_running_seqs == 0
     assert local.state_manager.num_running_tokens == 0
     assert local.is_finished()
+    load = local.load_snapshot(wave_id=1, quantum_id=2)
+    assert load.useful_decode_tokens == 17
+    assert load.raw_token_slots == 128
+    assert load.control_dummy_slots == 96
+    assert load.total_rank_forwards == 128
+    assert load.all_dummy_rank_forwards == 0
 
 
 def test_local_scheduler_inflight_abort_wins_before_commit():
@@ -364,6 +371,31 @@ def test_local_scheduler_inflight_abort_wins_before_commit():
     assert local.state_manager.num_running_seqs == 0
     assert local.state_manager.num_running_tokens == 0
     assert local.abort(77).status == "already_terminal"
+    assert local.is_finished()
+
+
+def test_local_scheduler_waiting_abort_emits_terminal_immediately():
+    config = make_hierarchical_config()
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    assert local.add(
+        AddCommand(
+            request_id=78,
+            prompt_token_ids=(10, 11),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+    ).accepted
+
+    assert local.abort(78).status == "aborted"
+    events = local.drain_terminal_events()
+    assert [(event.request_id, event.status) for event in events] == [
+        (78, "ABORTED")
+    ]
+    assert local.drain_terminal_events() == ()
+    assert local.state_manager.num_running_seqs == 0
+    assert local.state_manager.num_running_tokens == 0
     assert local.is_finished()
 
 
@@ -398,6 +430,7 @@ def test_local_scheduler_preempts_running_tail_and_readmits_cleanly():
     assert waiting[0].num_tokens == 60
     assert waiting[0].num_bootstrap_tokens == 0
     assert local.state_manager.num_running_tokens == 61
+    assert local.load_snapshot(wave_id=1, quantum_id=0).preemption_count == 1
 
     events = local.postprocess(batch, make_worker_results(batch))
     assert [(event.request_id, event.status) for event in events] == [
@@ -410,3 +443,62 @@ def test_local_scheduler_preempts_running_tail_and_readmits_cleanly():
     assert readmitted.num_tokens == 61
     assert readmitted.num_bootstrap_tokens == 1
     assert local.state_manager.num_running_tokens == 61
+
+
+def test_real_request_id_can_match_control_dummy_internal_id():
+    config = make_hierarchical_config()
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    colliding_id = local.state_manager.dummy_seqs[0].seq_id
+    assert local.add(
+        AddCommand(
+            request_id=colliding_id,
+            prompt_token_ids=(10, 11),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+    ).accepted
+    assert local.admit() == (colliding_id,)
+
+    batch = local.plan_decode(wave_id=1, quantum_id=0)
+    assert batch.engine_has_real
+    assert colliding_id in batch.request_master_global_rank
+    events = local.postprocess(batch, make_worker_results(batch))
+    assert [(event.request_id, event.status) for event in events] == [
+        (colliding_id, "FINISHED")
+    ]
+
+
+def test_control_dummy_id_collision_does_not_remove_dummy_on_abort():
+    config = make_hierarchical_config()
+    local = LocalScheduler(config, config.hierarchical_topology.engine(0))
+    collision_dummy = local.state_manager.dummy_seqs[1]
+    colliding_id = collision_dummy.seq_id
+    assert local.add(
+        AddCommand(
+            request_id=colliding_id,
+            prompt_token_ids=(10, 11),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+    ).accepted
+    local.admit()
+    batch = local.plan_decode(wave_id=1, quantum_id=0)
+    assert any(
+        id(sequence) == id(collision_dummy)
+        for sequence in batch._all_sequences
+    )
+
+    assert local.abort(colliding_id).status == "abort_pending"
+    events = local.postprocess(batch, make_worker_results(batch))
+
+    assert [(event.request_id, event.status) for event in events] == [
+        (colliding_id, "ABORTED")
+    ]
+    assert any(
+        id(sequence) == id(collision_dummy)
+        for sequence in batch._all_sequences
+    )

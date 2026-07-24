@@ -10,13 +10,19 @@ import numpy as np
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-from nanodeploy._cpp import BlockContextSlot
+from nanodeploy._cpp import BlockContextSlot, SequenceStatus
 from nanodeploy.config import Config
+from nanodeploy.engine.deployment_manager import DeploymentManager
+from nanodeploy.engine.hierarchical_contract import (
+    AddResult,
+    FinishEvent,
+)
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.metrics import MetricsManager
+from nanodeploy.router.request_router import RequestRouter
 
 logger = get_logger()
 
@@ -45,9 +51,30 @@ class LLMEngine:
         self.config.engine_id = self.engine_id
         self.ps = []
         self.events = []
+        self.metrics_manager = MetricsManager()
+        self._closed = False
         self.log_decode_step_detail = _env_flag_enabled(
             "NANODEPLOY_LOG_DECODE_STEP_DETAIL", default=False
         )
+
+        if config.scheduler_arch == "hierarchical":
+            self.tokenizer = None
+            config.eos = getattr(config.hf_config, "eos_token_id", 1) or 1
+            self.executor = None
+            self.scheduler = None
+            self.deployment = DeploymentManager(config)
+            self.router = RequestRouter(
+                self.deployment.engine_clients,
+                wakeup=(
+                    self.deployment.notify_request
+                    if config.attention_dp > 1
+                    else None
+                ),
+            )
+            self._hierarchical_sequences: dict[int, Sequence] = {}
+            self._last_load_report_time = 0.0
+            atexit.register(self.exit)
+            return
 
         self.executor = RayExecutor(config=config)
         self.update_num_kvcache_blocks()
@@ -64,11 +91,18 @@ class LLMEngine:
         logger.info(
             f"Initialized Scheduler with RoutingStrategy: {self.scheduler.routing_strategy}"
         )
-        self.metrics_manager = MetricsManager()
         atexit.register(self.exit)
 
     def exit(self):
-        del self.executor
+        if self._closed:
+            return
+        self._closed = True
+        if self.config.scheduler_arch == "hierarchical":
+            self.deployment.close()
+            return
+        if self.executor is not None:
+            del self.executor
+            self.executor = None
 
     def update_num_kvcache_blocks(self):
         self.config.num_kvcache_blocks = self.executor.update_kvcache_blocks()
@@ -77,6 +111,27 @@ class LLMEngine:
     def add_request(self, seqs: Sequence | list[Sequence]):
         if isinstance(seqs, Sequence):
             seqs = [seqs]
+        if self.config.scheduler_arch == "hierarchical":
+            results: list[AddResult] = []
+            for seq in seqs:
+                result = self.router.add(
+                    request_id=seq.seq_id,
+                    prompt_token_ids=tuple(seq.prompt_token_ids),
+                    max_tokens=seq.max_tokens,
+                    temperature=seq.temperature,
+                    ignore_eos=seq.ignore_eos,
+                )
+                if result.accepted:
+                    seq.metric = self.metrics_manager.create_sequence_metric(
+                        seq.seq_id, seq.num_prompt_tokens
+                    )
+                    seq.metric.record_arrival()
+                    seq.metric.record_decode_arrival()
+                    seq.metric.record_first_scheduled()
+                    seq.metric.record_decode_scheduled()
+                    self._hierarchical_sequences[seq.seq_id] = seq
+                results.append(result)
+            return results[0] if len(results) == 1 else tuple(results)
         for seq in seqs:
             seq.metric = self.metrics_manager.create_sequence_metric(
                 seq.seq_id, seq.num_prompt_tokens
@@ -84,9 +139,26 @@ class LLMEngine:
             self.scheduler.add(seq)
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
+        if self.config.scheduler_arch == "hierarchical":
+            raise RuntimeError(
+                "hierarchical dummy-decode mode does not support KV migration"
+            )
         self.scheduler.free_to_be_migrated(seqs)
 
     def step(self):
+        if self.config.scheduler_arch == "hierarchical":
+            events = self.poll()
+            outputs = [
+                (event.request_id, [])
+                for event in events
+            ]
+            return (
+                outputs,
+                -sum(event.generated_count for event in events),
+                self.router.active_count,
+                0.0,
+                0.0,
+            )
         step_start = time.perf_counter()
         dp_size = self.config.attention_dp
         sp_size = self.config.attention_sp
@@ -303,11 +375,146 @@ class LLMEngine:
         )
 
     def is_finished(self):
+        if self.config.scheduler_arch == "hierarchical":
+            return self.router.is_idle
         return self.scheduler.is_finished()
+
+    def poll(self) -> tuple[FinishEvent, ...]:
+        if self.config.scheduler_arch != "hierarchical":
+            outputs, *_ = self.step()
+            return tuple(
+                FinishEvent(
+                    request_id=seq_id,
+                    generated_count=len(token_ids),
+                    status="FINISHED",
+                    engine_id=-1,
+                )
+                for seq_id, token_ids in outputs
+            )
+
+        events = self.deployment.poll_events()
+        now = time.monotonic()
+        if (
+            now - self._last_load_report_time
+            >= self.config.load_report_interval_ms / 1000
+        ):
+            snapshots = self.deployment.load_snapshots()
+            self.router.record_loads(snapshots)
+            self._last_load_report_time = now
+            self.metrics_manager.server_metric.update_waiting_requests(
+                sum(snapshot.waiting for snapshot in snapshots)
+            )
+            self.metrics_manager.server_metric.update_running_requests(
+                sum(snapshot.running for snapshot in snapshots)
+            )
+        for event in events:
+            self.router.finish(event)
+            sequence = self._hierarchical_sequences[event.request_id]
+            metric = sequence.metric
+            if metric is not None:
+                metric.num_generated_tokens = event.generated_count
+                if event.generated_count > 0 and metric.first_token_time is None:
+                    metric.record_first_token()
+                self.metrics_manager.complete_sequence(event.request_id)
+            sequence.status = SequenceStatus.FINISHED
+        return events
+
+    def abort_request(self, request_id: int):
+        if self.config.scheduler_arch != "hierarchical":
+            raise RuntimeError(
+                "abort_request is currently implemented for hierarchical mode"
+            )
+        return self.router.abort(request_id)
+
+    def drain_execution_traces(self) -> tuple[dict, ...]:
+        if self.config.scheduler_arch != "hierarchical":
+            raise RuntimeError(
+                "execution traces are only available in hierarchical mode"
+            )
+        return self.deployment.execution_traces()
+
+    def hierarchical_metrics(self, *, refresh: bool = True) -> dict:
+        if self.config.scheduler_arch != "hierarchical":
+            raise RuntimeError(
+                "hierarchical metrics are only available in hierarchical mode"
+            )
+        if refresh:
+            snapshots = self.deployment.load_snapshots()
+            self.router.record_loads(snapshots)
+        else:
+            snapshots = tuple(self.router.last_loads().values())
+        if not snapshots:
+            return {}
+
+        summed_fields = (
+            "useful_decode_tokens",
+            "raw_token_slots",
+            "control_dummy_slots",
+            "total_rank_forwards",
+            "all_dummy_rank_forwards",
+            "preemption_count",
+            "command_count",
+            "command_queue_delay_ms_total",
+            "decode_quantum_count",
+            "admission_latency_ms_total",
+            "schedule_latency_ms_total",
+            "coordination_latency_ms_total",
+            "execute_latency_ms_total",
+            "postprocess_latency_ms_total",
+        )
+        metrics = {
+            field: sum(getattr(snapshot, field) for snapshot in snapshots)
+            for field in summed_fields
+        }
+        metrics.update(
+            {
+                "waiting_requests": sum(
+                    snapshot.waiting for snapshot in snapshots
+                ),
+                "running_requests": sum(
+                    snapshot.running for snapshot in snapshots
+                ),
+                "free_blocks_min": min(
+                    snapshot.free_blocks_min for snapshot in snapshots
+                ),
+            }
+        )
+        raw_slots = metrics["raw_token_slots"]
+        rank_forwards = metrics["total_rank_forwards"]
+        metrics["dummy_slot_ratio"] = (
+            metrics["control_dummy_slots"] / raw_slots
+            if raw_slots
+            else 0.0
+        )
+        metrics["dummy_rank_forward_ratio"] = (
+            metrics["all_dummy_rank_forwards"] / rank_forwards
+            if rank_forwards
+            else 0.0
+        )
+        measured_ms = sum(
+            metrics[name]
+            for name in (
+                "admission_latency_ms_total",
+                "schedule_latency_ms_total",
+                "coordination_latency_ms_total",
+                "execute_latency_ms_total",
+                "postprocess_latency_ms_total",
+            )
+        )
+        metrics["coordination_overhead_ratio"] = (
+            metrics["coordination_latency_ms_total"] / measured_ms
+            if measured_ms
+            else 0.0
+        )
+        return metrics
 
     def p2p_init(
         self, remote_engine_name: str, num_kv_blocks: int, remote_world_size: int
     ):
+        if self.config.scheduler_arch == "hierarchical":
+            raise RuntimeError(
+                "hierarchical dummy-decode mode does not support P/D migration"
+            )
         return self.executor.p2p_init(
             remote_engine_name, num_kv_blocks, remote_world_size
         )
@@ -315,6 +522,10 @@ class LLMEngine:
     def p2p_connect(
         self, remote_engine_name: str, remote_endpoints_info: list[list[dict]]
     ):
+        if self.config.scheduler_arch == "hierarchical":
+            raise RuntimeError(
+                "hierarchical dummy-decode mode does not support P/D migration"
+            )
         return self.executor.p2p_connect(remote_engine_name, remote_endpoints_info)
 
     def generate(
@@ -322,6 +533,8 @@ class LLMEngine:
         use_tqdm: bool = True,
         log_metrics_interval: int = 10,
     ) -> None:
+        if self.config.scheduler_arch == "hierarchical":
+            return self._generate_hierarchical(use_tqdm=use_tqdm)
         num_reqs = self.scheduler.get_total_waiting_size()
         if use_tqdm:
             pbar = tqdm(total=num_reqs, desc="Generating", dynamic_ncols=True)
@@ -373,3 +586,28 @@ class LLMEngine:
         logger.info("=" * 60)
 
         return
+
+    def _generate_hierarchical(self, *, use_tqdm: bool) -> None:
+        total = self.router.active_count
+        pbar = (
+            tqdm(total=total, desc="Generating", dynamic_ncols=True)
+            if use_tqdm
+            else None
+        )
+        while not self.is_finished():
+            events = self.poll()
+            if not events:
+                time.sleep(0.001)
+                continue
+            if pbar is not None:
+                pbar.update(len(events))
+                pbar.set_postfix(
+                    {
+                        "active": self.router.active_count,
+                        "wave": self.router.wave_id,
+                    }
+                )
+        if pbar is not None:
+            pbar.close()
+        logger.info({"mode": "hierarchical", **self.hierarchical_metrics()})
+        self.metrics_manager.log_server_metrics(include_detailed=True)

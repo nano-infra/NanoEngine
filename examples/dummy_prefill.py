@@ -43,7 +43,15 @@ def main():
     parser.add_argument("--max-num-send-seqs", type=int, default=128)
     parser.add_argument("--max-num-recv-seqs", type=int, default=130)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--loop-count", type=int, default=48)
+    parser.add_argument(
+        "--loop-count",
+        type=int,
+        default=None,
+        help=(
+            "Steps per decode iteration. Defaults to 16 for hierarchical "
+            "and 48 for legacy_global."
+        ),
+    )
     parser.add_argument("--max-model-len", type=int, default=200_000)
     parser.add_argument("--max-num-batched-tokens", type=int, default=200_000)
     parser.add_argument("--num-steps", type=int, default=0)
@@ -55,6 +63,9 @@ def main():
     parser.add_argument("--profiling-duration", type=float, default=None)
     args = parser.parse_args()
     path = os.path.expanduser(args.model_path)
+    loop_count = args.loop_count
+    if loop_count is None:
+        loop_count = 16 if args.scheduler_arch == "hierarchical" else 48
 
     decode = LLM(
         path,
@@ -74,7 +85,7 @@ def main():
         max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
-        loop_count=args.loop_count,
+        loop_count=loop_count,
         max_num_send_seqs=args.max_num_send_seqs,
         max_num_recv_seqs=args.max_num_recv_seqs,
         kvcache_block_size=64,
@@ -91,7 +102,7 @@ def main():
 
     print(
         f"Starting with scheduler_arch={args.scheduler_arch}, "
-        f"routing_strategy={args.routing_strategy}"
+        f"routing_strategy={args.routing_strategy}, loop_count={loop_count}"
     )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=args.max_tokens, ignore_eos=True)

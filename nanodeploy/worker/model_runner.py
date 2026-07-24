@@ -53,7 +53,12 @@ architectures = {
 
 @ray.remote(num_cpus=0.1, num_gpus=1)
 class ModelRunner:
-    def __init__(self, config: Config, rank: int):
+    def __init__(
+        self,
+        config: Config,
+        rank: int,
+        engine_local_rank: int | None = None,
+    ):
         self.config = config
         self.engine_id = self.config.engine_id
         hf_config = config.hf_config
@@ -61,6 +66,9 @@ class ModelRunner:
         self.cuda_graph_mode = config.cuda_graph_mode
         self.world_size = config.attn_world_size
         self.rank = rank
+        self.engine_local_rank = (
+            rank if engine_local_rank is None else engine_local_rank
+        )
         self.log_decode_a2a_masks = _env_flag_enabled(
             "NANODEPLOY_LOG_DECODE_A2A_MASKS", default=False
         )
@@ -204,7 +212,9 @@ class ModelRunner:
         # self.warmup_model()
         self.preallocate_kvcache()
 
-        self.endpoint = RPCClientEndpoint(32*32_000_000, get_dist_context().rank)
+        self.endpoint = RPCClientEndpoint(
+            32 * 32_000_000, self.engine_local_rank
+        )
 
     def init_rpc_endpoint(self, server_info):
         client_info = self.endpoint.init_client_endpoint()
@@ -214,6 +224,15 @@ class ModelRunner:
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
+
+    def get_worker_identity(self):
+        return {
+            "global_rank": self.rank,
+            "engine_local_rank": self.engine_local_rank,
+            "node_id": ray.get_runtime_context().get_node_id(),
+            "gpu_ids": tuple(ray.get_gpu_ids()),
+            "config_fingerprint": self.config.collective_fingerprint(),
+        }
 
     def allocate_kvcache(self, num_kvcache_blocks: int):
         self.config.num_kvcache_blocks = num_kvcache_blocks
@@ -237,6 +256,12 @@ class ModelRunner:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(self.default_dtype)
+
+    def zero_kvcache(self):
+        cache_context = get_cache_context()
+        cache_context.kv_cache.zero_()
+        torch.cuda.synchronize()
+        return cache_context.kv_cache.numel()
 
     def p2p_init(self, remote_engine_id, num_kv_blocks, remote_engine_world_size):
         return get_cache_context().p2p_init(
@@ -827,11 +852,30 @@ class ModelRunner:
         get_cache_context().migrate(seqs=seqs)
 
     def run(
-        self, dp_seqs: list[Sequence], is_prefill: bool, enable_rpc: bool = False, send_timestamp: float = 0.0
-    ) -> list[list[int]]:
+        self,
+        dp_seqs: list[Sequence],
+        is_prefill: bool,
+        enable_rpc: bool = False,
+        send_timestamp: float = 0.0,
+        hierarchical_trace: dict | None = None,
+    ) -> (
+        tuple[list[list[int]], float]
+        | tuple[list[list[int]], float, dict]
+    ):
 
         if enable_rpc:
             dp_seqs = self.endpoint.recv_seqs()
+
+        if hierarchical_trace is not None:
+            if is_prefill:
+                raise RuntimeError(
+                    "hierarchical execution trace is decode-only"
+                )
+            if hierarchical_trace.get("global_rank") != self.rank:
+                raise RuntimeError(
+                    "hierarchical trace/global worker rank mismatch"
+                )
+            execution_forwards: list[dict] = []
 
         if send_timestamp > 0:
             latency = (time.time() - send_timestamp) * 1000
@@ -910,7 +954,20 @@ class ModelRunner:
                 if self.log_decode_a2a_masks:
                     self._log_decode_a2a_masks(loop_idx=i, is_dummy=is_dummy)
 
-            logits = self.run_model(input_ids, positions, is_prefill)
+            if hierarchical_trace is not None:
+                forward_begin = time.perf_counter()
+                logits = self.run_model(input_ids, positions, is_prefill)
+                forward_end = time.perf_counter()
+                execution_forwards.append(
+                    {
+                        "inner_loop_idx": i,
+                        "use_sp_a2a": bool(get_context().use_sp_a2a),
+                        "forward_begin": forward_begin,
+                        "forward_end": forward_end,
+                    }
+                )
+            else:
+                logits = self.run_model(input_ids, positions, is_prefill)
 
             tp_rank = get_dist_context().attn_tp_rank
             if tp_rank == 0:
@@ -1030,6 +1087,11 @@ class ModelRunner:
         reset_context()
         worker_end_time = time.time()
 
+        if hierarchical_trace is not None:
+            trace = dict(hierarchical_trace)
+            trace["forward_count"] = loop_count
+            trace["forwards"] = tuple(execution_forwards)
+            return loop_count_token_ids, worker_end_time, trace
         return loop_count_token_ids, worker_end_time
 
     @torch.inference_mode()
