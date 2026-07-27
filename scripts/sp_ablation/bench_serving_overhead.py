@@ -1,9 +1,11 @@
 import argparse
+import json
 import os
 import sys
 import time
 from random import randint, seed
 from dataclasses import asdict
+from pathlib import Path
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
@@ -16,6 +18,7 @@ if ROOT_DIR not in sys.path:
 import numpy as np
 import pandas as pd
 from nanodeploy import LLM, SamplingParams
+from nanodeploy.engine.hierarchical_contract import FinishEvent
 from nanodeploy.engine.sequence import Sequence
 from tqdm.auto import tqdm
 
@@ -49,7 +52,33 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="random", choices=["random", "csv"], help="Dataset type.")
     parser.add_argument("--csv-path", type=str, default=None, help="Path to CSV file.")
     parser.add_argument("--max-input-len", type=int, default=None, help="Filter out CSV rows with prompt_len >= this value.")
-    parser.add_argument("--itl-log-path", type=str, default="itl_samples.jsonl", help="Path to save ITL samples (JSONL).")
+    parser.add_argument(
+        "--itl-log-path",
+        type=str,
+        default="itl_samples.jsonl",
+        help=(
+            "Compatibility path for request-level metric JSONL. Raw per-token "
+            "ITL samples are not required."
+        ),
+    )
+    parser.add_argument(
+        "--request-metrics-log-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to incrementally save one scalar metric record per request. "
+            "Defaults to --itl-log-path for compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--metrics-summary-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to save aggregate metric percentiles. Defaults to "
+            "<request-metrics-log-path stem>.summary.json."
+        ),
+    )
     
     # Distributed / Cluster arguments
     parser.add_argument("--master-address", type=str, default=None, help="Ray master address.")
@@ -91,6 +120,13 @@ def parse_args():
     parser.add_argument("--scheduler-arch", type=str, default="legacy_global",
                         choices=["legacy_global", "hierarchical"],
                         help="Scheduler architecture (default: legacy_global).")
+    parser.add_argument(
+        "--router-policy",
+        type=str,
+        default="least_batch",
+        choices=["round_robin", "least_batch", "least_cache"],
+        help="Hierarchical load-balancer policy (default: least_batch).",
+    )
     
     # Profiler arguments
     parser.add_argument("--enable-profiler", action="store_true", help="Enable profiler.")
@@ -99,6 +135,38 @@ def parse_args():
     parser.add_argument("--profiler-dir", type=str, default="./profiler_logs", help="Directory to save profiler logs.")
     parser.add_argument("--profiler-start-time", type=float, default=None, help="Start profiling after N seconds (time-based mode).")
     parser.add_argument("--profiling-duration", type=float, default=None, help="Profile for N seconds (time-based mode).")
+    parser.add_argument(
+        "--diagnostic-log-interval",
+        type=float,
+        default=0.0,
+        help=(
+            "Emit a structured [BENCH_DIAG] scheduler/client snapshot every N "
+            "seconds (0 disables diagnostics)."
+        ),
+    )
+    parser.add_argument(
+        "--slow-add-threshold-ms",
+        type=float,
+        default=0.0,
+        help=(
+            "Emit [BENCH_SLOW_ASYNC_SUBMIT] when a due-batch submission "
+            "exceeds this latency in milliseconds (0 disables it)."
+        ),
+    )
+    parser.add_argument(
+        "--hierarchical-execution-trace",
+        action="store_true",
+        help=(
+            "Capture detailed per-rank hierarchical execution traces. This "
+            "has non-trivial overhead and is intended only for diagnosis."
+        ),
+    )
+    parser.add_argument(
+        "--hierarchical-trace-log-path",
+        type=str,
+        default=None,
+        help="JSONL output path for --hierarchical-execution-trace.",
+    )
     
     args = parser.parse_args()
     
@@ -107,7 +175,27 @@ def parse_args():
             parser.error("--csv-path is required when --dataset=csv")
         if not os.path.exists(args.csv_path):
             parser.error(f"CSV file not found: {args.csv_path}")
-            
+    if args.diagnostic_log_interval < 0:
+        parser.error("--diagnostic-log-interval must be non-negative")
+    if args.slow_add_threshold_ms < 0:
+        parser.error("--slow-add-threshold-ms must be non-negative")
+    if args.hierarchical_execution_trace:
+        if args.scheduler_arch != "hierarchical":
+            parser.error(
+                "--hierarchical-execution-trace requires "
+                "--scheduler-arch hierarchical"
+            )
+        if args.diagnostic_log_interval <= 0:
+            parser.error(
+                "--hierarchical-execution-trace requires a positive "
+                "--diagnostic-log-interval so traces are drained periodically"
+            )
+        if not args.hierarchical_trace_log_path:
+            parser.error(
+                "--hierarchical-trace-log-path is required with "
+                "--hierarchical-execution-trace"
+            )
+
     return args
 
 
@@ -222,13 +310,33 @@ def run_warmup(engine, max_num_seqs, world_size):
     for prompt in warmup_prompts:
         seq = Sequence(token_ids=prompt, sampling_params=warmup_sampling_params)
         warmup_seqs.append(seq)
-        engine.add_request(seq)
+    if getattr(engine.config, "scheduler_arch", None) == "hierarchical":
+        engine.submit_requests_async(warmup_seqs)
+    else:
+        engine.add_request(warmup_seqs)
     
     # Process warmup requests
     warmup_start = time.perf_counter()
     with tqdm(total=num_warmup_requests, desc="Warmup Requests") as pbar:
         completed = 0
         while completed < num_warmup_requests:
+            if getattr(engine.config, "scheduler_arch", None) == "hierarchical":
+                rejected_acks = [
+                    ack
+                    for ack in engine.poll_ingress_acks()
+                    if not ack.enqueued
+                ]
+                rejected_adds = [
+                    result
+                    for result in engine.poll_add_results()
+                    if not result.accepted
+                ]
+                if rejected_acks or rejected_adds:
+                    raise RuntimeError(
+                        "hierarchical warmup request rejected: "
+                        f"ingress={rejected_acks}, add={rejected_adds}"
+                    )
+                engine.poll_first_token_events()
             if not engine.is_finished():
                 outputs, _, _, _, _ = engine.step()
                 for seq_id, _ in outputs:
@@ -247,8 +355,163 @@ def run_warmup(engine, max_num_seqs, world_size):
     print(f"{'=' * 60}\n")
 
 
-def run_benchmark(engine, request_generator, arrival_times, num_requests):
+def metric_percentiles(records, key):
+    values = [
+        float(record[key])
+        for record in records
+        if not record.get("is_error") and record.get(key) is not None
+    ]
+    if not values:
+        return None
+    data = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": round(float(np.mean(data)), 3),
+        "p50": round(float(np.percentile(data, 50)), 3),
+        "p90": round(float(np.percentile(data, 90)), 3),
+        "p95": round(float(np.percentile(data, 95)), 3),
+        "p99": round(float(np.percentile(data, 99)), 3),
+        "max": round(float(np.max(data)), 3),
+    }
+
+
+def _weighted_metric_percentiles(samples):
+    weighted = sorted(
+        (
+            float(sample.itl_ms),
+            int(sample.token_count),
+        )
+        for sample in samples
+        if int(sample.token_count) > 0
+    )
+    if not weighted:
+        return None
+
+    values = np.asarray([item[0] for item in weighted], dtype=np.float64)
+    weights = np.asarray([item[1] for item in weighted], dtype=np.int64)
+    cumulative = np.cumsum(weights)
+    total_weight = int(cumulative[-1])
+
+    def percentile(percent):
+        position = (total_weight - 1) * percent / 100.0
+        lower = int(np.floor(position))
+        upper = int(np.ceil(position))
+
+        def value_at(index):
+            value_index = int(
+                np.searchsorted(cumulative, index, side="right")
+            )
+            return float(values[value_index])
+
+        lower_value = value_at(lower)
+        upper_value = value_at(upper)
+        return lower_value + (upper_value - lower_value) * (
+            position - lower
+        )
+
+    return {
+        "mean": round(
+            float(np.average(values, weights=weights)), 3
+        ),
+        "p50": round(percentile(50), 3),
+        "p90": round(percentile(90), 3),
+        "p95": round(percentile(95), 3),
+        "p99": round(percentile(99), 3),
+        "max": round(float(values[-1]), 3),
+        "token_intervals": total_weight,
+        "quantum_samples": len(weighted),
+    }
+
+
+def build_hierarchical_itl_summary(samples):
+    samples = tuple(samples)
+    global_stats = _weighted_metric_percentiles(samples)
+    if global_stats is None:
+        return None
+    engine_ids = sorted({int(sample.engine_id) for sample in samples})
+    return {
+        "definition": (
+            "LocalEngine executor duration / loop_count, weighted by "
+            "generated inter-token slots"
+        ),
+        **global_stats,
+        "per_engine": {
+            str(engine_id): _weighted_metric_percentiles(
+                sample
+                for sample in samples
+                if int(sample.engine_id) == engine_id
+            )
+            for engine_id in engine_ids
+        },
+    }
+
+
+def default_metrics_summary_path(request_metrics_log_path):
+    if not request_metrics_log_path:
+        return None
+    path = Path(request_metrics_log_path)
+    if path.suffix:
+        return str(path.with_suffix(".summary.json"))
+    return str(path.with_name(f"{path.name}.summary.json"))
+
+
+def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
+    successful = [
+        record for record in records if not record.get("is_error")
+    ]
+    tpot_values = [
+        float(record["tpot_with_queue_ms"])
+        for record in successful
+        if record.get("tpot_with_queue_ms") is not None
+    ]
+    slo_success = sum(value < slo_threshold_ms for value in tpot_values)
+    return {
+        "total_requests": len(records),
+        "successful_requests": len(successful),
+        "failed_requests": len(records) - len(successful),
+        "e2e_ms": metric_percentiles(records, "e2e_ms"),
+        "ttft_ms": metric_percentiles(records, "ttft_ms"),
+        "tpot_with_queue_ms": metric_percentiles(
+            records, "tpot_with_queue_ms"
+        ),
+        "dispatch_lag_ms": metric_percentiles(records, "dispatch_lag_ms"),
+        "ingress_ack_latency_ms": metric_percentiles(
+            records, "ingress_ack_latency_ms"
+        ),
+        "add_accept_latency_ms": metric_percentiles(
+            records, "add_accept_latency_ms"
+        ),
+        "goodput": {
+            "metric": "tpot_with_queue_ms",
+            "threshold_ms": slo_threshold_ms,
+            "successful_requests": slo_success,
+            "eligible_requests": len(tpot_values),
+            "attainment_percent": round(
+                100.0 * slo_success / len(tpot_values), 3
+            )
+            if tpot_values
+            else 0.0,
+        },
+    }
+
+
+def run_benchmark(
+    engine,
+    request_generator,
+    arrival_times,
+    num_requests,
+    *,
+    diagnostic_log_interval=0.0,
+    slow_add_threshold_ms=0.0,
+    hierarchical_trace_log_path=None,
+    request_metrics_log_path=None,
+    metrics_summary_path=None,
+    clock_ns=None,
+    sleep_fn=None,
+    show_progress=True,
+):
     """Runs the main benchmark loop with rate-controlled request submission."""
+    clock_ns = clock_ns or time.perf_counter_ns
+    sleep_fn = sleep_fn or time.sleep
     seq_map = {}
     completed_latencies = []
 
@@ -267,38 +530,665 @@ def run_benchmark(engine, request_generator, arrival_times, num_requests):
     requests_to_send = len(all_seqs)
     print(f"Prepared {requests_to_send} requests. Submitting according to arrival_times (rate-controlled).")
 
+    if len(arrival_times) < requests_to_send:
+        raise ValueError("arrival_times is shorter than the prepared requests")
+
     next_idx = 0
-    start_time = time.perf_counter()
+    start_ns = clock_ns()
+    start_time = start_ns / 1_000_000_000
+    dispatched = 0
+    ingress_enqueued = 0
+    ingress_rejected = 0
+    accepted = 0
+    scheduler_rejected = 0
+    failed = 0
+    completed = 0
+    dispatch_lag_ms = []
+    ingress_ack_latency_ms = []
+    add_accept_latency_ms = []
+    observed_ttft_ms = []
+    observed_e2e_ms = []
+    request_times = {
+        seq.seq_id: {
+            "scheduled_ns": start_ns
+            + int(float(arrival_times[index]) * 1_000_000_000)
+        }
+        for index, seq in enumerate(all_seqs)
+    }
+    terminal_ids = set()
+    rejected_ids = set()
+    last_dispatch_ns = start_ns
+    slow_add_count = 0
+    last_diag_time = start_time
+    previous_hierarchical = None
+    previous_hierarchical_time = start_time
+    trace_file = None
+    request_metrics_file = None
+    request_metric_records = []
+    recorded_request_ids = set()
 
-    with tqdm(total=requests_to_send, desc="Processing Requests") as pbar:
-        while next_idx < requests_to_send or not engine.is_finished():
-            now = time.perf_counter() - start_time
+    if request_metrics_log_path:
+        request_metrics_path = Path(request_metrics_log_path).expanduser()
+        request_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        request_metrics_file = request_metrics_path.open(
+            "w",
+            encoding="utf-8",
+            buffering=1,
+        )
+        request_metrics_log_path = str(request_metrics_path)
+        if metrics_summary_path is None:
+            metrics_summary_path = default_metrics_summary_path(
+                request_metrics_log_path
+            )
 
-            # Submit all requests whose arrival time has passed
-            while next_idx < requests_to_send and arrival_times[next_idx] <= now:
-                engine.add_request(all_seqs[next_idx])
-                next_idx += 1
+    def _interval_ms(timing, end_key, start_key):
+        end_ns = timing.get(end_key)
+        start_value_ns = timing.get(start_key)
+        if end_ns is None or start_value_ns is None:
+            return None
+        return round((end_ns - start_value_ns) / 1_000_000, 6)
 
-            if not engine.is_finished():
-                outputs, _, _, _, _ = engine.step()
-                for seq_id, _ in outputs:
-                    if seq_id in seq_map:
-                        seq = seq_map[seq_id]
-                        if seq.metric and seq.metric.e2e_latency:
-                            completed_latencies.append(seq.metric.e2e_latency / 1000)
-                            avg_lat = np.mean(completed_latencies)
-                            pbar.set_postfix({"Avg Latency": f"{avg_lat:.2f}s"})
-                        pbar.update(1)
-            else:
-                # Engine idle: wait for next scheduled arrival
-                if next_idx < requests_to_send:
-                    wait = arrival_times[next_idx] - (time.perf_counter() - start_time)
-                    if wait > 0:
-                        time.sleep(min(wait, 0.005))
+    def append_request_record(record):
+        request_id = record["request_id"]
+        if request_id in recorded_request_ids:
+            raise RuntimeError(
+                f"duplicate request metric record {request_id}"
+            )
+        recorded_request_ids.add(request_id)
+        request_metric_records.append(record)
+        if request_metrics_file is not None:
+            request_metrics_file.write(
+                json.dumps(
+                    record, sort_keys=True, separators=(",", ":")
+                )
+                + "\n"
+            )
+            request_metrics_file.flush()
+
+    def build_request_record(
+        *,
+        request_id,
+        engine_id,
+        status,
+        actual_output_tokens,
+        observed_ns,
+        error_message=None,
+    ):
+        timing = request_times[request_id]
+        seq = seq_map[request_id]
+        timing["completion_ns"] = observed_ns
+        e2e_ms = _interval_ms(timing, "completion_ns", "dispatch_ns")
+        arrival_e2e_ms = _interval_ms(
+            timing, "completion_ns", "scheduled_ns"
+        )
+        ttft_ms = _interval_ms(
+            timing, "first_token_ns", "dispatch_ns"
+        )
+        if ttft_ms is None and seq.metric is not None:
+            metric_ttft = seq.metric.ttft
+            if metric_ttft is not None:
+                ttft_ms = round(float(metric_ttft), 6)
+        tpot_with_queue_ms = (
+            round(e2e_ms / actual_output_tokens, 6)
+            if e2e_ms is not None and actual_output_tokens > 0
+            else None
+        )
+        return {
+            "schema_version": 1,
+            "request_id": int(request_id),
+            "engine_id": int(engine_id),
+            "status": status,
+            "is_error": status != "FINISHED",
+            "error_message": error_message,
+            "prompt_tokens": int(seq.num_prompt_tokens),
+            "expected_output_tokens": int(seq.max_tokens),
+            "actual_output_tokens": int(actual_output_tokens),
+            "dispatch_offset_ms": round(
+                (
+                    timing.get("dispatch_ns", timing["scheduled_ns"])
+                    - start_ns
+                )
+                / 1_000_000,
+                6,
+            ),
+            "completion_offset_ms": round(
+                (observed_ns - start_ns) / 1_000_000,
+                6,
+            ),
+            "dispatch_lag_ms": _interval_ms(
+                timing, "dispatch_ns", "scheduled_ns"
+            ),
+            "ingress_ack_latency_ms": _interval_ms(
+                timing, "ingress_ack_ns", "dispatch_ns"
+            ),
+            "add_accept_latency_ms": _interval_ms(
+                timing, "add_result_ns", "dispatch_ns"
+            ),
+            "ttft_ms": ttft_ms,
+            "e2e_ms": e2e_ms,
+            "arrival_e2e_ms": arrival_e2e_ms,
+            "tpot_with_queue_ms": tpot_with_queue_ms,
+        }
+
+    if hierarchical_trace_log_path:
+        trace_dir = os.path.dirname(
+            os.path.abspath(hierarchical_trace_log_path)
+        )
+        os.makedirs(trace_dir, exist_ok=True)
+        trace_file = open(
+            hierarchical_trace_log_path,
+            "w",
+            encoding="utf-8",
+            buffering=1,
+        )
+
+    def emit_diagnostic(*, force=False):
+        nonlocal last_diag_time
+        nonlocal previous_hierarchical
+        nonlocal previous_hierarchical_time
+
+        if diagnostic_log_interval <= 0:
+            return
+        current_time = clock_ns() / 1_000_000_000
+        if (
+            not force
+            and current_time - last_diag_time < diagnostic_log_interval
+        ):
+            return
+
+        elapsed = current_time - start_time
+        payload = {
+            "elapsed_s": round(elapsed, 3),
+            "requests_total": requests_to_send,
+            "scheduled_requests": requests_to_send,
+            "dispatched_requests": dispatched,
+            "ingress_enqueued": ingress_enqueued,
+            "ingress_rejected": ingress_rejected,
+            "scheduler_accepted": accepted,
+            "scheduler_rejected": scheduler_rejected,
+            "failed_requests": failed,
+            "client_unsent": requests_to_send - next_idx,
+            "completed": completed,
+            "client_outstanding": accepted - completed,
+            "pending_ingress": getattr(
+                engine, "num_pending_ingress", 0
+            ),
+            "pending_add": getattr(engine, "num_pending_adds", 0),
+            "slow_add_count": slow_add_count,
+        }
+
+        if getattr(engine.config, "scheduler_arch", None) == "hierarchical":
+            hierarchical = engine.hierarchical_metrics(
+                refresh=False,
+                include_per_engine=True,
+            )
+            if not hierarchical:
+                payload["hierarchical"] = {}
+                print(
+                    "[BENCH_DIAG] "
+                    + json.dumps(
+                        payload, sort_keys=True, separators=(",", ":")
+                    ),
+                    flush=True,
+                )
+                last_diag_time = current_time
+                return
+            hierarchical_interval = current_time - previous_hierarchical_time
+            if (
+                previous_hierarchical is not None
+                and hierarchical_interval > 0
+            ):
+                quantum_delta = (
+                    hierarchical["decode_quantum_count"]
+                    - previous_hierarchical["decode_quantum_count"]
+                )
+                useful_token_delta = (
+                    hierarchical["useful_decode_tokens"]
+                    - previous_hierarchical["useful_decode_tokens"]
+                )
+                execute_ms_delta = (
+                    hierarchical["execute_latency_ms_total"]
+                    - previous_hierarchical["execute_latency_ms_total"]
+                )
+                payload["hierarchical_interval"] = {
+                    "seconds": round(hierarchical_interval, 3),
+                    "decode_quantums": quantum_delta,
+                    "useful_decode_tokens": useful_token_delta,
+                    "useful_decode_tokens_per_s": round(
+                        useful_token_delta / hierarchical_interval, 3
+                    ),
+                    "avg_execute_ms_per_engine_quantum": round(
+                        execute_ms_delta / quantum_delta, 3
+                    )
+                    if quantum_delta
+                    else None,
+                    "preemptions": (
+                        hierarchical["preemption_count"]
+                        - previous_hierarchical["preemption_count"]
+                    ),
+                }
+                itl_token_delta = (
+                    hierarchical["decode_itl_token_count"]
+                    - previous_hierarchical["decode_itl_token_count"]
+                )
+                itl_weighted_ms_delta = (
+                    hierarchical["decode_itl_ms_weighted_total"]
+                    - previous_hierarchical[
+                        "decode_itl_ms_weighted_total"
+                    ]
+                )
+                payload["hierarchical_interval"][
+                    "decode_itl_ms_mean"
+                ] = (
+                    round(
+                        itl_weighted_ms_delta / itl_token_delta,
+                        3,
+                    )
+                    if itl_token_delta > 0
+                    else None
+                )
+            payload["hierarchical"] = hierarchical
+            previous_hierarchical = hierarchical
+            previous_hierarchical_time = current_time
+
+        if trace_file is not None:
+            traces = engine.drain_execution_traces()
+            for trace in traces:
+                trace_file.write(
+                    json.dumps(trace, separators=(",", ":")) + "\n"
+                )
+            trace_file.flush()
+            payload["hierarchical_trace_records_drained"] = len(traces)
+
+        print(
+            "[BENCH_DIAG] "
+            + json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
+        last_diag_time = current_time
+
+    try:
+        with tqdm(
+            total=requests_to_send,
+            desc="Processing Requests",
+            disable=not show_progress,
+        ) as pbar:
+            while True:
+                now_ns = clock_ns()
+                elapsed_ns = now_ns - start_ns
+                due_begin = next_idx
+                while (
+                    next_idx < requests_to_send
+                    and int(
+                        float(arrival_times[next_idx]) * 1_000_000_000
+                    )
+                    <= elapsed_ns
+                ):
+                    next_idx += 1
+
+                if next_idx > due_begin:
+                    due = all_seqs[due_begin:next_idx]
+                    dispatch_ns = clock_ns()
+                    for seq in due:
+                        timing = request_times[seq.seq_id]
+                        timing["dispatch_ns"] = dispatch_ns
+                        dispatch_lag_ms.append(
+                            (
+                                dispatch_ns - timing["scheduled_ns"]
+                            )
+                            / 1_000_000
+                        )
+                    submit_begin_ns = clock_ns()
+                    engine.submit_requests_async(due)
+                    submit_latency_ms = (
+                        clock_ns() - submit_begin_ns
+                    ) / 1_000_000
+                    dispatched += len(due)
+                    last_dispatch_ns = dispatch_ns
+                    if (
+                        slow_add_threshold_ms > 0
+                        and submit_latency_ms >= slow_add_threshold_ms
+                    ):
+                        slow_add_count += len(due)
+                        print(
+                            "[BENCH_SLOW_ASYNC_SUBMIT] "
+                            + json.dumps(
+                                {
+                                    "elapsed_s": round(
+                                        (dispatch_ns - start_ns)
+                                        / 1_000_000_000,
+                                        3,
+                                    ),
+                                    "request_index_begin": due_begin,
+                                    "request_index_end": next_idx,
+                                    "batch_size": len(due),
+                                    "latency_ms": round(
+                                        submit_latency_ms, 3
+                                    ),
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            flush=True,
+                        )
+
+                for ack in engine.poll_ingress_acks():
+                    observed_ns = clock_ns()
+                    timing = request_times[ack.request_id]
+                    timing["ingress_ack_ns"] = observed_ns
+                    ingress_ack_latency_ms.append(
+                        (observed_ns - timing["dispatch_ns"]) / 1_000_000
+                    )
+                    if ack.enqueued:
+                        ingress_enqueued += 1
+                        continue
+                    ingress_rejected += 1
+                    rejected_ids.add(ack.request_id)
+                    append_request_record(
+                        build_request_record(
+                            request_id=ack.request_id,
+                            engine_id=ack.engine_id,
+                            status="INGRESS_REJECTED",
+                            actual_output_tokens=0,
+                            observed_ns=observed_ns,
+                            error_message=ack.reason,
+                        )
+                    )
+                    pbar.update(1)
+                    print(
+                        "[BENCH_INGRESS_REJECTED] "
+                        + json.dumps(
+                            {
+                                "request_id": ack.request_id,
+                                "engine_id": ack.engine_id,
+                                "reason": ack.reason,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
+
+                for result in engine.poll_add_results():
+                    observed_ns = clock_ns()
+                    timing = request_times[result.request_id]
+                    timing["add_result_ns"] = observed_ns
+                    add_accept_latency_ms.append(
+                        (observed_ns - timing["dispatch_ns"]) / 1_000_000
+                    )
+                    if result.accepted:
+                        accepted += 1
+                        continue
+                    scheduler_rejected += 1
+                    rejected_ids.add(result.request_id)
+                    append_request_record(
+                        build_request_record(
+                            request_id=result.request_id,
+                            engine_id=result.engine_id,
+                            status="ADD_REJECTED",
+                            actual_output_tokens=0,
+                            observed_ns=observed_ns,
+                            error_message=result.reason,
+                        )
+                    )
+                    pbar.update(1)
+                    print(
+                        "[BENCH_ADD_REJECTED] "
+                        + json.dumps(
+                            {
+                                "request_id": result.request_id,
+                                "engine_id": result.engine_id,
+                                "reason": result.reason,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
+
+                for event in engine.poll_first_token_events():
+                    observed_ns = clock_ns()
+                    timing = request_times[event.request_id]
+                    if "first_token_ns" not in timing:
+                        timing["first_token_ns"] = observed_ns
+                        timing["first_token_generated_count"] = (
+                            event.generated_count
+                        )
+                        observed_ttft_ms.append(
+                            (
+                                observed_ns - timing["scheduled_ns"]
+                            )
+                            / 1_000_000
+                        )
+
+                if (
+                    getattr(engine.config, "scheduler_arch", None)
+                    == "hierarchical"
+                ):
+                    finish_events = engine.poll()
                 else:
-                    break  # All sent and engine finished
+                    finish_events = []
+                    if not engine.is_finished():
+                        outputs, _, _, _, _ = engine.step()
+                        finish_events = [
+                            FinishEvent(
+                                request_id=seq_id,
+                                generated_count=len(token_ids),
+                                status="FINISHED",
+                                engine_id=-1,
+                            )
+                            for seq_id, token_ids in outputs
+                        ]
 
-    total_time = time.perf_counter() - start_time
+                for event in finish_events:
+                    request_id = event.request_id
+                    if (
+                        request_id in terminal_ids
+                        or request_id in rejected_ids
+                    ):
+                        raise RuntimeError(
+                            f"duplicate terminal request {request_id}"
+                        )
+                    terminal_ids.add(request_id)
+                    observed_ns = clock_ns()
+                    timing = request_times[request_id]
+                    request_record = build_request_record(
+                        request_id=request_id,
+                        engine_id=event.engine_id,
+                        status=event.status,
+                        actual_output_tokens=event.generated_count,
+                        observed_ns=observed_ns,
+                        error_message=(
+                            None
+                            if event.status == "FINISHED"
+                            else event.status
+                        ),
+                    )
+                    append_request_record(request_record)
+                    if event.status != "FINISHED":
+                        failed += 1
+                        pbar.update(1)
+                        continue
+
+                    completed += 1
+                    observed_e2e_ms.append(
+                        (observed_ns - timing["scheduled_ns"]) / 1_000_000
+                    )
+                    seq = seq_map[request_id]
+                    if seq.metric and seq.metric.e2e_latency:
+                        completed_latencies.append(
+                            seq.metric.e2e_latency / 1000
+                        )
+                        pbar.set_postfix(
+                            {
+                                "Avg Latency": (
+                                    f"{np.mean(completed_latencies):.2f}s"
+                                )
+                            }
+                        )
+                    pbar.update(1)
+
+                emit_diagnostic()
+                if (
+                    next_idx == requests_to_send
+                    and getattr(engine, "num_pending_ingress", 0) == 0
+                    and getattr(engine, "num_pending_adds", 0) == 0
+                    and engine.is_finished()
+                ):
+                    break
+
+                now_ns = clock_ns()
+                poll_deadline_ns = now_ns + 2_000_000
+                if next_idx < requests_to_send:
+                    next_arrival_ns = (
+                        start_ns
+                        + int(
+                            float(arrival_times[next_idx])
+                            * 1_000_000_000
+                        )
+                    )
+                    poll_deadline_ns = min(
+                        poll_deadline_ns, next_arrival_ns
+                    )
+                wait_ns = poll_deadline_ns - clock_ns()
+                if wait_ns > 0:
+                    sleep_fn(wait_ns / 1_000_000_000)
+        emit_diagnostic(force=True)
+    except KeyboardInterrupt:
+        print("[BENCH_INTERRUPTED] user requested stop", flush=True)
+        emit_diagnostic(force=True)
+        raise
+    finally:
+        if trace_file is not None:
+            trace_file.close()
+        if request_metrics_file is not None:
+            request_metrics_file.close()
+
+    total_time = (clock_ns() - start_ns) / 1_000_000_000
+    classified = completed + len(rejected_ids) + failed
+    if classified != dispatched:
+        raise RuntimeError(
+            "request accounting did not close: "
+            f"dispatched={dispatched}, completed={completed}, "
+            f"rejected={len(rejected_ids)}, failed={failed}"
+        )
+    if len(request_metric_records) != classified:
+        raise RuntimeError(
+            "request metric accounting did not close: "
+            f"records={len(request_metric_records)}, "
+            f"classified={classified}"
+        )
+
+    metrics_summary = build_request_metrics_summary(
+        request_metric_records
+    )
+    hierarchical_itl_summary = None
+    hierarchical_rank_loads = None
+    if (
+        getattr(engine.config, "scheduler_arch", None) == "hierarchical"
+        and hasattr(engine, "hierarchical_itl_samples")
+    ):
+        hierarchical_itl_summary = build_hierarchical_itl_summary(
+            engine.hierarchical_itl_samples()
+        )
+        if hierarchical_itl_summary is not None:
+            metrics_summary["hierarchical_decode_itl_ms"] = (
+                hierarchical_itl_summary
+            )
+    if (
+        getattr(engine.config, "scheduler_arch", None) == "hierarchical"
+        and hasattr(engine, "hierarchical_metrics")
+    ):
+        final_hierarchical = engine.hierarchical_metrics(
+            refresh=True,
+            include_per_engine=True,
+        )
+        hierarchical_rank_loads = {
+            engine_id: engine_metrics.get("rank_loads", [])
+            for engine_id, engine_metrics in final_hierarchical.get(
+                "per_engine", {}
+            ).items()
+        }
+        metrics_summary["hierarchical_rank_loads"] = (
+            hierarchical_rank_loads
+        )
+    metrics_summary.update(
+        {
+            "benchmark_runtime_s": round(total_time, 6),
+            "request_metrics_jsonl": request_metrics_log_path,
+        }
+    )
+    if metrics_summary_path:
+        summary_path = Path(metrics_summary_path).expanduser()
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            json.dumps(metrics_summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        metrics_summary_path = str(summary_path)
+
+    def latency_stats(values):
+        if not values:
+            return {}
+        return {
+            "avg": round(float(np.mean(values)), 3),
+            "p50": round(float(np.percentile(values, 50)), 3),
+            "p90": round(float(np.percentile(values, 90)), 3),
+            "p95": round(float(np.percentile(values, 95)), 3),
+            "p99": round(float(np.percentile(values, 99)), 3),
+            "max": round(float(np.max(values)), 3),
+        }
+
+    dispatch_window_s = max(
+        (last_dispatch_ns - start_ns) / 1_000_000_000, 1e-9
+    )
+    result = {
+        "scheduled_requests": requests_to_send,
+        "dispatched_requests": dispatched,
+        "ingress_enqueued": ingress_enqueued,
+        "ingress_rejected": ingress_rejected,
+        "scheduler_accepted": accepted,
+        "scheduler_rejected": scheduler_rejected,
+        "completed_requests": completed,
+        "failed_requests": failed,
+        "pending_ingress": getattr(engine, "num_pending_ingress", 0),
+        "pending_add": getattr(engine, "num_pending_adds", 0),
+        "active_requests": (
+            engine.router.active_count
+            if getattr(engine.config, "scheduler_arch", None)
+            == "hierarchical"
+            else 0
+        ),
+        "achieved_dispatch_rate": round(
+            dispatched / dispatch_window_s, 6
+        ),
+        "dispatch_lag_ms": latency_stats(dispatch_lag_ms),
+        "ingress_ack_latency_ms": latency_stats(
+            ingress_ack_latency_ms
+        ),
+        "add_accept_latency_ms": latency_stats(
+            add_accept_latency_ms
+        ),
+        "observed_ttft_ms": latency_stats(observed_ttft_ms),
+        "observed_e2e_ms": latency_stats(observed_e2e_ms),
+        "ttft_ms": metrics_summary["ttft_ms"],
+        "e2e_ms": metrics_summary["e2e_ms"],
+        "tpot_with_queue_ms": metrics_summary["tpot_with_queue_ms"],
+        "goodput": metrics_summary["goodput"],
+        "request_metrics_jsonl": request_metrics_log_path,
+        "metrics_summary_json": metrics_summary_path,
+    }
+    if hierarchical_itl_summary is not None:
+        result["hierarchical_decode_itl_ms"] = (
+            hierarchical_itl_summary
+        )
+    if hierarchical_rank_loads is not None:
+        result["hierarchical_rank_loads"] = hierarchical_rank_loads
+    print(
+        "[BENCH_RESULT] "
+        + json.dumps(result, sort_keys=True, separators=(",", ":")),
+        flush=True,
+    )
     return total_time, seq_map
 
 
@@ -396,6 +1286,15 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path
         print(f"  P99:  {tpot_stats.get('p99', 0):.2f}")
         print()
 
+    if tpot_wq_stats:
+        print("--- TPOT With Queueing Time (ms/token) ---")
+        print(f"  Avg:  {tpot_wq_stats.get('avg', 0):.2f}")
+        print(f"  P50:  {tpot_wq_stats.get('p50', 0):.2f}")
+        print(f"  P90:  {tpot_wq_stats.get('p90', 0):.2f}")
+        print(f"  P95:  {tpot_wq_stats.get('p95', 0):.2f}")
+        print(f"  P99:  {tpot_wq_stats.get('p99', 0):.2f}")
+        print()
+
     # ITL with decode queue
     itls_with_dq = [s.metric.avg_itl_with_decode_queue for s in completed_seqs if s.metric.avg_itl_with_decode_queue]
     if itls_with_dq:
@@ -431,26 +1330,10 @@ def calculate_and_print_metrics(total_time, seq_map, requests_sent, itl_log_path
     print("=" * 60 + "\n")
     
     if itl_log_path:
-        print(f"Logging ITL samples to {itl_log_path}...")
-        data = []
-        for s in completed_seqs:
-            if s.metric and s.metric.itl_samples:
-                data.append({
-                    "seq_id": s.seq_id, 
-                    "itl_samples": s.metric.itl_samples,
-                    "prompt_len": s.metric.num_prompt_tokens,
-                    "output_len": s.metric.num_generated_tokens,
-                    "queueing_time_ms": s.metric.queueing_time_ms,
-                    "decode_queue_time_ms": s.metric.decode_queue_time_ms,
-                    "avg_itl_with_decode_queue_ms": s.metric.avg_itl_with_decode_queue
-                })
-        
-        if data:
-            df = pd.DataFrame(data)
-            df.to_json(itl_log_path, orient="records", lines=True)
-            print(f"Saved {len(df)} ITL samples to {itl_log_path}.")
-        else:
-            print("No ITL samples to log.")
+        print(
+            "Per-request scalar metrics were written incrementally to "
+            f"{itl_log_path}."
+        )
 
 
 def main():
@@ -459,7 +1342,11 @@ def main():
     print(f"\n--- Benchmark: {args.num_requests} reqs, {args.request_rate} req/s, burst={args.burstiness} ---")
 
     # Initialize Engine
-    print(f"Scheduler architecture: {args.scheduler_arch}, Routing strategy: {args.routing_strategy}")
+    print(
+        f"Scheduler architecture: {args.scheduler_arch}, "
+        f"Routing strategy: {args.routing_strategy}, "
+        f"Router policy: {args.router_policy}"
+    )
     engine = LLM(
         args.model_path,
         enforce_eager=args.enforce_eager,
@@ -484,6 +1371,7 @@ def main():
         loop_count=args.loop_count,
         routing_strategy=args.routing_strategy,
         scheduler_arch=args.scheduler_arch,
+        router_policy=args.router_policy,
         segment_size=args.segment_size,
         enable_dynamic_sp_size=args.enable_dynamic_sp_size,
         kvcache_block_size=64,
@@ -502,6 +1390,7 @@ def main():
         dynamic_sp_size_strategy=args.dynamic_sp_size_strategy,
         dynamic_sp_long_request_threshold=args.long_request_sp_threshold,
         dynamic_sp_long_request_size=args.long_request_sp_size,
+        hierarchical_execution_trace=args.hierarchical_execution_trace,
     )
     
     # Print Config
@@ -515,11 +1404,30 @@ def main():
     request_generator = get_dataset_generator(args)
     arrival_times = generate_arrival_times(args.num_requests, args.request_rate, args.burstiness)
 
+    request_metrics_log_path = (
+        args.request_metrics_log_path or args.itl_log_path
+    )
+
     # Run Benchmark
-    total_time, seq_map = run_benchmark(engine, request_generator, arrival_times, args.num_requests)
+    total_time, seq_map = run_benchmark(
+        engine,
+        request_generator,
+        arrival_times,
+        args.num_requests,
+        diagnostic_log_interval=args.diagnostic_log_interval,
+        slow_add_threshold_ms=args.slow_add_threshold_ms,
+        hierarchical_trace_log_path=args.hierarchical_trace_log_path,
+        request_metrics_log_path=request_metrics_log_path,
+        metrics_summary_path=args.metrics_summary_path,
+    )
 
     # Report
-    calculate_and_print_metrics(total_time, seq_map, args.num_requests, itl_log_path=args.itl_log_path)
+    calculate_and_print_metrics(
+        total_time,
+        seq_map,
+        args.num_requests,
+        itl_log_path=request_metrics_log_path,
+    )
 
 
 if __name__ == "__main__":

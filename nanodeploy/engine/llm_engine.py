@@ -2,6 +2,7 @@ import atexit
 import os
 import time
 import uuid
+from collections import deque
 from dataclasses import fields
 from time import perf_counter
 from typing import Literal
@@ -15,7 +16,10 @@ from nanodeploy.config import Config
 from nanodeploy.engine.deployment_manager import DeploymentManager
 from nanodeploy.engine.hierarchical_contract import (
     AddResult,
+    AddResultEvent,
+    FirstTokenEvent,
     FinishEvent,
+    IngressAck,
 )
 from nanodeploy.engine.ray_executor import RayExecutor
 from nanodeploy.engine.scheduler import Scheduler
@@ -52,6 +56,8 @@ class LLMEngine:
         self.ps = []
         self.events = []
         self.metrics_manager = MetricsManager()
+        self._frontend_ingress_acks: deque[IngressAck] = deque()
+        self._frontend_add_results: deque[AddResultEvent] = deque()
         self._closed = False
         self.log_decode_step_detail = _env_flag_enabled(
             "NANODEPLOY_LOG_DECODE_STEP_DETAIL", default=False
@@ -63,14 +69,17 @@ class LLMEngine:
             self.executor = None
             self.scheduler = None
             self.deployment = DeploymentManager(config)
+            # LocalEngine ingress triggers wakeup only after the request is
+            # visible in its queue, avoiding a START_WAVE/enqueue race.
             self.router = RequestRouter(
                 self.deployment.engine_clients,
-                wakeup=(
-                    self.deployment.notify_request
-                    if config.attention_dp > 1
-                    else None
-                ),
+                router_policy=config.router_policy,
+                kvcache_block_size=config.kvcache_block_size,
             )
+            if config.router_policy == "least_cache":
+                self.router.record_loads(
+                    self.deployment.load_snapshots()
+                )
             self._hierarchical_sequences: dict[int, Sequence] = {}
             self._last_load_report_time = 0.0
             atexit.register(self.exit)
@@ -112,31 +121,150 @@ class LLMEngine:
         if isinstance(seqs, Sequence):
             seqs = [seqs]
         if self.config.scheduler_arch == "hierarchical":
-            results: list[AddResult] = []
-            for seq in seqs:
-                result = self.router.add(
-                    request_id=seq.seq_id,
-                    prompt_token_ids=tuple(seq.prompt_token_ids),
-                    max_tokens=seq.max_tokens,
-                    temperature=seq.temperature,
-                    ignore_eos=seq.ignore_eos,
-                )
-                if result.accepted:
-                    seq.metric = self.metrics_manager.create_sequence_metric(
-                        seq.seq_id, seq.num_prompt_tokens
-                    )
-                    seq.metric.record_arrival()
-                    seq.metric.record_decode_arrival()
-                    seq.metric.record_first_scheduled()
-                    seq.metric.record_decode_scheduled()
-                    self._hierarchical_sequences[seq.seq_id] = seq
-                results.append(result)
+            request_ids = set(self.submit_requests_async(seqs))
+            results_by_id: dict[int, AddResult] = {}
+            deferred_acks: list[IngressAck] = []
+            deferred_results: list[AddResultEvent] = []
+            deadline = perf_counter() + self.config.quantum_timeout_s
+            try:
+                while request_ids.difference(results_by_id):
+                    for ack in self.router.poll_ingress_acks():
+                        if ack.request_id not in request_ids:
+                            deferred_acks.append(ack)
+                        elif not ack.enqueued:
+                            results_by_id[ack.request_id] = AddResult(
+                                request_id=ack.request_id,
+                                accepted=False,
+                                engine_id=(
+                                    ack.engine_id
+                                    if ack.engine_id >= 0
+                                    else None
+                                ),
+                                reason=ack.reason,
+                            )
+                    raw_results = self.deployment.poll_add_results()
+                    for event in self.router.record_add_results(raw_results):
+                        if event.request_id not in request_ids:
+                            deferred_results.append(event)
+                        else:
+                            results_by_id[event.request_id] = AddResult(
+                                request_id=event.request_id,
+                                accepted=event.accepted,
+                                engine_id=event.engine_id,
+                                reason=event.reason,
+                            )
+                    if request_ids.issubset(results_by_id):
+                        break
+                    if perf_counter() >= deadline:
+                        raise TimeoutError(
+                            "hierarchical ADD result timed out"
+                        )
+                    time.sleep(0.0005)
+            finally:
+                self._frontend_ingress_acks.extend(deferred_acks)
+                self._frontend_add_results.extend(deferred_results)
+            results = [results_by_id[seq.seq_id] for seq in seqs]
             return results[0] if len(results) == 1 else tuple(results)
         for seq in seqs:
             seq.metric = self.metrics_manager.create_sequence_metric(
                 seq.seq_id, seq.num_prompt_tokens
             )
             self.scheduler.add(seq)
+
+    def submit_requests_async(
+        self, seqs: Sequence | list[Sequence]
+    ) -> tuple[int, ...]:
+        """Submit requests without waiting for hierarchical scheduler ADD."""
+        if isinstance(seqs, Sequence):
+            seqs = [seqs]
+        request_ids: list[int] = []
+        if self.config.scheduler_arch != "hierarchical":
+            for seq in seqs:
+                self.add_request(seq)
+                request_ids.append(seq.seq_id)
+                self._frontend_ingress_acks.append(
+                    IngressAck(
+                        request_id=seq.seq_id,
+                        engine_id=-1,
+                        enqueued=True,
+                    )
+                )
+                self._frontend_add_results.append(
+                    AddResultEvent(
+                        request_id=seq.seq_id,
+                        engine_id=-1,
+                        accepted=True,
+                    )
+                )
+            return tuple(request_ids)
+
+        for seq in seqs:
+            if seq.metric is None:
+                seq.metric = self.metrics_manager.create_sequence_metric(
+                    seq.seq_id, seq.num_prompt_tokens
+                )
+                seq.metric.record_arrival()
+                seq.metric.record_decode_arrival()
+            self._hierarchical_sequences.setdefault(seq.seq_id, seq)
+            request_ids.append(
+                self.router.submit_async(
+                    request_id=seq.seq_id,
+                    prompt_token_ids=tuple(seq.prompt_token_ids),
+                    max_tokens=seq.max_tokens,
+                    temperature=seq.temperature,
+                    ignore_eos=seq.ignore_eos,
+                )
+            )
+        return tuple(request_ids)
+
+    def poll_ingress_acks(self) -> tuple[IngressAck, ...]:
+        if self.config.scheduler_arch == "hierarchical":
+            events = tuple(self._frontend_ingress_acks)
+            self._frontend_ingress_acks.clear()
+            return events + self.router.poll_ingress_acks()
+        events = tuple(self._frontend_ingress_acks)
+        self._frontend_ingress_acks.clear()
+        return events
+
+    def poll_add_results(self) -> tuple[AddResultEvent, ...]:
+        if self.config.scheduler_arch == "hierarchical":
+            events = tuple(self._frontend_add_results)
+            self._frontend_add_results.clear()
+            return events + self.router.record_add_results(
+                self.deployment.poll_add_results()
+            )
+        events = tuple(self._frontend_add_results)
+        self._frontend_add_results.clear()
+        return events
+
+    def poll_first_token_events(self) -> tuple[FirstTokenEvent, ...]:
+        if self.config.scheduler_arch != "hierarchical":
+            return ()
+        events = self.deployment.poll_first_token_events()
+        for event in events:
+            sequence = self._hierarchical_sequences[event.request_id]
+            metric = sequence.metric
+            if metric is None:
+                continue
+            if metric.first_scheduled_time is None:
+                metric.record_first_scheduled()
+            if metric.decode_scheduled_time is None:
+                metric.record_decode_scheduled()
+            if metric.first_token_time is None:
+                metric.record_first_token()
+        return events
+
+    @property
+    def num_pending_ingress(self) -> int:
+        if self.config.scheduler_arch != "hierarchical":
+            return 0
+        return self.router.pending_ingress_count
+
+    @property
+    def num_pending_adds(self) -> int:
+        if self.config.scheduler_arch != "hierarchical":
+            return 0
+        return self.router.pending_add_count
 
     def free_to_be_migrated(self, seqs: Sequence | list[Sequence]):
         if self.config.scheduler_arch == "hierarchical":
@@ -414,6 +542,10 @@ class LLMEngine:
             if metric is not None:
                 metric.num_generated_tokens = event.generated_count
                 if event.generated_count > 0 and metric.first_token_time is None:
+                    if metric.first_scheduled_time is None:
+                        metric.record_first_scheduled()
+                    if metric.decode_scheduled_time is None:
+                        metric.record_decode_scheduled()
                     metric.record_first_token()
                 self.metrics_manager.complete_sequence(event.request_id)
             sequence.status = SequenceStatus.FINISHED
@@ -433,7 +565,20 @@ class LLMEngine:
             )
         return self.deployment.execution_traces()
 
-    def hierarchical_metrics(self, *, refresh: bool = True) -> dict:
+    def hierarchical_itl_samples(self):
+        if self.config.scheduler_arch != "hierarchical":
+            raise RuntimeError(
+                "hierarchical ITL samples are only available in "
+                "hierarchical mode"
+            )
+        return self.deployment.decode_itl_samples()
+
+    def hierarchical_metrics(
+        self,
+        *,
+        refresh: bool = True,
+        include_per_engine: bool = False,
+    ) -> dict:
         if self.config.scheduler_arch != "hierarchical":
             raise RuntimeError(
                 "hierarchical metrics are only available in hierarchical mode"
@@ -461,6 +606,11 @@ class LLMEngine:
             "coordination_latency_ms_total",
             "execute_latency_ms_total",
             "postprocess_latency_ms_total",
+            "ingress_queue_delay_ms_total",
+            "scheduler_add_ms_total",
+            "decode_itl_ms_weighted_total",
+            "decode_itl_token_count",
+            "decode_itl_sample_count",
         )
         metrics = {
             field: sum(getattr(snapshot, field) for snapshot in snapshots)
@@ -474,11 +624,96 @@ class LLMEngine:
                 "running_requests": sum(
                     snapshot.running for snapshot in snapshots
                 ),
+                "pending_ingress": sum(
+                    snapshot.pending_ingress for snapshot in snapshots
+                ),
+                "pending_add_results": sum(
+                    snapshot.pending_add_results for snapshot in snapshots
+                ),
+                "reserved_slots": sum(
+                    snapshot.reserved_slots for snapshot in snapshots
+                ),
                 "free_blocks_min": min(
                     snapshot.free_blocks_min for snapshot in snapshots
                 ),
             }
         )
+        decode_itl_token_count = metrics["decode_itl_token_count"]
+        metrics["decode_itl_ms_mean"] = (
+            metrics["decode_itl_ms_weighted_total"]
+            / decode_itl_token_count
+            if decode_itl_token_count
+            else None
+        )
+        if include_per_engine:
+            per_engine_fields = (
+                "waiting",
+                "running",
+                "free_blocks_min",
+                "wave_id",
+                "quantum_id",
+                "useful_real_batch_size",
+                "control_dummy_count",
+                "all_dummy_engine_quantums",
+                "useful_decode_tokens",
+                "raw_token_slots",
+                "control_dummy_slots",
+                "total_rank_forwards",
+                "all_dummy_rank_forwards",
+                "preemption_count",
+                "command_count",
+                "command_queue_delay_ms_total",
+                "decode_quantum_count",
+                "admission_latency_ms_total",
+                "schedule_latency_ms_total",
+                "coordination_latency_ms_total",
+                "execute_latency_ms_total",
+                "postprocess_latency_ms_total",
+                "pending_ingress",
+                "pending_add_results",
+                "reserved_slots",
+                "ingress_queue_delay_ms_total",
+                "scheduler_add_ms_total",
+                "decode_itl_ms_weighted_total",
+                "decode_itl_token_count",
+                "decode_itl_sample_count",
+            )
+            per_engine = {}
+            for snapshot in snapshots:
+                engine_metrics = {
+                    field: getattr(snapshot, field)
+                    for field in per_engine_fields
+                }
+                engine_metrics["decode_itl_ms_mean"] = (
+                    snapshot.decode_itl_ms_weighted_total
+                    / snapshot.decode_itl_token_count
+                    if snapshot.decode_itl_token_count
+                    else None
+                )
+                engine_metrics["rank_loads"] = [
+                    {
+                        "global_rank": rank_load.global_rank,
+                        "sp_idx": rank_load.sp_idx,
+                        "tp_idx": rank_load.tp_idx,
+                        "master_batch_size": (
+                            rank_load.master_batch_size
+                        ),
+                        "active_master_requests": (
+                            rank_load.active_master_requests
+                        ),
+                        "free_blocks": rank_load.free_blocks,
+                        "total_blocks": rank_load.total_blocks,
+                        "master_assignments": (
+                            rank_load.master_assignments
+                        ),
+                        "mastered_decode_tokens": (
+                            rank_load.mastered_decode_tokens
+                        ),
+                    }
+                    for rank_load in snapshot.rank_loads
+                ]
+                per_engine[str(snapshot.engine_id)] = engine_metrics
+            metrics["per_engine"] = per_engine
         raw_slots = metrics["raw_token_slots"]
         rank_forwards = metrics["total_rank_forwards"]
         metrics["dummy_slot_ratio"] = (

@@ -37,8 +37,11 @@ class RequestState(str, Enum):
 
 
 class OwnerState(str, Enum):
-    PENDING_OWNER = "PENDING_OWNER"
+    PENDING_INGRESS = "PENDING_INGRESS"
+    PENDING_ADD = "PENDING_ADD"
     OWNED = "OWNED"
+    # Compatibility alias for callers that only distinguished pending/owned.
+    PENDING_OWNER = "PENDING_INGRESS"
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +117,29 @@ class AddResult:
 
 
 @dataclass(frozen=True, slots=True)
+class IngressAck:
+    request_id: int
+    engine_id: int
+    enqueued: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AddResultEvent:
+    request_id: int
+    engine_id: int
+    accepted: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FirstTokenEvent:
+    request_id: int
+    engine_id: int
+    generated_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class AbortResult:
     request_id: int
     status: str
@@ -125,6 +151,32 @@ class FinishEvent:
     generated_count: int
     status: str
     engine_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class RankLoad:
+    """Latest and cumulative load for one runtime SP rank."""
+
+    global_rank: int
+    sp_idx: int
+    tp_idx: int
+    master_batch_size: int
+    active_master_requests: int
+    free_blocks: int
+    total_blocks: int
+    master_assignments: int
+    mastered_decode_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class DecodeITLSample:
+    """One lightweight, token-weighted hierarchical decode observation."""
+
+    engine_id: int
+    wave_id: int
+    quantum_id: int
+    itl_ms: float
+    token_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +205,15 @@ class LoadSnapshot:
     coordination_latency_ms_total: float = 0.0
     execute_latency_ms_total: float = 0.0
     postprocess_latency_ms_total: float = 0.0
+    pending_ingress: int = 0
+    pending_add_results: int = 0
+    reserved_slots: int = 0
+    ingress_queue_delay_ms_total: float = 0.0
+    scheduler_add_ms_total: float = 0.0
+    decode_itl_ms_weighted_total: float = 0.0
+    decode_itl_token_count: int = 0
+    decode_itl_sample_count: int = 0
+    rank_loads: tuple[RankLoad, ...] = ()
 
     @property
     def dummy_rank_forward_ratio(self) -> float:

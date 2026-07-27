@@ -16,9 +16,14 @@ from nanodeploy.config import Config
 from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AddResult,
+    AddResultEvent,
     AbortResult,
+    DecodeITLSample,
     EngineReady,
+    FirstTokenEvent,
     FinishEvent,
+    IngressAck,
+    HIERARCHICAL_LOOP_COUNT,
     LoadSnapshot,
 )
 from nanodeploy.engine.local_executor import LocalExecutor
@@ -34,6 +39,12 @@ class _LoopCommand:
     completed: threading.Event = field(default_factory=threading.Event)
     result: Any = None
     error: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _IngressAdd:
+    command: AddCommand
+    enqueued_at: float = field(default_factory=perf_counter)
 
 
 @ray.remote(num_cpus=0.1, max_concurrency=32)
@@ -54,8 +65,17 @@ class LocalEngineCore:
 
         self._normal_commands: queue.Queue[_LoopCommand] = queue.Queue()
         self._abort_commands: queue.Queue[_LoopCommand] = queue.Queue()
+        self._ingress_adds: queue.Queue[_IngressAdd] = queue.Queue()
+        self._ingress_lock = threading.Lock()
+        self._reserved_request_ids: set[int] = set()
+        self._ingress_pending_ids: set[int] = set()
+        self._cancelled_ingress_ids: set[int] = set()
+        self._reserved_slots = 0
+        self._add_result_events: deque[AddResultEvent] = deque()
+        self._first_token_events: deque[FirstTokenEvent] = deque()
         self._terminal_events: deque[FinishEvent] = deque()
         self._events_lock = threading.Lock()
+        self._load_lock = threading.Lock()
         self._state_cv = threading.Condition()
         self._wave_running = False
         self._wave_id = 0
@@ -75,6 +95,12 @@ class LocalEngineCore:
         self._coordination_latency_ms_total = 0.0
         self._execute_latency_ms_total = 0.0
         self._postprocess_latency_ms_total = 0.0
+        self._ingress_queue_delay_ms_total = 0.0
+        self._scheduler_add_ms_total = 0.0
+        self._decode_itl_ms_weighted_total = 0.0
+        self._decode_itl_token_count = 0
+        self._decode_itl_samples: list[DecodeITLSample] = []
+        self._cached_load_snapshot = self._build_load_snapshot()
 
     def initialize(
         self,
@@ -197,13 +223,91 @@ class LocalEngineCore:
     def submit_add(self, command: AddCommand) -> AddResult:
         return self._submit(_LoopCommand("add", command))
 
+    def enqueue_add(self, command: AddCommand) -> IngressAck:
+        """Reserve capacity and enqueue without touching LocalScheduler."""
+        self._raise_if_failed()
+        if self.config.attention_dp > 1 and self._coordinator is None:
+            raise RuntimeError("LocalEngine coordinator is not initialized")
+        with self._ingress_lock:
+            if command.request_id in self._reserved_request_ids:
+                return IngressAck(
+                    request_id=command.request_id,
+                    engine_id=self.engine_id,
+                    enqueued=False,
+                    reason="duplicate_request_id",
+                )
+            if (
+                self._reserved_slots
+                >= self.config.hierarchical_queue_capacity
+            ):
+                return IngressAck(
+                    request_id=command.request_id,
+                    engine_id=self.engine_id,
+                    enqueued=False,
+                    reason="queue_full",
+                )
+            self._reserved_request_ids.add(command.request_id)
+            self._ingress_pending_ids.add(command.request_id)
+            self._reserved_slots += 1
+            self._ingress_adds.put_nowait(_IngressAdd(command))
+
+        # The request is visible in ingress before any wakeup is triggered.
+        if self.config.attention_dp == 1:
+            with self._state_cv:
+                if not self._wave_running:
+                    self._wave_id += 1
+                    self._quantum_id = 0
+                    self._wave_running = True
+                self._state_cv.notify_all()
+        else:
+            self._coordinator.first_request.remote(
+                self.engine_id, self._wave_id
+            )
+            with self._state_cv:
+                self._state_cv.notify_all()
+        return IngressAck(
+            request_id=command.request_id,
+            engine_id=self.engine_id,
+            enqueued=True,
+        )
+
+    def enqueue_add_batch(
+        self, commands: tuple[AddCommand, ...]
+    ) -> tuple[IngressAck, ...]:
+        return tuple(self.enqueue_add(command) for command in commands)
+
     def submit_abort(self, request_id: int) -> AbortResult:
+        with self._ingress_lock:
+            if request_id in self._ingress_pending_ids:
+                self._cancelled_ingress_ids.add(request_id)
+                return AbortResult(
+                    request_id=request_id, status="abort_pending"
+                )
         return self._submit(
             _LoopCommand("abort", request_id), abort_priority=True
         )
 
     def get_load(self) -> LoadSnapshot:
         return self._submit(_LoopCommand("load"))
+
+    def get_cached_load(self) -> LoadSnapshot:
+        self._raise_if_failed()
+        with self._load_lock:
+            return self._cached_load_snapshot
+
+    def drain_add_results(self) -> tuple[AddResultEvent, ...]:
+        self._raise_if_failed()
+        with self._events_lock:
+            events = tuple(self._add_result_events)
+            self._add_result_events.clear()
+        return events
+
+    def drain_first_token_events(self) -> tuple[FirstTokenEvent, ...]:
+        self._raise_if_failed()
+        with self._events_lock:
+            events = tuple(self._first_token_events)
+            self._first_token_events.clear()
+        return events
 
     def drain_events(self) -> tuple[FinishEvent, ...]:
         self._raise_if_failed()
@@ -215,6 +319,10 @@ class LocalEngineCore:
     def drain_execution_traces(self) -> tuple[dict[str, Any], ...]:
         self._raise_if_failed()
         return self.executor.drain_execution_traces()
+
+    def get_decode_itl_samples(self) -> tuple[DecodeITLSample, ...]:
+        self._raise_if_failed()
+        return tuple(self._decode_itl_samples)
 
     def health(self) -> bool:
         self._raise_if_failed()
@@ -262,29 +370,7 @@ class LocalEngineCore:
                 command.result = self.scheduler.abort(command.payload)
                 self._publish_events(self.scheduler.drain_terminal_events())
             elif command.kind == "load":
-                snapshot = self.scheduler.load_snapshot(
-                    wave_id=self._wave_id,
-                    quantum_id=self._quantum_id,
-                )
-                command.result = replace(
-                    snapshot,
-                    command_count=self._command_count,
-                    command_queue_delay_ms_total=(
-                        self._command_queue_delay_ms_total
-                    ),
-                    decode_quantum_count=self._decode_quantum_count,
-                    admission_latency_ms_total=(
-                        self._admission_latency_ms_total
-                    ),
-                    schedule_latency_ms_total=self._schedule_latency_ms_total,
-                    coordination_latency_ms_total=(
-                        self._coordination_latency_ms_total
-                    ),
-                    execute_latency_ms_total=self._execute_latency_ms_total,
-                    postprocess_latency_ms_total=(
-                        self._postprocess_latency_ms_total
-                    ),
-                )
+                command.result = self._build_load_snapshot()
             else:
                 raise RuntimeError(f"unknown LocalEngine command {command.kind}")
         except BaseException as exc:
@@ -299,6 +385,130 @@ class LocalEngineCore:
             except queue.Empty:
                 return
             self._complete_command(command)
+
+    def _release_reservation(self, request_id: int) -> None:
+        with self._ingress_lock:
+            self._ingress_pending_ids.discard(request_id)
+            if request_id not in self._reserved_request_ids:
+                return
+            self._reserved_request_ids.remove(request_id)
+            self._reserved_slots -= 1
+            if self._reserved_slots < 0:
+                raise RuntimeError("negative LocalEngine ingress reservation")
+
+    def _drain_ingress(self) -> None:
+        begin = perf_counter()
+        results: list[AddResultEvent] = []
+        cancelled_events: list[FinishEvent] = []
+        processed = 0
+        while processed < self.config.max_ingress_batch_requests:
+            if (
+                processed > 0
+                and (perf_counter() - begin) * 1000
+                >= self.config.max_ingress_drain_ms
+            ):
+                break
+            try:
+                ingress = self._ingress_adds.get_nowait()
+            except queue.Empty:
+                break
+            processed += 1
+            command = ingress.command
+            with self._ingress_lock:
+                self._ingress_pending_ids.discard(command.request_id)
+                cancelled = (
+                    command.request_id in self._cancelled_ingress_ids
+                )
+                self._cancelled_ingress_ids.discard(command.request_id)
+            self._ingress_queue_delay_ms_total += (
+                perf_counter() - ingress.enqueued_at
+            ) * 1000
+            if cancelled:
+                results.append(
+                    AddResultEvent(
+                        request_id=command.request_id,
+                        engine_id=self.engine_id,
+                        accepted=True,
+                    )
+                )
+                cancelled_events.append(
+                    FinishEvent(
+                        request_id=command.request_id,
+                        generated_count=0,
+                        status="ABORTED",
+                        engine_id=self.engine_id,
+                    )
+                )
+                continue
+            add_begin = perf_counter()
+            try:
+                result = self.scheduler.add(command)
+            except BaseException as exc:
+                result = AddResult(
+                    request_id=command.request_id,
+                    accepted=False,
+                    engine_id=self.engine_id,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+            self._scheduler_add_ms_total += (
+                perf_counter() - add_begin
+            ) * 1000
+            event = AddResultEvent(
+                request_id=result.request_id,
+                engine_id=self.engine_id,
+                accepted=result.accepted,
+                reason=result.reason,
+            )
+            results.append(event)
+            if not result.accepted:
+                self._release_reservation(command.request_id)
+        if results:
+            with self._events_lock:
+                self._add_result_events.extend(results)
+        self._publish_events(tuple(cancelled_events))
+
+    def _build_load_snapshot(self) -> LoadSnapshot:
+        snapshot = self.scheduler.load_snapshot(
+            wave_id=self._wave_id,
+            quantum_id=self._quantum_id,
+        )
+        with self._ingress_lock:
+            pending_ingress = len(self._ingress_pending_ids)
+            reserved_slots = self._reserved_slots
+        with self._events_lock:
+            pending_add_results = len(self._add_result_events)
+        return replace(
+            snapshot,
+            command_count=self._command_count,
+            command_queue_delay_ms_total=(
+                self._command_queue_delay_ms_total
+            ),
+            decode_quantum_count=self._decode_quantum_count,
+            admission_latency_ms_total=self._admission_latency_ms_total,
+            schedule_latency_ms_total=self._schedule_latency_ms_total,
+            coordination_latency_ms_total=(
+                self._coordination_latency_ms_total
+            ),
+            execute_latency_ms_total=self._execute_latency_ms_total,
+            postprocess_latency_ms_total=self._postprocess_latency_ms_total,
+            pending_ingress=pending_ingress,
+            pending_add_results=pending_add_results,
+            reserved_slots=reserved_slots,
+            ingress_queue_delay_ms_total=(
+                self._ingress_queue_delay_ms_total
+            ),
+            scheduler_add_ms_total=self._scheduler_add_ms_total,
+            decode_itl_ms_weighted_total=(
+                self._decode_itl_ms_weighted_total
+            ),
+            decode_itl_token_count=self._decode_itl_token_count,
+            decode_itl_sample_count=len(self._decode_itl_samples),
+        )
+
+    def _refresh_cached_load(self) -> None:
+        snapshot = self._build_load_snapshot()
+        with self._load_lock:
+            self._cached_load_snapshot = snapshot
 
     def _consensus(self, local_unfinished: bool) -> bool:
         if self.config.attention_dp == 1:
@@ -334,12 +544,23 @@ class LocalEngineCore:
                 self._wave_running = True
             self._pending_start_wave = None
             self._state_cv.notify_all()
+        self._refresh_cached_load()
 
     def _publish_events(self, events: tuple[FinishEvent, ...]) -> None:
         if not events:
             return
+        for event in events:
+            self._release_reservation(event.request_id)
         with self._events_lock:
             self._terminal_events.extend(events)
+
+    def _publish_first_token_events(
+        self, events: tuple[FirstTokenEvent, ...]
+    ) -> None:
+        if not events:
+            return
+        with self._events_lock:
+            self._first_token_events.extend(events)
 
     def _fail_pending_commands(self, error: RuntimeError) -> None:
         for source in (self._abort_commands, self._normal_commands):
@@ -355,7 +576,9 @@ class LocalEngineCore:
         try:
             while True:
                 self._drain_queue(self._abort_commands)
+                self._drain_ingress()
                 self._drain_queue(self._normal_commands)
+                self._refresh_cached_load()
                 with self._state_cv:
                     if self._stop:
                         return
@@ -370,6 +593,7 @@ class LocalEngineCore:
                 self._admission_latency_ms_total += (
                     perf_counter() - begin
                 ) * 1000
+                self._refresh_cached_load()
                 begin = perf_counter()
                 batch = self.scheduler.plan_decode(
                     wave_id=wave_id, quantum_id=quantum_id
@@ -399,9 +623,8 @@ class LocalEngineCore:
                 worker_results = self.executor.run(
                     batch, timeout=self.config.quantum_timeout_s
                 )
-                self._execute_latency_ms_total += (
-                    perf_counter() - begin
-                ) * 1000
+                execute_latency_ms = (perf_counter() - begin) * 1000
+                self._execute_latency_ms_total += execute_latency_ms
                 # ABORT is the only command allowed to mutate scheduler state
                 # after batch freeze and before canonical token commit.
                 self._drain_queue(self._abort_commands)
@@ -410,8 +633,30 @@ class LocalEngineCore:
                 self._postprocess_latency_ms_total += (
                     perf_counter() - begin
                 ) * 1000
+                itl_token_count = self.scheduler.last_itl_token_slots
+                if itl_token_count > 0:
+                    itl_ms = (
+                        execute_latency_ms / HIERARCHICAL_LOOP_COUNT
+                    )
+                    self._decode_itl_samples.append(
+                        DecodeITLSample(
+                            engine_id=self.engine_id,
+                            wave_id=wave_id,
+                            quantum_id=quantum_id,
+                            itl_ms=itl_ms,
+                            token_count=itl_token_count,
+                        )
+                    )
+                    self._decode_itl_ms_weighted_total += (
+                        itl_ms * itl_token_count
+                    )
+                    self._decode_itl_token_count += itl_token_count
                 self._decode_quantum_count += 1
+                self._publish_first_token_events(
+                    self.scheduler.drain_first_token_events()
+                )
                 self._publish_events(events)
+                self._refresh_cached_load()
                 with self._state_cv:
                     self._quantum_id += 1
         except BaseException as exc:

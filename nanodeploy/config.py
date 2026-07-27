@@ -40,9 +40,13 @@ class Config:
     gpu_memory_limit_gb: float | None = None
     routing_strategy: Literal["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"] = "RoundRobin"
     scheduler_arch: Literal["legacy_global", "hierarchical"] = "legacy_global"
-    router_policy: Literal["round_robin"] = "round_robin"
+    router_policy: Literal[
+        "round_robin", "least_batch", "least_cache"
+    ] = "least_batch"
     load_report_interval_ms: int = 100
     hierarchical_queue_capacity: int = 4096
+    max_ingress_batch_requests: int = 256
+    max_ingress_drain_ms: float = 10.0
     startup_timeout_s: float = 600.0
     quantum_timeout_s: float = 120.0
     hierarchical_execution_trace: bool = False
@@ -140,7 +144,9 @@ class Config:
     enable_non_uniform_split: bool = False
 
     # Strategy for how to select 
-    sp_master_selector: Literal["RoundRobin", "LeastBatch", "LeastCache"] = "RoundRobin"
+    sp_master_selector: Literal[
+        "RoundRobin", "LeastBatch", "LeastCache"
+    ] = "LeastBatch"
 
     # Debug mode for SP allocation (uses simplified RoundRobin + segment-based allocation)
     sp_debug: bool = False
@@ -155,14 +161,23 @@ class Config:
             raise ValueError(
                 "scheduler_arch must be one of: legacy_global, hierarchical"
             )
-        if self.router_policy != "round_robin":
+        if self.router_policy not in {
+            "round_robin",
+            "least_batch",
+            "least_cache",
+        }:
             raise ValueError(
-                "hierarchical MVP only supports router_policy='round_robin'"
+                "router_policy must be one of: "
+                "round_robin, least_batch, least_cache"
             )
         if self.load_report_interval_ms <= 0:
             raise ValueError("load_report_interval_ms must be positive")
         if self.hierarchical_queue_capacity <= 0:
             raise ValueError("hierarchical_queue_capacity must be positive")
+        if self.max_ingress_batch_requests <= 0:
+            raise ValueError("max_ingress_batch_requests must be positive")
+        if self.max_ingress_drain_ms <= 0:
+            raise ValueError("max_ingress_drain_ms must be positive")
         if self.startup_timeout_s <= 0:
             raise ValueError("startup_timeout_s must be positive")
         if self.quantum_timeout_s <= 0:

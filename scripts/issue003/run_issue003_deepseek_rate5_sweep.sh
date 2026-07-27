@@ -119,7 +119,10 @@ find_latest_log() {
 find_latest_json() {
     local dir="$1"
     [[ -n "${dir:-}" && -d "$dir" ]] || return 1
-    find "$dir" -maxdepth 1 -type f -name '*.json' | sort | tail -n 1
+    find "$dir" -maxdepth 1 -type f \
+        \( -name '*.jsonl' -o -name '*.json' \) \
+        ! -name '*.summary.json' ! -name '*.hier_trace.jsonl' \
+        | sort | tail -n 1
 }
 
 extract_metric_from_section() {

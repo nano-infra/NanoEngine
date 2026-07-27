@@ -202,13 +202,23 @@ def compute_request_level_metrics(json_path: Path, slo_target_ms: float) -> dict
                 continue
 
             request = parse_json_line(raw_line)
-            itl_samples = request.get("itl_samples") or []
-            if not itl_samples:
-                continue
+            tpot_with_queue_ms = request.get("tpot_with_queue_ms")
+            if tpot_with_queue_ms is not None:
+                if request.get("is_error"):
+                    continue
+                normlat_ms = float(tpot_with_queue_ms)
+            else:
+                itl_samples = request.get("itl_samples") or []
+                if not itl_samples:
+                    continue
+                queueing_time_ms = float(
+                    request.get("queueing_time_ms", 0.0) or 0.0
+                )
+                normlat_ms = (
+                    sum(itl_samples) + queueing_time_ms
+                ) / len(itl_samples)
 
             total_requests += 1
-            queueing_time_ms = float(request.get("queueing_time_ms", 0.0) or 0.0)
-            normlat_ms = (sum(itl_samples) + queueing_time_ms) / len(itl_samples)
             normalized_latencies.append(normlat_ms)
             if normlat_ms <= slo_target_ms:
                 slo_success_count += 1

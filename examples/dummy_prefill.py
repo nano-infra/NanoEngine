@@ -27,6 +27,13 @@ def main():
         choices=["RoundRobin", "LeastBatch", "LeastCache", "VLLMLoadBalance"],
         help="Legacy scheduler routing strategy (default: RoundRobin)"
     )
+    parser.add_argument(
+        "--router-policy",
+        type=str,
+        default="least_batch",
+        choices=["round_robin", "least_batch", "least_cache"],
+        help="Hierarchical load-balancer policy (default: least_batch)",
+    )
     parser.add_argument("--num-seqs", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--max-tokens", type=int, default=4)
@@ -114,12 +121,14 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         scheduler_arch=args.scheduler_arch,
         routing_strategy=args.routing_strategy,
+        router_policy=args.router_policy,
         hierarchical_execution_trace=args.hierarchical_execution_trace,
     )
 
     print(
         f"Starting with scheduler_arch={args.scheduler_arch}, "
-        f"routing_strategy={args.routing_strategy}, loop_count={loop_count}"
+        f"routing_strategy={args.routing_strategy}, "
+        f"router_policy={args.router_policy}, loop_count={loop_count}"
     )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=args.max_tokens, ignore_eos=True)

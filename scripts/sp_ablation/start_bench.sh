@@ -25,6 +25,7 @@ DEFAULT_GPU_UTIL=0.9
 # 策略配置
 DEFAULT_ROUTING="LeastBatch"
 DEFAULT_SCHEDULER_ARCH="legacy_global"
+DEFAULT_ROUTER_POLICY="least_batch"
 DEFAULT_LOOP_COUNT=16
 DEFAULT_FIXED_SP_SIZE=0
 DEFAULT_SP_BACKEND="hao_basic"
@@ -35,6 +36,8 @@ DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER=0
 DEFAULT_DYNAMIC_SP_SIZE_STRATEGY="legacy"
 DEFAULT_LONG_REQUEST_SP_THRESHOLD=100000
 DEFAULT_LONG_REQUEST_SP_SIZE=0
+DEFAULT_DIAGNOSTIC_LOG_INTERVAL=0
+DEFAULT_SLOW_ADD_THRESHOLD_MS=0
 DISABLE_NON_UNIFORM_SPLIT=""  # 开关变量，非空时启用
 DEFAULT_MAX_INPUT_LEN=""  # 为空表示不过滤
 # ===================================================================
@@ -58,6 +61,7 @@ MAX_MODEL_LEN="$DEFAULT_MAX_MODEL_LEN"
 GPU_UTIL="$DEFAULT_GPU_UTIL"
 ROUTING_STRATEGY="$DEFAULT_ROUTING"
 SCHEDULER_ARCH="$DEFAULT_SCHEDULER_ARCH"
+ROUTER_POLICY="${ROUTER_POLICY:-$DEFAULT_ROUTER_POLICY}"
 LOOP_COUNT="$DEFAULT_LOOP_COUNT"
 FIXED_SP_SIZE="${FIXED_SP_SIZE:-$DEFAULT_FIXED_SP_SIZE}"
 SP_BACKEND="${SP_BACKEND:-$DEFAULT_SP_BACKEND}"
@@ -69,6 +73,9 @@ USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER="$DEFAULT_USE_NEW_DECODE_DYNAMIC_SP_SCHEDULE
 DYNAMIC_SP_SIZE_STRATEGY="$DEFAULT_DYNAMIC_SP_SIZE_STRATEGY"
 LONG_REQUEST_SP_THRESHOLD="$DEFAULT_LONG_REQUEST_SP_THRESHOLD"
 LONG_REQUEST_SP_SIZE="$DEFAULT_LONG_REQUEST_SP_SIZE"
+DIAGNOSTIC_LOG_INTERVAL="${DIAGNOSTIC_LOG_INTERVAL:-$DEFAULT_DIAGNOSTIC_LOG_INTERVAL}"
+SLOW_ADD_THRESHOLD_MS="${SLOW_ADD_THRESHOLD_MS:-$DEFAULT_SLOW_ADD_THRESHOLD_MS}"
+HIERARCHICAL_EXECUTION_TRACE="${HIERARCHICAL_EXECUTION_TRACE:-0}"
 RUN_LABEL="${RUN_LABEL:-}"
 
 # 用于存储位置参数（Rates）
@@ -94,6 +101,7 @@ usage() {
     echo "  --gpu-util <float>        GPU Memory Utilization (default: $DEFAULT_GPU_UTIL)"
     echo "  --routing-strategy <str>  Routing Strategy (default: $DEFAULT_ROUTING)"
     echo "  --scheduler-arch <str>    Scheduler architecture (default: $DEFAULT_SCHEDULER_ARCH)"
+    echo "  --router-policy <str>     round_robin | least_batch | least_cache (default: $DEFAULT_ROUTER_POLICY)"
     echo "  --loop-count <int>        Loop count (default: $DEFAULT_LOOP_COUNT)"
     echo "  --fixed-sp-size <int>     Fixed SP size baseline (0 = disabled, default: $DEFAULT_FIXED_SP_SIZE)"
     echo "  --sp-backend <str>        legacy_ll | hao_basic | nccl | nccl_compact (default: $DEFAULT_SP_BACKEND)"
@@ -104,6 +112,9 @@ usage() {
     echo "  --dynamic-sp-size-strategy <str>  legacy | long_short_sp8 (default: $DEFAULT_DYNAMIC_SP_SIZE_STRATEGY)"
     echo "  --long-request-sp-threshold <int> Prompt len threshold for long_short_sp8 (default: $DEFAULT_LONG_REQUEST_SP_THRESHOLD)"
     echo "  --long-request-sp-size <int>      SP size for long requests (0 = SP size, default: $DEFAULT_LONG_REQUEST_SP_SIZE)"
+    echo "  --diagnostic-log-interval <sec>   Structured client/scheduler snapshot interval (0 = disabled)"
+    echo "  --slow-add-threshold-ms <ms>      Log slow async due-batch submissions (0 = disabled)"
+    echo "  --hierarchical-execution-trace    Capture high-overhead per-rank hierarchical traces"
     echo "  --enforce-eager           Disable cudagraph capture and enforce eager mode"
     echo "  --disable-non-uniform-split  Disable non-uniform split (flag)"
     echo "  --help                    Show this help message"
@@ -130,6 +141,7 @@ while [[ $# -gt 0 ]]; do
         --gpu-util)         GPU_UTIL="$2"; shift 2 ;;
         --routing-strategy) ROUTING_STRATEGY="$2"; shift 2 ;;
         --scheduler-arch)   SCHEDULER_ARCH="$2"; shift 2 ;;
+        --router-policy)    ROUTER_POLICY="$2"; shift 2 ;;
         --loop-count)       LOOP_COUNT="$2"; shift 2 ;;
         --fixed-sp-size)     FIXED_SP_SIZE="$2"; shift 2 ;;
         --sp-backend)       SP_BACKEND="$2"; shift 2 ;;
@@ -141,6 +153,9 @@ while [[ $# -gt 0 ]]; do
         --dynamic-sp-size-strategy) DYNAMIC_SP_SIZE_STRATEGY="$2"; shift 2 ;;
         --long-request-sp-threshold) LONG_REQUEST_SP_THRESHOLD="$2"; shift 2 ;;
         --long-request-sp-size) LONG_REQUEST_SP_SIZE="$2"; shift 2 ;;
+        --diagnostic-log-interval) DIAGNOSTIC_LOG_INTERVAL="$2"; shift 2 ;;
+        --slow-add-threshold-ms) SLOW_ADD_THRESHOLD_MS="$2"; shift 2 ;;
+        --hierarchical-execution-trace) HIERARCHICAL_EXECUTION_TRACE=1; shift ;;
         --enforce-eager)    ENFORCE_EAGER=1; shift ;;
         --disable-non-uniform-split) DISABLE_NON_UNIFORM_SPLIT="true"; shift ;;
         --help)             usage ;;
@@ -173,6 +188,11 @@ case "$SCHEDULER_ARCH" in
     *) echo "Error: Invalid scheduler architecture '$SCHEDULER_ARCH'."; exit 1 ;;
 esac
 
+case "$ROUTER_POLICY" in
+    round_robin|least_batch|least_cache) ;;
+    *) echo "Error: Invalid router policy '$ROUTER_POLICY'."; exit 1 ;;
+esac
+
 case "$SP_BACKEND" in
     legacy_ll|hao_basic|nccl) ;;
     *) echo "Error: Invalid SP backend '$SP_BACKEND'."; exit 1 ;;
@@ -182,6 +202,19 @@ case "$CUDA_GRAPH_MODE" in
     full|piecewise) ;;
     *) echo "Error: Invalid CUDA graph mode '$CUDA_GRAPH_MODE'."; exit 1 ;;
 esac
+
+if [[ "$HIERARCHICAL_EXECUTION_TRACE" -ne 0 ]]; then
+    if [[ "$SCHEDULER_ARCH" != "hierarchical" ]]; then
+        echo "Error: --hierarchical-execution-trace requires --scheduler-arch hierarchical."
+        exit 1
+    fi
+    case "$DIAGNOSTIC_LOG_INTERVAL" in
+        0|0.0|0.00)
+            echo "Error: --hierarchical-execution-trace requires a positive --diagnostic-log-interval."
+            exit 1
+            ;;
+    esac
+fi
 
 # ================= 准备基础信息 (Preparation) =================
 DATASET_NAME=$(basename "$CSV_PATH" .csv)
@@ -212,6 +245,7 @@ echo "Dataset     : $DATASET_NAME"
 echo "Strategy    : DP=$DP, SP=$SP, EP=$EP, TP=$TP, BK_SZ=$BLOCK_SIZE"
 echo "Routing     : $ROUTING_STRATEGY"
 echo "SchedArch   : $SCHEDULER_ARCH"
+echo "RouterPolicy: $ROUTER_POLICY"
 echo "LBCandRatio : $LEASTBATCH_TOKEN_CANDIDATE_RATIO"
 echo "BatchSz     : $BATCH_SIZE"
 echo "GPU Util    : $GPU_UTIL ($MEM_TAG)"
@@ -226,6 +260,9 @@ echo "Enable Dynamic SP Size: $ENABLE_DYNAMIC_SP_SIZE"
 echo "New Decode Dynamic SP Scheduler: $USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 echo "Dynamic SP Size Strategy: $DYNAMIC_SP_SIZE_STRATEGY"
 echo "Long Request SP Threshold: $LONG_REQUEST_SP_THRESHOLD"
+echo "Diagnostic Log Interval: $DIAGNOSTIC_LOG_INTERVAL"
+echo "Slow Add Threshold: ${SLOW_ADD_THRESHOLD_MS}ms"
+echo "Hierarchical Execution Trace: $HIERARCHICAL_EXECUTION_TRACE"
 echo "Enforce Eager: $ENFORCE_EAGER"
 echo "Model Path  : $MODEL_PATH"
 echo "Rates       : ${RATES[*]}"
@@ -233,7 +270,7 @@ echo "================================================"
 
 log_progress "=== NEW BATCH STARTED ==="
 log_progress "Model: $MODEL_NAME | Dataset: $DATASET_NAME"
-log_progress "Parallel: DP=$DP, SP=$SP, EP=$EP, TP=$TP | Scheduler: $SCHEDULER_ARCH"
+log_progress "Parallel: DP=$DP, SP=$SP, EP=$EP, TP=$TP | Scheduler: $SCHEDULER_ARCH | RouterPolicy: $ROUTER_POLICY"
 log_progress "SegSize=$SEG_SIZE | BatchSize=$BATCH_SIZE | MaxLen=$MAX_MODEL_LEN | MaxInput=${MAX_INPUT_LEN:-unlimited} | FixedSPSize=$FIXED_SP_SIZE"
 log_progress "SPBackend=$SP_BACKEND"
 log_progress "CUDAGraphMode=$CUDA_GRAPH_MODE"
@@ -241,6 +278,9 @@ log_progress "EnableDynamicSPSize=$ENABLE_DYNAMIC_SP_SIZE"
 log_progress "UseNewDecodeDynamicSPScheduler=$USE_NEW_DECODE_DYNAMIC_SP_SCHEDULER"
 log_progress "DynamicSPSizeStrategy=$DYNAMIC_SP_SIZE_STRATEGY"
 log_progress "LongRequestSPThreshold=$LONG_REQUEST_SP_THRESHOLD"
+log_progress "DiagnosticLogInterval=$DIAGNOSTIC_LOG_INTERVAL"
+log_progress "SlowAddThresholdMs=$SLOW_ADD_THRESHOLD_MS"
+log_progress "HierarchicalExecutionTrace=$HIERARCHICAL_EXECUTION_TRACE"
 log_progress "EnforceEager=$ENFORCE_EAGER"
 log_progress "GPU: ${GPU_MEM}GB, Util=$GPU_UTIL | Routing=$ROUTING_STRATEGY | Loop=$LOOP_COUNT"
 log_progress "LeastBatchTokenCandidateRatio=$LEASTBATCH_TOKEN_CANDIDATE_RATIO"
@@ -276,6 +316,12 @@ for rate in "${RATES[@]}"; do
         hierarchical) sc_short="hier" ;;
         *)             sc_short="$SCHEDULER_ARCH" ;;
     esac
+    case "$ROUTER_POLICY" in
+        round_robin) rp_short="rpRR" ;;
+        least_batch) rp_short="rpLB" ;;
+        least_cache) rp_short="rpLC" ;;
+        *)           rp_short="$ROUTER_POLICY" ;;
+    esac
     # segment size 缩写 (65536->64k)
     seg_short=$(( SEG_SIZE / 1024 ))k
     # max-input-len 缩写
@@ -304,13 +350,14 @@ for rate in "${RATES[@]}"; do
     if [[ -n "$RUN_LABEL" ]]; then
         extra_tags="${extra_tags}_${RUN_LABEL}"
     fi
-    STRATEGY_STR="dp${DP}sp${SP}_seg${seg_short}_n${NUM_REQUESTS}_r${rate}_bs${BATCH_SIZE}_${rt_short}_${sc_short}${maxin_tag}${extra_tags}"
+    STRATEGY_STR="dp${DP}sp${SP}_seg${seg_short}_n${NUM_REQUESTS}_r${rate}_bs${BATCH_SIZE}_${rt_short}_${sc_short}_${rp_short}${maxin_tag}${extra_tags}"
 
     CURRENT_LOG_DIR="$BASE_LOG_DIR/$MODEL_NAME/$DATASET_NAME/$STRATEGY_STR"
     mkdir -p "$CURRENT_LOG_DIR"
 
     LOG_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.log"
-    JSON_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.json"
+    JSON_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.jsonl"
+    TRACE_FILE="$CURRENT_LOG_DIR/${TIMESTAMP}.hier_trace.jsonl"
 
     # 构建 Python 命令
     CMD=(
@@ -333,15 +380,18 @@ for rate in "${RATES[@]}"; do
         --loop-count "$LOOP_COUNT"
         --model-path "$MODEL_PATH"
         --routing-strategy "$ROUTING_STRATEGY"
-        --itl-log-path "$JSON_FILE"
+        --request-metrics-log-path "$JSON_FILE"
         --segment-size "$SEG_SIZE"
         --sp-backend "$SP_BACKEND"
         --cuda-graph-mode "$CUDA_GRAPH_MODE"
         --scheduler-arch "$SCHEDULER_ARCH"
+        --router-policy "$ROUTER_POLICY"
         --fixed-sp-size "$FIXED_SP_SIZE"
         --dynamic-sp-size-strategy "$DYNAMIC_SP_SIZE_STRATEGY"
         --long-request-sp-threshold "$LONG_REQUEST_SP_THRESHOLD"
         --long-request-sp-size "$LONG_REQUEST_SP_SIZE"
+        --diagnostic-log-interval "$DIAGNOSTIC_LOG_INTERVAL"
+        --slow-add-threshold-ms "$SLOW_ADD_THRESHOLD_MS"
     )
 
     # 如果启用了 disable_non_uniform_split
@@ -357,6 +407,12 @@ for rate in "${RATES[@]}"; do
     fi
     if [[ "$ENABLE_DYNAMIC_SP_SIZE" -ne 0 ]]; then
         CMD+=(--enable-dynamic-sp-size)
+    fi
+    if [[ "$HIERARCHICAL_EXECUTION_TRACE" -ne 0 ]]; then
+        CMD+=(
+            --hierarchical-execution-trace
+            --hierarchical-trace-log-path "$TRACE_FILE"
+        )
     fi
 
     # 如果设置了 max-input-len

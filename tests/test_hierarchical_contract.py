@@ -108,6 +108,16 @@ def test_complete_hierarchical_topology_whitelist(
         ("mode", "hybrid", "mode='decode'"),
         ("dummy_prefill", False, "dummy_prefill=True"),
         ("ffn_ep", 4, "topology is not supported"),
+        (
+            "max_ingress_batch_requests",
+            0,
+            "max_ingress_batch_requests must be positive",
+        ),
+        (
+            "max_ingress_drain_ms",
+            0,
+            "max_ingress_drain_ms must be positive",
+        ),
     ],
 )
 def test_hierarchical_config_rejects_out_of_contract_values(
@@ -124,6 +134,8 @@ def test_hierarchical_config_uses_deepseek_v3_mla_contract():
     assert config.hf_config.num_key_value_heads == 1
     assert config.kvcache_block_size == 64
     assert not config.hierarchical_execution_trace
+    assert config.max_ingress_batch_requests == 256
+    assert config.max_ingress_drain_ms == 10.0
     assert len(config.collective_fingerprint()) == 64
 
 
@@ -322,8 +334,31 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     first = local.plan_decode(wave_id=1, quantum_id=0)
     assert first.engine_has_real
     assert first.request_master_global_rank[42] in {4, 5, 6, 7}
+    first_load = local.load_snapshot(wave_id=1, quantum_id=0)
+    assert len(first_load.rank_loads) == config.attention_sp
+    assert tuple(load.global_rank for load in first_load.rank_loads) == (
+        4,
+        5,
+        6,
+        7,
+    )
+    assert sum(load.master_batch_size for load in first_load.rank_loads) == 1
+    assert sum(
+        load.active_master_requests for load in first_load.rank_loads
+    ) == 1
+    assert sum(load.master_assignments for load in first_load.rank_loads) == 1
+    assert all(load.total_blocks == 32 for load in first_load.rank_loads)
     assert local.postprocess(first, make_worker_results(first)) == ()
     assert sequence.num_completed_tokens == 16
+    assert local.last_itl_token_slots == 15
+    first_load = local.load_snapshot(wave_id=1, quantum_id=1)
+    assert sum(
+        load.mastered_decode_tokens for load in first_load.rank_loads
+    ) == 16
+    first_token_events = local.drain_first_token_events()
+    assert len(first_token_events) == 1
+    assert first_token_events[0].request_id == 42
+    assert first_token_events[0].generated_count == 16
 
     assert local.admit() == ()
     final = local.plan_decode(wave_id=1, quantum_id=1)
@@ -334,7 +369,9 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert events[0].request_id == 42
     assert events[0].generated_count == 17
     assert events[0].status == "FINISHED"
+    assert local.drain_first_token_events() == ()
     assert sequence.num_completed_tokens == 17
+    assert local.last_itl_token_slots == 1
     assert len(sequence.completion_token_ids) == 17
     assert local.state_manager.num_running_seqs == 0
     assert local.state_manager.num_running_tokens == 0
@@ -345,6 +382,10 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert load.control_dummy_slots == 96
     assert load.total_rank_forwards == 128
     assert load.all_dummy_rank_forwards == 0
+    assert len(load.rank_loads) == config.attention_sp
+    assert sum(load.active_master_requests for load in load.rank_loads) == 0
+    assert sum(load.master_assignments for load in load.rank_loads) == 1
+    assert sum(load.mastered_decode_tokens for load in load.rank_loads) == 17
 
 
 def test_local_scheduler_rejects_illegal_exclusive_sp_lifetime_on_add():

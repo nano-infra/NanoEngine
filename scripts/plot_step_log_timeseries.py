@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -333,6 +334,116 @@ def extract_step_records(
         sp_rows.append([float(x) for x in sp_batch_sizes])
         free_rows.append([float(x) for x in free_blocks])
         used_rows.append([float(x) for x in used_blocks])
+
+    if not rows:
+        for line in clean_text.splitlines():
+            marker = "[BENCH_DIAG] "
+            if marker not in line:
+                continue
+            try:
+                data = json.loads(line.split(marker, 1)[1])
+            except (json.JSONDecodeError, ValueError):
+                continue
+            hierarchical = data.get("hierarchical") or {}
+            per_engine = hierarchical.get("per_engine") or {}
+            engine_items = sorted(
+                per_engine.items(), key=lambda item: int(item[0])
+            )
+            rank_loads_by_engine = [
+                sorted(
+                    engine.get("rank_loads") or [],
+                    key=lambda load: int(load["global_rank"]),
+                )
+                for _, engine in engine_items
+            ]
+            rank_loads = [
+                load
+                for engine_loads in rank_loads_by_engine
+                for load in engine_loads
+            ]
+            if not rank_loads:
+                continue
+
+            sp_batch_sizes = [
+                int(load["master_batch_size"]) for load in rank_loads
+            ]
+            free_blocks = [
+                int(load["free_blocks"]) for load in rank_loads
+            ]
+            total_blocks = [
+                int(load["total_blocks"]) for load in rank_loads
+            ]
+            dp_batch_sizes = [
+                sum(
+                    int(load["master_batch_size"])
+                    for load in engine_loads
+                )
+                for engine_loads in rank_loads_by_engine
+            ]
+            used_blocks = [
+                total - free
+                for total, free in zip(
+                    total_blocks, free_blocks, strict=True
+                )
+            ]
+            kv_util_pct = [
+                100.0 * used / total if total > 0 else float("nan")
+                for used, total in zip(
+                    used_blocks, total_blocks, strict=True
+                )
+            ]
+            interval = data.get("hierarchical_interval") or {}
+            itl_ms = float(
+                interval.get("decode_itl_ms_mean", float("nan"))
+                if interval.get("decode_itl_ms_mean") is not None
+                else float("nan")
+            )
+            elapsed_s = float(data.get("elapsed_s", float("nan")))
+            rows.append(
+                {
+                    "timestamp": "",
+                    "wall_elapsed_s": elapsed_s,
+                    "decode_elapsed_s": elapsed_s,
+                    "itl_ms": itl_ms,
+                    "sch_ovhd_ms": float("nan"),
+                    "post_sch_ovhd_ms": float("nan"),
+                    "step_duration_ms": (
+                        itl_ms * loop_count
+                        if loop_count is not None and np.isfinite(itl_ms)
+                        else float("nan")
+                    ),
+                    "waiting_reqs": float(
+                        hierarchical.get(
+                            "waiting_requests", float("nan")
+                        )
+                    ),
+                    "waiting_head_blocks": float("nan"),
+                    "waiting_total_blocks": float("nan"),
+                    "total_batch_size": float(sum(dp_batch_sizes)),
+                    "avg_dp_batch_size": float(np.mean(dp_batch_sizes)),
+                    "max_dp_batch_size": float(np.max(dp_batch_sizes)),
+                    "min_dp_batch_size": float(np.min(dp_batch_sizes)),
+                    "avg_sp_batch_size": float(np.mean(sp_batch_sizes)),
+                    "max_sp_batch_size": float(np.max(sp_batch_sizes)),
+                    "min_sp_batch_size": float(np.min(sp_batch_sizes)),
+                    "total_free_blocks": float(np.sum(free_blocks)),
+                    "mean_free_blocks": float(np.mean(free_blocks)),
+                    "min_free_blocks": float(np.min(free_blocks)),
+                    "max_free_blocks": float(np.max(free_blocks)),
+                    "total_used_blocks": float(np.sum(used_blocks)),
+                    "mean_used_blocks": float(np.mean(used_blocks)),
+                    "mean_kv_util_pct": float(np.mean(kv_util_pct)),
+                    "max_kv_util_pct": float(np.max(kv_util_pct)),
+                }
+            )
+            sp_rows.append([float(x) for x in sp_batch_sizes])
+            free_rows.append([float(x) for x in free_blocks])
+            used_rows.append([float(x) for x in used_blocks])
+            if (
+                num_kvcache_blocks is None
+                and len(set(total_blocks)) == 1
+            ):
+                num_kvcache_blocks = total_blocks[0]
 
     df = pd.DataFrame(rows)
     if not df.empty:

@@ -197,3 +197,7 @@ cython_debug/
 *.pyi
 
 profiler_traces/
+
+# Local development experiment outputs
+docs-dev/**/*.json
+docs-dev/**/*.jsonl

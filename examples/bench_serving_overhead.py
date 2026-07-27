@@ -74,6 +74,13 @@ def parse_args():
     parser.add_argument("--scheduler-arch", type=str, default="legacy_global",
                         choices=["legacy_global", "hierarchical"],
                         help="Scheduler architecture (default: legacy_global).")
+    parser.add_argument(
+        "--router-policy",
+        type=str,
+        default="least_batch",
+        choices=["round_robin", "least_batch", "least_cache"],
+        help="Hierarchical load-balancer policy (default: least_batch).",
+    )
     
     # Profiler arguments
     parser.add_argument("--enable-profiler", action="store_true", help="Enable profiler.")
@@ -378,7 +385,11 @@ def main():
     print(f"\n--- Benchmark: {args.num_requests} reqs, {args.request_rate} req/s, burst={args.burstiness} ---")
 
     # Initialize Engine
-    print(f"Scheduler architecture: {args.scheduler_arch}, Routing strategy: {args.routing_strategy}")
+    print(
+        f"Scheduler architecture: {args.scheduler_arch}, "
+        f"Routing strategy: {args.routing_strategy}, "
+        f"Router policy: {args.router_policy}"
+    )
     engine = LLM(
         args.model_path,
         enforce_eager=args.enforce_eager,
@@ -402,6 +413,7 @@ def main():
         loop_count=args.loop_count,
         routing_strategy=args.routing_strategy,
         scheduler_arch=args.scheduler_arch,
+        router_policy=args.router_policy,
         segment_size=args.segment_size,
         kvcache_block_size=64,
         max_num_recv_seqs=16,

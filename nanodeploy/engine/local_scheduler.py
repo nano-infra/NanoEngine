@@ -10,10 +10,12 @@ from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AddResult,
     AbortResult,
+    FirstTokenEvent,
     FinishEvent,
     HIERARCHICAL_LOOP_COUNT,
     LoadSnapshot,
     LocalDecodeBatch,
+    RankLoad,
     RequestState,
     WorkerDecodeResult,
     round_up,
@@ -31,6 +33,7 @@ class LocalRequestRecord:
     state: RequestState
     original_prompt_len: int
     padded_completion_len: int
+    first_token_emitted: bool = False
     terminal_emitted: bool = False
 
 
@@ -73,6 +76,7 @@ class LocalScheduler:
         ] = {}
         self._records: dict[int, LocalRequestRecord] = {}
         self._terminal_events: list[FinishEvent] = []
+        self._first_token_events: list[FirstTokenEvent] = []
         self._inflight_ids: set[int] = set()
         self._all_dummy_engine_quantums = 0
         self._useful_decode_tokens = 0
@@ -81,6 +85,16 @@ class LocalScheduler:
         self._total_rank_forwards = 0
         self._all_dummy_rank_forwards = 0
         self._preemption_count = 0
+        self._last_master_batch_sizes = [
+            0 for _ in range(self.topology.attention_sp)
+        ]
+        self._master_assignments = [
+            0 for _ in range(self.topology.attention_sp)
+        ]
+        self._mastered_decode_tokens = [
+            0 for _ in range(self.topology.attention_sp)
+        ]
+        self._last_itl_token_slots = 0
 
     @property
     def cpp_scheduler(self) -> Scheduler:
@@ -89,6 +103,14 @@ class LocalScheduler:
     @property
     def state_manager(self):
         return self._state_manager
+
+    @property
+    def useful_decode_tokens(self) -> int:
+        return self._useful_decode_tokens
+
+    @property
+    def last_itl_token_slots(self) -> int:
+        return self._last_itl_token_slots
 
     def _active_request_count(self) -> int:
         return sum(
@@ -332,6 +354,15 @@ class LocalScheduler:
             sequence.block_ctx(BlockContextSlot.ACTIVE).dp_idx = (
                 self.topology.global_dp_idx
             )
+            master_sp_idx = sequence.block_ctx(
+                BlockContextSlot.ACTIVE
+            ).master_sp_idx
+            if not 0 <= master_sp_idx < self.topology.attention_sp:
+                raise RuntimeError(
+                    "admitted request has invalid master SP rank: "
+                    f"request_id={sequence.seq_id}, sp_idx={master_sp_idx}"
+                )
+            self._master_assignments[master_sp_idx] += 1
             record.state = RequestState.RUNNING_DECODE
             admitted_ids.append(sequence.seq_id)
         return tuple(admitted_ids)
@@ -394,6 +425,14 @@ class LocalScheduler:
             )
             for global_rank in self.topology.global_ranks
         }
+        self._last_master_batch_sizes = [
+            len(
+                frozen_request_order[
+                    self.topology.global_rank(sp_idx=sp_idx)
+                ]
+            )
+            for sp_idx in range(self.topology.attention_sp)
+        ]
         per_rank_sequences = {
             global_rank: list(sequences)
             for global_rank in self.topology.global_ranks
@@ -484,6 +523,15 @@ class LocalScheduler:
             request_id: self._records[request_id].sequence.num_completed_tokens
             for request_id in self._inflight_ids.difference(aborted_ids)
         }
+        master_sp_by_request = {
+            request_id: (
+                self._records[request_id]
+                .sequence.block_ctx(BlockContextSlot.ACTIVE)
+                .master_sp_idx
+            )
+            for request_id in completed_before
+        }
+        self._last_itl_token_slots = 0
         for request_id in sorted(aborted_ids):
             self._finish_aborted(request_id)
 
@@ -528,13 +576,45 @@ class LocalScheduler:
             metrics_manager=None,
             loop_count=HIERARCHICAL_LOOP_COUNT,
         )
-        self._useful_decode_tokens += sum(
-            self._records[request_id].sequence.num_completed_tokens
-            - completed_before[request_id]
-            for request_id in completed_before
-        )
+        for request_id, previous_tokens in completed_before.items():
+            completed_tokens = self._records[
+                request_id
+            ].sequence.num_completed_tokens
+            generated_tokens = completed_tokens - previous_tokens
+            if generated_tokens < 0:
+                raise RuntimeError(
+                    "hierarchical completed-token counter moved backwards: "
+                    f"request_id={request_id}"
+                )
+            master_sp_idx = master_sp_by_request[request_id]
+            if not 0 <= master_sp_idx < self.topology.attention_sp:
+                raise RuntimeError(
+                    "decoded request has invalid master SP rank: "
+                    f"request_id={request_id}, sp_idx={master_sp_idx}"
+                )
+            self._useful_decode_tokens += generated_tokens
+            self._mastered_decode_tokens[master_sp_idx] += generated_tokens
+            self._last_itl_token_slots += (
+                generated_tokens
+                if previous_tokens > 0
+                else max(0, generated_tokens - 1)
+            )
         for request_id in sorted(self._inflight_ids.difference(aborted_ids)):
             record = self._records[request_id]
+            if (
+                not record.first_token_emitted
+                and record.sequence.num_completed_tokens > 0
+            ):
+                record.first_token_emitted = True
+                self._first_token_events.append(
+                    FirstTokenEvent(
+                        request_id=request_id,
+                        engine_id=self.engine_id,
+                        generated_count=(
+                            record.sequence.num_completed_tokens
+                        ),
+                    )
+                )
             if record.sequence.is_finished:
                 record.state = RequestState.FINISHED
                 self._emit_terminal(record, "FINISHED")
@@ -548,14 +628,49 @@ class LocalScheduler:
         self._terminal_events.clear()
         return events
 
+    def drain_first_token_events(self) -> tuple[FirstTokenEvent, ...]:
+        events = tuple(self._first_token_events)
+        self._first_token_events.clear()
+        return events
+
     def is_finished(self) -> bool:
         return all(record.state.is_terminal for record in self._records.values())
 
     def load_snapshot(self, *, wave_id: int, quantum_id: int) -> LoadSnapshot:
         free_blocks = [
-            block_manager.num_free_blocks
-            for block_manager in self._state_manager.block_manager.values()
+            self._state_manager.block_manager[sp_idx].num_free_blocks
+            for sp_idx in range(self.topology.attention_sp)
         ]
+        active_master_requests = [
+            0 for _ in range(self.topology.attention_sp)
+        ]
+        for record in self._records.values():
+            if record.state not in {
+                RequestState.RUNNING_DECODE,
+                RequestState.ABORT_PENDING,
+            }:
+                continue
+            master_sp_idx = record.sequence.block_ctx(
+                BlockContextSlot.ACTIVE
+            ).master_sp_idx
+            if 0 <= master_sp_idx < self.topology.attention_sp:
+                active_master_requests[master_sp_idx] += 1
+        rank_loads = tuple(
+            RankLoad(
+                global_rank=self.topology.global_rank(sp_idx=sp_idx),
+                sp_idx=sp_idx,
+                tp_idx=0,
+                master_batch_size=self._last_master_batch_sizes[sp_idx],
+                active_master_requests=active_master_requests[sp_idx],
+                free_blocks=free_blocks[sp_idx],
+                total_blocks=self._state_manager.block_manager[
+                    sp_idx
+                ].num_blocks,
+                master_assignments=self._master_assignments[sp_idx],
+                mastered_decode_tokens=self._mastered_decode_tokens[sp_idx],
+            )
+            for sp_idx in range(self.topology.attention_sp)
+        )
         return LoadSnapshot(
             engine_id=self.engine_id,
             ready=True,
@@ -580,4 +695,5 @@ class LocalScheduler:
             total_rank_forwards=self._total_rank_forwards,
             all_dummy_rank_forwards=self._all_dummy_rank_forwards,
             preemption_count=self._preemption_count,
+            rank_loads=rank_loads,
         )

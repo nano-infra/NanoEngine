@@ -19,10 +19,14 @@ from nanodeploy.engine.decode_coordinator import DecodeCoordinator
 from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AddResult,
+    AddResultEvent,
     AbortResult,
     CoordinatorStatus,
+    DecodeITLSample,
     EngineReady,
+    FirstTokenEvent,
     FinishEvent,
+    IngressAck,
     LoadSnapshot,
 )
 from nanodeploy.engine.local_engine import LocalEngineCore
@@ -92,11 +96,28 @@ class RayEngineTransport:
     def add(self, command: AddCommand) -> AddResult:
         return self._get(self.actor.submit_add.remote(command))
 
+    def enqueue_async(self, command: AddCommand):
+        with _without_proxy_env():
+            return self.actor.enqueue_add.remote(command)
+
+    def enqueue_batch_async(self, commands: tuple[AddCommand, ...]):
+        with _without_proxy_env():
+            return self.actor.enqueue_add_batch.remote(commands)
+
+    def poll_enqueue(
+        self, handle
+    ) -> tuple[bool, IngressAck | None]:
+        with _without_proxy_env():
+            ready, _ = ray.wait([handle], num_returns=1, timeout=0)
+            if not ready:
+                return False, None
+            return True, ray.get(ready[0])
+
     def abort(self, request_id: int) -> AbortResult:
         return self._get(self.actor.submit_abort.remote(request_id))
 
     def load(self) -> LoadSnapshot:
-        return self._get(self.actor.get_load.remote())
+        return self._get(self.actor.get_cached_load.remote())
 
 
 class DeploymentManager:
@@ -357,11 +378,37 @@ class DeploymentManager:
             event for engine_events in per_engine for event in engine_events
         )
 
+    def poll_add_results(self) -> tuple[AddResultEvent, ...]:
+        with _without_proxy_env():
+            per_engine = ray.get(
+                [
+                    actor.drain_add_results.remote()
+                    for actor in self.engines.values()
+                ],
+                timeout=self.config.quantum_timeout_s,
+            )
+        return tuple(
+            event for engine_events in per_engine for event in engine_events
+        )
+
+    def poll_first_token_events(self) -> tuple[FirstTokenEvent, ...]:
+        with _without_proxy_env():
+            per_engine = ray.get(
+                [
+                    actor.drain_first_token_events.remote()
+                    for actor in self.engines.values()
+                ],
+                timeout=self.config.quantum_timeout_s,
+            )
+        return tuple(
+            event for engine_events in per_engine for event in engine_events
+        )
+
     def load_snapshots(self) -> tuple[LoadSnapshot, ...]:
         with _without_proxy_env():
             snapshots = ray.get(
                 [
-                    actor.get_load.remote()
+                    actor.get_cached_load.remote()
                     for actor in self.engines.values()
                 ],
                 timeout=self.config.quantum_timeout_s,
@@ -380,6 +427,19 @@ class DeploymentManager:
                 timeout=self.config.quantum_timeout_s,
             )
         return tuple(trace for traces in per_engine for trace in traces)
+
+    def decode_itl_samples(self) -> tuple[DecodeITLSample, ...]:
+        with _without_proxy_env():
+            per_engine = ray.get(
+                [
+                    actor.get_decode_itl_samples.remote()
+                    for actor in self.engines.values()
+                ],
+                timeout=self.config.quantum_timeout_s,
+            )
+        return tuple(
+            sample for engine_samples in per_engine for sample in engine_samples
+        )
 
     def close(self) -> None:
         with self._lock:
