@@ -40,6 +40,24 @@ scripts/run_2node_rate30_6min_matrix.sh
 旧的 benchmark-observed `dispatch -> completion / generated tokens` 保留为
 `dispatch_normalized_latency_ms`，不再作为默认 TPOT 或 goodput 的输入。
 
+### Admission 延迟拆解
+
+去中心化请求的 `T0 -> T1 -> T3` 指标会写入 per-request JSONL 和
+`summary.json`：
+
+- `dispatch_lag_ms`：T0 计划到达至 T1 实际投递；
+- `ingress_ack_latency_ms`：T1 投递至 T3 authoritative admission ACK；
+- `router_pending_ms`：RequestRouter 中等待发起 admission RPC 的累计时间；
+- `admission_rpc_ms`：前端观察到的 LocalEngine admission RPC 累计时间；
+- `local_command_queue_ms`：最终 LocalEngine 命令进入队列至单写循环拾取；
+- `local_admission_ms`：最终本地 admission batch 的处理时间；
+- `admission_rpc_residual_ms`：RPC 总时间扣除本地命令排队和 admission，
+  用于定位 Ray actor mailbox、传输、轮询或前序 fallback；
+- `frontend_ack_overhead_ms`：T1-T3 扣除 router 和 RPC 后的前端观察余量。
+
+所有跨节点字段传递的是各进程内单调时钟计算出的“时长”，不比较不同节点
+的绝对时间戳。
+
 ## `plot_run_metrics.py`
 
 用途：

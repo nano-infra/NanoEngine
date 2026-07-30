@@ -56,12 +56,18 @@ class _PendingIngress:
     candidate_engine_ids: tuple[int, ...]
     candidate_index: int
     handle: Any
+    rpc_started_at: float
+    router_pending_ms: float = 0.0
+    admission_rpc_ms: float = 0.0
     centralized_admission: bool = False
 
 
 @dataclass(slots=True)
 class _GlobalPending:
     command: AddCommand
+    router_queued_at: float
+    router_pending_ms: float = 0.0
+    admission_rpc_ms: float = 0.0
     blocked_generation: int | None = None
     capacity_blocked_since: float | None = None
 
@@ -404,6 +410,7 @@ class RequestRouter:
         ignore_eos: bool,
     ) -> int:
         """Queue a request without waiting for a LocalEngine result."""
+        submitted_at = perf_counter()
         if (
             request_id in self._owners
             or request_id in self._terminal
@@ -441,6 +448,7 @@ class RequestRouter:
             self._global_pending.append(
                 _GlobalPending(
                     command,
+                    router_queued_at=submitted_at,
                     capacity_blocked_since=capacity_blocked_since,
                 )
             )
@@ -462,6 +470,7 @@ class RequestRouter:
             max_tokens=max_tokens,
         )
         try:
+            rpc_started_at = perf_counter()
             handle = self._engines[engine_id].enqueue_async(command)
         except BaseException:
             self._refund_cache(request_id)
@@ -472,6 +481,11 @@ class RequestRouter:
             candidate_engine_ids=candidates,
             candidate_index=0,
             handle=handle,
+            rpc_started_at=rpc_started_at,
+            router_pending_ms=(
+                rpc_started_at - submitted_at
+            )
+            * 1000,
         )
         return request_id
 
@@ -517,6 +531,7 @@ class RequestRouter:
             )
             self._admission_attempts[engine_id] += 1
             try:
+                rpc_started_at = perf_counter()
                 handle = self._engines[engine_id].admit_async(command)
             except BaseException:
                 self._refund_least_batch(command.request_id)
@@ -530,6 +545,16 @@ class RequestRouter:
                 candidate_engine_ids=candidates,
                 candidate_index=0,
                 handle=handle,
+                rpc_started_at=rpc_started_at,
+                router_pending_ms=(
+                    pending_global.router_pending_ms
+                    + (
+                        rpc_started_at
+                        - pending_global.router_queued_at
+                    )
+                    * 1000
+                ),
+                admission_rpc_ms=pending_global.admission_rpc_ms,
                 centralized_admission=True,
             )
 
@@ -547,6 +572,10 @@ class RequestRouter:
             )
             if not ready:
                 continue
+            ack_observed_at = perf_counter()
+            pending.admission_rpc_ms += (
+                ack_observed_at - pending.rpc_started_at
+            ) * 1000
             if ack is None:
                 raise RuntimeError(
                     f"engine {engine_id} returned no ready ingress ACK"
@@ -603,11 +632,16 @@ class RequestRouter:
                     self._admission_attempts[fallback_engine_id] += 1
                 try:
                     transport = self._engines[fallback_engine_id]
+                    fallback_started_at = perf_counter()
+                    pending.router_pending_ms += (
+                        fallback_started_at - ack_observed_at
+                    ) * 1000
                     pending.handle = (
                         transport.admit_async(pending.command)
                         if pending.centralized_admission
                         else transport.enqueue_async(pending.command)
                     )
+                    pending.rpc_started_at = fallback_started_at
                 except BaseException:
                     self._refund_cache(request_id)
                     self._refund_least_batch(request_id)
@@ -626,6 +660,9 @@ class RequestRouter:
                 self._global_pending.append(
                     _GlobalPending(
                         pending.command,
+                        router_queued_at=capacity_blocked_since,
+                        router_pending_ms=pending.router_pending_ms,
+                        admission_rpc_ms=pending.admission_rpc_ms,
                         blocked_generation=self._load_generation,
                         capacity_blocked_since=capacity_blocked_since,
                     )
@@ -658,7 +695,13 @@ class RequestRouter:
                 self._global_capacity_queue_ms.pop(request_id, None)
                 self._owners.pop(request_id, None)
                 self._rejected_request_ids.add(request_id)
-            acks.append(ack)
+            acks.append(
+                replace(
+                    ack,
+                    router_pending_ms=pending.router_pending_ms,
+                    admission_rpc_ms=pending.admission_rpc_ms,
+                )
+            )
         return tuple(acks)
 
     def record_add_results(

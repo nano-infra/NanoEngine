@@ -469,11 +469,12 @@ class LocalEngineCore:
         if not commands:
             return
         now = perf_counter()
-        self._command_count += len(commands)
-        self._command_queue_delay_ms_total += sum(
+        command_queue_ms = tuple(
             (now - command.enqueued_at) * 1000
             for command in commands
         )
+        self._command_count += len(commands)
+        self._command_queue_delay_ms_total += sum(command_queue_ms)
         add_commands = tuple(command.payload for command in commands)
         try:
             with self._ingress_lock:
@@ -564,11 +565,19 @@ class LocalEngineCore:
                         )
                     )
 
-            for command, add_command, result, admission_version in zip(
+            local_admission_ms = (perf_counter() - now) * 1000
+            for (
+                command,
+                add_command,
+                result,
+                admission_version,
+                queue_ms,
+            ) in zip(
                 commands,
                 add_commands,
                 results,
                 admission_versions,
+                command_queue_ms,
                 strict=True,
             ):
                 command.result = IngressAck(
@@ -577,6 +586,8 @@ class LocalEngineCore:
                     enqueued=result.accepted,
                     reason=result.reason,
                     admission_version=admission_version,
+                    local_command_queue_ms=queue_ms,
+                    local_admission_ms=local_admission_ms,
                 )
             if accepted_events:
                 with self._events_lock:

@@ -565,6 +565,55 @@ def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
         "ingress_ack_latency_ms": metric_percentiles(
             records, "ingress_ack_latency_ms"
         ),
+        "router_pending_ms": metric_percentiles(
+            records, "router_pending_ms"
+        ),
+        "admission_rpc_ms": metric_percentiles(
+            records, "admission_rpc_ms"
+        ),
+        "local_command_queue_ms": metric_percentiles(
+            records, "local_command_queue_ms"
+        ),
+        "local_admission_ms": metric_percentiles(
+            records, "local_admission_ms"
+        ),
+        "admission_rpc_residual_ms": metric_percentiles(
+            records, "admission_rpc_residual_ms"
+        ),
+        "frontend_ack_overhead_ms": metric_percentiles(
+            records, "frontend_ack_overhead_ms"
+        ),
+        "dispatch_lag_ms_definition": (
+            "T0->T1: scheduled arrival to actual benchmark dispatch"
+        ),
+        "ingress_ack_latency_ms_definition": (
+            "T1->T3: benchmark dispatch to authoritative admission ACK"
+        ),
+        "router_pending_ms_definition": (
+            "RequestRouter submit to admission RPC issue, accumulated across "
+            "global retries; includes any separately reported GPU-capacity "
+            "queue time"
+        ),
+        "admission_rpc_ms_definition": (
+            "frontend monotonic time across all LocalEngine admission RPC "
+            "attempts until each ACK is observed by RequestRouter"
+        ),
+        "local_command_queue_ms_definition": (
+            "final LocalEngine admission command enqueue to single-writer "
+            "loop pickup"
+        ),
+        "local_admission_ms_definition": (
+            "final LocalEngine single-writer admission batch processing"
+        ),
+        "admission_rpc_residual_ms_definition": (
+            "admission RPC time minus final local command-queue and admission "
+            "work; includes Ray actor mailbox/transport/polling and any prior "
+            "fallback attempts"
+        ),
+        "frontend_ack_overhead_ms_definition": (
+            "T1->T3 minus router-pending and admission-RPC time; covers "
+            "frontend submit and ACK observation overhead"
+        ),
         "add_accept_latency_ms": metric_percentiles(
             records, "add_accept_latency_ms"
         ),
@@ -792,6 +841,37 @@ def run_benchmark(
             if e2e_ms is not None and actual_output_tokens > 0
             else None
         )
+        ingress_ack_latency_ms = _interval_ms(
+            timing, "ingress_ack_ns", "dispatch_ns"
+        )
+        router_pending_ms = timing.get("router_pending_ms")
+        admission_rpc_ms = timing.get("admission_rpc_ms")
+        local_command_queue_ms = timing.get("local_command_queue_ms")
+        local_admission_ms = timing.get("local_admission_ms")
+        admission_rpc_residual_ms = None
+        if (
+            admission_rpc_ms is not None
+            and local_command_queue_ms is not None
+            and local_admission_ms is not None
+        ):
+            admission_rpc_residual_ms = round(
+                float(admission_rpc_ms)
+                - float(local_command_queue_ms)
+                - float(local_admission_ms),
+                6,
+            )
+        frontend_ack_overhead_ms = None
+        if (
+            ingress_ack_latency_ms is not None
+            and router_pending_ms is not None
+            and admission_rpc_ms is not None
+        ):
+            frontend_ack_overhead_ms = round(
+                float(ingress_ack_latency_ms)
+                - float(router_pending_ms)
+                - float(admission_rpc_ms),
+                6,
+            )
         first_forward_to_terminal_ms = None
         tpot_with_queue_ms = None
         tpot_with_queue_source = None
@@ -896,9 +976,13 @@ def run_benchmark(
             "dispatch_lag_ms": _interval_ms(
                 timing, "dispatch_ns", "scheduled_ns"
             ),
-            "ingress_ack_latency_ms": _interval_ms(
-                timing, "ingress_ack_ns", "dispatch_ns"
-            ),
+            "ingress_ack_latency_ms": ingress_ack_latency_ms,
+            "router_pending_ms": router_pending_ms,
+            "admission_rpc_ms": admission_rpc_ms,
+            "local_command_queue_ms": local_command_queue_ms,
+            "local_admission_ms": local_admission_ms,
+            "admission_rpc_residual_ms": admission_rpc_residual_ms,
+            "frontend_ack_overhead_ms": frontend_ack_overhead_ms,
             "add_accept_latency_ms": _interval_ms(
                 timing, "add_result_ns", "dispatch_ns"
             ),
@@ -1155,6 +1239,17 @@ def run_benchmark(
                     observed_ns = clock_ns()
                     timing = request_times[ack.request_id]
                     timing["ingress_ack_ns"] = observed_ns
+                    for metric_name in (
+                        "router_pending_ms",
+                        "admission_rpc_ms",
+                        "local_command_queue_ms",
+                        "local_admission_ms",
+                    ):
+                        metric_value = getattr(ack, metric_name)
+                        if metric_value is not None:
+                            timing[metric_name] = round(
+                                float(metric_value), 6
+                            )
                     if (
                         ack.enqueued
                         and ack.admission_version is not None
@@ -1478,6 +1573,18 @@ def run_benchmark(
         "ingress_ack_latency_ms": latency_stats(
             ingress_ack_latency_ms
         ),
+        "router_pending_ms": metrics_summary["router_pending_ms"],
+        "admission_rpc_ms": metrics_summary["admission_rpc_ms"],
+        "local_command_queue_ms": metrics_summary[
+            "local_command_queue_ms"
+        ],
+        "local_admission_ms": metrics_summary["local_admission_ms"],
+        "admission_rpc_residual_ms": metrics_summary[
+            "admission_rpc_residual_ms"
+        ],
+        "frontend_ack_overhead_ms": metrics_summary[
+            "frontend_ack_overhead_ms"
+        ],
         "add_accept_latency_ms": latency_stats(
             add_accept_latency_ms
         ),

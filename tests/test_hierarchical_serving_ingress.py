@@ -561,6 +561,10 @@ def test_authoritative_admission_ack_records_bootstrap_ttft(
                     enqueued=ack.enqueued,
                     reason=ack.reason,
                     admission_version=1,
+                    router_pending_ms=25.0,
+                    admission_rpc_ms=450.0,
+                    local_command_queue_ms=100.0,
+                    local_admission_ms=50.0,
                 )
                 for ack in super().poll_ingress_acks()
             )
@@ -613,6 +617,12 @@ def test_authoritative_admission_ack_records_bootstrap_ttft(
     assert record["ttft_ms"] == 500.0
     assert record["bootstrap_ttft_ms"] == 500.0
     assert record["model_ttft_ms"] is None
+    assert record["router_pending_ms"] == 25.0
+    assert record["admission_rpc_ms"] == 450.0
+    assert record["local_command_queue_ms"] == 100.0
+    assert record["local_admission_ms"] == 50.0
+    assert record["admission_rpc_residual_ms"] == 300.0
+    assert record["frontend_ack_overhead_ms"] == 25.0
     assert record["first_schedule_latency_ms"] == 42.5
     assert (
         record["first_schedule_latency_source"]
@@ -632,6 +642,12 @@ def test_authoritative_admission_ack_records_bootstrap_ttft(
     assert summary["ttft_ms"]["mean"] == 500.0
     assert summary["bootstrap_ttft_ms"]["mean"] == 500.0
     assert summary["model_ttft_ms"] is None
+    assert summary["router_pending_ms"]["mean"] == 25.0
+    assert summary["admission_rpc_ms"]["mean"] == 450.0
+    assert summary["local_command_queue_ms"]["mean"] == 100.0
+    assert summary["local_admission_ms"]["mean"] == 50.0
+    assert summary["admission_rpc_residual_ms"]["mean"] == 300.0
+    assert summary["frontend_ack_overhead_ms"]["mean"] == 25.0
     assert summary["first_schedule_latency_ms"]["mean"] == 42.5
     assert summary["global_capacity_queue_ms"]["mean"] == 30.0
     assert summary["local_scheduler_queue_ms"]["mean"] == 12.5

@@ -127,6 +127,16 @@ class IngressAck:
     # centralized-admission ACK carries the version that will be visible in
     # subsequent cached load snapshots.
     admission_version: int | None = None
+    # Frontend monotonic-clock intervals. router_pending_ms covers time in
+    # RequestRouter before admission RPC attempts; admission_rpc_ms covers all
+    # attempts through the ACK observed by RequestRouter.
+    router_pending_ms: float | None = None
+    admission_rpc_ms: float | None = None
+    # LocalEngine monotonic-clock intervals for the final admission attempt.
+    # These are safe across nodes because each duration is computed entirely
+    # inside the destination actor.
+    local_command_queue_ms: float | None = None
+    local_admission_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

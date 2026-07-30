@@ -297,7 +297,10 @@ def test_router_buffers_terminal_until_async_owner_commit():
     assert router.record_finish_events((event,)) == ()
 
     engines[0].handles[0]["ready"] = True
-    assert router.poll_ingress_acks()[0].enqueued
+    ack = router.poll_ingress_acks()[0]
+    assert ack.enqueued
+    assert ack.router_pending_ms is not None
+    assert ack.admission_rpc_ms is not None
     assert router.owner(5) == RequestOwner(OwnerState.PENDING_ADD, 0)
     assert router.record_finish_events(()) == ()
 
@@ -362,7 +365,10 @@ def test_router_retries_globally_after_all_dps_defer_admission(
     assert router.poll_ingress_acks() == ()
     assert len(engines[0].commands) == 2
     engines[0].handles[1]["ready"] = True
-    assert router.poll_ingress_acks()[0].enqueued
+    ack = router.poll_ingress_acks()[0]
+    assert ack.enqueued
+    assert ack.router_pending_ms == 25_000.0
+    assert ack.admission_rpc_ms == 10_000.0
     schedule_events = router.record_first_schedule_events(
         (FirstScheduleEvent(9, 0, local_scheduler_queue_ms=7.0),)
     )
@@ -716,12 +722,12 @@ def test_local_engine_central_admission_commits_only_after_local_plan():
     engine._complete_admission_commands((accepted, deferred))
     assert engine.scheduler.batches == [(60, 61)]
     assert accepted.error is None
-    assert accepted.result == IngressAck(
-        request_id=60,
-        engine_id=0,
-        enqueued=True,
-        admission_version=1,
-    )
+    assert accepted.result.request_id == 60
+    assert accepted.result.engine_id == 0
+    assert accepted.result.enqueued
+    assert accepted.result.admission_version == 1
+    assert accepted.result.local_command_queue_ms >= 0.0
+    assert accepted.result.local_admission_ms >= 0.0
     assert engine._reserved_request_ids == {60}
     assert engine._reserved_slots == 1
     assert engine.drain_add_results() == (
@@ -730,12 +736,12 @@ def test_local_engine_central_admission_commits_only_after_local_plan():
     assert engine._wave_running
 
     assert deferred.error is None
-    assert deferred.result == IngressAck(
-        request_id=61,
-        engine_id=0,
-        enqueued=False,
-        reason="admission_deferred",
-    )
+    assert deferred.result.request_id == 61
+    assert deferred.result.engine_id == 0
+    assert not deferred.result.enqueued
+    assert deferred.result.reason == "admission_deferred"
+    assert deferred.result.local_command_queue_ms >= 0.0
+    assert deferred.result.local_admission_ms >= 0.0
     assert engine._reserved_request_ids == {60}
     assert engine._reserved_slots == 1
     assert 61 not in engine._admission_pending_ids
