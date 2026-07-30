@@ -4,11 +4,13 @@
 
 This note compares NanoDeploy's hierarchical `least_batch` path with local
 vLLM commit `a5d19cbb9`. The goal is to remove the rate-50 admission RPC
-collapse without hiding scheduler queueing time.
+collapse while retaining NanoDeploy's global queue: requests are sent to a
+LocalEngine only when a fresh load snapshot indicates admission capacity.
 
 ## What vLLM Does
 
-vLLM separates transport acceptance from scheduler admission:
+For API-to-EngineCore dispatch, vLLM separates transport acceptance from
+scheduler admission:
 
 1. `AsyncLLM` registers frontend output state, chooses one DP EngineCore, and
    awaits only the ZMQ send.
@@ -32,66 +34,95 @@ poll a separate RPC for every event type. Its ZMQ high-water marks are
 unbounded, so NanoDeploy should copy the asynchronous queueing model but add
 explicit overload limits.
 
+### Ray-specific behavior
+
+vLLM RayExecutorV2 uses Ray to place and own long-lived worker actors, then
+starts one `run.remote()` busy loop per actor. Scheduler inputs and model
+outputs travel through shared-memory or TCP `MessageQueue` instances rather
+than per-step Ray actor RPCs. Each long-lived `run()` ObjectRef is retained as
+a liveness sentinel. A background monitor calls one `ray.wait()` over that
+fixed worker set with a five-second timeout.
+
+The older Ray executor also avoids per-ref polling: it fans a collective call
+out to all workers and then performs one `ray.get(refs)`, or wraps the complete
+ref list in one future for non-blocking execution.
+
+The transferable rule is therefore not “increase Ray actor concurrency.” It is
+“keep ObjectRef cardinality bounded by workers or batches, never by requests.”
+
 ## NanoDeploy Gap
 
 NanoDeploy already has most required primitives:
 
-- `enqueue_add_batch()` quickly reserves and queues requests;
-- `_drain_ingress()` batches local `scheduler.add()` calls;
-- `LocalScheduler.add()` retains requests in `WAITING_ADMISSION`;
+- `try_admit_batch()` atomically evaluates a candidate batch;
 - `LoadSnapshot` carries waiting, running, pending ingress, and KV state.
 
-The `least_batch` path bypasses those advantages. It calls blocking
-`admit_add()`, waits for the single-writer loop to attempt immediate placement,
-polls every Ray object reference separately, removes deferred requests from the
-local waiting queue, and retries them on another DP. Separately, frontend
-polling issues distinct actor RPCs for add results, first-token events,
-first-schedule events, terminal events, health, and load.
+The `least_batch` path launches one blocking `admit_add()` actor call per
+request, eagerly moves the global queue into `_pending_ingress`, and calls
+`ray.wait([handle], timeout=0)` for every pending request on every frontend
+poll. A deferred request can then create a second-DP fallback and a later
+global retry. ObjectRefs and retries therefore grow with offered load rather
+than DP count.
 
 ## Recommended Design
 
-### Phase 1: Sticky, queue-preserving routing
+### Phase 1: Global queue with bounded batch flights
 
-- Score each DP from `waiting`, `running`, and frontend tentative assignments;
-  start with vLLM's `waiting * 4 + running` policy.
-- Batch new commands per DP and use the existing `enqueue_add_batch()` fast
-  path.
-- Once routed, retain the request in that LocalScheduler's waiting queue.
-- Remove `admission_deferred` fallback and global retry from normal flow.
-- Keep fallback only for engine failure. Treat hard validation failure as a
-  rejection and queue-capacity exhaustion as explicit overload/backpressure.
+- Keep requests in global FIFO until a new `LoadSnapshot` indicates an engine
+  can attempt admission.
+- Permit at most one `_AdmissionBatchFlight` per engine. Select a bounded
+  candidate batch from the global head and issue one
+  `admit_batch.remote(commands, load_generation)` call.
+- Poll all active batch refs with one `ray.wait(refs,
+  num_returns=len(refs), timeout=0)`, then call one `ray.get(ready_refs)`.
+  With DP=2, the wait set can never exceed two refs.
+- Accepted requests become owned by the selected engine. Deferred requests
+  return to global FIFO and remain blocked until an admission-relevant load
+  generation advances.
+- Do not immediately fallback to another DP in the same generation. Retry
+  limits apply to batches/generations, not individual poll iterations.
 
-### Phase 2: O(DP), not O(request), control-plane work
+The LocalEngine batch actor method may still wait for its single-writer loop,
+but it occupies only one actor concurrency slot and creates only one mailbox
+entry per engine. `max_concurrency` is no longer the admission window.
 
-- Replace per-object `ray.wait([ref], timeout=0)` with one batched `ray.wait`
-  over outstanding batch handles.
-- Consolidate LocalEngine events and the latest load snapshot into one
-  `drain_frontend_events()` call per DP per frontend tick. A later persistent
-  long-poll/event channel can further approximate vLLM's ZMQ output task.
+### Phase 2: Capacity notification and event consolidation
+
+- Initially, fetch all DP cached load snapshots together at the existing
+  100 ms cadence. Include an admission-capacity epoch or generation in every
+  snapshot so stale credits cannot launch duplicate batches.
+- If 100 ms wakeup granularity is material, keep one long-poll state-change
+  ObjectRef per engine. Re-arm it after completion and wait over the fixed DP
+  set. This is the Ray analogue of vLLM's persistent MessageQueue.
+- Consolidate add results, first-token, first-schedule, terminal, health, and
+  load into one frontend event batch per engine rather than separate actor RPCs.
+- A later MessageQueue/TCP control channel can remove Ray from the hot path
+  completely, following RayExecutorV2, but is not required for the first A/B.
 
 ### Phase 3: Preserve metric boundaries
 
-Record three separate milestones:
+Record these milestones:
 
-- ingress receipt: target LocalEngine has durably queued the command;
-- local queued: LocalScheduler has created the waiting record;
-- admission/scheduled: the request first obtains SP/KV placement.
+- global queued: request entered the frontend global FIFO;
+- batch dispatched: capacity snapshot caused a batch RPC;
+- admission committed: the request obtained SP/KV placement;
+- first scheduled/model token/terminal.
 
 Primary arrival TTFT and TPOT-with-queue must include all real waiting.
-Additionally report `queued -> scheduled` locally, split into cadence wait and
-capacity/contention wait if the fixed decode-loop admission cadence should be
-excluded from a centralized-scheduler comparison. Never use the fast ingress
-receipt as bootstrap readiness.
+Report global queue time separately from batch RPC time and local command queue
+time. Split cadence wait from capacity/contention wait if the fixed decode-loop
+admission cadence should be excluded from a centralized-scheduler comparison.
+Never treat batch dispatch or mailbox receipt as bootstrap readiness.
 
 ## Validation
 
 Run current-code-compatible rate 20 and rate 50 tests. Require:
 
 - 18,000 requests dispatched without growing dispatch lag;
-- normal-flow fallback and global retry counts remain zero;
-- outstanding control-plane handles scale with DP count/batches, not requests;
-- P50/P90/P99 ingress receipt, queued-to-scheduled, TTFT, TPOT-with-queue, and
-  decode ITL are reported;
+- normal-flow same-generation fallback count remains zero;
+- outstanding admission refs never exceed the number of DP engines;
+- P50/P90/P99 global queue, batch RPC, local command queue, TTFT,
+  TPOT-with-queue, and decode ITL are reported;
 - queue capacity produces controlled backpressure or rejection, not a retry
   storm.
 
