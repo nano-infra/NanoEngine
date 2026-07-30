@@ -130,3 +130,69 @@ Implemented the global-queue dispatch redesign:
 Focused CPU validation passed: 78 tests covering control plane, contracts,
 serving ingress, and routing configuration. The rate-50 Ray/GPU validation is
 still pending.
+
+## 2026-07-30 — batched-admission rate-50 validation
+
+### Runtime fix
+
+The first initialized validation exposed a merged-event lifecycle edge case:
+the consolidated ingress poll could buffer the final `FinishEvent` and remove
+the last router owner before the serving loop called `step()`. Consequently,
+`is_finished()` returned true while a completion was still buffered. The
+hierarchical completion predicate now also requires the frontend finish buffer
+to be empty. A focused regression was added; 79 control-plane, contract,
+serving-ingress, and routing tests pass. The fix is commit `1c5deac`.
+
+### Successful run
+
+- Ray: `10.102.206.14:8776`, nodes `10.102.206.14` and
+  `10.102.252.174`;
+- topology/workload: DP2 × SP8, rate 50, 360-second injection,
+  18,000 requests;
+- result:
+  `bench_logs/rate50_decentralized_dp2sp8_admission_batch_fixed_20260730_0811/`;
+- 18,000/18,000 requests completed, no ingress/scheduler rejection or
+  benchmark failure;
+- achieved dispatch rate: 49.70 req/s; total drain time: 469.96 s;
+- diagnostic maxima: 2 admission ObjectRefs, 312 requests represented by
+  those refs, 284 requests in the global admission FIFO, and 3,045 client
+  requests outstanding.
+
+Capacity saturation produced 2,978 request-level `admission_deferred`
+retries, but zero same-generation fallback and zero `queue_full`. These are
+global-queue retries gated by `capacity_epoch`; they did not increase the Ray
+wait set beyond DP=2. The final per-engine commit counters include the
+256-request warmup, while benchmark acceptance is exactly 18,000.
+
+### P50 / P90 / P99
+
+- bootstrap/ingress ACK: 2.240 / 5.002 / 9.523 s;
+- model TTFT: 3.601 / 6.427 / 10.981 s;
+- true global capacity queue: 0.747 / 1.661 / 4.141 s;
+- admission RPC: 1.541 / 3.286 / 5.371 s;
+- admission RPC residual: 0.025 / 1.665 / 3.588 s;
+- LocalEngine command queue: 1.425 / 1.560 / 1.665 s;
+- local batch admission: 0.070 / 0.152 / 0.290 s;
+- TPOT with queue: 93.999 / 101.852 / 109.617 ms;
+- weighted hierarchical decode ITL: 84.771 / 89.580 / 90.701 ms;
+- E2E: 55.632 / 76.692 / 101.142 s.
+
+Against the same-day `max_concurrency=64` per-request-RPC run, ACK P90/P99
+fell by 91.0%/92.1%, admission-RPC-residual P90/P99 by 96.8%/96.1%,
+TPOT-with-queue P90/P99 by 46.7%/45.2%, and decode ITL P90/P99 by
+50.8%/51.5%. Total drain time fell 14.2%; TPOT-under-100-ms goodput increased
+from 58.28% to 80.16%. ACK P50 increased from 1.20 s to 2.24 s because one
+bounded batch commonly waits for the current decode quantum before the
+single-writer loop picks it up.
+
+### Remaining bottleneck
+
+The request-scaled Ray mailbox collapse is fixed, but median admission still
+waits roughly one decode quantum in the LocalEngine command queue. The next
+control-plane optimization should target that pickup boundary or add a
+capacity-change long poll; increasing actor concurrency is no longer useful.
+As a rough execution-side reference, the new decode ITL is close to the
+July 29 centralized TPOT (84.77/89.58/90.70 ms versus
+83.62/87.83/90.61 ms); these are not identical metric boundaries. The
+decentralized TPOT-with-queue remains higher because it now includes real
+capacity waiting.

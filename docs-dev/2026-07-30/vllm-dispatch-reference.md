@@ -166,5 +166,21 @@ pytest -q tests/test_hierarchical_control_plane.py \
   tests/test_routing_config.py
 ```
 
-The next validation step is the rate-50 Ray/GPU A/B, checking the P50/P90/P99
-queue and TTFT boundaries plus `pending_rpc <= attention_dp`.
+Rate-50 validation completed on Ray `10.102.206.14:8776` with DP2 × SP8 and
+18,000 requests:
+
+- all requests completed without rejection or failure;
+- `pending_rpc` peaked at 2, exactly the DP bound; the two batch refs
+  represented at most 312 requests;
+- zero same-generation fallback and zero `queue_full`; 2,978 capacity-epoch
+  gated request deferrals returned to the global queue;
+- ingress ACK P50/P90/P99 was 2.240/5.002/9.523 s;
+- global capacity queue P50/P90/P99 was 0.747/1.661/4.141 s;
+- TPOT-with-queue was 93.999/101.852/109.617 ms and weighted decode ITL was
+  84.771/89.580/90.701 ms.
+
+The prior per-request-RPC rate-50 run reached roughly 604 pending RPCs.
+Batched flights reduced admission-RPC-residual P90/P99 from
+52.20/92.73 s to 1.665/3.588 s. The remaining median cost is the
+single-writer pickup boundary: LocalEngine command-queue
+P50/P90/P99 is 1.425/1.560/1.665 s, approximately one decode quantum.
