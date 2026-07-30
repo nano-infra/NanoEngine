@@ -1,7 +1,37 @@
+import ctypes
+
+import pytest
 from dlengine._rust.config import CachePlan, SchedulerConfig
 from dlengine._rust.core import Scheduler
 from dlengine._rust.proto import RequestIn, RunnerIn, SamplingParams
-from dlengine.engine.dlslime_protocol import decode_run_result, encode_run_result
+from dlengine.engine.dlslime_protocol import (
+    decode_run_request,
+    decode_run_result,
+    encode_run_request,
+    encode_run_result,
+)
+
+
+@pytest.mark.parametrize("is_prefill", [False, True])
+def test_run_request_phase_envelope(is_prefill):
+    encoded = encode_run_request(b"\x00LDMD\x00", is_prefill)
+    buffer = ctypes.create_string_buffer(encoded)
+
+    payload, decoded_is_prefill = decode_run_request(
+        ctypes.addressof(buffer), len(encoded)
+    )
+
+    assert payload == b"\x00LDMD\x00"
+    assert decoded_is_prefill is is_prefill
+
+
+def test_run_request_rejects_missing_or_invalid_phase():
+    with pytest.raises(ValueError, match="missing its phase byte"):
+        decode_run_request(0, 0)
+
+    buffer = ctypes.create_string_buffer(b"\x02payload")
+    with pytest.raises(ValueError, match="invalid run request phase byte 2"):
+        decode_run_request(ctypes.addressof(buffer), 8)
 
 
 def _scheduler() -> Scheduler:

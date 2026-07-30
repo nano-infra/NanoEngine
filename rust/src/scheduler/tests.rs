@@ -36,6 +36,7 @@ fn make_scheduler_with_flags_prefix_cache_and_batch_tokens(
         routing_strategy: RoutingStrategy::RoundRobin,
         gdn_state_cache_slots: 0,
         enable_prefix_cache,
+        use_decode_metadata_kernel: false,
         cache_plan: CachePlan::new(flags),
     })
 }
@@ -57,6 +58,7 @@ fn make_scheduler_with_host_blocks() -> Scheduler {
         routing_strategy: RoutingStrategy::RoundRobin,
         gdn_state_cache_slots: 0,
         enable_prefix_cache: true,
+        use_decode_metadata_kernel: false,
         cache_plan: CachePlan::new(1),
     })
 }
@@ -78,6 +80,7 @@ fn make_scheduler_with_host_prefix_cache() -> Scheduler {
         routing_strategy: RoutingStrategy::RoundRobin,
         gdn_state_cache_slots: 0,
         enable_prefix_cache: true,
+        use_decode_metadata_kernel: false,
         cache_plan: CachePlan::new(1),
     })
 }
@@ -101,6 +104,7 @@ fn make_scheduler_with_gqa_hisparse_tail(tail_tokens: i32) -> Scheduler {
         routing_strategy: RoutingStrategy::RoundRobin,
         gdn_state_cache_slots: 0,
         enable_prefix_cache: true,
+        use_decode_metadata_kernel: false,
         cache_plan: plan,
     })
 }

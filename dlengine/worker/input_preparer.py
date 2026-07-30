@@ -16,12 +16,19 @@ from dlengine.context_v2.cache.hisparse import (
 from dlengine.context_v2.distributed import get_dist_context
 from dlengine.context_v2.graph import PagedAttentionStrategy
 from dlengine.logging import get_logger
+from dlengine.worker.decode_metadata import (
+    decode_metadata_enabled,
+    DecodeMetadataRuntime,
+)
 
 logger = get_logger("DLENGINE")
 
 
 def prepare_sample_from_aux(aux) -> torch.Tensor:
     """Build temperature tensor from BatchAuxData."""
+    context_temperatures = get_batch_context().sampling_temperatures
+    if context_temperatures is not None:
+        return context_temperatures[: aux.num_group_seqs]
     return torch.tensor(aux.temperatures, dtype=torch.float32, pin_memory=True).cuda(
         non_blocking=True
     )
@@ -32,6 +39,15 @@ class InputPreparer:
 
     def __init__(self, config: Config):
         self.config = config
+        self.decode_metadata = (
+            DecodeMetadataRuntime(config) if decode_metadata_enabled(config) else None
+        )
+
+    @property
+    def decode_metadata_views(self):
+        if self.decode_metadata is None:
+            return None
+        return self.decode_metadata.views
 
     def prepare_prefill_bytes(self, data: bytes, aux, is_dummy: bool = False):
         sp_rank = get_dist_context().attn_sp_rank
@@ -374,3 +390,38 @@ class InputPreparer:
         get_hca_context().tile_scheduler_metadata = new_tile_scheduler_metadata
 
         return input_ids, positions
+
+    def prepare_decode_flat_bytes(self, data: bytes):
+        cache_ctx = get_cache_context()
+        if cache_ctx.gdn_conv_states is None:
+            raise RuntimeError(
+                "mapped decode metadata requires Qwen3.5 GDN state buffers"
+            )
+        control = self.decode_metadata.stage(data)
+        views = self.decode_metadata.views
+        num_seqs = control.num_group_seqs
+
+        set_batch_context(
+            is_prefill=False,
+            max_bs=self.config.max_num_seqs,
+            slot_mapping=views.slot_mapping[:num_seqs],
+            context_lens=views.context_lens,
+            block_tables=views.block_tables,
+            is_dummy=control.is_dummy,
+            gdn_conv_states=cache_ctx.gdn_conv_states,
+            gdn_recurrent_states=cache_ctx.gdn_recurrent_states,
+            gdn_state_slots=views.state_slots[:num_seqs],
+            sampling_temperatures=views.temperatures,
+            paged_attention_strategy=(
+                PagedAttentionStrategy.FLASHINFER
+                if getattr(self.config, "use_flashinfer_decode", False)
+                else PagedAttentionStrategy.FLASH_ATTN
+            ),
+            decode_page_plan_key=tuple(control.page_plan_key),
+        )
+        get_hca_context().tile_scheduler_metadata = None
+        return (
+            views.input_ids[:num_seqs],
+            views.positions[:num_seqs],
+            control,
+        )

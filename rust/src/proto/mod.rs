@@ -6,8 +6,8 @@ mod serialization;
 pub(crate) mod wire;
 
 pub(crate) use metadata::{
-    BatchAuxData, DecodeMeta, FreeSequences, FreeVisionSlots, MigrateSequenceView, MigrationIn,
-    Packet, PrefillMeta, RequestIn, RequestMigrate, RunnerIn, RunnerOut, StepOut,
+    BatchAuxData, DecodeControl, DecodeMeta, FreeSequences, FreeVisionSlots, MigrateSequenceView,
+    MigrationIn, Packet, PrefillMeta, RequestIn, RequestMigrate, RunnerIn, RunnerOut, StepOut,
 };
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -17,6 +17,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RunnerIn>()?;
     m.add_class::<RunnerOut>()?;
     m.add_class::<BatchAuxData>()?;
+    m.add_class::<DecodeControl>()?;
     m.add_class::<PrefillMeta>()?;
     m.add_class::<DecodeMeta>()?;
     m.add_class::<MigrateSequenceView>()?;
@@ -36,5 +37,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         serialization::decode_free_vision_slots,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(prepare::decode_flat_control, m)?)?;
     Ok(())
 }

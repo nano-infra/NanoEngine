@@ -1509,9 +1509,12 @@ class ModelRunner:
                         num_seqs, dtype=torch.float32, device=input_ids.device
                     )
                 return input_ids, logprobs
-            greedy_only = not want_lp and all(
-                float(t) < 1e-5 for t in getattr(aux, "temperatures", ())
-            )
+            all_greedy = getattr(aux, "all_greedy", None)
+            if all_greedy is None:
+                all_greedy = all(
+                    float(t) < 1e-5 for t in getattr(aux, "temperatures", ())
+                )
+            greedy_only = not want_lp and all_greedy
             if greedy_only:
                 if str(logits.dtype).startswith("torch.float8"):
                     logits = logits.float()
@@ -1591,23 +1594,33 @@ class ModelRunner:
             _gap_start_evt.record()
             _gap_report = (self.run_count + 1) % _rcfg.step_timing_interval == 0
         sp_rank = get_dist_context().attn_sp_rank
-        runner_in = RunnerIn.from_bytes(data)
-        aux = runner_in.aux(sp_rank)
-        num_seqs = aux.num_group_seqs
-        if _timer is not None:
-            _timer.mark("rpc_in")
-
-        is_dummy = False
-        if num_seqs == 0:
-            is_dummy = True
-            runner_in = RunnerIn.dummy(
-                self.engine_id,
-                get_cache_context().num_local_kvcache_blocks,
-                is_prefill,
+        use_flat_decode = (
+            not is_prefill and self.input_preparer.decode_metadata is not None
+        )
+        runner_in = None
+        if use_flat_decode:
+            input_ids, positions, aux = self.input_preparer.prepare_decode_flat_bytes(
+                data
             )
-            data = runner_in.to_bytes()
+            num_seqs = aux.num_group_seqs
+            is_dummy = aux.is_dummy
+        else:
+            runner_in = RunnerIn.from_bytes(data)
             aux = runner_in.aux(sp_rank)
             num_seqs = aux.num_group_seqs
+            is_dummy = False
+            if num_seqs == 0:
+                is_dummy = True
+                runner_in = RunnerIn.dummy(
+                    self.engine_id,
+                    get_cache_context().num_local_kvcache_blocks,
+                    is_prefill,
+                )
+                data = runner_in.to_bytes()
+                aux = runner_in.aux(sp_rank)
+                num_seqs = aux.num_group_seqs
+        if _timer is not None:
+            _timer.mark("rpc_in")
 
         if is_prefill and self.mtp_runner is not None:
             self.mtp_runner.reset_lazy_verify_state()
@@ -1620,6 +1633,7 @@ class ModelRunner:
         # --- Prepare inputs ---
         has_lazy_verify = False
         if is_prefill:
+            assert runner_in is not None
             if not self.vision_manager.has_embeds:
                 vision_slots = runner_in.vision_slots()
                 if vision_slots:
@@ -1629,12 +1643,10 @@ class ModelRunner:
             input_ids, positions = self.input_preparer.prepare_prefill_bytes(
                 data, aux, is_dummy
             )
-        else:
+        elif not use_flat_decode:
             input_ids, positions = self.input_preparer.prepare_decode_bytes(
                 data, aux, is_dummy
             )
-            if _timer is not None:
-                _timer.mark("prep")
 
             if (
                 self.mtp_runner is not None
@@ -1645,6 +1657,8 @@ class ModelRunner:
                 input_ids, positions = self.mtp_runner.prepare_lazy_verify_decode(
                     input_ids, positions, num_seqs
                 )
+        if not is_prefill and _timer is not None:
+            _timer.mark("prep")
 
         if input_ids.numel() == 0:
             logger.critical(
@@ -1700,6 +1714,7 @@ class ModelRunner:
             num_tokens_per_seq=context.num_tokens_per_seq,
             sampling_token_indices=context.sampling_token_indices,
             sampling_seq_indices=context.sampling_seq_indices,
+            sampling_temperatures=context.sampling_temperatures,
             paged_attention_strategy=context.paged_attention_strategy,
             graph_attention_strategy=context.graph_attention_strategy,
             decode_page_plan_key=context.decode_page_plan_key,
@@ -1860,7 +1875,12 @@ class ModelRunner:
         )
         cache_ctx = get_cache_context()
 
-        self.decode_graph_runner = DecodeGraphRunner(config, hf_config, cache_ctx)
+        self.decode_graph_runner = DecodeGraphRunner(
+            config,
+            hf_config,
+            cache_ctx,
+            self.input_preparer.decode_metadata,
+        )
         graph_pool = self.decode_graph_runner.capture(self.model, cache_ctx)
 
         if self.mtp_runner is not None:

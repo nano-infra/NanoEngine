@@ -1,6 +1,198 @@
-use super::metadata::{BatchAuxData, DecodeMeta, PrefillMeta};
-use super::wire::decode_wire;
+use super::metadata::{BatchAuxData, DecodeControl, DecodeMeta, PrefillMeta};
+use super::wire::{
+    decode_wire, DECODE_FLAG_ALL_GREEDY, DECODE_FLAG_COMPLETION_LOGPROBS, DECODE_FLAG_DUMMY,
+    DECODE_FLAT_HEADER_BYTES, DECODE_FLAT_MAGIC, DECODE_FLAT_VERSION,
+};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
+
+fn read_u16(data: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap())
+}
+
+fn read_u32(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+}
+
+fn checked_array(
+    payload_len: usize,
+    name: &str,
+    offset: usize,
+    count: usize,
+    element_bytes: usize,
+) -> PyResult<(usize, usize)> {
+    if offset < DECODE_FLAT_HEADER_BYTES || offset % 16 != 0 {
+        return Err(PyValueError::new_err(format!(
+            "flat decode {name} offset {offset} is not 16-byte aligned"
+        )));
+    }
+    let bytes = count
+        .checked_mul(element_bytes)
+        .ok_or_else(|| PyValueError::new_err(format!("flat decode {name} size overflows")))?;
+    let end = offset
+        .checked_add(bytes)
+        .ok_or_else(|| PyValueError::new_err(format!("flat decode {name} range overflows")))?;
+    if end > payload_len {
+        return Err(PyValueError::new_err(format!(
+            "flat decode {name} range [{offset}, {end}) exceeds payload {payload_len}"
+        )));
+    }
+    Ok((offset, end))
+}
+
+#[pyfunction]
+pub(crate) fn decode_flat_control(data: &Bound<'_, PyAny>) -> PyResult<DecodeControl> {
+    let bytes = data
+        .downcast::<PyBytes>()
+        .map_err(|_| PyValueError::new_err("flat decode payload must be bytes"))?;
+    let data = bytes.as_bytes();
+    if data.len() < DECODE_FLAT_HEADER_BYTES {
+        return Err(PyValueError::new_err(format!(
+            "flat decode payload is truncated: {} < {DECODE_FLAT_HEADER_BYTES}",
+            data.len()
+        )));
+    }
+    let magic = read_u32(data, 0);
+    let version = read_u16(data, 4);
+    let flags = read_u16(data, 6);
+    let payload_bytes = read_u32(data, 8) as usize;
+    let num_seqs = read_u32(data, 12) as usize;
+    let max_num_seqs = read_u32(data, 16) as usize;
+    let max_num_blocks = read_u32(data, 20) as usize;
+    let block_size = read_u32(data, 24) as usize;
+    let offsets = [
+        read_u32(data, 28) as usize,
+        read_u32(data, 32) as usize,
+        read_u32(data, 36) as usize,
+        read_u32(data, 40) as usize,
+        read_u32(data, 44) as usize,
+        read_u32(data, 48) as usize,
+        read_u32(data, 52) as usize,
+        read_u32(data, 56) as usize,
+    ];
+    let block_count = read_u32(data, 60) as usize;
+
+    if magic != DECODE_FLAT_MAGIC {
+        return Err(PyValueError::new_err(format!(
+            "flat decode magic mismatch: 0x{magic:08x}"
+        )));
+    }
+    if version != DECODE_FLAT_VERSION {
+        return Err(PyValueError::new_err(format!(
+            "unsupported flat decode version {version}, expected {DECODE_FLAT_VERSION}"
+        )));
+    }
+    if payload_bytes != data.len() {
+        return Err(PyValueError::new_err(format!(
+            "flat decode payload length mismatch: header={payload_bytes}, actual={}",
+            data.len()
+        )));
+    }
+    if num_seqs == 0 || max_num_seqs == 0 || num_seqs > max_num_seqs {
+        return Err(PyValueError::new_err(format!(
+            "flat decode invalid batch dimensions: num_seqs={num_seqs}, max_num_seqs={max_num_seqs}"
+        )));
+    }
+    if max_num_blocks == 0 || block_size == 0 {
+        return Err(PyValueError::new_err(
+            "flat decode block dimensions must be positive",
+        ));
+    }
+    if block_count > num_seqs.saturating_mul(max_num_blocks) {
+        return Err(PyValueError::new_err(format!(
+            "flat decode block_count {block_count} exceeds batch capacity {}",
+            num_seqs * max_num_blocks
+        )));
+    }
+
+    let specs = [
+        ("input_ids", offsets[0], num_seqs, 8),
+        ("positions", offsets[1], num_seqs, 8),
+        ("temperatures", offsets[2], num_seqs, 4),
+        ("state_slots", offsets[3], num_seqs, 8),
+        ("hisparse_slots", offsets[4], num_seqs, 8),
+        ("block_row_offsets", offsets[5], num_seqs + 1, 4),
+        ("block_ids", offsets[6], block_count, 4),
+        ("seq_ids", offsets[7], num_seqs, 8),
+    ];
+    let mut non_empty_ranges = Vec::new();
+    for (name, offset, count, element_bytes) in specs {
+        let range = checked_array(payload_bytes, name, offset, count, element_bytes)?;
+        if range.0 != range.1 {
+            non_empty_ranges.push((range.0, range.1, name));
+        }
+    }
+    non_empty_ranges.sort_by_key(|range| range.0);
+    for pair in non_empty_ranges.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(PyValueError::new_err(format!(
+                "flat decode arrays {} and {} overlap",
+                pair[0].2, pair[1].2
+            )));
+        }
+    }
+
+    let row_offset = offsets[5];
+    let mut previous = 0usize;
+    for row in 0..=num_seqs {
+        let current = read_u32(data, row_offset + row * 4) as usize;
+        if current < previous || current > block_count {
+            return Err(PyValueError::new_err(format!(
+                "flat decode block row offsets are invalid at row {row}: {current} after {previous}"
+            )));
+        }
+        if row > 0 && current - previous > max_num_blocks {
+            return Err(PyValueError::new_err(format!(
+                "flat decode row {} has {} blocks, exceeds {max_num_blocks}",
+                row - 1,
+                current - previous
+            )));
+        }
+        previous = current;
+    }
+    if previous != block_count {
+        return Err(PyValueError::new_err(format!(
+            "flat decode final row offset {previous} does not match block_count {block_count}"
+        )));
+    }
+    let block_ids_offset = offsets[6];
+    for index in 0..block_count {
+        let offset = block_ids_offset + index * 4;
+        let block_id = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        if block_id < 0 {
+            return Err(PyValueError::new_err(format!(
+                "flat decode block id at index {index} is negative"
+            )));
+        }
+    }
+
+    let positions_offset = offsets[1];
+    let mut page_plan_key = Vec::with_capacity(num_seqs);
+    for index in 0..num_seqs {
+        let offset = positions_offset + index * 8;
+        let position = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        if position < 0 {
+            return Err(PyValueError::new_err(format!(
+                "flat decode position at index {index} is negative"
+            )));
+        }
+        page_plan_key.push((position as usize + 1).div_ceil(block_size));
+    }
+
+    Ok(DecodeControl {
+        num_group_seqs: num_seqs,
+        payload_bytes,
+        max_num_seqs,
+        max_num_blocks,
+        block_size,
+        block_count,
+        page_plan_key,
+        is_dummy: flags & DECODE_FLAG_DUMMY != 0,
+        all_greedy: flags & DECODE_FLAG_ALL_GREEDY != 0,
+        any_return_completion_logprobs: flags & DECODE_FLAG_COMPLETION_LOGPROBS != 0,
+    })
+}
 
 pub(crate) fn runner_in_aux(data: &[u8], _sp_rank: usize) -> PyResult<BatchAuxData> {
     let batch = decode_wire(data)?;

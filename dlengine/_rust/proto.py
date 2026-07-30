@@ -20,6 +20,7 @@ _ENGINE_PROTO = [
 # Engine/scheduler <-> model-runner messages. These are on the hot path; keep
 # bytes ownership and from_bytes/to_bytes symmetry explicit.
 _RUNNER_PROTO = [
+    "DecodeControl",
     "MigrationIn",
     "RunnerIn",
     "RunnerOut",
@@ -32,3 +33,5 @@ __all__ = [
 ]
 
 globals().update(export(tuple(__all__)))
+decode_flat_control = export(("decode_flat_control",))["decode_flat_control"]
+__all__.append("decode_flat_control")

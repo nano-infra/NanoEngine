@@ -64,6 +64,8 @@ pub struct SchedulerConfig {
     #[pyo3(get, set)]
     pub enable_prefix_cache: bool,
     #[pyo3(get, set)]
+    pub use_decode_metadata_kernel: bool,
+    #[pyo3(get, set)]
     pub cache_plan: CachePlan,
 }
 
@@ -86,6 +88,7 @@ impl SchedulerConfig {
         routing_strategy = RoutingStrategy::RoundRobin,
         gdn_state_cache_slots = 0,
         enable_prefix_cache = true,
+        use_decode_metadata_kernel = false,
         cache_plan = CachePlan::new(0)
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -105,6 +108,7 @@ impl SchedulerConfig {
         routing_strategy: i32,
         gdn_state_cache_slots: i32,
         enable_prefix_cache: bool,
+        use_decode_metadata_kernel: bool,
         cache_plan: CachePlan,
     ) -> Self {
         Self {
@@ -123,6 +127,7 @@ impl SchedulerConfig {
             routing_strategy,
             gdn_state_cache_slots,
             enable_prefix_cache,
+            use_decode_metadata_kernel,
             cache_plan,
         }
     }

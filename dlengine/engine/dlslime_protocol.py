@@ -5,17 +5,23 @@ import time as _time
 
 from dlslime.rpc import method
 
-from dlengine._rust.proto import RunnerIn, RunnerOut
+from dlengine._rust.proto import RunnerOut
 
 
-def encode_run_request(data: bytes) -> bytes:
-    return RunnerIn.from_bytes(data).to_bytes()
+def encode_run_request(data: bytes, is_prefill: bool) -> bytes:
+    # The flat decode wire deliberately is not a RunnerIn/bincode payload, so
+    # transport the phase as a one-byte envelope instead of reparsing metadata.
+    return bytes((int(is_prefill),)) + data
 
 
 def decode_run_request(ptr: int, nbytes: int) -> tuple[bytes, bool]:
-    buf = (ctypes.c_char * nbytes).from_address(ptr)
-    runner_in = RunnerIn.from_bytes(bytes(buf))
-    return runner_in.to_bytes(), bool(runner_in.is_prefill)
+    if nbytes < 1:
+        raise ValueError("run request is missing its phase byte")
+    buf = (ctypes.c_ubyte * nbytes).from_address(ptr)
+    phase = int(buf[0])
+    if phase not in (0, 1):
+        raise ValueError(f"invalid run request phase byte {phase}")
+    return bytes(buf[1:]), bool(phase)
 
 
 def encode_run_result(result, server_handler_ns: int = 0) -> bytes:
@@ -96,6 +102,11 @@ class ModelRunnerRpcService:
     def prepare_batch(self, channel, ptr: int, nbytes: int) -> bytes:
         if self._runner is None:
             raise RuntimeError("ModelRunnerRpcService is not attached to a runner")
+        if self._prepared:
+            raise RuntimeError(
+                "ModelRunner already has a prepared batch; run or cancel it "
+                "before preparing another"
+            )
         data, is_prefill = decode_run_request(ptr, nbytes)
         handle = next(self._prepare_ids)
         self._prepared[handle] = self._runner.prepare_from_bytes(data, is_prefill)
@@ -109,7 +120,9 @@ class ModelRunnerRpcService:
             raise ValueError(f"run_prepared expects an 8-byte handle, got {nbytes}")
         t0 = _time.perf_counter()
         handle = struct.unpack("<Q", (ctypes.c_char * nbytes).from_address(ptr))[0]
-        prepared = self._prepared.pop(handle)
+        prepared = self._prepared.pop(handle, None)
+        if prepared is None:
+            raise ValueError(f"unknown or already consumed prepared handle {handle}")
         result = self._runner.run_prepared(prepared)
         handler_ns = int((_time.perf_counter() - t0) * 1e9)
         return encode_run_result(result, handler_ns)

@@ -642,6 +642,31 @@ pub struct BatchAuxData {
     pub any_return_completion_logprobs: bool,
 }
 
+#[pyclass(module = "dlengine._engine")]
+#[derive(Clone, Debug)]
+pub struct DecodeControl {
+    #[pyo3(get)]
+    pub num_group_seqs: usize,
+    #[pyo3(get)]
+    pub payload_bytes: usize,
+    #[pyo3(get)]
+    pub max_num_seqs: usize,
+    #[pyo3(get)]
+    pub max_num_blocks: usize,
+    #[pyo3(get)]
+    pub block_size: usize,
+    #[pyo3(get)]
+    pub block_count: usize,
+    #[pyo3(get)]
+    pub page_plan_key: Vec<usize>,
+    #[pyo3(get)]
+    pub is_dummy: bool,
+    #[pyo3(get)]
+    pub all_greedy: bool,
+    #[pyo3(get)]
+    pub any_return_completion_logprobs: bool,
+}
+
 #[pymethods]
 impl BatchAuxData {
     #[new]
