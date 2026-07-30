@@ -223,3 +223,40 @@ New per-request fields are
 10 ms and excludes the remaining 150 ms. Focused control-plane, scheduler,
 serving-benchmark, and routing validation passed 82 tests; `py_compile` and
 `git diff --check` also passed.
+
+## 2026-07-30 — corrected rate-50 decentralized validation
+
+The corrected `decentralized_dp2sp8` benchmark completed successfully against
+Ray at `10.102.206.14:8776`: all 18,000 requests completed, with no failures,
+ingress/scheduler rejections, fallbacks, queue-full events, preemptions,
+tracebacks, CUDA errors, or NCCL errors. Runtime was 464.64 s. Across 464
+diagnostic samples, admission stayed bounded at two concurrent Ray
+RPCs (one per DP engine); a single RPC represented as many as 340 batched
+requests. Capacity saturation caused 1,733 epoch-gated deferred retries but no
+busy retry collapse.
+
+All 18,000 request records use schema version 2 and contain the real-token
+fields. The raw-minus-corrected terminal interval exactly matches
+`final_quantum_unused_decode_ms` within 1 microsecond, and the recomputed TPOT
+matches the recorded value within 0.000001 ms/token.
+
+Corrected TPOT-with-capacity-queue P50/P90/P99 is
+94.05/96.67/101.13 ms/token, with 98.53% of requests below 100 ms. Reapplying
+the previous whole-final-quantum boundary to the same records gives
+94.85/98.13/105.37 ms/token, so the correction removes
+0.80/1.46/4.24 ms/token at those percentiles. The unused final-quantum time
+itself is 596.16/1,137.93/1,319.79 ms per request.
+
+Decode ITL is 85.40/88.51/89.65 ms and GPU-capacity queue time is
+655.84/1,318.80/5,086.20 ms per request. Real execution-boundary time without
+capacity queue is 92.55/94.86/95.45 ms/token. Against the July 29 centralized
+TPOT of 83.62/87.83/90.61 ms/token, corrected decentralized TPOT remains
+10.42/8.84/10.53 ms/token higher. The centralized baseline predates the new
+final-quantum correction, so this is conservative rather than a perfectly
+matched metric comparison. The close decode-ITL values, together with the
+higher per-request execution boundary, show that most of the remaining gap is
+real inter-quantum scheduling/coordination and capacity waiting, not the
+removed final-token accounting artifact.
+
+Artifacts are under
+`bench_logs/rate50_decentralized_dp2sp8_real_token_tpot_20260730_0934/`.
