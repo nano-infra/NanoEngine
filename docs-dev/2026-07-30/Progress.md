@@ -260,3 +260,49 @@ removed final-token accounting artifact.
 
 Artifacts are under
 `bench_logs/rate50_decentralized_dp2sp8_real_token_tpot_20260730_0934/`.
+
+## 2026-07-30 — rate-50 qdiag-off A/B
+
+The same 18,000-request `decentralized_dp2sp8` command was rerun with
+`HIERARCHICAL_QUANTUM_DIAGNOSTICS=0`; the normalized benchmark commands differ
+only by the removed hierarchical quantum log option. The run completed all
+requests without failures or rejections, and emitted zero quantum diagnostic
+records.
+
+Disabling qdiag did not improve performance. Runtime increased from 464.64 s
+to 479.44 s. TPOT P50/P90/P99 changed from
+94.05/96.67/101.13 to 96.82/111.28/125.86 ms/token, and sub-100-ms goodput
+fell from 98.53% to 61.87%. Capacity-queue P50/P90/P99 increased from
+655.84/1,318.80/5,086.20 to 939.26/4,861.86/9,036.11 ms/request.
+
+Using actual output-token weighting, corrected TPOT increased by
+6.408 ms/token (88.731 to 95.139). About 1.280 ms/token came from the
+benchmark-window executor ITL increase, 3.381 ms/token from additional
+first-forward-to-terminal non-executor gaps, and 1.746 ms/token from capacity
+queue. The reported hierarchical ITL contains 65,280 pre-benchmark token
+slots in both runs; removing the qdiag-on pre-window accumulator gives
+81.376 versus an estimated 82.656 ms/token for the two benchmark windows.
+
+The dominant change was admission retry amplification. Epoch-gated deferred
+retries rose from 1,733 to 11,578, exactly accounting for the 9,845 extra
+LocalEngine commands. Command-queue-delay total increased 64% and Gloo
+coordination-wait total 58%. The retry RPC residual, which is not currently
+included in `global_capacity_queue_ms`, rose from 175.78 to
+1,275.47 ms/request on average.
+
+Least-batch also exposed timing-sensitive KV imbalance: qdiag-off assigned
+50.12M versus 39.52M prompt-plus-output tokens to the two engines despite
+balancing request counts at 8,988 versus 9,012. The qdiag-on split was
+47.41M versus 42.23M. This explains the later capacity pressure and much
+higher deferral count, especially on engine 0.
+
+The result rules out qdiag construction as the primary TPOT bottleneck but
+does not establish that qdiag intrinsically improves performance. Removing
+its inter-quantum delay perturbs least-batch placement and the capacity-event
+pickup race, exposing an unstable admission feedback loop. The next
+instrumentation should time the post-quantum-to-next-command pickup window;
+the scheduler should balance predicted KV demand and avoid retrying a
+256-request batch after only a small capacity release.
+
+Artifacts are under
+`bench_logs/rate50_decentralized_dp2sp8_real_token_tpot_no_qdiag_20260730_1141/`.
