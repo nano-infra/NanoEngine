@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import importlib
 import queue
+import sys
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -377,6 +379,38 @@ def test_local_engine_drains_frontend_events_in_one_batch():
     assert engine._first_schedule_events == deque()
     assert engine._first_token_events == deque()
     assert engine._terminal_events == deque()
+
+
+def test_hierarchical_engine_is_not_finished_with_buffered_finish_events(
+    monkeypatch,
+):
+    lightweight_imports = {
+        "nanodeploy.engine.deployment_manager": "DeploymentManager",
+        "nanodeploy.engine.ray_executor": "RayExecutor",
+        "nanodeploy.engine.scheduler": "Scheduler",
+        "nanodeploy.engine.sequence": "Sequence",
+    }
+    for module_name, symbol in lightweight_imports.items():
+        module = ModuleType(module_name)
+        setattr(module, symbol, type(symbol, (), {}))
+        monkeypatch.setitem(sys.modules, module_name, module)
+    monkeypatch.delitem(
+        sys.modules, "nanodeploy.engine.llm_engine", raising=False
+    )
+    llm_engine_module = importlib.import_module(
+        "nanodeploy.engine.llm_engine"
+    )
+    LLMEngine = llm_engine_module.LLMEngine
+    engine = object.__new__(LLMEngine)
+    engine.config = SimpleNamespace(scheduler_arch="hierarchical")
+    engine.router = SimpleNamespace(is_idle=True)
+    engine._frontend_finish_events = deque(
+        (FinishEvent(1, 16, "FINISHED", 0),)
+    )
+
+    assert not engine.is_finished()
+    engine._frontend_finish_events.clear()
+    assert engine.is_finished()
 
 
 def test_router_buffers_terminal_until_async_owner_commit():

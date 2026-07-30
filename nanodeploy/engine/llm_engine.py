@@ -515,7 +515,13 @@ class LLMEngine:
 
     def is_finished(self):
         if self.config.scheduler_arch == "hierarchical":
-            return self.router.is_idle
+            # A consolidated frontend poll can remove the final owners from
+            # the router before the serving loop consumes their buffered
+            # FinishEvents through step()/poll().
+            return (
+                self.router.is_idle
+                and not self._frontend_finish_events
+            )
         return self.scheduler.is_finished()
 
     def _ensure_frontend_cycle(self, *, force: bool = False) -> None:
