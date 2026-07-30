@@ -26,3 +26,23 @@
 When `port` is left at `0`, DLEngine binds an OS-assigned port and logs the
 resulting bind and advertise endpoints. NanoCtrl registration uses the
 advertise endpoint, never the wildcard bind address.
+
+### Runtime Profiling
+
+A running OpenAI server can delimit a profiling window without
+`enable_profiler`:
+
+```bash
+curl -X POST http://127.0.0.1:<port>/start_profiler \
+  -H 'content-type: application/json' \
+  -d '{"trace_name":"baseline"}'
+
+# Send the inference requests to capture.
+
+curl -X POST http://127.0.0.1:<port>/stop_profiler
+```
+
+`trace_name` accepts 1-64 letters, numbers, dots, underscores, or hyphens.
+Traces from every worker are written below
+`<profiler_dir>/<trace_name>/`, and the stop response lists the files. Restrict
+these management endpoints to trusted networks in production.

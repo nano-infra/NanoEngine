@@ -14,7 +14,7 @@ queue with ``put_nowait``.
 
 Wire protocol (JSON packet, see ``dlengine.server.wire``):
 - client -> engine: action 1 = ADD (Rust bincode RequestIn/RequestMigrate), 2 = GET_INFO,
-  3 = FREE (FreeSequences).
+  3 = FREE (FreeSequences), 7/8 = START/STOP_PROFILER (JSON).
 - engine -> client: action 0 = StepOut, 1 = Migration (Rust bincode RequestMigrate),
   2 = engine_info (JSON).
 """
@@ -52,6 +52,8 @@ _ACTION_GET_INFO = 2
 _ACTION_FREE = 3
 _ACTION_ABORT = 5
 _ACTION_GET_METRICS = 6
+_ACTION_START_PROFILER = 7
+_ACTION_STOP_PROFILER = 8
 
 
 class ZmqEngineWorker:
@@ -73,6 +75,8 @@ class ZmqEngineWorker:
         self._ready = asyncio.Event()
         self.engine_id: Optional[str] = None
         self._metrics_future: Optional[asyncio.Future] = None
+        self._profiler_future: Optional[asyncio.Future] = None
+        self._profiler_lock = asyncio.Lock()
 
     async def start(self, info_timeout: Optional[float] = None) -> None:
         """Connect to the engine process and wait until it is ready.
@@ -174,6 +178,25 @@ class ZmqEngineWorker:
         finally:
             self._metrics_future = None
 
+    async def start_profiler(self, trace_name: str | None = None) -> dict:
+        payload = json.dumps({"trace_name": trace_name}).encode("utf-8")
+        return await self._profiler_control(_ACTION_START_PROFILER, payload)
+
+    async def stop_profiler(self) -> dict:
+        return await self._profiler_control(_ACTION_STOP_PROFILER, b"")
+
+    async def _profiler_control(self, action: int, payload: bytes) -> dict:
+        if self._socket is None:
+            raise RuntimeError("engine worker is not connected")
+        async with self._profiler_lock:
+            loop = asyncio.get_running_loop()
+            self._profiler_future = loop.create_future()
+            self._outbox.put_nowait((action, payload))
+            try:
+                return await asyncio.wait_for(self._profiler_future, timeout=60.0)
+            finally:
+                self._profiler_future = None
+
     def _build_free_payload(self, seq_ids: list[int]) -> bytes:
         return encode_free_sequences(seq_ids, self.engine_id or "")
 
@@ -230,6 +253,8 @@ class ZmqEngineWorker:
                     self._handle_engine_info(payload)
                 elif action == _ACTION_GET_METRICS:
                     self._handle_engine_metrics(payload)
+                elif action in (_ACTION_START_PROFILER, _ACTION_STOP_PROFILER):
+                    self._handle_profiler_response(payload)
                 else:
                     logger.warning(f"ZmqEngineWorker unknown action: {action}")
             except Exception as e:  # noqa: BLE001
@@ -310,3 +335,11 @@ class ZmqEngineWorker:
                 self._metrics_future.set_result(metrics)
             except Exception as e:  # noqa: BLE001
                 self._metrics_future.set_exception(e)
+
+    def _handle_profiler_response(self, payload: bytes) -> None:
+        if self._profiler_future is None or self._profiler_future.done():
+            return
+        try:
+            self._profiler_future.set_result(json.loads(payload.decode("utf-8")))
+        except Exception as e:  # noqa: BLE001
+            self._profiler_future.set_exception(e)

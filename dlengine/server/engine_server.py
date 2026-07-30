@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import traceback
 from collections import defaultdict
@@ -34,6 +35,8 @@ _ACTION_ABORT = 5
 
 # client -> engine: fetch Prometheus-format metrics from the backend process.
 _ACTION_GET_METRICS = 6
+_ACTION_START_PROFILER = 7
+_ACTION_STOP_PROFILER = 8
 
 
 def build_stepout_payload(seq_id, token_ids, status) -> bytes:
@@ -85,6 +88,22 @@ class BackendService:
         except Exception as e:
             logger.error(f"Error getting metrics: {e}")
             self._send_response(action=_ACTION_GET_METRICS, payload=b"")
+
+    def _handle_profiler_control(self, action: int, payload: bytes):
+        try:
+            if action == _ACTION_START_PROFILER:
+                options = json.loads(payload.decode("utf-8")) if payload else {}
+                result = self.engine.start_profiler(options.get("trace_name"))
+            else:
+                result = self.engine.stop_profiler()
+            response = {"ok": True, **result}
+        except Exception as e:
+            logger.exception("Profiler control failed")
+            response = {"ok": False, "error": str(e)}
+        self._send_response(
+            action=action,
+            payload=json.dumps(response).encode("utf-8"),
+        )
 
     def _handle_free_sequences(self, payload: bytes):
         """Handle P2P free sequence request."""
@@ -220,6 +239,8 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                             service._handle_get_info()
                         elif action == _ACTION_GET_METRICS:
                             service._handle_get_metrics()
+                        elif action in (_ACTION_START_PROFILER, _ACTION_STOP_PROFILER):
+                            service._handle_profiler_control(action, payload)
                         elif action == 3:
                             service._handle_free_sequences(payload)
                         elif action == _ACTION_ABORT:
@@ -249,6 +270,8 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                             service._handle_get_info()
                         elif action == _ACTION_GET_METRICS:
                             service._handle_get_metrics()
+                        elif action in (_ACTION_START_PROFILER, _ACTION_STOP_PROFILER):
+                            service._handle_profiler_control(action, payload)
                         elif action == 3:
                             service._handle_free_sequences(payload)
                         elif action == _ACTION_ABORT:
@@ -271,6 +294,8 @@ def run_engine_backend(config: Config, requests_queue, results_queue, p2p_port: 
                             service._handle_get_info()
                         elif action == _ACTION_GET_METRICS:
                             service._handle_get_metrics()
+                        elif action in (_ACTION_START_PROFILER, _ACTION_STOP_PROFILER):
+                            service._handle_profiler_control(action, payload)
                         elif action == 3:
                             service._handle_free_sequences(payload)
                         elif action == _ACTION_ABORT:
