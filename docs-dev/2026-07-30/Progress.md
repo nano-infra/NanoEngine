@@ -61,3 +61,51 @@ started yet.
 - `python -m compileall` and `git diff --check` passed.
 - A rate-50, 18,000-request `decentralized_dp2sp8` matrix dry-run resolved to
   `scripts/sp_ablation/start_bench.sh` and its updated benchmark driver.
+
+## 2026-07-30 — rate-50 LocalEngine concurrency experiment
+
+### Change and run
+
+- Increased `LocalEngineCore` Ray `max_concurrency` from 32 to 64.
+- Re-ran `decentralized_dp2sp8` at rate 50 for 360 seconds against Ray
+  `10.102.206.14:8776`: 18,000/18,000 requests completed with no failures.
+- Result:
+  `bench_logs/rate50_decentralized_dp2sp8_mc64_20260730_0655/`.
+- Before the GPU run, 37 focused tests, `compileall`, and `git diff --check`
+  passed.
+
+### Result
+
+The higher actor concurrency improved low-percentile dispatch/admission but did
+not prevent a late-run queue collapse. Compared with the July 29 rate-50
+historical run:
+
+- ingress ACK P50 improved from 12.23 s to 1.20 s, while P90/P99 worsened from
+  43.44/45.51 s to 55.84/120.68 s;
+- model TTFT P50 improved from 11.80 s to 2.66 s, while P90/P99 worsened from
+  43.95/49.69 s to 54.43/119.55 s;
+- TPOT-with-queue P50/P90/P99 changed from 81.61/84.79/87.27 ms to
+  93.25/191.25/200.10 ms;
+- hierarchical decode ITL P50/P90/P99 changed from 76.93/80.41/81.96 ms to
+  86.09/182.01/187.20 ms.
+
+The new decomposition attributes the ACK tail primarily to
+`admission_rpc_residual_ms` (P50/P90/P99 36.87 ms/52.20 s/92.73 s), not local
+admission work (37.86/84.79/133.06 ms). Local command queueing reached
+1.12/2.95/3.09 s. Around 294 seconds, pending RPCs rose from roughly 50 to 604;
+the run ended with 2,490 fallbacks and 802 global retries.
+
+### Conclusion and next change
+
+`max_concurrency=64` adds early headroom but is not a complete fix. Blocking
+`admit_add()` calls retain actor concurrency slots until the single-writer loop
+handles them, while the router performs one zero-timeout `ray.wait()` per
+pending request. Once pending work grows, fallback and global retry attempts
+amplify both RPC count and decode interference.
+
+Next, make admission completion non-blocking and batch-oriented: batch-poll
+object refs with one `ray.wait`, return an admission receipt immediately, emit
+the authoritative decision from the LocalEngine loop, and add bounded
+retry/backoff to avoid retry storms. Re-run current-code rate 50 at 32 and 64
+only if an isolated concurrency A/B is still needed; the historical comparison
+also includes intervening admission-path changes.

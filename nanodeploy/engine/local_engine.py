@@ -62,7 +62,7 @@ def _rank_load_payload(snapshot: LoadSnapshot) -> tuple[dict[str, int], ...]:
     )
 
 
-@ray.remote(num_cpus=0.1, max_concurrency=32)
+@ray.remote(num_cpus=0.1, max_concurrency=64)
 class LocalEngineCore:
     """Single-writer LocalScheduler plus one DP-group LocalExecutor."""
 
