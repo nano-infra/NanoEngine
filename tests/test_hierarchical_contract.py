@@ -9,6 +9,9 @@ from nanodeploy.engine.hierarchical_contract import (
     AdmissionReservation,
     HIERARCHICAL_LOOP_COUNT,
     LocalDecodeBatch,
+    LoadSnapshot,
+    RankLoad,
+    RequestState,
     WorkerDecodeResult,
     round_up,
     validate_add_request,
@@ -318,6 +321,68 @@ def test_frontend_admission_mirror_matches_local_cpp_placements():
     )
 
 
+def test_legacy_frontend_batch_master_reservation_is_counted_once():
+    planner = AdmissionPlanner(
+        AdmissionPlannerConfig(
+            attention_sp=1,
+            kvcache_block_size=64,
+            max_num_seqs=2,
+            max_num_batched_tokens=3,
+            max_num_recv_seqs=1,
+            reserved_blocks_per_req=1.0,
+            segment_size=64,
+            queue_capacity=2,
+            sp_master_selector="RoundRobin",
+        )
+    )
+    shadow = planner.shadow_from_snapshot(
+        LoadSnapshot(
+            engine_id=0,
+            ready=True,
+            waiting=0,
+            running=0,
+            free_blocks_min=4,
+            wave_id=1,
+            quantum_id=0,
+            rank_loads=(
+                RankLoad(
+                    global_rank=0,
+                    sp_idx=0,
+                    tp_idx=0,
+                    master_batch_size=0,
+                    active_master_requests=0,
+                    free_blocks=4,
+                    total_blocks=4,
+                    master_assignments=0,
+                    mastered_decode_tokens=0,
+                ),
+            ),
+        )
+    )
+    assert shadow is not None
+
+    commands = tuple(
+        AddCommand(
+            request_id=request_id,
+            prompt_token_ids=(1,),
+            max_tokens=1,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+        for request_id in (1, 2)
+    )
+
+    first = planner.plan(shadow, commands[0])
+    second = planner.plan(shadow, commands[1])
+
+    assert first is not None
+    assert second is not None
+    assert shadow.master_counts == [2]
+    assert shadow.batch_master_counts == [2]
+    assert shadow.free_blocks == [2]
+
+
 def test_planned_admission_mismatch_keeps_local_fifo_clean():
     config = make_hierarchical_config()
     local = LocalScheduler(
@@ -348,6 +413,107 @@ def test_planned_admission_mismatch_keeps_local_fifo_clean():
     assert not local.cpp_scheduler.waiting_migration
     assert not local.cpp_scheduler.running(0)
     assert local.is_finished()
+
+
+def test_planned_admission_scans_live_records_once_per_batch():
+    class CountingRecords(dict):
+        def __init__(self, records):
+            super().__init__(records)
+            self.values_calls = 0
+            self.items_calls = 0
+            self.yielded_records = 0
+
+        def values(self):
+            self.values_calls += 1
+            for record in super().values():
+                self.yielded_records += 1
+                yield record
+
+        def items(self):
+            self.items_calls += 1
+            for item in super().items():
+                self.yielded_records += 1
+                yield item
+
+    config = make_hierarchical_config()
+    local = LocalScheduler(
+        config, config.hierarchical_topology.engine(0)
+    )
+    planner = AdmissionPlanner(
+        AdmissionPlannerConfig.from_config(config)
+    )
+    shadow = planner.shadow_from_snapshot(
+        local.load_snapshot(wave_id=1, quantum_id=0)
+    )
+    assert shadow is not None
+    seed_commands = tuple(
+        AddCommand(
+            request_id=request_id,
+            prompt_token_ids=(1, 2),
+            max_tokens=17,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+        for request_id in range(100, 104)
+    )
+    seed_reservations = tuple(
+        planner.plan(shadow, command) for command in seed_commands
+    )
+    assert all(
+        reservation is not None for reservation in seed_reservations
+    )
+    seed_results = local.commit_planned_batch(
+        seed_commands,
+        tuple(
+            reservation
+            for reservation in seed_reservations
+            if reservation is not None
+        ),
+    )
+    assert all(result.accepted for result in seed_results)
+
+    commands = tuple(
+        AddCommand(
+            request_id=request_id,
+            prompt_token_ids=(1, 2),
+            max_tokens=17,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+        for request_id in range(104, 112)
+    )
+    reservations = tuple(
+        planner.plan(shadow, command) for command in commands
+    )
+    assert all(reservation is not None for reservation in reservations)
+    records = CountingRecords(local._records)
+    local._records = records
+
+    results = local.commit_planned_batch(
+        commands,
+        tuple(
+            reservation
+            for reservation in reservations
+            if reservation is not None
+        ),
+    )
+
+    assert all(result.accepted for result in results)
+    assert records.values_calls == 1
+    assert records.items_calls == 0
+    assert records.yielded_records == len(seed_commands)
+
+    records.values_calls = 0
+    records.yielded_records = 0
+    load = local.load_snapshot(wave_id=1, quantum_id=0)
+    assert load.running == len(seed_commands) + len(commands)
+    assert records.values_calls == 1
+    assert records.yielded_records == load.running
+    assert not local.is_finished()
+    assert records.values_calls == 1
+    assert records.yielded_records == load.running
 
 
 def test_local_decode_batch_validates_rank_order_and_forward_count():
@@ -514,6 +680,21 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert local.state_manager.num_running_seqs == 0
     assert local.state_manager.num_running_tokens == 0
     assert local.is_finished()
+    assert 42 not in local._records
+    assert local._terminal_states[42] is RequestState.FINISHED
+    duplicate = local.add(
+        AddCommand(
+            request_id=42,
+            prompt_token_ids=(10, 11, 12),
+            max_tokens=17,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+    )
+    assert not duplicate.accepted
+    assert duplicate.reason == "duplicate request in state FINISHED"
+    assert local.abort(42).status == "already_terminal"
     load = local.load_snapshot(wave_id=1, quantum_id=2)
     assert load.useful_decode_tokens == 17
     assert load.raw_token_slots == 128

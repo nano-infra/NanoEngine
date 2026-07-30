@@ -332,9 +332,10 @@ class AdmissionPlanner:
         dispatched: list[int],
     ) -> AdmissionReservation | None:
         block_size = self.config.kvcache_block_size
+        # Earlier reservations in this frontend batch are already reflected
+        # in master_counts by apply_reservation().
         projected_masters = [
             shadow.master_counts[sp_idx]
-            + shadow.batch_master_counts[sp_idx]
             + (1 if sp_idx == master else 0)
             for sp_idx in range(self.config.attention_sp)
         ]

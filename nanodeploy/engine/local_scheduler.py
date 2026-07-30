@@ -43,6 +43,15 @@ class LocalRequestRecord:
     terminal_emitted: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _ActiveLoadState:
+    waiting: int
+    running: int
+    master_counts: tuple[int, ...]
+    receiver_counts: tuple[int, ...]
+    dispatched_tokens: tuple[int, ...]
+
+
 class LocalScheduler:
     """Single-writer scheduler state for exactly one attention DP group."""
 
@@ -80,7 +89,11 @@ class LocalScheduler:
         self._capacity_validation_cache: dict[
             tuple[int, int, int], str | None
         ] = {}
+        # Keep only live requests in the hot record table. Terminal request
+        # IDs retain duplicate/abort semantics through compact tombstones
+        # without keeping full Sequence objects in every subsequent scan.
         self._records: dict[int, LocalRequestRecord] = {}
+        self._terminal_states: dict[int, RequestState] = {}
         self._terminal_events: list[FinishEvent] = []
         self._first_token_events: list[FirstTokenEvent] = []
         self._inflight_ids: set[int] = set()
@@ -119,8 +132,50 @@ class LocalScheduler:
         return self._last_itl_token_slots
 
     def _active_request_count(self) -> int:
-        return sum(
-            not record.state.is_terminal for record in self._records.values()
+        return len(self._records)
+
+    def _active_load_state(self) -> _ActiveLoadState:
+        attention_sp = self.topology.attention_sp
+        master_counts = [0] * attention_sp
+        receiver_counts = [0] * attention_sp
+        dispatched_tokens = [0] * attention_sp
+        waiting = 0
+        running = 0
+        for record in self._records.values():
+            if record.state == RequestState.WAITING_ADMISSION:
+                waiting += 1
+                continue
+            if record.state not in {
+                RequestState.RUNNING_DECODE,
+                RequestState.ABORT_PENDING,
+            }:
+                raise RuntimeError(
+                    "LocalScheduler live record has invalid state: "
+                    f"request_id={record.sequence.seq_id}, "
+                    f"state={record.state.value}"
+                )
+            running += 1
+            block_ctx = record.sequence.block_ctx(BlockContextSlot.ACTIVE)
+            master_sp_idx = block_ctx.master_sp_idx
+            if not 0 <= master_sp_idx < attention_sp:
+                raise RuntimeError(
+                    "LocalScheduler live request has invalid master rank: "
+                    f"request_id={record.sequence.seq_id}, "
+                    f"sp_idx={master_sp_idx}"
+                )
+            master_counts[master_sp_idx] += 1
+            for sp_idx, token_count in enumerate(
+                block_ctx.num_dispatched_tokens
+            ):
+                dispatched_tokens[sp_idx] += token_count
+                if token_count > 0 and sp_idx != master_sp_idx:
+                    receiver_counts[sp_idx] += 1
+        return _ActiveLoadState(
+            waiting=waiting,
+            running=running,
+            master_counts=tuple(master_counts),
+            receiver_counts=tuple(receiver_counts),
+            dispatched_tokens=tuple(dispatched_tokens),
         )
 
     def _ensure_capacity_probe(
@@ -263,6 +318,17 @@ class LocalScheduler:
                 engine_id=self.engine_id,
                 reason=f"duplicate request in state {existing.state.value}",
             )
+        terminal_state = self._terminal_states.get(command.request_id)
+        if terminal_state is not None:
+            return AddResult(
+                request_id=command.request_id,
+                accepted=False,
+                engine_id=self.engine_id,
+                reason=(
+                    "duplicate request in state "
+                    f"{terminal_state.value}"
+                ),
+            )
         if self._active_request_count() >= self.config.hierarchical_queue_capacity:
             return AddResult(
                 request_id=command.request_id,
@@ -386,6 +452,8 @@ class LocalScheduler:
         sequence: Sequence,
         reservation: AdmissionReservation,
         *,
+        active_master_counts: tuple[int, ...],
+        active_receiver_counts: tuple[int, ...],
         batch_master_counts: list[int],
         batch_receiver_counts: list[int],
         batch_tokens: list[int],
@@ -402,28 +470,6 @@ class LocalScheduler:
             or sum(dispatched) != sequence.num_tokens
         ):
             return False
-
-        active_master_counts = [0] * attention_sp
-        active_receiver_counts = [0] * attention_sp
-        for record in self._records.values():
-            if record.state not in {
-                RequestState.RUNNING_DECODE,
-                RequestState.ABORT_PENDING,
-            }:
-                continue
-            block_ctx = record.sequence.block_ctx(
-                BlockContextSlot.ACTIVE
-            )
-            if 0 <= block_ctx.master_sp_idx < attention_sp:
-                active_master_counts[block_ctx.master_sp_idx] += 1
-            for sp_idx, token_count in enumerate(
-                block_ctx.num_dispatched_tokens
-            ):
-                if (
-                    token_count > 0
-                    and sp_idx != block_ctx.master_sp_idx
-                ):
-                    active_receiver_counts[sp_idx] += 1
 
         if (
             active_master_counts[master]
@@ -489,6 +535,7 @@ class LocalScheduler:
             raise ValueError(
                 "planned admission command/reservation count mismatch"
             )
+        active_load = self._active_load_state()
         results = [self.add(command) for command in commands]
         batch_master_counts = [0] * self.topology.attention_sp
         batch_receiver_counts = [0] * self.topology.attention_sp
@@ -516,6 +563,8 @@ class LocalScheduler:
                 and self._planned_admission_fits(
                     sequence,
                     reservation,
+                    active_master_counts=active_load.master_counts,
+                    active_receiver_counts=active_load.receiver_counts,
                     batch_master_counts=batch_master_counts,
                     batch_receiver_counts=batch_receiver_counts,
                     batch_tokens=batch_tokens,
@@ -757,9 +806,11 @@ class LocalScheduler:
     def abort(self, request_id: int) -> AbortResult:
         record = self._records.get(request_id)
         if record is None:
+            if request_id in self._terminal_states:
+                return AbortResult(
+                    request_id=request_id, status="already_terminal"
+                )
             return AbortResult(request_id=request_id, status="not_found")
-        if record.state.is_terminal:
-            return AbortResult(request_id=request_id, status="already_terminal")
         if request_id in self._inflight_ids:
             record.state = RequestState.ABORT_PENDING
             return AbortResult(request_id=request_id, status="abort_pending")
@@ -783,6 +834,18 @@ class LocalScheduler:
             raise RuntimeError(
                 f"duplicate terminal event for request {record.sequence.seq_id}"
             )
+        if not record.state.is_terminal:
+            raise RuntimeError(
+                "cannot emit a terminal event for a live request: "
+                f"request_id={record.sequence.seq_id}, "
+                f"state={record.state.value}"
+            )
+        request_id = record.sequence.seq_id
+        if self._records.get(request_id) is not record:
+            raise RuntimeError(
+                "terminal request is missing from LocalScheduler live records: "
+                f"request_id={request_id}"
+            )
         first_forward_to_terminal_ms = None
         if record.first_forward_started_at is not None:
             first_forward_to_terminal_ms = max(
@@ -800,7 +863,7 @@ class LocalScheduler:
         record.terminal_emitted = True
         self._terminal_events.append(
             FinishEvent(
-                request_id=record.sequence.seq_id,
+                request_id=request_id,
                 generated_count=record.sequence.num_completed_tokens,
                 status=status,
                 engine_id=self.engine_id,
@@ -810,6 +873,8 @@ class LocalScheduler:
                 final_quantum_execute_ms=final_quantum_execute_ms,
             )
         )
+        self._records.pop(request_id)
+        self._terminal_states[request_id] = record.state
 
     def postprocess(
         self,
@@ -959,45 +1024,23 @@ class LocalScheduler:
         return events
 
     def is_finished(self) -> bool:
-        return all(record.state.is_terminal for record in self._records.values())
+        return not self._records
 
     def load_snapshot(self, *, wave_id: int, quantum_id: int) -> LoadSnapshot:
         free_blocks = [
             self._state_manager.block_manager[sp_idx].num_free_blocks
             for sp_idx in range(self.topology.attention_sp)
         ]
-        active_master_requests = [
-            0 for _ in range(self.topology.attention_sp)
-        ]
-        active_receiver_requests = [
-            0 for _ in range(self.topology.attention_sp)
-        ]
-        active_dispatched_tokens = [
-            0 for _ in range(self.topology.attention_sp)
-        ]
-        for record in self._records.values():
-            if record.state not in {
-                RequestState.RUNNING_DECODE,
-                RequestState.ABORT_PENDING,
-            }:
-                continue
-            block_ctx = record.sequence.block_ctx(BlockContextSlot.ACTIVE)
-            master_sp_idx = block_ctx.master_sp_idx
-            if 0 <= master_sp_idx < self.topology.attention_sp:
-                active_master_requests[master_sp_idx] += 1
-            for sp_idx, token_count in enumerate(
-                block_ctx.num_dispatched_tokens
-            ):
-                active_dispatched_tokens[sp_idx] += token_count
-                if token_count > 0 and sp_idx != master_sp_idx:
-                    active_receiver_requests[sp_idx] += 1
+        active_load = self._active_load_state()
         rank_loads = tuple(
             RankLoad(
                 global_rank=self.topology.global_rank(sp_idx=sp_idx),
                 sp_idx=sp_idx,
                 tp_idx=0,
                 master_batch_size=self._last_master_batch_sizes[sp_idx],
-                active_master_requests=active_master_requests[sp_idx],
+                active_master_requests=(
+                    active_load.master_counts[sp_idx]
+                ),
                 free_blocks=free_blocks[sp_idx],
                 total_blocks=self._state_manager.block_manager[
                     sp_idx
@@ -1005,10 +1048,10 @@ class LocalScheduler:
                 master_assignments=self._master_assignments[sp_idx],
                 mastered_decode_tokens=self._mastered_decode_tokens[sp_idx],
                 active_receiver_requests=(
-                    active_receiver_requests[sp_idx]
+                    active_load.receiver_counts[sp_idx]
                 ),
                 active_dispatched_tokens=(
-                    active_dispatched_tokens[sp_idx]
+                    active_load.dispatched_tokens[sp_idx]
                 ),
                 control_dummy_blocks=(
                     self._state_manager.num_control_dummy_blocks(sp_idx)
@@ -1019,15 +1062,8 @@ class LocalScheduler:
         return LoadSnapshot(
             engine_id=self.engine_id,
             ready=True,
-            waiting=sum(
-                record.state == RequestState.WAITING_ADMISSION
-                for record in self._records.values()
-            ),
-            running=sum(
-                record.state
-                in {RequestState.RUNNING_DECODE, RequestState.ABORT_PENDING}
-                for record in self._records.values()
-            ),
+            waiting=active_load.waiting,
+            running=active_load.running,
             free_blocks_min=min(free_blocks, default=0),
             wave_id=wave_id,
             quantum_id=quantum_id,

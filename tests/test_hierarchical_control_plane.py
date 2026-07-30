@@ -541,8 +541,8 @@ def test_router_capacity_planner_reserves_each_planned_batch_request():
         admission_planner_config=planner_config(),
     )
     # Each one-token prompt needs one KV block plus one reserved block.
-    # The legacy planner also mirrors its within-batch reservation accounting:
-    # request 1 fits with four free blocks, while request 2 stays global.
+    # Earlier requests in this frontend batch are already reflected in the
+    # shadow's master count, so four free blocks fit both requests exactly.
     router.record_loads((load_snapshot(0, 4),))
     for request_id in (1, 2):
         router.submit_async(
@@ -554,8 +554,12 @@ def test_router_capacity_planner_reserves_each_planned_batch_request():
         )
 
     assert router.poll_ingress_acks() == ()
-    assert [command.request_id for command in engine.commands] == [1]
-    assert router.owner(2) == RequestOwner(OwnerState.PENDING_GLOBAL)
+    assert [command.request_id for command in engine.commands] == [1, 2]
+    assert router.owner(2) == RequestOwner(OwnerState.PENDING_INGRESS, 0)
+    assert [
+        reservation.request_id
+        for reservation in engine.planned_batches[0]
+    ] == [1, 2]
     assert router.admission_metrics()["global_retries"] == 0
 
 

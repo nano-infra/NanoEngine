@@ -1,5 +1,77 @@
 # Development progress
 
+## 2026-07-30 16:45:14 UTC — admission hot-path fix, CPU validation
+
+### Implemented
+
+- `LocalScheduler._records` now contains live requests only. Finished and
+  aborted request IDs move to compact `_terminal_states` tombstones, preserving
+  duplicate-add and repeated-abort behavior without retaining full `Sequence`
+  objects in hot scans.
+- Planned admission computes active master/receiver load once per batch.
+  `add()` uses an O(1) live-request count, and `load_snapshot()` aggregates all
+  live counters in one pass. The planned path is now O(active + batch), rather
+  than O(batch * lifetime history).
+- Fixed frontend legacy placement's within-batch master reservation accounting:
+  `apply_reservation()` already updates `master_counts`, so
+  `_check_legacy_placement()` must not add `batch_master_counts` a second time.
+- Added structural complexity and lifecycle regressions. A counted record table
+  verifies that a second batch of eight requests scans four existing live
+  records exactly once; `load_snapshot()` scans live records once and
+  `is_finished()` does not enumerate them.
+
+### CPU validation
+
+- `python -m pytest tests/test_hierarchical_contract.py -q`:
+  `34 passed in 2.32s`.
+- `python -m pytest tests/test_hierarchical_control_plane.py -q`:
+  `35 passed in 3.23s`.
+- `python tests/test_sequence_proxy.py`:
+  passed.
+- `git diff --check`:
+  passed.
+- DP2/SP8 synthetic planned-admission benchmark, median of seven:
+  history 0 / batch 32 = `1.286 ms`;
+  history 9000 / batch 32 = `1.263 ms`.
+  Before this fix the corresponding measurements were about `1.9 ms` and
+  `125.6 ms`.
+- With 9000 terminal tombstones, new medians are:
+  batch 8 = `0.479 ms`, batch 16 = `0.745 ms`,
+  batch 64 = `2.290 ms`, and batch 256 = `9.130 ms` (five samples for 256).
+  The pre-fix batch 8/16/32/64 measurements at 9000 terminal records were about
+  `31.4/63.3/129.1/257.0 ms`.
+
+### Normal-command drain decision
+
+- No normal-drain code was changed in this patch. Production least-batch keeps
+  at most one admission flight per LocalEngine, and a planned `admit_batch` is
+  one atomic loop command. A command-boundary drain budget cannot interrupt the
+  single large transaction that caused the observed decode pause.
+- Splitting that command would change FIFO suffix-failure and all-at-once ACK
+  semantics. If a distributed run still shows admission long tails after the
+  O(active + batch) fix, the safe first A/B is a smaller router admission batch
+  cap; a resumable atomic-batch continuation is a separate design.
+- No C++ source was changed. No GPU, Ray-cluster, or multi-node run has been
+  started.
+
+## 2026-07-30 16:36:42 UTC — decentralized performance fix baseline
+
+- Pre-change repository `HEAD`:
+  `576258de5b121b036c1c2480dfd62f308bfb88f8`
+  (`docs: diagnose decentralized performance regression`).
+- Branch: `decentralized-july`.
+- The runtime baseline immediately below the two documentation commits is
+  `1136a72d5514a39e4adab3657a078c13352f392d`
+  (`Eliminate speculative decentralized admission retries`).
+- Existing user worktree state is intentionally preserved:
+  `scripts/sp_ablation/start_bench.sh` changes the default batch size from 192
+  to 256, and `bench_logs/` is untracked generated output.
+- First implementation scope is Python-only: remove lifetime-record scans from
+  planned admission and load snapshots, bound normal-command drain work, fix
+  frontend admission-shadow double counting, and add focused CPU regressions.
+- No C++ source has been changed and no GPU, Ray-cluster, or multi-node run has
+  been started.
+
 ## 2026-07-30 — decentralized admission latency decomposition
 
 ### Checkpoint
