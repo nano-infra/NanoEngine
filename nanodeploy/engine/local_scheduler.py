@@ -10,6 +10,7 @@ from nanodeploy.config import Config
 from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AddResult,
+    AdmissionReservation,
     AbortResult,
     FirstScheduleEvent,
     FirstTokenEvent,
@@ -25,6 +26,7 @@ from nanodeploy.engine.hierarchical_contract import (
 )
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.engine.sequence import SequenceStatus
 from nanodeploy.engine.topology import EngineTopology
 from nanodeploy.sampling_params import SamplingParams
 
@@ -342,13 +344,12 @@ class LocalScheduler:
     def try_admit_batch(
         self, commands: tuple[AddCommand, ...]
     ) -> tuple[AddResult, ...]:
-        """Atomically validate, plan, and commit a local DP candidate batch.
+        """Compatibility path that plans a candidate batch locally.
 
         `Scheduler.admit()` invokes the same C++ SP placement planner used by
-        the legacy centralized scheduler. Candidates that current local SP/KV
-        state cannot place are removed from the local waiting queue so the
-        global admission coordinator can try another DP or retain them
-        globally.
+        the legacy centralized scheduler. Normal global-FIFO admission uses
+        `commit_planned_batch()` so LocalEngine does not revise the LB's
+        placement decision.
         """
         if not commands:
             return ()
@@ -380,14 +381,203 @@ class LocalScheduler:
     def try_admit(self, command: AddCommand) -> AddResult:
         return self.try_admit_batch((command,))[0]
 
+    def _planned_admission_fits(
+        self,
+        sequence: Sequence,
+        reservation: AdmissionReservation,
+        *,
+        batch_master_counts: list[int],
+        batch_receiver_counts: list[int],
+        batch_tokens: list[int],
+        padded_completion_len: int,
+    ) -> bool:
+        attention_sp = self.topology.attention_sp
+        master = reservation.master_sp_idx
+        dispatched = reservation.dispatched_tokens
+        if (
+            reservation.engine_id != self.engine_id
+            or not 0 <= master < attention_sp
+            or len(dispatched) != attention_sp
+            or any(token_count < 0 for token_count in dispatched)
+            or sum(dispatched) != sequence.num_tokens
+        ):
+            return False
+
+        active_master_counts = [0] * attention_sp
+        active_receiver_counts = [0] * attention_sp
+        for record in self._records.values():
+            if record.state not in {
+                RequestState.RUNNING_DECODE,
+                RequestState.ABORT_PENDING,
+            }:
+                continue
+            block_ctx = record.sequence.block_ctx(
+                BlockContextSlot.ACTIVE
+            )
+            if 0 <= block_ctx.master_sp_idx < attention_sp:
+                active_master_counts[block_ctx.master_sp_idx] += 1
+            for sp_idx, token_count in enumerate(
+                block_ctx.num_dispatched_tokens
+            ):
+                if (
+                    token_count > 0
+                    and sp_idx != block_ctx.master_sp_idx
+                ):
+                    active_receiver_counts[sp_idx] += 1
+
+        if (
+            active_master_counts[master]
+            + batch_master_counts[master]
+            + 1
+            > self.config.max_num_seqs
+        ):
+            return False
+        if (
+            batch_tokens[master] + sequence.num_tokens
+            >= self.config.max_num_batched_tokens
+        ):
+            return False
+
+        self._state_manager.apply_planned_placement(
+            sequence, master, dispatched
+        )
+        block_size = self.config.kvcache_block_size
+        for sp_idx, token_count in enumerate(dispatched):
+            if token_count <= 0 and sp_idx != master:
+                continue
+            if (
+                self.config.fixed_sp_size == 0
+                and sp_idx != master
+                and token_count > 0
+                and (
+                    active_receiver_counts[sp_idx]
+                    + batch_receiver_counts[sp_idx]
+                )
+                >= self.config.max_num_recv_seqs
+            ):
+                return False
+            prefill_blocks = (
+                token_count + block_size - 1
+            ) // block_size
+            projected_masters = (
+                active_master_counts[sp_idx]
+                + batch_master_counts[sp_idx]
+                + (1 if sp_idx == master else 0)
+            )
+            reserved_blocks = ceil(
+                projected_masters
+                * self.config.reserved_blocks_per_req
+            )
+            block_manager = self._state_manager.block_manager[sp_idx]
+            if (
+                block_manager.num_free_blocks
+                < prefill_blocks + reserved_blocks
+                or not block_manager.can_allocate(sequence)
+            ):
+                return False
+        return self._state_manager.can_fit_lifetime(
+            sequence, 1 + padded_completion_len
+        )
+
+    def commit_planned_batch(
+        self,
+        commands: tuple[AddCommand, ...],
+        reservations: tuple[AdmissionReservation, ...],
+    ) -> tuple[AddResult, ...]:
+        """Validate and commit LB-selected placements without replanning."""
+        if len(commands) != len(reservations):
+            raise ValueError(
+                "planned admission command/reservation count mismatch"
+            )
+        results = [self.add(command) for command in commands]
+        batch_master_counts = [0] * self.topology.attention_sp
+        batch_receiver_counts = [0] * self.topology.attention_sp
+        batch_tokens = [0] * self.topology.attention_sp
+        admitted = []
+        state_mismatch = False
+        for index, (command, reservation, result) in enumerate(
+            zip(commands, reservations, results, strict=True)
+        ):
+            if reservation.request_id != command.request_id:
+                raise ValueError(
+                    "planned admission request mismatch: "
+                    f"command={command.request_id}, "
+                    f"reservation={reservation.request_id}"
+                )
+            if not result.accepted:
+                continue
+            record = self._records[command.request_id]
+            sequence = record.sequence
+            waiting = self._scheduler.waiting_migration
+            fits = (
+                not state_mismatch
+                and bool(waiting)
+                and waiting[0].seq_id == sequence.seq_id
+                and self._planned_admission_fits(
+                    sequence,
+                    reservation,
+                    batch_master_counts=batch_master_counts,
+                    batch_receiver_counts=batch_receiver_counts,
+                    batch_tokens=batch_tokens,
+                    padded_completion_len=record.padded_completion_len,
+                )
+            )
+            if not fits:
+                state_mismatch = True
+                self._discard_waiting_request(command.request_id)
+                results[index] = AddResult(
+                    request_id=command.request_id,
+                    accepted=False,
+                    engine_id=self.engine_id,
+                    reason="admission_state_mismatch",
+                )
+                continue
+
+            popped = waiting.popleft()
+            if popped.seq_id != sequence.seq_id:
+                raise RuntimeError(
+                    "planned admission lost local FIFO ownership"
+                )
+            self._state_manager.allocate(sequence)
+            sequence.status = SequenceStatus.RUNNING
+            self._state_manager.running.append(sequence)
+            batch_master_counts[reservation.master_sp_idx] += 1
+            for sp_idx, token_count in enumerate(
+                reservation.dispatched_tokens
+            ):
+                if (
+                    token_count > 0
+                    and sp_idx != reservation.master_sp_idx
+                ):
+                    batch_receiver_counts[sp_idx] += 1
+            batch_tokens[reservation.master_sp_idx] += sequence.num_tokens
+            admitted.append(sequence)
+
+        admitted_ids = set(self._finalize_admitted(admitted))
+        for index, (command, result) in enumerate(
+            zip(commands, results, strict=True)
+        ):
+            if not result.accepted:
+                continue
+            if command.request_id not in admitted_ids:
+                self._discard_waiting_request(command.request_id)
+                results[index] = AddResult(
+                    request_id=command.request_id,
+                    accepted=False,
+                    engine_id=self.engine_id,
+                    reason="admission_state_mismatch",
+                )
+        return tuple(results)
+
     def _defer_admission(self, sequence: Sequence) -> None:
         if sequence not in self._state_manager.running:
             raise RuntimeError("cannot defer a sequence that is not running")
         self._state_manager.running.remove(sequence)
         self._scheduler.preempt(0, sequence)
 
-    def admit(self) -> tuple[int, ...]:
-        admitted = self._scheduler.admit()[0]
+    def _finalize_admitted(
+        self, admitted: list[Sequence]
+    ) -> tuple[int, ...]:
         admitted_ids: list[int] = []
         for sequence in admitted:
             record = self._records[sequence.seq_id]
@@ -429,6 +619,11 @@ class LocalScheduler:
             record.state = RequestState.RUNNING_DECODE
             admitted_ids.append(sequence.seq_id)
         return tuple(admitted_ids)
+
+    def admit(self) -> tuple[int, ...]:
+        return self._finalize_admitted(
+            list(self._scheduler.admit()[0])
+        )
 
     def _reconcile_preemptions(self) -> None:
         waiting_ids = {
@@ -774,17 +969,28 @@ class LocalScheduler:
         active_master_requests = [
             0 for _ in range(self.topology.attention_sp)
         ]
+        active_receiver_requests = [
+            0 for _ in range(self.topology.attention_sp)
+        ]
+        active_dispatched_tokens = [
+            0 for _ in range(self.topology.attention_sp)
+        ]
         for record in self._records.values():
             if record.state not in {
                 RequestState.RUNNING_DECODE,
                 RequestState.ABORT_PENDING,
             }:
                 continue
-            master_sp_idx = record.sequence.block_ctx(
-                BlockContextSlot.ACTIVE
-            ).master_sp_idx
+            block_ctx = record.sequence.block_ctx(BlockContextSlot.ACTIVE)
+            master_sp_idx = block_ctx.master_sp_idx
             if 0 <= master_sp_idx < self.topology.attention_sp:
                 active_master_requests[master_sp_idx] += 1
+            for sp_idx, token_count in enumerate(
+                block_ctx.num_dispatched_tokens
+            ):
+                active_dispatched_tokens[sp_idx] += token_count
+                if token_count > 0 and sp_idx != master_sp_idx:
+                    active_receiver_requests[sp_idx] += 1
         rank_loads = tuple(
             RankLoad(
                 global_rank=self.topology.global_rank(sp_idx=sp_idx),
@@ -798,6 +1004,15 @@ class LocalScheduler:
                 ].num_blocks,
                 master_assignments=self._master_assignments[sp_idx],
                 mastered_decode_tokens=self._mastered_decode_tokens[sp_idx],
+                active_receiver_requests=(
+                    active_receiver_requests[sp_idx]
+                ),
+                active_dispatched_tokens=(
+                    active_dispatched_tokens[sp_idx]
+                ),
+                control_dummy_blocks=(
+                    self._state_manager.num_control_dummy_blocks(sp_idx)
+                ),
             )
             for sp_idx in range(self.topology.attention_sp)
         )

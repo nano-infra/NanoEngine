@@ -306,3 +306,55 @@ the scheduler should balance predicted KV demand and avoid retrying a
 
 Artifacts are under
 `bench_logs/rate50_decentralized_dp2sp8_real_token_tpot_no_qdiag_20260730_1141/`.
+
+## 2026-07-30 — deterministic LB-side decentralized admission
+
+The qdiag-off run showed that the old admission path still speculated: the
+frontend balanced request counts, sent candidates to each LocalEngine, and
+learned actual SP/KV infeasibility from `admission_deferred`. A deferred
+request was removed from the local queue, returned through Ray, reinserted in
+the global queue, and retried after a capacity epoch. That feedback loop
+produced 11,578 retry attempts and made `admission_rpc_residual_ms` include
+whole earlier attempts rather than only transport overhead.
+
+The normal path now makes the capacity decision in `RequestRouter`:
+
+- each DP LocalEngine attaches its aggregate per-SP master/receiver counts,
+  dispatched-token load, free/total blocks, and control-dummy blocks to the
+  existing consolidated frontend event RPC; SP ranks do not contact the
+  frontend and no new Ray RPC is added;
+- the LB reconstructs a versioned capacity shadow for each DP, examines only
+  the global FIFO head, and evaluates DPs in projected-batch order using the
+  same SP placement, receiver, KV reservation, lifetime, and queue limits as
+  the LocalEngine planner;
+- every accepted plan immediately deducts its placement from the LB shadow,
+  so the rest of that Ray batch is planned against tentative capacity;
+- the admission batch carries the selected master and per-SP token placement.
+  LocalEngine validates current capacity and commits that placement verbatim;
+  it does not run a second placement decision that prefix-cache reuse could
+  steer to different ranks;
+- if the FIFO head fits no DP, dispatch stops in place. No admission RPC is
+  sent for that request and later requests cannot bypass it;
+- only prevalidated batches are sent, still with at most one flight per DP
+  and one `ray.wait` over all DP flights. `admission_state_mismatch`,
+  legacy `admission_deferred`, and `queue_full` remain as resynchronization
+  recovery and are counted separately as `state_mismatches`, rather than
+  serving as the normal capacity probe.
+
+Native rank ordering now breaks equal-free-block ties by SP index so the LB
+mirror and LocalEngine choose the same deterministic placement. A load
+snapshot that contains a local preemption queue is temporarily excluded from
+new global admission until the LocalEngine clears its older local FIFO.
+
+Verification after rebuilding the editable C++ extension:
+
+- 87 focused control-plane, hierarchical contract, serving-ingress, and
+  routing-config tests passed;
+- regressions cover an infeasible FIFO head producing zero RPCs, no
+  small-request bypass, tentative batch capacity deduction, and DP selection
+  from aggregated receiver limits. A compiled C++ integration case confirms
+  that the placements selected by the frontend are committed unchanged even
+  when same-prefix KV blocks are reusable;
+- a synthetic SP8 planner pass over 18,000 requests took 0.205 seconds
+  (11.4 microseconds/request) on the frontend CPU;
+- `py_compile` and `git diff --check` passed.

@@ -5,7 +5,7 @@ import queue
 import sys
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -16,6 +16,7 @@ from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AddResult,
     AddResultEvent,
+    AdmissionReservation,
     AbortResult,
     FirstScheduleEvent,
     FirstTokenEvent,
@@ -24,12 +25,17 @@ from nanodeploy.engine.hierarchical_contract import (
     IngressAck,
     LoadSnapshot,
     OwnerState,
+    RankLoad,
     validate_execution_trace_set,
 )
 from nanodeploy.engine.local_executor import LocalExecutor
-from nanodeploy.engine.local_engine import LocalEngineCore
+from nanodeploy.engine.local_engine import (
+    LocalEngineCore,
+    _PlannedAdmission,
+)
 from nanodeploy.engine.topology import EngineTopology
 from nanodeploy.router.request_router import RequestOwner, RequestRouter
+from nanodeploy.router.admission_planner import AdmissionPlannerConfig
 
 
 def test_finish_event_excludes_unused_final_quantum_decode_slots():
@@ -125,15 +131,91 @@ def test_execution_boundary_recorder_reset_and_snapshot():
     assert recorder.snapshot() == {"sample_count": 0}
 
 
-def load_snapshot(engine_id: int, free_blocks_min: int) -> LoadSnapshot:
+def planner_config(
+    *, attention_sp: int = 1, queue_capacity: int = 4096
+) -> AdmissionPlannerConfig:
+    return AdmissionPlannerConfig(
+        attention_sp=attention_sp,
+        kvcache_block_size=4,
+        max_num_seqs=256,
+        max_num_batched_tokens=16384,
+        max_num_recv_seqs=32,
+        reserved_blocks_per_req=1.0,
+        segment_size=64,
+        queue_capacity=queue_capacity,
+    )
+
+
+def load_snapshot(
+    engine_id: int,
+    free_blocks_min: int,
+    *,
+    running: int = 0,
+    quantum_id: int = 2,
+    admission_version: int = 0,
+    capacity_epoch: int = 0,
+) -> LoadSnapshot:
     return LoadSnapshot(
         engine_id=engine_id,
         ready=True,
         waiting=0,
-        running=0,
+        running=running,
         free_blocks_min=free_blocks_min,
         wave_id=1,
+        quantum_id=quantum_id,
+        admission_version=admission_version,
+        capacity_epoch=capacity_epoch,
+        reserved_slots=running,
+        rank_loads=(
+            RankLoad(
+                global_rank=engine_id,
+                sp_idx=0,
+                tp_idx=0,
+                master_batch_size=running,
+                active_master_requests=running,
+                free_blocks=free_blocks_min,
+                total_blocks=max(256, free_blocks_min + 1),
+                master_assignments=running,
+                mastered_decode_tokens=0,
+                control_dummy_blocks=1,
+            ),
+        ),
+    )
+
+
+def multi_rank_load_snapshot(
+    engine_id: int,
+    *,
+    free_blocks: tuple[int, ...],
+    master_counts: tuple[int, ...],
+    receiver_counts: tuple[int, ...],
+) -> LoadSnapshot:
+    running = sum(master_counts)
+    return LoadSnapshot(
+        engine_id=engine_id,
+        ready=True,
+        waiting=0,
+        running=running,
+        free_blocks_min=min(free_blocks),
+        wave_id=1,
         quantum_id=2,
+        reserved_slots=running,
+        rank_loads=tuple(
+            RankLoad(
+                global_rank=engine_id * len(free_blocks) + sp_idx,
+                sp_idx=sp_idx,
+                tp_idx=0,
+                master_batch_size=master_counts[sp_idx],
+                active_master_requests=master_counts[sp_idx],
+                active_receiver_requests=receiver_counts[sp_idx],
+                free_blocks=rank_free_blocks,
+                total_blocks=256,
+                master_assignments=master_counts[sp_idx],
+                mastered_decode_tokens=0,
+                control_dummy_blocks=1,
+            )
+            for sp_idx, rank_free_blocks in enumerate(free_blocks)
+        ),
     )
 
 
@@ -200,6 +282,9 @@ def test_router_rejects_invalid_load_policy_configuration():
 class FakeAsyncEngine(FakeEngine):
     enqueue_reasons: list[str | None] = field(default_factory=list)
     handles: list[dict] = field(default_factory=list)
+    planned_batches: list[tuple[AdmissionReservation, ...]] = field(
+        default_factory=list
+    )
     admission_version: int = 0
 
     def enqueue_async(self, command: AddCommand):
@@ -233,7 +318,12 @@ class FakeAsyncEngine(FakeEngine):
             )
         return handle
 
-    def admit_batch_async(self, commands: tuple[AddCommand, ...]):
+    def admit_batch_async(
+        self,
+        commands: tuple[AddCommand, ...],
+        reservations: tuple[AdmissionReservation, ...],
+    ):
+        self.planned_batches.append(reservations)
         acks = []
         for command in commands:
             reason = (
@@ -277,7 +367,14 @@ def test_router_least_batch_drains_global_pending_with_tentative_counts():
         0: FakeAsyncEngine(0),
         1: FakeAsyncEngine(1),
     }
-    router = RequestRouter(engines, router_policy="least_batch")
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch",
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 100), load_snapshot(1, 100))
+    )
 
     for request_id in (1, 2, 3, 4):
         router.submit_async(
@@ -310,11 +407,15 @@ def test_router_least_batch_uses_live_running_plus_tentative_admissions():
         0: FakeAsyncEngine(0),
         1: FakeAsyncEngine(1),
     }
-    router = RequestRouter(engines, router_policy="least_batch")
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch",
+        admission_planner_config=planner_config(),
+    )
     router.record_loads(
         (
-            LoadSnapshot(0, True, 0, 3, 10, 1, 2),
-            LoadSnapshot(1, True, 0, 1, 10, 1, 2),
+            load_snapshot(0, 100, running=3),
+            load_snapshot(1, 100, running=1),
         )
     )
 
@@ -355,6 +456,10 @@ def test_router_polls_at_most_one_admission_batch_per_dp():
         router_policy="least_batch",
         admission_batch_size=2,
         poll_admission_batches=poll_batches,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 100), load_snapshot(1, 100))
     )
     for request_id in range(5):
         router.submit_async(
@@ -376,6 +481,124 @@ def test_router_polls_at_most_one_admission_batch_per_dp():
     assert metrics["pending_rpc"] == 2
     assert metrics["pending_rpc_requests"] == 4
     assert metrics["global_pending"] == 1
+
+
+def test_router_capacity_planner_does_not_rpc_past_unfit_fifo_head():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+    }
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch",
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 4), load_snapshot(1, 4))
+    )
+    router.submit_async(
+        request_id=1,
+        prompt_token_ids=tuple(range(16)),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+    router.submit_async(
+        request_id=2,
+        prompt_token_ids=(1,),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    assert router.poll_ingress_acks() == ()
+    assert engines[0].commands == []
+    assert engines[1].commands == []
+    assert router.pending_global_count == 2
+    assert router.admission_metrics()["global_retries"] == 0
+
+    router.record_loads(
+        (
+            load_snapshot(0, 6, quantum_id=3, capacity_epoch=1),
+            load_snapshot(1, 6, quantum_id=3, capacity_epoch=1),
+        )
+    )
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engines[0].commands] == [1]
+    assert [command.request_id for command in engines[1].commands] == [2]
+    assert engines[0].planned_batches[0][0].request_id == 1
+    assert sum(
+        engines[0].planned_batches[0][0].dispatched_tokens
+    ) == 16
+    assert engines[1].planned_batches[0][0].request_id == 2
+
+
+def test_router_capacity_planner_reserves_each_planned_batch_request():
+    engine = FakeAsyncEngine(0)
+    router = RequestRouter(
+        {0: engine},
+        router_policy="least_batch",
+        admission_planner_config=planner_config(),
+    )
+    # Each one-token prompt needs one KV block plus one reserved block.
+    # The legacy planner also mirrors its within-batch reservation accounting:
+    # request 1 fits with four free blocks, while request 2 stays global.
+    router.record_loads((load_snapshot(0, 4),))
+    for request_id in (1, 2):
+        router.submit_async(
+            request_id=request_id,
+            prompt_token_ids=(request_id,),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    assert router.poll_ingress_acks() == ()
+    assert [command.request_id for command in engine.commands] == [1]
+    assert router.owner(2) == RequestOwner(OwnerState.PENDING_GLOBAL)
+    assert router.admission_metrics()["global_retries"] == 0
+
+
+def test_router_capacity_planner_honors_dp_aggregated_receiver_limits():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+    }
+    config = planner_config(attention_sp=2)
+    config = replace(config, max_num_recv_seqs=1)
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch",
+        admission_planner_config=config,
+    )
+    router.record_loads(
+        (
+            multi_rank_load_snapshot(
+                0,
+                free_blocks=(100, 100),
+                master_counts=(0, 1),
+                receiver_counts=(0, 1),
+            ),
+            multi_rank_load_snapshot(
+                1,
+                free_blocks=(100, 100),
+                master_counts=(0, 1),
+                receiver_counts=(0, 0),
+            ),
+        )
+    )
+    router.submit_async(
+        request_id=1,
+        prompt_token_ids=tuple(range(65)),
+        max_tokens=16,
+        temperature=0.1,
+        ignore_eos=True,
+    )
+
+    assert router.poll_ingress_acks() == ()
+    assert engines[0].commands == []
+    assert [command.request_id for command in engines[1].commands] == [1]
+    assert router.admission_metrics()["global_retries"] == 0
 
 
 def test_local_engine_drains_frontend_events_in_one_batch():
@@ -447,7 +670,14 @@ def test_router_buffers_terminal_until_async_owner_commit():
         0: FakeAsyncEngine(0),
         1: FakeAsyncEngine(1),
     }
-    router = RequestRouter(engines, router_policy="least_batch")
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch",
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 100), load_snapshot(1, 100))
+    )
     router.submit_async(
         request_id=5,
         prompt_token_ids=(1, 2),
@@ -486,7 +716,7 @@ def test_router_buffers_terminal_until_async_owner_commit():
     assert router.is_idle
 
 
-def test_router_retries_globally_after_all_dps_defer_admission(
+def test_router_resyncs_after_unexpected_local_admission_mismatch(
     monkeypatch,
 ):
     clock = {"now": 0.0}
@@ -496,13 +726,17 @@ def test_router_retries_globally_after_all_dps_defer_admission(
     )
     engines = {
         0: FakeAsyncEngine(
-            0, enqueue_reasons=["admission_deferred"]
+            0, enqueue_reasons=["admission_state_mismatch"]
         ),
         1: FakeAsyncEngine(
-            1, enqueue_reasons=["admission_deferred"]
+            1, enqueue_reasons=["admission_state_mismatch"]
         ),
     }
-    router = RequestRouter(engines, router_policy="least_batch")
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch",
+        admission_planner_config=planner_config(),
+    )
     router.record_loads(
         (load_snapshot(0, 10), load_snapshot(1, 10))
     )
@@ -531,25 +765,11 @@ def test_router_retries_globally_after_all_dps_defer_admission(
     clock["now"] = 35.0
     router.record_loads(
         (
-            LoadSnapshot(
-                0,
-                True,
-                0,
-                0,
-                11,
-                1,
-                3,
-                capacity_epoch=1,
+            load_snapshot(
+                0, 11, quantum_id=3, capacity_epoch=1
             ),
-            LoadSnapshot(
-                1,
-                True,
-                0,
-                0,
-                11,
-                1,
-                3,
-                capacity_epoch=1,
+            load_snapshot(
+                1, 11, quantum_id=3, capacity_epoch=1
             ),
         )
     )
@@ -581,11 +801,14 @@ def test_router_retries_globally_after_all_dps_defer_admission(
     assert terminal.global_capacity_queue_ms == 25_000.0
     admission_metrics = router.admission_metrics()
     assert admission_metrics["global_retries"] == 2
+    assert admission_metrics["state_mismatches"] == 2
     assert admission_metrics["fallbacks"] == 0
     assert admission_metrics["per_engine"]["0"]["attempts"] == 2
-    assert admission_metrics["per_engine"]["0"]["deferred"] == 1
+    assert admission_metrics["per_engine"]["0"]["deferred"] == 0
+    assert admission_metrics["per_engine"]["0"]["state_mismatches"] == 1
     assert admission_metrics["per_engine"]["1"]["attempts"] == 1
-    assert admission_metrics["per_engine"]["1"]["deferred"] == 1
+    assert admission_metrics["per_engine"]["1"]["deferred"] == 0
+    assert admission_metrics["per_engine"]["1"]["state_mismatches"] == 1
 
 
 def test_router_least_cache_uses_padded_request_blocks_optimistically():
@@ -680,7 +903,13 @@ def test_router_async_ingress_fallback_and_add_state_transition():
         0: FakeAsyncEngine(0, enqueue_reasons=["queue_full"]),
         1: FakeAsyncEngine(1),
     }
-    router = RequestRouter(engines)
+    router = RequestRouter(
+        engines,
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads(
+        (load_snapshot(0, 100), load_snapshot(1, 100))
+    )
 
     router.submit_async(
         request_id=40,
@@ -732,7 +961,11 @@ def test_router_async_ingress_fallback_and_add_state_transition():
 
 def test_router_buffers_add_result_observed_before_ingress_ack():
     engine = FakeAsyncEngine(0)
-    router = RequestRouter({0: engine})
+    router = RequestRouter(
+        {0: engine},
+        admission_planner_config=planner_config(),
+    )
+    router.record_loads((load_snapshot(0, 100),))
     router.submit_async(
         request_id=41,
         prompt_token_ids=(1, 2),
@@ -847,14 +1080,22 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     assert engine._reserved_slots == 1
 
 
-def test_local_engine_central_admission_commits_only_after_local_plan():
+def test_local_engine_commits_lb_plans_and_reports_state_mismatch():
     class FakeScheduler:
         def __init__(self):
             self.batches = []
 
-        def try_admit_batch(self, commands):
+        def commit_planned_batch(self, commands, reservations):
             self.batches.append(
-                tuple(command.request_id for command in commands)
+                tuple(
+                    (
+                        command.request_id,
+                        reservation.master_sp_idx,
+                    )
+                    for command, reservation in zip(
+                        commands, reservations, strict=True
+                    )
+                )
             )
             return tuple(
                 {
@@ -863,7 +1104,7 @@ def test_local_engine_central_admission_commits_only_after_local_plan():
                         61,
                         False,
                         engine_id=0,
-                        reason="admission_deferred",
+                        reason="admission_state_mismatch",
                     ),
                 }[command.request_id]
                 for command in commands
@@ -897,13 +1138,21 @@ def test_local_engine_central_admission_commits_only_after_local_plan():
     def loop_command(request_id):
         return SimpleNamespace(
             kind="admit",
-            payload=AddCommand(
-                request_id=request_id,
-                prompt_token_ids=(1, 2),
-                max_tokens=16,
-                temperature=0.1,
-                ignore_eos=True,
-                wave_id=0,
+            payload=_PlannedAdmission(
+                AddCommand(
+                    request_id=request_id,
+                    prompt_token_ids=(1, 2),
+                    max_tokens=16,
+                    temperature=0.1,
+                    ignore_eos=True,
+                    wave_id=0,
+                ),
+                AdmissionReservation(
+                    request_id=request_id,
+                    engine_id=0,
+                    master_sp_idx=request_id - 60,
+                    dispatched_tokens=(2,),
+                ),
             ),
             enqueued_at=0.0,
             completed=threading.Event(),
@@ -914,7 +1163,7 @@ def test_local_engine_central_admission_commits_only_after_local_plan():
     accepted = loop_command(60)
     deferred = loop_command(61)
     engine._complete_admission_commands((accepted, deferred))
-    assert engine.scheduler.batches == [(60, 61)]
+    assert engine.scheduler.batches == [((60, 0), (61, 1))]
     assert accepted.error is None
     assert accepted.result.request_id == 60
     assert accepted.result.engine_id == 0
@@ -933,7 +1182,7 @@ def test_local_engine_central_admission_commits_only_after_local_plan():
     assert deferred.result.request_id == 61
     assert deferred.result.engine_id == 0
     assert not deferred.result.enqueued
-    assert deferred.result.reason == "admission_deferred"
+    assert deferred.result.reason == "admission_state_mismatch"
     assert deferred.result.local_command_queue_ms >= 0.0
     assert deferred.result.local_admission_ms >= 0.0
     assert engine._reserved_request_ids == {60}

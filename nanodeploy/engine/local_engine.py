@@ -17,6 +17,7 @@ from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AddResult,
     AddResultEvent,
+    AdmissionReservation,
     AbortResult,
     DecodeITLSample,
     EngineReady,
@@ -49,6 +50,12 @@ class _IngressAdd:
     enqueued_at: float = field(default_factory=perf_counter)
 
 
+@dataclass(frozen=True, slots=True)
+class _PlannedAdmission:
+    command: AddCommand
+    reservation: AdmissionReservation | None
+
+
 def _rank_load_payload(snapshot: LoadSnapshot) -> tuple[dict[str, int], ...]:
     return tuple(
         {
@@ -56,8 +63,15 @@ def _rank_load_payload(snapshot: LoadSnapshot) -> tuple[dict[str, int], ...]:
             "sp_idx": rank_load.sp_idx,
             "master_batch_size": rank_load.master_batch_size,
             "active_master_requests": rank_load.active_master_requests,
+            "active_receiver_requests": (
+                rank_load.active_receiver_requests
+            ),
+            "active_dispatched_tokens": (
+                rank_load.active_dispatched_tokens
+            ),
             "free_blocks": rank_load.free_blocks,
             "total_blocks": rank_load.total_blocks,
+            "control_dummy_blocks": rank_load.control_dummy_blocks,
         }
         for rank_load in snapshot.rank_loads
     )
@@ -306,17 +320,29 @@ class LocalEngineCore:
         return self.admit_add_batch((command,))[0]
 
     def admit_add_batch(
-        self, commands: tuple[AddCommand, ...]
+        self,
+        commands: tuple[AddCommand, ...],
+        reservations: tuple[AdmissionReservation, ...] | None = None,
     ) -> tuple[IngressAck, ...]:
         """Admit one frontend batch with one actor RPC and loop command."""
         self._raise_if_failed()
         if self.config.attention_dp > 1 and self._coordinator is None:
             raise RuntimeError("LocalEngine coordinator is not initialized")
+        if reservations is not None and len(reservations) != len(commands):
+            raise ValueError(
+                "admission command/reservation count mismatch"
+            )
         immediate: list[IngressAck | None] = [None] * len(commands)
         active_commands: list[AddCommand] = []
+        active_reservations: list[AdmissionReservation | None] = []
         active_indexes: list[int] = []
         with self._ingress_lock:
             for index, command in enumerate(commands):
+                reservation = (
+                    reservations[index]
+                    if reservations is not None
+                    else None
+                )
                 if (
                     command.request_id in self._reserved_request_ids
                     or command.request_id in self._ingress_pending_ids
@@ -342,11 +368,22 @@ class LocalEngineCore:
                     continue
                 self._admission_pending_ids.add(command.request_id)
                 active_commands.append(command)
+                active_reservations.append(reservation)
                 active_indexes.append(index)
 
         if active_commands:
             active_acks = self._submit(
-                _LoopCommand("admit_batch", tuple(active_commands))
+                _LoopCommand(
+                    "admit_batch",
+                    tuple(
+                        _PlannedAdmission(command, reservation)
+                        for command, reservation in zip(
+                            active_commands,
+                            active_reservations,
+                            strict=True,
+                        )
+                    ),
+                )
             )
             if len(active_acks) != len(active_commands):
                 raise RuntimeError(
@@ -493,10 +530,10 @@ class LocalEngineCore:
             children = tuple(
                 _LoopCommand(
                     "admit",
-                    add_command,
+                    planned_admission,
                     enqueued_at=command.enqueued_at,
                 )
-                for add_command in command.payload
+                for planned_admission in command.payload
             )
             self._complete_admission_commands(children)
             error = next(
@@ -555,7 +592,18 @@ class LocalEngineCore:
         )
         self._command_count += len(commands)
         self._command_queue_delay_ms_total += sum(command_queue_ms)
-        add_commands = tuple(command.payload for command in commands)
+        planned_admissions = tuple(
+            command.payload
+            if isinstance(command.payload, _PlannedAdmission)
+            else _PlannedAdmission(command.payload, None)
+            for command in commands
+        )
+        add_commands = tuple(
+            planned.command for planned in planned_admissions
+        )
+        reservations = tuple(
+            planned.reservation for planned in planned_admissions
+        )
         try:
             with self._ingress_lock:
                 cancelled_ids = {
@@ -572,9 +620,41 @@ class LocalEngineCore:
                 for add_command in add_commands
                 if add_command.request_id not in cancelled_ids
             )
-            active_results = tuple(
-                self.scheduler.try_admit_batch(active_add_commands)
+            active_indexes = tuple(
+                index
+                for index, add_command in enumerate(add_commands)
+                if add_command.request_id not in cancelled_ids
             )
+            active_reservations = tuple(
+                reservations[index] for index in active_indexes
+            )
+            if all(
+                reservation is not None
+                for reservation in active_reservations
+            ):
+                active_results = tuple(
+                    self.scheduler.commit_planned_batch(
+                        active_add_commands,
+                        tuple(
+                            reservation
+                            for reservation in active_reservations
+                            if reservation is not None
+                        ),
+                    )
+                )
+            elif all(
+                reservation is None
+                for reservation in active_reservations
+            ):
+                active_results = tuple(
+                    self.scheduler.try_admit_batch(
+                        active_add_commands
+                    )
+                )
+            else:
+                raise RuntimeError(
+                    "admission batch mixed planned and unplanned commands"
+                )
             if len(active_results) != len(active_add_commands):
                 raise RuntimeError(
                     "LocalScheduler active admission result count mismatch: "

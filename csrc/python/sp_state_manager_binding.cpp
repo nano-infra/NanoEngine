@@ -222,6 +222,20 @@ void bind_sp_state_manager(py::module_& m)
              py::arg("seq"),
              py::arg("num_seqs"),
              py::arg("num_batched_tokens"))
+        .def(
+            "apply_planned_placement",
+            [](SPStateManager&        state,
+               Sequence&              seq,
+               int                    master_sp_idx,
+               const std::vector<int>& dispatched_tokens) {
+                SPStateManager::PlannedPlacement placement;
+                placement.master_sp_idx = master_sp_idx;
+                placement.num_dispatched_tokens = dispatched_tokens;
+                state.apply_planned_placement(seq, placement);
+            },
+            py::arg("seq"),
+            py::arg("master_sp_idx"),
+            py::arg("dispatched_tokens"))
 
         .def("allocate", &SPStateManager::allocate, py::arg("seq"))
         .def("deallocate", &SPStateManager::deallocate, py::arg("seq"), py::arg("slot"))

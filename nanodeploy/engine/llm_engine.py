@@ -27,6 +27,7 @@ from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.sequence import Sequence
 from nanodeploy.logging import get_logger
 from nanodeploy.metrics import MetricsManager
+from nanodeploy.router.admission_planner import AdmissionPlannerConfig
 from nanodeploy.router.request_router import RequestRouter
 
 logger = get_logger()
@@ -87,6 +88,9 @@ class LLMEngine:
                 admission_batch_size=config.max_ingress_batch_requests,
                 poll_admission_batches=(
                     self.deployment.poll_admission_batches
+                ),
+                admission_planner_config=(
+                    AdmissionPlannerConfig.from_config(config)
                 ),
             )
             # LeastBatch also needs an authoritative running-count baseline
@@ -873,8 +877,17 @@ class LLMEngine:
                         "active_master_requests": (
                             rank_load.active_master_requests
                         ),
+                        "active_receiver_requests": (
+                            rank_load.active_receiver_requests
+                        ),
+                        "active_dispatched_tokens": (
+                            rank_load.active_dispatched_tokens
+                        ),
                         "free_blocks": rank_load.free_blocks,
                         "total_blocks": rank_load.total_blocks,
+                        "control_dummy_blocks": (
+                            rank_load.control_dummy_blocks
+                        ),
                         "master_assignments": (
                             rank_load.master_assignments
                         ),

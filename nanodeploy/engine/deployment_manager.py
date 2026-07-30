@@ -20,6 +20,7 @@ from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AddResult,
     AddResultEvent,
+    AdmissionReservation,
     AbortResult,
     CoordinatorStatus,
     DecodeITLSample,
@@ -106,9 +107,15 @@ class RayEngineTransport:
         with _without_proxy_env():
             return self.actor.admit_add.remote(command)
 
-    def admit_batch_async(self, commands: tuple[AddCommand, ...]):
+    def admit_batch_async(
+        self,
+        commands: tuple[AddCommand, ...],
+        reservations: tuple[AdmissionReservation, ...],
+    ):
         with _without_proxy_env():
-            return self.actor.admit_add_batch.remote(commands)
+            return self.actor.admit_add_batch.remote(
+                commands, reservations
+            )
 
     def enqueue_batch_async(self, commands: tuple[AddCommand, ...]):
         with _without_proxy_env():

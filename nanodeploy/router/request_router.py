@@ -9,6 +9,7 @@ from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
     AddResult,
     AddResultEvent,
+    AdmissionReservation,
     AbortResult,
     FirstScheduleEvent,
     FinishEvent,
@@ -16,6 +17,11 @@ from nanodeploy.engine.hierarchical_contract import (
     LoadSnapshot,
     OwnerState,
     round_up,
+)
+from nanodeploy.router.admission_planner import (
+    AdmissionPlanner,
+    AdmissionPlannerConfig,
+    AdmissionShadow,
 )
 
 RouterPolicy = Literal["round_robin", "least_batch", "least_cache"]
@@ -36,7 +42,9 @@ class EngineTransport(Protocol):
     def admit_async(self, command: AddCommand) -> Any: ...
 
     def admit_batch_async(
-        self, commands: tuple[AddCommand, ...]
+        self,
+        commands: tuple[AddCommand, ...],
+        reservations: tuple[AdmissionReservation, ...],
     ) -> Any: ...
 
     def poll_enqueue(
@@ -91,6 +99,7 @@ class _AdmissionBatchFlight:
 @dataclass(slots=True)
 class _LeastBatchCharge:
     engine_id: int
+    reservation: AdmissionReservation
     admission_version: int | None = None
 
 
@@ -112,6 +121,7 @@ class RequestRouter:
         wakeup: WakeupCallback | None = None,
         admission_batch_size: int = 256,
         poll_admission_batches: AdmissionBatchPoller | None = None,
+        admission_planner_config: AdmissionPlannerConfig | None = None,
         initial_wave_id: int = 0,
     ) -> None:
         if not engines:
@@ -143,6 +153,11 @@ class RequestRouter:
         self._admission_flights: dict[int, _AdmissionBatchFlight] = {}
         self._admission_batch_size = admission_batch_size
         self._poll_admission_batches = poll_admission_batches
+        self._admission_planner = (
+            AdmissionPlanner(admission_planner_config)
+            if admission_planner_config is not None
+            else None
+        )
         self._engine_blocked_capacity_epoch: dict[int, int | None] = {
             engine_id: None for engine_id in self._ready_engine_ids
         }
@@ -170,8 +185,12 @@ class RequestRouter:
         self._admission_queue_full = {
             engine_id: 0 for engine_id in self._ready_engine_ids
         }
+        self._admission_local_state_mismatch = {
+            engine_id: 0 for engine_id in self._ready_engine_ids
+        }
         self._admission_fallbacks = 0
         self._admission_global_retries = 0
+        self._admission_state_mismatches = 0
         self._rr_cursor = 0
         self._wakeup = wakeup
         self._wave_id = initial_wave_id
@@ -318,7 +337,11 @@ class RequestRouter:
             self._estimated_free_blocks[engine_id] += request_blocks
 
     def _charge_least_batch(
-        self, *, request_id: int, engine_id: int
+        self,
+        *,
+        request_id: int,
+        engine_id: int,
+        reservation: AdmissionReservation,
     ) -> None:
         if self.router_policy != "least_batch":
             return
@@ -326,7 +349,18 @@ class RequestRouter:
             raise RuntimeError(
                 f"duplicate least-batch charge for {request_id}"
             )
-        self._least_batch_charges[request_id] = _LeastBatchCharge(engine_id)
+        if (
+            reservation.request_id != request_id
+            or reservation.engine_id != engine_id
+        ):
+            raise RuntimeError(
+                "admission reservation ownership mismatch: "
+                f"request={request_id}, engine={engine_id}, "
+                f"reservation={reservation}"
+            )
+        self._least_batch_charges[request_id] = _LeastBatchCharge(
+            engine_id, reservation
+        )
         self._least_batch_tentative_counts[engine_id] += 1
 
     def _refund_least_batch(self, request_id: int) -> None:
@@ -353,6 +387,15 @@ class RequestRouter:
                 f"admission version: request={request_id}"
             )
         charge.admission_version = admission_version
+        snapshot = self._loads.get(charge.engine_id)
+        if (
+            snapshot is not None
+            and snapshot.admission_version >= admission_version
+        ):
+            # The consolidated load/event poll can observe the commit before
+            # the admission ObjectRef is resolved. Do not apply the same
+            # reservation twice during the next dispatch in this cycle.
+            self._refund_least_batch(request_id)
 
     def add(
         self,
@@ -546,16 +589,55 @@ class RequestRouter:
             if pending.capacity_blocked_since is None:
                 pending.capacity_blocked_since = blocked_at
 
+    def _admission_shadows(self) -> dict[int, AdmissionShadow]:
+        planner = self._admission_planner
+        if planner is None:
+            raise RuntimeError(
+                "least_batch async admission requires "
+                "admission_planner_config"
+            )
+        shadows: dict[int, AdmissionShadow] = {}
+        for engine_id in self._ready_engine_ids:
+            snapshot = self._loads.get(engine_id)
+            if snapshot is None:
+                continue
+            shadow = planner.shadow_from_snapshot(snapshot)
+            if shadow is None:
+                continue
+            for charge in self._least_batch_charges.values():
+                if charge.engine_id == engine_id:
+                    planner.apply_reservation(
+                        shadow, charge.reservation
+                    )
+            shadows[engine_id] = shadow
+        return shadows
+
     def _dispatch_global_pending(self) -> None:
+        if not self._global_pending:
+            return
+        planner = self._admission_planner
+        if planner is None:
+            raise RuntimeError(
+                "least_batch async admission requires "
+                "admission_planner_config"
+            )
+        shadows = self._admission_shadows()
         available = {
             engine_id
             for engine_id in self._ready_engine_ids
-            if self._engine_has_admission_window(engine_id)
+            if (
+                engine_id in shadows
+                and self._engine_has_admission_window(engine_id)
+            )
         }
-        batches: dict[int, list[_GlobalPending]] = {}
+        batches: dict[
+            int, list[tuple[_GlobalPending, AdmissionReservation]]
+        ] = {}
         assignment_order: list[_GlobalPending] = []
+        capacity_blocked = False
         while self._global_pending and available:
-            engine_id = min(
+            pending_global = self._global_pending[0]
+            candidates = sorted(
                 available,
                 key=lambda candidate: (
                     self._projected_batch(candidate)
@@ -563,15 +645,33 @@ class RequestRouter:
                     candidate,
                 ),
             )
-            pending_global = self._global_pending.popleft()
-            batches.setdefault(engine_id, []).append(pending_global)
+            selected: tuple[int, AdmissionReservation] | None = None
+            for engine_id in candidates:
+                candidate_shadow = shadows[engine_id].copy()
+                reservation = planner.plan(
+                    candidate_shadow, pending_global.command
+                )
+                if reservation is None:
+                    continue
+                selected = (engine_id, reservation)
+                shadows[engine_id] = candidate_shadow
+                break
+            if selected is None:
+                capacity_blocked = True
+                break
+            engine_id, reservation = selected
+            self._global_pending.popleft()
+            batches.setdefault(engine_id, []).append(
+                (pending_global, reservation)
+            )
             assignment_order.append(pending_global)
             if len(batches[engine_id]) >= self._admission_batch_size:
                 available.remove(engine_id)
 
         dispatched_request_ids: set[int] = set()
-        for engine_id, batch in batches.items():
-            for pending_global in batch:
+        for engine_id, planned_batch in batches.items():
+            batch = [pending for pending, _ in planned_batch]
+            for pending_global, reservation in planned_batch:
                 command = pending_global.command
                 owner = self._owners.get(command.request_id)
                 if (
@@ -589,6 +689,7 @@ class RequestRouter:
                 self._charge_least_batch(
                     request_id=command.request_id,
                     engine_id=engine_id,
+                    reservation=reservation,
                 )
                 self._admission_attempts[engine_id] += 1
 
@@ -610,7 +711,11 @@ class RequestRouter:
                 handle = self._engines[
                     engine_id
                 ].admit_batch_async(
-                    tuple(item.command for item in batch)
+                    tuple(item.command for item in batch),
+                    tuple(
+                        reservation
+                        for _, reservation in planned_batch
+                    ),
                 )
             except BaseException:
                 for pending_global in batch:
@@ -642,7 +747,15 @@ class RequestRouter:
                 pending.command.request_id for pending in batch
             )
         if self._global_pending:
-            self._mark_global_capacity_blocked(perf_counter())
+            if capacity_blocked or (
+                not self._admission_flights
+                and any(
+                    self._engine_blocked_capacity_epoch[engine_id]
+                    is not None
+                    for engine_id in self._ready_engine_ids
+                )
+            ):
+                self._mark_global_capacity_blocked(perf_counter())
 
     def _ready_admission_batches(
         self,
@@ -713,16 +826,26 @@ class RequestRouter:
 
                 transient = (
                     not ack.enqueued
-                    and ack.reason in {"queue_full", "admission_deferred"}
+                    and ack.reason
+                    in {
+                        "queue_full",
+                        "admission_deferred",
+                        "admission_state_mismatch",
+                    }
                 )
                 if transient:
+                    self._admission_state_mismatches += 1
                     capacity_blocked = True
                     if ack.capacity_epoch is not None:
                         blocked_capacity_epoch = max(
                             blocked_capacity_epoch,
                             ack.capacity_epoch,
                         )
-                    if ack.reason == "admission_deferred":
+                    if ack.reason == "admission_state_mismatch":
+                        self._admission_local_state_mismatch[
+                            engine_id
+                        ] += 1
+                    elif ack.reason == "admission_deferred":
                         self._admission_deferred[engine_id] += 1
                     else:
                         self._admission_queue_full[engine_id] += 1
@@ -1127,6 +1250,9 @@ class RequestRouter:
                 "commits": self._admission_commits[engine_id],
                 "deferred": self._admission_deferred[engine_id],
                 "queue_full": self._admission_queue_full[engine_id],
+                "state_mismatches": (
+                    self._admission_local_state_mismatch[engine_id]
+                ),
             }
         return {
             "policy": self.router_policy,
@@ -1139,5 +1265,6 @@ class RequestRouter:
             "admission_batch_size": self._admission_batch_size,
             "fallbacks": self._admission_fallbacks,
             "global_retries": self._admission_global_retries,
+            "state_mismatches": self._admission_state_mismatches,
             "per_engine": per_engine,
         }

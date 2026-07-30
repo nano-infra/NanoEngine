@@ -923,7 +923,8 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
             std::sort(rank_free_count.begin(),
                       rank_free_count.end(),
                       [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
-                          return a.second > b.second;
+                          return a.second != b.second ? a.second > b.second
+                                                     : a.first < b.first;
                       });
             
             // Select participating ranks (non-master ranks first)
@@ -1023,7 +1024,10 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
         }
         std::sort(rank_free_count.begin(),
                   rank_free_count.end(),
-                  [](const std::pair<int, int>& a, const std::pair<int, int>& b) { return a.second > b.second; });
+                  [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                      return a.second != b.second ? a.second > b.second
+                                                 : a.first < b.first;
+                  });
 
         int start_ranks = initial_num_ranks;
         int end_ranks   = enable_dynamic_sp_size_ ? attention_sp_ : initial_num_ranks;
@@ -1082,7 +1086,8 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
                 // 2. Sort participating ranks by free blocks descending (richest first)
                 std::sort(sorted_ranks.begin(), sorted_ranks.end(),
                           [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
-                              return a.second > b.second;
+                              return a.second != b.second ? a.second > b.second
+                                                         : a.first < b.first;
                           });
 
                 long long total_tokens_needed = seq.num_tokens;
@@ -1267,7 +1272,10 @@ bool SPStateManager::can_allocate(Sequence&                           seq,
 
         std::sort(rank_free_count.begin(),
                   rank_free_count.end(),
-                  [](const std::pair<int, int>& a, const std::pair<int, int>& b) { return a.second > b.second; });
+                  [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                      return a.second != b.second ? a.second > b.second
+                                                 : a.first < b.first;
+                  });
 
         std::vector<int> top_most_free_ranks;
         int              ranks_to_pick = std::min((int)rank_free_count.size(), num_ranks - 1);

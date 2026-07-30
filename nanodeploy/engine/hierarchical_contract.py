@@ -110,6 +110,16 @@ class AddCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class AdmissionReservation:
+    """One LB-selected LocalEngine SP placement to validate and commit."""
+
+    request_id: int
+    engine_id: int
+    master_sp_idx: int
+    dispatched_tokens: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class AddResult:
     request_id: int
     accepted: bool
@@ -240,6 +250,11 @@ class RankLoad:
     total_blocks: int
     master_assignments: int
     mastered_decode_tokens: int
+    # Admission-planner state. These values describe the currently running
+    # placements, not just the most recent decode batch.
+    active_receiver_requests: int = 0
+    active_dispatched_tokens: int = 0
+    control_dummy_blocks: int = 0
 
 
 @dataclass(frozen=True, slots=True)

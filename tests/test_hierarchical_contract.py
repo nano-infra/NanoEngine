@@ -6,6 +6,7 @@ from nanodeploy._cpp import BlockContextSlot
 from nanodeploy.config import Config
 from nanodeploy.engine.hierarchical_contract import (
     AddCommand,
+    AdmissionReservation,
     HIERARCHICAL_LOOP_COUNT,
     LocalDecodeBatch,
     WorkerDecodeResult,
@@ -16,6 +17,10 @@ from nanodeploy.engine.local_scheduler import LocalScheduler
 from nanodeploy.engine.scheduler import Scheduler
 from nanodeploy.engine.topology import build_hierarchical_topology
 from nanodeploy.engine.sequence import Sequence
+from nanodeploy.router.admission_planner import (
+    AdmissionPlanner,
+    AdmissionPlannerConfig,
+)
 from nanodeploy.sampling_params import SamplingParams
 
 
@@ -240,6 +245,111 @@ def test_admission_and_decode_are_separate_cpp_calls():
     )
 
 
+def test_frontend_admission_mirror_matches_local_cpp_placements():
+    config = make_hierarchical_config(
+        enable_non_uniform_split=True,
+        segment_size=64,
+    )
+    local = LocalScheduler(
+        config, config.hierarchical_topology.engine(0)
+    )
+    planner = AdmissionPlanner(
+        AdmissionPlannerConfig.from_config(config)
+    )
+    shadow = planner.shadow_from_snapshot(
+        local.load_snapshot(wave_id=1, quantum_id=0)
+    )
+    assert shadow is not None
+
+    commands = tuple(
+        AddCommand(
+            request_id=request_id,
+            prompt_token_ids=tuple(
+                (index % 100) + 1 for index in range(prompt_len)
+            ),
+            max_tokens=17,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+        for request_id, prompt_len in enumerate(
+            (1, 65, 129, 257), start=1
+        )
+    )
+    reservations = tuple(
+        planner.plan(shadow, command) for command in commands
+    )
+    assert all(reservation is not None for reservation in reservations)
+
+    results = local.commit_planned_batch(
+        commands,
+        tuple(
+            reservation
+            for reservation in reservations
+            if reservation is not None
+        ),
+    )
+    assert all(result.accepted for result in results)
+    running_by_id = {
+        sequence.seq_id: sequence
+        for sequence in local.cpp_scheduler.running(0)
+    }
+    actual_reservations = []
+    for command in commands:
+        reservation = reservations[command.request_id - 1]
+        assert reservation is not None
+        sequence = running_by_id[command.request_id]
+        block_ctx = sequence.block_ctx(BlockContextSlot.ACTIVE)
+        actual_prompt_placement = list(block_ctx.num_dispatched_tokens)
+        actual_prompt_placement[block_ctx.master_sp_idx] -= 1
+        actual_reservations.append(
+            (
+                block_ctx.master_sp_idx,
+                tuple(actual_prompt_placement),
+            )
+        )
+    assert tuple(actual_reservations) == tuple(
+        (
+            reservation.master_sp_idx,
+            reservation.dispatched_tokens,
+        )
+        for reservation in reservations
+        if reservation is not None
+    )
+
+
+def test_planned_admission_mismatch_keeps_local_fifo_clean():
+    config = make_hierarchical_config()
+    local = LocalScheduler(
+        config, config.hierarchical_topology.engine(0)
+    )
+    commands = tuple(
+        AddCommand(
+            request_id=request_id,
+            prompt_token_ids=(1, 2),
+            max_tokens=17,
+            temperature=0.1,
+            ignore_eos=True,
+            wave_id=1,
+        )
+        for request_id in (10, 11)
+    )
+    reservations = (
+        AdmissionReservation(10, 0, 0, (0, 0, 0, 0)),
+        AdmissionReservation(11, 0, 1, (0, 2, 0, 0)),
+    )
+
+    results = local.commit_planned_batch(commands, reservations)
+
+    assert tuple(result.reason for result in results) == (
+        "admission_state_mismatch",
+        "admission_state_mismatch",
+    )
+    assert not local.cpp_scheduler.waiting_migration
+    assert not local.cpp_scheduler.running(0)
+    assert local.is_finished()
+
+
 def test_local_decode_batch_validates_rank_order_and_forward_count():
     batch = LocalDecodeBatch(
         wave_id=3,
@@ -358,6 +468,14 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert sum(
         load.active_master_requests for load in first_load.rank_loads
     ) == 1
+    assert sum(
+        load.active_dispatched_tokens for load in first_load.rank_loads
+    ) == sequence.num_tokens
+    assert all(
+        load.active_receiver_requests >= 0
+        and load.control_dummy_blocks > 0
+        for load in first_load.rank_loads
+    )
     assert sum(load.master_assignments for load in first_load.rank_loads) == 1
     assert all(load.total_blocks == 32 for load in first_load.rank_loads)
     assert local.postprocess(first, make_worker_results(first)) == ()
@@ -404,6 +522,8 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert load.all_dummy_rank_forwards == 0
     assert len(load.rank_loads) == config.attention_sp
     assert sum(load.active_master_requests for load in load.rank_loads) == 0
+    assert sum(load.active_receiver_requests for load in load.rank_loads) == 0
+    assert sum(load.active_dispatched_tokens for load in load.rank_loads) == 0
     assert sum(load.master_assignments for load in load.rank_loads) == 1
     assert sum(load.mastered_decode_tokens for load in load.rank_loads) == 17
 
