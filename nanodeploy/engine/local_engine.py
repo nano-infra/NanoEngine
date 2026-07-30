@@ -20,6 +20,7 @@ from nanodeploy.engine.hierarchical_contract import (
     AbortResult,
     DecodeITLSample,
     EngineReady,
+    FrontendEventBatch,
     FirstScheduleEvent,
     FirstTokenEvent,
     FinishEvent,
@@ -88,6 +89,7 @@ class LocalEngineCore:
         self._cancelled_ingress_ids: set[int] = set()
         self._reserved_slots = 0
         self._admission_version = 0
+        self._capacity_epoch = 0
         self._add_result_events: deque[AddResultEvent] = deque()
         self._first_schedule_events: deque[FirstScheduleEvent] = deque()
         self._first_token_events: deque[FirstTokenEvent] = deque()
@@ -301,33 +303,62 @@ class LocalEngineCore:
 
     def admit_add(self, command: AddCommand) -> IngressAck:
         """Run local SP admission in the scheduler's single-writer loop."""
+        return self.admit_add_batch((command,))[0]
+
+    def admit_add_batch(
+        self, commands: tuple[AddCommand, ...]
+    ) -> tuple[IngressAck, ...]:
+        """Admit one frontend batch with one actor RPC and loop command."""
         self._raise_if_failed()
         if self.config.attention_dp > 1 and self._coordinator is None:
             raise RuntimeError("LocalEngine coordinator is not initialized")
+        immediate: list[IngressAck | None] = [None] * len(commands)
+        active_commands: list[AddCommand] = []
+        active_indexes: list[int] = []
         with self._ingress_lock:
-            if (
-                command.request_id in self._reserved_request_ids
-                or command.request_id in self._ingress_pending_ids
-                or command.request_id in self._admission_pending_ids
-            ):
-                return IngressAck(
-                    request_id=command.request_id,
-                    engine_id=self.engine_id,
-                    enqueued=False,
-                    reason="duplicate_request_id",
+            for index, command in enumerate(commands):
+                if (
+                    command.request_id in self._reserved_request_ids
+                    or command.request_id in self._ingress_pending_ids
+                    or command.request_id in self._admission_pending_ids
+                ):
+                    immediate[index] = IngressAck(
+                        request_id=command.request_id,
+                        engine_id=self.engine_id,
+                        enqueued=False,
+                        reason="duplicate_request_id",
+                    )
+                    continue
+                if (
+                    self._reserved_slots + len(self._admission_pending_ids)
+                    >= self.config.hierarchical_queue_capacity
+                ):
+                    immediate[index] = IngressAck(
+                        request_id=command.request_id,
+                        engine_id=self.engine_id,
+                        enqueued=False,
+                        reason="queue_full",
+                    )
+                    continue
+                self._admission_pending_ids.add(command.request_id)
+                active_commands.append(command)
+                active_indexes.append(index)
+
+        if active_commands:
+            active_acks = self._submit(
+                _LoopCommand("admit_batch", tuple(active_commands))
+            )
+            if len(active_acks) != len(active_commands):
+                raise RuntimeError(
+                    "LocalEngine admission batch result count mismatch"
                 )
-            if (
-                self._reserved_slots + len(self._admission_pending_ids)
-                >= self.config.hierarchical_queue_capacity
+            for index, ack in zip(
+                active_indexes, active_acks, strict=True
             ):
-                return IngressAck(
-                    request_id=command.request_id,
-                    engine_id=self.engine_id,
-                    enqueued=False,
-                    reason="queue_full",
-                )
-            self._admission_pending_ids.add(command.request_id)
-        return self._submit(_LoopCommand("admit", command))
+                immediate[index] = ack
+        if any(ack is None for ack in immediate):
+            raise RuntimeError("LocalEngine admission batch result is missing")
+        return tuple(ack for ack in immediate if ack is not None)
 
     def submit_abort(self, request_id: int) -> AbortResult:
         with self._ingress_lock:
@@ -380,6 +411,29 @@ class LocalEngineCore:
             events = tuple(self._terminal_events)
             self._terminal_events.clear()
         return events
+
+    def drain_frontend_events(self) -> FrontendEventBatch:
+        """Drain all frontend events and attach the latest cached load."""
+        self.health()
+        with self._events_lock:
+            add_results = tuple(self._add_result_events)
+            first_schedule_events = tuple(self._first_schedule_events)
+            first_token_events = tuple(self._first_token_events)
+            finish_events = tuple(self._terminal_events)
+            self._add_result_events.clear()
+            self._first_schedule_events.clear()
+            self._first_token_events.clear()
+            self._terminal_events.clear()
+        with self._load_lock:
+            load = self._cached_load_snapshot
+        return FrontendEventBatch(
+            engine_id=self.engine_id,
+            load=load,
+            add_results=add_results,
+            first_schedule_events=first_schedule_events,
+            first_token_events=first_token_events,
+            finish_events=finish_events,
+        )
 
     def drain_execution_traces(self) -> tuple[dict[str, Any], ...]:
         self._raise_if_failed()
@@ -434,6 +488,32 @@ class LocalEngineCore:
     def _complete_command(self, command: _LoopCommand) -> None:
         if command.kind == "admit":
             self._complete_admission_commands((command,))
+            return
+        if command.kind == "admit_batch":
+            children = tuple(
+                _LoopCommand(
+                    "admit",
+                    add_command,
+                    enqueued_at=command.enqueued_at,
+                )
+                for add_command in command.payload
+            )
+            self._complete_admission_commands(children)
+            error = next(
+                (
+                    child.error
+                    for child in children
+                    if child.error is not None
+                ),
+                None,
+            )
+            if error is not None:
+                command.error = error
+            else:
+                command.result = tuple(
+                    child.result for child in children
+                )
+            command.completed.set()
             return
         self._command_count += 1
         self._command_queue_delay_ms_total += (
@@ -586,6 +666,7 @@ class LocalEngineCore:
                     enqueued=result.accepted,
                     reason=result.reason,
                     admission_version=admission_version,
+                    capacity_epoch=self._capacity_epoch,
                     local_command_queue_ms=queue_ms,
                     local_admission_ms=local_admission_ms,
                 )
@@ -642,6 +723,7 @@ class LocalEngineCore:
             self._reserved_request_ids.remove(request_id)
             self._reserved_slots -= 1
             self._admission_version += 1
+            self._capacity_epoch += 1
             if self._reserved_slots < 0:
                 raise RuntimeError("negative LocalEngine ingress reservation")
 
@@ -773,6 +855,7 @@ class LocalEngineCore:
             pending_add_results=pending_add_results,
             reserved_slots=reserved_slots,
             admission_version=self._admission_version,
+            capacity_epoch=self._capacity_epoch,
             ingress_queue_delay_ms_total=(
                 self._ingress_queue_delay_ms_total
             ),

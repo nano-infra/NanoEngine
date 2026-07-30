@@ -5,7 +5,7 @@ import os
 import threading
 from dataclasses import dataclass
 from math import ceil
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 import ray
 from ray.util.placement_group import (
@@ -24,6 +24,7 @@ from nanodeploy.engine.hierarchical_contract import (
     CoordinatorStatus,
     DecodeITLSample,
     EngineReady,
+    FrontendEventBatch,
     FirstScheduleEvent,
     FirstTokenEvent,
     FinishEvent,
@@ -105,6 +106,10 @@ class RayEngineTransport:
         with _without_proxy_env():
             return self.actor.admit_add.remote(command)
 
+    def admit_batch_async(self, commands: tuple[AddCommand, ...]):
+        with _without_proxy_env():
+            return self.actor.admit_add_batch.remote(commands)
+
     def enqueue_batch_async(self, commands: tuple[AddCommand, ...]):
         with _without_proxy_env():
             return self.actor.enqueue_add_batch.remote(commands)
@@ -117,6 +122,15 @@ class RayEngineTransport:
             if not ready:
                 return False, None
             return True, ray.get(ready[0])
+
+    def poll_admission_batch(
+        self, handle
+    ) -> tuple[bool, tuple[IngressAck, ...] | None]:
+        with _without_proxy_env():
+            ready, _ = ray.wait([handle], num_returns=1, timeout=0)
+            if not ready:
+                return False, None
+            return True, tuple(ray.get(ready[0]))
 
     def abort(self, request_id: int) -> AbortResult:
         return self._get(self.actor.submit_abort.remote(request_id))
@@ -361,6 +375,63 @@ class DeploymentManager:
                 timeout=self.config.quantum_timeout_s,
             )
         return status.wave_id
+
+    def poll_admission_batches(
+        self, handles: Mapping[int, Any]
+    ) -> dict[int, tuple[IngressAck, ...]]:
+        """Resolve all ready DP admission flights with one nonblocking wait."""
+        if not handles:
+            return {}
+        unknown = set(handles).difference(self.engines)
+        if unknown:
+            raise ValueError(
+                f"admission handles contain unknown engines {sorted(unknown)}"
+            )
+        if len(handles) > len(self.engines):
+            raise RuntimeError("more than one admission flight per engine")
+        ref_to_engine = {
+            handle: engine_id for engine_id, handle in handles.items()
+        }
+        with _without_proxy_env():
+            ready, _ = ray.wait(
+                list(ref_to_engine),
+                num_returns=len(ref_to_engine),
+                timeout=0,
+            )
+            if not ready:
+                return {}
+            results = ray.get(
+                ready, timeout=self.config.quantum_timeout_s
+            )
+        return {
+            ref_to_engine[ref]: tuple(acks)
+            for ref, acks in zip(ready, results, strict=True)
+        }
+
+    def poll_frontend_events(self) -> tuple[FrontendEventBatch, ...]:
+        """Fetch health, load, and all lifecycle events in one RPC per DP."""
+        engine_items = sorted(self.engines.items())
+        with _without_proxy_env():
+            try:
+                batches = ray.get(
+                    [
+                        actor.drain_frontend_events.remote()
+                        for _, actor in engine_items
+                    ],
+                    timeout=self.config.quantum_timeout_s,
+                )
+            except BaseException:
+                self.close()
+                raise
+        for (engine_id, _), batch in zip(
+            engine_items, batches, strict=True
+        ):
+            if batch.engine_id != engine_id:
+                raise RuntimeError(
+                    "LocalEngine frontend event batch owner mismatch: "
+                    f"expected={engine_id}, got={batch.engine_id}"
+                )
+        return tuple(batches)
 
     def poll_events(self) -> tuple[FinishEvent, ...]:
         with _without_proxy_env():

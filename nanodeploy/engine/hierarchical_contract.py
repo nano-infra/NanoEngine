@@ -127,6 +127,9 @@ class IngressAck:
     # centralized-admission ACK carries the version that will be visible in
     # subsequent cached load snapshots.
     admission_version: int | None = None
+    # Capacity epoch observed by the LocalEngine planner. Transient admission
+    # failures remain blocked until a later snapshot advances past this epoch.
+    capacity_epoch: int | None = None
     # Frontend monotonic-clock intervals. router_pending_ms covers time in
     # RequestRouter before admission RPC attempts; admission_rpc_ms covers all
     # attempts through the ACK observed by RequestRouter.
@@ -223,6 +226,11 @@ class LoadSnapshot:
     wave_id: int
     quantum_id: int
     admission_version: int = 0
+    # Monotonic LocalEngine capacity generation. Unlike admission_version,
+    # this only advances when a lifecycle reservation is released, so a
+    # deferred global admission batch is not retried against unchanged
+    # capacity.
+    capacity_epoch: int = 0
     useful_real_batch_size: int = 0
     control_dummy_count: int = 0
     all_dummy_engine_quantums: int = 0
@@ -269,6 +277,18 @@ class LoadSnapshot:
         if self.raw_token_slots == 0:
             return 0.0
         return self.control_dummy_slots / self.raw_token_slots
+
+
+@dataclass(frozen=True, slots=True)
+class FrontendEventBatch:
+    """One consolidated LocalEngine-to-frontend control-plane response."""
+
+    engine_id: int
+    load: LoadSnapshot
+    add_results: tuple[AddResultEvent, ...] = ()
+    first_schedule_events: tuple[FirstScheduleEvent, ...] = ()
+    first_token_events: tuple[FirstTokenEvent, ...] = ()
+    finish_events: tuple[FinishEvent, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

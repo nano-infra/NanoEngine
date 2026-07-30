@@ -109,3 +109,24 @@ the authoritative decision from the LocalEngine loop, and add bounded
 retry/backoff to avoid retry storms. Re-run current-code rate 50 at 32 and 64
 only if an isolated concurrency A/B is still needed; the historical comparison
 also includes intervening admission-path changes.
+
+## 2026-07-30 — bounded admission flights and merged events
+
+Implemented the global-queue dispatch redesign:
+
+- LeastBatch now issues one bounded admission batch per available DP and keeps
+  at most one batch ObjectRef per DP.
+- The frontend polls all active admission refs with one nonblocking
+  `ray.wait`, followed by one `ray.get` for ready batches.
+- `capacity_epoch` blocks a deferred DP until a lifecycle reservation is
+  actually released; this replaces retry-on-any-load-change behavior.
+- LocalEngine processes a complete admission batch as one actor mailbox
+  command while preserving single-writer scheduler admission.
+- Health, cached load, add results, first-schedule, first-token, and terminal
+  events now return in one consolidated RPC per DP/frontend poll cycle.
+- Capacity queue time excludes ordinary frontend poll cadence. Router pending,
+  batch RPC, and true capacity-blocked time remain separate.
+
+Focused CPU validation passed: 78 tests covering control plane, contracts,
+serving ingress, and routing configuration. The rate-50 Ray/GPU validation is
+still pending.

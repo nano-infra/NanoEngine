@@ -59,6 +59,14 @@ class LLMEngine:
         self.metrics_manager = MetricsManager()
         self._frontend_ingress_acks: deque[IngressAck] = deque()
         self._frontend_add_results: deque[AddResultEvent] = deque()
+        self._frontend_first_token_events: deque[
+            FirstTokenEvent
+        ] = deque()
+        self._frontend_first_schedule_events: deque[
+            FirstScheduleEvent
+        ] = deque()
+        self._frontend_finish_events: deque[FinishEvent] = deque()
+        self._frontend_cycle_active = False
         self._closed = False
         self.log_decode_step_detail = _env_flag_enabled(
             "NANODEPLOY_LOG_DECODE_STEP_DETAIL", default=False
@@ -76,6 +84,10 @@ class LLMEngine:
                 self.deployment.engine_clients,
                 router_policy=config.router_policy,
                 kvcache_block_size=config.kvcache_block_size,
+                admission_batch_size=config.max_ingress_batch_requests,
+                poll_admission_batches=(
+                    self.deployment.poll_admission_batches
+                ),
             )
             # LeastBatch also needs an authoritative running-count baseline
             # before draining its global admission queue.
@@ -130,7 +142,7 @@ class LLMEngine:
             deadline = perf_counter() + self.config.quantum_timeout_s
             try:
                 while request_ids.difference(results_by_id):
-                    for ack in self.router.poll_ingress_acks():
+                    for ack in self.poll_ingress_acks():
                         if ack.request_id not in request_ids:
                             deferred_acks.append(ack)
                         elif not ack.enqueued:
@@ -144,8 +156,7 @@ class LLMEngine:
                                 ),
                                 reason=ack.reason,
                             )
-                    raw_results = self.deployment.poll_add_results()
-                    for event in self.router.record_add_results(raw_results):
+                    for event in self.poll_add_results():
                         if event.request_id not in request_ids:
                             deferred_results.append(event)
                         else:
@@ -221,20 +232,17 @@ class LLMEngine:
 
     def poll_ingress_acks(self) -> tuple[IngressAck, ...]:
         if self.config.scheduler_arch == "hierarchical":
-            events = tuple(self._frontend_ingress_acks)
-            self._frontend_ingress_acks.clear()
-            return events + self.router.poll_ingress_acks()
+            # This is the first call in the serving loop's frontend poll
+            # cycle. Force one new consolidated RPC; the other poll_* methods
+            # consume buffers populated by the same response.
+            self._ensure_frontend_cycle(force=True)
         events = tuple(self._frontend_ingress_acks)
         self._frontend_ingress_acks.clear()
         return events
 
     def poll_add_results(self) -> tuple[AddResultEvent, ...]:
         if self.config.scheduler_arch == "hierarchical":
-            events = tuple(self._frontend_add_results)
-            self._frontend_add_results.clear()
-            return events + self.router.record_add_results(
-                self.deployment.poll_add_results()
-            )
+            self._ensure_frontend_cycle()
         events = tuple(self._frontend_add_results)
         self._frontend_add_results.clear()
         return events
@@ -242,18 +250,9 @@ class LLMEngine:
     def poll_first_token_events(self) -> tuple[FirstTokenEvent, ...]:
         if self.config.scheduler_arch != "hierarchical":
             return ()
-        events = self.deployment.poll_first_token_events()
-        for event in events:
-            sequence = self._hierarchical_sequences[event.request_id]
-            metric = sequence.metric
-            if metric is None:
-                continue
-            if metric.first_scheduled_time is None:
-                metric.record_first_scheduled()
-            if metric.decode_scheduled_time is None:
-                metric.record_decode_scheduled()
-            if metric.first_token_time is None:
-                metric.record_first_token()
+        self._ensure_frontend_cycle()
+        events = tuple(self._frontend_first_token_events)
+        self._frontend_first_token_events.clear()
         return events
 
     def poll_first_schedule_events(
@@ -261,9 +260,10 @@ class LLMEngine:
     ) -> tuple[FirstScheduleEvent, ...]:
         if self.config.scheduler_arch != "hierarchical":
             return ()
-        return self.router.record_first_schedule_events(
-            self.deployment.poll_first_schedule_events()
-        )
+        self._ensure_frontend_cycle()
+        events = tuple(self._frontend_first_schedule_events)
+        self._frontend_first_schedule_events.clear()
+        return events
 
     @property
     def num_pending_ingress(self) -> int:
@@ -518,6 +518,98 @@ class LLMEngine:
             return self.router.is_idle
         return self.scheduler.is_finished()
 
+    def _ensure_frontend_cycle(self, *, force: bool = False) -> None:
+        if force:
+            self._frontend_cycle_active = False
+        if self._frontend_cycle_active:
+            return
+        self._poll_frontend_control_plane()
+        self._frontend_cycle_active = True
+
+    def _poll_frontend_control_plane(self) -> None:
+        batches = self.deployment.poll_frontend_events()
+        snapshots = tuple(batch.load for batch in batches)
+        self.router.record_loads(snapshots)
+
+        raw_add_results = tuple(
+            event
+            for batch in batches
+            for event in batch.add_results
+        )
+        ready_add_results = list(
+            self.router.record_add_results(raw_add_results)
+        )
+        self._frontend_ingress_acks.extend(
+            self.router.poll_ingress_acks()
+        )
+        # Admission ACKs can make ADD results fetched in the same consolidated
+        # RPC routable, so flush the router's early-event buffer immediately.
+        ready_add_results.extend(self.router.record_add_results(()))
+        self._frontend_add_results.extend(ready_add_results)
+
+        first_schedule_events = self.router.record_first_schedule_events(
+            event
+            for batch in batches
+            for event in batch.first_schedule_events
+        )
+        self._frontend_first_schedule_events.extend(
+            first_schedule_events
+        )
+
+        first_token_events = tuple(
+            event
+            for batch in batches
+            for event in batch.first_token_events
+        )
+        self._frontend_first_token_events.extend(first_token_events)
+        for event in first_token_events:
+            sequence = self._hierarchical_sequences[event.request_id]
+            metric = sequence.metric
+            if metric is None:
+                continue
+            if metric.first_scheduled_time is None:
+                metric.record_first_scheduled()
+            if metric.decode_scheduled_time is None:
+                metric.record_decode_scheduled()
+            if metric.first_token_time is None:
+                metric.record_first_token()
+
+        finish_events = self.router.record_finish_events(
+            event
+            for batch in batches
+            for event in batch.finish_events
+        )
+        for event in finish_events:
+            sequence = self._hierarchical_sequences[event.request_id]
+            metric = sequence.metric
+            if metric is not None:
+                metric.num_generated_tokens = event.generated_count
+                if (
+                    event.generated_count > 0
+                    and metric.first_token_time is None
+                ):
+                    if metric.first_scheduled_time is None:
+                        metric.record_first_scheduled()
+                    if metric.decode_scheduled_time is None:
+                        metric.record_decode_scheduled()
+                    metric.record_first_token()
+                self.metrics_manager.complete_sequence(event.request_id)
+            sequence.status = SequenceStatus.FINISHED
+        self._frontend_finish_events.extend(finish_events)
+
+        now = time.monotonic()
+        if (
+            now - self._last_load_report_time
+            >= self.config.load_report_interval_ms / 1000
+        ):
+            self._last_load_report_time = now
+            self.metrics_manager.server_metric.update_waiting_requests(
+                sum(snapshot.waiting for snapshot in snapshots)
+            )
+            self.metrics_manager.server_metric.update_running_requests(
+                sum(snapshot.running for snapshot in snapshots)
+            )
+
     def poll(self) -> tuple[FinishEvent, ...]:
         if self.config.scheduler_arch != "hierarchical":
             outputs, *_ = self.step()
@@ -531,39 +623,11 @@ class LLMEngine:
                 for seq_id, token_ids in outputs
             )
 
-        events = self.router.record_finish_events(
-            self.deployment.poll_events()
-        )
-        now = time.monotonic()
-        if (
-            now - self._last_load_report_time
-            >= self.config.load_report_interval_ms / 1000
-        ):
-            snapshots = self.deployment.load_snapshots()
-            self.router.record_loads(snapshots)
-            self._last_load_report_time = now
-            self.metrics_manager.server_metric.update_waiting_requests(
-                sum(snapshot.waiting for snapshot in snapshots)
-            )
-            self.metrics_manager.server_metric.update_running_requests(
-                sum(snapshot.running for snapshot in snapshots)
-            )
-        routed_events: list[FinishEvent] = []
-        for event in events:
-            routed_events.append(event)
-            sequence = self._hierarchical_sequences[event.request_id]
-            metric = sequence.metric
-            if metric is not None:
-                metric.num_generated_tokens = event.generated_count
-                if event.generated_count > 0 and metric.first_token_time is None:
-                    if metric.first_scheduled_time is None:
-                        metric.record_first_scheduled()
-                    if metric.decode_scheduled_time is None:
-                        metric.record_decode_scheduled()
-                    metric.record_first_token()
-                self.metrics_manager.complete_sequence(event.request_id)
-            sequence.status = SequenceStatus.FINISHED
-        return tuple(routed_events)
+        self._ensure_frontend_cycle()
+        events = tuple(self._frontend_finish_events)
+        self._frontend_finish_events.clear()
+        self._frontend_cycle_active = False
+        return events
 
     def abort_request(self, request_id: int):
         if self.config.scheduler_arch != "hierarchical":

@@ -129,3 +129,42 @@ Run current-code-compatible rate 20 and rate 50 tests. Require:
 After the blocking path is removed, return `LocalEngineCore.max_concurrency`
 to 32 (or lower) and A/B it separately; it should no longer be a throughput
 control knob.
+
+## Implemented on 2026-07-30
+
+The first two phases are now implemented:
+
+- `RequestRouter` keeps LeastBatch requests in the global FIFO, assigns them
+  fairly using `running + tentative`, and sends at most one bounded admission
+  batch per DP.
+- `DeploymentManager.poll_admission_batches()` performs one nonblocking
+  `ray.wait` over the active DP flights and one `ray.get` for all ready
+  batches. Outstanding admission refs are therefore bounded by DP, not request
+  count.
+- `LoadSnapshot.capacity_epoch` advances only when a LocalEngine lifecycle
+  reservation is released. A DP that returns any transient deferral is blocked
+  until that epoch changes; a request may still be batch-probed on another
+  currently available DP, but never creates another same-DP flight against
+  unchanged capacity.
+- `LocalEngineCore.admit_add_batch()` reserves mailbox capacity once and runs
+  the complete candidate tuple through the single-writer admission planner.
+- `FrontendEventBatch` merges health validation, cached load, add results,
+  first schedule, first token, and terminal events into one actor RPC per DP
+  per frontend poll cycle. Existing public `poll_*` methods now drain buffers
+  populated by that consolidated response.
+- `global_capacity_queue_ms` starts only after all currently usable admission
+  windows are occupied or a transient deferral is observed. Normal frontend
+  poll cadence remains in `router_pending_ms`; batch ObjectRef latency remains
+  in `admission_rpc_ms`.
+
+CPU validation:
+
+```bash
+pytest -q tests/test_hierarchical_control_plane.py \
+  tests/test_hierarchical_contract.py \
+  tests/test_hierarchical_serving_ingress.py \
+  tests/test_routing_config.py
+```
+
+The next validation step is the rate-50 Ray/GPU A/B, checking the P50/P90/P99
+queue and TTFT boundaries plus `pending_rpc <= attention_dp`.

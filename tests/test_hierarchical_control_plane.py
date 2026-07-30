@@ -16,6 +16,8 @@ from nanodeploy.engine.hierarchical_contract import (
     AddResultEvent,
     AbortResult,
     FirstScheduleEvent,
+    FirstTokenEvent,
+    FrontendEventBatch,
     FinishEvent,
     IngressAck,
     LoadSnapshot,
@@ -200,10 +202,43 @@ class FakeAsyncEngine(FakeEngine):
             )
         return handle
 
+    def admit_batch_async(self, commands: tuple[AddCommand, ...]):
+        acks = []
+        for command in commands:
+            reason = (
+                self.enqueue_reasons.pop(0)
+                if self.enqueue_reasons
+                else None
+            )
+            self.commands.append(command)
+            if reason is None:
+                self.admission_version += 1
+            acks.append(
+                IngressAck(
+                    request_id=command.request_id,
+                    engine_id=self.engine_id,
+                    enqueued=reason is None,
+                    reason=reason,
+                    admission_version=(
+                        self.admission_version
+                        if reason is None
+                        else None
+                    ),
+                )
+            )
+        handle = {"ready": False, "acks": tuple(acks)}
+        self.handles.append(handle)
+        return handle
+
     def poll_enqueue(self, handle):
         if not handle["ready"]:
             return False, None
         return True, handle["ack"]
+
+    def poll_admission_batch(self, handle):
+        if not handle["ready"]:
+            return False, None
+        return True, handle["acks"]
 
 
 def test_router_least_batch_drains_global_pending_with_tentative_counts():
@@ -267,6 +302,81 @@ def test_router_least_batch_uses_live_running_plus_tentative_admissions():
     # tentative charges bring both projected batches to three.
     assert [command.request_id for command in engines[0].commands] == [3]
     assert [command.request_id for command in engines[1].commands] == [1, 2]
+
+
+def test_router_polls_at_most_one_admission_batch_per_dp():
+    engines = {
+        0: FakeAsyncEngine(0),
+        1: FakeAsyncEngine(1),
+    }
+    poll_calls = []
+
+    def poll_batches(handles):
+        poll_calls.append(dict(handles))
+        return {
+            engine_id: handle["acks"]
+            for engine_id, handle in handles.items()
+            if handle["ready"]
+        }
+
+    router = RequestRouter(
+        engines,
+        router_policy="least_batch",
+        admission_batch_size=2,
+        poll_admission_batches=poll_batches,
+    )
+    for request_id in range(5):
+        router.submit_async(
+            request_id=request_id,
+            prompt_token_ids=(1, 2),
+            max_tokens=16,
+            temperature=0.1,
+            ignore_eos=True,
+        )
+
+    assert router.poll_ingress_acks() == ()
+    assert len(poll_calls) == 1
+    assert set(poll_calls[0]) == {0, 1}
+    assert all(
+        len(handle["acks"]) == 2
+        for handle in poll_calls[0].values()
+    )
+    metrics = router.admission_metrics()
+    assert metrics["pending_rpc"] == 2
+    assert metrics["pending_rpc_requests"] == 4
+    assert metrics["global_pending"] == 1
+
+
+def test_local_engine_drains_frontend_events_in_one_batch():
+    actor_class = LocalEngineCore.__ray_metadata__.modified_class
+    engine = object.__new__(actor_class)
+    engine.engine_id = 0
+    engine._failure = None
+    engine._loop_thread = SimpleNamespace(is_alive=lambda: True)
+    engine._events_lock = threading.Lock()
+    engine._load_lock = threading.Lock()
+    engine._add_result_events = deque((AddResultEvent(1, 0, True),))
+    engine._first_schedule_events = deque(
+        (FirstScheduleEvent(1, 0, 3.0),)
+    )
+    engine._first_token_events = deque((FirstTokenEvent(1, 0, 1),))
+    engine._terminal_events = deque(
+        (FinishEvent(1, 16, "FINISHED", 0),)
+    )
+    engine._cached_load_snapshot = load_snapshot(0, 9)
+
+    batch = engine.drain_frontend_events()
+
+    assert isinstance(batch, FrontendEventBatch)
+    assert batch.load.free_blocks_min == 9
+    assert batch.add_results[0].request_id == 1
+    assert batch.first_schedule_events[0].request_id == 1
+    assert batch.first_token_events[0].request_id == 1
+    assert batch.finish_events[0].request_id == 1
+    assert engine._add_result_events == deque()
+    assert engine._first_schedule_events == deque()
+    assert engine._first_token_events == deque()
+    assert engine._terminal_events == deque()
 
 
 def test_router_buffers_terminal_until_async_owner_commit():
@@ -358,8 +468,26 @@ def test_router_retries_globally_after_all_dps_defer_admission(
     clock["now"] = 35.0
     router.record_loads(
         (
-            LoadSnapshot(0, True, 0, 0, 11, 1, 3),
-            LoadSnapshot(1, True, 0, 0, 11, 1, 3),
+            LoadSnapshot(
+                0,
+                True,
+                0,
+                0,
+                11,
+                1,
+                3,
+                capacity_epoch=1,
+            ),
+            LoadSnapshot(
+                1,
+                True,
+                0,
+                0,
+                11,
+                1,
+                3,
+                capacity_epoch=1,
+            ),
         )
     )
     assert router.poll_ingress_acks() == ()
@@ -389,8 +517,8 @@ def test_router_retries_globally_after_all_dps_defer_admission(
     assert terminal.first_forward_to_terminal_ms == 1_000.0
     assert terminal.global_capacity_queue_ms == 25_000.0
     admission_metrics = router.admission_metrics()
-    assert admission_metrics["global_retries"] == 1
-    assert admission_metrics["fallbacks"] == 1
+    assert admission_metrics["global_retries"] == 2
+    assert admission_metrics["fallbacks"] == 0
     assert admission_metrics["per_engine"]["0"]["attempts"] == 2
     assert admission_metrics["per_engine"]["0"]["deferred"] == 1
     assert admission_metrics["per_engine"]["1"]["attempts"] == 1
@@ -603,6 +731,7 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
     engine._cancelled_ingress_ids = set()
     engine._reserved_slots = 0
     engine._admission_version = 0
+    engine._capacity_epoch = 0
     engine._events_lock = threading.Lock()
     engine._add_result_events = deque()
     engine._first_token_events = deque()
@@ -643,6 +772,7 @@ def test_local_engine_ingress_is_nonblocking_and_reserves_lifecycle_capacity(
 
     engine._publish_events((FinishEvent(50, 16, "FINISHED", 0),))
     assert engine._reserved_slots == 1
+    assert engine._capacity_epoch == 1
     assert engine.enqueue_add(commands[2]).enqueued
     assert engine.submit_abort(52).status == "abort_pending"
     engine._drain_ingress()
@@ -692,6 +822,7 @@ def test_local_engine_central_admission_commits_only_after_local_plan():
     engine._cancelled_ingress_ids = set()
     engine._reserved_slots = 0
     engine._admission_version = 0
+    engine._capacity_epoch = 0
     engine._events_lock = threading.Lock()
     engine._add_result_events = deque()
     engine._terminal_events = deque()
