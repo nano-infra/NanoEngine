@@ -218,11 +218,7 @@ class Config(BaseModel):
     # ``step_timing_rank``. Off → zero overhead.
     gpu_idle_probe: bool = False
 
-    # profiler
-    enable_profiler: bool = False
-    profiler_start_step: int = 34
-    profiling_step: int = 8
-    profiler_forward_per_step: int = 2
+    # Output root for traces delimited by the runtime profiler API.
     profiler_dir: str = "./profiler_res"
 
     # logging config – override via DLENGINE_LOG_LEVEL env var

@@ -34,11 +34,9 @@ def main():
         # max_num_send_seqs=128, # Not standard config args, checking if Config supports them or if they go into kwargs of Config. Config definition has them.
         # max_num_recv_seqs=130,
         # kvcache_block_size=256,
-        # enable_profiler=False,
         max_num_send_seqs=128,
         max_num_recv_seqs=130,
         kvcache_block_size=256,
-        enable_profiler=False,
         log_level="INFO",
     )
     decode = LLM(config)

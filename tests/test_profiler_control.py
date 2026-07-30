@@ -42,12 +42,7 @@ def _bare_runner(tmp_path: Path):
     runner.rank = 0
     runner.run_count = 12
     runner.profiler = None
-    runner.profiler_active = False
-    runner.profiler_mode = None
     runner.profiler_trace_dir = None
-    runner.profiler_start_step = 34
-    runner.profiler_end_step = 50
-    runner.profiler_forward_per_step = 2
     return runner
 
 

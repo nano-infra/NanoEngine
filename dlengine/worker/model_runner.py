@@ -356,33 +356,7 @@ class ModelRunner:
 
         self.run_count = 0
         self.profiler = None
-        self.profiler_active = False
-        self.profiler_mode = None
         self.profiler_trace_dir = None
-        self.profiler_start_step = getattr(config, "profiler_start_step", 10)
-        self.profiler_steps = getattr(config, "profiling_step", 10)
-        self.profiler_forward_per_step = max(
-            1, getattr(config, "profiler_forward_per_step", 2)
-        )
-        self.profiler_end_step = (
-            self.profiler_start_step
-            + self.profiler_steps * self.profiler_forward_per_step
-        )
-        if getattr(config, "enable_profiler", False):
-            # Number of forward iterations bundled into one profiler.step()
-            # boundary. Default 2 -- amortises per-step bookkeeping overhead
-            # so the captured trace better reflects steady-state cost.
-            # Total forwards captured = profiler_steps * forward_per_step.
-            profiler_dir = getattr(config, "profiler_dir", "./profiler_logs")
-            self.profiler = self._create_profiler(profiler_dir)
-            self.profiler_mode = "scheduled"
-            self.profiler_trace_dir = str(Path(profiler_dir).resolve())
-            logger.info(
-                f"Rank {rank}: Profiler enabled. Start at {self.profiler_start_step}, "
-                f"{self.profiler_steps} step boundaries × "
-                f"{self.profiler_forward_per_step} forwards/step "
-                f"(end at {self.profiler_end_step})."
-            )
 
         # Initialise the hardware backend before constructing the model so that
         # all layer factories are available when model __init__ runs.
@@ -497,7 +471,6 @@ class ModelRunner:
             return {
                 "rank": self.rank,
                 "status": "already_running",
-                "mode": self.profiler_mode,
                 "trace_name": (
                     Path(self.profiler_trace_dir).name
                     if self.profiler_trace_dir
@@ -510,11 +483,10 @@ class ModelRunner:
         trace_dir = str(
             (Path(self.config.profiler_dir).expanduser().resolve() / trace_name)
         )
-        self.profiler = self._create_profiler(trace_dir)
-        self.profiler_mode = "manual"
+        profiler = self._create_profiler(trace_dir)
+        profiler.start()
+        self.profiler = profiler
         self.profiler_trace_dir = trace_dir
-        self.profiler.start()
-        self.profiler_active = True
         logger.info(
             "Rank %s: Runtime profiler started at step %s; trace_dir=%s",
             self.rank,
@@ -524,7 +496,6 @@ class ModelRunner:
         return {
             "rank": self.rank,
             "status": "started",
-            "mode": self.profiler_mode,
             "trace_name": trace_name,
             "trace_dir": trace_dir,
             "run_count": self.run_count,
@@ -532,24 +503,20 @@ class ModelRunner:
 
     def stop_profiler(self) -> dict:
         """Stop the active profiler and report trace files visible to this worker."""
-        if self.profiler is None or not self.profiler_active:
+        if self.profiler is None:
             return {
                 "rank": self.rank,
                 "status": "not_running",
-                "mode": self.profiler_mode,
                 "trace_dir": self.profiler_trace_dir,
                 "run_count": self.run_count,
                 "trace_files": [],
             }
 
         trace_dir = self.profiler_trace_dir
-        mode = self.profiler_mode
         if torch.cuda.is_initialized():
             torch.cuda.synchronize()
         self.profiler.stop()
         self.profiler = None
-        self.profiler_active = False
-        self.profiler_mode = None
         trace_files = (
             sorted(str(path) for path in Path(trace_dir).glob("**/*") if path.is_file())
             if trace_dir
@@ -564,32 +531,14 @@ class ModelRunner:
         return {
             "rank": self.rank,
             "status": "stopped",
-            "mode": mode,
             "trace_dir": trace_dir,
             "run_count": self.run_count,
             "trace_files": trace_files,
         }
 
     def _advance_profiler(self) -> None:
-        if self.profiler is None or not self.profiler_active:
-            return
-        if self.profiler_mode == "manual":
+        if self.profiler is not None:
             self.profiler.step()
-            return
-        if self.run_count < self.profiler_end_step:
-            rel = self.run_count - self.profiler_start_step
-            if (rel + 1) % self.profiler_forward_per_step == 0:
-                self.profiler.step()
-        if self.run_count == self.profiler_end_step - 1:
-            self.profiler.stop()
-            self.profiler = None
-            self.profiler_active = False
-            self.profiler_mode = None
-            logger.info(
-                "Rank %s: Profiler stopped and saved at step %s",
-                self.rank,
-                self.run_count,
-            )
 
     def num_kvcache_blocks(self):
         return self.config.num_kvcache_blocks
@@ -1718,16 +1667,6 @@ class ModelRunner:
 
         if is_prefill and self.mtp_runner is not None:
             self.mtp_runner.reset_lazy_verify_state()
-
-        # --- Profiler start ---
-        if (
-            self.profiler
-            and self.profiler_mode == "scheduled"
-            and self.run_count == self.profiler_start_step
-        ):
-            self.profiler.start()
-            self.profiler_active = True
-            logger.info(f"Rank {self.rank}: Profiler started at step {self.run_count}")
 
         # --- Prepare inputs ---
         has_lazy_verify = False
