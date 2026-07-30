@@ -44,6 +44,8 @@ class DelayedAckEngine:
         self._active: set[int] = set()
         self.first_forward_to_terminal_ms = 500.0
         self.finish_global_capacity_queue_ms = 0.0
+        self.generated_count = 16
+        self.final_quantum_execute_ms = None
 
     @property
     def active_count(self) -> int:
@@ -106,7 +108,7 @@ class DelayedAckEngine:
         return tuple(
             FinishEvent(
                 request_id,
-                16,
+                self.generated_count,
                 "FINISHED",
                 0,
                 first_forward_to_terminal_ms=(
@@ -114,6 +116,9 @@ class DelayedAckEngine:
                 ),
                 global_capacity_queue_ms=(
                     self.finish_global_capacity_queue_ms
+                ),
+                final_quantum_execute_ms=(
+                    self.final_quantum_execute_ms
                 ),
             )
             for request_id in ready
@@ -196,6 +201,30 @@ class SyntheticCentralEngine:
 
     def execution_boundary_metrics(self):
         return {"mode": "synthetic_central"}
+
+
+class SyntheticCentralPartialQuantumEngine(SyntheticCentralEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self._decode_steps = 0
+
+    def step(self):
+        self._decode_steps += 1
+        if self._decode_steps == 1:
+            for sequence in self._active:
+                sequence.metric.record_first_token()
+                sequence.metric.record_step_tokens(16, 1.0)
+            return [], 16, len(self._active), 0.0, 0.0
+
+        outputs = []
+        for sequence in self._active:
+            sequence.metric.record_step_tokens(1, 10.0)
+            sequence.metric.arrival_time = 0.0
+            sequence.metric.first_scheduled_time = 0.1
+            sequence.metric.completion_time = 0.42
+            outputs.append((sequence.seq_id, [0] * 17))
+        self._active.clear()
+        return outputs, 1, len(outputs), 0.0, 0.0
 
 
 def _load_benchmark_module(monkeypatch, script_dir="sp_ablation"):
@@ -518,11 +547,19 @@ def test_delayed_ingress_ack_does_not_throttle_fixed_rate_dispatch(
     )
     assert all(
         record["tpot_with_queue_source"]
-        == "hierarchical_first_forward_to_terminal"
+        == "hierarchical_real_token_execution_boundary"
         for record in records
     )
     assert all(
         record["first_forward_to_terminal_ms"] == 500.0
+        for record in records
+    )
+    assert all(
+        record["first_forward_to_terminal_real_token_ms"] == 500.0
+        for record in records
+    )
+    assert all(
+        record["final_quantum_unused_decode_ms"] == 0.0
         for record in records
     )
     assert all(
@@ -634,8 +671,11 @@ def test_authoritative_admission_ack_records_bootstrap_ttft(
     assert record["tpot_with_queue_ms"] == 31.25
     assert (
         record["tpot_with_queue_source"]
-        == "hierarchical_first_forward_to_terminal"
+        == "hierarchical_real_token_execution_boundary"
     )
+    assert record["first_forward_to_terminal_real_token_ms"] == 470.0
+    assert record["final_quantum_real_tokens"] == 16
+    assert record["final_quantum_unused_decode_ms"] == 0.0
     assert record["dispatch_normalized_latency_ms"] == 31.25
 
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -652,8 +692,101 @@ def test_authoritative_admission_ack_records_bootstrap_ttft(
     assert summary["global_capacity_queue_ms"]["mean"] == 30.0
     assert summary["local_scheduler_queue_ms"]["mean"] == 12.5
     assert summary["first_forward_to_terminal_ms"]["mean"] == 470.0
+    assert (
+        summary["first_forward_to_terminal_real_token_ms"]["mean"]
+        == 470.0
+    )
+    assert summary["final_quantum_unused_decode_ms"]["mean"] == 0.0
     assert summary["tpot_with_queue_ms"]["mean"] == 31.25
     assert summary["dispatch_normalized_latency_ms"]["mean"] == 31.25
+
+
+def test_hierarchical_tpot_excludes_partial_final_quantum_tail(
+    monkeypatch,
+    tmp_path,
+):
+    benchmark = _load_benchmark_module(monkeypatch)
+    clock = FakeClock()
+    engine = DelayedAckEngine(clock, ack_delay_ms=0)
+    engine.generated_count = 17
+    engine.first_forward_to_terminal_ms = 320.0
+    engine.finish_global_capacity_queue_ms = 20.0
+    engine.final_quantum_execute_ms = 160.0
+    request_metrics_path = tmp_path / "partial_hierarchical.jsonl"
+
+    benchmark.run_benchmark(
+        engine,
+        iter(
+            (
+                (
+                    [1, 2, 3, 4],
+                    SamplingParams(
+                        temperature=0.6,
+                        ignore_eos=True,
+                        max_tokens=17,
+                    ),
+                ),
+            )
+        ),
+        np.asarray([0.05]),
+        1,
+        request_metrics_log_path=str(request_metrics_path),
+        clock_ns=clock,
+        sleep_fn=clock.sleep,
+        show_progress=False,
+    )
+
+    record = json.loads(
+        request_metrics_path.read_text(encoding="utf-8").strip()
+    )
+    assert record["first_forward_to_terminal_ms"] == 320.0
+    assert record["final_quantum_real_tokens"] == 1
+    assert record["final_quantum_unused_decode_ms"] == 150.0
+    assert record["first_forward_to_terminal_real_token_ms"] == 170.0
+    assert record["global_capacity_queue_ms"] == 20.0
+    assert record["tpot_with_queue_ms"] == round(190.0 / 17, 6)
+
+
+def test_centralized_tpot_excludes_partial_final_quantum_tail(
+    monkeypatch,
+    tmp_path,
+):
+    benchmark = _load_benchmark_module(monkeypatch)
+    clock = FakeClock()
+    engine = SyntheticCentralPartialQuantumEngine()
+    request_metrics_path = tmp_path / "partial_central.jsonl"
+
+    benchmark.run_benchmark(
+        engine,
+        iter(
+            (
+                (
+                    [1, 2, 3, 4],
+                    SamplingParams(
+                        temperature=0.6,
+                        ignore_eos=True,
+                        max_tokens=17,
+                    ),
+                ),
+            )
+        ),
+        np.asarray([0.05]),
+        1,
+        request_metrics_log_path=str(request_metrics_path),
+        clock_ns=clock,
+        sleep_fn=clock.sleep,
+        show_progress=False,
+    )
+
+    record = json.loads(
+        request_metrics_path.read_text(encoding="utf-8").strip()
+    )
+    assert record["first_forward_to_terminal_ms"] == 320.0
+    assert record["final_quantum_real_tokens"] == 1
+    assert record["final_quantum_unused_decode_ms"] == 150.0
+    assert record["first_forward_to_terminal_real_token_ms"] == 170.0
+    assert record["global_capacity_queue_ms"] == 100.0
+    assert record["tpot_with_queue_ms"] == round(270.0 / 17, 6)
 
 
 def test_centralized_default_tpot_uses_sequence_scheduler_boundary(
@@ -702,12 +835,18 @@ def test_centralized_default_tpot_uses_sequence_scheduler_boundary(
     assert record["tpot_with_queue_ms"] == expected_tpot
     assert (
         record["tpot_with_queue_source"]
-        == "sequence_metric_first_scheduled_to_terminal"
+        == "sequence_metric_real_token_execution_boundary"
     )
     assert (
         record["first_forward_to_terminal_ms"]
         == expected_execution_ms
     )
+    assert (
+        record["first_forward_to_terminal_real_token_ms"]
+        == expected_execution_ms
+    )
+    assert record["final_quantum_real_tokens"] == 16
+    assert record["final_quantum_unused_decode_ms"] == 0.0
     assert record["global_capacity_queue_ms"] is not None
     assert record["local_scheduler_queue_ms"] == 0.0
     assert record["dispatch_normalized_latency_ms"] == 0.0
@@ -721,7 +860,8 @@ def test_centralized_default_tpot_uses_sequence_scheduler_boundary(
         metrics_summary,
     )
     output = capsys.readouterr().out
-    assert "first forward to local completion" in output
+    assert "real-token execution-boundary time" in output
+    assert "unused final-quantum slots excluded" in output
     assert "Legacy Dispatch-Normalized Latency" in output
     assert "GPU-capacity queue only" in output
 

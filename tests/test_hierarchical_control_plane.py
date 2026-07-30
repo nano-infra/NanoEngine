@@ -32,6 +32,35 @@ from nanodeploy.engine.topology import EngineTopology
 from nanodeploy.router.request_router import RequestOwner, RequestRouter
 
 
+def test_finish_event_excludes_unused_final_quantum_decode_slots():
+    event = FinishEvent(
+        request_id=1,
+        generated_count=17,
+        status="FINISHED",
+        engine_id=0,
+        first_forward_to_terminal_ms=1_000.0,
+        final_quantum_execute_ms=160.0,
+    )
+
+    assert event.final_quantum_real_tokens == 1
+    assert event.final_quantum_unused_decode_ms == 150.0
+    assert event.first_forward_to_terminal_real_token_ms == 850.0
+
+    full_quantum = FinishEvent(
+        request_id=2,
+        generated_count=32,
+        status="FINISHED",
+        engine_id=0,
+        first_forward_to_terminal_ms=2_000.0,
+    )
+    assert full_quantum.final_quantum_real_tokens == 16
+    assert full_quantum.final_quantum_unused_decode_ms == 0.0
+    assert (
+        full_quantum.first_forward_to_terminal_real_token_ms
+        == 2_000.0
+    )
+
+
 @dataclass
 class FakeEngine:
     engine_id: int

@@ -196,3 +196,30 @@ July 29 centralized TPOT (84.77/89.58/90.70 ms versus
 83.62/87.83/90.61 ms); these are not identical metric boundaries. The
 decentralized TPOT-with-queue remains higher because it now includes real
 capacity waiting.
+
+## 2026-07-30 — real-token final-quantum TPOT accounting
+
+The comparison metric previously used the complete first-forward-to-terminal
+wall interval. A request that finished after only part of its final 16-loop
+quantum was therefore charged for all 16 decode slots. The legacy C++
+`SequenceMetric::record_step_tokens()` ITL path instead divides each step by
+the loop count and records samples only for tokens actually generated.
+
+The request benchmark now applies that real-token method consistently to both
+architectures:
+
+- centralized runs subtract unused final slots using the last recorded
+  step-ITL sample;
+- hierarchical runs carry the final `executor.run` duration in `FinishEvent`
+  and subtract `(16 - final_real_tokens) * execute_ms / 16`;
+- true GPU-capacity queue time is retained in full, while raw
+  `first_forward_to_terminal_ms` remains available for diagnostics.
+
+New per-request fields are
+`first_forward_to_terminal_real_token_ms`,
+`final_quantum_real_tokens`, and `final_quantum_unused_decode_ms`.
+`tpot_with_queue_ms` and goodput use the corrected real-token interval. A
+17-token regression case verifies that a 160 ms final quantum contributes
+10 ms and excludes the remaining 150 ms. Focused control-plane, scheduler,
+serving-benchmark, and routing validation passed 82 tests; `py_compile` and
+`git diff --check` also passed.

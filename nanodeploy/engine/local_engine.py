@@ -1008,7 +1008,11 @@ class LocalEngineCore:
                 # after batch freeze and before canonical token commit.
                 self._drain_queue(self._abort_commands)
                 begin = perf_counter()
-                events = self.scheduler.postprocess(batch, worker_results)
+                events = self.scheduler.postprocess(
+                    batch,
+                    worker_results,
+                    execute_latency_ms=execute_latency_ms,
+                )
                 postprocess_latency_ms = (perf_counter() - begin) * 1000
                 self._postprocess_latency_ms_total += postprocess_latency_ms
                 itl_token_count = self.scheduler.last_itl_token_slots

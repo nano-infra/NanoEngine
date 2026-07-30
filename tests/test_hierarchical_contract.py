@@ -375,7 +375,9 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert local.admit() == ()
     final = local.plan_decode(wave_id=1, quantum_id=1)
     events = local.postprocess(
-        final, make_worker_results(final, token_base=200)
+        final,
+        make_worker_results(final, token_base=200),
+        execute_latency_ms=0.0,
     )
     assert len(events) == 1
     assert events[0].request_id == 42
@@ -383,6 +385,9 @@ def test_local_scheduler_bootstrap_and_final_overrun_accounting():
     assert events[0].status == "FINISHED"
     assert events[0].first_forward_to_terminal_ms is not None
     assert events[0].first_forward_to_terminal_ms >= 0
+    assert events[0].final_quantum_execute_ms == 0.0
+    assert events[0].final_quantum_real_tokens == 1
+    assert events[0].final_quantum_unused_decode_ms == 0.0
     assert events[0].global_capacity_queue_ms == 0
     assert local.drain_first_token_events() == ()
     assert sequence.num_completed_tokens == 17

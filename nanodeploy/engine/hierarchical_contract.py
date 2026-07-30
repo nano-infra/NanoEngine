@@ -188,6 +188,43 @@ class FinishEvent:
     engine_id: int
     first_forward_to_terminal_ms: float | None = None
     global_capacity_queue_ms: float = 0.0
+    final_quantum_execute_ms: float | None = None
+
+    @property
+    def final_quantum_real_tokens(self) -> int:
+        if self.generated_count <= 0:
+            return 0
+        remainder = self.generated_count % HIERARCHICAL_LOOP_COUNT
+        return remainder or HIERARCHICAL_LOOP_COUNT
+
+    @property
+    def final_quantum_unused_decode_ms(self) -> float | None:
+        if self.status != "FINISHED" or self.generated_count <= 0:
+            return None
+        unused_tokens = (
+            HIERARCHICAL_LOOP_COUNT - self.final_quantum_real_tokens
+        )
+        if unused_tokens == 0:
+            return 0.0
+        if self.final_quantum_execute_ms is None:
+            return None
+        return (
+            max(0.0, self.final_quantum_execute_ms)
+            * unused_tokens
+            / HIERARCHICAL_LOOP_COUNT
+        )
+
+    @property
+    def first_forward_to_terminal_real_token_ms(self) -> float | None:
+        if self.first_forward_to_terminal_ms is None:
+            return None
+        unused_decode_ms = self.final_quantum_unused_decode_ms
+        if unused_decode_ms is None:
+            return None
+        return max(
+            0.0,
+            self.first_forward_to_terminal_ms - unused_decode_ms,
+        )
 
 
 @dataclass(frozen=True, slots=True)

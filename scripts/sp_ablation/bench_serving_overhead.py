@@ -18,7 +18,10 @@ if ROOT_DIR not in sys.path:
 import numpy as np
 import pandas as pd
 from nanodeploy import LLM, SamplingParams
-from nanodeploy.engine.hierarchical_contract import FinishEvent
+from nanodeploy.engine.hierarchical_contract import (
+    FinishEvent,
+    HIERARCHICAL_LOOP_COUNT,
+)
 from nanodeploy.engine.sequence import Sequence
 from tqdm.auto import tqdm
 
@@ -493,6 +496,37 @@ def default_metrics_summary_path(request_metrics_log_path):
     return str(path.with_name(f"{path.name}.summary.json"))
 
 
+def central_final_quantum_unused_decode_ms(
+    metric,
+    generated_count,
+    raw_service_ms,
+    loop_count,
+):
+    if generated_count <= 0:
+        return None
+    if loop_count <= 0:
+        raise ValueError("loop_count must be positive")
+    final_real_tokens = generated_count % loop_count
+    final_real_tokens = final_real_tokens or loop_count
+    unused_tokens = loop_count - final_real_tokens
+    if unused_tokens == 0:
+        return 0.0
+
+    itl_samples = metric.itl_samples
+    if itl_samples:
+        final_token_slot_ms = float(itl_samples[-1])
+    elif generated_count == 1:
+        # record_step_tokens intentionally has no ITL sample for the first
+        # token. A one-token request has exactly one quantum, so use its raw
+        # service wall time as the best available full-quantum duration.
+        final_token_slot_ms = float(raw_service_ms) / loop_count
+    else:
+        raise RuntimeError(
+            "centralized partial final quantum has no ITL sample"
+        )
+    return max(0.0, final_token_slot_ms) * unused_tokens
+
+
 def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
     successful = [
         record for record in records if not record.get("is_error")
@@ -527,6 +561,12 @@ def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
         "first_forward_to_terminal_ms": metric_percentiles(
             records, "first_forward_to_terminal_ms"
         ),
+        "first_forward_to_terminal_real_token_ms": metric_percentiles(
+            records, "first_forward_to_terminal_real_token_ms"
+        ),
+        "final_quantum_unused_decode_ms": metric_percentiles(
+            records, "final_quantum_unused_decode_ms"
+        ),
         "ttft_ms_definition": (
             "dispatch to bootstrap-ready for authoritative hierarchical "
             "admission or the legacy sequence metric; model first-token "
@@ -543,16 +583,24 @@ def build_request_metrics_summary(records, *, slo_threshold_ms=100.0):
             "forward execution"
         ),
         "first_forward_to_terminal_ms_definition": (
-            "server-side time from immediately before the request's first "
-            "executor.run until local terminal completion"
+            "raw scheduler execution-boundary wall time through terminal "
+            "completion, including any unused tail loops in the final quantum"
+        ),
+        "first_forward_to_terminal_real_token_ms_definition": (
+            "raw execution-boundary wall time minus final-quantum decode "
+            "slots that did not produce real tokens"
+        ),
+        "final_quantum_unused_decode_ms_definition": (
+            "per-token-slot decode time multiplied by unused slots in the "
+            "final fixed-size quantum"
         ),
         "tpot_with_queue_ms": metric_percentiles(
             records, "tpot_with_queue_ms"
         ),
         "tpot_with_queue_ms_definition": (
-            "(first-forward-to-local-terminal time plus GPU-capacity queue "
-            "time) / generated tokens; excludes dispatch, RPC/command pickup, "
-            "and non-capacity scheduler-boundary delay"
+            "(real-token execution-boundary time plus GPU-capacity queue "
+            "time) / generated tokens; final-quantum loops beyond the actual "
+            "output length are excluded"
         ),
         "dispatch_normalized_latency_ms": metric_percentiles(
             records, "dispatch_normalized_latency_ms"
@@ -873,6 +921,9 @@ def run_benchmark(
                 6,
             )
         first_forward_to_terminal_ms = None
+        first_forward_to_terminal_real_token_ms = None
+        final_quantum_real_tokens = None
+        final_quantum_unused_decode_ms = None
         tpot_with_queue_ms = None
         tpot_with_queue_source = None
         if finish_event is not None:
@@ -913,16 +964,35 @@ def run_benchmark(
                         f"disagree for request {request_id}"
                     )
                 global_capacity_queue_ms = terminal_capacity_queue_ms
+                final_quantum_real_tokens = (
+                    finish_event.final_quantum_real_tokens
+                )
+                final_quantum_unused_decode_ms = (
+                    finish_event.final_quantum_unused_decode_ms
+                )
+                first_forward_to_terminal_real_token_ms = (
+                    finish_event.first_forward_to_terminal_real_token_ms
+                )
+                if (
+                    final_quantum_unused_decode_ms is None
+                    or first_forward_to_terminal_real_token_ms is None
+                ):
+                    raise RuntimeError(
+                        "hierarchical FINISHED request is missing final "
+                        "quantum execution timing: "
+                        f"request_id={request_id}, "
+                        f"generated_count={actual_output_tokens}"
+                    )
                 tpot_with_queue_ms = round(
                     (
-                        first_forward_to_terminal_ms
+                        first_forward_to_terminal_real_token_ms
                         + global_capacity_queue_ms
                     )
                     / actual_output_tokens,
                     6,
                 )
                 tpot_with_queue_source = (
-                    "hierarchical_first_forward_to_terminal"
+                    "hierarchical_real_token_execution_boundary"
                 )
             else:
                 if seq.metric is None:
@@ -942,17 +1012,52 @@ def run_benchmark(
                         "centralized FINISHED request has incomplete "
                         f"scheduling metrics: request_id={request_id}"
                     )
-                tpot_with_queue_ms = round(float(metric_tpot), 6)
                 first_forward_to_terminal_ms = round(
                     float(metric_tpot_without_queue)
                     * actual_output_tokens,
                     6,
                 )
+                central_loop_count = int(
+                    getattr(
+                        engine.config,
+                        "loop_count",
+                        HIERARCHICAL_LOOP_COUNT,
+                    )
+                )
+                final_quantum_real_tokens = (
+                    actual_output_tokens % central_loop_count
+                    or central_loop_count
+                )
+                final_quantum_unused_decode_ms = (
+                    central_final_quantum_unused_decode_ms(
+                        seq.metric,
+                        actual_output_tokens,
+                        first_forward_to_terminal_ms,
+                        central_loop_count,
+                    )
+                )
+                first_forward_to_terminal_real_token_ms = max(
+                    0.0,
+                    first_forward_to_terminal_ms
+                    - final_quantum_unused_decode_ms,
+                )
+                raw_with_queue_ms = (
+                    float(metric_tpot) * actual_output_tokens
+                )
+                tpot_with_queue_ms = round(
+                    max(
+                        0.0,
+                        raw_with_queue_ms
+                        - final_quantum_unused_decode_ms,
+                    )
+                    / actual_output_tokens,
+                    6,
+                )
                 tpot_with_queue_source = (
-                    "sequence_metric_first_scheduled_to_terminal"
+                    "sequence_metric_real_token_execution_boundary"
                 )
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "request_id": int(request_id),
             "engine_id": int(engine_id),
             "status": status,
@@ -998,6 +1103,20 @@ def run_benchmark(
             "local_scheduler_queue_ms": local_scheduler_queue_ms,
             "first_forward_to_terminal_ms": (
                 first_forward_to_terminal_ms
+            ),
+            "first_forward_to_terminal_real_token_ms": (
+                round(
+                    float(first_forward_to_terminal_real_token_ms),
+                    6,
+                )
+                if first_forward_to_terminal_real_token_ms is not None
+                else None
+            ),
+            "final_quantum_real_tokens": final_quantum_real_tokens,
+            "final_quantum_unused_decode_ms": (
+                round(float(final_quantum_unused_decode_ms), 6)
+                if final_quantum_unused_decode_ms is not None
+                else None
             ),
             "e2e_ms": e2e_ms,
             "arrival_e2e_ms": arrival_e2e_ms,
@@ -1725,8 +1844,8 @@ def calculate_and_print_metrics(
     if tpot_wq_stats:
         print("--- TPOT With Queueing Time (ms/token) ---")
         print(
-            "  Definition: first forward to local completion plus "
-            "GPU-capacity queue"
+            "  Definition: real-token execution-boundary time plus "
+            "GPU-capacity queue; unused final-quantum slots excluded"
         )
         print(f"  Avg:  {tpot_wq_stats.get('mean', 0):.2f}")
         print(f"  P50:  {tpot_wq_stats.get('p50', 0):.2f}")

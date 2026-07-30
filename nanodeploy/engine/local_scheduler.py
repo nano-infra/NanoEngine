@@ -578,7 +578,11 @@ class LocalScheduler:
         return AbortResult(request_id=request_id, status="aborted")
 
     def _emit_terminal(
-        self, record: LocalRequestRecord, status: str
+        self,
+        record: LocalRequestRecord,
+        status: str,
+        *,
+        final_quantum_execute_ms: float | None = None,
     ) -> None:
         if record.terminal_emitted:
             raise RuntimeError(
@@ -608,6 +612,7 @@ class LocalScheduler:
                 first_forward_to_terminal_ms=(
                     first_forward_to_terminal_ms
                 ),
+                final_quantum_execute_ms=final_quantum_execute_ms,
             )
         )
 
@@ -615,9 +620,13 @@ class LocalScheduler:
         self,
         batch: LocalDecodeBatch,
         worker_results: list[WorkerDecodeResult],
+        *,
+        execute_latency_ms: float | None = None,
     ) -> tuple[FinishEvent, ...]:
         if batch.engine_id != self.engine_id:
             raise ValueError("decode batch belongs to a different LocalScheduler")
+        if execute_latency_ms is not None and execute_latency_ms < 0:
+            raise ValueError("execute_latency_ms must be non-negative")
         results_by_rank = batch.validate_worker_results(worker_results)
         self._raw_token_slots += (
             len(batch._all_sequences) * HIERARCHICAL_LOOP_COUNT
@@ -734,7 +743,11 @@ class LocalScheduler:
                 )
             if record.sequence.is_finished:
                 record.state = RequestState.FINISHED
-                self._emit_terminal(record, "FINISHED")
+                self._emit_terminal(
+                    record,
+                    "FINISHED",
+                    final_quantum_execute_ms=execute_latency_ms,
+                )
             else:
                 record.state = RequestState.RUNNING_DECODE
         self._inflight_ids.clear()

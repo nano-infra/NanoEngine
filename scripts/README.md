@@ -34,8 +34,16 @@ scripts/run_2node_rate30_6min_matrix.sh
   GPU 容量排队；
 - 去中心化：LocalScheduler 首次进入 `executor.run` 到本地完成时间，加
   RequestRouter 全局 GPU 容量排队；
-- 两者都除以实际生成 token 数，不计 benchmark dispatch、RPC/command pickup
-  或非容量的 quantum 边界等待。
+- 两者都会扣除最后一个固定 16-loop quantum 中未生成真实 token 的
+  decode slot，再除以实际生成 token 数。中心化使用
+  `record_step_tokens()` 保存的末 step ITL，去中心化使用末 quantum 的
+  `executor.run / 16`，统计口径一致；
+- GPU 容量排队完整保留；不计 benchmark dispatch、RPC/command pickup 或
+  非容量的 quantum 边界等待。
+
+每条请求同时保留原始 `first_forward_to_terminal_ms`、修正后的
+`first_forward_to_terminal_real_token_ms`、末 quantum 的真实 token 数和
+被扣除的 `final_quantum_unused_decode_ms`，便于复核修正幅度。
 
 旧的 benchmark-observed `dispatch -> completion / generated tokens` 保留为
 `dispatch_normalized_latency_ms`，不再作为默认 TPOT 或 goodput 的输入。
