@@ -7,6 +7,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub(crate) const DECODE_FLAT_MAGIC: u32 = 0x444d_444c;
+pub(crate) const DECODE_FLAT_VERSION: u16 = 1;
+pub(crate) const DECODE_FLAT_HEADER_BYTES: usize = 64;
+pub(crate) const DECODE_FLAG_DUMMY: u16 = 1 << 0;
+pub(crate) const DECODE_FLAG_ALL_GREEDY: u16 = 1 << 1;
+pub(crate) const DECODE_FLAG_COMPLETION_LOGPROBS: u16 = 1 << 2;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct WireBatch {
     pub(super) is_prefill: bool,
@@ -352,6 +359,177 @@ pub(crate) fn sequence_refs_runner_in_bytes(
         },
         "run batch",
     )
+}
+
+fn align_decode_payload(payload: &mut Vec<u8>, alignment: usize) -> usize {
+    let aligned = payload.len().div_ceil(alignment) * alignment;
+    payload.resize(aligned, 0);
+    aligned
+}
+
+fn append_i64s(payload: &mut Vec<u8>, values: &[i64]) -> usize {
+    let offset = align_decode_payload(payload, 16);
+    for value in values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    offset
+}
+
+fn append_u64s(payload: &mut Vec<u8>, values: &[u64]) -> usize {
+    let offset = align_decode_payload(payload, 16);
+    for value in values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    offset
+}
+
+fn append_f32s(payload: &mut Vec<u8>, values: &[f32]) -> usize {
+    let offset = align_decode_payload(payload, 16);
+    for value in values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    offset
+}
+
+fn append_u32s(payload: &mut Vec<u8>, values: &[u32]) -> usize {
+    let offset = align_decode_payload(payload, 16);
+    for value in values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    offset
+}
+
+fn append_i32s(payload: &mut Vec<u8>, values: &[i32]) -> usize {
+    let offset = align_decode_payload(payload, 16);
+    for value in values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    offset
+}
+
+fn put_u16(header: &mut [u8], offset: usize, value: u16) {
+    header[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(header: &mut [u8], offset: usize, value: usize) -> PyResult<()> {
+    let value = u32::try_from(value)
+        .map_err(|_| PyValueError::new_err("flat decode payload exceeds u32 limits"))?;
+    header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+pub(crate) fn sequence_refs_decode_flat_bytes(
+    seqs: Vec<&Sequence>,
+    max_num_seqs: usize,
+    max_num_blocks: usize,
+    block_size: usize,
+) -> PyResult<Vec<u8>> {
+    if max_num_seqs == 0 || max_num_blocks == 0 || block_size == 0 {
+        return Err(PyValueError::new_err(
+            "flat decode configuration dimensions must be positive",
+        ));
+    }
+    if seqs.len() > max_num_seqs {
+        return Err(PyValueError::new_err(format!(
+            "flat decode batch {} exceeds max_num_seqs {max_num_seqs}",
+            seqs.len()
+        )));
+    }
+
+    let is_dummy = seqs.is_empty();
+    let num_seqs = if is_dummy { 1 } else { seqs.len() };
+    let mut input_ids = Vec::with_capacity(num_seqs);
+    let mut positions = Vec::with_capacity(num_seqs);
+    let mut temperatures = Vec::with_capacity(num_seqs);
+    let mut state_slots = Vec::with_capacity(num_seqs);
+    let mut hisparse_slots = Vec::with_capacity(num_seqs);
+    let mut seq_ids = Vec::with_capacity(num_seqs);
+    let mut row_offsets = Vec::with_capacity(num_seqs + 1);
+    let mut block_ids = Vec::new();
+    let mut all_greedy = true;
+    let mut any_completion_logprobs = false;
+    row_offsets.push(0);
+
+    if is_dummy {
+        input_ids.push(0);
+        positions.push(0);
+        temperatures.push(0.0);
+        state_slots.push(-1);
+        hisparse_slots.push(-1);
+        seq_ids.push(0);
+        row_offsets.push(0);
+    } else {
+        for seq in seqs {
+            if seq.active_block_table.len() > max_num_blocks {
+                return Err(PyValueError::new_err(format!(
+                    "sequence {} has {} blocks, exceeds flat decode capacity {max_num_blocks}",
+                    seq.seq_id,
+                    seq.active_block_table.len()
+                )));
+            }
+            if seq.active_block_table.iter().any(|block| *block < 0) {
+                return Err(PyValueError::new_err(format!(
+                    "sequence {} has a negative block id",
+                    seq.seq_id
+                )));
+            }
+            let temperature = seq.sampling_params.temperature as f32;
+            input_ids.push(i64::from(seq.last_token));
+            positions.push(seq.token_ids.len().saturating_sub(1) as i64);
+            temperatures.push(temperature);
+            state_slots.push(i64::from(seq.active_state_slot));
+            hisparse_slots.push(i64::from(seq.active_hisparse_slot));
+            seq_ids.push(seq.seq_id);
+            block_ids.extend_from_slice(&seq.active_block_table);
+            row_offsets.push(u32::try_from(block_ids.len()).map_err(|_| {
+                PyValueError::new_err("flat decode block id count exceeds u32 limits")
+            })?);
+            all_greedy &= temperature < 1e-5;
+            any_completion_logprobs |= seq.sampling_params.return_completion_logprobs;
+        }
+    }
+
+    let mut payload = vec![0u8; DECODE_FLAT_HEADER_BYTES];
+    let input_ids_offset = append_i64s(&mut payload, &input_ids);
+    let positions_offset = append_i64s(&mut payload, &positions);
+    let temperatures_offset = append_f32s(&mut payload, &temperatures);
+    let state_slots_offset = append_i64s(&mut payload, &state_slots);
+    let hisparse_slots_offset = append_i64s(&mut payload, &hisparse_slots);
+    let row_offsets_offset = append_u32s(&mut payload, &row_offsets);
+    let block_ids_offset = append_i32s(&mut payload, &block_ids);
+    let seq_ids_offset = append_u64s(&mut payload, &seq_ids);
+
+    let mut flags = 0u16;
+    if is_dummy {
+        flags |= DECODE_FLAG_DUMMY;
+    }
+    if all_greedy {
+        flags |= DECODE_FLAG_ALL_GREEDY;
+    }
+    if any_completion_logprobs {
+        flags |= DECODE_FLAG_COMPLETION_LOGPROBS;
+    }
+
+    let payload_len = payload.len();
+    let header = &mut payload[..DECODE_FLAT_HEADER_BYTES];
+    header[0..4].copy_from_slice(&DECODE_FLAT_MAGIC.to_le_bytes());
+    put_u16(header, 4, DECODE_FLAT_VERSION);
+    put_u16(header, 6, flags);
+    put_u32(header, 8, payload_len)?;
+    put_u32(header, 12, num_seqs)?;
+    put_u32(header, 16, max_num_seqs)?;
+    put_u32(header, 20, max_num_blocks)?;
+    put_u32(header, 24, block_size)?;
+    put_u32(header, 28, input_ids_offset)?;
+    put_u32(header, 32, positions_offset)?;
+    put_u32(header, 36, temperatures_offset)?;
+    put_u32(header, 40, state_slots_offset)?;
+    put_u32(header, 44, hisparse_slots_offset)?;
+    put_u32(header, 48, row_offsets_offset)?;
+    put_u32(header, 52, block_ids_offset)?;
+    put_u32(header, 56, seq_ids_offset)?;
+    put_u32(header, 60, block_ids.len())?;
+    Ok(payload)
 }
 
 pub(crate) fn sequence_refs_migrate_batch_bytes(seqs: Vec<&Sequence>) -> PyResult<Vec<u8>> {

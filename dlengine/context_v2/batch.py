@@ -21,6 +21,7 @@ class BatchContext(BaseContext):
     num_tokens_per_seq: int = 1
     sampling_token_indices: torch.Tensor | None = None
     sampling_seq_indices: torch.Tensor | None = None
+    sampling_temperatures: torch.Tensor | None = None
     paged_attention_strategy: PagedAttentionStrategy | None = None
     graph_attention_strategy: PagedAttentionStrategy | None = None
     decode_page_plan_key: tuple[int, ...] | None = None
@@ -85,6 +86,7 @@ def set_batch_context(
     num_tokens_per_seq: int = 1,
     sampling_token_indices: Optional[torch.Tensor] = None,
     sampling_seq_indices: Optional[torch.Tensor] = None,
+    sampling_temperatures: Optional[torch.Tensor] = None,
     paged_attention_strategy: PagedAttentionStrategy | None = None,
     graph_attention_strategy: PagedAttentionStrategy | None = None,
     decode_page_plan_key: tuple[int, ...] | None = None,
@@ -104,6 +106,7 @@ def set_batch_context(
         num_tokens_per_seq=num_tokens_per_seq,
         sampling_token_indices=sampling_token_indices,
         sampling_seq_indices=sampling_seq_indices,
+        sampling_temperatures=sampling_temperatures,
         paged_attention_strategy=paged_attention_strategy,
         graph_attention_strategy=graph_attention_strategy,
         decode_page_plan_key=decode_page_plan_key,

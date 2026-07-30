@@ -34,6 +34,16 @@ def build_scheduler_config(
     # ``max_num_batched_tokens`` is the per-forward/per-stage microbatch size.
     # Admit one microbatch per PP stage so a scheduler step can fill the pipe.
     token_budget = scheduler_token_budget(config)
+    architectures = getattr(config.hf_config, "architectures", None) or []
+    use_decode_metadata_kernel = bool(
+        getattr(config, "use_decode_metadata_kernel", True)
+        and architectures
+        and architectures[0]
+        in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
+        and not config.enforce_eager
+        and config.num_speculative_tokens == 0
+        and not getattr(config, "enable_hisparse", False)
+    )
     return SchedulerConfig(
         engine_id=config.engine_id or "",
         num_speculative_tokens=config.num_speculative_tokens,
@@ -50,6 +60,7 @@ def build_scheduler_config(
         routing_strategy=RoutingStrategy[config.routing_strategy],
         gdn_state_cache_slots=max(0, getattr(config, "gdn_state_cache_slots", 0)),
         enable_prefix_cache=bool(getattr(config, "enable_prefix_cache", True)),
+        use_decode_metadata_kernel=use_decode_metadata_kernel,
         cache_plan=cache_plan,
     )
 

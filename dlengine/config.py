@@ -218,6 +218,11 @@ class Config(BaseModel):
     # ``step_timing_rank``. Off → zero overhead.
     gpu_idle_probe: bool = False
 
+    # Use the versioned mapped-host decode metadata path on supported models.
+    # The scheduler and workers must agree because the flat decode wire has no
+    # legacy runtime fallback.
+    use_decode_metadata_kernel: bool = True
+
     # profiler
     enable_profiler: bool = False
     profiler_start_step: int = 34

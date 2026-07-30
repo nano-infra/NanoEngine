@@ -3,8 +3,9 @@ use crate::common;
 use crate::metrics::{RuntimeMetrics, ServerMetric};
 use crate::proto::wire::{
     bytes_arg, decode_binary, migrate_request_to_sequence, request_to_sequence,
-    sequence_refs_migrate_batch_bytes, sequence_refs_runner_in_bytes, WireRequestIn,
-    WireRequestMigrate, WireSamplingParams, WireVisionSlot,
+    sequence_refs_decode_flat_bytes, sequence_refs_migrate_batch_bytes,
+    sequence_refs_runner_in_bytes, WireRequestIn, WireRequestMigrate, WireSamplingParams,
+    WireVisionSlot,
 };
 use crate::proto::RunnerOut;
 use crate::sampling::SamplingParams;
@@ -215,7 +216,19 @@ impl Scheduler {
                     .iter()
                     .filter_map(|seq_id| self.seq_table.get(seq_id))
                     .collect::<Vec<_>>();
-                let bytes = sequence_refs_runner_in_bytes(borrowed, is_prefill)?;
+                let bytes = if is_prefill || !self.config.use_decode_metadata_kernel {
+                    sequence_refs_runner_in_bytes(borrowed, is_prefill)?
+                } else {
+                    let block_size = self.config.kvcache_block_size.max(1) as usize;
+                    let max_num_blocks =
+                        (self.config.max_model_len.max(1) as usize).div_ceil(block_size);
+                    sequence_refs_decode_flat_bytes(
+                        borrowed,
+                        self.config.max_num_seqs.max(1) as usize,
+                        max_num_blocks,
+                        block_size,
+                    )?
+                };
                 out.push(PyBytes::new(py, &bytes).into());
             }
         }

@@ -65,20 +65,36 @@ def _make_bs_list(max_bs: int) -> list[int]:
 class DecodeGraphRunner:
     """CUDAGraph capture / replay for standard decode (one token per seq)."""
 
-    def __init__(self, config, hf_config, cache_ctx):
+    def __init__(self, config, hf_config, cache_ctx, decode_metadata=None):
         self.config = config
+        self._decode_metadata = decode_metadata
+        decode_metadata_views = (
+            decode_metadata.views if decode_metadata is not None else None
+        )
         max_bs = min(config.max_num_seqs, 512)
         block_size = cache_ctx.block_size
         max_num_blocks = (config.max_model_len + block_size - 1) // block_size
         is_mla = getattr(hf_config, "kv_lora_rank", 0) > 0
         is_dsv4 = hf_config.architectures[0] == "DeepseekV4ForCausalLM"
 
-        # Persistent input / output buffers
-        self._input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        self._positions = torch.zeros(max_bs, dtype=torch.int64)
-        self._slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        self._context_lens = torch.zeros(1, max_bs, dtype=torch.int32)
-        self._block_tables = torch.zeros(1, max_bs, max_num_blocks, dtype=torch.int32)
+        # Persistent input / output buffers. The mapped metadata path owns
+        # these allocations so the unpack kernel writes the exact addresses
+        # captured by CUDA Graph.
+        self._external_decode_metadata = decode_metadata_views is not None
+        if decode_metadata_views is None:
+            self._input_ids = torch.zeros(max_bs, dtype=torch.int64)
+            self._positions = torch.zeros(max_bs, dtype=torch.int64)
+            self._slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+            self._context_lens = torch.zeros(1, max_bs, dtype=torch.int32)
+            self._block_tables = torch.zeros(
+                1, max_bs, max_num_blocks, dtype=torch.int32
+            )
+        else:
+            self._input_ids = decode_metadata_views.input_ids
+            self._positions = decode_metadata_views.positions
+            self._slot_mapping = decode_metadata_views.slot_mapping
+            self._context_lens = decode_metadata_views.context_lens
+            self._block_tables = decode_metadata_views.block_tables
         self._outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self._returns_logits = (
             _capture_logits_enabled() and get_dist_context().attn_tp_world_size == 1
@@ -127,8 +143,10 @@ class DecodeGraphRunner:
         self._dummy_gdn_slot = None
         if cache_ctx.gdn_conv_states is not None:
             self._dummy_gdn_slot = cache_ctx.gdn_conv_states.shape[1] - 1
-            self._gdn_state_slots = torch.full(
-                (max_bs,), self._dummy_gdn_slot, dtype=torch.int64
+            self._gdn_state_slots = (
+                torch.full((max_bs,), self._dummy_gdn_slot, dtype=torch.int64)
+                if decode_metadata_views is None
+                else decode_metadata_views.state_slots
             )
 
         # DSv4 compressor state slots (parallel to gdn_state_slots)
@@ -265,6 +283,19 @@ class DecodeGraphRunner:
             return None
         state = self._graph_ctx.flashinfer_decode
         return state.ensure_wrapper(master_bs) if state is not None else None
+
+    def _flashinfer_plan_buffers(
+        self, master_bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        state = self._graph_ctx.flashinfer_decode
+        if state is None:
+            raise RuntimeError("FlashInfer decode graph state is not initialized")
+        state.ensure_wrapper(master_bs)
+        return (
+            state.indptr[master_bs],
+            state.indices[master_bs],
+            state.last_page_len[master_bs],
+        )
 
     def _plan_flashinfer_graph_wrapper(
         self,
@@ -425,6 +456,14 @@ class DecodeGraphRunner:
             # Capture
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, g.graph_pool):
+                if self._decode_metadata is not None:
+                    if self._flashinfer_decode_enabled:
+                        self._decode_metadata.launch_graph(
+                            g.dummy_gdn_slot,
+                            self._flashinfer_plan_buffers(master_bs),
+                        )
+                    else:
+                        self._decode_metadata.launch(g.dummy_gdn_slot)
                 hidden = model(
                     g.input_ids[:master_bs], g.positions[:master_bs], **model_kwargs
                 )
@@ -462,9 +501,10 @@ class DecodeGraphRunner:
             raise RuntimeError(f"No graph map for master_bs={master_bs}")
         attn_bs = next(x for x in valid if x >= attn_bs)
 
-        # Copy inputs
-        g.input_ids[:bs] = input_ids
-        g.positions[:bs] = positions
+        # The mapped metadata kernel writes persistent graph buffers directly.
+        if not self._external_decode_metadata:
+            g.input_ids[:bs] = input_ids
+            g.positions[:bs] = positions
         if g.per_layer_token_part is not None:
             token_part = self._model.model.prepare_decode_graph_token_part(
                 input_ids,
@@ -472,8 +512,9 @@ class DecodeGraphRunner:
                 g.per_layer_token_part.dtype,
             )
             g.per_layer_token_part[:bs].copy_(token_part)
-        g.slot_mapping.fill_(-1)
-        g.slot_mapping[:bs] = context.slot_mapping
+        if not self._external_decode_metadata:
+            g.slot_mapping.fill_(-1)
+            g.slot_mapping[:bs] = context.slot_mapping
         g.hisparse_slots.fill_(g.max_num_seqs)
         if context.hisparse_slots is not None:
             g.hisparse_slots[:bs].copy_(context.hisparse_slots[:bs])
@@ -486,19 +527,22 @@ class DecodeGraphRunner:
                 g.positions[:master_bs],
                 g.hisparse_slot_mapping[:master_bs],
             )
-        g.context_lens.zero_()
-        g.context_lens[:, : context.context_lens.shape[1]].copy_(context.context_lens)
-        g.block_tables.zero_()
-        g.block_tables[
-            :, : context.block_tables.size(1), : context.block_tables.size(2)
-        ] = context.block_tables
-        if self._flashinfer_decode_enabled and bs < master_bs:
-            g.context_lens[:, bs:master_bs] = 1
+        if not self._external_decode_metadata:
+            g.context_lens.zero_()
+            g.context_lens[:, : context.context_lens.shape[1]].copy_(
+                context.context_lens
+            )
+            g.block_tables.zero_()
+            g.block_tables[
+                :, : context.block_tables.size(1), : context.block_tables.size(2)
+            ] = context.block_tables
+            if self._flashinfer_decode_enabled and bs < master_bs:
+                g.context_lens[:, bs:master_bs] = 1
 
         if self._is_mla:
             pass  # FlashMLASchedMeta is managed internally by the kernel; no copy needed
 
-        if g.gdn_state_slots is not None:
+        if g.gdn_state_slots is not None and not self._external_decode_metadata:
             g.gdn_state_slots.fill_(g.dummy_gdn_slot)
             if context.gdn_state_slots is not None:
                 g.gdn_state_slots[:bs].copy_(context.gdn_state_slots)
@@ -523,9 +567,21 @@ class DecodeGraphRunner:
         if page_plan_key is not None:
             page_plan_key = page_plan_key[:bs] + (1,) * max(0, master_bs - bs)
 
-        self._plan_flashinfer_graph_wrapper(
-            master_bs, master_bs, page_plan_key=page_plan_key
-        )
+        if self._decode_metadata is not None and self._flashinfer_decode_enabled:
+            state = self._graph_ctx.flashinfer_decode
+            if state.needs_precomputed_plan(master_bs, page_plan_key):
+                self._decode_metadata.launch_graph(
+                    g.dummy_gdn_slot,
+                    self._flashinfer_plan_buffers(master_bs),
+                )
+                state.plan_precomputed(master_bs, page_plan_key)
+            self._graph_ctx.set_active_flashinfer_decode_wrapper(
+                state.ensure_wrapper(master_bs)
+            )
+        else:
+            self._plan_flashinfer_graph_wrapper(
+                master_bs, master_bs, page_plan_key=page_plan_key
+            )
         g.graphs[(master_bs, attn_bs)].replay()
         if g.returns_logits:
             return g.logits[:bs]

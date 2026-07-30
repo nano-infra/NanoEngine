@@ -147,7 +147,7 @@ class DLSLimeExecutor(RayExecutor):
         # inside run_batch, so the snapshot must straddle submit + wait_all.
         wwi_ns0_list, imm_ns0_list = self._probe_per_proxy()
         futures = [
-            proxy.run_batch(encode_run_request(data))
+            proxy.run_batch(encode_run_request(data, is_prefill))
             for proxy, data in zip(self._proxies, batch_bytes)
         ]
         _t2 = _time.perf_counter()
@@ -170,7 +170,7 @@ class DLSLimeExecutor(RayExecutor):
 
         _t0 = _time.perf_counter()
         futures = [
-            proxy.prepare_batch(encode_run_request(data))
+            proxy.prepare_batch(encode_run_request(data, is_prefill))
             for proxy, data in zip(self._proxies, batch_bytes)
         ]
         _t1 = _time.perf_counter()

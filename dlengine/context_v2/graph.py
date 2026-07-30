@@ -94,17 +94,6 @@ class FlashInferDecodeGraphState:
         if wrapper is None:
             return None
 
-        if self.config.reuse_page_plan and page_plan_key is not None:
-            plan_key = (bs, page_plan_key[:bs])
-            if self.plan_keys.get(master_bs) == plan_key:
-                update_decode_last_page_len(
-                    self.last_page_len[master_bs],
-                    context_lens,
-                    bs,
-                    self.config.block_size,
-                )
-                return wrapper
-
         indptr, indices, last_page_len = paged_decode_metadata(
             block_tables, context_lens, bs, self.config.block_size
         )
@@ -127,19 +116,65 @@ class FlashInferDecodeGraphState:
                     tuple((indptr[1:] - indptr[:-1]).tolist()),
                 )
             )
+            # Matching compact shapes do not imply matching physical pages
+            # after a batch slot is reused. Refresh persistent metadata before
+            # skipping the expensive wrapper.plan() call.
             if self.plan_keys.get(master_bs) == plan_key:
                 return wrapper
             self.plan_keys[master_bs] = plan_key
 
+        self._plan_wrapper(
+            wrapper,
+            plan_indptr,
+            plan_indices,
+            plan_last_page_len,
+        )
+        return wrapper
+
+    def needs_precomputed_plan(
+        self,
+        master_bs: int,
+        page_plan_key: tuple[int, ...],
+    ) -> bool:
+        return self.plan_keys.get(master_bs) != (master_bs, page_plan_key)
+
+    def plan_precomputed(
+        self,
+        master_bs: int,
+        page_plan_key: tuple[int, ...],
+    ) -> object | None:
+        wrapper = self.ensure_wrapper(master_bs)
+        if wrapper is None:
+            return None
+        plan_key = (master_bs, page_plan_key)
+        if self.plan_keys.get(master_bs) == plan_key:
+            return wrapper
+        self.plan_keys[master_bs] = plan_key
+        num_indices = sum(page_plan_key)
+        self._plan_wrapper(
+            wrapper,
+            self.indptr[master_bs],
+            self.indices[master_bs][:num_indices],
+            self.last_page_len[master_bs],
+        )
+        return wrapper
+
+    def _plan_wrapper(
+        self,
+        wrapper,
+        indptr: torch.Tensor,
+        indices: torch.Tensor,
+        last_page_len: torch.Tensor,
+    ) -> None:
         plan_kwargs = {}
         if self.config.fixed_split_size > 0:
             plan_kwargs["fixed_split_size"] = self.config.fixed_split_size
         if self.config.disable_split_kv:
             plan_kwargs["disable_split_kv"] = True
         wrapper.plan(
-            plan_indptr,
-            plan_indices,
-            plan_last_page_len,
+            indptr,
+            indices,
+            last_page_len,
             num_qo_heads=self.config.num_heads,
             num_kv_heads=self.config.num_kv_heads,
             head_dim=self.config.head_dim,
@@ -151,7 +186,6 @@ class FlashInferDecodeGraphState:
             sm_scale=self.config.softmax_scale,
             **plan_kwargs,
         )
-        return wrapper
 
 
 @dataclass
